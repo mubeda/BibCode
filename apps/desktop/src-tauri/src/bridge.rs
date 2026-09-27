@@ -1064,7 +1064,36 @@ pub async fn desktop_bridge_retry_project_data(
     backend: State<'_, BackendSupervisor>,
     environment_id: String,
 ) -> Result<(), String> {
-    data_safety::retry_project_data(backend.inner(), &environment_id).await
+    data_safety::retry_project_data(backend.inner(), &environment_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn ensure_app_restart_allowed(
+    update_coordination: bool,
+    install_in_flight: bool,
+) -> Result<(), String> {
+    if update_coordination || install_in_flight {
+        return Err(
+            "BiBCode can't restart while an update or project-data operation is running."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn desktop_bridge_restart_app(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+    updates: State<'_, DesktopUpdateManager>,
+) -> Result<(), String> {
+    ensure_app_restart_allowed(
+        backend.update_coordination_in_progress(),
+        updates.install_in_flight(),
+    )?;
+    app.request_restart();
+    Ok(())
 }
 
 #[tauri::command]
@@ -3957,6 +3986,17 @@ mod tests {
     }
 
     #[test]
+    fn app_restart_guard_refuses_update_and_project_data_operations() {
+        assert!(ensure_app_restart_allowed(false, false).is_ok());
+        for (coordination, installing) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                ensure_app_restart_allowed(coordination, installing).expect_err("restart is busy"),
+                "BiBCode can't restart while an update or project-data operation is running."
+            );
+        }
+    }
+
+    #[test]
     fn tauri_ipc_handlers_preserve_runtime_agnostic_bridge_contracts() {
         use crate::config::IsolatedTestDataRoot;
         use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
@@ -3985,6 +4025,7 @@ mod tests {
                 desktop_bridge_restore_project_data,
                 desktop_bridge_start_empty_project_data,
                 desktop_bridge_retry_project_data,
+                desktop_bridge_restart_app,
                 desktop_bridge_open_project_data_path,
                 desktop_bridge_export_project_data_diagnostics,
                 desktop_bridge_get_client_settings,

@@ -5,7 +5,7 @@ use bibcode_server::process::{configure_background_command, configure_background
 use bibcode_server::{
     DESKTOP_SHUTDOWN_PATH as SERVER_BACKEND_SHUTDOWN_PATH,
     DESKTOP_SHUTDOWN_TOKEN_HEADER as SERVER_BACKEND_SHUTDOWN_TOKEN_HEADER, DataRootRequest,
-    DataRootSource, ResolvedDataRoot, ServerConfig, ServerRuntime,
+    DataRootSource, ResolvedDataRoot, ServerConfig, ServerError, ServerRuntime,
 };
 use serde_json::{Value, json};
 use std::{
@@ -455,6 +455,7 @@ struct BackendSlotState {
     backend: Option<ManagedBackend>,
     pid: Option<u32>,
     last_error: Option<String>,
+    recovery_failure: Option<BackendStartFailure>,
     plan_error: Option<BackendPlanError>,
     unavailable: Option<BackendUnavailableEnvironment>,
     restart_attempt: u32,
@@ -464,10 +465,26 @@ struct BackendSlotState {
 #[derive(Debug, Default)]
 struct BackendState {
     slots: BTreeMap<String, BackendSlotState>,
+    published_recovery: Vec<BackendRecoveryEntry>,
     next_run_id: u64,
     in_flight_starts: usize,
     update_coordination: bool,
     lifecycle: BackendLifecycle,
+}
+
+impl BackendState {
+    fn backend_recovery(&self) -> Vec<BackendRecoveryEntry> {
+        self.slots
+            .values()
+            .filter_map(|slot| {
+                let plan = slot.launch_plan.as_ref()?;
+                let failure = slot.recovery_failure.as_ref()?;
+                slot.backend
+                    .is_none()
+                    .then(|| BackendRecoveryEntry::new(plan, failure.clone()))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -594,10 +611,13 @@ impl WslCommandResolver for SystemWslCommandResolver {
     }
 }
 
+type BackendRecoveryListener = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 pub struct BackendSupervisor {
     state: Arc<Mutex<BackendState>>,
     start_completed: Arc<Notify>,
+    recovery_listener: Arc<Mutex<Option<BackendRecoveryListener>>>,
     ui_process_observer: Arc<Mutex<Option<Arc<dyn DesktopUiProcessObserver>>>>,
     remote_update_delegate:
         Arc<Mutex<Option<Arc<dyn bibcode_server::remote_update::RemoteUpdateDelegate>>>>,
@@ -636,6 +656,7 @@ impl Default for BackendSupervisor {
         Self {
             state: Arc::default(),
             start_completed: Arc::default(),
+            recovery_listener: Arc::default(),
             ui_process_observer: Arc::default(),
             remote_update_delegate: Arc::default(),
             remote_update_support: Arc::default(),
@@ -672,6 +693,69 @@ pub(crate) struct BackendUpdateSnapshot {
     pub environments: Vec<BackendUpdateEnvironment>,
     running_plans: Vec<BackendLaunchPlan>,
     unavailable_environments: Vec<BackendUnavailableEnvironment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum BackendStartFailure {
+    #[error("{detail}")]
+    PortInUse { port: u16, detail: String },
+    #[error("{detail}")]
+    Other { detail: String },
+}
+
+impl BackendStartFailure {
+    fn other(detail: impl Into<String>) -> Self {
+        Self::Other {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl From<BackendStartFailure> for String {
+    fn from(failure: BackendStartFailure) -> Self {
+        failure.to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackendRecoveryEntry {
+    pub environment_id: String,
+    pub label: String,
+    pub port: u16,
+    pub failure: BackendStartFailure,
+}
+
+impl BackendRecoveryEntry {
+    fn new(plan: &BackendLaunchPlan, failure: BackendStartFailure) -> Self {
+        let port = match &failure {
+            BackendStartFailure::PortInUse { port, .. } => *port,
+            BackendStartFailure::Other { .. } => plan.config.port,
+        };
+        Self {
+            environment_id: plan.config.environment_id.clone(),
+            label: plan.config.label.clone(),
+            port,
+            failure,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendRecoveryFailure {
+    pub entries: Vec<BackendRecoveryEntry>,
+}
+
+impl fmt::Display for BackendRecoveryFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Could not restart every desktop backend: ")?;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index > 0 {
+                write!(formatter, "; ")?;
+            }
+            write!(formatter, "{}: {}", entry.label, entry.failure)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -736,8 +820,9 @@ impl BackendProjectDataOperation {
         Ok(())
     }
 
-    pub(crate) async fn restart_after_commit(&self) -> Result<(), String> {
-        self.supervisor
+    pub(crate) async fn restart_after_commit(&self) -> Result<(), BackendStartFailure> {
+        let result = self
+            .supervisor
             .start_with_options_inner(
                 self.target.launch_plan.clone(),
                 BackendReadinessConfig::default(),
@@ -748,7 +833,13 @@ impl BackendProjectDataOperation {
                 self.target.running.then_some(SAME_PORT_RESTART_BIND_RETRY),
             )
             .await
-            .map(|_| ())
+            .map(|_| ());
+        if let Err(failure) = &result {
+            self.supervisor
+                .record_recovery_restart_failure(&self.target.launch_plan, failure);
+        }
+        self.supervisor.publish_recovery_change();
+        result
     }
 }
 
@@ -917,6 +1008,13 @@ impl BackendSupervisor {
         Ok(self.snapshot_for_update())
     }
 
+    pub(crate) fn update_coordination_in_progress(&self) -> bool {
+        self.state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .update_coordination
+    }
+
     pub(crate) fn expect_update_snapshot_exit(&self, snapshot: &BackendUpdateSnapshot) {
         let state = self
             .state
@@ -952,8 +1050,8 @@ impl BackendSupervisor {
     pub(crate) async fn restart_update_snapshot(
         &self,
         snapshot: &BackendUpdateSnapshot,
-    ) -> Result<(), String> {
-        let mut errors = Vec::new();
+    ) -> Result<(), BackendRecoveryFailure> {
+        let mut entries = Vec::new();
         for plan in &snapshot.running_plans {
             if let Err(error) = self
                 .start_with_options_inner(
@@ -966,7 +1064,20 @@ impl BackendSupervisor {
                 )
                 .await
             {
-                errors.push(format!("{}: {error}", plan.config.label));
+                self.record_plan_error_with_classification(plan, error.to_string(), None);
+                if let Some(slot) = self
+                    .state
+                    .lock()
+                    .expect("backend supervisor mutex poisoned")
+                    .slots
+                    .get_mut(&backend_slot_key(plan))
+                    && slot.launch_plan.as_ref() == Some(plan)
+                    && slot.backend.is_none()
+                {
+                    // Shutdown or a topology restart may already have removed/replaced this slot.
+                    slot.recovery_failure = Some(error.clone());
+                }
+                entries.push(BackendRecoveryEntry::new(plan, error));
             }
         }
         for unavailable in &snapshot.unavailable_environments {
@@ -974,15 +1085,13 @@ impl BackendSupervisor {
         }
         self.state
             .lock()
-            .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .update_coordination = false;
-        if errors.is_empty() {
+        self.publish_recovery_change();
+        if entries.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "Could not restart every desktop backend: {}",
-                errors.join("; ")
-            ))
+            Err(BackendRecoveryFailure { entries })
         }
     }
 
@@ -1008,6 +1117,62 @@ impl BackendSupervisor {
     ) {
         *self.remote_update_delegate.lock().expect("delegate slot") = Some(delegate);
         *self.remote_update_support.lock().expect("support slot") = Some(support);
+    }
+
+    pub(crate) fn install_recovery_listener(&self, listener: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .recovery_listener
+            .lock()
+            .expect("recovery listener mutex poisoned") = Some(listener);
+    }
+
+    pub(crate) fn backend_recovery(&self) -> Vec<BackendRecoveryEntry> {
+        self.state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .backend_recovery()
+    }
+
+    fn publish_recovery_change(&self) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("backend supervisor mutex poisoned");
+            let recovery = state.backend_recovery();
+            if state.published_recovery == recovery {
+                return;
+            }
+            state.published_recovery = recovery;
+        }
+        let listener = self
+            .recovery_listener
+            .lock()
+            .expect("recovery listener mutex poisoned")
+            .clone();
+        // The listener reads update state, whose only nested lock order is updates -> supervisor.
+        if let Some(listener) = listener {
+            listener();
+        }
+    }
+
+    fn record_recovery_restart_failure(
+        &self,
+        plan: &BackendLaunchPlan,
+        failure: &BackendStartFailure,
+    ) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("backend supervisor mutex poisoned");
+            if let Some(slot) = state.slots.get_mut(&backend_slot_key(plan))
+                && slot.recovery_failure.is_some()
+            {
+                slot.recovery_failure = Some(failure.clone());
+            }
+        }
+        self.publish_recovery_change();
     }
 
     pub fn local_environment_bootstraps(&self) -> Vec<Value> {
@@ -1065,6 +1230,8 @@ impl BackendSupervisor {
             .entry(PRIMARY_LOCAL_ENVIRONMENT_ID.to_string())
             .or_default()
             .last_error = Some(error.into());
+        drop(state);
+        self.publish_recovery_change();
     }
 
     pub(crate) fn record_planning_error(&self, error: BackendPlanError) {
@@ -1077,11 +1244,14 @@ impl BackendSupervisor {
             .entry(PRIMARY_LOCAL_ENVIRONMENT_ID.to_string())
             .or_default();
         slot.launch_plan = None;
+        slot.recovery_failure = None;
         slot.backend = None;
         slot.pid = None;
         slot.last_error = Some(error.to_string());
         slot.plan_error = Some(error);
         slot.restart_scheduled = false;
+        drop(state);
+        self.publish_recovery_change();
     }
 
     pub(crate) fn primary_plan_error(&self) -> Option<BackendPlanError> {
@@ -1160,15 +1330,7 @@ impl BackendSupervisor {
                     error.clone(),
                     plan_error,
                 );
-                if let Err(event_error) =
-                    emit_project_data_status_changed(&app, &primary_plan.config.environment_id)
-                {
-                    tracing::warn!(
-                        target: "bibcode_desktop_tauri::backend",
-                        environment_id = primary_plan.config.environment_id,
-                        "desktop project-data status invalidation failed: {event_error}"
-                    );
-                }
+                emit_project_data_status_changed(&app, &primary_plan.config.environment_id);
                 return Err(error);
             }
         };
@@ -1266,6 +1428,7 @@ impl BackendSupervisor {
     ) -> Result<BackendRunConfig, String> {
         self.start_with_options_inner(plan, readiness, restart, true, false, None)
             .await
+            .map_err(String::from)
     }
 
     /// Starts one plan of the default topology. A plan whose port a backend
@@ -1287,6 +1450,7 @@ impl BackendSupervisor {
             listener_bind_retry,
         )
         .await
+        .map_err(String::from)
     }
 
     /// Starts `plan`. `listener_bind_retry` is set only by a restart onto the
@@ -1300,9 +1464,10 @@ impl BackendSupervisor {
         reset_restart_attempt: bool,
         update_recovery: bool,
         listener_bind_retry: Option<Duration>,
-    ) -> Result<BackendRunConfig, String> {
-        let permit =
-            self.begin_start_with_update_recovery(reset_restart_attempt, update_recovery)?;
+    ) -> Result<BackendRunConfig, BackendStartFailure> {
+        let permit = self
+            .begin_start_with_update_recovery(reset_restart_attempt, update_recovery)
+            .map_err(BackendStartFailure::other)?;
         let ui_process_observer = self.ui_process_observer_for_start();
         let remote_update_delegate = self
             .remote_update_delegate
@@ -1345,6 +1510,7 @@ impl BackendSupervisor {
                 slot.launch_plan = Some(active_plan);
                 slot.pid = pid;
                 slot.last_error = None;
+                slot.recovery_failure = None;
                 slot.plan_error = None;
                 slot.unavailable = None;
                 slot.restart_scheduled = false;
@@ -1364,7 +1530,7 @@ impl BackendSupervisor {
             if let Err(error) = &cleanup {
                 permit.record_cleanup_error(error.clone());
             }
-            return Err(match cleanup {
+            return Err(BackendStartFailure::other(match cleanup {
                 Ok(()) => {
                     "Desktop backend shutdown began before startup could be published.".to_string()
                 }
@@ -1372,8 +1538,9 @@ impl BackendSupervisor {
                     "Desktop backend shutdown began before startup could be published; \
                      late backend cleanup failed: {error}"
                 ),
-            });
+            }));
         };
+        self.publish_recovery_change();
         #[cfg(test)]
         self.runtime_published.publish();
 
@@ -1601,6 +1768,7 @@ impl BackendSupervisor {
             }
         };
 
+        self.publish_recovery_change();
         if let Some((shutdown_epoch, backends, completion_tx)) = pending_shutdown {
             let supervisor = self.clone();
             tauri::async_runtime::spawn(async move {
@@ -1702,6 +1870,7 @@ impl BackendSupervisor {
             (attempt, restart_delay_for_attempt(attempt, &restart))
         };
 
+        self.publish_recovery_change();
         tracing::warn!(
             target: "bibcode_desktop_tauri::backend",
             "desktop backend restart attempt {attempt} scheduled after {delay:?}"
@@ -1725,7 +1894,7 @@ impl BackendSupervisor {
                 )
                 .await
             {
-                supervisor.schedule_restart(plan, readiness, restart, error);
+                supervisor.schedule_restart(plan, readiness, restart, error.into());
             }
         });
     }
@@ -1752,6 +1921,8 @@ impl BackendSupervisor {
         slot.last_error = Some(error);
         slot.plan_error = plan_error;
         slot.restart_scheduled = false;
+        drop(state);
+        self.publish_recovery_change();
     }
 
     pub(crate) fn record_unavailable_environment(
@@ -1767,12 +1938,15 @@ impl BackendSupervisor {
             .entry(unavailable.environment_id.clone())
             .or_default();
         slot.launch_plan = None;
+        slot.recovery_failure = None;
         slot.backend = None;
         slot.pid = None;
         slot.last_error = Some(unavailable.detail.clone());
         slot.plan_error = None;
         slot.unavailable = Some(unavailable);
         slot.restart_scheduled = false;
+        drop(state);
+        self.publish_recovery_change();
     }
 
     #[cfg(test)]
@@ -1846,15 +2020,20 @@ fn emit_backend_ready<R: Runtime>(
     .map_err(|error| format!("Could not emit desktop backend readiness: {error}"))
 }
 
-fn emit_project_data_status_changed<R: Runtime>(
+pub(crate) fn emit_project_data_status_changed<R: Runtime>(
     app: &AppHandle<R>,
     environment_id: &str,
-) -> Result<(), String> {
-    app.emit(
+) {
+    if let Err(error) = app.emit(
         PROJECT_DATA_STATUS_CHANGED_EVENT,
         json!({ "environmentId": environment_id }),
-    )
-    .map_err(|error| format!("Could not emit project-data status change: {error}"))
+    ) {
+        tracing::warn!(
+            target: "bibcode_desktop_tauri::backend",
+            environment_id,
+            "desktop project-data status invalidation failed: Could not emit project-data status change: {error}"
+        );
+    }
 }
 
 async fn start_managed_backend(
@@ -1865,11 +2044,12 @@ async fn start_managed_backend(
     remote_update_support: Option<bibcode_server::remote_update::RemoteUpdateSupport>,
     run_id: u64,
     listener_bind_retry: Option<Duration>,
-) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), String> {
+) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), BackendStartFailure> {
     match &plan.target {
         BackendLaunchTarget::InProcess { data_root, .. } => {
             #[cfg(test)]
-            prepare_isolated_test_server_settings(&data_root.effective)?;
+            prepare_isolated_test_server_settings(&data_root.effective)
+                .map_err(BackendStartFailure::other)?;
             let mut server_config = server_config_for_launch(data_root.clone(), &plan.config);
             if let Some(support) = remote_update_support {
                 server_config = server_config.with_remote_update_support(support);
@@ -1894,14 +2074,27 @@ async fn start_managed_backend(
                     .await
                 }
             }
-            .map_err(|error| format!("Could not start in-process desktop backend: {error}"))?;
+            .map_err(|error| {
+                let detail = format!("Could not start in-process desktop backend: {error}");
+                match error {
+                    ServerError::Bind { source, .. }
+                        if source.kind() == io::ErrorKind::AddrInUse =>
+                    {
+                        BackendStartFailure::PortInUse {
+                            port: plan.config.port,
+                            detail,
+                        }
+                    }
+                    _ => BackendStartFailure::other(detail),
+                }
+            })?;
 
             let mut config = plan.config.clone();
             config.port = handle.local_addr().port();
             if let Err(error) = wait_for_http_ready(&config.http_base_url(), &readiness).await {
                 handle.shutdown();
                 let _ = handle.join().await;
-                return Err(error);
+                return Err(BackendStartFailure::other(error));
             }
 
             Ok((
@@ -1928,17 +2121,24 @@ async fn start_managed_backend(
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
             let mut child = command.spawn().map_err(|error| {
-                format!("Could not start desktop backend using {program}: {error}")
+                BackendStartFailure::other(format!(
+                    "Could not start desktop backend using {program}: {error}"
+                ))
             })?;
 
             let mut stdin = child.stdin.take().ok_or_else(|| {
-                "Desktop backend child process did not expose stdin for bootstrap delivery."
-                    .to_string()
+                BackendStartFailure::other(
+                    "Desktop backend child process did not expose stdin for bootstrap delivery.",
+                )
             })?;
             stdin
                 .write_all(bootstrap_line.as_bytes())
                 .await
-                .map_err(|error| format!("Could not write desktop backend bootstrap: {error}"))?;
+                .map_err(|error| {
+                    BackendStartFailure::other(format!(
+                        "Could not write desktop backend bootstrap: {error}"
+                    ))
+                })?;
             drop(stdin);
 
             drain_output("stdout", child.stdout.take(), plan.log_path.clone());
@@ -1947,7 +2147,7 @@ async fn start_managed_backend(
             let config = plan.config.clone();
             if let Err(error) = wait_for_http_ready(&config.http_base_url(), &readiness).await {
                 let _ = child.start_kill();
-                return Err(error);
+                return Err(BackendStartFailure::other(error));
             }
 
             let pid = child.id();
@@ -2990,6 +3190,28 @@ fn desktop_base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
 }
 
 #[cfg(test)]
+pub(crate) fn recovery_test_supervisor(
+    plan: BackendLaunchPlan,
+    failure: BackendStartFailure,
+) -> BackendSupervisor {
+    let supervisor = BackendSupervisor::new();
+    supervisor
+        .state
+        .lock()
+        .expect("test supervisor")
+        .slots
+        .insert(
+            backend_slot_key(&plan),
+            BackendSlotState {
+                launch_plan: Some(plan),
+                recovery_failure: Some(failure),
+                ..Default::default()
+            },
+        );
+    supervisor
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::free_test_port;
@@ -3912,6 +4134,281 @@ exit /b 9
         })
         .await
         .unwrap_or_else(|_| panic!("the stopped backend should release port {port} within 5s"))
+    }
+
+    fn capture_recovery_changes(
+        supervisor: &BackendSupervisor,
+    ) -> Arc<Mutex<Vec<Vec<BackendRecoveryEntry>>>> {
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let captured = notifications.clone();
+        let observed = supervisor.clone();
+        supervisor.install_recovery_listener(Arc::new(move || {
+            captured
+                .lock()
+                .expect("notifications")
+                .push(observed.backend_recovery());
+        }));
+        notifications
+    }
+
+    #[tokio::test]
+    async fn stopped_recovery_is_removed_and_notified_once() {
+        let root = tempfile::tempdir().expect("isolated backend data");
+        let supervisor = recovery_test_supervisor(
+            BackendLaunchPlan::local(root.path().to_path_buf(), local_test_config(43117)),
+            BackendStartFailure::PortInUse {
+                port: 43118,
+                detail: "held port".to_owned(),
+            },
+        );
+        let notifications = capture_recovery_changes(&supervisor);
+        supervisor.record_error("held port");
+        let recovery = supervisor.backend_recovery();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(
+            recovery[0].port, 43118,
+            "typed bind port wins over the plan port"
+        );
+        assert_eq!(notifications.lock().expect("notifications").len(), 1);
+        supervisor.record_error("same visible failure");
+        assert_eq!(notifications.lock().expect("notifications").len(), 1);
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("stop");
+        assert!(supervisor.backend_recovery().is_empty());
+        assert_eq!(notifications.lock().expect("notifications").len(), 2);
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("idempotent stop");
+        assert_eq!(notifications.lock().expect("notifications").len(), 2);
+    }
+
+    #[test]
+    fn recovery_restart_failure_reclassifies_only_pending_slots() {
+        let root = tempfile::tempdir().expect("isolated backend data");
+        let plan = BackendLaunchPlan::local(root.path().to_path_buf(), local_test_config(43117));
+        let supervisor = recovery_test_supervisor(
+            plan.clone(),
+            BackendStartFailure::PortInUse {
+                port: 43118,
+                detail: "held port".to_owned(),
+            },
+        );
+        let notifications = capture_recovery_changes(&supervisor);
+        let other = BackendStartFailure::Other {
+            detail: "broken store".to_owned(),
+        };
+        supervisor.record_recovery_restart_failure(&plan, &other);
+        assert_eq!(supervisor.backend_recovery()[0].failure, other);
+        assert_eq!(supervisor.backend_recovery()[0].port, 43117);
+        assert_eq!(notifications.lock().expect("notifications").len(), 1);
+        supervisor.record_plan_error(&plan, "new diagnostic".to_owned());
+        assert_eq!(supervisor.backend_recovery()[0].failure, other);
+        assert_eq!(notifications.lock().expect("notifications").len(), 1);
+        supervisor.record_recovery_restart_failure(&plan, &other);
+        assert_eq!(notifications.lock().expect("notifications").len(), 1);
+
+        let first_start = BackendSupervisor::new();
+        first_start.record_plan_error(&plan, "first start failed".to_owned());
+        first_start.record_recovery_restart_failure(&plan, &other);
+        assert!(first_start.backend_recovery().is_empty());
+    }
+
+    #[test]
+    fn removing_recovery_launch_plans_clears_entries_and_notifies() {
+        for unavailable in [false, true] {
+            let root = tempfile::tempdir().expect("isolated backend data");
+            let plan =
+                BackendLaunchPlan::local(root.path().to_path_buf(), local_test_config(43117));
+            let supervisor = recovery_test_supervisor(
+                plan,
+                BackendStartFailure::Other {
+                    detail: "restart failed".to_owned(),
+                },
+            );
+            let notifications = capture_recovery_changes(&supervisor);
+            supervisor.record_error("restart failed");
+            if unavailable {
+                supervisor.record_unavailable_environment(BackendUnavailableEnvironment {
+                    environment_id: "primary".to_owned(),
+                    label: "Local".to_owned(),
+                    configured_distro: None,
+                    detail: "no longer available".to_owned(),
+                });
+            } else {
+                supervisor.record_planning_error(BackendPlanError::Other {
+                    detail: "planning failed".to_owned(),
+                });
+            }
+            assert!(supervisor.backend_recovery().is_empty());
+            assert_eq!(notifications.lock().expect("notifications").len(), 2);
+            let state = supervisor.state.lock().expect("supervisor");
+            assert!(state.slots["primary"].recovery_failure.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_publication_tolerates_concurrent_slot_removal() {
+        let root = tempfile::tempdir().expect("isolated data");
+        let invalid_root = root.path().join("not-a-directory");
+        fs::write(&invalid_root, b"file").expect("broken store fixture");
+        let plan = BackendLaunchPlan::local(invalid_root, local_test_config(43117));
+        let supervisor = recovery_test_supervisor(
+            plan.clone(),
+            BackendStartFailure::PortInUse {
+                port: 43117,
+                detail: "previous restart".to_owned(),
+            },
+        );
+        let state = supervisor.state.clone();
+        supervisor.install_recovery_listener(Arc::new(move || {
+            // Simulate stop clearing the slot after recording an error releases its lock.
+            state.lock().expect("supervisor").slots.clear();
+        }));
+        let snapshot = BackendUpdateSnapshot {
+            environments: Vec::new(),
+            running_plans: vec![plan],
+            unavailable_environments: Vec::new(),
+        };
+        let failure = supervisor
+            .restart_update_snapshot(&snapshot)
+            .await
+            .expect_err("broken store");
+        assert!(matches!(
+            failure.entries[0].failure,
+            BackendStartFailure::Other { .. }
+        ));
+        assert!(supervisor.backend_recovery().is_empty());
+        assert!(supervisor.project_data_targets().is_empty());
+        assert!(!supervisor.update_coordination_in_progress());
+    }
+
+    #[tokio::test]
+    async fn failed_update_recovery_retains_and_retries_primary() {
+        if !crate::test_support::scenario_runs_in_this_process(
+            "backend::tests::failed_update_recovery_retains_and_retries_primary",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().expect("isolated backend data");
+        let port = free_test_port();
+        let supervisor = BackendSupervisor::new();
+        let notifications = capture_recovery_changes(&supervisor);
+        supervisor
+            .start(BackendLaunchPlan::local(
+                root.path().to_path_buf(),
+                local_test_config(port),
+            ))
+            .await
+            .expect("primary starts");
+        let snapshot = supervisor.begin_update_snapshot().await.expect("snapshot");
+        supervisor
+            .stop_update_snapshot(&snapshot)
+            .await
+            .expect("stop");
+        let holder = hold_released_port(port).await;
+        let error = supervisor
+            .restart_update_snapshot(&snapshot)
+            .await
+            .expect_err("port is held");
+        assert_eq!(supervisor.backend_recovery(), error.entries);
+        assert_eq!(notifications.lock().expect("notifications").len(), 1);
+        assert_eq!(error.entries.len(), 1);
+        assert_eq!(error.entries[0].environment_id, "primary");
+        assert_eq!(error.entries[0].label, "Local");
+        assert_eq!(error.entries[0].port, port);
+        assert!(
+            matches!(error.entries[0].failure, BackendStartFailure::PortInUse { port: actual, .. } if actual == port)
+        );
+        assert!(error.to_string().starts_with("Could not restart every desktop backend: Local: Could not start in-process desktop backend: "));
+        let targets = supervisor.project_data_targets();
+        assert_eq!(targets.len(), 1, "the failed plan remains registered");
+        assert_eq!(targets[0].environment_id, "primary");
+        assert_eq!(targets[0].launch_plan.config.port, port);
+        assert!(!targets[0].running);
+        assert!(supervisor.local_environment_bootstraps().is_empty());
+        drop(
+            supervisor
+                .begin_project_data_operation("primary")
+                .await
+                .expect("coordination released"),
+        );
+
+        drop(holder);
+        crate::data_safety::retry_project_data(&supervisor, "primary")
+            .await
+            .expect("retry on the same port");
+        assert!(supervisor.backend_recovery().is_empty());
+        assert_eq!(notifications.lock().expect("notifications").len(), 2);
+        assert_eq!(
+            supervisor.local_environment_bootstraps()[0]["httpBaseUrl"],
+            format!("http://127.0.0.1:{port}")
+        );
+        let starts = recorded_listener_bind_retries(&supervisor);
+        crate::data_safety::retry_project_data(&supervisor, "primary")
+            .await
+            .expect("running retry is inert");
+        assert_eq!(recorded_listener_bind_retries(&supervisor), starts);
+        assert_eq!(notifications.lock().expect("notifications").len(), 2);
+        assert_eq!(starts.last(), Some(&primary_bind_retry(None)));
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn failed_update_recovery_can_restart_through_exposure() {
+        if !crate::test_support::scenario_runs_in_this_process(
+            "backend::tests::failed_update_recovery_can_restart_through_exposure",
+        ) {
+            return;
+        }
+        use crate::config::IsolatedTestDataRoot;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        let root = tempfile::tempdir().expect("isolated backend data");
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(root.path().join("data-root")))
+            .build(mock_context(noop_assets()))
+            .expect("mock app");
+        let port = free_test_port();
+        let supervisor =
+            BackendSupervisor::with_backend_port_resolver(Arc::new(SequenceBackendPortResolver {
+                ports: Mutex::new(VecDeque::from([port, port])),
+            }));
+        let notifications = capture_recovery_changes(&supervisor);
+        supervisor
+            .start_default(app.handle().clone())
+            .await
+            .expect("primary starts");
+        let snapshot = supervisor.begin_update_snapshot().await.expect("snapshot");
+        supervisor
+            .stop_update_snapshot(&snapshot)
+            .await
+            .expect("stop");
+        let holder = hold_released_port(port).await;
+        supervisor
+            .restart_update_snapshot(&snapshot)
+            .await
+            .expect_err("port is held");
+        assert_eq!(supervisor.backend_recovery().len(), 1);
+        assert_eq!(notifications.lock().expect("notifications").len(), 1);
+        drop(holder);
+        let restarted = supervisor
+            .restart_default_if_active_preserving_exposure(app.handle().clone())
+            .await
+            .expect("exposure restart")
+            .expect("failed primary is still active");
+        assert_eq!(restarted.port, port);
+        assert!(supervisor.backend_recovery().is_empty());
+        assert_eq!(notifications.lock().expect("notifications").len(), 2);
+        assert_eq!(supervisor.local_environment_bootstraps().len(), 1);
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("cleanup");
     }
 
     #[tokio::test]
@@ -5851,6 +6348,10 @@ exit /b 9
             "unexpected error: {error}",
         );
         assert!(supervisor.local_environment_bootstraps().is_empty());
+        assert!(
+            supervisor.backend_recovery().is_empty(),
+            "first starts are not update recovery"
+        );
         let targets = supervisor.project_data_targets();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].environment_id, PRIMARY_LOCAL_ENVIRONMENT_ID);
@@ -6150,7 +6651,12 @@ exit /b 9
         )
         .await
         .expect_err("missing executable should fail");
-        assert!(error.contains("Could not start desktop backend using"));
+        assert!(matches!(error, BackendStartFailure::Other { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Could not start desktop backend using")
+        );
 
         let temp = tempfile::tempdir().expect("tempdir should open");
         let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("port fixture should bind");
@@ -6170,7 +6676,10 @@ exit /b 9
         )
         .await
         .expect_err("occupied local port should fail");
-        assert!(error.contains("Could not start in-process desktop backend"));
+        assert!(
+            matches!(error, BackendStartFailure::PortInUse { port: actual, .. } if actual == port)
+        );
+        assert!(error.to_string().starts_with(&format!("Could not start in-process desktop backend: failed to bind the server listener on 127.0.0.1:{port}: ")));
     }
 
     #[tokio::test]
@@ -6194,8 +6703,13 @@ exit /b 9
         .await
         .expect_err("unreachable renderer address should fail readiness");
 
-        assert!(error.contains("Desktop backend did not become ready"));
-        assert!(error.contains(BACKEND_READINESS_PATH));
+        assert!(matches!(error, BackendStartFailure::Other { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Desktop backend did not become ready")
+        );
+        assert!(error.to_string().contains(BACKEND_READINESS_PATH));
     }
 
     #[tokio::test]

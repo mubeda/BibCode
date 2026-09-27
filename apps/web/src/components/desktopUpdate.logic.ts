@@ -1,11 +1,33 @@
-import type { DesktopUpdateActionResult, DesktopUpdateState } from "@bibcode/contracts";
+import type {
+  DesktopBackendRecovery,
+  DesktopUpdateActionResult,
+  DesktopUpdateState,
+} from "@bibcode/contracts";
 
 export type DesktopUpdateButtonAction = "download" | "install" | "none";
+
+export function hasDesktopBackendRecovery(state: DesktopUpdateState | null): boolean {
+  return (state?.backendRecovery?.length ?? 0) > 0;
+}
+
+export function getDesktopBackendRecoveryMessage(entry: DesktopBackendRecovery): string {
+  const server =
+    entry.environmentId === "primary"
+      ? "BiBCode's local server"
+      : `BiBCode's ${entry.label} server`;
+  return entry.reason === "port-in-use"
+    ? `${server} couldn't restart: port ${entry.port} is in use by another program. Quit that program, then choose Restart server.`
+    : `${server} couldn't restart. Choose Restart server. If that fails, restart BiBCode.`;
+}
+
+export function getDesktopUpdateErrorMessage(error: unknown, fallback: string): string {
+  return typeof error === "string" ? error : error instanceof Error ? error.message : fallback;
+}
 
 export function resolveDesktopUpdateButtonAction(
   state: DesktopUpdateState,
 ): DesktopUpdateButtonAction {
-  if (state.downloadedVersion) {
+  if (hasDesktopBackendRecovery(state) || state.downloadedVersion) {
     return "install";
   }
   if (state.status === "available") {
@@ -20,6 +42,7 @@ export function resolveDesktopUpdateButtonAction(
 }
 
 export function shouldShowDesktopUpdateButton(state: DesktopUpdateState | null): boolean {
+  if (hasDesktopBackendRecovery(state)) return true;
   if (!state || !state.enabled) {
     return false;
   }
@@ -57,6 +80,16 @@ export function getArm64IntelBuildWarningDescription(state: DesktopUpdateState):
 }
 
 export function getDesktopUpdateButtonTooltip(state: DesktopUpdateState): string {
+  const recovery = state.backendRecovery ?? [];
+  if (recovery.length > 1) {
+    return "Update not installed: some of BiBCode's servers are stopped.";
+  }
+  const stoppedServer = recovery[0];
+  if (stoppedServer) {
+    return stoppedServer.environmentId === "primary"
+      ? "Update not installed: BiBCode's local server is stopped."
+      : `Update not installed: BiBCode's ${stoppedServer.label} server is stopped.`;
+  }
   if (state.status === "available") {
     return `Update ${state.availableVersion ?? "available"} ready to download`;
   }
@@ -104,7 +137,7 @@ export function shouldHighlightDesktopUpdateError(state: DesktopUpdateState | nu
 }
 
 export function canCheckForUpdate(state: DesktopUpdateState | null): boolean {
-  if (!state || !state.enabled) return false;
+  if (!state || !state.enabled || hasDesktopBackendRecovery(state)) return false;
   return (
     state.status !== "checking" &&
     state.status !== "downloading" &&

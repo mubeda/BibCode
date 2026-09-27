@@ -775,6 +775,39 @@ or topology restart that re-plans a held port) lets the in-process server retry
 a bind that finds the port still in use for up to 3 s, backing off from 25 ms
 to 250 ms. First starts and WSL backends fail at once, and an expired window
 reports the original bind error.
+If that recovery restart fails, the supervisor keeps the exact launch plan
+registered as stopped, records a typed update-recovery failure in its slot,
+and withholds its connection bootstrap. In-process `ServerError::Bind` failures
+with `AddrInUse` retain a typed port-in-use reason and the conflicting port;
+other failures retain their original detail and use the plan's port. The update
+manager derives `backendRecovery` from registered, stopped supervisor slots
+with these failures; first-start failures do not create update-recovery entries.
+A supervisor listener re-emits the current update state whenever that derived
+list changes, after the supervisor releases its state lock. A failed installation
+also emits one `desktop:project-data-status-changed` invalidation per current
+recovery entry.
+Checks, downloads, and installations (including protection bypass) pause while
+any recovery entry remains, preserving the downloaded update and recovery state.
+
+The update dialog and toast offer **Restart server**, calling the privileged
+`retryProjectData` bridge command sequentially for each failed environment and
+then requesting its normal connection retry. Any successful restart into a slot,
+including a retry or an exposure/topology restart, clears its recovery entry;
+removing the slot also drops the entry. A failed project-data restart replaces
+an existing entry's typed failure, and an admission failure leaves it intact.
+Once every entry is cleared, **Retry installation** becomes available. A failed
+retry also offers **Restart BiBCode** through the optional `restartApp` bridge command.
+The host rejects that command during an install or exclusive update/project-data
+operation; otherwise it requests the normal application restart, whose exit
+path persists window state, stops backends through `stop_for_exit`, and shuts
+down SSH forwarding. Recovery never automatically retries or selects a new port.
+
+In a desktop renderer, a missing primary bootstrap is a typed topology-read
+failure, never a fallback to the development server or WebView origin. The
+platform poll retains the registered primary and its cached data and composer
+drafts while that bootstrap is withheld, and reuses its registration when the
+same endpoints return. Browser and hosted endpoint fallbacks are unchanged.
+
 Stopping the primary in-process backend never sweeps descendants of the shared
 desktop PID; doing so would terminate the system WebView before the installer
 can take ownership of application restart.

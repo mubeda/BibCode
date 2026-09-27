@@ -14,7 +14,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 #[cfg(test)]
 use crate::test_support::FixtureEvent;
 use crate::{
-    backend::{BackendRunConfig, BackendSupervisor, BackendUpdateSnapshot},
+    backend::{
+        BackendRecoveryEntry, BackendRunConfig, BackendStartFailure, BackendSupervisor,
+        BackendUpdateSnapshot, emit_project_data_status_changed,
+    },
     config::{app_version, runtime_info},
 };
 
@@ -90,6 +93,42 @@ struct DesktopUpdateProtection {
     blocked_operation_count: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum BackendRecoveryReason {
+    PortInUse,
+    Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopBackendRecovery {
+    environment_id: String,
+    label: String,
+    reason: BackendRecoveryReason,
+    port: u16,
+}
+
+impl From<BackendRecoveryEntry> for DesktopBackendRecovery {
+    fn from(entry: BackendRecoveryEntry) -> Self {
+        Self {
+            environment_id: entry.environment_id,
+            label: entry.label,
+            reason: match entry.failure {
+                BackendStartFailure::PortInUse { .. } => BackendRecoveryReason::PortInUse,
+                BackendStartFailure::Other { .. } => BackendRecoveryReason::Other,
+            },
+            port: entry.port,
+        }
+    }
+}
+
+fn backend_recovery<R: Runtime>(app: &AppHandle<R>) -> Vec<BackendRecoveryEntry> {
+    app.try_state::<BackendSupervisor>()
+        .map(|backend| backend.backend_recovery())
+        .unwrap_or_default()
+}
+
 fn apply_named_secondary_exclusions(
     protection: &mut [DesktopUpdateProtection],
     exclusions: &BTreeSet<String>,
@@ -162,6 +201,12 @@ struct DesktopUpdateInner {
     protection: Vec<DesktopUpdateProtection>,
 }
 
+#[cfg(test)]
+struct InstallFailure {
+    message: String,
+    on_failure: Option<Box<dyn FnOnce() + Send>>,
+}
+
 #[derive(Default)]
 pub struct DesktopUpdateManager {
     inner: Mutex<DesktopUpdateInner>,
@@ -172,7 +217,7 @@ pub struct DesktopUpdateManager {
     #[cfg(test)]
     background_timer_armed: FixtureEvent,
     #[cfg(test)]
-    install_failure: Mutex<Option<String>>,
+    install_failure: Mutex<Option<InstallFailure>>,
 }
 
 #[derive(Clone, Copy)]
@@ -239,6 +284,17 @@ impl DesktopUpdateManager {
         Self::default()
     }
 
+    pub(crate) fn install_in_flight(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("desktop update mutex poisoned")
+            .install_in_flight
+    }
+
+    pub(crate) fn emit_current_state<R: Runtime>(&self, app: &AppHandle<R>) {
+        emit_update_state(app, &self.state(app));
+    }
+
     pub fn state<R: Runtime>(&self, app: &AppHandle<R>) -> Value {
         let inner = self.inner.lock().expect("desktop update mutex poisoned");
         match app.updater() {
@@ -255,7 +311,7 @@ impl DesktopUpdateManager {
 
         let busy_state = {
             let inner = self.inner.lock().expect("desktop update mutex poisoned");
-            (!can_begin_check(&inner)).then(|| update_state_value(&app, true, &inner))
+            (!can_begin_check(&app, &inner)).then(|| update_state_value(&app, true, &inner))
         };
         if let Some(state) = busy_state {
             return json!({
@@ -356,7 +412,7 @@ impl DesktopUpdateManager {
     pub async fn download_update<R: Runtime>(&self, app: AppHandle<R>) -> Value {
         let busy_state = {
             let inner = self.inner.lock().expect("desktop update mutex poisoned");
-            (!can_begin_download(&inner)).then(|| update_state_value(&app, true, &inner))
+            (!can_begin_download(&app, &inner)).then(|| update_state_value(&app, true, &inner))
         };
         if let Some(state) = busy_state {
             return json!({
@@ -380,7 +436,7 @@ impl DesktopUpdateManager {
 
         let (update, download_guard, state) = {
             let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
-            if !can_begin_download(&inner) {
+            if !can_begin_download(&app, &inner) {
                 return json!({
                     "accepted": false,
                     "completed": false,
@@ -491,7 +547,13 @@ impl DesktopUpdateManager {
     ) -> Value {
         let unavailable_state = {
             let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
-            if inner.install_in_flight {
+            if !backend.backend_recovery().is_empty() {
+                let mut state = update_state_value(app, true, &inner);
+                state["message"] = Value::String(
+                    "Restart the server before retrying the installation.".to_owned(),
+                );
+                Some(state)
+            } else if inner.install_in_flight {
                 Some(update_state_value(app, true, &inner))
             } else if input.skip_protection
                 && !protection_bypass_allowed(inner.phase, &inner.protection)
@@ -698,7 +760,11 @@ impl DesktopUpdateManager {
             return self.finish_failed_install(app, downloaded, protection, message);
         }
         if let Err(error) = backend.stop_update_snapshot(&snapshot).await {
-            let recovery_error = backend.restart_update_snapshot(&snapshot).await.err();
+            let recovery_error = backend
+                .restart_update_snapshot(&snapshot)
+                .await
+                .err()
+                .map(|error| error.to_string());
             let message = append_recovery_error(error, recovery_error);
             return self.finish_failed_install(app, downloaded, protection, message);
         }
@@ -734,7 +800,11 @@ impl DesktopUpdateManager {
                 result
             }
             Err(error) => {
-                let recovery_error = backend.restart_update_snapshot(&snapshot).await.err();
+                let recovery_error = backend
+                    .restart_update_snapshot(&snapshot)
+                    .await
+                    .err()
+                    .map(|error| error.to_string());
                 let message = append_recovery_error(error, recovery_error);
                 self.finish_failed_install(app, downloaded, protection, message)
             }
@@ -749,7 +819,10 @@ impl DesktopUpdateManager {
             .expect("desktop update install failure mutex poisoned")
             .take()
         {
-            return Err(error);
+            if let Some(on_failure) = error.on_failure {
+                on_failure();
+            }
+            return Err(error.message);
         }
         downloaded
             .update
@@ -762,7 +835,10 @@ impl DesktopUpdateManager {
         *self
             .install_failure
             .lock()
-            .expect("desktop update install failure mutex poisoned") = Some(error.into());
+            .expect("desktop update install failure mutex poisoned") = Some(InstallFailure {
+            message: error.into(),
+            on_failure: None,
+        });
     }
 
     fn finish_failed_install<R: Runtime>(
@@ -784,10 +860,14 @@ impl DesktopUpdateManager {
             inner.phase = UpdatePhase::Failed;
             inner.protection = protection;
         });
+        let update_state = state.emit(app);
+        for entry in backend_recovery(app) {
+            emit_project_data_status_changed(app, &entry.environment_id);
+        }
         json!({
             "accepted": true,
             "completed": false,
-            "state": state.emit(app),
+            "state": update_state,
         })
     }
 
@@ -802,7 +882,7 @@ impl DesktopUpdateManager {
         app: &AppHandle<R>,
     ) -> Option<(UpdateOperationGuard<'_, R>, DesktopUpdateInner)> {
         let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
-        if !can_begin_check(&inner) {
+        if !can_begin_check(app, &inner) {
             return None;
         }
         let prior_state = inner.clone_without_updates();
@@ -889,8 +969,9 @@ impl DesktopUpdateInner {
     }
 }
 
-fn can_begin_check(inner: &DesktopUpdateInner) -> bool {
-    !inner.check_in_flight
+fn can_begin_check<R: Runtime>(app: &AppHandle<R>, inner: &DesktopUpdateInner) -> bool {
+    backend_recovery(app).is_empty()
+        && !inner.check_in_flight
         && !inner.download_in_flight
         && !inner.install_in_flight
         && !matches!(
@@ -899,8 +980,9 @@ fn can_begin_check(inner: &DesktopUpdateInner) -> bool {
         )
 }
 
-fn can_begin_download(inner: &DesktopUpdateInner) -> bool {
-    !inner.check_in_flight
+fn can_begin_download<R: Runtime>(app: &AppHandle<R>, inner: &DesktopUpdateInner) -> bool {
+    backend_recovery(app).is_empty()
+        && !inner.check_in_flight
         && !inner.download_in_flight
         && !inner.install_in_flight
         && !matches!(
@@ -1143,7 +1225,7 @@ async fn stop_and_restart(
     match (stop, restart) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(stop), Ok(())) => Err(stop),
-        (Ok(()), Err(restart)) => Err(restart),
+        (Ok(()), Err(restart)) => Err(restart.to_string()),
         (Err(stop), Err(restart)) => Err(format!("{stop}; {restart}")),
     }
 }
@@ -1241,6 +1323,7 @@ pub fn disabled_update_state<R: Runtime>(app: &AppHandle<R>) -> Value {
         "canRetry": false,
         "phase": UpdatePhase::Idle,
         "protection": [],
+        "backendRecovery": [],
     })
 }
 
@@ -1266,6 +1349,7 @@ fn error_update_state<R: Runtime>(
         "canRetry": true,
         "phase": UpdatePhase::Failed,
         "protection": [],
+        "backendRecovery": [],
     })
 }
 
@@ -1291,6 +1375,7 @@ fn update_state_value<R: Runtime>(
         "canRetry": inner.can_retry,
         "phase": inner.phase,
         "protection": inner.protection,
+        "backendRecovery": backend_recovery(app).into_iter().map(DesktopBackendRecovery::from).collect::<Vec<_>>(),
     })
 }
 
@@ -1332,6 +1417,277 @@ mod tests {
 
     const TEST_PUBLIC_KEY: &str = "untrusted comment: minisign public key E7620F1842B4E81F\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
     const TEST_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\nRWQf6LRCGA9i59SLOFxz6NxvASXDJeRtuZykwQepbDEGt87ig1BNpWaVWuNrm73YiIiJbq71Wi+dP9eKL8OC351vwIasSSbXxwA=\ntrusted comment: timestamp:1555779966\tfile:test\nQtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfNQUaOAA==";
+
+    #[test]
+    fn refused_recovery_install_preserves_original_message() {
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_owned());
+        let manager = DesktopUpdateManager::new();
+        let root = tempfile::tempdir().expect("isolated data");
+        let supervisor = pending_recovery_supervisor(root.path());
+        app.manage(supervisor.clone());
+        manager.replace_inner(|inner| {
+            inner.message = Some("original installer and restart failure".to_owned());
+        });
+        for skip_protection in [false, true] {
+            let result = tauri::async_runtime::block_on(manager.install_update(
+                app.handle(),
+                &supervisor,
+                DesktopUpdateInstallInput {
+                    skip_protection,
+                    ..Default::default()
+                },
+            ));
+            assert_eq!(result["accepted"], false);
+            assert_eq!(
+                result["state"]["message"],
+                "Restart the server before retrying the installation."
+            );
+            assert_eq!(
+                manager.state(app.handle())["message"],
+                "original installer and restart failure"
+            );
+        }
+    }
+
+    fn pending_recovery_supervisor(root: &std::path::Path) -> BackendSupervisor {
+        crate::backend::recovery_test_supervisor(
+            BackendLaunchPlan::local(
+                root.to_path_buf(),
+                BackendRunConfig {
+                    port: 43117,
+                    ..test_backend_config()
+                },
+            ),
+            BackendStartFailure::PortInUse {
+                port: 43118,
+                detail: "held port".to_owned(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn recovery_listener_reemits_supervisor_changes() {
+        use tauri::Listener;
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_owned());
+        let root = tempfile::tempdir().expect("isolated data");
+        let supervisor = pending_recovery_supervisor(root.path());
+        app.manage(supervisor.clone());
+        let handle = app.handle().clone();
+        supervisor.install_recovery_listener(Arc::new(move || {
+            handle
+                .state::<DesktopUpdateManager>()
+                .emit_current_state(&handle);
+        }));
+        let (sender, receiver) = mpsc::channel();
+        app.listen_any(UPDATE_STATE_EVENT, move |event| {
+            sender
+                .send(event.payload().to_owned())
+                .expect("update event");
+        });
+        supervisor.record_error("held port");
+        let state: Value =
+            serde_json::from_str(&receiver.try_recv().expect("recovery event")).expect("JSON");
+        assert_eq!(
+            state["backendRecovery"],
+            json!([{
+                "environmentId": "primary", "label": "Local", "reason": "port-in-use", "port": 43118,
+            }])
+        );
+        supervisor.record_error("unchanged classification");
+        assert!(
+            receiver.try_recv().is_err(),
+            "unchanged recovery emits nothing"
+        );
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("stop");
+        let state: Value =
+            serde_json::from_str(&receiver.try_recv().expect("cleared event")).expect("JSON");
+        assert_eq!(state["backendRecovery"], json!([]));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pending_backend_recovery_blocks_checks_downloads_and_all_install_attempts() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("update endpoint");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking endpoint");
+        let app = updater_test_app(format!(
+            "http://{}/latest.json",
+            listener.local_addr().expect("address")
+        ));
+        let manager = DesktopUpdateManager::new();
+        let root = tempfile::tempdir().expect("isolated data");
+        let supervisor = pending_recovery_supervisor(root.path());
+        app.manage(supervisor.clone());
+        manager.replace_inner(|inner| {
+            inner.status = Some(STATUS_ERROR.to_owned());
+            inner.phase = UpdatePhase::Failed;
+            inner.message = Some("installer failed".to_owned());
+        });
+        let before = manager.current_state(app.handle());
+        let check = manager.check_for_update(app.handle().clone()).await;
+        assert_eq!(check["checked"], false);
+        assert_eq!(check["state"], before);
+        let download = manager.download_update(app.handle().clone()).await;
+        assert_eq!(download["accepted"], false);
+        assert_eq!(download["state"], before);
+        assert_eq!(
+            listener.accept().expect_err("no update request").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        for skip_protection in [false, true] {
+            let result = manager
+                .install_update(
+                    app.handle(),
+                    &supervisor,
+                    DesktopUpdateInstallInput {
+                        skip_protection,
+                        excluded_environment_ids: vec![],
+                    },
+                )
+                .await;
+            assert_eq!(result["accepted"], false);
+            assert_eq!(result["completed"], false);
+            assert_eq!(
+                result["state"]["message"],
+                "Restart the server before retrying the installation."
+            );
+            assert_eq!(
+                result["state"]["backendRecovery"],
+                before["backendRecovery"]
+            );
+            assert!(!manager.install_in_flight());
+            assert_eq!(manager.state(app.handle())["message"], "installer failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_install_publishes_typed_backend_recovery_and_status_invalidation() {
+        if !crate::test_support::scenario_runs_in_this_process(
+            "updates::tests::failed_install_publishes_typed_backend_recovery_and_status_invalidation",
+        ) {
+            return;
+        }
+        use tauri::Listener;
+        let (base_url, update_server) = spawn_update_server("test");
+        let app = updater_test_app(format!("{base_url}/latest.json"));
+        let manager = DesktopUpdateManager::new();
+        assert_eq!(
+            manager.check_for_update(app.handle().clone()).await["checked"],
+            true
+        );
+        assert_eq!(
+            manager.download_update(app.handle().clone()).await["completed"],
+            true
+        );
+        update_server.join().expect("update server finished");
+        let root = tempfile::tempdir().expect("isolated data");
+        let supervisor = BackendSupervisor::new();
+        app.manage(supervisor.clone());
+        let port = crate::test_support::free_test_port();
+        supervisor
+            .start(BackendLaunchPlan::local(
+                root.path().to_path_buf(),
+                BackendRunConfig {
+                    port,
+                    ..test_backend_config()
+                },
+            ))
+            .await
+            .expect("primary starts");
+        let held_port = Arc::new(Mutex::new(None));
+        let hook_holder = held_port.clone();
+        manager.fail_next_install("synthetic installer failure");
+        manager
+            .install_failure
+            .lock()
+            .expect("failure fixture")
+            .as_mut()
+            .expect("failure")
+            .on_failure = Some(Box::new(move || {
+            *hook_holder.lock().expect("holder") =
+                Some(TcpListener::bind(("127.0.0.1", port)).expect("stopped port can be held"));
+        }));
+        let (sender, receiver) = mpsc::channel();
+        app.listen_any(
+            crate::backend::PROJECT_DATA_STATUS_CHANGED_EVENT,
+            move |event| {
+                sender
+                    .send(event.payload().to_owned())
+                    .expect("status event");
+            },
+        );
+        let result = manager
+            .install_update(
+                app.handle(),
+                &supervisor,
+                DesktopUpdateInstallInput::default(),
+            )
+            .await;
+        assert_eq!(result["completed"], false);
+        assert_eq!(
+            result["state"]["backendRecovery"],
+            json!([{
+                "environmentId": "primary", "label": "Local", "reason": "port-in-use", "port": port,
+            }])
+        );
+        let targets = supervisor.project_data_targets();
+        assert_eq!(targets.len(), 1);
+        assert!(!targets[0].running);
+        assert!(result["state"]["message"].as_str().expect("message").starts_with(&format!(
+            "synthetic installer failure Desktop backend recovery also failed: Could not restart every desktop backend: Local: Could not start in-process desktop backend: failed to bind the server listener on 127.0.0.1:{port}: "
+        )));
+        assert_eq!(
+            serde_json::from_str::<Value>(&receiver.try_recv().expect("invalidation"))
+                .expect("JSON"),
+            json!({"environmentId":"primary"})
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "one invalidation per failed environment"
+        );
+        let original_message = manager.state(app.handle())["message"].clone();
+        assert_eq!(
+            manager.check_for_update(app.handle().clone()).await["checked"],
+            false
+        );
+        assert_eq!(
+            manager.download_update(app.handle().clone()).await["accepted"],
+            false
+        );
+        for skip_protection in [false, true] {
+            let refused = manager
+                .install_update(
+                    app.handle(),
+                    &supervisor,
+                    DesktopUpdateInstallInput {
+                        skip_protection,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(refused["accepted"], false);
+            assert_eq!(manager.state(app.handle())["message"], original_message);
+        }
+        drop(held_port.lock().expect("holder").take());
+        crate::data_safety::retry_project_data(&supervisor, "primary")
+            .await
+            .expect("restart slot");
+        assert_eq!(manager.state(app.handle())["backendRecovery"], json!([]));
+        // Reaching checking proves the supervisor restart alone released admission, with no settle call.
+        let check = manager
+            .begin_check(app.handle())
+            .expect("recovery no longer blocks checks");
+        assert_eq!(manager.current_state(app.handle())["phase"], "checking");
+        drop(check);
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("cleanup");
+    }
 
     #[test]
     fn maintenance_error_details_are_single_line_and_bounded() {

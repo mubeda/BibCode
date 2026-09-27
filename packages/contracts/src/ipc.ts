@@ -96,7 +96,7 @@ import type {
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration.ts";
-import { EnvironmentId, NonNegativeInt } from "./baseSchemas.ts";
+import { EnvironmentId, NonNegativeInt, PortSchema } from "./baseSchemas.ts";
 import {
   AuthAccessTokenResult,
   type AuthEnvironmentScope,
@@ -232,6 +232,20 @@ export interface DesktopUpdateInstallInput {
   excludedEnvironmentIds?: readonly string[];
   skipProtection?: boolean;
 }
+
+export interface DesktopBackendRecovery {
+  environmentId: string;
+  label: string;
+  reason: "port-in-use" | "other";
+  port: number;
+}
+
+export const DesktopBackendRecoverySchema = Schema.Struct({
+  environmentId: Schema.String,
+  label: Schema.String,
+  reason: Schema.Literals(["port-in-use", "other"]),
+  port: PortSchema,
+});
 
 export type DesktopRuntimeArch = "arm64" | "x64" | "other";
 export type DesktopTheme = "light" | "dark" | "system";
@@ -436,6 +450,7 @@ export interface DesktopUpdateState {
   canRetry: boolean;
   phase?: DesktopUpdatePhase;
   protection?: ReadonlyArray<DesktopUpdateProtection>;
+  backendRecovery?: ReadonlyArray<DesktopBackendRecovery>;
 }
 
 export const DesktopUpdateStateSchema = Schema.Struct({
@@ -454,6 +469,9 @@ export const DesktopUpdateStateSchema = Schema.Struct({
   canRetry: Schema.Boolean,
   phase: DesktopUpdatePhaseSchema.pipe(Schema.withDecodingDefault(Effect.succeed("idle"))),
   protection: Schema.Array(DesktopUpdateProtectionSchema).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
+  backendRecovery: Schema.Array(DesktopBackendRecoverySchema).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
 });
@@ -1261,6 +1279,7 @@ export interface DesktopBridge {
   ) => Promise<DesktopProjectDataRecoveryResult>;
   startEmptyProjectData?: (environmentId: string) => Promise<DesktopProjectDataRecoveryResult>;
   retryProjectData?: (environmentId: string) => Promise<void>;
+  restartApp?: () => Promise<void>;
   openProjectDataPath?: (environmentId: string) => Promise<void>;
   exportProjectDataDiagnostics?: (environmentId: string) => Promise<string | null>;
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;

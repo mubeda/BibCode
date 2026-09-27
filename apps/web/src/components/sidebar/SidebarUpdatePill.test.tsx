@@ -1,235 +1,224 @@
-import React, { type ReactElement } from "react";
-import { renderToStaticMarkup } from "react-dom/server";
-import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
+// @vitest-environment happy-dom
+
+import type { DesktopBridge, DesktopUpdateState } from "@bibcode/contracts";
+import { act, type ReactNode } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const harness = vi.hoisted(() => ({
-  state: null as Record<string, unknown> | null,
-  dismissed: false,
-  setDismissed: vi.fn(),
-  visible: false,
-  disabled: false,
-  action: "none" as "none" | "download" | "install",
-  showWarning: false,
-  actionError: null as string | null,
-  shouldToast: false,
+  state: null as DesktopUpdateState | null,
   toastAdd: vi.fn(),
-  stackedToast: vi.fn((value: unknown) => value),
   navigate: vi.fn(),
-  bridge: null as null | {
-    downloadUpdate: ReturnType<typeof vi.fn>;
-    installUpdate: ReturnType<typeof vi.fn>;
-  },
+  forceVisible: false,
 }));
 
-vi.mock("@tanstack/react-router", () => ({
-  useNavigate: () => harness.navigate,
-}));
-
-vi.mock("react", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("react")>()),
-  useCallback: (callback: unknown) => callback,
-  useState: () => [harness.dismissed, harness.setDismissed],
-}));
+vi.mock("@tanstack/react-router", () => ({ useNavigate: () => harness.navigate }));
 vi.mock("../../env", () => ({ isDesktopHost: true }));
 vi.mock("../../state/desktopUpdate", () => ({ useDesktopUpdateState: () => harness.state }));
-vi.mock("../desktopUpdate.logic", () => ({
-  getArm64IntelBuildWarningDescription: () => "Use the native Apple Silicon build.",
-  getDesktopUpdateActionError: () => harness.actionError,
-  getDesktopUpdateButtonTooltip: () => "Update tooltip",
-  isDesktopUpdateButtonDisabled: () => harness.disabled,
-  resolveDesktopUpdateButtonAction: () => harness.action,
-  shouldShowArm64IntelBuildWarning: () => harness.showWarning,
-  shouldShowDesktopUpdateButton: () => harness.visible,
-  shouldToastDesktopUpdateActionResult: () => harness.shouldToast,
-}));
+vi.mock("../desktopUpdate.logic", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../desktopUpdate.logic")>();
+  return {
+    ...actual,
+    shouldShowDesktopUpdateButton: (state: DesktopUpdateState | null) =>
+      harness.forceVisible || actual.shouldShowDesktopUpdateButton(state),
+  };
+});
 vi.mock("../ui/toast", () => ({
   toastManager: { add: harness.toastAdd },
-  stackedThreadToast: harness.stackedToast,
+  stackedThreadToast: (value: unknown) => value,
+}));
+vi.mock("../desktop/UpdateProtectionDialog", () => ({
+  UpdateProtectionDialog: ({ open }: { open: boolean }) =>
+    open ? <div role="dialog">Update recovery</div> : null,
 }));
 vi.mock("../ui/alert", () => ({
-  Alert: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  AlertTitle: ({ children }: { children: React.ReactNode }) => <strong>{children}</strong>,
-  AlertDescription: ({ children }: { children: React.ReactNode }) => <span>{children}</span>,
+  Alert: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  AlertTitle: ({ children }: { children: ReactNode }) => <strong>{children}</strong>,
+  AlertDescription: ({ children }: { children: ReactNode }) => <span>{children}</span>,
 }));
 vi.mock("../ui/tooltip", () => ({
-  Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  TooltipTrigger: ({ render }: { render: React.ReactNode }) => <>{render}</>,
-  TooltipPopup: ({ children }: { children: React.ReactNode }) => <span>{children}</span>,
+  Tooltip: ({ children }: { children: ReactNode }) => <>{children}</>,
+  TooltipTrigger: ({ render }: { render: ReactNode }) => <>{render}</>,
+  TooltipPopup: ({ children }: { children: ReactNode }) => <span>{children}</span>,
 }));
 
 import { SidebarUpdatePill } from "./SidebarUpdatePill";
 
-function visit(node: React.ReactNode, entries: ReactElement[] = []): ReactElement[] {
-  if (Array.isArray(node)) {
-    for (const child of node) visit(child, entries);
-    return entries;
-  }
-  if (!React.isValidElement(node)) return entries;
-  entries.push(node);
-  visit((node.props as { children?: React.ReactNode }).children, entries);
-  const render = (node.props as { render?: React.ReactNode }).render;
-  if (render) visit(render, entries);
-  return entries;
+const baseState: DesktopUpdateState = {
+  enabled: true,
+  status: "idle",
+  currentVersion: "1.0.0",
+  hostArch: "x64",
+  appArch: "x64",
+  runningUnderArm64Translation: false,
+  availableVersion: null,
+  downloadedVersion: null,
+  downloadPercent: null,
+  checkedAt: null,
+  message: null,
+  errorContext: null,
+  canRetry: false,
+};
+const recoveryState: DesktopUpdateState = {
+  ...baseState,
+  status: "error",
+  backendRecovery: [
+    { environmentId: "primary", label: "Local", reason: "port-in-use", port: 14373 },
+  ],
+};
+let container: HTMLDivElement;
+let root: Root;
+let downloadUpdate: ReturnType<typeof vi.fn>;
+let installUpdate: ReturnType<typeof vi.fn>;
+
+async function render(state: DesktopUpdateState | null) {
+  harness.state = state;
+  await act(async () => root.render(<SidebarUpdatePill />));
 }
 
-function actionButton(tree: React.ReactNode) {
-  const button = visit(tree).find(
-    (element) =>
-      element.type === "button" &&
-      (element.props as Record<string, unknown>).className ===
-        "update-main relative flex h-full flex-1 items-center gap-2 px-2 enabled:cursor-pointer",
-  );
-  if (!button) throw new Error("Update action button not found");
-  return button.props as { onClick: () => void; disabled: boolean; "aria-disabled"?: boolean };
+function actionButton(): HTMLButtonElement {
+  const button = container.querySelector<HTMLButtonElement>("button.update-main");
+  expect(button).not.toBeNull();
+  return button!;
 }
 
 beforeEach(() => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  vi.clearAllMocks();
   harness.state = null;
-  harness.dismissed = false;
-  harness.setDismissed.mockReset();
-  harness.visible = false;
-  harness.disabled = false;
-  harness.action = "none";
-  harness.showWarning = false;
-  harness.actionError = null;
-  harness.shouldToast = false;
-  harness.toastAdd.mockReset();
-  harness.stackedToast.mockClear();
-  harness.navigate.mockReset();
-  harness.bridge = null;
-  Object.defineProperty(globalThis, "window", {
-    configurable: true,
-    value: { desktopBridge: null },
-  });
+  harness.forceVisible = false;
+  downloadUpdate = vi.fn();
+  installUpdate = vi.fn();
+  window.desktopBridge = { downloadUpdate, installUpdate } as unknown as DesktopBridge;
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+});
+
+afterEach(async () => {
+  await act(async () => root.unmount());
+  container.remove();
+  delete window.desktopBridge;
 });
 
 describe("SidebarUpdatePill", () => {
-  it("hides when neither an update nor architecture warning is visible", () => {
-    expect(SidebarUpdatePill()).toBeNull();
+  it("hides when neither an update nor architecture warning is visible", async () => {
+    await render(null);
+    expect(container.textContent).toBe("");
   });
 
-  it("renders the Apple Silicon warning independently", () => {
-    harness.state = { status: "idle" };
-    harness.showWarning = true;
-    const markup = renderToStaticMarkup(<SidebarUpdatePill />);
-    expect(markup).toContain("Intel build on Apple Silicon");
-    expect(markup).toContain("Use the native Apple Silicon build.");
+  it("renders the Apple Silicon warning independently", async () => {
+    await render({ ...baseState, hostArch: "arm64", appArch: "x64" });
+    expect(container.textContent).toContain("Intel build on Apple Silicon");
+    expect(container.textContent).toContain("native Apple Silicon build");
   });
 
-  it("renders available, downloading, disabled, install, and dismissed states", () => {
-    harness.state = { status: "available" };
-    harness.visible = true;
-    harness.action = "download";
-    let tree = SidebarUpdatePill();
-    expect(renderToStaticMarkup(tree)).toContain("Update available");
-    const dismiss = visit(tree).find(
-      (element) =>
-        element.type === "button" &&
-        (element.props as Record<string, unknown>)["aria-label"] === "Dismiss update",
-    );
-    if (!dismiss) throw new Error("Dismiss button not found");
-    (dismiss.props as { onClick: () => void }).onClick();
-    expect(harness.setDismissed).toHaveBeenCalledWith(true);
-
-    harness.state = { status: "downloading", downloadPercent: 42.8 };
-    harness.disabled = true;
-    tree = SidebarUpdatePill();
-    expect(renderToStaticMarkup(tree)).toContain("Downloading (42%)");
-    expect(actionButton(tree).disabled).toBe(true);
-    expect(actionButton(tree)["aria-disabled"]).toBe(true);
-
-    harness.state = { status: "downloading", downloadPercent: null };
-    expect(renderToStaticMarkup(<SidebarUpdatePill />)).toContain("Downloading…");
-
-    harness.state = { status: "downloaded" };
-    harness.disabled = false;
-    harness.action = "install";
-    expect(renderToStaticMarkup(<SidebarUpdatePill />)).toContain("Restart to update");
-
-    harness.dismissed = true;
-    harness.visible = false;
-    expect(SidebarUpdatePill()).toBeNull();
+  it("renders available, downloading and installation states", async () => {
+    await render({ ...baseState, status: "available", availableVersion: "1.1.0" });
+    expect(container.textContent).toContain("Update available");
+    await render({ ...baseState, status: "downloading", downloadPercent: 42.8 });
+    expect(container.textContent).toContain("Downloading (42%)");
+    expect(actionButton().disabled).toBe(true);
+    expect(actionButton().getAttribute("aria-disabled")).toBe("true");
+    await render({ ...baseState, status: "downloading" });
+    expect(container.textContent).toContain("Downloading…");
+    await render({ ...baseState, status: "downloaded", downloadedVersion: "1.1.0" });
+    expect(container.textContent).toContain("Restart to update");
   });
 
-  it("guards actions without a bridge, state, or enabled action", () => {
-    harness.state = { status: "available" };
-    harness.visible = true;
-    harness.action = "download";
-    actionButton(SidebarUpdatePill()).onClick();
+  it("guards download actions when the desktop bridge is unavailable", async () => {
+    await render({ ...baseState, status: "available", availableVersion: "1.1.0" });
+    delete window.desktopBridge;
+    await act(async () => actionButton().click());
+    expect(downloadUpdate).not.toHaveBeenCalled();
+  });
 
-    harness.bridge = {
-      downloadUpdate: vi.fn(),
-      installUpdate: vi.fn(),
-    };
-    (window as unknown as { desktopBridge: unknown }).desktopBridge = harness.bridge;
-    harness.disabled = true;
-    actionButton(SidebarUpdatePill()).onClick();
-    harness.disabled = false;
-    harness.action = "none";
-    actionButton(SidebarUpdatePill()).onClick();
-    expect(harness.bridge.downloadUpdate).not.toHaveBeenCalled();
+  it("does not download when the disabled pill is clicked while downloading", async () => {
+    await render({
+      ...baseState,
+      status: "downloading",
+      availableVersion: "1.1.0",
+      downloadPercent: 42.8,
+    });
+    expect(actionButton().disabled).toBe(true);
+    await act(async () => actionButton().click());
+    expect(downloadUpdate).not.toHaveBeenCalled();
+    expect(installUpdate).not.toHaveBeenCalled();
+    expect(harness.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("does not download for an action of none", async () => {
+    harness.forceVisible = true;
+    await render(baseState);
+    expect(actionButton().disabled).toBe(false);
+    await act(async () => actionButton().click());
+    expect(downloadUpdate).not.toHaveBeenCalled();
+    expect(installUpdate).not.toHaveBeenCalled();
+    expect(harness.toastAdd).not.toHaveBeenCalled();
   });
 
   it("downloads updates and reports completion and action failures", async () => {
-    const downloadUpdate = vi.fn().mockResolvedValue({ completed: true });
-    harness.bridge = { downloadUpdate, installUpdate: vi.fn() };
-    (window as unknown as { desktopBridge: unknown }).desktopBridge = harness.bridge;
-    harness.state = { status: "available" };
-    harness.visible = true;
-    harness.action = "download";
-    actionButton(SidebarUpdatePill()).onClick();
-    await vi.waitFor(() => expect(downloadUpdate).toHaveBeenCalled());
-    await vi.waitFor(() =>
-      expect(harness.toastAdd).toHaveBeenCalledWith(
-        expect.objectContaining({ title: "Update downloaded" }),
-      ),
+    await render({ ...baseState, status: "available", availableVersion: "1.1.0" });
+    downloadUpdate.mockResolvedValueOnce({ accepted: true, completed: true, state: baseState });
+    await act(async () => actionButton().click());
+    expect(downloadUpdate).toHaveBeenCalledOnce();
+    expect(harness.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Update downloaded" }),
     );
-
-    harness.toastAdd.mockReset();
-    harness.shouldToast = true;
-    harness.actionError = "network failed";
-    downloadUpdate.mockResolvedValueOnce({ completed: false });
-    actionButton(SidebarUpdatePill()).onClick();
-    await vi.waitFor(() =>
-      expect(harness.toastAdd).toHaveBeenCalledWith(
-        expect.objectContaining({ title: "Could not download update" }),
-      ),
+    downloadUpdate.mockResolvedValueOnce({
+      accepted: true,
+      completed: false,
+      state: { ...baseState, message: "network failed" },
+    });
+    await act(async () => actionButton().click());
+    expect(harness.toastAdd).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        title: "Could not download update",
+        description: "network failed",
+      }),
     );
   });
 
   it("reports rejected download attempts with error and unknown causes", async () => {
-    const downloadUpdate = vi.fn().mockRejectedValue(new Error("offline"));
-    harness.bridge = { downloadUpdate, installUpdate: vi.fn() };
-    (window as unknown as { desktopBridge: unknown }).desktopBridge = harness.bridge;
-    harness.state = { status: "available" };
-    harness.visible = true;
-    harness.action = "download";
-    actionButton(SidebarUpdatePill()).onClick();
-    await vi.waitFor(() =>
-      expect(harness.toastAdd).toHaveBeenCalledWith(
-        expect.objectContaining({ description: "offline" }),
-      ),
+    await render({ ...baseState, status: "available", availableVersion: "1.1.0" });
+    downloadUpdate.mockRejectedValueOnce(new Error("offline"));
+    await act(async () => actionButton().click());
+    expect(harness.toastAdd).toHaveBeenLastCalledWith(
+      expect.objectContaining({ description: "offline" }),
     );
-
-    harness.toastAdd.mockReset();
     downloadUpdate.mockRejectedValueOnce("offline");
-    actionButton(SidebarUpdatePill()).onClick();
-    await vi.waitFor(() =>
-      expect(harness.toastAdd).toHaveBeenCalledWith(
-        expect.objectContaining({ description: "An unexpected error occurred." }),
-      ),
+    await act(async () => actionButton().click());
+    expect(harness.toastAdd).toHaveBeenLastCalledWith(
+      expect.objectContaining({ description: "An unexpected error occurred." }),
     );
   });
 
-  it("opens typed protection instead of invoking the installer directly", () => {
-    const installUpdate = vi.fn();
-    harness.bridge = { downloadUpdate: vi.fn(), installUpdate };
-    (window as unknown as { desktopBridge: unknown }).desktopBridge = harness.bridge;
-    harness.state = { status: "downloaded" };
-    harness.visible = true;
-    harness.action = "install";
-    actionButton(SidebarUpdatePill()).onClick();
-    expect(harness.setDismissed).toHaveBeenCalledWith(true);
+  it("opens typed protection instead of invoking the installer directly", async () => {
+    await render({ ...baseState, status: "downloaded", downloadedVersion: "1.1.0" });
+    await act(async () => actionButton().click());
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull();
     expect(installUpdate).not.toHaveBeenCalled();
+  });
+
+  it("shows the recovery warning, restart tooltip and recovery dialog", async () => {
+    await render(recoveryState);
+    expect(actionButton().textContent).toBe("Update not installed");
+    expect(actionButton().getAttribute("aria-label")).toBe(
+      "Update not installed: BiBCode's local server is stopped.",
+    );
+    expect(actionButton().querySelector("svg.lucide-triangle-alert")).not.toBeNull();
+    await act(async () => actionButton().click());
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(installUpdate).not.toHaveBeenCalled();
+  });
+
+  it("reveals recovery even when an earlier update notification was dismissed", async () => {
+    await render({ ...baseState, status: "available", availableVersion: "1.1.0" });
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[aria-label="Dismiss update"]')!.click(),
+    );
+    expect(container.textContent).toBe("");
+    await render(recoveryState);
+    expect(actionButton().textContent).toBe("Update not installed");
   });
 });
