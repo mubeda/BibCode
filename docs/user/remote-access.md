@@ -166,6 +166,11 @@ data root and refuses to run before the server has ever started there. Revoke
 the resulting device from the Share tab like any other client. The focused
 `bibcode pairing issue` command remains for desktop-managed SSH bootstrap.
 
+A server started with `--dev-url` keeps its data in `<base>/dev`; without it,
+the server uses `<base>/userdata`. Pass the same `--dev-url`, or set
+`VITE_DEV_SERVER_URL`, for `bibcode pairing offer` and `bibcode pairing issue`
+to select that server's state, including when both stores exist.
+
 ## Desktop-managed SSH
 
 The desktop contains an SSH launcher that can install a small runner under

@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bibcode_server::{
     Cli, ConfigError, ServerConfig, ServerRuntime,
     persistence::{BackupTrigger, StatePaths, create_verified_backup, prepare_store},
@@ -21,12 +22,43 @@ use tokio::{
 #[path = "support/hermetic_providers.rs"]
 mod hermetic_providers;
 
-/// Writes hermetic provider settings into `root`'s state directory before any
-/// boot (in-process or the spawned `bibcode` binary) reads it, so neither
-/// probes a real host provider CLI. A later boot from the same `--base-dir`
-/// only reads this file; nothing here re-writes it.
-fn seed_hermetic_settings(root: &std::path::Path) {
-    hermetic_providers::write_hermetic_settings(&ServerConfig::new(root).state_dir(), json!({}));
+/// Writes hermetic provider settings into `config`'s selected state directory
+/// before any boot (in-process or the spawned `bibcode` binary) reads it, so
+/// neither probes a real host provider CLI. A later boot with the same
+/// `--base-dir` and dev URL only reads this file; nothing here re-writes it.
+fn seed_hermetic_settings(config: &ServerConfig) {
+    hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+}
+
+#[test]
+fn hermetic_settings_are_seeded_in_the_selected_state_directory() {
+    for (dev_url, state, other_state) in [
+        (None, "userdata", "dev"),
+        (Some("http://localhost:5733"), "dev", "userdata"),
+    ] {
+        let root = TempDir::new().expect("temporary settings root");
+        let mut config = ServerConfig::new(root.path());
+        if let Some(dev_url) = dev_url {
+            config = config.with_dev_url(dev_url.parse().expect("dev URL"));
+        }
+        seed_hermetic_settings(&config);
+
+        let state_dir = root.path().join(state);
+        let settings: Value = serde_json::from_slice(
+            &std::fs::read(state_dir.join("settings.json")).expect("selected state settings"),
+        )
+        .expect("hermetic settings JSON");
+        assert_eq!(settings["enableProviderUpdateChecks"], false);
+        for driver in ["codex", "claudeAgent", "cursor", "grok", "opencode"] {
+            let binary = settings["providers"][driver]["binaryPath"]
+                .as_str()
+                .expect("pinned provider binary");
+            let binary = std::path::Path::new(binary);
+            assert!(binary.is_absolute() && binary.starts_with(&state_dir));
+            assert!(!binary.exists());
+        }
+        assert!(!root.path().join(other_state).join("settings.json").exists());
+    }
 }
 
 async fn exchange_startup_admin(handle: &bibcode_server::ServerHandle) -> String {
@@ -84,8 +116,9 @@ fn headless_binary_exposes_the_compatible_serve_flags() {
 #[tokio::test]
 async fn storage_inspect_prints_one_json_document_for_an_offline_store() {
     let root = TempDir::new().expect("temporary storage root");
-    seed_hermetic_settings(root.path());
-    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+    let config = ServerConfig::new(root.path()).with_bind("127.0.0.1", 0);
+    seed_hermetic_settings(&config);
+    let handle = ServerRuntime::start(config)
         .await
         .expect("seed inspectable store");
     handle.shutdown();
@@ -199,8 +232,9 @@ async fn storage_restore_prints_json_and_restores_the_selected_verified_generati
 #[tokio::test]
 async fn storage_start_empty_exits_nonzero_without_mutating_a_running_store() {
     let root = TempDir::new().expect("temporary active storage root");
-    seed_hermetic_settings(root.path());
-    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+    let config = ServerConfig::new(root.path()).with_bind("127.0.0.1", 0);
+    seed_hermetic_settings(&config);
+    let handle = ServerRuntime::start(config)
         .await
         .expect("start active storage owner");
     let mut config = ServerConfig::new(root.path());
@@ -237,19 +271,36 @@ async fn storage_start_empty_exits_nonzero_without_mutating_a_running_store() {
 
 #[tokio::test]
 async fn pairing_issue_prints_a_credential_the_running_server_exchanges() {
+    assert_pairing_issue_exchanges(None).await;
+}
+
+#[tokio::test]
+async fn pairing_issue_with_dev_url_prints_a_credential_the_dev_server_exchanges() {
+    assert_pairing_issue_exchanges(Some("http://localhost:5733")).await;
+}
+
+async fn assert_pairing_issue_exchanges(dev_url: Option<&str>) {
     let root = TempDir::new().expect("temporary storage root");
-    seed_hermetic_settings(root.path());
-    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+    let mut config = ServerConfig::new(root.path()).with_bind("127.0.0.1", 0);
+    if let Some(dev_url) = dev_url {
+        config = config.with_dev_url(dev_url.parse().expect("dev URL"));
+    }
+    seed_hermetic_settings(&config);
+    let handle = ServerRuntime::start(config)
         .await
         .expect("start pairing storage owner");
     let http_base_url = format!("http://{}", handle.local_addr());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bibcode"));
+    command
+        .env_remove("VITE_DEV_SERVER_URL")
         .args(["pairing", "issue", "--base-dir"])
         .arg(root.path())
-        .args(["--label", "SSH bootstrap", "--json"])
-        .output()
-        .expect("run pairing issue");
+        .args(["--label", "SSH bootstrap", "--json"]);
+    if let Some(dev_url) = dev_url {
+        command.args(["--dev-url", dev_url]);
+    }
+    let output = command.output().expect("run pairing issue");
     assert!(
         output.status.success(),
         "pairing issue failed: {}",
@@ -509,7 +560,7 @@ fn headless_configuration_reads_an_inherited_nonzero_bootstrap_fd() {
 #[tokio::test]
 async fn headless_binary_reads_desktop_bootstrap_and_shuts_down_over_http() {
     let temp = TempDir::new().expect("temporary base directory");
-    seed_hermetic_settings(temp.path());
+    seed_hermetic_settings(&ServerConfig::new(temp.path()));
     let mut child = TokioCommand::new(env!("CARGO_BIN_EXE_bibcode"))
         .args([
             "serve",
@@ -579,13 +630,28 @@ async fn headless_binary_reads_desktop_bootstrap_and_shuts_down_over_http() {
 
 #[tokio::test]
 async fn pairing_offer_prints_a_code_the_running_server_redeems() {
+    assert_pairing_offer_redeems(None).await;
+}
+
+#[tokio::test]
+async fn pairing_offer_with_dev_url_prints_a_code_the_dev_server_redeems() {
+    assert_pairing_offer_redeems(Some("http://localhost:5733")).await;
+}
+
+async fn assert_pairing_offer_redeems(dev_url: Option<&str>) {
     let root = TempDir::new().expect("temporary storage root");
-    seed_hermetic_settings(root.path());
-    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+    let mut config = ServerConfig::new(root.path()).with_bind("127.0.0.1", 0);
+    if let Some(dev_url) = dev_url {
+        config = config.with_dev_url(dev_url.parse().expect("dev URL"));
+    }
+    seed_hermetic_settings(&config);
+    let handle = ServerRuntime::start(config)
         .await
         .expect("start pairing storage owner");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bibcode"));
+    command
+        .env_remove("VITE_DEV_SERVER_URL")
         .args(["pairing", "offer", "--base-dir"])
         .arg(root.path())
         .args([
@@ -596,9 +662,11 @@ async fn pairing_offer_prints_a_code_the_running_server_redeems() {
             "--label",
             "laptop",
             "--json",
-        ])
-        .output()
-        .expect("run pairing offer");
+        ]);
+    if let Some(dev_url) = dev_url {
+        command.args(["--dev-url", dev_url]);
+    }
+    let output = command.output().expect("run pairing offer");
     assert!(
         output.status.success(),
         "pairing offer failed: {}",
@@ -678,11 +746,213 @@ fn pairing_offer_fails_closed_without_a_data_store() {
     );
 }
 
+async fn prepare_pairing_store(root: &TempDir, dev_url: Option<&str>) -> (StatePaths, String) {
+    let mut config = ServerConfig::new(root.path());
+    if let Some(dev_url) = dev_url {
+        config = config.with_dev_url(dev_url.parse().expect("dev URL"));
+    }
+    let resolved =
+        resolve_data_root(config.data_root_request.clone()).expect("resolve pairing root");
+    config.base_dir.clone_from(&resolved.effective);
+    config.resolved_data_root = Some(resolved);
+    std::fs::create_dir_all(config.state_dir()).expect("pairing state directory");
+    let prepared = prepare_store(&config).await.expect("prepare pairing store");
+    let storage_instance_id = prepared.storage_instance_id.to_string();
+    // Startup persists a 64-byte private-then-public Noise identity before offers can be minted.
+    let keypair = snow::Builder::new(
+        "Noise_NK_25519_ChaChaPoly_SHA256"
+            .parse()
+            .expect("Noise params"),
+    )
+    .generate_keypair()
+    .expect("fixture host identity");
+    std::fs::create_dir_all(&prepared.paths.secrets_dir).expect("fixture secrets directory");
+    std::fs::write(
+        prepared.paths.secrets_dir.join("host-identity-x25519.bin"),
+        [keypair.private, keypair.public].concat(),
+    )
+    .expect("persist fixture host identity");
+    drop(prepared.database);
+    (prepared.paths, storage_instance_id)
+}
+
+fn pairing_command(root: &TempDir, subcommand: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bibcode"));
+    command
+        .env_remove("VITE_DEV_SERVER_URL")
+        .args(["pairing", subcommand, "--base-dir"])
+        .arg(root.path())
+        .arg("--json");
+    if subcommand == "offer" {
+        command.args(["--endpoint", "http://192.168.1.20:3773"]);
+    }
+    command
+}
+
+#[tokio::test]
+async fn pairing_commands_without_dev_url_report_the_existing_dev_store() {
+    let root = TempDir::new().expect("temporary pairing root");
+    let (paths, _) = prepare_pairing_store(&root, Some("http://localhost:5733")).await;
+    let selected = paths.base_dir.join("userdata").join("state.sqlite");
+    for subcommand in ["offer", "issue"] {
+        let output = pairing_command(&root, subcommand)
+            .output()
+            .expect("run pairing CLI");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{subcommand}: {stderr}");
+        assert!(output.stdout.is_empty(), "no pairing output on failure");
+        assert!(
+            stderr.contains(selected.to_string_lossy().as_ref()),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(paths.database.to_string_lossy().as_ref()),
+            "{stderr}"
+        );
+        assert!(stderr.contains("pass the same --dev-url"), "{stderr}");
+        assert!(
+            !selected.exists(),
+            "must not create a store in the wrong state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pairing_commands_with_dev_url_report_the_existing_userdata_store() {
+    let root = TempDir::new().expect("temporary pairing root");
+    let (paths, _) = prepare_pairing_store(&root, None).await;
+    let selected = paths.base_dir.join("dev").join("state.sqlite");
+    for subcommand in ["offer", "issue"] {
+        let output = pairing_command(&root, subcommand)
+            .args(["--dev-url", "http://localhost:5733"])
+            .output()
+            .expect("run pairing CLI");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{subcommand}: {stderr}");
+        assert!(output.stdout.is_empty(), "no pairing output on failure");
+        assert!(
+            stderr.contains(selected.to_string_lossy().as_ref()),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(paths.database.to_string_lossy().as_ref()),
+            "{stderr}"
+        );
+        assert!(stderr.contains("drop --dev-url"), "{stderr}");
+        assert!(
+            !selected.exists(),
+            "must not create a store in the wrong state"
+        );
+    }
+}
+
+#[test]
+fn pairing_commands_with_dev_url_fail_closed_without_either_store() {
+    let root = TempDir::new().expect("temporary empty pairing root");
+    for subcommand in ["offer", "issue"] {
+        let output = pairing_command(&root, subcommand)
+            .args(["--dev-url", "http://localhost:5733"])
+            .output()
+            .expect("run pairing CLI without a store");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{subcommand}: {stderr}");
+        assert!(output.stdout.is_empty(), "no pairing output on failure");
+        assert!(
+            stderr.contains("start the server on this data root first"),
+            "{stderr}"
+        );
+        assert!(!root.path().join("dev/state.sqlite").exists());
+        assert!(!root.path().join("userdata/state.sqlite").exists());
+    }
+}
+
+async fn assert_pairing_commands_select_existing_state(
+    args: &[&str],
+    dev_env: Option<&str>,
+    selected_state: &str,
+) {
+    let root = TempDir::new().expect("temporary pairing root");
+    let (userdata, userdata_id) = prepare_pairing_store(&root, None).await;
+    let (dev, dev_id) = prepare_pairing_store(&root, Some("http://localhost:5733")).await;
+    for subcommand in ["offer", "issue"] {
+        let mut command = pairing_command(&root, subcommand);
+        command.args(args);
+        if let Some(dev_env) = dev_env {
+            command.env("VITE_DEV_SERVER_URL", dev_env);
+        }
+        let output = command.output().expect("run pairing CLI");
+        assert!(
+            output.status.success(),
+            "{subcommand}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("pairing JSON");
+        let id = value["id"].as_str().expect("pairing ID");
+        for (state, paths, storage_id) in [
+            ("userdata", &userdata, &userdata_id),
+            ("dev", &dev, &dev_id),
+        ] {
+            let connection = Connection::open_with_flags(
+                &paths.database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("read pairing store");
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM auth_pairing_links WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("pairing row count");
+            assert_eq!(
+                count,
+                i64::from(state == selected_state),
+                "{subcommand}: {state}"
+            );
+            if subcommand == "offer" && state == selected_state {
+                let payload = bibcode_server::auth_pairing_code::decode_pairing_code(
+                    value["code"].as_str().expect("pairing code"),
+                )
+                .expect("decode pairing code");
+                assert_eq!(&payload.storage_instance_id, storage_id);
+                let identity = std::fs::read(paths.secrets_dir.join("host-identity-x25519.bin"))
+                    .expect("selected host identity");
+                assert_eq!(
+                    payload.host_key,
+                    URL_SAFE_NO_PAD.encode(&identity[32..]),
+                    "host identity must use the selected state"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn pairing_commands_with_dev_url_select_dev_when_both_stores_exist() {
+    assert_pairing_commands_select_existing_state(
+        &["--dev-url", "http://localhost:5733"],
+        None,
+        "dev",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pairing_commands_with_dev_environment_select_dev_when_both_stores_exist() {
+    assert_pairing_commands_select_existing_state(&[], Some("http://localhost:5733"), "dev").await;
+}
+
+#[tokio::test]
+async fn pairing_commands_without_dev_url_select_userdata_when_both_stores_exist() {
+    assert_pairing_commands_select_existing_state(&[], None, "userdata").await;
+}
+
 #[tokio::test]
 async fn pairing_offer_rejects_a_loopback_endpoint_for_another_device() {
     let root = TempDir::new().expect("temporary storage root");
-    seed_hermetic_settings(root.path());
-    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+    let config = ServerConfig::new(root.path()).with_bind("127.0.0.1", 0);
+    seed_hermetic_settings(&config);
+    let handle = ServerRuntime::start(config)
         .await
         .expect("start pairing storage owner");
     let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
@@ -705,7 +975,7 @@ async fn pairing_offer_rejects_a_loopback_endpoint_for_another_device() {
 #[tokio::test]
 async fn serve_on_loopback_prints_no_startup_pairing_code() {
     let temp = TempDir::new().expect("temporary base directory");
-    seed_hermetic_settings(temp.path());
+    seed_hermetic_settings(&ServerConfig::new(temp.path()));
     let mut child = TokioCommand::new(env!("CARGO_BIN_EXE_bibcode"))
         .args(["serve", "--host", "127.0.0.1", "--port", "0", "--base-dir"])
         .arg(temp.path())
