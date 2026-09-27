@@ -785,6 +785,10 @@ impl Drop for ServerHandle {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    use crate::test_support::hermetic_providers;
+
     use super::*;
 
     #[test]
@@ -928,9 +932,9 @@ mod tests {
     #[tokio::test]
     async fn loopback_serve_has_no_startup_pairing_link() {
         let temp = tempfile::tempdir().expect("temporary base directory");
-        let handle = ServerRuntime::start(ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0))
-            .await
-            .expect("server starts");
+        let config = ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let handle = ServerRuntime::start(config).await.expect("server starts");
         let access = handle.startup_access().expect("web mode startup access");
         assert_eq!(access.pairing_link, None);
         handle.shutdown();
@@ -950,10 +954,11 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().expect("temporary base directory");
-        let handle =
-            ServerRuntime::start(ServerConfig::new(temp.path()).with_bind(ip.to_string(), 0))
-                .await
-                .expect("server starts on the routable address");
+        let config = ServerConfig::new(temp.path()).with_bind(ip.to_string(), 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let handle = ServerRuntime::start(config)
+            .await
+            .expect("server starts on the routable address");
         let access = handle.startup_access().expect("web mode startup access");
         let link = access
             .pairing_link
@@ -977,6 +982,7 @@ mod tests {
         let disabled = {
             let mut config = ServerConfig::new(second.path()).with_bind(ip.to_string(), 0);
             config.startup_pairing_offer = false;
+            hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
             ServerRuntime::start(config)
                 .await
                 .expect("server starts without an offer")
@@ -1057,6 +1063,7 @@ mod tests {
         let production_state = tempfile::tempdir().expect("production state directory");
         let production_config =
             ServerConfig::new(production_state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&production_config.state_dir(), json!({}));
         let production = ServerRuntime::start(production_config)
             .await
             .expect("production server should start");
