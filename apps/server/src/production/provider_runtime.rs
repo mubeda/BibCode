@@ -5949,7 +5949,7 @@ where
     if let Some(pid) = inner.id() {
         after_spawn(pid).await;
     }
-    let registration = match inner.try_wait() {
+    let identity = match inner.try_wait() {
         Ok(Some(_)) => None,
         Ok(None) => {
             let identity = match inner
@@ -5968,15 +5968,8 @@ where
                 }
             };
             match inner.try_wait() {
-                Ok(None) => {}
-                Ok(Some(_)) => {
-                    let report = terminate_and_wait(&mut *inner).await;
-                    log_cleanup_failures("exited provider ownership unit", &report);
-                    return Err(ProviderRuntimeError::Spawn {
-                        provider,
-                        detail: "provider process exited before ownership admission".to_owned(),
-                    });
-                }
+                Ok(None) => Some(identity),
+                Ok(Some(_)) => None,
                 Err(error) => {
                     let report = terminate_and_wait(&mut *inner).await;
                     log_cleanup_failures("unattributed provider process", &report);
@@ -5988,30 +5981,6 @@ where
                     });
                 }
             }
-            match attribution.register_identity(
-                identity,
-                ProcessRegistrationMetadata {
-                    scope: AttributionScope::External,
-                    kind: AttributionKind::Provider,
-                    label: request.provider_label.clone(),
-                    source: RegistrationSource::Provider,
-                },
-            ) {
-                Ok(registration) => Some(registration),
-                Err(ProcessRegistrationError::Shutdown) => {
-                    let report = terminate_and_wait(&mut *inner).await;
-                    log_cleanup_failures("rejected provider process", &report);
-                    return Err(ProviderRuntimeError::Shutdown);
-                }
-                Err(error @ ProcessRegistrationError::Capacity) => {
-                    let report = terminate_and_wait(&mut *inner).await;
-                    log_cleanup_failures("unattributed provider process", &report);
-                    return Err(ProviderRuntimeError::Spawn {
-                        provider,
-                        detail: error.to_string(),
-                    });
-                }
-            }
         }
         Err(error) => {
             let report = terminate_and_wait(&mut *inner).await;
@@ -6019,6 +5988,41 @@ where
             return Err(ProviderRuntimeError::Spawn {
                 provider,
                 detail: format!("failed to inspect spawned provider process: {error}"),
+            });
+        }
+    };
+    let Some(identity) = identity else {
+        // ProcessGroupChild::try_wait can report an exited root while another group member
+        // still runs: waitpid(-pgid) sees only our own children. An exited root cannot
+        // prove the ownership unit is empty, so both exit checks must clean up the group.
+        let report = terminate_and_wait(&mut *inner).await;
+        log_cleanup_failures("exited provider ownership unit", &report);
+        return Err(ProviderRuntimeError::Spawn {
+            provider,
+            detail: "provider process exited before ownership admission".to_owned(),
+        });
+    };
+    let registration = match attribution.register_identity(
+        identity,
+        ProcessRegistrationMetadata {
+            scope: AttributionScope::External,
+            kind: AttributionKind::Provider,
+            label: request.provider_label.clone(),
+            source: RegistrationSource::Provider,
+        },
+    ) {
+        Ok(registration) => Some(registration),
+        Err(ProcessRegistrationError::Shutdown) => {
+            let report = terminate_and_wait(&mut *inner).await;
+            log_cleanup_failures("rejected provider process", &report);
+            return Err(ProviderRuntimeError::Shutdown);
+        }
+        Err(error @ ProcessRegistrationError::Capacity) => {
+            let report = terminate_and_wait(&mut *inner).await;
+            log_cleanup_failures("unattributed provider process", &report);
+            return Err(ProviderRuntimeError::Spawn {
+                provider,
+                detail: error.to_string(),
             });
         }
     };
@@ -17776,6 +17780,58 @@ done
         let _ = inner.wait().await;
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_provider_that_exits_before_ownership_admission_is_refused_and_reaped() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let registry = ProcessAttributionRegistry::new();
+        let fixture = executable_fixture(&temp, "exited-provider", "#!/bin/sh\nexit 0\n");
+        let mut request = native_launch(&temp, "fixture");
+        request.binary_path = fixture.to_string_lossy().into_owned();
+        let mut spawned_pid = None;
+
+        let result =
+            super::spawn_child_after_spawn(&request, &[], false, registry.clone(), |pid| {
+                spawned_pid = Some(pid);
+                async move {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                                .expect("unreaped provider root stat");
+                            if stat
+                                .rsplit_once(") ")
+                                .and_then(|(_, fields)| fields.split_whitespace().next())
+                                == Some("Z")
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("provider root must exit before admission resumes");
+                }
+            })
+            .await;
+
+        let error = result.expect_err("an exited provider must be refused");
+        assert!(matches!(
+            error,
+            super::ProviderRuntimeError::Spawn { provider, detail }
+                if provider == "fixture"
+                    && detail == "provider process exited before ownership admission"
+        ));
+        assert!(live_claims(&registry).await.is_empty());
+        let pid = spawned_pid.expect("spawned provider PID");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("refused provider root must be reaped");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ownership_freeze_rejects_and_reaps_a_provider_spawn_in_flight() {
         let temp = TempDir::new().expect("provider fixture directory");
@@ -19880,6 +19936,7 @@ printf '2.1.0 (Claude Code)\n'
                 super::spawn_child(&request, &[], false, ProcessAttributionRegistry::new())
                     .await
                     .expect("spawn instance executable");
+            drop(child.stdin().take());
             child.wait().await.expect("wait for runtime fixture");
 
             assert_eq!(
@@ -19908,7 +19965,7 @@ printf '2.1.0 (Claude Code)\n'
             TestSandbox::write_executable(
                 executable,
                 &format!(
-                    "#!/bin/sh\nprintf '%s' '{label}' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\n"
+                    "#!/bin/sh\nprintf '%s' '{label}' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\nwhile read -r release; do :; done\n"
                 ),
             );
         }
