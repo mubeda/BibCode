@@ -1328,12 +1328,13 @@ function WorkGroupToggleTimelineRow({
   row: Extract<TimelineRow, { kind: "work-toggle" }>;
 }) {
   const ctx = use(TimelineRowCtx);
-  const labelNoun = row.onlyToolEntries ? "tool call" : "log entry";
+  const singularNoun = row.onlyToolEntries ? "tool call" : "log entry";
+  const pluralNoun = row.onlyToolEntries ? "tool calls" : "log entries";
 
   return (
     <button
       type="button"
-      className="flex w-full cursor-pointer items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-[12px] leading-5 transition-colors duration-150 hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+      className="flex w-full cursor-pointer items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-xs leading-5 transition-colors duration-150 hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
       aria-expanded={row.expanded}
       onClick={(event) => {
         const anchorElement =
@@ -1350,13 +1351,10 @@ function WorkGroupToggleTimelineRow({
         />
       </span>
       {row.expanded ? (
-        <span className="font-medium text-foreground/82">
-          Show fewer {row.onlyToolEntries ? "tool calls" : "log entries"}
-        </span>
+        <span className="font-medium text-foreground/82">Show fewer {pluralNoun}</span>
       ) : (
         <span className="font-medium text-foreground/82">
-          +{row.hiddenCount} previous {labelNoun}
-          {row.hiddenCount === 1 ? "" : "s"}
+          +{row.hiddenCount} previous {row.hiddenCount === 1 ? singularNoun : pluralNoun}
         </span>
       )}
     </button>
@@ -1907,7 +1905,6 @@ type WorkEntryIconName =
   | "square-pen"
   | "terminal"
   | "wrench"
-  | "x"
   | "zap";
 
 function WorkEntryIconSvg({ name, className }: { name: WorkEntryIconName; className: string }) {
@@ -1932,8 +1929,6 @@ function WorkEntryIconSvg({ name, className }: { name: WorkEntryIconName; classN
       return <TerminalIcon className={className} aria-hidden />;
     case "wrench":
       return <WrenchIcon className={className} aria-hidden />;
-    case "x":
-      return <XIcon className={className} aria-hidden />;
     case "zap":
       return <ZapIcon className={className} aria-hidden />;
   }
@@ -2068,10 +2063,10 @@ function capitalizePhrase(value: string): string {
 }
 
 function toolWorkEntryHeading(workEntry: TimelineWorkEntry): string {
-  if (!workEntry.toolTitle) {
-    return capitalizePhrase(normalizeCompactToolLabel(workEntry.label));
+  if (!workEntry.toolTitle && !workEntry.sourceActivityKind?.startsWith("tool.")) {
+    return capitalizePhrase(workEntry.label);
   }
-  return capitalizePhrase(normalizeCompactToolLabel(workEntry.toolTitle));
+  return capitalizePhrase(normalizeCompactToolLabel(workEntry.toolTitle ?? workEntry.label));
 }
 
 const stopRowToggle = (e: { stopPropagation: () => void }) => e.stopPropagation();
@@ -2084,8 +2079,7 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   const activity = use(TimelineRowActivityCtx);
   const [expanded, setExpanded] = useState(false);
   const iconConfig = workToneIcon(workEntry.tone);
-  const showWarningIndicator = workEntry.sourceActivityKind === "runtime.warning";
-  const entryIconName = showWarningIndicator ? "x" : workEntryIconName(workEntry);
+  const entryIconName = workEntryIconName(workEntry);
   const heading = toolWorkEntryHeading(workEntry);
   const rawPreview = workEntryPreview(workEntry, workspaceRoot);
   const preview =
@@ -2103,19 +2097,15 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
     (workEntry.sourceActivityKind === "runtime.error" || !workLogEntryIsToolLike(workEntry));
   const iconWrapperClass = cn(
     "flex size-5 shrink-0 items-center justify-center",
-    showWarningIndicator
+    showDestructiveRowStyle
       ? "text-destructive"
-      : showDestructiveRowStyle
-        ? "text-destructive"
-        : workEntry.tone === "tool" || showFailedIndicator
-          ? "text-muted-foreground"
-          : iconConfig.className,
+      : workEntry.tone === "tool" || showFailedIndicator
+        ? "text-muted-foreground"
+        : iconConfig.className,
   );
-  const headingClass = showWarningIndicator
-    ? "font-medium text-warning"
-    : showDestructiveRowStyle
-      ? "font-medium text-destructive"
-      : "font-medium text-foreground/82";
+  const headingClass = showDestructiveRowStyle
+    ? "font-medium text-destructive"
+    : "font-medium text-foreground/82";
   const turnSettled = !activity.activeTurnInProgress;
   const showNeutralIndicator = !turnSettled && workEntryIndicatesToolNeutralStatus(workEntry);
   const showSuccessIndicator =
