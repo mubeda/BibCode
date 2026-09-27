@@ -49,11 +49,11 @@ pub(crate) fn missing_hosting_executable_dir(sandbox: &Path) -> PathBuf {
     directory
 }
 
-/// Settings that explicitly preserve the control plane's persisted-document
-/// enabled defaults (Codex, Claude, and OpenCode enabled; Cursor and Grok
-/// disabled) in both settings readers, while pinning each legacy `binaryPath`
-/// to [`missing_provider_executable`] and disabling the update check that would
-/// otherwise call registry.npmjs.org / downloads.claude.ai.
+/// Settings that explicitly preserve the built-in enabled defaults (Codex,
+/// Claude, Cursor, and OpenCode enabled; Grok disabled) in both settings readers,
+/// while pinning each legacy `binaryPath` to [`missing_provider_executable`] and
+/// disabling the update check that would otherwise call registry.npmjs.org /
+/// downloads.claude.ai.
 ///
 /// A test that needs a driver disabled instead (irrelevant to what it
 /// exercises) or a specific `providerInstances` fixture should overlay that
@@ -67,7 +67,7 @@ pub(crate) fn hermetic_provider_settings(sandbox: &Path) -> Value {
     for (driver, enabled_by_default) in [
         ("codex", true),
         ("claudeAgent", true),
-        ("cursor", false),
+        ("cursor", true),
         ("grok", false),
         ("opencode", true),
     ] {

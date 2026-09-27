@@ -5,6 +5,12 @@ instance binds a driver to its configured executable, options, readiness state,
 and instance metadata. Commands identify the instance rather than
 reconstructing driver state in the client.
 
+Built-in provider settings defaults come from one server table. Both the control
+plane and the runtime settings reader fill missing fields from it, so a partial
+`providers.<driver>` object means the same thing everywhere. Codex, Claude,
+Cursor, and OpenCode are enabled by default; Grok is disabled. Explicitly saved
+values, including `enabled: false`, are preserved.
+
 `supportsContextWindowUsage` is provider-inventory metadata, not a UI guess or
 a property of an individual usage event. Codex and Claude are the only initial
 providers that advertise this capability; an absent capability means that the

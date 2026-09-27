@@ -479,7 +479,7 @@ async fn config_and_settings_match_the_typescript_contract_without_faking_provid
             .to_str()
             .unwrap()
     );
-    assert_eq!(settings["providers"]["cursor"]["enabled"], false);
+    assert_eq!(settings["providers"]["cursor"]["enabled"], true);
 
     call(&control, "server.refreshProviders", json!({})).await;
     let config = call(&control, "server.getConfig", json!({})).await;

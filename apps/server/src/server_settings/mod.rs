@@ -10,6 +10,34 @@ use thiserror::Error;
 use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 use uuid::Uuid;
 
+/// The one source both settings readers fill missing built-in provider fields from.
+pub(crate) fn built_in_provider_defaults() -> Value {
+    serde_json::json!({
+        "codex": { "enabled": true, "binaryPath": "codex", "homePath": "", "shadowHomePath": "", "customModels": [] },
+        "claudeAgent": { "enabled": true, "binaryPath": "claude", "homePath": "", "customModels": [], "launchArgs": "" },
+        "cursor": { "enabled": true, "binaryPath": "cursor-agent", "apiEndpoint": "", "customModels": [] },
+        "grok": { "enabled": false, "binaryPath": "grok", "customModels": [] },
+        "opencode": { "enabled": true, "binaryPath": "opencode", "serverUrl": "", "serverPassword": "", "customModels": [] },
+    })
+}
+
+/// Recursively fills missing keys in `target` from `defaults` without overwriting existing values.
+pub(crate) fn merge_missing(target: &mut Value, defaults: &Value) {
+    if let (Some(target), Some(defaults)) = (target.as_object_mut(), defaults.as_object()) {
+        for (key, default) in defaults {
+            match target.get_mut(key) {
+                Some(value) if value.is_object() && default.is_object() => {
+                    merge_missing(value, default)
+                }
+                Some(_) => {}
+                None => {
+                    target.insert(key.clone(), default.clone());
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderBinarySettingsState {
@@ -35,32 +63,19 @@ pub struct ProvidersState {
 
 impl ProvidersState {
     fn with_defaults() -> Self {
+        let mut defaults = built_in_provider_defaults();
+        // Decode entries separately: ProvidersState's container-level serde
+        // default would recurse back here even for a complete document.
+        let mut provider = |driver: &str| {
+            serde_json::from_value(defaults[driver].take())
+                .expect("built-in provider defaults must decode")
+        };
         Self {
-            codex: ProviderBinarySettingsState {
-                enabled: true,
-                binary_path: "codex".to_owned(),
-                ..ProviderBinarySettingsState::default()
-            },
-            claude_agent: ProviderBinarySettingsState {
-                enabled: true,
-                binary_path: "claude".to_owned(),
-                ..ProviderBinarySettingsState::default()
-            },
-            cursor: ProviderBinarySettingsState {
-                enabled: true,
-                binary_path: "cursor-agent".to_owned(),
-                ..ProviderBinarySettingsState::default()
-            },
-            grok: ProviderBinarySettingsState {
-                enabled: false,
-                binary_path: "grok".to_owned(),
-                ..ProviderBinarySettingsState::default()
-            },
-            opencode: ProviderBinarySettingsState {
-                enabled: true,
-                binary_path: "opencode".to_owned(),
-                ..ProviderBinarySettingsState::default()
-            },
+            codex: provider("codex"),
+            claude_agent: provider("claudeAgent"),
+            cursor: provider("cursor"),
+            grok: provider("grok"),
+            opencode: provider("opencode"),
         }
     }
 }
@@ -316,6 +331,9 @@ impl ProviderSettingsStore {
                 source,
             })?;
         normalize_agent_activity_settings(&mut settings);
+        if let Some(providers) = settings.get_mut("providers") {
+            merge_missing(providers, &built_in_provider_defaults());
+        }
         serde_json::from_value(settings)
             .map_err(|source| ServerSettingsReadError::Decode { path, source })
     }
@@ -612,6 +630,103 @@ async fn write_bytes_atomically(path: &Path, contents: &[u8]) -> Result<(), std:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BUILTIN_DEFAULTS: &[(&str, bool, &str)] = &[
+        ("codex", true, "codex"),
+        ("claudeAgent", true, "claude"),
+        ("cursor", true, "cursor-agent"),
+        ("grok", false, "grok"),
+        ("opencode", true, "opencode"),
+    ];
+
+    #[tokio::test]
+    async fn partial_builtin_provider_objects_preserve_enabled_defaults_and_custom_paths() {
+        let temp = tempfile::tempdir().expect("settings root");
+        let store = ProviderSettingsStore::new(temp.path());
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for &(driver, enabled, _) in BUILTIN_DEFAULTS {
+            let binary = temp.path().join(format!("custom-{driver}"));
+            fs::write(
+                temp.path().join("settings.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "providers": { driver: { "binaryPath": binary } }
+                }))
+                .expect("partial settings JSON"),
+            )
+            .await
+            .expect("partial settings file");
+
+            let settings = store.get().await.expect("partial settings load");
+            let providers = serde_json::to_value(settings.providers).expect("providers JSON");
+            actual.push((driver, providers[driver]["enabled"].clone()));
+            expected.push((driver, Value::Bool(enabled)));
+            assert_eq!(providers[driver]["binaryPath"], serde_json::json!(binary));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn absent_settings_file_uses_all_builtin_provider_defaults() {
+        let temp = tempfile::tempdir().expect("settings root");
+        let settings = ProviderSettingsStore::new(temp.path())
+            .get()
+            .await
+            .expect("absent settings load");
+        let providers = serde_json::to_value(settings.providers).expect("providers JSON");
+        for &(driver, enabled, binary) in BUILTIN_DEFAULTS {
+            assert_eq!(providers[driver]["enabled"], enabled, "{driver}");
+            assert_eq!(providers[driver]["binaryPath"], binary, "{driver}");
+        }
+        assert!(!temp.path().join("settings.json").exists());
+    }
+
+    #[tokio::test]
+    async fn explicit_builtin_provider_disable_preserves_default_binary_paths() {
+        let temp = tempfile::tempdir().expect("settings root");
+        let store = ProviderSettingsStore::new(temp.path());
+        for &(driver, _, binary) in BUILTIN_DEFAULTS {
+            fs::write(
+                temp.path().join("settings.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "providers": { driver: { "enabled": false } }
+                }))
+                .expect("disabled settings JSON"),
+            )
+            .await
+            .expect("disabled settings file");
+
+            let settings = store.get().await.expect("disabled settings load");
+            let providers = serde_json::to_value(settings.providers).expect("providers JSON");
+            assert_eq!(providers[driver]["enabled"], false, "{driver}");
+            assert_eq!(providers[driver]["binaryPath"], binary, "{driver}");
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_custom_path_update_roundtrip_preserves_enabled_default() {
+        let temp = tempfile::tempdir().expect("settings root");
+        let store = ProviderSettingsStore::new(temp.path());
+        let updated = store
+            .update(ServerSettingsPatch {
+                providers: Some(ProvidersPatch {
+                    codex: Some(ProviderSettingsPatch {
+                        binary_path: Some("custom-codex".to_owned()),
+                        ..ProviderSettingsPatch::default()
+                    }),
+                    ..ProvidersPatch::default()
+                }),
+                ..ServerSettingsPatch::default()
+            })
+            .await
+            .expect("update Codex binary");
+        assert!(updated.providers.codex.enabled);
+
+        let reloaded = store.get().await.expect("reload Codex settings");
+        assert!(reloaded.providers.codex.enabled);
+        assert_eq!(reloaded.providers.codex.binary_path, "custom-codex");
+        assert_eq!(reloaded, updated);
+    }
 
     #[test]
     fn grok_is_disabled_by_default() {

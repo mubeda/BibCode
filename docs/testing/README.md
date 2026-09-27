@@ -77,14 +77,14 @@ Integration tests include it with `#[path = "support/hermetic_providers.rs"]`;
 library tests use `crate::test_support::hermetic_providers`.
 `write_hermetic_settings(&config.state_dir(), overlay)` disables update checks
 and pins every built-in driver's legacy `binaryPath` to an absolute missing
-path. It explicitly preserves the control plane's persisted-document enabled
-defaults in both settings readers: Codex, Claude, and OpenCode enabled; Cursor
-and Grok disabled. It deep-merges fixture overrides, including partial
-`providerInstances`, so unspecified drivers stay pinned.
-`ensure_hermetic_settings` reads existing settings as the overlay and writes
-the hermetic base beneath them; explicit pinned-key overrides remain the
-fixture's responsibility. Read or parse errors fail the test. Seed the same
-state directory before spawning `bibcode` with `--base-dir`.
+path. It explicitly preserves the built-in enabled defaults in both settings
+readers: Codex, Claude, Cursor, and OpenCode enabled; Grok disabled. It
+deep-merges fixture overrides, including partial `providerInstances`, so
+unspecified drivers stay pinned. `ensure_hermetic_settings` reads existing
+settings as the overlay and writes the hermetic base beneath them; explicit
+pinned-key overrides remain the fixture's responsibility. Read or parse errors
+fail the test. Seed the same state directory before spawning `bibcode` with
+`--base-dir`.
 
 Tests exercising probes or updates must explicitly overlay test-owned binaries
 and local endpoints. Use the discovery and Git VCS
