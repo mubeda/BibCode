@@ -38,6 +38,7 @@ import {
   type GeneratedShareOffer,
   type GenerateShareOfferFailure,
   generateShareOffer,
+  nativeShareAddressUnavailableReason,
   resolveShareAddressOptions,
   type ShareIntent,
 } from "./shareOffer";
@@ -379,8 +380,10 @@ export function ShareThisHostTab(): ReactElement {
             canManageNativeExposure &&
             exposureState?.mode === "local-only" ? (
               <p className="mx-4 mb-3 text-xs text-warning">
-                Native sharing needs a private network address. For a public-only host, use an
-                externally managed server or reverse proxy.
+                {nativeShareAddressUnavailableReason(advertisedEndpoints) ===
+                "no-private-default-route"
+                  ? "Native sharing uses the private address of this computer's default network route, and this computer has none right now. Connect it to a local network that provides a default route, then Refresh. Otherwise, use an externally managed server or reverse proxy."
+                  : "Native sharing needs a private network address. For a public-only host, use an externally managed server or reverse proxy."}
               </p>
             ) : null}
           </>

@@ -421,8 +421,36 @@ describe("ShareThisHostTab", () => {
       (button) => button.textContent === "Generate pairing offer",
     );
     expect(generate?.disabled).toBe(true);
-    expect(container.textContent).toContain("Native sharing needs a private network address");
-    expect(container.textContent).toContain("externally managed server or reverse proxy");
+    expect(container.textContent).toContain(
+      "Native sharing needs a private network address. For a public-only host, use an externally managed server or reverse proxy.",
+    );
+  });
+
+  it("explains the missing private address when no endpoints were observed", async () => {
+    h.networkQuery.data.advertisedEndpoints = [];
+    installBridge();
+
+    await renderTab();
+
+    expect(button("Generate pairing offer").disabled).toBe(true);
+    expect(container.textContent).toContain(
+      "Native sharing needs a private network address. For a public-only host, use an externally managed server or reverse proxy.",
+    );
+  });
+
+  it("explains the missing private default route when a private address exists", async () => {
+    h.networkQuery.data.advertisedEndpoints = [
+      { ...nativePrivateDefaultObservation, isDefault: false },
+    ];
+    installBridge();
+
+    await renderTab();
+
+    expect(button("Generate pairing offer").disabled).toBe(true);
+    expect(container.textContent).toContain(
+      "Native sharing uses the private address of this computer's default network route, and this computer has none right now. Connect it to a local network that provides a default route, then Refresh. Otherwise, use an externally managed server or reverse proxy.",
+    );
+    expect(container.textContent).not.toContain("Native sharing needs a private network address");
   });
 
   it("widens before minting and renders code, links, and QR", async () => {
