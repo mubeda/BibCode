@@ -256,10 +256,9 @@ function button(label: string): HTMLButtonElement {
   return match;
 }
 
-// Transitional: RetryButton moves from `disabled` to `aria-disabled` in another lane. Once
-// that lands, only aria-disabled="true" may pass.
+// RetryButton stays focusable while inactive and exposes that state with aria-disabled.
 function isInactive(button: HTMLButtonElement): boolean {
-  return button.getAttribute("aria-disabled") === "true" || button.disabled;
+  return button.getAttribute("aria-disabled") === "true";
 }
 
 async function selectTab(name: "Changes" | "History" | "Tags"): Promise<void> {
