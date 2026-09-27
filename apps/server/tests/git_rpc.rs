@@ -39,7 +39,10 @@ impl WorktreeBaseDirectoryProvider for StaticWorktreeBaseDirectory {
 }
 
 fn repository_with_workspace(path: Option<PathBuf>) -> GitRepository {
-    GitRepository::with_worktree_settings(Arc::new(StaticWorktreeBaseDirectory(path)))
+    GitRepository::with_worktree_settings(
+        Arc::new(StaticWorktreeBaseDirectory(path)),
+        Arc::default(),
+    )
 }
 
 #[test]

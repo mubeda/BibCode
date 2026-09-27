@@ -2137,19 +2137,21 @@ async fn launch_request_for_command(
     let options = selection_options(selection);
     let session_options = provider_session_options(&route.provider, &options);
     // Only Codex checks a turn's model against a list that leaves out the catalog's custom models.
-    let custom_models = if provider == "codex" {
-        ProviderSettingsStore::new(settings_root)
-            .get_document()
-            .await
-            .map(|settings| {
-                super::provider_inventory::instance_custom_models(&settings, &instance_id)
-            })
-            .map_err(|error| ProviderRuntimeError::Provider {
-                provider: provider.to_owned(),
-                detail: error.to_string(),
-            })?
-    } else {
-        Vec::new()
+    let (custom_models, codex_home) = match route.codex {
+        Some(codex) => {
+            let custom_models = ProviderSettingsStore::new(settings_root)
+                .get_document()
+                .await
+                .map(|settings| {
+                    super::provider_inventory::instance_custom_models(&settings, &instance_id)
+                })
+                .map_err(|error| ProviderRuntimeError::Provider {
+                    provider: provider.to_owned(),
+                    detail: error.to_string(),
+                })?;
+            (custom_models, Some(codex.home))
+        }
+        None => (Vec::new(), None),
     };
     Ok(ProviderLaunchRequest {
         thread_id: thread_id.clone(),
@@ -2178,8 +2180,13 @@ async fn launch_request_for_command(
         server_password: (!route.binary.server_password.is_empty())
             .then(|| route.binary.server_password.clone()),
         mcp: None,
-        codex_home: route.codex_home,
+        codex_home,
     })
+}
+
+/// Settings carried only by Codex provider routes.
+struct CodexRouteSettings {
+    home: CodexHomeLayout,
 }
 
 struct ResolvedProviderRouteSettings {
@@ -2188,7 +2195,7 @@ struct ResolvedProviderRouteSettings {
     provider_label: String,
     binary: ProviderBinarySettingsState,
     environment: BTreeMap<String, String>,
-    codex_home: Option<CodexHomeLayout>,
+    codex: Option<CodexRouteSettings>,
 }
 
 impl ResolvedProviderRouteSettings {
@@ -2211,7 +2218,7 @@ impl ResolvedProviderRouteSettings {
             (!self.binary.server_url.trim().is_empty()).then_some(self.binary.server_url.as_str()),
             (!self.binary.server_password.is_empty())
                 .then_some(self.binary.server_password.as_str()),
-            self.codex_home.as_ref(),
+            self.codex.as_ref().map(|codex| &codex.home),
             model.as_deref(),
             &session_options,
             service_tier.as_deref(),
@@ -2284,19 +2291,21 @@ async fn resolve_provider_route_settings(
             )
         })
         .collect();
-    let codex_home = (provider == "codex").then(|| {
+    let codex = (provider == "codex").then(|| {
         let config = instance.map(|value| &value.config);
-        resolve_codex_home_layout(
-            config
-                .and_then(|value| value.get("homePath"))
-                .and_then(Value::as_str),
-            config
-                .and_then(|value| value.get("shadowHomePath"))
-                .and_then(Value::as_str),
-            dirs::home_dir()
-                .as_deref()
-                .unwrap_or_else(|| Path::new(".")),
-        )
+        CodexRouteSettings {
+            home: resolve_codex_home_layout(
+                config
+                    .and_then(|value| value.get("homePath"))
+                    .and_then(Value::as_str),
+                config
+                    .and_then(|value| value.get("shadowHomePath"))
+                    .and_then(Value::as_str),
+                dirs::home_dir()
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(".")),
+            ),
+        }
     });
     Ok(ResolvedProviderRouteSettings {
         provider: provider.to_owned(),
@@ -2308,7 +2317,7 @@ async fn resolve_provider_route_settings(
         ),
         binary,
         environment,
-        codex_home,
+        codex,
     })
 }
 
@@ -11610,6 +11619,79 @@ mod tests {
 
     async fn launch_request_with_options(options: Vec<Value>) -> super::ProviderLaunchRequest {
         launch_request_for_provider_with_options("codex", "gpt-5.6", options).await
+    }
+
+    async fn launch_request_with_custom_models(
+        provider: &str,
+        settings: &TempDir,
+    ) -> super::ProviderLaunchRequest {
+        let engine = supervisor_engine().await;
+        std::fs::write(
+            settings.path().join("settings.json"),
+            serde_json::to_vec(&json!({
+                "providers": {
+                    provider: { "customModels": ["legacy-custom"] }
+                },
+                "providerInstances": {
+                    "custom-instance": {
+                        "driver": provider,
+                        "enabled": true,
+                        "config": {
+                            "binaryPath": settings.path().join("missing-provider"),
+                            "homePath": settings.path().join("shared-home"),
+                            "shadowHomePath": settings.path().join("shadow-home"),
+                            "customModels": ["custom-one", "custom-two"]
+                        }
+                    }
+                }
+            }))
+            .expect("provider settings document"),
+        )
+        .expect("write provider settings");
+        let command = serde_json::from_value(json!({
+            "type":"thread.turn.start",
+            "commandId":"launch-custom-models",
+            "threadId":"t1",
+            "message":{"messageId":"custom-model-message","role":"user","text":"launch","attachments":[]},
+            "modelSelection":{"instanceId":"custom-instance","model":"custom-one"},
+            "runtimeMode":"full-access",
+            "interactionMode":"default",
+            "createdAt":"2026-07-16T00:00:00Z"
+        }))
+        .expect("turn command");
+        let request = super::launch_request_for_command(
+            &engine,
+            &settings.path().to_path_buf(),
+            &command,
+            None,
+        )
+        .await
+        .expect("launch request");
+        engine.shutdown().await;
+        request
+    }
+
+    #[tokio::test]
+    async fn codex_launch_request_carries_instance_custom_models_and_home_layout() {
+        let settings = TempDir::new().expect("provider settings directory");
+        let request = launch_request_with_custom_models("codex", &settings).await;
+
+        assert_eq!(request.custom_models, ["custom-one", "custom-two"]);
+        let home = request.codex_home.expect("Codex home layout");
+        assert_eq!(home.shared_home_path, settings.path().join("shared-home"));
+        assert_eq!(
+            home.effective_home_path,
+            Some(settings.path().join("shadow-home"))
+        );
+    }
+
+    #[tokio::test]
+    async fn non_codex_launch_request_omits_custom_models_and_home_layout() {
+        let settings = TempDir::new().expect("provider settings directory");
+        let request = launch_request_with_custom_models("claudeAgent", &settings).await;
+
+        assert!(request.custom_models.is_empty());
+        assert!(request.codex_home.is_none());
     }
 
     #[test]

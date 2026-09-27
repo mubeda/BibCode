@@ -313,19 +313,21 @@ impl ProductionRuntime {
         // One host observation: Pull Requests scope resolution and Settings discovery
         // write it, status reads (and the create path) only read it.
         let provider_hosts = Arc::new(crate::source_control::ProviderHosts::default());
-        let git_repository = Arc::new(
-            GitRepository::with_worktree_settings(control.clone())
-                .with_provider_hosts(provider_hosts.clone()),
-        );
+        let git_repository = Arc::new(GitRepository::with_worktree_settings(
+            control.clone(),
+            provider_hosts.clone(),
+        ));
         let workspace_availability = WorkspaceAvailabilityRegistry::new();
         let worktree_catalog = WorktreeCatalogService::new_with_availability_registry(
             Arc::new(repositories.clone()),
             git_repository.clone(),
             workspace_availability.clone(),
         );
-        let pull_requests =
-            PullRequestsRpcServices::with_dependencies(config.state_dir(), repositories.clone())
-                .with_provider_hosts(provider_hosts.clone());
+        let pull_requests = PullRequestsRpcServices::with_dependencies(
+            config.state_dir(),
+            repositories.clone(),
+            provider_hosts.clone(),
+        );
         let git_vcs = GitVcsRpcServices::with_production_dependencies(
             git_repository.clone(),
             terminal_manager.clone(),
@@ -1220,6 +1222,100 @@ mod tests {
         assert!(
             factories.opencode.is_some(),
             "production must install the OpenCode terminal observer factory"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_server_repository_reads_the_host_observation_it_is_constructed_with() {
+        struct WorktreeSettings;
+
+        impl crate::git::WorktreeBaseDirectoryProvider for WorktreeSettings {
+            fn worktree_base_directory<'a>(
+                &'a self,
+            ) -> crate::git::BoxWorktreeBaseDirectoryFuture<'a> {
+                Box::pin(async { None })
+            }
+        }
+
+        let checkout = TempDir::new().expect("temporary Git repository");
+        for args in [
+            &["init", "--quiet", "-b", "main"][..],
+            &["config", "core.fsmonitor", "false"],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://git.acme.example/team/repo.git",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(checkout.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .expect("Git fixture command starts");
+            assert!(
+                output.status.success(),
+                "Git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let hosts = Arc::new(crate::source_control::ProviderHosts::default());
+        let repository =
+            GitRepository::with_worktree_settings(Arc::new(WorktreeSettings), hosts.clone());
+        let cancellation = CancellationToken::new();
+        let before = repository
+            .status(checkout.path(), &cancellation)
+            .await
+            .expect("status before recording the host");
+        assert!(before.local.is_repo);
+        assert!(before.local.has_primary_remote);
+        assert_eq!(before.local.source_control_provider, None);
+
+        hosts.record(
+            "git.acme.example",
+            crate::source_control::ProviderKind::Gitlab,
+        );
+
+        let after = repository
+            .status(checkout.path(), &cancellation)
+            .await
+            .expect("status after recording the host");
+        assert_eq!(
+            after.local.source_control_provider,
+            Some(crate::git::SourceControlProviderInfo {
+                kind: crate::git::ProviderKind::Gitlab,
+                name: "GitLab".to_owned(),
+                base_url: "https://git.acme.example".to_owned(),
+            }),
+            "status must read the supplied host observation after it changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_request_services_keep_the_host_observation_they_are_constructed_with() {
+        let state = TempDir::new().expect("temporary state directory");
+        let database = Database::open_in_memory().await.expect("database");
+        let hosts = Arc::new(crate::source_control::ProviderHosts::default());
+        assert_eq!(Arc::strong_count(&hosts), 1);
+
+        let services = PullRequestsRpcServices::with_dependencies(
+            state.path().to_path_buf(),
+            Repositories::new(database),
+            hosts.clone(),
+        );
+
+        assert_eq!(
+            Arc::strong_count(&hosts),
+            2,
+            "the constructed services must retain the supplied host observation, not a private one"
+        );
+        drop(services);
+        assert_eq!(
+            Arc::strong_count(&hosts),
+            1,
+            "dropping the services must release their shared host observation"
         );
     }
 
