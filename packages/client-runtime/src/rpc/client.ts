@@ -256,11 +256,16 @@ export function subscribeInSession<TTag extends EnvironmentSubscriptionRpcTag>(
                 }
                 return handled.pipe(
                   Stream.concat(
-                    Stream.fromEffect(Effect.sleep(options.retryExpectedFailureAfter)).pipe(
-                      Stream.drain,
-                    ),
+                    Stream.fromEffect(
+                      Effect.sleep(options.retryExpectedFailureAfter).pipe(
+                        Effect.andThen(
+                          Effect.sync(() => {
+                            retryRequested = true;
+                          }),
+                        ),
+                      ),
+                    ).pipe(Stream.drain),
                   ),
-                  Stream.concat(subscribeToSession()),
                 );
               }
               return Stream.failCause(cause);
@@ -270,7 +275,7 @@ export function subscribeInSession<TTag extends EnvironmentSubscriptionRpcTag>(
       );
     const stream = subscribeToSession();
     // Close each completed attempt before repeating; recursive recovery retains its scopes.
-    return retry === undefined
+    return retry === undefined && options?.retryExpectedFailureAfter === undefined
       ? stream
       : stream.pipe(Stream.repeat(Schedule.forever.pipe(Schedule.while(() => retryRequested))));
   });
