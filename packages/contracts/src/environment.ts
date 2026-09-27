@@ -57,6 +57,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   remoteUpdateControl: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** The server reports update progress, `bootId` and `updater.activeWork`. */
+  remoteUpdateProgress: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   terminalOrderedInput: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   terminalSizeOwnership: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   vcsCloneReattach: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
@@ -72,6 +74,10 @@ export const ExecutionEnvironmentDescriptor = Schema.Struct({
   platform: ExecutionEnvironmentPlatform,
   serverVersion: TrimmedNonEmptyString,
   storageInstanceId: Schema.NullOr(TrimmedNonEmptyString).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  /** Random for each server start; never persisted and never a storage identity. */
+  bootId: Schema.NullOr(TrimmedNonEmptyString).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   remoteUpdateSupport: Schema.NullOr(RemoteUpdateSupport).pipe(

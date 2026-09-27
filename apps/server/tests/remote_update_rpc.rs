@@ -148,6 +148,12 @@ async fn headless_server_answers_manual_update_surface() {
         })
     );
 
+    assert_eq!(descriptor["capabilities"]["remoteUpdateProgress"], true);
+    let boot_id = descriptor["bootId"]
+        .as_str()
+        .expect("descriptor carries a bootId");
+    assert!(uuid::Uuid::parse_str(boot_id).is_ok());
+
     let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
         .await
         .expect("WebSocket connects");
@@ -190,6 +196,59 @@ async fn headless_server_answers_manual_update_surface() {
     socket.close(None).await.expect("close socket");
     handle.shutdown();
     handle.join().await.expect("server joins");
+}
+
+#[tokio::test]
+async fn boot_id_changes_on_every_start_while_storage_identity_stays() {
+    let temp = TempDir::new().expect("data root");
+    disable_provider_processes(temp.path());
+    let config = || {
+        let mut config = ServerConfig::new(temp.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        assert!(config.boot_id.is_none());
+        config.boot_id = Some(uuid::Uuid::nil());
+        config
+    };
+    let descriptor = |handle: &ServerHandle| {
+        let url = format!(
+            "http://{}/.well-known/bibcode/environment",
+            handle.local_addr()
+        );
+        async move {
+            reqwest::get(url)
+                .await
+                .expect("descriptor fetch")
+                .json::<Value>()
+                .await
+                .expect("descriptor JSON")
+        }
+    };
+
+    let first = ServerRuntime::start(config()).await.expect("first start");
+    let first_descriptor = descriptor(&first).await;
+    first.shutdown();
+    first.join().await.expect("first joins");
+    let second = ServerRuntime::start(config()).await.expect("second start");
+    let second_descriptor = descriptor(&second).await;
+    second.shutdown();
+    second.join().await.expect("second joins");
+
+    for descriptor in [&first_descriptor, &second_descriptor] {
+        let boot_id = uuid::Uuid::parse_str(
+            descriptor["bootId"]
+                .as_str()
+                .expect("descriptor carries a bootId"),
+        )
+        .expect("bootId is a UUID");
+        assert_eq!(boot_id.get_version_num(), 4);
+    }
+    assert_ne!(first_descriptor["bootId"], second_descriptor["bootId"]);
+    assert!(first_descriptor["storageInstanceId"].as_str().is_some());
+    assert_eq!(
+        first_descriptor["storageInstanceId"],
+        second_descriptor["storageInstanceId"]
+    );
 }
 
 #[derive(Default)]

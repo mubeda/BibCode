@@ -354,6 +354,25 @@ describe("execution environment contracts", () => {
 });
 
 describe("remote update descriptor surface", () => {
+  it("defaults bootId and remoteUpdateProgress for an older server", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: {},
+    });
+    expect(decoded.bootId).toBeNull();
+    expect(decoded.capabilities.remoteUpdateProgress).toBe(false);
+  });
+
+  it("preserves an advertised bootId and remote update progress support", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      bootId: "00000000-0000-4000-8000-000000000003",
+      capabilities: { remoteUpdateProgress: true },
+    });
+    expect(decoded.bootId).toBe("00000000-0000-4000-8000-000000000003");
+    expect(decoded.capabilities.remoteUpdateProgress).toBe(true);
+  });
+
   it("defaults remoteUpdateControl to false and remoteUpdateSupport to null for older servers", () => {
     const decoded = decodeExecutionEnvironmentDescriptor({
       ...descriptor,

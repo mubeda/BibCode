@@ -191,6 +191,7 @@ const fixtureEnvironmentDescriptor = {
   platform: { os: "windows", arch: "x64" },
   serverVersion: "0.1.1",
   storageInstanceId: "00000000-0000-4000-8000-000000000002",
+  bootId: "00000000-0000-4000-8000-000000000003",
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: true,

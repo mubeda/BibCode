@@ -734,6 +734,8 @@ replaces it. Prepared-descriptor mismatch gating happens before session
 creation, and initial-configuration mismatch gating happens before
 synchronization, lease publication, or cache consumption. Neither decision is
 inferred by the bootstrap helper or authorization token cache.
+`bootId` is random per server start and published only in environment descriptors;
+it is never persisted or used for storage identity or accepted-identity checks.
 
 See [Remote architecture](./remote.md) for access methods and
 [RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary, and

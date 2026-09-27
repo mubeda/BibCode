@@ -106,6 +106,7 @@ function makeHarness() {
             platform: { os: "linux", arch: "x64" },
             serverVersion: "0.0.0-test",
             storageInstanceId: "store-test",
+            bootId: null,
             remoteUpdateSupport: null,
             remoteProtocolVersion: 1,
             minCompatibleRemoteProtocol: 1,
