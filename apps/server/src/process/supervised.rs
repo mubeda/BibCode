@@ -157,7 +157,7 @@ where
         }
     };
     #[cfg(not(windows))]
-    let child = spawn_wrapped_until(&mut command, overall_deadline)
+    let child = spawn_retrying_busy_executable(&mut command, overall_deadline)
         .await
         .map_err(SupervisedRunError::Spawn)?;
     let mut guard = SupervisedChildGuard::arm(child);
@@ -515,11 +515,13 @@ const SPAWN_BUSY_RETRY_BUDGET: Duration = Duration::from_secs(1);
 /// when the writer is still closing it, or when another thread of this
 /// process forked between the writer's open and close and the child has not
 /// exec'd yet. The condition clears within milliseconds, so the spawn retries
-/// for at most one second inside the run's own deadline; every other error,
+/// for at most one second inside the caller's deadline; every other error,
 /// and a deadline that would be crossed by the next retry, returns
 /// immediately.
+///
+/// Shared by the supervised runner and provider-terminal helper launchers.
 #[cfg(not(windows))]
-async fn spawn_wrapped_until(
+pub(crate) async fn spawn_retrying_busy_executable(
     command: &mut CommandWrap,
     deadline: tokio::time::Instant,
 ) -> io::Result<Box<dyn ChildWrapper>> {

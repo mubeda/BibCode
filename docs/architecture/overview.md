@@ -284,7 +284,9 @@ flowchart TB
   `ETXTBSY` (the executable is still open for writing, typically a helper
   that was just installed or rewritten, or a fork of this process that has
   not exec'd yet) every 25 ms for at most one second and never past the run's
-  own deadline. Every other spawn error is returned immediately. A run whose
+  own deadline. Every other spawn error is returned immediately.
+  The OpenCode and Codex provider-terminal helper launchers use the same retry
+  before waiting for readiness. A run whose
   future is dropped before it settles (an interrupted inline RPC, an aborted
   task, runtime shutdown, or a panic) kills its whole process group or Windows
   job while the root is unreaped, without waiting; see the cancellation

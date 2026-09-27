@@ -34,6 +34,8 @@ use super::{
     TerminalAgentActivityTransition, TerminalGenerationActivityPublisher,
     TerminalObserverWorkerContext,
 };
+#[cfg(not(windows))]
+use crate::process::supervised::spawn_retrying_busy_executable;
 #[cfg(test)]
 use crate::provider::opencode::sse::OPENCODE_SSE_EVENT_LIMIT;
 use crate::{
@@ -1940,6 +1942,14 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                 crate::provider::environment::sanitize_provider_subprocess_environment(command);
             });
             configure_supervised_background_command_wrap(&mut command);
+            #[cfg(not(windows))]
+            let mut child = spawn_retrying_busy_executable(
+                &mut command,
+                tokio::time::Instant::now() + self.readiness_timeout,
+            )
+            .await
+            .map_err(|error| format!("failed to start OpenCode helper: {error}"))?;
+            #[cfg(windows)]
             let mut child = command
                 .spawn()
                 .map_err(|error| format!("failed to start OpenCode helper: {error}"))?;
@@ -3480,14 +3490,7 @@ mod tests {
             .expect("OpenCode helper start task")
     }
 
-    /// Launches a sandbox helper script through `/bin/sh` instead of
-    /// executing the file itself.
-    ///
-    /// `execve` fails with ETXTBSY while any process holds the file open for
-    /// writing, and a sibling test's fork inherits the sandbox's short-lived
-    /// write descriptor until that child execs. Under load the helper spawn
-    /// then failed before its fixture events were published. The shell only
-    /// reads the script, so no write descriptor can block it.
+    /// Builds a launch that executes a sandbox script directly.
     #[cfg(unix)]
     fn sandbox_script_launch(
         sandbox: &TestSandbox,
@@ -3495,12 +3498,100 @@ mod tests {
         process_attribution: ProcessAttributionRegistry,
     ) -> OpenCodeHelperLaunch {
         OpenCodeHelperLaunch {
-            executable: "/bin/sh".to_owned(),
-            args: vec![script.to_string_lossy().into_owned()],
+            executable: script.to_string_lossy().into_owned(),
+            args: Vec::new(),
             cwd: sandbox.root().to_path_buf(),
             env: sandbox.environment(std::iter::empty::<(String, String)>()),
             process_attribution,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn system_helper_launcher_retries_while_its_executable_is_busy() {
+        let sandbox = TestSandbox::new("opencode-helper-busy-executable");
+        let script = sandbox.executable_script(
+            "helper",
+            "printf 'opencode server listening on http://127.0.0.1:43127\\n'\nexec sleep 3600",
+            "",
+        );
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&script)
+            .expect("hold the helper executable open for writing");
+        let launcher = Arc::new(SystemOpenCodeHelperLauncher::default());
+        let launch = sandbox_script_launch(&sandbox, &script, ProcessAttributionRegistry::new());
+        let start = tokio::spawn({
+            let launcher = launcher.clone();
+            async move { launcher.start(launch).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !start.is_finished(),
+            "spawn must keep retrying while the script is busy: {:?}",
+            join_start(start).await
+        );
+        drop(writer);
+
+        let ready = join_start(start)
+            .await
+            .expect("spawn must succeed once the writer closes");
+        within_fixture_deadline(
+            "the retried OpenCode helper to be reaped",
+            ready.process.terminate_and_reap(),
+        )
+        .await;
+        within_fixture_deadline(
+            "the retried OpenCode helper launcher to shut down",
+            launcher.shutdown(),
+        )
+        .await;
+        assert_eq!(ready.endpoint, "http://127.0.0.1:43127");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn system_helper_launcher_stops_retrying_a_permanently_busy_executable() {
+        let sandbox = TestSandbox::new("opencode-helper-permanently-busy-executable");
+        let script = sandbox.executable_script(
+            "helper",
+            "printf 'opencode server listening on http://127.0.0.1:43127\\n'\nexec sleep 3600",
+            "",
+        );
+        let _writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&script)
+            .expect("keep the helper executable open for writing");
+        let launcher = SystemOpenCodeHelperLauncher::default();
+        let launch = sandbox_script_launch(&sandbox, &script, ProcessAttributionRegistry::new());
+        let started = std::time::Instant::now();
+        let error = within_fixture_deadline(
+            "the permanently busy OpenCode helper to exhaust its spawn retry budget",
+            tokio::time::timeout(Duration::from_secs(2), launcher.start(launch)),
+        )
+        .await
+        .expect("spawn retries must stop before the three-second readiness timeout")
+        .expect_err("a permanently busy executable must not spawn");
+        let elapsed = started.elapsed();
+        within_fixture_deadline(
+            "the busy OpenCode helper launcher to shut down",
+            launcher.shutdown(),
+        )
+        .await;
+
+        assert!(
+            error.starts_with("failed to start OpenCode helper:")
+                && error.contains("Text file busy"),
+            "unexpected spawn error: {error}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "spawn must retry a busy executable before failing: {elapsed:?}; {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "spawn retries must use the one-second budget: {elapsed:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -5624,16 +5715,11 @@ mod tests {
                 wait_error: None,
             },
         );
-        let launch = OpenCodeHelperLaunch {
-            executable: sandbox
-                .path("missing-opencode-helper")
-                .to_string_lossy()
-                .into_owned(),
-            args: Vec::new(),
-            cwd: sandbox.root().to_path_buf(),
-            env: sandbox.environment(std::iter::empty::<(String, String)>()),
-            process_attribution: ProcessAttributionRegistry::new(),
-        };
+        let launch = sandbox_script_launch(
+            &sandbox,
+            &sandbox.path("missing-opencode-helper"),
+            ProcessAttributionRegistry::new(),
+        );
         let mut start = tokio::spawn(async move { launcher.start(launch).await });
         wait_during_start(
             &mut start,
