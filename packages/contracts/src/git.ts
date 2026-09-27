@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { SourceControlProviderError, SourceControlProviderInfo } from "./sourceControl.ts";
-import { VcsDriverKind } from "./vcs.ts";
+import { VcsDriverKind, VcsRepositoryUnavailableReasonField } from "./vcs.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const GIT_LIST_BRANCHES_MAX_LIMIT = 200;
@@ -254,18 +254,9 @@ const VcsStatusChangeRequest = Schema.Struct({
   state: VcsStatusChangeRequestState,
 });
 
-/** Why Git cannot use a folder as a working repository, when the server can tell. */
-export const VcsRepositoryUnavailableReason = Schema.Literals([
-  "absent",
-  "unreadable",
-  "untrusted",
-]);
-export type VcsRepositoryUnavailableReason = typeof VcsRepositoryUnavailableReason.Type;
-
 const VcsStatusLocalShape = {
   isRepo: Schema.Boolean,
-  /** Present only when isRepo is false and the server can tell why; absent from older servers. */
-  repositoryUnavailableReason: Schema.optional(VcsRepositoryUnavailableReason),
+  repositoryUnavailableReason: VcsRepositoryUnavailableReasonField,
   sourceControlProvider: Schema.optional(SourceControlProviderInfo),
   hasPrimaryRemote: Schema.Boolean,
   isDefaultRef: Schema.Boolean,

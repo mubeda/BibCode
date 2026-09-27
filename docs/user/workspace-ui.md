@@ -81,7 +81,10 @@ show the most urgent glyph among the cards they hide.
 
 - The primary card represents the project's live checkout. Its title is the
   checkout's current branch, refreshed from Git rather than from a stored
-  thread title.
+  thread title. When Git cannot use the checkout, the title shows the project
+  name and line 2 says **Not a Git repository**, **Repository unreadable**,
+  **Repository not trusted**, or **Repository unavailable**, with the full
+  explanation on hover and for screen readers.
 - The primary card is backed by an undeletable default thread; to remove it,
   remove the project from its header.
 - Worktree cards represent worktree threads. Creating a worktree creates both

@@ -2129,6 +2129,29 @@ impl GitRepository {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(supported);
     }
 
+    /// Only a confirmed non-work-tree result replaces the original status error.
+    /// Its reason stays optional when classification is inconclusive or times out.
+    async fn classify_status_failure(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+        error: GitCommandError,
+    ) -> Result<Option<VcsRepositoryUnavailableReason>, GitCommandError> {
+        let probe = match self.probe_repository(cwd, cancellation).await {
+            Ok(RepositoryProbe::WorkTree) | Err(_) => return Err(error),
+            Ok(probe) => probe,
+        };
+        let reason = bounded_repository_classification(
+            classify_repository_unavailable(cwd, &probe, self.discovery_environment),
+            cancellation,
+        )
+        .await;
+        if cancellation.is_cancelled() {
+            return Err(error);
+        }
+        Ok(reason)
+    }
+
     pub(crate) async fn observe_status(
         &self,
         cwd: &Path,
@@ -2152,18 +2175,9 @@ impl GitRepository {
         {
             Ok(status) => status,
             Err(error) => {
-                let probe = match self.probe_repository(cwd, cancellation).await {
-                    Ok(RepositoryProbe::WorkTree) | Err(_) => return Err(error),
-                    Ok(probe) => probe,
-                };
-                let reason = bounded_repository_classification(
-                    classify_repository_unavailable(cwd, &probe, self.discovery_environment),
-                    cancellation,
-                )
-                .await;
-                if cancellation.is_cancelled() {
-                    return Err(error);
-                }
+                let reason = self
+                    .classify_status_failure(cwd, cancellation, error)
+                    .await?;
                 return Ok(StatusObservation {
                     local: reason.map_or_else(
                         VcsStatusLocalResult::non_repository,
@@ -2368,28 +2382,19 @@ impl GitRepository {
             )
             .await?;
         if status.exit_code != 0 {
-            if status
-                .stderr
-                .to_ascii_lowercase()
-                .contains("not a git repository")
-            {
-                return Ok(VcsStatusSummary {
-                    is_repo: false,
-                    ref_name: None,
-                    detached_head: None,
-                    has_working_tree_changes: false,
-                    source_control_provider: None,
-                    pr: None,
-                    observed_at: summary_observed_at(),
-                    stale: false,
-                });
-            }
-            return Err(command_output_error(
+            let error = command_output_error(
                 "GitVcsDriver.summaryStatus.status",
                 cwd,
                 args.len(),
                 &status,
                 "Git status summary failed.",
+            );
+            let reason = self
+                .classify_status_failure(cwd, cancellation, error)
+                .await?;
+            return Ok(VcsStatusSummary::non_repository(
+                reason,
+                summary_observed_at(),
             ));
         }
         let (ref_name, detached_head) = parse_summary_identity(cwd, &status.stdout)?;
@@ -2400,6 +2405,7 @@ impl GitRepository {
         let source_control_provider = self.remote_provider(cwd, cancellation).await?;
         Ok(VcsStatusSummary {
             is_repo: true,
+            repository_unavailable_reason: None,
             ref_name,
             detached_head,
             has_working_tree_changes,
@@ -9678,6 +9684,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn summary_repository_unavailable_plain_folder_is_absent() {
+        let Some(root) =
+            plain_folder_fixture("summary_repository_unavailable_plain_folder_is_absent")
+        else {
+            return;
+        };
+        assert_summary_repository_reason(&GitRepository::default(), root.path(), Some("absent"))
+            .await;
+    }
+
+    async fn assert_summary_repository_reason(
+        repository: &GitRepository,
+        cwd: &Path,
+        reason: Option<&str>,
+    ) {
+        let summary = repository
+            .summary_status(cwd, &CancellationToken::new())
+            .await
+            .expect("unavailable summary is not an error");
+        assert!(!summary.is_repo);
+        assert!(summary.ref_name.is_none());
+        assert!(summary.detached_head.is_none());
+        assert!(summary.source_control_provider.is_none());
+        assert!(summary.pr.is_none());
+        assert!(!summary.has_working_tree_changes);
+        assert!(!summary.stale);
+        assert!(summary.observed_at.contains('T'));
+        let encoded = serde_json::to_value(summary).expect("summary JSON");
+        assert_eq!(
+            encoded.get("repositoryUnavailableReason"),
+            reason.map(serde_json::Value::from).as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_repository_unavailable_damaged_head_is_unreadable() {
+        for contents in ["not a ref", ""] {
+            let root = tempfile::tempdir().expect("damaged repository");
+            repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+            fs::write(root.path().join(".git/HEAD"), contents).expect("damage HEAD");
+            assert_summary_repository_reason(
+                &GitRepository::default(),
+                root.path(),
+                Some("unreadable"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_repository_unavailable_malformed_config_is_unreadable_not_an_error() {
+        let root = tempfile::tempdir().expect("damaged repository");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        fs::write(root.path().join(".git/config"), "[invalid").expect("damage config");
+        assert_summary_repository_reason(
+            &GitRepository::default(),
+            root.path(),
+            Some("unreadable"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn summary_repository_unavailable_real_git_ownership_refusal_is_untrusted() {
+        let root = tempfile::tempdir().expect("untrusted repository");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        assert_summary_repository_reason(
+            &GitRepository::with_runner_for_test(Arc::new(DifferentOwnerGitRunner)),
+            root.path(),
+            Some("untrusted"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn summary_repository_unavailable_bare_repository_omits_reason() {
+        let root = tempfile::tempdir().expect("bare repository");
+        repository_fixture_git(root.path(), &["init", "-q", "--bare"]);
+        assert_summary_repository_reason(&GitRepository::default(), root.path(), None).await;
+    }
+
+    #[tokio::test]
+    async fn summary_repository_unavailable_discovery_overrides_omit_reason() {
+        let Some(root) =
+            plain_folder_fixture("summary_repository_unavailable_discovery_overrides_omit_reason")
+        else {
+            return;
+        };
+        for environment in [
+            (|name: &str| (name == "GIT_DIR").then(OsString::new)) as fn(&str) -> Option<OsString>,
+            |name: &str| (name == "GIT_CEILING_DIRECTORIES").then(|| OsString::from("/")),
+        ] {
+            let repository = GitRepository {
+                discovery_environment: environment,
+                ..GitRepository::default()
+            };
+            assert_summary_repository_reason(&repository, root.path(), None).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_repository_unavailable_worktree_probe_preserves_the_status_error() {
+        let root = tempfile::tempdir().expect("repository with corrupt index");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        fs::write(root.path().join(".git/index"), "invalid index").expect("damage index");
+        let repository = GitRepository::default();
+        assert!(
+            repository
+                .is_repository(root.path(), &CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        let error = repository
+            .summary_status(root.path(), &CancellationToken::new())
+            .await
+            .expect_err("a readable worktree keeps the error");
+        assert_eq!(
+            error.operation.as_ref(),
+            "GitVcsDriver.summaryStatus.status"
+        );
+        assert_eq!(error.detail.as_ref(), "Git status summary failed.");
+    }
+
+    #[tokio::test]
     async fn summary_status_uses_one_porcelain_read_without_numstat_or_file_storage() {
         let runner = Arc::new(RecordingGitRunner {
             outputs: HashMap::from([
@@ -9694,7 +9824,10 @@ mod tests {
             ]),
             requests: Mutex::new(Vec::new()),
         });
-        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let repository = GitRepository {
+            discovery_environment: |_| panic!("healthy summary must not classify discovery"),
+            ..GitRepository::with_runner_for_test(runner.clone())
+        };
 
         let summary = repository
             .summary_status(Path::new("/repo"), &CancellationToken::new())
@@ -9702,6 +9835,12 @@ mod tests {
             .expect("summary fixture succeeds");
 
         assert!(summary.is_repo);
+        assert!(
+            serde_json::to_value(&summary)
+                .expect("summary JSON")
+                .get("repositoryUnavailableReason")
+                .is_none()
+        );
         assert_eq!(summary.ref_name.as_deref(), Some("feature/test"));
         assert_eq!(summary.detached_head, None);
         assert!(summary.has_working_tree_changes);
@@ -9832,6 +9971,11 @@ mod tests {
                 outputs.insert(
                     "GitVcsDriver.remoteProvider".into(),
                     process_result(1, "", ""),
+                );
+            } else {
+                outputs.insert(
+                    "GitVcsDriver.detectRepository".into(),
+                    process_result(128, "", "fatal: not a git repository"),
                 );
             }
             let runner = Arc::new(RecordingGitRunner {

@@ -41,6 +41,7 @@ import {
   threadKeyOf,
 } from "./Sidebar.testHarness";
 import * as Cause from "effect/Cause";
+import * as Schema from "effect/Schema";
 import * as React from "react";
 import { beforeEach, expect, it, vi } from "vite-plus/test";
 import {
@@ -48,6 +49,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  VcsStatusSummary,
   WorktreeKey,
   WorktreeRepositoryKey,
 } from "@bibcode/contracts";
@@ -64,6 +66,8 @@ import Sidebar, {
   handleSidebarSelectionMouseDown,
 } from "./Sidebar";
 import { WORKSPACE_CARD_STATUS } from "./Sidebar.logic";
+
+const decodeStatusSummary = Schema.decodeUnknownSync(VcsStatusSummary);
 
 /** A card menu item as `api.contextMenu.show` receives it. */
 type CardMenuItem = {
@@ -2539,6 +2543,130 @@ staticDescribe("thread context menu", () => {
 
 staticDescribe("primary row", () => {
   const primaryCard = () => mustFindProps(byTestId("primary-card-project-a"), "primary card");
+
+  it.each([
+    {
+      reason: "unreadable",
+      label: "Repository unreadable",
+      message:
+        "Git can't read this repository. Check its .git folder, for example a damaged HEAD or config file.",
+    },
+    {
+      reason: "absent",
+      label: "Not a Git repository",
+      message: "This folder isn't a Git repository. Run git init to create one.",
+    },
+    {
+      reason: "untrusted",
+      label: "Repository not trusted",
+      message:
+        "Git doesn't trust this repository because another user owns it. Run git config --global --add safe.directory C:/repo-a to trust it.",
+    },
+    {
+      reason: undefined,
+      label: "Repository unavailable",
+      message:
+        "Git can't read this folder as a repository. Run git init to create one, or check its .git folder if it already is one.",
+    },
+  ])("explains an unavailable primary checkout: $label", ({ reason, label, message }) => {
+    baseScenario();
+    h.state.threads = [{ ...threadDefault, branch: "main" }];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = {
+      isRepo: false,
+      ...(reason === undefined ? {} : { repositoryUnavailableReason: reason }),
+      refName: null,
+      detachedHead: null,
+      pr: null,
+      sourceControlProvider: null,
+      hasWorkingTreeChanges: false,
+      stale: false,
+    };
+    const markup = render(<Sidebar />);
+    expect(markup.match(/data-testid="primary-card-title-project-a"[^>]*>([^<]+)/)?.[1]).toBe(
+      "Repo A",
+    );
+    expect(markup).toContain(`>${label}</span>`);
+    expect(markup).toContain(`<span class="sr-only">${message.replaceAll("'", "&#x27;")}</span>`);
+    const cardMarkup = markup.match(/data-testid="primary-card-project-a"[\s\S]*?<\/li>/)?.[0];
+    expect(cardMarkup).toBeDefined();
+    expect(cardMarkup).not.toContain("lucide-git-branch");
+    expect(markup).not.toContain('aria-label="Uncommitted changes"');
+    const button = mustFindProps(byTestId("primary-card-button-project-a"), "primary button");
+    expect(button["aria-describedby"]).toContain("-branch");
+  });
+
+  it("renders generic primary-card copy for an unknown reason decoded from a newer server", () => {
+    baseScenario();
+    h.state.threads = [{ ...threadDefault, branch: "main" }];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = decodeStatusSummary({
+      isRepo: false,
+      repositoryUnavailableReason: "futureReason",
+      refName: null,
+      detachedHead: null,
+      pr: null,
+      sourceControlProvider: null,
+      hasWorkingTreeChanges: false,
+      observedAt: iso(0),
+      stale: false,
+    });
+
+    const markup = render(<Sidebar />);
+    const cardMarkup = markup.match(/data-testid="primary-card-project-a"[\s\S]*?<\/li>/)?.[0];
+    expect(cardMarkup).toBeDefined();
+    expect(cardMarkup).toContain(">Repository unavailable</span>");
+    expect(cardMarkup).toContain(
+      '<span class="sr-only">Git can&#x27;t read this folder as a repository. Run git init to create one, or check its .git folder if it already is one.</span>',
+    );
+  });
+
+  it("keeps a stale unavailable summary visible instead of the recorded branch", () => {
+    baseScenario();
+    h.state.threads = [{ ...threadDefault, branch: "main" }];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = {
+      isRepo: false,
+      repositoryUnavailableReason: "unreadable",
+      stale: true,
+    };
+    const markup = render(<Sidebar />);
+    expect(markup.match(/data-testid="primary-card-title-project-a"[^>]*>([^<]+)/)?.[1]).toBe(
+      "Repo A",
+    );
+    expect(markup).toContain(">Repository unreadable</span>");
+  });
+
+  it("keeps terminal and port indicators on an unavailable primary card", () => {
+    baseScenario();
+    h.state.threads = [threadDefault];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = {
+      isRepo: false,
+      repositoryUnavailableReason: "absent",
+    };
+    h.state.runningTerminalIds = ["terminal-1"];
+    h.state.discoveredPortsByThreadId[threadDefault.id] = [{ port: 3000 }];
+    const markup = render(<Sidebar />);
+    expect(markup).toContain(">Not a Git repository</span>");
+    expect(markup).toContain("lucide-terminal");
+    expect(markup).toContain('aria-label="Open localhost:3000"');
+  });
+
+  it("passes no branch to the unavailable primary card's context menu", async () => {
+    baseScenario();
+    h.state.threads = [{ ...threadDefault, branch: "main" }];
+    h.state.vcsStatusByCwd[projectA.workspaceRoot] = {
+      isRepo: false,
+      repositoryUnavailableReason: "unreadable",
+    };
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("copy-branch-name");
+    invoke(primaryCard(), "onContextMenu", mouseEvent());
+    await flush();
+    expect(h.spies.contextMenuShow).toHaveBeenCalledOnce();
+    const items = h.spies.contextMenuShow.mock.calls[0]![0] as CardMenuItem[];
+    expect(items.some((item) => item.id === "copy-branch-name")).toBe(false);
+    expect(h.spies.copyToClipboard).not.toHaveBeenCalled();
+  });
+
   it("navigates to the default thread on click", () => {
     baseScenario();
     render(<Sidebar />);

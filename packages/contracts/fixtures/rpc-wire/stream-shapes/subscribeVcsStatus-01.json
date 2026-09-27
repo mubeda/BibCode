@@ -6,6 +6,7 @@
       "_tag": "localUpdated",
       "local": {
         "isRepo": true,
+        "repositoryUnavailableReason": "unreadable",
         "hasPrimaryRemote": false,
         "isDefaultRef": true,
         "refName": null,

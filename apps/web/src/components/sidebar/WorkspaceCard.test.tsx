@@ -283,6 +283,35 @@ describe("card lines", () => {
     expect(shown).toContain("h-[18px]");
   });
 
+  it("replaces the branch with a compact notice and describes the full reason", () => {
+    const description = "Git cannot read this repository. Check its .git folder.";
+    const container = document.createElement("div");
+    container.innerHTML = renderToStaticMarkup(
+      <WorkspaceCardBranchLine
+        id="unavailable-branch"
+        branch="main"
+        branchTooltip="Branch: main"
+        notice={{ label: "Repository unreadable", description }}
+      >
+        <span data-indicator="">terminal</span>
+      </WorkspaceCardBranchLine>,
+    );
+
+    const line = container.querySelector("#unavailable-branch")!;
+    const label = line.querySelector('span[aria-hidden="true"]')!;
+    expect(label?.textContent).toBe("Repository unreadable");
+    expect(label.classList.contains("truncate")).toBe(true);
+    expect(line.querySelector(".sr-only")?.textContent).toBe(description);
+    expect(line.querySelector("[data-tooltip]")?.textContent).toBe(description);
+    expect(line.querySelector(".lucide-git-branch")).toBeNull();
+    const icon = line.querySelector(".lucide-circle-alert")!;
+    expect(icon?.getAttribute("aria-hidden")).toBe("true");
+    expect(icon.classList.contains("size-3")).toBe(true);
+    expect(icon.classList.contains("shrink-0")).toBe(true);
+    expect(line.textContent).not.toContain("main");
+    expect(line.lastElementChild?.getAttribute("data-indicator")).toBe("");
+  });
+
   it("renders line 3 with the preview tone, a mono model and no age without a source", () => {
     const markup = renderToStaticMarkup(
       <WorkspaceCardSessionLine

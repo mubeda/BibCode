@@ -1,5 +1,6 @@
 import type { ProviderDriverKind } from "@bibcode/contracts";
 import {
+  CircleAlertIcon,
   CircleHelpIcon,
   GitBranchIcon,
   Globe2Icon,
@@ -246,11 +247,12 @@ export function WorkspaceCardTitleLine(props: {
   );
 }
 
-/** Line 2: branch (or a spacer when hidden), then indicators at the right end. */
+/** Line 2: branch, notice, or spacer, then indicators at the right end. */
 export function WorkspaceCardBranchLine(props: {
   readonly id: string;
   readonly branch: string | null;
   readonly branchTooltip: string | null;
+  readonly notice?: { readonly label: string; readonly description: string } | null;
   readonly children?: ReactNode;
 }) {
   return (
@@ -258,7 +260,20 @@ export function WorkspaceCardBranchLine(props: {
       id={props.id}
       className="flex h-[18px] min-w-0 items-center gap-1.5 text-xs text-muted-foreground"
     >
-      {props.branch !== null ? (
+      {props.notice ? (
+        <>
+          <CircleAlertIcon aria-hidden className="size-3 shrink-0" />
+          <Tooltip>
+            <TooltipTrigger
+              render={<span aria-hidden className="pointer-events-auto min-w-0 flex-1 truncate" />}
+            >
+              {props.notice.label}
+            </TooltipTrigger>
+            <TooltipPopup side="top">{props.notice.description}</TooltipPopup>
+          </Tooltip>
+          <span className="sr-only">{props.notice.description}</span>
+        </>
+      ) : props.branch !== null ? (
         <>
           <GitBranchIcon aria-hidden className="size-3 shrink-0" />
           <Tooltip>

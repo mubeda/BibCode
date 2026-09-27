@@ -150,6 +150,44 @@ describe("VCS repository schemas", () => {
   };
   const observedAt = "2026-08-20T12:00:00.000Z";
 
+  it.each([undefined, "absent", "unreadable", "untrusted"] as const)(
+    "preserves a non-repository summary with reason %s",
+    (reason) => {
+      const summary = {
+        isRepo: false,
+        ...(reason === undefined ? {} : { repositoryUnavailableReason: reason }),
+        refName: null,
+        detachedHead: null,
+        hasWorkingTreeChanges: false,
+        sourceControlProvider: null,
+        pr: null,
+        observedAt,
+        stale: false,
+      };
+      expect(encodeStatusSummary(decodeStatusSummary(summary))).toEqual(summary);
+    },
+  );
+
+  it("decodes an unknown repository-unavailable reason in a summary as absent", () => {
+    const summary = {
+      isRepo: false,
+      refName: null,
+      detachedHead: null,
+      hasWorkingTreeChanges: false,
+      sourceControlProvider: null,
+      pr: null,
+      observedAt,
+      stale: false,
+    };
+    const decoded = decodeStatusSummary({
+      ...summary,
+      repositoryUnavailableReason: "futureReason",
+    });
+
+    expect(decoded).toStrictEqual(summary);
+    expect(Object.hasOwn(decoded, "repositoryUnavailableReason")).toBe(false);
+  });
+
   it("accepts every valid passive summary identity", () => {
     const valid = [
       {

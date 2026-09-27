@@ -41,8 +41,11 @@ const decodeResolvePullRequestResult = Schema.decodeUnknownSync(GitResolvePullRe
 const decodeManagerServiceError = Schema.decodeUnknownSync(GitManagerServiceError);
 const encodeManagerServiceError = Schema.encodeUnknownSync(GitManagerServiceError);
 const decodeStatusLocalResult = Schema.decodeUnknownSync(VcsStatusLocalResult);
+const encodeStatusLocalResult = Schema.encodeSync(VcsStatusLocalResult);
 const decodeStatusResult = Schema.decodeUnknownSync(VcsStatusResult);
+const encodeStatusResult = Schema.encodeSync(VcsStatusResult);
 const decodeStatusStreamEvent = Schema.decodeUnknownSync(VcsStatusStreamEvent);
+const encodeStatusStreamEvent = Schema.encodeSync(VcsStatusStreamEvent);
 
 describe("VCS repository availability", () => {
   const local = {
@@ -56,11 +59,11 @@ describe("VCS repository availability", () => {
   const remote = { hasUpstream: false, aheadCount: 0, behindCount: 0, pr: null };
 
   it.each(["absent", "unreadable", "untrusted"])(
-    "decodes %s across local status shapes",
+    "round-trips %s across local status shapes",
     (reason) => {
       const unavailable = { ...local, repositoryUnavailableReason: reason };
-      expect(decodeStatusLocalResult(unavailable)).toEqual(unavailable);
-      expect(decodeStatusResult({ ...unavailable, ...remote })).toEqual({
+      expect(encodeStatusLocalResult(decodeStatusLocalResult(unavailable))).toEqual(unavailable);
+      expect(encodeStatusResult(decodeStatusResult({ ...unavailable, ...remote }))).toEqual({
         ...unavailable,
         ...remote,
       });
@@ -68,7 +71,7 @@ describe("VCS repository availability", () => {
         { _tag: "snapshot", local: unavailable, remote: null },
         { _tag: "localUpdated", local: unavailable },
       ]) {
-        expect(decodeStatusStreamEvent(event)).toEqual(event);
+        expect(encodeStatusStreamEvent(decodeStatusStreamEvent(event))).toEqual(event);
       }
     },
   );
@@ -84,13 +87,39 @@ describe("VCS repository availability", () => {
     }
   });
 
-  it("rejects unknown repository reasons", () => {
-    expect(() =>
-      decodeStatusLocalResult({
-        ...local,
-        repositoryUnavailableReason: "unknown",
-      }),
-    ).toThrow();
+  it("decodes an unknown repository reason in local status as absent", () => {
+    const decoded = decodeStatusLocalResult({
+      ...local,
+      repositoryUnavailableReason: "futureReason",
+    });
+
+    expect(decoded).toStrictEqual(local);
+    expect(Object.hasOwn(decoded, "repositoryUnavailableReason")).toBe(false);
+  });
+
+  it("decodes an unknown repository reason in full status as absent", () => {
+    const decoded = decodeStatusResult({
+      ...local,
+      ...remote,
+      repositoryUnavailableReason: "futureReason",
+    });
+
+    expect(decoded).toStrictEqual({ ...local, ...remote });
+    expect(Object.hasOwn(decoded, "repositoryUnavailableReason")).toBe(false);
+  });
+
+  it.each([
+    { _tag: "snapshot", local, remote },
+    { _tag: "localUpdated", local },
+  ] as const)("decodes an unknown repository reason in $_tag as absent", (event) => {
+    const decoded = decodeStatusStreamEvent({
+      ...event,
+      local: { ...local, repositoryUnavailableReason: "futureReason" },
+    });
+
+    expect(decoded).toStrictEqual(event);
+    if (decoded._tag === "remoteUpdated") throw new Error("Expected a local status event");
+    expect(Object.hasOwn(decoded.local, "repositoryUnavailableReason")).toBe(false);
   });
 });
 
