@@ -63,7 +63,10 @@ import {
   GitCommandError,
   VcsCreateRefInput,
   VcsCreateRefResult,
+  GitCancelCloneInput,
+  GitCancelCloneResult,
   GitCloneInput,
+  GitCloneOperationError,
   GitCloneResult,
   VcsDiscardFilesInput,
   VcsGenerateCommitMessageInput,
@@ -142,7 +145,12 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
-import { RemoteUpdateInstallError, RemoteUpdateSnapshot } from "./remoteUpdate.ts";
+import {
+  RemoteUpdateActiveWork,
+  RemoteUpdateActiveWorkError,
+  RemoteUpdateInstallError,
+  RemoteUpdateSnapshot,
+} from "./remoteUpdate.ts";
 import {
   RelayClientInstallFailedError,
   RelayClientInstallProgressEventSchema,
@@ -399,6 +407,7 @@ export const WS_METHODS = {
   vcsListRefs: "vcs.listRefs",
   vcsListCommits: "vcs.listCommits",
   vcsClone: "vcs.clone",
+  vcsCancelClone: "vcs.cancelClone",
   vcsCreateRef: "vcs.createRef",
   vcsSwitchRef: "vcs.switchRef",
   vcsInit: "vcs.init",
@@ -501,6 +510,7 @@ export const WS_METHODS = {
   serverConsumeCodexRateLimitReset: "server.consumeCodexRateLimitReset",
 
   // Remote updater methods
+  updaterActiveWork: "updater.activeWork",
   updaterStatus: "updater.status",
   updaterCheck: "updater.check",
   updaterInstall: "updater.install",
@@ -640,6 +650,12 @@ export const WsServerConsumeCodexRateLimitResetRpc = Rpc.make(
     error: Schema.Union([ServerProviderUsageResetError, EnvironmentRpcError]),
   },
 );
+
+export const WsUpdaterActiveWorkRpc = Rpc.make(WS_METHODS.updaterActiveWork, {
+  payload: Schema.Struct({}),
+  success: RemoteUpdateActiveWork,
+  error: Schema.Union([RemoteUpdateActiveWorkError, EnvironmentRpcError]),
+});
 
 export const WsUpdaterStatusRpc = Rpc.make(WS_METHODS.updaterStatus, {
   payload: Schema.Struct({}),
@@ -970,7 +986,14 @@ export const WsVcsCloneRpc = Rpc.make(WS_METHODS.vcsClone, {
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
     EnvironmentRpcError,
+    GitCloneOperationError,
   ]),
+});
+
+export const WsVcsCancelCloneRpc = Rpc.make(WS_METHODS.vcsCancelClone, {
+  payload: GitCancelCloneInput,
+  success: GitCancelCloneResult,
+  error: Schema.Union([GitCommandError, EnvironmentRpcError]),
 });
 
 export const WsVcsCreateRefRpc = Rpc.make(WS_METHODS.vcsCreateRef, {
@@ -1604,6 +1627,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetProviderUsageRpc,
   WsServerRefreshProviderUsageRpc,
   WsServerConsumeCodexRateLimitResetRpc,
+  WsUpdaterActiveWorkRpc,
   WsUpdaterStatusRpc,
   WsUpdaterCheckRpc,
   WsUpdaterInstallRpc,
@@ -1636,6 +1660,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsListRefsRpc,
   WsVcsListCommitsRpc,
   WsVcsCloneRpc,
+  WsVcsCancelCloneRpc,
   WsVcsCreateRefRpc,
   WsVcsSwitchRefRpc,
   WsVcsInitRpc,

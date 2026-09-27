@@ -167,6 +167,7 @@ async function assertDescriptor(): Promise<void> {
   expect(descriptor.remoteUpdateSupport).toEqual({
     installMode: "manual",
     reason: "manual-update-required",
+    installKind: "unknown",
   });
 }
 
@@ -179,7 +180,10 @@ async function assertRemoteUpdateRpc(channel: EncryptedTestSocket): Promise<void
     expect(response.requestId).toBe(requestId);
     expect(decodeUpdateSnapshot(response.exit.value)).toMatchObject({
       state: "idle",
-      support: { installMode: "manual", reason: "manual-update-required" },
+      support: { installMode: "manual", reason: "manual-update-required", installKind: "unknown" },
+      downloadPercent: null,
+      targetVersion: null,
+      installStage: null,
     });
   }
 
@@ -194,7 +198,10 @@ async function assertRemoteUpdateRpc(channel: EncryptedTestSocket): Promise<void
   const statusAfterFailure = decodeRpcSuccess(await requestTestRpc(channel, "4", "updater.status"));
   expect(decodeUpdateSnapshot(statusAfterFailure.exit.value)).toMatchObject({
     state: "idle",
-    support: { installMode: "manual", reason: "manual-update-required" },
+    support: { installMode: "manual", reason: "manual-update-required", installKind: "unknown" },
+    downloadPercent: null,
+    targetVersion: null,
+    installStage: null,
   });
 }
 

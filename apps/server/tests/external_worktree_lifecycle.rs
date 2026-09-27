@@ -1,3 +1,9 @@
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::{fs, path::Path, process::Command, time::Duration};
 
 #[cfg(unix)]
@@ -20,7 +26,7 @@ use bibcode_server::{
     },
     worktree_catalog::WorktreeCatalogService,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 #[cfg(unix)]
@@ -28,6 +34,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -45,7 +55,6 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
     let config = ServerConfig::new(state.path())
         .with_bind("127.0.0.1", 0)
         .with_unsafe_no_auth();
-    fs::create_dir_all(config.state_dir()).expect("server state directory");
     let provider_cwd_fifo = state.path().join("provider-cwd.fifo");
     let provider_shutdowns = state.path().join("provider-shutdowns.log");
     let setup_sentinel = state.path().join("adoption-must-not-run-setup");
@@ -56,10 +65,9 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
     assert!(fifo.status.success(), "mkfifo failed");
     let provider_fixture =
         write_cwd_recording_codex_fixture(state.path(), &provider_cwd_fifo, &provider_shutdowns);
-    fs::write(
-        config.state_dir().join("settings.json"),
-        serde_json::to_vec(&json!({
-            "enableProviderUpdateChecks": false,
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
             "providerInstances": {
                 "codex": {
                     "driver": "codex",
@@ -67,10 +75,8 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
                     "config": { "binaryPath": provider_fixture }
                 }
             }
-        }))
-        .expect("provider settings JSON"),
-    )
-    .expect("provider settings");
+        }),
+    );
     let handle = ServerRuntime::start(config.clone())
         .await
         .expect("production server starts");
@@ -297,7 +303,10 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
             "cwd":adopted_path,
             "cols":80,
             "rows":24,
-            "env":{}
+            "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(state.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(state.path()),
+                }
         }),
     )
     .await;
@@ -590,7 +599,10 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
             "cwd":adopted_path,
             "cols":80,
             "rows":24,
-            "env":{}
+            "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(state.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(state.path()),
+                }
         }),
     )
     .await;
@@ -914,6 +926,13 @@ async fn detach_succeeds_when_cleanup_cannot_complete() {
 struct PendingCleanup;
 
 impl WorktreeRemovalQuiescer for PendingCleanup {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> bibcode_server::production::worktree_catalog_rpc::WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn quiesce(
         &self,
         _admission: WorktreeRemovalCleanupAdmission,
@@ -939,8 +958,6 @@ fn write_cwd_recording_codex_fixture(
     cwd_fifo: &Path,
     shutdown_log: &Path,
 ) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let executable = directory.join("codex-cwd-fixture.sh");
     let script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -966,12 +983,7 @@ done
         "__BIBCODE_SHUTDOWN_LOG__",
         &shutdown_log.to_string_lossy(),
     );
-    fs::write(&executable, script).expect("write provider fixture");
-    let mut permissions = fs::metadata(&executable)
-        .expect("provider fixture metadata")
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&executable, permissions).expect("provider fixture executable");
+    executable_fixture::write_executable(&executable, script);
     executable
 }
 
@@ -1031,7 +1043,7 @@ async fn ack(socket: &mut TestSocket, request_id: &str) {
 }
 
 async fn next(socket: &mut TestSocket) -> ServerMessage {
-    let message = timeout(Duration::from_secs(10), socket.next())
+    let message = timeout(Duration::from_secs(10), next_frame_past_heartbeat(socket))
         .await
         .expect("bounded RPC response")
         .expect("WebSocket remains open")

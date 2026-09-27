@@ -1,5 +1,6 @@
 import {
   AVAILABLE_CONNECTION_STATE,
+  ConnectionTransientError,
   type SupervisorConnectionState,
 } from "@bibcode/client-runtime/connection";
 import type { ServerConfig } from "@bibcode/contracts";
@@ -35,6 +36,7 @@ describe("resolveGitManagerAvailability", () => {
       resolveGitManagerAvailability(
         connection({ desired: true, phase: "connected", network: "online" }),
         null,
+        "Local",
       ),
     ).toMatchObject({ kind: "pending" });
   });
@@ -44,6 +46,7 @@ describe("resolveGitManagerAvailability", () => {
       resolveGitManagerAvailability(
         connection({ desired: false, phase: "available", network: "online" }),
         serverConfig(true),
+        "Local",
       ),
     ).toEqual({
       kind: "disconnected",
@@ -56,17 +59,42 @@ describe("resolveGitManagerAvailability", () => {
       resolveGitManagerAvailability(
         connection({ desired: true, phase: "backoff", network: "online" }),
         serverConfig(true),
+        "Local",
       ),
     ).toEqual({
       kind: "disconnected",
-      reason: "This environment is reconnecting.",
+      reason: "Reconnecting to Local. Git Manager loads when the connection is back.",
     });
     expect(
       resolveGitManagerAvailability(
         connection({ desired: true, phase: "connected", network: "online" }),
         serverConfig(false),
+        "Local",
       ),
     ).toEqual({ kind: "unsupported", missingCapability: "gitManagerReads" });
+  });
+
+  it("keeps the reconnecting copy while a reconnect attempt is connecting", () => {
+    expect(
+      resolveGitManagerAvailability(
+        connection({
+          desired: true,
+          phase: "connecting",
+          stage: "opening",
+          attempt: 2,
+          network: "online",
+          lastFailure: new ConnectionTransientError({
+            reason: "liveness-timeout",
+            detail: "No data from Local for 30 seconds. The connection is too slow or was lost.",
+          }),
+        }),
+        serverConfig(true),
+        "Local",
+      ),
+    ).toEqual({
+      kind: "pending",
+      reason: "Reconnecting to Local. Git Manager loads when the connection is back.",
+    });
   });
 
   it("is ready only for a connected environment with read support", () => {
@@ -74,6 +102,7 @@ describe("resolveGitManagerAvailability", () => {
       resolveGitManagerAvailability(
         connection({ desired: true, phase: "connected", network: "online" }),
         serverConfig(true),
+        "Local",
       ),
     ).toEqual({ kind: "ready" });
   });

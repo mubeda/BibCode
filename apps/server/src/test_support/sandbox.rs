@@ -194,19 +194,20 @@ impl TestSandbox {
     }
 
     #[cfg(unix)]
+    pub(crate) fn write_executable(path: &Path, contents: &str) {
+        super::executable_fixture::write_executable(path, contents);
+    }
+
+    #[cfg(unix)]
     pub(crate) fn executable_script(
         &self,
         name: &str,
         unix_body: &str,
         _windows_body: &str,
     ) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = self.path(format!("{name}.sh"));
-        std::fs::write(&path, format!("#!/bin/sh\n{unix_body}\n"))
-            .expect("write test fixture script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .expect("set test fixture script permissions");
+        let contents = format!("#!/bin/sh\n{unix_body}\n");
+        Self::write_executable(&path, &contents);
         path
     }
 
@@ -218,7 +219,7 @@ impl TestSandbox {
         windows_body: &str,
     ) -> PathBuf {
         let path = self.path(format!("{name}.cmd"));
-        std::fs::write(&path, format!("{windows_body}\r\n")).expect("write test fixture script");
+        super::executable_fixture::write_executable(&path, format!("{windows_body}\r\n"));
         path
     }
 
@@ -242,5 +243,125 @@ impl TestSandbox {
 impl Drop for FixtureLease {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::{
+        io::ErrorKind,
+        os::unix::process::CommandExt,
+        panic::RefUnwindSafe,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{
+            Barrier,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use super::TestSandbox;
+
+    fn assert_fixtures_run_during_fork_storm(
+        case: &str,
+        test_name: &str,
+        label: &str,
+        make_fixture: impl Fn(&TestSandbox, usize) -> PathBuf + RefUnwindSafe,
+    ) {
+        let sandbox = TestSandbox::new(case);
+        if TestSandbox::is_isolated_case(case, test_name) {
+            let stop = AtomicBool::new(false);
+            let start = Barrier::new(5);
+            thread::scope(|scope| {
+                let workers = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            while !stop.load(Ordering::Relaxed) {
+                                let mut command = Command::new("/bin/true");
+                                // SAFETY: The hook only calls async-signal-safe poll
+                                // after fork; it neither allocates nor acquires locks.
+                                unsafe {
+                                    command.pre_exec(|| {
+                                        libc::poll(std::ptr::null_mut(), 0, 2);
+                                        Ok(())
+                                    });
+                                }
+                                let status = command.status().expect("spawn fork-storm child");
+                                assert!(status.success(), "fork-storm child failed: {status}");
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                start.wait();
+
+                let result = std::panic::catch_unwind(|| {
+                    // Leave room for cleanup before the isolated-case deadline under load.
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    for index in 0..1000 {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        let fixture = make_fixture(&sandbox, index);
+                        match Command::new(&fixture).status() {
+                            Ok(status) => assert!(
+                                status.success(),
+                                "fixture {} failed: {status}",
+                                fixture.display()
+                            ),
+                            Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => {
+                                panic!(
+                                    "fixture {index} execution hit ETXTBSY after {index} fixtures executed: a concurrent fork inherited a writable {label} descriptor"
+                                );
+                            }
+                            Err(error) => panic!("execute fixture {}: {error}", fixture.display()),
+                        }
+                    }
+                });
+                stop.store(true, Ordering::Relaxed);
+                for worker in workers {
+                    worker.join().expect("join fork-storm worker");
+                }
+                result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            });
+            return;
+        }
+
+        let output = sandbox.run_isolated_case(case, test_name, &[]);
+        assert!(
+            output.status.success(),
+            "isolated {label} fork storm failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn executable_scripts_run_during_concurrent_forks() {
+        assert_fixtures_run_during_fork_storm(
+            "executable-scripts-concurrent-forks",
+            "test_support::sandbox::tests::executable_scripts_run_during_concurrent_forks",
+            "script",
+            |sandbox, index| sandbox.executable_script(&format!("fixture-{index}"), "exit 0", ""),
+        );
+    }
+
+    #[test]
+    fn copied_executables_run_during_concurrent_forks() {
+        assert_fixtures_run_during_fork_storm(
+            "copied-executables-concurrent-forks",
+            "test_support::sandbox::tests::copied_executables_run_during_concurrent_forks",
+            "copied executable",
+            |sandbox, index| {
+                let fixture = sandbox.path(format!("fixture-{index}"));
+                crate::test_support::executable_fixture::copy_executable(
+                    Path::new("/bin/true"),
+                    &fixture,
+                );
+                fixture
+            },
+        );
     }
 }

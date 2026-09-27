@@ -36,6 +36,7 @@ const harness = vi.hoisted(() => ({
   projects: [] as unknown[],
   createProject: vi.fn(),
   cloneRepository: vi.fn(),
+  cancelClone: vi.fn(),
   createThread: vi.fn(),
   navigate: vi.fn(),
   readEnvironmentThreadRefs: vi.fn(),
@@ -89,6 +90,7 @@ vi.mock("~/state/projects", () => ({
 vi.mock("~/state/vcs", () => ({
   vcsEnvironment: {
     clone: { key: "vcs.clone" },
+    cancelClone: { key: "vcs.cancelClone" },
   },
 }));
 
@@ -105,6 +107,9 @@ vi.mock("~/state/use-atom-command", () => ({
     }
     if (command.key === "vcs.clone") {
       return (input: unknown, runOptions?: unknown) => harness.cloneRepository(input, runOptions);
+    }
+    if (command.key === "vcs.cancelClone") {
+      return (input: unknown) => harness.cancelClone(input);
     }
     if (command.key === "thread.create") {
       return (input: unknown) => harness.createThread(input);
@@ -295,6 +300,7 @@ beforeEach(() => {
   harness.cloneRepository
     .mockReset()
     .mockResolvedValue(AsyncResult.success({ path: "/code/cloned" }));
+  harness.cancelClone.mockReset().mockResolvedValue(AsyncResult.success({ cancelled: true }));
   harness.createThread.mockReset().mockResolvedValue(AsyncResult.success({ sequence: 1 }));
   harness.navigate.mockReset().mockResolvedValue(undefined);
   harness.readEnvironmentThreadRefs.mockReset().mockReturnValue([]);
@@ -509,7 +515,11 @@ describe("useAddProjectWorkflow public adapter", () => {
     expect(harness.cloneRepository).toHaveBeenCalledWith(
       {
         environmentId,
-        input: { url: "https://example.test/repository.git", parentDir: "/code" },
+        input: {
+          url: "https://example.test/repository.git",
+          parentDir: "/code",
+          onProgress: expect.any(Function),
+        },
       },
       { signal: expect.any(AbortSignal) },
     );
@@ -526,6 +536,7 @@ describe("useAddProjectWorkflow public adapter", () => {
     expect(currentWorkflow.busy).toBe(false);
     expect(harness.createProject).not.toHaveBeenCalled();
     expect(harness.onOpenChange).not.toHaveBeenCalledWith(false);
+    expect(harness.cancelClone).not.toHaveBeenCalled();
   });
 
   it("shows the server's clone failure detail without the RPC wrapper", async () => {

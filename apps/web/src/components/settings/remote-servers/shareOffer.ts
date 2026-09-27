@@ -15,6 +15,19 @@ export interface ShareAddressOption {
   readonly requiresExplicitSelection?: boolean;
 }
 
+export function nativeShareAddressUnavailableReason(
+  advertisedEndpoints: ReadonlyArray<AdvertisedEndpoint>,
+): "no-private-address" | "no-private-default-route" | null {
+  const privateEndpoints = advertisedEndpoints.filter(
+    (endpoint) =>
+      shareClassForPairingEndpoint(endpoint.httpBaseUrl) === "off-host" &&
+      endpoint.source === "desktop-core" &&
+      (endpoint.reachability === "lan" || endpoint.reachability === "private-network"),
+  );
+  if (privateEndpoints.some((endpoint) => endpoint.isDefault === true)) return null;
+  return privateEndpoints.length === 0 ? "no-private-address" : "no-private-default-route";
+}
+
 export function resolveShareAddressOptions(input: {
   readonly intent: ShareIntent;
   readonly advertisedEndpoints: ReadonlyArray<AdvertisedEndpoint>;
@@ -52,12 +65,8 @@ export function resolveShareAddressOptions(input: {
     (endpoint) => endpoint.status === "available",
   );
   const nativeManaged = input.exposureState?.management === "native";
-  const nativePrivateDefaultObserved = offHostEndpoints.some(
-    (endpoint) =>
-      endpoint.source === "desktop-core" &&
-      endpoint.isDefault === true &&
-      (endpoint.reachability === "lan" || endpoint.reachability === "private-network"),
-  );
+  const nativePrivateDefaultObserved =
+    nativeShareAddressUnavailableReason(offHostEndpoints) === null;
   const selectableOffHostEndpoints = availableOffHostEndpoints.filter(
     (endpoint) => !(nativeManaged && endpoint.reachability === "public"),
   );

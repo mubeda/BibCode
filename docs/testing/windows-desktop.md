@@ -114,6 +114,13 @@ Select focused tests from affected source and verify at least:
   state;
 - independent runtimes cannot terminate each other's process roots;
 - local Windows and WSL presentation follows current environment capability;
+- desktop-managed SSH child I/O runs on the desktop's own SSH runtime: with the
+  calling runtime's only blocking thread held, a stand-in ssh's pairing line is
+  still parsed, and after a descendant holding its pipes makes the drain give
+  up, no pipe read stays parked
+  (`node scripts/run-msvc.mjs cargo test -p bibcode-desktop --lib ssh::tests::windows_drain`;
+  the tests start `cmd.exe` and the built-in `powershell.exe`, and kill the
+  descendant they record);
 - saved remote environments appear in the environment rail without exposing
   privileged SSH, Tailscale, relay, or connection-lifecycle controls outside
   their owning settings and desktop-bridge boundaries; and
@@ -304,6 +311,17 @@ action, the no-backup action requires acknowledgement, a forged first-attempt
 bypass is rejected by the native host, and an installer failure restarts the
 exact pre-update native and WSL backend set.
 
+With the same isolated test instance, arrange an installer failure and have a
+test-owned listener acquire the native backend port after shutdown, keeping it
+bound past the 3 s restart window. Confirm **Update not installed** names that
+port as in use, offers **Restart server**, and disables **Retry installation**
+with the visible restart explanation. Keep an unsent composer draft and verify
+it survives the outage in the packaged WebView. Release only the test listener,
+choose **Restart server**, and confirm the same backend port reconnects, the
+draft remains, and **Retry installation** becomes available without reopening
+the dialog. Record the listener/installer fixture and observed port in the
+execution report; never use the user's running instance for this check.
+
 ## Native tests and static gates
 
 Follow the shared focused and broad gates. Root workspace scripts already use
@@ -441,6 +459,10 @@ retained after reload. Record unavailable fixture/host states separately from
 that pass. The packaged Pierre spec's sibling checks route entry only; the
 shared procedure owns authenticated list/detail/files evidence.
 
+Include the shared [slow-link liveness scenario](./cross-platform-validation.md#slow-link-liveness-scenario)
+when a browser client and a development or standalone server are available on
+this platform; otherwise record it as unavailable evidence.
+
 Use Codex Computer Use to operate the packaged executable. Capture normal,
 minimum-size, and relevant Windows DPI states. Verify:
 
@@ -469,18 +491,28 @@ minimum-size, and relevant Windows DPI states. Verify:
   (**EB** for **Edge box**). Hover the Settings row's status dot before and after
   saving: it stays **Connected**, with no reconnect during the rename. Reload
   the app, then restart it; after each, confirm the saved name and initials
-  persist;
+  persist. Disconnect reasons also use the saved name: rename the connected server, then
+  close or interrupt its connection and confirm the reconnecting detail names
+  the new alias. Repeat with a liveness timeout. Storage-identity errors still
+  use the server's reported name;
 - With that renamed test server connected, check a stalled connection on a
   Windows remote host: open Resource Monitor (`resmon.exe`) on that host, select
   the **CPU** tab, find the test server's `bibcode` process in the process list,
   right-click it, and choose **Suspend process**. Hover the Settings row's status
   dot and wait for
-  `Failed to connect. Reconnecting... Reason: <server's own name> disconnected.`,
+  `No data from <saved name> for 30 seconds. The connection is too slow or was lost. Reconnecting…`,
   followed by
-  `Reason: Remote environment endpoint <base URL>/.well-known/bibcode/environment timed out after 10000ms.`
-  with the test server's endpoint URL. The disconnect reason uses the server's
-  own name, not the saved name. The disconnect appears before a health-check
-  message can become visible. In Resource Monitor, right-click the same test
+  `Remote environment endpoint <base URL>/.well-known/bibcode/environment timed out after 10000ms. Reconnecting…`
+  with the test server's endpoint URL. The disconnect reason uses the saved
+  name (**Edge box**) and appears 27–33 seconds after the last data from the
+  stopped server, when the client's liveness timeout closes the socket with
+  code 4408. Keep BiBCode visible and focused for the whole stall: the
+  disconnect then appears before a health-check message can become visible. If
+  the window is restored from hidden or minimized during the stall, the
+  application-active health check can report
+  `<saved name> did not respond to a connection health check.` after 15
+  seconds instead; repeat the check with the window kept visible.
+  In Resource Monitor, right-click the same test
   server process, choose **Resume process**, and confirm it reconnects;
 - select a saved server within a second of launch and confirm the rail keeps it
   selected for at least ten seconds while provider and settings updates arrive;
@@ -609,6 +641,15 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   OpenCode without Early Access labels and omit Grok/Grok Terminal;
 - external worktrees group by parent, expose full paths accessibly, adopt
   idempotently through junction/case aliases, and persist across restart;
+- sidebar menus use the in-app menu: separators split the groups and are
+  never doubled or at an edge. From the keyboard, focus starts on the first
+  enabled item, the arrow keys skip separators but land on disabled items
+  (focus is visible, the reason stays readable, and **Enter**, **Space** or a
+  click leaves the menu open), **Home** and **End** jump to the ends, **→** and
+  **←** open and close **Open in**, **Enter** or **Space** chooses, and
+  **Escape** closes the menu and returns focus to the card or **⋯**.
+  **Shift+F10** and the **Menu** key on a focused card open the menu once, at
+  the card;
 - thread creation, switching, persistence, terminal I/O, and panel switching
   work;
 - Activity subagents/background tasks align, show realistic elapsed time, and

@@ -6,47 +6,47 @@
       "_tag": "snapshot",
       "local": {
         "isRepo": false,
-        "sourceControlProvider": {
-          "kind": "gitlab",
-          "name": "CyT2wdGPfl^y",
-          "baseUrl": "f~yX"
-        },
+        "repositoryUnavailableReason": "unreadable",
         "hasPrimaryRemote": true,
         "isDefaultRef": false,
-        "refName": null,
-        "defaultRefName": "@",
+        "refName": "ref",
         "hasWorkingTreeChanges": true,
         "workingTree": {
           "files": [
             {
-              "path": "70$8>}x3]#",
-              "insertions": 11,
-              "deletions": 1576334567,
-              "status": "deleted",
-              "area": "staged"
+              "path": "f&[\"Vy>$~\"P",
+              "insertions": 2147483626,
+              "deletions": 13,
+              "status": "renamed"
             },
             {
-              "path": "YKx",
-              "insertions": 17,
-              "deletions": 29
+              "path": "VcbBMW",
+              "insertions": 2063773623,
+              "deletions": 1949265014,
+              "area": "unstaged"
             },
             {
-              "path": "}_Y",
-              "insertions": 13,
-              "deletions": 2147483621,
-              "area": "untracked"
+              "path": "Y}%",
+              "insertions": 2147483640,
+              "deletions": 12
             },
             {
-              "path": "numeran",
-              "insertions": 435754498,
-              "deletions": 415710238
+              "path": "N[:oNI;Y",
+              "insertions": 1021885809,
+              "deletions": 29,
+              "status": "added"
             }
           ],
-          "insertions": 995438101,
-          "deletions": 1734523376
+          "insertions": 1126509057,
+          "deletions": 2
         }
       },
-      "remote": null
+      "remote": {
+        "hasUpstream": false,
+        "aheadCount": 1976854562,
+        "behindCount": 2147483621,
+        "pr": null
+      }
     }
   ]
 }

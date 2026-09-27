@@ -1,17 +1,21 @@
 import {
   EnvironmentId,
+  GitCommandError,
   type RelayClientInstallProgressEvent,
+  type TerminalEvent,
   ThreadId,
   WS_METHODS,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
@@ -409,6 +413,211 @@ describe("environment RPC", () => {
     }),
   );
 
+  it.effect("releases legacy retry bookkeeping scopes between repeated failures", () =>
+    Effect.gen(function* () {
+      const clock = yield* Clock.Clock;
+      const liveScopes = new Set<Scope.Scope>();
+      let maxLiveScopes = 0;
+      let finalizedScopes = 0;
+      // Track the attempt scope outside catchCause, which already closes the RPC stream itself.
+      const trackedTime = clock.currentTimeMillis.pipe(
+        Effect.tap(
+          Effect.gen(function* () {
+            const scope = yield* Effect.serviceOption(Scope.Scope);
+            if (Option.isSome(scope) && !liveScopes.has(scope.value)) {
+              liveScopes.add(scope.value);
+              maxLiveScopes = Math.max(maxLiveScopes, liveScopes.size);
+              yield* Scope.addFinalizer(
+                scope.value,
+                Effect.sync(() => {
+                  liveScopes.delete(scope.value);
+                  finalizedScopes += 1;
+                }),
+              );
+            }
+          }),
+        ),
+      );
+      let subscriptions = 0;
+      const domainError = new Error("thread not found yet");
+      const client = {
+        [WS_METHODS.subscribeTerminalEvents]: () => {
+          subscriptions += 1;
+          return Stream.fail(domainError);
+        },
+      } as unknown as WsRpcProtocolClient;
+      const fiber = yield* subscribeInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.subscribeTerminalEvents,
+        {},
+        {
+          onExpectedFailure: () => Effect.void,
+          retryExpectedFailureAfter: "1 millis",
+        },
+      ).pipe(
+        Stream.runDrain,
+        Effect.scoped,
+        Effect.provideService(Clock.Clock, { ...clock, currentTimeMillis: trackedTime }),
+        Effect.forkChild,
+      );
+
+      yield* TestClock.adjust(50);
+      expect(subscriptions).toBe(51);
+      expect(liveScopes.size).toBe(1);
+      expect(maxLiveScopes).toBe(1);
+      expect(finalizedScopes).toBe(50);
+      yield* Fiber.interrupt(fiber);
+      expect(liveScopes.size).toBe(0);
+      expect(finalizedScopes).toBe(51);
+    }),
+  );
+
+  it.effect("delivers legacy retry values in order and waits after each failure handler", () =>
+    Effect.gen(function* () {
+      const domainError = new Error("thread not found yet");
+      const events: string[] = [];
+      const observedFailures: unknown[] = [];
+      const failureTimes: number[] = [];
+      let subscriptions = 0;
+      const client = {
+        [WS_METHODS.subscribeTerminalEvents]: () => {
+          subscriptions += 1;
+          return Stream.fromIterable<TerminalEvent>([
+            {
+              type: "output",
+              threadId: "thread-1",
+              terminalId: "terminal-1",
+              data: `${subscriptions}:first`,
+            },
+            {
+              type: "output",
+              threadId: "thread-1",
+              terminalId: "terminal-1",
+              data: `${subscriptions}:second`,
+            },
+          ]).pipe(Stream.concat(Stream.fail(domainError)));
+        },
+      } as unknown as WsRpcProtocolClient;
+      const fiber = yield* subscribeInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.subscribeTerminalEvents,
+        {},
+        {
+          onExpectedFailure: (cause) =>
+            Effect.gen(function* () {
+              failureTimes.push(yield* Clock.currentTimeMillis);
+              observedFailures.push(Cause.squash(cause));
+              events.push(`${subscriptions}:failure`);
+              yield* Effect.sleep("25 millis");
+              events.push(`${subscriptions}:handled`);
+            }),
+          retryExpectedFailureAfter: "250 millis",
+        },
+      ).pipe(
+        Stream.runForEach((event) =>
+          Effect.sync(() => {
+            if (event.type === "output") events.push(event.data);
+          }),
+        ),
+        Effect.forkChild,
+      );
+
+      yield* TestClock.adjust(0);
+      expect(events).toEqual(["1:first", "1:second", "1:failure"]);
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        yield* TestClock.adjust("25 millis");
+        expect(events.at(-1)).toBe(`${attempt}:handled`);
+        yield* TestClock.adjust("249 millis");
+        expect(subscriptions).toBe(attempt);
+        yield* TestClock.adjust("1 millis");
+        expect(subscriptions).toBe(attempt + 1);
+        expect(observedFailures).toHaveLength(attempt + 1);
+      }
+      yield* TestClock.adjust("25 millis");
+      expect(events).toEqual([
+        "1:first",
+        "1:second",
+        "1:failure",
+        "1:handled",
+        "2:first",
+        "2:second",
+        "2:failure",
+        "2:handled",
+        "3:first",
+        "3:second",
+        "3:failure",
+        "3:handled",
+      ]);
+      expect(failureTimes).toEqual([0, 275, 550]);
+      expect(observedFailures).toEqual([domainError, domainError, domainError]);
+
+      yield* Fiber.interrupt(fiber);
+      yield* TestClock.adjust("1 minute");
+      expect(subscriptions).toBe(3);
+      expect(observedFailures).toHaveLength(3);
+    }),
+  );
+
+  for (const outcome of ["completion", "transport", "defect", "mixed", "interruption"] as const) {
+    it.effect(`stops legacy retries after ${outcome}`, () =>
+      Effect.gen(function* () {
+        const domainError = new Error("thread not found yet");
+        const defect = new Error("subscription invariant failed");
+        const causes = {
+          completion: null,
+          transport: Cause.fail(
+            new RpcClientError.RpcClientError({
+              reason: new RpcClientError.RpcClientDefect({
+                message: "socket closed",
+                cause: new Error("socket closed"),
+              }),
+            }),
+          ),
+          defect: Cause.die(defect),
+          mixed: Cause.combine(Cause.fail(domainError), Cause.die(defect)),
+          interruption: Cause.interrupt(),
+        };
+        const cause = causes[outcome];
+        let subscriptions = 0;
+        let observedFailures = 0;
+        const client = {
+          [WS_METHODS.subscribeTerminalEvents]: () => {
+            subscriptions += 1;
+            if (subscriptions === 1) return Stream.fail(domainError);
+            return cause === null ? Stream.empty : Stream.failCause(cause);
+          },
+        } as unknown as WsRpcProtocolClient;
+        const fiber = yield* subscribeInSession(
+          session(client),
+          TARGET.environmentId,
+          WS_METHODS.subscribeTerminalEvents,
+          {},
+          {
+            onExpectedFailure: () =>
+              Effect.sync(() => {
+                observedFailures += 1;
+              }),
+            retryExpectedFailureAfter: "250 millis",
+          },
+        ).pipe(Stream.runDrain, Effect.forkChild);
+
+        yield* TestClock.adjust("250 millis");
+        const exit = yield* Fiber.await(fiber);
+        if (outcome === "completion" || outcome === "transport") {
+          expect(exit).toEqual(Exit.void);
+        } else {
+          expect(Exit.isFailure(exit)).toBe(true);
+          if (Exit.isFailure(exit)) expect(exit.cause.reasons).toEqual(cause?.reasons);
+        }
+        yield* TestClock.adjust("1 minute");
+        expect(subscriptions).toBe(2);
+        expect(observedFailures).toBe(1);
+      }),
+    );
+  }
+
   it.effect("does not classify subscription defects as expected failures", () =>
     Effect.gen(function* () {
       const defect = new Error("subscription invariant failed");
@@ -439,6 +648,204 @@ describe("environment RPC", () => {
         expect(Cause.hasDies(exit.cause)).toBe(true);
       }
       expect(expectedFailureCount).toBe(0);
+    }),
+  );
+
+  it.effect("retries only matching expected failures with bounded exponential backoff", () =>
+    Effect.gen(function* () {
+      const error = new GitCommandError({
+        operation: "retryable",
+        command: "git",
+        cwd: "/repo",
+        detail: "retry",
+      });
+      let subscriptions = 0;
+      let observedFailures = 0;
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () => {
+          subscriptions += 1;
+          return Stream.fail(error);
+        },
+      } as unknown as WsRpcProtocolClient;
+      const subscriptionFiber = yield* subscribeInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.subscribeVcsStatus,
+        { cwd: "/repo" },
+        {
+          onExpectedFailure: () =>
+            Effect.sync(() => {
+              observedFailures += 1;
+            }),
+          retryExpectedFailure: {
+            when: (failure) =>
+              failure._tag === "GitCommandError" && failure.operation === "retryable",
+            initialDelay: "10 millis",
+            maxDelay: "40 millis",
+            resetAfter: "100 millis",
+          },
+        },
+      ).pipe(Stream.runDrain, Effect.forkChild);
+
+      yield* TestClock.adjust(0);
+      expect(subscriptions).toBe(1);
+      for (const [index, delay] of [10, 20, 40, 40].entries()) {
+        yield* TestClock.adjust(delay - 1);
+        expect(subscriptions).toBe(index + 1);
+        yield* TestClock.adjust(1);
+        expect(subscriptions).toBe(index + 2);
+        expect(observedFailures).toBe(subscriptions);
+      }
+      yield* Fiber.interrupt(subscriptionFiber);
+      yield* TestClock.adjust("1 second");
+      expect(subscriptions).toBe(5);
+    }),
+  );
+
+  it.effect("propagates unmatched expected failures without handling or retrying them", () =>
+    Effect.gen(function* () {
+      const error = new GitCommandError({
+        operation: "fatal",
+        command: "git",
+        cwd: "/repo",
+        detail: "do not retry",
+      });
+      let subscriptions = 0;
+      let observedFailures = 0;
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () => {
+          subscriptions += 1;
+          return Stream.fail(error);
+        },
+      } as unknown as WsRpcProtocolClient;
+      const exit = yield* subscribeInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.subscribeVcsStatus,
+        { cwd: "/repo" },
+        {
+          onExpectedFailure: () =>
+            Effect.sync(() => {
+              observedFailures += 1;
+            }),
+          retryExpectedFailure: {
+            when: (failure) =>
+              failure._tag === "GitCommandError" && failure.operation === "retryable",
+            initialDelay: "10 millis",
+            maxDelay: "40 millis",
+            resetAfter: "100 millis",
+          },
+        },
+      ).pipe(Stream.runDrain, Effect.exit);
+
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBe(error);
+      yield* TestClock.adjust("1 minute");
+      expect(subscriptions).toBe(1);
+      expect(observedFailures).toBe(0);
+    }),
+  );
+
+  it.effect("releases retry bookkeeping scopes between repeated failures", () =>
+    Effect.gen(function* () {
+      const clock = yield* Clock.Clock;
+      const liveScopes = new Set<Scope.Scope>();
+      const trackedTime = clock.currentTimeMillis.pipe(
+        Effect.tap(
+          Effect.gen(function* () {
+            const scope = yield* Effect.serviceOption(Scope.Scope);
+            if (Option.isSome(scope) && !liveScopes.has(scope.value)) {
+              liveScopes.add(scope.value);
+              yield* Scope.addFinalizer(
+                scope.value,
+                Effect.sync(() => {
+                  liveScopes.delete(scope.value);
+                }),
+              );
+            }
+          }),
+        ),
+      );
+      let subscriptions = 0;
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () => {
+          subscriptions += 1;
+          return Stream.fail(
+            new GitCommandError({
+              operation: "retryable",
+              command: "git",
+              cwd: "/repo",
+              detail: "retry",
+            }),
+          );
+        },
+      } as unknown as WsRpcProtocolClient;
+      const fiber = yield* subscribeInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.subscribeVcsStatus,
+        { cwd: "/repo" },
+        {
+          retryExpectedFailure: {
+            when: () => true,
+            initialDelay: 1,
+            maxDelay: 1,
+            resetAfter: "30 seconds",
+          },
+        },
+      ).pipe(
+        Stream.runDrain,
+        Effect.scoped,
+        Effect.provideService(Clock.Clock, { ...clock, currentTimeMillis: trackedTime }),
+        Effect.forkChild,
+      );
+      yield* TestClock.adjust(100);
+      expect(subscriptions).toBe(101);
+      expect(liveScopes.size).toBeGreaterThan(0);
+      expect(liveScopes.size).toBeLessThanOrEqual(2);
+      yield* Fiber.interrupt(fiber);
+      expect(liveScopes.size).toBe(0);
+    }),
+  );
+
+  it.effect("leaves transport failures dormant even when the retry predicate matches", () =>
+    Effect.gen(function* () {
+      let subscriptions = 0;
+      let observedFailures = 0;
+      const client = {
+        [WS_METHODS.subscribeVcsStatus]: () => {
+          subscriptions += 1;
+          return Stream.fail(
+            new RpcClientError.RpcClientError({
+              reason: new RpcClientError.RpcClientDefect({
+                message: "socket closed",
+                cause: new Error("socket closed"),
+              }),
+            }),
+          );
+        },
+      } as unknown as WsRpcProtocolClient;
+      yield* subscribeInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.subscribeVcsStatus,
+        { cwd: "/repo" },
+        {
+          onExpectedFailure: () =>
+            Effect.sync(() => {
+              observedFailures += 1;
+            }),
+          retryExpectedFailure: {
+            when: () => true,
+            initialDelay: "10 millis",
+            maxDelay: "40 millis",
+            resetAfter: "100 millis",
+          },
+        },
+      ).pipe(Stream.runDrain);
+      yield* TestClock.adjust("1 minute");
+      expect(subscriptions).toBe(1);
+      expect(observedFailures).toBe(0);
     }),
   );
 });

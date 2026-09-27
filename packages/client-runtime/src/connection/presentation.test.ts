@@ -22,6 +22,7 @@ import {
   connectionPhaseMessage,
   connectionStatusText,
   connectionTransportSecurity,
+  isConnectionUnavailable,
   isDesktopLocalConnectionId,
   presentEnvironmentConnection,
   presentConnectionState,
@@ -195,6 +196,39 @@ describe("connection presentation", () => {
     });
   });
 
+  for (const [attempt, phase] of [
+    [1, "connecting"],
+    [2, "reconnecting"],
+  ] as const) {
+    it(`presents slow settings progress without a stale error while ${phase}`, () => {
+      const notice = "Receiving settings from Test environment over a slow connection…";
+      const presentation = presentConnectionState(
+        supervisorState({
+          stage: "configuring",
+          attempt,
+          notice,
+          lastFailure:
+            attempt === 1
+              ? null
+              : new ConnectionTransientError({
+                  reason: "transport",
+                  detail: "Socket closed.",
+                  traceId: "trace-previous",
+                }),
+        }),
+      );
+      expect(presentation).toEqual({ phase, error: null, traceId: null, notice });
+      expect(connectionStatusText(presentation)).toBe(notice);
+    });
+  }
+
+  it("counts every phase but connected as unavailable", () => {
+    for (const phase of ["available", "offline", "connecting", "reconnecting", "error"] as const) {
+      expect(isConnectionUnavailable({ phase, error: null, traceId: null })).toBe(true);
+    }
+    expect(isConnectionUnavailable({ phase: "connected", error: null, traceId: null })).toBe(false);
+  });
+
   it("gives offline status precedence in global messaging", () => {
     expect(connectionPhaseMessage("connected", TARGET.label, "offline")).toBe("You are offline");
   });
@@ -206,7 +240,22 @@ describe("connection presentation", () => {
         error: "Relay request timed out.",
         traceId: "trace-retry",
       }),
-    ).toBe("Failed to connect. Reconnecting... Reason: Relay request timed out.");
+    ).toBe("Relay request timed out. Reconnecting…");
+  });
+
+  it("ends a failure that lacks punctuation before announcing the reconnect", () => {
+    expect(
+      connectionStatusText({ phase: "reconnecting", error: "connect ECONNREFUSED", traceId: null }),
+    ).toBe("connect ECONNREFUSED. Reconnecting…");
+    expect(
+      connectionStatusText({
+        phase: "reconnecting",
+        error: "No data from Local for 30 seconds. The connection is too slow or was lost.",
+        traceId: null,
+      }),
+    ).toBe(
+      "No data from Local for 30 seconds. The connection is too slow or was lost. Reconnecting…",
+    );
   });
 
   it("presents the supervisor's offline state without consulting shell state", () => {
@@ -302,10 +351,10 @@ describe("connection presentation", () => {
     );
     expect(connectionStatusText({ phase: "offline", error: null, traceId: null })).toBe("Offline");
     expect(connectionStatusText({ phase: "connecting", error: null, traceId: null })).toBe(
-      "Connecting...",
+      "Connecting…",
     );
     expect(connectionStatusText({ phase: "reconnecting", error: null, traceId: null })).toBe(
-      "Reconnecting...",
+      "Reconnecting…",
     );
     expect(connectionStatusText({ phase: "connected", error: null, traceId: null })).toBe(
       "Connected",

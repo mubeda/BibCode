@@ -56,6 +56,10 @@ const testExclude = [
   "**/node_modules/**",
   "**/dist/**",
   "**/.{idea,git,cache,output,temp}/**",
+  // The root config runs no React plugins, so this React Compiler guard only passes in
+  // the web package's lane (`vp run test`). See "Web unit tests and the React Compiler"
+  // in docs/testing/README.md.
+  "apps/web/src/reactCompiler.test.tsx",
 ] as const;
 
 export default defineConfig({
@@ -162,6 +166,7 @@ export default defineConfig({
           ],
         },
       ],
+      "bibcode/no-effect-event-in-memo-or-forward-ref": "error",
       "bibcode/no-global-process-runtime": "error",
       "bibcode/no-inline-schema-compile": "warn",
       "bibcode/no-manual-effect-runtime-in-tests": "error",

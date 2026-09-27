@@ -16,6 +16,12 @@ export const vcsStatusRefreshScheduler = createAtomCommandScheduler();
  */
 export const vcsGenerateScheduler = createAtomCommandScheduler();
 
+/**
+ * Own lane for `vcs.cancelClone`: the clone it cancels holds the destination's serial lane on
+ * `vcsCommandScheduler` for as long as it runs, so a cancel queued there would never go out.
+ */
+export const vcsCloneCancelScheduler = createAtomCommandScheduler();
+
 export const vcsCommandConcurrency: AtomCommandConcurrency<{
   readonly environmentId: EnvironmentId;
   readonly input: { readonly cwd: string };

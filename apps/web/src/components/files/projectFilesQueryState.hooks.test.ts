@@ -1,11 +1,14 @@
 import { EnvironmentId } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
+import { RpcClientError } from "effect/unstable/rpc";
+import * as Socket from "effect/unstable/socket/Socket";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const harness = vi.hoisted(() => ({
   atomValues: new Map<string, unknown>(),
   refresh: vi.fn(),
+  retries: [] as unknown[],
   key(atom: unknown): string {
     return (atom as { key: string }).key;
   },
@@ -56,8 +59,13 @@ vi.mock("~/rpc/atomRegistry", () => ({
   },
 }));
 
-vi.mock("@bibcode/client-runtime/state/runtime", () => ({
+vi.mock("@bibcode/client-runtime/state/runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@bibcode/client-runtime/state/runtime")>()),
   executeAtomQuery: vi.fn(),
+  retryEnvironmentQuery: (atom: unknown, refresh: () => void) => {
+    harness.retries.push(atom);
+    refresh();
+  },
 }));
 
 import { useProjectEntriesQuery, useProjectFileQuery } from "./projectFilesQueryState";
@@ -72,6 +80,7 @@ const emptyOptimisticKey = `optimistic:${environmentId}:/repo:`;
 beforeEach(() => {
   harness.atomValues.clear();
   harness.refresh.mockReset();
+  harness.retries.length = 0;
 });
 
 describe("project file query hooks", () => {
@@ -84,6 +93,31 @@ describe("project file query hooks", () => {
     expect(result).toMatchObject({ data, error: null, isPending: true });
     result.refresh();
     expect(harness.refresh).toHaveBeenCalledOnce();
+    expect(harness.retries).toEqual([{ key: entriesKey }]);
+  });
+
+  it("names a transport cut-off with the connection-dropped copy", () => {
+    harness.atomValues.set(
+      entriesKey,
+      AsyncResult.failure(
+        Cause.fail(
+          new RpcClientError.RpcClientError({
+            reason: new Socket.SocketCloseError({ code: 4408, closeReason: "liveness timeout" }),
+          }),
+        ),
+      ),
+    );
+    expect(useProjectEntriesQuery(environmentId, "/repo").error).toBe(
+      "The connection dropped before the result arrived.",
+    );
+  });
+
+  it("revalidates without clearing a transport cut-off; only refresh retries", () => {
+    harness.atomValues.set(entriesKey, AsyncResult.success({ entries: [], truncated: false }));
+    const result = useProjectEntriesQuery(environmentId, "/repo");
+    result.revalidate();
+    expect(harness.refresh).toHaveBeenCalledOnce();
+    expect(harness.retries).toEqual([]);
   });
 
   it("maps error and opaque entry failures while leaving initial queries error-free", () => {
@@ -94,6 +128,10 @@ describe("project file query hooks", () => {
     expect(useProjectEntriesQuery(environmentId, "/repo").error).toBe("workspace unavailable");
 
     harness.atomValues.set(entriesKey, AsyncResult.failure(Cause.fail("offline")));
+    expect(useProjectEntriesQuery(environmentId, "/repo").error).toBe("Workspace query failed.");
+
+    // A blank message is no message: the view's fallback names what failed.
+    harness.atomValues.set(entriesKey, AsyncResult.failure(Cause.fail(new Error("   "))));
     expect(useProjectEntriesQuery(environmentId, "/repo").error).toBe("Workspace query failed.");
 
     harness.atomValues.set(entriesKey, AsyncResult.initial(false));

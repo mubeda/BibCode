@@ -15,6 +15,7 @@ import {
   removeConnectionFromCatalog,
   removeConnectionRegistrationFromCatalog,
   replaceCatalogValue,
+  replaceSavedConnectionCredential,
 } from "@bibcode/client-runtime/platform";
 import { TokenStore } from "@bibcode/client-runtime/authorization";
 import {
@@ -759,6 +760,13 @@ export const connectionStorageLayer = Layer.effectContext(
             connectionId,
           ),
         })),
+      putIfSaved: (connectionId, credential) =>
+        catalog.modify((document) => {
+          const next = replaceSavedConnectionCredential(document, connectionId, credential);
+          return next === null
+            ? { mutation: { _tag: "Keep" }, result: false }
+            : { mutation: { _tag: "Set", document: next }, result: true };
+        }),
     });
     const remoteTokenStore = TokenStore.make({
       get: (environmentId) =>

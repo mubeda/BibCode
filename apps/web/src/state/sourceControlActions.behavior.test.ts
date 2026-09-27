@@ -26,6 +26,7 @@ const h = vi.hoisted(() => ({
   trackCalls: [] as Array<{ scope: unknown; opts: unknown }>,
   resetErrorCalls: [] as Array<{ scope: unknown; operation: unknown }>,
   refresh: (() => undefined) as () => void,
+  revalidate: (() => undefined) as () => void,
   queryData: null as unknown,
   queryError: null as unknown,
   queryPending: false,
@@ -62,6 +63,8 @@ vi.mock("./query", () => ({
     error: h.queryError,
     isPending: h.queryPending,
     refresh: h.refresh,
+    revalidate: h.revalidate,
+    requiresRetry: false,
   }),
 }));
 
@@ -137,6 +140,7 @@ beforeEach(() => {
   h.trackCalls.length = 0;
   h.resetErrorCalls.length = 0;
   h.refresh = vi.fn();
+  h.revalidate = vi.fn();
   h.queryData = null;
   h.queryError = null;
   h.queryPending = false;
@@ -217,12 +221,15 @@ describe("command dispatch on a complete scope", () => {
   it("useVcsPullAction refreshes status on success", async () => {
     await useVcsPullAction(fullScope).run();
     expect(h.commandCalls).toHaveLength(1);
-    expect(h.refresh).toHaveBeenCalledTimes(1);
+    // A finished action re-reads automatically; only an explicit Retry clears a cut-off.
+    expect(h.revalidate).toHaveBeenCalledTimes(1);
+    expect(h.refresh).not.toHaveBeenCalled();
   });
 
   it("does not refresh status when the command fails", async () => {
     h.nextCommandResult = AsyncResult.failure(Cause.fail(new Error("boom")));
     await useVcsPullAction(fullScope).run();
+    expect(h.revalidate).not.toHaveBeenCalled();
     expect(h.refresh).not.toHaveBeenCalled();
   });
 
@@ -232,7 +239,7 @@ describe("command dispatch on a complete scope", () => {
       environmentId,
       input: { cwd: "/repo", filePaths: ["a.ts", "b.ts"] },
     });
-    expect(h.refresh).toHaveBeenCalledTimes(1);
+    expect(h.revalidate).toHaveBeenCalledTimes(1);
   });
 
   it("generate commit message omits filePaths when empty and includes them otherwise", async () => {
@@ -266,7 +273,7 @@ describe("command dispatch on a complete scope", () => {
         protocol: "ssh",
       },
     });
-    expect(h.refresh).toHaveBeenCalledTimes(1);
+    expect(h.revalidate).toHaveBeenCalledTimes(1);
   });
 
   it("prepares pull requests only in safe local mode", async () => {
@@ -299,7 +306,7 @@ describe("command dispatch on a complete scope", () => {
       onProgress,
     });
     // onSuccess still refreshes status even though tracking is external.
-    expect(h.refresh).toHaveBeenCalledTimes(1);
+    expect(h.revalidate).toHaveBeenCalledTimes(1);
   });
 
   it("stacked action drops optional fields that are absent", async () => {

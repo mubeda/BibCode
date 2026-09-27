@@ -19,19 +19,25 @@ pub(crate) struct ContextMenuPosition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum NativeContextMenuEntry {
+    Item(NativeContextMenuItem),
+    Separator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeContextMenuItem {
     native_id: String,
     original_id: String,
     label: String,
     destructive: bool,
     disabled: bool,
-    children: Vec<NativeContextMenuItem>,
+    children: Vec<NativeContextMenuEntry>,
 }
 
 #[derive(Debug)]
 pub(crate) struct NativeContextMenuRequest {
     request_id: String,
-    items: Vec<NativeContextMenuItem>,
+    items: Vec<NativeContextMenuEntry>,
     native_to_original: HashMap<String, String>,
 }
 
@@ -187,34 +193,61 @@ fn build_native_context_menu<R: Runtime>(
     Ok(root)
 }
 
+/// A row of one native menu level in display order. The separator the native
+/// menu adds before its first destructive item is resolved here, and skipped
+/// when an explicit separator already precedes that item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeMenuRow<'a> {
+    Item(&'a NativeContextMenuItem),
+    Separator,
+}
+
+fn native_menu_rows(entries: &[NativeContextMenuEntry]) -> Vec<NativeMenuRow<'_>> {
+    let mut rows = Vec::with_capacity(entries.len() + 1);
+    let mut inserted_destructive_separator = false;
+    for entry in entries {
+        match entry {
+            NativeContextMenuEntry::Separator => rows.push(NativeMenuRow::Separator),
+            NativeContextMenuEntry::Item(item) => {
+                // Entries are normalised, so a non-empty `rows` always holds an item.
+                if item.destructive && !inserted_destructive_separator {
+                    if !rows.is_empty() && !matches!(rows.last(), Some(NativeMenuRow::Separator)) {
+                        rows.push(NativeMenuRow::Separator);
+                    }
+                    inserted_destructive_separator = true;
+                }
+                rows.push(NativeMenuRow::Item(item));
+            }
+        }
+    }
+    rows
+}
+
 fn append_context_menu_items<R: Runtime>(
     app: &AppHandle<R>,
     menu: &Submenu<R>,
-    items: &[NativeContextMenuItem],
+    entries: &[NativeContextMenuEntry],
 ) -> tauri::Result<()> {
-    let mut inserted_any = false;
-    let mut inserted_destructive_separator = false;
-
-    for item in items {
-        if item.destructive && !inserted_destructive_separator && inserted_any {
-            let separator = PredefinedMenuItem::separator(app)?;
-            menu.append(&separator)?;
-            inserted_destructive_separator = true;
+    for row in native_menu_rows(entries) {
+        match row {
+            NativeMenuRow::Separator => {
+                let separator = PredefinedMenuItem::separator(app)?;
+                menu.append(&separator)?;
+            }
+            NativeMenuRow::Item(item) if item.children.is_empty() => {
+                let native_item = MenuItemBuilder::with_id(item.native_id.clone(), &item.label)
+                    .enabled(!item.disabled)
+                    .build(app)?;
+                menu.append(&native_item)?;
+            }
+            NativeMenuRow::Item(item) => {
+                let submenu = SubmenuBuilder::with_id(app, item.native_id.clone(), &item.label)
+                    .enabled(!item.disabled)
+                    .build()?;
+                append_context_menu_items(app, &submenu, &item.children)?;
+                menu.append(&submenu)?;
+            }
         }
-
-        if item.children.is_empty() {
-            let native_item = MenuItemBuilder::with_id(item.native_id.clone(), &item.label)
-                .enabled(!item.disabled)
-                .build(app)?;
-            menu.append(&native_item)?;
-        } else {
-            let submenu = SubmenuBuilder::with_id(app, item.native_id.clone(), &item.label)
-                .enabled(!item.disabled)
-                .build()?;
-            append_context_menu_items(app, &submenu, &item.children)?;
-            menu.append(&submenu)?;
-        }
-        inserted_any = true;
     }
 
     Ok(())
@@ -225,28 +258,62 @@ fn normalize_context_menu_items(
     request_id: &str,
     next_item_index: &mut usize,
     native_to_original: &mut HashMap<String, String>,
-) -> Vec<NativeContextMenuItem> {
-    values
+) -> Vec<NativeContextMenuEntry> {
+    let entries = values
         .iter()
         .filter_map(|value| {
-            normalize_context_menu_item(value, request_id, next_item_index, native_to_original)
+            normalize_context_menu_entry(value, request_id, next_item_index, native_to_original)
         })
-        .collect()
+        .collect();
+    normalize_separators(entries)
 }
 
-fn normalize_context_menu_item(
+/// Drops leading and trailing separators and collapses runs. Runs after the
+/// entries a native menu cannot show (headers, empty submenus) are filtered.
+fn normalize_separators(entries: Vec<NativeContextMenuEntry>) -> Vec<NativeContextMenuEntry> {
+    let mut normalized: Vec<NativeContextMenuEntry> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let is_separator = matches!(entry, NativeContextMenuEntry::Separator);
+        if is_separator
+            && matches!(
+                normalized.last(),
+                None | Some(NativeContextMenuEntry::Separator)
+            )
+        {
+            continue;
+        }
+        normalized.push(entry);
+    }
+    if matches!(normalized.last(), Some(NativeContextMenuEntry::Separator)) {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn normalize_context_menu_entry(
     value: &Value,
     request_id: &str,
     next_item_index: &mut usize,
     native_to_original: &mut HashMap<String, String>,
-) -> Option<NativeContextMenuItem> {
+) -> Option<NativeContextMenuEntry> {
     let object = value.as_object()?;
+    // A separator carries no id or label, so it is read before those requirements.
+    if bool_property(object, "separator") {
+        return Some(NativeContextMenuEntry::Separator);
+    }
     if bool_property(object, "header") {
         return None;
     }
 
     let original_id = string_property(object, "id")?.to_string();
-    let label = string_property(object, "label")?.to_string();
+    let base_label = string_property(object, "label")?;
+    let label = match (
+        bool_property(object, "disabled"),
+        string_property(object, "description"),
+    ) {
+        (true, Some(reason)) if !reason.trim().is_empty() => format!("{base_label} — {reason}"),
+        _ => base_label.to_string(),
+    };
     let children = object
         .get("children")
         .and_then(Value::as_array)
@@ -266,14 +333,14 @@ fn normalize_context_menu_item(
         native_to_original.insert(native_id.clone(), original_id.clone());
     }
 
-    Some(NativeContextMenuItem {
+    Some(NativeContextMenuEntry::Item(NativeContextMenuItem {
         native_id,
         original_id,
         label,
         destructive: bool_property(object, "destructive"),
         disabled: bool_property(object, "disabled"),
         children,
-    })
+    }))
 }
 
 fn normalize_context_menu_position(
@@ -302,6 +369,32 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn item(entry: &NativeContextMenuEntry) -> &NativeContextMenuItem {
+        match entry {
+            NativeContextMenuEntry::Item(item) => item,
+            NativeContextMenuEntry::Separator => panic!("expected an item, found a separator"),
+        }
+    }
+
+    fn entry_kinds(entries: &[NativeContextMenuEntry]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                NativeContextMenuEntry::Item(item) => item.original_id.as_str(),
+                NativeContextMenuEntry::Separator => "---",
+            })
+            .collect()
+    }
+
+    fn row_kinds<'a>(rows: &[NativeMenuRow<'a>]) -> Vec<&'a str> {
+        rows.iter()
+            .map(|row| match *row {
+                NativeMenuRow::Item(item) => item.original_id.as_str(),
+                NativeMenuRow::Separator => "---",
+            })
+            .collect()
+    }
+
     #[test]
     fn normalizes_context_menu_items_for_native_menus() {
         let request = context_menu_request_from_values(vec![
@@ -320,12 +413,15 @@ mod tests {
         ]);
 
         assert_eq!(request.items.len(), 3);
-        assert_eq!(request.items[0].original_id, "open");
-        assert_eq!(request.items[1].original_id, "share");
-        assert_eq!(request.items[1].children.len(), 1);
-        assert_eq!(request.items[1].children[0].original_id, "copy-link");
-        assert!(request.items[1].children[0].disabled);
-        assert!(request.items[2].destructive);
+        assert_eq!(item(&request.items[0]).original_id, "open");
+        assert_eq!(item(&request.items[1]).original_id, "share");
+        assert_eq!(item(&request.items[1]).children.len(), 1);
+        assert_eq!(
+            item(&item(&request.items[1]).children[0]).original_id,
+            "copy-link"
+        );
+        assert!(item(&item(&request.items[1]).children[0]).disabled);
+        assert!(item(&request.items[2]).destructive);
         assert_eq!(request.native_to_original.len(), 3);
         assert!(request.native_to_original.values().any(|id| id == "open"));
         assert!(
@@ -343,6 +439,114 @@ mod tests {
                 "header":true
             })])
         ));
+    }
+
+    #[test]
+    fn keeps_explicit_separators_without_ids_between_items() {
+        let request = context_menu_request_from_values(vec![
+            json!({ "id": "open", "label": "Open" }),
+            json!({ "separator": true }),
+            json!({ "id": "copy", "label": "Copy" }),
+        ]);
+
+        assert_eq!(entry_kinds(&request.items), vec!["open", "---", "copy"]);
+        assert_eq!(request.native_to_original.len(), 2);
+        let disabled = context_menu_request_from_values(vec![json!({
+            "id": "pull", "label": "Pull", "disabled": true,
+            "description": "Workspace is unavailable."
+        })]);
+        assert_eq!(
+            item(&disabled.items[0]).label,
+            "Pull — Workspace is unavailable."
+        );
+    }
+
+    #[test]
+    fn trims_and_collapses_separators_after_filtering() {
+        let request = context_menu_request_from_values(vec![
+            json!({ "separator": true }),
+            json!({ "id": "header", "label": "Group", "header": true }),
+            json!({ "id": "open", "label": "Open" }),
+            json!({ "separator": true }),
+            json!({ "id": "empty", "label": "Empty", "children": [{ "separator": true }] }),
+            json!({ "separator": true }),
+            json!({ "id": "copy", "label": "Copy" }),
+            json!({ "separator": true }),
+        ]);
+        assert_eq!(entry_kinds(&request.items), vec!["open", "---", "copy"]);
+
+        let nested = context_menu_request_from_values(vec![json!({
+            "id": "open-in",
+            "label": "Open in",
+            "children": [
+                { "id": "a", "label": "A" },
+                { "separator": true },
+                { "separator": true },
+                { "id": "b", "label": "B" },
+                { "separator": true }
+            ]
+        })]);
+        assert_eq!(
+            entry_kinds(&item(&nested.items[0]).children),
+            vec!["a", "---", "b"]
+        );
+    }
+
+    #[test]
+    fn never_separates_a_leading_destructive_group_at_root_or_in_a_submenu() {
+        let values = vec![
+            json!({ "separator": true }),
+            json!({ "id": "delete", "label": "Delete", "destructive": true }),
+            json!({ "id": "purge", "label": "Purge", "destructive": true }),
+            json!({ "separator": true }),
+            json!({ "separator": true }),
+            json!({ "id": "copy", "label": "Copy" }),
+            json!({ "separator": true }),
+        ];
+        let root = context_menu_request_from_values(values.clone());
+        assert_eq!(
+            row_kinds(&native_menu_rows(&root.items)),
+            vec!["delete", "purge", "---", "copy"]
+        );
+        let nested = context_menu_request_from_values(vec![json!({
+            "id": "remove", "label": "Remove Project…", "children": values
+        })]);
+        assert_eq!(
+            row_kinds(&native_menu_rows(&item(&nested.items[0]).children)),
+            vec!["delete", "purge", "---", "copy"]
+        );
+    }
+
+    #[test]
+    fn skips_the_automatic_destructive_separator_after_an_explicit_one() {
+        let explicit = context_menu_request_from_values(vec![
+            json!({ "id": "rename", "label": "Rename" }),
+            json!({ "separator": true }),
+            json!({ "id": "delete", "label": "Delete", "destructive": true }),
+        ]);
+        assert_eq!(
+            row_kinds(&native_menu_rows(&explicit.items)),
+            vec!["rename", "---", "delete"]
+        );
+
+        let implicit = context_menu_request_from_values(vec![
+            json!({ "id": "rename", "label": "Rename" }),
+            json!({ "id": "delete", "label": "Delete", "destructive": true }),
+            json!({ "id": "purge", "label": "Purge", "destructive": true }),
+        ]);
+        assert_eq!(
+            row_kinds(&native_menu_rows(&implicit.items)),
+            vec!["rename", "---", "delete", "purge"]
+        );
+
+        let leading = context_menu_request_from_values(vec![
+            json!({ "id": "delete", "label": "Delete", "destructive": true }),
+            json!({ "id": "rename", "label": "Rename" }),
+        ]);
+        assert_eq!(
+            row_kinds(&native_menu_rows(&leading.items)),
+            vec!["delete", "rename"]
+        );
     }
 
     #[test]

@@ -1,3 +1,6 @@
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 use std::time::Duration;
 
 use bibcode_server::{
@@ -7,11 +10,15 @@ use bibcode_server::{
     persistence::{BackupTrigger, StatePaths, StorageInstanceId, inventory_verified_backups},
     rpc_mutability,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 fn desktop_config(root: &std::path::Path, token: &str) -> ServerConfig {
     ServerConfig::new(root)
@@ -21,23 +28,15 @@ fn desktop_config(root: &std::path::Path, token: &str) -> ServerConfig {
 }
 
 fn disable_provider_processes(root: &std::path::Path) {
-    let settings = root.join("userdata/settings.json");
-    std::fs::create_dir_all(settings.parent().expect("settings parent"))
-        .expect("settings directory");
-    std::fs::write(
-        settings,
-        serde_json::to_vec(&json!({
-            "providers": {
-                "codex": {"enabled": false},
-                "claudeAgent": {"enabled": false},
-                "cursor": {"enabled": false},
-                "grok": {"enabled": false},
-                "opencode": {"enabled": false}
-            }
-        }))
-        .expect("settings JSON"),
-    )
-    .expect("settings fixture");
+    // Maintenance fixtures keep providers disabled as well as pinning their executables.
+    let providers = hermetic_providers::BUILTIN_PROVIDER_DRIVERS
+        .iter()
+        .map(|driver| ((*driver).to_owned(), json!({"enabled": false})))
+        .collect::<serde_json::Map<String, Value>>();
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(root).state_dir(),
+        json!({"providers": providers}),
+    );
 }
 
 #[tokio::test]
@@ -282,11 +281,14 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
         ))
         .await
         .expect("mutating RPC request");
-    let rejected = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("mutating response timeout")
-        .expect("socket remains open")
-        .expect("mutating response frame");
+    let rejected = timeout(
+        Duration::from_secs(2),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("mutating response timeout")
+    .expect("socket remains open")
+    .expect("mutating response frame");
     let rejected: Value =
         serde_json::from_str(rejected.to_text().expect("response text")).expect("response JSON");
     assert_eq!(rejected["exit"]["_tag"], "Failure");
@@ -313,11 +315,14 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
             ))
             .await
             .expect("activity mutation RPC request");
-        let rejected = timeout(Duration::from_secs(2), socket.next())
-            .await
-            .expect("activity mutation response timeout")
-            .expect("socket remains open")
-            .expect("activity mutation response frame");
+        let rejected = timeout(
+            Duration::from_secs(2),
+            next_frame_past_heartbeat(&mut socket),
+        )
+        .await
+        .expect("activity mutation response timeout")
+        .expect("socket remains open")
+        .expect("activity mutation response frame");
         let rejected: Value =
             serde_json::from_str(rejected.to_text().expect("activity mutation response text"))
                 .expect("activity mutation response JSON");
@@ -340,11 +345,14 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
         ))
         .await
         .expect("read RPC request");
-    let readable = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("read response timeout")
-        .expect("socket remains open")
-        .expect("read response frame");
+    let readable = timeout(
+        Duration::from_secs(2),
+        next_frame_past_heartbeat(&mut socket),
+    )
+    .await
+    .expect("read response timeout")
+    .expect("socket remains open")
+    .expect("read response frame");
     let readable: Value =
         serde_json::from_str(readable.to_text().expect("response text")).expect("response JSON");
     assert_eq!(readable["exit"]["_tag"], "Success");
@@ -418,6 +426,10 @@ async fn desktop_prepare_is_authenticated_single_flight_and_cancel_is_identity_b
 #[tokio::test]
 async fn maintenance_routes_are_hidden_outside_local_desktop_mode() {
     let web_root = tempfile::tempdir().expect("web data root");
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(web_root.path()).state_dir(),
+        json!({}),
+    );
     let web = ServerRuntime::start(ServerConfig::new(web_root.path()).with_bind("127.0.0.1", 0))
         .await
         .expect("web runtime");
@@ -436,6 +448,10 @@ async fn maintenance_routes_are_hidden_outside_local_desktop_mode() {
     web.join().await.expect("web join");
 
     let exposed_root = tempfile::tempdir().expect("exposed data root");
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(exposed_root.path()).state_dir(),
+        json!({}),
+    );
     let exposed = ServerRuntime::start(
         ServerConfig::new(exposed_root.path())
             .with_bind("0.0.0.0", 0)
@@ -579,4 +595,295 @@ async fn abandoned_preparation_lease_expires_and_exits() {
         .await
         .expect("lease expiry shuts the quiesced backend down");
     server.join().await.expect("expired server joins cleanly");
+}
+
+/// Exchanges the desktop bootstrap token and opens an authenticated RPC socket.
+async fn authenticated_socket(
+    server: &bibcode_server::ServerHandle,
+    bootstrap: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+    let token = client
+        .post(format!("{base}/oauth/token"))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", bootstrap),
+            (
+                "subject_token_type",
+                "urn:bibcode:params:oauth:token-type:environment-bootstrap",
+            ),
+            (
+                "requested_token_type",
+                "urn:ietf:params:oauth:token-type:access_token",
+            ),
+        ])
+        .send()
+        .await
+        .expect("bootstrap exchange")
+        .json::<Value>()
+        .await
+        .expect("bootstrap exchange JSON")["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_owned();
+    let ticket = client
+        .post(format!("{base}/api/auth/websocket-ticket"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("ticket response")
+        .json::<Value>()
+        .await
+        .expect("ticket JSON")["ticket"]
+        .as_str()
+        .expect("ticket")
+        .to_owned();
+    connect_async(format!("ws://{}/ws?wsTicket={ticket}", server.local_addr()))
+        .await
+        .expect("authenticated socket")
+        .0
+}
+
+#[tokio::test]
+async fn shutdown_stops_a_detached_clone_and_removes_its_folder() {
+    use tokio::io::AsyncReadExt;
+
+    let root = tempfile::tempdir().expect("data root");
+    disable_provider_processes(root.path());
+    let clones = tempfile::tempdir().expect("clone parent");
+    let destination = clones.path().join("detached");
+    // `git://` has no HTTP proxy, so a host proxy setting cannot divert Git away from this
+    // listener. The listener accepts and never answers, so the clone runs until stopped.
+    let remote = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stalled remote");
+    let url = format!(
+        "git://{}/stalled.git",
+        remote.local_addr().expect("address")
+    );
+    let bootstrap = "clone-shutdown-bootstrap";
+    let server = ServerRuntime::start(desktop_config(root.path(), bootstrap))
+        .await
+        .expect("desktop runtime");
+    let mut socket = authenticated_socket(&server, bootstrap).await;
+
+    socket
+        .send(Message::Text(
+            json!({
+                "_tag": "Request", "id": "1", "tag": "vcs.clone", "headers": [],
+                "payload": { "url": url, "parentDir": clones.path(), "directoryName": "detached", "detach": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("clone request");
+    let (mut connection, _) = timeout(Duration::from_secs(30), remote.accept())
+        .await
+        .expect("Git connects")
+        .expect("accept Git");
+    assert!(destination.is_dir(), "the clone created its destination");
+    // The client leaves; the detached clone keeps running until shutdown.
+    let _ = socket.close(None).await;
+
+    server.shutdown();
+    timeout(Duration::from_secs(60), server.join())
+        .await
+        .expect("shutdown finishes")
+        .expect("server joins");
+    assert!(
+        !destination.exists(),
+        "shutdown removed the partial folder before finishing"
+    );
+    let mut buffer = [0_u8; 1024];
+    let closed = timeout(Duration::from_secs(5), async {
+        loop {
+            match connection.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "Git was stopped");
+}
+
+#[tokio::test]
+async fn a_wide_bound_desktop_runtime_protects_in_process_while_http_maintenance_stays_hidden() {
+    let root = tempfile::tempdir().expect("wide data root");
+    disable_provider_processes(root.path());
+    let bootstrap = "wide-bootstrap";
+    let server = ServerRuntime::start(
+        ServerConfig::new(root.path())
+            .with_bind("0.0.0.0", 0)
+            .with_desktop(bootstrap)
+            .expect("desktop config"),
+    )
+    .await
+    .expect("wide desktop runtime");
+    let base = format!("http://127.0.0.1:{}", server.local_addr().port());
+    let client = reqwest::Client::new();
+
+    // The loopback-or-WSL HTTP invariant is unchanged.
+    let hidden = client
+        .post(format!("{base}{MAINTENANCE_UPDATE_PREPARE_PATH}"))
+        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, bootstrap)
+        .send()
+        .await
+        .expect("wide prepare response");
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+    let maintenance = server
+        .update_maintenance()
+        .expect("a desktop runtime owns update maintenance whatever its bind");
+    let prepared = timeout(Duration::from_secs(45), maintenance.prepare())
+        .await
+        .expect("in-process prepare stays within the 45 s bound")
+        .expect("in-process prepare succeeds");
+    assert_eq!(maintenance.status().await["phase"], "prepared");
+
+    let paths = StatePaths::from_config(&desktop_config(root.path(), bootstrap));
+    let inventory = inventory_verified_backups(&paths, prepared.storage_instance_id)
+        .await
+        .expect("verified backup inventory");
+    assert_eq!(inventory.verified.len(), 1);
+    assert_eq!(
+        inventory.verified[0].manifest.trigger,
+        BackupTrigger::PreUpdate
+    );
+    assert_eq!(
+        inventory.verified[0].manifest.backup_id.to_string(),
+        prepared.backup_id
+    );
+
+    let operation_id =
+        uuid::Uuid::parse_str(&prepared.operation_id).expect("operation id is a UUID");
+    maintenance
+        .commit(operation_id)
+        .await
+        .expect("in-process commit succeeds");
+    maintenance.shutdown_after_response();
+    timeout(Duration::from_secs(2), server.wait_for_shutdown())
+        .await
+        .expect("commit exits the quiesced runtime");
+    server.join().await.expect("wide runtime joins");
+}
+
+#[tokio::test]
+async fn in_process_cancel_exits_and_a_mismatched_operation_changes_nothing() {
+    let root = tempfile::tempdir().expect("cancel data root");
+    disable_provider_processes(root.path());
+    let server = ServerRuntime::start(
+        ServerConfig::new(root.path())
+            .with_bind("0.0.0.0", 0)
+            .with_desktop("cancel-bootstrap")
+            .expect("desktop config"),
+    )
+    .await
+    .expect("wide desktop runtime");
+    let maintenance = server.update_maintenance().expect("maintenance owner");
+    let prepared = maintenance.prepare().await.expect("prepare");
+
+    let mismatch = maintenance
+        .cancel(uuid::Uuid::nil())
+        .await
+        .expect_err("a foreign operation id is refused");
+    assert!(
+        matches!(
+            mismatch,
+            bibcode_server::MaintenanceError::OperationMismatch
+        ),
+        "{mismatch:?}"
+    );
+    let status = maintenance.status().await;
+    assert_eq!(status["phase"], "prepared");
+    assert_eq!(
+        status["result"]["operationId"],
+        prepared.operation_id.as_str()
+    );
+    assert!(
+        timeout(Duration::from_millis(50), server.wait_for_shutdown())
+            .await
+            .is_err(),
+        "a mismatched operation must not alter maintenance state"
+    );
+
+    maintenance
+        .cancel(uuid::Uuid::parse_str(&prepared.operation_id).expect("uuid"))
+        .await
+        .expect("cancel succeeds");
+    maintenance.shutdown_after_response();
+    timeout(Duration::from_secs(2), server.wait_for_shutdown())
+        .await
+        .expect("cancel exits instead of resuming");
+    server.join().await.expect("join");
+}
+
+#[tokio::test]
+async fn only_desktop_runtimes_with_a_bootstrap_token_own_update_maintenance() {
+    let web_root = tempfile::tempdir().expect("web data root");
+    disable_provider_processes(web_root.path());
+    let web = ServerRuntime::start(ServerConfig::new(web_root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("web runtime");
+    assert!(web.update_maintenance().is_none());
+    web.shutdown();
+    web.join().await.expect("web join");
+
+    let desktop_root = tempfile::tempdir().expect("desktop data root");
+    disable_provider_processes(desktop_root.path());
+    let desktop = ServerRuntime::start(desktop_config(desktop_root.path(), "loopback-bootstrap"))
+        .await
+        .expect("loopback desktop runtime");
+    assert!(desktop.update_maintenance().is_some());
+    desktop.shutdown();
+    desktop.join().await.expect("desktop join");
+}
+
+#[tokio::test]
+async fn a_loopback_desktop_runtime_shares_one_maintenance_owner_between_http_and_in_process() {
+    let root = tempfile::tempdir().expect("shared owner data root");
+    disable_provider_processes(root.path());
+    let bootstrap = "shared-owner-bootstrap";
+    let server = ServerRuntime::start(desktop_config(root.path(), bootstrap))
+        .await
+        .expect("loopback desktop runtime");
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{base}{MAINTENANCE_UPDATE_PREPARE_PATH}"))
+        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, bootstrap)
+        .send()
+        .await
+        .expect("HTTP prepare response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response.json::<Value>().await.expect("HTTP prepare JSON");
+    let operation_id = response["operationId"].as_str().expect("HTTP operation id");
+
+    let maintenance = server
+        .update_maintenance()
+        .expect("loopback desktop runtime owns update maintenance");
+    let status = maintenance.status().await;
+    assert_eq!(status["phase"], "prepared");
+    assert_eq!(status["result"]["operationId"], operation_id);
+    let prepared = timeout(Duration::from_secs(45), maintenance.prepare())
+        .await
+        .expect("in-process prepare stays within the 45 s bound")
+        .expect("in-process prepare succeeds");
+    assert_eq!(prepared.operation_id, operation_id);
+
+    maintenance
+        .cancel(uuid::Uuid::parse_str(operation_id).expect("operation id is a UUID"))
+        .await
+        .expect("in-process cancel succeeds");
+    maintenance.shutdown_after_response();
+    timeout(Duration::from_secs(2), server.wait_for_shutdown())
+        .await
+        .expect("cancel exits the quiesced runtime");
+    server.join().await.expect("loopback runtime joins");
 }

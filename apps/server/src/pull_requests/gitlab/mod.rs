@@ -702,7 +702,7 @@ mod tests {
             cwd: PathBuf::new(),
             host: "git.acme.example".into(),
             repository: "team/sub/repo".into(),
-            provider: ProviderKind::Gitlab,
+            provider: PullRequestsProvider::Gitlab,
         }
     }
 

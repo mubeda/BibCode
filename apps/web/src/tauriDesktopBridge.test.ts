@@ -311,6 +311,7 @@ function sensitivePrepared(storageInstanceId: string | null): PreparedConnection
       platform: { os: "windows", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      bootId: null,
       remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
@@ -443,6 +444,12 @@ describe("tauriDesktopBridge", () => {
       bridge.bootstrapSshBearerSession("http://127.0.0.1:3773", "pairing-token"),
     ).resolves.toEqual({ access_token: "ssh-bearer" });
     await expect(
+      bridge.bootstrapSshBearerSession("http://127.0.0.1:3773", "scoped-token", [
+        "orchestration:read",
+        "terminal:operate",
+      ]),
+    ).resolves.toEqual({ access_token: "ssh-bearer" });
+    await expect(
       bridge.fetchSshSessionState("http://127.0.0.1:3773", "bearer-token"),
     ).resolves.toEqual({ authenticated: true });
     await expect(
@@ -455,6 +462,11 @@ describe("tauriDesktopBridge", () => {
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_bootstrap_ssh_bearer_session", {
       httpBaseUrl: "http://127.0.0.1:3773",
       credential: "pairing-token",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_bootstrap_ssh_bearer_session", {
+      httpBaseUrl: "http://127.0.0.1:3773",
+      credential: "scoped-token",
+      scopes: ["orchestration:read", "terminal:operate"],
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_fetch_ssh_session_state", {
       httpBaseUrl: "http://127.0.0.1:3773",
@@ -1141,6 +1153,15 @@ describe("tauriDesktopBridge", () => {
     });
   });
 
+  it("restarts BiBCode through the guarded desktop command", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+
+    expect(bridge.restartApp).toBeTypeOf("function");
+    await bridge.restartApp!();
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_restart_app", undefined);
+  });
+
   it("forwards project data status invalidations and disposes the native listener", async () => {
     const harness = installTauriHarness();
     const bridge = await installBridge();
@@ -1403,6 +1424,7 @@ describe("tauriDesktopBridge", () => {
       message: null,
       errorContext: null,
       canRetry: false,
+      requestedBy: null,
     });
 
     expect(window.open).toHaveBeenCalledWith(

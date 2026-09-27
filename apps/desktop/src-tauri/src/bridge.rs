@@ -1064,7 +1064,38 @@ pub async fn desktop_bridge_retry_project_data(
     backend: State<'_, BackendSupervisor>,
     environment_id: String,
 ) -> Result<(), String> {
-    data_safety::retry_project_data(backend.inner(), &environment_id).await
+    data_safety::retry_project_data(backend.inner(), &environment_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn ensure_app_restart_allowed(
+    update_coordination: bool,
+    install_in_flight: bool,
+) -> Result<(), String> {
+    if update_coordination || install_in_flight {
+        return Err(
+            "BiBCode can't restart while an update or project-data operation is running."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn desktop_bridge_restart_app(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+    updates: State<'_, DesktopUpdateManager>,
+) -> Result<(), String> {
+    ensure_app_restart_allowed(
+        backend.update_coordination_in_progress(),
+        updates.install_in_flight(),
+    )?;
+    // If requesting exit fails, Tauri restarts without RunEvent::Exit.
+    crate::relaunch::prepare_descriptors_for_relaunch();
+    app.request_restart();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1220,21 +1251,28 @@ pub async fn desktop_bridge_fetch_environment_descriptor(
 pub async fn desktop_bridge_bootstrap_ssh_bearer_session(
     http_base_url: String,
     credential: String,
+    scopes: Option<Vec<String>>,
 ) -> Result<Value, String> {
     let client = remote_api_client()?;
+    let mut form = vec![
+        ("grant_type", AUTH_TOKEN_EXCHANGE_GRANT_TYPE.to_string()),
+        ("subject_token", credential),
+        (
+            "subject_token_type",
+            AUTH_ENVIRONMENT_BOOTSTRAP_TOKEN_TYPE.to_string(),
+        ),
+        ("requested_token_type", AUTH_ACCESS_TOKEN_TYPE.to_string()),
+        ("client_label", "BiBCode Tauri Desktop".to_string()),
+        ("client_device_type", "desktop".to_string()),
+    ];
+    // Without `scope` the exchange grants everything the bootstrap allows,
+    // administrative scopes included; the renderer narrows it explicitly.
+    if let Some(scopes) = scopes.filter(|scopes| !scopes.is_empty()) {
+        form.push(("scope", scopes.join(" ")));
+    }
     let response = client
         .post(environment_endpoint_url(&http_base_url, "/oauth/token")?)
-        .form(&[
-            ("grant_type", AUTH_TOKEN_EXCHANGE_GRANT_TYPE.to_string()),
-            ("subject_token", credential),
-            (
-                "subject_token_type",
-                AUTH_ENVIRONMENT_BOOTSTRAP_TOKEN_TYPE.to_string(),
-            ),
-            ("requested_token_type", AUTH_ACCESS_TOKEN_TYPE.to_string()),
-            ("client_label", "BiBCode Tauri Desktop".to_string()),
-            ("client_device_type", "desktop".to_string()),
-        ])
+        .form(&form)
         .send()
         .await
         .map_err(|error| bridge_error("Could not reach the environment API", error))?;
@@ -1976,11 +2014,34 @@ pub async fn desktop_bridge_get_advertised_endpoints(
 }
 
 #[tauri::command]
-pub fn desktop_bridge_set_theme(
+pub async fn desktop_bridge_set_theme(
     app: AppHandle<DesktopRuntime>,
     theme: String,
 ) -> Result<(), String> {
     let native_theme = desktop_theme_to_tauri_theme(&theme)?;
+    #[cfg(target_os = "linux")]
+    let theme_state = app.state::<crate::linux_theme::LinuxThemeState>();
+    #[cfg(target_os = "linux")]
+    let _request = theme_state.request_lock.lock().await;
+    #[cfg(target_os = "linux")]
+    theme_state.remember(native_theme);
+
+    #[cfg(target_os = "linux")]
+    let native_theme = match native_theme {
+        Some(theme) => Some(theme),
+        None => {
+            // Tao's SetTheme(None) forces light. Query the portal directly on a
+            // worker: a window theme getter would dispatch that blocking read
+            // back to the main thread and would need its explicit theme cleared.
+            let system_theme = crate::linux_theme::read_system_theme()
+                .await
+                .map_err(|error| bridge_error("Could not update the Tauri window theme", error))?;
+            Some(crate::linux_theme::resolve_theme_to_apply(
+                native_theme,
+                system_theme,
+            ))
+        }
+    };
     for window in app.webview_windows().values() {
         window
             .set_theme(native_theme)
@@ -3862,7 +3923,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            desktop_bridge_bootstrap_ssh_bearer_session(base_url, "credential".to_string())
+            desktop_bridge_bootstrap_ssh_bearer_session(base_url, "credential".to_string(), None)
                 .await
                 .is_err()
         );
@@ -3888,10 +3949,16 @@ mod tests {
         let (base_url, requests) =
             spawn_json_test_server(r#"{"access_token":"bearer-token","token_type":"Bearer"}"#);
 
-        let session =
-            desktop_bridge_bootstrap_ssh_bearer_session(base_url, "bootstrap-token".to_string())
-                .await
-                .expect("bootstrap request should succeed");
+        let session = desktop_bridge_bootstrap_ssh_bearer_session(
+            base_url,
+            "bootstrap-token".to_string(),
+            Some(vec![
+                "orchestration:read".to_string(),
+                "terminal:operate".to_string(),
+            ]),
+        )
+        .await
+        .expect("bootstrap request should succeed");
 
         assert_eq!(
             session,
@@ -3905,6 +3972,23 @@ mod tests {
                 .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange")
         );
         assert!(request.contains("client_label=BiBCode+Tauri+Desktop"));
+        assert!(
+            request.contains("scope=orchestration%3Aread+terminal%3Aoperate"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_ssh_bearer_session_omits_scope_when_none_is_requested() {
+        let (base_url, requests) =
+            spawn_json_test_server(r#"{"access_token":"bearer-token","token_type":"Bearer"}"#);
+
+        desktop_bridge_bootstrap_ssh_bearer_session(base_url, "bootstrap-token".to_string(), None)
+            .await
+            .expect("bootstrap request should succeed");
+
+        let request = requests.recv().expect("request should be captured");
+        assert!(!request.contains("scope="), "{request}");
     }
 
     #[tokio::test]
@@ -3927,11 +4011,23 @@ mod tests {
     }
 
     #[test]
+    fn app_restart_guard_refuses_update_and_project_data_operations() {
+        assert!(ensure_app_restart_allowed(false, false).is_ok());
+        for (coordination, installing) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                ensure_app_restart_allowed(coordination, installing).expect_err("restart is busy"),
+                "BiBCode can't restart while an update or project-data operation is running."
+            );
+        }
+    }
+
+    #[test]
     fn tauri_ipc_handlers_preserve_runtime_agnostic_bridge_contracts() {
         use crate::config::IsolatedTestDataRoot;
         use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
 
         let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let ssh_config = tempfile::NamedTempFile::new().expect("empty SSH config");
         // Use the generated application context so IPC exercises the same command
         // permissions as the production desktop shell.
         let mut context = crate::desktop_context();
@@ -3943,7 +4039,10 @@ mod tests {
             .manage(ServerExposureCoordinator::default())
             .manage(ConnectionCatalogCoordinator::new())
             .manage(NativeContextMenuManager::new())
-            .manage(SshEnvironmentManager::new())
+            .manage(
+                SshEnvironmentManager::new()
+                    .with_ssh_config_file_for_test(ssh_config.path().to_path_buf()),
+            )
             .manage(SshPasswordPromptManager::new())
             .manage(DesktopUpdateManager::new())
             .plugin(tauri_plugin_updater::Builder::new().build())
@@ -3955,6 +4054,7 @@ mod tests {
                 desktop_bridge_restore_project_data,
                 desktop_bridge_start_empty_project_data,
                 desktop_bridge_retry_project_data,
+                desktop_bridge_restart_app,
                 desktop_bridge_open_project_data_path,
                 desktop_bridge_export_project_data_diagnostics,
                 desktop_bridge_get_client_settings,
@@ -3997,6 +4097,8 @@ mod tests {
             ])
             .build(context)
             .expect("mock Tauri app");
+        #[cfg(target_os = "linux")]
+        app.manage(crate::linux_theme::LinuxThemeState::default());
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("mock webview");
@@ -4092,8 +4194,14 @@ mod tests {
             .unwrap(),
             false
         );
-        assert!(invoke("desktop_bridge_set_theme", json!({"theme":"unsupported"}),).is_err());
-        assert!(invoke("desktop_bridge_set_theme", json!({"theme":"dark"})).is_ok());
+        assert_eq!(
+            invoke("desktop_bridge_set_theme", json!({"theme":"unsupported"}))
+                .expect_err("unsupported theme"),
+            "Unsupported desktop theme: unsupported"
+        );
+        for theme in ["dark", "system", "light", "system"] {
+            assert!(invoke("desktop_bridge_set_theme", json!({"theme":theme})).is_ok());
+        }
         for command in [
             "desktop_bridge_get_update_state",
             "desktop_bridge_check_for_update",
@@ -4202,7 +4310,7 @@ mod tests {
             .is_err()
         );
         let unreachable_target = json!({
-            "alias":"unreachable-localhost",
+            "alias":"",
             "hostname":"127.0.0.1",
             "username":null,
             "port":1,

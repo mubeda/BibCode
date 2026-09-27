@@ -367,7 +367,15 @@ impl PortablePtyBackend {
         input: &PtySpawnInput,
         prepared: PreparedPtyCommand,
     ) -> Result<Arc<dyn PtyProcess>, String> {
-        self.spawn_command_with_waiter(input, prepared, spawn_pty_thread)
+        self.spawn_command_with_waiter(
+            input,
+            prepared,
+            spawn_pty_thread,
+            #[cfg(all(test, unix))]
+            |_| {},
+            #[cfg(all(test, unix))]
+            |_| {},
+        )
     }
 
     fn spawn_command_with_waiter(
@@ -375,6 +383,10 @@ impl PortablePtyBackend {
         input: &PtySpawnInput,
         prepared: PreparedPtyCommand,
         spawn_waiter: impl FnOnce(String, PtyThreadTask) -> std::io::Result<()>,
+        #[cfg(all(test, unix))] before_identity_probe: impl FnOnce(u32),
+        #[cfg(all(test, unix))] observe_waiter_reservation: impl FnOnce(std::io::Result<()>)
+        + Send
+        + 'static,
     ) -> Result<Arc<dyn PtyProcess>, String> {
         let command = prepared.command;
         #[cfg(windows)]
@@ -410,6 +422,8 @@ impl PortablePtyBackend {
             Some(pid) => pid,
             None => return Err("PTY child did not expose a process id".to_string()),
         };
+        #[cfg(all(test, unix))]
+        before_identity_probe(pid);
         let process_identity = retain_captured_identity_if_child_live(
             child.child_mut(),
             NativeProcessSampler::process_identity(pid).ok(),
@@ -488,9 +502,12 @@ impl PortablePtyBackend {
                 let mut child = wait_child;
                 #[cfg(unix)]
                 if let Some(process_group) = process_group {
-                    if let Err(error) = wait_for_unix_child_exit_without_reaping(pid) {
+                    let reservation = wait_for_unix_child_exit_without_reaping(pid);
+                    if let Err(error) = &reservation {
                         tracing::warn!(%error, pid, "failed to reserve PTY root identity through group cleanup");
                     }
+                    #[cfg(test)]
+                    observe_waiter_reservation(reservation);
                     loop {
                         match kill_reserved_unix_process_group_after_root_exit(
                             process_group,
@@ -851,6 +868,17 @@ fn retain_captured_identity_if_child_live(
     child: &mut (dyn portable_pty::Child + Send + Sync),
     captured: Option<ProcessIdentity>,
 ) -> Option<ProcessIdentity> {
+    #[cfg(unix)]
+    {
+        // try_wait reaps an exited Unix child, releasing its PID/PGID before
+        // the waiter can terminate the owned group. Keep that root waitable.
+        captured.filter(|_| {
+            child
+                .process_id()
+                .is_some_and(|pid| matches!(probe_unix_child_exit_without_reaping(pid), Ok(false)))
+        })
+    }
+    #[cfg(not(unix))]
     captured.filter(|_| matches!(child.try_wait(), Ok(None)))
 }
 
@@ -1069,6 +1097,16 @@ fn kill_reserved_unix_process_group_after_root_exit(
 
 #[cfg(unix)]
 fn wait_for_unix_child_exit_without_reaping(process_id: u32) -> std::io::Result<()> {
+    unix_child_exit_without_reaping(process_id, 0).map(|_| ())
+}
+
+#[cfg(unix)]
+fn probe_unix_child_exit_without_reaping(process_id: u32) -> std::io::Result<bool> {
+    unix_child_exit_without_reaping(process_id, libc::WNOHANG)
+}
+
+#[cfg(unix)]
+fn unix_child_exit_without_reaping(process_id: u32, options: i32) -> std::io::Result<bool> {
     let process_id = libc::id_t::try_from(process_id)
         .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     loop {
@@ -1081,11 +1119,14 @@ fn wait_for_unix_child_exit_without_reaping(process_id: u32) -> std::io::Result<
                 libc::P_PID,
                 process_id,
                 information.as_mut_ptr(),
-                libc::WEXITED | libc::WNOWAIT,
+                libc::WEXITED | libc::WNOWAIT | options,
             )
         };
         if result == 0 {
-            return Ok(());
+            // SAFETY: waitid succeeded with a zero-initialized siginfo_t. A
+            // zero si_pid means WNOHANG found no exit; otherwise it names the
+            // exited child, which WNOWAIT has deliberately left waitable.
+            return Ok(unsafe { information.assume_init().si_pid() } != 0);
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
@@ -1196,9 +1237,11 @@ mod tests {
         assert_eq!(output, "a\u{fffd}b\u{fffd}");
     }
 
+    #[cfg(not(unix))]
     #[derive(Clone, Debug)]
     struct FinishedPortableChild;
 
+    #[cfg(not(unix))]
     impl portable_pty::ChildKiller for FinishedPortableChild {
         fn kill(&mut self) -> std::io::Result<()> {
             Ok(())
@@ -1209,6 +1252,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(unix))]
     impl portable_pty::Child for FinishedPortableChild {
         fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
             Ok(Some(portable_pty::ExitStatus::with_exit_code(17)))
@@ -1228,6 +1272,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(unix))]
     #[test]
     fn finished_pty_child_does_not_expose_a_captured_process_identity() {
         let mut child = FinishedPortableChild;
@@ -1240,6 +1285,129 @@ mod tests {
             retain_captured_identity_if_child_live(&mut child, Some(captured)),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_unix_child_identity_probe_leaves_status_waitable() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 17"])
+            .spawn()
+            .expect("spawn immediately exiting child");
+        let pid = child.id();
+        let captured = ProcessIdentity {
+            pid,
+            started_at: 100,
+        };
+        wait_for_unix_child_exit_without_reaping(pid).expect("observe exit before probing");
+
+        let exited = probe_unix_child_exit_without_reaping(pid);
+        let retained = retain_captured_identity_if_child_live(&mut child, Some(captured));
+        let still_waitable = wait_for_unix_child_exit_without_reaping(pid);
+        let mut status = 0;
+        // SAFETY: this is the test's direct child, observed exited above, and
+        // status is writable. Reap before asserting so a failure cannot leak it.
+        let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &raw mut status, libc::WNOHANG) };
+
+        assert!(exited.expect("probe exited child"));
+        assert_eq!(retained, None, "an exited root must not expose an identity");
+        assert!(
+            still_waitable.is_ok(),
+            "identity probe reaped the root before waiter handoff: {still_waitable:?}"
+        );
+        assert_eq!(reaped, pid as libc::pid_t);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 17);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_unix_child_identity_probe_retains_identity_without_reaping() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read -r line; exit 23"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child gated by stdin");
+        let pid = child.id();
+        let captured = ProcessIdentity {
+            pid,
+            started_at: 100,
+        };
+
+        let exited = probe_unix_child_exit_without_reaping(pid);
+        let retained = retain_captured_identity_if_child_live(&mut child, Some(captured));
+        let mut status = 0;
+        // SAFETY: this test owns the direct child and writable status buffer.
+        let running = unsafe { libc::waitpid(pid as libc::pid_t, &raw mut status, libc::WNOHANG) };
+        drop(child.stdin.take());
+        let status = child.wait().expect("reap child after releasing stdin");
+
+        assert!(!exited.expect("probe live child"));
+        assert_eq!(retained, Some(captured));
+        assert_eq!(
+            running, 0,
+            "probe must leave the live child owned and running"
+        );
+        assert_eq!(status.code(), Some(23));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_backend_immediate_exit_reserves_root_until_waiter_reaps() {
+        let input = PtySpawnInput {
+            executable: "/bin/sh".to_owned(),
+            // Stop only to let spawn capture the process group deterministically.
+            // Once released, the command exits immediately before the probe.
+            args: vec!["-c".to_owned(), "kill -STOP $$; exit 17".to_owned()],
+            cwd: std::env::temp_dir(),
+            cols: 80,
+            rows: 24,
+            env: BTreeMap::new(),
+        };
+        let prepared = build_pty_command(&input).unwrap();
+        let (reservation, reserved) = mpsc::channel();
+        let process = PortablePtyBackend
+            .spawn_command_with_waiter(
+                &input,
+                prepared,
+                |_name, task| {
+                    task();
+                    Ok(())
+                },
+                |pid| {
+                    let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                    // SAFETY: pid names this fixture's child and information is
+                    // writable. WNOWAIT leaves the stopped child owned by spawn.
+                    let stopped = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            pid as libc::id_t,
+                            information.as_mut_ptr(),
+                            libc::WSTOPPED | libc::WNOWAIT,
+                        )
+                    };
+                    assert_eq!(stopped, 0, "observe fixture stop");
+                    // SAFETY: the stopped, unreaped fixture still owns this PID.
+                    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
+                    wait_for_unix_child_exit_without_reaping(pid)
+                        .expect("fixture exits before the spawn identity probe");
+                },
+                move |result| reservation.send(result).expect("record waiter reservation"),
+            )
+            .expect("spawn immediately exiting PTY");
+
+        assert_eq!(
+            *process.subscribe_exit().borrow(),
+            Some(PtyExit {
+                exit_code: Some(17),
+                signal: None,
+            })
+        );
+        assert_eq!(process.process_identity(), None);
+        reserved
+            .try_recv()
+            .expect("waiter must reserve the captured process group")
+            .expect("waiter must not take the failed-to-reserve warning path");
     }
 
     #[cfg(not(windows))]
@@ -2218,12 +2386,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn portable_backend_discovers_a_relative_executable_from_the_terminal_cwd() {
-        use std::os::unix::fs::PermissionsExt;
-
         let cwd = tempfile::tempdir().unwrap();
         let executable = cwd.path().join("provider-fixture");
-        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            "#!/bin/sh\nexit 0\n",
+        );
 
         let process = PortablePtyBackend
             .spawn(&PtySpawnInput {
@@ -2255,14 +2423,22 @@ mod tests {
         let prepared = build_pty_command(&input).unwrap();
         let (completed, waiter_completed) = tokio::sync::oneshot::channel();
         let process = PortablePtyBackend
-            .spawn_command_with_waiter(&input, prepared, |name, task| {
-                spawn_pty_thread_with(name, task, |builder, task| {
-                    builder.spawn(move || {
-                        task();
-                        let _ = completed.send(());
+            .spawn_command_with_waiter(
+                &input,
+                prepared,
+                |name, task| {
+                    spawn_pty_thread_with(name, task, |builder, task| {
+                        builder.spawn(move || {
+                            task();
+                            let _ = completed.send(());
+                        })
                     })
-                })
-            })
+                },
+                #[cfg(all(test, unix))]
+                |_| {},
+                #[cfg(all(test, unix))]
+                |_| {},
+            )
             .unwrap();
 
         // Wait for native reaping and exit publication, without ever creating

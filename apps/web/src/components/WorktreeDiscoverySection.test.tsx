@@ -265,6 +265,100 @@ afterEach(async () => {
 });
 
 describe("WorktreeDiscoverySection", () => {
+  it("reports the hidden candidate count while mounted and clears it on unmount", async () => {
+    testState.catalogs.set(
+      `${ENVIRONMENT_ID}:${PROJECT_ID}`,
+      snapshot([
+        candidate("/worktrees/one", "feature/one"),
+        candidate("/worktrees/two", "feature/two"),
+      ]),
+    );
+    const onHiddenCountChange = vi.fn();
+    await mount(
+      <WorktreeDiscoverySection
+        project={project("hidden")}
+        serverConfigs={serverConfigs(true)}
+        onNavigateToThread={testState.navigate}
+        onHiddenCountChange={onHiddenCountChange}
+      />,
+    );
+    expect(onHiddenCountChange).toHaveBeenLastCalledWith(2);
+
+    await unmountLastMountedTree();
+    expect(onHiddenCountChange).toHaveBeenLastCalledWith(null);
+  });
+
+  it.each([
+    { remoteLoaded: false, expected: null },
+    { remoteLoaded: true, expected: 3 },
+  ])(
+    "reports a grouped count only when all members are known: %j",
+    async ({ remoteLoaded, expected }) => {
+      testState.catalogs.set(
+        `${ENVIRONMENT_ID}:${PROJECT_ID}`,
+        snapshot([candidate("/wt/one", "one"), candidate("/wt/two", "two")]),
+      );
+      if (remoteLoaded) {
+        testState.catalogs.set(
+          `${REMOTE_ENVIRONMENT_ID}:${REMOTE_PROJECT_ID}`,
+          snapshot([candidate("/wt/remote", "remote")]),
+        );
+      }
+      const onHiddenCountChange = vi.fn();
+      await mount(
+        <WorktreeDiscoverySection
+          project={groupedProject("hidden", "hidden")}
+          serverConfigs={groupedServerConfigs()}
+          onNavigateToThread={testState.navigate}
+          onHiddenCountChange={onHiddenCountChange}
+        />,
+      );
+      expect(onHiddenCountChange).toHaveBeenLastCalledWith(expected);
+      if (!remoteLoaded)
+        expect(onHiddenCountChange.mock.calls.every(([count]) => count === null)).toBe(true);
+      await unmountLastMountedTree();
+      expect(onHiddenCountChange).toHaveBeenLastCalledWith(null);
+    },
+  );
+
+  it("counts a known shown member as zero alongside a hidden member", async () => {
+    testState.catalogs.set(
+      `${ENVIRONMENT_ID}:${PROJECT_ID}`,
+      snapshot([candidate("/wt/local", "local")]),
+    );
+    testState.catalogs.set(
+      `${REMOTE_ENVIRONMENT_ID}:${REMOTE_PROJECT_ID}`,
+      snapshot([candidate("/wt/remote", "remote")]),
+    );
+    const onHiddenCountChange = vi.fn();
+    await mount(
+      <WorktreeDiscoverySection
+        project={groupedProject("hidden", "shown")}
+        serverConfigs={groupedServerConfigs()}
+        onNavigateToThread={testState.navigate}
+        onHiddenCountChange={onHiddenCountChange}
+      />,
+    );
+    expect(onHiddenCountChange).toHaveBeenLastCalledWith(1);
+  });
+
+  it("reports zero hidden worktrees while discovery is shown", async () => {
+    testState.catalogs.set(
+      `${ENVIRONMENT_ID}:${PROJECT_ID}`,
+      snapshot([candidate("/worktrees/one", "feature/one")]),
+    );
+    const onHiddenCountChange = vi.fn();
+    await mount(
+      <WorktreeDiscoverySection
+        project={project("shown")}
+        serverConfigs={serverConfigs(true)}
+        onNavigateToThread={testState.navigate}
+        onHiddenCountChange={onHiddenCountChange}
+      />,
+    );
+    expect(onHiddenCountChange).toHaveBeenLastCalledWith(0);
+  });
+
   it("keeps identical labels, candidate names, and host paths unique by physical scope", async () => {
     const sharedEnvironmentLabel = "Shared host";
     const sharedPath = "/worktrees/shared";

@@ -2,7 +2,7 @@ import * as React from "react";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@bibcode/contracts/settings";
 import type { EnvironmentShellAvailability } from "@bibcode/client-runtime/state/shell";
 import type { ConnectionCatalogHealth } from "@bibcode/client-runtime/platform";
-import type { EnvironmentId } from "@bibcode/contracts";
+import type { EnvironmentId, VcsStatusResult, VcsStatusSummary } from "@bibcode/contracts";
 import {
   getThreadSortTimestamp,
   sortThreads,
@@ -10,7 +10,9 @@ import {
   type ThreadSortInput,
 } from "../lib/threadSort";
 import type { SidebarThreadSummary, Thread } from "../types";
+import { scopeThreadRef, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import { cn } from "../lib/utils";
+import { KEYBOARD_CONTEXT_MENU_ECHO_MS } from "../contextMenuKeyboard";
 import { isLatestTurnSettled } from "../session-logic";
 import { resolveServerBackedAppStageLabel } from "../branding.logic";
 
@@ -110,6 +112,33 @@ type SidebarProject = {
 
 export type ThreadTraversalDirection = "previous" | "next";
 
+/**
+ * Status tones shared by the thread pill (Agents view) and the card glyphs, so
+ * both surfaces colour a status the same way.
+ */
+const STATUS_TONES = {
+  approval: {
+    colorClass: "text-amber-600 dark:text-amber-300/90",
+    dotClass: "bg-amber-500 dark:bg-amber-300/90",
+  },
+  input: {
+    colorClass: "text-indigo-600 dark:text-indigo-300/90",
+    dotClass: "bg-indigo-500 dark:bg-indigo-300/90",
+  },
+  working: {
+    colorClass: "text-sky-600 dark:text-sky-300/80",
+    dotClass: "bg-sky-500 dark:bg-sky-300/80",
+  },
+  plan: {
+    colorClass: "text-violet-600 dark:text-violet-300/90",
+    dotClass: "bg-violet-500 dark:bg-violet-300/90",
+  },
+  completed: {
+    colorClass: "text-emerald-600 dark:text-emerald-300/90",
+    dotClass: "bg-emerald-500 dark:bg-emerald-300/90",
+  },
+} as const;
+
 export interface ThreadStatusPill {
   label:
     | "Working"
@@ -122,15 +151,6 @@ export interface ThreadStatusPill {
   dotClass: string;
   pulse: boolean;
 }
-
-const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["label"], number> = {
-  "Pending Approval": 5,
-  "Awaiting Input": 4,
-  Working: 3,
-  Connecting: 3,
-  "Plan Ready": 2,
-  Completed: 1,
-};
 
 type ThreadStatusInput = Pick<
   SidebarThreadSummary,
@@ -246,6 +266,39 @@ export function hasUnseenCompletion(thread: ThreadStatusInput): boolean {
   const lastVisitedAt = Date.parse(thread.lastVisitedAt);
   if (Number.isNaN(lastVisitedAt)) return true;
   return completedAt > lastVisitedAt;
+}
+
+/**
+ * The branch a workspace card shows: the fresh VCS status's ref, else its
+ * detached HEAD, else the branch the thread recorded. A stale passive summary is
+ * ignored rather than presented as the current branch.
+ */
+export function resolveWorkspaceBranchLabel(
+  status: VcsStatusResult | VcsStatusSummary | null | undefined,
+  fallbackBranch: string | null,
+): string | null {
+  if (status && !("stale" in status && status.stale)) {
+    const liveBranch = status.refName ?? ("detachedHead" in status ? status.detachedHead : null);
+    if (liveBranch) {
+      return liveBranch;
+    }
+  }
+  return fallbackBranch;
+}
+
+/** Whether the checkout has uncommitted changes, per a fresh (not stale) status. */
+export function resolveWorkspaceDirty(
+  status: VcsStatusResult | VcsStatusSummary | null | undefined,
+): boolean {
+  return Boolean(status && !("stale" in status && status.stale) && status.hasWorkingTreeChanges);
+}
+
+/** Line 2 hides the branch when it repeats the title (the primary card's title is its branch). */
+export function shouldShowWorkspaceBranchText(
+  branch: string | null,
+  title: string,
+): branch is string {
+  return branch !== null && branch !== title;
 }
 
 export function shouldClearThreadSelectionOnMouseDown(target: HTMLElement | null): boolean {
@@ -411,35 +464,16 @@ export function isContextMenuPointerDown(input: {
   return input.isMac && input.button === 0 && input.ctrlKey;
 }
 
-export function resolveThreadRowClassName(input: {
-  isActive: boolean;
-  isSelected: boolean;
-}): string {
-  const baseClassName =
-    "h-6 w-full translate-x-0 cursor-pointer justify-start px-2 text-left text-[13px] select-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring sm:h-7";
+/** Where a menu opened from the keyboard or a button appears: the element's bottom-left. */
+export function contextMenuAnchorForRect(rect: Pick<DOMRect, "left" | "bottom">): {
+  x: number;
+  y: number;
+} {
+  return { x: Math.round(rect.left), y: Math.round(rect.bottom) };
+}
 
-  if (input.isSelected && input.isActive) {
-    return cn(
-      baseClassName,
-      "bg-primary/22 text-foreground font-medium hover:bg-primary/26 hover:text-foreground dark:bg-primary/30 dark:hover:bg-primary/36",
-    );
-  }
-
-  if (input.isSelected) {
-    return cn(
-      baseClassName,
-      "bg-primary/15 text-foreground hover:bg-primary/19 hover:text-foreground dark:bg-primary/22 dark:hover:bg-primary/28",
-    );
-  }
-
-  if (input.isActive) {
-    return cn(
-      baseClassName,
-      "bg-accent/85 text-foreground font-medium hover:bg-accent hover:text-foreground dark:bg-accent/55 dark:hover:bg-accent/70",
-    );
-  }
-
-  return cn(baseClassName, "text-foreground/80 hover:bg-accent hover:text-foreground");
+export function isWorkspaceThreadRunning(thread: Pick<ThreadStatusInput, "session">): boolean {
+  return thread.session?.status === "running";
 }
 
 export function resolveThreadStatusPill(input: {
@@ -448,39 +482,19 @@ export function resolveThreadStatusPill(input: {
   const { thread } = input;
 
   if (thread.hasPendingApprovals) {
-    return {
-      label: "Pending Approval",
-      colorClass: "text-amber-600 dark:text-amber-300/90",
-      dotClass: "bg-amber-500 dark:bg-amber-300/90",
-      pulse: false,
-    };
+    return { label: "Pending Approval", ...STATUS_TONES.approval, pulse: false };
   }
 
   if (thread.hasPendingUserInput) {
-    return {
-      label: "Awaiting Input",
-      colorClass: "text-indigo-600 dark:text-indigo-300/90",
-      dotClass: "bg-indigo-500 dark:bg-indigo-300/90",
-      pulse: false,
-    };
+    return { label: "Awaiting Input", ...STATUS_TONES.input, pulse: false };
   }
 
-  if (thread.session?.status === "running") {
-    return {
-      label: "Working",
-      colorClass: "text-sky-600 dark:text-sky-300/80",
-      dotClass: "bg-sky-500 dark:bg-sky-300/80",
-      pulse: true,
-    };
+  if (isWorkspaceThreadRunning(thread)) {
+    return { label: "Working", ...STATUS_TONES.working, pulse: true };
   }
 
   if (thread.session?.status === "starting") {
-    return {
-      label: "Connecting",
-      colorClass: "text-sky-600 dark:text-sky-300/80",
-      dotClass: "bg-sky-500 dark:bg-sky-300/80",
-      pulse: true,
-    };
+    return { label: "Connecting", ...STATUS_TONES.working, pulse: true };
   }
 
   const hasPlanReadyPrompt =
@@ -489,42 +503,295 @@ export function resolveThreadStatusPill(input: {
     isLatestTurnSettled(thread.latestTurn, thread.session) &&
     thread.hasActionableProposedPlan;
   if (hasPlanReadyPrompt) {
-    return {
-      label: "Plan Ready",
-      colorClass: "text-violet-600 dark:text-violet-300/90",
-      dotClass: "bg-violet-500 dark:bg-violet-300/90",
-      pulse: false,
-    };
+    return { label: "Plan Ready", ...STATUS_TONES.plan, pulse: false };
   }
 
   if (hasUnseenCompletion(thread)) {
-    return {
-      label: "Completed",
-      colorClass: "text-emerald-600 dark:text-emerald-300/90",
-      dotClass: "bg-emerald-500 dark:bg-emerald-300/90",
-      pulse: false,
-    };
+    return { label: "Completed", ...STATUS_TONES.completed, pulse: false };
   }
 
   return null;
 }
 
-export function resolveProjectStatusIndicator(
-  statuses: ReadonlyArray<ThreadStatusPill | null>,
-): ThreadStatusPill | null {
-  let highestPriorityStatus: ThreadStatusPill | null = null;
+export type WorkspaceCardStatusKind =
+  | "approval"
+  | "input"
+  | "working"
+  | "failed"
+  | "plan"
+  | "done"
+  | "idle";
 
+export interface WorkspaceCardStatus {
+  readonly kind: WorkspaceCardStatusKind;
+  /** Accessible name and tooltip of the glyph. */
+  readonly label: string;
+  readonly colorClass: string;
+}
+
+/**
+ * The card glyph states from the spec's status table. `resolveWorkspaceCardStatus`
+ * returns these exact objects, so memoised components compare them by identity.
+ */
+export const WORKSPACE_CARD_STATUS = {
+  approval: {
+    kind: "approval",
+    label: "Needs approval",
+    colorClass: STATUS_TONES.approval.colorClass,
+  },
+  input: {
+    kind: "input",
+    label: "Waiting for your answer",
+    colorClass: STATUS_TONES.input.colorClass,
+  },
+  working: { kind: "working", label: "Working", colorClass: STATUS_TONES.working.colorClass },
+  connecting: { kind: "working", label: "Connecting", colorClass: STATUS_TONES.working.colorClass },
+  failed: { kind: "failed", label: "Failed", colorClass: "text-destructive" },
+  plan: { kind: "plan", label: "Plan ready", colorClass: STATUS_TONES.plan.colorClass },
+  done: {
+    kind: "done",
+    label: "Finished, not opened yet",
+    colorClass: STATUS_TONES.completed.colorClass,
+  },
+  idle: { kind: "idle", label: "Idle", colorClass: "text-muted-foreground" },
+} as const satisfies Record<string, WorkspaceCardStatus>;
+
+export type WorkspaceCardStatusInput = Omit<ThreadStatusInput, "lastVisitedAt"> &
+  Pick<SidebarThreadSummary, "unresolvedDelivery">;
+
+/**
+ * A card's glyph, wrapping the thread pill so the Agents view keeps its labels.
+ * First match wins: approval, input, working/connecting, failed (session error,
+ * refused delivery, or an unseen turn that errored — the pill calls that
+ * "Completed"), plan ready, finished-not-opened, idle.
+ */
+export function resolveWorkspaceCardStatus(
+  thread: WorkspaceCardStatusInput,
+  lastVisitedAt: string | null | undefined,
+): WorkspaceCardStatus {
+  const visited: ThreadStatusInput = lastVisitedAt ? { ...thread, lastVisitedAt } : thread;
+  const pill = resolveThreadStatusPill({ thread: visited });
+  switch (pill?.label) {
+    case "Pending Approval":
+      return WORKSPACE_CARD_STATUS.approval;
+    case "Awaiting Input":
+      return WORKSPACE_CARD_STATUS.input;
+    case "Working":
+      return WORKSPACE_CARD_STATUS.working;
+    case "Connecting":
+      return WORKSPACE_CARD_STATUS.connecting;
+    default:
+      break;
+  }
+  if (
+    thread.session?.status === "error" ||
+    thread.unresolvedDelivery?.state === "failed" ||
+    (thread.latestTurn?.state === "error" && hasUnseenCompletion(visited))
+  ) {
+    return WORKSPACE_CARD_STATUS.failed;
+  }
+  if (pill?.label === "Plan Ready") {
+    return WORKSPACE_CARD_STATUS.plan;
+  }
+  if (pill?.label === "Completed") {
+    return WORKSPACE_CARD_STATUS.done;
+  }
+  return WORKSPACE_CARD_STATUS.idle;
+}
+
+const WORKSPACE_CARD_STATUS_PRIORITY: Record<WorkspaceCardStatusKind, number> = {
+  approval: 7,
+  input: 6,
+  working: 5,
+  failed: 4,
+  plan: 3,
+  done: 2,
+  idle: 1,
+};
+
+/** The more urgent of two statuses; the first wins ties. */
+export function pickMoreUrgentWorkspaceCardStatus(
+  left: WorkspaceCardStatus,
+  right: WorkspaceCardStatus,
+): WorkspaceCardStatus {
+  return WORKSPACE_CARD_STATUS_PRIORITY[right.kind] > WORKSPACE_CARD_STATUS_PRIORITY[left.kind]
+    ? right
+    : left;
+}
+
+/**
+ * The most urgent non-idle status, for summaries of hidden cards (a collapsed
+ * project, the Show more row). Null when every card is idle.
+ */
+export function resolveHighestWorkspaceCardStatus(
+  statuses: Iterable<WorkspaceCardStatus>,
+): WorkspaceCardStatus | null {
+  let highest: WorkspaceCardStatus | null = null;
   for (const status of statuses) {
-    if (status === null) continue;
-    if (
-      highestPriorityStatus === null ||
-      THREAD_STATUS_PRIORITY[status.label] > THREAD_STATUS_PRIORITY[highestPriorityStatus.label]
-    ) {
-      highestPriorityStatus = status;
+    if (status.kind === "idle") continue;
+    highest = highest === null ? status : pickMoreUrgentWorkspaceCardStatus(highest, status);
+  }
+  return highest;
+}
+
+export function createWorkspaceStatusLookup(
+  threads: readonly SidebarThreadSummary[],
+  visits: readonly (string | null | undefined)[],
+) {
+  const visitsByKey = new Map(
+    threads.map(
+      (thread, index) =>
+        [
+          scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
+          visits[index] ?? null,
+        ] as const,
+    ),
+  );
+  const lastVisitedAt = (thread: SidebarThreadSummary) =>
+    visitsByKey.get(scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)));
+  const statusOf = (thread: SidebarThreadSummary) =>
+    resolveWorkspaceCardStatus(thread, lastVisitedAt(thread));
+  return { lastVisitedAt, statusOf };
+}
+
+type WorkspaceChatThread = WorkspaceCardStatusInput & {
+  readonly environmentId: string;
+  readonly projectId: string;
+  readonly kind?: "default" | "workspace" | "panel" | undefined;
+  readonly worktreePath: string | null;
+  readonly archivedAt: string | null;
+};
+
+export interface WorkspaceChatSummary {
+  readonly count: number;
+  /** The most urgent status among the chats, idle included; shown as the row's glyph. */
+  readonly status: WorkspaceCardStatus;
+}
+
+/**
+ * The checkout a chat runs in. Panels copy their host's worktree path, so a
+ * worktree card matches on it; a panel without a path runs in its project's main
+ * checkout and counts on the primary card.
+ */
+export function workspaceCheckoutKey(input: {
+  readonly environmentId: string;
+  readonly projectId: string;
+  readonly worktreePath: string | null;
+}): string {
+  return input.worktreePath === null
+    ? `main\u0000${input.environmentId}\u0000${input.projectId}`
+    : `worktree\u0000${input.environmentId}\u0000${input.worktreePath}`;
+}
+
+/** Counts unarchived panel chats per checkout with their most urgent status. O(threads). */
+export function summarizeWorkspaceChats<T extends WorkspaceChatThread>(
+  threads: readonly T[],
+  resolveLastVisitedAt: (thread: T) => string | null | undefined,
+): ReadonlyMap<string, WorkspaceChatSummary> {
+  const summaries = new Map<string, { count: number; status: WorkspaceCardStatus }>();
+  for (const thread of threads) {
+    if (thread.kind !== "panel" || thread.archivedAt !== null) continue;
+    const key = workspaceCheckoutKey(thread);
+    const status = resolveWorkspaceCardStatus(thread, resolveLastVisitedAt(thread));
+    const current = summaries.get(key);
+    if (current === undefined) {
+      summaries.set(key, { count: 1, status });
+    } else {
+      current.count += 1;
+      current.status = pickMoreUrgentWorkspaceCardStatus(current.status, status);
     }
   }
+  return summaries;
+}
 
-  return highestPriorityStatus;
+type WorktreeSessionThread = Pick<
+  WorkspaceChatThread,
+  "environmentId" | "projectId" | "worktreePath" | "archivedAt"
+> &
+  Pick<ThreadStatusInput, "session">;
+
+/**
+ * Whether a provider session is running in a worktree card's checkout: the
+ * card's own thread, or an unarchived chat open in the same worktree (its
+ * "N more chats"). Deletion waits for both `running` and `starting` sessions,
+ * matching the server's removal refusal. The Working pill still uses
+ * `isWorkspaceThreadRunning` (session status `running`).
+ *
+ * Archived chats are skipped, as in `summarizeWorkspaceChats`, even though
+ * archiving does not stop a session (the engine only records `thread.archived`),
+ * so an archived chat can leave an idle session in the worktree. That is safe:
+ * archiving requires no active turn, the sidebar offers no way to stop a chat it
+ * hides, and removing the worktree stops any idle session left behind (the
+ * server's `stop_session_if_current` in `worktree_runtime.rs`).
+ *
+ * O(threads), so run it when a menu opens or memoize it, never on every render.
+ * A thread without a worktree has none.
+ */
+export function isWorktreeSessionRunning<T extends WorktreeSessionThread>(
+  card: T,
+  threads: Iterable<T>,
+): boolean {
+  if (card.worktreePath === null) return false;
+  if (isWorkspaceThreadRunning(card) || card.session?.status === "starting") return true;
+  const key = workspaceCheckoutKey(card);
+  for (const thread of threads) {
+    if (
+      thread.archivedAt === null &&
+      (isWorkspaceThreadRunning(thread) || thread.session?.status === "starting") &&
+      workspaceCheckoutKey(thread) === key
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * A card's surface for its state, per States.dc.html, refined by the user on
+ * 2026-09-25: every card is outlined so neighbouring cards read as separate.
+ * Idle cards use the standard border token, the active card a stronger neutral
+ * border, and multi-selected cards a tinted one; the orange ring stays for focus.
+ */
+export function resolveWorkspaceCardClassName(input: {
+  isActive: boolean;
+  isSelected: boolean;
+}): string {
+  const base = "w-full rounded-md border select-none";
+  if (input.isSelected && input.isActive) {
+    return cn(
+      base,
+      "border-primary/60 bg-primary/22 hover:bg-primary/26 dark:bg-primary/30 dark:hover:bg-primary/36",
+    );
+  }
+  if (input.isSelected) {
+    return cn(
+      base,
+      "border-primary/40 bg-primary/15 hover:bg-primary/19 dark:bg-primary/22 dark:hover:bg-primary/28",
+    );
+  }
+  if (input.isActive) {
+    return cn(base, "border-foreground/25 bg-accent");
+  }
+  return cn(base, "border-border hover:bg-accent/60");
+}
+
+/** Shift+F10 or the Menu key: the platform shortcuts for a focused element's menu. */
+export function isContextMenuShortcut(
+  event: Pick<KeyboardEvent, "key" | "shiftKey" | "ctrlKey" | "altKey" | "metaKey">,
+): boolean {
+  if (event.key === "ContextMenu") {
+    return true;
+  }
+  return event.key === "F10" && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
+}
+
+/**
+ * Chromium and WebView2 follow Shift+F10 and the Menu key with a contextmenu
+ * event; one arriving within this window after a keyboard-opened menu is ignored.
+ */
+export function isKeyboardContextMenuEcho(openedAtMs: number, nowMs: number): boolean {
+  const elapsedMs = nowMs - openedAtMs;
+  return elapsedMs >= 0 && elapsedMs < KEYBOARD_CONTEXT_MENU_ECHO_MS;
 }
 
 export function getVisibleThreadsForProject<T extends Pick<Thread, "id">>(input: {
@@ -674,22 +941,28 @@ const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
 /**
- * Coarse elapsed-time label for the running/starting agent sub-row (Orca's
- * "Claude Code – Running · 1h"). Prefers `session.updatedAt`, falling back to
- * `latestTurn.startedAt`. Returns `null` when neither timestamp is usable.
+ * The instant a card's age counts from: the running turn's start while the agent
+ * works, else the latest user message, update or creation, as the rows did.
  */
-export function formatSessionDuration(input: {
-  readonly sessionUpdatedAt?: string | null | undefined;
-  readonly latestTurnStartedAt?: string | null | undefined;
-  readonly now?: number;
-}): string | null {
-  const iso = input.sessionUpdatedAt ?? input.latestTurnStartedAt ?? null;
+export function resolveWorkspaceCardAgeSource(
+  thread: Pick<
+    SidebarThreadSummary,
+    "latestTurn" | "latestUserMessageAt" | "updatedAt" | "createdAt"
+  >,
+  isWorking: boolean,
+): string | null {
+  if (isWorking && thread.latestTurn?.startedAt) {
+    return thread.latestTurn.startedAt;
+  }
+  return thread.latestUserMessageAt ?? thread.updatedAt ?? thread.createdAt ?? null;
+}
+
+/** A compact age for card line 3: now, 5m, 3h, 2d. Null when the instant is unusable. */
+export function formatCompactAge(iso: string | null | undefined, now: number): string | null {
   if (!iso) return null;
   const startedAt = Date.parse(iso);
   if (Number.isNaN(startedAt)) return null;
-  const now = input.now ?? Date.now();
   const elapsedMs = Math.max(0, now - startedAt);
-
   if (elapsedMs < MINUTE_MS) return "now";
   if (elapsedMs < HOUR_MS) return `${Math.floor(elapsedMs / MINUTE_MS)}m`;
   if (elapsedMs < DAY_MS) return `${Math.floor(elapsedMs / HOUR_MS)}h`;

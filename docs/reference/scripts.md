@@ -91,6 +91,18 @@ macOS `/tmp`; non-test commands and implicit Cargo targets are unchanged.
 Exact subprocess tests may use `--test-threads=1` only inside an isolated child
 process that intentionally owns process-global state.
 
+The two entry points compile web tests differently. `vp run test` runs each
+package's own configuration; `apps/web`'s applies the React Compiler to Vite's
+client environment, so web tests marked `// @vitest-environment happy-dom` run
+compiled, as in the client build. Node-environment web tests run in Vite's `ssr`
+environment, which the compiler preset skips, so they are uncompiled. Root
+`vp test` uses the root configuration, which runs no React plugins, so no web
+test is compiled there, and `vp run test:coverage:ts` measures source rather
+than the compiler's generated memoization code.
+`apps/web/src/reactCompiler.test.tsx` guards the compiled lane and is excluded
+from root runs; see
+[Web unit tests and the React Compiler](../testing/README.md#web-unit-tests-and-the-react-compiler).
+
 `node scripts/run-local-vp.mjs <vp arguments>` runs the checkout-local Vite+
 installation from `node_modules/vite-plus` with the current Node, ignoring any
 globally installed `vp`. Use it wherever a global `vp` might shadow the
@@ -162,6 +174,17 @@ preservation in the documented native-architecture containers.
 
 ## Repository Maintenance
 
+- `cargo run -p bibcode-server --example remote_update_fake_host -- <base-dir> <port 4800-4899> <server-version> [label]`:
+  development-only, loopback-only scripted interactive host for remote-update
+  live checks (default label: `Fake-host`). Stdin accepts one JSON object per
+  line: `{"status":{...}}` replaces the camelCase update status,
+  `{"restart":{"serverVersion":"9.9.1","afterMs":2000}}` restarts on the same
+  data root and port with a fresh boot ID and idle status (`afterMs` defaults to
+  2000), `{"stop":true}` stops serving permanently while the process stays alive,
+  and `{"exit":true}` or EOF shuts down and exits. Pair through
+  `bibcode pairing offer --base-dir <base-dir> --endpoint http://127.0.0.1:<port> --reach this-computer --json`;
+  the example prints only a `started` JSON event with `port`, `serverVersion`,
+  and `bootId`, without pairing credentials.
 - `bash scripts/test-linux-git-compatibility.sh TEST_BINARY [IMAGE ...]`: run the
   compiled Linux Git-runner regression in disposable Debian, Ubuntu, Fedora,
   and Arch containers. Build the executable on the Ubuntu 22.04 glibc baseline;
@@ -193,6 +216,12 @@ preservation in the documented native-architecture containers.
   lock automatically.
 - `vp run measure:desktop-runtime -- ...`: capture startup, memory, and
   process-tree measurements.
+- `node scripts/throttle-proxy.ts --listen <host:port> --target <host:port> --control <host:port> [--down <bytes/s>] [--up <bytes/s>]`:
+  development-only throttling TCP proxy for the
+  [slow-link liveness scenario](../testing/cross-platform-validation.md#slow-link-liveness-scenario).
+  Each direction is paced separately with backpressure; `GET /set?down=&up=&freeze=0|1`
+  on the control address changes the link (0 bytes/s is unlimited) and `GET /state`
+  reports it.
 - `node scripts/measure-vcs-runtime.ts`: on Windows, build and run the
   current-source server VCS idle-process measurement plus the production-Atom
   foreground queue benchmark. It defaults to 600 seconds and writes all

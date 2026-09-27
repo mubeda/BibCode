@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -19,7 +19,9 @@ use crate::{
         UnavailableDesktopUiProcessObserver,
     },
     http, logging,
-    maintenance::{UpdateMaintenance, maintenance_routes_enabled},
+    maintenance::{
+        UpdateMaintenance, maintenance_routes_enabled, update_maintenance_owner_enabled,
+    },
     persistence::{
         Database, Repositories, StatePaths, StorageInstanceId, StoreRuntimeGuard, prepare_store,
     },
@@ -53,14 +55,17 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             .storage_instance_id
             .expect("a running server has a prepared persistent store")
             .to_string(),
+        "bootId": config.boot_id.map(|id| id.to_string()),
         "remoteUpdateSupport": config.remote_update_support,
         "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
         "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
         "capabilities": {
             "repositoryIdentity": true,
             "remoteUpdateControl": true,
+            "remoteUpdateProgress": true,
             "terminalOrderedInput": true,
             "terminalSizeOwnership": true,
+            "vcsCloneReattach": true,
         },
     })
 }
@@ -72,6 +77,7 @@ pub struct ServerHandle {
     database: Option<Database>,
     _store_runtime_guard: StoreRuntimeGuard,
     _production_runtime: Option<Arc<ProductionRuntime>>,
+    update_maintenance: Option<Arc<UpdateMaintenance>>,
     _log_sink: Arc<logging::LogSinkLease>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
@@ -224,18 +230,13 @@ impl ServerRuntime {
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
         config.storage_instance_id = Some(prepared_store.storage_instance_id);
+        config.boot_id = Some(uuid::Uuid::new_v4());
         let storage_instance_id = prepared_store.storage_instance_id;
         let store_classification = prepared_store.classification;
         let database = prepared_store.database;
-        let bind_address = format!("{}:{}", config.host, config.port);
-        let listener = TcpListener::bind((config.host.as_str(), config.port))
-            .await
-            .map_err(|source| ServerError::Bind {
-                address: bind_address.clone(),
-                source,
-            })?;
+        let listener = bind_listener(&config.host, config.port, config.listener_bind_retry).await?;
         let local_addr = listener.local_addr().map_err(|source| ServerError::Bind {
-            address: bind_address,
+            address: format!("{}:{}", config.host, config.port),
             source,
         })?;
         let state_directory = config.base_dir.join(if config.dev_url.is_some() {
@@ -380,7 +381,7 @@ impl ServerRuntime {
         };
         let shutdown = CancellationToken::new();
         let admission_gate = rpc_registry.admission_gate();
-        let update_maintenance = if maintenance_routes_enabled(&config) {
+        let update_maintenance_owner = if update_maintenance_owner_enabled(&config) {
             production_runtime.as_ref().map(|runtime| {
                 UpdateMaintenance::new(
                     admission_gate.clone(),
@@ -395,6 +396,12 @@ impl ServerRuntime {
                     config.update_maintenance_lease,
                 )
             })
+        } else {
+            None
+        };
+        // HTTP gets the owner only on a loopback or desktop-owned WSL bind.
+        let update_maintenance = if maintenance_routes_enabled(&config) {
+            update_maintenance_owner.clone()
         } else {
             None
         };
@@ -434,10 +441,76 @@ impl ServerRuntime {
             database: Some(database),
             _store_runtime_guard: store_runtime_guard,
             _production_runtime: production_runtime,
+            update_maintenance: update_maintenance_owner,
             _log_sink: log_sink,
             shutdown,
             task: Some(task),
         })
+    }
+}
+
+/// First pause before retrying a listener bind whose port is still in use.
+const LISTENER_BIND_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
+/// The pause doubles up to this cap.
+const LISTENER_BIND_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Binds the server listener on `host:port`.
+///
+/// With a `retry` window, a bind that fails because the port is still in use
+/// is retried with backoff until the window ends, so a server restarted on
+/// the port its predecessor has only just released does not fail on a socket
+/// that is still closing. Any other failure, or a port still in use when the
+/// window ends, returns that last bind error. Without a window the first
+/// failure is final.
+async fn bind_listener(
+    host: &str,
+    port: u16,
+    retry: Option<Duration>,
+) -> Result<TcpListener, ServerError> {
+    let address = format!("{host}:{port}");
+    let started = tokio::time::Instant::now();
+    let mut backoff = LISTENER_BIND_RETRY_INITIAL_BACKOFF;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let source = match TcpListener::bind((host, port)).await {
+            Ok(listener) => {
+                if attempts > 1 {
+                    tracing::info!(
+                        %address,
+                        attempts,
+                        elapsed = ?started.elapsed(),
+                        "bound the server listener once its port was released"
+                    );
+                }
+                return Ok(listener);
+            }
+            Err(source) => source,
+        };
+        let Some(window) = retry.filter(|_| source.kind() == std::io::ErrorKind::AddrInUse) else {
+            return Err(ServerError::Bind { address, source });
+        };
+        let elapsed = started.elapsed();
+        let Some(remaining) = window.checked_sub(elapsed).filter(|left| !left.is_zero()) else {
+            tracing::warn!(
+                %address,
+                attempts,
+                ?elapsed,
+                ?window,
+                "the server listener port stayed in use for the whole bind retry window"
+            );
+            return Err(ServerError::Bind { address, source });
+        };
+        tracing::debug!(
+            %address,
+            attempt = attempts,
+            ?elapsed,
+            "the server listener port is still in use; retrying the bind"
+        );
+        tokio::time::sleep(backoff.min(remaining)).await;
+        backoff = backoff
+            .saturating_mul(2)
+            .min(LISTENER_BIND_RETRY_MAX_BACKOFF);
     }
 }
 
@@ -600,6 +673,14 @@ impl ServerHandle {
         self.startup_access.as_ref()
     }
 
+    /// The runtime's update-maintenance owner, for the desktop host's in-process
+    /// protection. `Some` for every desktop-mode production runtime with a bootstrap
+    /// token, whatever its bind; the HTTP routes may still be hidden.
+    #[must_use]
+    pub fn update_maintenance(&self) -> Option<Arc<UpdateMaintenance>> {
+        self.update_maintenance.clone()
+    }
+
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
@@ -614,6 +695,7 @@ impl ServerHandle {
             Ok(result) => result.map_err(ServerError::Serve),
             Err(error) => Err(ServerError::Join(error)),
         };
+        drop(self.update_maintenance.take());
         drop(self._production_runtime.take());
         if let Some(database) = self.database.take() {
             database.close().await;
@@ -706,6 +788,10 @@ impl Drop for ServerHandle {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    use crate::test_support::hermetic_providers;
+
     use super::*;
 
     #[test]
@@ -739,12 +825,119 @@ mod tests {
         );
     }
 
+    /// Holds a loopback port the way a predecessor's listener would.
+    fn hold_loopback_port() -> (std::net::TcpListener, u16) {
+        let holder = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("a loopback port should bind");
+        let port = holder.local_addr().expect("held port address").port();
+        (holder, port)
+    }
+
+    fn release_after(
+        holder: std::net::TcpListener,
+        delay: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            drop(holder);
+        })
+    }
+
+    fn assert_address_in_use(error: &ServerError, port: u16) {
+        match error {
+            ServerError::Bind { address, source } => {
+                assert_eq!(address, &format!("127.0.0.1:{port}"));
+                assert_eq!(source.kind(), std::io::ErrorKind::AddrInUse);
+            }
+            other => panic!("expected an address-in-use Bind error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bind_retry_window_outlasts_a_port_released_within_it() {
+        let (holder, port) = hold_loopback_port();
+        let release = release_after(holder, Duration::from_millis(200));
+
+        let listener = bind_listener("127.0.0.1", port, Some(Duration::from_secs(3)))
+            .await
+            .expect("the bind should succeed once the port is released");
+
+        assert_eq!(listener.local_addr().expect("bound address").port(), port);
+        release.join().expect("the holder thread should finish");
+    }
+
+    #[tokio::test]
+    async fn a_bind_retry_window_ends_with_the_bind_error_while_the_port_stays_held() {
+        let (_holder, port) = hold_loopback_port();
+        let window = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+
+        let error = bind_listener("127.0.0.1", port, Some(window))
+            .await
+            .expect_err("a port held throughout the window must fail the bind");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= window,
+            "the bind gave up after {elapsed:?}, before its {window:?} window ended"
+        );
+        assert_address_in_use(&error, port);
+    }
+
+    #[tokio::test]
+    async fn without_a_bind_retry_window_the_first_failure_is_final() {
+        let (holder, port) = hold_loopback_port();
+        // The port frees half a second in; a bind that retried would succeed.
+        let release = release_after(holder, Duration::from_millis(500));
+
+        let error = bind_listener("127.0.0.1", port, None)
+            .await
+            .expect_err("without a window a held port must fail the bind at once");
+
+        assert!(
+            !release.is_finished(),
+            "the bind should fail while the port is still held"
+        );
+        assert_address_in_use(&error, port);
+        release.join().expect("the holder thread should finish");
+    }
+
+    #[tokio::test]
+    async fn server_start_applies_the_configured_bind_retry_window() {
+        let (_holder, port) = hold_loopback_port();
+        let temp = tempfile::tempdir().expect("temporary base directory");
+        let window = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+
+        let error = match ServerRuntime::start_with_registry(
+            ServerConfig::new(temp.path())
+                .with_bind("127.0.0.1", port)
+                .with_listener_bind_retry(window),
+            RpcRegistry::empty(),
+        )
+        .await
+        {
+            Ok(handle) => {
+                drop(handle);
+                panic!("a port held throughout the window must fail startup");
+            }
+            Err(error) => error,
+        };
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= window,
+            "startup gave up after {elapsed:?}, before its {window:?} bind window ended"
+        );
+        assert_address_in_use(&error, port);
+    }
+
     #[tokio::test]
     async fn loopback_serve_has_no_startup_pairing_link() {
         let temp = tempfile::tempdir().expect("temporary base directory");
-        let handle = ServerRuntime::start(ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0))
-            .await
-            .expect("server starts");
+        let config = ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let handle = ServerRuntime::start(config).await.expect("server starts");
         let access = handle.startup_access().expect("web mode startup access");
         assert_eq!(access.pairing_link, None);
         handle.shutdown();
@@ -764,10 +957,11 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().expect("temporary base directory");
-        let handle =
-            ServerRuntime::start(ServerConfig::new(temp.path()).with_bind(ip.to_string(), 0))
-                .await
-                .expect("server starts on the routable address");
+        let config = ServerConfig::new(temp.path()).with_bind(ip.to_string(), 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let handle = ServerRuntime::start(config)
+            .await
+            .expect("server starts on the routable address");
         let access = handle.startup_access().expect("web mode startup access");
         let link = access
             .pairing_link
@@ -791,6 +985,7 @@ mod tests {
         let disabled = {
             let mut config = ServerConfig::new(second.path()).with_bind(ip.to_string(), 0);
             config.startup_pairing_offer = false;
+            hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
             ServerRuntime::start(config)
                 .await
                 .expect("server starts without an offer")
@@ -811,14 +1006,22 @@ mod tests {
         config.storage_instance_id = Some(crate::persistence::StorageInstanceId::from_uuid(
             uuid::Uuid::nil(),
         ));
+        config.boot_id = Some(uuid::Uuid::nil());
         let descriptor = connect_environment_descriptor(&config);
+        assert_eq!(descriptor["bootId"], "00000000-0000-0000-0000-000000000000");
         assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
         assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
+        assert_eq!(descriptor["capabilities"]["remoteUpdateProgress"], true);
         assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
         assert_eq!(descriptor["capabilities"]["terminalSizeOwnership"], true);
+        assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],
-            serde_json::json!({ "installMode": "manual", "reason": "manual-update-required" })
+            serde_json::json!({
+                "installMode": "manual",
+                "reason": "manual-update-required",
+                "installKind": "unknown"
+            })
         );
     }
 
@@ -866,6 +1069,7 @@ mod tests {
         let production_state = tempfile::tempdir().expect("production state directory");
         let production_config =
             ServerConfig::new(production_state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&production_config.state_dir(), json!({}));
         let production = ServerRuntime::start(production_config)
             .await
             .expect("production server should start");

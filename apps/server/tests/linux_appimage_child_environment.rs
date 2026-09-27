@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::{collections::BTreeMap, time::Duration};
 
 use bibcode_server::{
@@ -175,7 +178,7 @@ fn extracted_appdir_isolates_real_child_commands() {
     let bin = appdir.join("usr/bin");
     std::fs::create_dir_all(&bin).unwrap();
     let executable = bin.join("appimage-test");
-    std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    executable_fixture::copy_executable(&std::env::current_exe().unwrap(), &executable);
     let apprun = appdir.join("AppRun");
     std::fs::write(&apprun, "fixture launcher").unwrap();
     for case in ["unset", "empty", "missing-launcher"] {

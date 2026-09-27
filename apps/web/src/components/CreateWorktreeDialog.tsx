@@ -283,8 +283,8 @@ export function CreateWorktreeDialog({
   useEffect(() => {
     const wasEnabled = refsEnabledRef.current;
     refsEnabledRef.current = refsEnabled;
-    if (refsEnabled && !wasEnabled) refsQuery.refresh();
-  }, [refsEnabled, refsQuery.refresh]);
+    if (refsEnabled && !wasEnabled) refsQuery.revalidate();
+  }, [refsEnabled, refsQuery.revalidate]);
   // TODO(orca-port): confirm VcsListRefsResult field name is `refs`.
   const refs: ReadonlyArray<RefLike> = refsQuery.data?.refs ?? [];
   const exactBranchRef = useMemo(() => findExactRefMatch(refs, sourceText), [refs, sourceText]);

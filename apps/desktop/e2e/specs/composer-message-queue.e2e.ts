@@ -82,7 +82,7 @@ async function ensureFixtureProjectImported(): Promise<void> {
 async function openInitialCodexDraft(): Promise<void> {
   const projectSelector = `//button[@data-sidebar="menu-button"][.//span[normalize-space()="${desktopUiFixture.projectName}"]]`;
   const primaryWorkspace = browser.$(
-    '//a[@data-thread-item="true"][.//span[normalize-space()="main"]]',
+    '//*[@data-thread-item="true"][.//span[normalize-space()="main"]]',
   );
   if (!(await primaryWorkspace.isDisplayed())) {
     let projectClicked = false;

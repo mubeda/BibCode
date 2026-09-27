@@ -552,6 +552,35 @@ describe("Add Project presentational steps", () => {
     expect(buttonWithText("Clone").disabled).toBe(false);
   });
 
+  it("keeps Cancel while reconnecting and announces the reconnecting line", async () => {
+    const onCancel = vi.fn();
+    const line =
+      "Lost the connection to Local Mac. The clone continues on the server; reconnecting…";
+    await mount(
+      <AddProjectCloneStep
+        {...cloneStepProps({ busy: true, progress: "reconnecting", notice: line, onCancel })}
+      />,
+    );
+
+    expect(buttonWithText("Cloning…").disabled).toBe(true);
+    expect(document.querySelector('[role="status"]')?.textContent).toBe(line);
+    await click(buttonWithText("Cancel clone"));
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows Cancelling… without a second Cancel while the server confirms", async () => {
+    const line = "The clone stops when Local Mac reconnects.";
+    await mount(
+      <AddProjectCloneStep
+        {...cloneStepProps({ busy: true, progress: "cancelling", notice: line })}
+      />,
+    );
+
+    expect(buttonWithText("Cancelling…").disabled).toBe(true);
+    expect(document.body.textContent).not.toContain("Cancel clone");
+    expect(document.querySelector('[role="status"]')?.textContent).toBe(line);
+  });
+
   it("shows BiBCode create copy and target summary", async () => {
     await mount(
       <AddProjectCreateStep

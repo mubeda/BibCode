@@ -1,5 +1,4 @@
 import type {
-  VcsRef,
   VcsStatusLocalResult,
   VcsStatusRemoteResult,
   VcsStatusResult,
@@ -9,8 +8,6 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   applyGitStatusStreamEvent,
   buildTemporaryWorktreeBranchName,
-  dedupeRemoteBranchesWithLocalMatches,
-  deriveLocalBranchNameFromRemoteRef,
   detectSourceControlProviderFromGitRemoteUrl,
   isTemporaryWorktreeBranch,
   mergeGitStatusParts,
@@ -43,15 +40,6 @@ const remoteStatus: VcsStatusRemoteResult = {
   pr: null,
 };
 
-function ref(input: Pick<VcsRef, "name"> & Partial<VcsRef>): VcsRef {
-  return {
-    current: false,
-    isDefault: false,
-    worktreePath: null,
-    ...input,
-  };
-}
-
 describe("branch names", () => {
   it("sanitizes branch fragments and supplies a non-empty fallback", () => {
     expect(sanitizeBranchFragment("  `Fix API!!!`  ")).toBe("fix-api");
@@ -75,13 +63,6 @@ describe("branch names", () => {
     ).toBe("feature/release-notes-4");
     expect(resolveAutoFeatureBranchName([], "   ")).toBe("feature/update");
     expect(resolveAutoFeatureBranchName([])).toBe("feature/update");
-  });
-
-  it("strips only a complete remote prefix", () => {
-    expect(deriveLocalBranchNameFromRemoteRef("origin/feature/demo")).toBe("feature/demo");
-    expect(deriveLocalBranchNameFromRemoteRef("main")).toBe("main");
-    expect(deriveLocalBranchNameFromRemoteRef("/main")).toBe("/main");
-    expect(deriveLocalBranchNameFromRemoteRef("origin/")).toBe("origin/");
   });
 });
 
@@ -147,32 +128,6 @@ describe("parseGitHubRepositoryNameWithOwnerFromRemoteUrl", () => {
   });
 });
 
-describe("remote branch deduplication", () => {
-  it("hides origin refs with local matches while preserving order and other remotes", () => {
-    const refs = [
-      ref({ name: "feature/demo", isRemote: false }),
-      ref({ name: "origin/feature/demo", isRemote: true, remoteName: "origin" }),
-      ref({ name: "upstream/feature/demo", isRemote: true, remoteName: "upstream" }),
-      ref({ name: "origin/feature/other", isRemote: true, remoteName: "origin" }),
-    ];
-
-    expect(dedupeRemoteBranchesWithLocalMatches(refs).map((entry) => entry.name)).toEqual([
-      "feature/demo",
-      "upstream/feature/demo",
-      "origin/feature/other",
-    ]);
-  });
-
-  it("retains malformed-but-typed remote names that have no local candidate", () => {
-    const refs = [
-      ref({ name: "main" }),
-      ref({ name: "origin/", isRemote: true, remoteName: "origin" }),
-      ref({ name: "upstream/other", isRemote: true, remoteName: "origin" }),
-    ];
-    expect(dedupeRemoteBranchesWithLocalMatches(refs)).toEqual(refs);
-  });
-});
-
 describe("source control provider delegation", () => {
   it("detects providers through the git-facing API", () => {
     expect(
@@ -208,6 +163,53 @@ describe("isTemporaryWorktreeBranch", () => {
 });
 
 describe("applyGitStatusStreamEvent", () => {
+  it.each(["absent", "unreadable", "untrusted"] as const)(
+    "preserves the %s repository reason through every event kind",
+    (repositoryUnavailableReason) => {
+      const local = {
+        isRepo: false,
+        repositoryUnavailableReason,
+        hasPrimaryRemote: false,
+        isDefaultRef: false,
+        refName: null,
+        hasWorkingTreeChanges: false,
+        workingTree: { files: [], insertions: 0, deletions: 0 },
+      };
+      const snapshot = applyGitStatusStreamEvent(null, { _tag: "snapshot", local, remote: null });
+      const updated = applyGitStatusStreamEvent(snapshot, { _tag: "localUpdated", local });
+      const remoteUpdated = applyGitStatusStreamEvent(updated, {
+        _tag: "remoteUpdated",
+        remote: null,
+      });
+      for (const status of [snapshot, updated, remoteUpdated]) {
+        expect(status).toHaveProperty("repositoryUnavailableReason", repositoryUnavailableReason);
+      }
+    },
+  );
+
+  it("keeps an omitted repository reason absent through every event kind and recovery", () => {
+    const snapshot = applyGitStatusStreamEvent(null, {
+      _tag: "snapshot",
+      local: localStatus,
+      remote: null,
+    });
+    const updated = applyGitStatusStreamEvent(snapshot, {
+      _tag: "localUpdated",
+      local: localStatus,
+    });
+    const remoteUpdated = applyGitStatusStreamEvent(updated, {
+      _tag: "remoteUpdated",
+      remote: remoteStatus,
+    });
+    const recovered = applyGitStatusStreamEvent(
+      { ...snapshot, isRepo: false, repositoryUnavailableReason: "unreadable" },
+      { _tag: "localUpdated", local: localStatus },
+    );
+    for (const status of [snapshot, updated, remoteUpdated, recovered]) {
+      expect(Object.hasOwn(status, "repositoryUnavailableReason")).toBe(false);
+    }
+  });
+
   it("treats a remote-only update as a repository when local state is missing", () => {
     const remote: VcsStatusRemoteResult = {
       hasUpstream: true,

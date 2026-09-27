@@ -26,7 +26,15 @@ vi.mock("../../../state/query", () => ({
       () => (atom ? { entries: h.entries, truncated: false } : null),
       [atom, revision],
     );
-    return { data, emission: { _tag: "Initial" }, error: null, isPending: false, refresh: publish };
+    return {
+      data,
+      emission: { _tag: "Initial" },
+      error: null,
+      isPending: false,
+      refresh: publish,
+      revalidate: publish,
+      requiresRetry: false,
+    };
   },
 }));
 import { PullRequestsFilters } from "./PullRequestsFilters";

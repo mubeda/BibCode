@@ -23,13 +23,17 @@ import {
   OrchestrationThreadActivity,
   ProviderInteractionMode,
   ProviderDriverKind,
-  PROVIDER_DISPLAY_NAMES,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   RuntimeMode,
 } from "@bibcode/contracts";
 import {
+  describeUnavailableEnvironment,
   selectQueuedMessages,
   deriveQueuedCardStatus,
+  deliveryOffersRetry,
+  deliveryProviderLabel,
+  findBlockingDelivery,
+  waitsBehind,
   shouldEnqueueOnSend,
   isQueuedTimelineMessage,
 } from "./ChatView.logic";
@@ -37,8 +41,8 @@ import { queuedMessageCache } from "./chat/queuedMessageCache";
 import { mergeQueuedMessageIntoDraft } from "./chat/restoreQueuedMessage";
 import type { TimestampFormat } from "@bibcode/contracts/settings";
 import {
-  connectionStatusText,
   type EnvironmentConnectionPresentation,
+  isConnectionUnavailable,
 } from "@bibcode/client-runtime/connection";
 import {
   scopedProjectKey,
@@ -143,7 +147,7 @@ import { isCommandPaletteOpen } from "../commandPaletteContext";
 import { buildTemporaryWorktreeBranchName } from "@bibcode/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
-import { formatProviderDriverKindLabel, formatProviderSlugLabel } from "../providerModels";
+import { formatProviderSlugLabel } from "../providerModels";
 import {
   ACTIVITY_DOCK_COMPACT_MEDIA_QUERY,
   RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
@@ -172,7 +176,12 @@ import {
   type CenterPanelLayoutPath,
 } from "../centerPanelLayout";
 import { useCenterPanelActions } from "../centerPanelActions";
-import { type ProviderInstanceEntry } from "../providerInstances";
+import {
+  applyProviderInstanceSettings,
+  deriveProviderInstanceEntries,
+  providerDriverLabel,
+  type ProviderInstanceEntry,
+} from "../providerInstances";
 import {
   CenterPanelWorkspace,
   type CenterPanelWorkspaceHandle,
@@ -250,6 +259,7 @@ import { appendPreviewAnnotationPrompt } from "../lib/previewAnnotation";
 import { appendReviewCommentsToPrompt, type ReviewCommentContext } from "../reviewCommentContext";
 import { environmentCatalog } from "../connection/catalog";
 import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
+import { environmentConnectionActions } from "../connection/environmentPresentationPolicy";
 import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { projectEnvironment } from "../state/projects";
 import { useEnvironmentQuery } from "../state/query";
@@ -382,7 +392,10 @@ type ActivityPageData = ActivityRosterPageData | ActivityDetailPageData;
 interface BoundedActivityQuery<Page extends ActivityPageData> extends ActivityQueryResult<Page> {
   readonly failure: unknown | null;
   readonly loadMore: () => void;
+  /** Explicit user Retry from the newest page. */
   readonly refresh: () => void;
+  /** Automatic re-read from the newest page; keeps an exhausted cut-off latched. */
+  readonly revalidate: () => void;
 }
 
 function useBoundedActivityQuery<Page extends ActivityPageData>(
@@ -402,7 +415,7 @@ function useBoundedActivityQuery<Page extends ActivityPageData>(
     [atomForCursor, current.cursor, queryKey],
   );
   const query = useEnvironmentQuery<Page, unknown>(queryAtom);
-  const newestRefreshKeyRef = useRef<string | null>(null);
+  const newestRefreshKeyRef = useRef<{ key: string; retry: boolean } | null>(null);
 
   useEffect(() => {
     if (queryKey === null || query.data === null) {
@@ -420,12 +433,12 @@ function useBoundedActivityQuery<Page extends ActivityPageData>(
   }, [current.cursor, query.data, queryKey]);
 
   useEffect(() => {
-    if (queryKey === null || current.cursor !== null || newestRefreshKeyRef.current !== queryKey) {
-      return;
-    }
+    const pending = newestRefreshKeyRef.current;
+    if (queryKey === null || current.cursor !== null || pending?.key !== queryKey) return;
     newestRefreshKeyRef.current = null;
-    query.refresh();
-  }, [current.cursor, query.refresh, queryKey]);
+    if (pending.retry) query.refresh();
+    else query.revalidate();
+  }, [current.cursor, query.refresh, query.revalidate, queryKey]);
 
   const pages = useMemo(() => current.pages.map((entry) => entry.page), [current.pages]);
   const failure = Option.getOrNull(AsyncResult.error(query.emission));
@@ -447,21 +460,27 @@ function useBoundedActivityQuery<Page extends ActivityPageData>(
       pages: previous.key === queryKey ? previous.pages : [],
     }));
   }, [current.cursor, failure, pages, query.refresh, queryKey]);
-  const refresh = useCallback(() => {
-    if (queryKey === null) {
-      return;
-    }
-    if (current.cursor === null) {
-      query.refresh();
-      return;
-    }
-    newestRefreshKeyRef.current = queryKey;
-    setState((previous) => ({
-      key: queryKey,
-      cursor: null,
-      pages: previous.key === queryKey ? previous.pages : [],
-    }));
-  }, [current.cursor, query.refresh, queryKey]);
+  // Returning to the newest page keeps whether the initiating action was an
+  // explicit Retry or an automatic re-read.
+  const refreshNewest = useCallback(
+    (retry: boolean) => {
+      if (queryKey === null) return;
+      if (current.cursor === null) {
+        if (retry) query.refresh();
+        else query.revalidate();
+        return;
+      }
+      newestRefreshKeyRef.current = { key: queryKey, retry };
+      setState((previous) => ({
+        key: queryKey,
+        cursor: null,
+        pages: previous.key === queryKey ? previous.pages : [],
+      }));
+    },
+    [current.cursor, query.refresh, query.revalidate, queryKey],
+  );
+  const refresh = useCallback(() => refreshNewest(true), [refreshNewest]);
+  const revalidate = useCallback(() => refreshNewest(false), [refreshNewest]);
 
   return useMemo(
     () => ({
@@ -471,8 +490,9 @@ function useBoundedActivityQuery<Page extends ActivityPageData>(
       failure,
       loadMore,
       refresh,
+      revalidate,
     }),
-    [failure, loadMore, pages, query.error, query.isPending, refresh],
+    [failure, loadMore, pages, query.error, query.isPending, refresh, revalidate],
   );
 }
 
@@ -661,9 +681,9 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
   const detailQuery = useBoundedActivityQuery(detailQueryKey, detailAtomForCursor);
   const refreshQueriesRef = useRef<() => void>(() => undefined);
   refreshQueriesRef.current = () => {
-    activeRoster.refresh();
-    doneRoster.refresh();
-    detailQuery.refresh();
+    activeRoster.revalidate();
+    doneRoster.revalidate();
+    detailQuery.revalidate();
   };
   const refreshTimerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(null);
   useEffect(() => {
@@ -2083,9 +2103,8 @@ function ChatViewContent(props: ChatViewProps) {
 
   const activeEnvironment =
     activeThread == null ? null : (environmentById.get(activeThread.environmentId) ?? null);
-  const activeEnvironmentConnectionPhase = activeEnvironment?.connection.phase ?? "available";
   const activeEnvironmentUnavailable =
-    activeEnvironment !== null && activeEnvironmentConnectionPhase !== "connected";
+    activeEnvironment !== null && isConnectionUnavailable(activeEnvironment.connection);
   const activeEnvironmentUnavailableLabel = activeEnvironment?.label ?? null;
   const activeEnvironmentUnavailableState = useMemo<EnvironmentUnavailableState | null>(() => {
     if (!activeEnvironmentUnavailable || !activeEnvironmentUnavailableLabel || !activeEnvironment) {
@@ -2309,6 +2328,14 @@ function ChatViewContent(props: ChatViewProps) {
     ? (activeEnvironment?.serverConfig ?? null)
     : (primaryEnvironment?.serverConfig ?? null);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  const providerInstanceEntries = useMemo(
+    () => applyProviderInstanceSettings(deriveProviderInstanceEntries(providerStatuses), settings),
+    [providerStatuses, settings],
+  );
+  const instanceLabels = useMemo<ReadonlyMap<ProviderInstanceId, string>>(
+    () => new Map(providerInstanceEntries.map((entry) => [entry.instanceId, entry.displayName])),
+    [providerInstanceEntries],
+  );
   const providerBinding = resolveThreadProviderBinding({
     thread: activeThread,
     projectDefaultModelSelection: activeProject?.defaultModelSelection,
@@ -2342,7 +2369,8 @@ function ChatViewContent(props: ChatViewProps) {
       const connection = activeEnvironmentUnavailableState.connection;
       const target = environmentById.get(activeEnvironmentUnavailableState.environmentId)?.entry
         ?.target;
-      const permitsReconnect = target !== undefined && presentation.permitsConnectionAction(target);
+      const connectionActions = environmentConnectionActions(presentation, target);
+      const permitsReconnect = connectionActions.reconnect;
       const showConnections = presentation.showRemoteDeviceControls;
       const isReconnecting =
         connection.phase === "connecting" || connection.phase === "reconnecting";
@@ -2350,13 +2378,15 @@ function ChatViewContent(props: ChatViewProps) {
         id: `environment-unavailable:${activeEnvironmentUnavailableState.environmentId}`,
         variant: connection.phase === "error" ? "error" : "warning",
         icon: <WifiOffIcon />,
-        title: `${activeEnvironmentUnavailableState.label}: ${connectionStatusText(connection)}`,
-        description:
-          connection.error ??
-          "Reconnect this environment before sending messages or running actions.",
+        ...describeUnavailableEnvironment(activeEnvironmentUnavailableState),
         actions:
-          permitsReconnect || showConnections ? (
+          permitsReconnect || connectionActions.openRemoteServers || showConnections ? (
             <>
+              {connectionActions.openRemoteServers ? (
+                <Button size="xs" onClick={() => void navigate({ to: "/settings/remote-servers" })}>
+                  Open Remote Servers
+                </Button>
+              ) : null}
               {permitsReconnect ? (
                 <Button
                   size="xs"
@@ -2540,32 +2570,49 @@ function ChatViewContent(props: ChatViewProps) {
     () => selectQueuedMessages(activeThread?.messages ?? []),
     [activeThread?.messages],
   );
+  const blocker = useMemo(
+    () => findBlockingDelivery(activeThread?.messages ?? []),
+    [activeThread?.messages],
+  );
+  const blockingId = blocker?.id ?? null;
+  const blockingCreatedAt = blocker?.createdAt ?? null;
+  const blockingOffersRetry = blocker?.delivery ? deliveryOffersRetry(blocker.delivery) : true;
+  const blockingDelivery = useMemo(
+    () =>
+      blockingId !== null && blockingCreatedAt !== null
+        ? { id: blockingId, createdAt: blockingCreatedAt, offersRetry: blockingOffersRetry }
+        : null,
+    [blockingId, blockingCreatedAt, blockingOffersRetry],
+  );
   const supportsTurnSteer = providerBinding.status?.supportsTurnSteer === true;
   const hasPendingApproval = activePendingApproval !== null;
   const hasPendingUserInput = activePendingUserInput !== null;
   const queueSessionStatus = activeThread?.session?.status ?? null;
-  const queuedStatuses = useMemo(
-    () =>
-      queuedMessages.map((message, index) =>
-        deriveQueuedCardStatus({
-          index,
-          phase,
-          sessionStatus: queueSessionStatus,
-          supportsTurnSteer,
-          delivery: message.delivery!,
-          hasPendingApproval,
-          hasPendingUserInput,
-        }),
-      ),
-    [
-      queuedMessages,
-      phase,
-      queueSessionStatus,
-      supportsTurnSteer,
-      hasPendingApproval,
-      hasPendingUserInput,
-    ],
-  );
+  const queuedStatuses = useMemo(() => {
+    return queuedMessages.map((message, index) =>
+      deriveQueuedCardStatus({
+        index,
+        phase,
+        sessionStatus: queueSessionStatus,
+        supportsTurnSteer,
+        delivery: message.delivery!,
+        hasPendingApproval,
+        hasPendingUserInput,
+        waitingBehind:
+          blockingDelivery !== null && waitsBehind(message, blockingDelivery)
+            ? { offersRetry: blockingDelivery.offersRetry }
+            : null,
+      }),
+    );
+  }, [
+    queuedMessages,
+    phase,
+    queueSessionStatus,
+    supportsTurnSteer,
+    hasPendingApproval,
+    hasPendingUserInput,
+    blockingDelivery,
+  ]);
   const [resolvingQueuedMessageId, setResolvingQueuedMessageId] = useState<MessageId | null>(null);
   const [queuedMessageErrors, setQueuedMessageErrors] = useState<Record<string, string>>({});
   const queuedActionsInFlightRef = useRef(new Set<MessageId>());
@@ -2911,11 +2958,11 @@ function ChatViewContent(props: ChatViewProps) {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const availableEditors = useAtomValue(primaryServerAvailableEditorsAtom);
   const activeProviderStatus = providerBinding.status;
-  const centerHostLabel =
-    activeProviderStatus?.displayName?.trim() ||
-    (lockedProviderInstanceId
+  const centerHostLabel = activeProviderStatus
+    ? activeProviderStatus.displayName?.trim() || providerDriverLabel(activeProviderStatus.driver)
+    : lockedProviderInstanceId
       ? formatProviderSlugLabel(lockedProviderInstanceId)
-      : formatProviderDriverKindLabel(providerBinding.driver ?? selectedProvider));
+      : providerDriverLabel(providerBinding.driver ?? selectedProvider);
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
   const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;
@@ -4789,9 +4836,7 @@ function ChatViewContent(props: ChatViewProps) {
       if (action === "retry" && delivery.state === "uncertain") {
         const localApi = readLocalApi();
         if (!localApi) return;
-        const provider =
-          PROVIDER_DISPLAY_NAMES[delivery.provider] ??
-          formatProviderDriverKindLabel(delivery.provider);
+        const provider = deliveryProviderLabel(delivery, instanceLabels);
         const confirmed = await localApi.dialogs.confirm(
           [
             "Retry this message?",
@@ -4822,6 +4867,7 @@ function ChatViewContent(props: ChatViewProps) {
       environmentId,
       resolveTurnDelivery,
       resolvingTurnDeliveryMessageId,
+      instanceLabels,
       setThreadError,
     ],
   );
@@ -6325,6 +6371,8 @@ function ChatViewContent(props: ChatViewProps) {
                       onRevertUserMessage={onRevertUserMessage}
                       onResolveTurnDelivery={onResolveTurnDelivery}
                       resolvingTurnDeliveryMessageId={resolvingTurnDeliveryMessageId}
+                      blockingDelivery={blockingDelivery}
+                      instanceLabels={instanceLabels}
                       isRevertingCheckpoint={isRevertingCheckpoint}
                       onImageExpand={onExpandTimelineImage}
                       markdownCwd={gitCwd ?? undefined}

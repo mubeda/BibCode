@@ -480,6 +480,9 @@ export function AddProjectRemoteBrowseStep({
 const CLONE_SUBMIT_LABELS: Record<AddProjectCloneProgress, string> = {
   idle: "Clone",
   cloning: "Cloning…",
+  // The clone keeps running on the server while the connection is down.
+  reconnecting: "Cloning…",
+  cancelling: "Cancelling…",
   registering: "Adding project…",
 };
 
@@ -503,6 +506,7 @@ export function AddProjectCloneStep({
   const visibleUrlError = url.trim().length > 0 ? urlError : null;
   const visibleParentError = parentDir.trim().length > 0 ? parentError : null;
   const canSubmit = urlError === null && parentError === null && !busy;
+  const canCancel = progress === "cloning" || progress === "reconnecting";
   const onEnter = (event: KeyboardEvent<HTMLInputElement>) =>
     handleInputEnter(event, canSubmit, onClone);
   const formRef = useRef<HTMLFormElement>(null);
@@ -579,7 +583,7 @@ export function AddProjectCloneStep({
           {CLONE_SUBMIT_LABELS[progress]}
         </Button>
         {/* Below the submit button, so a repeated click on Clone cannot land on Cancel. */}
-        {progress === "cloning" ? (
+        {canCancel ? (
           <Button
             className="w-full"
             onClick={() => {

@@ -38,6 +38,7 @@ pub use repository::{
     BoxWorktreeBaseDirectoryFuture, GitManagerCommitOutcome, GitManagerHeadCommit, GitRepository,
     WorktreeBaseDirectoryProvider,
 };
+pub(crate) use repository::{CloneLeaf, CloneReservation, clone_destination_leaf};
 pub(crate) use repository::{NETWORK_TRANSFER_STALLED, reports_stalled_transfer};
 #[allow(unused_imports)]
 pub(crate) use repository::{StatusObservation, validate_pathspecs};

@@ -153,6 +153,8 @@ Delete the unused result values above. Do not leave an ambiguous status.
 | Tag create/delete/push and all four image-diff modes                      |        |                                      |                                   |
 | Explicit pull-request/check refresh and no idle provider refresh          |        |                                      |                                   |
 | Disconnect/reconnect and one missing-capability degradation               |        |                                      |                                   |
+| Slow-link liveness: no disconnect; 4408 within 33 s when frozen           |        |                                      |                                   |
+| Slow-link establishment: 16/8/4 KiB/s, notice, and deadlines              |        |                                      |                                   |
 | Local-only author identity and no external image source                   |        |                                      |                                   |
 | Two-project selection, filter, tab, and repository-data isolation         |        |                                      |                                   |
 | Three-project visit with two-entry least-recently-used eviction           |        |                                      |                                   |
@@ -218,6 +220,52 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Cancel: notice, destination removal, immediate retry result:
 - Stalled transfer: failure time and exact message, destination removal:
 - Incomplete-clone refusal message, folder kept, Git Manager "No commits yet":
+- Connection drop: outage length, reconnecting line shown, clone duration, registration after reconnect:
+- Fixture duration or slow-rate method used to keep the clone running through each event:
+- Cancel across a reconnect: Cancelling… line; for each variant (disconnected, reconnected, Cancel then drop), whether the clone was partial ("Clone cancelled.", folder removed) or completed (the finished-before-cancel notice, folder kept and not added, next Clone adds it):
+- Dialog closed while reconnecting: close button shown, dialog closed, folder removed after the connection returned, and whether a new Clone of that URL into that folder waited for the cancel, then started:
+- Server restart mid-clone: partial or completed at the stop; partial folder removed at shutdown and the exact "No clone is in progress…" message, or the completed clone added:
+- Window closed mid-clone: whether the host kept cloning, and the result of re-cloning the same URL into the same folder (joined or added):
+
+## Slow-link liveness scenario
+
+- Server, web, and proxy ports; fixture diff size:
+- First config snapshot size in bytes (network panel); size ÷ rate exceeds 15 seconds at the tested rates:
+- 16 KiB/s: time to connected, attempt count, setup timeout seen (none expected):
+- 8 KiB/s: time to connected, attempt count, setup timeout seen (none expected):
+- 4 KiB/s: time to connected or session end, attempt count, deciding bound (buffered delivery or server write deadline):
+- Slow-setup text after 5 seconds receiving settings, and whether it cleared on connection:
+- Freeze during configuring: seconds from the freeze until the 'No data from' status (at most 33), exact banner text, reconnect after thawing:
+- 64 KiB/s: transfer duration, negotiated subprotocol, binary frames seen, disconnects (none expected), slow-request warning text and whether it cleared:
+- 256 KiB/s: transfer duration, disconnects (none expected):
+- Frozen link: seconds until the 4408 close, exact status text, reconnect after thawing; the next attempt's failure time (at most 15 seconds after it starts) and text:
+- Idle freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 50), observed before thaw:
+- Transfer freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 33), observed before thaw; subscription cleanup evidence:
+
+## SSH environment evidence
+
+See [Desktop-managed SSH environments](./ssh-environments.md).
+
+- Automated harness command and result (`ssh_environment`, `--ignored`):
+- Remote host OS and login shell:
+- Authentication methods exercised (key, password):
+- Remote `bibcode --version`:
+- Devices for this desktop on the host before (count, access):
+
+| #   | Scenario                     | Evidence class | Result | Exact error or message |
+| --- | ---------------------------- | -------------- | ------ | ---------------------- |
+| 1   | Add                          |                |        |                        |
+| 2   | Remote restart, tunnel alive |                |        |                        |
+| 3   | Disconnect, then Connect     |                |        |                        |
+| 4   | Reload                       |                |        |                        |
+| 5   | Desktop restart              |                |        |                        |
+| 6   | Dead link (optional)         |                |        |                        |
+| 7   | Revocation (optional)        |                |        |                        |
+| 8   | Hung pairing (optional)      |                |        |                        |
+
+- Devices for this desktop on the host after (count, access):
+- Cleanup (environment removed, device revoked, no leftover managed server or
+  pairing command):
 
 ## Process and temporary-root cleanup
 

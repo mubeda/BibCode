@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   second: null as PullRequestsListPage | null,
   error: null as PullRequestsOperationError | null,
   pending: false,
+  awaitingRetry: false,
   autoCompleteRefresh: true,
   requests: vi.fn((args: { input: PullRequestsListInput }) => ({ kind: "list", ...args })),
   requestTotals: vi.fn(),
@@ -42,22 +43,25 @@ vi.mock("../../../state/query", () => ({
     const error = atom?.kind === "list" ? h.error : null;
     if (error && !h.failures.has(error))
       h.failures.set(error, { _tag: "Failure", cause: Cause.fail(error) });
+    const refresh = () => {
+      h.refresh(atom?.input.cursor);
+      if (h.autoCompleteRefresh && atom?.kind === "list") {
+        if (atom.input.cursor === null && h.first)
+          h.first = { ...h.first, rows: [...h.first.rows] };
+        if (atom.input.cursor !== null && h.second)
+          h.second = { ...h.second, rows: [...h.second.rows] };
+        if (h.error) h.failures.delete(h.error);
+        publish();
+      }
+    };
     return {
       data,
       emission: error ? h.failures.get(error) : { _tag: "Success", value: data },
       error: error?.message ?? null,
       isPending: h.pending,
-      refresh: () => {
-        h.refresh(atom?.input.cursor);
-        if (h.autoCompleteRefresh && atom?.kind === "list") {
-          if (atom.input.cursor === null && h.first)
-            h.first = { ...h.first, rows: [...h.first.rows] };
-          if (atom.input.cursor !== null && h.second)
-            h.second = { ...h.second, rows: [...h.second.rows] };
-          if (h.error) h.failures.delete(h.error);
-          publish();
-        }
-      },
+      refresh,
+      revalidate: refresh,
+      requiresRetry: h.awaitingRetry,
     };
   },
 }));
@@ -128,6 +132,7 @@ beforeEach(() => {
   h.error = null;
   h.failures.clear();
   h.pending = false;
+  h.awaitingRetry = false;
   h.autoCompleteRefresh = true;
   h.requests.mockClear();
   h.requestTotals.mockClear();
@@ -475,5 +480,23 @@ it("hides a cached failure when opened during revalidation until the existing re
   h.pending = false;
   await render();
   expect(container.textContent).toContain("Fix connection recovery");
+  expect(h.refresh).not.toHaveBeenCalled();
+});
+
+it("shows an exhausted cached failure on remount without issuing another request", async () => {
+  h.first = null;
+  h.awaitingRetry = true;
+  h.error = new PullRequestsOperationError({
+    operation: "list",
+    code: "not_authenticated",
+    message: "The connection dropped.",
+    hostDetail: null,
+    retryable: false,
+  });
+  await render();
+  expect(container.textContent).toContain("The connection dropped.");
+  await act(async () => root.render(null));
+  await render();
+  expect(container.textContent).toContain("The connection dropped.");
   expect(h.refresh).not.toHaveBeenCalled();
 });

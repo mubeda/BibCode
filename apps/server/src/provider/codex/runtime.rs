@@ -37,9 +37,12 @@ use super::{
         build_turn_steer_params, decode_background_terminals_list_response,
         decode_thread_list_response, decode_thread_read_response, delivery_key_exists,
         is_recoverable_thread_resume_error, parse_model_list_response, parse_skills_list_response,
-        parse_thread_snapshot,
+        parse_thread_snapshot, reasoning_effort_label, turn_option_label,
     },
     protocol::{IncomingEvent, JsonRpcConnection, ProtocolError},
+};
+use crate::provider::{
+    OptionRefusal, RefusedOption, model_unavailable_refusal, unsupported_option_refusal,
 };
 
 const PROVIDER: &str = "codex";
@@ -160,6 +163,20 @@ pub enum RuntimeError {
     PendingRequestNotFound { request_id: String },
     #[error("Invalid Codex payload: {message}")]
     InvalidPayload { message: String },
+    /// Codex's model list refuses the turn: it does not offer the session's model, or the model
+    /// does not advertise one of the turn's option values. The same request is refused again on
+    /// every retry.
+    #[error("{0}")]
+    UnsupportedOption(RefusedOption),
+}
+
+impl OptionRefusal for RuntimeError {
+    fn refused_option(&self) -> Option<&RefusedOption> {
+        match self {
+            Self::UnsupportedOption(refused) => Some(refused),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -855,10 +872,16 @@ impl CodexSessionRuntime {
         };
     }
 
+    /// Checks the turn's options against Codex's model list, which, as in the catalog, also
+    /// offers the instance's `custom_models` with the options of the first listed model.
+    /// `provider_label` is the instance's label, which the refusal for a model offered by neither
+    /// names.
     pub async fn validate_turn_options(
         &self,
         service_tier: Option<&str>,
         effort: Option<&str>,
+        provider_label: &str,
+        custom_models: &[String],
     ) -> Result<(), RuntimeError> {
         if service_tier.is_none() && effort.is_none() {
             return Ok(());
@@ -902,25 +925,29 @@ impl CodexSessionRuntime {
                 break;
             }
         }
-        let models = parse_model_list_response(&json!({ "data": data }), &[])
+        let models = parse_model_list_response(&json!({ "data": data }), custom_models)
             .map_err(|message| RuntimeError::InvalidPayload { message })?;
         let capabilities = models
             .into_iter()
             .find(|candidate| candidate.slug == model)
             .map(|candidate| candidate.capabilities)
-            .ok_or_else(|| RuntimeError::InvalidPayload {
-                message: format!("Codex did not advertise capabilities for model {model}"),
+            .ok_or_else(|| {
+                RuntimeError::UnsupportedOption(RefusedOption::new(
+                    format!("Codex did not advertise capabilities for model {model}"),
+                    model_unavailable_refusal(&model, provider_label),
+                ))
             })?;
         for (id, value) in [("serviceTier", service_tier), ("reasoningEffort", effort)] {
             let Some(value) = value else {
                 continue;
             };
-            let supported = capabilities
+            let descriptor = capabilities
                 .get("optionDescriptors")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .find(|descriptor| descriptor.get("id").and_then(Value::as_str) == Some(id))
+                .find(|descriptor| descriptor.get("id").and_then(Value::as_str) == Some(id));
+            let supported = descriptor
                 .and_then(|descriptor| descriptor.get("options"))
                 .and_then(Value::as_array)
                 .is_some_and(|options| {
@@ -929,9 +956,19 @@ impl CodexSessionRuntime {
                         .any(|option| option.get("id").and_then(Value::as_str) == Some(value))
                 });
             if !supported {
-                return Err(RuntimeError::InvalidPayload {
-                    message: format!("Codex model {model} does not advertise {id}={value}"),
-                });
+                let label = descriptor
+                    .and_then(|descriptor| descriptor.get("label"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| turn_option_label(id));
+                let value_label = if id == "reasoningEffort" {
+                    reasoning_effort_label(value)
+                } else {
+                    value
+                };
+                return Err(RuntimeError::UnsupportedOption(RefusedOption::new(
+                    format!("Codex model {model} does not advertise {id}={value}"),
+                    unsupported_option_refusal(&format!("{label} {value_label}")),
+                )));
             }
         }
         Ok(())
@@ -3848,6 +3885,28 @@ mod tests {
                         "nextCursor": null
                     }),
                 ),
+                (
+                    None,
+                    json!({
+                        "data": [{
+                            "model": "gpt-other",
+                            "serviceTiers": [{ "id": "fast" }],
+                            "supportedReasoningEfforts": [{ "reasoningEffort": "high" }]
+                        }],
+                        "nextCursor": null
+                    }),
+                ),
+                (
+                    None,
+                    json!({
+                        "data": [{
+                            "model": "gpt-other",
+                            "serviceTiers": [{ "id": "fast" }],
+                            "supportedReasoningEfforts": [{ "reasoningEffort": "high" }]
+                        }],
+                        "nextCursor": null
+                    }),
+                ),
             ] {
                 let request = read_runtime_test_json(&mut reader).await;
                 assert_eq!(request["method"], "model/list");
@@ -3861,18 +3920,55 @@ mod tests {
                 )
                 .await;
             }
+            let request = read_runtime_test_json(&mut reader).await;
+            assert_eq!(request["method"], "model/list");
+            write_runtime_test_json(
+                &mut writer,
+                json!({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "error": { "code": -32000, "message": "model list unavailable" }
+                }),
+            )
+            .await;
         });
 
         runtime
-            .validate_turn_options(Some("fast"), Some("high"))
+            .validate_turn_options(Some("fast"), Some("high"), "Work Codex", &[])
             .await
             .expect("exact model options are advertised");
-        assert!(
-            runtime
-                .validate_turn_options(Some("slow"), Some("high"))
-                .await
-                .is_err()
+        let refused = runtime
+            .validate_turn_options(Some("slow"), Some("high"), "Work Codex", &[])
+            .await
+            .expect_err("an unadvertised service tier is refused");
+        assert_eq!(
+            refused.option_refusal(),
+            Some("Service Tier slow is not supported by the selected model.")
         );
+        // A model the list does not offer is refused on every retry too, naming the instance.
+        let missing = runtime
+            .validate_turn_options(Some("fast"), None, "Work Codex", &[])
+            .await
+            .expect_err("a model missing from the list is refused");
+        assert_eq!(
+            missing.option_refusal(),
+            Some("gpt-target is not available in Work Codex.")
+        );
+        // As a custom model of the instance, the same model has the first listed model's options.
+        runtime
+            .validate_turn_options(
+                Some("fast"),
+                Some("high"),
+                "Work Codex",
+                &["gpt-target".to_owned()],
+            )
+            .await
+            .expect("a custom model takes the catalog's fallback options");
+        // A failed model list says nothing about the options, so a retry may succeed.
+        let unavailable = runtime
+            .validate_turn_options(Some("fast"), None, "Work Codex", &[])
+            .await
+            .expect_err("a failed model list fails validation");
+        assert_eq!(unavailable.option_refusal(), None, "{unavailable}");
         peer.await.expect("peer");
     }
 

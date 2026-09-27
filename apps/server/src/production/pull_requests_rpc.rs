@@ -1,6 +1,9 @@
 //! Registers the repository-scoped Pull Requests RPC surface.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,9 +39,10 @@ impl PullRequestsRpcServices {
     pub fn with_dependencies(
         state_dir: PathBuf,
         repositories: Repositories,
+        provider_hosts: Arc<crate::source_control::ProviderHosts>,
     ) -> ConfiguredPullRequestsRpcServices {
         ConfiguredPullRequestsRpcServices {
-            service: PullRequestsService::new(state_dir),
+            service: PullRequestsService::new(state_dir).with_provider_hosts(provider_hosts),
             repositories: Some(repositories),
             worktrees: None,
         }
@@ -53,6 +57,9 @@ pub struct ConfiguredPullRequestsRpcServices {
     pub worktrees: Option<super::worktree_catalog_rpc::WorktreeCatalogRpcServices>,
 }
 
+/// For tests and stand-alone registration: the service keeps a private host
+/// observation. The server builds its services with
+/// `PullRequestsRpcServices::with_dependencies(..)`, requiring its shared observation.
 impl Default for ConfiguredPullRequestsRpcServices {
     fn default() -> Self {
         Self {
@@ -70,16 +77,6 @@ impl From<PullRequestsRpcServices> for ConfiguredPullRequestsRpcServices {
 }
 
 impl ConfiguredPullRequestsRpcServices {
-    /// Shares the server's host observation (status reads and Settings discovery).
-    #[must_use]
-    pub fn with_provider_hosts(
-        mut self,
-        provider_hosts: std::sync::Arc<crate::source_control::ProviderHosts>,
-    ) -> Self {
-        self.service = self.service.with_provider_hosts(provider_hosts);
-        self
-    }
-
     pub fn with_worktrees(
         mut self,
         worktrees: super::worktree_catalog_rpc::WorktreeCatalogRpcServices,

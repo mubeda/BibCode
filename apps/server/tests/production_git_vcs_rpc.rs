@@ -1,4 +1,8 @@
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -12,7 +16,7 @@ use bibcode_server::{
         AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
     },
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
@@ -28,12 +32,18 @@ use bibcode_server::production::git_vcs::{
 #[path = "support/isolated_git_config.rs"]
 mod isolated_git_config;
 use isolated_git_config::IsolatedGitConfig;
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
-fn git_vcs_services() -> GitVcsRpcServices {
+fn git_vcs_services(temp: &TempDir) -> GitVcsRpcServices {
     let hosts = Arc::new(bibcode_server::source_control::ProviderHosts::default());
     let repository =
         Arc::new(bibcode_server::git::GitRepository::default().with_provider_hosts(hosts.clone()));
     GitVcsRpcServices::with_repository(repository, hosts)
+        .with_hosting_executable_dir_for_integration_test(
+            hermetic_providers::missing_hosting_executable_dir(temp.path()),
+        )
 }
 
 const ISOLATED_GIT_TEST: &str = "BIBCODE_PRODUCTION_GIT_VCS_RPC_ISOLATED";
@@ -74,7 +84,7 @@ async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_la
             .await
             .expect("physical identity resolves")
     );
-    let services = git_vcs_services().with_availability_registry(availability);
+    let services = git_vcs_services(&temp).with_availability_registry(availability);
     let mut registry = RpcRegistry::empty();
     register_git_vcs_rpc(&mut registry, services);
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
@@ -120,7 +130,7 @@ async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_la
 impl GitServerHarness {
     async fn start(temp: &TempDir, parallelism_permit: OwnedSemaphorePermit) -> Self {
         let mut registry = RpcRegistry::empty();
-        register_git_vcs_rpc(&mut registry, git_vcs_services());
+        register_git_vcs_rpc(&mut registry, git_vcs_services(temp));
         let handle = ServerRuntime::start_with_registry(test_config(temp), registry)
             .await
             .expect("server starts");
@@ -136,6 +146,18 @@ impl GitServerHarness {
 
     fn socket(&mut self) -> &mut TestSocket {
         self.socket.as_mut().expect("active test socket")
+    }
+
+    /// Closes the current socket, as a dropped connection does, and opens a new one.
+    async fn reconnect(&mut self) {
+        if let Some(mut socket) = self.socket.take() {
+            let _ = socket.close(None).await;
+        }
+        let handle = self.handle.as_ref().expect("running server");
+        let (socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+            .await
+            .expect("WebSocket reconnects");
+        self.socket = Some(socket);
     }
 
     async fn shutdown(mut self) {
@@ -168,6 +190,7 @@ fn registrar_owns_the_complete_git_vcs_rpc_surface() {
             "vcs.listRefs",
             "vcs.listCommits",
             "vcs.clone",
+            "vcs.cancelClone",
             "vcs.createRef",
             "vcs.switchRef",
             "vcs.init",
@@ -243,7 +266,7 @@ async fn registers_native_vcs_handlers_with_unchanged_wire_shapes() {
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, git_vcs_services());
+    register_git_vcs_rpc(&mut registry, git_vcs_services(&temp));
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -311,7 +334,7 @@ async fn vcs_status_stream_is_bounded_and_cancellable() {
         .expect("git init succeeds");
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, git_vcs_services());
+    register_git_vcs_rpc(&mut registry, git_vcs_services(&temp));
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -363,7 +386,7 @@ async fn vcs_summary_stream_publishes_the_lightweight_shape_and_is_cancellable()
     fs::write(repository.path().join("tracked.txt"), "changed\n").expect("dirty fixture");
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, git_vcs_services());
+    register_git_vcs_rpc(&mut registry, git_vcs_services(&temp));
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -827,7 +850,7 @@ async fn stacked_commit_stream_finishes_with_a_decodable_success_event() {
     );
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, git_vcs_services());
+    register_git_vcs_rpc(&mut registry, git_vcs_services(&temp));
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -915,7 +938,7 @@ async fn stacked_commit_generates_a_message_when_the_ui_leaves_it_empty() {
     );
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, git_vcs_services());
+    register_git_vcs_rpc(&mut registry, git_vcs_services(&temp));
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -1030,7 +1053,7 @@ async fn stacked_feature_branch_commit_creates_and_switches_the_branch_first() {
     );
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, git_vcs_services());
+    register_git_vcs_rpc(&mut registry, git_vcs_services(&temp));
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -1139,7 +1162,7 @@ async fn stacked_commit_as_is_preserves_newer_unstaged_edits() {
     std::fs::write(&tracked, "unstaged\n").expect("write unstaged fixture");
 
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, git_vcs_services());
+    register_git_vcs_rpc(&mut registry, git_vcs_services(&temp));
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -2356,6 +2379,173 @@ async fn wait_for_connection_close(connection: &mut tokio::net::TcpStream, metho
     .unwrap_or_else(|_| panic!("interrupting {method} did not stop Git"));
 }
 
+async fn stalled_http_remote() -> (tokio::net::TcpListener, String) {
+    let remote = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stalled remote listener");
+    let url = format!(
+        "http://{}/stalled.git",
+        remote.local_addr().expect("stalled remote address")
+    );
+    (remote, url)
+}
+
+async fn accept_git(remote: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    timeout(GIT_RPC_RESPONSE_DEADLOCK_BOUND, remote.accept())
+        .await
+        .expect("Git connects to the remote")
+        .expect("accept Git's connection")
+        .0
+}
+
+/// Git still holds its connection two seconds later: the clone is running.
+async fn assert_connection_stays_open(connection: &mut tokio::net::TcpStream, context: &str) {
+    use tokio::io::AsyncReadExt;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match timeout_at(deadline, connection.read(&mut buffer)).await {
+            Err(_) => return,
+            Ok(Ok(0) | Err(_)) => panic!("{context}: Git's connection closed"),
+            Ok(Ok(_)) => {}
+        }
+    }
+}
+
+async fn assert_no_reply(socket: &mut TestSocket, context: &str) {
+    if let Ok(message) = timeout(
+        Duration::from_millis(500),
+        next_frame_past_heartbeat(socket),
+    )
+    .await
+    {
+        panic!("{context}: expected no reply yet, got {message:?}");
+    }
+}
+
+async fn next_exits(socket: &mut TestSocket, count: usize) -> HashMap<String, RpcExit> {
+    let mut exits = HashMap::new();
+    while exits.len() < count {
+        match next_server_message(socket).await {
+            ServerMessage::Exit { request_id, exit } => {
+                exits.insert(request_id.as_str().to_owned(), exit);
+            }
+            message => panic!("expected an Exit, got {message:?}"),
+        }
+    }
+    exits
+}
+
+fn failure_of(exit: &RpcExit) -> Value {
+    match exit {
+        RpcExit::Failure { cause } => match cause.as_slice() {
+            [CauseItem::Fail { error }] => error.clone(),
+            cause => panic!("expected one failure, got {cause:?}"),
+        },
+        exit => panic!("expected failure, got {exit:?}"),
+    }
+}
+
+fn success_of(exit: &RpcExit) -> Value {
+    match exit {
+        RpcExit::Success { value } => value.clone().unwrap_or(Value::Null),
+        exit => panic!("expected success, got {exit:?}"),
+    }
+}
+
+fn with_flags(payload: &Value, attach: bool, detach: bool) -> Value {
+    let mut payload = payload.clone();
+    payload["attach"] = json!(attach);
+    payload["detach"] = json!(detach);
+    payload
+}
+
+#[tokio::test]
+async fn production_runtime_pins_hosting_discovery_to_the_configured_directory() {
+    let _parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "production_runtime_pins_hosting_discovery_to_the_configured_directory",
+    ) {
+        return;
+    }
+
+    // The optional audit fakes log one file per process. This test runs alone
+    // in a child, so its PID excludes calls from parallel tests and binaries.
+    let hosting_call_count = || {
+        let calls = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/fakes/calls");
+        let entries = match fs::read_dir(calls) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(error) => panic!("read hosting audit directory: {error}"),
+        };
+        let parent = format!("ppid={}", std::process::id());
+        entries
+            .map(|entry| {
+                let contents = fs::read_to_string(entry.expect("audit entry").path())
+                    .expect("read hosting audit record");
+                contents
+                    .lines()
+                    .filter(|line| {
+                        line.split('\t').any(|field| field == parent)
+                            && line.split('\t').any(|field| {
+                                ["name=gh", "name=glab", "name=az", "name=jj"].contains(&field)
+                            })
+                    })
+                    .count()
+            })
+            .sum::<usize>()
+    };
+    let calls_before = hosting_call_count();
+    let temp = TempDir::new().expect("temporary server directory");
+    let config = test_config(&temp).with_hosting_executable_dir_for_integration_test(
+        hermetic_providers::missing_hosting_executable_dir(temp.path()),
+    );
+    let handle = ServerRuntime::start(config)
+        .await
+        .expect("production server starts");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects");
+    request(&mut socket, "1", "server.discoverSourceControl", json!({})).await;
+    let discovery = success_value(&mut socket, "1").await;
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+
+    assert_eq!(
+        hosting_call_count(),
+        calls_before,
+        "production runtime must not execute hosting CLIs from PATH"
+    );
+    for (collection, executable) in [
+        ("versionControlSystems", "jj"),
+        ("sourceControlProviders", "gh"),
+        ("sourceControlProviders", "glab"),
+        ("sourceControlProviders", "az"),
+    ] {
+        let item = discovery[collection]
+            .as_array()
+            .expect("discovery entries")
+            .iter()
+            .find(|item| item["executable"] == executable)
+            .expect("hosting discovery entry");
+        assert_eq!(item["status"], "missing", "{executable}");
+        assert_eq!(item["version"]["_tag"], "None", "{executable}");
+        assert_eq!(
+            item["detail"]["_tag"], "Some",
+            "{executable} was not spawned"
+        );
+    }
+    let git = discovery["versionControlSystems"]
+        .as_array()
+        .expect("VCS discovery entries")
+        .iter()
+        .find(|item| item["kind"] == "git")
+        .expect("Git discovery entry");
+    assert_eq!(git["status"], "available", "real Git remains available");
+}
+
 #[tokio::test]
 async fn source_control_discovery_and_typed_errors_are_deterministic() {
     let parallelism_permit = acquire_git_rpc_fixture().await;
@@ -2767,7 +2957,7 @@ async fn start_git_server(
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 ) {
     let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, git_vcs_services());
+    register_git_vcs_rpc(&mut registry, git_vcs_services(temp));
     let handle = ServerRuntime::start_with_registry(test_config(temp), registry)
         .await
         .expect("server starts");
@@ -2811,9 +3001,11 @@ where
 }
 
 fn test_config(temp: &TempDir) -> ServerConfig {
-    ServerConfig::new(temp.path())
+    let config = ServerConfig::new(temp.path())
         .with_bind("127.0.0.1", 0)
-        .with_unsafe_no_auth()
+        .with_unsafe_no_auth();
+    hermetic_providers::ensure_hermetic_settings(&config.state_dir());
+    config
 }
 
 async fn request<S>(socket: &mut WebSocketStream<S>, id: &str, tag: &str, payload: Value)
@@ -2914,11 +3106,14 @@ async fn next_server_message_for<S>(socket: &mut WebSocketStream<S>, context: &s
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(GIT_RPC_RESPONSE_DEADLOCK_BOUND, socket.next())
-        .await
-        .unwrap_or_else(|_| panic!("WebSocket response timeout while waiting for {context}"))
-        .expect("WebSocket remains open")
-        .expect("valid WebSocket frame");
+    let frame = timeout(
+        GIT_RPC_RESPONSE_DEADLOCK_BOUND,
+        next_frame_past_heartbeat(socket),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("WebSocket response timeout while waiting for {context}"))
+    .expect("WebSocket remains open")
+    .expect("valid WebSocket frame");
     let Message::Text(text) = frame else {
         panic!("expected text WebSocket message while waiting for {context}, got {frame:?}");
     };
@@ -2932,7 +3127,7 @@ async fn next_server_message_with_timeout<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let frame = timeout(timeout_duration, socket.next())
+    let frame = timeout(timeout_duration, next_frame_past_heartbeat(socket))
         .await
         .expect("WebSocket response timeout")
         .expect("WebSocket remains open")
@@ -2941,4 +3136,541 @@ where
         panic!("expected text WebSocket message, got {frame:?}");
     };
     serde_json::from_str(&text).expect("valid server RPC message")
+}
+
+#[tokio::test]
+async fn a_detached_clone_survives_a_socket_close_and_an_interrupt_and_attach_shares_its_outcome() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "a_detached_clone_survives_a_socket_close_and_an_interrupt_and_attach_shares_its_outcome",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary fixture root");
+    // An explicit empty proxy keeps Git on the loopback remote even when the host sets one.
+    run_git_in(root.path(), &["config", "--global", "http.proxy", ""]);
+    let clone_parent = root.path().join("clones");
+    fs::create_dir(&clone_parent).expect("clone parent");
+    let (remote, url) = stalled_http_remote().await;
+    let destination = clone_parent.join("detached");
+    let clone = json!({ "url": url, "parentDir": clone_parent, "directoryName": "detached" });
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+
+    request(
+        server.socket(),
+        "701",
+        "vcs.clone",
+        with_flags(&clone, false, true),
+    )
+    .await;
+    let mut connection = accept_git(&remote).await;
+    assert!(destination.is_dir(), "the clone created its destination");
+
+    // The socket drops. The detached clone keeps running on the server.
+    server.reconnect().await;
+    assert_connection_stays_open(&mut connection, "after the socket closed").await;
+    assert!(destination.is_dir());
+
+    // A new socket re-attaches. An Interrupt ends only that wait.
+    let attach = with_flags(&clone, true, true);
+    request(server.socket(), "702", "vcs.clone", attach.clone()).await;
+    assert_no_reply(server.socket(), "a joined attach waits for the clone").await;
+    interrupt_clone(server.socket(), "702", "vcs.clone").await;
+    assert_connection_stays_open(&mut connection, "after the attach was interrupted").await;
+
+    // Join again, then end the transfer from the remote's side: the attach shares the failure.
+    request(server.socket(), "703", "vcs.clone", attach.clone()).await;
+    assert_no_reply(server.socket(), "the second attach waits").await;
+    drop(connection);
+    let failure = failure_value(server.socket(), "703").await;
+    assert_eq!(failure["_tag"], "GitCommandError");
+    assert!(
+        !destination.exists(),
+        "the outcome was published after the cleanup"
+    );
+
+    // Within five minutes, another socket's re-attach gets the same failure.
+    server.reconnect().await;
+    request(server.socket(), "704", "vcs.clone", attach).await;
+    assert_eq!(failure_value(server.socket(), "704").await, failure);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn without_detach_a_socket_close_still_stops_the_clone_and_removes_its_folder() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "without_detach_a_socket_close_still_stops_the_clone_and_removes_its_folder",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary fixture root");
+    run_git_in(root.path(), &["config", "--global", "http.proxy", ""]);
+    let clone_parent = root.path().join("clones");
+    fs::create_dir(&clone_parent).expect("clone parent");
+    let (remote, url) = stalled_http_remote().await;
+    let destination = clone_parent.join("legacy");
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+
+    request(
+        server.socket(),
+        "711",
+        "vcs.clone",
+        json!({ "url": url, "parentDir": clone_parent, "directoryName": "legacy" }),
+    )
+    .await;
+    let mut connection = accept_git(&remote).await;
+    server.reconnect().await;
+    wait_for_connection_close(&mut connection, "a socket close without detach").await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while destination.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the created folder was left behind"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn attach_reports_nothing_a_finished_clone_an_incomplete_one_and_busy() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "attach_reports_nothing_a_finished_clone_an_incomplete_one_and_busy",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary fixture root");
+    run_git_in(root.path(), &["config", "--global", "http.proxy", ""]);
+    let clone_parent = root.path().join("clones");
+    fs::create_dir(&clone_parent).expect("clone parent");
+    let source = TempDir::new().expect("clone source");
+    initialize_repository(&source);
+    commit_file(source.path(), "tracked.txt", "base\n", "initial");
+    let source_url = local_file_url(source.path());
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+
+    // Nothing there: not-in-progress, and attach never creates the folder.
+    let nothing =
+        json!({ "url": source_url, "parentDir": clone_parent, "directoryName": "nothing" });
+    request(
+        server.socket(),
+        "721",
+        "vcs.clone",
+        with_flags(&nothing, true, true),
+    )
+    .await;
+    let error = failure_value(server.socket(), "721").await;
+    assert_eq!(error["_tag"], "GitCloneOperationError");
+    assert_eq!(error["reason"], "not-in-progress");
+    assert!(!clone_parent.join("nothing").exists());
+
+    // A finished clone: a later attach from a new socket gets its path from the disk.
+    let finished =
+        json!({ "url": source_url, "parentDir": clone_parent, "directoryName": "finished" });
+    request(
+        server.socket(),
+        "722",
+        "vcs.clone",
+        with_flags(&finished, false, true),
+    )
+    .await;
+    let cloned = success_value(server.socket(), "722").await;
+    server.reconnect().await;
+    request(
+        server.socket(),
+        "723",
+        "vcs.clone",
+        with_flags(&finished, true, true),
+    )
+    .await;
+    assert_eq!(success_value(server.socket(), "723").await, cloned);
+
+    // A leftover with the same origin but no commit: the incomplete-clone error.
+    let leftover = clone_parent.join("leftover");
+    fs::create_dir(&leftover).expect("leftover");
+    initialize_repository_in(&leftover);
+    run_git_in(&leftover, &["remote", "add", "origin", &source_url]);
+    let incomplete =
+        json!({ "url": source_url, "parentDir": clone_parent, "directoryName": "leftover" });
+    request(
+        server.socket(),
+        "724",
+        "vcs.clone",
+        with_flags(&incomplete, true, true),
+    )
+    .await;
+    let error = failure_value(server.socket(), "724").await;
+    assert_eq!(error["_tag"], "GitCommandError");
+    assert!(
+        error["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("An incomplete clone exists at")
+    );
+    assert!(leftover.join(".git").is_dir(), "attach keeps the leftover");
+
+    // Another URL into a running clone's folder: busy at once, never naming the running URL.
+    let (remote, stalled_url) = stalled_http_remote().await;
+    let running = json!({ "url": stalled_url, "parentDir": clone_parent, "directoryName": "busy" });
+    request(
+        server.socket(),
+        "725",
+        "vcs.clone",
+        with_flags(&running, false, true),
+    )
+    .await;
+    let connection = accept_git(&remote).await;
+    let other = json!({ "url": source_url, "parentDir": clone_parent, "directoryName": "busy" });
+    for (id, payload) in [
+        ("726", with_flags(&other, false, true)),
+        ("727", with_flags(&other, true, true)),
+    ] {
+        request(server.socket(), id, "vcs.clone", payload).await;
+        let error = failure_value(server.socket(), id).await;
+        assert_eq!(error["reason"], "busy");
+        assert!(!error.to_string().contains(&stalled_url));
+    }
+    // End the running clone from the remote's side.
+    drop(connection);
+    let exits = next_exits(server.socket(), 1).await;
+    assert_eq!(failure_of(&exits["725"])["_tag"], "GitCommandError");
+
+    server.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_control_clone_through_a_symlinked_parent_joins_the_running_clone() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "source_control_clone_through_a_symlinked_parent_joins_the_running_clone",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary fixture root");
+    run_git_in(root.path(), &["config", "--global", "http.proxy", ""]);
+    let clone_parent = root.path().join("clones");
+    fs::create_dir(&clone_parent).expect("clone parent");
+    let link = root.path().join("clones-link");
+    std::os::unix::fs::symlink(&clone_parent, &link).expect("symlinked parent");
+    let (remote, url) = stalled_http_remote().await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+
+    let clone = json!({ "url": url, "parentDir": clone_parent, "directoryName": "joined" });
+    request(
+        server.socket(),
+        "731",
+        "vcs.clone",
+        with_flags(&clone, false, true),
+    )
+    .await;
+    let connection = accept_git(&remote).await;
+
+    request(
+        server.socket(),
+        "732",
+        "sourceControl.cloneRepository",
+        json!({ "remoteUrl": url, "destinationPath": link.join("joined") }),
+    )
+    .await;
+    assert_no_reply(
+        server.socket(),
+        "the aliased clone joins instead of failing",
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_millis(500), remote.accept())
+            .await
+            .is_err(),
+        "a join starts no second transfer"
+    );
+
+    // End the transfer from the remote's side: both callers get the one outcome.
+    drop(connection);
+    let exits = next_exits(server.socket(), 2).await;
+    let failure = failure_of(&exits["731"]);
+    assert_eq!(failure["_tag"], "GitCommandError");
+    let joined = failure_of(&exits["732"]);
+    assert_eq!(joined["_tag"], "SourceControlRepositoryError");
+    assert_eq!(joined["operation"], "cloneRepository");
+    assert_eq!(
+        joined["detail"], failure["detail"],
+        "the join shared the clone's outcome"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancel_clone_from_a_new_socket_stops_a_detached_clone_and_removes_only_its_folder() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "cancel_clone_from_a_new_socket_stops_a_detached_clone_and_removes_only_its_folder",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary fixture root");
+    run_git_in(root.path(), &["config", "--global", "http.proxy", ""]);
+    let clone_parent = root.path().join("clones");
+    fs::create_dir(&clone_parent).expect("clone parent");
+    let (remote, url) = stalled_http_remote().await;
+    let destination = clone_parent.join("detached");
+    let clone = json!({ "url": url, "parentDir": clone_parent, "directoryName": "detached" });
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+
+    request(
+        server.socket(),
+        "741",
+        "vcs.clone",
+        with_flags(&clone, false, true),
+    )
+    .await;
+    let mut connection = accept_git(&remote).await;
+    server.reconnect().await;
+    let attach = with_flags(&clone, true, true);
+    request(server.socket(), "742", "vcs.clone", attach.clone()).await;
+    assert_no_reply(server.socket(), "the attach waits for the clone").await;
+
+    request(server.socket(), "743", "vcs.cancelClone", clone.clone()).await;
+    wait_for_connection_close(&mut connection, "vcs.cancelClone").await;
+    let exits = next_exits(server.socket(), 2).await;
+    assert_eq!(success_of(&exits["743"]), json!({ "cancelled": true }));
+    let cancelled = failure_of(&exits["742"]);
+    assert_eq!(cancelled["_tag"], "GitCloneOperationError");
+    assert_eq!(cancelled["reason"], "cancelled");
+    assert!(
+        !destination.exists(),
+        "the cancel answered after the cleanup"
+    );
+    assert!(clone_parent.is_dir(), "only the created folder was removed");
+
+    // Idempotent, and a re-attach within five minutes gets the real reason.
+    request(server.socket(), "744", "vcs.cancelClone", clone).await;
+    assert_success_eq(server.socket(), "744", json!({ "cancelled": false })).await;
+    request(server.socket(), "745", "vcs.clone", attach).await;
+    assert_eq!(
+        failure_value(server.socket(), "745").await["reason"],
+        "cancelled"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancel_clone_answers_only_its_declared_shapes() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config("cancel_clone_answers_only_its_declared_shapes") {
+        return;
+    }
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary fixture root");
+    run_git_in(root.path(), &["config", "--global", "http.proxy", ""]);
+    let clone_parent = root.path().join("clones");
+    fs::create_dir(&clone_parent).expect("clone parent");
+    let (remote, url) = stalled_http_remote().await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+
+    // Nothing live: exactly {"cancelled": false}.
+    let none = json!({ "url": url, "parentDir": clone_parent, "directoryName": "none" });
+    request(server.socket(), "751", "vcs.cancelClone", none).await;
+    assert_eq!(
+        success_value(server.socket(), "751").await,
+        json!({ "cancelled": false })
+    );
+
+    // An unresolvable parent: a GitCommandError with exactly the handler's fields.
+    let missing = json!({ "url": url, "parentDir": root.path().join("missing-parent") });
+    request(server.socket(), "752", "vcs.cancelClone", missing).await;
+    let error = failure_value(server.socket(), "752").await;
+    let mut keys = error
+        .as_object()
+        .expect("an error object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(keys, ["_tag", "command", "cwd", "detail", "operation"]);
+    assert_eq!(error["_tag"], "GitCommandError");
+    assert_eq!(error["operation"], "vcs.cancelClone");
+    assert_eq!(error["command"], "git");
+
+    // A live clone: exactly {"cancelled": true}.
+    let live = json!({ "url": url, "parentDir": clone_parent, "directoryName": "live" });
+    request(
+        server.socket(),
+        "753",
+        "vcs.clone",
+        with_flags(&live, false, true),
+    )
+    .await;
+    let mut connection = accept_git(&remote).await;
+    request(server.socket(), "754", "vcs.cancelClone", live).await;
+    wait_for_connection_close(&mut connection, "vcs.cancelClone").await;
+    let exits = next_exits(server.socket(), 2).await;
+    assert_eq!(success_of(&exits["754"]), json!({ "cancelled": true }));
+    assert_eq!(failure_of(&exits["753"])["reason"], "cancelled");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_clone_folder_name_that_is_a_path_is_refused_and_creates_nothing() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "a_clone_folder_name_that_is_a_path_is_refused_and_creates_nothing",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary fixture root");
+    let clone_parent = root.path().join("clones");
+    fs::create_dir(&clone_parent).expect("clone parent");
+    let source = TempDir::new().expect("clone source");
+    initialize_repository(&source);
+    commit_file(source.path(), "tracked.txt", "base\n", "initial");
+    let source_url = local_file_url(source.path());
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+
+    request(
+        server.socket(),
+        "771",
+        "vcs.clone",
+        json!({ "url": source_url, "parentDir": clone_parent, "directoryName": "a/../b" }),
+    )
+    .await;
+    let error = failure_value(server.socket(), "771").await;
+    assert_eq!(error["_tag"], "GitCommandError");
+    assert_eq!(
+        error["detail"],
+        "The folder name \"a/../b\" must be a single name, without slashes or \"..\"."
+    );
+    assert!(
+        !clone_parent.join("a").exists(),
+        "no folder is created for the name's first part"
+    );
+    assert!(
+        !clone_parent.join("b").exists(),
+        "nothing is cloned where the path leads"
+    );
+
+    // A URL that yields no folder name is refused, and the URL, which may embed credentials, is
+    // never echoed.
+    let nameless = "https://user:secret@example.test/org/.git";
+    request(
+        server.socket(),
+        "772",
+        "vcs.clone",
+        json!({ "url": nameless, "parentDir": clone_parent }),
+    )
+    .await;
+    let error = failure_value(server.socket(), "772").await;
+    assert_eq!(error["_tag"], "GitCommandError");
+    assert_eq!(
+        error["detail"],
+        "Could not work out a folder name from the repository URL. Check that the URL ends with the repository's name."
+    );
+    assert!(
+        !error.to_string().contains("secret"),
+        "the URL is never echoed: {error}"
+    );
+
+    // sourceControl.cloneRepository checks the name before it creates the parent folder. A
+    // destination ending in ".." has no folder name, so the name comes from the URL.
+    let unnamed_parent = clone_parent.join("new-parent");
+    request(
+        server.socket(),
+        "773",
+        "sourceControl.cloneRepository",
+        json!({ "remoteUrl": nameless, "destinationPath": unnamed_parent.join("..") }),
+    )
+    .await;
+    let error = failure_value(server.socket(), "773").await;
+    assert_eq!(error["_tag"], "SourceControlRepositoryError");
+    assert_eq!(
+        error["detail"],
+        "Could not work out a folder name from the repository URL. Check that the URL ends with the repository's name."
+    );
+    assert!(
+        !error.to_string().contains("secret"),
+        "the URL is never echoed: {error}"
+    );
+    assert!(
+        !unnamed_parent.exists(),
+        "a refused clone creates no parent folder"
+    );
+    assert_eq!(
+        fs::read_dir(&clone_parent).expect("clone parent").count(),
+        0,
+        "nothing was created in the parent folder"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_cancel_through_a_folder_name_alias_is_refused_and_the_live_clone_keeps_running() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "a_cancel_through_a_folder_name_alias_is_refused_and_the_live_clone_keeps_running",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary fixture root");
+    run_git_in(root.path(), &["config", "--global", "http.proxy", ""]);
+    let clone_parent = root.path().join("clones");
+    fs::create_dir(&clone_parent).expect("clone parent");
+    let (remote, url) = stalled_http_remote().await;
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+
+    let live = json!({ "url": url, "parentDir": clone_parent, "directoryName": "b" });
+    request(
+        server.socket(),
+        "781",
+        "vcs.clone",
+        with_flags(&live, false, true),
+    )
+    .await;
+    let mut connection = accept_git(&remote).await;
+
+    // "a/../b" names the live clone's folder lexically; the server refuses the path instead of
+    // resolving it, so the live clone is untouched.
+    request(
+        server.socket(),
+        "782",
+        "vcs.cancelClone",
+        json!({ "url": url, "parentDir": clone_parent, "directoryName": "a/../b" }),
+    )
+    .await;
+    let error = failure_value(server.socket(), "782").await;
+    assert_eq!(error["_tag"], "GitCommandError");
+    assert_eq!(error["operation"], "vcs.cancelClone");
+    assert_eq!(
+        error["detail"],
+        "The folder name \"a/../b\" must be a single name, without slashes or \"..\"."
+    );
+    assert_connection_stays_open(&mut connection, "after the refused cancel").await;
+    assert!(
+        clone_parent.join("b").is_dir(),
+        "the live clone keeps its folder"
+    );
+
+    // End the transfer from the remote's side: the clone fails on its own, not as cancelled.
+    drop(connection);
+    let failure = failure_value(server.socket(), "781").await;
+    assert_eq!(
+        failure["_tag"], "GitCommandError",
+        "the live clone was not cancelled: {failure}"
+    );
+
+    server.shutdown().await;
 }

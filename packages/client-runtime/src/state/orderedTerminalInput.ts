@@ -1,4 +1,5 @@
 import { TerminalInputError, WS_METHODS, type TerminalBeginInput } from "@bibcode/contracts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -18,6 +19,16 @@ const nextAttachmentSequence = new WeakMap<RpcSession, number>();
 const encoder = new TextEncoder();
 const isTerminalInputError = Schema.is(TerminalInputError);
 const inputError = (message: string) => new TerminalInputError({ code: "closed", message });
+
+/** Every RPC here runs under a 15-second timeout whose `TimeoutError` has no message. */
+function describeInputFailure(error: unknown): string {
+  if (Cause.isTimeoutError(error)) {
+    return "Terminal input timed out after 15 seconds. Reattach before typing again.";
+  }
+  return error instanceof Error && typeof error.message === "string" && error.message.length > 0
+    ? error.message
+    : String(error);
+}
 
 /** UTF-8 frames preserve complete Unicode scalar values, including surrogate pairs. */
 export function splitTerminalInputFrames(data: string): string[] {
@@ -129,9 +140,7 @@ export function createOrderedTerminalInputBinding(
     return preparation;
   };
   const mapError = (error: unknown): TerminalInputError =>
-    isTerminalInputError(error)
-      ? error
-      : inputError(error instanceof Error ? error.message : String(error));
+    isTerminalInputError(error) ? error : inputError(describeInputFailure(error));
   return {
     session,
     prepare: Effect.tryPromise({ try: prepare, catch: mapError }),

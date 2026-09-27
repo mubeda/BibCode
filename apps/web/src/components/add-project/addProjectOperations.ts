@@ -1,3 +1,4 @@
+import type { VcsCloneProgress } from "@bibcode/client-runtime/state/vcs";
 import type { EnvironmentId, ProjectId, ThreadId } from "@bibcode/contracts";
 
 import { findProjectByPath, inferProjectTitleFromPath } from "~/lib/projectPaths";
@@ -15,6 +16,14 @@ export type AddProjectOutcome =
   | { readonly _tag: "Opened" }
   | { readonly _tag: "Failed"; readonly title: string; readonly error: unknown }
   | { readonly _tag: "Stopped" };
+
+/**
+ * How a clone ended: an add-project outcome, or `ClonedNotAdded` when the repository reached the
+ * disk after Cancel was pressed, so it was left there unregistered.
+ */
+export type AddProjectCloneOutcome =
+  | AddProjectOutcome
+  | { readonly _tag: "ClonedNotAdded"; readonly path: string };
 
 type AddProjectCommandOutcome<T> =
   | { readonly _tag: "Success"; readonly value: T }
@@ -38,6 +47,13 @@ export interface AddProjectCloneControl extends AddProjectOperationControl {
   readonly signal?: AbortSignal;
   /** Called once the repository is on disk, before it is registered as a project. */
   readonly onCloned?: () => void;
+  /** Whether the clone runs or waits for a lost connection, and whether the server re-attaches. */
+  readonly onProgress?: (progress: VcsCloneProgress) => void;
+  /**
+   * Checked once the repository is on disk: `false` leaves it there unregistered (after Cancel),
+   * and the clone ends as `ClonedNotAdded` with the repository's path.
+   */
+  readonly shouldRegister?: () => boolean;
 }
 
 export interface AddProjectOperationsDependencies {
@@ -60,7 +76,13 @@ export interface AddProjectOperationsDependencies {
     readonly url: string;
     readonly parentDir: string;
     readonly signal?: AbortSignal;
+    readonly onProgress?: (progress: VcsCloneProgress) => void;
   }) => Promise<AddProjectCommandResult<{ readonly path: string }>>;
+  readonly cancelClone: (input: {
+    readonly environmentId: EnvironmentId;
+    readonly url: string;
+    readonly parentDir: string;
+  }) => Promise<AddProjectCommandResult<{ readonly cancelled: boolean }>>;
   readonly openProject: (input: {
     readonly environmentId: EnvironmentId;
     readonly projectId: ProjectId;
@@ -179,17 +201,21 @@ export function createAddProjectOperations(dependencies: AddProjectOperationsDep
         readonly url: string;
         readonly parentDir: string;
       } & AddProjectCloneControl,
-    ): Promise<AddProjectOutcome> => {
+    ): Promise<AddProjectCloneOutcome> => {
       const cloned = await executeCommand("Clone failed", input.shouldContinue, () =>
         dependencies.cloneRepository({
           environmentId: input.environmentId,
           url: input.url,
           parentDir: input.parentDir,
           ...(input.signal === undefined ? {} : { signal: input.signal }),
+          ...(input.onProgress === undefined ? {} : { onProgress: input.onProgress }),
         }),
       );
       if (cloned._tag !== "Success") {
         return cloned;
+      }
+      if (input.shouldRegister !== undefined && !input.shouldRegister()) {
+        return { _tag: "ClonedNotAdded", path: cloned.value.path };
       }
       input.onCloned?.();
       return registerOrOpen({
@@ -201,5 +227,11 @@ export function createAddProjectOperations(dependencies: AddProjectOperationsDep
         failureTitle: "Failed to add cloned project",
       });
     },
+    /** `vcs.cancelClone`: stops the server-side clone, even across a reconnect. */
+    cancelClone: (input: {
+      readonly environmentId: EnvironmentId;
+      readonly url: string;
+      readonly parentDir: string;
+    }) => dependencies.cancelClone(input),
   };
 }

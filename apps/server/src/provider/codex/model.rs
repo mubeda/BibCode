@@ -752,7 +752,7 @@ pub fn fallback_models(
             "optionDescriptors": [
                 {
                     "id": "reasoningEffort",
-                    "label": "Reasoning",
+                    "label": REASONING_EFFORT_LABEL,
                     "type": "select",
                     "options": effort_options,
                     "currentValue": selected_effort,
@@ -936,7 +936,7 @@ fn map_model_capabilities(model: &Value) -> Value {
     if !reasoning_options.is_empty() {
         option_descriptors.push(json!({
             "id": "reasoningEffort",
-            "label": "Reasoning",
+            "label": REASONING_EFFORT_LABEL,
             "type": "select",
             "options": reasoning_options,
             "currentValue": default_reasoning_effort,
@@ -982,7 +982,7 @@ fn map_model_capabilities(model: &Value) -> Value {
     if !options.is_empty() {
         option_descriptors.push(json!({
             "id": "serviceTier",
-            "label": "Service Tier",
+            "label": SERVICE_TIER_LABEL,
             "type": "select",
             "options": options,
             "currentValue": effective_default_service_tier,
@@ -994,7 +994,21 @@ fn map_model_capabilities(model: &Value) -> Value {
     })
 }
 
-fn reasoning_effort_label(value: &str) -> &str {
+/// The labels BiBCode gives Codex's turn options. The model catalog shows them, and the refusal
+/// for an option shows the same label.
+pub(crate) const REASONING_EFFORT_LABEL: &str = "Reasoning";
+pub(crate) const SERVICE_TIER_LABEL: &str = "Service Tier";
+
+/// The label for a Codex turn option id, or the id itself for an option Codex does not take.
+pub(crate) fn turn_option_label(id: &str) -> &str {
+    match id {
+        "reasoningEffort" => REASONING_EFFORT_LABEL,
+        "serviceTier" => SERVICE_TIER_LABEL,
+        other => other,
+    }
+}
+
+pub(crate) fn reasoning_effort_label(value: &str) -> &str {
     match value {
         "none" => "None",
         "minimal" => "Minimal",

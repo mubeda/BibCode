@@ -610,13 +610,6 @@ vi.mock("./RightPanelSheet", () => ({
   },
 }));
 
-vi.mock("./BranchToolbar", () => ({
-  BranchToolbar: (props: Record<string, unknown>) => {
-    h.capture("branchToolbar", props);
-    return <div data-mock="branch-toolbar" />;
-  },
-}));
-
 vi.mock("./preview/PreviewPanel", () => ({
   PreviewPanel: () => <div data-mock="preview-panel" />,
 }));
@@ -5365,13 +5358,6 @@ describe("ChatView model and environment selection", () => {
     expect(
       useComposerDraftStore.getState().getComposerDraft(threadRef)?.modelSelectionByProvider ?? {},
     ).toEqual({});
-  });
-
-  it("does not render the removed branch toolbar below the composer", () => {
-    seedConnectedServerThread();
-    renderServerRoute();
-
-    expect(h.capturedList.some((entry) => entry.name === "branchToolbar")).toBe(false);
   });
 });
 

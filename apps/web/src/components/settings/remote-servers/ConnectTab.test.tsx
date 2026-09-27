@@ -90,6 +90,8 @@ const h = vi.hoisted(() => {
       error: null as string | null,
       isPending: false,
       refresh: vi.fn(),
+      revalidate: vi.fn(),
+      requiresRetry: false,
     },
     networkAccessQuery: {
       data: null as unknown,
@@ -924,7 +926,10 @@ const UP_TO_DATE_SNAPSHOT = {
   latestVersion: null,
   state: "up-to-date",
   error: null,
-  support: { installMode: "interactive", reason: "available" },
+  support: { installMode: "interactive", reason: "available", installKind: "unknown" },
+  downloadPercent: null,
+  targetVersion: null,
+  installStage: null,
 } as const;
 
 function updateCapableConfig() {
@@ -937,12 +942,15 @@ function updateCapableConfig() {
 }
 
 function settledUpdateQuery(data: unknown) {
+  const refresh = vi.fn();
   return {
     data,
     emission: AsyncResult.success(data),
     error: null,
     isPending: false,
-    refresh: vi.fn(),
+    refresh,
+    revalidate: refresh,
+    requiresRetry: false,
   };
 }
 
@@ -1076,6 +1084,8 @@ beforeEach(() => {
     error: null,
     isPending: false,
     refresh: vi.fn(),
+    revalidate: vi.fn(),
+    requiresRetry: false,
   };
   h.networkAccessQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.sshHostsQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
@@ -1370,6 +1380,108 @@ describe("Remote Servers tabs", () => {
     expect(markup).toContain("No saved remote environments");
     expect(markup).not.toContain("Authorized clients");
     expect(markup).not.toContain("BiBCode Connect.");
+  });
+
+  it("wraps a long connection error instead of cutting off its action", () => {
+    stubBrowserWindow();
+    h.hasCloudConfig = false;
+    h.primarySessionState = {
+      data: { authenticated: false, auth: { policy: "loopback-only" } },
+    };
+    h.environments = [
+      environment({
+        id: "environment-ssh",
+        label: "Devbox",
+        targetTag: "SshConnectionTarget",
+        sshTarget: { alias: "devbox", hostname: "devbox.internal", username: "dev", port: 2222 },
+        connection: {
+          phase: "error",
+          error: new Error(
+            "devbox rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.",
+          ),
+          traceId: "trace-9",
+        },
+      }),
+    ];
+
+    const markup = render();
+
+    const errorLine =
+      /<span class="([^"]*)">[^<]*remove the environment and add it again\.<\/span>/u.exec(markup);
+    expect(errorLine, "the error line renders the whole message").not.toBeNull();
+    const classes = errorLine![1]!.split(/\s+/u);
+    expect(classes).not.toContain("truncate");
+    expect(classes).toContain("line-clamp-3");
+    expect(markup).toContain("Copy trace ID");
+  });
+
+  it.each(["connecting", "reconnecting"])("shows a visible slow-setup status while %s", (phase) => {
+    stubBrowserWindow();
+    const notice = "Receiving settings from Devbox over a slow connection…";
+    const connection = { phase, notice };
+    h.environments = [environment({ id: "environment-ssh", label: "Devbox", connection })];
+
+    const container = document.createElement("div");
+    container.innerHTML = render(<ConnectTab />);
+
+    const noticeLine = container.querySelector('[role="status"]');
+    expect(noticeLine, "the notice renders outside the tooltip").not.toBeNull();
+    expect(noticeLine?.closest("[data-tooltip-popup]")).toBeNull();
+    expect(noticeLine?.textContent).toBe(notice);
+    expect(noticeLine?.getAttribute("aria-live")).toBe("polite");
+    expect(noticeLine?.classList.contains("text-xs")).toBe(true);
+    expect(noticeLine?.classList.contains("text-muted-foreground")).toBe(true);
+    expect(noticeLine?.classList.contains("text-destructive")).toBe(false);
+    expect(noticeLine?.classList.contains("flex-wrap")).toBe(true);
+    expect(noticeLine?.querySelector(".truncate")).toBeNull();
+    expect(noticeLine?.querySelector(".wrap-break-word")).not.toBeNull();
+    expect(noticeLine?.querySelector(".animate-spin")).not.toBeNull();
+    expect(noticeLine?.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    expect(container.textContent).not.toContain("Copy trace ID");
+  });
+
+  it.each(["error", "reconnecting"])(
+    "shows only the error line when a notice is also present while %s",
+    (phase) => {
+      stubBrowserWindow();
+      const notice = "Receiving settings from Devbox over a slow connection…";
+      const connection = {
+        phase,
+        error: "Devbox did not send its settings. Connect again.",
+        notice,
+        traceId: "trace-9",
+      };
+      h.environments = [environment({ id: "environment-ssh", label: "Devbox", connection })];
+
+      const container = document.createElement("div");
+      container.innerHTML = render(<ConnectTab />);
+      for (const tooltip of container.querySelectorAll("[data-tooltip-popup]")) tooltip.remove();
+
+      const errorLines = container.querySelectorAll("p.text-destructive");
+      expect(errorLines).toHaveLength(1);
+      expect(errorLines[0]?.textContent).toContain(connection.error);
+      expect(errorLines[0]?.textContent).toContain("Copy trace ID");
+      expect(container.querySelector('[role="status"]')).toBeNull();
+      expect(container.textContent).not.toContain(notice);
+    },
+  );
+
+  it("shows no connection status line when connected without an error or notice", () => {
+    stubBrowserWindow();
+    h.environments = [
+      environment({
+        id: "environment-ssh",
+        label: "Devbox",
+        connection: { phase: "connected" },
+      }),
+    ];
+
+    const container = document.createElement("div");
+    container.innerHTML = render(<ConnectTab />);
+
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    expect(container.querySelector("p.text-destructive")).toBeNull();
+    expect(container.textContent).not.toContain("Copy trace ID");
   });
 
   it("lists saved environments with connect, disconnect and error affordances", async () => {
@@ -1975,7 +2087,11 @@ describe("Remote Servers tabs", () => {
         settledUpdateQuery({
           ...UP_TO_DATE_SNAPSHOT,
           state: "idle",
-          support: { installMode: "manual", reason: "manual-update-required" },
+          support: {
+            installMode: "manual",
+            reason: "manual-update-required",
+            installKind: "unknown",
+          },
         }),
       );
 
@@ -2054,6 +2170,77 @@ describe("Remote Servers tabs", () => {
       });
       expect(refresh).toHaveBeenCalledOnce();
       expect(h.commands.remoteUpdateCheck).not.toHaveBeenCalled();
+    });
+
+    it("re-reads each status after Check for Server Updates without clearing a cut-off latch", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const environmentId = EnvironmentId.make("env-fan-out");
+      h.environments = [
+        environment({
+          id: environmentId,
+          label: "Fan-out server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      const refresh = vi.fn();
+      const revalidate = vi.fn();
+      h.remoteUpdateQueries.set(environmentId, {
+        ...settledUpdateQuery(UP_TO_DATE_SNAPSHOT),
+        refresh,
+        revalidate,
+        requiresRetry: true,
+      });
+
+      await mountConnections(<ConnectTab showServerUpdateCheck />);
+      await act(async () => {
+        clickButton("Check for Server Updates");
+        await flush();
+      });
+
+      expect(h.commands.remoteUpdateCheck).toHaveBeenCalledExactlyOnceWith({
+        environmentId,
+        input: {},
+      });
+      // The fan-out's epoch is automatic: only the row's Retry may clear the latch.
+      expect(revalidate).toHaveBeenCalledOnce();
+      expect(refresh).not.toHaveBeenCalled();
+    });
+
+    it("re-reads the status after a row Check without clearing a cut-off latch", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const environmentId = EnvironmentId.make("env-row-check");
+      h.environments = [
+        environment({
+          id: environmentId,
+          label: "Row check server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      const refresh = vi.fn();
+      const revalidate = vi.fn();
+      h.remoteUpdateQueries.set(environmentId, {
+        ...settledUpdateQuery(UP_TO_DATE_SNAPSHOT),
+        refresh,
+        revalidate,
+        requiresRetry: true,
+      });
+
+      await mountConnections(<ConnectTab />);
+      await act(async () => {
+        clickButton("Check");
+        await flush();
+      });
+
+      expect(h.commands.remoteUpdateCheck).toHaveBeenCalledExactlyOnceWith({
+        environmentId,
+        input: {},
+      });
+      expect(revalidate).toHaveBeenCalledOnce();
+      expect(refresh).not.toHaveBeenCalled();
     });
 
     it("says a host has not checked yet and keeps Check usable during background re-reads", () => {
@@ -2652,6 +2839,98 @@ describe("Remote Servers tabs", () => {
     expect(h.toastAdd).not.toHaveBeenCalled();
   });
 
+  // "Updated" means the host answered with an environment that is already
+  // saved; the alias is not the environment (two users on one host differ).
+  const savedSshEnvironment = () =>
+    environment({
+      id: "environment-ssh",
+      label: "Build box",
+      targetTag: "SshConnectionTarget",
+      sshTarget: { alias: "10.0.0.5", hostname: "10.0.0.5", username: "alice", port: 22 },
+    });
+
+  it("says a manual re-add of a saved SSH environment updated it", async () => {
+    stubDesktopWindow();
+    h.stateOverrides.set("pairing-code", "ssh");
+    h.stateOverrides.set("", "10.0.0.5:2222");
+    h.wslQuery.data = null;
+    h.sshHostsQuery.data = [];
+    h.environments = [
+      environment({
+        id: "environment-ssh",
+        label: "Build box",
+        targetTag: "SshConnectionTarget",
+        sshTarget: { alias: "build-box", hostname: "10.0.0.5", username: null, port: 22 },
+      }),
+    ];
+    h.commands.connectSsh.mockResolvedValueOnce(success(EnvironmentId.make("environment-ssh")));
+
+    render();
+
+    clickButton("Add environment");
+    await flush();
+    expect(h.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Environment updated",
+        description: "10.0.0.5 is connecting over SSH.",
+      }),
+    );
+  });
+
+  it("says a different user on a saved SSH host was added", async () => {
+    stubDesktopWindow();
+    h.stateOverrides.set("pairing-code", "ssh");
+    h.stateOverrides.set("", "10.0.0.5:2222");
+    h.wslQuery.data = null;
+    h.sshHostsQuery.data = [];
+    h.environments = [savedSshEnvironment()];
+    h.commands.connectSsh.mockResolvedValueOnce(success(EnvironmentId.make("environment-ssh-bob")));
+
+    render();
+
+    clickButton("Add environment");
+    await flush();
+    expect(h.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Environment added" }),
+    );
+  });
+
+  for (const [returned, title] of [
+    ["environment-ssh", "Environment updated"],
+    ["environment-ssh-new", "Environment added"],
+  ] as const) {
+    it(`uses the returned environment for a discovered host (${title})`, async () => {
+      stubDesktopWindow();
+      // Opens the add dialog, which lists discovered hosts.
+      h.stateOverrides.set(false, true);
+      h.stateOverrides.set("pairing-code", "ssh");
+      h.wslQuery.data = null;
+      h.sshHostsQuery.data = [
+        {
+          alias: "devbox",
+          hostname: "devbox.internal",
+          username: "dev",
+          port: 22,
+          source: "ssh-config",
+        },
+      ];
+      h.environments = [savedSshEnvironment()];
+      h.commands.connectSsh.mockResolvedValueOnce(success(EnvironmentId.make(returned)));
+
+      render();
+
+      const row = findControls("button", "Add environment").find(
+        (entry) => typeof entry.props.onClick === "function",
+      );
+      invoke(row!, "onClick");
+      await flush();
+      expect(h.commands.connectSsh).toHaveBeenCalledWith(
+        expect.objectContaining({ target: expect.objectContaining({ alias: "devbox" }) }),
+      );
+      expect(h.toastAdd).toHaveBeenCalledWith(expect.objectContaining({ title }));
+    });
+  }
+
   it("adds SSH backends with parsed manual targets", async () => {
     stubDesktopWindow();
     h.stateOverrides.set("pairing-code", "ssh");
@@ -2673,7 +2952,10 @@ describe("Remote Servers tabs", () => {
     expect(target.username).toBe("10.0.0.5:2222");
     expect(target.port).toBe(10);
     expect(h.toastAdd).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Environment connected" }),
+      expect.objectContaining({
+        title: "Environment added",
+        description: "10.0.0.5 is connecting over SSH.",
+      }),
     );
 
     // SSH connect failures strip IPC prefixes from the error text.
@@ -3000,7 +3282,11 @@ describe("Remote Servers tabs", () => {
 
     const markup = render();
 
-    expect(markup.match(/Connecting…/gu)).toHaveLength(2);
+    // Both in-progress rows label their action "Connecting…", and the connecting row's
+    // status copy now uses the same ellipsis character.
+    expect(findControls("button", "Connecting…")).toHaveLength(2);
+    expect(markup.match(/Connecting…/gu)).toHaveLength(5);
+    expect(markup).not.toContain("Connecting...");
     expect(markup).toContain("Connection failed. Reason: Error: transport failed");
     expect(markup).not.toContain("Copy trace ID");
     expect(markup).toContain("SSH build-host.internal");

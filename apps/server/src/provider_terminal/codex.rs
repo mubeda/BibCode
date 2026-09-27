@@ -33,6 +33,8 @@ use super::{
     TerminalGenerationActivityPublisher, TerminalObserverWorkerContext,
     supervisor::cleanup_owned_generation_directory,
 };
+#[cfg(not(windows))]
+use crate::process::supervised::spawn_retrying_busy_executable;
 #[cfg(test)]
 use crate::process::supervised::{
     run_supervised_with_spawn_observer, run_supervised_with_spawn_observer_until,
@@ -2047,6 +2049,14 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                 crate::provider::environment::sanitize_provider_subprocess_environment(command);
             });
             configure_supervised_background_command_wrap(&mut command);
+            #[cfg(not(windows))]
+            let child = spawn_retrying_busy_executable(
+                &mut command,
+                tokio::time::Instant::now() + self.readiness_timeout,
+            )
+            .await
+            .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
+            #[cfg(windows)]
             let child = command
                 .spawn()
                 .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
@@ -2715,6 +2725,54 @@ impl CodexRemoteClient for SystemCodexRemoteClient {
 mod tests {
     use super::*;
     use crate::test_support::{FixtureEvent, TestSandbox};
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn system_helper_launcher_retries_while_its_executable_is_busy() {
+        use crate::test_support::within_fixture_deadline;
+
+        let fixture = helper_fixture(TestSandbox::new("codex-helper-busy-executable"));
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.executable)
+            .expect("hold the helper executable open for writing");
+        let launcher = Arc::new(SystemCodexHelperLauncher::with_fixture_events(
+            CODEX_HELPER_READY_TIMEOUT,
+            fixture.events.clone(),
+        ));
+        let launch = fixture.launch(ProcessAttributionRegistry::new());
+        let start = tokio::spawn({
+            let launcher = launcher.clone();
+            async move { launcher.start(launch).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !start.is_finished(),
+            "spawn must keep retrying while the script is busy: {:?}",
+            within_fixture_deadline("the failed Codex helper start task to finish", start).await
+        );
+        drop(writer);
+
+        let process = within_fixture_deadline("the retried Codex helper to become ready", start)
+            .await
+            .expect("Codex helper start task")
+            .expect("spawn must succeed once the writer closes");
+        process.terminate();
+        within_fixture_deadline(
+            "the retried Codex helper to be reaped",
+            fixture.events.reaped.wait_after(0),
+        )
+        .await;
+        within_fixture_deadline(
+            "the retried Codex helper launcher to shut down",
+            launcher.shutdown(),
+        )
+        .await;
+        let pid = read_fixture_pid(&fixture.pid_path).expect("retried Codex helper PID");
+        assert!(fixture.socket_path.exists(), "helper published its socket");
+        assert!(!process_exists(pid), "retried Codex helper survived reap");
+        assert_child_was_reaped(pid, "retried Codex helper");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

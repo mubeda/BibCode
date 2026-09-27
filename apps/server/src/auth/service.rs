@@ -1944,6 +1944,16 @@ impl AuthService {
             .expect("new authenticated connection guard is armed"))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn live_connection_count_for_test(&self, session_id: &str) -> usize {
+        self.state
+            .lock()
+            .await
+            .live_connections
+            .get(session_id)
+            .map_or(0, HashMap::len)
+    }
+
     pub(crate) async fn mark_connected_guard(
         &self,
         session_id: &str,

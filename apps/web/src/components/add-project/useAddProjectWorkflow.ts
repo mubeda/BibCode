@@ -47,7 +47,13 @@ import {
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { buildThreadRouteParams } from "~/threadRoutes";
 import {
+  CLONE_CANCELLED_NOTICE,
+  CLONE_STOPPED_ERROR,
+  cloneCancelPendingNotice,
+  cloneFinishedBeforeCancelNotice,
+  cloneReconnectingNotice,
   defaultAddProjectParent,
+  describeCloneOperationFailure,
   getEnvironmentBrowsePlatform,
   joinProjectPath,
   shouldUseNativePicker,
@@ -55,6 +61,7 @@ import {
   validateGitCloneParentPath,
   validateGitCloneUrl,
   validateProjectName,
+  type AddProjectCloneFeedback,
   type AddProjectCloneProgress,
   type AddProjectHostOption,
   type AddProjectStep,
@@ -62,7 +69,7 @@ import {
 import {
   createAddProjectOperations,
   type AddProjectCommandResult,
-  type AddProjectOutcome,
+  type AddProjectCloneOutcome,
 } from "./addProjectOperations";
 import { readPrimaryRunningDistro } from "../hostFolderPicker";
 import { pickAddProjectFolder, type PickAddProjectFolderResult } from "./pickAddProjectFolder";
@@ -75,6 +82,12 @@ export interface AddProjectWorkflow {
   readonly selectedHost: AddProjectHostOption;
   readonly step: AddProjectStep;
   readonly busy: boolean;
+  /**
+   * Whether the dialog can be closed: when nothing is running, and while a clone waits for its
+   * host (reconnecting or cancelling), which can take as long as the host stays down. Closing
+   * then cancels the clone and ends the wait. Never while cloning or adding the project.
+   */
+  readonly dismissible: boolean;
   readonly cloneProgress: AddProjectCloneProgress;
   readonly hostPath: string;
   readonly cloneUrl: string;
@@ -116,7 +129,7 @@ export interface AddProjectWorkflowStateInput {
   readonly initialEnvironmentId: EnvironmentId | null;
   readonly operations: Pick<
     ReturnType<typeof createAddProjectOperations>,
-    "addFolder" | "clone" | "create"
+    "addFolder" | "clone" | "create" | "cancelClone"
   >;
   readonly pickFolder: (
     host: AddProjectHostOption,
@@ -156,10 +169,6 @@ function unexpectedErrorMessage(error: unknown): string {
     : "An error occurred.";
 }
 
-const CLONE_CANCELLED_NOTICE = "Clone cancelled.";
-// An interrupted clone request (for example by a reconnect) makes the server stop Git and, when it
-// can, remove the folder that clone created; the copy does not promise the removal.
-const CLONE_STOPPED_ERROR = "The clone stopped before it finished. Try again.";
 const CLONE_REGISTRATION_STOPPED_ERROR =
   "Adding the project stopped before it finished. Try again.";
 
@@ -180,6 +189,91 @@ function addProjectFailureMessage(error: unknown): string {
     return error.detail;
   }
   return unexpectedErrorMessage(error);
+}
+
+/** How a server cancel ended. */
+type CloneCancellation =
+  | { readonly _tag: "Acknowledged"; readonly cancelled: boolean }
+  | { readonly _tag: "Failed"; readonly error: unknown };
+
+/** One running clone request. Cleared once the repository is on disk (registration is not cancelled). */
+interface CloneAttempt {
+  readonly controller: AbortController;
+  readonly hostLabel: string;
+  readonly requestCancel: () => Promise<AddProjectCommandResult<{ readonly cancelled: boolean }>>;
+  phase: "cloning" | "reconnecting";
+  /** The server keeps this clone across reconnects: Cancel and close must reach it. */
+  reattach: boolean;
+  /**
+   * The server cancel, once requested. It settles when the host acknowledged it, the
+   * environment stopped, or it failed. Until then no new clone may start: the cancel is keyed
+   * by destination, so a cancel that is still retrying would stop a new clone into this folder.
+   */
+  cancellation: Promise<CloneCancellation> | null;
+}
+
+function settleCancellation(
+  result: Promise<AddProjectCommandResult<{ readonly cancelled: boolean }>>,
+): Promise<CloneCancellation> {
+  return result.then(
+    (settled): CloneCancellation =>
+      settled._tag === "Success"
+        ? { _tag: "Acknowledged", cancelled: settled.value.cancelled }
+        : { _tag: "Failed", error: settled.error },
+    (cause: unknown): CloneCancellation => ({ _tag: "Failed", error: cause }),
+  );
+}
+
+/**
+ * Stops a clone attempt whose result nothing can add any more, because the dialog closed or
+ * unmounted. With re-attach an abort alone only detaches, so the server cancel goes first unless
+ * Cancel already sent it. The cancel is best effort: a closing or disconnected window may never
+ * get it out, and then the clone continues on the host. The client runtime keeps the cancel
+ * registered until it settles, so a later clone into this folder waits for it.
+ */
+function stopCloneAttempt(attempt: CloneAttempt | null): void {
+  if (attempt === null) return;
+  if (attempt.reattach && attempt.cancellation === null) {
+    attempt.cancellation = settleCancellation(attempt.requestCancel());
+  }
+  attempt.controller.abort();
+}
+
+function cloneFeedback(
+  outcome: Exclude<AddProjectCloneOutcome, { readonly _tag: "Opened" }>,
+  attempt: CloneAttempt,
+  cancellation: CloneCancellation | null,
+  cloned: boolean,
+): AddProjectCloneFeedback {
+  // Git finished before the Cancel landed: the repository is on disk, left unregistered because
+  // the user asked to cancel. Say so, whether the cancel was acknowledged or failed.
+  if (outcome._tag === "ClonedNotAdded") {
+    return { kind: "notice", text: cloneFinishedBeforeCancelNotice(outcome.path) };
+  }
+  const cancelRequested = cancellation !== null;
+  // The clone's own outcome comes first: a folder a cancelled clone could not remove must show.
+  if (outcome._tag === "Failed") {
+    return (
+      describeCloneOperationFailure(outcome.error, attempt.hostLabel, cancelRequested) ?? {
+        kind: "error",
+        text: `${outcome.title}: ${addProjectFailureMessage(outcome.error)}`,
+      }
+    );
+  }
+  if (cancellation?._tag === "Failed") {
+    return (
+      describeCloneOperationFailure(cancellation.error, attempt.hostLabel, true) ?? {
+        kind: "error",
+        text: `Clone failed: ${addProjectFailureMessage(cancellation.error)}`,
+      }
+    );
+  }
+  if (cancelRequested || attempt.controller.signal.aborted) {
+    return { kind: "notice", text: CLONE_CANCELLED_NOTICE };
+  }
+  // Interrupted by something other than Cancel; never re-enable the form silently, and name
+  // the step that stopped.
+  return { kind: "error", text: cloned ? CLONE_REGISTRATION_STOPPED_ERROR : CLONE_STOPPED_ERROR };
 }
 
 export function useAddProjectWorkflowState(
@@ -205,7 +299,7 @@ export function useAddProjectWorkflowState(
   const openRef = useRef(input.open);
   const previousOpenRef = useRef(false);
   /** Set only while the clone request itself runs, so Cancel cannot interrupt registration. */
-  const cloneAbortRef = useRef<AbortController | null>(null);
+  const cloneAttemptRef = useRef<CloneAttempt | null>(null);
   openRef.current = input.open;
 
   const catalogSelectedHost = input.hosts.find(
@@ -241,6 +335,8 @@ export function useAddProjectWorkflowState(
     }
     if (!input.open && wasOpen) {
       generationRef.current += 1;
+      // Closing while a clone waits for its host cancels it and ends the wait.
+      stopCloneAttempt(cloneAttemptRef.current);
       setBusy(false);
       busyRef.current = false;
       setCloneProgress("idle");
@@ -260,7 +356,7 @@ export function useAddProjectWorkflowState(
       generationRef.current += 1;
       openRef.current = false;
       // Nothing can register the result after unmount, so stop the server-side clone too.
-      cloneAbortRef.current?.abort();
+      stopCloneAttempt(cloneAttemptRef.current);
     },
     [],
   );
@@ -529,24 +625,56 @@ export function useAddProjectWorkflowState(
     if (generation === null) {
       return;
     }
-    const controller = new AbortController();
-    cloneAbortRef.current = controller;
+    const url = cloneUrl.trim();
+    const parentDir = cloneParent.trim();
+    const environmentId = selectedHost.environmentId;
+    const attempt: CloneAttempt = {
+      controller: new AbortController(),
+      hostLabel: selectedHost.label,
+      requestCancel: () => input.operations.cancelClone({ environmentId, url, parentDir }),
+      phase: "cloning",
+      reattach: false,
+      cancellation: null,
+    };
+    cloneAttemptRef.current = attempt;
     setCloneProgress("cloning");
-    const attempt = { cloned: false };
-    let outcome: AddProjectOutcome;
+    let cloned = false;
+    let outcome: AddProjectCloneOutcome;
     try {
       outcome = await input.operations.clone({
-        environmentId: selectedHost.environmentId,
-        url: cloneUrl.trim(),
-        parentDir: cloneParent.trim(),
+        environmentId,
+        url,
+        parentDir,
         shouldContinue: () => isCurrent(generation),
-        signal: controller.signal,
+        // After Cancel, a clone that finished anyway stays on disk unregistered.
+        shouldRegister: () => attempt.cancellation === null,
+        signal: attempt.controller.signal,
+        onProgress: (progress) => {
+          attempt.phase = progress.phase;
+          attempt.reattach = progress.reattach;
+          if (!isCurrent(generation)) return;
+          if (attempt.cancellation !== null) {
+            // Cancel requested: stay Cancelling…, but follow the connection. While it is down,
+            // say when the clone stops; once it is back, the cancel goes out and the line clears.
+            setNotice(
+              progress.phase === "reconnecting"
+                ? cloneCancelPendingNotice(attempt.hostLabel)
+                : null,
+            );
+            return;
+          }
+          setCloneProgress(progress.phase);
+          setNotice(
+            progress.phase === "reconnecting" ? cloneReconnectingNotice(attempt.hostLabel) : null,
+          );
+        },
         onCloned: () => {
-          attempt.cloned = true;
-          if (cloneAbortRef.current === controller) {
-            cloneAbortRef.current = null;
+          cloned = true;
+          if (cloneAttemptRef.current === attempt) {
+            cloneAttemptRef.current = null;
           }
           if (isCurrent(generation)) {
+            setNotice(null);
             setCloneProgress("registering");
           }
         },
@@ -554,27 +682,32 @@ export function useAddProjectWorkflowState(
     } catch (cause) {
       outcome = { _tag: "Failed", title: "Clone failed", error: cause };
     } finally {
-      if (cloneAbortRef.current === controller) {
-        cloneAbortRef.current = null;
+      if (cloneAttemptRef.current === attempt) {
+        cloneAttemptRef.current = null;
       }
     }
+    // A stale attempt returns at once; the client runtime still holds any new clone into this
+    // folder until its cancel has settled.
+    if (!isCurrent(generation)) {
+      return;
+    }
+    // Keep Cancelling… until the cancel settles.
+    const cancellation = attempt.cancellation === null ? null : await attempt.cancellation;
     if (!isCurrent(generation)) {
       return;
     }
     setCloneProgress("idle");
+    setNotice(null);
     if (outcome._tag === "Opened") {
       closeAfterSuccess(generation);
       return;
     }
     finishAsync(generation);
-    if (outcome._tag === "Failed") {
-      setError(`${outcome.title}: ${addProjectFailureMessage(outcome.error)}`);
-    } else if (controller.signal.aborted) {
-      setNotice(CLONE_CANCELLED_NOTICE);
+    const feedback = cloneFeedback(outcome, attempt, cancellation, cloned);
+    if (feedback.kind === "notice") {
+      setNotice(feedback.text);
     } else {
-      // Interrupted by something other than Cancel; never re-enable the form silently, and name
-      // the step that stopped.
-      setError(attempt.cloned ? CLONE_REGISTRATION_STOPPED_ERROR : CLONE_STOPPED_ERROR);
+      setError(feedback.text);
     }
   }, [
     beginAsync,
@@ -585,11 +718,33 @@ export function useAddProjectWorkflowState(
     input.operations,
     isCurrent,
     selectedHost.environmentId,
+    selectedHost.label,
     selectedHost.platform,
   ]);
 
   const cancelClone = useCallback(() => {
-    cloneAbortRef.current?.abort();
+    const attempt = cloneAttemptRef.current;
+    if (attempt === null || attempt.cancellation !== null) {
+      return;
+    }
+    if (!attempt.reattach) {
+      // Older server: interrupting the request is what stops the clone.
+      attempt.controller.abort();
+      return;
+    }
+    setCloneProgress("cancelling");
+    setNotice(
+      attempt.phase === "reconnecting" ? cloneCancelPendingNotice(attempt.hostLabel) : null,
+    );
+    const cancellation = settleCancellation(attempt.requestCancel());
+    attempt.cancellation = cancellation;
+    // A failed or stopped cancel leaves nothing to wait for: stop following the clone. An
+    // acknowledged one lets the clone request report its own outcome.
+    void cancellation.then((settled) => {
+      if (settled._tag === "Failed") {
+        attempt.controller.abort();
+      }
+    });
   }, []);
 
   const submitCreate = useCallback(async () => {
@@ -646,6 +801,7 @@ export function useAddProjectWorkflowState(
     selectedHost,
     step,
     busy,
+    dismissible: !busy || cloneProgress === "reconnecting" || cloneProgress === "cancelling",
     cloneProgress,
     hostPath,
     cloneUrl,
@@ -711,6 +867,7 @@ export function useAddProjectWorkflow(input: {
   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
   const createDefaultThread = useAtomCommand(threadEnvironment.create, { reportFailure: false });
   const cloneRepository = useAtomCommand(vcsEnvironment.clone, { reportFailure: false });
+  const cancelCloneCommand = useAtomCommand(vcsEnvironment.cancelClone, { reportFailure: false });
   const primaryEnvironmentId =
     primaryEnvironment?.environmentId ?? EnvironmentId.make(PRIMARY_LOCAL_ENVIRONMENT_ID);
   const presentation = useMemo(readCurrentEnvironmentPresentationPolicy, []);
@@ -823,11 +980,22 @@ export function useAddProjectWorkflow(input: {
                 input: {
                   url: commandInput.url,
                   parentDir: commandInput.parentDir,
+                  ...(commandInput.onProgress === undefined
+                    ? {}
+                    : { onProgress: commandInput.onProgress }),
                 },
               },
-              // Aborting interrupts the RPC; the server stops Git and removes a folder it created.
+              // Aborting ends this dialog's wait. Without re-attach it also interrupts the RPC,
+              // and the server stops Git; with re-attach only vcs.cancelClone stops the clone.
               { signal: commandInput.signal },
             ),
+          ),
+        cancelClone: async (commandInput) =>
+          adaptAtomResult(
+            await cancelCloneCommand({
+              environmentId: commandInput.environmentId,
+              input: { url: commandInput.url, parentDir: commandInput.parentDir },
+            }),
           ),
         openProject: async (commandInput) => {
           let defaultThreadId =
@@ -910,7 +1078,14 @@ export function useAddProjectWorkflow(input: {
           );
         },
       }),
-    [cloneRepository, createDefaultThread, createProject, environments, navigate],
+    [
+      cancelCloneCommand,
+      cloneRepository,
+      createDefaultThread,
+      createProject,
+      environments,
+      navigate,
+    ],
   );
 
   const wslCandidates = useMemo(

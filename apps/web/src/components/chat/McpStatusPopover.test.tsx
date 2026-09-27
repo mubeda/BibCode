@@ -41,6 +41,82 @@ function activity(
 }
 
 describe("deriveMcpStatusSnapshot", () => {
+  it("recognizes MCP status events with a plain summary", () => {
+    expect(
+      deriveMcpStatusSnapshot(
+        [
+          activity(
+            {
+              eventType: "mcp.status.updated",
+              providerInstanceId: "codex_work",
+              servers: [{ name: "context7", state: "connected" }],
+            },
+            { summary: "Tool connections updated" },
+          ),
+        ],
+        "codex_work",
+        true,
+      ),
+    ).toEqual({ servers: [{ name: "context7", state: "connected", detail: null }] });
+  });
+
+  it("recognizes legacy MCP status rows without an event type", () => {
+    expect(
+      deriveMcpStatusSnapshot(
+        [
+          activity({
+            providerInstanceId: "codex_work",
+            servers: [{ name: "legacy", state: "connected" }],
+          }),
+        ],
+        "codex_work",
+        true,
+      ),
+    ).toEqual({ servers: [{ name: "legacy", state: "connected", detail: null }] });
+  });
+
+  it.each(["Tool connections updated", "mcp.status.updated"])(
+    "ignores unrelated events whose summary is %s",
+    (summary) => {
+      expect(
+        deriveMcpStatusSnapshot(
+          [
+            activity({
+              providerInstanceId: "codex_work",
+              servers: [{ name: "older", state: "connected" }],
+            }),
+            activity(
+              {
+                eventType: "provider.note",
+                providerInstanceId: "codex_work",
+                servers: [{ name: "unrelated", state: "error" }],
+              },
+              { summary },
+            ),
+          ],
+          "codex_work",
+          true,
+        ),
+      ).toEqual({ servers: [{ name: "older", state: "connected", detail: null }] });
+    },
+  );
+
+  it.each([null, ""])("does not treat a present %j event type as missing", (eventType) => {
+    expect(
+      deriveMcpStatusSnapshot(
+        [
+          activity({
+            eventType,
+            providerInstanceId: "codex_work",
+            servers: [{ name: "unrelated", state: "connected" }],
+          }),
+        ],
+        "codex_work",
+        true,
+      ),
+    ).toEqual({ servers: [] });
+  });
+
   it("uses the newest valid snapshot for the active provider instance", () => {
     const snapshot = deriveMcpStatusSnapshot(
       [

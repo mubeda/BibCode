@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import {
   createThreadJumpHintVisibilityController,
   findDefaultThread,
-  formatSessionDuration,
   getSidebarThreadIdsToPrewarm,
   getVisibleSidebarThreadIds,
   orderRowsWithPins,
@@ -14,24 +13,43 @@ import {
   isContextMenuPointerDown,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
-  resolveProjectStatusIndicator,
   resolveSidebarNewThreadSeedContext,
   resolveSidebarNewThreadEnvMode,
   resolveSidebarProjectAvailability,
   resolveSidebarStageBadgeLabel,
-  resolveThreadRowClassName,
   resolveThreadStatusPill,
+  resolveWorkspaceBranchLabel,
   shouldClearThreadSelectionOnMouseDown,
   sortProjectsForSidebar,
   splitPrimaryAndWorkspaceThreads,
   THREAD_JUMP_HINT_SHOW_DELAY_MS,
+  contextMenuAnchorForRect,
+  pickMoreUrgentWorkspaceCardStatus,
+  resolveHighestWorkspaceCardStatus,
+  resolveWorkspaceCardStatus,
+  WORKSPACE_CARD_STATUS,
+  formatCompactAge,
+  isContextMenuShortcut,
+  isKeyboardContextMenuEcho,
+  resolveWorkspaceCardAgeSource,
+  resolveWorkspaceCardClassName,
+  resolveWorkspaceDirty,
+  shouldShowWorkspaceBranchText,
+  summarizeWorkspaceChats,
+  workspaceCheckoutKey,
+  isWorktreeSessionRunning,
 } from "./Sidebar.logic";
+import { KEYBOARD_CONTEXT_MENU_ECHO_MS } from "../contextMenuKeyboard";
 import {
   EnvironmentId,
   OrchestrationLatestTurn,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
+  type OrchestrationSessionStatus,
+  type VcsStatusResult,
+  type VcsStatusSummary,
 } from "@bibcode/contracts";
 import {
   DEFAULT_INTERACTION_MODE,
@@ -782,80 +800,6 @@ describe("resolveThreadStatusPill", () => {
   });
 });
 
-describe("resolveThreadRowClassName", () => {
-  it("uses the darker selected palette when a thread is both selected and active", () => {
-    const className = resolveThreadRowClassName({ isActive: true, isSelected: true });
-    expect(className).toContain("bg-primary/22");
-    expect(className).toContain("hover:bg-primary/26");
-    expect(className).toContain("dark:bg-primary/30");
-    expect(className).not.toContain("bg-accent/85");
-  });
-
-  it("uses selected hover colors for selected threads", () => {
-    const className = resolveThreadRowClassName({ isActive: false, isSelected: true });
-    expect(className).toContain("bg-primary/15");
-    expect(className).toContain("hover:bg-primary/19");
-    expect(className).toContain("dark:bg-primary/22");
-    expect(className).not.toContain("hover:bg-accent");
-  });
-
-  it("keeps the accent palette for active-only threads", () => {
-    const className = resolveThreadRowClassName({ isActive: true, isSelected: false });
-    expect(className).toContain("bg-accent/85");
-    expect(className).toContain("hover:bg-accent");
-  });
-});
-
-describe("resolveProjectStatusIndicator", () => {
-  it("returns null when no threads have a notable status", () => {
-    expect(resolveProjectStatusIndicator([null, null])).toBeNull();
-  });
-
-  it("surfaces the highest-priority actionable state across project threads", () => {
-    expect(
-      resolveProjectStatusIndicator([
-        {
-          label: "Completed",
-          colorClass: "text-emerald-600",
-          dotClass: "bg-emerald-500",
-          pulse: false,
-        },
-        {
-          label: "Pending Approval",
-          colorClass: "text-amber-600",
-          dotClass: "bg-amber-500",
-          pulse: false,
-        },
-        {
-          label: "Working",
-          colorClass: "text-sky-600",
-          dotClass: "bg-sky-500",
-          pulse: true,
-        },
-      ]),
-    ).toMatchObject({ label: "Pending Approval", dotClass: "bg-amber-500" });
-  });
-
-  it("prefers plan-ready over completed when no stronger action is needed", () => {
-    expect(
-      resolveProjectStatusIndicator([
-        {
-          label: "Completed",
-          colorClass: "text-emerald-600",
-          dotClass: "bg-emerald-500",
-          pulse: false,
-        },
-        {
-          label: "Plan Ready",
-          colorClass: "text-violet-600",
-          dotClass: "bg-violet-500",
-          pulse: false,
-        },
-      ]),
-    ).toMatchObject({ label: "Plan Ready", dotClass: "bg-violet-500" });
-  });
-});
-
 describe("getVisibleThreadsForProject", () => {
   it("includes the active thread even when it falls below the folded preview", () => {
     const threads = Array.from({ length: 8 }, (_, index) =>
@@ -1362,15 +1306,8 @@ describe("sidebar logic defensive branch coverage", () => {
     ).toBe(Number.NEGATIVE_INFINITY);
   });
 
-  it("clamps negative prewarm limits and invalid session elapsed time", () => {
+  it("clamps negative prewarm limits", () => {
     expect(getSidebarThreadIdsToPrewarm(["a", "b"], -1)).toEqual([]);
-    expect(
-      formatSessionDuration({
-        sessionUpdatedAt: "2026-03-09T10:00:00.000Z",
-        now: Date.parse("2026-03-09T09:00:00.000Z"),
-      }),
-    ).toBe("now");
-    expect(formatSessionDuration({ sessionUpdatedAt: "invalid" })).toBeNull();
   });
 });
 
@@ -1457,36 +1394,472 @@ describe("orderRowsWithPins", () => {
   });
 });
 
-describe("formatSessionDuration", () => {
-  const now = Date.parse("2026-07-03T12:00:00.000Z");
+describe("resolveWorkspaceBranchLabel", () => {
+  const summary = (overrides: Record<string, unknown>) =>
+    ({
+      isRepo: true,
+      refName: "main",
+      detachedHead: null,
+      hasWorkingTreeChanges: false,
+      sourceControlProvider: null,
+      pr: null,
+      observedAt: "2026-09-24T10:00:00.000Z",
+      stale: false,
+      ...overrides,
+    }) as unknown as VcsStatusSummary;
 
-  it("returns null when neither timestamp is present", () => {
-    expect(formatSessionDuration({ now })).toBeNull();
+  it("prefers the fresh ref name", () => {
+    expect(resolveWorkspaceBranchLabel(summary({}), "stored")).toBe("main");
   });
 
-  it("formats sub-minute elapsed time as 'now'", () => {
-    expect(formatSessionDuration({ sessionUpdatedAt: "2026-07-03T11:59:45.000Z", now })).toBe(
-      "now",
+  it("falls back to the detached head", () => {
+    expect(
+      resolveWorkspaceBranchLabel(summary({ refName: null, detachedHead: "abc1234" }), "stored"),
+    ).toBe("abc1234");
+  });
+
+  it("ignores a stale summary", () => {
+    expect(resolveWorkspaceBranchLabel(summary({ stale: true }), "stored")).toBe("stored");
+  });
+
+  it("uses the recorded branch without a status", () => {
+    expect(resolveWorkspaceBranchLabel(null, "stored")).toBe("stored");
+    expect(resolveWorkspaceBranchLabel(undefined, null)).toBeNull();
+  });
+
+  it("reads the ref from a full status result", () => {
+    expect(
+      resolveWorkspaceBranchLabel({ refName: "feat/x" } as unknown as VcsStatusResult, null),
+    ).toBe("feat/x");
+  });
+});
+
+describe("contextMenuAnchorForRect", () => {
+  it("anchors a keyboard-opened menu at the element's rounded bottom-left", () => {
+    expect(contextMenuAnchorForRect({ left: 40.4, bottom: 152.6 })).toEqual({ x: 40, y: 153 });
+  });
+});
+
+describe("resolveWorkspaceCardStatus", () => {
+  const base = {
+    hasActionableProposedPlan: false,
+    hasPendingApprovals: false,
+    hasPendingUserInput: false,
+    interactionMode: "default" as const,
+    latestTurn: null,
+    session: null,
+    unresolvedDelivery: null,
+  };
+  const session = (status: "running" | "starting" | "ready" | "error") => ({
+    threadId: ThreadId.make("thread-1"),
+    status,
+    providerName: "claudeAgent",
+    runtimeMode: DEFAULT_RUNTIME_MODE,
+    activeTurnId: status === "running" ? ("turn-1" as never) : null,
+    lastError: status === "error" ? "provider exited" : null,
+    updatedAt: "2026-03-09T10:00:00.000Z",
+  });
+  const settled = (state: "completed" | "error" | "interrupted") => ({
+    ...makeLatestTurn(),
+    state,
+  });
+  // makeLatestTurn completes at 10:05.
+  const visitedBefore = "2026-03-09T10:04:00.000Z";
+  const visitedAfter = "2026-03-09T10:06:00.000Z";
+  const W = WORKSPACE_CARD_STATUS;
+
+  it("maps each row of the status table, first match winning", () => {
+    expect(
+      resolveWorkspaceCardStatus(
+        {
+          ...base,
+          hasPendingApprovals: true,
+          hasPendingUserInput: true,
+          session: session("error"),
+        },
+        null,
+      ),
+    ).toBe(W.approval);
+    expect(
+      resolveWorkspaceCardStatus(
+        { ...base, hasPendingUserInput: true, session: session("running") },
+        null,
+      ),
+    ).toBe(W.input);
+    expect(resolveWorkspaceCardStatus({ ...base, session: session("running") }, null)).toBe(
+      W.working,
+    );
+    expect(resolveWorkspaceCardStatus({ ...base, session: session("starting") }, null)).toBe(
+      W.connecting,
+    );
+    expect(resolveWorkspaceCardStatus({ ...base, session: session("error") }, null)).toBe(W.failed);
+    expect(
+      resolveWorkspaceCardStatus(
+        {
+          ...base,
+          interactionMode: "plan",
+          hasActionableProposedPlan: true,
+          latestTurn: settled("completed"),
+          session: session("ready"),
+        },
+        null,
+      ),
+    ).toBe(W.plan);
+    expect(
+      resolveWorkspaceCardStatus(
+        { ...base, latestTurn: settled("completed"), session: session("ready") },
+        visitedBefore,
+      ),
+    ).toBe(W.done);
+    expect(resolveWorkspaceCardStatus(base, null)).toBe(W.idle);
+  });
+
+  it("names and colours each glyph as the spec's table does", () => {
+    expect(W.approval).toEqual({
+      kind: "approval",
+      label: "Needs approval",
+      colorClass: "text-amber-600 dark:text-amber-300/90",
+    });
+    expect(W.input).toEqual({
+      kind: "input",
+      label: "Waiting for your answer",
+      colorClass: "text-indigo-600 dark:text-indigo-300/90",
+    });
+    expect(W.working.label).toBe("Working");
+    expect(W.connecting.label).toBe("Connecting");
+    expect(W.failed).toEqual({ kind: "failed", label: "Failed", colorClass: "text-destructive" });
+    expect(W.plan.label).toBe("Plan ready");
+    expect(W.done.label).toBe("Finished, not opened yet");
+    expect(W.idle).toEqual({ kind: "idle", label: "Idle", colorClass: "text-muted-foreground" });
+  });
+
+  it("shows an unseen errored turn as Failed, where the pill said Completed", () => {
+    const errored = { ...base, latestTurn: settled("error"), session: session("ready") };
+    expect(
+      resolveThreadStatusPill({ thread: { ...errored, lastVisitedAt: visitedBefore } })?.label,
+    ).toBe("Completed");
+    expect(resolveWorkspaceCardStatus(errored, visitedBefore)).toBe(W.failed);
+  });
+
+  it("keeps never-visited threads idle, even after an error", () => {
+    expect(
+      resolveWorkspaceCardStatus(
+        { ...base, latestTurn: settled("error"), session: session("ready") },
+        null,
+      ),
+    ).toBe(W.idle);
+  });
+
+  it("keeps an interrupted turn Finished until opened, then Idle", () => {
+    const interrupted = { ...base, latestTurn: settled("interrupted"), session: session("ready") };
+    expect(resolveWorkspaceCardStatus(interrupted, visitedBefore)).toBe(W.done);
+    expect(resolveWorkspaceCardStatus(interrupted, visitedAfter)).toBe(W.idle);
+  });
+
+  it("fails on a refused delivery and leaves the glyph alone for an uncertain one", () => {
+    expect(
+      resolveWorkspaceCardStatus({ ...base, unresolvedDelivery: { state: "failed" } }, null),
+    ).toBe(W.failed);
+    expect(
+      resolveWorkspaceCardStatus({ ...base, unresolvedDelivery: { state: "uncertain" } }, null),
+    ).toBe(W.idle);
+    expect(
+      resolveWorkspaceCardStatus(
+        { ...base, unresolvedDelivery: { state: "uncertain" }, session: session("running") },
+        null,
+      ),
+    ).toBe(W.working);
+  });
+
+  it("ranks Failed above Plan ready", () => {
+    expect(
+      resolveWorkspaceCardStatus(
+        {
+          ...base,
+          interactionMode: "plan",
+          hasActionableProposedPlan: true,
+          latestTurn: settled("completed"),
+          session: session("ready"),
+          unresolvedDelivery: { state: "failed" },
+        },
+        null,
+      ),
+    ).toBe(W.failed);
+  });
+});
+
+describe("workspace card status priority", () => {
+  const W = WORKSPACE_CARD_STATUS;
+
+  it("summarises by the most urgent non-idle status", () => {
+    expect(resolveHighestWorkspaceCardStatus([W.idle, W.done, W.failed, W.plan])).toBe(W.failed);
+    expect(resolveHighestWorkspaceCardStatus([W.working, W.input])).toBe(W.input);
+    expect(resolveHighestWorkspaceCardStatus([W.input, W.approval])).toBe(W.approval);
+    expect(resolveHighestWorkspaceCardStatus([W.connecting, W.plan])).toBe(W.connecting);
+    expect(resolveHighestWorkspaceCardStatus([W.idle])).toBeNull();
+    expect(resolveHighestWorkspaceCardStatus([])).toBeNull();
+  });
+
+  it("picks the more urgent of two statuses, idle included", () => {
+    expect(pickMoreUrgentWorkspaceCardStatus(W.idle, W.done)).toBe(W.done);
+    expect(pickMoreUrgentWorkspaceCardStatus(W.approval, W.working)).toBe(W.approval);
+    expect(pickMoreUrgentWorkspaceCardStatus(W.idle, W.idle)).toBe(W.idle);
+  });
+});
+
+describe("card line 2 helpers", () => {
+  it("hides the branch text when it repeats the title", () => {
+    expect(shouldShowWorkspaceBranchText("develop", "develop")).toBe(false);
+    expect(shouldShowWorkspaceBranchText(null, "Fix invoice date format")).toBe(false);
+    expect(shouldShowWorkspaceBranchText("fix-TRI-150", "Fix invoice date format")).toBe(true);
+  });
+
+  it("reads uncommitted changes only from a fresh status", () => {
+    expect(
+      resolveWorkspaceDirty({ hasWorkingTreeChanges: true } as unknown as VcsStatusResult),
+    ).toBe(true);
+    expect(
+      resolveWorkspaceDirty({
+        hasWorkingTreeChanges: true,
+        stale: true,
+      } as unknown as VcsStatusSummary),
+    ).toBe(false);
+    expect(
+      resolveWorkspaceDirty({ hasWorkingTreeChanges: false } as unknown as VcsStatusResult),
+    ).toBe(false);
+    expect(resolveWorkspaceDirty(null)).toBe(false);
+  });
+});
+
+describe("card age", () => {
+  const thread = {
+    latestTurn: {
+      ...makeLatestTurn({ startedAt: "2026-07-03T11:54:00.000Z" }),
+      state: "running" as const,
+    },
+    latestUserMessageAt: "2026-07-03T11:40:00.000Z",
+    updatedAt: "2026-07-03T11:30:00.000Z",
+    createdAt: "2026-07-01T00:00:00.000Z",
+  };
+
+  it("counts from the running turn's start while working, else from the last message", () => {
+    expect(resolveWorkspaceCardAgeSource(thread, true)).toBe("2026-07-03T11:54:00.000Z");
+    expect(resolveWorkspaceCardAgeSource(thread, false)).toBe("2026-07-03T11:40:00.000Z");
+    expect(resolveWorkspaceCardAgeSource({ ...thread, latestTurn: null }, true)).toBe(
+      "2026-07-03T11:40:00.000Z",
+    );
+    expect(resolveWorkspaceCardAgeSource({ ...thread, latestUserMessageAt: null }, false)).toBe(
+      "2026-07-03T11:30:00.000Z",
     );
   });
 
-  it("formats minutes coarsely", () => {
-    expect(formatSessionDuration({ sessionUpdatedAt: "2026-07-03T11:48:00.000Z", now })).toBe(
-      "12m",
+  it("formats compactly", () => {
+    const now = Date.parse("2026-07-03T12:00:00.000Z");
+    expect(formatCompactAge("2026-07-03T11:59:45.000Z", now)).toBe("now");
+    expect(formatCompactAge("2026-07-03T11:54:00.000Z", now)).toBe("6m");
+    expect(formatCompactAge("2026-07-03T09:00:00.000Z", now)).toBe("3h");
+    expect(formatCompactAge("2026-07-01T12:00:00.000Z", now)).toBe("2d");
+    expect(formatCompactAge("2026-07-03T12:05:00.000Z", now)).toBe("now");
+    expect(formatCompactAge("invalid", now)).toBeNull();
+    expect(formatCompactAge(null, now)).toBeNull();
+  });
+});
+
+describe("summarizeWorkspaceChats", () => {
+  const environmentId = localEnvironmentId;
+  const panel = (id: string, overrides: Record<string, unknown> = {}) => ({
+    id,
+    environmentId,
+    projectId: ProjectId.make("project-1"),
+    kind: "panel" as const,
+    worktreePath: null as string | null,
+    archivedAt: null as string | null,
+    hasActionableProposedPlan: false,
+    hasPendingApprovals: false,
+    hasPendingUserInput: false,
+    interactionMode: "default" as const,
+    latestTurn: null,
+    session: null,
+    unresolvedDelivery: null,
+    ...overrides,
+  });
+
+  it("groups panels by worktree path, sends pathless panels to the main checkout and skips archived ones", () => {
+    const summaries = summarizeWorkspaceChats(
+      [
+        panel("a", { worktreePath: "/wt/fix" }),
+        panel("b", { worktreePath: "/wt/fix", hasPendingApprovals: true }),
+        panel("c"),
+        panel("d", { archivedAt: "2026-03-09T10:00:00.000Z" }),
+        { ...panel("e"), kind: "workspace" as const },
+      ],
+      () => null,
     );
+    expect(
+      summaries.get(
+        workspaceCheckoutKey({
+          environmentId,
+          projectId: ProjectId.make("project-1"),
+          worktreePath: "/wt/fix",
+        }),
+      ),
+    ).toEqual({ count: 2, status: WORKSPACE_CARD_STATUS.approval });
+    expect(
+      summaries.get(
+        workspaceCheckoutKey({
+          environmentId,
+          projectId: ProjectId.make("project-1"),
+          worktreePath: null,
+        }),
+      ),
+    ).toEqual({ count: 1, status: WORKSPACE_CARD_STATUS.idle });
+    expect(summaries.size).toBe(2);
   });
 
-  it("formats hours coarsely", () => {
-    expect(formatSessionDuration({ sessionUpdatedAt: "2026-07-03T11:00:00.000Z", now })).toBe("1h");
+  it("keeps worktree keys apart across environments and projects", () => {
+    expect(
+      workspaceCheckoutKey({ environmentId: "a", projectId: "p", worktreePath: "/wt" }),
+    ).not.toBe(workspaceCheckoutKey({ environmentId: "b", projectId: "p", worktreePath: "/wt" }));
+    expect(
+      workspaceCheckoutKey({ environmentId: "a", projectId: "p", worktreePath: null }),
+    ).not.toBe(workspaceCheckoutKey({ environmentId: "a", projectId: "q", worktreePath: null }));
+  });
+});
+
+describe("isWorktreeSessionRunning", () => {
+  const environmentId = localEnvironmentId;
+  const session = (status: OrchestrationSessionStatus, activeTurnId: TurnId | null = null) => ({
+    threadId: ThreadId.make("session-thread"),
+    status,
+    providerName: "Claude Code",
+    runtimeMode: DEFAULT_RUNTIME_MODE,
+    activeTurnId,
+    lastError: null,
+    updatedAt: "2026-03-09T10:00:00.000Z",
+  });
+  const thread = (id: string, overrides: Record<string, unknown> = {}) => ({
+    id,
+    environmentId: environmentId as string,
+    projectId: "project-1",
+    worktreePath: "/wt/fix" as string | null,
+    archivedAt: null as string | null,
+    session: null as ReturnType<typeof session> | null,
+    ...overrides,
   });
 
-  it("formats days coarsely", () => {
-    expect(formatSessionDuration({ sessionUpdatedAt: "2026-07-01T12:00:00.000Z", now })).toBe("2d");
+  it("is true while the card's own session runs", () => {
+    const card = thread("card", { session: session("running") });
+    expect(isWorktreeSessionRunning(card, [card])).toBe(true);
   });
 
-  it("falls back to latestTurn.startedAt when session.updatedAt is absent", () => {
-    expect(formatSessionDuration({ latestTurnStartedAt: "2026-07-03T11:00:00.000Z", now })).toBe(
-      "1h",
-    );
+  it("is true while a chat open in the same worktree runs", () => {
+    const card = thread("card", { session: session("ready") });
+    const chat = thread("chat", { session: session("running") });
+    expect(isWorktreeSessionRunning(card, [card, chat])).toBe(true);
+  });
+
+  it("refuses Delete Worktree for the realistic busy case: a running session mid-turn", () => {
+    const busy = session("running", TurnId.make("turn-busy"));
+    const card = thread("card", { session: busy });
+    expect(isWorktreeSessionRunning(card, [card])).toBe(true);
+    const idleCard = thread("idle-card", { session: session("ready") });
+    const chat = thread("chat", { session: busy });
+    expect(isWorktreeSessionRunning(idleCard, [idleCard, chat])).toBe(true);
+  });
+
+  it("ignores other worktrees, other environments, the main checkout and archived chats", () => {
+    const card = thread("card");
+    expect(
+      isWorktreeSessionRunning(card, [
+        card,
+        thread("other-worktree", { worktreePath: "/wt/other", session: session("running") }),
+        thread("other-environment", {
+          environmentId: "environment-remote",
+          session: session("running"),
+        }),
+        thread("main-checkout", { worktreePath: null, session: session("running") }),
+        thread("archived", {
+          archivedAt: "2026-03-09T10:00:00.000Z",
+          session: session("running"),
+        }),
+      ]),
+    ).toBe(false);
+  });
+
+  it("counts a starting session on the card or another chat in the checkout", () => {
+    const card = thread("card", { session: session("starting") });
+    expect(isWorktreeSessionRunning(card, [card])).toBe(true);
+    const idleCard = thread("idle-card");
+    expect(isWorktreeSessionRunning(idleCard, [idleCard, card])).toBe(true);
+  });
+
+  it("ignores sessions that are neither running nor starting", () => {
+    const card = thread("card");
+    for (const status of ["idle", "ready", "interrupted", "stopped", "error"] as const) {
+      expect(
+        isWorktreeSessionRunning(card, [card, thread("chat", { session: session(status) })]),
+      ).toBe(false);
+    }
+  });
+
+  it("is false for a thread without a worktree", () => {
+    const card = thread("card", { worktreePath: null, session: session("running") });
+    expect(isWorktreeSessionRunning(card, [card])).toBe(false);
+  });
+});
+
+describe("resolveWorkspaceCardClassName", () => {
+  it("outlines every card and keeps the hover wash on idle ones", () => {
+    const idle = resolveWorkspaceCardClassName({ isActive: false, isSelected: false });
+    expect(idle).toContain("border");
+    expect(idle).toContain("border-border");
+    expect(idle).not.toContain("border-transparent");
+    expect(idle).toContain("hover:bg-accent/60");
+  });
+
+  it("fills the active card and gives it a stronger border than its neighbours", () => {
+    const active = resolveWorkspaceCardClassName({ isActive: true, isSelected: false });
+    expect(active).toContain("bg-accent");
+    expect(active).toContain("border-foreground/25");
+    expect(active).not.toContain("border-border");
+    expect(active).not.toContain("font-medium");
+  });
+
+  it("keeps the multi-select tints with a tinted border", () => {
+    const selected = resolveWorkspaceCardClassName({ isActive: false, isSelected: true });
+    expect(selected).toContain("bg-primary/15");
+    expect(selected).toContain("border-primary/40");
+    expect(selected).not.toContain("border-transparent");
+    const selectedActive = resolveWorkspaceCardClassName({ isActive: true, isSelected: true });
+    expect(selectedActive).toContain("bg-primary/22");
+    expect(selectedActive).toContain("border-primary/60");
+  });
+});
+
+describe("keyboard context menu helpers", () => {
+  const key = (
+    overrides: Partial<Record<"key" | "shiftKey" | "ctrlKey" | "altKey" | "metaKey", unknown>>,
+  ) =>
+    ({ key: "", shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, ...overrides }) as {
+      key: string;
+      shiftKey: boolean;
+      ctrlKey: boolean;
+      altKey: boolean;
+      metaKey: boolean;
+    };
+
+  it("recognises Shift+F10 and the Menu key only", () => {
+    expect(isContextMenuShortcut(key({ key: "F10", shiftKey: true }))).toBe(true);
+    expect(isContextMenuShortcut(key({ key: "ContextMenu" }))).toBe(true);
+    expect(isContextMenuShortcut(key({ key: "F10" }))).toBe(false);
+    expect(isContextMenuShortcut(key({ key: "F10", shiftKey: true, ctrlKey: true }))).toBe(false);
+    expect(isContextMenuShortcut(key({ key: "Enter" }))).toBe(false);
+  });
+
+  it("treats a contextmenu inside the window after a keyboard open as its echo", () => {
+    expect(isKeyboardContextMenuEcho(1_000, 1_000)).toBe(true);
+    expect(isKeyboardContextMenuEcho(1_000, 1_000 + KEYBOARD_CONTEXT_MENU_ECHO_MS - 1)).toBe(true);
+    expect(isKeyboardContextMenuEcho(1_000, 1_000 + KEYBOARD_CONTEXT_MENU_ECHO_MS)).toBe(false);
+    expect(isKeyboardContextMenuEcho(Number.NEGATIVE_INFINITY, 5)).toBe(false);
   });
 });

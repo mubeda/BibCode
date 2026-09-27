@@ -1,13 +1,10 @@
 import type {
-  VcsRef,
   SourceControlProviderInfo,
   VcsStatusLocalResult,
   VcsStatusRemoteResult,
   VcsStatusResult,
   VcsStatusStreamEvent,
 } from "@bibcode/contracts";
-import * as Arr from "effect/Array";
-import * as Result from "effect/Result";
 import { detectSourceControlProviderFromRemoteUrl } from "./sourceControl.ts";
 
 export const WORKTREE_BRANCH_PREFIX = "bibcode";
@@ -75,17 +72,6 @@ export function resolveAutoFeatureBranchName(
   return `${resolvedBase}-${suffix}`;
 }
 
-/**
- * Strip the remote prefix from a remote ref such as `origin/feature/demo`.
- */
-export function deriveLocalBranchNameFromRemoteRef(branchName: string): string {
-  const firstSeparatorIndex = branchName.indexOf("/");
-  if (firstSeparatorIndex <= 0 || firstSeparatorIndex === branchName.length - 1) {
-    return branchName;
-  }
-  return branchName.slice(firstSeparatorIndex + 1);
-}
-
 export function buildTemporaryWorktreeBranchName(
   randomHex: (byteLength: number) => string,
 ): string {
@@ -147,49 +133,6 @@ export function parseGitHubRepositoryNameWithOwnerFromRemoteUrl(url: string | nu
   return repositoryNameWithOwner.length > 0 ? repositoryNameWithOwner : null;
 }
 
-function deriveLocalBranchNameCandidatesFromRemoteRef(
-  branchName: string,
-  remoteName: string,
-): ReadonlyArray<string> {
-  const candidates = new Set<string>([deriveLocalBranchNameFromRemoteRef(branchName)]);
-
-  const remotePrefix = `${remoteName}/`;
-  if (branchName.startsWith(remotePrefix) && branchName.length > remotePrefix.length) {
-    candidates.add(branchName.slice(remotePrefix.length));
-  }
-
-  return [...candidates];
-}
-
-/**
- * Hide `origin/*` remote refs when a matching local refName already exists.
- */
-export function dedupeRemoteBranchesWithLocalMatches(
-  refs: ReadonlyArray<VcsRef>,
-): ReadonlyArray<VcsRef> {
-  const localBranchNames = new Set(
-    Arr.filterMap(refs, (refName) =>
-      refName.isRemote ? Result.failVoid : Result.succeed(refName.name),
-    ),
-  );
-
-  return refs.filter((refName) => {
-    if (!refName.isRemote) {
-      return true;
-    }
-
-    if (refName.remoteName !== "origin") {
-      return true;
-    }
-
-    const localBranchCandidates = deriveLocalBranchNameCandidatesFromRemoteRef(
-      refName.name,
-      refName.remoteName,
-    );
-    return !localBranchCandidates.some((candidate) => localBranchNames.has(candidate));
-  });
-}
-
 export function detectSourceControlProviderFromGitRemoteUrl(
   remoteUrl: string,
 ): SourceControlProviderInfo | null {
@@ -229,6 +172,9 @@ function toRemoteStatusPart(status: VcsStatusResult): VcsStatusRemoteResult {
 function toLocalStatusPart(status: VcsStatusResult): VcsStatusLocalResult {
   return {
     isRepo: status.isRepo,
+    ...(status.repositoryUnavailableReason === undefined
+      ? {}
+      : { repositoryUnavailableReason: status.repositoryUnavailableReason }),
     ...(status.sourceControlProvider
       ? { sourceControlProvider: status.sourceControlProvider }
       : {}),

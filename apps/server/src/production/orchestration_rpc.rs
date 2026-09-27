@@ -14,17 +14,24 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    json_size::encoded_json_len,
     orchestration::{
         CommandAdmission, NewProviderTurnDelivery, OrchestrationCommand, OrchestrationEngine,
         OrchestrationError, canonical_command_digest,
         engine::{CommandLifetimeGuard, OptionalNullable, TurnDeliveryResolutionAction},
         load_snapshot,
     },
-    persistence::{OrchestrationEvent, ProjectionThread},
+    persistence::{
+        EVENT_PAGE_SIZE, OrchestrationEvent, PersistenceError, ProjectionThread, Repositories,
+    },
     provider::attachments::{
         AttachmentMaterializationError, AttachmentMaterializer, PreparedAttachmentBatch,
+        ReusableAttachments, id_only_attachment_ids,
     },
-    rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
+    rpc::{
+        MAX_RECORDED_MESSAGE_BYTES, RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk,
+        response_too_large_failure,
+    },
     server_settings::ProviderSettingsStore,
     worktree_catalog::WorkspaceAvailabilityRegistry,
 };
@@ -38,6 +45,8 @@ use super::turn_delivery::TurnDeliveryService;
 use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
 
 const STREAM_CAPACITY: usize = 16;
+/// Use the History page target (`COMMIT_PAGE_TARGET_BYTES`): 1 MiB of event JSON.
+const REPLAY_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 
 pub fn register_orchestration_rpc(registry: &mut RpcRegistry, engine: OrchestrationEngine) {
     register_orchestration_rpc_inner(registry, engine, None, None);
@@ -170,12 +179,44 @@ fn register_orchestration_rpc_inner(
     registry.register_unary("orchestration.replayEvents", move |request, _| {
         let replay = replay.clone();
         async move {
+            let tag = request.tag.clone();
             let input = decode::<ReplayInput>(request)?;
-            replay
-                .read_events(input.from_sequence_exclusive.max(0))
-                .await
-                .map(|events| Value::Array(events.iter().map(wire_event).collect()))
-                .map_err(|error| orchestration_error("OrchestrationReplayEventsError", error))
+            if input.from_sequence_exclusive < 0 {
+                return Err(invalid_request(
+                    &tag,
+                    "fromSequenceExclusive must be a non-negative integer",
+                ));
+            }
+            let budget = if input.paged {
+                ReplayBudget::Page {
+                    target_bytes: REPLAY_PAGE_TARGET_BYTES,
+                }
+            } else {
+                ReplayBudget::Whole {
+                    limit_bytes: MAX_RECORDED_MESSAGE_BYTES,
+                }
+            };
+            let read = read_replay(
+                &replay.repositories(),
+                input.from_sequence_exclusive,
+                budget,
+            )
+            .await
+            .map_err(|error| match error {
+                ReplayReadError::TooLarge { bytes, limit_bytes } => {
+                    response_too_large_failure(&tag, bytes, limit_bytes)
+                }
+                error => orchestration_error("OrchestrationReplayEventsError", error),
+            })?;
+            let events = Value::Array(read.events);
+            if input.paged {
+                let mut page = json!({ "exhausted": read.exhausted });
+                // json! uses to_value(&value); move by index to avoid deep-copying the whole page.
+                page["events"] = events;
+                Ok(page)
+            } else {
+                Ok(events)
+            }
         }
     });
 
@@ -538,8 +579,9 @@ async fn dispatch_reserved_turn_command(
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
     command_claim: crate::orchestration::engine::CommandAdmissionClaim,
 ) -> RpcResult {
+    let reusable = reusable_thread_attachments(&dispatch, &command, &request_tag).await?;
     let (mut command, prepared_batch) =
-        prepare_attachments(&provider.attachments, command)
+        prepare_attachments(&provider.attachments, command, &reusable)
             .await
             .map_err(|error| invalid_request(&request_tag, error.to_string()))?;
     let attachment_refs = prepared_batch
@@ -722,9 +764,35 @@ async fn turn_identity(
     ))
 }
 
+/// The attachments a turn start may send again by id alone: those an accepted command already
+/// attached in the same thread. Nothing is looked up when every attachment carries its bytes.
+async fn reusable_thread_attachments(
+    engine: &OrchestrationEngine,
+    command: &OrchestrationCommand,
+    request_tag: &str,
+) -> Result<ReusableAttachments, Value> {
+    let OrchestrationCommand::ThreadTurnStart {
+        thread_id, message, ..
+    } = command
+    else {
+        return Ok(ReusableAttachments::new());
+    };
+    let ids = id_only_attachment_ids(&message.attachments)
+        .map_err(|error| invalid_request(request_tag, error.to_string()))?;
+    if ids.is_empty() {
+        return Ok(ReusableAttachments::new());
+    }
+    engine
+        .repositories()
+        .thread_attachment_digests(thread_id.clone(), ids)
+        .await
+        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))
+}
+
 async fn prepare_attachments(
     attachments: &AttachmentMaterializer,
     mut command: OrchestrationCommand,
+    reusable: &ReusableAttachments,
 ) -> Result<(OrchestrationCommand, Option<PreparedAttachmentBatch>), AttachmentMaterializationError>
 {
     if let OrchestrationCommand::ThreadTurnStart { message, .. } = &mut command {
@@ -732,7 +800,7 @@ async fn prepare_attachments(
             return Ok((command, None));
         }
         let prepared = attachments
-            .prepare(std::mem::take(&mut message.attachments))
+            .prepare(std::mem::take(&mut message.attachments), reusable)
             .await?;
         message.attachments = prepared.attachments().to_vec();
         return Ok((command, Some(prepared)));
@@ -966,6 +1034,9 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
                         (&row.delivery_state, &row.delivery_provider)
                     {
                         let mut delivery = json!({"state": state, "provider": provider});
+                        if let Some(provider_instance_id) = &row.delivery_provider_instance_id {
+                            delivery["providerInstanceId"] = json!(provider_instance_id);
+                        }
                         if let Some(mode) = &row.delivery_mode {
                             delivery["mode"] = json!(mode);
                         }
@@ -974,6 +1045,9 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
                         }
                         if let Some(detail) = &row.delivery_detail {
                             delivery["detail"] = json!(detail);
+                        }
+                        if let Some(reason) = &row.delivery_reason {
+                            delivery["reason"] = json!(reason);
                         }
                         message["delivery"] = delivery;
                     }
@@ -1258,6 +1332,85 @@ pub fn wire_event(row: &OrchestrationEvent) -> Value {
     })
 }
 
+/// Controls byte limits for paged and whole-tail replay reads.
+enum ReplayBudget {
+    /// Stops before an event would exceed `target_bytes`, always keeping the first event.
+    Page { target_bytes: usize },
+    /// Returns the whole tail or fails as soon as counted bytes exceed `limit_bytes`.
+    Whole { limit_bytes: usize },
+}
+
+#[derive(Debug)]
+struct ReplayRead {
+    events: Vec<Value>,
+    exhausted: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReplayReadError {
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
+    #[error(transparent)]
+    Count(#[from] serde_json::Error),
+    #[error("encoded replay JSON is too large to count")]
+    CountOverflow,
+    #[error("replay events exceed {limit_bytes} bytes ({bytes} bytes read)")]
+    TooLarge { bytes: usize, limit_bytes: usize },
+}
+
+/// Reads one batch at a time and counts only event JSON, array brackets and commas.
+/// Unpaged oversize bytes are the running total at the crossing, a lower bound;
+/// the session's size check remains the backstop for the uncounted Exit envelope.
+/// Paged reads always retain their first event, even over the target. A single
+/// event over the connection's message limit is left to `send_server_message`'s
+/// own size check and `RpcResponseTooLargeError`.
+async fn read_replay(
+    repositories: &Repositories,
+    from_sequence_exclusive: i64,
+    budget: ReplayBudget,
+) -> Result<ReplayRead, ReplayReadError> {
+    let mut pages = repositories.event_pages(from_sequence_exclusive);
+    let mut events = Vec::new();
+    let mut total = 2_usize; // JSON array brackets
+    while let Some(batch) = pages.next_page().await? {
+        let last_batch = batch.len() < EVENT_PAGE_SIZE;
+        for row in batch {
+            let event = wire_event(&row);
+            let event_bytes = encoded_json_len(&event)?;
+            let next_total = total
+                .checked_add(event_bytes)
+                .and_then(|bytes| bytes.checked_add(usize::from(!events.is_empty())))
+                .ok_or(ReplayReadError::CountOverflow)?;
+            match budget {
+                ReplayBudget::Page { target_bytes }
+                    if !events.is_empty() && next_total > target_bytes =>
+                {
+                    return Ok(ReplayRead {
+                        events,
+                        exhausted: false,
+                    });
+                }
+                ReplayBudget::Whole { limit_bytes } if next_total > limit_bytes => {
+                    return Err(ReplayReadError::TooLarge {
+                        bytes: next_total,
+                        limit_bytes,
+                    });
+                }
+                _ => {}
+            }
+            total = next_total;
+            events.push(event);
+        }
+        if last_batch {
+            break;
+        }
+    }
+    Ok(ReplayRead {
+        events,
+        exhausted: true,
+    })
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(request: RpcRequest) -> Result<T, Value> {
     serde_json::from_value(request.payload)
         .map_err(|error| invalid_request(&request.tag, error.to_string()))
@@ -1299,6 +1452,8 @@ fn now_iso() -> String {
 #[serde(rename_all = "camelCase")]
 struct ReplayInput {
     from_sequence_exclusive: i64,
+    #[serde(default)]
+    paged: bool,
 }
 
 #[derive(Deserialize)]
@@ -1334,8 +1489,8 @@ mod tests {
             engine::{EngineOptions, TestHooks},
         },
         persistence::{
-            Database, ProjectionThreadActivity, ProjectionThreadMessage, ProjectionTurn,
-            run_migrations,
+            Database, NewOrchestrationEvent, ProjectionThreadActivity, ProjectionThreadMessage,
+            ProjectionTurn, run_migrations,
         },
         production::{
             provider_runtime::{
@@ -1349,9 +1504,11 @@ mod tests {
             AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
         },
     };
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
     use std::sync::atomic::AtomicUsize;
     use tokio_tungstenite::tungstenite::Message;
+
+    use crate::test_support::websocket_frames::next_frame_past_heartbeat;
 
     const CREATED_AT: &str = "2026-07-11T00:00:00.000Z";
 
@@ -1391,7 +1548,9 @@ mod tests {
                     is_streaming: false,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.000Z".to_owned(),
@@ -1407,7 +1566,9 @@ mod tests {
                     is_streaming: false,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.001Z".to_owned(),
@@ -1423,7 +1584,9 @@ mod tests {
                     is_streaming: false,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.002Z".to_owned(),
@@ -1439,7 +1602,9 @@ mod tests {
                     is_streaming: false,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.003Z".to_owned(),
@@ -1455,7 +1620,9 @@ mod tests {
                     is_streaming: false,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.004Z".to_owned(),
@@ -1471,7 +1638,9 @@ mod tests {
                     is_streaming: true,
                     delivery_state: None,
                     delivery_provider: None,
+                    delivery_provider_instance_id: None,
                     delivery_detail: None,
+                    delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
                     created_at: "2026-07-11T00:00:00.005Z".to_owned(),
@@ -1714,6 +1883,329 @@ mod tests {
         OrchestrationEngine::start(database, EngineOptions::default())
             .await
             .expect("engine starts")
+    }
+
+    async fn append_replay_events(
+        engine: &OrchestrationEngine,
+        count: usize,
+        text: &str,
+    ) -> Vec<Value> {
+        let repositories = engine.repositories();
+        let mut events = Vec::with_capacity(count);
+        for index in 0..count {
+            let row = repositories
+                .append_event(NewOrchestrationEvent {
+                    event_id: format!("replay-event-{index:04}"),
+                    event_type: "thread.message-sent".to_owned(),
+                    aggregate_kind: "thread".to_owned(),
+                    aggregate_id: "replay-thread".to_owned(),
+                    occurred_at: CREATED_AT.to_owned(),
+                    command_id: None,
+                    causation_event_id: None,
+                    correlation_id: None,
+                    payload: json!({
+                        "threadId": "replay-thread",
+                        "messageId": format!("replay-message-{index:04}"),
+                        "role": "assistant",
+                        "text": text,
+                        "turnId": null,
+                        "streaming": false,
+                        "createdAt": CREATED_AT,
+                        "updatedAt": CREATED_AT,
+                    }),
+                    metadata: json!({}),
+                })
+                .await
+                .expect("append replay event");
+            events.push(wire_event(&row));
+        }
+        events
+    }
+
+    fn replay_array_bytes(events: &[Value]) -> usize {
+        serde_json::to_vec(events)
+            .expect("encode event array")
+            .len()
+    }
+
+    #[tokio::test]
+    async fn replay_page_stops_before_large_event_exceeds_target() {
+        let engine = migrated_engine().await;
+        let events = append_replay_events(&engine, 9, &"x".repeat(1_500)).await;
+        let target_bytes = replay_array_bytes(&events[..3]);
+        let page = read_replay(
+            &engine.repositories(),
+            0,
+            ReplayBudget::Page { target_bytes },
+        )
+        .await
+        .expect("replay page");
+        assert_eq!(page.events, events[..3]);
+        assert!(!page.exhausted);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_page_keeps_one_oversized_event() {
+        let engine = migrated_engine().await;
+        let events = append_replay_events(&engine, 2, &"x".repeat(2_000)).await;
+        let page = read_replay(
+            &engine.repositories(),
+            0,
+            ReplayBudget::Page { target_bytes: 100 },
+        )
+        .await
+        .expect("oversized first event");
+        assert_eq!(page.events, events[..1]);
+        assert!(!page.exhausted);
+        let final_page = read_replay(
+            &engine.repositories(),
+            events[0]["sequence"].as_i64().unwrap(),
+            ReplayBudget::Page { target_bytes: 100 },
+        )
+        .await
+        .expect("oversized final event");
+        assert_eq!(final_page.events, events[1..]);
+        assert!(final_page.exhausted);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_page_returns_all_small_events_at_tail() {
+        let engine = migrated_engine().await;
+        let events = append_replay_events(&engine, 20, "small").await;
+        let page = read_replay(
+            &engine.repositories(),
+            0,
+            ReplayBudget::Page {
+                target_bytes: 100_000,
+            },
+        )
+        .await
+        .expect("small events");
+        assert_eq!(page.events, events);
+        assert!(page.exhausted);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_page_counts_escaped_json_bytes_exactly() {
+        let engine = migrated_engine().await;
+        let text = "\"\\\u{1}é🙂".repeat(20);
+        let events = append_replay_events(&engine, 4, &text).await;
+        let encoded_text_bytes = serde_json::to_vec(&text).expect("encode text").len() - 2;
+        let escape_overhead = encoded_text_bytes - text.len();
+        assert!(escape_overhead > 0);
+        let escaped_pair_bytes = replay_array_bytes(&events[..2]);
+        let unescaped_pair_bytes = escaped_pair_bytes - 2 * escape_overhead;
+        let target_bytes = unescaped_pair_bytes + escape_overhead;
+        assert!(unescaped_pair_bytes < target_bytes && target_bytes < escaped_pair_bytes);
+        let page = read_replay(
+            &engine.repositories(),
+            0,
+            ReplayBudget::Page { target_bytes },
+        )
+        .await
+        .expect("escaped page");
+        assert_eq!(page.events, events[..1]);
+        assert!(!page.exhausted);
+        let exact_page = read_replay(
+            &engine.repositories(),
+            0,
+            ReplayBudget::Page {
+                target_bytes: escaped_pair_bytes,
+            },
+        )
+        .await
+        .expect("exact escaped boundary");
+        assert_eq!(exact_page.events, events[..2]);
+        assert_eq!(replay_array_bytes(&exact_page.events), escaped_pair_bytes);
+        assert!(!exact_page.exhausted);
+        for page in [page, exact_page] {
+            let accounted_bytes =
+                page.events
+                    .iter()
+                    .enumerate()
+                    .fold(2, |total, (index, event)| {
+                        total
+                            + encoded_json_len(event).expect("count event")
+                            + usize::from(index > 0)
+                    });
+            assert_eq!(replay_array_bytes(&page.events), accounted_bytes);
+        }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_page_probes_tail_at_full_batch() {
+        let engine = migrated_engine().await;
+        let events = append_replay_events(&engine, 128, "boundary").await;
+        let page = read_replay(
+            &engine.repositories(),
+            0,
+            ReplayBudget::Page {
+                target_bytes: 1_000_000,
+            },
+        )
+        .await
+        .expect("full final batch");
+        assert_eq!(page.events, events);
+        assert!(page.exhausted);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_page_resumes_into_short_final_batch() {
+        let engine = migrated_engine().await;
+        let events = append_replay_events(&engine, 129, "boundary").await;
+        let target_bytes = replay_array_bytes(&events[..128]);
+        let first = read_replay(
+            &engine.repositories(),
+            0,
+            ReplayBudget::Page { target_bytes },
+        )
+        .await
+        .expect("first page");
+        assert_eq!(first.events, events[..128]);
+        assert!(!first.exhausted);
+        let last = read_replay(
+            &engine.repositories(),
+            first.events.last().unwrap()["sequence"].as_i64().unwrap(),
+            ReplayBudget::Page { target_bytes },
+        )
+        .await
+        .expect("last page");
+        assert_eq!(last.events, events[128..]);
+        assert!(last.exhausted);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_page_at_full_batch_resumes_without_skipping() {
+        let engine = migrated_engine().await;
+        let events = append_replay_events(&engine, 256, "boundary").await;
+        // Later sequences use more digits; this budget fits either batch but
+        // cannot fit the first event of the next batch alongside the first 128.
+        let target_bytes = replay_array_bytes(&events[128..]);
+        assert!(target_bytes < replay_array_bytes(&events[..129]));
+        let first = read_replay(
+            &engine.repositories(),
+            0,
+            ReplayBudget::Page { target_bytes },
+        )
+        .await
+        .expect("exact first batch");
+        assert_eq!(first.events, events[..128]);
+        assert!(!first.exhausted);
+        let last = read_replay(
+            &engine.repositories(),
+            first.events.last().unwrap()["sequence"].as_i64().unwrap(),
+            ReplayBudget::Page { target_bytes },
+        )
+        .await
+        .expect("exact final batch");
+        assert_eq!(last.events, events[128..]);
+        assert!(last.exhausted);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_pages_equal_whole_replay_and_engine_events() {
+        let engine = migrated_engine().await;
+        let seeded = append_replay_events(&engine, 270, "page \"text\" é").await;
+        let mut cursor = 0;
+        let mut events = Vec::new();
+        let target_bytes = replay_array_bytes(&seeded[..7]);
+        for _ in 0..=seeded.len() {
+            let page = read_replay(
+                &engine.repositories(),
+                cursor,
+                ReplayBudget::Page { target_bytes },
+            )
+            .await
+            .expect("next replay page");
+            assert!(!page.events.is_empty());
+            assert!(replay_array_bytes(&page.events) <= target_bytes);
+            for event in &page.events {
+                let sequence = event["sequence"].as_i64().unwrap();
+                assert!(sequence > cursor);
+                cursor = sequence;
+            }
+            events.extend(page.events);
+            assert_eq!(page.exhausted, events.len() == seeded.len());
+            if page.exhausted {
+                break;
+            }
+        }
+        let whole = read_replay(
+            &engine.repositories(),
+            0,
+            ReplayBudget::Whole {
+                limit_bytes: replay_array_bytes(&seeded),
+            },
+        )
+        .await
+        .expect("whole replay at exact ceiling");
+        assert!(whole.exhausted);
+        assert_eq!(events, whole.events);
+        assert_eq!(events, seeded);
+        assert_eq!(
+            events,
+            engine
+                .read_events(0)
+                .await
+                .expect("engine events")
+                .iter()
+                .map(wire_event)
+                .collect::<Vec<_>>()
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_whole_fails_when_limit_is_crossed_in_first_batch() {
+        let engine = migrated_engine().await;
+        let events = append_replay_events(&engine, 300, &"x".repeat(200)).await;
+        let limit_bytes = replay_array_bytes(&events[..10]);
+        let error = read_replay(
+            &engine.repositories(),
+            0,
+            ReplayBudget::Whole { limit_bytes },
+        )
+        .await
+        .expect_err("whole replay exceeds ceiling");
+        let ReplayReadError::TooLarge {
+            bytes,
+            limit_bytes: actual_limit,
+        } = error
+        else {
+            panic!("expected size error, got {error:?}");
+        };
+        assert_eq!(actual_limit, limit_bytes);
+        assert!(limit_bytes < bytes && bytes <= replay_array_bytes(&events[..128]));
+        assert_eq!(bytes, replay_array_bytes(&events[..11]));
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_past_tail_is_empty_in_both_modes() {
+        let engine = migrated_engine().await;
+        append_replay_events(&engine, 2, "tail").await;
+        for cursor in [2, 100] {
+            for budget in [
+                ReplayBudget::Page {
+                    target_bytes: 1_000,
+                },
+                ReplayBudget::Whole { limit_bytes: 1_000 },
+            ] {
+                let replay = read_replay(&engine.repositories(), cursor, budget)
+                    .await
+                    .expect("empty tail");
+                assert!(replay.events.is_empty());
+                assert!(replay.exhausted);
+            }
+        }
+        engine.shutdown().await;
     }
 
     async fn delivery_engine(hooks: TestHooks) -> (Database, OrchestrationEngine, String) {
@@ -2132,11 +2624,14 @@ mod tests {
             ))
             .await
             .expect("send registered orchestration request");
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
-            .await
-            .expect("registered orchestration response timeout")
-            .expect("registered orchestration socket remains open")
-            .expect("registered orchestration frame");
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            next_frame_past_heartbeat(socket),
+        )
+        .await
+        .expect("registered orchestration response timeout")
+        .expect("registered orchestration socket remains open")
+        .expect("registered orchestration frame");
         let Message::Text(text) = frame else {
             panic!("expected registered orchestration text frame, got {frame:?}");
         };
@@ -2739,6 +3234,7 @@ mod tests {
                 interaction_mode: "default".to_owned(),
                 model: Some("gpt-5".to_owned()),
                 options: Vec::new(),
+                custom_models: Vec::new(),
                 service_tier: None,
                 effort: None,
                 agent: None,
@@ -3200,11 +3696,14 @@ mod tests {
             ))
             .await
             .expect("interrupt disconnect-only request");
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
-            .await
-            .expect("disconnect-only interrupt response timeout")
-            .expect("disconnect-only interrupt response")
-            .expect("disconnect-only interrupt frame");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_frame_past_heartbeat(&mut socket),
+        )
+        .await
+        .expect("disconnect-only interrupt response timeout")
+        .expect("disconnect-only interrupt response")
+        .expect("disconnect-only interrupt frame");
         disconnect_pause.release();
         let disconnect_scope = WorkspaceLossTransition {
             thread_id: thread_id.clone(),
@@ -3267,7 +3766,9 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
                 () = pause.wait_until_entered() => {}
-                frame = socket.next() => panic!("turn exited before persistence: {frame:?}"),
+                frame = next_frame_past_heartbeat(&mut socket) => {
+                    panic!("turn exited before persistence: {frame:?}")
+                }
             }
         })
         .await
@@ -3280,11 +3781,14 @@ mod tests {
             ))
             .await
             .expect("interrupt turn request");
-        let interrupted = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
-            .await
-            .expect("interrupt response timeout")
-            .expect("interrupt response")
-            .expect("interrupt frame");
+        let interrupted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_frame_past_heartbeat(&mut socket),
+        )
+        .await
+        .expect("interrupt response timeout")
+        .expect("interrupt response")
+        .expect("interrupt frame");
         assert!(matches!(interrupted, Message::Text(_)));
 
         let loss = WorkspaceLossTransition {
@@ -4116,9 +4620,10 @@ mod tests {
                 "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
             }]}, "createdAt": CREATED_AT,
         }));
-        let (command, prepared) = prepare_attachments(&attachments, command)
-            .await
-            .expect("upload prepares");
+        let (command, prepared) =
+            prepare_attachments(&attachments, command, &ReusableAttachments::new())
+                .await
+                .expect("upload prepares");
         engine.dispatch(command).await.expect("turn dispatches");
         prepared.expect("attachment batch").commit();
         let snapshot = thread_snapshot(&engine, &thread_id)
@@ -4146,6 +4651,7 @@ mod tests {
                     "sizeBytes":5, "dataUrl":"data:text/plain,notes"
                 }]}, "createdAt": CREATED_AT,
             })),
+            &ReusableAttachments::new(),
         )
         .await
         .expect_err("malformed upload rejects before dispatch");
@@ -4348,6 +4854,61 @@ mod tests {
         );
         assert_eq!(snapshot["thread"]["session"]["status"], "running");
         assert_eq!(snapshot["thread"]["latestTurn"]["turnId"], "turn-1");
+        for provider_instance_id in [Some("claude-personal"), None] {
+            let mut message = engine
+                .repositories()
+                .get_message("message-1".to_owned())
+                .await
+                .expect("message lookup")
+                .expect("message");
+            message.delivery_provider_instance_id = provider_instance_id.map(str::to_owned);
+            engine
+                .repositories()
+                .upsert_message(message)
+                .await
+                .expect("store delivery instance");
+            let snapshot = thread_snapshot(&engine, &default_id)
+                .await
+                .expect("snapshot with delivery instance");
+            let message = snapshot["thread"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["id"] == "message-1")
+                .unwrap();
+            assert_eq!(
+                message["delivery"].get("providerInstanceId"),
+                provider_instance_id.map(|value| json!(value)).as_ref()
+            );
+        }
+        for reason in [Some("modelSelectionRefused"), None] {
+            let mut message = engine
+                .repositories()
+                .get_message("message-1".to_owned())
+                .await
+                .expect("message lookup")
+                .expect("message");
+            message.delivery_state = Some("failed".to_owned());
+            message.delivery_reason = reason.map(str::to_owned);
+            engine
+                .repositories()
+                .upsert_message(message)
+                .await
+                .expect("store reason");
+            let snapshot = thread_snapshot(&engine, &default_id)
+                .await
+                .expect("snapshot with reason");
+            let message = snapshot["thread"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["id"] == "message-1")
+                .unwrap();
+            assert_eq!(
+                message["delivery"].get("reason"),
+                reason.map(|value| json!(value)).as_ref()
+            );
+        }
         engine.shutdown().await;
     }
 

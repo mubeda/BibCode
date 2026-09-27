@@ -12,11 +12,27 @@ const UPSTREAM_FILENAME = "bibcode-linuxdeploy-gtk-upstream.sh";
 const UPSTREAM_BACKEND_LINE =
   "export GDK_BACKEND=x11 # Crash with Wayland backend on Wayland - https://github.com/tauri-apps/tauri/issues/8541";
 const BACKEND_LINE = 'export GDK_BACKEND="${BIBCODE_GDK_BACKEND:-wayland,x11}"';
+const UPSTREAM_THEME_VARIANT_LINE =
+  'gsettings get org.gnome.desktop.interface gtk-theme 2> /dev/null | grep -qi "dark" && GTK_THEME_VARIANT="dark" || GTK_THEME_VARIANT="light"';
+const UPSTREAM_THEME_DEFAULT_LINE =
+  'APPIMAGE_GTK_THEME="${APPIMAGE_GTK_THEME:-"Adwaita:$GTK_THEME_VARIANT"}" # Allow user to override theme (discouraged)';
+const UPSTREAM_THEME_EXPORT_LINE =
+  'export GTK_THEME="$APPIMAGE_GTK_THEME" # Custom themes are broken';
+const THEME_OVERRIDE_LINE =
+  'if [ -n "${APPIMAGE_GTK_THEME:-}" ]; then export GTK_THEME="$APPIMAGE_GTK_THEME"; fi';
 const UPSTREAM_HOOK = `#!/usr/bin/env bash
 export GTK_DATA_PREFIX="$APPDIR/usr"
+${UPSTREAM_THEME_VARIANT_LINE}
+${UPSTREAM_THEME_DEFAULT_LINE}
 ${UPSTREAM_BACKEND_LINE}
 
-export GTK_THEME="Adwaita"
+${UPSTREAM_THEME_EXPORT_LINE}
+`;
+const REWRITTEN_HOOK = `#!/usr/bin/env bash
+export GTK_DATA_PREFIX="$APPDIR/usr"
+${BACKEND_LINE}
+
+${THEME_OVERRIDE_LINE}
 `;
 const temporaryDirectories: Array<string> = [];
 
@@ -119,7 +135,7 @@ ${UPSTREAM_HOOK}HOOK
         "utf8",
       );
       expect(hook.split("\n").filter((line) => line === BACKEND_LINE)).toHaveLength(1);
-      expect(hook).toBe(UPSTREAM_HOOK.replace(UPSTREAM_BACKEND_LINE, BACKEND_LINE));
+      expect(hook).toBe(REWRITTEN_HOOK);
     },
   );
 
@@ -138,10 +154,86 @@ ${UPSTREAM_HOOK}HOOK
     );
 
     expect(result.status, result.stderr).toBe(0);
-    expect(NodeFS.readFileSync(hookPath, "utf8")).toBe(
-      UPSTREAM_HOOK.replace(UPSTREAM_BACKEND_LINE, BACKEND_LINE),
-    );
+    expect(NodeFS.readFileSync(hookPath, "utf8")).toBe(REWRITTEN_HOOK);
   });
+
+  it.each([
+    { name: "no override", gtkTheme: undefined, appimageTheme: undefined, expected: "unset" },
+    { name: "empty override", gtkTheme: undefined, appimageTheme: "", expected: "unset" },
+    {
+      name: "session override",
+      gtkTheme: "Custom:dark",
+      appimageTheme: undefined,
+      expected: "Custom:dark",
+    },
+    {
+      name: "empty AppImage override",
+      gtkTheme: "Custom:light",
+      appimageTheme: "",
+      expected: "Custom:light",
+    },
+    {
+      name: "AppImage override",
+      gtkTheme: undefined,
+      appimageTheme: "Adwaita:dark",
+      expected: "Adwaita:dark",
+    },
+    {
+      name: "both overrides",
+      gtkTheme: "Custom:light",
+      appimageTheme: "Adwaita:dark",
+      expected: "Adwaita:dark",
+    },
+  ])(
+    "honours $name without consulting the session theme",
+    ({ gtkTheme, appimageTheme, expected }) => {
+      const toolDirectory = makeToolDirectory();
+      const appDirectory = NodePath.join(toolDirectory, "BiBCode.AppDir");
+      const hookPath = NodePath.join(appDirectory, "apprun-hooks/linuxdeploy-plugin-gtk.sh");
+      const gsettingsMarker = NodePath.join(toolDirectory, "gsettings-called");
+      NodeFS.mkdirSync(NodePath.dirname(hookPath), { recursive: true });
+      NodeFS.writeFileSync(hookPath, UPSTREAM_HOOK);
+      NodeFS.writeFileSync(
+        NodePath.join(toolDirectory, "gsettings"),
+        '#!/usr/bin/env bash\nprintf called > "$GSETTINGS_MARKER"\nprintf "Adwaita-dark\\n"\n',
+        { mode: 0o755 },
+      );
+      writeUpstream(toolDirectory, "#!/usr/bin/env bash\nexit 0\n");
+      const rewrite = NodeChildProcess.spawnSync(
+        NodePath.join(toolDirectory, "linuxdeploy-plugin-gtk.sh"),
+        ["--appdir", appDirectory],
+        { encoding: "utf8" },
+      );
+      expect(rewrite.status, rewrite.stderr).toBe(0);
+
+      for (const backend of [undefined, "x11"]) {
+        const result = NodeChildProcess.spawnSync(
+          "bash",
+          [
+            "-c",
+            'source "$1"; printf "%s\\n%s\\n" "${GTK_THEME-unset}" "$GDK_BACKEND"',
+            "hook-test",
+            hookPath,
+          ],
+          {
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              PATH: `${toolDirectory}:${process.env.PATH}`,
+              APPDIR: appDirectory,
+              GTK_THEME: gtkTheme,
+              APPIMAGE_GTK_THEME: appimageTheme,
+              GSETTINGS_MARKER: gsettingsMarker,
+              BIBCODE_GDK_BACKEND: backend,
+            },
+          },
+        );
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toBe(`${expected}\n${backend ?? "wayland,x11"}\n`);
+        expect(NodeFS.existsSync(gsettingsMarker)).toBe(false);
+      }
+    },
+  );
 
   it.each([
     { name: "missing", hook: undefined, diagnostic: "missing GTK AppRun hook" },
@@ -155,6 +247,22 @@ ${UPSTREAM_HOOK}HOOK
       hook: `${UPSTREAM_HOOK}${UPSTREAM_BACKEND_LINE}\n`,
       diagnostic: "found 2",
     },
+    ...[
+      { line: UPSTREAM_THEME_VARIANT_LINE, label: "gsettings gtk-theme" },
+      { line: UPSTREAM_THEME_DEFAULT_LINE, label: "APPIMAGE_GTK_THEME default" },
+      { line: UPSTREAM_THEME_EXPORT_LINE, label: "GTK_THEME export" },
+    ].flatMap(({ line, label }) => [
+      {
+        name: `without the ${label}`,
+        hook: UPSTREAM_HOOK.replace(`${line}\n`, ""),
+        diagnostic: `expected exactly one ${label} line`,
+      },
+      {
+        name: `with duplicate ${label} lines`,
+        hook: `${UPSTREAM_HOOK}${line}\n`,
+        diagnostic: `expected exactly one ${label} line`,
+      },
+    ]),
   ])("rejects a hook $name without mutating the AppDir", ({ hook, diagnostic }) => {
     const toolDirectory = makeToolDirectory();
     const appDirectory = NodePath.join(toolDirectory, "BiBCode.AppDir");

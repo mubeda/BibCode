@@ -18,11 +18,13 @@ public package has no root export; callers use focused subpaths such as
   `storageInstanceId`, rather than reducing it to a label and logical ID.
 - `ConnectionDriver` reports `preparing`, atomically verifies and if necessary
   persists the prepared descriptor's storage identity, then reports `opening`
-  and creates an `RpcSession`. After the session is ready it verifies the
-  initial `server.getConfig` descriptor through the same identity owner. Only
-  then does it report `synchronizing` and return a live lease. A prepared
-  mismatch cannot open a socket, and a backend restart between HTTP preparation
-  and WebSocket configuration cannot publish synchronization or a live lease.
+  and creates an `RpcSession`. It reports `configuring` after the socket connects
+  (for E2EE, after authentication), before the first snapshot and identity check.
+  After the session is ready it verifies the descriptor from the first
+  `subscribeServerConfig` snapshot through the same identity owner. Only then
+  does it report `synchronizing` and return a live lease. A prepared mismatch
+  cannot open a socket, and a backend restart between HTTP preparation and
+  WebSocket configuration cannot publish synchronization or a live lease.
 - `EnvironmentSupervisor` owns desired state, connectivity, retries, the
   prepared connection, and the live RPC session for one environment.
 - `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It
@@ -66,13 +68,13 @@ The composition root is
 Canonical targets are defined in
 [`connection/model.ts`](../../packages/client-runtime/src/connection/model.ts).
 
-| Target                        | Preparation                                                                                                                                                     |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PrimaryConnectionTarget`     | Uses the host-provided HTTP/WebSocket address and optional primary bearer credential. It is runtime-provided, not persisted as a saved connection.              |
-| `BearerConnectionTarget`      | Loads a saved endpoint profile and bearer credential, validates the environment identity, then exchanges/uses authorization.                                    |
-| `RelayConnectionTarget`       | Uses the Clerk session and relay to obtain a DPoP-bound environment bootstrap, then prepares direct HTTP/WSS access.                                            |
-| `SshConnectionTarget`         | Asks the desktop SSH gateway to probe or launch the remote server and create local forwarding, then authorizes with the returned bootstrap.                     |
-| `UnavailableConnectionTarget` | Retains a platform-owned desired environment and its cached projections without an endpoint or credential; preparation fails transiently before transport work. |
+| Target                        | Preparation                                                                                                                                                                                                    |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PrimaryConnectionTarget`     | Uses the host-provided HTTP/WebSocket address and optional primary bearer credential. It is runtime-provided, not persisted as a saved connection.                                                             |
+| `BearerConnectionTarget`      | Loads a saved endpoint profile and bearer credential, validates the environment identity, then exchanges/uses authorization.                                                                                   |
+| `RelayConnectionTarget`       | Uses the Clerk session and relay to obtain a DPoP-bound environment bootstrap, then prepares direct HTTP/WSS access.                                                                                           |
+| `SshConnectionTarget`         | Asks the desktop SSH gateway for a tunnel (`ensureTunnel`, no token), then authorizes with the saved bearer; a missing or rejected bearer is minted once (`mintBearer`) and saved, and a rejected mint blocks. |
+| `UnavailableConnectionTarget` | Retains a platform-owned desired environment and its cached projections without an endpoint or credential; preparation fails transiently before transport work.                                                |
 
 Bearer, relay, and SSH targets may be persisted in the connection catalog.
 Unavailable targets are reconciled only from host topology and are never
@@ -102,11 +104,16 @@ a rename neither reconnects nor resynchronizes. The registry maintains
 `serviceScopes[id].entry === entries[id]` for every installed scope; rename
 updates both references together and updates the supervisor's target Ref. The
 Settings row title, rail entry and avatar initials, and selected server's
-workspace card use the saved label. Disconnect reasons and storage-identity
-errors still use `PreparedConnection.label`, the server's reported name. When
-a test server is paused, the visible disconnect reason uses that server name,
-followed by an endpoint timeout; the health-check message does not become
-visible in this scenario.
+workspace card use the saved label. Disconnect reasons read the current saved
+catalog label from the supervisor's target Ref when the failure is published,
+so a rename during a live session also names the next disconnect correctly.
+Storage-identity errors still use the server's reported name. When a test
+server is paused while BiBCode stays visible, the visible disconnect reason uses
+the saved name after the 30-second liveness timeout, followed by an endpoint
+timeout; the health-check message does not become visible in this scenario.
+Restoring a hidden or minimized window during the pause runs the
+application-active health check, whose 15-second timeout can be reported
+first.
 A failed or missing durable relabel leaves all runtime and persisted-target
 bookkeeping unchanged. Platform-managed environments (the primary and
 desktop-local backends) are named by their host and cannot be renamed.
@@ -141,7 +148,7 @@ deadline or transport failure follows the supervisor's bounded transient retry
 policy.
 
 The verify-then-add flow uses that session to compare the descriptor, pairing
-payload, `e2ee_authenticated` response, and `server.getConfig` identities. The
+payload, `e2ee_authenticated` response, and initial configuration identities. The
 pairing authentication message carries no confirmation request flag. The server
 decides delivery from the consumed grant: an off-host grant is persisted as
 `pending-pairing` and returns `pairingConfirmationRequired: true`; an on-host or
@@ -358,14 +365,32 @@ The supervisor publishes these phases:
 
 - `available`: disconnected and not requested;
 - `offline`: requested while network state is offline;
-- `connecting`: preparing, opening, or synchronizing;
+- `connecting`: preparing, opening, configuring, or synchronizing;
 - `backoff`: a transient failure is waiting for retry;
-- `connected`: the WebSocket is open and `server.getConfig` succeeded;
+- `connected`: the WebSocket is open and the first `subscribeServerConfig`
+  snapshot arrived;
 - `blocked`: configuration, authentication, permission, capability, or a
   changed persistent store requires an explicit wakeup or user action.
 
+Establishment has 15 seconds from the attempt's start to a connected socket
+(for E2EE, an authenticated one). In `configuring`, the first snapshot and
+identity check can take up to 120 seconds while the liveness monitor keeps the
+socket alive. After 5 seconds, status reads "Receiving settings from <environment>
+over a slow connection…". At the ceiling, the attempt fails with "<environment>
+took more than 2 minutes to send its settings." and follows the normal retry
+ladder. A dead link during `configuring` ends under the liveness rule below,
+with "No data from <environment> for 30 seconds. The connection is too slow or
+was lost." The slow-setup notice replaces any previous attempt's error in
+connection status and clears when the attempt advances or ends.
+
 Transient failures retry after 1, 2, 4, 8, then 16 seconds, with 16 seconds as
-the cap. The sequence continues while the connection remains desired. A stable
+the cap, and every delay moves by up to ±15 % so reconnecting clients spread
+out. The sequence continues while the connection remains desired. After five
+minutes of continuous failure, an environment that is not selected in the
+environment rail (`EnvironmentSelection`) retries after 60, 120, then 300
+seconds. Connect, retry, network-change and wakeup signals still end any wait
+at once, selecting the environment ends its idle wait and returns it to the
+normal ladder, and blocked states are unchanged. A stable
 30-second connection resets accumulated backoff. Network changes, credential
 changes, catalog reconciliation, and explicit retry requests wake the
 supervisor. Disconnect and scope closure interrupt in-flight work.
@@ -377,7 +402,11 @@ writes `false`, and removal clears the entry. Catalog/profile drift recreates a
 scope with the stored intent, so a deliberately disconnected environment does
 not reconnect merely because its supervisor was replaced. Passive state lookup
 may materialize a cold supervisor for state publication, but it preserves the
-stored intent and does not dial while that intent is disconnected.
+stored intent and does not dial while that intent is disconnected. The registry
+builds every supervisor, a replacement included, with the stored intent, so the
+first state it publishes already carries that intent: a desired environment
+starts at `connecting` (`offline` while the network is offline), never at
+`available`.
 
 Environment commands may place a deadline around the complete lazy
 `runInEnvironment` effect. That deadline includes supervisor acquisition,
@@ -388,6 +417,84 @@ fan-out slot and isolates the timeout to that environment's result.
 `RpcSessionFactory` disables protocol-owned reconnects. This is deliberate: one
 supervisor owns retry state, status, cancellation, and generation fencing, so a
 stale socket cannot silently become current.
+
+Liveness is decided by the client from inbound data alone. The WebSocket that
+`RpcSessionFactory` creates records every raw inbound message, including E2EE
+records before reassembly, so a large response that is still arriving keeps the
+connection alive. After 10 seconds without inbound data the client sends the
+RPC `Ping`; after three such intervals (30 seconds, each ±10 % jitter) it closes
+the socket with code 4408 and reason `liveness timeout`, logs `liveness-timeout`
+with the silent time, and fails the session with a `ConnectionTransientError`
+whose reason is `liveness-timeout`. A close frame from the server reports
+`connection-closed`, and an abnormal closure (1006) or socket error reports
+`connection-lost`. The protocol is a local copy of Effect's
+`makeProtocolSocket` in `rpc/livenessProtocol.ts`; re-check it against upstream
+on every Effect upgrade and delete it once upstream exposes a configurable
+pinger. The supervisor uses the current saved catalog name in "No data from <environment> for 30 seconds. The
+connection is too slow or was lost.", "<environment> closed the connection.",
+and "The connection to <environment> was lost."; renaming a connected environment
+changes the name used by the next disconnect without replacing its session.
+While the supervisor retries,
+connection status appends "Reconnecting…", and Git Manager shows "Reconnecting to
+<environment>. Git Manager loads when the connection is back."
+
+Each session opens exactly one `subscribeServerConfig` stream. Readiness waits
+for its first snapshot, and every later config subscription on that session
+replays the same stream (a snapshot of the current config, then live events),
+so the roughly 250 KB config crosses the wire once per connection. The stream
+starts once the socket is connected (for E2EE, authenticated), so a session
+that ends earlier never sends it. Its first snapshot is bounded by inbound
+progress (liveness) and the 120-second configuring ceiling, not the 15-second
+setup deadline. The `application-active` health probe sends
+an RPC `Ping` and succeeds at the next inbound message instead of re-fetching
+the config.
+
+Query atoms re-run when a new connection generation arrives. A request cut off
+by a transport failure (`RpcClientError`) is re-issued once on the next
+connection. After that automatic attempt fails, mount revalidation, periodic refresh,
+cache invalidation and later connections keep showing
+the failure ("The connection dropped before the result arrived.") until the
+user presses Retry, so a payload the link cannot carry is not requested again on
+every reconnect. The bookkeeping guarantees:
+
+- One attempt per request runs at a time. Views that share a request wait for the
+  running attempt and then decide, so there are never concurrent re-issues.
+- An interrupted re-issue is not a failure by itself: when the next evaluation runs
+  on the same session, the request keeps the automatic budget and re-issues. When
+  that session is gone by then, the interrupt counts as a cut-off (next rule), and
+  the request waits for Retry.
+- An interrupt counts as a cut-off when that attempt's own session is gone: its
+  generation was replaced or is no longer connected. The RPC client interrupts a
+  closing session's requests before the drop is reported, so an interrupt that sees
+  the session still connected is settled by the next evaluation: the same generation
+  means a refresh on the live session and changes nothing; a newer one counts it as
+  cut off.
+- Known limit of that rule: a request interrupted on a live session (for example, its
+  view unmounted) and evaluated again only after an unrelated later reconnect is
+  treated as cut off. That costs its one automatic retry, and Retry is still offered.
+
+In the web client, `useEnvironmentQuery` exposes `refresh` for
+explicit Retry and Refresh actions and `revalidate` for every automatic re-read
+(timers, Git and file signals, opening a view, finished mutations); only
+`refresh` clears the latch. Its `requiresRetry` is true only while the rendered
+result is the latched failure: `useEnvironmentQuery` reads the latch against the
+emission it renders, because the React Compiler re-runs that read only when its
+arguments change.
+Views format a failed query with one rule (`formatEnvironmentQueryError`): a
+cut-off, or an attempt interrupted by its closing session, shows the
+connection-dropped copy, an error with a non-blank message shows that message, and
+anything else shows the view's own fallback.
+The file browser, Git Manager's Changes view and History offer **Retry**, bound
+to `refresh`, with any failed load they show in place of their content. Retry
+ignores activation but stays focusable (`aria-disabled`) to preserve keyboard
+focus while a read runs (**Retrying…**, or History's loading state) and, in
+the file browser while the environment is not connected and in Changes when a
+read found no session (**Waiting for the connection…**), because those views
+read again by themselves once the connection is back. The file preview, the diff panes, the stash list, commit detail
+and merge preview do not offer Retry yet.
+`requiresRetry` does not decide whether Retry is shown: `usePullRequestsQuery`
+uses it so that opening a view neither re-reads a latched failure nor hides it
+behind a fresh load.
 
 ## Worktree catalog subscriptions
 
@@ -498,8 +605,60 @@ command disposes its atom, which interrupts its fiber; the RPC client then
 sends `Interrupt`, which the server maps to the request's cancellation token.
 An invocation aborted while still queued settles when its turn comes and never
 starts. On `singleFlight`, a caller that joins a running execution cannot abort
-it; on `latest`, the newest caller's abort interrupts the shared run. Add
-Project's **Cancel clone** uses this on the `serial` clone command.
+it; on `latest`, the newest caller's abort interrupts the shared run.
+Add Project's clone command is `serial` per destination. Against a server
+without `vcsCloneReattach`, it is today's single `vcs.clone` call, and **Cancel
+clone**, or the dialog unmounting, aborts it, so the interrupt stops the clone.
+
+With the capability, the command (`state/vcsClone.ts`) owns the re-attach loop;
+React owns no retry loop. It sends `detach: true`. On `RpcClientError`,
+`EnvironmentRpcUnavailableError`, or an interrupt it did not request (the RPC
+client resumes pending calls with an interrupt when the socket closes), it
+reports `reconnecting`, waits for the next session as `subscribe()` does, and
+re-issues with `attach: true`. The wait follows the environment's current
+supervisor through the registry's `followStream`: when the registry replaces
+the supervisor (a changed platform registration, for example), the loop takes
+the replacement's session, and a removed environment ends the wait. Typed
+failures never re-attach. There is no attempt limit and no timer. The loop ends
+at an outcome, at an abort, when the environment is blocked, disconnected by the
+user, or removed, or on a session without the capability; the last two end with
+`VcsCloneStoppedError`.
+
+**Cancel clone** then sends `vcs.cancelClone` on its own command lane, because
+the clone holds the destination's serial lane. The cancel waits for a session
+that advertises `vcsCloneReattach` (it stops with `VcsCloneStoppedError` on one
+that does not). The form stays in **Cancelling…** until both the clone request
+and that cancel have settled: the cancel is keyed by destination, so a new
+clone into the same folder must not start while a cancel may still be retrying.
+The client runtime enforces this, not the dialog. The cancel command records
+itself in a module-level registry keyed by environment, exact URL, and leaf
+(the parent folder is left out, because only the server can canonicalize its
+spelling), and a clone of that URL into that leaf waits for every pending cancel
+to settle before it dispatches, even after the dialog unmounted and a new one
+mounted. The key compares an explicit `directoryName` exactly, so on a
+case-insensitive file system two spellings of one folder name get separate keys;
+the dialog never sends one, and the leaf derived from one URL is always the
+same. After that wait the clone continues on the environment's current
+supervisor: it still fails at once if that supervisor is not connected, and
+ends with `VcsCloneStoppedError` if the environment was removed. The cancel
+follows the current supervisor the same way the clone does. While the cancel is
+pending, the form stays **Cancelling…** and follows the connection: "The clone
+stops when <host> reconnects." shows while it is down. After the clone request
+settles, a cancel that is still pending no longer moves that line with the
+connection; it keeps re-sending, and the form reports once it settles.
+Only a failed or stopped cancel ends the clone wait early; otherwise the clone
+request reports its own outcome, including a folder that could not be removed.
+A clone that finishes while its cancel is pending is not added as a project;
+the form names its folder and says that the next **Clone** adds it.
+The dialog can be closed while the clone waits for its host, that is while it
+shows the reconnecting line or **Cancelling…**, but not while cloning or adding
+the project. Closing it, like unmounting it, requests `vcs.cancelClone` unless
+**Cancel clone** already did, then ends the wait; the cancel goes out when the
+host is back, and the client runtime keeps it registered until it settles.
+Closing the dialog's window does the same as best effort: a closing or
+disconnected window may never get the cancel out, and then the clone keeps
+running on the host (the orphan policy). An abort alone only stops following
+the clone.
 
 ## Git Manager capability negotiation
 
@@ -556,11 +715,10 @@ nothing.
 
 ## Data boundary
 
-A session becomes ready only after the socket connects and the initial
-`server.getConfig` call succeeds. Current servers publish the same prepared
-`storageInstanceId` through that configuration, the initial configuration
-subscription snapshot, and lifecycle welcome and ready events as through the
-well-known descriptor. Domain requests resolve the current scoped session
+A session becomes ready only after the socket connects and the first
+`subscribeServerConfig` snapshot arrives. Current servers publish the same
+prepared `storageInstanceId` through that snapshot, `server.getConfig`, and
+lifecycle welcome and ready events as through the well-known descriptor. Domain requests resolve the current scoped session
 through the registry; they fail or wait according to the domain API instead of
 retaining a global client. Removing a saved environment also removes its
 registration, profile, credential, supervisor scope, and environment-keyed
@@ -576,6 +734,8 @@ replaces it. Prepared-descriptor mismatch gating happens before session
 creation, and initial-configuration mismatch gating happens before
 synchronization, lease publication, or cache consumption. Neither decision is
 inferred by the bootstrap helper or authorization token cache.
+`bootId` is random per server start and published only in environment descriptors;
+it is never persisted or used for storage identity or accepted-identity checks.
 
 See [Remote architecture](./remote.md) for access methods and
 [RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary, and

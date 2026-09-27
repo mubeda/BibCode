@@ -6,6 +6,7 @@ import {
   getArm64IntelBuildWarningDescription,
   getDesktopUpdateActionError,
   getDesktopUpdateButtonTooltip,
+  getDesktopBackendRecoveryMessage,
   getDesktopUpdateInstallConfirmationMessage,
   isDesktopUpdateButtonDisabled,
   resolveDesktopUpdateButtonAction,
@@ -32,6 +33,22 @@ const baseState: DesktopUpdateState = {
 };
 
 describe("desktop update button state", () => {
+  it("keeps pending backend recovery visible and opens installation recovery", () => {
+    const state: DesktopUpdateState = {
+      ...baseState,
+      status: "error",
+      backendRecovery: [
+        { environmentId: "primary", label: "Local", reason: "port-in-use", port: 14373 },
+      ],
+    };
+    expect(shouldShowDesktopUpdateButton(state)).toBe(true);
+    expect(resolveDesktopUpdateButtonAction(state)).toBe("install");
+    expect(isDesktopUpdateButtonDisabled(state)).toBe(false);
+    expect(getDesktopUpdateButtonTooltip(state)).toBe(
+      "Update not installed: BiBCode's local server is stopped.",
+    );
+    expect(canCheckForUpdate(state)).toBe(false);
+  });
   it("shows a download action when an update is available", () => {
     const state: DesktopUpdateState = {
       ...baseState,
@@ -108,6 +125,34 @@ describe("desktop update button state", () => {
   it("disables duplicate actions while protecting or installing", () => {
     expect(isDesktopUpdateButtonDisabled({ ...baseState, phase: "protecting" })).toBe(true);
     expect(isDesktopUpdateButtonDisabled({ ...baseState, phase: "installing" })).toBe(true);
+  });
+});
+
+describe("desktop backend recovery copy", () => {
+  it("explains a primary port conflict using the actual port", () => {
+    expect(
+      getDesktopBackendRecoveryMessage({
+        environmentId: "primary",
+        label: "Windows",
+        reason: "port-in-use",
+        port: 14373,
+      }),
+    ).toBe(
+      "BiBCode's local server couldn't restart: port 14373 is in use by another program. Quit that program, then choose Restart server.",
+    );
+  });
+
+  it("names a secondary server and explains how to recover another start failure", () => {
+    expect(
+      getDesktopBackendRecoveryMessage({
+        environmentId: "wsl:Ubuntu",
+        label: "WSL (Ubuntu)",
+        reason: "other",
+        port: 14374,
+      }),
+    ).toBe(
+      "BiBCode's WSL (Ubuntu) server couldn't restart. Choose Restart server. If that fails, restart BiBCode.",
+    );
   });
 });
 
@@ -385,6 +430,29 @@ describe("desktop update defensive branch coverage", () => {
 });
 
 describe("getDesktopUpdateButtonTooltip", () => {
+  it("names the stopped secondary server when it is the only recovery entry", () => {
+    expect(
+      getDesktopUpdateButtonTooltip({
+        ...baseState,
+        backendRecovery: [
+          { environmentId: "wsl:Ubuntu", label: "WSL (Ubuntu)", reason: "other", port: 14374 },
+        ],
+      }),
+    ).toBe("Update not installed: BiBCode's WSL (Ubuntu) server is stopped.");
+  });
+
+  it("describes multiple stopped servers without implying that clicking restarts them", () => {
+    expect(
+      getDesktopUpdateButtonTooltip({
+        ...baseState,
+        backendRecovery: [
+          { environmentId: "primary", label: "Local", reason: "port-in-use", port: 14373 },
+          { environmentId: "wsl:Ubuntu", label: "WSL (Ubuntu)", reason: "other", port: 14374 },
+        ],
+      }),
+    ).toBe("Update not installed: some of BiBCode's servers are stopped.");
+  });
+
   it("returns 'Up to date' for non-actionable states", () => {
     expect(getDesktopUpdateButtonTooltip({ ...baseState, status: "idle" })).toBe("Up to date");
     expect(getDesktopUpdateButtonTooltip({ ...baseState, status: "up-to-date" })).toBe(

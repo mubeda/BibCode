@@ -38,6 +38,8 @@ export interface EnvironmentContextCardView {
   readonly name: string;
   readonly status: EnvironmentRailStatus;
   readonly statusText: string;
+  /** Whether `statusText` carries a failure reason, which gets its own clamped line. */
+  readonly hasReason: boolean;
   readonly versionLine: string | null;
   readonly compatBadge: EnvironmentCompatBadge | null;
   readonly showUpdateActions: boolean;
@@ -65,6 +67,10 @@ export function buildEnvironmentContextCardView(input: {
       updateAvailable: false,
     }),
     statusText: connectionStatusText(input.connection),
+    // Mirrors `connectionStatusText`: only reconnecting and error put a non-empty error in the text.
+    hasReason:
+      (input.connection.phase === "reconnecting" || input.connection.phase === "error") &&
+      Boolean(input.connection.error),
     versionLine: serverVersion === null ? null : `BiBCode v${serverVersion}`,
     compatBadge: resolveCompatBadge(compat),
     showUpdateActions: selectRemoteUpdateControlCapability(input.serverConfig),

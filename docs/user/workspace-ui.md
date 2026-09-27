@@ -9,6 +9,12 @@ in the left rail. Selecting a remote server changes both the displayed account
 usage and the target of refresh or usage-reset actions. A server that has not
 returned usage does not borrow the local server's values.
 
+When a request has waited more than 15 seconds for a response, the status bar
+shows a warning such as **2 slow requests**. Click it to see each request's name,
+the environment it was sent to, and its start time. The warning goes away when
+the requests finish. The hosted web app has no status bar, so there a bar holding
+only this warning appears at the bottom while requests are slow.
+
 ## Left Panel
 
 The panel opens 422px wide by default (a 370px projects panel beside the 52px
@@ -24,7 +30,7 @@ the name you gave them on this device (see
 [Remote access](./remote-access.md#name-a-saved-server)).
 
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
-unread-count badge covers agents across all connected environments. Selecting
+unread-count badge covers agents across all connected environments and is hidden when nothing is unread. Selecting
 the row opens the full-screen Agents view; its top strip has a back arrow for
 returning to the normal workspace, the title **agents**, and an **N unread**
 badge.
@@ -47,23 +53,64 @@ pane while keeping the list visible. The per-row **Jump to workspace** action
 exits to the normal workspace view and re-points the environment rail to that
 row's environment.
 
-Projects are shown as groups of workspace rows:
+Projects are shown as groups of workspace cards. Each card is outlined, so it
+is clear which lines belong together; the open card has a light fill and a
+stronger outline, and selected cards a tinted one. A card has up to three
+lines:
 
-- The primary row represents the project's live checkout. Its branch label is
-  refreshed from the checkout, not from a stale thread title.
-- The primary row is backed by an undeletable default thread. Attempts to delete
-  it should guide the user to remove the project instead.
-- Worktree rows represent eager worktree threads. Creating a worktree creates
-  both the Git worktree and its thread before the first message.
-- Rows can show pinned/unread state and nested agent activity such as provider,
-  running state, and elapsed time.
+- **Line 1:** a status glyph, the title (bold while unread), a **primary**
+  chip on the main checkout, and a pin when pinned. Hovering or focusing a
+  worktree card shows **Archive**; holding the thread-jump modifier shows its
+  number instead.
+- **Line 2:** the branch (hidden when it equals the title), the pull or merge
+  request number (`#12`, or `!57` on GitLab), coloured by state and opening
+  the request when clicked, a dot for uncommitted changes, a terminal icon
+  while a terminal process runs, and a globe that opens a discovered local
+  server.
+- **Line 3:** the provider icon, what the agent is doing (its current tool
+  while working, otherwise the latest reply or prompt, or **Delivery failed**
+  or **Delivery uncertain** when a message didn't land), the model (its short
+  name, or its identifier such as `sonnet` when the catalog gives it none), and
+  how long ago that was.
+
+The glyph's shape carries the status: a hand (needs approval), a question mark
+(waiting for your answer), a spinner (working or connecting), a warning
+triangle (failed), a checklist (plan ready), a filled dot (finished, not opened
+yet) and a hollow ring (idle). A collapsed project and the **Show more** row
+show the most urgent glyph among the cards they hide.
+
+- The primary card represents the project's live checkout. Its title is the
+  checkout's current branch, refreshed from Git rather than from a stored
+  thread title. When Git cannot use the checkout, the title shows the project
+  name and line 2 says **Not a Git repository**, **Repository unreadable**,
+  **Repository not trusted**, or **Repository unavailable**, with the full
+  explanation on hover and for screen readers.
+- The primary card is backed by an undeletable default thread; to remove it,
+  remove the project from its header.
+- Worktree cards represent worktree threads. Creating a worktree creates both
+  the Git worktree and its thread before the first message.
+- Other chats open in a worktree show as **N more chats** under its card;
+  chats in the main checkout count on the primary card.
+
+Tab moves between cards; **Enter** opens one, and **Shift+F10** or the
+**Menu** key opens its menu at the card.
 
 The sidebar says **No projects yet** only after every configured environment
 has connected and returned a successful empty project snapshot. During startup,
 reconnects, unavailable environments, storage-location changes, or recovery
 conditions it shows that availability state instead. Cached project rows stay
 visible during those conditions and are replaced only after a newly accepted
-environment completes synchronization.
+environment completes synchronization. When an environment cannot connect, the
+notice names it ("<name> is not connected."); hover or focus that line for the
+reason, which the chat's banner states in full.
+
+In a chat whose environment is not connected, the banner above the composer
+gives the state in its title and the reason once in its body, and the composer
+says only that the environment is not connected. The banner offers
+**Reconnect** where this client reconnects in place. For a remote environment
+in the desktop app, which manages remote connections in **Settings → Remote
+Servers**, the banner and the sidebar notice offer **Open Remote Servers**
+instead.
 
 Use the project `+` action to create a worktree. The Create Worktree dialog has a
 permanent Name field, an optional Smart/GitHub/Branch **Create From** selector,
@@ -90,23 +137,76 @@ directories; **Type a path instead** switches to manual entry of an absolute
 or home-relative path. Selecting a folder adds that folder as one project and
 does not scan for nested repositories.
 
-While a clone runs, the clone form stays open with **Cancel clone**. Cancelling
-stops Git, shows "Clone cancelled.", and removes the folder the clone created;
-if the clone had already finished, the folder stays and the next **Clone** into
-it adds it. A failed clone shows the reason in the form, including a stalled
-transfer or an incomplete earlier clone in the chosen folder (remove it or
-choose another folder). The dialog closes once the project has been added and
-opened.
+While a clone runs, the clone form stays open with **Cancel clone**. If the
+connection to the host drops, the clone keeps running there: the form shows
+"Lost the connection to <host>. The clone continues on the server;
+reconnecting…", and when the connection returns it resumes following the clone
+and adds the project once it finishes. Cancelling stops Git, shows "Clone
+cancelled.", and removes the folder the clone created; while disconnected, the
+form shows **Cancelling…** until the host is back, and it accepts a new clone
+only once the host has confirmed the cancel. If the clone had already finished,
+the form says so and names its folder; the folder stays unregistered, and the
+next **Clone** into it adds it. While the form shows the reconnecting line or
+**Cancelling…**, you can close the dialog: the clone is cancelled once the host
+is back, and a new clone of that URL into that folder waits for the cancel to
+finish. Closing the window
+during a clone asks the host to cancel it, but a closing or disconnected window
+may not reach the host; the clone then keeps running there, and cloning the
+same URL into the same folder later joins it or adds the finished repository.
+A failed clone shows the reason in the form,
+including a stalled transfer or an incomplete earlier clone in the chosen
+folder (remove it or choose another folder). If the host cannot be reached
+again, the form says so; cloning the same URL into the same folder later joins
+the clone or adds the finished repository. The dialog closes once the project
+has been added and opened.
 
 Clicking a project header selects it and toggles its thread list; the header
 stays highlighted as the selected node until you open a thread, and it is also
 highlighted while that project's Git Manager or Pull Requests route is open.
+Hovering or focusing a header shows **⋯** (project actions), **+** (New
+worktree), **Git Manager** and, when enabled, **Pull Requests**.
 
-Workspace row context menus include update/open/copy/pin/unread actions, plus
-delete worktree for worktree rows and remove project for primary rows. On the
-local desktop environment, **Open in → File Explorer** opens the repository
-folder for a primary row or the worktree folder for a worktree row. The action
-is omitted for remote environments and browser mode.
+Menus separate their groups:
+
+- **Worktree card:** **Open in ›**, **Pull** · **Copy Path**, **Copy Branch
+  Name**, **Copy Thread ID** · **Pin** or **Unpin**, **Mark as Unread** or
+  **Mark as Read**, **Rename…** · **Delete Worktree…**. A thread without a
+  worktree offers **Delete Thread** instead, with an ellipsis when deletion
+  asks for confirmation. While a session in the worktree is running or starting, on the
+  card or in one of its other chats, **Delete Worktree…** is disabled with
+  "Stop the running session before deleting this worktree." (the card hides
+  **Archive** while its session runs, too). The removal dialog follows the same
+  rule however it opens (this menu, a missing worktree's **Remove from
+  BiBCode**, or **Delete** on an archived worktree in **Settings → Archive**):
+  its delete buttons stay disabled, with that sentence shown, until the session
+  stops. The server also refuses deletion while a session is running or
+  starting, so a turn started by another client is protected even before this
+  window updates. A server refusal shows the same sentence and keeps the
+  worktree. **Remove from BiBCode** remains available without deleting the
+  checkout.
+- **Primary card (the main checkout):** **Open in ›**, **Pull** · **Copy Path**,
+  **Copy Branch Name** · **Pin** or **Unpin**, **Mark as Unread** or **Mark as
+  Read**. It can't be deleted; remove the project from its header instead.
+- **Project header** (**⋯** or right-click): **New Worktree…** · **Rename…**,
+  **Group into…**, **Copy Path** · **Show Hidden Worktrees (N)** or **Hide
+  Discovered Worktrees**, **Archived Threads** · **Remove Project…**. N appears
+  once the project is expanded. Grouped projects list their members in a
+  submenu for the actions that target one member.
+- **Several selected cards:** **Mark as Unread (N)** · **Delete (N)**.
+
+**Pull** runs `git pull` in that checkout. **Copy Branch Name** copies the
+branch the card shows and is left out when the card shows none. On the local
+desktop environment, **Open in → File Explorer** opens the repository folder
+for a primary card or the worktree folder for a worktree card; it is left out for
+remote environments and browser mode.
+
+The desktop app shows native menus on macOS and Linux. In the browser and on
+Windows the menu opens inside the app: its first enabled item is focused, the
+arrow keys move between items (skipping separators, but stopping on disabled
+items so you can read or hear why they are unavailable; choosing one does
+nothing), **Home** and **End** jump to the ends, **→** and **←** open and
+close a submenu, **Enter** or **Space** chooses, and **Escape** closes the menu
+and returns focus to where you were.
 
 External editors are listed when the server host can find them on `PATH`. Zed
 is additionally detected through the `zeditor` alias, a Flatpak export
@@ -256,6 +356,23 @@ becomes available once the running turn and any pending approval or question are
 done. Cancelling remains available while the message is queued; it is disabled
 while steering is being acknowledged.
 
+If an earlier message has a failed or uncertain delivery, the first queued card
+shows **Waiting for an earlier message**. **Steer** and **Send now** are disabled
+with **Retry or dismiss the earlier message first**, or **Dismiss the earlier
+message first** when its model or options were refused and Retry cannot help.
+Later cards keep their usual **Sends after the messages above** status.
+
+Delivery notices name the provider instance the message was sent to, using its
+configured name when available. If the instance is no longer available or an
+older server supplied no instance identity, the notice uses the provider name.
+A failed delivery whose model or options were refused keeps its failure detail
+and offers only **Dismiss**: **Sending it again unchanged would fail, and later
+messages wait behind it. Dismiss it, then send it again with another model or
+without that option.** The message
+remains in the timeline with its copy button so you can prepare the corrected
+message. Other failed deliveries still offer Retry and Dismiss; uncertain
+deliveries still warn that Retry could send a duplicate.
+
 ### Composer context window
 
 In the normal composer footer, controls remain visible in this order: MCP
@@ -297,8 +414,11 @@ as `Waiting for 3s`. The timer is anchored to the persisted user-message time
 after reload and never moves backward when the provider start time arrives.
 The animation uses the current theme's muted foreground and becomes static when
 reduced motion is requested. A later `pending` delivery blocked behind an
-unresolved failed or uncertain delivery does not appear active; resolve the
-earlier delivery's Retry/Dismiss notice before that pending message can run.
+unresolved failed or uncertain delivery shows the
+muted line **Waiting for an earlier message. Retry or dismiss it to send this
+one.**, or **Waiting for an earlier message. Dismiss it to send this one.** when
+the earlier message's model or options were refused. Resolve that earlier
+delivery's notice before the pending message can run.
 The composer offers `Cancel queued message` for this blocked pending delivery.
 That control cancels an already admitted start; the durable **Queued** cards
 above have their own Cancel action and let you continue composing.
@@ -353,13 +473,30 @@ The toolbar has three segments:
    repository usable; ahead/behind remain unknown at zero until Fetch obtains
    that ref instead of making the complete Git Manager unavailable.
 
-The manager opens on **History**. When a checkout with pending changes becomes
-clean after a commit, discard, or recovery, it returns to History. Dirty or
-still-loading checkouts preserve the tab the user chose, and so does the
-**Tags** tab, which is unrelated to the working tree. An in-progress merge
-always selects **Changes**, since that merge is finished there, and returns to
-History once the merge is committed or aborted; the tab is not remembered
-between openings.
+The manager keeps the chosen tab for the session but does not save it, so it
+opens on **History** after a reload. A reconnect keeps the chosen tab and is not
+an opening. Opening it, or switching to another
+worktree, selects History for a clean checkout and **Changes** while a merge is
+pending; otherwise the chosen tab stays. The manager also returns to History
+when a checkout with pending changes becomes clean, for example after a commit
+or discard, and selects Changes when a merge starts, since the merge is
+finished there. A clean checkout never pulls the user off the **Tags** tab,
+which is unrelated to the working tree. A repository Git cannot read is not
+a clean checkout: the chosen tab stays during the failure and after repair.
+**Changes**, **History** and **Tags** show the same explanation with **Retry**:
+no repository (run `git init`); Git can't read it (check `.git`, for example
+HEAD or config); or Git doesn't trust another user's repository (run
+`git config --global --add safe.directory <folder>` with the selected checkout's
+path quoted for the server's shell: single quotes for POSIX shells; forward
+slashes in PowerShell single quotes on Windows).
+When an older server omits the reason, the message suggests `git init`
+or checking an existing repository's `.git` folder. The toolbar shows **No
+branch** and **Sync unavailable**; branch, tag, sync, stash, merge and rebase
+actions are disabled with that reason. Tabs and Worktree stay usable.
+Everything reloads automatically once status reports that Git can read the
+repository again; a repaired HEAD or config file is noticed within a moment,
+while after `git init` or trusting the folder the manager rechecks within about
+a minute, or at once with **Retry**.
 
 The **Tags** tab lists local tags newest first, then one collapsible section
 per remote with the tags that remote currently advertises, queried with
@@ -407,7 +544,10 @@ pane without making a request. Pull-request and check data load only when
 **Refresh** is pressed, and the pane never starts a
 provider timer. The pane's toggle, heading, status messages, request number and
 Create button follow the provider: GitLab uses merge-request wording, `!N` and
-**Create merge request**. Its create-pull-request review
+**Create merge request**. Until the repository status has loaded, the toggle,
+the pane and its review dialog say “change request”; a loaded status that
+names no host keeps pull-request wording. Its
+create-pull-request review
 dialog groups repository, base, and head details separately from branch-publication status, then keeps the
 editable title and description in one padded form above the fixed action footer.
 On GitLab it says **Create merge request** and uses `!N`. A self-hosted host

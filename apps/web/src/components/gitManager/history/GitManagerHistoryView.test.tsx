@@ -5,6 +5,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { textSizesBelowTextXs } from "~/test/uiTypography";
+
 const h = vi.hoisted(() => ({
   listProps: null as Record<string, unknown> | null,
   commitPage: null as {
@@ -26,24 +28,33 @@ const h = vi.hoisted(() => ({
   contextMenuShow: vi.fn(),
   dndProps: null as Record<string, unknown> | null,
   refreshCommits: vi.fn(),
+  scrollNode: null as HTMLElement | null,
 }));
 
-vi.mock("@legendapp/list/react", () => ({
-  LegendList: (props: {
-    data: ReadonlyArray<GitManagerCommitEntry>;
-    keyExtractor: (commit: GitManagerCommitEntry) => string;
-    renderItem: (input: { item: GitManagerCommitEntry; index: number }) => React.ReactNode;
-  }) => {
-    h.listProps = props as unknown as Record<string, unknown>;
-    return (
-      <div>
-        {props.data.map((item, index) => (
-          <div key={props.keyExtractor(item)}>{props.renderItem({ item, index })}</div>
-        ))}
-      </div>
-    );
-  },
-}));
+vi.mock("@legendapp/list/react", async () => {
+  const React = await import("react");
+  return {
+    LegendList: (props: {
+      data: ReadonlyArray<GitManagerCommitEntry>;
+      keyExtractor: (commit: GitManagerCommitEntry) => string;
+      renderItem: (input: { item: GitManagerCommitEntry; index: number }) => React.ReactNode;
+      ref?: React.Ref<unknown>;
+    }) => {
+      h.listProps = props as unknown as Record<string, unknown>;
+      // Only tests that measure the scroll node get a list handle.
+      React.useImperativeHandle(props.ref, () =>
+        h.scrollNode === null ? null : { getScrollableNode: () => h.scrollNode },
+      );
+      return (
+        <div>
+          {props.data.map((item, index) => (
+            <div key={props.keyExtractor(item)}>{props.renderItem({ item, index })}</div>
+          ))}
+        </div>
+      );
+    },
+  };
+});
 
 vi.mock("../../../localApi", () => ({
   readLocalApi: () => ({ contextMenu: { show: h.contextMenuShow } }),
@@ -84,6 +95,8 @@ vi.mock("../../../state/query", () => ({
           : null,
     isPending: false,
     refresh: atom?.kind === "commits" ? h.refreshCommits : h.retryRetained,
+    revalidate: vi.fn(),
+    requiresRetry: false,
   }),
 }));
 
@@ -130,6 +143,7 @@ function commit(index: number): GitManagerCommitEntry {
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   h.listProps = null;
+  h.scrollNode = null;
   h.commitPage = null;
   h.retainedPages = null;
   h.retainedInputs.length = 0;
@@ -156,6 +170,25 @@ afterEach(async () => {
 });
 
 describe("GitManagerCommitList", () => {
+  it("sets every row's text at 12 px or larger (UI.md typography)", async () => {
+    const decorated = { ...commit(1), decorations: ["main"] };
+    await act(async () =>
+      root?.render(
+        <GitManagerCommitList
+          commits={[decorated, commit(2)]}
+          selectedSha={null}
+          onSelect={() => undefined}
+          onReachEnd={() => undefined}
+          isLoadingMore={false}
+        />,
+      ),
+    );
+    const markup = container.innerHTML;
+    expect(markup).toContain(decorated.shortSha);
+    expect(markup).toContain(">main<");
+    expect(textSizesBelowTextXs(markup)).toEqual([]);
+  });
+
   it("requests one next page when the tenth-from-last row becomes visible", async () => {
     const commits = Array.from({ length: 100 }, (_, index) => commit(index));
     const onReachEnd = vi.fn();
@@ -185,6 +218,121 @@ describe("GitManagerCommitList", () => {
     expect(onReachEnd).toHaveBeenCalledTimes(1);
     expect(h.listProps?.estimatedItemSize).toBe(50);
     expect((h.listProps?.getFixedItemSize as (() => number) | undefined)?.()).toBe(50);
+  });
+
+  function scrollNode(scrollHeight: number, clientHeight: number): HTMLElement {
+    const node = document.createElement("div");
+    Object.defineProperty(node, "scrollHeight", { configurable: true, value: scrollHeight });
+    Object.defineProperty(node, "clientHeight", { configurable: true, value: clientHeight });
+    return node;
+  }
+
+  it("asks for the next page when a short page does not fill the list", async () => {
+    // A byte-capped History page can hold a few large commits that fit the viewport.
+    h.scrollNode = scrollNode(600, 700);
+    const onReachEnd = vi.fn();
+    vi.spyOn(Date, "now").mockReturnValue(1_000);
+    await act(async () =>
+      root?.render(
+        <GitManagerCommitList
+          commits={Array.from({ length: 12 }, (_, index) => commit(index))}
+          selectedSha={null}
+          onSelect={() => undefined}
+          onReachEnd={onReachEnd}
+          isLoadingMore={false}
+        />,
+      ),
+    );
+    expect(onReachEnd).toHaveBeenCalledTimes(1);
+    // Layout reports again within the throttle window: still one request.
+    act(() => (h.listProps?.onLayout as (() => void) | undefined)?.());
+    expect(onReachEnd).toHaveBeenCalledTimes(1);
+  });
+
+  function renderList(
+    commits: ReadonlyArray<GitManagerCommitEntry>,
+    isLoadingMore: boolean,
+    onReachEnd: () => void,
+  ) {
+    return act(async () =>
+      root?.render(
+        <GitManagerCommitList
+          commits={commits}
+          selectedSha={null}
+          onSelect={() => undefined}
+          onReachEnd={onReachEnd}
+          isLoadingMore={isLoadingMore}
+        />,
+      ),
+    );
+  }
+
+  it("keeps paging while the loaded pages still do not fill the list", async () => {
+    vi.useFakeTimers({ now: 1_000 });
+    try {
+      h.scrollNode = scrollNode(600, 700);
+      const onReachEnd = vi.fn();
+      const firstPage = Array.from({ length: 12 }, (_, index) => commit(index));
+      await renderList(firstPage, false, onReachEnd);
+      expect(onReachEnd).toHaveBeenCalledTimes(1);
+      await renderList(firstPage, true, onReachEnd);
+      // The second short page lands 100 ms later, inside the request interval.
+      vi.advanceTimersByTime(100);
+      h.scrollNode = scrollNode(1_200, 700);
+      const twoPages = Array.from({ length: 24 }, (_, index) => commit(index));
+      await renderList(twoPages, false, onReachEnd);
+      expect(onReachEnd).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(onReachEnd).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not ask again after a page that added no rows (failed, latched or exhausted)", async () => {
+    vi.useFakeTimers({ now: 1_000 });
+    try {
+      h.scrollNode = scrollNode(600, 700);
+      const onReachEnd = vi.fn();
+      const firstPage = Array.from({ length: 12 }, (_, index) => commit(index));
+      await renderList(firstPage, false, onReachEnd);
+      await renderList(firstPage, true, onReachEnd);
+      await act(async () => {
+        vi.advanceTimersByTime(5_000);
+      });
+      // The request settled without new rows: loading ends, the same rows remain.
+      await renderList(firstPage, false, onReachEnd);
+      act(() => (h.listProps?.onLayout as (() => void) | undefined)?.());
+      await act(async () => {
+        vi.advanceTimersByTime(5_000);
+      });
+      expect(onReachEnd).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not ask while the rows fill the list or before it is laid out", async () => {
+    const onReachEnd = vi.fn();
+    vi.spyOn(Date, "now").mockReturnValue(1_000);
+    for (const node of [scrollNode(5_000, 700), scrollNode(600, 0)]) {
+      h.scrollNode = node;
+      await act(async () =>
+        root?.render(
+          <GitManagerCommitList
+            commits={Array.from({ length: 100 }, (_, index) => commit(index))}
+            selectedSha={null}
+            onSelect={() => undefined}
+            onReachEnd={onReachEnd}
+            isLoadingMore={false}
+          />,
+        ),
+      );
+      act(() => (h.listProps?.onLayout as (() => void) | undefined)?.());
+    }
+    expect(onReachEnd).not.toHaveBeenCalled();
   });
 
   it("moves selection with the arrow keys and exposes a useful row name", async () => {
@@ -886,14 +1034,14 @@ describe("GitManagerHistoryView repository generation tracking", () => {
       "Couldn’t refresh history: The environment request failed. Your loaded commits are still available.",
     );
     expect(retryButton()?.textContent).toBe("Retry");
-    expect(retryButton()?.disabled).toBe(false);
+    expect(retryButton()?.getAttribute("aria-disabled")).toBeNull();
     await act(async () => retryButton()?.click());
     expect(h.refreshCommits).toHaveBeenCalledOnce();
 
     h.firstPageWaiting = true;
     await renderHistory(1, 1);
     expect(retryButton()?.textContent).toBe("Retrying…");
-    expect(retryButton()?.disabled).toBe(true);
+    expect(retryButton()?.getAttribute("aria-disabled")).toBe("true");
     expect(container.textContent).toContain("Commit 80");
 
     h.firstPageWaiting = false;

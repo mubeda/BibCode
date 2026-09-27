@@ -1,29 +1,67 @@
-import { type E2eeAuthenticatedMessage, type ServerConfig, WS_METHODS } from "@bibcode/contracts";
+import {
+  type E2eeAuthenticatedMessage,
+  type ServerConfig,
+  type ServerConfigStreamEvent,
+  WS_METHODS,
+} from "@bibcode/contracts";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
-import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import * as RpcClient from "effect/unstable/rpc/RpcClient";
+import { constPing } from "effect/unstable/rpc/RpcMessage";
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
 import * as Socket from "effect/unstable/socket/Socket";
 
 import { makeWsRpcProtocolClient, type WsRpcProtocolClient } from "./protocol.ts";
 import { e2eeFailureOf, makeE2eeSocket } from "../e2ee/index.ts";
-import type { ConnectionAttemptError, PreparedConnection } from "../connection/model.ts";
+import type {
+  ConnectionAttemptError,
+  ConnectionTransientReason,
+  PreparedConnection,
+} from "../connection/model.ts";
 import {
   ConnectionBlockedError,
   ConnectionTransientError as ConnectionTransientErrorClass,
 } from "../connection/model.ts";
 
+import { CHUNKED_RPC_SUBPROTOCOL, makeChunkedSocket } from "./chunkedSocket.ts";
 import { withInputAdmission } from "./inputAdmission.ts";
+import { makeInboundActivity } from "./liveness.ts";
+import { makeLivenessProtocol, type RpcDisconnect } from "./livenessProtocol.ts";
+import { makeSharedServerConfig } from "./sharedServerConfig.ts";
 
 const SOCKET_OPEN_TIMEOUT = "15 seconds";
 
+type ServerConfigSubscription = WsRpcProtocolClient[typeof WS_METHODS.subscribeServerConfig];
+
+/** Failures of the config subscription that readiness waits on. */
+type InitialConfigError = ServerConfigSubscription extends (
+  input: any,
+  options?: any,
+) => Stream.Stream<any, infer E, any>
+  ? E
+  : never;
+
+/**
+ * The session's RPC client. Its `subscribeServerConfig` replays the connection's one config
+ * stream instead of opening another, so it has only the stream form: no `asQueue`, and no
+ * per-call options.
+ */
+export type RpcSessionClient = Omit<
+  WsRpcProtocolClient,
+  typeof WS_METHODS.subscribeServerConfig
+> & {
+  readonly [WS_METHODS.subscribeServerConfig]: (
+    input: Parameters<ServerConfigSubscription>[0],
+  ) => Stream.Stream<ServerConfigStreamEvent, InitialConfigError>;
+};
+
 export interface RpcSession {
-  readonly client: WsRpcProtocolClient;
+  readonly client: RpcSessionClient;
   readonly initialConfig: Effect.Effect<ServerConfig, ConnectionAttemptError>;
   readonly ready: Effect.Effect<void, ConnectionAttemptError>;
   readonly probe: Effect.Effect<void, ConnectionAttemptError>;
@@ -31,18 +69,23 @@ export interface RpcSession {
   readonly e2eeAuthenticated: Effect.Effect<E2eeAuthenticatedMessage | null>;
 }
 
+/**
+ * Factory return type: `connected` completes when the socket connects (for E2EE,
+ * after authentication), or fails with the disconnect if the socket ends first.
+ * Live-session consumers use `RpcSession`.
+ */
+export interface EstablishingRpcSession extends RpcSession {
+  readonly connected: Effect.Effect<void, ConnectionAttemptError>;
+}
+
 export class RpcSessionFactory extends Context.Service<
   RpcSessionFactory,
   {
     readonly connect: (
       connection: PreparedConnection,
-    ) => Effect.Effect<RpcSession, ConnectionAttemptError, Scope.Scope>;
+    ) => Effect.Effect<EstablishingRpcSession, ConnectionAttemptError, Scope.Scope>;
   }
 >()("@bibcode/client-runtime/rpc/session/RpcSessionFactory") {}
-
-type InitialConfigError = Effect.Error<
-  ReturnType<WsRpcProtocolClient[typeof WS_METHODS.serverGetConfig]>
->;
 
 function mapInitialConfigError(error: InitialConfigError): ConnectionAttemptError {
   switch (error._tag) {
@@ -52,12 +95,9 @@ function mapInitialConfigError(error: InitialConfigError): ConnectionAttemptErro
         detail: error.message,
       });
     case "UpdateMaintenanceActiveError":
-      return new ConnectionTransientErrorClass({
-        reason: "remote-unavailable",
-        detail: error.message,
-      });
     case "KeybindingsConfigParseError":
     case "ServerSettingsError":
+    case "RpcResponseTooLargeError":
       return new ConnectionTransientErrorClass({
         reason: "remote-unavailable",
         detail: error.message,
@@ -97,6 +137,29 @@ function mapE2eeFailure(error: unknown): ConnectionAttemptError | null {
   }
 }
 
+/** How each end of an established connection is reported; the supervisor adds the name. */
+const DISCONNECT_REASONS = {
+  LivenessTimeout: "liveness-timeout",
+  Closed: "connection-closed",
+  Lost: "connection-lost",
+} as const satisfies Record<RpcDisconnect["_tag"], ConnectionTransientReason>;
+
+function disconnectError(
+  wasConnected: boolean,
+  disconnect: RpcDisconnect,
+): ConnectionTransientErrorClass {
+  if (!wasConnected) {
+    return new ConnectionTransientErrorClass({
+      reason: "transport",
+      detail: "Could not establish a WebSocket connection.",
+    });
+  }
+  return new ConnectionTransientErrorClass({
+    reason: DISCONNECT_REASONS[disconnect._tag],
+    detail: "The connection disconnected.",
+  });
+}
+
 export const make = Effect.gen(function* () {
   const webSocketConstructor = yield* Socket.WebSocketConstructor;
 
@@ -109,37 +172,40 @@ export const make = Effect.gen(function* () {
     const disconnected = yield* Deferred.make<never, ConnectionAttemptError>();
     const e2eeAuthenticated = yield* Deferred.make<E2eeAuthenticatedMessage | null>();
     const e2eeAttemptFailure = yield* Ref.make<ConnectionAttemptError | null>(null);
-    const hooks = RpcClient.ConnectionHooks.of({
-      onConnect: Deferred.succeed(connected, undefined).pipe(Effect.asVoid),
-      onDisconnect: Effect.all({
+    const activity = yield* makeInboundActivity;
+    const onDisconnect = (disconnect: RpcDisconnect) =>
+      Effect.all({
         wasConnected: Deferred.isDone(connected),
         e2eeFailure: Ref.get(e2eeAttemptFailure),
       }).pipe(
         Effect.flatMap(({ wasConnected, e2eeFailure }) =>
-          Deferred.fail(
-            disconnected,
-            e2eeFailure ??
-              new ConnectionTransientErrorClass({
-                reason: "transport",
-                detail: wasConnected
-                  ? `${connection.label} disconnected.`
-                  : `${connection.label} could not establish a WebSocket connection.`,
-              }),
-          ),
+          Deferred.fail(disconnected, e2eeFailure ?? disconnectError(wasConnected, disconnect)),
         ),
         Effect.asVoid,
-      ),
-    });
+      );
+    let rawSocket: globalThis.WebSocket | null = null;
     const connectionWebSocketConstructor: typeof webSocketConstructor = (url, protocols) => {
       const socket = webSocketConstructor(url, protocols);
-      if (connection.e2ee !== null) socket.binaryType = "arraybuffer";
+      // Binary frames must stay in delivery order: E2EE ciphertext and plain records.
+      socket.binaryType = "arraybuffer";
+      // Every raw frame is proof of life, including E2EE records before reassembly.
+      socket.addEventListener("message", activity.record);
+      rawSocket = socket;
       return socket;
     };
     const socketLayer = Layer.effect(
       Socket.Socket,
-      Socket.makeWebSocket(connection.socketUrl, { openTimeout: SOCKET_OPEN_TIMEOUT }).pipe(
+      Socket.makeWebSocket(connection.socketUrl, {
+        openTimeout: SOCKET_OPEN_TIMEOUT,
+        ...(connection.e2ee === null ? { protocols: [CHUNKED_RPC_SUBPROTOCOL] } : {}),
+      }).pipe(
         Effect.map((plainSocket) => {
-          if (connection.e2ee === null) return plainSocket;
+          if (connection.e2ee === null) {
+            return makeChunkedSocket(
+              plainSocket,
+              () => rawSocket?.protocol === CHUNKED_RPC_SUBPROTOCOL,
+            );
+          }
           const encryptedSocket = makeE2eeSocket(plainSocket, {
             hostKey: connection.e2ee.hostKey,
             auth: connection.e2ee.auth,
@@ -162,42 +228,70 @@ export const make = Effect.gen(function* () {
     ).pipe(
       Layer.provide(Layer.succeed(Socket.WebSocketConstructor, connectionWebSocketConstructor)),
     );
-    const protocolLayer = Layer.effect(
-      RpcClient.Protocol,
-      RpcClient.makeProtocolSocket({
-        retryTransientErrors: false,
-        retryPolicy: Schedule.recurs(0),
-      }),
-    ).pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          socketLayer,
-          RpcSerialization.layerJson,
-          Layer.succeed(RpcClient.ConnectionHooks, hooks),
-        ),
+    // Layer.build keeps the socket in this session's scope; Effect.provide(layer) would close it.
+    const transportContext = yield* Layer.build(
+      Layer.mergeAll(socketLayer, RpcSerialization.layerJson),
+    );
+    const protocol = yield* makeLivenessProtocol({
+      activity,
+      onConnect: Deferred.succeed(connected, undefined).pipe(Effect.asVoid),
+      onDisconnect,
+    }).pipe(Effect.provide(transportContext), Effect.withSpan("environment.websocket.connect"));
+    const admitted = withInputAdmission(
+      yield* makeWsRpcProtocolClient.pipe(Effect.provideService(RpcClient.Protocol, protocol)),
+    );
+    // The connection's one config stream: readiness waits for its first
+    // snapshot, and later subscribers replay it instead of opening another.
+    // It starts once the socket is connected (for E2EE, authenticated), so a
+    // session torn down before that never waits to send its interrupt.
+    const sharedConfig = yield* makeSharedServerConfig(
+      Stream.unwrap(
+        Deferred.await(connected).pipe(Effect.as(admitted[WS_METHODS.subscribeServerConfig]({}))),
       ),
     );
-    const protocolContext = yield* Layer.build(protocolLayer).pipe(
-      Effect.withSpan("environment.websocket.connect"),
-    );
-    const client = withInputAdmission(
-      yield* makeWsRpcProtocolClient.pipe(Effect.provide(protocolContext)),
-    );
+    // Later subscribers replay the shared stream (see `RpcSessionClient`).
+    const client: RpcSessionClient = {
+      ...admitted,
+      [WS_METHODS.subscribeServerConfig]: () => sharedConfig.events,
+    };
+    // The protocol publishes the classified disconnect before it fails sends
+    // and pending calls, so a transport failure seen after the socket ended
+    // reports that disconnect. Typed server answers keep their own mapping.
+    const failWithDisconnectOr = (fallback: ConnectionAttemptError) =>
+      Deferred.isDone(disconnected).pipe(
+        Effect.flatMap((done) => (done ? Deferred.await(disconnected) : Effect.fail(fallback))),
+      );
+    const mapSessionRequestError = (error: InitialConfigError) =>
+      error._tag === "RpcClientError"
+        ? failWithDisconnectOr(mapInitialConfigError(error))
+        : Effect.fail(mapInitialConfigError(error));
     const initialConfig = yield* Effect.cached(
-      client[WS_METHODS.serverGetConfig]({}).pipe(
-        Effect.mapError(mapInitialConfigError),
+      sharedConfig.initialConfig.pipe(
+        Effect.catch(mapSessionRequestError),
         Effect.withSpan("environment.initialSync"),
       ),
     );
-    const probe = client[WS_METHODS.serverGetConfig]({}).pipe(
-      Effect.mapError(mapInitialConfigError),
-      Effect.asVoid,
+    // Any inbound message after the Ping proves the connection is alive.
+    const probe = Effect.suspend(() => {
+      const before = activity.sequence();
+      return protocol.send(0, constPing).pipe(Effect.andThen(activity.awaitAfter(before)));
+    }).pipe(
+      Effect.catch((error) =>
+        failWithDisconnectOr(
+          new ConnectionTransientErrorClass({
+            reason: "transport",
+            detail: error.message,
+          }),
+        ),
+      ),
+      Effect.raceFirst(Deferred.await(disconnected)),
       Effect.withSpan("clientRuntime.connection.rpcSession.probe"),
     );
 
     return {
       client,
       initialConfig,
+      connected: Deferred.await(connected).pipe(Effect.raceFirst(Deferred.await(disconnected))),
       ready: Deferred.await(connected).pipe(
         Effect.andThen(initialConfig),
         Effect.asVoid,
@@ -207,7 +301,7 @@ export const make = Effect.gen(function* () {
       closed: Deferred.await(disconnected),
       e2eeAuthenticated:
         connection.e2ee === null ? Effect.succeed(null) : Deferred.await(e2eeAuthenticated),
-    } satisfies RpcSession;
+    } satisfies EstablishingRpcSession;
   });
 
   return RpcSessionFactory.of({ connect });

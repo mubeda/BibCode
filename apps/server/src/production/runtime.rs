@@ -35,6 +35,7 @@ use crate::{
     process::configure_background_command,
     production::{
         agent_activity::ProductionAgentActivity,
+        clone_operations::CloneRuntime,
         connect_mcp::ConnectMcpService,
         control::{NativeServerControl, ProviderUpdateCheckTask},
         git_manager_rpc::{GitManagerRpcServices, register_git_manager_rpc},
@@ -106,6 +107,7 @@ pub struct ProductionRuntime {
     worktree_catalog_operations: WorktreeCatalogOperationRuntime,
     worktree_runtime: WorktreeRuntime,
     worktree_removal_tasks: WorktreeRemovalTaskTracker,
+    clone_operations: CloneRuntime,
     status_broadcaster: crate::git::StatusBroadcaster,
     workspace: WorkspaceRpc,
     _resource_sampler: Arc<NativeResourceSampler>,
@@ -292,7 +294,8 @@ impl ProductionRuntime {
                     state_paths.attachments_dir.clone(),
                     process_attribution.clone(),
                     chat_activity_controller.clone(),
-                ),
+                )
+                .with_published_inventory(control.published_provider_inventory()),
             ),
             activity_projections.chat(),
             SupervisorOptions::default(),
@@ -310,19 +313,21 @@ impl ProductionRuntime {
         // One host observation: Pull Requests scope resolution and Settings discovery
         // write it, status reads (and the create path) only read it.
         let provider_hosts = Arc::new(crate::source_control::ProviderHosts::default());
-        let git_repository = Arc::new(
-            GitRepository::with_worktree_settings(control.clone())
-                .with_provider_hosts(provider_hosts.clone()),
-        );
+        let git_repository = Arc::new(GitRepository::with_worktree_settings(
+            control.clone(),
+            provider_hosts.clone(),
+        ));
         let workspace_availability = WorkspaceAvailabilityRegistry::new();
         let worktree_catalog = WorktreeCatalogService::new_with_availability_registry(
             Arc::new(repositories.clone()),
             git_repository.clone(),
             workspace_availability.clone(),
         );
-        let pull_requests =
-            PullRequestsRpcServices::with_dependencies(config.state_dir(), repositories.clone())
-                .with_provider_hosts(provider_hosts.clone());
+        let pull_requests = PullRequestsRpcServices::with_dependencies(
+            config.state_dir(),
+            repositories.clone(),
+            provider_hosts.clone(),
+        );
         let git_vcs = GitVcsRpcServices::with_production_dependencies(
             git_repository.clone(),
             terminal_manager.clone(),
@@ -332,7 +337,13 @@ impl ProductionRuntime {
         )
         .with_created_request_observer(Arc::new(pull_requests.service.clone()))
         .with_availability_registry(workspace_availability.clone());
+        let git_vcs = if let Some(dir) = &config.hosting_executable_dir_for_integration_test {
+            git_vcs.with_hosting_executable_dir_for_integration_test(dir.clone())
+        } else {
+            git_vcs
+        };
         let worktree_removal_tasks = git_vcs.worktree_removal_tasks();
+        let clone_operations = git_vcs.clone_operations();
         let status_broadcaster = git_vcs.status_broadcaster();
         let terminal_status_broadcaster = status_broadcaster.clone();
         terminal_manager.set_process_exit_callback(Arc::new(move |cwd| {
@@ -462,6 +473,10 @@ impl ProductionRuntime {
                 config.remote_update_support,
                 remote_update_delegate.clone(),
             ),
+            crate::production::remote_update_rpc::ActiveWorkCounter::new(
+                repositories.clone(),
+                terminal_services.clone(),
+            ),
         );
         finalize_rpc_registry(&registry, &control)?;
 
@@ -484,6 +499,7 @@ impl ProductionRuntime {
             worktree_catalog_operations,
             worktree_runtime,
             worktree_removal_tasks,
+            clone_operations,
             status_broadcaster,
             workspace,
             _resource_sampler: resource_sampler,
@@ -619,6 +635,9 @@ impl ProductionRuntime {
         self.worktree_runtime.shutdown().await;
         let mut first_error = None;
         self.worktree_removal_tasks.close_and_drain().await;
+        // Stops every live clone, including detached ones, and waits until each removed the
+        // folder it created, before providers and terminals shut down.
+        self.clone_operations.close_and_drain().await;
         self.provider_update_checks.shutdown().await;
         self.turn_delivery.shutdown().await;
         self.orchestration_effects.shutdown().await;
@@ -783,6 +802,44 @@ struct GitReviewBackend;
 const MAX_UNTRACKED_REVIEW_FILES: usize = 500;
 const MAX_UNTRACKED_REVIEW_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_UNTRACKED_REVIEW_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+/// Each review preview source is bounded like a Git Manager commit diff.
+const MAX_REVIEW_SOURCE_DIFF_BYTES: usize = crate::git::manager::graph::MAX_REASONABLE_DIFF_SIZE;
+
+/// Keeps a diff within `limit`, cut at the last complete file. A diff that was
+/// captured incompletely is always treated as truncated.
+fn bound_review_diff(diff: String, limit: usize, captured_truncated: bool) -> (String, bool) {
+    if !captured_truncated && diff.len() <= limit {
+        return (diff, false);
+    }
+    let mut end = limit.min(diff.len());
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = diff[..end]
+        .rfind("\ndiff --git ")
+        .map_or(0, |index| index + 1);
+    (diff[..cut].to_owned(), true)
+}
+
+/// Reads at most `limit` bytes plus one probe byte, so an oversized diff stops
+/// the capture at once instead of being read to the end.
+async fn capture_review_diff<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    limit: usize,
+) -> std::io::Result<(String, bool)> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    Ok(bound_review_diff(
+        String::from_utf8_lossy(&bytes).into_owned(),
+        limit,
+        truncated,
+    ))
+}
 
 impl ReviewBackend for GitReviewBackend {
     fn get_diff_preview<'a>(
@@ -811,8 +868,23 @@ impl ReviewBackend for GitReviewBackend {
                 review_diff_args(ignore_whitespace, Some("HEAD"), false),
             )
             .await?;
-            let untracked = untracked_review_diff(&input.cwd).await?;
-            let working_tree_diff = join_review_diffs(&tracked_worktree, &untracked.diff);
+            let untracked = if tracked_worktree.truncated {
+                BoundedReviewDiff {
+                    diff: String::new(),
+                    truncated: false,
+                }
+            } else {
+                untracked_review_diff(
+                    &input.cwd,
+                    MAX_REVIEW_SOURCE_DIFF_BYTES.saturating_sub(tracked_worktree.diff.len() + 1),
+                )
+                .await?
+            };
+            let (working_tree_diff, working_tree_truncated) = bound_review_diff(
+                join_review_diffs(&tracked_worktree.diff, &untracked.diff),
+                MAX_REVIEW_SOURCE_DIFF_BYTES,
+                false,
+            );
 
             let base_ref = input.base_ref.clone().or(status.default_ref_name);
             let branch_diff = match (&base_ref, &status.ref_name) {
@@ -824,7 +896,10 @@ impl ReviewBackend for GitReviewBackend {
                     )
                     .await?
                 }
-                _ => String::new(),
+                _ => BoundedReviewDiff {
+                    diff: String::new(),
+                    truncated: false,
+                },
             };
             let sources = vec![
                 review_source(
@@ -834,7 +909,7 @@ impl ReviewBackend for GitReviewBackend {
                     Some("HEAD".to_owned()),
                     None,
                     working_tree_diff,
-                    untracked.truncated,
+                    tracked_worktree.truncated || untracked.truncated || working_tree_truncated,
                 ),
                 review_source(
                     "branch-range",
@@ -845,8 +920,8 @@ impl ReviewBackend for GitReviewBackend {
                     ),
                     base_ref,
                     Some(status.ref_name.unwrap_or_else(|| "HEAD".to_owned())),
-                    branch_diff,
-                    false,
+                    branch_diff.diff,
+                    branch_diff.truncated,
                 ),
             ];
             Ok(Some(ReviewDiffPreviewResult {
@@ -858,7 +933,8 @@ impl ReviewBackend for GitReviewBackend {
     }
 }
 
-struct UntrackedReviewDiff {
+/// One review preview source, bounded at the patch cap; `truncated` says later files were dropped.
+struct BoundedReviewDiff {
     diff: String,
     truncated: bool,
 }
@@ -882,20 +958,37 @@ fn review_diff_args(ignore_whitespace: bool, target: Option<&str>, three_dot: bo
     args
 }
 
-async fn run_review_diff(cwd: &str, args: Vec<String>) -> Result<String, ReviewError> {
+async fn run_review_diff(cwd: &str, args: Vec<String>) -> Result<BoundedReviewDiff, ReviewError> {
     let mut command = Command::new("git");
     configure_background_command(&mut command);
     crate::process::isolate_appimage_environment(&mut command);
-    let output = command
+    let mut child = command
         .args(["-C", cwd])
         .args(args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| ReviewError::Backend(error.to_string()))?;
+    let stdout = child.stdout.take().expect("piped git stdout");
+    let captured = capture_review_diff(stdout, MAX_REVIEW_SOURCE_DIFF_BYTES).await;
+    if !matches!(&captured, Ok((_, false))) {
+        // Stop git once the capture is complete or failed; `wait` reaps it.
+        let _ = child.start_kill();
+    }
+    let status = child
+        .wait()
         .await
         .map_err(|error| ReviewError::Backend(error.to_string()))?;
-    Ok(if output.status.success() {
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    } else {
-        String::new()
+    let (diff, truncated) = captured.map_err(|error| ReviewError::Backend(error.to_string()))?;
+    Ok(BoundedReviewDiff {
+        diff: if status.success() || truncated {
+            diff
+        } else {
+            String::new()
+        },
+        truncated,
     })
 }
 
@@ -929,7 +1022,7 @@ fn review_source(
     }
 }
 
-async fn untracked_review_diff(cwd: &str) -> Result<UntrackedReviewDiff, ReviewError> {
+async fn untracked_review_diff(cwd: &str, limit: usize) -> Result<BoundedReviewDiff, ReviewError> {
     let mut command = Command::new("git");
     configure_background_command(&mut command);
     crate::process::isolate_appimage_environment(&mut command);
@@ -956,12 +1049,17 @@ async fn untracked_review_diff(cwd: &str) -> Result<UntrackedReviewDiff, ReviewE
     let mut total_bytes = 0_u64;
     let mut diffs = Vec::new();
     let mut truncated = false;
+    let mut patch_bytes = 0_usize;
     for path in output
         .stdout
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .take(MAX_UNTRACKED_REVIEW_FILES)
     {
+        if patch_bytes >= limit {
+            truncated = true;
+            break;
+        }
         let path = String::from_utf8_lossy(path).into_owned();
         let absolute = root.join(&path);
         let metadata = tokio::fs::symlink_metadata(&absolute)
@@ -973,21 +1071,44 @@ async fn untracked_review_diff(cwd: &str) -> Result<UntrackedReviewDiff, ReviewE
         if metadata.len() > MAX_UNTRACKED_REVIEW_FILE_BYTES
             || total_bytes.saturating_add(metadata.len()) > MAX_UNTRACKED_REVIEW_TOTAL_BYTES
         {
-            diffs.push(binary_untracked_diff(&path));
+            let marker = binary_untracked_diff(&path);
+            let bytes = marker.len() + usize::from(!diffs.is_empty());
+            if patch_bytes.saturating_add(bytes) > limit {
+                truncated = true;
+                break;
+            }
+            patch_bytes += bytes;
+            diffs.push(marker);
             truncated = true;
             continue;
         }
-        let contents = tokio::fs::read(&absolute)
+        let file = tokio::fs::File::open(&absolute)
             .await
             .map_err(|error| ReviewError::Backend(error.to_string()))?;
+        let remaining = limit.saturating_sub(patch_bytes);
+        let mut contents = Vec::new();
+        file.take(remaining.saturating_add(1) as u64)
+            .read_to_end(&mut contents)
+            .await
+            .map_err(|error| ReviewError::Backend(error.to_string()))?;
+        if contents.len() > remaining {
+            truncated = true;
+            break;
+        }
         total_bytes = total_bytes.saturating_add(contents.len() as u64);
-        diffs.push(if contents.contains(&0) {
+        let diff = if contents.contains(&0) {
             binary_untracked_diff(&path)
         } else {
             text_untracked_diff(&path, &String::from_utf8_lossy(&contents))
-        });
+        };
+        if patch_bytes.saturating_add(diff.len() + usize::from(!diffs.is_empty())) > limit {
+            truncated = true;
+            break;
+        }
+        patch_bytes += diff.len() + usize::from(!diffs.is_empty());
+        diffs.push(diff);
     }
-    Ok(UntrackedReviewDiff {
+    Ok(BoundedReviewDiff {
         diff: diffs.join("\n"),
         truncated,
     })
@@ -1075,10 +1196,13 @@ mod tests {
         terminal::{TerminalEvent, TerminalLaunchCommand, TerminalOpenInput},
     };
     use axum::http::{HeaderMap, Uri};
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
     use tempfile::TempDir;
     use tokio::time::timeout;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    use crate::test_support::hermetic_providers;
+    use crate::test_support::websocket_frames::next_frame_past_heartbeat;
 
     fn route_context() -> RouteContext {
         RouteContext {
@@ -1107,6 +1231,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_server_repository_reads_the_host_observation_it_is_constructed_with() {
+        struct WorktreeSettings;
+
+        impl crate::git::WorktreeBaseDirectoryProvider for WorktreeSettings {
+            fn worktree_base_directory<'a>(
+                &'a self,
+            ) -> crate::git::BoxWorktreeBaseDirectoryFuture<'a> {
+                Box::pin(async { None })
+            }
+        }
+
+        let checkout = TempDir::new().expect("temporary Git repository");
+        for args in [
+            &["init", "--quiet", "-b", "main"][..],
+            &["config", "core.fsmonitor", "false"],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://git.acme.example/team/repo.git",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(checkout.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .expect("Git fixture command starts");
+            assert!(
+                output.status.success(),
+                "Git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let hosts = Arc::new(crate::source_control::ProviderHosts::default());
+        let repository =
+            GitRepository::with_worktree_settings(Arc::new(WorktreeSettings), hosts.clone());
+        let cancellation = CancellationToken::new();
+        let before = repository
+            .status(checkout.path(), &cancellation)
+            .await
+            .expect("status before recording the host");
+        assert!(before.local.is_repo);
+        assert!(before.local.has_primary_remote);
+        assert_eq!(before.local.source_control_provider, None);
+
+        hosts.record(
+            "git.acme.example",
+            crate::source_control::ProviderKind::Gitlab,
+        );
+
+        let after = repository
+            .status(checkout.path(), &cancellation)
+            .await
+            .expect("status after recording the host");
+        assert_eq!(
+            after.local.source_control_provider,
+            Some(crate::git::SourceControlProviderInfo {
+                kind: crate::git::ProviderKind::Gitlab,
+                name: "GitLab".to_owned(),
+                base_url: "https://git.acme.example".to_owned(),
+            }),
+            "status must read the supplied host observation after it changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_request_services_keep_the_host_observation_they_are_constructed_with() {
+        let state = TempDir::new().expect("temporary state directory");
+        let database = Database::open_in_memory().await.expect("database");
+        let hosts = Arc::new(crate::source_control::ProviderHosts::default());
+        assert_eq!(Arc::strong_count(&hosts), 1);
+
+        let services = PullRequestsRpcServices::with_dependencies(
+            state.path().to_path_buf(),
+            Repositories::new(database),
+            hosts.clone(),
+        );
+
+        assert_eq!(
+            Arc::strong_count(&hosts),
+            2,
+            "the constructed services must retain the supplied host observation, not a private one"
+        );
+        drop(services);
+        assert_eq!(
+            Arc::strong_count(&hosts),
+            1,
+            "dropping the services must release their shared host observation"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_lifecycle_and_delivery_events_do_not_trigger_git_status_reads() {
         let _native_watcher_permit = crate::git::acquire_native_watcher_test_permit().await;
         const NOW: &str = "2026-08-22T00:00:00Z";
@@ -1128,6 +1346,7 @@ mod tests {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1371,6 +1590,7 @@ mod tests {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1541,6 +1761,7 @@ mod tests {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1646,7 +1867,7 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let frame = timeout(Duration::from_secs(2), socket.next())
+        let frame = timeout(Duration::from_secs(2), next_frame_past_heartbeat(socket))
             .await
             .expect("activity message timeout")
             .expect("WebSocket remains open")
@@ -1693,6 +1914,7 @@ mod tests {
     async fn http_dispatch_cannot_bypass_durable_or_worktree_authority() {
         let state = TempDir::new().expect("state");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1833,12 +2055,10 @@ mod tests {
     async fn startup_interrupts_only_unresolved_terminal_activity() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
-        std::fs::create_dir_all(config.state_dir()).expect("state directory");
-        std::fs::write(
-            config.state_dir().join("settings.json"),
-            br#"{"enableChatAgentActivity":true,"enableTerminalAgentActivity":true}"#,
-        )
-        .expect("activity settings fixture");
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({"enableChatAgentActivity": true, "enableTerminalAgentActivity": true}),
+        );
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1978,12 +2198,10 @@ mod tests {
     async fn agent_activity_startup_migrates_legacy_true_to_chat_enabled_and_terminal_disabled() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
-        std::fs::create_dir_all(config.state_dir()).expect("state directory");
-        std::fs::write(
-            config.state_dir().join("settings.json"),
-            br#"{"enableAgentActivity":true}"#,
-        )
-        .expect("legacy settings fixture");
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({"enableAgentActivity": true}),
+        );
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -2047,6 +2265,7 @@ mod tests {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -2118,7 +2337,7 @@ mod tests {
     async fn hardening_bootstrap_provider_observation_failure_does_not_abort_production_runtime() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
-        std::fs::create_dir_all(config.state_dir()).expect("state directory");
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         std::fs::write(
             config.state_dir().join("runtime"),
             b"blocks private observer directory",
@@ -2151,6 +2370,7 @@ mod tests {
     async fn production_runtime_covers_core_routes_assets_diagnostics_and_shutdown() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory()
             .await
             .expect("in-memory database should open");
@@ -2516,6 +2736,7 @@ mod tests {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -2710,7 +2931,6 @@ mod tests {
             ENVIRONMENT_CASES, assert_child_environment, check_inherited_environment,
         };
         use crate::test_support::reexec;
-        use std::os::unix::fs::PermissionsExt;
 
         const FIXTURE: &str = "BIBCODE_REVIEW_ENVIRONMENT_FIXTURE";
         const TEST: &str =
@@ -2724,12 +2944,16 @@ mod tests {
                         review_diff_args(false, Some("HEAD"), false),
                     )
                     .await
-                    .expect("tracked review diff"),
+                    .expect("tracked review diff")
+                    .diff,
                     "tracked review fixture\n"
                 );
-                let untracked = untracked_review_diff(&directory.to_string_lossy())
-                    .await
-                    .expect("untracked review diff");
+                let untracked = untracked_review_diff(
+                    &directory.to_string_lossy(),
+                    MAX_REVIEW_SOURCE_DIFF_BYTES,
+                )
+                .await
+                .expect("untracked review diff");
                 assert!(untracked.diff.contains("+++ b/untracked.txt"));
                 assert!(untracked.diff.contains("+untracked review fixture"));
                 assert!(!untracked.truncated);
@@ -2741,7 +2965,7 @@ mod tests {
         check_inherited_environment(TEST, ENVIRONMENT_CASES, |expected| {
             let directory = tempfile::tempdir().expect("review fixture directory");
             let executable = directory.path().join("git");
-            std::fs::write(
+            crate::test_support::executable_fixture::write_executable(
                 &executable,
                 concat!(
                     "#!/bin/sh\n",
@@ -2752,10 +2976,7 @@ mod tests {
                     "  *) exit 1 ;;\n",
                     "esac\n",
                 ),
-            )
-            .expect("git review fixture");
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
-                .expect("executable git fixture");
+            );
             std::fs::write(
                 directory.path().join("untracked.txt"),
                 "untracked review fixture\n",
@@ -2796,9 +3017,12 @@ mod tests {
         )
         .expect("oversized fixture");
 
-        let diff = untracked_review_diff(&repository.path().to_string_lossy())
-            .await
-            .expect("untracked diff");
+        let diff = untracked_review_diff(
+            &repository.path().to_string_lossy(),
+            MAX_REVIEW_SOURCE_DIFF_BYTES,
+        )
+        .await
+        .expect("untracked diff");
         assert!(diff.diff.contains("binary.dat"));
         assert!(diff.diff.contains("oversized.dat"));
         assert!(diff.truncated);
@@ -2814,7 +3038,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(untracked_review_diff("\0").await.is_err());
+        assert!(
+            untracked_review_diff("\0", MAX_REVIEW_SOURCE_DIFF_BYTES)
+                .await
+                .is_err()
+        );
         assert!(
             format!("{:?}", internal_error("injected review error"))
                 .contains("injected review error")
@@ -2859,10 +3087,69 @@ mod tests {
             std::fs::write(&unreadable, "secret\n").expect("unreadable fixture");
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
                 .expect("remove read permission");
-            let result = untracked_review_diff(&repository.path().to_string_lossy()).await;
+            let result = untracked_review_diff(
+                &repository.path().to_string_lossy(),
+                MAX_REVIEW_SOURCE_DIFF_BYTES,
+            )
+            .await;
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600))
                 .expect("restore read permission");
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn review_diffs_over_the_bound_are_cut_at_a_file_boundary() {
+        let first = format!("diff --git a/one b/one\n+{}\n", "1".repeat(40));
+        let second = format!("diff --git a/two b/two\n+{}\n", "2".repeat(40));
+        let diff = format!("{first}{second}");
+        assert_eq!(
+            bound_review_diff(diff.clone(), diff.len(), false),
+            (diff.clone(), false)
+        );
+        let (cut, truncated) = bound_review_diff(diff.clone(), first.len() + 16, false);
+        assert!(truncated);
+        assert_eq!(cut, first);
+        let (empty, truncated) = bound_review_diff(diff, 10, false);
+        assert!(truncated);
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_capture_stops_reading_at_the_cap_plus_one_probe_byte() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Endless(Arc<AtomicUsize>);
+        impl tokio::io::AsyncRead for Endless {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let bytes = vec![b'x'; buf.remaining()];
+                self.0.fetch_add(bytes.len(), Ordering::Relaxed);
+                buf.put_slice(&bytes);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let read = Arc::new(AtomicUsize::new(0));
+        let (diff, truncated) = tokio::time::timeout(
+            Duration::from_secs(1),
+            capture_review_diff(Endless(Arc::clone(&read)), 128),
+        )
+        .await
+        .expect("never wait for EOF on an oversized diff")
+        .expect("capture");
+        assert_eq!(read.load(Ordering::Relaxed), 129);
+        assert!(truncated);
+        assert!(diff.len() <= 128);
+
+        let first = "diff --git a/one b/one\n+one\n";
+        let second = format!("diff --git a/two b/two\n+{}\n", "x".repeat(1000));
+        let input = format!("{first}{second}");
+        let (diff, truncated) = capture_review_diff(input.as_bytes(), first.len() + 32)
+            .await
+            .expect("capture bounded diff");
+        assert!(truncated);
+        assert_eq!(diff, first, "the incomplete last file is discarded");
     }
 }

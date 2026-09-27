@@ -15,7 +15,7 @@ use url::Url;
 
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
 use crate::persistence::StorageInstanceId;
-use crate::remote_update::RemoteUpdateSupport;
+use crate::remote_update::{RemoteUpdateInstallKind, RemoteUpdateSupport};
 use crate::static_assets::{StaticDirError, StaticDirSource, resolve_static_dir};
 
 pub const DEFAULT_PORT: u16 = 3773;
@@ -79,11 +79,17 @@ pub struct ServerConfig {
     pub environment_label: String,
     pub server_version: String,
     pub storage_instance_id: Option<StorageInstanceId>,
+    /// Random per start; set by `ServerRuntime`; never persisted.
+    pub boot_id: Option<uuid::Uuid>,
     /// How this server can be updated remotely (spec section 4.5). Headless
     /// default is manual; the desktop host overrides at launch.
     pub remote_update_support: RemoteUpdateSupport,
     pub(crate) update_maintenance_drain_timeout: Duration,
     pub(crate) update_maintenance_lease: Duration,
+    pub(crate) hosting_executable_dir_for_integration_test: Option<PathBuf>,
+    /// How long the listener bind keeps retrying while its port is still in
+    /// use. `None`, the default, fails the bind at once.
+    pub(crate) listener_bind_retry: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -112,9 +118,12 @@ impl ServerConfig {
             environment_label: LOCAL_ENVIRONMENT_LABEL.to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             storage_instance_id: None,
+            boot_id: None,
             remote_update_support: RemoteUpdateSupport::manual(),
             update_maintenance_drain_timeout: Duration::from_secs(30),
             update_maintenance_lease: Duration::from_secs(90),
+            hosting_executable_dir_for_integration_test: None,
+            listener_bind_retry: None,
         }
     }
 
@@ -128,6 +137,16 @@ impl ServerConfig {
     #[must_use]
     pub fn with_remote_update_support(mut self, support: RemoteUpdateSupport) -> Self {
         self.remote_update_support = support;
+        self
+    }
+
+    /// Keeps retrying the listener bind for up to `window` while the port is
+    /// still in use, backing off from 25 ms to 250 ms between attempts. For an
+    /// embedder restarting a server on a port its predecessor has only just
+    /// released; when the window ends, startup fails with the last bind error.
+    #[must_use]
+    pub fn with_listener_bind_retry(mut self, window: Duration) -> Self {
+        self.listener_bind_retry = Some(window);
         self
     }
 
@@ -174,6 +193,14 @@ impl ServerConfig {
         self
     }
 
+    /// Pins hosting commands to a test-owned directory; Git remains on PATH.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hosting_executable_dir_for_integration_test(mut self, dir: PathBuf) -> Self {
+        self.hosting_executable_dir_for_integration_test = Some(dir);
+        self
+    }
+
     #[must_use]
     pub fn state_dir(&self) -> PathBuf {
         self.base_dir.join(if self.dev_url.is_some() {
@@ -193,7 +220,7 @@ impl ServerConfig {
 mod tests {
     use super::*;
     use crate::data_root::DataRootSource;
-    use clap::Parser;
+    use clap::{CommandFactory, FromArgMatches, Parser};
 
     #[test]
     fn owned_builder_inputs_cover_desktop_and_static_configuration() {
@@ -224,7 +251,22 @@ mod tests {
             crate::remote_update::RemoteUpdateSupport {
                 install_mode: crate::remote_update::RemoteUpdateInstallMode::Manual,
                 reason: crate::remote_update::RemoteUpdateSupportReason::ManualUpdateRequired,
+                install_kind: RemoteUpdateInstallKind::Unknown,
             }
+        );
+    }
+
+    #[test]
+    fn listener_bind_retry_is_opt_in() {
+        assert_eq!(
+            ServerConfig::new("/tmp/bibcode-test").listener_bind_retry,
+            None
+        );
+        assert_eq!(
+            ServerConfig::new("/tmp/bibcode-test")
+                .with_listener_bind_retry(Duration::from_secs(3))
+                .listener_bind_retry,
+            Some(Duration::from_secs(3))
         );
     }
 
@@ -359,6 +401,10 @@ mod tests {
 
         assert_eq!(config.static_dir, Some(web));
         assert_eq!(config.static_dir_source, Some(StaticDirSource::Packaged));
+        assert_eq!(
+            config.remote_update_support.install_kind,
+            crate::remote_update::RemoteUpdateInstallKind::Archive
+        );
     }
 
     #[test]
@@ -379,7 +425,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary base directory");
         let base_dir = temp.path().to_string_lossy().into_owned();
 
-        let action = Cli::try_parse_from([
+        let action = pairing_cli_without_dev_env(&[
             "bibcode",
             "pairing",
             "issue",
@@ -389,13 +435,19 @@ mod tests {
             "SSH bootstrap",
             "--json",
         ])
-        .expect("parse pairing issue CLI")
         .into_action()
         .expect("build pairing action");
-        let CliAction::Pairing(PairingCommand::Issue { root, label, json }) = action else {
+        let CliAction::Pairing(PairingCommand::Issue {
+            root,
+            dev_url,
+            label,
+            json,
+        }) = action
+        else {
             panic!("pairing issue must produce a pairing action");
         };
         assert_eq!(root.requested, PathBuf::from(base_dir.as_str()));
+        assert_eq!(dev_url, None);
         assert_eq!(label.as_deref(), Some("SSH bootstrap"));
         assert!(json);
 
@@ -470,7 +522,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary base directory");
         let base_dir = temp.path().to_string_lossy().into_owned();
 
-        let action = Cli::try_parse_from([
+        let action = pairing_cli_without_dev_env(&[
             "bibcode",
             "pairing",
             "offer",
@@ -482,11 +534,11 @@ mod tests {
             "laptop",
             "--json",
         ])
-        .expect("parse pairing offer CLI")
         .into_action()
         .expect("build pairing action");
         let CliAction::Pairing(PairingCommand::Offer {
             root,
+            dev_url,
             endpoint,
             reach,
             name,
@@ -497,6 +549,7 @@ mod tests {
             panic!("pairing offer must produce an offer action");
         };
         assert_eq!(root.requested, PathBuf::from(base_dir.as_str()));
+        assert_eq!(dev_url, None);
         assert_eq!(endpoint, "http://100.105.196.60:3773");
         assert_eq!(reach, "another-device");
         assert_eq!(name, None);
@@ -527,6 +580,49 @@ mod tests {
             .is_err(),
             "reach is an enumerated value"
         );
+    }
+
+    #[test]
+    fn pairing_commands_preserve_dev_url_and_select_the_matching_state() {
+        for subcommand in ["offer", "issue"] {
+            for (dev_url, state) in [(None, "userdata"), (Some("http://localhost:5733"), "dev")] {
+                let temp = tempfile::tempdir().expect("temporary pairing root");
+                let base_dir = temp.path().to_string_lossy().into_owned();
+                let mut args = vec!["bibcode", "pairing", subcommand, "--base-dir", &base_dir];
+                if subcommand == "offer" {
+                    args.extend(["--endpoint", "http://100.105.196.60:3773"]);
+                }
+                if let Some(dev_url) = dev_url {
+                    args.extend(["--dev-url", dev_url]);
+                }
+                let action = pairing_cli_without_dev_env(&args)
+                    .into_action()
+                    .expect("build pairing action");
+                let (root, selected_dev_url) = match action {
+                    CliAction::Pairing(PairingCommand::Offer { root, dev_url, .. })
+                    | CliAction::Pairing(PairingCommand::Issue { root, dev_url, .. }) => {
+                        (root, dev_url)
+                    }
+                    _ => panic!("pairing command must produce a pairing action"),
+                };
+                assert_eq!(
+                    selected_dev_url,
+                    dev_url.map(|value| value.parse::<Url>().expect("dev URL")),
+                    "{subcommand} with {dev_url:?}"
+                );
+                let mut config = ServerConfig::new(&root.effective);
+                config.dev_url = selected_dev_url;
+                assert_eq!(config.state_dir(), root.effective.join(state));
+            }
+        }
+    }
+
+    fn pairing_cli_without_dev_env(args: &[&str]) -> Cli {
+        let matches = Cli::command()
+            .mut_arg("dev_url", |arg| arg.env(None::<&str>))
+            .try_get_matches_from(args)
+            .expect("parse pairing CLI without an ambient dev URL");
+        Cli::from_arg_matches(&matches).expect("pairing CLI")
     }
 }
 
@@ -690,11 +786,13 @@ pub enum CliAction {
 pub enum PairingCommand {
     Issue {
         root: ResolvedDataRoot,
+        dev_url: Option<Url>,
         label: Option<String>,
         json: bool,
     },
     Offer {
         root: ResolvedDataRoot,
+        dev_url: Option<Url>,
         endpoint: String,
         reach: String,
         name: Option<String>,
@@ -859,9 +957,12 @@ impl Cli {
                 );
                 let root = crate::data_root::resolve_data_root(request)?;
                 return Ok(CliAction::Pairing(match pairing.command {
-                    PairingSubcommand::Issue { label, json } => {
-                        PairingCommand::Issue { root, label, json }
-                    }
+                    PairingSubcommand::Issue { label, json } => PairingCommand::Issue {
+                        root,
+                        dev_url: args.dev_url,
+                        label,
+                        json,
+                    },
                     PairingSubcommand::Offer {
                         endpoint,
                         reach,
@@ -870,6 +971,7 @@ impl Cli {
                         json,
                     } => PairingCommand::Offer {
                         root,
+                        dev_url: args.dev_url,
                         endpoint,
                         reach: reach.as_str().to_owned(),
                         name,
@@ -957,7 +1059,12 @@ impl Cli {
         config.static_dir = resolved_static_dir
             .as_ref()
             .map(|resolved| resolved.path.clone());
-        config.static_dir_source = resolved_static_dir.map(|resolved| resolved.source);
+        config.static_dir_source = resolved_static_dir.as_ref().map(|resolved| resolved.source);
+        config.remote_update_support.install_kind = resolved_static_dir
+            .as_ref()
+            .map_or(RemoteUpdateInstallKind::Unknown, |resolved| {
+                resolved.install_kind
+            });
         config.dev_url = args.dev_url;
         config.no_browser = headless
             || args.no_browser

@@ -3,9 +3,11 @@ import * as Effect from "effect/Effect";
 import { RpcClient } from "effect/unstable/rpc";
 import * as RpcMessage from "effect/unstable/rpc/RpcMessage";
 
+import { RpcTransportErrors } from "./transportErrors.ts";
+
 let nextRequestId = 0n;
 
-export const makeWsRpcProtocolClient = RpcClient.make(WsRpcGroup, {
+export const makeWsRpcProtocolClient = RpcClient.make(WsRpcGroup.middleware(RpcTransportErrors), {
   generateRequestId: () => RpcMessage.RequestId(String(nextRequestId++)),
 });
 type RpcClientFactory = typeof makeWsRpcProtocolClient;

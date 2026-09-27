@@ -36,6 +36,12 @@ function fakeConsole() {
   };
 }
 
+function errorWithStack<T extends Error>(error: T): T {
+  // Keep record sizes independent of absolute checkout paths in native stacks.
+  error.stack = `${error.name}: ${error.message}\n    at fixture (fixture.ts:1:1)`;
+  return error;
+}
+
 describe("frontend log capture", () => {
   it("records warn and error while preserving native console calls", () => {
     const capture = createFrontendLogCapture({
@@ -52,7 +58,7 @@ describe("frontend log capture", () => {
     consoleTarget.info("ignored");
     consoleTarget.debug("ignored");
     consoleTarget.warn("slow", 42);
-    consoleTarget.error(new Error("boom"));
+    consoleTarget.error(errorWithStack(new Error("boom")));
 
     expect(nativeWarn).toHaveBeenCalledWith("slow", 42);
     expect(nativeError).toHaveBeenCalledTimes(1);
@@ -69,11 +75,13 @@ describe("frontend log capture", () => {
     const events = fakeEventTarget();
     capture.install({ console: fakeConsole(), eventTarget: events.target });
 
-    events.dispatch("error", { error: new TypeError("uncaught") });
-    events.dispatch("unhandledrejection", { reason: new Error("rejected") });
+    events.dispatch("error", { error: errorWithStack(new TypeError("uncaught")) });
+    events.dispatch("unhandledrejection", { reason: errorWithStack(new Error("rejected")) });
 
     expect(capture.snapshot()).toContain("window.error TypeError: uncaught");
     expect(capture.snapshot()).toContain("window.unhandledrejection Error: rejected");
+    expect(capture.snapshot()).toContain("    at fixture (fixture.ts:1:1)");
+    expect(capture.snapshot()).not.toContain(import.meta.dirname);
   });
 
   it("survives circular and hostile values while redacting credentials", () => {
@@ -90,7 +98,7 @@ describe("frontend log capture", () => {
     Object.defineProperty(hostile, "value", {
       enumerable: true,
       get() {
-        throw new Error("getter exploded");
+        throw errorWithStack(new Error("getter exploded"));
       },
     });
 
@@ -149,7 +157,7 @@ describe("frontend log capture", () => {
       {},
       {
         ownKeys() {
-          throw new Error("no keys");
+          throw errorWithStack(new Error("no keys"));
         },
       },
     );
@@ -187,7 +195,7 @@ describe("frontend log capture", () => {
 
     const brokenClock = createFrontendLogCapture({
       now: () => {
-        throw new Error("clock failed");
+        throw errorWithStack(new Error("clock failed"));
       },
     });
     const consoleTarget = fakeConsole();

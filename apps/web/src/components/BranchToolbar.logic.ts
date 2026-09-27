@@ -1,16 +1,5 @@
-import type { EnvironmentId, VcsRef, ProjectId } from "@bibcode/contracts";
+import type { EnvironmentId } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
-export {
-  dedupeRemoteBranchesWithLocalMatches,
-  deriveLocalBranchNameFromRemoteRef,
-} from "@bibcode/shared/git";
-
-export interface EnvironmentOption {
-  environmentId: EnvironmentId;
-  projectId: ProjectId;
-  label: string;
-  isPrimary: boolean;
-}
 
 export const EnvMode = Schema.Literals(["local", "worktree"]);
 export type EnvMode = typeof EnvMode.Type;
@@ -42,18 +31,6 @@ export function resolveEnvironmentOptionLabel(input: {
   return runtimeLabel ?? savedLabel ?? input.environmentId;
 }
 
-export function resolveEnvModeLabel(mode: EnvMode): string {
-  return mode === "worktree" ? "New worktree" : "Current checkout";
-}
-
-export function resolveCurrentWorkspaceLabel(activeWorktreePath: string | null): string {
-  return activeWorktreePath ? "Current worktree" : resolveEnvModeLabel("local");
-}
-
-export function resolveLockedWorkspaceLabel(activeWorktreePath: string | null): string {
-  return activeWorktreePath ? "Worktree" : "Local checkout";
-}
-
 export function resolveEffectiveEnvMode(input: {
   activeWorktreePath: string | null;
   hasServerThread: boolean;
@@ -67,84 +44,4 @@ export function resolveEffectiveEnvMode(input: {
     return draftThreadEnvMode === "worktree" ? "worktree" : "local";
   }
   return activeWorktreePath ? "worktree" : "local";
-}
-
-export function resolveDraftEnvModeAfterBranchChange(input: {
-  nextWorktreePath: string | null;
-  currentWorktreePath: string | null;
-  effectiveEnvMode: EnvMode;
-}): EnvMode {
-  const { nextWorktreePath, currentWorktreePath, effectiveEnvMode } = input;
-  if (nextWorktreePath) {
-    return "worktree";
-  }
-  if (effectiveEnvMode === "worktree" && !currentWorktreePath) {
-    return "worktree";
-  }
-  return "local";
-}
-
-export function resolveBranchToolbarValue(input: {
-  envMode: EnvMode;
-  activeWorktreePath: string | null;
-  activeThreadBranch: string | null;
-  currentGitBranch: string | null;
-}): string | null {
-  const { envMode, activeWorktreePath, activeThreadBranch, currentGitBranch } = input;
-  if (envMode === "worktree" && !activeWorktreePath) {
-    return activeThreadBranch ?? currentGitBranch;
-  }
-  return currentGitBranch ?? activeThreadBranch;
-}
-
-export function resolveBranchSelectionTarget(input: {
-  activeProjectCwd: string;
-  activeWorktreePath: string | null;
-  refName: Pick<VcsRef, "isDefault" | "worktreePath">;
-}): {
-  checkoutCwd: string;
-  nextWorktreePath: string | null;
-  reuseExistingWorktree: boolean;
-} {
-  const { activeProjectCwd, activeWorktreePath, refName } = input;
-
-  if (refName.worktreePath) {
-    return {
-      checkoutCwd: refName.worktreePath,
-      nextWorktreePath: refName.worktreePath === activeProjectCwd ? null : refName.worktreePath,
-      reuseExistingWorktree: true,
-    };
-  }
-
-  const nextWorktreePath =
-    activeWorktreePath !== null && refName.isDefault ? null : activeWorktreePath;
-
-  return {
-    checkoutCwd: nextWorktreePath ?? activeProjectCwd,
-    nextWorktreePath,
-    reuseExistingWorktree: false,
-  };
-}
-
-export function shouldIncludeBranchPickerItem(input: {
-  itemValue: string;
-  normalizedQuery: string;
-  createBranchItemValue: string | null;
-  checkoutPullRequestItemValue: string | null;
-}): boolean {
-  const { itemValue, normalizedQuery, createBranchItemValue, checkoutPullRequestItemValue } = input;
-
-  if (normalizedQuery.length === 0) {
-    return true;
-  }
-
-  if (createBranchItemValue && itemValue === createBranchItemValue) {
-    return true;
-  }
-
-  if (checkoutPullRequestItemValue && itemValue === checkoutPullRequestItemValue) {
-    return true;
-  }
-
-  return itemValue.toLowerCase().includes(normalizedQuery);
 }

@@ -26,7 +26,7 @@ function TabsTab({ className, ...props }: ComponentProps<typeof TabsPrimitive.Ta
     <TabsPrimitive.Tab
       className={cn(
         "rounded-md px-3 py-1.5 text-[13px] font-medium text-muted-foreground transition-colors",
-        "hover:text-foreground data-selected:bg-background data-selected:text-foreground data-selected:shadow-sm",
+        "hover:text-foreground data-active:bg-background data-active:text-foreground data-active:shadow-sm",
         className,
       )}
       {...props}

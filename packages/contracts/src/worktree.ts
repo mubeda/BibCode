@@ -278,6 +278,7 @@ export const WorktreeRemovalErrorReason = Schema.Literals([
   "environment-unsupported",
   "command-conflict",
   "cleanup-capacity",
+  "session-running",
   "ownership-conflict",
   "stale-generation",
   "stale-plan",

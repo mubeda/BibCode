@@ -5,6 +5,21 @@ import {
   type PairingAddFailureReason,
 } from "@bibcode/client-runtime/connection";
 
+/**
+ * Toast after an SSH environment is saved. Registration returns before any
+ * connection, so it says the environment is connecting; its row shows the
+ * real state.
+ */
+export function describeSshEnvironmentAddedToast(input: {
+  readonly label: string;
+  readonly updated: boolean;
+}): { readonly title: string; readonly description: string } {
+  return {
+    title: input.updated ? "Environment updated" : "Environment added",
+    description: `${input.label} is connecting over SSH.`,
+  };
+}
+
 /** D16: version strings render as "BiBCode v<serverVersion>". */
 export function formatServerVersionLabel(serverVersion: string | null | undefined): string | null {
   const trimmed = serverVersion?.trim() ?? "";

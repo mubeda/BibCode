@@ -310,6 +310,7 @@ function primaryPrepared(storageInstanceId: string | null): PreparedConnection {
       platform: { os: "linux", arch: "x64" },
       serverVersion: "0.0.0-test",
       storageInstanceId,
+      bootId: null,
       remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
@@ -1460,6 +1461,7 @@ describe("connectionStorageLayer", () => {
           platform: { os: "linux", arch: "x64" },
           serverVersion: "0.0.0-test",
           storageInstanceId,
+          bootId: null,
           remoteUpdateSupport: null,
           remoteProtocolVersion: 1,
           minCompatibleRemoteProtocol: 1,
@@ -1867,6 +1869,24 @@ describe("connectionStorageLayer", () => {
 
       yield* registrationStore.remove(bearerRegistration().target);
       expect(yield* targetStore.list).toEqual([]);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("refreshes a credential only while its environment is saved", () => {
+    installFakeIndexedDb();
+    return Effect.gen(function* () {
+      const registrationStore = yield* ConnectionRegistrationStore;
+      const credentialStore = yield* CredentialStore.ConnectionCredentialStore;
+      const refreshed = new BearerConnectionCredential({ token: "refreshed-token" });
+
+      yield* registrationStore.register(bearerRegistration());
+      expect(yield* credentialStore.putIfSaved(connectionId, refreshed)).toBe(true);
+      expect(yield* credentialStore.get(connectionId)).toEqual(Option.some(refreshed));
+
+      yield* registrationStore.remove(bearerRegistration().target);
+      expect(yield* credentialStore.get(connectionId)).toEqual(Option.none());
+      expect(yield* credentialStore.putIfSaved(connectionId, refreshed)).toBe(false);
+      expect(yield* credentialStore.get(connectionId)).toEqual(Option.none());
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 

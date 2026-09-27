@@ -56,7 +56,14 @@ vi.mock("~/state/query", () => ({
     h.resolveOnQueryRender = null;
     resolve?.();
     return target === null
-      ? { data: null, error: null, isPending: false, refresh: h.refresh }
+      ? {
+          data: null,
+          error: null,
+          isPending: false,
+          refresh: h.refresh,
+          revalidate: h.refresh,
+          requiresRetry: false,
+        }
       : {
           ...(h.responses.get(queryKey(target)) ?? {
             data: null,
@@ -67,6 +74,11 @@ vi.mock("~/state/query", () => ({
             h.refresh();
             h.refreshCalls.push(queryKey(target));
           },
+          revalidate: () => {
+            h.refresh();
+            h.refreshCalls.push(queryKey(target));
+          },
+          requiresRetry: false,
         };
   },
 }));

@@ -21,7 +21,9 @@ import {
   OrchestrationEvent,
   ORCHESTRATION_WS_METHODS,
 } from "../src/orchestration.ts";
+import { RemoteUpdateSnapshot } from "../src/remoteUpdate.ts";
 import { WS_METHODS, WsRpcGroup } from "../src/rpc.ts";
+import { RpcResponseTooLargeError } from "../src/rpcTransport.ts";
 import {
   ServerProcessDiagnosticsResult,
   ServerProcessResourceHistoryResult,
@@ -103,6 +105,25 @@ const fixtures = {
       cause: [{ _tag: "Interrupt", fiberId: undefined }],
     },
   } satisfies RpcMessage.ResponseExitEncoded,
+  "exit-response-too-large": {
+    _tag: "Exit",
+    requestId,
+    exit: {
+      _tag: "Failure",
+      cause: [
+        {
+          _tag: "Fail",
+          error: Schema.encodeSync(RpcResponseTooLargeError)(
+            new RpcResponseTooLargeError({
+              method: "gitManager.getCommits",
+              bytes: 70_000_000,
+              limitBytes: 67_108_864,
+            }),
+          ),
+        },
+      ],
+    },
+  } satisfies RpcMessage.ResponseExitEncoded,
   "exit-stream-success": {
     _tag: "Exit",
     requestId,
@@ -170,6 +191,7 @@ const fixtureEnvironmentDescriptor = {
   platform: { os: "windows", arch: "x64" },
   serverVersion: "0.1.1",
   storageInstanceId: "00000000-0000-4000-8000-000000000002",
+  bootId: "00000000-0000-4000-8000-000000000003",
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: true,
@@ -564,6 +586,29 @@ const stripEffectOptionIds = (value: unknown): unknown =>
   ) as unknown;
 
 const dynamicFixtures = new Map<string, unknown>();
+const fixtureRemoteUpdateSnapshot = {
+  serverVersion: "0.6.2",
+  latestVersion: "0.6.4",
+  state: "downloading",
+  error: null,
+  support: { installMode: "interactive", reason: "available", installKind: "unknown" },
+  downloadPercent: 42,
+  targetVersion: "0.6.4",
+  installStage: null,
+} satisfies typeof RemoteUpdateSnapshot.Type;
+dynamicFixtures.set(
+  "contract-shapes/updater__status-success.json",
+  stripEffectOptionIds(
+    serializeWireFixture({
+      _tag: "Exit",
+      requestId,
+      exit: {
+        _tag: "Success",
+        value: compileUnknownEncoder(RemoteUpdateSnapshot)(fixtureRemoteUpdateSnapshot),
+      },
+    } satisfies RpcMessage.ResponseExitEncoded),
+  ),
+);
 dynamicFixtures.set(
   "contract-shapes/server__getProcessDiagnostics-success.json",
   stripEffectOptionIds(
@@ -858,8 +903,8 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 131) {
-  throw new Error(`Expected 131 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 133) {
+  throw new Error(`Expected 133 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
 if (streamMethodCount !== 20) {
@@ -875,8 +920,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
     `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
   );
 }
-if (typedFailureFixtures.length !== 288) {
-  throw new Error(`Expected 288 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+if (typedFailureFixtures.length !== 293) {
+  throw new Error(`Expected 293 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
 if (orchestrationEventShapeCount !== 24) {
   throw new Error(`Expected 24 orchestration event shapes, found ${orchestrationEventShapeCount}.`);

@@ -3,6 +3,26 @@ import { describe, expect, expectTypeOf, it } from "vite-plus/test";
 import { resolveSyncState, type SyncStateInput } from "./syncButton.logic";
 
 describe("resolveSyncState", () => {
+  it("prioritizes an unavailable repository over stale sync state and hides counts", () => {
+    const reason = "Git can't read this repository.";
+    expect(
+      resolveSyncState({
+        repositoryUnavailableReason: reason,
+        isOperationRunning: true,
+        hasRemote: true,
+        isUnborn: false,
+        isDetached: true,
+        aheadBehind: { ahead: 3, behind: 2 },
+        forcePushRecommended: true,
+      }),
+    ).toEqual({
+      kind: "unavailable",
+      label: "Sync unavailable",
+      ahead: 0,
+      behind: 0,
+      disabledReason: reason,
+    });
+  });
   it("disables sync while an operation is running", () => {
     expect(
       resolveSyncState({

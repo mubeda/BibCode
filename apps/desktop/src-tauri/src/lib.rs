@@ -14,6 +14,7 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_restore_project_data,
             desktop_bridge_start_empty_project_data,
             desktop_bridge_retry_project_data,
+            desktop_bridge_restart_app,
             desktop_bridge_open_project_data_path,
             desktop_bridge_export_project_data_diagnostics,
             desktop_bridge_get_client_settings,
@@ -102,6 +103,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build());
+    #[cfg(target_os = "linux")]
+    let builder = builder.manage(linux_theme::LinuxThemeState::default());
     #[cfg(feature = "desktop-e2e")]
     let builder = builder
         .plugin(desktop_e2e_logging_plugin())
@@ -109,7 +112,10 @@ pub fn run() {
         .plugin(tauri_plugin_wdio_webdriver::init());
     let builder = builder.setup(move |app| {
         #[cfg(target_os = "linux")]
-        linux_text_rendering::apply_webview_hinting_override();
+        {
+            linux_text_rendering::apply_webview_hinting_override();
+            linux_theme::configure_theme(&app.state::<linux_theme::LinuxThemeState>());
+        }
         shell_path_hydration.record();
         window::configure_application_menu(app.handle())?;
         window::restore_main_window_state(app.handle())?;
@@ -132,6 +138,12 @@ pub fn run() {
                     update_app.updater().is_ok(),
                 ),
             );
+            let recovery_app = update_app.clone();
+            backend.install_recovery_listener(std::sync::Arc::new(move || {
+                recovery_app
+                    .state::<updates::DesktopUpdateManager>()
+                    .emit_current_state(&recovery_app);
+            }));
         }
         tauri::async_runtime::spawn(updates::run_background_update_checks(update_app));
 
@@ -166,6 +178,7 @@ pub fn run() {
         bridge::desktop_bridge_restore_project_data,
         bridge::desktop_bridge_start_empty_project_data,
         bridge::desktop_bridge_retry_project_data,
+        bridge::desktop_bridge_restart_app,
         bridge::desktop_bridge_open_project_data_path,
         bridge::desktop_bridge_export_project_data_diagnostics,
         bridge::desktop_bridge_get_client_settings,
@@ -231,6 +244,10 @@ pub fn run() {
             {
                 tracing::warn!("failed to stop Tauri desktop runtime during exit: {error}");
             }
+            if matches!(event, tauri::RunEvent::Exit) {
+                // Mark after backend shutdown, at the last callback before Tauri's relaunch spawn.
+                crate::relaunch::prepare_descriptors_for_relaunch();
+            }
         });
 }
 
@@ -294,8 +311,11 @@ mod desktop_e2e_page_load;
 mod firewall;
 #[cfg(target_os = "linux")]
 mod linux_text_rendering;
+#[cfg(target_os = "linux")]
+mod linux_theme;
 mod network_interfaces;
 mod preview;
+mod relaunch;
 mod remote_update_delegate;
 mod security;
 mod server_exposure;

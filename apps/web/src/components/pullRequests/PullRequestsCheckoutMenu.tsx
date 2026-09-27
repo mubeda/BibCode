@@ -50,7 +50,7 @@ export function PullRequestsCheckoutMenu({
     headBranch,
     permission,
     worktrees,
-    onSuccess: catalog.refresh,
+    onSuccess: catalog.revalidate,
   });
   const available = constrainPermission(permission, disabledReason);
   const reason = available.allowed ? undefined : (available.reason ?? undefined);

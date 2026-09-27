@@ -57,12 +57,24 @@ export class DesktopEnvironmentBootstrapIncompleteError extends Schema.TaggedErr
   }
 }
 
+export class DesktopPrimaryEnvironmentWithheldError extends Schema.TaggedError<DesktopPrimaryEnvironmentWithheldError>()(
+  "DesktopPrimaryEnvironmentWithheldError",
+  {},
+) {
+  override get message(): string {
+    return "The desktop primary environment bootstrap is unavailable.";
+  }
+}
+
 export const isPrimaryEnvironmentUrlInvalidError = Schema.is(PrimaryEnvironmentUrlInvalidError);
 export const isPrimaryEnvironmentProtocolUnsupportedError = Schema.is(
   PrimaryEnvironmentProtocolUnsupportedError,
 );
 export const isDesktopEnvironmentBootstrapIncompleteError = Schema.is(
   DesktopEnvironmentBootstrapIncompleteError,
+);
+export const isDesktopPrimaryEnvironmentWithheldError = Schema.is(
+  DesktopPrimaryEnvironmentWithheldError,
 );
 
 export interface PrimaryEnvironmentTarget {
@@ -242,12 +254,15 @@ function resolveWindowOriginPrimaryTarget(): PrimaryEnvironmentTarget {
 }
 
 function resolveDesktopPrimaryTarget(): PrimaryEnvironmentTarget | null {
-  const desktopBootstrap = getDesktopLocalEnvironmentBootstrap();
-  if (!desktopBootstrap) {
+  if (window.desktopBridge === undefined) {
     return null;
   }
-  if (!desktopBootstrap.httpBaseUrl && !desktopBootstrap.wsBaseUrl) {
-    return null;
+
+  const desktopBootstrap = getDesktopLocalEnvironmentBootstrap();
+  if (!desktopBootstrap || (!desktopBootstrap.httpBaseUrl && !desktopBootstrap.wsBaseUrl)) {
+    // A stopped desktop backend remains desired. A failed topology read lets
+    // the platform retain its registration and the user's environment data.
+    throw new DesktopPrimaryEnvironmentWithheldError();
   }
   if (!desktopBootstrap.httpBaseUrl || !desktopBootstrap.wsBaseUrl) {
     throw new DesktopEnvironmentBootstrapIncompleteError({

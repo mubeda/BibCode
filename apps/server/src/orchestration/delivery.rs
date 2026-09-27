@@ -15,6 +15,20 @@ pub enum TurnDeliveryState {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnDeliveryFailureReason {
+    ModelSelectionRefused,
+}
+
+impl TurnDeliveryFailureReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelSelectionRefused => "modelSelectionRefused",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TurnDeliveryMode {
     Start,

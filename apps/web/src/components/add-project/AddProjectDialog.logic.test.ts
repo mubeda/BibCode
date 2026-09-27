@@ -1,8 +1,13 @@
-import { EnvironmentId } from "@bibcode/contracts";
+import { VcsCloneStoppedError } from "@bibcode/client-runtime/state/vcs";
+import { EnvironmentId, GitCloneOperationError } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  cloneCancelPendingNotice,
+  cloneFinishedBeforeCancelNotice,
+  cloneReconnectingNotice,
   defaultAddProjectParent,
+  describeCloneOperationFailure,
   getEnvironmentBrowsePlatform,
   joinProjectPath,
   shouldUseNativePicker,
@@ -141,5 +146,72 @@ describe("Add Project rules", () => {
         desktopInstanceId: "wsl:Ubuntu",
       }),
     ).toBe(true);
+  });
+});
+
+describe("clone re-attach copy", () => {
+  const error = (reason: GitCloneOperationError["reason"]) =>
+    new GitCloneOperationError({ reason, destination: "/srv/code/demo", message: "server text" });
+
+  it("names the host while reconnecting and while a cancel waits for it", () => {
+    expect(cloneReconnectingNotice("Remote")).toBe(
+      "Lost the connection to Remote. The clone continues on the server; reconnecting…",
+    );
+    expect(cloneCancelPendingNotice("Remote")).toBe("The clone stops when Remote reconnects.");
+  });
+
+  it("says where a clone that finished before its cancel was left", () => {
+    expect(cloneFinishedBeforeCancelNotice("/srv/code/demo")).toBe(
+      "The clone finished before it could be cancelled. It is in /srv/code/demo and was not added as a project. Press Clone to add it.",
+    );
+  });
+
+  it("maps every clone runtime reason to the dialog copy", () => {
+    expect(describeCloneOperationFailure(error("not-in-progress"), "Remote", false)).toEqual({
+      kind: "error",
+      text: "No clone is in progress for /srv/code/demo. Press Clone to start again.",
+    });
+    expect(describeCloneOperationFailure(error("cancelled"), "Remote", false)).toEqual({
+      kind: "error",
+      text: "The clone into /srv/code/demo was cancelled elsewhere. Press Clone to start again.",
+    });
+    expect(describeCloneOperationFailure(error("cancelled"), "Remote", true)).toEqual({
+      kind: "notice",
+      text: "Clone cancelled.",
+    });
+    expect(describeCloneOperationFailure(error("busy"), "Remote", false)).toEqual({
+      kind: "error",
+      text: "Another clone into /srv/code/demo is in progress. Wait for it to finish or choose another folder.",
+    });
+    expect(describeCloneOperationFailure(error("capacity"), "Remote", false)).toEqual({
+      kind: "error",
+      text: "Too many clones are running on Remote. Wait for one to finish and try again.",
+    });
+    expect(describeCloneOperationFailure(error("shutting-down"), "Remote", false)).toEqual({
+      kind: "error",
+      text: "Remote is shutting down. Press Clone again once it is back.",
+    });
+  });
+
+  it("explains a clone the client stopped following", () => {
+    const stopped = (reason: VcsCloneStoppedError["reason"]) =>
+      new VcsCloneStoppedError({ environmentId: "remote", reason, message: "x" });
+    expect(
+      describeCloneOperationFailure(stopped("environment-unavailable"), "Remote", false),
+    ).toEqual({
+      kind: "error",
+      text: "Can't reconnect to Remote. The clone continues there; clone the same URL into the same folder to finish.",
+    });
+    expect(describeCloneOperationFailure(stopped("reattach-unsupported"), "Remote", false)).toEqual(
+      {
+        kind: "error",
+        text: "The clone stopped before it finished. Try again.",
+      },
+    );
+  });
+
+  it("leaves other failures to the generic Clone failed copy", () => {
+    expect(describeCloneOperationFailure(new Error("boom"), "Remote", false)).toBeNull();
+    expect(describeCloneOperationFailure(null, "Remote", false)).toBeNull();
   });
 });

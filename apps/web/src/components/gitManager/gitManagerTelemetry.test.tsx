@@ -69,6 +69,7 @@ vi.mock("../../state/entities", () => ({
 
 vi.mock("../../state/environments", () => ({
   useEnvironmentConnectionState: () => ({ data: h.connectionState }),
+  useEnvironment: () => ({ label: "Local" }),
 }));
 
 vi.mock("../../state/query", () => ({
@@ -77,6 +78,8 @@ vi.mock("../../state/query", () => ({
     error: null,
     isPending: false,
     refresh: h.refresh,
+    revalidate: h.refresh,
+    requiresRetry: false,
   }),
 }));
 
@@ -272,6 +275,7 @@ describe("Git Manager zero-telemetry runtime", () => {
     await render(
       <GitManagerPullRequestPanel
         scope={{ environmentId: "environment-1" as never, cwd: "/opaque/main" }}
+        statusLoaded={false}
         onRefresh={vi.fn()}
       />,
     );

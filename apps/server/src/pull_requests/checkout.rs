@@ -1,7 +1,7 @@
 //! Guarded checkout and managed worktree creation for hosted pull requests.
 use super::{
     PullRequestsService, bounded_read,
-    context::{DiscoveredHosts, resolve_scope, supported_provider},
+    context::{DiscoveredHosts, resolve_scope},
     error::{PullRequestsOperationError, from_process_error},
     host::{Budget, CommandOutput, HostCommandRunner, HostScope, ProcessFailure},
     model::PullRequestsProvider,
@@ -284,7 +284,7 @@ impl LockedCheckout<'_> {
             return Ok(mismatch());
         }
         let head_branch = service
-            .host(scope, "pullRequests.checkout")?
+            .host(scope)
             .head_branch(scope, input.number, c)
             .await?;
         validate_branch(&service.runner, &input.cwd, &head_branch, c).await?;
@@ -313,9 +313,7 @@ impl LockedCheckout<'_> {
                     &service.runner,
                     scope,
                     input.number,
-                    &service
-                        .host(scope, "pullRequests.checkout")?
-                        .head_ref_spec(input.number),
+                    &service.host(scope).head_ref_spec(input.number),
                     branch_name.as_deref().unwrap_or(&head_branch),
                     &snapshot.worktrees,
                     c,
@@ -471,7 +469,7 @@ async fn local_checkout(
         ..scope.clone()
     };
     let number = number.to_string();
-    let (cli, result) = match supported_provider(scope).map_err(|u| u.operation_error(OP))? {
+    let (cli, result) = match scope.provider {
         PullRequestsProvider::Github => (
             "gh",
             runner

@@ -12,6 +12,7 @@ import {
   createEnvironmentRpcStreamCommand,
   createEnvironmentRpcSubscriptionAtomFamily,
   environmentRpcKey,
+  forwardEnvironmentQueryRetry,
   parseEnvironmentRpcKey,
 } from "./runtime.ts";
 import { request } from "../rpc/client.ts";
@@ -56,9 +57,10 @@ export function createGitManagerEnvironmentAtoms<R, E>(
         environmentId: target.environmentId,
         input: { cwd: target.input.cwd },
       });
-      return query(target).pipe(
-        Atom.makeRefreshOnSignal(focusRefresh(scopeKey)),
-        Atom.setIdleTTL(0),
+      const source = query(target);
+      return forwardEnvironmentQueryRetry(
+        source,
+        source.pipe(Atom.makeRefreshOnSignal(focusRefresh(scopeKey)), Atom.setIdleTTL(0)),
       );
     });
     return (target: Parameters<typeof query>[0]) => family(environmentRpcKey(target));
@@ -83,6 +85,7 @@ export function createGitManagerEnvironmentAtoms<R, E>(
         label: "environment-data:git-manager:history-first-page",
         staleTimeMs: 10_000,
         idleTtlMs: 0,
+        transportCutoffKey: (input) => ({ cwd: input.cwd, limit: input.limit }),
         execute: (input: {
           readonly cwd: string;
           readonly limit: number;
@@ -95,6 +98,12 @@ export function createGitManagerEnvironmentAtoms<R, E>(
       label: "environment-data:git-manager:retained-history",
       staleTimeMs: 10_000,
       idleTtlMs: 0,
+      transportCutoffKey: (input) => ({
+        cwd: input.cwd,
+        pinnedTips: input.pinnedTips,
+        offsets: input.offsets,
+        limit: input.limit,
+      }),
       execute: (input: {
         readonly cwd: string;
         readonly pinnedTips: ReadonlyArray<string>;

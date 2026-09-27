@@ -14,8 +14,10 @@ import {
   ConnectionBlockedError,
   ConnectionTransientError,
   Connectivity,
+  EnvironmentSelection,
   mapRemoteEnvironmentError,
   type PlatformConnectionRegistration,
+  sshCredentialRejectedError,
   PrimaryConnectionRegistration,
   PrimaryConnectionTarget,
   UnavailableConnectionRegistration,
@@ -30,6 +32,7 @@ import {
   AuthStandardClientScopes,
   type DesktopBridge,
   type DesktopEnvironmentBootstrap,
+  type DesktopSshEnvironmentBootstrap,
   type DesktopSshEnvironmentTarget,
   EnvironmentId,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
@@ -53,6 +56,7 @@ import {
 import { clearComposerDraftsEnvironment } from "../composerDraftStore";
 import { isHostedStaticApp } from "../hostedPairing";
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import { makeEnvironmentSelection } from "./environmentSelection";
 import { acknowledgeRpcRequest, trackRpcRequestSent } from "../rpc/requestLatencyState";
 import {
   desktopLocalConnectionId,
@@ -185,12 +189,47 @@ function clientMetadata() {
   };
 }
 
-function sshPreparationError(cause: unknown) {
+const SSH_HTTP_STATUS_PREFIX = /^\[ssh_http:(\d{3})\]\s*/u;
+const SSH_TIMEOUT_PREFIX = /^\[ssh_timeout:[a-z-]+\]\s*/u;
+const SSH_CANCELLED_PREFIX = /^\[ssh_cancelled\]\s*/u;
+
+/**
+ * Classifies a desktop SSH bridge failure. The bridge prefixes a remote API
+ * refusal with `[ssh_http:<status>]` and an expired remote-script deadline
+ * with `[ssh_timeout:<operation>]`, and the user's own cancellation of the
+ * password prompt with `[ssh_cancelled]`. A refusal is blocked (it will not pass on
+ * its own); network failures, 5xx, and deadlines are transient.
+ */
+export function sshPreparationError(cause: unknown) {
   const message = cause instanceof Error ? cause.message : String(cause);
-  if (message.toLowerCase().includes("cancel")) {
+  const status = SSH_HTTP_STATUS_PREFIX.exec(message)?.[1];
+  switch (status) {
+    case "401":
+      return new ConnectionBlockedError({
+        reason: "authentication",
+        detail: "The SSH environment rejected the credential.",
+      });
+    case "403":
+      return new ConnectionBlockedError({
+        reason: "permission",
+        detail: "The SSH environment credential does not grant the required access.",
+      });
+    case "400":
+      return new ConnectionBlockedError({
+        reason: "configuration",
+        detail: "The SSH environment rejected the authentication request.",
+      });
+  }
+  if (SSH_TIMEOUT_PREFIX.test(message)) {
+    return new ConnectionTransientError({
+      reason: "timeout",
+      detail: `${message.replace(SSH_TIMEOUT_PREFIX, "")} Check the connection; BiBCode keeps trying.`,
+    });
+  }
+  if (SSH_CANCELLED_PREFIX.test(message)) {
     return new ConnectionBlockedError({
       reason: "authentication",
-      detail: message,
+      detail: message.replace(SSH_CANCELLED_PREFIX, ""),
     });
   }
   return new ConnectionTransientError({
@@ -199,37 +238,89 @@ function sshPreparationError(cause: unknown) {
   });
 }
 
+const ensureDesktopSshEnvironment = (
+  bridge: DesktopBridge,
+  target: DesktopSshEnvironmentTarget,
+  issuePairingToken: boolean,
+) =>
+  Effect.tryPromise({
+    try: () => bridge.ensureSshEnvironment(target, { issuePairingToken }),
+    catch: sshPreparationError,
+  });
+
+function requirePairingToken(bootstrap: DesktopSshEnvironmentBootstrap) {
+  return bootstrap.pairingToken === null
+    ? Effect.fail(
+        new ConnectionBlockedError({
+          reason: "authentication",
+          detail: "The SSH environment did not issue a pairing credential.",
+        }),
+      )
+    : Effect.succeed(bootstrap.pairingToken);
+}
+
+// Standard scopes only: a leaked saved bearer must not manage access or mint
+// pairings on the host. SSH access stays the authority for this desktop.
+const exchangeSshPairingToken = (
+  bridge: DesktopBridge,
+  bootstrap: DesktopSshEnvironmentBootstrap,
+  pairingToken: string,
+) =>
+  Effect.tryPromise({
+    try: () =>
+      bridge.bootstrapSshBearerSession(
+        bootstrap.httpBaseUrl,
+        pairingToken,
+        AuthStandardClientScopes,
+      ),
+    catch: sshPreparationError,
+  });
+
 export const provisionDesktopSshEnvironment = Effect.fn(
   "web.connectionPlatform.ssh.provisionDesktop",
 )(function* (bridge: DesktopBridge, target: DesktopSshEnvironmentTarget) {
-  const bootstrap = yield* Effect.tryPromise({
-    try: () =>
-      bridge.ensureSshEnvironment(target, {
-        issuePairingToken: true,
-      }),
-    catch: sshPreparationError,
-  });
-  const pairingToken = bootstrap.pairingToken;
-  if (pairingToken === null) {
-    return yield* new ConnectionBlockedError({
-      reason: "authentication",
-      detail: "The SSH environment did not issue a pairing credential.",
-    });
-  }
+  const bootstrap = yield* ensureDesktopSshEnvironment(bridge, target, true);
+  const pairingToken = yield* requirePairingToken(bootstrap);
+  // The descriptor comes first so a descriptor failure does not spend the token.
   const descriptor = yield* Effect.tryPromise({
     try: () => bridge.fetchSshEnvironmentDescriptor(bootstrap.httpBaseUrl),
     catch: sshPreparationError,
   });
-  const access = yield* Effect.tryPromise({
-    try: () => bridge.bootstrapSshBearerSession(bootstrap.httpBaseUrl, pairingToken),
-    catch: sshPreparationError,
-  });
+  const access = yield* exchangeSshPairingToken(bridge, bootstrap, pairingToken);
   return {
     environmentId: descriptor.environmentId,
     label: descriptor.label,
     bootstrap,
     bearerToken: access.access_token,
   };
+});
+
+export const mintDesktopSshBearer = Effect.fn("web.connectionPlatform.ssh.mintDesktop")(function* (
+  bridge: DesktopBridge,
+  target: DesktopSshEnvironmentTarget,
+) {
+  const bootstrap = yield* ensureDesktopSshEnvironment(bridge, target, true);
+  const pairingToken = yield* requirePairingToken(bootstrap);
+  const access = yield* exchangeSshPairingToken(bridge, bootstrap, pairingToken).pipe(
+    Effect.mapError((error) =>
+      error._tag === "ConnectionBlockedError" && error.reason === "authentication"
+        ? sshCredentialRejectedError(target.alias || target.hostname)
+        : error,
+    ),
+  );
+  return { bootstrap, bearerToken: access.access_token };
+});
+
+const desktopBridgeOrUnsupported = Effect.suspend(() => {
+  const bridge = window.desktopBridge;
+  return bridge === undefined
+    ? Effect.fail(
+        new ConnectionBlockedError({
+          reason: "unsupported",
+          detail: "SSH environments are only available in the desktop app.",
+        }),
+      )
+    : Effect.succeed(bridge);
 });
 
 const capabilitiesLayer = Layer.effectContext(
@@ -277,45 +368,16 @@ const capabilitiesLayer = Layer.effectContext(
     });
     const ssh = SshEnvironmentGateway.of({
       provision: Effect.fn("web.connectionPlatform.ssh.provision")(function* (target) {
-        const bridge = window.desktopBridge;
-        if (bridge === undefined) {
-          return yield* new ConnectionBlockedError({
-            reason: "unsupported",
-            detail: "SSH environments are only available in the desktop app.",
-          });
-        }
+        const bridge = yield* desktopBridgeOrUnsupported;
         return yield* provisionDesktopSshEnvironment(bridge, target);
       }),
-      prepare: Effect.fn("web.connectionPlatform.ssh.prepare")(function* (input) {
-        const bridge = window.desktopBridge;
-        if (bridge === undefined) {
-          return yield* new ConnectionBlockedError({
-            reason: "unsupported",
-            detail: "SSH environments are only available in the desktop app.",
-          });
-        }
-        const bootstrap = yield* Effect.tryPromise({
-          try: () =>
-            bridge.ensureSshEnvironment(input.target, {
-              issuePairingToken: true,
-            }),
-          catch: sshPreparationError,
-        });
-        if (bootstrap.pairingToken === null) {
-          return yield* new ConnectionBlockedError({
-            reason: "authentication",
-            detail: "The SSH environment did not issue a pairing credential.",
-          });
-        }
-        const access = yield* Effect.tryPromise({
-          try: () =>
-            bridge.bootstrapSshBearerSession(bootstrap.httpBaseUrl, bootstrap.pairingToken!),
-          catch: sshPreparationError,
-        });
-        return {
-          bootstrap,
-          bearerToken: access.access_token,
-        };
+      ensureTunnel: Effect.fn("web.connectionPlatform.ssh.ensureTunnel")(function* (input) {
+        const bridge = yield* desktopBridgeOrUnsupported;
+        return yield* ensureDesktopSshEnvironment(bridge, input.target, false);
+      }),
+      mintBearer: Effect.fn("web.connectionPlatform.ssh.mintBearer")(function* (input) {
+        const bridge = yield* desktopBridgeOrUnsupported;
+        return yield* mintDesktopSshBearer(bridge, input.target);
       }),
       disconnect: Effect.fn("web.connectionPlatform.ssh.disconnect")(function* (target) {
         const bridge = window.desktopBridge;
@@ -672,12 +734,17 @@ const rpcRequestObserverLayer = Layer.succeed(
       Effect.sync(() => {
         nextObservedRpcRequestId += 1;
         const requestId = `${environmentId}:${nextObservedRpcRequestId}`;
-        trackRpcRequestSent(requestId, `${method} · ${environmentId}`);
+        trackRpcRequestSent(requestId, { method, environmentId });
         return Effect.sync(() => {
           acknowledgeRpcRequest(requestId);
         });
       }),
   }),
+);
+
+const environmentSelectionLayer = Layer.succeed(
+  EnvironmentSelection,
+  makeEnvironmentSelection(appAtomRegistry),
 );
 
 type ConnectionPlatformLayerSource =
@@ -687,7 +754,8 @@ type ConnectionPlatformLayerSource =
   | typeof capabilitiesLayer
   | typeof platformConnectionSourceLayer
   | typeof environmentOwnedDataCleanupLayer
-  | typeof rpcRequestObserverLayer;
+  | typeof rpcRequestObserverLayer
+  | typeof environmentSelectionLayer;
 
 export const connectionPlatformLayer: Layer.Layer<
   Layer.Success<ConnectionPlatformLayerSource>,
@@ -701,4 +769,5 @@ export const connectionPlatformLayer: Layer.Layer<
   platformConnectionSourceLayer,
   environmentOwnedDataCleanupLayer,
   rpcRequestObserverLayer,
+  environmentSelectionLayer,
 );

@@ -2,7 +2,10 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  type ContextMenuEntry,
+  ContextMenuEntrySchema,
   ContextMenuItemSchema,
+  ContextMenuSeparatorSchema,
   type DesktopBridge,
   DesktopProjectDataEnvironmentStatusSchema,
   DesktopProjectDataRecoveryResultSchema,
@@ -15,6 +18,9 @@ import { expectDecodeFailure, expectEncodeFailure } from "./test/schemaAssertion
 
 const decodeContextMenuItem = Schema.decodeUnknownSync(ContextMenuItemSchema);
 const encodeContextMenuItem = Schema.encodeSync(ContextMenuItemSchema);
+const decodeContextMenuEntry = Schema.decodeUnknownSync(ContextMenuEntrySchema);
+const encodeContextMenuEntry = Schema.encodeSync(ContextMenuEntrySchema);
+const decodeContextMenuSeparator = Schema.decodeUnknownSync(ContextMenuSeparatorSchema);
 const decodeDesktopEnvironmentBootstrap = Schema.decodeUnknownSync(
   DesktopEnvironmentBootstrapSchema,
 );
@@ -210,7 +216,60 @@ describe("Desktop update protection contract", () => {
       ...legacyUpdateState,
       phase: "idle",
       protection: [],
+      backendRecovery: [],
+      requestedBy: null,
     });
+  });
+
+  it("defaults requestedBy for an older desktop host and decodes a remote request", () => {
+    expect(decodeDesktopUpdateState(legacyUpdateState).requestedBy).toBeNull();
+    expect(
+      decodeDesktopUpdateState({
+        ...legacyUpdateState,
+        requestedBy: { label: "BiBCode Desktop", detail: "MacIntel (192.168.1.34)" },
+      }).requestedBy,
+    ).toEqual({ label: "BiBCode Desktop", detail: "MacIntel (192.168.1.34)" });
+    expect(
+      decodeDesktopUpdateState({
+        ...legacyUpdateState,
+        requestedBy: { label: "Another device", detail: null },
+      }).requestedBy,
+    ).toEqual({ label: "Another device", detail: null });
+  });
+
+  it("decodes stopped backends with typed recovery reasons and their original ports", () => {
+    const backendRecovery = [
+      { environmentId: "primary", label: "Local", reason: "port-in-use", port: 14373 },
+      { environmentId: "wsl:Ubuntu", label: "WSL (Ubuntu)", reason: "other", port: 14374 },
+    ];
+    expect(decodeDesktopUpdateState({ ...legacyUpdateState, backendRecovery })).toMatchObject({
+      backendRecovery,
+    });
+  });
+
+  it.each([1, 65535])("accepts backend recovery port boundary %s", (port) => {
+    expect(
+      decodeDesktopUpdateState({
+        ...legacyUpdateState,
+        backendRecovery: [{ environmentId: "primary", label: "Local", reason: "other", port }],
+      }),
+    ).toMatchObject({ backendRecovery: [{ port }] });
+  });
+
+  it.each([-1, 0, 65536, 1.5])("rejects invalid backend recovery port %s", (port) => {
+    expect(() =>
+      decodeDesktopUpdateState({
+        ...legacyUpdateState,
+        backendRecovery: [{ environmentId: "primary", label: "Local", reason: "other", port }],
+      }),
+    ).toThrow();
+  });
+
+  it("exposes application restart as an optional desktop bridge capability", async () => {
+    const legacyBridge: Pick<DesktopBridge, "restartApp"> = {};
+    const bridge: Pick<DesktopBridge, "restartApp"> = { restartApp: async () => undefined };
+    expect(legacyBridge.restartApp).toBeUndefined();
+    await expect(bridge.restartApp!()).resolves.toBeUndefined();
   });
 
   it("exposes explicit named exclusions on the asynchronous install command", async () => {
@@ -366,7 +425,7 @@ describe("ContextMenuItemSchema", () => {
     };
     const decoded = decodeContextMenuItem(input);
 
-    expect(decoded.children?.[0]?.id).toBe("push");
+    expect(decoded.children?.[0]).toMatchObject({ id: "push" });
     expect(encodeContextMenuItem(decoded)).toEqual(input);
   });
 
@@ -379,5 +438,63 @@ describe("ContextMenuItemSchema", () => {
     };
     expectDecodeFailure(ContextMenuItemSchema, invalid, expected);
     expectEncodeFailure(ContextMenuItemSchema, invalid, expected);
+  });
+});
+
+describe("ContextMenuEntrySchema", () => {
+  it("decodes and encodes a bare separator", () => {
+    expect(decodeContextMenuEntry({ separator: true })).toEqual({ separator: true });
+    expect(encodeContextMenuEntry({ separator: true })).toEqual({ separator: true });
+    expect(decodeContextMenuSeparator({ separator: true })).toEqual({ separator: true });
+  });
+
+  it("round-trips separators between submenu children", () => {
+    const input = {
+      id: "open-in",
+      label: "Open in",
+      children: [
+        { id: "open-in:file-explorer", label: "File Explorer" },
+        { separator: true },
+        { id: "open-in:vscode", label: "VS Code" },
+      ],
+    };
+    expect(encodeContextMenuEntry(decodeContextMenuEntry(input))).toEqual(input);
+  });
+
+  it("round-trips a disabled action's explanation", () => {
+    const input = {
+      id: "pull",
+      label: "Pull",
+      disabled: true,
+      description: "Workspace is unavailable.",
+    };
+    expect(encodeContextMenuEntry(decodeContextMenuEntry(input))).toEqual(input);
+  });
+
+  it("types a mixed list of items and separators", () => {
+    const entries: readonly ContextMenuEntry<"pull" | "copy-path">[] = [
+      { id: "pull", label: "Pull" },
+      { separator: true },
+      { id: "copy-path", label: "Copy Path" },
+    ];
+    expect(entries.filter((entry) => "separator" in entry)).toHaveLength(1);
+  });
+
+  it("rejects a separator flag that is not literally true", () => {
+    const expected = {
+      rootTag: "AnyOf" as const,
+      paths: [["id"]],
+      containsTag: "MissingKey" as const,
+    };
+    expectDecodeFailure(ContextMenuEntrySchema, { separator: false }, expected);
+    expectEncodeFailure(ContextMenuEntrySchema, { separator: false }, expected);
+  });
+
+  it("rejects an invalid separator nested in children", () => {
+    expectDecodeFailure(
+      ContextMenuEntrySchema,
+      { id: "git", label: "Git", children: [{ separator: "yes" }] },
+      { rootTag: "AnyOf", paths: [["children", 0, "id"]], containsTag: "MissingKey" },
+    );
   });
 });

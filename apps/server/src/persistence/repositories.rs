@@ -5,6 +5,7 @@
 //! not normalize or regenerate them while reading an existing database.
 
 use std::cmp::min;
+use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -23,6 +24,31 @@ use crate::{
 use super::{Database, PersistenceError, Result};
 
 pub type Timestamp = String;
+
+/// How many events one page holds when a caller walks the event log.
+pub const EVENT_PAGE_SIZE: usize = 128;
+
+/// Walks the event log after an exclusive sequence cursor, one bounded read at a time, so a
+/// caller never holds more than [`EVENT_PAGE_SIZE`] events.
+pub struct EventPages<'a> {
+    repositories: &'a Repositories,
+    cursor: i64,
+}
+
+impl EventPages<'_> {
+    /// Returns the next page after the cursor, or `None` once a read finds no newer event.
+    pub async fn next_page(&mut self) -> Result<Option<Vec<OrchestrationEvent>>> {
+        let page = self
+            .repositories
+            .read_events_from_sequence(self.cursor, EVENT_PAGE_SIZE)
+            .await?;
+        let Some(last) = page.last() else {
+            return Ok(None);
+        };
+        self.cursor = last.sequence;
+        Ok(Some(page))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Repositories {
@@ -108,6 +134,7 @@ impl Repositories {
 
     /// Reads at most `limit` events after an exclusive sequence cursor.  Callers
     /// stream large replays by advancing the cursor to the last returned event.
+    /// [`Repositories::event_pages`] walks the log that way in [`EVENT_PAGE_SIZE`] pages.
     pub async fn read_events_from_sequence(
         &self,
         sequence_exclusive: i64,
@@ -129,6 +156,14 @@ impl Repositories {
                     .map_err(Into::into)
             })
             .await
+    }
+
+    /// Starts walking the event log after `sequence_exclusive`; see [`EventPages`].
+    pub fn event_pages(&self, sequence_exclusive: i64) -> EventPages<'_> {
+        EventPages {
+            repositories: self,
+            cursor: sequence_exclusive,
+        }
     }
 
     pub async fn max_event_sequence(&self) -> Result<i64> {
@@ -288,6 +323,30 @@ impl Repositories {
                 params![row.thread_id, row.provider_name, row.provider_instance_id, row.adapter_key, row.runtime_mode, row.status, row.last_seen_at, optional_json(&row.resume_cursor)?, optional_json(&row.runtime_payload)?],
             )?;
             Ok(())
+        }).await
+    }
+
+    /// Preserve resumable state only while its thread still exists and is not deleted.
+    /// The existence check covers both insertion and conflict updates in one statement.
+    pub(crate) async fn upsert_provider_session_runtime_if_thread_live(
+        &self,
+        row: ProviderSessionRuntime,
+    ) -> Result<bool> {
+        self.database.call(move |connection| {
+            let written = connection.execute(
+                "INSERT INTO provider_session_runtime ( \
+                   thread_id, provider_name, provider_instance_id, adapter_key, runtime_mode, status, \
+                   last_seen_at, resume_cursor_json, runtime_payload_json \
+                 ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
+                   WHERE EXISTS (SELECT 1 FROM projection_threads WHERE thread_id = ?1 AND deleted_at IS NULL) \
+                 ON CONFLICT (thread_id) DO UPDATE SET \
+                   provider_name = excluded.provider_name, provider_instance_id = excluded.provider_instance_id, \
+                   adapter_key = excluded.adapter_key, runtime_mode = excluded.runtime_mode, \
+                   status = excluded.status, last_seen_at = excluded.last_seen_at, \
+                   resume_cursor_json = excluded.resume_cursor_json, runtime_payload_json = excluded.runtime_payload_json",
+                params![row.thread_id, row.provider_name, row.provider_instance_id, row.adapter_key, row.runtime_mode, row.status, row.last_seen_at, optional_json(&row.resume_cursor)?, optional_json(&row.runtime_payload)?],
+            )?;
+            Ok(written != 0)
         }).await
     }
 
@@ -587,13 +646,13 @@ impl Repositories {
         self.database.call(move |connection| {
             let attachments = row.attachments.as_ref().map(encode_json).transpose()?;
             connection.execute(
-                "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held) \
-                 VALUES (?, ?, ?, ?, ?, COALESCE(?, (SELECT attachments_json FROM projection_thread_messages WHERE message_id = ?)), ?, ?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id) \
+                 VALUES (?, ?, ?, ?, ?, COALESCE(?, (SELECT attachments_json FROM projection_thread_messages WHERE message_id = ?)), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (message_id) DO UPDATE SET \
                    thread_id=excluded.thread_id, turn_id=excluded.turn_id, role=excluded.role, text=excluded.text, \
                    attachments_json=COALESCE(excluded.attachments_json, projection_thread_messages.attachments_json), \
-                   is_streaming=excluded.is_streaming, delivery_state=excluded.delivery_state, delivery_provider=excluded.delivery_provider, delivery_detail=excluded.delivery_detail, delivery_mode=excluded.delivery_mode, delivery_held=excluded.delivery_held, created_at=excluded.created_at, updated_at=excluded.updated_at",
-                params![row.message_id,row.thread_id,row.turn_id,row.role,row.text,attachments,row.message_id,i64::from(row.is_streaming),row.delivery_state,row.delivery_provider,row.delivery_detail,row.created_at,row.updated_at,row.delivery_mode,row.delivery_held],
+                   is_streaming=excluded.is_streaming, delivery_state=excluded.delivery_state, delivery_provider=excluded.delivery_provider, delivery_detail=excluded.delivery_detail, delivery_mode=excluded.delivery_mode, delivery_held=excluded.delivery_held, delivery_reason=excluded.delivery_reason, delivery_provider_instance_id=excluded.delivery_provider_instance_id, created_at=excluded.created_at, updated_at=excluded.updated_at",
+                params![row.message_id,row.thread_id,row.turn_id,row.role,row.text,attachments,row.message_id,i64::from(row.is_streaming),row.delivery_state,row.delivery_provider,row.delivery_detail,row.created_at,row.updated_at,row.delivery_mode,row.delivery_held,row.delivery_reason,row.delivery_provider_instance_id],
             )?; Ok(())
         }).await
     }
@@ -757,6 +816,43 @@ impl Repositories {
 
     pub async fn list_referenced_attachment_ids(&self) -> Result<Vec<String>> {
         self.database.call(|connection| collect(connection, "SELECT DISTINCT attachment_id FROM orchestration_attachment_refs ORDER BY attachment_id ASC", [], |row| row.get(0))).await
+    }
+
+    /// Returns which of `attachment_ids` an accepted command on `thread_id` already attached, each
+    /// with its recorded content digest (none for references backfilled from legacy events).
+    pub async fn thread_attachment_digests(
+        &self,
+        thread_id: String,
+        attachment_ids: Vec<String>,
+    ) -> Result<HashMap<String, Option<String>>> {
+        self.database
+            .call(move |connection| {
+                // One digest per attachment: MAX ignores NULL, so a recorded digest wins over a
+                // legacy reference without one. Several different digests for one id, which the
+                // immutable attachment files rule out in practice, resolve to the
+                // lexicographically greatest, and the stored file must then match that one.
+                let mut statement = connection.prepare(
+                    "SELECT MAX(refs.content_digest) FROM orchestration_attachment_refs AS refs \
+                     JOIN orchestration_command_receipts AS receipts \
+                       ON receipts.command_id = refs.command_id \
+                     WHERE refs.attachment_id = ? AND receipts.aggregate_kind = 'thread' \
+                       AND receipts.aggregate_id = ? AND receipts.status = 'accepted' \
+                     GROUP BY refs.attachment_id",
+                )?;
+                let mut digests = HashMap::new();
+                for attachment_id in attachment_ids {
+                    let digest = statement
+                        .query_row(params![attachment_id, thread_id], |row| {
+                            row.get::<_, Option<String>>(0)
+                        })
+                        .optional()?;
+                    if let Some(digest) = digest {
+                        digests.insert(attachment_id, digest);
+                    }
+                }
+                Ok(digests)
+            })
+            .await
     }
 
     pub async fn claim_provider_turn(
@@ -961,6 +1057,30 @@ impl Repositories {
     ) -> Result<Option<ProjectionThreadSession>> {
         self.database.call(move |connection| connection.query_row("SELECT thread_id, status, provider_name, provider_instance_id, runtime_mode, active_turn_id, last_error, last_error_class, updated_at FROM projection_thread_sessions WHERE thread_id = ?", [thread_id], decode_thread_session).optional().map_err(Into::into)).await
     }
+
+    /// Sessions that are running or starting, and queued messages, for the update confirmation.
+    pub async fn count_active_work(&self) -> Result<(u64, u64)> {
+        self.database
+            .call(|connection| {
+                let running: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM projection_thread_sessions WHERE status IN ('running', 'starting')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let queued: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM provider_turn_outbox WHERE state = 'queued'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                // COUNT(*) is never negative.
+                Ok((
+                    u64::try_from(running).unwrap_or(0),
+                    u64::try_from(queued).unwrap_or(0),
+                ))
+            })
+            .await
+    }
+
     pub async fn list_thread_sessions_by_status(
         &self,
         statuses: Vec<String>,
@@ -1973,7 +2093,9 @@ pub struct ProjectionThreadMessage {
     pub is_streaming: bool,
     pub delivery_state: Option<String>,
     pub delivery_provider: Option<String>,
+    pub delivery_provider_instance_id: Option<String>,
     pub delivery_detail: Option<String>,
+    pub delivery_reason: Option<String>,
     pub delivery_mode: Option<String>,
     pub delivery_held: Option<bool>,
     pub created_at: Timestamp,
@@ -2201,7 +2323,7 @@ pub struct AuthSession {
 }
 
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at FROM projection_threads";
-const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held FROM projection_thread_messages";
+const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id FROM projection_thread_messages";
 const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held FROM provider_turn_outbox";
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
@@ -2440,7 +2562,9 @@ fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
         is_streaming: row.get::<_, i64>(6)? == 1,
         delivery_state: row.get(7)?,
         delivery_provider: row.get(8)?,
+        delivery_provider_instance_id: row.get(15)?,
         delivery_detail: row.get(9)?,
+        delivery_reason: row.get(14)?,
         delivery_mode: row.get(12)?,
         delivery_held: row.get(13)?,
         created_at: row.get(10)?,

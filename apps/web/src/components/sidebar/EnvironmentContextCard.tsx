@@ -11,6 +11,7 @@ import { useActiveEnvironmentId } from "../../state/entities";
 import { useEnvironment } from "../../state/environments";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { buildEnvironmentContextCardView } from "./environmentContextCard.logic";
 import type { EnvironmentRailStatus } from "./environmentRail.logic";
 
@@ -52,6 +53,30 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
     return null;
   }
 
+  // A failure reason ("No data from … for 30 seconds. …") runs to several
+  // lines, so it takes its own line, clamped to three, and the version moves
+  // to the badge row. The clamp is visual only: assistive technology reads the
+  // whole reason, the tooltip shows it on hover (the help cursor hints at it),
+  // and Tab reaches the line to open the tooltip from the keyboard.
+  const reasonLine = view.hasReason ? (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <div
+            data-testid="environment-context-card-status"
+            tabIndex={0}
+            className="line-clamp-3 wrap-break-word cursor-help rounded-sm text-xs text-muted-foreground outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+          />
+        }
+      >
+        {view.statusText}
+      </TooltipTrigger>
+      <TooltipPopup side="top" className="max-w-80 whitespace-normal leading-tight">
+        {view.statusText}
+      </TooltipPopup>
+    </Tooltip>
+  ) : null;
+
   return (
     <div
       data-testid="environment-context-card"
@@ -63,13 +88,30 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
       />
       <div className="min-w-0 flex-1">
         <div className="truncate text-[13px] font-semibold text-foreground">{view.name}</div>
+        {reasonLine}
         {/* Badges wrap onto their own row in a narrow sidebar instead of being clipped. */}
         <div className="flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
-          <span className="flex min-w-0 items-center gap-1">
-            <span className="truncate">{view.statusText}</span>
-            {view.versionLine ? <span aria-hidden>·</span> : null}
-            {view.versionLine ? <span className="shrink-0">{view.versionLine}</span> : null}
-          </span>
+          {view.hasReason ? (
+            view.versionLine ? (
+              <span className="shrink-0">{view.versionLine}</span>
+            ) : null
+          ) : (
+            // A short status wraps with its version instead of shrinking to "Co…"
+            // at the narrowest sidebar; the no-break space keeps "·" off a line start.
+            <span
+              data-testid="environment-context-card-status"
+              className="min-w-0 line-clamp-3 wrap-break-word"
+            >
+              {view.statusText}
+              {view.versionLine ? (
+                <>
+                  {"\u00a0"}
+                  <span aria-hidden>·</span>{" "}
+                  <span className="whitespace-nowrap">{view.versionLine}</span>
+                </>
+              ) : null}
+            </span>
+          )}
           {view.compatBadge ? (
             <span
               data-tone={view.compatBadge.tone}

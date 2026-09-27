@@ -1,4 +1,4 @@
-use bibcode_server::provider::cursor;
+use bibcode_server::provider::{OptionRefusal, cursor};
 
 use std::{path::PathBuf, time::Duration};
 
@@ -107,21 +107,54 @@ fn cursor_config_updates_reject_stale_or_malformed_descriptors_before_rpc() {
         )
         .is_ok()
     );
-    assert!(resolve_acp_config_updates(
-        &json!([{ "id": "fast", "category": "model", "type": "select", "options": [{ "value": "true" }] }]),
-        &json!([{ "id": "fastMode", "value": true }]),
-    )
-    .is_err());
-    assert!(resolve_acp_config_updates(
-        &json!([{ "id": "context", "category": "model_config", "type": "select", "options": [{ "value": "272k" }] }]),
-        &json!([{ "id": "contextWindow", "value": "1m" }]),
-    )
-    .is_err());
-    assert!(resolve_acp_config_updates(
-        &json!([{ "id": "reasoning", "category": "thought_level", "type": "boolean", "options": [{ "value": "high" }] }]),
-        &json!([{ "id": "reasoning", "value": "high" }]),
-    )
-    .is_err());
+    // A request the session can't satisfy is refused in words naming the option by the label its
+    // descriptor shows: the session's name for it, or BiBCode's default.
+    let refusal = |options: Value, updates: Value| {
+        resolve_acp_config_updates(&options, &updates)
+            .expect_err("the update is refused")
+            .option_refusal()
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        refusal(json!([]), json!([{ "id": "fastMode", "value": true }])).as_deref(),
+        Some("Fast is not supported by the selected model.")
+    );
+    assert_eq!(
+        refusal(
+            json!([{ "id": "context", "category": "model_config", "type": "select", "options": [{ "value": "272k" }] }]),
+            json!([{ "id": "contextWindow", "value": "1m" }]),
+        )
+        .as_deref(),
+        Some("Context 1m is not supported by the selected model.")
+    );
+    assert_eq!(
+        refusal(
+            json!([{ "id": "fast", "name": "Turbo", "category": "model_config", "type": "select", "options": [{ "value": "true" }] }]),
+            json!([{ "id": "fastMode", "value": "yes" }]),
+        )
+        .as_deref(),
+        Some("Turbo must be on or off.")
+    );
+    // A session configuration BiBCode can't work with is protocol detail the user can't act on,
+    // so its refusal stays generic, with the next step the user can take.
+    const UNUSABLE_OPTIONS: &str = "BiBCode can't apply these options to the selected model. Choose another model, or turn these options off.";
+    for options in [
+        json!([{ "id": "fast", "category": "model", "type": "select", "options": [{ "value": "true" }] }]),
+        json!([{ "id": "fast", "category": "model_config", "type": "boolean", "options": [{ "value": "true" }] }]),
+    ] {
+        assert_eq!(
+            refusal(options, json!([{ "id": "fastMode", "value": true }])).as_deref(),
+            Some(UNUSABLE_OPTIONS)
+        );
+    }
+    assert_eq!(
+        refusal(
+            json!([{ "id": "reasoning", "category": "thought_level", "type": "boolean", "options": [{ "value": "high" }] }]),
+            json!([{ "id": "reasoning", "value": "high" }]),
+        )
+        .as_deref(),
+        Some(UNUSABLE_OPTIONS)
+    );
 }
 
 #[tokio::test]
@@ -648,11 +681,15 @@ async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_option
         .set_model("no-fast")
         .await
         .expect("switch to target without fast");
-    assert!(
-        runtime
-            .set_options(vec![json!({ "id": "fastMode", "value": true })])
-            .await
-            .is_err()
+    let refused = runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .expect_err("the target model does not advertise fast");
+    // The model does not advertise the option, so a retry of the same turn cannot succeed.
+    assert_eq!(
+        refused.option_refusal(),
+        Some("Fast is not supported by the selected model."),
+        "{refused}"
     );
     runtime
         .set_model("old")
@@ -795,7 +832,16 @@ async fn cursor_default_model_restoration_rejects_a_fabricated_default() {
 
     runtime.start().await.expect("start");
     runtime.set_model("target").await.expect("switch to target");
-    assert!(runtime.set_model("default").await.is_err());
+    let refused = runtime
+        .set_model("default")
+        .await
+        .expect_err("a session without a reversible default refuses it");
+    // The session advertises no default, so switching to it is refused for good, in plain words.
+    assert_eq!(
+        refused.option_refusal(),
+        Some("This session can't switch to the default model. Choose another model."),
+        "{refused}"
+    );
     peer_task.await.expect("peer");
 }
 
@@ -866,14 +912,20 @@ async fn cursor_option_failure_compensates_acknowledged_updates() {
     let peer_task = tokio::spawn(peer.run());
 
     runtime.start().await.expect("start");
+    let rolled_back = runtime
+        .set_options(vec![
+            json!({ "id": "fastMode", "value": true }),
+            json!({ "id": "contextWindow", "value": "1m" }),
+        ])
+        .await
+        .expect_err("the rejected update fails after compensation");
+    // Cursor rejected an advertised value and the update was rolled back, so a retry may succeed.
+    assert_eq!(rolled_back.option_refusal(), None, "{rolled_back}");
     assert!(
-        runtime
-            .set_options(vec![
-                json!({ "id": "fastMode", "value": true }),
-                json!({ "id": "contextWindow", "value": "1m" }),
-            ])
-            .await
-            .is_err()
+        rolled_back
+            .to_string()
+            .starts_with("Cursor option update failed and was rolled back: "),
+        "{rolled_back}"
     );
     runtime
         .set_options(vec![json!({ "id": "fastMode", "value": true })])

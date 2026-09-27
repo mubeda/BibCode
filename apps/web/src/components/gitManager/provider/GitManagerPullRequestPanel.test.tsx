@@ -51,16 +51,19 @@ import { GitManagerPullRequestPanel } from "./GitManagerPullRequestPanel";
 let container: HTMLDivElement;
 let root: Root;
 
+/** Renders the pane as the Git Manager does; status has answered unless a test says not. */
 async function renderPanel(
   onRefresh = vi.fn(),
   disabledReason: string | null = null,
   provider: SourceControlProviderInfo | null = null,
+  statusLoaded = true,
 ) {
   await act(async () =>
     root.render(
       <GitManagerPullRequestPanel
         disabledReason={disabledReason}
         provider={provider}
+        statusLoaded={statusLoaded}
         scope={{ environmentId: "env-a" as never, cwd: "/repo" }}
         onRefresh={onRefresh}
       />,
@@ -137,6 +140,46 @@ describe("GitManagerPullRequestPanel", () => {
       expect(h.listRequests).toHaveBeenCalledOnce();
     },
   );
+
+  it("uses neutral change-request wording until status answers", async () => {
+    await renderPanel(vi.fn(), null, null, false);
+
+    expect(container.querySelector("section")?.getAttribute("aria-label")).toBe(
+      "Change requests and checks",
+    );
+    expect(container.querySelector("h2")?.textContent).toBe("Change requests and checks");
+    expect(button("Create change request").disabled).toBe(false);
+    expect(container.textContent).toContain(
+      "Change requests and checks load only when you choose Refresh.",
+    );
+    expect(container.textContent).not.toContain("ull request");
+    expect(h.listRequests).not.toHaveBeenCalled();
+
+    // Once status names a GitLab host, the pane says merge request throughout.
+    const gitlab = { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.invalid" } as const;
+    await renderPanel(vi.fn(), null, gitlab, true);
+    expect(container.querySelector("h2")?.textContent).toBe("Merge requests and checks");
+    expect(button("Create merge request").disabled).toBe(false);
+  });
+
+  it("keeps pull-request wording once status reports no provider", async () => {
+    await renderPanel();
+    expect(container.querySelector("h2")?.textContent).toBe("Pull requests and checks");
+    expect(button("Create pull request").disabled).toBe(false);
+    expect(container.textContent).toContain(
+      "Pull requests and checks load only when you choose Refresh.",
+    );
+  });
+
+  it("names the host from a known provider before status answers", async () => {
+    await renderPanel(
+      vi.fn(),
+      null,
+      { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.invalid" },
+      false,
+    );
+    expect(container.querySelector("h2")?.textContent).toBe("Merge requests and checks");
+  });
 
   it("issues no provider request on mount or after an idle hour", async () => {
     await renderPanel();
@@ -251,6 +294,7 @@ it("links each current-branch row to its project-scoped Pull Requests detail", a
       <GitManagerPullRequestPanel
         scope={{ environmentId: "env-a" as never, cwd: "/repo" }}
         projectRef={{ environmentId: "env-a", projectId: "project-a" } as never}
+        statusLoaded
         onRefresh={() => undefined}
       />
     ),

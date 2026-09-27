@@ -335,6 +335,17 @@ impl RepositoryFetchOwner {
     }
 
     #[cfg(test)]
+    pub(super) fn has_subscriber_for_test(&self, cwd: &Path, subscriber_id: u64) -> bool {
+        let state = self.lock_state();
+        state
+            .worktree_keys
+            .get(cwd)
+            .and_then(|key| state.repositories.get(key))
+            .and_then(|repository| repository.worktrees.get(cwd))
+            .is_some_and(|worktree| worktree.subscribers.contains(&subscriber_id))
+    }
+
+    #[cfg(test)]
     pub(crate) async fn wait_for_worktree_count_for_test(&self, expected: usize) {
         loop {
             let notified = self.inner.attachments_changed.notified();

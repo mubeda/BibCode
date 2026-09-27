@@ -82,7 +82,7 @@ function RemoteEntryButton({
       >
         <span
           className={cn(
-            "flex size-[26px] items-center justify-center rounded-lg text-[10px] font-semibold tracking-wide",
+            "flex size-[26px] items-center justify-center rounded-lg text-xs font-semibold",
             entry.selected
               ? "bg-primary text-primary-foreground"
               : "bg-muted text-muted-foreground",

@@ -39,7 +39,7 @@ use bibcode_server::{
         WorktreeDirectoryState, WorktreeRegistrationState,
     },
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
@@ -49,6 +49,10 @@ use tokio::{
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/websocket_frames.rs"]
+mod websocket_frames;
+use websocket_frames::next_frame_past_heartbeat;
 
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -600,9 +604,12 @@ async fn stream_delivers_initial_and_latest_snapshots_refreshes_and_cancels() {
     assert_eq!(initial["worktrees"].as_array().expect("worktrees").len(), 1);
     ack(fixture.socket(), "1").await;
     assert!(
-        timeout(Duration::from_millis(100), fixture.socket().next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(100),
+            next_frame_past_heartbeat(fixture.socket())
+        )
+        .await
+        .is_err(),
         "the initial latest value must not be emitted twice"
     );
 
@@ -834,9 +841,12 @@ async fn interrupt_during_catalog_subscribe_bootstrap_exits_without_a_snapshot()
             .any(|item| matches!(item, CauseItem::Interrupt { .. }))
     );
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), fixture.socket().next())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            next_frame_past_heartbeat(fixture.socket())
+        )
+        .await
+        .is_err(),
         "cancelled bootstrap must not publish a late snapshot"
     );
     assert!(
@@ -1185,9 +1195,12 @@ async fn removal_claim_survives_a_cancelled_policy_waiter_and_conflicts_the_next
     )
     .await;
     assert!(
-        timeout(Duration::from_millis(200), cancelled_socket.next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(200),
+            next_frame_past_heartbeat(&mut cancelled_socket)
+        )
+        .await
+        .is_err(),
         "policy must wait without mutating while removal owns the command and project"
     );
     send_json(
@@ -1219,9 +1232,12 @@ async fn removal_claim_survives_a_cancelled_policy_waiter_and_conflicts_the_next
     )
     .await;
     assert!(
-        timeout(Duration::from_millis(200), next_socket.next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(200),
+            next_frame_past_heartbeat(&mut next_socket)
+        )
+        .await
+        .is_err(),
         "the next waiter must remain behind the live removal claimant"
     );
     release.add_permits(1);
@@ -1307,9 +1323,12 @@ async fn cancelling_policy_while_waiting_for_project_lock_releases_its_command_c
     )
     .await;
     assert!(
-        timeout(Duration::from_millis(200), fixture.socket().next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(200),
+            next_frame_past_heartbeat(fixture.socket())
+        )
+        .await
+        .is_err(),
         "policy remains queued behind the project lock"
     );
     send_json(
@@ -1405,9 +1424,12 @@ async fn interrupted_policy_handoff_retains_project_serialization_until_terminal
     )
     .await;
     assert!(
-        timeout(Duration::from_millis(200), fixture.socket().next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(200),
+            next_frame_past_heartbeat(fixture.socket())
+        )
+        .await
+        .is_err(),
         "the sibling update remains serialized while the first envelope is paused"
     );
     pause.release();
@@ -3047,9 +3069,12 @@ async fn removal_command_claim_blocks_generic_dispatch_through_git_and_detach() 
     )
     .await;
     assert!(
-        timeout(Duration::from_millis(200), generic_socket.next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(200),
+            next_frame_past_heartbeat(&mut generic_socket)
+        )
+        .await
+        .is_err(),
         "generic dispatch must wait while removal owns Git and detach"
     );
     release.add_permits(1);
@@ -3434,9 +3459,12 @@ async fn owner_mutation_that_wins_the_fence_invalidates_removal_before_git() {
     )
     .await;
     assert!(
-        timeout(Duration::from_millis(100), fixture.socket().next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(100),
+            next_frame_past_heartbeat(fixture.socket())
+        )
+        .await
+        .is_err(),
         "removal waits behind the owner mutation fence"
     );
     pause.release();
@@ -3574,9 +3602,12 @@ async fn assert_owner_creation_that_wins_invalidates_removal(kind: RacingOwnerCr
     )
     .await;
     assert!(
-        timeout(Duration::from_millis(100), fixture.socket().next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(100),
+            next_frame_past_heartbeat(fixture.socket())
+        )
+        .await
+        .is_err(),
         "removal must wait behind the owner creation fence"
     );
     assert_eq!(remove_calls.load(Ordering::SeqCst), 0);
@@ -4402,6 +4433,13 @@ struct CapacityRejectingQuiescer {
 }
 
 impl WorktreeRemovalQuiescer for CapacityRejectingQuiescer {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> bibcode_server::production::worktree_catalog_rpc::WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn admit_cleanup(&self) -> WorktreeRemovalCleanupAdmissionFuture {
         Box::pin(async { Err(WorktreeRemovalCleanupAdmissionError::Capacity) })
     }
@@ -4437,6 +4475,13 @@ impl RecordingPendingQuiescer {
 }
 
 impl WorktreeRemovalQuiescer for RecordingPendingQuiescer {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> bibcode_server::production::worktree_catalog_rpc::WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn quiesce(
         &self,
         _admission: WorktreeRemovalCleanupAdmission,
@@ -4711,6 +4756,13 @@ fn catalog_rpc_fixture_parallelism() -> Arc<Semaphore> {
 struct TestNoopQuiescer;
 
 impl WorktreeRemovalQuiescer for TestNoopQuiescer {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> bibcode_server::production::worktree_catalog_rpc::WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn quiesce(
         &self,
         _admission: WorktreeRemovalCleanupAdmission,
@@ -4725,6 +4777,13 @@ struct SwitchingAnchorQuiescer {
 }
 
 impl WorktreeRemovalQuiescer for SwitchingAnchorQuiescer {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> bibcode_server::production::worktree_catalog_rpc::WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn quiesce(
         &self,
         _admission: WorktreeRemovalCleanupAdmission,
@@ -5234,7 +5293,7 @@ async fn next_server_message_with_deadline(
     socket: &mut TestSocket,
     deadline: Duration,
 ) -> ServerMessage {
-    let message = timeout(deadline, socket.next())
+    let message = timeout(deadline, next_frame_past_heartbeat(socket))
         .await
         .expect("server response timeout")
         .expect("WebSocket open")

@@ -1,7 +1,7 @@
 import type {
   AuthAccessTokenResult,
   ClientSettings,
-  ContextMenuItem,
+  ContextMenuEntry,
   DesktopAppBranding,
   DesktopBridge,
   DesktopBridgeHostMetadata,
@@ -401,6 +401,7 @@ function defaultUpdateState(): DesktopUpdateState {
     message: null,
     errorContext: null,
     canRetry: false,
+    requestedBy: null,
   };
 }
 
@@ -436,7 +437,7 @@ function isWindowsWebViewRuntime(): boolean {
 }
 
 async function showTauriContextMenu<T extends string>(
-  items: readonly ContextMenuItem<T>[],
+  items: readonly ContextMenuEntry<T>[],
   position?: { x: number; y: number },
 ): Promise<T | null> {
   if (isWindowsWebViewRuntime()) {
@@ -515,6 +516,7 @@ function createTauriDesktopBridge(
       tauriInvokeDesktop("desktop_bridge_start_empty_project_data", { environmentId }),
     retryProjectData: (environmentId) =>
       tauriInvokeDesktop("desktop_bridge_retry_project_data", { environmentId }),
+    restartApp: () => tauriInvokeDesktop("desktop_bridge_restart_app", undefined),
     openProjectDataPath: (environmentId) =>
       tauriInvokeDesktop("desktop_bridge_open_project_data_path", { environmentId }),
     exportProjectDataDiagnostics: (environmentId) =>
@@ -526,8 +528,12 @@ function createTauriDesktopBridge(
       tauriInvokeOr("desktop_bridge_disconnect_ssh_environment", { target }, () => undefined),
     fetchSshEnvironmentDescriptor: (httpBaseUrl: string) =>
       tauriInvoke("desktop_bridge_fetch_environment_descriptor", { httpBaseUrl }),
-    bootstrapSshBearerSession: (httpBaseUrl: string, credential: string) =>
-      tauriInvoke("desktop_bridge_bootstrap_ssh_bearer_session", { httpBaseUrl, credential }),
+    bootstrapSshBearerSession: (httpBaseUrl, credential, scopes) =>
+      tauriInvoke("desktop_bridge_bootstrap_ssh_bearer_session", {
+        httpBaseUrl,
+        credential,
+        ...(scopes === undefined ? {} : { scopes }),
+      }),
     fetchSshSessionState: (httpBaseUrl: string, bearerToken: string) =>
       tauriInvoke("desktop_bridge_fetch_ssh_session_state", { httpBaseUrl, bearerToken }),
     issueSshWebSocketTicket: (httpBaseUrl: string, bearerToken: string) =>
@@ -588,7 +594,7 @@ function createTauriDesktopBridge(
       tauriInvokeOr("desktop_bridge_confirm", { message }, () => window.confirm(message)),
     setTheme: (theme) => tauriInvokeOr("desktop_bridge_set_theme", { theme }, () => undefined),
     showContextMenu: <T extends string>(
-      items: readonly ContextMenuItem<T>[],
+      items: readonly ContextMenuEntry<T>[],
       position?: { x: number; y: number },
     ) => showTauriContextMenu(items, position),
     openExternal: (url: string) =>

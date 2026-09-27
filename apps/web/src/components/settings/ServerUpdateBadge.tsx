@@ -1,5 +1,9 @@
 import type { RemoteUpdateSnapshot } from "@bibcode/contracts";
 import {
+  isRemoteUpdateRunActive,
+  type RemoteUpdateRunState,
+} from "@bibcode/client-runtime/state/remoteUpdateCoordinator";
+import {
   REMOTE_UPDATE_CHECK_TIMEOUT_MS,
   type RemoteUpdateCheckState,
   isRemoteUpdateConnectionFailure,
@@ -11,6 +15,11 @@ import type { AsyncResult } from "effect/unstable/reactivity";
 import { cn } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import {
+  remoteUpdateActionLabel,
+  remoteUpdateFailureMessage,
+  remoteUpdateProgressLabel,
+} from "./remoteUpdatePresentation";
 
 export type ServerUpdateBadgeVariant =
   | "checking"
@@ -153,6 +162,11 @@ function badgeReason(variant: ServerUpdateBadgeVariant, status: ServerUpdateStat
 }
 
 export interface ServerUpdateBadgeProps extends ServerUpdateStatus {
+  /** The caller derives visibility with visibleRemoteUpdateRun. */
+  readonly run?: RemoteUpdateRunState | null | undefined;
+  /** Saved server name, used only to explain a failed run. */
+  readonly name?: string | undefined;
+  readonly onUpdate?: (() => void) | undefined;
   /** Re-reads the status; offered next to "Can't reach updater". */
   readonly onRetry?: (() => void) | undefined;
   /**
@@ -162,15 +176,49 @@ export interface ServerUpdateBadgeProps extends ServerUpdateStatus {
   readonly onCheckAgain?: (() => void) | undefined;
 }
 
-export function ServerUpdateBadge({ onRetry, onCheckAgain, ...status }: ServerUpdateBadgeProps) {
-  const variant = serverUpdateBadgeVariant(status);
+export function ServerUpdateBadge({
+  run = null,
+  name = "The server",
+  onUpdate,
+  onRetry,
+  onCheckAgain,
+  ...status
+}: ServerUpdateBadgeProps) {
+  const variant =
+    run === null
+      ? serverUpdateBadgeVariant(status)
+      : isRemoteUpdateRunActive(run)
+        ? "busy"
+        : run.phase === "failed"
+          ? "error"
+          : "up-to-date";
   if (variant === null) return null;
   const { snapshot } = status;
+  if (
+    run === null &&
+    variant === "update-available" &&
+    snapshot?.support.installMode === "interactive" &&
+    snapshot.latestVersion !== null &&
+    onUpdate !== undefined
+  ) {
+    return (
+      <Button size="xs" variant="outline" onClick={onUpdate}>
+        {remoteUpdateActionLabel(snapshot.latestVersion)}
+      </Button>
+    );
+  }
   const label =
-    variant === "update-available" && snapshot?.latestVersion != null
-      ? `Update to v${snapshot.latestVersion}`
-      : BADGE_LABELS[variant];
-  const reason = badgeReason(variant, status);
+    run !== null
+      ? (remoteUpdateProgressLabel(run) ?? "Update failed")
+      : variant === "update-available" && snapshot?.latestVersion != null
+        ? `Update to v${snapshot.latestVersion}`
+        : BADGE_LABELS[variant];
+  const reason =
+    run === null
+      ? badgeReason(variant, status)
+      : run.phase === "failed"
+        ? remoteUpdateFailureMessage(name, run.failure)
+        : null;
   const badge = (
     <span
       data-variant={variant}
@@ -195,7 +243,7 @@ export function ServerUpdateBadge({ onRetry, onCheckAgain, ...status }: ServerUp
       </Tooltip>
     );
   const action =
-    variant === "unreachable" && onRetry !== undefined ? (
+    run !== null ? null : variant === "unreachable" && onRetry !== undefined ? (
       <Button size="xs" variant="outline" aria-label="Retry update status" onClick={onRetry}>
         Retry
       </Button>

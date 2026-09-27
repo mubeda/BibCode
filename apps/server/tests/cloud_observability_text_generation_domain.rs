@@ -1,3 +1,6 @@
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use bibcode_server::{
     cloud, production::managed_endpoint::ManagedEndpointRuntime, text_generation,
 };
@@ -105,32 +108,23 @@ async fn managed_endpoint_runtime_handles_disabled_unsupported_and_missing_conne
 fn long_running_connector_fixture(directory: &std::path::Path) -> std::path::PathBuf {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         let executable = directory.join("bibcode-connect");
-        std::fs::write(
+        executable_fixture::write_executable(
             &executable,
             "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile true; do sleep 1; done\n",
-        )
-        .expect("connector fixture should write");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("connector metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions).expect("connector should be executable");
+        );
         executable
     }
     #[cfg(windows)]
     {
         let executable = directory.join("bibcode-connect.cmd");
-        std::fs::write(
+        executable_fixture::write_executable(
             &executable,
             "@echo off\r\n\
              :loop\r\n\
              %SystemRoot%\\System32\\ping.exe -n 2 127.0.0.1 >nul\r\n\
              goto loop\r\n",
-        )
-        .expect("connector fixture should write");
+        );
         executable
     }
 }

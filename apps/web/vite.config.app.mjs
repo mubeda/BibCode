@@ -8,6 +8,7 @@ import { defineConfig } from "vite-plus";
 import pkg from "./package.json" with { type: "json" };
 
 import { loadRepoEnv } from "../../scripts/lib/public-config";
+import { themeBootstrapPlugins } from "../../scripts/lib/theme-bootstrap";
 
 const repoEnv = loadRepoEnv();
 Object.assign(process.env, repoEnv);
@@ -77,6 +78,7 @@ const devProxyTarget = resolveDevProxyTarget(configuredWsUrl);
 export default defineConfig(({ mode } = {}) => {
   return {
     plugins: [
+      ...themeBootstrapPlugins(),
       tanstackRouter({
         // Unit tests inspect route component behavior directly. Keep the source
         // components available instead of replacing them with lazy wrappers.

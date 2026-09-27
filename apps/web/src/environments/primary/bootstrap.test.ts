@@ -1,4 +1,12 @@
-import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
+import {
+  PrimaryConnectionRegistration,
+  PrimaryConnectionTarget,
+} from "@bibcode/client-runtime/connection";
+import {
+  EnvironmentId,
+  type DesktopEnvironmentBootstrap,
+  type ExecutionEnvironmentDescriptor,
+} from "@bibcode/contracts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import * as Effect from "effect/Effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -15,6 +23,12 @@ import {
   writePrimaryEnvironmentDescriptor,
 } from ".";
 import { installEnvironmentHttpTest } from "../../../test/environmentHttpTest";
+import {
+  canReuseCachedPlatformRegistration,
+  primaryRegistrationToRetainAfterTopologyRead,
+  readPrimaryEnvironmentTargetResult,
+} from "../../connection/platform";
+import { isDesktopPrimaryEnvironmentWithheldError } from "./target";
 
 const BASE_ENVIRONMENT = {
   environmentId: EnvironmentId.make("environment-local"),
@@ -25,6 +39,7 @@ const BASE_ENVIRONMENT = {
   },
   serverVersion: "0.0.0-test",
   storageInstanceId: null,
+  bootId: null,
   remoteUpdateSupport: null,
   remoteProtocolVersion: 1,
   minCompatibleRemoteProtocol: 1,
@@ -92,6 +107,7 @@ describe("environmentBootstrap", () => {
       },
       serverVersion: "0.0.0-test",
       storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      bootId: null,
       remoteUpdateSupport: null,
       remoteProtocolVersion: 1,
       minCompatibleRemoteProtocol: 1,
@@ -314,7 +330,56 @@ describe("environmentBootstrap", () => {
     });
   });
 
-  it("ignores empty desktop endpoint entries and supports an HTTPS window origin", () => {
+  it.each([
+    { runtime: "Windows packaged", url: "http://tauri.localhost/", configuredUrl: "" },
+    { runtime: "Linux/macOS packaged", url: "tauri://localhost/", configuredUrl: "" },
+    {
+      runtime: "desktop development",
+      url: "http://127.0.0.1:5733/",
+      configuredUrl: "http://127.0.0.1:13773/",
+    },
+  ])("withholds the primary target without a bootstrap in $runtime", ({ url, configuredUrl }) => {
+    vi.stubEnv("VITE_HTTP_URL", configuredUrl);
+    vi.stubEnv("VITE_WS_URL", "");
+    vi.stubGlobal("window", {
+      location: new URL(url),
+      history: { replaceState: vi.fn() },
+      desktopBridge: { getLocalEnvironmentBootstraps: () => [] },
+    });
+
+    expect(readPrimaryEnvironmentTarget).toThrowError(
+      expect.objectContaining({ _tag: "DesktopPrimaryEnvironmentWithheldError" }),
+    );
+    expect(() => resolvePrimaryEnvironmentHttpUrl("/.well-known/bibcode/environment")).toThrowError(
+      expect.objectContaining({ _tag: "DesktopPrimaryEnvironmentWithheldError" }),
+    );
+    expect(
+      isDesktopPrimaryEnvironmentWithheldError(captureThrown(readPrimaryEnvironmentTarget)),
+    ).toBe(true);
+  });
+
+  it("withholds the primary target when only secondary desktop bootstraps exist", () => {
+    vi.stubGlobal("window", {
+      location: new URL("http://tauri.localhost/"),
+      history: { replaceState: vi.fn() },
+      desktopBridge: {
+        getLocalEnvironmentBootstraps: () => [
+          {
+            id: "wsl:ubuntu",
+            label: "Ubuntu",
+            httpBaseUrl: "http://127.0.0.1:4773/",
+            wsBaseUrl: "ws://127.0.0.1:4773/",
+          },
+        ],
+      },
+    });
+
+    expect(readPrimaryEnvironmentTarget).toThrowError(
+      expect.objectContaining({ _tag: "DesktopPrimaryEnvironmentWithheldError" }),
+    );
+  });
+
+  it("withholds empty desktop endpoint entries", () => {
     vi.stubGlobal("window", {
       location: new URL("https://app.example.test/"),
       history: { replaceState: vi.fn() },
@@ -329,6 +394,14 @@ describe("environmentBootstrap", () => {
       },
     });
 
+    expect(readPrimaryEnvironmentTarget).toThrowError(
+      expect.objectContaining({ _tag: "DesktopPrimaryEnvironmentWithheldError" }),
+    );
+  });
+
+  it("supports an HTTPS window-origin fallback in browser mode", () => {
+    installTestBrowser("https://app.example.test/");
+
     expect(readPrimaryEnvironmentTarget()).toEqual({
       source: "window-origin",
       target: {
@@ -336,6 +409,68 @@ describe("environmentBootstrap", () => {
         wsBaseUrl: "wss://app.example.test/",
       },
     });
+    expect(resolvePrimaryEnvironmentHttpUrl("/.well-known/bibcode/environment")).toBe(
+      "https://app.example.test/.well-known/bibcode/environment",
+    );
+  });
+
+  it("retains a withheld desktop primary registration and reuses it when its bootstrap returns", () => {
+    let bootstraps: DesktopEnvironmentBootstrap[] = [];
+    vi.stubGlobal("window", {
+      location: new URL("http://tauri.localhost/"),
+      history: { replaceState: vi.fn() },
+      desktopBridge: { getLocalEnvironmentBootstraps: () => bootstraps },
+    });
+    const registration = new PrimaryConnectionRegistration({
+      target: new PrimaryConnectionTarget({
+        environmentId: EnvironmentId.make("primary"),
+        label: "Local",
+        httpBaseUrl: "http://127.0.0.1:3773/",
+        wsBaseUrl: "ws://127.0.0.1:3773/",
+      }),
+    });
+    const cached = {
+      signature: "primary|http://127.0.0.1:3773/|ws://127.0.0.1:3773/",
+      registration,
+    };
+    const previous = new Map([["primary", cached]]);
+
+    const withheld = readPrimaryEnvironmentTargetResult();
+    expect(withheld).toMatchObject({
+      _tag: "Failure",
+      cause: { _tag: "DesktopPrimaryEnvironmentWithheldError" },
+    });
+    const retained = primaryRegistrationToRetainAfterTopologyRead(previous, withheld);
+    expect(retained).toBe(cached);
+    if (retained === undefined) {
+      throw new Error("Expected the cached primary registration to be retained.");
+    }
+
+    bootstraps = [
+      {
+        id: "primary",
+        label: "Local",
+        httpBaseUrl: "http://127.0.0.1:3773",
+        wsBaseUrl: "ws://127.0.0.1:3773",
+      },
+    ];
+    const restored = readPrimaryEnvironmentTargetResult();
+    expect(restored).toEqual({
+      _tag: "Success",
+      target: {
+        source: "desktop-managed",
+        target: {
+          httpBaseUrl: "http://127.0.0.1:3773/",
+          wsBaseUrl: "ws://127.0.0.1:3773/",
+        },
+      },
+    });
+    if (restored._tag !== "Success" || restored.target === null) {
+      throw new Error("Expected the desktop primary bootstrap to be restored.");
+    }
+    const signature = `primary|${restored.target.target.httpBaseUrl}|${restored.target.target.wsBaseUrl}`;
+    expect(canReuseCachedPlatformRegistration(retained, signature, 6_000)).toBe(true);
+    expect(retained.registration).toBe(registration);
   });
 
   it("preserves an unsupported window-origin protocol", () => {

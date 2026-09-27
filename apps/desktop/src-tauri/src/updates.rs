@@ -1,9 +1,13 @@
-use std::{collections::BTreeSet, sync::Mutex, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use bibcode_server::{
     DESKTOP_MAINTENANCE_TOKEN_HEADER, MAINTENANCE_UPDATE_CANCEL_PATH,
     MAINTENANCE_UPDATE_COMMIT_PATH, MAINTENANCE_UPDATE_PREPARE_PATH,
-    MAINTENANCE_UPDATE_STATUS_PATH, PrepareForUpdateResult,
+    MAINTENANCE_UPDATE_STATUS_PATH, MaintenanceError, PrepareForUpdateResult, UpdateMaintenance,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,7 +18,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 #[cfg(test)]
 use crate::test_support::FixtureEvent;
 use crate::{
-    backend::{BackendRunConfig, BackendSupervisor, BackendUpdateSnapshot},
+    backend::{
+        BackendRecoveryEntry, BackendRunConfig, BackendStartFailure, BackendSupervisor,
+        BackendUpdateSnapshot, emit_project_data_status_changed,
+    },
     config::{app_version, runtime_info},
 };
 
@@ -31,6 +38,54 @@ const STARTUP_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(15);
 const BACKGROUND_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const UPDATE_PROTECTION_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const UPDATE_PROTECTION_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+const UPDATE_PROTECTION_PREPARE_TIMEOUT: Duration = Duration::from_secs(45);
+const UPDATE_PROTECTION_FINISH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The primary calls its owner directly, including while shared on a wide bind.
+/// WSL and other external backends retain the loopback HTTP maintenance API.
+#[derive(Clone)]
+pub(crate) enum UpdateProtectionTransport {
+    Http,
+    InProcess(Arc<UpdateMaintenance>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MaintenanceFinish {
+    Commit,
+    Cancel,
+}
+
+impl MaintenanceFinish {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Commit => MAINTENANCE_UPDATE_COMMIT_PATH,
+            Self::Cancel => MAINTENANCE_UPDATE_CANCEL_PATH,
+        }
+    }
+
+    const fn step(self) -> MaintenanceStep {
+        match self {
+            Self::Commit => MaintenanceStep::Commit,
+            Self::Cancel => MaintenanceStep::Cancel,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MaintenanceStep {
+    Prepare,
+    Commit,
+    Cancel,
+}
+
+impl MaintenanceStep {
+    const fn timeout_detail(self) -> &'static str {
+        match self {
+            Self::Prepare => "timed out after 45 seconds",
+            Self::Commit | Self::Cancel => "timed out after 10 seconds",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -56,7 +111,7 @@ enum ProtectionStatus {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-enum ProtectionStage {
+pub(crate) enum ProtectionStage {
     WaitingForMutations,
     QuiescingRuntime,
     AcquiringStoreLock,
@@ -67,9 +122,9 @@ enum ProtectionStage {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct UpdateMaintenanceProgress {
+pub(crate) struct UpdateMaintenanceProgress {
     #[serde(default)]
-    stage: Option<ProtectionStage>,
+    pub(crate) stage: Option<ProtectionStage>,
     #[serde(default)]
     elapsed_ms: Option<u64>,
     #[serde(default)]
@@ -88,6 +143,42 @@ struct DesktopUpdateProtection {
     stage: Option<ProtectionStage>,
     elapsed_ms: Option<u64>,
     blocked_operation_count: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum BackendRecoveryReason {
+    PortInUse,
+    Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopBackendRecovery {
+    environment_id: String,
+    label: String,
+    reason: BackendRecoveryReason,
+    port: u16,
+}
+
+impl From<BackendRecoveryEntry> for DesktopBackendRecovery {
+    fn from(entry: BackendRecoveryEntry) -> Self {
+        Self {
+            environment_id: entry.environment_id,
+            label: entry.label,
+            reason: match entry.failure {
+                BackendStartFailure::PortInUse { .. } => BackendRecoveryReason::PortInUse,
+                BackendStartFailure::Other { .. } => BackendRecoveryReason::Other,
+            },
+            port: entry.port,
+        }
+    }
+}
+
+fn backend_recovery<R: Runtime>(app: &AppHandle<R>) -> Vec<BackendRecoveryEntry> {
+    app.try_state::<BackendSupervisor>()
+        .map(|backend| backend.backend_recovery())
+        .unwrap_or_default()
 }
 
 fn apply_named_secondary_exclusions(
@@ -140,7 +231,15 @@ pub(crate) struct DesktopUpdateInstallInput {
 
 struct PreparedBackend {
     config: BackendRunConfig,
+    transport: UpdateProtectionTransport,
     operation_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteUpdateRequest {
+    pub label: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Default)]
@@ -160,6 +259,13 @@ struct DesktopUpdateInner {
     install_in_flight: bool,
     phase: UpdatePhase,
     protection: Vec<DesktopUpdateProtection>,
+    requested_by: Option<RemoteUpdateRequest>,
+}
+
+#[cfg(test)]
+struct InstallFailure {
+    message: String,
+    on_failure: Option<Box<dyn FnOnce() + Send>>,
 }
 
 #[derive(Default)]
@@ -168,11 +274,13 @@ pub struct DesktopUpdateManager {
     #[cfg(test)]
     check_attempts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
+    panic_next_check: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     background_check_completion: FixtureEvent,
     #[cfg(test)]
     background_timer_armed: FixtureEvent,
     #[cfg(test)]
-    install_failure: Mutex<Option<String>>,
+    install_failure: Mutex<Option<InstallFailure>>,
 }
 
 #[derive(Clone, Copy)]
@@ -192,11 +300,7 @@ struct UpdateOperationGuard<'a, R: Runtime> {
 impl<R: Runtime> UpdateOperationGuard<'_, R> {
     fn finish(mut self, update: impl FnOnce(&mut DesktopUpdateInner)) -> DesktopUpdateInner {
         let state = {
-            let mut inner = self
-                .manager
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut inner = self.manager.lock_inner();
             update(&mut inner);
             self.operation.clear_in_flight(&mut inner);
             inner.clone_without_updates()
@@ -212,11 +316,7 @@ impl<R: Runtime> Drop for UpdateOperationGuard<'_, R> {
             return;
         }
         let state = {
-            let mut inner = self
-                .manager
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut inner = self.manager.lock_inner();
             self.operation.clear_in_flight(&mut inner);
             inner.restore_visible_state(&self.prior_state);
             inner.clone_without_updates()
@@ -239,8 +339,27 @@ impl DesktopUpdateManager {
         Self::default()
     }
 
+    fn lock_inner(&self) -> MutexGuard<'_, DesktopUpdateInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            let inner = poisoned.into_inner();
+            self.inner.clear_poison();
+            tracing::warn!(
+                "desktop update state lock was poisoned by an earlier panic; keeping the last state"
+            );
+            inner
+        })
+    }
+
+    pub(crate) fn install_in_flight(&self) -> bool {
+        self.lock_inner().install_in_flight
+    }
+
+    pub(crate) fn emit_current_state<R: Runtime>(&self, app: &AppHandle<R>) {
+        emit_update_state(app, &self.state(app));
+    }
+
     pub fn state<R: Runtime>(&self, app: &AppHandle<R>) -> Value {
-        let inner = self.inner.lock().expect("desktop update mutex poisoned");
+        let inner = self.lock_inner();
         match app.updater() {
             Ok(_) => update_state_value(app, true, &inner),
             Err(error) if is_updater_disabled(&error) => disabled_update_state(app),
@@ -248,14 +367,80 @@ impl DesktopUpdateManager {
         }
     }
 
+    /// Records the first remote requester; later clients join without another notice.
+    pub(crate) fn begin_remote_request<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        request: RemoteUpdateRequest,
+    ) -> bool {
+        let mut began = false;
+        let state = self.replace_inner(|inner| {
+            if inner.requested_by.is_none() {
+                inner.requested_by = Some(request);
+                began = true;
+            }
+        });
+        if began {
+            state.emit(app);
+        }
+        began
+    }
+
+    pub(crate) fn clear_remote_request<R: Runtime>(&self, app: &AppHandle<R>) {
+        self.replace_inner(|inner| inner.requested_by = None)
+            .emit(app);
+    }
+
+    pub(crate) fn note_remote_secondary_protection_failure<R: Runtime>(&self, app: &AppHandle<R>) {
+        const FINISH_ON_HOST: &str = "Finish the update on the host.";
+        let mut changed = false;
+        let state = self.replace_inner(|inner| {
+            if inner.phase != UpdatePhase::Failed
+                || !inner
+                    .protection
+                    .iter()
+                    .any(|entry| !entry.primary && entry.status == ProtectionStatus::Failed)
+                || inner
+                    .protection
+                    .iter()
+                    .any(|entry| entry.primary && entry.status == ProtectionStatus::Failed)
+            {
+                return;
+            }
+            let message = inner.message.get_or_insert_with(String::new);
+            if message.ends_with(FINISH_ON_HOST) {
+                return;
+            }
+            if !message.is_empty() {
+                if !message.ends_with(['.', '!', '?']) {
+                    message.push('.');
+                }
+                message.push(' ');
+            }
+            message.push_str(FINISH_ON_HOST);
+            changed = true;
+        });
+        if changed {
+            state.emit(app);
+        }
+    }
+
     pub async fn check_for_update<R: Runtime>(&self, app: AppHandle<R>) -> Value {
         #[cfg(test)]
-        self.check_attempts
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        {
+            self.check_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                !self
+                    .panic_next_check
+                    .swap(false, std::sync::atomic::Ordering::SeqCst),
+                "synthetic panic for background_scheduler_survives_a_panicking_check"
+            );
+        }
 
         let busy_state = {
-            let inner = self.inner.lock().expect("desktop update mutex poisoned");
-            (!can_begin_check(&inner)).then(|| update_state_value(&app, true, &inner))
+            let inner = self.lock_inner();
+            (!can_begin_check(&app, &inner)).then(|| update_state_value(&app, true, &inner))
         };
         if let Some(state) = busy_state {
             return json!({
@@ -355,8 +540,8 @@ impl DesktopUpdateManager {
 
     pub async fn download_update<R: Runtime>(&self, app: AppHandle<R>) -> Value {
         let busy_state = {
-            let inner = self.inner.lock().expect("desktop update mutex poisoned");
-            (!can_begin_download(&inner)).then(|| update_state_value(&app, true, &inner))
+            let inner = self.lock_inner();
+            (!can_begin_download(&app, &inner)).then(|| update_state_value(&app, true, &inner))
         };
         if let Some(state) = busy_state {
             return json!({
@@ -379,8 +564,8 @@ impl DesktopUpdateManager {
         }
 
         let (update, download_guard, state) = {
-            let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
-            if !can_begin_download(&inner) {
+            let mut inner = self.lock_inner();
+            if !can_begin_download(&app, &inner) {
                 return json!({
                     "accepted": false,
                     "completed": false,
@@ -490,8 +675,14 @@ impl DesktopUpdateManager {
         input: DesktopUpdateInstallInput,
     ) -> Value {
         let unavailable_state = {
-            let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
-            if inner.install_in_flight {
+            let mut inner = self.lock_inner();
+            if !backend.backend_recovery().is_empty() {
+                let mut state = update_state_value(app, true, &inner);
+                state["message"] = Value::String(
+                    "Restart the server before retrying the installation.".to_owned(),
+                );
+                Some(state)
+            } else if inner.install_in_flight {
                 Some(update_state_value(app, true, &inner))
             } else if input.skip_protection
                 && !protection_bypass_allowed(inner.phase, &inner.protection)
@@ -529,12 +720,7 @@ impl DesktopUpdateManager {
             });
         }
 
-        let downloaded = self
-            .inner
-            .lock()
-            .expect("desktop update mutex poisoned")
-            .downloaded_update
-            .take();
+        let downloaded = self.lock_inner().downloaded_update.take();
         let Some(downloaded) = downloaded else {
             self.replace_inner(|inner| inner.install_in_flight = false);
             let state = self.record_error_state(
@@ -636,7 +822,15 @@ impl DesktopUpdateManager {
                     continue;
                 }
                 let environment_id = environment.environment_id.clone();
-                match prepare_backend_for_update(&config, |progress| {
+                let transport = if environment.primary {
+                    snapshot.in_process_maintenance(&environment_id).map_or(
+                        UpdateProtectionTransport::Http,
+                        UpdateProtectionTransport::InProcess,
+                    )
+                } else {
+                    UpdateProtectionTransport::Http
+                };
+                match prepare_backend_for_update(&config, &transport, |progress| {
                     if set_protection_progress(&mut protection, &environment_id, &progress) {
                         self.replace_inner(|inner| inner.protection = protection.clone())
                             .emit(app);
@@ -653,6 +847,7 @@ impl DesktopUpdateManager {
                         );
                         prepared.push(PreparedBackend {
                             config,
+                            transport,
                             operation_id: result.operation_id,
                         });
                     }
@@ -681,7 +876,8 @@ impl DesktopUpdateManager {
             for operation in &prepared {
                 if let Err(error) = finish_backend_update(
                     &operation.config,
-                    MAINTENANCE_UPDATE_COMMIT_PATH,
+                    &operation.transport,
+                    MaintenanceFinish::Commit,
                     &operation.operation_id,
                 )
                 .await
@@ -698,7 +894,11 @@ impl DesktopUpdateManager {
             return self.finish_failed_install(app, downloaded, protection, message);
         }
         if let Err(error) = backend.stop_update_snapshot(&snapshot).await {
-            let recovery_error = backend.restart_update_snapshot(&snapshot).await.err();
+            let recovery_error = backend
+                .restart_update_snapshot(&snapshot)
+                .await
+                .err()
+                .map(|error| error.to_string());
             let message = append_recovery_error(error, recovery_error);
             return self.finish_failed_install(app, downloaded, protection, message);
         }
@@ -729,12 +929,18 @@ impl DesktopUpdateManager {
                     "state": update_state,
                 });
                 if restart_required_after_install(std::env::consts::OS) {
+                    // A main-thread restart skips RunEvent::Exit.
+                    crate::relaunch::prepare_descriptors_for_relaunch();
                     app.restart();
                 }
                 result
             }
             Err(error) => {
-                let recovery_error = backend.restart_update_snapshot(&snapshot).await.err();
+                let recovery_error = backend
+                    .restart_update_snapshot(&snapshot)
+                    .await
+                    .err()
+                    .map(|error| error.to_string());
                 let message = append_recovery_error(error, recovery_error);
                 self.finish_failed_install(app, downloaded, protection, message)
             }
@@ -749,7 +955,10 @@ impl DesktopUpdateManager {
             .expect("desktop update install failure mutex poisoned")
             .take()
         {
-            return Err(error);
+            if let Some(on_failure) = error.on_failure {
+                on_failure();
+            }
+            return Err(error.message);
         }
         downloaded
             .update
@@ -762,7 +971,10 @@ impl DesktopUpdateManager {
         *self
             .install_failure
             .lock()
-            .expect("desktop update install failure mutex poisoned") = Some(error.into());
+            .expect("desktop update install failure mutex poisoned") = Some(InstallFailure {
+            message: error.into(),
+            on_failure: None,
+        });
     }
 
     fn finish_failed_install<R: Runtime>(
@@ -784,15 +996,19 @@ impl DesktopUpdateManager {
             inner.phase = UpdatePhase::Failed;
             inner.protection = protection;
         });
+        let update_state = state.emit(app);
+        for entry in backend_recovery(app) {
+            emit_project_data_status_changed(app, &entry.environment_id);
+        }
         json!({
             "accepted": true,
             "completed": false,
-            "state": state.emit(app),
+            "state": update_state,
         })
     }
 
     fn replace_inner(&self, update: impl FnOnce(&mut DesktopUpdateInner)) -> DesktopUpdateInner {
-        let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
+        let mut inner = self.lock_inner();
         update(&mut inner);
         inner.clone_without_updates()
     }
@@ -801,8 +1017,8 @@ impl DesktopUpdateManager {
         &self,
         app: &AppHandle<R>,
     ) -> Option<(UpdateOperationGuard<'_, R>, DesktopUpdateInner)> {
-        let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
-        if !can_begin_check(&inner) {
+        let mut inner = self.lock_inner();
+        if !can_begin_check(app, &inner) {
             return None;
         }
         let prior_state = inner.clone_without_updates();
@@ -827,7 +1043,7 @@ impl DesktopUpdateManager {
     }
 
     fn current_state<R: Runtime>(&self, app: &AppHandle<R>) -> Value {
-        let inner = self.inner.lock().expect("desktop update mutex poisoned");
+        let inner = self.lock_inner();
         update_state_value(app, true, &inner)
     }
 
@@ -872,10 +1088,12 @@ impl DesktopUpdateInner {
             install_in_flight: false,
             phase: self.phase,
             protection: self.protection.clone(),
+            requested_by: self.requested_by.clone(),
         }
     }
 
     fn restore_visible_state(&mut self, prior_state: &DesktopUpdateInner) {
+        // Only begin_remote_request and clear_remote_request change requested_by.
         self.available_version = prior_state.available_version.clone();
         self.downloaded_version = prior_state.downloaded_version.clone();
         self.status = prior_state.status.clone();
@@ -889,8 +1107,9 @@ impl DesktopUpdateInner {
     }
 }
 
-fn can_begin_check(inner: &DesktopUpdateInner) -> bool {
-    !inner.check_in_flight
+fn can_begin_check<R: Runtime>(app: &AppHandle<R>, inner: &DesktopUpdateInner) -> bool {
+    backend_recovery(app).is_empty()
+        && !inner.check_in_flight
         && !inner.download_in_flight
         && !inner.install_in_flight
         && !matches!(
@@ -899,8 +1118,9 @@ fn can_begin_check(inner: &DesktopUpdateInner) -> bool {
         )
 }
 
-fn can_begin_download(inner: &DesktopUpdateInner) -> bool {
-    !inner.check_in_flight
+fn can_begin_download<R: Runtime>(app: &AppHandle<R>, inner: &DesktopUpdateInner) -> bool {
+    backend_recovery(app).is_empty()
+        && !inner.check_in_flight
         && !inner.download_in_flight
         && !inner.install_in_flight
         && !matches!(
@@ -957,7 +1177,88 @@ fn set_protection_progress(
     changed
 }
 
-async fn prepare_backend_for_update(
+pub(crate) async fn prepare_backend_for_update(
+    config: &BackendRunConfig,
+    transport: &UpdateProtectionTransport,
+    on_progress: impl FnMut(UpdateMaintenanceProgress),
+) -> Result<PrepareForUpdateResult, String> {
+    prepare_backend_for_update_with_timeout(
+        config,
+        transport,
+        UPDATE_PROTECTION_PREPARE_TIMEOUT,
+        on_progress,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_backend_for_update_with_timeout(
+    config: &BackendRunConfig,
+    transport: &UpdateProtectionTransport,
+    timeout: Duration,
+    on_progress: impl FnMut(UpdateMaintenanceProgress),
+) -> Result<PrepareForUpdateResult, String> {
+    tokio::time::timeout(timeout, async {
+        match transport {
+            UpdateProtectionTransport::Http => prepare_backend_over_http(config, on_progress).await,
+            UpdateProtectionTransport::InProcess(maintenance) => {
+                prepare_backend_in_process(config, maintenance, on_progress).await
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(maintenance_failure_text(
+            config,
+            MaintenanceStep::Prepare,
+            MaintenanceStep::Prepare.timeout_detail(),
+        ))
+    })
+}
+
+async fn prepare_backend_in_process(
+    config: &BackendRunConfig,
+    maintenance: &Arc<UpdateMaintenance>,
+    mut on_progress: impl FnMut(UpdateMaintenanceProgress),
+) -> Result<PrepareForUpdateResult, String> {
+    // A caller timeout must not strand the owner in Preparing. Dropping this
+    // handle detaches preparation so it can settle and retain its exit guarantees.
+    let mut prepare = tokio::spawn({
+        let maintenance = maintenance.clone();
+        async move { maintenance.prepare().await }
+    });
+    let first_progress_poll = tokio::time::Instant::now() + UPDATE_PROTECTION_PROGRESS_INTERVAL;
+    let mut progress_interval =
+        tokio::time::interval_at(first_progress_poll, UPDATE_PROTECTION_PROGRESS_INTERVAL);
+    progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut prepare => {
+                return result.map_err(|_| {
+                    maintenance_failure_text(
+                        config,
+                        MaintenanceStep::Prepare,
+                        "the preparation task stopped unexpectedly",
+                    )
+                })?.map_err(|error| {
+                    maintenance_failure_text(config, MaintenanceStep::Prepare, &error.to_string())
+                });
+            }
+            _ = progress_interval.tick() => {
+                if let Ok(status) =
+                    tokio::time::timeout(UPDATE_PROTECTION_STATUS_TIMEOUT, maintenance.status()).await
+                    && let Ok(progress) = serde_json::from_value::<UpdateMaintenanceProgress>(status)
+                    && progress.stage.is_some()
+                {
+                    on_progress(progress);
+                }
+            }
+        }
+    }
+}
+
+async fn prepare_backend_over_http(
     config: &BackendRunConfig,
     mut on_progress: impl FnMut(UpdateMaintenanceProgress),
 ) -> Result<PrepareForUpdateResult, String> {
@@ -972,7 +1273,7 @@ async fn prepare_backend_for_update(
             DESKTOP_MAINTENANCE_TOKEN_HEADER,
             &config.desktop_bootstrap_token,
         )
-        .timeout(Duration::from_secs(45))
+        .timeout(UPDATE_PROTECTION_PREPARE_TIMEOUT)
         .send();
     tokio::pin!(prepare);
     let first_progress_poll = tokio::time::Instant::now() + UPDATE_PROTECTION_PROGRESS_INTERVAL;
@@ -983,21 +1284,18 @@ async fn prepare_backend_for_update(
     loop {
         tokio::select! {
             biased;
+            response = &mut prepare => {
+                let response = response.map_err(|error| {
+                    maintenance_transport_error(config, MaintenanceStep::Prepare, &error)
+                })?;
+                return decode_maintenance_response(config, MaintenanceStep::Prepare, response).await;
+            }
             _ = progress_interval.tick() => {
                 if let Ok(progress) = fetch_update_maintenance_progress(&client, config).await
                     && progress.stage.is_some()
                 {
                     on_progress(progress);
                 }
-            }
-            response = &mut prepare => {
-                let response = response.map_err(|error| {
-                    format!(
-                        "Could not prepare {} for update protection: {error}",
-                        config.label
-                    )
-                })?;
-                return decode_maintenance_response(config, "prepare", response).await;
             }
         }
     }
@@ -1027,66 +1325,145 @@ async fn fetch_update_maintenance_progress(
     response.json().await.map_err(|error| error.to_string())
 }
 
-async fn finish_backend_update(
+pub(crate) async fn finish_backend_update(
     config: &BackendRunConfig,
-    path: &str,
+    transport: &UpdateProtectionTransport,
+    finish: MaintenanceFinish,
+    operation_id: &str,
+) -> Result<(), String> {
+    let step = finish.step();
+    tokio::time::timeout(UPDATE_PROTECTION_FINISH_TIMEOUT, async {
+        match transport {
+            UpdateProtectionTransport::Http => {
+                finish_backend_update_over_http(config, finish, operation_id).await
+            }
+            UpdateProtectionTransport::InProcess(maintenance) => {
+                let operation_id = uuid::Uuid::parse_str(operation_id).map_err(|_| {
+                    maintenance_failure_text(
+                        config,
+                        step,
+                        &MaintenanceError::OperationMismatch.to_string(),
+                    )
+                })?;
+                let result = match finish {
+                    MaintenanceFinish::Commit => maintenance.commit(operation_id).await,
+                    MaintenanceFinish::Cancel => maintenance.cancel(operation_id).await,
+                };
+                result
+                    .map_err(|error| maintenance_failure_text(config, step, &error.to_string()))?;
+                // Match the HTTP route: a quiesced backend exits after either finish.
+                maintenance.shutdown_after_response();
+                Ok(())
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(maintenance_failure_text(
+            config,
+            step,
+            step.timeout_detail(),
+        ))
+    })
+}
+
+async fn finish_backend_update_over_http(
+    config: &BackendRunConfig,
+    finish: MaintenanceFinish,
     operation_id: &str,
 ) -> Result<(), String> {
     let response = reqwest::Client::new()
-        .post(format!("{}{}", config.http_base_url(), path))
+        .post(format!("{}{}", config.http_base_url(), finish.path()))
         .header(
             DESKTOP_MAINTENANCE_TOKEN_HEADER,
             &config.desktop_bootstrap_token,
         )
         .json(&json!({ "operationId": operation_id }))
-        .timeout(Duration::from_secs(10))
+        .timeout(UPDATE_PROTECTION_FINISH_TIMEOUT)
         .send()
         .await
-        .map_err(|error| {
-            format!(
-                "Could not complete update maintenance for {}: {error}",
-                config.label
-            )
-        })?;
+        .map_err(|error| maintenance_transport_error(config, finish.step(), &error))?;
     if response.status().is_success() {
         Ok(())
     } else {
-        let status = response.status();
-        Err(format!(
-            "Update maintenance for {} failed with HTTP {}.",
-            config.label,
-            status.as_u16()
-        ))
+        Err(maintenance_response_error(config, finish.step(), response).await)
     }
 }
 
 async fn decode_maintenance_response<T: serde::de::DeserializeOwned>(
     config: &BackendRunConfig,
-    operation: &str,
+    step: MaintenanceStep,
     response: reqwest::Response,
 ) -> Result<T, String> {
     if !response.status().is_success() {
-        let status = response.status();
-        let detail = response
-            .json::<UpdateMaintenanceErrorResponse>()
-            .await
-            .ok()
-            .map(|error| bounded_maintenance_error_detail(&error.message));
-        return Err(format!(
-            "Could not {operation} {} for update protection (HTTP {}).{}",
-            config.label,
-            status.as_u16(),
-            detail
-                .map(|detail| format!(" {detail}"))
-                .unwrap_or_default()
-        ));
+        return Err(maintenance_response_error(config, step, response).await);
     }
     response.json::<T>().await.map_err(|error| {
-        format!(
-            "Could not decode the update protection result for {}: {error}",
-            config.label
-        )
+        if error.is_timeout() {
+            maintenance_transport_error(config, step, &error)
+        } else {
+            format!(
+                "Could not decode the update protection result for {}: {error}",
+                config.label
+            )
+        }
     })
+}
+
+async fn maintenance_response_error(
+    config: &BackendRunConfig,
+    step: MaintenanceStep,
+    response: reqwest::Response,
+) -> String {
+    let fallback = if response.status() == reqwest::StatusCode::NOT_FOUND {
+        "update maintenance is not available"
+    } else {
+        "the server gave no reason"
+    };
+    match response.json::<UpdateMaintenanceErrorResponse>().await {
+        Ok(error) if !error.message.trim().is_empty() => {
+            maintenance_failure_text(config, step, &error.message)
+        }
+        Err(error) if error.is_timeout() => maintenance_transport_error(config, step, &error),
+        _ => maintenance_failure_text(config, step, fallback),
+    }
+}
+
+fn maintenance_transport_error(
+    config: &BackendRunConfig,
+    step: MaintenanceStep,
+    error: &reqwest::Error,
+) -> String {
+    if error.is_timeout() {
+        maintenance_failure_text(config, step, step.timeout_detail())
+    } else {
+        maintenance_failure_text(config, step, &error.to_string())
+    }
+}
+
+fn maintenance_failure_text(
+    config: &BackendRunConfig,
+    step: MaintenanceStep,
+    detail: &str,
+) -> String {
+    let detail = bounded_maintenance_error_detail(detail);
+    let punctuation = if detail.ends_with(['.', '!', '?']) {
+        ""
+    } else {
+        "."
+    };
+    let label = &config.label;
+    match step {
+        MaintenanceStep::Prepare => {
+            format!("Could not prepare {label} for update protection: {detail}{punctuation}")
+        }
+        MaintenanceStep::Commit => {
+            format!("Could not finish update protection for {label}: {detail}{punctuation}")
+        }
+        MaintenanceStep::Cancel => {
+            format!("Could not cancel update protection for {label}: {detail}{punctuation}")
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1116,7 +1493,8 @@ async fn cancel_stop_and_restart(
     for operation in prepared {
         if let Err(error) = finish_backend_update(
             &operation.config,
-            MAINTENANCE_UPDATE_CANCEL_PATH,
+            &operation.transport,
+            MaintenanceFinish::Cancel,
             &operation.operation_id,
         )
         .await
@@ -1143,7 +1521,7 @@ async fn stop_and_restart(
     match (stop, restart) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(stop), Ok(())) => Err(stop),
-        (Ok(()), Err(restart)) => Err(restart),
+        (Ok(()), Err(restart)) => Err(restart.to_string()),
         (Err(stop), Err(restart)) => Err(format!("{stop}; {restart}")),
     }
 }
@@ -1241,6 +1619,8 @@ pub fn disabled_update_state<R: Runtime>(app: &AppHandle<R>) -> Value {
         "canRetry": false,
         "phase": UpdatePhase::Idle,
         "protection": [],
+        "backendRecovery": [],
+        "requestedBy": null,
     })
 }
 
@@ -1266,6 +1646,8 @@ fn error_update_state<R: Runtime>(
         "canRetry": true,
         "phase": UpdatePhase::Failed,
         "protection": [],
+        "backendRecovery": [],
+        "requestedBy": null,
     })
 }
 
@@ -1291,6 +1673,8 @@ fn update_state_value<R: Runtime>(
         "canRetry": inner.can_retry,
         "phase": inner.phase,
         "protection": inner.protection,
+        "requestedBy": inner.requested_by,
+        "backendRecovery": backend_recovery(app).into_iter().map(DesktopBackendRecovery::from).collect::<Vec<_>>(),
     })
 }
 
@@ -1334,6 +1718,278 @@ mod tests {
     const TEST_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\nRWQf6LRCGA9i59SLOFxz6NxvASXDJeRtuZykwQepbDEGt87ig1BNpWaVWuNrm73YiIiJbq71Wi+dP9eKL8OC351vwIasSSbXxwA=\ntrusted comment: timestamp:1555779966\tfile:test\nQtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfNQUaOAA==";
 
     #[test]
+    fn refused_recovery_install_preserves_original_message() {
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_owned());
+        let manager = DesktopUpdateManager::new();
+        let root = tempfile::tempdir().expect("isolated data");
+        let supervisor = pending_recovery_supervisor(root.path());
+        app.manage(supervisor.clone());
+        manager.replace_inner(|inner| {
+            inner.message = Some("original installer and restart failure".to_owned());
+        });
+        for skip_protection in [false, true] {
+            let result = tauri::async_runtime::block_on(manager.install_update(
+                app.handle(),
+                &supervisor,
+                DesktopUpdateInstallInput {
+                    skip_protection,
+                    ..Default::default()
+                },
+            ));
+            assert_eq!(result["accepted"], false);
+            assert_eq!(
+                result["state"]["message"],
+                "Restart the server before retrying the installation."
+            );
+            assert_eq!(
+                manager.state(app.handle())["message"],
+                "original installer and restart failure"
+            );
+        }
+    }
+
+    fn pending_recovery_supervisor(root: &std::path::Path) -> BackendSupervisor {
+        crate::backend::recovery_test_supervisor(
+            BackendLaunchPlan::local(
+                root.to_path_buf(),
+                BackendRunConfig {
+                    port: 43117,
+                    ..test_backend_config()
+                },
+            ),
+            BackendStartFailure::PortInUse {
+                port: 43118,
+                detail: "held port".to_owned(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn recovery_listener_reemits_supervisor_changes() {
+        use tauri::Listener;
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_owned());
+        let root = tempfile::tempdir().expect("isolated data");
+        let supervisor = pending_recovery_supervisor(root.path());
+        app.manage(supervisor.clone());
+        let handle = app.handle().clone();
+        supervisor.install_recovery_listener(Arc::new(move || {
+            handle
+                .state::<DesktopUpdateManager>()
+                .emit_current_state(&handle);
+        }));
+        let (sender, receiver) = mpsc::channel();
+        app.listen_any(UPDATE_STATE_EVENT, move |event| {
+            sender
+                .send(event.payload().to_owned())
+                .expect("update event");
+        });
+        supervisor.record_error("held port");
+        let state: Value =
+            serde_json::from_str(&receiver.try_recv().expect("recovery event")).expect("JSON");
+        assert_eq!(
+            state["backendRecovery"],
+            json!([{
+                "environmentId": "primary", "label": "Local", "reason": "port-in-use", "port": 43118,
+            }])
+        );
+        supervisor.record_error("unchanged classification");
+        assert!(
+            receiver.try_recv().is_err(),
+            "unchanged recovery emits nothing"
+        );
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("stop");
+        let state: Value =
+            serde_json::from_str(&receiver.try_recv().expect("cleared event")).expect("JSON");
+        assert_eq!(state["backendRecovery"], json!([]));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pending_backend_recovery_blocks_checks_downloads_and_all_install_attempts() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("update endpoint");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking endpoint");
+        let app = updater_test_app(format!(
+            "http://{}/latest.json",
+            listener.local_addr().expect("address")
+        ));
+        let manager = DesktopUpdateManager::new();
+        let root = tempfile::tempdir().expect("isolated data");
+        let supervisor = pending_recovery_supervisor(root.path());
+        app.manage(supervisor.clone());
+        manager.replace_inner(|inner| {
+            inner.status = Some(STATUS_ERROR.to_owned());
+            inner.phase = UpdatePhase::Failed;
+            inner.message = Some("installer failed".to_owned());
+        });
+        let before = manager.current_state(app.handle());
+        let check = manager.check_for_update(app.handle().clone()).await;
+        assert_eq!(check["checked"], false);
+        assert_eq!(check["state"], before);
+        let download = manager.download_update(app.handle().clone()).await;
+        assert_eq!(download["accepted"], false);
+        assert_eq!(download["state"], before);
+        assert_eq!(
+            listener.accept().expect_err("no update request").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        for skip_protection in [false, true] {
+            let result = manager
+                .install_update(
+                    app.handle(),
+                    &supervisor,
+                    DesktopUpdateInstallInput {
+                        skip_protection,
+                        excluded_environment_ids: vec![],
+                    },
+                )
+                .await;
+            assert_eq!(result["accepted"], false);
+            assert_eq!(result["completed"], false);
+            assert_eq!(
+                result["state"]["message"],
+                "Restart the server before retrying the installation."
+            );
+            assert_eq!(
+                result["state"]["backendRecovery"],
+                before["backendRecovery"]
+            );
+            assert!(!manager.install_in_flight());
+            assert_eq!(manager.state(app.handle())["message"], "installer failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_install_publishes_typed_backend_recovery_and_status_invalidation() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::failed_install_publishes_typed_backend_recovery_and_status_invalidation",
+        ) else {
+            return;
+        };
+        use tauri::Listener;
+        let (base_url, update_server) = spawn_update_server("test");
+        let app = updater_test_app(format!("{base_url}/latest.json"));
+        let manager = DesktopUpdateManager::new();
+        assert_eq!(
+            manager.check_for_update(app.handle().clone()).await["checked"],
+            true
+        );
+        assert_eq!(
+            manager.download_update(app.handle().clone()).await["completed"],
+            true
+        );
+        update_server.join().expect("update server finished");
+        let root = tempfile::tempdir().expect("isolated data");
+        let supervisor = BackendSupervisor::new();
+        app.manage(supervisor.clone());
+        let port = crate::test_support::free_test_port();
+        supervisor
+            .start(BackendLaunchPlan::local(
+                root.path().to_path_buf(),
+                BackendRunConfig {
+                    port,
+                    ..test_backend_config()
+                },
+            ))
+            .await
+            .expect("primary starts");
+        let held_port = Arc::new(Mutex::new(None));
+        let hook_holder = held_port.clone();
+        manager.fail_next_install("synthetic installer failure");
+        manager
+            .install_failure
+            .lock()
+            .expect("failure fixture")
+            .as_mut()
+            .expect("failure")
+            .on_failure = Some(Box::new(move || {
+            *hook_holder.lock().expect("holder") =
+                Some(TcpListener::bind(("127.0.0.1", port)).expect("stopped port can be held"));
+        }));
+        let (sender, receiver) = mpsc::channel();
+        app.listen_any(
+            crate::backend::PROJECT_DATA_STATUS_CHANGED_EVENT,
+            move |event| {
+                sender
+                    .send(event.payload().to_owned())
+                    .expect("status event");
+            },
+        );
+        let result = manager
+            .install_update(
+                app.handle(),
+                &supervisor,
+                DesktopUpdateInstallInput::default(),
+            )
+            .await;
+        assert_eq!(result["completed"], false);
+        assert_eq!(
+            result["state"]["backendRecovery"],
+            json!([{
+                "environmentId": "primary", "label": "Local", "reason": "port-in-use", "port": port,
+            }])
+        );
+        let targets = supervisor.project_data_targets();
+        assert_eq!(targets.len(), 1);
+        assert!(!targets[0].running);
+        assert!(result["state"]["message"].as_str().expect("message").starts_with(&format!(
+            "synthetic installer failure Desktop backend recovery also failed: Could not restart every desktop backend: Local: Could not start in-process desktop backend: failed to bind the server listener on 127.0.0.1:{port}: "
+        )));
+        assert_eq!(
+            serde_json::from_str::<Value>(&receiver.try_recv().expect("invalidation"))
+                .expect("JSON"),
+            json!({"environmentId":"primary"})
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "one invalidation per failed environment"
+        );
+        let original_message = manager.state(app.handle())["message"].clone();
+        assert_eq!(
+            manager.check_for_update(app.handle().clone()).await["checked"],
+            false
+        );
+        assert_eq!(
+            manager.download_update(app.handle().clone()).await["accepted"],
+            false
+        );
+        for skip_protection in [false, true] {
+            let refused = manager
+                .install_update(
+                    app.handle(),
+                    &supervisor,
+                    DesktopUpdateInstallInput {
+                        skip_protection,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(refused["accepted"], false);
+            assert_eq!(manager.state(app.handle())["message"], original_message);
+        }
+        drop(held_port.lock().expect("holder").take());
+        crate::data_safety::retry_project_data(&supervisor, "primary")
+            .await
+            .expect("restart slot");
+        assert_eq!(manager.state(app.handle())["backendRecovery"], json!([]));
+        // Reaching checking proves the supervisor restart alone released admission, with no settle call.
+        let check = manager
+            .begin_check(app.handle())
+            .expect("recovery no longer blocks checks");
+        assert_eq!(manager.current_state(app.handle())["phase"], "checking");
+        drop(check);
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("cleanup");
+        isolated.complete();
+    }
+
+    #[test]
     fn maintenance_error_details_are_single_line_and_bounded() {
         assert_eq!(
             bounded_maintenance_error_detail("backup\n  verification failed"),
@@ -1343,6 +1999,115 @@ mod tests {
         let bounded = bounded_maintenance_error_detail(&oversized);
         assert_eq!(bounded.chars().count(), 323);
         assert!(bounded.ends_with("..."));
+    }
+
+    #[test]
+    fn maintenance_failures_use_consistent_bounded_sentences() {
+        let config = test_backend_config();
+        for (step, detail, expected) in [
+            (
+                MaintenanceStep::Prepare,
+                "backup\n verification failed",
+                "Could not prepare Local for update protection: backup verification failed.",
+            ),
+            (
+                MaintenanceStep::Commit,
+                "no prepared operation.",
+                "Could not finish update protection for Local: no prepared operation.",
+            ),
+            (
+                MaintenanceStep::Cancel,
+                "operation mismatch!",
+                "Could not cancel update protection for Local: operation mismatch!",
+            ),
+            (
+                MaintenanceStep::Cancel,
+                "operation mismatch?",
+                "Could not cancel update protection for Local: operation mismatch?",
+            ),
+        ] {
+            assert_eq!(maintenance_failure_text(&config, step, detail), expected);
+        }
+        assert_eq!(
+            maintenance_failure_text(&config, MaintenanceStep::Prepare, &"x".repeat(400)),
+            format!(
+                "Could not prepare Local for update protection: {}...",
+                "x".repeat(320)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn http_maintenance_failures_report_messages_or_readable_fallbacks() {
+        for (step, status, body, expected) in [
+            (
+                MaintenanceStep::Prepare,
+                "409 Conflict",
+                r#"{"message":"backup\n verification failed"}"#,
+                "Could not prepare Local for update protection: backup verification failed.",
+            ),
+            (
+                MaintenanceStep::Prepare,
+                "404 Not Found",
+                "Not Found",
+                "Could not prepare Local for update protection: update maintenance is not available.",
+            ),
+            (
+                MaintenanceStep::Commit,
+                "500 Internal Server Error",
+                "unreadable body",
+                "Could not finish update protection for Local: the server gave no reason.",
+            ),
+            (
+                MaintenanceStep::Cancel,
+                "409 Conflict",
+                r#"{"message":"operation mismatch!"}"#,
+                "Could not cancel update protection for Local: operation mismatch!",
+            ),
+            (
+                MaintenanceStep::Cancel,
+                "404 Not Found",
+                r#"{"message":"  "}"#,
+                "Could not cancel update protection for Local: update maintenance is not available.",
+            ),
+        ] {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("maintenance server should bind");
+            let mut config = test_backend_config();
+            config.port = listener.local_addr().expect("maintenance address").port();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("maintenance request");
+                assert_request_read(&mut stream, "maintenance request should read");
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("maintenance response should write");
+            });
+            let result = match step {
+                MaintenanceStep::Prepare => {
+                    prepare_backend_for_update(&config, &UpdateProtectionTransport::Http, |_| {})
+                        .await
+                        .map(|_| ())
+                }
+                MaintenanceStep::Commit | MaintenanceStep::Cancel => {
+                    let finish = match step {
+                        MaintenanceStep::Commit => MaintenanceFinish::Commit,
+                        _ => MaintenanceFinish::Cancel,
+                    };
+                    finish_backend_update(
+                        &config,
+                        &UpdateProtectionTransport::Http,
+                        finish,
+                        "00000000-0000-4000-8000-000000000000",
+                    )
+                    .await
+                }
+            };
+            server.join().expect("maintenance server should stop");
+            assert_eq!(result.expect_err("maintenance should fail"), expected);
+        }
     }
 
     #[test]
@@ -1392,6 +2157,75 @@ mod tests {
         )
         .expect("the exact secondary may be excluded");
         assert_eq!(with_exclusion[0].status, ProtectionStatus::Excluded);
+    }
+
+    #[test]
+    fn remote_secondary_protection_notice_requires_a_settled_secondary_only_failure() {
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_string());
+        let manager = DesktopUpdateManager::new();
+        let message = "The secondary environment WSL (Ubuntu) must be protected or explicitly excluded by name.";
+        for (phase, primary_status, secondary_status) in [
+            (
+                UpdatePhase::Failed,
+                ProtectionStatus::Failed,
+                ProtectionStatus::Failed,
+            ),
+            (
+                UpdatePhase::Failed,
+                ProtectionStatus::Failed,
+                ProtectionStatus::Protected,
+            ),
+            (
+                UpdatePhase::Protecting,
+                ProtectionStatus::Protected,
+                ProtectionStatus::Failed,
+            ),
+            (
+                UpdatePhase::Failed,
+                ProtectionStatus::Protected,
+                ProtectionStatus::Protected,
+            ),
+        ] {
+            manager.replace_inner(|inner| {
+                inner.phase = phase;
+                inner.message = Some(message.to_owned());
+                inner.protection = [(true, primary_status), (false, secondary_status)]
+                    .into_iter()
+                    .map(|(primary, status)| DesktopUpdateProtection {
+                        environment_id: if primary { "primary" } else { "wsl:Ubuntu" }.to_owned(),
+                        label: if primary { "Local" } else { "WSL (Ubuntu)" }.to_owned(),
+                        primary,
+                        status,
+                        message: None,
+                        stage: None,
+                        elapsed_ms: None,
+                        blocked_operation_count: None,
+                    })
+                    .collect();
+            });
+            manager.note_remote_secondary_protection_failure(app.handle());
+            assert_eq!(manager.state(app.handle())["message"], message);
+        }
+
+        let recovery_message =
+            append_recovery_error(message.to_owned(), Some("port in use".to_owned()));
+        manager.replace_inner(|inner| {
+            inner.protection[1].status = ProtectionStatus::Failed;
+            inner.message = Some(recovery_message.clone());
+        });
+        manager.note_remote_secondary_protection_failure(app.handle());
+        assert_eq!(
+            manager.state(app.handle())["message"],
+            format!("{recovery_message}. Finish the update on the host.")
+        );
+        for message in ["Protection failed!", "Protection failed?"] {
+            manager.replace_inner(|inner| inner.message = Some(message.to_owned()));
+            manager.note_remote_secondary_protection_failure(app.handle());
+            assert_eq!(
+                manager.state(app.handle())["message"],
+                format!("{message} Finish the update on the host.")
+            );
+        }
     }
 
     #[test]
@@ -1570,7 +2404,10 @@ mod tests {
         config.port = port;
         let mut progress = Vec::new();
 
-        let result = prepare_backend_for_update(&config, |update| progress.push(update))
+        let result =
+            prepare_backend_for_update(&config, &UpdateProtectionTransport::Http, |update| {
+                progress.push(update)
+            })
             .await
             .expect("prepare should complete");
 
@@ -1616,6 +2453,11 @@ mod tests {
 
     #[tokio::test]
     async fn protection_bypass_after_failure_stops_and_restarts_prior_set_on_installer_failure() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::protection_bypass_after_failure_stops_and_restarts_prior_set_on_installer_failure",
+        ) else {
+            return;
+        };
         let (base_url, update_server) = spawn_update_server("test");
         let app = updater_test_app(format!("{base_url}/latest.json"));
         let handle = app.handle();
@@ -1632,11 +2474,13 @@ mod tests {
 
         let state = tempfile::tempdir().expect("backend state tempdir should open");
         let supervisor = BackendSupervisor::new();
+        let port = crate::test_support::free_test_port();
+        let config = BackendRunConfig {
+            port,
+            ..test_backend_config()
+        };
         supervisor
-            .start(BackendLaunchPlan::local(
-                state.path().to_path_buf(),
-                test_backend_config(),
-            ))
+            .start(BackendLaunchPlan::local(state.path().to_path_buf(), config))
             .await
             .expect("primary backend should start");
         supervisor.record_unavailable_environment(BackendUnavailableEnvironment {
@@ -1657,11 +2501,28 @@ mod tests {
         );
         assert_eq!(blocked["state"]["protection"][1]["status"], "failed");
         assert!(
-            supervisor
-                .snapshot_for_update()
+            !blocked["state"]["message"]
+                .as_str()
+                .expect("host install should explain the protection failure")
+                .contains("Finish the update on the host.")
+        );
+        manager.note_remote_secondary_protection_failure(handle);
+        let remote_message = manager.state(handle)["message"].clone();
+        assert!(
+            remote_message
+                .as_str()
+                .is_some_and(|message| message.ends_with(". Finish the update on the host."))
+        );
+        manager.note_remote_secondary_protection_failure(handle);
+        assert_eq!(manager.state(handle)["message"], remote_message);
+        let after_blocked = supervisor.snapshot_for_update();
+        assert!(
+            after_blocked
                 .environments
                 .iter()
-                .any(|environment| environment.primary && environment.running)
+                .any(|environment| environment.primary && environment.running),
+            "{blocked}\n{:?}",
+            after_blocked.environments
         );
 
         manager.fail_next_install("synthetic installer failure");
@@ -1690,18 +2551,21 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("synthetic installer failure"))
         );
+        let after_restart = supervisor.snapshot_for_update();
         assert!(
-            supervisor
-                .snapshot_for_update()
+            after_restart
                 .environments
                 .iter()
-                .any(|environment| environment.primary && environment.running)
+                .any(|environment| environment.primary && environment.running),
+            "{failed_install}\n{:?}",
+            after_restart.environments
         );
 
         supervisor
             .stop(BackendShutdownConfig::default())
             .await
             .expect("restarted primary should stop");
+        isolated.complete();
     }
 
     fn test_backend_config() -> BackendRunConfig {
@@ -1825,6 +2689,18 @@ mod tests {
                 .expect("update response should write");
         });
         (base_url, thread)
+    }
+
+    fn poison_update_lock(manager: &DesktopUpdateManager) {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = manager
+                .inner
+                .lock()
+                .expect("update state lock should not already be poisoned");
+            panic!("synthetic panic while holding the update state lock");
+        }));
+        assert!(panic.is_err());
+        assert!(manager.inner.is_poisoned());
     }
 
     async fn wait_for_fixture_event(event: &FixtureEvent, checkpoint: u64, description: &str) {
@@ -1995,6 +2871,123 @@ mod tests {
         server.join().expect("update server should stop");
     }
 
+    #[test]
+    fn manager_state_reads_recover_a_poisoned_lock() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::manager_state_reads_recover_a_poisoned_lock",
+        ) else {
+            return;
+        };
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_owned());
+        let manager = app.state::<DesktopUpdateManager>();
+        manager.replace_inner(|inner| {
+            inner.status = Some(STATUS_AVAILABLE.to_owned());
+            inner.available_version = Some("99.0.0".to_owned());
+            inner.phase = UpdatePhase::Available;
+        });
+
+        poison_update_lock(&manager);
+        let state = manager.state(app.handle());
+        assert_eq!(state["status"], STATUS_AVAILABLE);
+        assert_eq!(state["availableVersion"], "99.0.0");
+        assert_eq!(state["phase"], "available");
+        assert!(!manager.inner.is_poisoned());
+
+        poison_update_lock(&manager);
+        let bridge_state = crate::bridge::desktop_bridge_get_update_state(
+            app.handle().clone(),
+            app.state::<DesktopUpdateManager>(),
+        )
+        .expect("bridge update state read should recover");
+        assert_eq!(bridge_state, state);
+        assert!(!manager.inner.is_poisoned());
+        isolated.complete();
+    }
+
+    #[test]
+    fn manager_native_reads_recover_a_poisoned_lock() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::manager_native_reads_recover_a_poisoned_lock",
+        ) else {
+            return;
+        };
+        use tauri::Listener;
+
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_owned());
+        let manager = app.state::<DesktopUpdateManager>();
+        manager.replace_inner(|inner| {
+            inner.install_in_flight = true;
+            inner.phase = UpdatePhase::Protecting;
+        });
+
+        poison_update_lock(&manager);
+        assert!(manager.install_in_flight());
+        assert!(!manager.inner.is_poisoned());
+
+        let (sender, receiver) = mpsc::channel();
+        app.listen_any(UPDATE_STATE_EVENT, move |event| {
+            sender
+                .send(event.payload().to_owned())
+                .expect("update state event");
+        });
+        poison_update_lock(&manager);
+        manager.emit_current_state(app.handle());
+        let state: Value =
+            serde_json::from_str(&receiver.try_recv().expect("recovered update state event"))
+                .expect("update state JSON");
+        assert_eq!(state["phase"], "protecting");
+        assert!(!manager.inner.is_poisoned());
+        isolated.complete();
+    }
+
+    #[test]
+    fn operation_guard_recovers_a_poisoned_lock() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::operation_guard_recovers_a_poisoned_lock",
+        ) else {
+            return;
+        };
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_owned());
+        let manager = app.state::<DesktopUpdateManager>();
+        let (guard, _) = manager.begin_check(app.handle()).expect("first check");
+
+        poison_update_lock(&manager);
+        guard.finish(|inner| inner.status = Some(STATUS_UP_TO_DATE.to_owned()));
+        assert!(!manager.inner.is_poisoned());
+        assert_eq!(manager.state(app.handle())["status"], STATUS_UP_TO_DATE);
+
+        let (guard, _) = manager
+            .begin_check(app.handle())
+            .expect("check after completion");
+        poison_update_lock(&manager);
+        drop(guard);
+        assert!(!manager.inner.is_poisoned());
+        assert_eq!(manager.state(app.handle())["status"], STATUS_UP_TO_DATE);
+        assert!(manager.begin_check(app.handle()).is_some());
+        isolated.complete();
+    }
+
+    #[tokio::test]
+    async fn manager_check_recovers_a_poisoned_lock() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::manager_check_recovers_a_poisoned_lock",
+        ) else {
+            return;
+        };
+        let (base_url, server) = spawn_no_update_server();
+        let app = updater_test_app(format!("{base_url}/latest.json"));
+        let manager = app.state::<DesktopUpdateManager>();
+
+        poison_update_lock(&manager);
+        let check = manager.check_for_update(app.handle().clone()).await;
+        assert_eq!(check["checked"], true);
+        assert_eq!(check["state"]["status"], STATUS_UP_TO_DATE);
+        assert!(!manager.inner.is_poisoned());
+
+        server.join().expect("update server should stop");
+        isolated.complete();
+    }
+
     #[tokio::test]
     async fn manager_handles_up_to_date_and_missing_update_actions() {
         use tauri::test::{mock_builder, mock_context, noop_assets};
@@ -2099,6 +3092,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn background_scheduler_survives_a_panicking_check() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "updates::tests::background_scheduler_survives_a_panicking_check",
+        ) else {
+            return;
+        };
         let listener = TcpListener::bind("127.0.0.1:0").expect("update server should bind");
         let base_url = format!(
             "http://{}",
@@ -2120,15 +3118,7 @@ mod tests {
         });
         let app = updater_test_app(format!("{base_url}/latest.json"));
         let manager = app.state::<DesktopUpdateManager>();
-        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _inner = manager
-                .inner
-                .lock()
-                .expect("desktop update mutex should initially lock");
-            panic!("synthetic update-check panic");
-        }));
-        assert!(poison.is_err());
-        assert!(manager.inner.is_poisoned());
+        manager.panic_next_check.store(true, Ordering::SeqCst);
         let task = tokio::spawn(run_background_update_checks(app.handle().clone()));
         wait_for_background_timer(&manager, 1).await;
         tokio::time::advance(STARTUP_UPDATE_CHECK_DELAY).await;
@@ -2136,7 +3126,9 @@ mod tests {
         wait_for_background_check_completion(&manager, 1).await;
         assert_eq!(manager.check_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(manager.background_check_completion.checkpoint(), 1);
-        manager.inner.clear_poison();
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.state(app.handle())["status"], STATUS_IDLE);
+        assert!(!manager.inner.is_poisoned());
 
         wait_for_background_timer(&manager, 2).await;
         tokio::time::advance(BACKGROUND_UPDATE_CHECK_INTERVAL).await;
@@ -2147,8 +3139,15 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("surviving scheduler should issue a retry request");
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.state(app.handle())["status"], STATUS_UP_TO_DATE);
         task.abort();
+        assert!(
+            task.await
+                .expect_err("background scheduler should abort")
+                .is_cancelled()
+        );
         server.join().expect("update server should stop");
+        isolated.complete();
     }
 
     #[tokio::test]
@@ -2630,6 +3629,66 @@ mod tests {
         let retry = manager.check_for_update(app.handle().clone()).await;
         assert_eq!(retry["checked"], true);
         assert_eq!(retry["state"]["status"], STATUS_UP_TO_DATE);
+        server.join().expect("update server should stop");
+    }
+
+    #[tokio::test]
+    async fn an_aborted_check_keeps_a_remote_request_recorded_during_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("update server should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("update server address")
+        );
+        let check_started = Arc::new(FixtureEvent::default());
+        let check_started_checkpoint = check_started.checkpoint();
+        let server_check_started = check_started.clone();
+        let (release_check_sender, release_check_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("check should arrive");
+            assert_request_read(&mut stream, "check should read");
+            server_check_started.publish();
+            release_check_receiver
+                .recv()
+                .expect("test should release the check");
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        });
+        let app = updater_test_app(format!("{base_url}/latest.json"));
+        let manager = Arc::new(DesktopUpdateManager::new());
+        let check_manager = manager.clone();
+        let check_handle = app.handle().clone();
+        let check = tokio::spawn(async move { check_manager.check_for_update(check_handle).await });
+        wait_for_fixture_event(
+            &check_started,
+            check_started_checkpoint,
+            "check should become active",
+        )
+        .await;
+
+        assert!(manager.begin_remote_request(
+            app.handle(),
+            RemoteUpdateRequest {
+                label: "Tablet".to_owned(),
+                detail: None
+            },
+        ));
+        check.abort();
+        assert!(
+            check
+                .await
+                .expect_err("check should be cancelled")
+                .is_cancelled()
+        );
+        release_check_sender
+            .send(())
+            .expect("server should still await the check release");
+
+        assert_eq!(manager.state(app.handle())["status"], STATUS_IDLE);
+        assert_eq!(
+            manager.state(app.handle())["requestedBy"]["label"],
+            "Tablet"
+        );
+        manager.clear_remote_request(app.handle());
+        assert_eq!(manager.state(app.handle())["requestedBy"], Value::Null);
         server.join().expect("update server should stop");
     }
 

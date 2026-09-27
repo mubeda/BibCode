@@ -12,6 +12,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { desktopLocalConnectionId } from "./desktopLocal";
 import {
   createEnvironmentPresentationPolicy,
+  environmentConnectionActions,
   normalizeDesktopHostPlatform,
 } from "./environmentPresentationPolicy";
 
@@ -128,5 +129,39 @@ describe("environment presentation policy", () => {
     ["FreeBSD", "unknown"],
   ] as const)("normalizes %s as %s", (platform, expected) => {
     expect(normalizeDesktopHostPlatform(platform)).toBe(expected);
+  });
+});
+
+describe("environmentConnectionActions", () => {
+  const desktop = createEnvironmentPresentationPolicy({ surface: "desktop", platform: "linux" });
+  const browser = createEnvironmentPresentationPolicy({ surface: "browser", platform: "linux" });
+
+  it("sends remote targets on desktop to Remote Servers instead of reconnecting in place", () => {
+    for (const target of [sshTarget, relayTarget, remoteBearerTarget]) {
+      expect(environmentConnectionActions(desktop, target)).toEqual({
+        reconnect: false,
+        openRemoteServers: true,
+      });
+    }
+  });
+
+  it("reconnects in place wherever this client manages the connection", () => {
+    expect(environmentConnectionActions(desktop, primaryTarget)).toEqual({
+      reconnect: true,
+      openRemoteServers: false,
+    });
+    for (const target of allTargetKinds) {
+      expect(environmentConnectionActions(browser, target)).toEqual({
+        reconnect: true,
+        openRemoteServers: false,
+      });
+    }
+  });
+
+  it("offers nothing for an unknown target", () => {
+    expect(environmentConnectionActions(desktop, null)).toEqual({
+      reconnect: false,
+      openRemoteServers: false,
+    });
   });
 });

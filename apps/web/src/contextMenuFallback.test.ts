@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { showContextMenuFallback } from "./contextMenuFallback";
+import { normalizeContextMenuEntries, showContextMenuFallback } from "./contextMenuFallback";
 
 type FakeListener = (event: FakeDomEvent) => void;
 
@@ -17,6 +17,8 @@ class FakeDomEvent {
   preventDefault() {
     this.defaultPrevented = true;
   }
+
+  stopPropagation() {}
 }
 
 class FakeElement {
@@ -217,6 +219,53 @@ describe("showContextMenuFallback", () => {
     await expect(selectionPromise).resolves.toBe("rename");
   });
 
+  it("renders separators and drops leading, trailing and repeated ones", async () => {
+    const fakeDocument = document as unknown as FakeDocument;
+    const selectionPromise = showContextMenuFallback([
+      { separator: true },
+      { id: "open", label: "Open" },
+      { separator: true },
+      { separator: true },
+      { id: "copy", label: "Copy" },
+      { separator: true },
+    ]);
+    const inner = fakeDocument.body.children[0]!.children[0]!;
+    expect(inner.children.map((child) => child.tagName)).toEqual(["button", "div", "button"]);
+    const separator = inner.children[1]!;
+    expect(separator.attributes["role"]).toBe("separator");
+    expect(separator.className).toBe("my-1 mx-1.5 h-px bg-border");
+
+    findButton("Copy")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await expect(selectionPromise).resolves.toBe("copy");
+  });
+
+  it("normalizes separators inside submenus", async () => {
+    const fakeDocument = document as unknown as FakeDocument;
+    const selectionPromise = showContextMenuFallback([
+      {
+        id: "open-in",
+        label: "Open in",
+        children: [
+          { id: "open-in:file-explorer", label: "File Explorer" },
+          { separator: true },
+          { separator: true },
+          { id: "open-in:vscode", label: "VS Code" },
+          { separator: true },
+        ],
+      },
+    ]);
+    findButton("Open in")?.dispatchEvent(new FakeDomEvent("mouseenter"));
+    const submenuInner = fakeDocument.body.children[1]!.children[0]!;
+    expect(submenuInner.children.map((child) => child.tagName)).toEqual([
+      "button",
+      "div",
+      "button",
+    ]);
+
+    findButton("VS Code")?.dispatchEvent(new FakeDomEvent("click"));
+    await expect(selectionPromise).resolves.toBe("open-in:vscode");
+  });
+
   it("opens nested submenus and resolves the clicked leaf id", async () => {
     const selectionPromise = showContextMenuFallback([
       {
@@ -256,6 +305,17 @@ describe("showContextMenuFallback", () => {
     expect(copy.style.background).toBe("var(--accent)");
     copy.dispatchEvent(new FakeDomEvent("mouseleave"));
     expect(copy.style.color).toBe("var(--foreground)");
+
+    // A disabled row stays reachable (aria-disabled, not `disabled`), but a
+    // click or hover neither chooses it nor closes the menu.
+    const disabled = findButton("Disabled")!;
+    expect(disabled.disabled).toBe(false);
+    expect(disabled.attributes["aria-disabled"]).toBe("true");
+    disabled.dispatchEvent(new FakeDomEvent("mouseenter"));
+    disabled.dispatchEvent(new FakeDomEvent("click"));
+    expect(disabled.dataset.active).not.toBe("true");
+    expect(disabled.style.color).toBe("var(--muted-foreground)");
+    expect(fakeDocument.body.children).toHaveLength(1);
 
     const remove = findButton("Remove")!;
     remove.dispatchEvent(new FakeDomEvent("mouseenter"));
@@ -328,6 +388,35 @@ describe("showContextMenuFallback", () => {
     await expect(selectionPromise).resolves.toBeNull();
   });
 
+  it("positions the menu inside the viewport before it can paint", async () => {
+    vi.stubGlobal("window", { innerWidth: 400, innerHeight: 300 });
+    const frames: Array<(time: number) => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const fakeDocument = document as unknown as FakeDocument;
+    const visibilityAtInsert: Array<string | undefined> = [];
+    const append = fakeDocument.body.appendChild.bind(fakeDocument.body);
+    fakeDocument.body.appendChild = (child: FakeElement) => {
+      visibilityAtInsert.push(child.style.visibility);
+      return append(child);
+    };
+    const selectionPromise = showContextMenuFallback([{ id: "copy", label: "Copy" }], {
+      x: 390,
+      y: 290,
+    });
+    const menu = fakeDocument.body.children[0]!;
+    // Inserted hidden, then measured and clamped before any frame could paint it.
+    expect(visibilityAtInsert).toEqual(["hidden"]);
+    expect(frames.length).toBeGreaterThan(0);
+    expect(menu.style.left).toBe(`${400 - 180 - 4}px`);
+    expect(menu.style.top).toBe(`${300 - 120 - 4}px`);
+    expect(menu.style.visibility).toBe("visible");
+    findButton("Copy")?.dispatchEvent(new FakeDomEvent("click"));
+    await expect(selectionPromise).resolves.toBe("copy");
+  });
+
   it("clamps nested menus, prevents parent clicks, and closes child levels", async () => {
     vi.stubGlobal("window", { innerWidth: 250, innerHeight: 180 });
     const frames: Array<(time: number) => void> = [];
@@ -360,5 +449,24 @@ describe("showContextMenuFallback", () => {
     findButton("Child")?.dispatchEvent(new FakeDomEvent("mouseenter"));
     findButton("Child")?.dispatchEvent(new FakeDomEvent("click"));
     await expect(selectionPromise).resolves.toBe("child");
+  });
+});
+
+describe("normalizeContextMenuEntries", () => {
+  it("trims leading and trailing separators and collapses runs", () => {
+    expect(
+      normalizeContextMenuEntries([
+        { separator: true },
+        { id: "a", label: "A" },
+        { separator: true },
+        { separator: true },
+        { id: "b", label: "B" },
+        { separator: true },
+      ]),
+    ).toEqual([{ id: "a", label: "A" }, { separator: true }, { id: "b", label: "B" }]);
+  });
+
+  it("returns nothing for a list of separators", () => {
+    expect(normalizeContextMenuEntries([{ separator: true }, { separator: true }])).toEqual([]);
   });
 });

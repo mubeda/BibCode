@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { EnvironmentRpcUnavailableError } from "@bibcode/client-runtime/rpc";
-import { GitManagerOperationError } from "@bibcode/contracts";
+import { GitManagerOperationError, type VcsRepositoryUnavailableReason } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
 import { act } from "react";
@@ -19,17 +19,24 @@ const h = vi.hoisted(() => ({
     conflictedPaths: [] as string[],
   } as Record<string, unknown> | null,
   commits: null as Record<string, unknown> | null,
+  commitsEmission: null as AsyncResult.AsyncResult<unknown, unknown> | null,
   signalGeneration: 1 as number | null,
   liveSignalAvailable: true,
   availableEditors: [] as string[],
   statusError: null as string | null,
   statusEmission: null as AsyncResult.AsyncResult<unknown, unknown> | null,
+  refsError: null as string | null,
+  refsEmission: null as AsyncResult.AsyncResult<unknown, unknown> | null,
+  refreshStatusQuery: vi.fn(),
+  revalidateStatusQuery: vi.fn(),
   statusAtom: vi.fn((target: unknown) => ({ kind: "status", target })),
   refsAtom: vi.fn((target: unknown) => ({ kind: "refs", target })),
   commitsAtom: vi.fn((target: unknown) => ({ kind: "commits", target })),
   signalAtom: vi.fn((target: unknown) => ({ kind: "signal", target })),
   refreshRefs: vi.fn(),
+  revalidateRefs: vi.fn(),
   refreshCommits: vi.fn(),
+  revalidateCommits: vi.fn(),
   contextMenuShow: vi.fn(
     (
       _items: ReadonlyArray<{ label: string }>,
@@ -37,6 +44,7 @@ const h = vi.hoisted(() => ({
     ): Promise<string | null> => Promise.resolve(null),
   ),
   openInEditor: vi.fn(() => Promise.resolve({ _tag: "Success" })),
+  onRetry: vi.fn(),
   refreshStatus: vi.fn(),
   stageFiles: vi.fn(),
   unstageFiles: vi.fn(),
@@ -67,9 +75,29 @@ vi.mock("../../../state/gitManager", () => ({
   },
 }));
 
+const NO_READ_ACTIONS = { refresh: () => undefined, revalidate: () => undefined };
+
+/** Explicit Retry (`refresh`) and automatic re-reads (`revalidate`) go to separate spies. */
+function readActionsFor(kind: string | undefined) {
+  if (kind === "status")
+    return { refresh: h.refreshStatusQuery, revalidate: h.revalidateStatusQuery };
+  if (kind === "refs") return { refresh: h.refreshRefs, revalidate: h.revalidateRefs };
+  if (kind === "commits") return { refresh: h.refreshCommits, revalidate: h.revalidateCommits };
+  return NO_READ_ACTIONS;
+}
+
+/** A settled failure is not pending; a read after Retry waits on the failure it replaces. */
+function pendingFor(kind: string | undefined, data: unknown): boolean {
+  if (kind === "status" && h.statusEmission !== null) return h.statusEmission.waiting;
+  if (kind === "refs" && h.refsError !== null) return false;
+  if (kind === "commits" && h.commitsEmission !== null) return h.commitsEmission.waiting;
+  return data === null;
+}
+
 vi.mock("../../../state/query", () => ({
   useEnvironmentQuery: (atom: { kind?: string } | null) => {
     const kind = atom?.kind;
+    const { refresh, revalidate } = readActionsFor(kind);
     const data =
       kind === "status"
         ? h.status
@@ -85,11 +113,16 @@ vi.mock("../../../state/query", () => ({
       emission:
         kind === "status" && h.statusEmission !== null
           ? h.statusEmission
-          : { _tag: data === null ? "Initial" : "Success", waiting: data === null },
-      error: kind === "status" ? h.statusError : null,
-      isPending: data === null,
-      refresh:
-        kind === "refs" ? h.refreshRefs : kind === "commits" ? h.refreshCommits : () => undefined,
+          : kind === "refs" && h.refsEmission !== null
+            ? h.refsEmission
+            : kind === "commits" && h.commitsEmission !== null
+              ? h.commitsEmission
+              : { _tag: data === null ? "Initial" : "Success", waiting: data === null },
+      error: kind === "status" ? h.statusError : kind === "refs" ? h.refsError : null,
+      isPending: pendingFor(kind, data),
+      refresh,
+      revalidate,
+      requiresRetry: false,
     };
   },
 }));
@@ -178,15 +211,47 @@ function statusWith(path: string) {
   };
 }
 
+/** The status a live server streamed while `.git/HEAD` was broken; a bad `.git/config` matched it. */
+function unreadableStatus() {
+  return {
+    isRepo: false,
+    hasPrimaryRemote: false,
+    isDefaultRef: false,
+    refName: null,
+    hasWorkingTreeChanges: false,
+    workingTree: { files: [], insertions: 0, deletions: 0 },
+    hasUpstream: false,
+    aheadCount: 0,
+    behindCount: 0,
+    aheadOfDefaultCount: 0,
+    pr: null,
+  };
+}
+
 let container: HTMLDivElement;
 let root: Root | null;
 
-async function renderView() {
+async function renderView(
+  cwd = "/repo/main",
+  retrying = false,
+  overrides: Partial<React.ComponentProps<typeof GitManagerChangesView>> = {},
+) {
   await act(async () =>
     root?.render(
       <GitManagerChangesView
-        scope={{ environmentId: "environment-1" as never, cwd: "/repo/main" }}
+        scope={{ environmentId: "environment-1" as never, cwd }}
         projectRef={projectRef}
+        refsRecovering={false}
+        repositoryUnavailable={
+          h.statusError === null && h.status?.isRepo === false
+            ? ((h.status.repositoryUnavailableReason as
+                | VcsRepositoryUnavailableReason
+                | undefined) ?? "unknown")
+            : null
+        }
+        retrying={retrying}
+        onRetry={h.onRetry}
+        {...overrides}
       />,
     ),
   );
@@ -200,6 +265,10 @@ function buttonWithText(text: string): HTMLButtonElement {
   );
   if (!(button instanceof HTMLButtonElement)) throw new Error(`Missing button: ${text}`);
   return button;
+}
+
+function isInactive(button: HTMLButtonElement): boolean {
+  return button.getAttribute("aria-disabled") === "true";
 }
 
 function checkboxLabelWithText(text: string): HTMLLabelElement {
@@ -230,11 +299,16 @@ beforeEach(() => {
     localBranches: [],
   };
   h.commits = null;
+  h.commitsEmission = null;
   h.signalGeneration = 1;
   h.liveSignalAvailable = true;
   h.availableEditors = [];
   h.statusError = null;
   h.statusEmission = null;
+  h.refsError = null;
+  h.refsEmission = null;
+  h.refreshStatusQuery.mockClear();
+  h.revalidateStatusQuery.mockClear();
   h.listProps = null;
   h.listRenderCount = 0;
   h.statusAtom.mockClear();
@@ -242,9 +316,12 @@ beforeEach(() => {
   h.commitsAtom.mockClear();
   h.signalAtom.mockClear();
   h.refreshRefs.mockClear();
+  h.revalidateRefs.mockClear();
   h.refreshCommits.mockClear();
+  h.revalidateCommits.mockClear();
   h.contextMenuShow.mockClear();
   h.openInEditor.mockClear();
+  h.onRetry.mockClear();
   h.refreshStatus.mockReset();
   h.refreshStatus.mockImplementation(() =>
     Promise.resolve(AsyncResult.success(h.freshStatus ?? h.status)),
@@ -278,6 +355,94 @@ afterEach(async () => {
 });
 
 describe("GitManagerChangesView", () => {
+  it("revalidates a persistently failing latest-commit read only once after repair", async () => {
+    h.status = unreadableStatus();
+    h.commitsEmission = AsyncResult.failure(Cause.fail(new Error("Git could not read HEAD.")));
+
+    await renderView();
+    expect(h.revalidateCommits).not.toHaveBeenCalled();
+
+    h.status = { ...statusWith("src/repaired.ts"), isRepo: true };
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledOnce();
+    expect(h.refreshCommits).not.toHaveBeenCalled();
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      h.commitsEmission = { ...h.commitsEmission, waiting: true };
+      await renderView();
+      expect(h.revalidateCommits).toHaveBeenCalledOnce();
+      h.commitsEmission = AsyncResult.failure(Cause.fail(new Error("Git could not read HEAD.")));
+      await renderView();
+      expect(h.revalidateCommits).toHaveBeenCalledOnce();
+    }
+    expect(h.refreshCommits).not.toHaveBeenCalled();
+  });
+
+  it("revalidates a cached latest-commit failure once when entering Changes after repair", async () => {
+    h.status = { ...statusWith("src/repaired.ts"), isRepo: true };
+    h.commitsEmission = AsyncResult.failure(Cause.fail(new Error("Git could not read HEAD.")));
+
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledOnce();
+    h.commitsEmission = { ...h.commitsEmission, waiting: true };
+    await renderView();
+    h.commitsEmission = AsyncResult.failure(Cause.fail(new Error("Git could not read HEAD.")));
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledOnce();
+
+    await act(async () => root?.render(null));
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledTimes(2);
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledTimes(2);
+    expect(h.refreshCommits).not.toHaveBeenCalled();
+  });
+
+  it("revalidates the latest-commit failure once more after a second outage and repair", async () => {
+    h.status = unreadableStatus();
+    h.commitsEmission = AsyncResult.failure(Cause.fail(new Error("Git could not read HEAD.")));
+    await renderView();
+
+    h.status = { ...statusWith("src/repaired.ts"), isRepo: true };
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledOnce();
+
+    h.status = unreadableStatus();
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledOnce();
+    h.status = null;
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledOnce();
+
+    h.status = { ...statusWith("src/repaired-again.ts"), isRepo: true };
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledTimes(2);
+    h.commitsEmission = { ...h.commitsEmission, waiting: true };
+    await renderView();
+    h.commitsEmission = AsyncResult.failure(Cause.fail(new Error("Git could not read HEAD.")));
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledTimes(2);
+    expect(h.refreshCommits).not.toHaveBeenCalled();
+  });
+
+  it("waits for a pending latest-commit read to settle after the repository becomes readable", async () => {
+    h.status = unreadableStatus();
+    h.commitsEmission = {
+      ...AsyncResult.failure(Cause.fail(new Error("Git could not read HEAD."))),
+      waiting: true,
+    };
+    await renderView();
+    expect(h.revalidateCommits).not.toHaveBeenCalled();
+
+    h.status = { ...statusWith("src/repaired.ts"), isRepo: true };
+    await renderView();
+    expect(h.revalidateCommits).not.toHaveBeenCalled();
+    h.commitsEmission = { ...h.commitsEmission, waiting: false };
+    await renderView();
+    expect(h.revalidateCommits).toHaveBeenCalledOnce();
+    expect(h.refreshCommits).not.toHaveBeenCalled();
+  });
+
   it("keeps explicit change reads available without opening the live signal", async () => {
     h.liveSignalAvailable = false;
     h.status = statusWith("src/manual-refresh.ts");
@@ -326,6 +491,186 @@ describe("GitManagerChangesView", () => {
 
     expect(container.textContent).toContain("Environment unavailable");
     expect(container.textContent).toContain("Remote environment is not connected.");
+    // The read resumes by itself when the connection is back; Retry could not reach it.
+    expect(buttonWithText("Waiting for the connection…").getAttribute("aria-disabled")).toBe(
+      "true",
+    );
+    expect(container.textContent).not.toContain("Retry");
+  });
+
+  it("offers Retry when changes fail to load, and reads status again explicitly", async () => {
+    h.statusError = "The connection dropped before the result arrived.";
+    h.statusEmission = AsyncResult.failure(Cause.fail(new Error(h.statusError)));
+
+    await renderView();
+    expect(h.revalidateRefs).not.toHaveBeenCalled();
+
+    expect(container.textContent).toContain("Could not load changes");
+    await act(async () => buttonWithText("Retry").click());
+    expect(h.refreshStatusQuery).toHaveBeenCalledOnce();
+    expect(h.refreshRefs).not.toHaveBeenCalled();
+    expect(h.revalidateStatusQuery).not.toHaveBeenCalled();
+    expect(h.revalidateRefs).not.toHaveBeenCalled();
+  });
+
+  it("retries only the read that failed", async () => {
+    h.status = statusWith("src/loaded.ts");
+    h.refs = null;
+    h.refsError = "Git could not read the branches.";
+
+    await renderView();
+    h.revalidateRefs.mockClear();
+
+    expect(container.textContent).toContain("Git could not read the branches.");
+    await act(async () => buttonWithText("Retry").click());
+    expect(h.refreshRefs).toHaveBeenCalledOnce();
+    expect(h.refreshStatusQuery).not.toHaveBeenCalled();
+    expect(h.revalidateRefs).not.toHaveBeenCalled();
+    expect(h.revalidateStatusQuery).not.toHaveBeenCalled();
+  });
+
+  it("keeps the failure on screen and disables Retry while changes are read again", async () => {
+    h.statusError = "The connection dropped before the result arrived.";
+    h.statusEmission = {
+      ...AsyncResult.failure(Cause.fail(new Error(h.statusError))),
+      waiting: true,
+    };
+
+    await renderView();
+
+    expect(container.textContent).toContain("Could not load changes");
+    expect(buttonWithText("Retrying…").getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("explains a repository Git cannot read instead of showing no changes", async () => {
+    h.status = unreadableStatus();
+
+    await renderView();
+
+    expect(container.textContent).toContain("Could not load changes");
+    expect(container.textContent).toContain(
+      "Git can't read this folder as a repository. Run git init to create one, or check its .git folder if it already is one.",
+    );
+    expect(container.textContent).not.toContain("No local changes");
+    expect(container.querySelector("#git-manager-summary")).toBeNull();
+    expect(buttonWithText("Retry").textContent).toBe("Retry");
+    expect(isInactive(buttonWithText("Retry"))).toBe(false);
+  });
+
+  it("calls onRetry for an unreadable repository and shows busy from its props", async () => {
+    h.status = unreadableStatus();
+    await renderView();
+    h.revalidateRefs.mockClear();
+
+    await act(async () => buttonWithText("Retry").click());
+
+    expect(h.onRetry).toHaveBeenCalledOnce();
+    expect(h.refreshStatus).not.toHaveBeenCalled();
+    expect(buttonWithText("Retry").textContent).toBe("Retry");
+
+    await renderView("/repo/main", true);
+    expect(buttonWithText("Retrying…").textContent).toBe("Retrying…");
+    expect(buttonWithText("Retrying…").getAttribute("aria-disabled")).toBe("true");
+    // The status stream itself is healthy, and the refs keep their last good answer.
+    expect(h.refreshStatusQuery).not.toHaveBeenCalled();
+    expect(h.refreshRefs).not.toHaveBeenCalled();
+    expect(h.revalidateRefs).not.toHaveBeenCalled();
+
+    await renderView("/repo/main", false);
+
+    expect(container.textContent).toContain("Git can't read this folder as a repository.");
+    expect(buttonWithText("Retry").textContent).toBe("Retry");
+    expect(isInactive(buttonWithText("Retry"))).toBe(false);
+  });
+
+  it("uses the retry state supplied for the selected checkout", async () => {
+    h.status = unreadableStatus();
+    await renderView("/repo/main", true);
+    expect(buttonWithText("Retrying…").textContent).toBe("Retrying…");
+    expect(buttonWithText("Retrying…").getAttribute("aria-disabled")).toBe("true");
+
+    await renderView("/repo/other", false);
+    expect(buttonWithText("Retry").textContent).toBe("Retry");
+    expect(isInactive(buttonWithText("Retry"))).toBe(false);
+
+    await renderView("/repo/main", true);
+    expect(buttonWithText("Retrying…").textContent).toBe("Retrying…");
+    expect(isInactive(buttonWithText("Retrying…"))).toBe(true);
+  });
+
+  it("explains the unreadable repository rather than the refs failure it causes", async () => {
+    h.status = unreadableStatus();
+    h.refs = null;
+    h.refsError = "Git could not complete the requested read.";
+
+    await renderView();
+
+    expect(container.textContent).toContain("Git can't read this folder as a repository.");
+    expect(container.textContent).not.toContain("Git could not complete the requested read.");
+  });
+
+  it("waits for the connection instead of blaming the repository", async () => {
+    h.status = unreadableStatus();
+    h.statusError = "Remote environment is not connected.";
+    h.statusEmission = AsyncResult.failure(
+      Cause.fail(
+        new EnvironmentRpcUnavailableError({
+          environmentId: "environment-1",
+          message: h.statusError,
+        }),
+      ),
+    );
+
+    await renderView();
+
+    expect(container.textContent).toContain("Environment unavailable");
+    expect(container.textContent).not.toContain("Git can't read this folder as a repository.");
+    expect(buttonWithText("Waiting for the connection…").getAttribute("aria-disabled")).toBe(
+      "true",
+    );
+  });
+
+  it("shows the changes again once Git can read the repository", async () => {
+    h.status = unreadableStatus();
+    await renderView();
+
+    h.status = statusWith("src/repaired.ts");
+    await renderView();
+
+    expect(container.textContent).toContain("src/repaired.ts");
+    expect(container.textContent).not.toContain("Could not load changes");
+  });
+
+  it("uses availability supplied by the panel instead of deriving it from its own status read", async () => {
+    h.status = statusWith("src/cached.ts");
+    await renderView("/repo/selected", false, { repositoryUnavailable: "untrusted" });
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "Git doesn't trust this repository because another user owns it. Run git config --global --add safe.directory /repo/selected to trust it.",
+    );
+    expect(container.querySelector("code")?.textContent).toBe(
+      "git config --global --add safe.directory /repo/selected",
+    );
+    expect(container.textContent).not.toContain("src/cached.ts");
+  });
+
+  it("keeps an unavailable-environment refs failure ahead of the repository explanation", async () => {
+    h.status = unreadableStatus();
+    h.refsError = "Remote environment is not connected.";
+    h.refsEmission = AsyncResult.failure(
+      Cause.fail(
+        new EnvironmentRpcUnavailableError({
+          environmentId: "environment-1",
+          message: h.refsError,
+        }),
+      ),
+    );
+    await renderView();
+    expect(container.textContent).toContain("Environment unavailable");
+    expect(container.textContent).not.toContain("Git can't read this folder as a repository.");
+    expect(buttonWithText("Waiting for the connection…").textContent).toBe(
+      "Waiting for the connection…",
+    );
+    expect(isInactive(buttonWithText("Waiting for the connection…"))).toBe(true);
   });
 
   it("keeps inclusion local while selection updates the shared view state", async () => {
@@ -515,17 +860,19 @@ describe("GitManagerChangesView", () => {
     h.status = statusWith("src/selected.ts");
     h.freshStatus = h.status;
     await renderView();
-    h.refreshRefs.mockClear();
-    h.refreshCommits.mockClear();
+    h.revalidateRefs.mockClear();
+    h.revalidateCommits.mockClear();
 
     await act(async () => buttonWithText("Commit 1 files to main").click());
 
     await vi.waitFor(() => expect(h.commit).toHaveBeenCalledOnce());
-    await vi.waitFor(() => expect(h.refreshRefs).toHaveBeenCalledOnce());
-    expect(h.refreshCommits).toHaveBeenCalledOnce();
-    expect(h.refreshRefs.mock.invocationCallOrder[0]).toBeGreaterThan(
+    await vi.waitFor(() => expect(h.revalidateRefs).toHaveBeenCalledOnce());
+    expect(h.revalidateCommits).toHaveBeenCalledOnce();
+    expect(h.revalidateRefs.mock.invocationCallOrder[0]).toBeGreaterThan(
       h.commit.mock.invocationCallOrder[0]!,
     );
+    expect(h.refreshRefs).not.toHaveBeenCalled();
+    expect(h.refreshCommits).not.toHaveBeenCalled();
   });
 
   it("does not refresh refs or history reads when the commit fails", async () => {
@@ -545,12 +892,14 @@ describe("GitManagerChangesView", () => {
       ),
     );
     await renderView();
-    h.refreshRefs.mockClear();
-    h.refreshCommits.mockClear();
+    h.revalidateRefs.mockClear();
+    h.revalidateCommits.mockClear();
 
     await act(async () => buttonWithText("Commit 1 files to main").click());
 
     await vi.waitFor(() => expect(container.textContent).toContain(reason));
+    expect(h.revalidateRefs).not.toHaveBeenCalled();
+    expect(h.revalidateCommits).not.toHaveBeenCalled();
     expect(h.refreshRefs).not.toHaveBeenCalled();
     expect(h.refreshCommits).not.toHaveBeenCalled();
   });

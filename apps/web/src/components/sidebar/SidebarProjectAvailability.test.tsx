@@ -1,9 +1,22 @@
+import { cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vite-plus/test";
+
+// Render tooltip popups inline, marked, so a test can tell the text a reader
+// sees from the text kept behind the tooltip.
+vi.mock("../ui/tooltip", () => ({
+  Tooltip: ({ children }: { children: ReactNode }) => <>{children}</>,
+  TooltipTrigger: ({ render }: { render: ReactElement }) => cloneElement(render),
+  TooltipPopup: ({ children }: { children: ReactNode }) => (
+    <span data-tooltip-popup="">{children}</span>
+  ),
+}));
 
 import { EnvironmentId } from "@bibcode/contracts";
 
 import { SidebarProjectAvailability } from "./SidebarProjectAvailability";
+import type { EnvironmentConnectionPresentation } from "@bibcode/client-runtime/connection";
+
 import type { SidebarProjectAvailabilityView } from "../Sidebar.logic";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
@@ -61,6 +74,8 @@ function render(
 describe("SidebarProjectAvailability", () => {
   it("uses the genuine empty copy only for an authoritative empty catalog", () => {
     expect(render("empty-confirmed")).toContain("No projects yet");
+    // UI.md: muted text uses the solid token, never an alpha-reduced one.
+    expect(render("empty-confirmed")).not.toContain("text-muted-foreground/");
     for (const kind of [
       "loading",
       "degraded",
@@ -171,4 +186,168 @@ describe("SidebarProjectAvailability", () => {
     );
     expect(markup).toContain("Cached projects remain visible");
   });
+
+  describe("an environment whose connection is down", () => {
+    const TOOLTIP = /<span data-tooltip-popup="">([^<]*)<\/span>/u;
+    const SCREEN_READER_ONLY = /<span[^>]*class="sr-only"[^>]*>[^<]*<\/span>/gu;
+
+    function renderNotice(
+      view: SidebarProjectAvailabilityView,
+      connection: EnvironmentConnectionPresentation,
+      options: { readonly showOpenRemoteServers?: boolean; readonly showRetry?: boolean } = {},
+    ) {
+      const markup = renderToStaticMarkup(
+        <SidebarProjectAvailability
+          view={view}
+          environment={{ label: "devbox", connection }}
+          showRetry={options.showRetry ?? false}
+          showConnectionSettings={false}
+          showOpenRemoteServers={options.showOpenRemoteServers ?? true}
+          onRetry={vi.fn()}
+          onOpenSettings={vi.fn()}
+          onViewDiagnostics={vi.fn()}
+          onAdoptStorage={vi.fn()}
+        />,
+      );
+      return {
+        visible: markup.replace(TOOLTIP, "").replace(SCREEN_READER_ONLY, ""),
+        tooltip: TOOLTIP.exec(markup)?.[1] ?? null,
+      };
+    }
+
+    it("names it, keeps the connection's reason behind a tooltip, and offers Open Remote Servers", () => {
+      const { visible, tooltip } = renderNotice(
+        {
+          kind: "configuration-error",
+          environmentId: ENVIRONMENT_ID,
+          error: null,
+          hasCachedProjects: true,
+        },
+        {
+          phase: "error",
+          error:
+            "devbox rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.",
+          traceId: null,
+        },
+      );
+
+      expect(visible).toContain("devbox is not connected.");
+      expect(visible).toContain("Cached projects remain visible.");
+      expect(visible).not.toContain("rejected a new pairing credential");
+      expect(visible).not.toContain("Project data configuration needs attention");
+      expect(tooltip).toBe(
+        "devbox rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.",
+      );
+      expect(visible).toContain("Open Remote Servers");
+      expect(visible).toContain("Diagnostics");
+      expect(visible).not.toContain(">Retry<");
+    });
+
+    it("takes a retrying timeout's reason from the connection, which the shell clears", () => {
+      const { visible, tooltip } = renderNotice(
+        {
+          kind: "degraded",
+          environmentId: ENVIRONMENT_ID,
+          error: null,
+          hasCachedProjects: true,
+        },
+        {
+          phase: "reconnecting",
+          error:
+            "The remote host did not issue a pairing credential within 30 seconds. Check the connection; BiBCode keeps trying.",
+          traceId: null,
+        },
+      );
+
+      expect(visible).toContain("devbox is not connected.");
+      expect(visible).toContain("Cached projects remain visible.");
+      expect(visible).not.toContain("did not issue a pairing credential");
+      expect(tooltip).toBe(
+        "The remote host did not issue a pairing credential within 30 seconds. Check the connection; BiBCode keeps trying.",
+      );
+    });
+
+    it("offers Retry instead of Open Remote Servers where the client reconnects in place", () => {
+      const { visible } = renderNotice(
+        {
+          kind: "unavailable",
+          environmentId: ENVIRONMENT_ID,
+          error: null,
+          hasCachedProjects: false,
+        },
+        { phase: "offline", error: null, traceId: null },
+        { showOpenRemoteServers: false, showRetry: true },
+      );
+
+      expect(visible).toContain("devbox is not connected.");
+      expect(visible).toContain(">Retry<");
+      expect(visible).not.toContain("Open Remote Servers");
+    });
+
+    it("keeps the project-data copy and a visible error while the connection is up", () => {
+      const { visible, tooltip } = renderNotice(
+        {
+          kind: "degraded",
+          environmentId: ENVIRONMENT_ID,
+          error: "Could not synchronize environment data.",
+          hasCachedProjects: true,
+        },
+        { phase: "connected", error: null, traceId: null },
+      );
+
+      expect(visible).toContain("Showing cached projects");
+      expect(visible).toContain("Could not synchronize environment data.");
+      expect(visible).not.toContain("is not connected");
+      expect(visible).not.toContain("Open Remote Servers");
+      expect(tooltip).toBeNull();
+    });
+
+    it("opens Remote Servers from its action", () => {
+      const onOpenSettings = vi.fn();
+      const element = SidebarProjectAvailability({
+        view: {
+          kind: "configuration-error",
+          environmentId: ENVIRONMENT_ID,
+          error: null,
+          hasCachedProjects: false,
+        },
+        environment: {
+          label: "devbox",
+          connection: {
+            phase: "error",
+            error:
+              "devbox rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.",
+            traceId: null,
+          },
+        },
+        showRetry: false,
+        showConnectionSettings: false,
+        showOpenRemoteServers: true,
+        onRetry: vi.fn(),
+        onOpenSettings,
+        onViewDiagnostics: vi.fn(),
+        onAdoptStorage: vi.fn(),
+      });
+      const open = findElementByText(element, "Open Remote Servers");
+
+      expect(open).not.toBeNull();
+      (open!.props as { onClick: () => void }).onClick();
+      expect(onOpenSettings).toHaveBeenCalledOnce();
+    });
+  });
 });
+
+/** The first element in `node`'s tree whose children are exactly `text`. */
+function findElementByText(node: ReactNode, text: string): ReactElement | null {
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findElementByText(child, text);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (!isValidElement(node)) return null;
+  const children = (node.props as { children?: ReactNode }).children;
+  if (children === text) return node;
+  return findElementByText(children, text);
+}

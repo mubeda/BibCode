@@ -356,8 +356,8 @@ export default function DiffPanel({
   );
   useEffect(() => {
     if (workspaceUnavailable || gitRefreshRequestId === 0 || selectedTurnId !== null) return;
-    branchDiffPreview.refresh();
-  }, [branchDiffPreview.refresh, gitRefreshRequestId, selectedTurnId, workspaceUnavailable]);
+    branchDiffPreview.revalidate();
+  }, [branchDiffPreview.revalidate, gitRefreshRequestId, selectedTurnId, workspaceUnavailable]);
   const selectedGitSource = branchDiffPreview.data?.sources.find(
     (source) => source.kind === (selectedGitScope === "unstaged" ? "working-tree" : "branch-range"),
   );

@@ -120,6 +120,8 @@ vi.mock("../state/query", () => ({
       error: queryState?.error ?? null,
       isPending: queryState?.isPending ?? false,
       refresh: key === "review.diffPreview" ? h.diffPreviewRefresh : () => undefined,
+      revalidate: key === "review.diffPreview" ? h.diffPreviewRefresh : () => undefined,
+      requiresRetry: false,
     };
   },
 }));

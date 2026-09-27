@@ -2,6 +2,9 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import {
+  GitCancelCloneInput,
+  GitCloneInput,
+  GitCloneOperationError,
   GitCommandError,
   GitManagerError,
   GitManagerServiceError,
@@ -13,6 +16,9 @@ import {
   GitRunStackedActionInput,
   GitResolvePullRequestResult,
   TextGenerationError,
+  VcsStatusLocalResult,
+  VcsStatusResult,
+  VcsStatusStreamEvent,
 } from "./git.ts";
 import { SourceControlProviderError } from "./sourceControl.ts";
 import {
@@ -28,9 +34,94 @@ const decodePreparePullRequestThreadInput = Schema.decodeUnknownSync(
 );
 const decodeRunStackedActionInput = Schema.decodeUnknownSync(GitRunStackedActionInput);
 const decodeRunStackedActionResult = Schema.decodeUnknownSync(GitRunStackedActionResult);
+const decodeCloneInput = Schema.decodeUnknownSync(GitCloneInput);
+const decodeCloneOperationError = Schema.decodeUnknownSync(GitCloneOperationError);
+const decodeCancelCloneInput = Schema.decodeUnknownSync(GitCancelCloneInput);
 const decodeResolvePullRequestResult = Schema.decodeUnknownSync(GitResolvePullRequestResult);
 const decodeManagerServiceError = Schema.decodeUnknownSync(GitManagerServiceError);
 const encodeManagerServiceError = Schema.encodeUnknownSync(GitManagerServiceError);
+const decodeStatusLocalResult = Schema.decodeUnknownSync(VcsStatusLocalResult);
+const encodeStatusLocalResult = Schema.encodeSync(VcsStatusLocalResult);
+const decodeStatusResult = Schema.decodeUnknownSync(VcsStatusResult);
+const encodeStatusResult = Schema.encodeSync(VcsStatusResult);
+const decodeStatusStreamEvent = Schema.decodeUnknownSync(VcsStatusStreamEvent);
+const encodeStatusStreamEvent = Schema.encodeSync(VcsStatusStreamEvent);
+
+describe("VCS repository availability", () => {
+  const local = {
+    isRepo: false,
+    hasPrimaryRemote: false,
+    isDefaultRef: false,
+    refName: null,
+    hasWorkingTreeChanges: false,
+    workingTree: { files: [], insertions: 0, deletions: 0 },
+  };
+  const remote = { hasUpstream: false, aheadCount: 0, behindCount: 0, pr: null };
+
+  it.each(["absent", "unreadable", "untrusted"])(
+    "round-trips %s across local status shapes",
+    (reason) => {
+      const unavailable = { ...local, repositoryUnavailableReason: reason };
+      expect(encodeStatusLocalResult(decodeStatusLocalResult(unavailable))).toEqual(unavailable);
+      expect(encodeStatusResult(decodeStatusResult({ ...unavailable, ...remote }))).toEqual({
+        ...unavailable,
+        ...remote,
+      });
+      for (const event of [
+        { _tag: "snapshot", local: unavailable, remote: null },
+        { _tag: "localUpdated", local: unavailable },
+      ]) {
+        expect(encodeStatusStreamEvent(decodeStatusStreamEvent(event))).toEqual(event);
+      }
+    },
+  );
+
+  it("accepts older servers and healthy repositories without a reason", () => {
+    for (const isRepo of [false, true]) {
+      const status = { ...local, isRepo };
+      expect(decodeStatusLocalResult(status)).toEqual(status);
+      expect(decodeStatusResult({ ...status, ...remote })).toEqual({
+        ...status,
+        ...remote,
+      });
+    }
+  });
+
+  it("decodes an unknown repository reason in local status as absent", () => {
+    const decoded = decodeStatusLocalResult({
+      ...local,
+      repositoryUnavailableReason: "futureReason",
+    });
+
+    expect(decoded).toStrictEqual(local);
+    expect(Object.hasOwn(decoded, "repositoryUnavailableReason")).toBe(false);
+  });
+
+  it("decodes an unknown repository reason in full status as absent", () => {
+    const decoded = decodeStatusResult({
+      ...local,
+      ...remote,
+      repositoryUnavailableReason: "futureReason",
+    });
+
+    expect(decoded).toStrictEqual({ ...local, ...remote });
+    expect(Object.hasOwn(decoded, "repositoryUnavailableReason")).toBe(false);
+  });
+
+  it.each([
+    { _tag: "snapshot", local, remote },
+    { _tag: "localUpdated", local },
+  ] as const)("decodes an unknown repository reason in $_tag as absent", (event) => {
+    const decoded = decodeStatusStreamEvent({
+      ...event,
+      local: { ...local, repositoryUnavailableReason: "futureReason" },
+    });
+
+    expect(decoded).toStrictEqual(event);
+    if (decoded._tag === "remoteUpdated") throw new Error("Expected a local status event");
+    expect(Object.hasOwn(decoded.local, "repositoryUnavailableReason")).toBe(false);
+  });
+});
 
 describe("VcsCreateWorktreeInput", () => {
   it("accepts omitted newRefName for existing-refName worktrees", () => {
@@ -304,5 +395,50 @@ describe("git errors", () => {
       makeInvalidClassInstance(GitPullRequestMaterializationError.prototype, invalid),
       encodeExpected,
     );
+  });
+});
+
+describe("clone re-attach contracts", () => {
+  it("keeps attach and detach optional on the clone input", () => {
+    expect(decodeCloneInput({ url: "https://example.test/demo.git", parentDir: "/code" })).toEqual({
+      url: "https://example.test/demo.git",
+      parentDir: "/code",
+    });
+    expect(
+      decodeCloneInput({
+        url: "https://example.test/demo.git",
+        parentDir: "/code",
+        directoryName: "demo",
+        attach: true,
+        detach: true,
+      }),
+    ).toMatchObject({ attach: true, detach: true, directoryName: "demo" });
+  });
+
+  it("decodes every clone operation reason and rejects unknown ones", () => {
+    for (const reason of ["busy", "capacity", "shutting-down", "not-in-progress", "cancelled"]) {
+      const error = decodeCloneOperationError({
+        _tag: "GitCloneOperationError",
+        reason,
+        destination: "/code/demo",
+        message: "Synthetic server message.",
+      });
+      expect(error.reason).toBe(reason);
+      expect(error.message).toBe("Synthetic server message.");
+    }
+    expect(() =>
+      decodeCloneOperationError({
+        _tag: "GitCloneOperationError",
+        reason: "unknown",
+        destination: "/code/demo",
+        message: "x",
+      }),
+    ).toThrow();
+  });
+
+  it("cancels by the clone's own input so only the server derives the destination", () => {
+    expect(
+      decodeCancelCloneInput({ url: "https://example.test/demo.git", parentDir: "~/code" }),
+    ).toEqual({ url: "https://example.test/demo.git", parentDir: "~/code" });
   });
 });

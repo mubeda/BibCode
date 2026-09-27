@@ -1,3 +1,6 @@
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 use bibcode_server::{
     ServerConfig, ServerRuntime,
     persistence::{
@@ -243,6 +246,10 @@ async fn fetch_connect_descriptor(client: &Client, handle: &bibcode_server::Serv
 #[tokio::test]
 async fn descriptor_surfaces_publish_one_stable_uuid_without_local_path_leakage() {
     let root = TempDir::new().expect("temporary absolute data root");
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(root.path()).state_dir(),
+        json!({}),
+    );
     let client = Client::builder()
         .no_proxy()
         .build()
@@ -1209,6 +1216,10 @@ async fn recovery_incomplete_staging_never_becomes_a_first_run_store() {
 #[tokio::test]
 async fn recovery_refuses_to_mutate_a_store_owned_by_a_running_server() {
     let root = TempDir::new().expect("temporary active-store root");
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(root.path()).state_dir(),
+        json!({}),
+    );
     let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
         .await
         .expect("start active store owner");

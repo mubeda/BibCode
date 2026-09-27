@@ -147,8 +147,9 @@ describe("desktop UI motion stabilization", () => {
     );
 
     expect(configuration).toMatch(
-      /\[data-slot="sidebar-group"\]:has\(\[data-testid="new-main-chat-button"\]\)\s+ul\[data-sidebar="menu"\]\s*>\s*li\s*\{[^}]*opacity:\s*1\s*!important;[^}]*\}/s,
+      /\[data-slot="sidebar-group"\]\[data-testid="sidebar-projects-group"\]\s+ul\[data-sidebar="menu"\]\s*>\s*li\s*\{[^}]*opacity:\s*1\s*!important;[^}]*\}/s,
     );
+    expect(configuration).not.toContain("new-main-chat-button");
     expect(configuration).not.toMatch(/(?:^|,)\s*li\s*\{[^}]*opacity:/s);
   });
 
@@ -161,6 +162,19 @@ describe("desktop UI motion stabilization", () => {
 });
 
 describe("packaged composer acceptance contract", () => {
+  it("finds sidebar workspace cards without requiring an anchor element", () => {
+    const specsDirectory = new URL("../specs/", import.meta.url);
+    const anchoredSpecs = NodeFS.readdirSync(specsDirectory)
+      .filter((name) => name.endsWith(".e2e.ts"))
+      .filter((name) =>
+        NodeFS.readFileSync(new URL(name, specsDirectory), "utf8").includes(
+          "//a[@data-thread-item",
+        ),
+      )
+      .toSorted();
+    expect(anchoredSpecs).toEqual([]);
+  });
+
   const readComposerSpec = (): string =>
     NodeFS.readFileSync(
       new URL("../specs/composer-native-triggers.e2e.ts", import.meta.url),

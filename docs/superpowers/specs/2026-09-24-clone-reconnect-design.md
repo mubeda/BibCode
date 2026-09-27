@@ -189,6 +189,7 @@ reconnecting → registering → closed`, plus `cancelling`. **Cancel clone** sh
 | Reconnected, still running      | **Cloning…**; status cleared                                                                               |
 | Cancel while disconnected       | **Cancelling…**; "The clone stops when <host> reconnects."                                                 |
 | Cancel confirmed                | "Clone cancelled." (today)                                                                                 |
+| Cancel after the clone finished (added 2026-09-25, controller ruling: the table had no row for this race) | "The clone finished before it could be cancelled. It is in <path> and was not added as a project. Press Clone to add it." |
 | Success after re-attach         | **Adding project…**, closes once the project opens (today)                                                 |
 | Clone failed, live or retained  | "Clone failed: <server detail>" (today)                                                                    |
 | `not-in-progress`               | "No clone is in progress for <path>. Press Clone to start again."                                          |

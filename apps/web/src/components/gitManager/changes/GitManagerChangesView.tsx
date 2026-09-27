@@ -17,6 +17,7 @@ import { SearchIcon, XIcon } from "lucide-react";
 import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
+import { RetryButton, type RetryButtonProps } from "~/components/ui/retry-button";
 import { Checkbox } from "~/components/ui/checkbox";
 import { useOpenInPreferredEditor } from "~/editorPreferences";
 import { readLocalApi } from "~/localApi";
@@ -28,6 +29,8 @@ import { useEnvironmentQuery } from "../../../state/query";
 import { shellEnvironment } from "../../../state/shell";
 import { useAtomCommand } from "../../../state/use-atom-command";
 import { vcsEnvironment } from "../../../state/vcs";
+import { GitManagerRepositoryUnavailable } from "../GitManagerRepositoryUnavailable";
+import type { RepositoryUnavailable } from "../gitManagerRepositoryUnavailable";
 import { joinWorkspacePath, parentRelativePath } from "../../files/FileTreeContextMenu.logic";
 import { GitManagerAgentActivity } from "./GitManagerAgentActivity";
 import { GitManagerCommitBox, type GitManagerCommitSubmission } from "./GitManagerCommitBox";
@@ -45,6 +48,11 @@ import {
 export interface GitManagerChangesViewProps {
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly projectRef: ScopedProjectRef;
+  readonly repositoryUnavailable: RepositoryUnavailable;
+  /** The persistent surfaces owner is replacing the refs failure observed during the break. */
+  readonly refsRecovering: boolean;
+  readonly retrying: boolean;
+  readonly onRetry: () => void;
 }
 
 type ChangeContextAction =
@@ -131,12 +139,13 @@ function contextMenuItems(
   ];
 }
 
-function errorPanel(title: string, message: string) {
+function errorPanel(title: string, message: string, retry: RetryButtonProps) {
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center p-6" role="alert">
       <div className="max-w-md text-center">
         <p className="font-medium text-sm text-foreground">{title}</p>
         <p className="mt-1 text-sm text-muted-foreground">{message}</p>
+        <RetryButton className="mt-3" {...retry} />
       </div>
     </div>
   );
@@ -154,6 +163,10 @@ function gitManagerMutationErrorMessage(error: unknown): string {
 export const GitManagerChangesView = memo(function GitManagerChangesView({
   scope,
   projectRef,
+  repositoryUnavailable,
+  refsRecovering,
+  retrying,
+  onRetry,
 }: GitManagerChangesViewProps) {
   const { environmentId, cwd } = scope;
   const { projectId } = projectRef;
@@ -185,7 +198,6 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   const readsAvailable = typeof gitManagerEnvironment.getRefs === "function";
   const project = useProject(stableProjectRef);
   const serverConfig = useServerConfigs().get(environmentId) ?? null;
-  const liveSignalAvailable = serverConfig?.environment?.capabilities.gitManagerLiveSignal === true;
 
   const statusAtom = useMemo(
     () => (readsAvailable ? vcsEnvironment.status({ environmentId, input: { cwd } }) : null),
@@ -195,13 +207,6 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
     const getRefs = gitManagerEnvironment.getRefs;
     return typeof getRefs === "function" ? getRefs({ environmentId, input: { cwd } }) : null;
   }, [cwd, environmentId]);
-  const signalAtom = useMemo(
-    () =>
-      readsAvailable && liveSignalAvailable
-        ? gitManagerEnvironment.signalWithDegradedFocusRefresh({ environmentId, input: { cwd } })
-        : null,
-    [cwd, environmentId, liveSignalAvailable, readsAvailable],
-  );
   const latestCommitAtom = useMemo(() => {
     const getCommits = gitManagerEnvironment.getCommits;
     return typeof getCommits === "function"
@@ -210,14 +215,39 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
   }, [cwd, environmentId]);
   const statusQuery = useEnvironmentQuery(statusAtom);
   const refsQuery = useEnvironmentQuery(refsAtom);
-  const signalQuery = useEnvironmentQuery(signalAtom);
   const latestCommitQuery = useEnvironmentQuery(latestCommitAtom);
-  const signalGeneration = signalQuery.data?.generation ?? null;
-  const refreshRefs = refsQuery.refresh;
-  const refreshLatestCommit = latestCommitQuery.refresh;
+  // Finished mutations revalidate without clearing a transport cut-off.
+  const revalidateRefs = refsQuery.revalidate;
+  const revalidateLatestCommit = latestCommitQuery.revalidate;
+  const repositoryReadable =
+    repositoryUnavailable === null &&
+    statusQuery.error === null &&
+    statusQuery.data?.isRepo === true;
+  const latestCommitFailed = latestCommitQuery.emission?._tag === "Failure";
+  const latestCommitPending = latestCommitQuery.isPending;
+  const retriedLatestCommitRef = useRef(false);
   useEffect(() => {
-    if (signalGeneration !== null) refreshRefs();
-  }, [refreshRefs, signalGeneration]);
+    // Allow one automatic retry per mount or recovery, even if that retry also fails.
+    if (repositoryUnavailable !== null) {
+      retriedLatestCommitRef.current = false;
+      return;
+    }
+    if (
+      !repositoryReadable ||
+      !latestCommitFailed ||
+      latestCommitPending ||
+      retriedLatestCommitRef.current
+    )
+      return;
+    retriedLatestCommitRef.current = true;
+    revalidateLatestCommit();
+  }, [
+    latestCommitFailed,
+    latestCommitPending,
+    repositoryReadable,
+    repositoryUnavailable,
+    revalidateLatestCommit,
+  ]);
 
   const availableEditors = serverConfig?.availableEditors ?? EMPTY_EDITORS;
   const openInPreferredEditor = useOpenInPreferredEditor(environmentId, availableEditors);
@@ -396,8 +426,8 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
           setMutationError(message);
           throw new Error(message);
         }
-        refreshRefs();
-        refreshLatestCommit();
+        revalidateRefs();
+        revalidateLatestCommit();
       } finally {
         setMutationBusy(false);
       }
@@ -406,8 +436,8 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
       commit,
       cwd,
       environmentId,
-      refreshLatestCommit,
-      refreshRefs,
+      revalidateLatestCommit,
+      revalidateRefs,
       refreshStatus,
       stageFiles,
       unstageFiles,
@@ -422,13 +452,13 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         setMutationError(gitManagerMutationErrorMessage(squashAtomCommandFailure(result)));
         return null;
       }
-      refreshRefs();
-      refreshLatestCommit();
+      revalidateRefs();
+      revalidateLatestCommit();
       return result.value;
     } finally {
       setMutationBusy(false);
     }
-  }, [cwd, environmentId, refreshLatestCommit, refreshRefs, undoCommit]);
+  }, [cwd, environmentId, revalidateLatestCommit, revalidateRefs, undoCommit]);
   const requestDiscardAll = useCallback(() => {
     if (allChangedPaths.length > 0) {
       setPendingDiscard({ paths: allChangedPaths, disposition: "trash" });
@@ -538,13 +568,40 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
 
   const statusUnavailable = isEnvironmentUnavailable(statusQuery.emission);
   const refsUnavailable = isEnvironmentUnavailable(refsQuery.emission);
-  if (statusQuery.error !== null || refsQuery.error !== null) {
-    const message = statusQuery.error ?? refsQuery.error ?? "The environment request failed.";
-    return statusUnavailable || refsUnavailable
-      ? errorPanel("Environment unavailable", message)
-      : errorPanel("Could not load changes", message);
+  // Changes owns this panel to preserve environment-error precedence; History and Tags unmount.
+  if (repositoryUnavailable !== null && !refsUnavailable) {
+    return (
+      <GitManagerRepositoryUnavailable
+        title="Could not load changes"
+        reason={repositoryUnavailable}
+        cwd={cwd}
+        retrying={retrying}
+        onRetry={onRetry}
+      />
+    );
   }
-  if (statusQuery.data === null || refsQuery.data === null) {
+  if (
+    statusQuery.error !== null ||
+    (refsQuery.error !== null && (!refsRecovering || refsUnavailable))
+  ) {
+    const message = statusQuery.error ?? refsQuery.error ?? "The environment request failed.";
+    // Retry reads again only what failed, through the explicit refresh that clears a cut-off.
+    // Without a session no read can run; both resume by themselves once it is back.
+    const retry: RetryButtonProps = {
+      retrying:
+        (statusQuery.error !== null && statusQuery.isPending) ||
+        (refsQuery.error !== null && refsQuery.isPending),
+      waitingForConnection: statusUnavailable || refsUnavailable,
+      onRetry: () => {
+        if (statusQuery.error !== null) statusQuery.refresh();
+        if (refsQuery.error !== null) refsQuery.refresh();
+      },
+    };
+    return statusUnavailable || refsUnavailable
+      ? errorPanel("Environment unavailable", message, retry)
+      : errorPanel("Could not load changes", message, retry);
+  }
+  if (statusQuery.data === null || refsQuery.data === null || refsRecovering) {
     return (
       <div
         className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground"

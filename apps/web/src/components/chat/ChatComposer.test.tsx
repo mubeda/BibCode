@@ -1136,9 +1136,23 @@ describe("ChatComposer rendering", () => {
     const { markup } = renderComposer({
       environmentUnavailable: { label: "Laptop", connection },
     });
-    expect(markup).toContain('data-placeholder="Laptop: Offline"');
+    expect(markup).toContain('data-placeholder="Laptop is not connected"');
     expect(markup).toContain("opacity-75");
     expect(editorProps()["disabled"]).toBe(true);
+  });
+
+  it("names the unavailable environment without repeating the banner's reason", () => {
+    const reason =
+      "devbox rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.";
+    const { markup } = renderComposer({
+      environmentUnavailable: {
+        label: "devbox",
+        connection: { phase: "error", error: reason, traceId: null },
+      },
+    });
+
+    expect(markup).toContain('data-placeholder="devbox is not connected"');
+    expect(markup).not.toContain("rejected a new pairing credential");
   });
 
   it("shows the disconnected placeholder", () => {
@@ -1348,6 +1362,28 @@ describe("ChatComposer rendering", () => {
     expect(attachmentIndex).toBeLessThan(contextIndex);
     expect(mcpIndex).toBeLessThan(contextIndex);
     expect(contextIndex).toBeLessThan(primaryIndex);
+  });
+
+  it("passes the thread instance's picker label to the context meter", () => {
+    const instanceId = ProviderInstanceId.make("codex_personal");
+    const modelSelection = { instanceId, model: "gpt-5.4" };
+    renderComposer({
+      activeThread: makeThread({ modelSelection }),
+      activeThreadModelSelection: modelSelection,
+      providerBindingInstanceId: instanceId,
+      providerStatuses: [
+        { ...codexProvider, displayName: "Default Codex" },
+        { ...codexProvider, instanceId, displayName: "Stale Personal Name" },
+      ],
+      settings: {
+        ...DEFAULT_UNIFIED_SETTINGS,
+        providerInstances: {
+          [instanceId]: { driver: codexProvider.driver, displayName: "Codex Personal" },
+        },
+      },
+    });
+
+    expect(findCapture("ContextWindowMeter")["providerDisplayName"]).toBe("Codex Personal");
   });
 
   it.each([

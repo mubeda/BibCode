@@ -141,7 +141,12 @@ const findE2eeCause = (exit: Exit.Exit<unknown, unknown>): E2eeProtocolError | n
   return Option.isSome(failure) ? e2eeFailureOf(failure.value) : null;
 };
 
-const responderScript = (options?: { failAuth?: boolean; messageBPayload?: Uint8Array }) => {
+const responderScript = (options?: {
+  failAuth?: boolean;
+  messageBPayload?: Uint8Array;
+  confirmInterleave?: boolean;
+  interleaveControl?: boolean;
+}) => {
   const staticPrivate = crypto.getRandomValues(new Uint8Array(32));
   const hostKey = derivePublicKey(staticPrivate);
   const responder = createNkResponder({ staticPrivateKey: staticPrivate });
@@ -189,8 +194,20 @@ const responderScript = (options?: { failAuth?: boolean; messageBPayload?: Uint8
           pairingConfirmationRequired: true,
         });
       } else {
-        reply({ type: "e2ee_authenticated" });
+        reply({
+          type: "e2ee_authenticated",
+          ...(options?.confirmInterleave === true ? { features: ["interleave-v1"] } : {}),
+        });
       }
+      return;
+    }
+    if (options?.interleaveControl === true) {
+      const body = new TextEncoder().encode(encodeJson({ echoed: text.length }));
+      const send = (bytes: Uint8Array) =>
+        emit(currentTransport().send.encryptWithAd(new Uint8Array(0), bytes));
+      send(Uint8Array.of(0x01, ...body.subarray(0, 4)));
+      send(Uint8Array.of(0x02, ...new TextEncoder().encode(encodeJson({ control: true }))));
+      send(Uint8Array.of(0x00, ...body.subarray(4)));
       return;
     }
     reply({ echoed: text.length });
@@ -199,6 +216,80 @@ const responderScript = (options?: { failAuth?: boolean; messageBPayload?: Uint8
 };
 
 describe("makeE2eeSocket", () => {
+  it.effect("offers interleave-v1 in the auth message", () =>
+    Effect.gen(function* () {
+      const responder = responderScript();
+      const socket = makeE2eeSocket(makeScriptedInnerSocket(responder.script), {
+        hostKey: Buffer.from(responder.hostKey).toString("base64url"),
+        auth: { kind: "bearer", credential: "stored" },
+      });
+      const opened = yield* Deferred.make<void>();
+      const fiber = yield* Effect.forkChild(
+        socket.runRaw(() => undefined, {
+          onOpen: Deferred.succeed(opened, undefined).pipe(Effect.asVoid),
+        }),
+      );
+      yield* Deferred.await(opened);
+      expect(decodeJson(responder.received[0]!)).toMatchObject({
+        type: "e2ee_auth",
+        bearer: "stored",
+        features: ["interleave-v1"],
+      });
+      yield* Fiber.interrupt(fiber);
+    }),
+  );
+
+  it.effect("delivers a mid-message control record once the server confirms interleave-v1", () =>
+    Effect.gen(function* () {
+      const responder = responderScript({ confirmInterleave: true, interleaveControl: true });
+      const socket = makeE2eeSocket(makeScriptedInnerSocket(responder.script), {
+        hostKey: Buffer.from(responder.hostKey).toString("base64url"),
+        auth: { kind: "bearer", credential: "stored" },
+      });
+      const received: Array<string> = [];
+      const opened = yield* Deferred.make<void>();
+      const fiber = yield* Effect.forkChild(
+        socket.runRaw(
+          (data) => {
+            received.push(typeof data === "string" ? data : new TextDecoder().decode(data));
+          },
+          { onOpen: Deferred.succeed(opened, undefined).pipe(Effect.asVoid) },
+        ),
+      );
+      yield* Deferred.await(opened);
+      const write = yield* Scope.provide(socket.writer, yield* Scope.make());
+      yield* write('{"hello":true}');
+      for (let attempt = 0; attempt < 100 && received.length < 2; attempt += 1) {
+        yield* Effect.yieldNow;
+      }
+      expect(received.map((text) => decodeJson(text))).toEqual([{ control: true }, { echoed: 14 }]);
+      yield* Fiber.interrupt(fiber);
+    }),
+  );
+
+  it.effect("fails closed on a control record the server never confirmed", () =>
+    Effect.gen(function* () {
+      const responder = responderScript({ interleaveControl: true });
+      const socket = makeE2eeSocket(makeScriptedInnerSocket(responder.script), {
+        hostKey: Buffer.from(responder.hostKey).toString("base64url"),
+        auth: { kind: "bearer", credential: "stored" },
+      });
+      const opened = yield* Deferred.make<void>();
+      const fiber = yield* Effect.forkChild(
+        Effect.exit(
+          socket.runRaw(() => undefined, {
+            onOpen: Deferred.succeed(opened, undefined).pipe(Effect.asVoid),
+          }),
+        ),
+      );
+      yield* Deferred.await(opened);
+      const write = yield* Scope.provide(socket.writer, yield* Scope.make());
+      yield* write('{"hello":true}');
+      const exit = yield* Fiber.join(fiber);
+      expect(findE2eeCause(exit)?.reason).toBe("protocol");
+    }),
+  );
+
   it.effect("fails closed when the transport delivers a non-binary frame", () =>
     Effect.gen(function* () {
       // A Blob here means the underlying WebSocket was left on binaryType
@@ -262,7 +353,9 @@ describe("makeE2eeSocket", () => {
       );
       yield* Effect.sleep("200 millis");
       yield* Fiber.interrupt(fiber);
-      expect(received[0]).toBe(encodeJson({ type: "e2ee_auth", pairing: "one-time-1" }));
+      expect(received[0]).toBe(
+        encodeJson({ type: "e2ee_auth", pairing: "one-time-1", features: ["interleave-v1"] }),
+      );
       expect(received[1]).toBe(encodeJson({ hello: true }));
       expect(delivered).toEqual([encodeJson({ echoed: received[1]?.length })]);
       expect(authenticated[0]?.credential).toBe("minted-for-one-time-1");
@@ -285,7 +378,9 @@ describe("makeE2eeSocket", () => {
       );
       yield* Deferred.await(opened);
       yield* Fiber.interrupt(fiber);
-      expect(received[0]).toBe(encodeJson({ type: "e2ee_auth", bearer: "stored-1" }));
+      expect(received[0]).toBe(
+        encodeJson({ type: "e2ee_auth", bearer: "stored-1", features: ["interleave-v1"] }),
+      );
     }),
   );
 
@@ -325,7 +420,9 @@ describe("makeE2eeSocket", () => {
       );
       yield* Effect.sleep("200 millis");
       yield* Fiber.interrupt(fiber);
-      expect(received[0]).toBe(encodeJson({ type: "e2ee_auth", pairing: "one-time-2" }));
+      expect(received[0]).toBe(
+        encodeJson({ type: "e2ee_auth", pairing: "one-time-2", features: ["interleave-v1"] }),
+      );
       expect(received[1]).toBe(encodeJson({ hello: true }));
       expect(delivered).toEqual([encodeJson({ echoed: received[1]?.length })]);
     }),

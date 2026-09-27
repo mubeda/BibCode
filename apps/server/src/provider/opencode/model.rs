@@ -255,6 +255,11 @@ pub fn merge_assistant_text(previous: Option<&str>, next: &str) -> (String, Stri
     )
 }
 
+/// The labels of OpenCode's turn options. The option descriptors show them, and the refusal for an
+/// option names it the same way.
+pub(crate) const FAST_MODE_LABEL: &str = "Fast";
+pub(crate) const VARIANT_LABEL: &str = "Variant";
+
 fn model_capabilities(provider_id: &str, model: &Value, agents: &Value) -> Value {
     let mut descriptors = Vec::new();
     let supports_fast = model
@@ -264,7 +269,7 @@ fn model_capabilities(provider_id: &str, model: &Value, agents: &Value) -> Value
     if supports_fast {
         descriptors.push(json!({
             "id": "fastMode",
-            "label": "Fast",
+            "label": FAST_MODE_LABEL,
             "type": "boolean",
             "currentValue": false,
         }));
@@ -273,7 +278,7 @@ fn model_capabilities(provider_id: &str, model: &Value, agents: &Value) -> Value
     if !variant_options.is_empty() {
         let mut descriptor = json!({
             "id": "variant",
-            "label": "Variant",
+            "label": VARIANT_LABEL,
             "type": "select",
             "options": variant_options,
         });

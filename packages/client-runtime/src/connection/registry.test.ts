@@ -84,6 +84,7 @@ const PREPARED: PreparedConnection = {
     platform: { os: "linux", arch: "x64" },
     serverVersion: "0.0.0-test",
     storageInstanceId: "store-test",
+    bootId: null,
     remoteUpdateSupport: null,
     remoteProtocolVersion: 1,
     minCompatibleRemoteProtocol: 1,
@@ -181,7 +182,12 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   initialCredentials: ReadonlyArray<readonly [string, ConnectionCredential]> = [],
   options?: {
     readonly relabel?: Persistence.ConnectionRegistrationStore["Service"]["relabel"];
+    /** Runs when an attempt starts, before the driver reports its first progress. */
+    readonly beforePreparing?: (environmentId: EnvironmentId) => Effect.Effect<void>;
     readonly beforeSessionConnect?: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<void, ConnectionAttemptError>;
+    readonly sessionReady?: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<void, ConnectionAttemptError>;
     readonly beforeRegistrationRegister?: (
@@ -513,6 +519,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         next.delete(connectionId);
         return next;
       }),
+    putIfSaved: () => Effect.die(new Error("SSH credential refresh is not used.")),
   });
   const tokenStore = TokenStore.RemoteDpopAccessTokenStore.of({
     get: (environmentId) =>
@@ -534,13 +541,15 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   });
   const sshGateway = ClientCapabilities.SshEnvironmentGateway.of({
     provision: () => Effect.die(new Error("SSH provisioning is not used.")),
-    prepare: () => Effect.die(new Error("SSH preparation is not used.")),
+    ensureTunnel: () => Effect.die(new Error("SSH tunnels are not used.")),
+    mintBearer: () => Effect.die(new Error("SSH minting is not used.")),
     disconnect: (target) => Ref.update(disconnectedSshTargets, (current) => [...current, target]),
   });
   const driver = ConnectionDriver.ConnectionDriver.of({
     connect: (entry, reportProgress) =>
       Effect.gen(function* () {
         const target = entry.target;
+        yield* options?.beforePreparing?.(target.environmentId) ?? Effect.void;
         if (target._tag === "UnavailableConnectionTarget") {
           return yield* new ConnectionTransientError({
             reason: "endpoint-unavailable",
@@ -562,7 +571,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
           Effect.succeed({
             client: {} as RpcSession.RpcSession["client"],
             initialConfig: Effect.die(new Error("Config is not used by registry tests.")),
-            ready: Effect.void,
+            ready: options?.sessionReady?.(target.environmentId) ?? Effect.void,
             probe: Effect.void,
             closed: Deferred.await(closed),
             e2eeAuthenticated: Effect.succeed(null),
@@ -619,6 +628,36 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     acceptedStorageIdentities,
     acceptedStorageIdentityWrites,
     networkStatus,
+  };
+});
+
+/** The state a desired supervisor is built with: generation 0, before any attempt reports. */
+const FIRST_DESIRED_STATE = { desired: true, phase: "connecting", generation: 0 } as const;
+
+/**
+ * Samples `registry.state` whenever an attempt starts, before the driver reports any progress.
+ * The supervisor's loop has published nothing by then, so every sample is the state the registry
+ * built the supervisor with. Hand the registry to `watch` before the first attempt can start.
+ */
+const makeFirstStateProbe = Effect.fn("TestEnvironmentRegistry.makeFirstStateProbe")(function* () {
+  const registryRef = yield* Ref.make(
+    Option.none<EnvironmentRegistry.EnvironmentRegistry["Service"]>(),
+  );
+  const samples = yield* Ref.make<
+    ReadonlyArray<readonly [EnvironmentId, SupervisorConnectionState]>
+  >([]);
+  const beforePreparing = Effect.fn("TestEnvironmentRegistry.beforePreparing")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    const registry = Option.getOrThrow(yield* Ref.get(registryRef));
+    const state = yield* registry.state(environmentId);
+    yield* Ref.update(samples, (current) => [...current, [environmentId, state] as const]);
+  }, Effect.orDie);
+  return {
+    beforePreparing,
+    samples,
+    watch: (registry: EnvironmentRegistry.EnvironmentRegistry["Service"]) =>
+      Ref.set(registryRef, Option.some(registry)),
   };
 });
 
@@ -1203,6 +1242,86 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
+  it.effect("names a disconnect during readiness with the saved name after a rename", () =>
+    Effect.gen(function* () {
+      const connecting = yield* Deferred.make<void>();
+      const renamed = yield* Deferred.make<void>();
+      const harness = yield* makeHarness([RELAY_TARGET], [], [], {
+        beforeSessionConnect: () =>
+          Deferred.succeed(connecting, undefined).pipe(Effect.andThen(Deferred.await(renamed))),
+        sessionReady: () =>
+          Effect.fail(
+            new ConnectionTransientError({
+              reason: "connection-closed",
+              detail: "The connection disconnected.",
+            }),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        const environmentId = RELAY_TARGET.environmentId;
+        yield* registry.start;
+        yield* Deferred.await(connecting);
+        yield* registry.rename(environmentId, "GPU box");
+        yield* Deferred.succeed(renamed, undefined);
+        const state = yield* awaitConnectionState(
+          registry,
+          environmentId,
+          (value) => value.phase === "backoff",
+        );
+        expect(state.lastFailure?.message).toBe("GPU box closed the connection.");
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  for (const [reason, expected] of [
+    ["connection-closed", "GPU box closed the connection."],
+    ["connection-lost", "The connection to GPU box was lost."],
+    [
+      "liveness-timeout",
+      "No data from GPU box for 30 seconds. The connection is too slow or was lost.",
+    ],
+  ] as const) {
+    it.effect(`uses the saved name after rename for ${reason}`, () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness([RELAY_TARGET]);
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          const environmentId = RELAY_TARGET.environmentId;
+          yield* registry.start;
+          yield* awaitConnectionState(
+            registry,
+            environmentId,
+            (state) => state.phase === "connected",
+          );
+          const supervisor = yield* registry.run(
+            environmentId,
+            EnvironmentSupervisor.EnvironmentSupervisor,
+          );
+          const prepared = yield* SubscriptionRef.get(supervisor.prepared);
+          yield* registry.rename(environmentId, "GPU box");
+          expect(yield* SubscriptionRef.get(supervisor.prepared)).toBe(prepared);
+          expect(Option.getOrThrow(prepared).label).not.toBe("GPU box");
+          const session = (yield* Ref.get(harness.sessions)).at(-1);
+          if (session === undefined) throw new Error("Missing live session");
+          yield* Deferred.fail(
+            session.closed,
+            new ConnectionTransientError({
+              reason,
+              detail: "The connection disconnected.",
+            }),
+          );
+          const state = yield* awaitConnectionState(
+            registry,
+            environmentId,
+            (value) => value.phase === "backoff",
+          );
+          expect(state.lastFailure?.message).toBe(expected);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+    );
+  }
+
   it.effect("keeps a disconnected environment disconnected across a rename", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness([RELAY_TARGET]);
@@ -1359,6 +1478,123 @@ describe("EnvironmentRegistry", () => {
         const state = yield* registry.state(TARGET.environmentId);
         expect(state.desired).toBe(false);
         expect(yield* Ref.get(harness.sessions)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("builds a registered environment's supervisor with the stored intent", () =>
+    Effect.gen(function* () {
+      const probe = yield* makeFirstStateProbe();
+      const harness = yield* makeHarness([], [], [], { beforePreparing: probe.beforePreparing });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* probe.watch(registry);
+        yield* registry.register(new RelayConnectionRegistration({ target: RELAY_TARGET }));
+        yield* awaitConnectionState(
+          registry,
+          RELAY_TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        expect(yield* Ref.get(probe.samples)).toEqual([
+          [RELAY_TARGET.environmentId, expect.objectContaining(FIRST_DESIRED_STATE)],
+        ]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect(
+    "builds a desired supervisor with offline as its first state while the network is offline",
+    () =>
+      Effect.gen(function* () {
+        const probe = yield* makeFirstStateProbe();
+        const harness = yield* makeHarness([TARGET], [], [], {
+          beforePreparing: probe.beforePreparing,
+        });
+        yield* SubscriptionRef.set(harness.networkStatus, "offline");
+
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* probe.watch(registry);
+
+          // A cold lookup builds and reads the supervisor before its loop can publish a state.
+          expect(yield* registry.state(TARGET.environmentId)).toMatchObject({
+            desired: true,
+            phase: "offline",
+            network: "offline",
+            generation: 0,
+          });
+          expect(yield* Ref.get(probe.samples)).toEqual([]);
+          expect(yield* Ref.get(harness.sessions)).toEqual([]);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+  );
+
+  it.effect("builds a replacement supervisor with the stored intent", () =>
+    Effect.gen(function* () {
+      const moved = new PrimaryConnectionTarget({
+        ...TARGET,
+        label: "Moved environment",
+        httpBaseUrl: "https://moved.example.test",
+        wsBaseUrl: "wss://moved.example.test",
+      });
+      const probe = yield* makeFirstStateProbe();
+      const harness = yield* makeHarness([], [], [], { beforePreparing: probe.beforePreparing });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* probe.watch(registry);
+        yield* registry.reconcilePlatform([new PrimaryConnectionRegistration({ target: TARGET })]);
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+        // A changed platform registration: the registry replaces the supervisor.
+        yield* registry.reconcilePlatform([new PrimaryConnectionRegistration({ target: moved })]);
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        expect(yield* Ref.get(probe.samples)).toEqual([
+          [TARGET.environmentId, expect.objectContaining(FIRST_DESIRED_STATE)],
+          [TARGET.environmentId, expect.objectContaining(FIRST_DESIRED_STATE)],
+        ]);
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(2);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("builds every started environment's supervisor with the stored intent", () =>
+    Effect.gen(function* () {
+      const probe = yield* makeFirstStateProbe();
+      const harness = yield* makeHarness([TARGET, SECOND_TARGET], [], [], {
+        beforePreparing: probe.beforePreparing,
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* probe.watch(registry);
+        yield* registry.start;
+        for (const target of [TARGET, SECOND_TARGET]) {
+          yield* awaitConnectionState(
+            registry,
+            target.environmentId,
+            (state) => state.phase === "connected",
+          );
+        }
+
+        // Startup acquires both environments concurrently, so sort before comparing.
+        const samples = [...(yield* Ref.get(probe.samples))].sort(([left], [right]) =>
+          left.localeCompare(right),
+        );
+        expect(samples).toEqual([
+          [TARGET.environmentId, expect.objectContaining(FIRST_DESIRED_STATE)],
+          [SECOND_TARGET.environmentId, expect.objectContaining(FIRST_DESIRED_STATE)],
+        ]);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );
@@ -1790,6 +2026,29 @@ describe("EnvironmentRegistry", () => {
           BEARER_TARGET.environmentId,
           (state) => state.desired === false,
         );
+        const original = yield* registry.run(
+          BEARER_TARGET.environmentId,
+          EnvironmentSupervisor.EnvironmentSupervisor,
+        );
+        // Every state any later supervisor publishes, from the first one it is built with.
+        const replacementStates = yield* Ref.make<ReadonlyArray<SupervisorConnectionState>>([]);
+        yield* registry
+          .followStream(
+            BEARER_TARGET.environmentId,
+            Stream.unwrap(
+              EnvironmentSupervisor.EnvironmentSupervisor.pipe(
+                Effect.map((supervisor) =>
+                  supervisor === original
+                    ? Stream.empty
+                    : SubscriptionRef.changes(supervisor.state),
+                ),
+              ),
+            ),
+          )
+          .pipe(
+            Stream.runForEach((state) => Ref.update(replacementStates, (all) => [...all, state])),
+            Effect.forkChild({ startImmediately: true }),
+          );
 
         yield* harness.externalRegistrationStore.register(replacement);
         expect(yield* registry.rollbackRegistration(first)).toBe(false);
@@ -1800,6 +2059,11 @@ describe("EnvironmentRegistry", () => {
         const state = yield* registry.state(BEARER_TARGET.environmentId);
         expect(state.desired).toBe(false);
         expect(state.phase).toBe("available");
+        const published = yield* Ref.get(replacementStates);
+        expect(published.length).toBeGreaterThan(0);
+        for (const replacementState of published) {
+          expect(replacementState).toMatchObject({ desired: false, phase: "available" });
+        }
         expect(yield* Ref.get(connectionAttempts)).toBe(1);
         expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);

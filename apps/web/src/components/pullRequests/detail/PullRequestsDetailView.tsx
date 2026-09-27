@@ -77,26 +77,28 @@ export function PullRequestsDetailView({
     },
     [navigate, projectRef],
   );
+  // Action receipts re-read automatically, so they keep an exhausted cut-off latched;
+  // a latched query keeps its own failure card with an explicit Retry.
   const actionRefresh = useMemo(
     () => ({
-      get: detailQuery.refresh,
+      get: detailQuery.revalidate,
       timeline:
-        tab === "conversation" || tab === "files" ? timelineQuery.refresh : refreshTimelineAtom,
-      files: tab === "files" ? filesQuery.refresh : refreshFilesAtom,
-      commits: tab === "commits" ? commitsQuery.refresh : refreshCommitsAtom,
-      checks: tab === "checks" ? checksQuery.refresh : refreshChecksAtom,
+        tab === "conversation" || tab === "files" ? timelineQuery.revalidate : refreshTimelineAtom,
+      files: tab === "files" ? filesQuery.revalidate : refreshFilesAtom,
+      commits: tab === "commits" ? commitsQuery.revalidate : refreshCommitsAtom,
+      checks: tab === "checks" ? checksQuery.revalidate : refreshChecksAtom,
       navigate: navigateAfterAction,
     }),
     [
-      detailQuery.refresh,
+      detailQuery.revalidate,
       tab,
-      timelineQuery.refresh,
-      filesQuery.refresh,
-      commitsQuery.refresh,
+      timelineQuery.revalidate,
+      filesQuery.revalidate,
+      commitsQuery.revalidate,
       refreshTimelineAtom,
       refreshFilesAtom,
       refreshCommitsAtom,
-      checksQuery.refresh,
+      checksQuery.revalidate,
       refreshChecksAtom,
       navigateAfterAction,
     ],

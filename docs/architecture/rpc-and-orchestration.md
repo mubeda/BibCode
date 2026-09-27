@@ -9,8 +9,14 @@ desktop bridge is reserved for host-native capabilities.
 `ConnectionResolver` first produces a `PreparedConnection`. Remote bearer and
 DPoP clients exchange their credential for a short-lived, one-purpose
 WebSocket ticket and put only `wsTicket` on the `/ws` URL. `RpcSessionFactory`
-then opens the socket, builds the Effect RPC client, and calls
-`server.getConfig`. The session is ready only after both steps succeed.
+then opens the socket, builds the Effect RPC client, and opens the connection's
+one `subscribeServerConfig` stream. The session is ready only after the socket
+opens and the first snapshot arrives; later config subscriptions on the same
+session replay that stream.
+
+The client allows 15 seconds from attempt start to a connected socket (for E2EE,
+after authentication), then bounds the first snapshot by liveness and a
+120-second configuring ceiling; see [Connection runtime](./connection-runtime.md#state-and-retry-policy).
 
 Primary desktop/browser bootstraps may already have a host-authorized socket
 URL, but they enter the same session and RPC pipeline.
@@ -37,6 +43,60 @@ from the schema-only `WsRpcGroup`. The Rust mirror is
 Schemas validate payloads at the client boundary. The Rust session validates
 request IDs, registered method names, authorization scopes, cancellation, and
 stream flow before invoking handlers.
+
+Each connection has one writer task that owns the socket sink. It drains a
+bounded control lane before every queued message: RPC `Pong`, interrupt exits,
+`RpcOutboundAdmissionError` terminals, and client protocol errors (80 entries,
+one per in-flight request plus room for Pongs). A `Ping` never ends the read
+loop; when the lane is full its `Pong` is dropped, because the client's
+liveness counts any inbound data. Terminal output and other data never use the
+lane. Every write is bounded by progress: a record must be accepted within 20
+seconds, a whole frame within its message deadline, and every message within
+30 seconds plus its size at 16 KiB/s. When a deadline passes, the writer ends
+the session at once, so the socket closes instead of staying open and silent.
+
+Plain and E2EE sessions share one heartbeat rule. Once a socket is
+authenticated (plain `/ws` after the upgrade, E2EE after `e2ee_authenticated`),
+the heartbeat asks the writer for a WebSocket Ping every 15 seconds, which it
+sends between frames or records. Every inbound frame, including the browser's
+automatic Pong, counts as activity. A data write counts only if it had to wait at
+least 100 ms for the peer to drain the socket before it completed; a write the
+socket accepts at once, or after a brief internal handoff, proves nothing about
+the peer, so small frames the server keeps sending to a frozen client never move
+the silence origin. No control write (Ping, Pong, interrupt, admission terminal or
+protocol error) is data progress. The heartbeat checks every 5 seconds and ends the session after
+45 seconds without activity, so a stopped reader is reaped within 50 seconds.
+A check that fires more than 10 seconds late, because the process was suspended
+or starved, restarts the silence clock and pings at once instead of reaping.
+A client close with code 4408, the client's liveness timeout, is logged at info
+level; other client closes are logged at debug level.
+Inbound activity counts per complete frame, so a single plain request that
+takes longer than 45 s to arrive on an otherwise idle connection is reaped (and
+the client's own 30 s monitor ends it first); E2EE requests travel in records.
+[Remote environments](./remote.md#direct-connection-e2ee) covers what reaping
+releases on E2EE sessions.
+
+A plain `/ws` client may offer the WebSocket subprotocol
+`bibcode.rpc.chunked.v1`. When the server selects it, every RPC message over 64
+KiB leaves as binary frames, one record per frame, in the E2EE record format:
+`0x00` for the final record, `0x01` for a continuation, and `0x02` for a
+stand-alone control message sent between the records of another message, which
+the client returns without touching the partial message. Smaller messages stay
+whole text frames, requests are never split, and the limits are 64 MiB and
+2,048 records per message. Without the echoed subprotocol the server keeps
+today's whole text frames. E2EE sockets always use records; `0x02` control
+records are used there only when the client lists `interleave-v1` in
+`e2ee_auth` and the server confirms it.
+
+A response that does not fit the connection's message limit (64 MiB on E2EE and
+record-framed plain sockets) fails only its own request with a typed
+`RpcResponseTooLargeError { method, bytes, limitBytes }`; the session stays
+open. Clients decode it for every method through the client-runtime
+`RpcTransportErrors` middleware, and its message reads "This result is too large
+to send (<size>; limit 64 MiB)."
+An unpaged `orchestration.replayEvents` stops reading and fails with the same
+error as soon as its events pass 64 MiB, on every framing, so `bytes` is a lower
+bound there.
 
 ## Server composition
 
@@ -68,8 +128,10 @@ without exactly one declared scope fails a server test.
 
 ## VCS status and mutation coordination
 
-`subscribeVcsStatus` and `vcs.refreshStatus` keep their existing wire shapes,
-but the production server coordinates their work by canonical worktree path.
+`subscribeVcsStatus` and `vcs.refreshStatus` add the optional
+[`repositoryUnavailableReason`](../superpowers/specs/2026-09-26-vcs-repository-state-design.md)
+to their local status part when `isRepo` is false; the production server
+coordinates their work by canonical worktree path.
 The status owner has independent Local and Full read keys. Concurrent callers
 for one key share one physical load while retaining cancellation leases; one
 caller leaving does not cancel peers, while final-lease release removes and
@@ -80,10 +142,17 @@ invalidation, and explicit full refresh all use this owner.
 latest-value stream shares one 30-second producer per canonical cwd and emits
 only repository identity, dirty, provider, matching named-branch PR,
 observation time, and stale state. It performs no numstat, full-file storage,
-or fetch. A finished local mutation or a reported local change (a terminal
+or fetch. After a failed status read, the shared repository probe and bounded
+classifier decide the same optional `repositoryUnavailableReason` as the status
+stream: malformed config or an ownership refusal becomes `isRepo: false`
+instead of an error, with a reason only when the server can tell.
+Clients decode a reason they do not know, in either stream, as absent.
+A finished local mutation or a reported local change (a terminal
 command exiting) for the same worktree starts a fresh cycle at once, so passive
 labels such as the sidebar branch follow a checkout without waiting for the
-deadline; watcher-driven reads of the active status stream do not nudge it.
+deadline; status reads, including watcher-driven reads, also nudge it when
+repository availability (`isRepo` or `repositoryUnavailableReason`) changes, so
+the sidebar follows a break or repair at once.
 Each successful base cycle publishes current local and provider state. A same-ref/provider PR from the immediately prior cycle may be carried
 only into cycle N+1 while enrichment runs or fails, preserving its original
 `observedAt` with `stale: true`; cycle N+2 expires it unless enrichment refreshes
@@ -99,7 +168,13 @@ status-owner entry once active mutations and cancellation-ignoring physical
 reads finish, so paths that are never reattached do not accumulate owner state.
 
 The first active status subscriber resolves worktree, Git directory, and common
-directory with one bounded, cancellation-aware Git command. The server installs
+directory with one bounded, cancellation-aware Git command. When Git cannot
+resolve them, the watcher uses the nearest `.git` directory with a repository
+marker found by the classifier's bounded discovery walk, with its parent as the
+worktree root, so a repaired HEAD or config triggers a read. These fallback
+roots feed only the watcher; Git Manager identity and fetch attachment still
+resolve through Git. Plain folders, gitfiles, and trust changes still converge
+through the safety read or **Retry**. The server installs
 native watches for those admitted execution-host paths before the initial local
 read. Watcher readiness is proved by a final, test-owned-style sentinel watch in
 a unique temporary directory outside all user and Git roots. Setup attempts
@@ -133,6 +208,13 @@ tasks; late reads cannot publish into a later lifecycle. Fetch shutdown clears
 repository and worktree ownership only after closing admission, cancels every
 worker, and retains join ownership even when an injected process runner ignores
 cancellation.
+
+A status subscriber whose bounded queue fills is removed; its stream delivers
+all queued publications and then ends with a `GitCommandError` whose operation
+is `GitStatusBroadcaster.fellBehind`, also used when setup exhausts its admission
+retries. The client runtime resubscribes only on that error with backoff starting
+at 250 ms, doubling to a 30 s cap, and resetting after the stream stays up for
+30 s. Shutdown and cancellation still end the stream without an error.
 
 `ProductionRuntime` connects only the structured `TerminalManager` process-exit
 callback to local invalidation. An explicit worktree path has priority;
@@ -1044,6 +1126,50 @@ typed `WorktreeOperationError` results (`operation-capacity` and
 terminal result; completion releases capacity and shutdown closes admission
 before draining all accepted tasks.
 
+The clone runtime (`apps/server/src/production/clone_operations.rs`, owned by
+`GitVcsRpcServices`) serves `vcs.clone` and `sourceControl.cloneRepository`. It
+keys one live clone per destination: the canonical parent folder plus the leaf
+derived from `directoryName` or the URL. The leaf must be a single folder name:
+the server refuses a `directoryName` that is a path, `.`, or `..`, and a URL that
+yields no usable name (never echoing the URL) before admission, the disk check,
+a cancel, or the reservation, so a destination key always names the folder the
+kernel resolves. A request for the same URL joins the live clone and shares its
+outcome; another URL is refused as `busy` at once, without naming the running
+clone's URL. Errors follow each method's declared union. `vcs.clone` reports
+the leaf refusal as a `GitCommandError` and runtime refusals (`busy`,
+`capacity`, `shutting-down`, `not-in-progress`, `cancelled`) as
+`GitCloneOperationError` reasons. `vcs.cancelClone` answers `{ cancelled }`,
+or a `GitCommandError` for the leaf refusal or a parent folder it cannot
+resolve; it has no runtime refusal. `sourceControl.cloneRepository` reports
+every clone-runtime failure, the leaf refusal and a failed clone included, as a
+`SourceControlRepositoryError` carrying the same detail. A new clone of the same
+URL waits for a cancelled one's cleanup, then starts. Admission never waits: at
+most 16 clones are live, and a full or closed runtime answers `capacity` or
+`shutting-down`. Each clone owns a root cancellation token, a tracked task, and
+a clone of its starter's admission permit, so the update drain names a detached
+`vcs.clone` until Git has stopped and its cleanup has finished. Git runs in a
+task of its own: the clone's task removes the folder it created after any
+failure, cancellation, or panic of that transfer, and only then publishes the
+outcome and frees its slot. A cancelled clone whose folder could not be removed
+reports that folder, not a clean cancel. `attach: true` is join-only: it joins
+a live clone, returns a failed or cancelled outcome retained for the same URL,
+or runs the reuse check without reserving (the finished clone's path, the
+incomplete-clone error, or `not-in-progress`). An attach that raced a new clone
+admits again and joins it. Outcomes are retained for five minutes per
+destination and URL and swept on every access. None is dropped early: once
+live clones plus retained outcomes reach 256, a new clone is refused with
+`capacity` until outcomes expire.
+`vcs.cancelClone` takes the clone's own input, cancels a live clone of that
+URL, and answers `{ cancelled }` after that clone's outcome is published:
+`true` unless Git had already succeeded, and it never touches a finished clone.
+A caller that leaves a waiting `vcs.clone` or `vcs.cancelClone` gets an
+`Interrupt` exit, never a typed failure. Shutdown closes admission, cancels
+every live clone, and drains beside the worktree-removal tasks, so Git stops
+and each partial folder is removed before providers and terminals shut down.
+Clients send `attach` and `detach` only when the server advertises
+`vcsCloneReattach`: `CloneInput` accepts unknown fields, so an older server
+would run an `attach` as a new clone.
+
 With that claim held, an already-accepted retry is replayed first. Every new
 removal must then acquire one finite runtime-cleanup lifetime slot before receipt
 reservation, `Removing`, quiesce, Git, or detach; saturation returns the retryable
@@ -1068,6 +1194,12 @@ files follows the same durable arbitration rule. A model-changing
 `thread.meta.update` reserves the exact command aggregate and canonical payload
 digest before calling the provider. A turn start reserves that identity before
 attachment publication, provider identity lookup, or delivery-route freezing.
+An attachment sent by id without its bytes is accepted only when an accepted
+command already attached that id in the same thread, the stored file's size
+equals the request's claimed `sizeBytes`, and, when a digest was recorded for
+that id, the file still matches it; the attachment cap and each id's shape are
+checked before that lookup, and any other id is refused as `InvalidRequest`
+before anything persists.
 An accepted replay performs none of those effects; a concurrent matching caller
 waits for the live claim and then replays without repeating preparation. A
 matching reserved receipt is restart-resumable, while a changed payload conflicts
@@ -1297,10 +1429,21 @@ failure is logged but cannot prevent process cleanup.
 
 Provider cleanup captures the supervisor's exact active runtime identity only
 while the loss transition remains current, then asks the supervisor to stop
-that identity. The actor rechecks identity against its current thread session;
-an old cleanup that resumes after exact recovery and provider replacement is a
-no-op. Retry resolution repeats capture only while its transition ownership is
-current, and recovery/newer-loss cancellation still short-circuits the whole
+that identity and settle the thread. The actor rechecks identity against its
+current thread session; a live replacement is neither stopped nor settled.
+When no live session remains and the projection is starting, connecting, or
+running, it uses the shared restart reconciliation function at the loss time:
+streaming assistant text is retained and settled, the active turn is cleared,
+the turn ends as error, and the session reports `transport_error` with
+"Provider session stopped because its workspace became unavailable. Review
+delivery status before continuing." A shutdown error does not skip settlement
+after detach. Cleanup also requests settlement without a captured identity, so
+a later attempt can retry a failed settlement. Ready projections are left alone;
+removal cleanup retains its existing stop-only behavior. A delivery accepted
+after its session's cancellation skips publishing running runtime and session
+state while retaining the accepted delivery outcome. Retry resolution repeats
+capture only while its transition ownership is current, and recovery/newer-loss
+cancellation still short-circuits the whole
 attempt. Terminal cleanup applies the same transition-scoped pattern to every
 session for the affected thread: it captures the exact session, generation, and
 process only while the loss transition is current, then acquires a counted
@@ -1397,12 +1540,18 @@ sequenceDiagram
 
 Unary command acceptance is not a promise that an external provider process
 will finish successfully. Provider delivery and completion are reflected by
-subsequent durable orchestration events. Streaming subscriptions can be
-re-established after reconnect from snapshots or replay methods rather than
-depending on connection-local push caches. `subscribeThread` and
+subsequent durable orchestration events. Resync after reconnect is snapshot-first:
+`subscribeShell` and `subscribeThread` send a whole snapshot. `subscribeThread` and
 `subscribeShell` register their durable-event receiver before reading the
 initial snapshot, so a commit concurrent with that read is queued and then
 projected instead of being lost between snapshot and live delivery.
+`orchestration.replayEvents` with `paged: true` returns about 1 MiB pages
+`{ events, exhausted }`, keeping at least one event when any remain. Replay
+resumes from the last applied `sequence` with no server state; the cursor is
+scoped to the environment and storage instance. An array answer from an old
+server is one exhausted page.
+`orchestration.replayEvents` refuses a negative `fromSequenceExclusive` with
+`InvalidRequest`, as the contract's non-negative integer requires.
 
 The `subscribeShell` thread-shell contract has an additive optional
 `conversationPreview` field with `prompt`, `tool`, and `assistantMessage`
@@ -1420,6 +1569,21 @@ and therefore cleared — by every later transition to pending, delivered or
 dismissed. Deriving it keeps the projection owner unchanged: no delivery
 component writes the provider session, and the field never alters session
 `status`, provider identity, runtime mode, the active turn, or any turn row.
+
+A launch refused because the selected model or session does not accept the
+turn's own options fails the delivery once, because the unchanged durable
+payload would be refused on every attempt. Its failed delivery carries the
+optional reason `modelSelectionRefused`, also used when a frozen turn's model
+or options are refused before delivery. Other launch failures, such as a
+spawn error, stay definitely not sent and retry with backoff. The delivery
+detail is what the turn shows, so every one is plain text from a single
+formatter that names the provider by its instance label, never by a driver id:
+the refusal itself, such as "Fast Mode is not supported by the selected model.";
+for a spawn failure, that the provider could not start and why; for an uncertain
+delivery, that the Claude instance never confirmed a written message, or that
+BiBCode can't check after a restart whether a provider without exact
+reconciliation received it. Error text, logs and runtime rows keep the internal
+detail.
 
 ### Durable message queue
 
@@ -1473,6 +1637,31 @@ The outbox persists `queued`, delivery `mode`, and `held` alongside the original
 command receipt and payload. The message projection stores delivery state, mode
 and hold metadata for snapshots and event replay; it is a view of the outbox,
 which remains the queue's source of truth.
+
+The outbox's nullable `failure_reason` and the message projection's nullable
+`delivery_reason` carry the typed delivery reason, set only for a failed
+delivery. The engine writes the reason with the state and delivery event in one
+transaction; `thread.turn-delivery-updated` projects its nested `delivery.reason`
+into messages and snapshots. Retry and dismiss clear it, and every later
+delivery update replaces the projected reason, clearing it when absent. Event
+replay restores the reason. Old rows and events have no reason, and contracts
+decode unknown reason values as an absent key. Delivery events and projected
+messages also carry the delivery's `providerInstanceId`, from the outbox's
+`provider_instance_id` through the nullable `delivery_provider_instance_id`
+projection column into snapshots. The projection keeps it once set; old rows
+and events lack it.
+
+The web decides which deliveries wait behind an unresolved one by comparing
+message `createdAt`, relying on the outbox `created_at` equalling the admitted
+message's `createdAt`; only promotion restamps the message, later.
+
+This W1 order proxy has a blind spot when the failed head was itself promoted:
+its message `createdAt` is the promotion time, while its outbox row retains the
+enqueue time. A pending start admitted between those times sits behind it in
+outbox order, but `waitsBehind` returns false, so that row shows no waiting line.
+Conversely, a promoted pending row whose enqueue time is older than the head's
+can show a transient false waiting line until it is claimed. Both errors are
+permissive or transient; the outbox remains authoritative for delivery order.
 
 The delivery worker examines the oldest queued row per thread before filling
 its available slots. Queue FIFO uses the original command receipt's durable
@@ -1530,6 +1719,17 @@ restart error as `transport_error`. That error settlement holds queued messages
 for explicit **Send now** and releases the pending-start claim gate. Completed
 reconciliation does not dispatch again on a later startup; ready/idle/stopped
 projections without live runtimes retain their existing state.
+
+Workspace-loss settlement uses the same error rule: every queued row is held,
+and pending or sending steer rows latch the hold. The queued head shows
+**Waiting for you**; **Send now** works once no running or starting session
+exists and the workspace admits work again. Settlement wakes the delivery
+worker to re-examine pending, non-queued starts. While the workspace is
+unavailable, admission refuses and delivery retries with backoff; after recovery,
+the existing provider-loss relaunch starts a replacement session. A retry bound
+to the stopped session's native identity can still fail because stopping deleted
+its resume state. The settled turn retains its partial assistant text and ends
+as error.
 
 `ThreadTurnSteer` validates the queued head, a running session with an active
 turn, and the driver-owned capability shared with inventory. It atomically
@@ -1869,6 +2069,52 @@ manual request per environment.
 
 ## Worktree removal flow
 
+`worktree.remove` refuses with `WorktreeRemovalError { reason: "session-running" }`
+and "Stop the running session before deleting this worktree." when any session
+it would stop has projected status `running` or `starting` **and** the provider
+supervisor holds a live session for that thread. The check asks the supervisor
+only about threads with those projected statuses; a liveness lookup failure
+also refuses removal with `session-running`. A stale projection without a live
+session no longer blocks deletion. This includes workspace-loss cleanup, whose
+`stop_session` does not settle the projected status. After resolving
+workspace ownership, an early check verifies the known checkout threads before
+marking the workspace `Removing`. Prepared retries skip this early check so
+their verified post-Git state can be resolved.
+
+After plan validation and Git preflight, the authoritative check waits up to
+five seconds for existing workspace admissions to drain while `Removing`
+refuses new admissions. A drain timeout returns the same typed refusal. The
+check resolves the quiescer's full thread set, including other projects sharing
+the repository, and checks their projected statuses and provider liveness before
+durable removal preparation, quiesce, or Git mutation. Refusal drops the removal guard and
+restores availability without stopping sessions or deleting the checkout.
+Cancellation is checked before quiesce and again afterward, before the trusted
+repository anchor is re-resolved and Git mutation starts.
+
+The authoritative check is bypassed only for a prepared retry in
+`delete-git-worktree` mode whose target is verified `missing-unregistered`:
+Git already succeeded, and durable detach must finish even with a running
+session row. Accepted receipts replay before either check. The foreground
+quiesce and its reaper retries suspend a current provider session only when its
+projection is neither `running` nor `starting`, has no active turn, and the
+supervisor has no active delivery generation. Suspension shuts down the driver
+and retains its resume cursor in a `suspended` runtime row. Other current
+sessions are stopped; `worktree.removeFromBibCode` retains its detach-only
+behavior, including stopping running sessions. Pending, queued, and uncertain
+deliveries alone do not cause the session refusal.
+
+Both removal RPCs tombstone the owner and its panels through the shared
+`thread.deleted` transaction, which also deletes each deleted thread's provider
+runtime row regardless of status. Other threads retain their rows. Suspension
+uses an atomic conditional upsert that refuses to recreate or update runtime
+state after thread deletion, so a late reaper attempt cannot leave an orphan.
+
+If removal fails or is cancelled after quiesce, idle provider conversations
+remain resumable on the next send. Terminals stay closed with their history
+kept and can be restarted when the checkout is available. A partially completed
+filesystem removal cannot be undone; a prepared retry completes durable detach
+after verified Git removal.
+
 `vcs.removeWorktree` is a server-held terminal, persistence, and filesystem
 critical section. `ownerThreadId` identifies the workspace owner, and the
 production server verifies its persisted project and worktree path. `threadIds`
@@ -1994,8 +2240,13 @@ replacement that now occupies the old path.
   group id reserved, so the kill reaches exactly the stragglers, and only an
   empty group's id could be reused, which takes a PID wrap-around in between.
   Work that must finish cleanup before the caller continues cancels its token
-  instead: clone's owned transfer task stops the process group and removes the
-  destination it created.
+  instead: a clone's owned transfer task stops the process group and removes the
+  destination it created. With `detach`, admission into the clone runtime is
+  the clone's handoff: caller cancellation (Interrupt, socket teardown, a
+  dropped handler) then ends only that caller's wait, and only
+  `vcs.cancelClone` or shutdown stops the clone. Without `detach`, a starter's
+  cancellation still cancels its clone; a caller that joined a running clone
+  never cancels it by leaving.
 - Git Manager mutations use the worktree catalog's project-then-repository lock
   order and fail a competing operation with `operation-in-flight`; they do not
   introduce an independent repository lock.

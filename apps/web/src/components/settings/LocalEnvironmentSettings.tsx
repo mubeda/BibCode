@@ -18,6 +18,7 @@ import {
   AlertDialogTitle,
 } from "../ui/alert-dialog";
 import { Button } from "../ui/button";
+import { RetryButton } from "../ui/retry-button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Spinner } from "../ui/spinner";
 import { Switch } from "../ui/switch";
@@ -192,16 +193,7 @@ export function LocalEnvironmentSettings(): ReactElement {
             title="WSL backend"
             description="Couldn't load the WSL backend state."
             status={<span className="block text-destructive">{desktopWslError}</span>}
-            control={
-              <Button
-                size="xs"
-                variant="outline"
-                onClick={loadWslState}
-                disabled={isLoadingWslState}
-              >
-                {isLoadingWslState ? "Retrying…" : "Retry"}
-              </Button>
-            }
+            control={<RetryButton retrying={isLoadingWslState} onRetry={loadWslState} />}
           />
         );
       }

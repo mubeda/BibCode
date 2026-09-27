@@ -37,7 +37,7 @@ esac"#, "");
         cwd: s.root().into(),
         host: "github.com".into(),
         repository: "openai/codex".into(),
-        provider: ProviderKind::Github,
+        provider: PullRequestsProvider::Github,
     };
     let host = GitHubHost::new(Arc::new(
         HostCommandRunner::new(s.path("state")).with_commands(gh, "missing-glab", "git"),

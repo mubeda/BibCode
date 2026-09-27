@@ -10,6 +10,7 @@ import {
   type OrchestrationSessionStatus,
   type TurnDelivery,
   type ProviderDriverKind,
+  type ProviderInstanceId,
   type ServerProvider,
   type ScopedThreadRef,
   type ThreadId,
@@ -17,6 +18,7 @@ import {
 } from "@bibcode/contracts";
 import { type ChatMessage, type SessionPhase, type Thread } from "../types";
 import { formatProviderDriverKindLabel } from "../providerModels";
+import { providerDriverLabel } from "../providerInstances";
 import { type ComposerAttachment, type DraftThreadState } from "../composerDraftStore";
 import * as Schema from "effect/Schema";
 import { appAtomRegistry } from "../rpc/atomRegistry";
@@ -27,6 +29,10 @@ import {
   type TerminalContextDraft,
 } from "../lib/terminalContext";
 import type { DraftThreadEnvMode } from "../composerDraftStore";
+import {
+  connectionStatusText,
+  type EnvironmentConnectionPresentation,
+} from "@bibcode/client-runtime/connection";
 
 export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "bibcode:last-invoked-script-by-project";
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
@@ -539,6 +545,43 @@ export function findActiveDeliveryMessage(
   return state === "pending" || state === "sending" ? (oldestUnresolved ?? null) : null;
 }
 
+export function deliveryOffersRetry(delivery: TurnDelivery): boolean {
+  return delivery.state !== "failed" || delivery.reason !== "modelSelectionRefused";
+}
+
+export function findBlockingDelivery(messages: ReadonlyArray<ChatMessage>): ChatMessage | null {
+  return (
+    messages.find(
+      (message) =>
+        !isQueuedTimelineMessage(message) &&
+        (message.delivery?.state === "failed" || message.delivery?.state === "uncertain"),
+    ) ?? null
+  );
+}
+
+/** W1 order proxy (2026-09-26-turn-delivery-failure-reason-design.md): only later timestamps prove a wait. */
+export function waitsBehind(
+  message: Pick<ChatMessage, "id" | "createdAt">,
+  blocker: Pick<ChatMessage, "id" | "createdAt"> | null,
+): boolean {
+  return (
+    blocker !== null &&
+    message.id !== blocker.id &&
+    Date.parse(message.createdAt) > Date.parse(blocker.createdAt)
+  );
+}
+
+export function deliveryProviderLabel(
+  delivery: Pick<TurnDelivery, "provider" | "providerInstanceId">,
+  instanceLabels: ReadonlyMap<ProviderInstanceId, string>,
+): string {
+  return (
+    (delivery.providerInstanceId !== undefined
+      ? instanceLabels.get(delivery.providerInstanceId)
+      : undefined) ?? providerDriverLabel(delivery.provider)
+  );
+}
+
 export function isQueuedTimelineMessage(message: ChatMessage): boolean {
   const delivery = message.delivery;
   return (
@@ -581,6 +624,7 @@ export function deriveQueuedCardStatus(input: {
   delivery: TurnDelivery;
   hasPendingApproval: boolean;
   hasPendingUserInput: boolean;
+  waitingBehind: { readonly offersRetry: boolean } | null;
 }): QueuedCardStatus {
   const steering =
     input.delivery.mode === "steer" &&
@@ -591,11 +635,15 @@ export function deriveQueuedCardStatus(input: {
     ? "Steering…"
     : input.index > 0
       ? "Send the messages above first"
-      : input.hasPendingApproval
-        ? "Respond to the pending approval first"
-        : input.hasPendingUserInput
-          ? "Answer the pending question first"
-          : null;
+      : input.waitingBehind !== null
+        ? input.waitingBehind.offersRetry
+          ? "Retry or dismiss the earlier message first"
+          : "Dismiss the earlier message first"
+        : input.hasPendingApproval
+          ? "Respond to the pending approval first"
+          : input.hasPendingUserInput
+            ? "Answer the pending question first"
+            : null;
   const steerDisabledReason =
     blockedReason ??
     (!input.supportsTurnSteer
@@ -615,11 +663,13 @@ export function deriveQueuedCardStatus(input: {
       ? "Steering…"
       : input.index > 0
         ? "Sends after the messages above."
-        : waiting
-          ? "Waiting for you"
-          : input.supportsTurnSteer
-            ? "Sends when the turn ends. Steer to send it now."
-            : "Sends when the turn ends.",
+        : input.waitingBehind !== null
+          ? "Waiting for an earlier message"
+          : waiting
+            ? "Waiting for you"
+            : input.supportsTurnSteer
+              ? "Sends when the turn ends. Steer to send it now."
+              : "Sends when the turn ends.",
     canSteer: steerDisabledReason === null,
     steerDisabledReason,
     canCancel: input.delivery.state === "queued",
@@ -756,4 +806,21 @@ export function threadErrorAttribution(input: {
       // than guess. An unattributed banner is better than a wrong attribution.
       return null;
   }
+}
+
+/**
+ * The composer banner for an environment that is not connected: a short
+ * state in the title, and the connection's reason, once, in the body.
+ */
+export function describeUnavailableEnvironment(input: {
+  readonly label: string;
+  readonly connection: EnvironmentConnectionPresentation;
+}): { readonly title: string; readonly description: string } {
+  return {
+    title: `${input.label}: ${connectionStatusText({ phase: input.connection.phase, error: null, traceId: null })}`,
+    description:
+      input.connection.notice ??
+      input.connection.error ??
+      "Reconnect this environment before sending messages or running actions.",
+  };
 }

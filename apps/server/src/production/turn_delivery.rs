@@ -17,21 +17,19 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     orchestration::{
-        OrchestrationCommand, OrchestrationEngine, ProviderTurnDelivery, TurnDeliveryMode,
-        TurnDeliveryState, TurnDeliveryTransition, engine::OptionalNullable,
+        OrchestrationCommand, OrchestrationEngine, ProviderTurnDelivery, TurnDeliveryFailureReason,
+        TurnDeliveryMode, TurnDeliveryState, TurnDeliveryTransition, engine::OptionalNullable,
     },
     production::provider_runtime::{
-        ProviderDeliveryOutcome, ProviderReconciliationOutcome, ProviderRuntimeSupervisor,
-        deliver_durable_orchestration_turn, finalize_delivery_route_cwd,
-        reconcile_orchestration_turn,
+        ProviderDeliveryOutcome, ProviderReconciliationOutcome, ProviderRuntimeError,
+        ProviderRuntimeSupervisor, STEER_TARGET_GONE_DETAIL, deliver_durable_orchestration_turn,
+        delivery_detail, finalize_delivery_route_cwd, provider_display_name,
+        provider_instance_label, reconcile_orchestration_turn,
     },
     worktree_catalog::WorkspaceAvailabilityRegistry,
 };
 
 use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
-
-#[cfg(test)]
-use crate::production::provider_runtime::ProviderRuntimeError;
 
 const MAX_CONCURRENT_THREADS: usize = 4;
 const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(50);
@@ -116,6 +114,7 @@ impl TurnDeliveryService {
             })
         });
         let reconciliation_engine = engine.clone();
+        let recovery_settings_root = settings_root.clone();
         let reconciler: DeliveryReconciler = Arc::new(move |row| {
             let engine = reconciliation_engine.clone();
             let provider = provider.clone();
@@ -130,6 +129,7 @@ impl TurnDeliveryService {
             MAX_CONCURRENT_THREADS,
             router,
             reconciler,
+            Some(recovery_settings_root),
         )
     }
 
@@ -163,6 +163,7 @@ impl TurnDeliveryService {
         let reconciliation_engine = engine.clone();
         let reconciliation_admission =
             WorkspaceAdmissionController::new(availability, engine.repositories());
+        let recovery_settings_root = settings_root.clone();
         let provider_reconciler: DeliveryReconciler = Arc::new(move |row| {
             let engine = reconciliation_engine.clone();
             let provider = provider.clone();
@@ -178,6 +179,7 @@ impl TurnDeliveryService {
             MAX_CONCURRENT_THREADS,
             router,
             reconciler,
+            Some(recovery_settings_root),
         )
     }
 
@@ -194,6 +196,7 @@ impl TurnDeliveryService {
             max_concurrent_threads,
             router,
             unavailable_reconciler(),
+            None,
         )
     }
 
@@ -210,6 +213,7 @@ impl TurnDeliveryService {
             capacity,
             legacy_delivery_router(router),
             unavailable_reconciler(),
+            None,
         )
     }
 
@@ -226,15 +230,19 @@ impl TurnDeliveryService {
             max_concurrent_threads,
             router,
             reconciler,
+            None,
         )
     }
 
+    /// `settings_root` is where recovery reads the instance labels its details name; without
+    /// one they name the provider's driver.
     fn start_worker(
         engine: OrchestrationEngine,
         max_concurrent_threads: usize,
         capacity: usize,
         router: ProviderDeliveryRouter,
         reconciler: DeliveryReconciler,
+        settings_root: Option<PathBuf>,
     ) -> Self {
         Self::start_worker_with_shutdown_grace(
             engine,
@@ -242,6 +250,7 @@ impl TurnDeliveryService {
             capacity,
             router,
             reconciler,
+            settings_root,
             SHUTDOWN_TASK_DRAIN_TIMEOUT,
         )
     }
@@ -252,6 +261,7 @@ impl TurnDeliveryService {
         capacity: usize,
         router: ProviderDeliveryRouter,
         reconciler: DeliveryReconciler,
+        settings_root: Option<PathBuf>,
         shutdown_grace: Duration,
     ) -> Self {
         let shutdown = CancellationToken::new();
@@ -265,6 +275,7 @@ impl TurnDeliveryService {
             engine,
             router,
             reconciler,
+            settings_root,
             max_concurrent_threads,
             permits,
             shutdown.clone(),
@@ -423,6 +434,7 @@ async fn run(
     engine: OrchestrationEngine,
     router: ProviderDeliveryRouter,
     reconciler: DeliveryReconciler,
+    settings_root: Option<PathBuf>,
     max_concurrent_threads: usize,
     permits: Arc<Semaphore>,
     stop_claiming: CancellationToken,
@@ -468,11 +480,18 @@ async fn run(
         {
             let engine = engine.clone();
             let reconciler = reconciler.clone();
+            let settings_root = settings_root.clone();
             let mut cohort = recovery_cohort.clone();
             let in_flight_commands = in_flight_commands.clone();
             recovery_task = Some(tokio::spawn(async move {
-                let result =
-                    recover_sending(&engine, &reconciler, &mut cohort, &in_flight_commands).await;
+                let result = recover_sending(
+                    &engine,
+                    &reconciler,
+                    settings_root.as_deref(),
+                    &mut cohort,
+                    &in_flight_commands,
+                )
+                .await;
                 RecoveryCompletion { cohort, result }
             }));
             reconciliation_ready_at = None;
@@ -664,6 +683,7 @@ struct FillResult {
 async fn recover_sending(
     engine: &OrchestrationEngine,
     reconciler: &DeliveryReconciler,
+    settings_root: Option<&Path>,
     recovery_cohort: &mut HashSet<String>,
     in_flight_commands: &HashSet<String>,
 ) -> Result<bool, String> {
@@ -684,6 +704,7 @@ async fn recover_sending(
                 && !in_flight_commands.contains(&row.command_id)
         })
         .collect::<Vec<_>>();
+    let mut labels = HashMap::new();
     for row in recovery_rows {
         let outcome = match row.provider_kind.as_str() {
             "codex" | "opencode" => {
@@ -694,9 +715,30 @@ async fn recover_sending(
                     },
                 }
             }
-            _ => ProviderReconciliationOutcome::Unavailable {
-                detail: "provider does not support exact delivery reconciliation".to_owned(),
-            },
+            // This provider cannot look up a delivery, so the row becomes uncertain and its
+            // detail is what the undelivered turn shows, naming the instance as the user does.
+            provider => {
+                if !labels.contains_key(&row.provider_instance_id) {
+                    let label = match settings_root {
+                        Some(settings_root) => {
+                            provider_instance_label(
+                                settings_root,
+                                &row.provider_instance_id,
+                                provider,
+                            )
+                            .await
+                        }
+                        None => provider_display_name(provider).to_owned(),
+                    };
+                    labels.insert(row.provider_instance_id.clone(), label);
+                }
+                let label = &labels[&row.provider_instance_id];
+                ProviderReconciliationOutcome::Unavailable {
+                    detail: format!(
+                        "BiBCode can't check whether {label} received this message after a restart."
+                    ),
+                }
+            }
         };
         let (next_state, detail) = match outcome {
             ProviderReconciliationOutcome::Found => (TurnDeliveryState::Delivered, None),
@@ -1131,10 +1173,10 @@ async fn deliver_claimed(
     };
     let route_result = match &active_turn_id {
         Err(detail) => ProviderDeliveryOutcome::DefinitelyNotSent {
-            detail: detail.clone(),
+            detail: delivery_detail(&ProviderRuntimeError::Persistence(detail.clone()), None),
         },
         Ok(None) if is_steer => ProviderDeliveryOutcome::Rejected {
-            detail: "The selected turn is no longer available for steering.".to_owned(),
+            detail: STEER_TARGET_GONE_DETAIL.to_owned(),
         },
         _ => match serde_json::from_value::<OrchestrationCommand>(row.payload.clone()) {
             Ok(command) => router(command, row.delivery_key.clone()).await,
@@ -1149,12 +1191,18 @@ async fn deliver_claimed(
         }
         _ => None,
     };
-    let (next_state, detail, task_outcome) = match route_result {
-        ProviderDeliveryOutcome::Rejected { detail } if is_steer => (
-            TurnDeliveryState::Queued,
-            Some(detail),
-            DeliveryTaskOutcome::Finished,
-        ),
+    let (next_state, detail, reason, task_outcome) = match route_result {
+        ProviderDeliveryOutcome::Rejected { detail }
+        | ProviderDeliveryOutcome::Refused { detail }
+            if is_steer =>
+        {
+            (
+                TurnDeliveryState::Queued,
+                Some(detail),
+                None,
+                DeliveryTaskOutcome::Finished,
+            )
+        }
         outcome => provider_delivery_outcome(outcome),
     };
     let transition = TurnDeliveryTransition {
@@ -1166,7 +1214,7 @@ async fn deliver_claimed(
         detail,
         updated_at: now(),
     };
-    persist_delivery_outcome(engine, shutdown, transition)
+    persist_delivery_outcome(engine, shutdown, transition, reason)
         .await
         .map(|()| task_outcome)
 }
@@ -1175,13 +1223,14 @@ async fn persist_delivery_outcome(
     engine: &OrchestrationEngine,
     shutdown: &CancellationToken,
     transition: TurnDeliveryTransition,
+    reason: Option<TurnDeliveryFailureReason>,
 ) -> Result<(), String> {
     let mut transition = transition;
     let mut backoff = RETRY_BACKOFF_MIN;
     loop {
         let result = tokio::select! {
             () = shutdown.cancelled() => return Err("provider delivery transition cancelled".to_owned()),
-            result = engine.transition_turn_delivery(transition.clone()) => result,
+            result = engine.transition_turn_delivery_with_reason(transition.clone(), reason) => result,
         };
         match result {
             Ok(true) => return Ok(()),
@@ -1245,26 +1294,41 @@ fn delivery_outcome(
 
 fn provider_delivery_outcome(
     outcome: ProviderDeliveryOutcome,
-) -> (TurnDeliveryState, Option<String>, DeliveryTaskOutcome) {
+) -> (
+    TurnDeliveryState,
+    Option<String>,
+    Option<TurnDeliveryFailureReason>,
+    DeliveryTaskOutcome,
+) {
     match outcome {
         ProviderDeliveryOutcome::Accepted { .. } => (
             TurnDeliveryState::Delivered,
+            None,
             None,
             DeliveryTaskOutcome::Finished,
         ),
         ProviderDeliveryOutcome::DefinitelyNotSent { detail } => (
             TurnDeliveryState::Pending,
             Some(detail),
+            None,
             DeliveryTaskOutcome::DefinitelyNotSent,
         ),
         ProviderDeliveryOutcome::Ambiguous { detail } => (
             TurnDeliveryState::Uncertain,
             Some(detail),
+            None,
             DeliveryTaskOutcome::Finished,
         ),
         ProviderDeliveryOutcome::Rejected { detail } => (
             TurnDeliveryState::Failed,
             Some(detail),
+            None,
+            DeliveryTaskOutcome::Finished,
+        ),
+        ProviderDeliveryOutcome::Refused { detail } => (
+            TurnDeliveryState::Failed,
+            Some(detail),
+            Some(TurnDeliveryFailureReason::ModelSelectionRefused),
             DeliveryTaskOutcome::Finished,
         ),
     }
@@ -1632,6 +1696,7 @@ mod tests {
             (
                 TurnDeliveryState::Delivered,
                 None,
+                None,
                 DeliveryTaskOutcome::Finished
             )
         );
@@ -1642,6 +1707,7 @@ mod tests {
             (
                 TurnDeliveryState::Pending,
                 Some("not admitted".to_owned()),
+                None,
                 DeliveryTaskOutcome::DefinitelyNotSent
             )
         );
@@ -1655,10 +1721,201 @@ mod tests {
         assert_eq!(
             provider_delivery_outcome(ProviderDeliveryOutcome::Rejected {
                 detail: "invalid request".to_owned(),
-            })
-            .0,
-            TurnDeliveryState::Failed
+            }),
+            (
+                TurnDeliveryState::Failed,
+                Some("invalid request".to_owned()),
+                None,
+                DeliveryTaskOutcome::Finished
+            )
         );
+        assert_eq!(
+            provider_delivery_outcome(ProviderDeliveryOutcome::Refused {
+                detail: "model refused".to_owned(),
+            }),
+            (
+                TurnDeliveryState::Failed,
+                Some("model refused".to_owned()),
+                Some(crate::orchestration::TurnDeliveryFailureReason::ModelSelectionRefused),
+                DeliveryTaskOutcome::Finished
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_delivery_persists_reason_through_transition_retries() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| Ok(run_migrations(connection, None)?))
+            .await
+            .expect("migrations");
+        seed_pending(&database, "refused", "thread", 1).await;
+        database.call(|connection| {
+            connection.execute(
+                "INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES ('message-1', 'thread', 'user', 'refused', 0, 'created', 'created')", [],
+            )?;
+            Ok(())
+        }).await.expect("message projection");
+        let hooks = TestHooks::default();
+        hooks.fail_next_delivery_transitions(2);
+        let engine = OrchestrationEngine::start(
+            database.clone(),
+            EngineOptions {
+                test_hooks: hooks.clone(),
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router: ProviderDeliveryRouter = Arc::new({
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderDeliveryOutcome::Refused {
+                    detail: "model refused".to_owned(),
+                }))
+            }
+        });
+        let service = TurnDeliveryService::start_with_delivery_router(
+            engine.clone(),
+            1,
+            router,
+            Arc::new(|_| Box::pin(ready(ProviderReconciliationOutcome::Absent))),
+        );
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("refused".to_owned())
+                    .await
+                    .expect("outbox")
+                    .expect("delivery");
+                if row.state == TurnDeliveryState::Failed {
+                    assert_eq!(row.attempts, 1);
+                    assert_eq!(row.last_error.as_deref(), Some("model refused"));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refusal persisted");
+        let reason = database
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT failure_reason FROM provider_turn_outbox WHERE command_id = 'refused'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )?)
+            })
+            .await
+            .expect("outbox reason");
+        assert_eq!(reason.as_deref(), Some("modelSelectionRefused"));
+        let events = engine.read_events(0).await.expect("events");
+        let refused = events
+            .iter()
+            .filter(|event| {
+                event.event.event_type == "thread.turn-delivery-updated"
+                    && event.event.payload["state"] == "failed"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            refused[0].event.payload["delivery"]["reason"],
+            "modelSelectionRefused"
+        );
+        let message = engine
+            .repositories()
+            .get_message("message-1".to_owned())
+            .await
+            .expect("message lookup")
+            .expect("message");
+        assert_eq!(
+            message.delivery_reason.as_deref(),
+            Some("modelSelectionRefused")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hooks.delivery_transition_attempts(), 3);
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn refused_steer_returns_to_queue_without_a_failure_reason() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| Ok(run_migrations(connection, None)?))
+            .await
+            .expect("migrations");
+        seed_delivery(
+            &database,
+            "refused-steer",
+            "thread",
+            1,
+            TurnDeliveryState::Sending,
+            1,
+        )
+        .await;
+        let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+            .await
+            .expect("engine");
+        database.call(|connection| {
+            connection.execute_batch(
+                "UPDATE provider_turn_outbox SET mode = 'steer';
+                 INSERT INTO projection_thread_sessions (thread_id, status, provider_name, active_turn_id, updated_at) VALUES ('thread', 'running', 'codex', 'turn-1', 'updated');
+                 INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+                 VALUES ('steer-event', 'thread', 'thread', 1, 'thread.turn-steer-requested', 'updated', 'server', '{\"threadId\":\"thread\",\"messageId\":\"message-1\",\"turnId\":\"turn-1\"}', '{}');
+                 INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES ('message-1', 'thread', 'user', 'steer', 0, 'created', 'created');",
+            )?;
+            Ok(())
+        }).await.expect("running steer target");
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("refused-steer".to_owned())
+            .await
+            .expect("outbox")
+            .expect("steer");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router: ProviderDeliveryRouter = Arc::new({
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderDeliveryOutcome::Refused {
+                    detail: "model refused".to_owned(),
+                }))
+            }
+        });
+        assert_eq!(
+            deliver_claimed(&engine, &router, row, &CancellationToken::new())
+                .await
+                .expect("requeue"),
+            DeliveryTaskOutcome::Finished
+        );
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("refused-steer".to_owned())
+            .await
+            .expect("outbox")
+            .expect("queued");
+        assert_eq!(row.state, TurnDeliveryState::Queued);
+        assert_eq!(row.mode, TurnDeliveryMode::Start);
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.last_error.as_deref(), Some("model refused"));
+        let reason = database.call(|connection| Ok(connection.query_row(
+            "SELECT failure_reason FROM provider_turn_outbox WHERE command_id = 'refused-steer'", [], |row| row.get::<_, Option<String>>(0),
+        )?)).await.expect("outbox reason");
+        assert_eq!(reason, None);
+        let message = engine
+            .repositories()
+            .get_message("message-1".to_owned())
+            .await
+            .expect("message lookup")
+            .expect("message");
+        assert_eq!(message.delivery_state.as_deref(), Some("queued"));
+        assert_eq!(message.delivery_reason, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -1705,6 +1962,112 @@ mod tests {
         service.shutdown().await;
         provider.shutdown().await.expect("provider shutdown");
         engine.shutdown().await;
+    }
+
+    /// Settles, as a restart does, a Claude row left sending, with `settings` as the server's
+    /// settings file, and returns the persisted row.
+    async fn restart_a_claude_sending_row(
+        settings: Option<serde_json::Value>,
+    ) -> ProviderTurnDelivery {
+        let database = Database::open_in_memory().await.expect("database");
+        database.call(|connection| {
+            run_migrations(connection, None)?;
+            connection.execute(
+                "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('recover', 'thread', 'thread-1', '2026-08-01T00:00:00Z', 0, 'accepted', NULL, 'digest')",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('recover', 'thread-1', 'message-1', 'claudeAgent', 'claudeAgent', NULL, 'key', '{}', 'sending', 1, NULL, '2026-08-01T00:00:00Z', '2026-08-01T00:00:01Z')",
+                [],
+            )?;
+            Ok(())
+        }).await.expect("seed");
+        let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+            .await
+            .expect("engine");
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(NeverFactory),
+            ActivityProjection::new(ActivityRepository::new(database)),
+            SupervisorOptions::default(),
+        ));
+        let state = tempfile::tempdir().expect("state");
+        if let Some(settings) = settings {
+            std::fs::write(
+                state.path().join("settings.json"),
+                serde_json::to_vec(&settings).expect("settings json"),
+            )
+            .expect("settings");
+        }
+        let service = TurnDeliveryService::start(
+            engine.clone(),
+            provider.clone(),
+            state.path().to_path_buf(),
+        );
+
+        let row = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("recover".to_owned())
+                    .await
+                    .expect("row")
+                    .expect("delivery");
+                if row.state != TurnDeliveryState::Sending {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the sending row is settled at startup");
+        service.shutdown().await;
+        provider.shutdown().await.expect("provider shutdown");
+        engine.shutdown().await;
+        row
+    }
+
+    /// Claude cannot look up a delivery after a restart, so a row left sending becomes uncertain,
+    /// and its detail says so in plain words, naming the instance as the user does.
+    #[tokio::test]
+    async fn restart_leaves_a_claude_sending_row_uncertain_with_a_plain_detail() {
+        let row = restart_a_claude_sending_row(None).await;
+        assert_eq!(row.state, TurnDeliveryState::Uncertain);
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("BiBCode can't check whether Claude received this message after a restart.")
+        );
+
+        let row = restart_a_claude_sending_row(Some(serde_json::json!({
+            "providerInstances": {
+                "claudeAgent": {"driver":"claudeAgent", "enabled":true, "displayName":"Work Claude"}
+            }
+        })))
+        .await;
+        assert_eq!(row.state, TurnDeliveryState::Uncertain);
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("BiBCode can't check whether Work Claude received this message after a restart.")
+        );
+
+        // The label is read without the instance's secrets, so a missing secret file still
+        // leaves the display name.
+        let row = restart_a_claude_sending_row(Some(serde_json::json!({
+            "providerInstances": {
+                "claudeAgent": {
+                    "driver":"claudeAgent", "enabled":true, "displayName":"Work Claude",
+                    "environment":[{
+                        "name":"ANTHROPIC_API_KEY", "value":"", "sensitive":true, "valueRedacted":true
+                    }]
+                }
+            }
+        })))
+        .await;
+        assert_eq!(row.state, TurnDeliveryState::Uncertain);
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("BiBCode can't check whether Work Claude received this message after a restart.")
+        );
     }
 
     #[tokio::test]
@@ -1961,6 +2324,7 @@ mod tests {
                 detail: None,
                 updated_at: now(),
             },
+            None,
         )
         .await
         .expect("accepted outcome is persisted despite the stale expected state");
@@ -2009,6 +2373,7 @@ mod tests {
                 detail: None,
                 updated_at: now(),
             },
+            None,
         )
         .await
         .expect_err("a stale acceptance must not deliver a later attempt");
@@ -2795,6 +3160,7 @@ mod tests {
             1,
             router,
             unavailable_reconciler(),
+            None,
             Duration::from_millis(50),
         ));
         tokio::time::timeout(Duration::from_secs(1), entered.notified())

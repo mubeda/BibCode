@@ -18,6 +18,8 @@ import {
   OrchestrationThreadShell,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
+  OrchestrationReplayEventsInput,
+  OrchestrationRpcSchemas,
   OrchestrationLatestTurn,
   ProjectCreatedPayload,
   ProjectMetaUpdatedPayload,
@@ -29,6 +31,7 @@ import {
   ThreadCreatedPayload,
   ThreadTurnDiff,
   ThreadTurnStartRequestedPayload,
+  ThreadTurnDeliveryUpdatedPayload,
   TurnDelivery,
   TurnDeliveryResolutionAction,
 } from "./orchestration.ts";
@@ -56,11 +59,124 @@ const decodeOrchestrationMessageSync = Schema.decodeUnknownSync(OrchestrationMes
 const decodeOrchestrationCommandSync = Schema.decodeUnknownSync(OrchestrationCommand);
 const decodeShell = Schema.decodeUnknownSync(OrchestrationThreadShell);
 const decodeTurnDelivery = Schema.decodeUnknownSync(TurnDelivery);
+const decodeThreadTurnDeliveryUpdatedPayload = Schema.decodeUnknownSync(
+  ThreadTurnDeliveryUpdatedPayload,
+);
 const encodeTurnDelivery = Schema.encodeSync(TurnDelivery);
 const decodeDeliveryResolutionAction = Schema.decodeUnknownSync(TurnDeliveryResolutionAction);
 const decodeOrchestrationEventSync = Schema.decodeUnknownSync(OrchestrationEvent);
 const encodeOrchestrationEventSync = Schema.encodeSync(OrchestrationEvent);
 const decodeClientOrchestrationCommandSync = Schema.decodeUnknownSync(ClientOrchestrationCommand);
+const decodeReplayEventsInput = Schema.decodeUnknownSync(OrchestrationReplayEventsInput);
+const decodeReplayEventsResult = Schema.decodeUnknownSync(
+  OrchestrationRpcSchemas.replayEvents.output,
+);
+
+describe("delivery failure reasons", () => {
+  const delivery = { state: "failed", provider: "codex" };
+
+  it("preserves a known refusal reason", () => {
+    expect(decodeTurnDelivery({ ...delivery, reason: "modelSelectionRefused" })).toEqual({
+      ...delivery,
+      reason: "modelSelectionRefused",
+    });
+  });
+
+  it("decodes old deliveries without a reason", () => {
+    expect(decodeTurnDelivery(delivery)).toEqual(delivery);
+  });
+
+  it("omits an unknown reason from a newer server", () => {
+    const decoded = decodeTurnDelivery({ ...delivery, reason: "futureReason" });
+    expect(decoded).toEqual(delivery);
+    expect(Object.hasOwn(decoded, "reason")).toBe(false);
+  });
+
+  it("keeps the reason in a delivery update payload", () => {
+    const payload = decodeThreadTurnDeliveryUpdatedPayload({
+      threadId: "thread-1",
+      messageId: "message-1",
+      delivery: { ...delivery, reason: "modelSelectionRefused" },
+      updatedAt: "2026-09-26T00:00:00Z",
+    });
+    expect(payload.delivery).toEqual({ ...delivery, reason: "modelSelectionRefused" });
+  });
+});
+
+describe("delivery provider instances", () => {
+  it("preserves the routed instance separately from the driver", () => {
+    const delivery = {
+      state: "failed",
+      provider: "codex",
+      providerInstanceId: "codex-personal",
+    };
+    expect(decodeTurnDelivery(delivery)).toEqual(delivery);
+  });
+
+  it("decodes older deliveries without an instance", () => {
+    const delivery = { state: "pending", provider: "codex" };
+    const decoded = decodeTurnDelivery(delivery);
+    expect(decoded).toEqual(delivery);
+    expect(Object.hasOwn(decoded, "providerInstanceId")).toBe(false);
+  });
+});
+
+describe("replay event pagination contracts", () => {
+  const event = {
+    sequence: 1,
+    eventId: "replay-event-1",
+    type: "thread.message-sent",
+    aggregateKind: "thread",
+    aggregateId: "thread-1",
+    occurredAt: "2026-09-26T00:00:00.000Z",
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    payload: {
+      threadId: "thread-1",
+      messageId: "message-1",
+      role: "assistant",
+      text: "replayed message",
+      turnId: null,
+      streaming: false,
+      createdAt: "2026-09-26T00:00:00.000Z",
+      updatedAt: "2026-09-26T00:00:00.000Z",
+    },
+  };
+
+  it("decodes an unpaged replay input", () => {
+    expect(decodeReplayEventsInput({ fromSequenceExclusive: 0 })).toEqual({
+      fromSequenceExclusive: 0,
+    });
+  });
+
+  it("preserves the paged replay opt-in", () => {
+    const input = { fromSequenceExclusive: 42, paged: true };
+    expect(decodeReplayEventsInput(input)).toEqual(input);
+  });
+
+  it("rejects paged false", () => {
+    expect(() => decodeReplayEventsInput({ fromSequenceExclusive: 0, paged: false })).toThrow();
+  });
+
+  it.each([{}, { paged: true }])("rejects a negative replay cursor %j", (flags) => {
+    expect(() => decodeReplayEventsInput({ fromSequenceExclusive: -1, ...flags })).toThrow();
+  });
+
+  it("decodes the legacy replay array", () => {
+    expect(decodeReplayEventsResult([event])).toEqual([event]);
+  });
+
+  it.each([false, true])("decodes a replay page with exhausted %j", (exhausted) => {
+    const page = { events: [event], exhausted };
+    expect(decodeReplayEventsResult(page)).toEqual(page);
+  });
+
+  it("requires the exhausted flag on a replay page", () => {
+    expect(() => decodeReplayEventsResult({ events: [event] })).toThrow();
+  });
+});
 
 describe("message queue contracts", () => {
   const createdAt = "2026-09-22T12:00:00.000Z";

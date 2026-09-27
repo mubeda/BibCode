@@ -234,6 +234,15 @@ until clone re-attach exists; after that, the clone-reconnect record's copy appl
 | Clone cut off by a lost connection | "The clone stopped before it finished. Try again." | "The connection to <host> was lost, so the clone stopped and its folder was removed. Clone again once <host> is connected." |
 | Response over the budget (item 6) | the whole connection drops | "This result is too large to send (<size>; limit 64 MiB)." |
 
+Copy notes (2026-09-26):
+
+- The Git Manager row was refined during implementation, and the user approved the change on
+  2026-09-26. The implemented copy is "Reconnecting to <label>. Git Manager loads when the
+  connection is back." (for example, "Reconnecting to Local. Git Manager loads when the
+  connection is back."), because this state replaces the whole panel, not only History.
+- The connecting status uses the ellipsis character, "Connecting…", so that it matches
+  "Reconnecting…".
+
 ## Validation
 
 - **Client runtime** (vitest with `TestClock`): activity resets the monitor; a Ping goes out only
