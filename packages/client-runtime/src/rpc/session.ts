@@ -69,12 +69,21 @@ export interface RpcSession {
   readonly e2eeAuthenticated: Effect.Effect<E2eeAuthenticatedMessage | null>;
 }
 
+/**
+ * Factory return type: `connected` completes when the socket connects (for E2EE,
+ * after authentication), or fails with the disconnect if the socket ends first.
+ * Live-session consumers use `RpcSession`.
+ */
+export interface EstablishingRpcSession extends RpcSession {
+  readonly connected: Effect.Effect<void, ConnectionAttemptError>;
+}
+
 export class RpcSessionFactory extends Context.Service<
   RpcSessionFactory,
   {
     readonly connect: (
       connection: PreparedConnection,
-    ) => Effect.Effect<RpcSession, ConnectionAttemptError, Scope.Scope>;
+    ) => Effect.Effect<EstablishingRpcSession, ConnectionAttemptError, Scope.Scope>;
   }
 >()("@bibcode/client-runtime/rpc/session/RpcSessionFactory") {}
 
@@ -282,6 +291,7 @@ export const make = Effect.gen(function* () {
     return {
       client,
       initialConfig,
+      connected: Deferred.await(connected).pipe(Effect.raceFirst(Deferred.await(disconnected))),
       ready: Deferred.await(connected).pipe(
         Effect.andThen(initialConfig),
         Effect.asVoid,
@@ -291,7 +301,7 @@ export const make = Effect.gen(function* () {
       closed: Deferred.await(disconnected),
       e2eeAuthenticated:
         connection.e2ee === null ? Effect.succeed(null) : Deferred.await(e2eeAuthenticated),
-    } satisfies RpcSession;
+    } satisfies EstablishingRpcSession;
   });
 
   return RpcSessionFactory.of({ connect });

@@ -196,6 +196,32 @@ describe("connection presentation", () => {
     });
   });
 
+  for (const [attempt, phase] of [
+    [1, "connecting"],
+    [2, "reconnecting"],
+  ] as const) {
+    it(`presents slow settings progress without a stale error while ${phase}`, () => {
+      const notice = "Receiving settings from Test environment over a slow connection…";
+      const presentation = presentConnectionState(
+        supervisorState({
+          stage: "configuring",
+          attempt,
+          notice,
+          lastFailure:
+            attempt === 1
+              ? null
+              : new ConnectionTransientError({
+                  reason: "transport",
+                  detail: "Socket closed.",
+                  traceId: "trace-previous",
+                }),
+        }),
+      );
+      expect(presentation).toEqual({ phase, error: null, traceId: null, notice });
+      expect(connectionStatusText(presentation)).toBe(notice);
+    });
+  }
+
   it("counts every phase but connected as unavailable", () => {
     for (const phase of ["available", "offline", "connecting", "reconnecting", "error"] as const) {
       expect(isConnectionUnavailable({ phase, error: null, traceId: null })).toBe(true);

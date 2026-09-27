@@ -307,6 +307,7 @@ const makeHarness = Effect.fn("TestPairingAdd.makeHarness")(function* (
             return { environment: configDescriptor } as ServerConfig;
           }),
           ready: Effect.void,
+          connected: Effect.void,
           probe: Effect.void,
           closed: Effect.never,
           e2eeAuthenticated: Effect.succeed({

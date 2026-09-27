@@ -59,6 +59,8 @@ export const make = Effect.gen(function* () {
     );
     yield* reportProgress({ stage: "opening", prepared });
     const session = yield* sessions.connect(prepared);
+    yield* session.connected;
+    yield* reportProgress({ stage: "configuring", prepared });
     yield* session.ready;
     const initialConfig = yield* session.initialConfig;
     yield* verifyPreparedStorageIdentity(prepared, initialConfig.environment).pipe(

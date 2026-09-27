@@ -280,6 +280,77 @@ const completeEncryptedInitialConfig = Effect.fn(
 });
 
 describe("RpcSessionFactory", () => {
+  it.effect("exposes a plain socket connection before the first settings snapshot is ready", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { factory, sockets } = yield* makeFactory();
+        const session = yield* factory.connect(PREPARED);
+        const connected = yield* Effect.forkChild(session.connected);
+        const ready = yield* Effect.forkChild(session.ready);
+        const socket = yield* awaitSocket(sockets);
+        expect(connected.pollUnsafe()).toBeUndefined();
+        socket.open();
+        yield* Fiber.join(connected);
+        expect(ready.pollUnsafe()).toBeUndefined();
+        yield* completeInitialConfig(socket);
+        yield* Fiber.join(ready);
+      }),
+    ),
+  );
+
+  it.effect("fails connected when the socket closes before opening", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { factory, sockets } = yield* makeFactory();
+        const session = yield* factory.connect(PREPARED);
+        const connected = yield* Effect.forkChild(Effect.flip(session.connected));
+        const socket = yield* awaitSocket(sockets);
+        socket.close(1006);
+        expect(yield* Fiber.join(connected)).toMatchObject({
+          _tag: "ConnectionTransientError",
+          reason: "transport",
+          detail: "Could not establish a WebSocket connection.",
+        });
+      }),
+    ),
+  );
+
+  it.effect("exposes an encrypted connection only after in-channel authentication", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { factory, sockets } = yield* makeFactory();
+        const staticPrivate = crypto.getRandomValues(new Uint8Array(32));
+        const responder = createNkResponder({ staticPrivateKey: staticPrivate });
+        const hostKey = Buffer.from(derivePublicKey(staticPrivate)).toString("base64url");
+        const session = yield* factory.connect({
+          ...PREPARED,
+          socketUrl: "wss://environment.example.test/ws-e2ee",
+          e2ee: { hostKey, auth: { kind: "bearer", credential: "stored-secret" } },
+        });
+        const connected = yield* Effect.forkChild(session.connected);
+        const ready = yield* Effect.forkChild(session.ready);
+        const socket = yield* awaitSocket(sockets);
+        socket.open();
+        responder.readMessageA(yield* awaitBinaryFrame(socket, 0));
+        expect(connected.pollUnsafe()).toBeUndefined();
+        socket.serverMessage(responder.writeMessageB(new Uint8Array(0)));
+        const transport = responder.split();
+        transport.receive.decryptWithAd(new Uint8Array(0), yield* awaitBinaryFrame(socket, 1));
+        expect(connected.pollUnsafe()).toBeUndefined();
+        const sendRecords = (body: unknown) => {
+          for (const record of splitIntoRecords(new TextEncoder().encode(encodeJson(body)))) {
+            socket.serverMessage(transport.send.encryptWithAd(new Uint8Array(0), record));
+          }
+        };
+        sendRecords({ type: "e2ee_authenticated" });
+        yield* Fiber.join(connected);
+        expect(ready.pollUnsafe()).toBeUndefined();
+        yield* completeEncryptedInitialConfig(socket, transport, sendRecords, 2);
+        yield* Fiber.join(ready);
+      }),
+    ),
+  );
+
   it.effect("starts ordered frames through the real session before earlier replies arrive", () =>
     Effect.scoped(
       Effect.gen(function* () {

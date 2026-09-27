@@ -771,8 +771,9 @@ export function describeUnavailableEnvironment(input: {
   readonly connection: EnvironmentConnectionPresentation;
 }): { readonly title: string; readonly description: string } {
   return {
-    title: `${input.label}: ${connectionStatusText({ ...input.connection, error: null })}`,
+    title: `${input.label}: ${connectionStatusText({ phase: input.connection.phase, error: null, traceId: null })}`,
     description:
+      input.connection.notice ??
       input.connection.error ??
       "Reconnect this environment before sending messages or running actions.",
   };

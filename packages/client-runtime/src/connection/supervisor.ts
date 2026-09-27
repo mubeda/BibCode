@@ -1,6 +1,7 @@
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -37,7 +38,12 @@ const RETRY_JITTER = 0.15;
 /** After this much continuous failure an unselected environment retries rarely. */
 const IDLE_LADDER_AFTER_MS = 5 * 60_000;
 const IDLE_RETRY_DELAYS_MS = [60_000, 120_000, 300_000] as const;
+/** Bounds preparation, socket opening, and authentication until configuring begins. */
 export const CONNECTION_ESTABLISHMENT_TIMEOUT = "15 seconds";
+/** Longest an attempt may stay in configuring while data keeps arriving. */
+const CONNECTION_CONFIGURING_TIMEOUT_MS = 120_000;
+/** How long configuring lasts before the slow-setup notice appears. */
+const SLOW_SETUP_NOTICE_DELAY_MS = 5_000;
 const CONNECTION_PROBE_TIMEOUT = "15 seconds";
 const BACKOFF_RESET_AFTER_MS = 30_000;
 
@@ -116,7 +122,7 @@ type EstablishmentEvent =
       >;
     }
   | { readonly _tag: "Interrupted" }
-  | { readonly _tag: "TimedOut" };
+  | { readonly _tag: "TimedOut"; readonly detail: string };
 
 function exitUnlessInterrupted<A, E, R>(
   effect: Effect.Effect<A, E, R>,
@@ -368,9 +374,14 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     attempt: number,
     generation: number,
     lastFailure: ConnectionAttemptError | null,
+    configuring: Deferred.Deferred<void>,
   ) {
     return yield* driver.connect({ ...entry, target: currentTarget() }, (progress) =>
-      reportProgress(attempt, generation, lastFailure, progress),
+      reportProgress(attempt, generation, lastFailure, progress).pipe(
+        Effect.tap(() =>
+          progress.stage === "configuring" ? Deferred.succeed(configuring, undefined) : Effect.void,
+        ),
+      ),
     );
   });
 
@@ -421,16 +432,17 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     generation: number,
     lastFailure: ConnectionAttemptError | null,
     pendingRetry: Option.Option<PendingRetryTrace>,
+    configuring: Deferred.Deferred<void>,
   ) {
     if (target._tag === "RelayConnectionTarget") {
       return yield* traceRelayEstablishment(
-        establishConnection(attempt, generation, lastFailure),
+        establishConnection(attempt, generation, lastFailure, configuring),
         attempt,
         generation,
         pendingRetry,
       );
     }
-    return yield* establishConnection(attempt, generation, lastFailure).pipe(
+    return yield* establishConnection(attempt, generation, lastFailure, configuring).pipe(
       Effect.map((lease) => ({
         attemptSpan: Option.none<Tracer.Span>(),
         lease,
@@ -465,6 +477,43 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           break;
       }
     }
+  });
+
+  const waitForEstablishmentDeadline = Effect.fnUntraced(function* (
+    attempt: number,
+    generation: number,
+    configuring: Deferred.Deferred<void>,
+  ): Effect.fn.Return<EstablishmentEvent> {
+    const configuringStarted = yield* Deferred.await(configuring).pipe(
+      Effect.as(true),
+      Effect.timeoutOrElse({
+        duration: CONNECTION_ESTABLISHMENT_TIMEOUT,
+        orElse: () => Effect.succeed(false),
+      }),
+    );
+    if (!configuringStarted) {
+      return {
+        _tag: "TimedOut",
+        detail: `${currentTarget().label} did not respond during connection setup.`,
+      };
+    }
+    yield* Effect.sleep(SLOW_SETUP_NOTICE_DELAY_MS);
+    yield* SubscriptionRef.update(state, (current) =>
+      current.phase === "connecting" &&
+      current.stage === "configuring" &&
+      current.generation === generation &&
+      current.attempt === attempt
+        ? {
+            ...current,
+            notice: `Receiving settings from ${currentTarget().label} over a slow connection…`,
+          }
+        : current,
+    );
+    yield* Effect.sleep(CONNECTION_CONFIGURING_TIMEOUT_MS - SLOW_SETUP_NOTICE_DELAY_MS);
+    return {
+      _tag: "TimedOut",
+      detail: `${currentTarget().label} took more than ${CONNECTION_CONFIGURING_TIMEOUT_MS / 60_000} minutes to send its settings.`,
+    };
   });
 
   const monitorConnectedLease = Effect.fnUntraced(function* (
@@ -546,9 +595,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     pendingRetry: Option.Option<PendingRetryTrace>,
   ) {
     yield* SubscriptionRef.set(prepared, Option.none());
+    const configuring = yield* Deferred.make<void>();
     const establishment = yield* Effect.raceAllFirst([
       exitUnlessInterrupted(
-        establishTracedConnection(attempt, generation, lastFailure, pendingRetry),
+        establishTracedConnection(attempt, generation, lastFailure, pendingRetry, configuring),
       ).pipe(
         Effect.map((exit): EstablishmentEvent => ({
           _tag: "Completed",
@@ -556,9 +606,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         })),
       ),
       waitForEstablishmentInterrupt().pipe(Effect.as<EstablishmentEvent>({ _tag: "Interrupted" })),
-      Effect.sleep(CONNECTION_ESTABLISHMENT_TIMEOUT).pipe(
-        Effect.as<EstablishmentEvent>({ _tag: "TimedOut" }),
-      ),
+      waitForEstablishmentDeadline(attempt, generation, configuring),
     ]);
 
     if (establishment._tag === "Interrupted") {
@@ -576,7 +624,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         failure: {
           error: new ConnectionTransientError({
             reason: "timeout",
-            detail: `${currentTarget().label} did not respond during connection setup.`,
+            detail: establishment.detail,
           }),
           attemptSpan: Option.none(),
         },

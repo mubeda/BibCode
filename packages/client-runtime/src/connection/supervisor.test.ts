@@ -141,6 +141,8 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
     target: ConnectionTarget,
   ) => Effect.Effect<PreparedConnection, ConnectionAttemptError>;
   readonly ready?: (attempt: number) => Effect.Effect<void, ConnectionAttemptError>;
+  readonly connected?: (attempt: number) => Effect.Effect<void, ConnectionAttemptError>;
+  readonly afterSynchronizing?: Effect.Effect<void>;
   readonly probe?: (attempt: number) => Effect.Effect<void, ConnectionAttemptError>;
   readonly random?: number;
   readonly selection?: SubscriptionRef.SubscriptionRef<EnvironmentId | null>;
@@ -202,8 +204,11 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
       () => Ref.update(releaseCount, (count) => count + 1),
     );
 
-    yield* reportProgress({ stage: "synchronizing", prepared });
+    yield* options?.connected?.(attempt) ?? Effect.void;
+    yield* reportProgress({ stage: "configuring", prepared });
     yield* session.ready;
+    yield* reportProgress({ stage: "synchronizing", prepared });
+    yield* options?.afterSynchronizing ?? Effect.void;
     return { prepared, session } satisfies ConnectionDriver.EnvironmentConnectionLease;
   });
 
@@ -316,10 +321,11 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
                 } as ServerConfig),
               ),
               ready: Effect.void,
+              connected: Effect.void,
               probe: Effect.void,
               closed: Effect.never,
               e2eeAuthenticated: Effect.succeed(null),
-            } satisfies RpcSession.RpcSession),
+            } satisfies RpcSession.EstablishingRpcSession),
             () => Ref.update(sessionReleaseCount, (count) => count + 1),
           ),
         ),
@@ -503,7 +509,7 @@ describe("EnvironmentSupervisor", () => {
       }).pipe(Effect.provide(harness.dependencies));
 
       yield* Deferred.await(initialConfigStarted);
-      expect((yield* SubscriptionRef.get(supervisor.state)).stage).toBe("opening");
+      expect((yield* SubscriptionRef.get(supervisor.state)).stage).toBe("configuring");
       expect(Option.isNone(yield* SubscriptionRef.get(supervisor.prepared))).toBe(true);
       expect(Option.isNone(yield* SubscriptionRef.get(supervisor.session))).toBe(true);
       yield* Deferred.succeed(releaseInitialConfig, undefined);
@@ -689,7 +695,7 @@ describe("EnvironmentSupervisor", () => {
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
-  it.effect("retries when a session never becomes ready", () =>
+  it.effect("retries at the configuring ceiling when a session never becomes ready", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
         ready: () => Effect.never,
@@ -700,26 +706,290 @@ describe("EnvironmentSupervisor", () => {
 
       yield* awaitState(
         supervisor.state,
-        (state) => state.phase === "connecting" && state.stage === "synchronizing",
+        (state) => state.phase === "connecting" && state.stage === "configuring",
       );
-      yield* TestClock.adjust("14 seconds");
-      expect((yield* SubscriptionRef.get(supervisor.state)).stage).toBe("synchronizing");
+      yield* TestClock.adjust("119 seconds");
+      expect(yield* SubscriptionRef.get(supervisor.state)).toMatchObject({
+        phase: "connecting",
+        stage: "configuring",
+        attempt: 1,
+      });
 
       yield* TestClock.adjust("1 second");
-      const retrying = yield* awaitState(supervisor.state, (state) => state.phase === "backoff");
+      const failedAt = yield* Clock.currentTimeMillis;
+      const retrying = yield* eventuallyState(
+        supervisor.state,
+        (state) => state.phase === "backoff",
+      );
 
       expect(retrying).toMatchObject({
         phase: "backoff",
+        attempt: 1,
+        retryAt: failedAt + 1000,
         lastFailure: {
           _tag: "ConnectionTransientError",
+          reason: "timeout",
+          message: "Test environment took more than 2 minutes to send its settings.",
+        },
+      });
+      expect(retrying).not.toHaveProperty("notice");
+      expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+      expect(Option.isNone(yield* SubscriptionRef.get(supervisor.prepared))).toBe(true);
+      yield* TestClock.adjust("1 second");
+      const next = yield* eventuallyState(
+        supervisor.state,
+        (state) => state.stage === "configuring" && state.attempt === 2,
+      );
+      expect(next).not.toHaveProperty("notice");
+      expect(yield* Ref.get(harness.sessionCount)).toBe(2);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("times out an unopened socket at fifteen seconds and releases the session", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ connected: () => Effect.never });
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, { initiallyDesired: true }).pipe(
+        Effect.provide(harness.dependencies),
+      );
+      yield* awaitState(supervisor.state, (state) => state.stage === "opening");
+      yield* TestClock.adjust("14 seconds");
+      expect(yield* SubscriptionRef.get(supervisor.state)).toMatchObject({
+        phase: "connecting",
+        stage: "opening",
+        attempt: 1,
+      });
+      yield* TestClock.adjust("1 second");
+      const state = yield* eventuallyState(
+        supervisor.state,
+        (current) => current.phase === "backoff",
+      );
+      expect(state).toMatchObject({
+        phase: "backoff",
+        attempt: 1,
+        lastFailure: {
           reason: "timeout",
           message: "Test environment did not respond during connection setup.",
         },
       });
       expect(yield* Ref.get(harness.releaseCount)).toBe(1);
-      expect(Option.isNone(yield* SubscriptionRef.get(supervisor.prepared))).toBe(true);
-    }).pipe(Effect.provide(TestClock.layer())),
+    }),
   );
+
+  it.effect("connects on the first attempt when settings take forty seconds", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ ready: () => Effect.sleep("40 seconds") });
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, { initiallyDesired: true }).pipe(
+        Effect.provide(harness.dependencies),
+      );
+      yield* awaitState(supervisor.state, (state) => state.stage === "configuring");
+      yield* TestClock.adjust("40 seconds");
+      const state = yield* eventuallyState(
+        supervisor.state,
+        (current) => current.phase === "connected",
+      );
+      expect(state).toMatchObject({ phase: "connected", attempt: 1, lastFailure: null });
+      expect(state).not.toHaveProperty("notice");
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+      expect(yield* Ref.get(harness.releaseCount)).toBe(0);
+      yield* TestClock.adjust("120 seconds");
+      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("connected");
+      expect(yield* Ref.get(harness.releaseCount)).toBe(0);
+    }),
+  );
+
+  it.effect("starts the settings notice and ceiling when the socket connects", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        connected: () => Effect.sleep("14 seconds"),
+        ready: () => Effect.never,
+      });
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, { initiallyDesired: true }).pipe(
+        Effect.provide(harness.dependencies),
+      );
+      yield* awaitState(supervisor.state, (state) => state.stage === "opening");
+      yield* TestClock.adjust("14 seconds");
+      yield* eventuallyState(supervisor.state, (state) => state.stage === "configuring");
+      yield* TestClock.adjust("4 seconds");
+      expect(yield* SubscriptionRef.get(supervisor.state)).toMatchObject({
+        stage: "configuring",
+        attempt: 1,
+      });
+      expect(yield* SubscriptionRef.get(supervisor.state)).not.toHaveProperty("notice");
+      yield* TestClock.adjust("1 second");
+      expect((yield* SubscriptionRef.get(supervisor.state)).notice).toBe(
+        "Receiving settings from Test environment over a slow connection…",
+      );
+      yield* TestClock.adjust("114 seconds");
+      expect(yield* SubscriptionRef.get(supervisor.state)).toMatchObject({
+        stage: "configuring",
+        attempt: 1,
+      });
+      yield* TestClock.adjust("1 second");
+      const state = yield* eventuallyState(
+        supervisor.state,
+        (current) => current.phase === "backoff",
+      );
+      expect(state.lastFailure?.message).toBe(
+        "Test environment took more than 2 minutes to send its settings.",
+      );
+    }),
+  );
+
+  it.effect("uses the current saved label for slow settings notices and ceiling failures", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ ready: () => Effect.never });
+      const targetRef = yield* Ref.make<ConnectionTarget>(TARGET);
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+        targetRef,
+      }).pipe(Effect.provide(harness.dependencies));
+      yield* awaitState(supervisor.state, (state) => state.stage === "configuring");
+      yield* Ref.set(targetRef, new PrimaryConnectionTarget({ ...TARGET, label: "GPU box" }));
+      yield* TestClock.adjust("5 seconds");
+      expect((yield* SubscriptionRef.get(supervisor.state)).notice).toBe(
+        "Receiving settings from GPU box over a slow connection…",
+      );
+      yield* Ref.set(targetRef, new PrimaryConnectionTarget({ ...TARGET, label: "Build server" }));
+      yield* TestClock.adjust("115 seconds");
+      const state = yield* eventuallyState(
+        supervisor.state,
+        (current) => current.phase === "backoff",
+      );
+      expect(state.lastFailure?.message).toBe(
+        "Build server took more than 2 minutes to send its settings.",
+      );
+    }),
+  );
+
+  it.effect(
+    "shows a slow settings notice after five seconds and clears it on synchronization",
+    () =>
+      Effect.gen(function* () {
+        const ready = yield* Deferred.make<void>();
+        const synchronized = yield* Deferred.make<void>();
+        const harness = yield* makeHarness({
+          ready: () => Deferred.await(ready),
+          afterSynchronizing: Deferred.await(synchronized),
+        });
+        const supervisor = yield* makeSupervisor(TARGET_ENTRY, { initiallyDesired: true }).pipe(
+          Effect.provide(harness.dependencies),
+        );
+        yield* awaitState(supervisor.state, (state) => state.stage === "configuring");
+        yield* TestClock.adjust("4 seconds");
+        expect(yield* SubscriptionRef.get(supervisor.state)).not.toHaveProperty("notice");
+        yield* TestClock.adjust("1 second");
+        expect(yield* SubscriptionRef.get(supervisor.state)).toMatchObject({
+          stage: "configuring",
+          notice: "Receiving settings from Test environment over a slow connection…",
+        });
+        yield* Deferred.succeed(ready, undefined);
+        const synchronizing = yield* eventuallyState(
+          supervisor.state,
+          (state) => state.stage === "synchronizing",
+        );
+        expect(synchronizing).not.toHaveProperty("notice");
+        yield* Deferred.succeed(synchronized, undefined);
+        const connected = yield* eventuallyState(
+          supervisor.state,
+          (state) => state.phase === "connected",
+        );
+        expect(connected).not.toHaveProperty("notice");
+      }),
+  );
+
+  it.effect("does not overwrite synchronization with a delayed slow settings notice", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        ready: () => Effect.sleep("4 seconds"),
+        afterSynchronizing: Effect.never,
+      });
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, { initiallyDesired: true }).pipe(
+        Effect.provide(harness.dependencies),
+      );
+      yield* awaitState(supervisor.state, (state) => state.stage === "configuring");
+      yield* TestClock.adjust("4 seconds");
+      const synchronizing = yield* eventuallyState(
+        supervisor.state,
+        (state) => state.stage === "synchronizing",
+      );
+      expect(synchronizing).not.toHaveProperty("notice");
+      yield* TestClock.adjust("1 second");
+      expect(yield* SubscriptionRef.get(supervisor.state)).toEqual(synchronizing);
+      yield* TestClock.adjust("20 seconds");
+      expect(yield* SubscriptionRef.get(supervisor.state)).toEqual(synchronizing);
+    }),
+  );
+
+  it.effect("reports liveness silence during configuring with the environment label", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        ready: () =>
+          Effect.sleep("30 seconds").pipe(
+            Effect.andThen(
+              Effect.fail(
+                new ConnectionTransientError({
+                  reason: "liveness-timeout",
+                  detail: "The connection disconnected.",
+                }),
+              ),
+            ),
+          ),
+      });
+      const supervisor = yield* makeSupervisor(TARGET_ENTRY, { initiallyDesired: true }).pipe(
+        Effect.provide(harness.dependencies),
+      );
+      yield* awaitState(supervisor.state, (state) => state.stage === "configuring");
+      yield* TestClock.adjust("30 seconds");
+      const state = yield* eventuallyState(
+        supervisor.state,
+        (current) =>
+          current.phase === "backoff" && current.lastFailure?.reason === "liveness-timeout",
+      );
+      expect(state).toMatchObject({
+        attempt: 1,
+        lastFailure: {
+          reason: "liveness-timeout",
+          message:
+            "No data from Test environment for 30 seconds. The connection is too slow or was lost.",
+        },
+      });
+      expect(state).not.toHaveProperty("notice");
+      expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+    }),
+  );
+
+  for (const action of ["disconnect", "retry", "offline"] as const) {
+    it.effect(`interrupts configuring and clears its notice on ${action}`, () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({
+          ready: (attempt) => (attempt === 1 ? Effect.never : Effect.void),
+        });
+        const supervisor = yield* makeSupervisor(TARGET_ENTRY, { initiallyDesired: true }).pipe(
+          Effect.provide(harness.dependencies),
+        );
+        yield* awaitState(supervisor.state, (state) => state.stage === "configuring");
+        yield* TestClock.adjust("5 seconds");
+        yield* action === "disconnect"
+          ? supervisor.disconnect
+          : action === "retry"
+            ? supervisor.retryNow
+            : harness.setNetworkStatus("offline");
+        const phase =
+          action === "disconnect" ? "available" : action === "retry" ? "connected" : "offline";
+        const state = yield* eventuallyState(
+          supervisor.state,
+          (current) => current.phase === phase,
+        );
+        expect(state).not.toHaveProperty("notice");
+        expect(state.lastFailure).toBeNull();
+        expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+        expect(yield* Ref.get(harness.sessionCount)).toBe(action === "retry" ? 2 : 1);
+        yield* TestClock.adjust("120 seconds");
+        expect(yield* SubscriptionRef.get(supervisor.state)).toEqual(state);
+        expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+      }),
+    );
+  }
 
   it.effect("interrupts and releases a connection attempt when setup times out", () =>
     Effect.gen(function* () {

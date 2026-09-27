@@ -14,6 +14,10 @@ one `subscribeServerConfig` stream. The session is ready only after the socket
 opens and the first snapshot arrives; later config subscriptions on the same
 session replay that stream.
 
+The client allows 15 seconds from attempt start to a connected socket (for E2EE,
+after authentication), then bounds the first snapshot by liveness and a
+120-second configuring ceiling; see [Connection runtime](./connection-runtime.md#state-and-retry-policy).
+
 Primary desktop/browser bootstraps may already have a host-authorized socket
 URL, but they enter the same session and RPC pipeline.
 

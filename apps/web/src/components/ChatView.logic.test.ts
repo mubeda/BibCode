@@ -1331,6 +1331,21 @@ describe("queued messages", () => {
 });
 
 describe("describeUnavailableEnvironment", () => {
+  for (const [phase, title] of [
+    ["connecting", "devbox: Connecting…"],
+    ["reconnecting", "devbox: Reconnecting…"],
+  ] as const) {
+    it(`keeps slow settings progress in the body while ${phase}`, () => {
+      const notice = "Receiving settings from devbox over a slow connection…";
+      expect(
+        describeUnavailableEnvironment({
+          label: "devbox",
+          connection: { phase, error: null, traceId: null, notice },
+        }),
+      ).toEqual({ title, description: notice });
+    });
+  }
+
   it("keeps the title short and states the reason once, in the body", () => {
     const reason =
       "devbox rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.";
