@@ -1190,6 +1190,7 @@ mod tests {
     use tokio::time::timeout;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+    use crate::test_support::hermetic_providers;
     use crate::test_support::websocket_frames::next_frame_past_heartbeat;
 
     fn route_context() -> RouteContext {
@@ -1240,6 +1241,7 @@ mod tests {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1483,6 +1485,7 @@ mod tests {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1653,6 +1656,7 @@ mod tests {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1805,6 +1809,7 @@ mod tests {
     async fn http_dispatch_cannot_bypass_durable_or_worktree_authority() {
         let state = TempDir::new().expect("state");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1945,12 +1950,10 @@ mod tests {
     async fn startup_interrupts_only_unresolved_terminal_activity() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
-        std::fs::create_dir_all(config.state_dir()).expect("state directory");
-        std::fs::write(
-            config.state_dir().join("settings.json"),
-            br#"{"enableChatAgentActivity":true,"enableTerminalAgentActivity":true}"#,
-        )
-        .expect("activity settings fixture");
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({"enableChatAgentActivity": true, "enableTerminalAgentActivity": true}),
+        );
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -2090,12 +2093,10 @@ mod tests {
     async fn agent_activity_startup_migrates_legacy_true_to_chat_enabled_and_terminal_disabled() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
-        std::fs::create_dir_all(config.state_dir()).expect("state directory");
-        std::fs::write(
-            config.state_dir().join("settings.json"),
-            br#"{"enableAgentActivity":true}"#,
-        )
-        .expect("legacy settings fixture");
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({"enableAgentActivity": true}),
+        );
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -2159,6 +2160,7 @@ mod tests {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -2230,7 +2232,7 @@ mod tests {
     async fn hardening_bootstrap_provider_observation_failure_does_not_abort_production_runtime() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
-        std::fs::create_dir_all(config.state_dir()).expect("state directory");
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         std::fs::write(
             config.state_dir().join("runtime"),
             b"blocks private observer directory",
@@ -2263,6 +2265,7 @@ mod tests {
     async fn production_runtime_covers_core_routes_assets_diagnostics_and_shutdown() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory()
             .await
             .expect("in-memory database should open");
@@ -2628,6 +2631,7 @@ mod tests {
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
             .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {

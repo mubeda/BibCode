@@ -1,3 +1,6 @@
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 use std::{fs, path::Path, process::Command, time::Duration};
 
 #[cfg(unix)]
@@ -49,7 +52,6 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
     let config = ServerConfig::new(state.path())
         .with_bind("127.0.0.1", 0)
         .with_unsafe_no_auth();
-    fs::create_dir_all(config.state_dir()).expect("server state directory");
     let provider_cwd_fifo = state.path().join("provider-cwd.fifo");
     let provider_shutdowns = state.path().join("provider-shutdowns.log");
     let setup_sentinel = state.path().join("adoption-must-not-run-setup");
@@ -60,10 +62,9 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
     assert!(fifo.status.success(), "mkfifo failed");
     let provider_fixture =
         write_cwd_recording_codex_fixture(state.path(), &provider_cwd_fifo, &provider_shutdowns);
-    fs::write(
-        config.state_dir().join("settings.json"),
-        serde_json::to_vec(&json!({
-            "enableProviderUpdateChecks": false,
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
             "providerInstances": {
                 "codex": {
                     "driver": "codex",
@@ -71,10 +72,8 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
                     "config": { "binaryPath": provider_fixture }
                 }
             }
-        }))
-        .expect("provider settings JSON"),
-    )
-    .expect("provider settings");
+        }),
+    );
     let handle = ServerRuntime::start(config.clone())
         .await
         .expect("production server starts");
@@ -301,7 +300,10 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
             "cwd":adopted_path,
             "cols":80,
             "rows":24,
-            "env":{}
+            "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(state.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(state.path()),
+                }
         }),
     )
     .await;
@@ -594,7 +596,10 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
             "cwd":adopted_path,
             "cols":80,
             "rows":24,
-            "env":{}
+            "env": {
+                    "HOME": hermetic_providers::isolated_terminal_home(state.path()),
+                    "USERPROFILE": hermetic_providers::isolated_terminal_home(state.path()),
+                }
         }),
     )
     .await;

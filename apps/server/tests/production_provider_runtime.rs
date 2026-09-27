@@ -4,6 +4,9 @@
 // Fixture snapshot guards are explicitly dropped before async shutdown, which this lint
 // does not model reliably.
 
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 use bibcode_server::production::provider_runtime;
 
 use std::{
@@ -4443,27 +4446,28 @@ async fn registered_dispatch_rpc_proves_one_mixed_attachment_delivery_for_every_
         activity_projection(&engine),
         SupervisorOptions::default(),
     ));
-    for (thread_id, _, provider, model) in providers {
-        supervisor
-            .launch(launch_for_provider(thread_id, provider, model))
-            .await
-            .expect("provider launch");
-    }
     let settings = TempDir::new().expect("settings");
-    std::fs::write(
-        settings.path().join("settings.json"),
-        serde_json::to_vec(&json!({
+    let binary_path = hermetic_providers::missing_provider_executable(settings.path());
+    hermetic_providers::write_hermetic_settings(
+        settings.path(),
+        json!({
             "providerInstances": {
                 "cursor": {
                     "driver": "cursor",
                     "enabled": true,
-                    "config": {"binaryPath": "cursor-agent"}
+                    "config": {"binaryPath": binary_path}
                 }
             }
-        }))
-        .expect("mixed provider settings"),
-    )
-    .expect("write mixed provider settings");
+        }),
+    );
+    for (thread_id, _, provider, model) in providers {
+        let mut request = launch_for_provider(thread_id, provider, model);
+        request.binary_path = binary_path
+            .to_str()
+            .expect("fixture path is UTF-8")
+            .to_owned();
+        supervisor.launch(request).await.expect("provider launch");
+    }
     let delivery = Arc::new(TurnDeliveryService::start(
         engine.clone(),
         supervisor.clone(),
@@ -14211,10 +14215,9 @@ done
     );
     let executable = executable_fixture(&state, "codex-targeted-rpc", &script, "");
     let config = test_config(&state);
-    std::fs::create_dir_all(config.state_dir()).expect("state directory");
-    std::fs::write(
-        config.state_dir().join("settings.json"),
-        serde_json::to_vec(&json!({
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
             "providerInstances": {
                 "codex-targeted": {
                     "driver": "codex",
@@ -14222,10 +14225,8 @@ done
                     "config": { "binaryPath": executable }
                 }
             }
-        }))
-        .expect("settings json"),
-    )
-    .expect("provider settings");
+        }),
+    );
     let workspace = state.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
     let handle = ServerRuntime::start(config.clone())
@@ -14679,10 +14680,9 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         .canonicalize()
         .expect("stable Claude targeted RPC fixture");
     let config = test_config(&state);
-    std::fs::create_dir_all(config.state_dir()).expect("state directory");
-    std::fs::write(
-        config.state_dir().join("settings.json"),
-        serde_json::to_vec(&json!({
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
             "providerInstances": {
                 "claude-targeted": {
                     "driver": "claudeAgent",
@@ -14690,10 +14690,8 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
                     "config": { "binaryPath": executable }
                 }
             }
-        }))
-        .expect("settings json"),
-    )
-    .expect("provider settings");
+        }),
+    );
     let handle = ServerRuntime::start(config.clone())
         .await
         .expect("production RPC server");
@@ -15199,10 +15197,9 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
         .canonicalize()
         .expect("stable ambiguous Claude targeted RPC fixture");
     let config = test_config(&state);
-    std::fs::create_dir_all(config.state_dir()).expect("state directory");
-    std::fs::write(
-        config.state_dir().join("settings.json"),
-        serde_json::to_vec(&json!({
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
             "providerInstances": {
                 "claude-targeted-ambiguous": {
                     "driver": "claudeAgent",
@@ -15210,10 +15207,8 @@ async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_witho
                     "config": { "binaryPath": executable }
                 }
             }
-        }))
-        .expect("settings json"),
-    )
-    .expect("provider settings");
+        }),
+    );
     let handle = ServerRuntime::start(config.clone())
         .await
         .expect("production RPC server");

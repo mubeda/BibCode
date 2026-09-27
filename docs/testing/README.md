@@ -61,6 +61,48 @@ cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Hermetic Rust fixtures
+
+Automated Rust tests must never execute the host's provider or hosting CLIs,
+perform real provider update checks, or use the user's HOME, shell rc files,
+or `~/.ssh`. Use test-owned executables, configuration, and temporary roots.
+Real Git may operate on disposable repositories with isolated Git configuration.
+
+Harnesses that start a production runtime or `NativeServerControl` with the
+default provider registry use
+[`tests/support/hermetic_providers.rs`](../../apps/server/tests/support/hermetic_providers.rs).
+Harnesses with restricted registries or disabled providers are hermetic by
+construction and need not use the helper.
+Integration tests include it with `#[path = "support/hermetic_providers.rs"]`;
+library tests use `crate::test_support::hermetic_providers`.
+`write_hermetic_settings(&config.state_dir(), overlay)` disables update checks
+and pins every built-in driver's legacy `binaryPath` to an absolute missing
+path. It explicitly preserves the control plane's persisted-document enabled
+defaults in both settings readers: Codex, Claude, and OpenCode enabled; Cursor
+and Grok disabled. It deep-merges fixture overrides, including partial
+`providerInstances`, so unspecified drivers stay pinned.
+`ensure_hermetic_settings` reads existing settings as the overlay and writes
+the hermetic base beneath them; explicit pinned-key overrides remain the
+fixture's responsibility. Read or parse errors fail the test. Seed the same
+state directory before spawning `bibcode` with `--base-dir`.
+
+Tests exercising probes or updates must explicitly overlay test-owned binaries
+and local endpoints. Use the discovery and Git VCS
+`*_for_integration_test` executable-directory seams for hosting commands;
+`missing_hosting_executable_dir` keeps them absent while preserving the real
+Git version probe. The Git VCS seam also pins pull-request commands and their
+passive-summary clone. Pass `isolated_terminal_home` as both `"HOME"` and
+`"USERPROFILE"` in each terminal open, attach-that-starts, restart, or
+setup-script environment. Do not mutate
+process-global PATH or HOME to isolate parallel tests. SSH fixtures must use
+test-owned SSH configuration and hosts.
+
+Wave 1 covers the migrated server harnesses; wave 2 for `control.rs`, lifecycle,
+and desktop harnesses is still to come. The
+[approved hermetic test guard](../superpowers/specs/2026-09-26-hermetic-test-guard-design.md)
+will enforce the no-host-provider-or-hosting-CLI rule across tests; it is not
+implemented by wave 1.
+
 ## Web unit tests and the React Compiler
 
 The web client build compiles components and hooks with the React Compiler.

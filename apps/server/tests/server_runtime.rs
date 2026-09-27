@@ -26,13 +26,19 @@ use uuid::Uuid;
 #[path = "support/websocket_frames.rs"]
 mod websocket_frames;
 use websocket_frames::next_frame_past_heartbeat;
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+use hermetic_providers::BUILTIN_PROVIDER_DRIVERS;
 
-const PROVIDER_DRIVERS: [&str; 5] = ["codex", "claudeAgent", "cursor", "grok", "opencode"];
 const SAME_LOG_PATH_CHILD_ENV: &str = "BIBCODE_TEST_SAME_LOG_PATH_CHILD_ROOT";
 const SAME_LOG_PATH_TEST: &str = "public_and_runtime_initializers_share_one_physical_log_writer";
 
 fn test_config(temp: &TempDir) -> ServerConfig {
-    ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0)
+    let config = ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0);
+    // Preserve pre-written fixture overrides while pinning unspecified drivers
+    // and disabling update checks before runtime startup.
+    hermetic_providers::ensure_hermetic_settings(&config.state_dir());
+    config
 }
 
 async fn assert_log_contains(path: &Path, marker: &str) {
@@ -124,6 +130,7 @@ fn write_disabled_provider_settings(temp: &TempDir) -> PathBuf {
     std::fs::write(
         &settings_path,
         serde_json::to_vec(&serde_json::json!({
+            "enableProviderUpdateChecks": false,
             "providers": {
                 "codex": { "enabled": false },
                 "claudeAgent": { "enabled": false },
@@ -821,14 +828,20 @@ async fn file_at_state_directory_returns_typed_state_files_error() {
     let state_directory = temp.path().join("userdata");
     std::fs::write(&state_directory, "not a directory").expect("state path fixture");
 
-    let error =
-        match ServerRuntime::start_with_registry(test_config(&temp), RpcRegistry::empty()).await {
-            Ok(handle) => {
-                drop(handle);
-                panic!("file state path must fail startup");
-            }
-            Err(error) => error,
-        };
+    // This custom-registry test must reach startup with an invalid state path;
+    // the normal fixture cannot write settings into that deliberate file.
+    let error = match ServerRuntime::start_with_registry(
+        ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0),
+        RpcRegistry::empty(),
+    )
+    .await
+    {
+        Ok(handle) => {
+            drop(handle);
+            panic!("file state path must fail startup");
+        }
+        Err(error) => error,
+    };
     match error {
         ServerError::StateFiles(message) => {
             assert!(message.contains("failed to create state directory"));
@@ -891,8 +904,8 @@ async fn production_runtime_adapters_serve_snapshot_and_asset_errors() {
     let access_token = exchange_startup_credential(&client, handle.local_addr(), &credential).await;
     let config = fetch_server_config(&client, handle.local_addr(), &access_token).await;
     let providers = config["providers"].as_array().expect("provider snapshots");
-    assert_eq!(providers.len(), PROVIDER_DRIVERS.len());
-    for driver in PROVIDER_DRIVERS {
+    assert_eq!(providers.len(), BUILTIN_PROVIDER_DRIVERS.len());
+    for &driver in BUILTIN_PROVIDER_DRIVERS {
         assert_eq!(config["settings"]["providers"][driver]["enabled"], false);
         let provider = providers
             .iter()
@@ -1066,6 +1079,7 @@ async fn preserves_path_and_query_when_redirecting_loopback_dev_requests() {
     let temp = TempDir::new().expect("temporary base directory");
     let config = test_config(&temp)
         .with_dev_url(Url::parse("http://127.0.0.1:5173/base").expect("valid dev URL"));
+    hermetic_providers::ensure_hermetic_settings(&config.state_dir());
     let handle = ServerRuntime::start(config).await.expect("server starts");
     let client = Client::builder()
         .redirect(Policy::none())

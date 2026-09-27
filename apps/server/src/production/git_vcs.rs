@@ -210,6 +210,7 @@ pub struct GitVcsRpcServices {
     /// `pullRequests.runAction` and its list-totals invalidation.
     created_request_observer: Option<Arc<dyn CreatedRequestObserver>>,
     github_command: PathBuf,
+    gitlab_command: PathBuf,
     github_runner: Arc<dyn GitProcessRunner>,
     availability_registry: Option<WorkspaceAvailabilityRegistry>,
     terminal: Option<TerminalManager>,
@@ -377,6 +378,7 @@ impl GitVcsRpcServices {
             pull_requests,
             created_request_observer: None,
             github_command: PathBuf::from("gh"),
+            gitlab_command: PathBuf::from("glab"),
             github_runner: Arc::new(ProcessRunner),
             availability_registry: None,
             terminal,
@@ -386,6 +388,35 @@ impl GitVcsRpcServices {
             #[cfg(test)]
             status_stream_enrichment_test_hook: None,
         }
+    }
+
+    /// Pin discovery, repository lookup, and pull requests (including passive
+    /// summaries) to test-owned executables before starting subscriptions.
+    /// Git remains the real executable; other probes use this directory.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hosting_executable_dir_for_integration_test(mut self, directory: PathBuf) -> Self {
+        self.discovery =
+            SourceControlDiscovery::with_executable_dir_for_integration_test(directory.clone());
+        self.github_command = directory.join("gh");
+        self.gitlab_command = directory.join("glab");
+        self.pull_requests = PullRequestService::with_provider_commands(
+            self.github_command.to_string_lossy().into_owned(),
+            self.gitlab_command.to_string_lossy().into_owned(),
+            directory.join("az").to_string_lossy().into_owned(),
+        );
+        self.summary =
+            GitStatusSummaryService::new(Arc::clone(&self.repository), self.pull_requests.clone());
+        let observed_summary = self.summary.clone();
+        self.broadcaster.set_local_change_observer(move |cwd| {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            let summary = observed_summary.clone();
+            let cwd = cwd.to_path_buf();
+            handle.spawn(async move { summary.notify_local_change(&cwd).await });
+        });
+        self
     }
 
     #[cfg(all(test, unix))]
@@ -1620,7 +1651,7 @@ impl GitVcsRpcServices {
                 ],
             ),
             "gitlab" => (
-                Path::new("glab"),
+                self.gitlab_command.as_path(),
                 vec!["repo", "view", &input.repository, "--output", "json"],
             ),
             provider => {
@@ -4228,7 +4259,10 @@ mod tests {
         let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
             CapturedGitRunner::new(&sandbox),
         )));
-        let services = GitVcsRpcServices::with_repository(repository, Arc::default());
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default())
+            .with_hosting_executable_dir_for_integration_test(
+                crate::test_support::hermetic_providers::missing_hosting_executable_dir(&cwd),
+            );
         let mut summaries = services
             .summary
             .subscribe(cwd.clone())
@@ -4247,6 +4281,67 @@ mod tests {
         )
         .await;
         assert!(!refreshed.stale);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosting_fixture_directory_also_pins_passive_summary_pull_requests() {
+        let sandbox = crate::test_support::TestSandbox::new("summary-hosting-fixture");
+        let cwd = sandbox.root().to_path_buf();
+        git(&sandbox, &cwd, &["init", "-b", "main"]).await;
+        git(&sandbox, &cwd, &["config", "user.name", "Summary Test"]).await;
+        git(
+            &sandbox,
+            &cwd,
+            &["config", "user.email", "summary@example.test"],
+        )
+        .await;
+        git(&sandbox, &cwd, &["commit", "--allow-empty", "-m", "base"]).await;
+        git(
+            &sandbox,
+            &cwd,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/repo.git",
+            ],
+        )
+        .await;
+        let fixture = sandbox.executable_script(
+            "gh",
+            r#"test "$1" = pr && test "$2" = list && test "$4" = main || exit 1
+printf '%s\n' '[{"number":42,"title":"Fixture PR","url":"https://github.com/acme/repo/pull/42","baseRefName":"base","headRefName":"main","state":"OPEN"}]'"#,
+            "",
+        );
+        std::fs::rename(fixture, cwd.join("gh")).expect("hosting fixture name");
+        let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
+            CapturedGitRunner::new(&sandbox),
+        )));
+        let services = GitVcsRpcServices::with_repository(repository, Arc::default())
+            .with_hosting_executable_dir_for_integration_test(cwd.clone());
+        let mut summaries = services
+            .summary
+            .subscribe(cwd)
+            .await
+            .expect("summary subscription");
+        let pr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Ok(summary)) = summaries.borrow_and_update().as_ref()
+                    && let Some(pr) = &summary.pr
+                {
+                    break pr.clone();
+                }
+                summaries
+                    .changed()
+                    .await
+                    .expect("summary producer stays alive");
+            }
+        })
+        .await
+        .expect("the summary must resolve its PR through the hosting fixture");
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.title, "Fixture PR");
     }
 
     #[tokio::test]
@@ -5284,6 +5379,56 @@ esac
         assert!(local.has_working_tree_changes, "nothing was committed");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosting_fixture_directory_pins_discovery_lookup_and_pull_request_commands() {
+        let sandbox = tempfile::tempdir().expect("hosting sandbox");
+        let directory =
+            crate::test_support::hermetic_providers::missing_hosting_executable_dir(sandbox.path());
+        let services =
+            GitVcsRpcServices::with_repository(Arc::new(GitRepository::default()), Arc::default())
+                .with_hosting_executable_dir_for_integration_test(directory.clone());
+        assert_eq!(services.github_command, directory.join("gh"));
+        assert_eq!(services.gitlab_command, directory.join("glab"));
+        for (provider, executable) in [
+            (ProviderKind::Github, "gh"),
+            (ProviderKind::Gitlab, "glab"),
+            (ProviderKind::AzureDevops, "az"),
+        ] {
+            assert_eq!(
+                services
+                    .pull_requests
+                    .current_provider_command(provider)
+                    .unwrap()
+                    .executable,
+                directory.join(executable),
+                "pull-request commands must use the same hosting directory"
+            );
+        }
+        let discovery = unary(&services, "server.discoverSourceControl", json!({}))
+            .await
+            .expect("discovery");
+        for provider in ["github", "gitlab"] {
+            let discovered = discovery["sourceControlProviders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["kind"] == provider)
+                .expect("hosting probe");
+            assert_eq!(discovered["status"], "missing");
+            let error = unary(
+                &services,
+                "sourceControl.lookupRepository",
+                json!({"provider":provider,"repository":"acme/repo","cwd":sandbox.path()}),
+            )
+            .await
+            .expect_err("missing hosting executable");
+            assert_eq!(error["_tag"], "SourceControlRepositoryError");
+            assert_eq!(error["provider"], provider);
+            assert_eq!(error["operation"], "lookupRepository");
+        }
+    }
+
     /// Only an explicit Settings scan records hosts: a background discovery read,
     /// such as the publish dialog's, leaves the host observation untouched.
     #[cfg(unix)]
@@ -5310,7 +5455,7 @@ esac
         let hosts = Arc::new(ProviderHosts::default());
         let repository = Arc::new(GitRepository::default().with_provider_hosts(hosts.clone()));
         let services = GitVcsRpcServices {
-            discovery: SourceControlDiscovery::with_executable_dir_for_test(bin),
+            discovery: SourceControlDiscovery::with_executable_dir_for_integration_test(bin),
             ..GitVcsRpcServices::with_repository(repository, hosts.clone())
         };
         let discover = |payload: Value| {

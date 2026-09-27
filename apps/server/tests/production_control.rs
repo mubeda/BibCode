@@ -18,6 +18,9 @@ use tokio::{net::TcpListener, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 const TEST_STORAGE_INSTANCE_ID: Uuid = Uuid::from_u128(0x00000000000040008000000000000003);
 
 fn test_config(path: &Path) -> ServerConfig {
@@ -118,6 +121,7 @@ async fn production_runtime_registers_every_git_manager_method() {
     let config = test_config(directory.path())
         .with_bind("127.0.0.1", 0)
         .with_unsafe_no_auth();
+    hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
     let runtime = ServerRuntime::start(config)
         .await
         .expect("the real production runtime registers every Git Manager method");
@@ -130,6 +134,7 @@ async fn fixture() -> (TempDir, NativeServerControl) {
     let mut config = test_config(directory.path());
     config.environment_id = "test-environment".into();
     config.environment_label = "Test Environment".into();
+    hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
     let control = NativeServerControl::new(config, auth_descriptor()).await;
     finalize_rpc_registry(&complete_registry(), &control).expect("complete production registry");
     (directory, control)
@@ -140,14 +145,17 @@ async fn fixture_with_state_file(
     contents: &[u8],
 ) -> (TempDir, NativeServerControl) {
     let directory = tempfile::tempdir().expect("temporary state directory");
-    let path = directory.path().join("userdata").join(relative_path);
+    let mut config = test_config(directory.path());
+    let path = config.state_dir().join(relative_path);
     tokio::fs::create_dir_all(path.parent().expect("state file parent"))
         .await
         .expect("create state directory");
     tokio::fs::write(path, contents)
         .await
         .expect("write state fixture");
-    let mut config = test_config(directory.path());
+    // Preserve settings overrides and any separate keybinding fixture while
+    // supplying the hermetic base for unspecified provider configuration.
+    hermetic_providers::ensure_hermetic_settings(&config.state_dir());
     config.environment_id = "test-environment".into();
     config.environment_label = "Test Environment".into();
     let control = NativeServerControl::new(config, auth_descriptor()).await;
@@ -423,19 +431,57 @@ async fn next_event_of_type(
 #[tokio::test]
 async fn config_and_settings_match_the_typescript_contract_without_faking_provider_authentication()
 {
-    let (_directory, control) = fixture().await;
+    // Probe a real fixture's version and authentication while keeping every
+    // other driver missing. General settings still use production defaults.
+    let sandbox = tempfile::tempdir().expect("provider sandbox");
+    let pinned = hermetic_providers::hermetic_provider_settings(sandbox.path());
+    let mut instances = pinned["providers"]
+        .as_object()
+        .expect("pinned providers")
+        .iter()
+        .map(|(driver, config)| (driver.clone(), json!({"driver": driver, "config": config})))
+        .collect::<serde_json::Map<String, Value>>();
+    let executable = write_discovering_claude_fixture(&sandbox).await;
+    instances.insert(
+        "claudeAgent".to_owned(),
+        json!({
+            "driver": "claudeAgent",
+            "enabled": true,
+            "environment": [{
+                "name": "BIBCODE_CLAUDE_FIXTURE_VERSION",
+                "value": "2.1.220",
+                "sensitive": false,
+            }],
+            "config": { "binaryPath": executable },
+        }),
+    );
+    let (directory, control) = fixture_with_state_file(
+        "settings.json",
+        &serde_json::to_vec(&json!({
+            "enableProviderUpdateChecks": false,
+            "providerInstances": instances,
+        }))
+        .expect("isolated defaults"),
+    )
+    .await;
     let settings = call(&control, "server.getSettings", json!({})).await;
 
     assert_eq!(settings["enableAssistantStreaming"], false);
-    assert_eq!(settings["enableProviderUpdateChecks"], true);
+    assert_eq!(settings["enableProviderUpdateChecks"], false);
     assert_eq!(settings["automaticGitFetchInterval"], 180_000);
     assert_eq!(
         settings["textGenerationModelSelection"]["model"],
         "gpt-5.4-mini"
     );
-    assert_eq!(settings["providers"]["codex"]["binaryPath"], "codex");
+    assert_eq!(
+        settings["providers"]["codex"]["binaryPath"],
+        hermetic_providers::missing_provider_executable(&test_config(directory.path()).state_dir())
+            .to_str()
+            .unwrap()
+    );
     assert_eq!(settings["providers"]["cursor"]["enabled"], false);
 
+    call(&control, "server.refreshProviders", json!({})).await;
     let config = call(&control, "server.getConfig", json!({})).await;
     assert_eq!(config["auth"], auth_descriptor());
     assert_eq!(
@@ -456,8 +502,26 @@ async fn config_and_settings_match_the_typescript_contract_without_faking_provid
     assert!(config["issues"].is_array());
     assert!(config["availableEditors"].is_array());
     assert_eq!(config["settings"], settings);
+    let providers = config["providers"].as_array().expect("provider snapshots");
+    assert_eq!(
+        providers
+            .iter()
+            .filter(|provider| provider["status"] == "ready")
+            .count(),
+        1,
+        "the ready-provider contract must be exercised"
+    );
+    assert!(
+        providers
+            .iter()
+            .any(|provider| provider["installed"] == false),
+        "the missing-provider contract must also be exercised"
+    );
     for provider in config["providers"].as_array().expect("provider snapshots") {
         if provider["status"] == "ready" {
+            assert_eq!(provider["driver"], "claudeAgent");
+            assert_eq!(provider["version"], "2.1.220 (Claude Code)");
+            assert_eq!(provider["auth"]["status"], "authenticated");
             assert_eq!(provider["installed"], true);
             assert!(matches!(
                 provider["auth"]["status"].as_str(),
@@ -497,7 +561,9 @@ async fn missing_keybindings_file_uses_the_shipped_defaults() {
 #[tokio::test]
 async fn activity_protocol_cannot_be_advertised_before_registry_validation() {
     let directory = tempfile::tempdir().expect("temporary state directory");
-    let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
+    let config = test_config(directory.path());
+    hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+    let control = NativeServerControl::new(config, auth_descriptor()).await;
 
     let before_registration = call(&control, "server.getConfig", json!({})).await;
     assert_eq!(
@@ -600,17 +666,21 @@ async fn settings_update_persists_atomically_redacts_secrets_and_emits_stream_ev
     assert_eq!(event["payload"]["settings"], updated);
 
     let persisted: Value = serde_json::from_slice(
-        &tokio::fs::read(directory.path().join("userdata/settings.json"))
-            .await
-            .expect("persisted settings"),
+        &tokio::fs::read(
+            test_config(directory.path())
+                .state_dir()
+                .join("settings.json"),
+        )
+        .await
+        .expect("persisted settings"),
     )
     .expect("valid settings JSON");
     assert!(!persisted.to_string().contains("top-secret"));
     assert_eq!(
         tokio::fs::read_to_string(
-            directory
-                .path()
-                .join("userdata/secrets/provider-env-d29yaw-VE9LRU4"),
+            test_config(directory.path())
+                .state_dir()
+                .join("secrets/provider-env-d29yaw-VE9LRU4"),
         )
         .await
         .expect("separate secret"),
@@ -678,9 +748,13 @@ async fn keybinding_upsert_replace_and_remove_are_resolved_persisted_and_streame
             })
     );
     let persisted: Value = serde_json::from_slice(
-        &tokio::fs::read(directory.path().join("userdata/keybindings.json"))
-            .await
-            .expect("persisted keybindings"),
+        &tokio::fs::read(
+            test_config(directory.path())
+                .state_dir()
+                .join("keybindings.json"),
+        )
+        .await
+        .expect("persisted keybindings"),
     )
     .expect("valid keybindings JSON");
     assert!(
@@ -786,16 +860,13 @@ async fn provider_inventory_uses_provider_specific_status_and_configured_models(
             }
         }
     });
-    let settings_path = directory.path().join("userdata/settings.json");
-    tokio::fs::create_dir_all(settings_path.parent().unwrap())
-        .await
-        .expect("create settings directory");
-    tokio::fs::write(
-        settings_path,
-        serde_json::to_vec(&settings).expect("serialize settings fixture"),
-    )
-    .await
-    .expect("write settings fixture");
+    // Layers this fixture's `cursor` override and `providerInstances` onto the
+    // hermetic base, so the other built-in drivers stay pinned to a missing
+    // executable instead of the default bare names.
+    hermetic_providers::write_hermetic_settings(
+        &test_config(directory.path()).state_dir(),
+        settings,
+    );
     let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
 
     call(&control, "server.refreshProviders", json!({})).await;
@@ -832,7 +903,9 @@ async fn claude_inventory_uses_authoritative_discovered_model_catalog() {
             "customModels": ["claude-custom-test"]
         }
     }));
-    let settings_path = directory.path().join("userdata/settings.json");
+    let settings_path = test_config(directory.path())
+        .state_dir()
+        .join("settings.json");
     tokio::fs::create_dir_all(settings_path.parent().unwrap())
         .await
         .expect("create settings directory");
@@ -898,7 +971,9 @@ async fn claude_inventory_keeps_discovered_models_when_skill_reload_is_invalid()
         }],
         "config": { "binaryPath": executable }
     }));
-    let settings_path = directory.path().join("userdata/settings.json");
+    let settings_path = test_config(directory.path())
+        .state_dir()
+        .join("settings.json");
     tokio::fs::create_dir_all(settings_path.parent().unwrap())
         .await
         .expect("create settings directory");
@@ -946,7 +1021,9 @@ async fn claude_inventory_hides_models_unsupported_by_the_installed_cli_version(
         "enabled": true,
         "config": { "binaryPath": executable }
     }));
-    let settings_path = directory.path().join("userdata/settings.json");
+    let settings_path = test_config(directory.path())
+        .state_dir()
+        .join("settings.json");
     tokio::fs::create_dir_all(settings_path.parent().unwrap())
         .await
         .expect("create settings directory");
@@ -1104,7 +1181,9 @@ async fn refresh_providers_returns_version_advisories_without_registry_access() 
             }
         }
     });
-    let settings_path = directory.path().join("userdata/settings.json");
+    let settings_path = test_config(directory.path())
+        .state_dir()
+        .join("settings.json");
     tokio::fs::create_dir_all(settings_path.parent().expect("settings parent"))
         .await
         .expect("create settings directory");
@@ -1147,16 +1226,10 @@ async fn provider_update_succeeds_when_cursor_installed_version_advances() {
             }
         }
     });
-    let settings_path = directory.path().join("userdata/settings.json");
-    tokio::fs::create_dir_all(settings_path.parent().expect("settings parent"))
-        .await
-        .expect("create settings directory");
-    tokio::fs::write(
-        settings_path,
-        serde_json::to_vec(&settings).expect("settings JSON"),
-    )
-    .await
-    .expect("write settings fixture");
+    hermetic_providers::write_hermetic_settings(
+        &test_config(directory.path()).state_dir(),
+        settings,
+    );
     let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
     let initial = call(
         &control,
@@ -1218,16 +1291,10 @@ async fn provider_update_rejects_malformed_instance_ids_without_publishing_updat
             }
         }
     });
-    let settings_path = directory.path().join("userdata/settings.json");
-    tokio::fs::create_dir_all(settings_path.parent().expect("settings parent"))
-        .await
-        .expect("create settings directory");
-    tokio::fs::write(
-        settings_path,
-        serde_json::to_vec(&settings).expect("settings JSON"),
-    )
-    .await
-    .expect("write settings fixture");
+    hermetic_providers::write_hermetic_settings(
+        &test_config(directory.path()).state_dir(),
+        settings,
+    );
     let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
 
     for instance_id in [Value::Null, json!(7), json!({}), json!("not a slug")] {
