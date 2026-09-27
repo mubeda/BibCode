@@ -2,7 +2,7 @@ import { RetryButton } from "../ui/retry-button";
 import {
   gitManagerRepositoryUnavailableCopy,
   type GitManagerRepositoryUnavailableReason,
-} from "./gitManagerRepositoryUnavailable";
+} from "./gitManagerRepositoryAvailability";
 
 interface GitManagerRepositoryUnavailableProps {
   readonly title: string;

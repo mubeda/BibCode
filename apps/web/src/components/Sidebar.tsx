@@ -163,7 +163,7 @@ import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
 import {
   gitManagerRepositoryUnavailableCopy,
   resolveGitManagerRepositoryUnavailable,
-} from "./gitManager/gitManagerRepositoryUnavailable";
+} from "./gitManager/gitManagerRepositoryAvailability";
 import { AgentsNavRow } from "./sidebar/AgentsNavRow";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
 import { ServerUpdateBadge, serverUpdateStatusFromQuery } from "./settings/ServerUpdateBadge";
