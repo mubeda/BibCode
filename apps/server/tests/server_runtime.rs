@@ -1002,8 +1002,14 @@ async fn streams_static_assets_with_security_and_cache_headers() {
     let temp = TempDir::new().expect("temporary base directory");
     let static_dir = temp.path().join("static");
     std::fs::create_dir_all(static_dir.join("docs")).expect("static directories");
+    std::fs::create_dir_all(static_dir.join("assets")).expect("build asset directory");
     std::fs::write(static_dir.join("index.html"), "<main>spa</main>").expect("SPA index");
     std::fs::write(static_dir.join("app.js"), "console.log('ok')").expect("asset");
+    std::fs::write(
+        static_dir.join("assets/app-AbCd1234.js"),
+        "console.log('hashed')",
+    )
+    .expect("hashed asset");
     std::fs::write(static_dir.join("docs/index.html"), "<main>docs</main>")
         .expect("extensionless index");
 
@@ -1018,14 +1024,14 @@ async fn streams_static_assets_with_security_and_cache_headers() {
         .expect("asset response");
     assert_eq!(asset.status(), StatusCode::OK);
     assert_eq!(asset.headers()["x-content-type-options"], "nosniff");
-    assert_eq!(
-        asset.headers()["cache-control"],
-        "public, max-age=31536000, immutable"
-    );
+    assert_eq!(asset.headers()["cache-control"], "no-cache");
+    let etag = asset.headers()["etag"].clone();
+    assert!(etag.to_str().expect("ETag").starts_with("W/\""));
     assert!(asset.headers().contains_key("content-security-policy"));
     let csp = asset.headers()["content-security-policy"]
         .to_str()
-        .expect("CSP header");
+        .expect("CSP header")
+        .to_owned();
     for directive in [
         "object-src 'none'",
         "base-uri 'self'",
@@ -1035,6 +1041,76 @@ async fn streams_static_assets_with_security_and_cache_headers() {
     }
     assert_eq!(asset.text().await.expect("asset body"), "console.log('ok')");
 
+    let hashed = client
+        .get(endpoint(handle.local_addr(), "/assets/app-AbCd1234.js"))
+        .send()
+        .await
+        .expect("hashed asset response");
+    assert_eq!(hashed.status(), StatusCode::OK);
+    assert_eq!(
+        hashed.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert!(!hashed.headers().contains_key("etag"));
+    assert_eq!(
+        hashed.text().await.expect("hashed body"),
+        "console.log('hashed')"
+    );
+
+    let conditional = client
+        .get(endpoint(handle.local_addr(), "/app.js"))
+        .header("if-none-match", etag.clone())
+        .send()
+        .await
+        .expect("conditional asset response");
+    assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(conditional.headers()["etag"], etag);
+    assert_eq!(conditional.headers()["cache-control"], "no-cache");
+    assert_eq!(conditional.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(conditional.headers()["content-security-policy"], csp);
+    assert!(
+        conditional
+            .bytes()
+            .await
+            .expect("conditional body")
+            .is_empty()
+    );
+
+    let head = client
+        .head(endpoint(handle.local_addr(), "/app.js"))
+        .send()
+        .await
+        .expect("HEAD asset response");
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers()["cache-control"], "no-cache");
+    assert_eq!(head.headers()["etag"], etag);
+    assert_eq!(head.headers()["content-length"], "17");
+    assert_eq!(head.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(head.headers()["content-security-policy"], csp);
+    assert!(head.bytes().await.expect("HEAD body").is_empty());
+
+    std::fs::write(static_dir.join("app.js"), "console.log('updated')").expect("updated asset");
+    let changed = client
+        .get(endpoint(handle.local_addr(), "/app.js"))
+        .header("if-none-match", etag.clone())
+        .send()
+        .await
+        .expect("changed asset response");
+    assert_eq!(changed.status(), StatusCode::OK);
+    assert_eq!(changed.headers()["cache-control"], "no-cache");
+    assert_ne!(changed.headers()["etag"], etag);
+    assert_eq!(
+        changed.text().await.expect("changed body"),
+        "console.log('updated')"
+    );
+
+    let post = client
+        .post(endpoint(handle.local_addr(), "/app.js"))
+        .send()
+        .await
+        .expect("POST asset response");
+    assert_eq!(post.status(), StatusCode::NOT_FOUND);
+
     let docs = client
         .get(endpoint(handle.local_addr(), "/docs"))
         .send()
@@ -1042,16 +1118,73 @@ async fn streams_static_assets_with_security_and_cache_headers() {
         .expect("docs response");
     assert_eq!(docs.text().await.expect("docs body"), "<main>docs</main>");
 
+    let index = client
+        .get(endpoint(handle.local_addr(), "/"))
+        .send()
+        .await
+        .expect("index response");
+    assert_eq!(index.status(), StatusCode::OK);
+    assert_eq!(index.headers()["cache-control"], "no-cache");
+    assert!(!index.headers().contains_key("etag"));
+    assert_eq!(index.text().await.expect("index body"), "<main>spa</main>");
+
     let fallback = client
         .get(endpoint(handle.local_addr(), "/missing/route"))
         .send()
         .await
         .expect("fallback response");
     assert_eq!(fallback.headers()["cache-control"], "no-cache");
+    assert!(!fallback.headers().contains_key("etag"));
     assert_eq!(
         fallback.text().await.expect("fallback body"),
         "<main>spa</main>"
     );
+
+    let missing_asset = client
+        .get(endpoint(handle.local_addr(), "/assets/missing-AbCd1234.js"))
+        .header("if-none-match", "*")
+        .send()
+        .await
+        .expect("missing asset fallback response");
+    assert_eq!(missing_asset.status(), StatusCode::OK);
+    assert_eq!(missing_asset.headers()["cache-control"], "no-cache");
+    assert!(!missing_asset.headers().contains_key("etag"));
+    assert_eq!(
+        missing_asset.text().await.expect("missing asset body"),
+        "<main>spa</main>"
+    );
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../app.js", static_dir.join("assets/alias-AbCd1234.js"))
+            .expect("unhashed asset symlink");
+        std::os::unix::fs::symlink("assets/app-AbCd1234.js", static_dir.join("alias.js"))
+            .expect("hashed asset symlink");
+        for (path, cache_control, has_etag, body) in [
+            (
+                "/assets/alias-AbCd1234.js",
+                "no-cache",
+                true,
+                "console.log('updated')",
+            ),
+            (
+                "/alias.js",
+                "public, max-age=31536000, immutable",
+                false,
+                "console.log('hashed')",
+            ),
+        ] {
+            let response = client
+                .get(endpoint(handle.local_addr(), path))
+                .send()
+                .await
+                .expect("symlink response");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()["cache-control"], cache_control, "{path}");
+            assert_eq!(response.headers().contains_key("etag"), has_etag, "{path}");
+            assert_eq!(response.text().await.expect("symlink body"), body, "{path}");
+        }
+    }
 
     handle.shutdown();
     handle.join().await.expect("server joins");
@@ -1096,6 +1229,18 @@ async fn preserves_path_and_query_when_redirecting_loopback_dev_requests() {
         response.headers()["location"],
         "http://127.0.0.1:5173/projects/one?tab=files"
     );
+
+    let head = client
+        .head(endpoint(handle.local_addr(), "/projects/one?tab=files"))
+        .send()
+        .await
+        .expect("HEAD redirect response");
+    assert_eq!(head.status(), StatusCode::FOUND);
+    assert_eq!(
+        head.headers()["location"],
+        "http://127.0.0.1:5173/projects/one?tab=files"
+    );
+    assert!(head.bytes().await.expect("HEAD redirect body").is_empty());
 
     handle.shutdown();
     handle.join().await.expect("server joins");
