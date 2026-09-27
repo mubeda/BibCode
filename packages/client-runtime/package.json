@@ -103,6 +103,10 @@
       "types": "./src/state/remoteUpdates.ts",
       "default": "./src/state/remoteUpdates.ts"
     },
+    "./state/remoteUpdateCoordinator": {
+      "types": "./src/state/remoteUpdateCoordinator.ts",
+      "default": "./src/state/remoteUpdateCoordinator.ts"
+    },
     "./state/review": {
       "types": "./src/state/review.ts",
       "default": "./src/state/review.ts"
