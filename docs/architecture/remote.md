@@ -151,10 +151,12 @@ broader `NSAllowsArbitraryLoads`.
 
 `bibcode serve` sends `script-src 'self'`, so the served page runs only
 same-origin scripts. The static `/theme-bootstrap.js` runs before first paint.
-The build versions its URL with a content hash because non-HTML static files
-are cached for a year, and fails if an inline script reaches the built
-`index.html`. The desktop webview has the same `script-src 'self'` policy, and
-Tauri ignores the query string when resolving the static asset.
+Only content-hashed build assets under `/assets/` are immutable. Other non-HTML
+static files, such as `/theme-bootstrap.js` and the icons, use `no-cache` with an
+ETag so browsers revalidate them and receive 304 when unchanged. The build still
+versions the bootstrap URL with a content hash and rejects inline scripts in
+the built `index.html`. The desktop webview has the same `script-src 'self'`
+policy, and Tauri ignores the query string when resolving the static asset.
 
 ### Direct-connection E2EE
 

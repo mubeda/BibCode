@@ -2,6 +2,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::UNIX_EPOCH,
 };
 
 use axum::{
@@ -10,7 +11,9 @@ use axum::{
     extract::{ConnectInfo, FromRef, Request, State, WebSocketUpgrade},
     http::{
         HeaderMap, Method, StatusCode, Uri,
-        header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION},
+        header::{
+            CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH, LOCATION,
+        },
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -556,7 +559,7 @@ async fn static_or_dev(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    if method != Method::GET {
+    if method != Method::GET && method != Method::HEAD {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
 
@@ -580,10 +583,15 @@ async fn static_or_dev(
         )
             .into_response();
     };
-    serve_static(static_dir, uri.path()).await
+    serve_static(static_dir, uri.path(), &method, &headers).await
 }
 
-async fn serve_static(static_dir: &Path, request_path: &str) -> Response {
+async fn serve_static(
+    static_dir: &Path,
+    request_path: &str,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
     let relative = match safe_relative_path(request_path) {
         Ok(path) => path,
         Err(()) => return (StatusCode::BAD_REQUEST, "Invalid static file path").into_response(),
@@ -604,7 +612,10 @@ async fn serve_static(static_dir: &Path, request_path: &str) -> Response {
             None => return (StatusCode::NOT_FOUND, "Not Found").into_response(),
         },
     };
-    stream_file(candidate).await
+    let content_hashed = candidate
+        .strip_prefix(&root)
+        .is_ok_and(is_content_hashed_asset);
+    stream_file(candidate, content_hashed, method, headers).await
 }
 
 fn safe_relative_path(request_path: &str) -> Result<PathBuf, ()> {
@@ -642,32 +653,114 @@ async fn canonical_file_within(root: &Path, candidate: &Path) -> Option<PathBuf>
     metadata.is_file().then_some(canonical)
 }
 
-async fn stream_file(path: PathBuf) -> Response {
+/// Vite emits build outputs into `assetsDir` (`assets/`) as `[name]-[hash].[ext]`
+/// with an 8-character base64url hash; `apps/web/public/` files are copied to the
+/// static root unhashed. The input is the resolved file's path relative to that root.
+fn is_content_hashed_asset(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let (Some(Component::Normal(directory)), Some(Component::Normal(filename)), None) =
+        (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    if directory != "assets" {
+        return false;
+    }
+    let filename = Path::new(filename);
+    if filename
+        .extension()
+        .is_none_or(|extension| extension.is_empty())
+    {
+        return false;
+    }
+    let Some(stem) = filename.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let stem = stem.as_bytes();
+    let Some(hash_start) = stem.len().checked_sub(8) else {
+        return false;
+    };
+    hash_start > 0
+        && stem[hash_start - 1] == b'-'
+        && stem[hash_start..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn if_none_match_matches(header: &str, etag: &str) -> bool {
+    let header = header.trim();
+    let etag = etag.strip_prefix("W/").unwrap_or(etag);
+    header == "*"
+        || header.split(',').any(|entry| {
+            let entry = entry.trim();
+            entry.strip_prefix("W/").unwrap_or(entry) == etag
+        })
+}
+
+async fn stream_file(
+    path: PathBuf,
+    content_hashed: bool,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
     let file = match File::open(&path).await {
         Ok(file) => file,
         Err(_) => return internal_server_error(),
     };
-    let length = match file.metadata().await {
-        Ok(metadata) => metadata.len(),
+    let metadata = match file.metadata().await {
+        Ok(metadata) => metadata,
         Err(_) => return internal_server_error(),
     };
     let content_type = mime_guess::from_path(&path).first_or_octet_stream();
-    let cache_control = if content_type.type_() == mime_guess::mime::TEXT
+    let (cache_control, etag) = if content_type.type_() == mime_guess::mime::TEXT
         && content_type.subtype() == mime_guess::mime::HTML
     {
-        HTML_CACHE_CONTROL
+        (HTML_CACHE_CONTROL, None)
+    } else if content_hashed {
+        (IMMUTABLE_CACHE_CONTROL, None)
     } else {
-        IMMUTABLE_CACHE_CONTROL
+        let etag = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|modified| {
+                format!(
+                    "W/\"{:x}-{:x}-{:x}\"",
+                    metadata.len(),
+                    modified.as_secs(),
+                    modified.subsec_nanos()
+                )
+            });
+        ("no-cache", etag)
     };
-    let body = Body::from_stream(ReaderStream::new(file));
+    let not_modified = etag.as_deref().is_some_and(|etag| {
+        headers.get_all(IF_NONE_MATCH).iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| if_none_match_matches(value, etag))
+        })
+    });
 
-    Response::builder()
-        .status(StatusCode::OK)
+    let mut response = Response::builder()
+        .status(if not_modified {
+            StatusCode::NOT_MODIFIED
+        } else {
+            StatusCode::OK
+        })
         .header(CONTENT_TYPE, content_type.as_ref())
-        .header(CONTENT_LENGTH, length)
+        .header(CONTENT_LENGTH, metadata.len())
         .header(CACHE_CONTROL, cache_control)
         .header("x-content-type-options", "nosniff")
-        .header("content-security-policy", CONTENT_SECURITY_POLICY_VALUE)
+        .header("content-security-policy", CONTENT_SECURITY_POLICY_VALUE);
+    if let Some(etag) = etag {
+        response = response.header(ETAG, etag);
+    }
+    let body = if not_modified || method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from_stream(ReaderStream::new(file))
+    };
+    response
         .body(body)
         .unwrap_or_else(|_| internal_server_error())
 }
@@ -716,6 +809,52 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn content_hashed_assets_follow_the_vite_output_convention() {
+        for (path, expected) in [
+            ("assets/index-C0420DUf.js", true),
+            ("assets/actionscript-3--17pq3dv.js", true),
+            ("assets/react-DV3x_TFi.js", true),
+            ("assets/style-AbCd12_-.css", true),
+            ("theme-bootstrap.js", false),
+            ("favicon.ico", false),
+            ("assets/logo.png", false),
+            ("nested/assets/index-C0420DUf.js", false),
+            ("assets/nested/index-C0420DUf.js", false),
+            ("assets/index-C0420DU.js", false),
+            ("assets/index-C0420DUff.js", false),
+            ("assets/index-C0420DUf", false),
+            ("assets/index-C0420DUf.", false),
+            ("assets/index-C0420D+f.js", false),
+            ("assets/index-C0420Déf.js", false),
+            ("/assets/index-C0420DUf.js", false),
+            ("index-C0420DUf.js", false),
+        ] {
+            assert_eq!(is_content_hashed_asset(Path::new(path)), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn if_none_match_uses_weak_comparison() {
+        for (header, etag, expected) in [
+            ("\"abc\"", "\"abc\"", true),
+            ("W/\"abc\"", "\"abc\"", true),
+            ("\"abc\"", "W/\"abc\"", true),
+            ("W/\"abc\"", "W/\"abc\"", true),
+            (" \"other\", W/\"abc\", \"last\" ", "W/\"abc\"", true),
+            ("*", "W/\"abc\"", true),
+            (" \t* \t", "W/\"abc\"", true),
+            ("\"other\"", "W/\"abc\"", false),
+            ("\"ABC\"", "W/\"abc\"", false),
+            ("", "W/\"abc\"", false),
+            (" \t", "W/\"abc\"", false),
+            ("abc", "W/\"abc\"", false),
+            ("\"other,*,value\"", "W/\"abc\"", false),
+        ] {
+            assert_eq!(if_none_match_matches(header, etag), expected, "{header:?}");
+        }
+    }
 
     async fn cors_response(
         config: &ServerConfig,
