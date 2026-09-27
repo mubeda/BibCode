@@ -2,6 +2,8 @@
 
 Status: **Approved by the user on 2026-09-26** — option C with the default answers to every open question (inline ≤256 KiB; 16 open uploads per session, 256 MiB per server, 10-minute expiry; resume across reconnects; 8 × 10 MiB per turn kept; progress and Cancel on the pending message). Build after the connection-liveness commit.
 
+Amendment: design B's Q5, approved 2026-09-26, folds `attachments.beginUpload / appendUpload / getUpload / cancelUpload` into `uploads.begin / append / get / cancel` with a `chat-attachment` target. See the [uploads and E2EE transfers implementation plan](../plans/2026-09-27-uploads-and-e2ee-transfers.md); the body below remains the historical design record.
+
 Input: the residual at lines 302–303 of
 [the connection-liveness record](./2026-09-24-connection-liveness-design.md). The liveness
 implementation report and the controller's Phase C review repeat it as "Residual (not
@@ -213,6 +215,8 @@ rule. D puts attachments in cleartext on E2EE LAN pairings and adds a second tra
 
 **Wire.** The methods require the operate scope, like `orchestration.dispatchCommand` and
 `projects.createUploadUrl` (`apps/server/src/auth/scope.rs:87-125`).
+
+Amendment (B Q5, approved 2026-09-26): `attachments.beginUpload / appendUpload / getUpload / cancelUpload` become `uploads.begin / append / get / cancel` with a `chat-attachment` target; see the [implementation plan](../plans/2026-09-27-uploads-and-e2ee-transfers.md).
 
 - **Methods.**
   - `attachments.beginUpload { type, name, mimeType, sizeBytes, sha256 } → { uploadId }`.
