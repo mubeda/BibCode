@@ -3,6 +3,9 @@
 #[path = "support/hermetic_providers.rs"]
 mod hermetic_providers;
 
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use bibcode_server::{git, production::host_paths::process_compatible_path, source_control, vcs};
 
 use std::{
@@ -230,8 +233,6 @@ async fn observe_initial_remote(
 fn provider_cli_fixture(directory: &Path, command: &str) -> std::path::PathBuf {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = directory.join(command);
         let script = r#"#!/bin/sh
 case "$*" in
@@ -246,10 +247,7 @@ case "$(basename "$0"):$*" in
   az:*) printf '%s\n' '{"pullRequestId":44,"title":"Azure PR","url":"https://azure.test/44","targetRefName":"refs/heads/main","sourceRefName":"refs/heads/feature","status":"active"}' ;;
 esac
 "#;
-        fs::write(&path, script).expect("provider fixture should write");
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).unwrap();
+        executable_fixture::write_executable(&path, script);
         path
     }
     #[cfg(windows)]
@@ -284,7 +282,7 @@ echo {"pullRequestId":44,"title":"Azure PR","url":"https://azure.test/44","targe
              )\r\n\
              {success}\r\n"
         );
-        fs::write(&path, script).expect("provider fixture should write");
+        executable_fixture::write_executable(&path, script);
         path
     }
 }

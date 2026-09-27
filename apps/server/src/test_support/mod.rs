@@ -4,6 +4,8 @@ pub(crate) mod appimage_environment;
 #[cfg(target_os = "linux")]
 mod capability_probe;
 mod event;
+#[path = "../../tests/support/executable_fixture.rs"]
+pub(crate) mod executable_fixture;
 #[path = "../../tests/support/hermetic_providers.rs"]
 pub(crate) mod hermetic_providers;
 #[cfg(target_os = "linux")]

@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -198,15 +201,12 @@ esac
     }
 
     fn script(root: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = root.join(name);
         let directory = root.to_string_lossy().replace('\'', "'\\''");
-        fs::write(
+        executable_fixture::write_executable(
             &path,
             format!("#!/bin/sh\nFIXTURE_DIR='{directory}'\n{body}"),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         path
     }
 }

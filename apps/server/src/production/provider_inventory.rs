@@ -1737,22 +1737,13 @@ mod tests {
 
     #[cfg(unix)]
     fn write_version_fixture(directory: &Path, name: &str, version: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let executable = directory.join(name);
-        std::fs::write(
+        crate::test_support::executable_fixture::write_executable(
             &executable,
             format!(
                 "#!/bin/sh\nif [ \"$1\" = about ]; then printf '%s\\n' '{{\"cliVersion\":\"{version}\"}}'; else printf '%s\\n' '{version}'; fi\n"
             ),
-        )
-        .expect("write version fixture");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("version fixture metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions)
-            .expect("make version fixture executable");
+        );
         executable
     }
 
@@ -1842,28 +1833,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn exact_target_probe_applies_the_same_case_variant_path_used_for_resolution() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = tempfile::tempdir().expect("inventory PATH root");
         let first = root.path().join("first");
         let second = root.path().join("second");
         std::fs::create_dir_all(&first).expect("first PATH directory");
         std::fs::create_dir_all(&second).expect("second PATH directory");
         let executable = first.join("codex");
-        std::fs::write(
+        crate::test_support::executable_fixture::write_executable(
             &executable,
             format!(
                 "#!/bin/sh\nif [ \"$PATH\" = '{}' ]; then printf '1.2.3\\n'; else printf '9.9.9\\n'; fi\n",
                 first.to_string_lossy()
             ),
-        )
-        .expect("write version fixture");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("version fixture metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions)
-            .expect("make version fixture executable");
+        );
         let target = ProviderMaintenanceTarget {
             instance_id: "codex-work".to_owned(),
             driver: "codex".to_owned(),

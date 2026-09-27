@@ -1,3 +1,6 @@
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -410,17 +413,13 @@ impl GitHubProviderStub {
         );
         let calls = fixture._root.path().join("provider-calls");
         let command = fixture._root.path().join("provider-gh");
-        fs::write(
+        executable_fixture::write_executable(
             &command,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1:$2\" in\n  pr:list) printf '%s\\n' '[{{\"number\":42,\"title\":\"Explicit PR\",\"url\":\"https://github.test/42\",\"baseRefName\":\"main\",\"headRefName\":\"main\",\"state\":\"OPEN\"}}]' ;;\n  pr:view) printf '%s\\n' '{checks_stdout}'; exit {checks_exit} ;;\n  *) exit 64 ;;\nesac\n",
                 calls.to_string_lossy()
             ),
-        )
-        .expect("provider fixture");
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&command, fs::Permissions::from_mode(0o755))
-            .expect("provider fixture executable");
+        );
         let services = fixture.services.clone().with_pull_request_service(
             PullRequestService::with_provider_commands(
                 command.to_string_lossy(),
@@ -1925,16 +1924,10 @@ async fn squash_merge_bypasses_commit_hooks_only_when_no_verify_is_requested() {
     let hooks = fixture._root.path().join("hooks");
     fs::create_dir(&hooks).expect("hooks directory");
     let hook = hooks.join("pre-commit");
-    fs::write(
+    executable_fixture::write_executable(
         &hook,
         "#!/bin/sh\necho 'pre-commit hook blocked the commit' >&2\nexit 1\n",
-    )
-    .expect("pre-commit hook");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("executable hook");
-    }
+    );
     git(
         &cwd,
         &[
@@ -2490,23 +2483,16 @@ async fn rebase_revert_and_all_reset_modes_execute_through_the_stream() {
 #[cfg(unix)]
 #[tokio::test]
 async fn concurrent_operation_is_rejected_and_cancellation_terminates_the_child() {
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Stdio;
     use tokio::time::sleep;
 
     let fixture = Fixture::new().await;
     let marker = fixture._root.path().join("slow-fetch.pid");
     let helper = fixture._root.path().join("slow-remote.sh");
-    fs::write(
+    executable_fixture::write_executable(
         &helper,
         format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n", path(&marker)),
-    )
-    .expect("slow remote helper");
-    let mut permissions = fs::metadata(&helper)
-        .expect("helper metadata")
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&helper, permissions).expect("helper permissions");
+    );
     git(
         &fixture.repository_path,
         &["config", "protocol.ext.allow", "always"],

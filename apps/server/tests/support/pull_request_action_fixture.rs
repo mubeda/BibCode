@@ -3,6 +3,9 @@
 //! their argv role's slot, regardless of process arrival order.
 //! Mutations are exercised only against this stub, never live hosts.
 
+#[path = "executable_fixture.rs"]
+pub(crate) mod executable_fixture;
+
 use bibcode_server::pull_requests::{
     github::GitHubHost,
     gitlab::GitLabHost,
@@ -26,7 +29,7 @@ impl Fixture {
     pub fn new(gitlab: bool) -> Self {
         let root = TempDir::new().unwrap();
         let script = root.path().join("cli");
-        fs::write(
+        executable_fixture::write_executable(
             &script,
             r#"#!/bin/sh
 until mkdir count.lock 2>/dev/null; do sleep 0.01; done
@@ -67,10 +70,7 @@ if [ ! -f "response-$slot" ]; then echo 'Unexpected process call' >&2; exit 64; 
 cat "response-$slot"
 if [ -f "error-$slot" ]; then cat "error-$slot" >&2; exit 1; fi
 "#,
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runner = Arc::new(
             HostCommandRunner::new(root.path().join("state"))
                 .with_commands(&script, &script, &script),

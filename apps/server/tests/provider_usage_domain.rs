@@ -1,3 +1,6 @@
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use bibcode_server::provider_usage;
 use serde_json::json;
 
@@ -137,15 +140,7 @@ fn write_codex_fixture(
         }
     }
     let body = format!("{}\n", commands.join("\n"));
-    fs::write(&path, body).expect("write codex fixture");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = fs::metadata(&path).expect("fixture metadata").permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&path, permissions).expect("fixture permissions");
-    }
+    executable_fixture::write_executable(&path, body);
     path
 }
 

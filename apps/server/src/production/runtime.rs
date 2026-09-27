@@ -2926,7 +2926,6 @@ mod tests {
             ENVIRONMENT_CASES, assert_child_environment, check_inherited_environment,
         };
         use crate::test_support::reexec;
-        use std::os::unix::fs::PermissionsExt;
 
         const FIXTURE: &str = "BIBCODE_REVIEW_ENVIRONMENT_FIXTURE";
         const TEST: &str =
@@ -2961,7 +2960,7 @@ mod tests {
         check_inherited_environment(TEST, ENVIRONMENT_CASES, |expected| {
             let directory = tempfile::tempdir().expect("review fixture directory");
             let executable = directory.path().join("git");
-            std::fs::write(
+            crate::test_support::executable_fixture::write_executable(
                 &executable,
                 concat!(
                     "#!/bin/sh\n",
@@ -2972,10 +2971,7 @@ mod tests {
                     "  *) exit 1 ;;\n",
                     "esac\n",
                 ),
-            )
-            .expect("git review fixture");
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
-                .expect("executable git fixture");
+            );
             std::fs::write(
                 directory.path().join("untracked.txt"),
                 "untracked review fixture\n",

@@ -1,5 +1,8 @@
 #![cfg(unix)]
 //! Recorded response shapes with synthetic content; no authenticated host/network traffic.
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use bibcode_server::{
     RequestId, RpcRequest,
     production::pull_requests_rpc::ConfiguredPullRequestsRpcServices,
@@ -235,15 +238,12 @@ fn write(root: &Path, name: &str, v: Value) {
     fs::write(root.join(name), v.to_string()).unwrap();
 }
 fn script(root: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = root.join(name);
     let quoted = root.to_string_lossy().replace('\'', "'\\''");
-    fs::write(
+    executable_fixture::write_executable(
         &path,
         format!("#!/bin/sh\nexport FIXTURE_DIR='{quoted}'\n{body}"),
-    )
-    .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    );
     path
 }
 fn assert_permission_reasons(detail: &Value) {

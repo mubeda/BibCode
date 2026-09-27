@@ -2532,9 +2532,7 @@ mod tests {
         let executable =
             release_directory.join(cursor_update_fixture_executable_name(cfg!(windows)));
         let fixture = compiled_cursor_update_fixture().await;
-        tokio::fs::copy(&fixture.executable, &executable)
-            .await
-            .expect("copy compiled Cursor update fixture");
+        crate::test_support::executable_fixture::copy_executable(&fixture.executable, &executable);
         executable
     }
 
