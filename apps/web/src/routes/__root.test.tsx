@@ -378,6 +378,24 @@ describe("Route.beforeLoad", () => {
     expect(result.authGateState.status).toBe("hosted-static");
   });
 
+  it("leaves hosted pairing codes to the existing Remote Servers redirect", async () => {
+    s.hostedStatic = true;
+    window.location.href = "https://app.test/pair?host=backend.example.test&code=%3CREDACTED%3E";
+
+    const result = await beforeLoad()({ location: { pathname: "/pair" } });
+
+    expect(result.authGateState.status).toBe("hosted-static");
+  });
+
+  it("keeps using server authentication for a non-hosted pair route after token removal", async () => {
+    s.authGate = { status: "requires-auth" };
+    window.location.href = "https://app.test/pair?host=backend.example.test";
+
+    const result = await beforeLoad()({ location: { pathname: "/pair" } });
+
+    expect(result.authGateState.status).toBe("requires-auth");
+  });
+
   it("resolves the server auth gate state for a normal boot", async () => {
     s.authGate = { status: "unauthenticated" };
     const result = await beforeLoad()({ location: { pathname: "/" } });
