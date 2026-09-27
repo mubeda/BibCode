@@ -2093,7 +2093,7 @@ fn apply_settings_defaults(settings: &mut Value) {
         .as_object_mut()
         .expect("settings object")
         .remove("observability");
-    merge_missing(
+    crate::server_settings::merge_missing(
         settings,
         &json!({
             "enableAssistantStreaming": false,
@@ -2109,13 +2109,7 @@ fn apply_settings_defaults(settings: &mut Value) {
                 "instanceId": "codex",
                 "model": "gpt-5.4-mini",
             },
-            "providers": {
-                "codex": { "enabled": true, "binaryPath": "codex", "homePath": "", "shadowHomePath": "", "customModels": [] },
-                "claudeAgent": { "enabled": true, "binaryPath": "claude", "homePath": "", "customModels": [], "launchArgs": "" },
-                "cursor": { "enabled": false, "binaryPath": "cursor-agent", "apiEndpoint": "", "customModels": [] },
-                "grok": { "enabled": false, "binaryPath": "grok", "customModels": [] },
-                "opencode": { "enabled": true, "binaryPath": "opencode", "serverUrl": "", "serverPassword": "", "customModels": [] },
-            },
+            "providers": crate::server_settings::built_in_provider_defaults(),
             "providerInstances": {},
             "providerSessionDefaults": {},
             "terminal": { "webglEnabled": true },
@@ -2126,22 +2120,6 @@ fn apply_settings_defaults(settings: &mut Value) {
         .expect("settings object")
         .entry("defaultAgent")
         .or_insert_with(|| json!({ "kind": "chat", "instanceId": "codex" }));
-}
-
-fn merge_missing(target: &mut Value, defaults: &Value) {
-    if let (Some(target), Some(defaults)) = (target.as_object_mut(), defaults.as_object()) {
-        for (key, default) in defaults {
-            match target.get_mut(key) {
-                Some(value) if value.is_object() && default.is_object() => {
-                    merge_missing(value, default)
-                }
-                Some(_) => {}
-                None => {
-                    target.insert(key.clone(), default.clone());
-                }
-            }
-        }
-    }
 }
 
 fn apply_settings_patch(target: &mut Value, patch: Value) {
@@ -5232,6 +5210,110 @@ mod tests {
         assert_eq!(merged["models"], json!([]));
         assert_eq!(merged["skills"], json!([]));
         assert_eq!(merged["agents"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn partial_builtin_provider_settings_agree_with_runtime_reader() {
+        let temp = tempfile::tempdir().expect("state directory");
+        // This helper writes only binaryPath for each legacy provider and pins
+        // every probed instance to an absent executable.
+        let control = scheduler_control(&temp).await;
+        let runtime =
+            crate::server_settings::ProviderSettingsStore::new(control.config.state_dir())
+                .get()
+                .await
+                .expect("runtime settings");
+        let runtime = serde_json::to_value(runtime.providers).expect("runtime providers");
+        let snapshot = control.config_snapshot().await;
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for driver in crate::test_support::hermetic_providers::BUILTIN_PROVIDER_DRIVERS {
+            actual.push((
+                *driver,
+                snapshot["settings"]["providers"][driver]["enabled"].clone(),
+            ));
+            expected.push((*driver, runtime[driver]["enabled"].clone()));
+            assert_eq!(
+                snapshot["settings"]["providers"][driver]["binaryPath"],
+                runtime[driver]["binaryPath"],
+                "{driver}"
+            );
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absent_settings_file_defaults_agree_with_runtime_reader() {
+        use crate::test_support::{reexec, run_on_current_thread};
+
+        const TEST: &str =
+            "production::control::tests::absent_settings_file_defaults_agree_with_runtime_reader";
+        if let Some(child) = reexec::enter(TEST, "isolated-provider-path") {
+            run_on_current_thread(async {
+                let temp = tempfile::tempdir().expect("state directory");
+                let config = running_test_config(temp.path());
+                let state_dir = config.state_dir();
+                assert!(!state_dir.join("settings.json").exists());
+                let control = NativeServerControl::new(config, json!({"policy": "test"})).await;
+                let runtime = crate::server_settings::ProviderSettingsStore::new(&state_dir)
+                    .get()
+                    .await
+                    .expect("runtime defaults");
+                let runtime = serde_json::to_value(runtime.providers).expect("runtime providers");
+                let snapshot = control.config_snapshot().await;
+                for driver in crate::test_support::hermetic_providers::BUILTIN_PROVIDER_DRIVERS {
+                    assert_eq!(
+                        snapshot["settings"]["providers"][driver]["enabled"],
+                        runtime[driver]["enabled"],
+                        "{driver}"
+                    );
+                    assert_eq!(
+                        snapshot["settings"]["providers"][driver]["binaryPath"],
+                        runtime[driver]["binaryPath"],
+                        "{driver}"
+                    );
+                }
+                assert!(
+                    snapshot["providers"]
+                        .as_array()
+                        .expect("inventory")
+                        .iter()
+                        .all(|provider| provider["installed"] == false)
+                );
+                assert!(!state_dir.join("settings.json").exists());
+            });
+            child.complete();
+            return;
+        }
+
+        // With no file there is nowhere to pin executables in settings. Isolate
+        // PATH and HOME in an exact-test child, leaving parallel tests untouched.
+        let sandbox = tempfile::tempdir().expect("provider lookup sandbox");
+        reexec::run(TEST, "isolated-provider-path", None, |command| {
+            command
+                .current_dir(sandbox.path())
+                .env("PATH", sandbox.path())
+                .env("HOME", sandbox.path())
+                .env("USERPROFILE", sandbox.path())
+                .env("CLAUDE_CONFIG_DIR", sandbox.path())
+                .env("XDG_CONFIG_HOME", sandbox.path());
+        });
+    }
+
+    #[test]
+    fn builtin_provider_defaults_enable_cursor_with_cursor_agent() {
+        let mut settings = json!({});
+        apply_settings_defaults(&mut settings);
+        assert_eq!(
+            settings["providers"],
+            crate::server_settings::built_in_provider_defaults()
+        );
+        assert_eq!(settings["providers"]["cursor"]["enabled"], true);
+        assert_eq!(
+            settings["providers"]["cursor"]["binaryPath"],
+            "cursor-agent"
+        );
     }
 
     #[test]
