@@ -38,6 +38,8 @@ for affected paths when intent is unclear.
 Documentation-only and very small mechanical work may use the relevant subset
 only after consulting `docs/README.md`. This keeps the workflow proportionate
 without letting agents skip documentation discovery.
+For releases and flaky tests, use [the release runbook](docs/operations/release.md) and [testing runbooks](docs/testing/README.md).
+Repository skills live in `.agents/skills/`, mirrored byte for byte to `.claude/skills/`.
 
 ## Evidence and Documentation
 
