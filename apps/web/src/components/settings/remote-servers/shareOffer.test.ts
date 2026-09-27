@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "@effect/vitest";
+import type { AdvertisedEndpoint } from "@bibcode/contracts";
 import { buildBrowserPairUrl, buildPairingDeepLink } from "@bibcode/shared/pairingCode";
 
-import { generateShareOffer, resolveShareAddressOptions } from "./shareOffer.ts";
+import {
+  generateShareOffer,
+  nativeShareAddressUnavailableReason,
+  resolveShareAddressOptions,
+} from "./shareOffer.ts";
 
 const wideState = {
   configuredMode: "network-accessible" as const,
@@ -583,6 +588,103 @@ describe("generateShareOffer", () => {
     expect(mintOffer).not.toHaveBeenCalled();
     expect(result).toMatchObject({ ok: false, failure: { kind: "invalid-address" } });
   });
+});
+
+describe("nativeShareAddressUnavailableReason", () => {
+  const privateObservation: AdvertisedEndpoint = {
+    id: "desktop-network:192.168.1.20:3773",
+    label: "Local network",
+    provider: { id: "desktop-core", label: "Desktop", kind: "core", isAddon: false },
+    httpBaseUrl: "http://192.168.1.20:3773/",
+    wsBaseUrl: "ws://192.168.1.20:3773/",
+    reachability: "lan",
+    compatibility: { hostedHttpsApp: "mixed-content-blocked", desktopApp: "compatible" },
+    source: "desktop-core",
+    status: "unavailable",
+  };
+
+  it("reports no private address when no endpoints were observed", () => {
+    expect(nativeShareAddressUnavailableReason([])).toBe("no-private-address");
+  });
+
+  it("reports no private address for a public-only endpoint", () => {
+    expect(
+      nativeShareAddressUnavailableReason([
+        {
+          ...privateObservation,
+          httpBaseUrl: "http://8.8.8.8:3773/",
+          reachability: "public",
+          isDefault: true,
+        },
+      ]),
+    ).toBe("no-private-address");
+  });
+
+  it.each(["http://127.0.0.1:3773/", "http://0.0.0.0:3773/"])(
+    "ignores an endpoint that is not off-host: %s",
+    (httpBaseUrl) => {
+      expect(
+        nativeShareAddressUnavailableReason([
+          { ...privateObservation, httpBaseUrl, isDefault: true },
+        ]),
+      ).toBe("no-private-address");
+    },
+  );
+
+  it.each(["desktop-addon", "server", "user"] as const)(
+    "ignores private endpoints from %s",
+    (source) => {
+      expect(
+        nativeShareAddressUnavailableReason([{ ...privateObservation, source, isDefault: true }]),
+      ).toBe("no-private-address");
+    },
+  );
+
+  it.each(["lan", "private-network"] as const)(
+    "reports no private default route for a %s endpoint without isDefault",
+    (reachability) => {
+      expect(nativeShareAddressUnavailableReason([{ ...privateObservation, reachability }])).toBe(
+        "no-private-default-route",
+      );
+    },
+  );
+
+  it("reports no private default route when the default route is public", () => {
+    expect(
+      nativeShareAddressUnavailableReason([
+        { ...privateObservation, isDefault: false },
+        {
+          ...privateObservation,
+          httpBaseUrl: "http://8.8.8.8:3773/",
+          reachability: "public",
+          isDefault: true,
+        },
+      ]),
+    ).toBe("no-private-default-route");
+  });
+
+  it.each(["lan", "private-network"] as const)(
+    "has no unavailable reason when a private %s default offers Automatic (LAN)",
+    (reachability) => {
+      const advertisedEndpoints = [{ ...privateObservation, reachability, isDefault: true }];
+      expect(nativeShareAddressUnavailableReason(advertisedEndpoints)).toBeNull();
+      expect(
+        resolveShareAddressOptions({
+          intent: "another-device",
+          advertisedEndpoints,
+          exposureState: loopbackState,
+          primaryHttpBaseUrl: "http://127.0.0.1:3773",
+        }),
+      ).toEqual([
+        {
+          id: "auto-lan",
+          label: "Automatic (LAN)",
+          httpBaseUrl: null,
+          description: "BiBCode will enable remote access and choose a LAN address.",
+        },
+      ]);
+    },
+  );
 });
 
 describe("resolveShareAddressOptions", () => {
