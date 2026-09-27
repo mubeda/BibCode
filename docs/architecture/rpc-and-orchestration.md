@@ -201,6 +201,13 @@ repository and worktree ownership only after closing admission, cancels every
 worker, and retains join ownership even when an injected process runner ignores
 cancellation.
 
+A status subscriber whose bounded queue fills is removed; its stream delivers
+all queued publications and then ends with a `GitCommandError` whose operation
+is `GitStatusBroadcaster.fellBehind`, also used when setup exhausts its admission
+retries. The client runtime resubscribes only on that error with backoff starting
+at 250 ms, doubling to a 30 s cap, and resetting after the stream stays up for
+30 s. Shutdown and cancellation still end the stream without an error.
+
 `ProductionRuntime` connects only the structured `TerminalManager` process-exit
 callback to local invalidation. An explicit worktree path has priority;
 otherwise the callback chooses the deepest canonical active worktree ancestor

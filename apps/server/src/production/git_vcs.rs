@@ -1311,7 +1311,14 @@ impl GitVcsRpcServices {
                     }
                     _ = cancellation.cancelled() => break,
                     publication = subscription.recv_publication() => {
-                        let Some(publication) = publication else { break };
+                        let publication = match publication {
+                            Some(Ok(publication)) => publication,
+                            Some(Err(error)) => {
+                                let _ = sender.send(Err(serialize_error(error))).await;
+                                break;
+                            }
+                            None => break,
+                        };
                         stop_status_stream_enrichment(&mut enrichment).await;
                         let enrichment_remote = match &publication.value {
                             VcsStatusStreamEvent::Snapshot { remote, .. }
