@@ -2377,6 +2377,7 @@ mod tests {
             agent_activity::{AgentActivitySettingsHandler, AgentActivityTransitionReport},
             server_terminal::ProductionServerControl,
         },
+        test_support::hermetic_providers,
     };
 
     use super::*;
@@ -2663,16 +2664,10 @@ mod tests {
         environment: Value,
     ) -> NativeServerControl {
         let directory = executable.parent().expect("fixture directory");
-        let settings_path = ServerConfig::new(directory)
-            .state_dir()
-            .join("settings.json");
-        tokio::fs::create_dir_all(settings_path.parent().expect("settings directory"))
-            .await
-            .expect("create settings directory");
-        tokio::fs::write(
-            &settings_path,
-            serde_json::to_vec(&json!({
-                "enableProviderUpdateChecks": false,
+        let state_dir = ServerConfig::new(directory).state_dir();
+        hermetic_providers::write_hermetic_settings(
+            &state_dir,
+            json!({
                 "providerInstances": {
                     "cursor-work": {
                         "driver": "cursor",
@@ -2681,11 +2676,8 @@ mod tests {
                         "environment": environment
                     }
                 }
-            }))
-            .expect("settings JSON"),
-        )
-        .await
-        .expect("write settings");
+            }),
+        );
         NativeServerControl::new(ServerConfig::new(directory), json!({})).await
     }
 
@@ -4352,11 +4344,20 @@ mod tests {
         assert_eq!(settings["providers"]["grok"]["enabled"], false);
     }
 
+    #[test]
+    fn native_settings_default_provider_update_checks_to_enabled() {
+        let mut settings = json!({});
+        apply_settings_defaults(&mut settings);
+
+        assert_eq!(settings["enableProviderUpdateChecks"], true);
+    }
+
     #[tokio::test]
     async fn agent_activity_setting_defaults_publishes_persists_and_rejects_strings() {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
 
         assert_eq!(
@@ -4405,12 +4406,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
-        tokio::fs::create_dir_all(config.state_dir())
-            .await
-            .expect("state directory");
-        tokio::fs::write(&settings_path, br#"{"enableAgentActivity":false}"#)
-            .await
-            .expect("legacy settings");
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({"enableAgentActivity": false}),
+        );
 
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
         assert_eq!(
@@ -4471,6 +4470,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
         let calls = Arc::new(StdMutex::new(Vec::new()));
         control
@@ -4514,6 +4514,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
         let calls = Arc::new(StdMutex::new(Vec::new()));
         control
@@ -4555,6 +4556,7 @@ mod tests {
     async fn agent_activity_two_source_update_dispatches_chat_then_terminal() {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
         let calls = Arc::new(StdMutex::new(Vec::new()));
         control
@@ -4623,6 +4625,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let first_transition_entered = Arc::new(Notify::new());
@@ -4720,6 +4723,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
         let chat = AgentActivityController::new(true);
         let terminal = AgentActivityController::new(false);
@@ -4815,6 +4819,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
 
         let updated = control
@@ -4852,6 +4857,7 @@ mod tests {
         tokio::fs::write(&file, b"file").await.expect("file");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
 
         let updated = control
@@ -5398,6 +5404,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
         config.environment_id = "environment-webgl".to_owned();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy": "test"})).await;
 
         let settings = control
@@ -5411,7 +5418,8 @@ mod tests {
             .await
             .expect("patch applies");
         assert_eq!(updated["terminal"]["webglEnabled"], false);
-        assert_eq!(updated["enableProviderUpdateChecks"], true);
+        // The unrelated hermetic setting survives the terminal patch.
+        assert_eq!(updated["enableProviderUpdateChecks"], false);
     }
 
     #[tokio::test]
@@ -5419,6 +5427,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
         config.environment_id = "environment-concurrent-settings".to_owned();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy": "test"})).await;
         control.install_settings_update_barrier(24).await;
 
@@ -6114,6 +6123,7 @@ mod tests {
         let mut config = running_test_config(temp.path());
         config.environment_id = "environment-1".to_owned();
         config.environment_label = "Environment One".to_owned();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config.clone(), json!({"policy":"test"})).await;
 
         let snapshot = control.config_snapshot().await;

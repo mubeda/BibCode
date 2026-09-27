@@ -101,11 +101,11 @@ setup-script environment. Do not mutate
 process-global PATH or HOME to isolate parallel tests. SSH fixtures must use
 test-owned SSH configuration and hosts.
 
-Wave 1 covers the migrated server harnesses; wave 2 for `control.rs`, lifecycle,
-and desktop harnesses is still to come. The
+The server harnesses, including the library's `control.rs` and lifecycle tests,
+follow these rules; the desktop harnesses are still to come. The
 [approved hermetic test guard](../superpowers/specs/2026-09-26-hermetic-test-guard-design.md)
 will enforce the no-host-provider-or-hosting-CLI rule across tests; it is not
-implemented by wave 1.
+implemented yet.
 
 ## Web unit tests and the React Compiler
 
