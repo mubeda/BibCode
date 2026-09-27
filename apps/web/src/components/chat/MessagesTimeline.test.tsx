@@ -1172,27 +1172,80 @@ describe("MessagesTimeline work groups", () => {
     expect(markup).not.toContain("echo one");
   });
 
-  it("labels mixed work runs as log entries", async () => {
-    const markup = await renderTimeline({
-      timelineEntries: [
-        buildWorkTimelineEntry("work-1", { label: "Note one", tone: "info" }),
-        buildWorkTimelineEntry("work-2", { label: "Note two", tone: "info" }),
-        buildWorkTimelineEntry("work-3", { label: "Note three", tone: "info" }),
-      ],
-    });
+  it.each([
+    {
+      tone: "tool",
+      hiddenCount: 1,
+      label: "+1 previous tool call",
+      expandedLabel: "Show fewer tool calls",
+    },
+    {
+      tone: "tool",
+      hiddenCount: 2,
+      label: "+2 previous tool calls",
+      expandedLabel: "Show fewer tool calls",
+    },
+    {
+      tone: "info",
+      hiddenCount: 1,
+      label: "+1 previous log entry",
+      expandedLabel: "Show fewer log entries",
+    },
+    {
+      tone: "info",
+      hiddenCount: 2,
+      label: "+2 previous log entries",
+      expandedLabel: "Show fewer log entries",
+    },
+  ] as const)(
+    "labels the work toggle '$label' with text-xs",
+    async ({ tone, hiddenCount, label, expandedLabel }) => {
+      const container = await mountTimeline({
+        timelineEntries: Array.from({ length: hiddenCount + 1 }, (_, index) =>
+          buildWorkTimelineEntry(`work-${index}`, { label: `Entry ${index}`, tone }),
+        ),
+      });
+      const toggle = container.querySelector<HTMLButtonElement>("button[aria-expanded]");
 
-    // Current pluralization appends a bare "s" ("log entrys"); assert the
-    // singular noun so this test keeps passing if the copy is fixed later.
-    expect(markup).toContain("+2 previous log entry");
-    expect(markup).not.toContain("tool call");
-    expect(markup).toContain("Note three");
-  });
+      expect.soft(toggle?.textContent).toBe(label);
+      expect.soft(toggle?.classList.contains("text-xs")).toBe(true);
+      expect(toggle).not.toBeNull();
+      await click(toggle!);
+      expect(toggle?.textContent).toBe(expandedLabel);
+      expect(container.textContent).toContain("Entry 0");
+    },
+  );
 });
 
 describe("MessagesTimeline work entry rows", () => {
   async function renderWorkEntry(entry: Parameters<typeof buildWorkTimelineEntry>[1]) {
     return renderTimeline({ timelineEntries: [buildWorkTimelineEntry("work-1", entry)] });
   }
+
+  it.each([
+    { label: "Turn completed", tone: "info", sourceActivityKind: "provider.turn" },
+    { label: "Step completed", tone: "info", sourceActivityKind: "provider.event" },
+    { label: "Step completed", tone: "tool", sourceActivityKind: "provider.event" },
+    { label: "Read completed", tone: "tool", sourceActivityKind: "provider.event" },
+  ] as const)("keeps the full '$label' provider heading", async (entry) => {
+    const markup = await renderWorkEntry(entry);
+
+    expect(markup).toContain(`>${entry.label}</span>`);
+  });
+
+  it.each(["tool", "info"] as const)(
+    "normalizes %s-toned tool lifecycle labels without a tool title",
+    async (tone) => {
+      const markup = await renderWorkEntry({
+        label: "Read file completed",
+        tone,
+        sourceActivityKind: "tool.completed",
+      });
+
+      expect(markup).toContain(">Read file</span>");
+      expect(markup).not.toContain("Read file completed");
+    },
+  );
 
   it("renders command entries with the terminal icon and success indicator", async () => {
     const markup = await renderWorkEntry({
@@ -1276,15 +1329,20 @@ describe("MessagesTimeline work entry rows", () => {
     expect(markup).toContain("lucide-message-circle");
   });
 
-  it("renders runtime warnings with warning chrome", async () => {
+  it("renders provider warnings with an amber alert icon and normal text", async () => {
     const markup = await renderWorkEntry({
-      label: "Warning",
-      detail: "something odd",
-      sourceActivityKind: "runtime.warning",
+      label: "Codex warning",
+      detail: "Rate limited; retrying",
+      tone: "warning",
+      sourceActivityKind: "provider.warning",
     });
 
-    expect(markup).toContain("lucide-x");
-    expect(markup).toContain("text-warning");
+    expect(markup).toContain("lucide-circle-alert");
+    expect(markup).toContain("text-warning-foreground");
+    expect(markup).toContain("font-medium text-foreground/82");
+    expect(markup).not.toContain("lucide-x");
+    expect(markup).not.toContain("text-destructive");
+    expect(markup).not.toContain('aria-label="Tool call failed"');
   });
 
   it("renders runtime errors with destructive chrome", async () => {
@@ -1328,20 +1386,26 @@ describe("MessagesTimeline work entry rows", () => {
       toolLifecycleStatus: "completed",
     });
 
-    expect(markup).toContain("Search files");
+    expect(markup).toContain(">Search files</span>");
+    expect(markup).not.toContain("Search files completed");
+    expect(markup).not.toContain("Tool call completed");
     expect(markup).toContain("3 matches");
   });
 
-  it("drops previews that repeat the heading", async () => {
-    const markup = await renderWorkEntry({
-      label: "Search files",
-      detail: "search files",
-      toolLifecycleStatus: "completed",
-    });
+  it.each(["search files", "SEARCH FILES complete", "search files completed"])(
+    "drops a tool preview '%s' that repeats the normalized heading",
+    async (detail) => {
+      const markup = await renderWorkEntry({
+        label: "Tool call completed",
+        toolTitle: "search files completed",
+        detail,
+        toolLifecycleStatus: "completed",
+      });
 
-    expect(markup).toContain("Search files");
-    expect(markup).not.toContain(">search files<");
-  });
+      expect(markup).toContain(">Search files</span>");
+      expect(markup).not.toContain(`>${detail}</span>`);
+    },
+  );
 });
 
 describe("MessagesTimeline user message affordances", () => {
