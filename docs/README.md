@@ -52,6 +52,7 @@ current behavior.
 ## Operations and reference
 
 - [Testing runbooks](./testing/README.md)
+- [Flaky-test diagnosis](./testing/flaky-tests.md)
 - [Continuous integration](./operations/ci.md)
 - [Release process](./operations/release.md)
 - [Observability](./operations/observability.md)

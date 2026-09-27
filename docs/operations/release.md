@@ -273,6 +273,87 @@ build and launch the selected native bundle. Never use production signing
 secrets for this smoke. Evidence must remain bounded and redact roots,
 bootstrap credentials, update-signing secrets, tokens, and database contents.
 
+Run this harness only on a disposable host or session with no unrelated
+BiBCode instance. Its restarted-application cleanup currently selects the
+process name (`pkill -TERM -x bibcode-desktop` on Unix and an image-name
+`taskkill` on Windows), so an isolated data root does not protect another
+running app from that cleanup.
+
+## Maintainer branch flow
+
+Maintainer integrations are local `--no-ff` merges into `main`, followed by a
+push of `main` and synchronization of `develop`. They do not require a pull
+request. Use the checkout that owns each branch; inspect `git worktree list`
+instead of assuming a checkout location. Preserve unrelated changes.
+
+Before the release merge, compare content. The long-lived working branch does
+not receive `main`'s release merge commits back, so an ancestry check alone can
+reject a branch that already contains all of `main`'s content:
+
+```sh
+work_branch='<working-branch>'
+git fetch origin
+git diff --quiet "$(git merge-base origin/main "$work_branch")" origin/main
+```
+
+Exit zero proves `main` adds no content relative to the merge base. A nonzero
+result needs inspection and reconciliation before merging; do not assume it
+is only merge history. After reconciliation, rerun candidate verification.
+
+Prepare the intended version and curated `CHANGELOG.md` entry on the working
+branch. The version updater owns both application Cargo manifests and
+`Cargo.lock` as well as the four package manifests:
+
+```sh
+version='<numeric-stable-version>'
+node scripts/update-release-package-versions.ts "$version"
+vp fmt apps/server/package.json apps/desktop/package.json apps/web/package.json packages/contracts/package.json
+vp install --lockfile-only --ignore-scripts
+cargo check --workspace --all-targets --locked
+vp run release:smoke
+```
+
+Review and commit the preparation only when authorized. Pre-bumping all version
+sources makes finalization a no-op when nothing else has changed.
+
+Write the merge and annotated-tag messages to files. Give the merge a summary
+of the requested change, implementation, tests, documentation, and review; give
+the tag a `BiBCode v<version>` subject and release summary. `git merge -F -`
+treats `-` as a filename. Use file-backed messages for both merge and tag so a
+failed message read cannot leave a tag on the old `main`.
+
+From the clean checkout of `main`, after the local verification below passes:
+
+```sh
+set -eu
+merge_message='<merge-message-file>'
+tag_message='<tag-message-file>'
+tag="v$version"
+git merge --ff-only origin/main
+git merge --no-ff "$work_branch" -F "$merge_message"
+git diff --quiet "$work_branch" HEAD
+git push origin main
+git tag -a "$tag" -F "$tag_message" main
+test "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse main)"
+git push origin "refs/tags/$tag"
+```
+
+For an ordinary integration, bring `develop` up after pushing `main`. For a
+release, do it after publication and finalization, so any workflow version
+commit is included. Fetch again and update the clean `main` checkout first:
+
+```sh
+git fetch origin
+git merge --ff-only origin/main
+git merge-base --is-ancestor origin/develop main
+```
+
+If the ancestry check succeeds, run `git push origin main:develop`. If it
+fails, create a disposable detached worktree at `origin/develop`, merge `main`
+there with `--no-ff -F <message-file>`, resolve and verify any conflicts, and
+push `HEAD:develop`. Never force `develop` to discard its own content. Remove
+only that disposable worktree after a successful integration.
+
 ## Stable Release Runbook
 
 1. Confirm the intended version and commit have passed the local verification
@@ -303,17 +384,136 @@ bootstrap credentials, update-signing secrets, tokens, and database contents.
      manifest; and
    - no private key or passphrase is present in any asset, manifest, or log.
 
-5. Compare the draft's sorted asset names with the workflow's
-   `expected-assets.txt`. The workflow must leave the release a draft when the
-   comparison or any verification fails.
+5. Confirm the workflow's comparison of sorted asset names with its generated
+   `expected-assets.txt` passed, then perform [Draft inspection](#draft-inspection).
+   The workflow must leave the release a draft when the comparison or any
+   verification fails. Apply the curated release notes before approval.
 6. After a human has inspected the draft, rerun the workflow manually with the
    same version, select the stable channel, and set `publish` to `true`. The
    approval run requires the existing draft, rebuilds the same tagged commit,
    repeats validation, and only then publishes it. It does not upload or
    replace the inspected draft assets. Only numeric non-prerelease stable
    releases are marked latest.
-7. Install and smoke-test each ordinary installer on its target operating
+7. Confirm publication through the REST latest endpoint as described below,
+   inspect finalization, and synchronize `develop` using the maintainer branch
+   flow. Install and smoke-test each ordinary installer on its target operating
    system after publication.
+
+### Failed release runs
+
+For a one-off infrastructure failure, such as an artifact upload timeout after
+a successful build, inspect the failed job and rerun only failed jobs:
+
+```sh
+gh run view "$failed_run" --log-failed
+gh run rerun "$failed_run" --failed
+```
+
+Two timing failures in a row require reproducing and hardening the test before
+another release attempt; use [Flaky-test diagnosis](../testing/flaky-tests.md).
+The approval run repeats preflight, so retrying until the tag run passes does
+not establish reliable publication. Keep product deadlines and assertions
+intact.
+
+Replacing a tag is a routine recovery option only for an unpublished candidate
+whose failed run produced no draft. It still requires authorization to move
+that tag; existing authorization for the same recovery remains valid. Never
+retag a published release. If a draft already exists, stop this procedure and
+reconcile its commit and assets explicitly; approval requires the inspected
+draft to match the tag. A controller-only repair can instead use the manual
+repair path in step 1 without moving the tag.
+
+After the fix has passed verification and been merged and pushed to `main`,
+confirm all old runs for this tag have stopped. Use an authenticated maintainer
+account that can see drafts. A failed API request is not proof of absence:
+
+```sh
+set -eu
+repository=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+recovery_dir=$(mktemp -d)
+gh run view "$failed_run" --json status,conclusion,headSha,event
+gh run list --workflow release.yml --branch "$tag" --json status,conclusion,headSha
+gh api --paginate "repos/$repository/releases?per_page=100" > "$recovery_dir/releases.json"
+jq -s -e --arg tag "$tag" 'all(.[][]; .tag_name != $tag)' "$recovery_dir/releases.json"
+old_tag_object=$(git ls-remote origin "refs/tags/$tag" | cut -f1)
+test -n "$old_tag_object"
+git tag -f -a "$tag" -F "$tag_message" main
+test "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse main)"
+git push --force-with-lease="refs/tags/$tag:$old_tag_object" origin "refs/tags/$tag:refs/tags/$tag"
+test "$(git ls-remote origin "refs/tags/$tag^{}" | cut -f1)" = "$(git rev-parse main)"
+```
+
+Inspect the new run's resolved commit. Repeat draft inspection and reapply
+curated notes after every new or regenerated draft.
+
+### Draft inspection
+
+Use a fresh inspection directory and the previous stable tag. Compare asset
+names with only the version replaced; a changed asset set needs an explanation
+from the current workflow, rather than a fixed historical asset count:
+
+```sh
+set -eu
+previous_tag='<previous-stable-tag>'
+inspection_dir=$(mktemp -d)
+gh release view "$previous_tag" --json assets > "$inspection_dir/previous.json"
+gh release view "$tag" --json isDraft,targetCommitish,assets > "$inspection_dir/draft.json"
+jq -r --arg old "${previous_tag#v}" --arg new "$version" \
+  '.assets[].name | split($old) | join($new)' "$inspection_dir/previous.json" \
+  | LC_ALL=C sort > "$inspection_dir/expected-from-previous.txt"
+jq -r '.assets[].name' "$inspection_dir/draft.json" \
+  | LC_ALL=C sort > "$inspection_dir/uploaded.txt"
+diff -u "$inspection_dir/expected-from-previous.txt" "$inspection_dir/uploaded.txt"
+jq -e '.isDraft and (.assets | length > 0 and all(.[]; .size > 0))' "$inspection_dir/draft.json"
+test "$(jq -r .targetCommitish "$inspection_dir/draft.json")" = "$(git rev-parse "$tag^{commit}")"
+gh release download "$tag" --dir "$inspection_dir/assets"
+```
+
+For the first release, use the current workflow's asset validation without a
+previous-release comparison. Inspect the downloaded stable manifest and verify
+its payloads, using the release overlay from the candidate commit:
+
+```sh
+repository=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+jq -e --arg version "$version" \
+  --arg prefix "https://github.com/$repository/releases/download/$tag/" '
+  .version == $version and
+  (.platforms | keys == ["darwin-aarch64", "darwin-x86_64", "linux-aarch64",
+                        "linux-x86_64", "windows-aarch64", "windows-x86_64"]) and
+  all(.platforms[];
+      (.signature | type == "string" and length > 0) and
+      (.url | startswith($prefix)))
+  ' "$inspection_dir/assets/latest.json"
+cargo run --locked -p bibcode-updater-verifier -- \
+  apps/desktop/src-tauri/tauri.release.conf.json \
+  "$inspection_dir/assets/latest.json" "$inspection_dir/assets"
+```
+
+Replace the draft's generated notes with the curated `CHANGELOG.md` entry,
+without its heading, saved in a notes file. Each new draft needs this step:
+
+```sh
+gh release edit "$tag" --notes-file "$notes_file"
+```
+
+After human inspection, dispatch approval and wait for the workflow to succeed:
+
+```sh
+gh workflow run release.yml --ref main -f channel=stable -f version="$version" -f publish=true
+```
+
+Both runs perform preflight and the native build matrices. The current job
+budgets are 60 minutes for preflight, 90 for each desktop build, and 120 for
+each server build; these are timeouts, not expected completion durations.
+Use Actions job timings to plan the tag and approval runs separately.
+
+After publication, check latest through the REST endpoint. `isLatest` is not a
+supported `gh release view --json` field:
+
+```sh
+test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = false
+test "$(gh api "repos/$repository/releases/latest" --jq .tag_name)" = "$tag"
+```
 
 ## Local Verification
 
@@ -328,9 +528,26 @@ Run the repository gates:
 ```powershell
 vp check
 vp run typecheck
-vp test
+vp run --concurrency-limit 1 test
 vp run release:smoke
 ```
+
+Before tagging, every workspace package's `test` script must finish
+successfully. Check the inventory in `pnpm-workspace.yaml` and each package's
+`package.json`, including `scripts`, `oxlint-plugin-bibcode`, and `infra/relay`;
+root `vp test` alone omits the package graph and Rust suites. The serialized
+preflight stops at the first failed package task. Cargo likewise stops after
+the first failing test binary, leaving later binaries unrun; tests within that
+binary normally run to completion. A failed early gate is not evidence about
+later packages or integration targets. After fixing it, rerun the complete
+graph and account for every package.
+
+Linux's case-sensitive filesystem does not reproduce module-resolution
+collisions seen on case-insensitive Windows/macOS filesystems. The scripts
+package's `module-case-collisions.test.ts` guards tracked module stems,
+including `.ts`/`.tsx` pairs that differ only by letter case. Keep it in the
+pre-tag test graph and retain native builds; the guard does not cover every
+filesystem difference.
 
 Run the updater/release regression set before changing stable release
 infrastructure:
