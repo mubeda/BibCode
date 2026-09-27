@@ -2045,7 +2045,7 @@ mod tests {
     use super::*;
     use crate::git::{
         BoxGitProcessFuture, GitProcessRunner, ProcessError, ProcessOutput, ProcessRequest,
-        ProcessRunner,
+        ProcessRunner, VcsRepositoryUnavailableReason,
     };
     use crate::test_support::TestSandbox;
     use std::{
@@ -4607,6 +4607,68 @@ mod tests {
             new_events.try_recv().is_err(),
             "the old lifecycle must not publish into the reattached subscriber"
         );
+    }
+
+    async fn unavailable_repository_broadcaster(
+        cwd: &Path,
+        reason: VcsRepositoryUnavailableReason,
+    ) -> (
+        StatusBroadcaster,
+        mpsc::Receiver<StatusPublication<VcsStatusStreamEvent>>,
+        StatusReadFence,
+    ) {
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+        let events = install_epoch_repository(&broadcaster, cwd);
+        broadcaster
+            .lock_state()
+            .repositories
+            .get_mut(cwd)
+            .unwrap()
+            .local = VcsStatusLocalResult::non_repository_with_reason(reason);
+        let fence = broadcaster
+            .acquire_read_fence(cwd, &CancellationToken::new())
+            .await
+            .expect("read fence");
+        (broadcaster, events, fence)
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_reason_change_is_republished() {
+        let root = tempfile::tempdir().expect("repository folder");
+        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
+        let (broadcaster, mut events, fence) =
+            unavailable_repository_broadcaster(&cwd, VcsRepositoryUnavailableReason::Absent).await;
+        let unreadable = VcsStatusLocalResult::non_repository_with_reason(
+            VcsRepositoryUnavailableReason::Unreadable,
+        );
+        broadcaster.publish_local(&cwd, 1, &unreadable, &fence);
+        assert_eq!(
+            events.try_recv().expect("reason change is published").value,
+            VcsStatusStreamEvent::LocalUpdated { local: unreadable }
+        );
+        broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_unchanged_unreadable_is_not_republished() {
+        let root = tempfile::tempdir().expect("repository folder");
+        let cwd = fs::canonicalize(root.path()).expect("canonical folder");
+        let (broadcaster, mut events, fence) =
+            unavailable_repository_broadcaster(&cwd, VcsRepositoryUnavailableReason::Unreadable)
+                .await;
+        let unreadable = VcsStatusLocalResult::non_repository_with_reason(
+            VcsRepositoryUnavailableReason::Unreadable,
+        );
+        broadcaster.publish_local(&cwd, 1, &unreadable, &fence);
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        broadcaster.shutdown().await;
     }
 
     #[tokio::test]

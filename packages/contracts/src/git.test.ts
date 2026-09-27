@@ -16,6 +16,9 @@ import {
   GitRunStackedActionInput,
   GitResolvePullRequestResult,
   TextGenerationError,
+  VcsStatusLocalResult,
+  VcsStatusResult,
+  VcsStatusStreamEvent,
 } from "./git.ts";
 import { SourceControlProviderError } from "./sourceControl.ts";
 import {
@@ -37,6 +40,59 @@ const decodeCancelCloneInput = Schema.decodeUnknownSync(GitCancelCloneInput);
 const decodeResolvePullRequestResult = Schema.decodeUnknownSync(GitResolvePullRequestResult);
 const decodeManagerServiceError = Schema.decodeUnknownSync(GitManagerServiceError);
 const encodeManagerServiceError = Schema.encodeUnknownSync(GitManagerServiceError);
+const decodeStatusLocalResult = Schema.decodeUnknownSync(VcsStatusLocalResult);
+const decodeStatusResult = Schema.decodeUnknownSync(VcsStatusResult);
+const decodeStatusStreamEvent = Schema.decodeUnknownSync(VcsStatusStreamEvent);
+
+describe("VCS repository availability", () => {
+  const local = {
+    isRepo: false,
+    hasPrimaryRemote: false,
+    isDefaultRef: false,
+    refName: null,
+    hasWorkingTreeChanges: false,
+    workingTree: { files: [], insertions: 0, deletions: 0 },
+  };
+  const remote = { hasUpstream: false, aheadCount: 0, behindCount: 0, pr: null };
+
+  it.each(["absent", "unreadable", "untrusted"])(
+    "decodes %s across local status shapes",
+    (reason) => {
+      const unavailable = { ...local, repositoryUnavailableReason: reason };
+      expect(decodeStatusLocalResult(unavailable)).toEqual(unavailable);
+      expect(decodeStatusResult({ ...unavailable, ...remote })).toEqual({
+        ...unavailable,
+        ...remote,
+      });
+      for (const event of [
+        { _tag: "snapshot", local: unavailable, remote: null },
+        { _tag: "localUpdated", local: unavailable },
+      ]) {
+        expect(decodeStatusStreamEvent(event)).toEqual(event);
+      }
+    },
+  );
+
+  it("accepts older servers and healthy repositories without a reason", () => {
+    for (const isRepo of [false, true]) {
+      const status = { ...local, isRepo };
+      expect(decodeStatusLocalResult(status)).toEqual(status);
+      expect(decodeStatusResult({ ...status, ...remote })).toEqual({
+        ...status,
+        ...remote,
+      });
+    }
+  });
+
+  it("rejects unknown repository reasons", () => {
+    expect(() =>
+      decodeStatusLocalResult({
+        ...local,
+        repositoryUnavailableReason: "unknown",
+      }),
+    ).toThrow();
+  });
+});
 
 describe("VcsCreateWorktreeInput", () => {
   it("accepts omitted newRefName for existing-refName worktrees", () => {

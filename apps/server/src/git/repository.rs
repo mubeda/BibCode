@@ -25,14 +25,15 @@ use super::{
     GitPrunableWorktree, GitWorktreeInventory, GitWorktreeRecord, GitWorktreeRemovalInspection,
     ManagedWorktreeRollback, OutputPolicy, ProcessError, ProcessOutput, ProcessRequest,
     ProcessRunner, PullStatus, SourceControlProviderInfo, VcsCommit, VcsCreateWorktreeResult,
-    VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef, VcsStagingArea,
-    VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsStatusSummary, VcsWorkingTree,
-    VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree, canonical_worktree_path_key,
-    git_worktree_prune_impact_digest, host_path_platform, normalize_worktree_path_key,
-    parse_numstat, parse_porcelain_v2_line, parse_worktree_porcelain,
+    VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef, VcsRepositoryUnavailableReason,
+    VcsStagingArea, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsStatusSummary,
+    VcsWorkingTree, VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree,
+    canonical_worktree_path_key, git_worktree_prune_impact_digest, host_path_platform,
+    normalize_worktree_path_key, parse_numstat, parse_porcelain_v2_line, parse_worktree_porcelain,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const REPOSITORY_CLASSIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_OUTPUT_LIMIT: usize = 1_000_000;
 const SUMMARY_STATUS_OUTPUT_LIMIT: usize = 64 * 1024;
 const WATCH_ROOTS_OUTPUT_LIMIT: usize = 16 * 1024;
@@ -150,6 +151,8 @@ pub struct GitRepository {
     command_timeout: Duration,
     /// `-c` configuration placed before the subcommand of every command this variant runs.
     command_config: &'static [&'static str],
+    /// Read only on failed status discovery; tests replace this without changing process state.
+    discovery_environment: fn(&str) -> Option<OsString>,
     /// Hosts identified by explicit provider probes; status reads only read it.
     /// `default()` and `with_worktree_settings` start with a private, empty
     /// observation, so status names only providers its host name identifies. That
@@ -163,6 +166,12 @@ pub struct GitRepository {
 pub(crate) struct StatusObservation {
     local: VcsStatusLocalResult,
     remote: StatusRemoteObservation,
+}
+
+enum RepositoryProbe {
+    WorkTree,
+    NonWorkTree,
+    Refused(String),
 }
 
 pub(crate) struct GitWatchRoots {
@@ -196,6 +205,7 @@ impl Default for GitRepository {
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
+            discovery_environment: |name| std::env::var_os(name),
             provider_hosts: Arc::default(),
         }
     }
@@ -361,6 +371,7 @@ impl GitRepository {
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
+            discovery_environment: |name| std::env::var_os(name),
             provider_hosts: Arc::default(),
         }
     }
@@ -380,6 +391,7 @@ impl GitRepository {
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
+            discovery_environment: |name| std::env::var_os(name),
             provider_hosts: Arc::default(),
         }
     }
@@ -1534,6 +1546,17 @@ impl GitRepository {
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<bool, GitCommandError> {
+        Ok(matches!(
+            self.probe_repository(cwd, cancellation).await?,
+            RepositoryProbe::WorkTree
+        ))
+    }
+
+    async fn probe_repository(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<RepositoryProbe, GitCommandError> {
         let result = self
             .execute_read(
                 "GitVcsDriver.detectRepository",
@@ -1543,7 +1566,13 @@ impl GitRepository {
                 cancellation,
             )
             .await?;
-        Ok(result.exit_code == 0 && result.stdout.trim() == "true")
+        Ok(if result.exit_code != 0 {
+            RepositoryProbe::Refused(result.stderr)
+        } else if result.stdout.trim() == "true" {
+            RepositoryProbe::WorkTree
+        } else {
+            RepositoryProbe::NonWorkTree
+        })
     }
 
     pub async fn repository_root(
@@ -2123,11 +2152,23 @@ impl GitRepository {
         {
             Ok(status) => status,
             Err(error) => {
-                if !matches!(self.is_repository(cwd, cancellation).await, Ok(false)) {
+                let probe = match self.probe_repository(cwd, cancellation).await {
+                    Ok(RepositoryProbe::WorkTree) | Err(_) => return Err(error),
+                    Ok(probe) => probe,
+                };
+                let reason = bounded_repository_classification(
+                    classify_repository_unavailable(cwd, &probe, self.discovery_environment),
+                    cancellation,
+                )
+                .await;
+                if cancellation.is_cancelled() {
                     return Err(error);
                 }
                 return Ok(StatusObservation {
-                    local: VcsStatusLocalResult::non_repository(),
+                    local: reason.map_or_else(
+                        VcsStatusLocalResult::non_repository,
+                        VcsStatusLocalResult::non_repository_with_reason,
+                    ),
                     remote: StatusRemoteObservation {
                         upstream_ref: None,
                         ahead_count: 0,
@@ -2274,6 +2315,7 @@ impl GitRepository {
         Ok(StatusObservation {
             local: VcsStatusLocalResult {
                 is_repo: true,
+                repository_unavailable_reason: None,
                 source_control_provider,
                 has_primary_remote,
                 is_default_ref: ref_name.is_some() && ref_name == default_ref_name,
@@ -7141,6 +7183,166 @@ fn rename_worktree_path_with_retries_blocking(
     Err(last_error.unwrap_or_else(|| io::Error::other("worktree rename failed")))
 }
 
+async fn bounded_repository_classification(
+    classification: impl Future<Output = Option<VcsRepositoryUnavailableReason>>,
+    cancellation: &CancellationToken,
+) -> Option<VcsRepositoryUnavailableReason> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => None,
+        result = tokio::time::timeout(REPOSITORY_CLASSIFICATION_TIMEOUT, classification) => result.ok().flatten(),
+    }
+}
+
+async fn classify_repository_unavailable(
+    cwd: &Path,
+    probe: &RepositoryProbe,
+    environment: impl Fn(&str) -> Option<OsString>,
+) -> Option<VcsRepositoryUnavailableReason> {
+    let RepositoryProbe::Refused(stderr) = probe else {
+        return None;
+    };
+    if stderr.contains("detected dubious ownership") {
+        return Some(VcsRepositoryUnavailableReason::Untrusted);
+    }
+    if environment("GIT_DIR").is_some() || environment("GIT_CEILING_DIRECTORIES").is_some() {
+        return None;
+    }
+    let cwd = tokio::fs::canonicalize(cwd).await.ok()?;
+    let across_filesystems = environment("GIT_DISCOVERY_ACROSS_FILESYSTEM")
+        .as_deref()
+        .and_then(|value| value.to_str())
+        .is_some_and(git_boolean_is_true);
+    repository_reason_from_ancestors(cwd, across_filesystems, |path| {
+        tokio::fs::symlink_metadata(path)
+    })
+    .await
+}
+
+async fn repository_reason_from_ancestors<F, Fut>(
+    mut cwd: PathBuf,
+    across_filesystems: bool,
+    symlink_metadata: F,
+) -> Option<VcsRepositoryUnavailableReason>
+where
+    F: Fn(PathBuf) -> Fut,
+    Fut: Future<Output = io::Result<fs::Metadata>>,
+{
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    #[cfg(unix)]
+    let starting_device = if across_filesystems {
+        None
+    } else {
+        Some(tokio::fs::metadata(&cwd).await.ok()?.dev())
+    };
+    #[cfg(not(unix))]
+    let _ = across_filesystems;
+
+    loop {
+        let git_dir = cwd.join(".git");
+        match symlink_metadata(git_dir.clone()).await {
+            Ok(metadata) => {
+                let metadata = if metadata.is_symlink() {
+                    match tokio::fs::metadata(&git_dir).await {
+                        Ok(metadata) => metadata,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                            ) =>
+                        {
+                            return Some(VcsRepositoryUnavailableReason::Unreadable);
+                        }
+                        Err(_) => return None,
+                    }
+                } else {
+                    metadata
+                };
+                if metadata.is_file() {
+                    return Some(VcsRepositoryUnavailableReason::Unreadable);
+                }
+                if metadata.is_dir() {
+                    for marker in ["HEAD", "config", "objects", "refs"] {
+                        match symlink_metadata(git_dir.join(marker)).await {
+                            Ok(_) => return Some(VcsRepositoryUnavailableReason::Unreadable),
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                                ) => {}
+                            Err(_) => return None,
+                        }
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(_) => return None,
+        }
+        let Some(parent) = cwd.parent() else {
+            return Some(VcsRepositoryUnavailableReason::Absent);
+        };
+        #[cfg(unix)]
+        if let Some(device) = starting_device
+            && tokio::fs::metadata(parent).await.ok()?.dev() != device
+        {
+            return Some(VcsRepositoryUnavailableReason::Absent);
+        }
+        cwd = parent.to_path_buf();
+    }
+}
+
+fn git_boolean_is_true(value: &str) -> bool {
+    if ["true", "yes", "on"]
+        .iter()
+        .any(|word| value.eq_ignore_ascii_case(word))
+    {
+        return true;
+    }
+    // Git also accepts nonzero signed integers (base 0, with optional k/m/g units).
+    let value = value.trim_start_matches(|character| matches!(character, ' ' | '\t'..='\r'));
+    let (sign, value) = if let Some(value) = value.strip_prefix('-') {
+        (-1_i64, value)
+    } else {
+        (1_i64, value.strip_prefix('+').unwrap_or(value))
+    };
+    let (value, factor) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1_i64 << 10),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1_i64 << 20),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1_i64 << 30),
+        _ => (value, 1),
+    };
+    let (digits, radix) = if let Some(value) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        (value, 16)
+    } else if let Some(value) = value
+        .strip_prefix("0b")
+        .or_else(|| value.strip_prefix("0B"))
+    {
+        (value, 2)
+    } else if value.starts_with('0') {
+        (value, 8)
+    } else {
+        (value, 10)
+    };
+    // Reject extra signs: from_str_radix would otherwise accept them after prefix removal.
+    if digits.starts_with(['+', '-']) {
+        return false;
+    }
+    i64::from_str_radix(digits, radix)
+        .ok()
+        .and_then(|number| number.checked_mul(sign)?.checked_mul(factor))
+        .and_then(|number| i32::try_from(number).ok())
+        .is_some_and(|number| number != 0)
+}
+
 pub(crate) fn git_environment() -> Vec<(OsString, OsString)> {
     [
         ("GCM_INTERACTIVE", "never"),
@@ -7568,6 +7770,531 @@ mod tests {
                 .push(request);
             Box::pin(async move { Ok(output) })
         }
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_plain_folder_is_absent() {
+        let Some(root) = plain_folder_fixture("repository_unavailable_plain_folder_is_absent")
+        else {
+            return;
+        };
+        assert_repository_reason(&GitRepository::default(), root.path(), Some("absent")).await;
+    }
+
+    fn plain_folder_fixture(test: &str) -> Option<tempfile::TempDir> {
+        let root = tempfile::tempdir().expect("plain folder");
+        let probe = Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(root.path())
+            .output()
+            .expect("fixture Git starts");
+        if probe.status.success() {
+            eprintln!(
+                "{test}: skipping plain-folder test because the temporary directory {} is inside a Git repository",
+                root.path().display()
+            );
+            return None;
+        }
+        Some(root)
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_markerless_git_ancestor_is_absent() {
+        let Some(root) =
+            plain_folder_fixture("repository_unavailable_markerless_git_ancestor_is_absent")
+        else {
+            return;
+        };
+        let git_dir = root.path().join(".git");
+        fs::create_dir(&git_dir).expect("empty git directory");
+        let nested = root.path().join("nested/deep");
+        fs::create_dir_all(&nested).expect("nested folder");
+        assert_repository_reason(&GitRepository::default(), &nested, Some("absent")).await;
+
+        fs::write(git_dir.join("unrelated"), "not repository metadata").expect("unrelated file");
+        assert_repository_reason(&GitRepository::default(), &nested, Some("absent")).await;
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_single_git_marker_is_unreadable() {
+        let Some(root) =
+            plain_folder_fixture("repository_unavailable_single_git_marker_is_unreadable")
+        else {
+            return;
+        };
+        for marker in ["HEAD", "config", "objects", "refs"] {
+            let folder = root.path().join(marker);
+            let git_dir = folder.join(".git");
+            fs::create_dir_all(&git_dir).expect("git directory");
+            if matches!(marker, "objects" | "refs") {
+                fs::create_dir(git_dir.join(marker)).expect("repository directory marker");
+            } else {
+                fs::write(git_dir.join(marker), "").expect("repository file marker");
+            }
+            assert_repository_reason(&GitRepository::default(), &folder, Some("unreadable")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_markerless_git_directory_continues_to_damaged_ancestor() {
+        let root = tempfile::tempdir().expect("damaged ancestor");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        fs::write(root.path().join(".git/config"), "[invalid").expect("damaged config");
+        let nested = root.path().join("nested");
+        fs::create_dir_all(nested.join(".git")).expect("empty nested git directory");
+        assert_repository_reason(&GitRepository::default(), &nested, Some("unreadable")).await;
+    }
+
+    fn repository_fixture_git(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_AUTHOR_NAME", "Repository State Test")
+            .env("GIT_AUTHOR_EMAIL", "repository@example.test")
+            .env("GIT_COMMITTER_NAME", "Repository State Test")
+            .env("GIT_COMMITTER_EMAIL", "repository@example.test")
+            .output()
+            .expect("fixture Git starts");
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("Git output")
+            .trim()
+            .to_owned()
+    }
+
+    async fn assert_repository_reason(
+        repository: &GitRepository,
+        cwd: &Path,
+        reason: Option<&str>,
+    ) {
+        let local = repository
+            .local_status(cwd, &CancellationToken::new())
+            .await
+            .expect("local status");
+        assert!(!local.is_repo);
+        let encoded = serde_json::to_value(local).expect("status JSON");
+        assert_eq!(
+            encoded
+                .get("repositoryUnavailableReason")
+                .and_then(serde_json::Value::as_str),
+            reason
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_damaged_metadata_is_unreadable() {
+        for (path, contents) in [("HEAD", "not a ref"), ("HEAD", ""), ("config", "[invalid")] {
+            let root = tempfile::tempdir().expect("damaged repository");
+            repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+            fs::write(root.path().join(".git").join(path), contents).expect("damage metadata");
+            assert_repository_reason(&GitRepository::default(), root.path(), Some("unreadable"))
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_damaged_ancestor_is_unreadable() {
+        let root = tempfile::tempdir().expect("damaged repository");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        fs::write(root.path().join(".git/HEAD"), "not a ref").expect("damage HEAD");
+        let nested = root.path().join("nested/deep");
+        fs::create_dir_all(&nested).expect("nested folder");
+        assert_repository_reason(&GitRepository::default(), &nested, Some("unreadable")).await;
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_deleted_worktree_admin_is_unreadable() {
+        let root = tempfile::tempdir().expect("repository and worktree");
+        let main = root.path().join("main");
+        let linked = root.path().join("linked");
+        fs::create_dir(&main).expect("main folder");
+        repository_fixture_git(&main, &["init", "-q", "-b", "main"]);
+        let tree = repository_fixture_git(&main, &["mktree"]);
+        let commit = repository_fixture_git(&main, &["commit-tree", &tree, "-m", "fixture"]);
+        repository_fixture_git(&main, &["update-ref", "HEAD", &commit]);
+        repository_fixture_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().expect("path"),
+                "HEAD",
+            ],
+        );
+        fs::remove_dir_all(main.join(".git/worktrees")).expect("remove linked admin directory");
+        assert_repository_reason(&GitRepository::default(), &linked, Some("unreadable")).await;
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_healthy_and_bare_repositories_omit_reason() {
+        let root = tempfile::tempdir().expect("healthy repository");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        let repository = GitRepository::default();
+        let local = repository
+            .local_status(root.path(), &CancellationToken::new())
+            .await
+            .expect("healthy status");
+        assert!(local.is_repo);
+        assert!(
+            serde_json::to_value(local)
+                .expect("status JSON")
+                .get("repositoryUnavailableReason")
+                .is_none()
+        );
+        assert_repository_reason(&repository, &root.path().join(".git"), None).await;
+        let bare = tempfile::tempdir().expect("bare repository");
+        repository_fixture_git(bare.path(), &["init", "-q", "--bare"]);
+        assert_repository_reason(&repository, bare.path(), None).await;
+    }
+
+    #[test]
+    fn repository_unavailable_reason_wire_round_trip_and_omission() {
+        let local = super::VcsStatusLocalResult::non_repository();
+        let mut encoded = serde_json::to_value(&local).expect("status JSON");
+        assert!(encoded.get("repositoryUnavailableReason").is_none());
+        assert_eq!(
+            serde_json::from_value::<super::VcsStatusLocalResult>(encoded.clone()).unwrap(),
+            local
+        );
+        for reason in ["absent", "unreadable", "untrusted"] {
+            encoded["repositoryUnavailableReason"] = reason.into();
+            let decoded: super::VcsStatusLocalResult =
+                serde_json::from_value(encoded.clone()).expect("reason decodes");
+            assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_discovery_overrides_leave_the_reason_unknown() {
+        let Some(root) = plain_folder_fixture(
+            "repository_unavailable_discovery_overrides_leave_the_reason_unknown",
+        ) else {
+            return;
+        };
+        for environment in [
+            (|name: &str| (name == "GIT_DIR").then(OsString::new)) as fn(&str) -> Option<OsString>,
+            |name: &str| (name == "GIT_CEILING_DIRECTORIES").then(|| OsString::from("/")),
+        ] {
+            let repository = GitRepository {
+                discovery_environment: environment,
+                ..GitRepository::default()
+            };
+            assert_repository_reason(&repository, root.path(), None).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_dubious_ownership_takes_precedence_over_discovery_overrides() {
+        let reason = super::classify_repository_unavailable(
+            Path::new("/does-not-exist"),
+            &super::RepositoryProbe::Refused(
+                "fatal: detected dubious ownership in repository at '/repo'".into(),
+            ),
+            |_| Some(OsString::new()),
+        )
+        .await;
+        assert_eq!(
+            reason,
+            Some(super::VcsRepositoryUnavailableReason::Untrusted)
+        );
+    }
+
+    struct DifferentOwnerGitRunner;
+
+    impl GitProcessRunner for DifferentOwnerGitRunner {
+        fn run<'a>(
+            &'a self,
+            mut request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> super::BoxGitProcessFuture<'a> {
+            request
+                .env
+                .push(("GIT_TEST_ASSUME_DIFFERENT_OWNER".into(), "1".into()));
+            request.env.push((
+                "GIT_CONFIG_GLOBAL".into(),
+                if cfg!(windows) { "NUL" } else { "/dev/null" }.into(),
+            ));
+            Box::pin(async move { super::ProcessRunner.run(request, cancellation).await })
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_real_git_ownership_refusal_is_untrusted() {
+        let root = tempfile::tempdir().expect("untrusted repository");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        assert_repository_reason(
+            &GitRepository::with_runner_for_test(Arc::new(DifferentOwnerGitRunner)),
+            root.path(),
+            Some("untrusted"),
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repository_unavailable_classification_timeout_is_unknown() {
+        let started = tokio::time::Instant::now();
+        let reason = super::bounded_repository_classification(
+            std::future::pending(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(reason, None);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_classification_is_cancellable() {
+        let cancellation = CancellationToken::new();
+        let classification =
+            super::bounded_repository_classification(std::future::pending(), &cancellation);
+        tokio::pin!(classification);
+        tokio::select! {
+            biased;
+            _ = &mut classification => panic!("classification must wait"),
+            () = tokio::task::yield_now() => {},
+        }
+        cancellation.cancel();
+        assert_eq!(classification.await, None);
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_metadata_errors_leave_the_reason_unknown() {
+        let Some(root) =
+            plain_folder_fixture("repository_unavailable_metadata_errors_leave_the_reason_unknown")
+        else {
+            return;
+        };
+        let reason =
+            super::repository_reason_from_ancestors(root.path().to_path_buf(), false, |_| async {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            })
+            .await;
+        assert_eq!(reason, None);
+        let missing = root.path().join("missing");
+        assert_eq!(
+            super::classify_repository_unavailable(
+                &missing,
+                &super::RepositoryProbe::Refused(String::new()),
+                |_| None
+            )
+            .await,
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_unavailable_dangling_git_entry_is_unreadable() {
+        let root = tempfile::tempdir().expect("dangling metadata");
+        std::os::unix::fs::symlink(root.path().join("missing"), root.path().join(".git"))
+            .expect("dangling git entry");
+        assert_repository_reason(&GitRepository::default(), root.path(), Some("unreadable")).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_unavailable_symlinked_git_directory_requires_a_marker() {
+        let Some(root) = plain_folder_fixture(
+            "repository_unavailable_symlinked_git_directory_requires_a_marker",
+        ) else {
+            return;
+        };
+        let git_dir = root.path().join("metadata");
+        fs::create_dir(&git_dir).expect("metadata directory");
+        std::os::unix::fs::symlink(&git_dir, root.path().join(".git")).expect("git directory link");
+        assert_repository_reason(&GitRepository::default(), root.path(), Some("absent")).await;
+        fs::write(git_dir.join("HEAD"), "not a ref").expect("damaged HEAD");
+        assert_repository_reason(&GitRepository::default(), root.path(), Some("unreadable")).await;
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_git_marker_errors_leave_the_reason_unknown() {
+        let root = tempfile::tempdir().expect("discovery start");
+        let directory = fs::metadata(root.path()).expect("directory metadata");
+        let reason =
+            super::repository_reason_from_ancestors(root.path().to_path_buf(), false, |path| {
+                std::future::ready(if path.file_name().is_some_and(|name| name == ".git") {
+                    Ok(directory.clone())
+                } else {
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                })
+            })
+            .await;
+        assert_eq!(reason, None);
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_missing_git_markers_walk_to_the_root() {
+        let root = tempfile::tempdir().expect("discovery start");
+        let directory = fs::metadata(root.path()).expect("directory metadata");
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            let reason = super::repository_reason_from_ancestors(
+                fs::canonicalize(root.path()).unwrap(),
+                true,
+                |path| {
+                    std::future::ready(if path.file_name().is_some_and(|name| name == ".git") {
+                        Ok(directory.clone())
+                    } else {
+                        Err(std::io::Error::from(kind))
+                    })
+                },
+            )
+            .await;
+            assert_eq!(reason, Some(super::VcsRepositoryUnavailableReason::Absent));
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_missing_entries_walk_to_the_root() {
+        let root = tempfile::tempdir().expect("discovery start");
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            let reason = super::repository_reason_from_ancestors(
+                fs::canonicalize(root.path()).unwrap(),
+                true,
+                |_| std::future::ready(Err(std::io::Error::from(kind))),
+            )
+            .await;
+            assert_eq!(reason, Some(super::VcsRepositoryUnavailableReason::Absent));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn repository_unavailable_checks_the_device_before_inspecting_parent_entries() {
+        use std::os::unix::fs::MetadataExt;
+
+        let proc = fs::metadata("/proc").expect("proc filesystem");
+        let root = fs::metadata("/").expect("root filesystem");
+        assert_ne!(proc.dev(), root.dev(), "proc is a separate filesystem");
+        for (across_filesystems, expected) in [
+            (false, super::VcsRepositoryUnavailableReason::Absent),
+            (true, super::VcsRepositoryUnavailableReason::Unreadable),
+        ] {
+            // Model a .git entry beyond the real proc mount without writing to either root.
+            let reason = super::repository_reason_from_ancestors(
+                PathBuf::from("/proc"),
+                across_filesystems,
+                |path| {
+                    std::future::ready(if matches!(path.to_str(), Some("/.git" | "/.git/HEAD")) {
+                        Ok(root.clone())
+                    } else {
+                        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                    })
+                },
+            )
+            .await;
+            assert_eq!(reason, Some(expected));
+        }
+    }
+
+    #[test]
+    fn repository_unavailable_discovery_accepts_git_true_values() {
+        for value in [
+            "true",
+            "TRUE",
+            "yes",
+            "Yes",
+            "on",
+            "ON",
+            "1",
+            "2",
+            "-1",
+            "+1",
+            "01",
+            "0x10",
+            "0b1",
+            "0B10",
+            "-0b1",
+            "1k",
+            "1M",
+            "1g",
+            " 1",
+            "\u{000b}1",
+            "-2147483648",
+        ] {
+            assert!(
+                super::git_boolean_is_true(value),
+                "{value:?} is true in Git"
+            );
+        }
+        for value in [
+            "false",
+            "no",
+            "off",
+            "0",
+            "0k",
+            "0b0",
+            "0b2",
+            "",
+            "true ",
+            "unknown",
+            "08",
+            "++1",
+            "0x-1",
+            "2147483648",
+            "-2147483649",
+        ] {
+            assert!(
+                !super::git_boolean_is_true(value),
+                "{value:?} is not true in Git"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_worktree_probe_preserves_the_status_error() {
+        let root = tempfile::tempdir().expect("repository with corrupt index");
+        repository_fixture_git(root.path(), &["init", "-q", "-b", "main"]);
+        fs::write(root.path().join(".git/index"), "invalid index").expect("damage index");
+        let repository = GitRepository::default();
+        assert!(
+            repository
+                .is_repository(root.path(), &CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        let error = repository
+            .local_status(root.path(), &CancellationToken::new())
+            .await
+            .expect_err("a readable worktree keeps the error");
+        assert_eq!(
+            error.operation.as_ref(),
+            "GitVcsDriver.statusDetailsLocal.status"
+        );
+        assert!(error.detail.contains("index"));
+    }
+
+    #[tokio::test]
+    async fn repository_unavailable_healthy_path_never_reads_discovery_environment() {
+        let repository = GitRepository {
+            discovery_environment: |_| {
+                panic!("healthy status must not classify repository discovery")
+            },
+            ..GitRepository::with_runner_for_test(Arc::new(RecordingGitRunner::clean_fixture()))
+        };
+        assert!(
+            repository
+                .local_status(Path::new("/repo"), &CancellationToken::new())
+                .await
+                .unwrap()
+                .is_repo
+        );
     }
 
     #[tokio::test]

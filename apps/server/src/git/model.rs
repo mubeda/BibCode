@@ -88,10 +88,20 @@ pub struct SourceControlProviderInfo {
     pub base_url: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VcsRepositoryUnavailableReason {
+    Absent,
+    Unreadable,
+    Untrusted,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VcsStatusLocalResult {
     pub is_repo: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_unavailable_reason: Option<VcsRepositoryUnavailableReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_control_provider: Option<SourceControlProviderInfo>,
     pub has_primary_remote: bool,
@@ -108,6 +118,7 @@ impl VcsStatusLocalResult {
     pub fn non_repository() -> Self {
         Self {
             is_repo: false,
+            repository_unavailable_reason: None,
             source_control_provider: None,
             has_primary_remote: false,
             is_default_ref: false,
@@ -115,6 +126,14 @@ impl VcsStatusLocalResult {
             default_ref_name: None,
             has_working_tree_changes: false,
             working_tree: VcsWorkingTree::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn non_repository_with_reason(reason: VcsRepositoryUnavailableReason) -> Self {
+        Self {
+            repository_unavailable_reason: Some(reason),
+            ..Self::non_repository()
         }
     }
 }

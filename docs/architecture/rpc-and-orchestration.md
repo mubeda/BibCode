@@ -121,8 +121,10 @@ without exactly one declared scope fails a server test.
 
 ## VCS status and mutation coordination
 
-`subscribeVcsStatus` and `vcs.refreshStatus` keep their existing wire shapes,
-but the production server coordinates their work by canonical worktree path.
+`subscribeVcsStatus` and `vcs.refreshStatus` add the optional
+[`repositoryUnavailableReason`](../superpowers/specs/2026-09-26-vcs-repository-state-design.md)
+to their local status part when `isRepo` is false; the production server
+coordinates their work by canonical worktree path.
 The status owner has independent Local and Full read keys. Concurrent callers
 for one key share one physical load while retaining cancellation leases; one
 caller leaving does not cancel peers, while final-lease release removes and

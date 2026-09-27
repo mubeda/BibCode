@@ -172,6 +172,9 @@ function toRemoteStatusPart(status: VcsStatusResult): VcsStatusRemoteResult {
 function toLocalStatusPart(status: VcsStatusResult): VcsStatusLocalResult {
   return {
     isRepo: status.isRepo,
+    ...(status.repositoryUnavailableReason === undefined
+      ? {}
+      : { repositoryUnavailableReason: status.repositoryUnavailableReason }),
     ...(status.sourceControlProvider
       ? { sourceControlProvider: status.sourceControlProvider }
       : {}),
