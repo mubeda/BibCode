@@ -605,6 +605,7 @@ struct ActivityDispatchCompletionTestHook {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IdleDeadlineEvaluation {
     Stale,
+    Busy,
     Suspended,
     Failed,
 }
@@ -3202,17 +3203,12 @@ async fn run_supervisor(
                         return Ok(());
                     }
                     let repositories = engine.repositories();
-                    let confirmed_idle = delivery_sequences
-                        .get(&identity.thread_id)
-                        .is_none_or(|sequence| sequence.active_generation.is_none())
-                        && repositories
-                            .get_thread_session(identity.thread_id.clone())
-                            .await
-                            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
-                            .is_some_and(|session| {
-                                !matches!(session.status.as_str(), "running" | "starting")
-                                    && session.active_turn_id.is_none()
-                            });
+                    let confirmed_idle = session_is_confirmed_idle(
+                        &repositories,
+                        &delivery_sequences,
+                        &identity.thread_id,
+                    )
+                    .await?;
                     if confirmed_idle {
                         suspend_idle_session(
                             &repositories,
@@ -3720,7 +3716,27 @@ async fn run_supervisor(
                     Arc::ptr_eq(&entry.idle_generation, &idle_generation)
                         && entry.idle_generation.load(Ordering::Relaxed) == generation
                 });
-                let suspension = if is_current {
+                let confirmed_idle = if is_current {
+                    match session_is_confirmed_idle(
+                        &engine.repositories(),
+                        &delivery_sequences,
+                        &thread_id,
+                    )
+                    .await
+                    {
+                        Ok(confirmed_idle) => confirmed_idle,
+                        Err(error) => {
+                            tracing::warn!(%error, %thread_id, "failed to confirm idle provider session");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                // The event pump can reserve a completion deadline during the projection read.
+                let is_current =
+                    is_current && idle_generation.load(Ordering::Relaxed) == generation;
+                let suspension = if is_current && confirmed_idle {
                     Some(
                         suspend_idle_session(
                             &engine.repositories(),
@@ -3736,9 +3752,28 @@ async fn run_supervisor(
                 if let Some(Err(error)) = &suspension {
                     tracing::warn!(%error, %thread_id, "failed to suspend idle provider session");
                 }
+                let rearm = sessions
+                    .get(&thread_id)
+                    .filter(|_| is_current && !confirmed_idle)
+                    .and_then(|entry| {
+                        reserve_idle_rearm(&entry.idle_generation, generation)
+                            .map(|generation| (entry, generation))
+                    });
+                if let Some((entry, generation)) = rearm {
+                    schedule_idle_suspend(
+                        entry.terminal_sender.clone(),
+                        thread_id,
+                        entry.idle_generation.clone(),
+                        generation,
+                        entry.idle_timeout,
+                        #[cfg(test)]
+                        entry.idle_deadline_test_observer.clone(),
+                    );
+                }
                 #[cfg(test)]
                 if let Some(observer) = &idle_deadline_test_observer {
                     let outcome = match suspension {
+                        None if rearm.is_some() => IdleDeadlineEvaluation::Busy,
                         None => IdleDeadlineEvaluation::Stale,
                         Some(Ok(())) => IdleDeadlineEvaluation::Suspended,
                         Some(Err(_)) => IdleDeadlineEvaluation::Failed,
@@ -5359,6 +5394,8 @@ fn spawn_event_pump(
                     // Start the fence after activity-control acknowledgements, before the
                     // final event becomes visible, so projection cannot deadlock on the supervisor.
                     let session_settlement = session_exited.then(&begin_settlement);
+                    let completion_generation = (event.event_type == "turn.completed")
+                        .then(|| idle_generation.fetch_add(1, Ordering::Relaxed) + 1);
                     let completed = event.event_type == "turn.completed"
                         && event.payload.get("state").and_then(Value::as_str) != Some("failed");
                     if let Err(error) = project_provider_event(
@@ -5375,11 +5412,12 @@ fn spawn_event_pump(
                             return;
                         }
                         tracing::warn!(%error, "failed to project provider runtime event");
-                    } else if completed {
+                    } else if completed && let Some(generation) = completion_generation {
                         schedule_idle_suspend(
                             terminal_sender.clone(),
                             launch.thread_id.clone(),
                             idle_generation.clone(),
+                            generation,
                             idle_timeout,
                             #[cfg(test)]
                             idle_deadline_test_observer.clone(),
@@ -5467,6 +5505,7 @@ fn spawn_event_pump(
                     activity: Vec::new(),
                     activity_controls: Default::default(),
                 };
+                idle_generation.fetch_add(1, Ordering::Relaxed);
                 if let Err(error) = project_provider_event(
                     &engine,
                     &launch,
@@ -5500,14 +5539,22 @@ fn spawn_event_pump(
     })
 }
 
+fn reserve_idle_rearm(idle_generation: &AtomicU64, expected: u64) -> Option<u64> {
+    let generation = expected + 1;
+    idle_generation
+        .compare_exchange(expected, generation, Ordering::Relaxed, Ordering::Relaxed)
+        .ok()
+        .map(|_| generation)
+}
+
 fn schedule_idle_suspend(
     sender: mpsc::UnboundedSender<SupervisorMessage>,
     thread_id: String,
     idle_generation: Arc<AtomicU64>,
+    generation: u64,
     idle_timeout: Duration,
     #[cfg(test)] idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
 ) {
-    let generation = idle_generation.fetch_add(1, Ordering::Relaxed) + 1;
     tokio::spawn(async move {
         #[cfg(test)]
         if let Some(observer) = &idle_deadline_test_observer {
@@ -6120,6 +6167,27 @@ async fn stop_session(
         .await
         .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
     result
+}
+
+async fn session_is_confirmed_idle(
+    repositories: &Repositories,
+    delivery_sequences: &HashMap<String, ThreadDeliverySequence>,
+    thread_id: &str,
+) -> Result<bool, ProviderRuntimeError> {
+    if delivery_sequences
+        .get(thread_id)
+        .is_some_and(|sequence| sequence.active_generation.is_some())
+    {
+        return Ok(false);
+    }
+    Ok(repositories
+        .get_thread_session(thread_id.to_owned())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+        .is_some_and(|session| {
+            !matches!(session.status.as_str(), "running" | "starting")
+                && session.active_turn_id.is_none()
+        }))
 }
 
 async fn suspend_idle_session(
@@ -11929,6 +11997,7 @@ mod tests {
         launches: usize,
         starts: usize,
         sends: Vec<String>,
+        send_turn_ids: std::collections::VecDeque<String>,
         interrupts: usize,
         approvals: usize,
         answers: usize,
@@ -12225,8 +12294,14 @@ mod tests {
                 if let Some(gate) = gate {
                     gate.notified().await;
                 }
-                self.state.lock().unwrap().sends.push(text);
-                Ok(Some("unit-turn".to_owned()))
+                let mut state = self.state.lock().unwrap();
+                state.sends.push(text);
+                Ok(Some(
+                    state
+                        .send_turn_ids
+                        .pop_front()
+                        .unwrap_or_else(|| "unit-turn".to_owned()),
+                ))
             })
         }
         fn reconcile(
@@ -18362,6 +18437,547 @@ done
 
         supervisor.shutdown().await.unwrap();
         engine.shutdown().await;
+    }
+
+    const BUSY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    // SQLite runs on another thread. Keep paused Tokio time from auto-advancing
+    // to a deadline while a test is only waiting for a database round trip.
+    fn keep_idle_clock_paused() -> tokio_util::task::AbortOnDropHandle<()> {
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }))
+    }
+
+    struct IdleDeadlineFixture {
+        engine: super::OrchestrationEngine,
+        supervisor: super::ProviderRuntimeSupervisor,
+        state: Arc<StdMutex<SupervisorDriverState>>,
+        events: mpsc::Sender<super::ProviderEvent>,
+        deadlines: mpsc::UnboundedReceiver<super::IdleDeadlineTestEvent>,
+        idle_timeout: Duration,
+        _workspace: TempDir,
+    }
+
+    impl IdleDeadlineFixture {
+        async fn new(idle_timeout: Duration) -> Self {
+            let engine = supervisor_engine().await;
+            let state = Arc::new(StdMutex::new(SupervisorDriverState {
+                send_turn_ids: ["idle-turn-1".to_owned(), "idle-turn-2".to_owned()].into(),
+                ..SupervisorDriverState::default()
+            }));
+            let (events, events_rx) = mpsc::channel(2);
+            let (idle_deadline_tx, deadlines) = mpsc::unbounded_channel();
+            let supervisor = super::ProviderRuntimeSupervisor::start(
+                engine.clone(),
+                Arc::new(SupervisorFactory {
+                    state: state.clone(),
+                    events: StdMutex::new(Some(events_rx)),
+                }),
+                super::ActivityProjection::new(crate::activity::ActivityRepository::new(
+                    engine.repositories().database().clone(),
+                )),
+                super::SupervisorOptions {
+                    queue_capacity: 2,
+                    session_idle_timeout: idle_timeout,
+                    idle_deadline_test_observer: Some(idle_deadline_tx),
+                },
+            );
+            let workspace = TempDir::new().unwrap();
+            let mut request = native_launch(&workspace, "codex");
+            request.thread_id = "t1".to_owned();
+            supervisor.launch(request).await.unwrap();
+            Self {
+                engine,
+                supervisor,
+                state,
+                events,
+                deadlines,
+                idle_timeout,
+                _workspace: workspace,
+            }
+        }
+
+        fn turn_command(id: &str) -> OrchestrationCommand {
+            // A model selection would dispatch through the paused engine before
+            // Deliver can return its admission handle.
+            serde_json::from_value(json!({
+                "type":"thread.turn.start", "commandId":id, "threadId":"t1",
+                "message":{"messageId":format!("user-{id}"),"role":"user","text":id,"attachments":[]},
+                "runtimeMode":"full-access", "interactionMode":"default",
+                "createdAt":"2026-07-16T00:00:01Z"
+            }))
+            .unwrap()
+        }
+
+        async fn admit(&self, id: &str) -> super::ProviderDeliveryHandle {
+            self.supervisor
+                .deliver_turn(Self::turn_command(id), id.to_owned())
+                .await
+                .expect("turn admitted")
+        }
+
+        async fn accepted(handle: super::ProviderDeliveryHandle, turn_id: &str) {
+            assert_eq!(
+                handle.completion().await,
+                super::ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some(turn_id.to_owned())
+                }
+            );
+        }
+
+        async fn emit(&self, event_type: &str, turn_id: &str, message_id: &str) {
+            self.events
+                .send(super::ProviderEvent {
+                    native_event_id: None,
+                    event_type: event_type.to_owned(),
+                    thread_id: "t1".to_owned(),
+                    turn_id: Some(turn_id.to_owned()),
+                    item_id: None,
+                    request_id: None,
+                    payload: json!({"messageId":message_id,"delta":"OK","state":"completed"}),
+                    activity: Vec::new(),
+                    activity_controls: Default::default(),
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn stream(&self, turn_id: &str, message_id: &str) {
+            self.emit("content.delta", turn_id, message_id).await;
+            let started = Instant::now();
+            loop {
+                if self
+                    .engine
+                    .repositories()
+                    .get_message(message_id.to_owned())
+                    .await
+                    .unwrap()
+                    .is_some_and(|message| {
+                        message.is_streaming && message.turn_id.as_deref() == Some(turn_id)
+                    })
+                {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "delta persisted"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+
+        async fn hold_completion_settlement(
+            &self,
+            turn_id: &str,
+            message_id: &str,
+        ) -> crate::orchestration::engine::AdmissionCommitPause {
+            // The hooks are unfiltered and take-once. No other command producer
+            // may run until both pauses have caught the completion's commands.
+            self.stream(turn_id, message_id).await;
+            let hooks = self.engine.test_hooks();
+            let ready = hooks.pause_before_next_command_persist();
+            self.emit("turn.completed", turn_id, message_id).await;
+            ready.wait_until_entered().await;
+            let settlement = hooks.pause_before_next_command_persist();
+            ready.release();
+            settlement.wait_until_entered().await;
+            self.assert_projection("ready", None).await;
+            settlement
+        }
+
+        async fn assert_projection(&self, status: &str, turn_id: Option<&str>) {
+            let session = self
+                .engine
+                .repositories()
+                .get_thread_session("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("projected session");
+            assert_eq!(session.status, status);
+            assert_eq!(session.active_turn_id.as_deref(), turn_id);
+        }
+
+        async fn assert_live(&self, reason: &str) {
+            let session = self
+                .engine
+                .repositories()
+                .get_thread_session("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("projected session");
+            let runtime = self
+                .engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("runtime row");
+            let live = self
+                .supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_some();
+            let shutdowns = self.state.lock().unwrap().shutdowns;
+            assert!(
+                live && shutdowns == 0 && runtime.status != "suspended",
+                "{reason}; projected status={} active_turn={:?}; runtime status={} (no active-turn field); live={live}, shutdowns={shutdowns}",
+                session.status,
+                session.active_turn_id,
+                runtime.status,
+            );
+        }
+
+        async fn next_deadline(&mut self) -> super::IdleDeadlineTestEvent {
+            self.deadlines.recv().await.expect("idle deadline event")
+        }
+
+        async fn assert_settled(&self, message_id: &str, turn_id: &str) {
+            let snapshot = load_snapshot(&self.engine.repositories()).await.unwrap();
+            assert!(
+                snapshot
+                    .messages
+                    .iter()
+                    .any(|message| { message.message_id == message_id && !message.is_streaming })
+            );
+            assert!(snapshot.activities.iter().any(|activity| {
+                activity.summary == "turn.completed" && activity.turn_id.as_deref() == Some(turn_id)
+            }));
+        }
+
+        async fn finish_follow_up(&mut self) {
+            self.stream("idle-turn-2", "assistant-follow-up").await;
+            self.emit("turn.completed", "idle-turn-2", "assistant-follow-up")
+                .await;
+            let armed = self.next_deadline().await;
+            self.assert_settled("assistant-follow-up", "idle-turn-2")
+                .await;
+            assert_eq!(armed, super::IdleDeadlineTestEvent::Armed { generation: 4 });
+            self.assert_suspended_after_timeout(4).await;
+        }
+
+        async fn assert_suspended_after_timeout(&mut self, generation: u64) {
+            tokio::time::advance(self.idle_timeout).await;
+            let evaluated = self.next_deadline().await;
+            assert!(
+                self.supervisor
+                    .capture_session_identity("t1")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the completed idle session is suspended"
+            );
+            assert_eq!(self.state.lock().unwrap().shutdowns, 1);
+            let runtime = self
+                .engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("suspension preserves resume state");
+            assert_eq!(runtime.status, "suspended");
+            assert_eq!(
+                runtime.resume_cursor,
+                Some(json!({"threadId":"unit-session"}))
+            );
+            self.assert_projection("ready", None).await;
+            assert_eq!(
+                evaluated,
+                super::IdleDeadlineTestEvent::Evaluated {
+                    generation,
+                    outcome: super::IdleDeadlineEvaluation::Suspended,
+                }
+            );
+        }
+
+        async fn close(self) {
+            self.supervisor.shutdown().await.unwrap();
+            self.engine.shutdown().await;
+        }
+    }
+
+    #[test]
+    fn idle_rearm_reservation_preserves_a_completion_generation() {
+        let idle_generation = AtomicU64::new(7);
+        assert_eq!(super::reserve_idle_rearm(&idle_generation, 7), Some(8));
+        assert_eq!(idle_generation.load(Ordering::Relaxed), 8);
+
+        // The event pump reserves the completion before the busy deadline re-arms.
+        idle_generation.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(super::reserve_idle_rearm(&idle_generation, 8), None);
+        assert_eq!(idle_generation.load(Ordering::Relaxed), 9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_ignores_a_send_admitted_before_it_was_armed() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        IdleDeadlineFixture::accepted(fixture.admit("first").await, "idle-turn-1").await;
+        let settlement = fixture
+            .hold_completion_settlement("idle-turn-1", "assistant-first")
+            .await;
+        let follow_up = fixture.admit("follow-up").await;
+        settlement.release();
+        IdleDeadlineFixture::accepted(follow_up, "idle-turn-2").await;
+        fixture
+            .assert_projection("running", Some("idle-turn-2"))
+            .await;
+        let armed = fixture.next_deadline().await;
+
+        tokio::time::advance(BUSY_SESSION_IDLE_TIMEOUT).await;
+        let evaluated = fixture.next_deadline().await;
+        fixture
+            .assert_live(
+                "F23: the idle deadline suspended the session while the admitted turn was running",
+            )
+            .await;
+        fixture
+            .assert_projection("running", Some("idle-turn-2"))
+            .await;
+        assert_eq!(armed, super::IdleDeadlineTestEvent::Armed { generation: 2 });
+        assert_eq!(
+            evaluated,
+            super::IdleDeadlineTestEvent::Evaluated {
+                generation: 2,
+                outcome: super::IdleDeadlineEvaluation::Stale,
+            }
+        );
+
+        fixture.finish_follow_up().await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_ignores_a_delivery_still_in_flight() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        IdleDeadlineFixture::accepted(fixture.admit("first").await, "idle-turn-1").await;
+        let settlement = fixture
+            .hold_completion_settlement("idle-turn-1", "assistant-first")
+            .await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.send_gate = Some(gate.clone());
+            state.send_entered = Some(entered.clone());
+        }
+        let follow_up = fixture.admit("follow-up").await;
+        settlement.release();
+        entered.notified().await;
+        let armed = fixture.next_deadline().await;
+        fixture.assert_projection("ready", None).await;
+
+        tokio::time::advance(BUSY_SESSION_IDLE_TIMEOUT).await;
+        let evaluated = fixture.next_deadline().await;
+        fixture
+            .assert_live("F23: the idle deadline suspended a delivery still in flight")
+            .await;
+        fixture.assert_projection("ready", None).await;
+        assert_eq!(armed, super::IdleDeadlineTestEvent::Armed { generation: 2 });
+        assert_eq!(
+            evaluated,
+            super::IdleDeadlineTestEvent::Evaluated {
+                generation: 2,
+                outcome: super::IdleDeadlineEvaluation::Stale,
+            }
+        );
+
+        gate.notify_one();
+        IdleDeadlineFixture::accepted(follow_up, "idle-turn-2").await;
+        fixture.finish_follow_up().await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_does_not_interrupt_completion_settlement() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        IdleDeadlineFixture::accepted(fixture.admit("first").await, "idle-turn-1").await;
+        let first_settlement = fixture
+            .hold_completion_settlement("idle-turn-1", "assistant-first")
+            .await;
+        let follow_up = fixture.admit("follow-up").await;
+        first_settlement.release();
+        IdleDeadlineFixture::accepted(follow_up, "idle-turn-2").await;
+        let first_armed = fixture.next_deadline().await;
+        let settlement = fixture
+            .hold_completion_settlement("idle-turn-2", "assistant-follow-up")
+            .await;
+
+        tokio::time::advance(BUSY_SESSION_IDLE_TIMEOUT).await;
+        let evaluated = fixture.next_deadline().await;
+        fixture
+            .assert_live("F23: the idle deadline interrupted completion settlement")
+            .await;
+        assert!(
+            fixture
+                .engine
+                .repositories()
+                .get_message("assistant-follow-up".to_owned())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_streaming,
+            "the completion is held before settling the assistant message"
+        );
+        assert_eq!(
+            first_armed,
+            super::IdleDeadlineTestEvent::Armed { generation: 2 }
+        );
+        assert_eq!(
+            evaluated,
+            super::IdleDeadlineTestEvent::Evaluated {
+                generation: 2,
+                outcome: super::IdleDeadlineEvaluation::Stale,
+            }
+        );
+
+        settlement.release();
+        let armed = fixture.next_deadline().await;
+        fixture
+            .assert_settled("assistant-follow-up", "idle-turn-2")
+            .await;
+        assert_eq!(armed, super::IdleDeadlineTestEvent::Armed { generation: 4 });
+        fixture.assert_suspended_after_timeout(4).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_rearms_while_the_projection_is_busy() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        IdleDeadlineFixture::accepted(fixture.admit("first").await, "idle-turn-1").await;
+        fixture.stream("idle-turn-1", "assistant-first").await;
+        fixture
+            .emit("turn.completed", "idle-turn-1", "assistant-first")
+            .await;
+        let armed = fixture.next_deadline().await;
+
+        // Exercise the guard independently of Deliver's generation bump.
+        fixture.engine.dispatch(serde_json::from_value(json!({
+            "type":"thread.session.set", "commandId":"busy-projection", "threadId":"t1",
+            "session":{"threadId":"t1","status":"running","providerName":"codex",
+                "providerInstanceId":"codex","runtimeMode":"full-access",
+                "activeTurnId":"external-turn","lastError":null,"updatedAt":"2026-07-16T00:00:02Z"},
+            "createdAt":"2026-07-16T00:00:02Z"
+        })).unwrap()).await.unwrap();
+        tokio::time::advance(BUSY_SESSION_IDLE_TIMEOUT).await;
+        let evaluated = fixture.next_deadline().await;
+        fixture
+            .assert_live("F23: the idle deadline suspended a busy projection instead of re-arming")
+            .await;
+        fixture
+            .assert_projection("running", Some("external-turn"))
+            .await;
+        assert_eq!(armed, super::IdleDeadlineTestEvent::Armed { generation: 2 });
+        assert_eq!(
+            evaluated,
+            super::IdleDeadlineTestEvent::Evaluated {
+                generation: 2,
+                outcome: super::IdleDeadlineEvaluation::Busy,
+            }
+        );
+        assert_eq!(
+            fixture.next_deadline().await,
+            super::IdleDeadlineTestEvent::Armed { generation: 3 }
+        );
+
+        fixture
+            .engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.session.set", "commandId":"idle-projection", "threadId":"t1",
+                    "session":{"threadId":"t1","status":"ready","providerName":"codex",
+                        "providerInstanceId":"codex","runtimeMode":"full-access",
+                        "activeTurnId":null,"lastError":null,"updatedAt":"2026-07-16T00:00:03Z"},
+                    "createdAt":"2026-07-16T00:00:03Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        fixture.assert_suspended_after_timeout(3).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_deadline_natural_race_probe() {
+        let mut fixture = IdleDeadlineFixture::new(Duration::from_secs(1)).await;
+        let mut transitions = fixture.engine.subscribe_events();
+        let supervisor = fixture.supervisor.clone();
+        let watcher = tokio::spawn(async move {
+            let mut saw_first_running = false;
+            loop {
+                let event = transitions.recv().await.expect("session transition").event;
+                if event.event_type != "thread.session-set" || event.payload["threadId"] != "t1" {
+                    continue;
+                }
+                let session = &event.payload["session"];
+                if session["status"] == "running" && session["activeTurnId"] == "idle-turn-1" {
+                    saw_first_running = true;
+                } else if saw_first_running && session["status"] == "ready" {
+                    return supervisor
+                        .deliver_turn(
+                            IdleDeadlineFixture::turn_command("follow-up"),
+                            "follow-up".to_owned(),
+                        )
+                        .await;
+                }
+            }
+        });
+        IdleDeadlineFixture::accepted(fixture.admit("first").await, "idle-turn-1").await;
+        fixture.stream("idle-turn-1", "assistant-first").await;
+        fixture
+            .emit("turn.completed", "idle-turn-1", "assistant-first")
+            .await;
+        let admission = timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("watcher observes first turn's running-to-ready transition")
+            .unwrap();
+        let armed = fixture.next_deadline().await;
+        let generation = match armed {
+            super::IdleDeadlineTestEvent::Armed { generation } => generation,
+            other => panic!("expected completion deadline, got {other:?}"),
+        };
+        match admission {
+            Err(super::ProviderRuntimeError::SessionNotFound { .. }) => {
+                assert_eq!(
+                    fixture.next_deadline().await,
+                    super::IdleDeadlineTestEvent::Evaluated {
+                        generation,
+                        outcome: super::IdleDeadlineEvaluation::Suspended,
+                    },
+                    "a missed window requires suspension before follow-up admission"
+                );
+                println!("F23-PROBE missed-window");
+            }
+            Ok(handle) => {
+                IdleDeadlineFixture::accepted(handle, "idle-turn-2").await;
+                let evaluated = timeout(Duration::from_secs(5), fixture.next_deadline())
+                    .await
+                    .expect("completion deadline evaluated");
+                fixture
+                    .assert_live("F23: the idle deadline suspended the session while the admitted turn was running")
+                    .await;
+                fixture
+                    .assert_projection("running", Some("idle-turn-2"))
+                    .await;
+                assert!(matches!(
+                    evaluated,
+                    super::IdleDeadlineTestEvent::Evaluated {
+                        outcome: super::IdleDeadlineEvaluation::Stale
+                            | super::IdleDeadlineEvaluation::Busy,
+                        ..
+                    }
+                ));
+            }
+            Err(error) => panic!("follow-up admission failed: {error}"),
+        }
+        fixture.close().await;
     }
 
     #[tokio::test]

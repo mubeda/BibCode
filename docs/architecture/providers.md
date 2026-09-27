@@ -172,7 +172,12 @@ settles an abandoned active turn only if one remains. Native runtimes can keep
 their event senders alive after process loss; recovery does not wait for channel
 closure. OpenCode's explicit-stop notice (`Session stopped.`) is excluded from
 the fatal-exit trigger, and intentional stop/idle suspension cancels and joins
-the supervisor event pump before shutting down any driver. The next start delivery,
+the supervisor event pump before shutting down any driver. Each completion reserves
+an idle deadline generation before `ready` is published; successful projection of a
+non-failed completion arms it. When a current deadline finds a busy session (an
+admitted delivery, a `running` or `starting` projection, or an active turn), it
+immediately re-arms for one idle timeout, and the next completion supersedes that
+re-arm. The next start delivery,
 including **Send now** on a held queued message, detaches the dead session and
 releases its activity and process ownership through normal session cleanup.
 It retains the persisted resume cursor and follows the existing missing-session

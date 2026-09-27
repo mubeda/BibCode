@@ -214,6 +214,9 @@ cargo test -p bibcode-server --test repositories -j 2
 cargo test -p bibcode-server migrations -j 2
 ```
 
+Deliver a queued message at completion and let its turn run past the idle timeout;
+the session must stay live until one idle timeout after that turn completes.
+
 Verify enqueue without a turn-start event or working projection, oldest-first
 promotion once per settle, explicit Send now clearing only its row's hold,
 interrupt/error holds, approval and user-input gates, and withdrawal without
