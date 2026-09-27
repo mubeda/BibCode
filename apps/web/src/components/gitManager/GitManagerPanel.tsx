@@ -1381,7 +1381,11 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
           selectedWorktreeCwd={activeCwd}
           worktrees={worktrees}
           catalogPending={catalog.isPending && catalog.data === null}
-          catalogError={catalog.error}
+          catalogError={
+            catalog.error !== null && repositoryUnavailable !== null
+              ? repositoryDisabledReason
+              : catalog.error
+          }
           stashMergeDisabledReason={effectiveDisabledReasons.stashMerge}
           tagDisabledReason={effectiveDisabledReasons.tag}
           onSelectedWorktreeChange={handleWorktreeChange}
