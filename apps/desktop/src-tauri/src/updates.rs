@@ -1566,11 +1566,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_install_publishes_typed_backend_recovery_and_status_invalidation() {
-        if !crate::test_support::scenario_runs_in_this_process(
+        let Some(isolated) = crate::test_support::isolated_scenario(
             "updates::tests::failed_install_publishes_typed_backend_recovery_and_status_invalidation",
-        ) {
+        ) else {
             return;
-        }
+        };
         use tauri::Listener;
         let (base_url, update_server) = spawn_update_server("test");
         let app = updater_test_app(format!("{base_url}/latest.json"));
@@ -1687,6 +1687,7 @@ mod tests {
             .stop(BackendShutdownConfig::default())
             .await
             .expect("cleanup");
+        isolated.complete();
     }
 
     #[test]
@@ -1972,11 +1973,11 @@ mod tests {
 
     #[tokio::test]
     async fn protection_bypass_after_failure_stops_and_restarts_prior_set_on_installer_failure() {
-        if !crate::test_support::scenario_runs_in_this_process(
+        let Some(isolated) = crate::test_support::isolated_scenario(
             "updates::tests::protection_bypass_after_failure_stops_and_restarts_prior_set_on_installer_failure",
-        ) {
+        ) else {
             return;
-        }
+        };
         let (base_url, update_server) = spawn_update_server("test");
         let app = updater_test_app(format!("{base_url}/latest.json"));
         let handle = app.handle();
@@ -2069,6 +2070,7 @@ mod tests {
             .stop(BackendShutdownConfig::default())
             .await
             .expect("restarted primary should stop");
+        isolated.complete();
     }
 
     fn test_backend_config() -> BackendRunConfig {

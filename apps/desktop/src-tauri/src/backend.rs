@@ -4287,11 +4287,11 @@ exit /b 9
 
     #[tokio::test]
     async fn failed_update_recovery_retains_and_retries_primary() {
-        if !crate::test_support::scenario_runs_in_this_process(
+        let Some(isolated) = crate::test_support::isolated_scenario(
             "backend::tests::failed_update_recovery_retains_and_retries_primary",
-        ) {
+        ) else {
             return;
-        }
+        };
         let root = tempfile::tempdir().expect("isolated backend data");
         let port = free_test_port();
         let supervisor = BackendSupervisor::new();
@@ -4357,15 +4357,16 @@ exit /b 9
             .stop(BackendShutdownConfig::default())
             .await
             .expect("cleanup");
+        isolated.complete();
     }
 
     #[tokio::test]
     async fn failed_update_recovery_can_restart_through_exposure() {
-        if !crate::test_support::scenario_runs_in_this_process(
+        let Some(isolated) = crate::test_support::isolated_scenario(
             "backend::tests::failed_update_recovery_can_restart_through_exposure",
-        ) {
+        ) else {
             return;
-        }
+        };
         use crate::config::IsolatedTestDataRoot;
         use tauri::test::{mock_builder, mock_context, noop_assets};
         let root = tempfile::tempdir().expect("isolated backend data");
@@ -4409,6 +4410,7 @@ exit /b 9
             .stop(BackendShutdownConfig::default())
             .await
             .expect("cleanup");
+        isolated.complete();
     }
 
     #[tokio::test]

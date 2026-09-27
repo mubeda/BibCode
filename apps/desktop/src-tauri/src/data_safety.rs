@@ -911,11 +911,11 @@ mod tests {
     #[tokio::test]
     async fn native_start_empty_stops_preserves_commits_and_restarts_the_same_target() {
         // Restarts a backend on the port it has just released.
-        if !crate::test_support::scenario_runs_in_this_process(
+        let Some(isolated) = crate::test_support::isolated_scenario(
             "data_safety::tests::native_start_empty_stops_preserves_commits_and_restarts_the_same_target",
-        ) {
+        ) else {
             return;
-        }
+        };
         let root = tempfile::tempdir().expect("native project-data root");
         let supervisor = BackendSupervisor::new();
         supervisor
@@ -951,6 +951,7 @@ mod tests {
             .stop(BackendShutdownConfig::default())
             .await
             .expect("native backend should stop");
+        isolated.complete();
     }
 
     #[tokio::test]
@@ -987,11 +988,11 @@ mod tests {
     #[tokio::test]
     async fn committed_recovery_restarts_a_previously_failed_registered_target() {
         // Restarts a backend on the port it has just released.
-        if !crate::test_support::scenario_runs_in_this_process(
+        let Some(isolated) = crate::test_support::isolated_scenario(
             "data_safety::tests::committed_recovery_restarts_a_previously_failed_registered_target",
-        ) {
+        ) else {
             return;
-        }
+        };
         let root = tempfile::tempdir().expect("native project-data root");
         let supervisor = BackendSupervisor::new();
         supervisor
@@ -1031,16 +1032,17 @@ mod tests {
             .stop(BackendShutdownConfig::default())
             .await
             .expect("native backend should stop");
+        isolated.complete();
     }
 
     #[tokio::test]
     async fn retry_starts_the_exact_registered_target_only_when_it_is_stopped() {
         // Restarts a backend on the port it has just released.
-        if !crate::test_support::scenario_runs_in_this_process(
+        let Some(isolated) = crate::test_support::isolated_scenario(
             "data_safety::tests::retry_starts_the_exact_registered_target_only_when_it_is_stopped",
-        ) {
+        ) else {
             return;
-        }
+        };
         let root = tempfile::tempdir().expect("native project-data root");
         let supervisor = BackendSupervisor::new();
         supervisor
@@ -1075,16 +1077,17 @@ mod tests {
             .stop(BackendShutdownConfig::default())
             .await
             .expect("native backend should stop");
+        isolated.complete();
     }
 
     #[tokio::test]
     async fn recovery_stops_only_the_selected_environment() {
         // Restarts a backend on the port it has just released.
-        if !crate::test_support::scenario_runs_in_this_process(
+        let Some(isolated) = crate::test_support::isolated_scenario(
             "data_safety::tests::recovery_stops_only_the_selected_environment",
-        ) {
+        ) else {
             return;
-        }
+        };
         let primary_root = tempfile::tempdir().expect("primary project-data root");
         let secondary_root = tempfile::tempdir().expect("secondary project-data root");
         let supervisor = BackendSupervisor::new();
@@ -1133,5 +1136,6 @@ mod tests {
             .stop(BackendShutdownConfig::default())
             .await
             .expect("backends should stop");
+        isolated.complete();
     }
 }
