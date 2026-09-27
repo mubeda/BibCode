@@ -1,13 +1,12 @@
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tokio::sync::Notify;
 
 // Share the server's re-execution harness.
-#[cfg(target_os = "linux")]
 #[path = "../../../server/tests/support/reexec.rs"]
-mod reexec;
+pub(crate) mod reexec;
 
 #[cfg(target_os = "linux")]
 fn appimage_test_child(test_name: &str) -> Option<reexec::ChildPhase> {
@@ -111,41 +110,41 @@ pub(crate) fn write_executable_fixture(path: &std::path::Path, contents: &str, m
 /// Any socket another process binds there in between makes the restart fail
 /// ("Address already in use"): with port 0 the port came from the kernel's
 /// ephemeral range, and portpicker's 15000-25000 is where this suite's own
-/// fixtures bind. A random free port from 25000-32767 sits below the ephemeral
-/// ranges (32768 on Linux, 49152 on macOS and Windows) and above portpicker.
+/// fixtures bind. Walking 25000-32767 from a per-process offset stays below
+/// the ephemeral ranges (32768 on Linux, 49152 on macOS and Windows) and above
+/// portpicker. Each probe claims a candidate from a process-wide cursor,
+/// offset by the process id. A port probed once in this process is not probed
+/// again until the cursor wraps. Each call tries at most PORT_COUNT candidates.
 pub(crate) fn free_test_port() -> u16 {
-    (0..64)
-        .map(|_| 25_000 + (uuid::Uuid::new_v4().as_u128() % 7_768) as u16)
+    const PORT_COUNT: u32 = 7_768;
+    static NEXT_OFFSET: AtomicU32 = AtomicU32::new(0);
+
+    let process_offset = std::process::id() % PORT_COUNT;
+    (0..PORT_COUNT)
+        .map(|_| {
+            let offset = NEXT_OFFSET.fetch_add(1, Ordering::Relaxed) % PORT_COUNT;
+            25_000 + ((process_offset + offset) % PORT_COUNT) as u16
+        })
         .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
         .expect("a free port from 25000-32767")
 }
 
 /// Runs test `name` again in a process of its own, where no other test runs,
-/// and returns false once it passed there; returns true in that process, which
-/// then runs the scenario itself. `name` is the test's full path, as
-/// `cargo test` prints it.
+/// and returns `None` once it proved entry and completion there. In that child,
+/// returns a phase the caller must complete after running the scenario and its
+/// assertions. `name` is the test's full path, as `cargo test` prints it.
 ///
 /// For tests that restart a backend on the port it has just released. In the
 /// shared test process other tests fork children, and a child keeps a copy of
 /// every open socket until it `exec`s, the old listener included; a restart in
 /// that window fails with "Address already in use".
-pub(crate) fn scenario_runs_in_this_process(name: &str) -> bool {
-    const ISOLATED: &str = "BIBCODE_DESKTOP_ISOLATED_TEST";
-    if std::env::var_os(ISOLATED).is_some() {
-        return true;
+pub(crate) fn isolated_scenario(name: &str) -> Option<reexec::ChildPhase> {
+    const PHASE: &str = "desktop-isolated-scenario";
+    if let Some(child) = reexec::enter(name, PHASE) {
+        return Some(child);
     }
-    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([name, "--exact", "--test-threads=1", "--nocapture"])
-        .env(ISOLATED, name)
-        .output()
-        .expect("run the scenario in its own process");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("test result: ok. 1 passed"),
-        "{name} did not pass in its own process:\n{stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    false
+    reexec::run(name, PHASE, None, |_| {});
+    None
 }
 
 #[derive(Debug, Default)]
@@ -190,6 +189,41 @@ impl FixtureEvent {
 #[cfg(test)]
 mod tests {
     use super::FixtureEvent;
+
+    #[test]
+    fn free_test_port_does_not_repeat_after_skipping_a_busy_port() {
+        let Some(child) = super::isolated_scenario(
+            "test_support::tests::free_test_port_does_not_repeat_after_skipping_a_busy_port",
+        ) else {
+            return;
+        };
+
+        // The isolated process starts with a fresh cursor. Keep its first
+        // candidate busy, but leave both returned ports unbound.
+        let first_candidate = 25_000 + (std::process::id() % 7_768) as u16;
+        let _occupied = match std::net::TcpListener::bind(("127.0.0.1", first_candidate)) {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+            Err(error) => panic!("bind the first candidate: {error}"),
+        };
+
+        let first = super::free_test_port();
+        let second = super::free_test_port();
+
+        assert!((25_000..=32_767).contains(&first));
+        assert!((25_000..=32_767).contains(&second));
+        assert_ne!(first, second);
+        child.complete();
+    }
+
+    #[test]
+    #[should_panic(expected = "isolated test must record entered")]
+    fn isolated_scenario_rejects_a_child_that_never_entered() {
+        // This test passes without entering an isolated scenario. Its successful
+        // libtest result alone must not count as proof that the scenario ran.
+        let _ =
+            super::isolated_scenario("test_support::tests::publication_before_wait_is_observed");
+    }
 
     #[tokio::test]
     async fn publication_before_wait_is_observed() {

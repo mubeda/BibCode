@@ -277,39 +277,44 @@ impl Harness {
     }
 
     fn tunnel_pids(&self) -> Vec<u32> {
-        fs::read_to_string(self.state.join("tunnels.jsonl"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter_map(|record| record["pid"].as_u64())
-            .filter_map(|pid| u32::try_from(pid).ok())
-            .collect()
+        self.json_pids_in("tunnels.jsonl")
     }
 
     fn remote_home(&self) -> PathBuf {
         self.state.join("remote-home")
     }
 
-    fn pids_in(&self, file: &str, field: Option<&str>) -> Vec<u32> {
+    fn lines_in(&self, file: &str) -> Vec<String> {
         fs::read_to_string(self.state.join(file))
             .unwrap_or_default()
             .lines()
-            .filter_map(|line| match field {
-                Some(field) => serde_json::from_str::<Value>(line).ok()?[field].as_u64(),
-                None => line.trim().parse::<u64>().ok(),
-            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn pid_lines_in(&self, file: &str) -> Vec<u32> {
+        self.lines_in(file)
+            .into_iter()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    }
+
+    fn json_pids_in(&self, file: &str) -> Vec<u32> {
+        self.lines_in(file)
+            .into_iter()
+            .filter_map(|line| serde_json::from_str::<Value>(&line).ok()?["pid"].as_u64())
             .filter_map(|pid| u32::try_from(pid).ok())
             .collect()
     }
 
     /// Pids of every hung remote `bibcode pairing` stand-in (`sleep 600`).
     fn hang_pids(&self) -> Vec<u32> {
-        self.pids_in("hang.pid", None)
+        self.pid_lines_in("hang.pid")
     }
 
     /// Pids of the sshd-like remote sessions the fake started.
     fn remote_session_pids(&self) -> Vec<u32> {
-        self.pids_in("remote-sessions.jsonl", Some("pid"))
+        self.json_pids_in("remote-sessions.jsonl")
     }
 
     /// Pids of the managed remote servers, from the launch script's pid files.

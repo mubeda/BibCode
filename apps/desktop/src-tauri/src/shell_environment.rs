@@ -958,34 +958,33 @@ printf '__BIBCODE_PATH_START__/user/bin:/usr/bin__BIBCODE_PATH_END__'",
     #[cfg(target_os = "macos")]
     #[test]
     fn login_shell_probe_survives_a_controlling_terminal() {
-        const FIXTURE_ENV: &str = "BIBCODE_PATH_CONTROLLING_TERMINAL_FIXTURE";
-        if std::env::var_os(FIXTURE_ENV).is_some() {
+        use crate::test_support::reexec;
+
+        const TEST_NAME: &str =
+            "shell_environment::tests::login_shell_probe_survives_a_controlling_terminal";
+        const PHASE: &str = "controlling-terminal";
+        if let Some(isolated) = reexec::enter(TEST_NAME, PHASE) {
             assert!(
                 probe_shell_path(Path::new("/bin/zsh"), Duration::from_secs(2), 4096,).is_ok(),
                 "interactive login-shell probe should complete while the app owns a controlling terminal"
             );
+            isolated.complete();
             return;
         }
 
         let executable = std::env::current_exe().expect("test executable should resolve");
         let zsh_config = tempfile::TempDir::new().expect("isolated zsh config should be created");
-        let status = Command::new("/usr/bin/script")
-            .args(["-q", "/dev/null"])
-            .arg(executable)
-            .args([
-                "--exact",
-                "shell_environment::tests::login_shell_probe_survives_a_controlling_terminal",
-                "--nocapture",
-            ])
-            .env(FIXTURE_ENV, "1")
-            .env("ZDOTDIR", zsh_config.path())
-            .status()
-            .expect("controlling-terminal fixture should launch");
-
-        assert!(
-            status.success(),
-            "controlling-terminal probe failed: {status}"
+        let wrapper = zsh_config.path().join("controlling-terminal");
+        crate::test_support::write_executable_fixture(
+            &wrapper,
+            "#!/bin/sh\nexec /usr/bin/script -q /dev/null \"$BIBCODE_TEST_EXECUTABLE\" \"$@\"\n",
+            0o755,
         );
+        reexec::run(TEST_NAME, PHASE, Some(&wrapper), |command| {
+            command
+                .env("BIBCODE_TEST_EXECUTABLE", executable)
+                .env("ZDOTDIR", zsh_config.path());
+        });
     }
 
     #[cfg(unix)]

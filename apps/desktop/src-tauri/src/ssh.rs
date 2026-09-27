@@ -78,6 +78,20 @@ const SSH_STOP_DEADLINE: Duration = Duration::from_secs(30);
 /// only failure a user sees.
 const SSH_PAIRING_WATCHDOG_MARGIN: Duration = Duration::from_secs(5);
 
+/// Script identity prefix, also used by test fixtures.
+macro_rules! remote_script_header_prefix {
+    () => {
+        "# bibcode-ssh:"
+    };
+}
+
+/// Full first-line script identity.
+macro_rules! remote_script_header {
+    ($kind:literal) => {
+        concat!(remote_script_header_prefix!(), $kind, "\n")
+    };
+}
+
 /// Shell helpers shared by every remote script. `wait_while SECONDS CMD…`
 /// polls every 0.2 s while CMD succeeds and fails if it still succeeds after
 /// SECONDS: the one wait loop the scripts use. `pid_running PID` is
@@ -199,7 +213,7 @@ write_state_file() {
 /// the bound it sends TERM, then KILL 2 s later, and exits 124. Otherwise it
 /// passes the command's output and status through.
 pub const REMOTE_PAIRING_SCRIPT: &str = concat!(
-    "# bibcode-ssh:pairing\n",
+    remote_script_header!("pairing"),
     "set -eu\n",
     remote_wait_functions!(),
     remote_run_bounded_function!(),
@@ -240,7 +254,7 @@ exit 1
 /// SIGPIPE is ignored and every report is allowed to fail, because the channel
 /// may already be closed when the script reaches it.
 const REMOTE_LAUNCH_SCRIPT: &str = concat!(
-    "# bibcode-ssh:launch\n",
+    remote_script_header!("launch"),
     "set -eu\n",
     "trap '' PIPE\n",
     remote_wait_functions!(),
@@ -373,7 +387,7 @@ printf '{"remotePort":%s,"serverKind":"managed"}\n' "$REMOTE_PORT" || true
 /// It still honours an `external` marker, which older host state may hold;
 /// no current script writes one.
 const REMOTE_STOP_SCRIPT: &str = concat!(
-    "# bibcode-ssh:stop\n",
+    remote_script_header!("stop"),
     "set -eu\n",
     "trap '' PIPE\n",
     remote_wait_functions!(),
@@ -4299,7 +4313,7 @@ mod tests {
         ] {
             assert_eq!(
                 script.lines().next(),
-                Some(format!("# bibcode-ssh:{kind}").as_str())
+                Some(format!("{}{kind}", remote_script_header_prefix!()).as_str())
             );
             assert_eq!(script.lines().nth(1), Some("set -eu"), "{kind}");
         }
@@ -6173,7 +6187,11 @@ printf '{"credential":"fixture-credential-%s"}\n' "$count"
         let manager = fake.manager(SshOperationDeadlines::default());
         // More than a pipe buffer holds, so the write cannot finish before
         // ssh exits.
-        let script = format!("# bibcode-ssh:pairing\n#{}\n", "x".repeat(256 * 1024));
+        let script = format!(
+            "{}#{}\n",
+            remote_script_header!("pairing"),
+            "x".repeat(256 * 1024)
+        );
 
         let error = run_remote_ssh_script(
             &manager
@@ -6345,7 +6363,8 @@ printf '{"credential":"fixture-credential-%s"}\n' "$count"
     /// `$dir/gate`; a stop answers at once; a `-N` tunnel answers every
     /// request on its forwarded local port with `200 {}`.
     #[cfg(unix)]
-    const GATED_LAUNCH_AND_SERVING_TUNNEL: &str = r##"if [ -z "$*" ]; then
+    const GATED_LAUNCH_AND_SERVING_TUNNEL: &str = concat!(
+        r##"if [ -z "$*" ]; then
   printf 'tunnel\n' >>"$dir/kinds.log"
   exec python3 -c 'import http.server, sys
 class H(http.server.BaseHTTPRequestHandler):
@@ -6360,12 +6379,16 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()' "${f
 fi
 script=$(cat)
 case "$script" in
-  "# bibcode-ssh:launch"*)
+  ""##,
+        remote_script_header_prefix!(),
+        r##"launch"*)
     printf 'launch\n' >>"$dir/kinds.log"
     while [ ! -e "$dir/gate" ]; do sleep 0.05; done
     printf '{"remotePort":4000,"serverKind":"managed"}\n'
     ;;
-  "# bibcode-ssh:stop"*)
+  ""##,
+        remote_script_header_prefix!(),
+        r##"stop"*)
     printf 'stop\n' >>"$dir/kinds.log"
     printf '{"stopped":true}\n'
     ;;
@@ -6374,7 +6397,8 @@ case "$script" in
     exit 1
     ;;
 esac
-"##;
+"##
+    );
 
     #[cfg(unix)]
     fn cached_http_base_url(manager: &SshEnvironmentManager, key: &str) -> Option<String> {
@@ -6616,7 +6640,8 @@ exit 0
     /// older ControlPersist master can. `@@FAILING@@` selects the step
     /// (`tunnel` or `launch`); the other steps succeed.
     #[cfg(unix)]
-    const FAILS_WITH_HELD_PIPES: &str = r##"hold_pipes_and_fail() {
+    const FAILS_WITH_HELD_PIPES: &str = concat!(
+        r##"hold_pipes_and_fail() {
   # The helper leads its own process group so cleanup can kill all of it.
   python3 -c 'import os; os.setpgid(0, 0); os.execvp("sleep", ["sleep", "600"])' &
   printf '%s\n' "$!" >>"$dir/background.pids"
@@ -6629,14 +6654,19 @@ if [ -z "$*" ]; then
 fi
 script=$(cat)
 case "$script" in
-  "# bibcode-ssh:launch"*)
+  ""##,
+        remote_script_header_prefix!(),
+        r##"launch"*)
     [ '@@FAILING@@' = launch ] && hold_pipes_and_fail launch
     printf '{"remotePort":4000,"serverKind":"managed"}\n'
     ;;
-  "# bibcode-ssh:stop"*) printf '{"stopped":true}\n' ;;
+  ""##,
+        remote_script_header_prefix!(),
+        r##"stop"*) printf '{"stopped":true}\n' ;;
   *) exit 1 ;;
 esac
-"##;
+"##
+    );
 
     /// Kills the backgrounded fixture processes a fake recorded in
     /// `background.pids`, even when the test panics. Only a pid whose command
