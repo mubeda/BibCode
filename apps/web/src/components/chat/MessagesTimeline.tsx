@@ -1,8 +1,9 @@
 import { QueuedMessageTimelineRow } from "./QueuedMessageTimelineRow";
-import type { QueuedCardStatus } from "../ChatView.logic";
+import { deliveryProviderLabel, waitsBehind, type QueuedCardStatus } from "../ChatView.logic";
 import {
   type EnvironmentId,
   type MessageId,
+  type ProviderInstanceId,
   type ScopedThreadRef,
   type ServerProviderSkill,
   type TurnId,
@@ -137,6 +138,10 @@ interface TimelineRowSharedState {
   onRevertUserMessage: (messageId: MessageId) => void;
   onResolveTurnDelivery: (messageId: MessageId, action: TurnDeliveryResolutionAction) => void;
   resolvingTurnDeliveryMessageId: MessageId | null;
+  blockingDelivery:
+    | (Pick<TimelineMessage, "id" | "createdAt"> & { readonly offersRetry: boolean })
+    | null;
+  instanceLabels: ReadonlyMap<ProviderInstanceId, string>;
   onSteerQueuedMessage: (messageId: MessageId) => void;
   onSendNowQueuedMessage: (messageId: MessageId) => void;
   onCancelQueuedMessage: (messageId: MessageId) => void;
@@ -181,6 +186,8 @@ interface MessagesTimelineProps {
   onRevertUserMessage: (messageId: MessageId) => void;
   onResolveTurnDelivery: (messageId: MessageId, action: TurnDeliveryResolutionAction) => void;
   resolvingTurnDeliveryMessageId: MessageId | null;
+  blockingDelivery: TimelineRowSharedState["blockingDelivery"];
+  instanceLabels: ReadonlyMap<ProviderInstanceId, string>;
   onSteerQueuedMessage: (messageId: MessageId) => void;
   onSendNowQueuedMessage: (messageId: MessageId) => void;
   onCancelQueuedMessage: (messageId: MessageId) => void;
@@ -223,6 +230,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onRevertUserMessage,
   onResolveTurnDelivery,
   resolvingTurnDeliveryMessageId,
+  blockingDelivery,
+  instanceLabels,
   onSteerQueuedMessage,
   onSendNowQueuedMessage,
   onCancelQueuedMessage,
@@ -453,6 +462,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onRevertUserMessage,
       onResolveTurnDelivery,
       resolvingTurnDeliveryMessageId,
+      blockingDelivery,
+      instanceLabels,
       onSteerQueuedMessage,
       onSendNowQueuedMessage,
       onCancelQueuedMessage,
@@ -474,6 +485,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onRevertUserMessage,
       onResolveTurnDelivery,
       resolvingTurnDeliveryMessageId,
+      blockingDelivery,
+      instanceLabels,
       onSteerQueuedMessage,
       onSendNowQueuedMessage,
       onCancelQueuedMessage,
@@ -1022,6 +1035,13 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
       {row.message.delivery ? (
         <TurnDeliveryNotice
           delivery={row.message.delivery}
+          providerLabel={deliveryProviderLabel(row.message.delivery, ctx.instanceLabels)}
+          waitingBehind={
+            row.message.delivery.state === "pending" &&
+            waitsBehind(row.message, ctx.blockingDelivery)
+              ? ctx.blockingDelivery
+              : null
+          }
           disabled={ctx.resolvingTurnDeliveryMessageId === row.message.id}
           onRetry={() => ctx.onResolveTurnDelivery(row.message.id, "retry")}
           onDismiss={() => ctx.onResolveTurnDelivery(row.message.id, "dismiss")}

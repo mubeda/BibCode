@@ -21,7 +21,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::orchestration::delivery::{CommandAdmission, TurnDeliveryState, TurnDeliveryTransition};
+use crate::orchestration::delivery::{
+    CommandAdmission, TurnDeliveryFailureReason, TurnDeliveryState, TurnDeliveryTransition,
+};
 use crate::persistence::{
     CheckpointDiffBlob, CommandReceipt, CommitFence, Database, NewOrchestrationEvent,
     OrchestrationEvent, PersistenceError, ProjectionPendingApproval, ProjectionProject,
@@ -1746,6 +1748,7 @@ impl CommandLifetimeGuard {
 
 struct DeliveryTransitionEnvelope {
     transition: TurnDeliveryTransition,
+    reason: Option<TurnDeliveryFailureReason>,
     response: oneshot::Sender<Result<bool, OrchestrationError>>,
 }
 
@@ -2602,6 +2605,15 @@ impl OrchestrationEngine {
         &self,
         transition: TurnDeliveryTransition,
     ) -> Result<bool, OrchestrationError> {
+        self.transition_turn_delivery_with_reason(transition, None)
+            .await
+    }
+
+    pub(crate) async fn transition_turn_delivery_with_reason(
+        &self,
+        transition: TurnDeliveryTransition,
+        reason: Option<TurnDeliveryFailureReason>,
+    ) -> Result<bool, OrchestrationError> {
         if self.shutdown.is_cancelled() {
             return Err(OrchestrationError::Cancelled);
         }
@@ -2610,6 +2622,7 @@ impl OrchestrationEngine {
             .send(WorkerEnvelope::DeliveryTransition(
                 DeliveryTransitionEnvelope {
                     transition,
+                    reason,
                     response,
                 },
             ))
@@ -2741,9 +2754,9 @@ fn spawn_worker(
                             drop(ownership);
                             drop(command_claim);
                         }
-                        WorkerEnvelope::DeliveryTransition(DeliveryTransitionEnvelope { transition, response }) => {
+                        WorkerEnvelope::DeliveryTransition(DeliveryTransitionEnvelope { transition, reason, response }) => {
                             let requeued = transition.next_state == TurnDeliveryState::Queued;
-                            let result = persist_turn_delivery_transition(&repositories, &events, &hooks, transition).await;
+                            let result = persist_turn_delivery_transition(&repositories, &events, &hooks, transition, reason).await;
                             if requeued && matches!(result, Ok(true))
                                 && let Some(wake) = turn_delivery_wake.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
                                 wake.notify_one();
@@ -3016,7 +3029,7 @@ async fn process_envelope(
                 "messageId": turn.message_id,
                 "state": turn_delivery_state_name(turn.state),
                 "provider": turn.provider_kind,
-                "delivery": delivery_value(turn_delivery_state_name(turn.state), &turn.provider_kind, turn.mode.as_str(), false, None),
+                "delivery": delivery_value(turn_delivery_state_name(turn.state), &turn.provider_kind, &turn.provider_instance_id, turn.mode.as_str(), false, None),
                 "detail": null,
                 "updatedAt": turn.created_at,
             }),
@@ -4172,7 +4185,7 @@ async fn plan_command(
                     metadata,
                     json!({"threadId":thread_id, "messageId":message_id, "state":"pending", "provider":row.provider_kind,
                         "mode":"steer", "held":false, "detail":null, "updatedAt":created_at,
-                        "delivery":delivery_value("pending", &row.provider_kind, "steer", false, None)}),
+                        "delivery":delivery_value("pending", &row.provider_kind, &row.provider_instance_id, "steer", false, None)}),
                 ),
             ])
         }
@@ -4259,7 +4272,7 @@ async fn plan_command(
                     command_id,
                     metadata,
                     json!({"threadId":thread_id, "messageId":message_id, "state":"pending", "provider":row.provider_kind, "mode":"start", "held":false, "detail":null, "updatedAt":created_at,
-                        "delivery":delivery_value("pending", &row.provider_kind, "start", false, None)}),
+                        "delivery":delivery_value("pending", &row.provider_kind, &row.provider_instance_id, "start", false, None)}),
                 ),
             ])
         }
@@ -4632,11 +4645,12 @@ fn insert_optional(target: &mut Value, key: &str, value: Option<Value>) {
 fn delivery_value(
     state: &str,
     provider: &str,
+    provider_instance_id: &str,
     mode: &str,
     held: bool,
     detail: Option<&str>,
 ) -> Value {
-    let mut delivery = json!({"state":state, "provider":provider, "mode":mode, "held":held});
+    let mut delivery = json!({"state":state, "provider":provider, "providerInstanceId":provider_instance_id, "mode":mode, "held":held});
     insert_optional(&mut delivery, "detail", detail.map(|value| json!(value)));
     delivery
 }
@@ -4754,14 +4768,14 @@ async fn persist_command(
             }
             if let Some((thread_id, updated_at)) = hold {
                 for delivery_id in hold_queued_provider_turns(&transaction, &thread_id, &updated_at)? {
-                    let (message_id, provider, mode, detail, state) = transaction.query_row(
-                        "SELECT message_id, provider_kind, mode, last_error, state FROM provider_turn_outbox WHERE command_id = ?",
-                        [&delivery_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?)),
+                    let (message_id, provider, mode, detail, state, provider_instance_id) = transaction.query_row(
+                        "SELECT message_id, provider_kind, mode, last_error, state, provider_instance_id FROM provider_turn_outbox WHERE command_id = ?",
+                        [&delivery_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?)),
                     )?;
                     event_list.push(make_event("thread.turn-delivery-updated", "thread", &thread_id, &updated_at, &command_id,
                         json!({"deliveryCommandId":delivery_id}),
                         json!({"threadId":thread_id, "messageId":message_id, "state":state, "provider":provider, "mode":mode, "held":true, "detail":detail, "updatedAt":updated_at,
-                            "delivery":delivery_value(&state, &provider, &mode, true, detail.as_deref())})));
+                            "delivery":delivery_value(&state, &provider, &provider_instance_id, &mode, true, detail.as_deref())})));
                 }
             }
             let mut committed = VecDeque::new();
@@ -4884,6 +4898,7 @@ async fn persist_turn_delivery_transition(
     events: &broadcast::Sender<OrchestrationEvent>,
     hooks: &TestHooks,
     transition: TurnDeliveryTransition,
+    reason: Option<TurnDeliveryFailureReason>,
 ) -> Result<bool, OrchestrationError> {
     hooks.maybe_fail_delivery_transition()?;
     let database = repositories.database().clone();
@@ -4893,12 +4908,12 @@ async fn persist_turn_delivery_transition(
             let transaction = connection.transaction()?;
             let current = transaction
                 .query_row(
-                    "SELECT thread_id, message_id, provider_kind, state, attempts, mode, held FROM provider_turn_outbox WHERE command_id = ?",
+                    "SELECT thread_id, message_id, provider_kind, state, attempts, mode, held, provider_instance_id FROM provider_turn_outbox WHERE command_id = ?",
                     [&transition.command_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, String>(5)?, row.get::<_, bool>(6)?)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, String>(5)?, row.get::<_, bool>(6)?, row.get::<_, String>(7)?)),
                 )
                 .optional()?;
-            let Some((thread_id, message_id, provider, state, attempts, mut mode, held)) = current else {
+            let Some((thread_id, message_id, provider, state, attempts, mut mode, held, provider_instance_id)) = current else {
                 return Ok(None);
             };
             if attempts != transition.expected_attempt
@@ -4910,16 +4925,18 @@ async fn persist_turn_delivery_transition(
                 return Ok(None);
             }
             let next_state = turn_delivery_state_name(transition.next_state);
+            let reason = reason.filter(|_| transition.next_state == TurnDeliveryState::Failed)
+                .map(TurnDeliveryFailureReason::as_str);
             if transition.next_state == TurnDeliveryState::Queued {
                 let Some(row) = crate::persistence::requeue_provider_turn_on(
                     &transaction, &transition.command_id, transition.expected_attempt, &transition.updated_at,
                 )? else { return Ok(None); };
                 mode = row.mode.as_str().to_owned();
-                transaction.execute("UPDATE provider_turn_outbox SET last_error = ? WHERE command_id = ?", params![transition.detail, transition.command_id])?;
+                transaction.execute("UPDATE provider_turn_outbox SET last_error = ?, failure_reason = NULL WHERE command_id = ?", params![transition.detail, transition.command_id])?;
             } else {
                 let updated = transaction.execute(
-                    "UPDATE provider_turn_outbox SET state = ?, last_error = ?, updated_at = ? WHERE command_id = ? AND state = ? AND attempts = ?",
-                    params![next_state, transition.detail, transition.updated_at, transition.command_id, state, transition.expected_attempt],
+                    "UPDATE provider_turn_outbox SET state = ?, last_error = ?, failure_reason = ?, updated_at = ? WHERE command_id = ? AND state = ? AND attempts = ?",
+                    params![next_state, transition.detail, reason, transition.updated_at, transition.command_id, state, transition.expected_attempt],
                 )?;
                 if updated == 0 { return Ok(None); }
             }
@@ -4929,10 +4946,13 @@ async fn persist_turn_delivery_transition(
             let mut payload = json!({
                 "threadId": thread_id, "messageId": message_id, "state": next_state, "provider": provider,
                 "mode":mode, "held":held, "detail":transition.detail,
-                "delivery":delivery_value(next_state, &provider, &mode, held, transition.detail.as_deref()),
+                "delivery":delivery_value(next_state, &provider, &provider_instance_id, &mode, held, transition.detail.as_deref()),
                 "updatedAt":transition.updated_at,
             });
             insert_optional(&mut payload, "turnId", turn_id.map(Value::String));
+            if let Some(reason) = reason {
+                payload["delivery"]["reason"] = json!(reason);
+            }
             let planned = make_event(
                 "thread.turn-delivery-updated", "thread", &thread_id, &transition.updated_at,
                 &format!("server:turn-delivery:{}", transition.command_id), json!({}), payload,
@@ -4988,7 +5008,7 @@ async fn persist_turn_delivery_resolution(
             let transaction = connection.transaction()?;
             let current = transaction
                 .query_row(
-                    "SELECT command_id, provider_kind, state, last_error, mode, held FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ?",
+                    "SELECT command_id, provider_kind, state, last_error, mode, held, provider_instance_id FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ?",
                     params![thread_id, message_id],
                     |row| {
                         Ok((
@@ -4998,11 +5018,12 @@ async fn persist_turn_delivery_resolution(
                             row.get::<_, Option<String>>(3)?,
                             row.get::<_, String>(4)?,
                             row.get::<_, bool>(5)?,
+                            row.get::<_, String>(6)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((delivery_command_id, provider, state, last_error, mode, held)) = current else {
+            let Some((delivery_command_id, provider, state, last_error, mode, held, provider_instance_id)) = current else {
                 return Ok(None);
             };
             let resolvable = match action {
@@ -5029,7 +5050,7 @@ async fn persist_turn_delivery_resolution(
                     "pending",
                     None,
                     transaction.execute(
-                        "UPDATE provider_turn_outbox SET state = 'pending', attempts = 0, last_error = NULL, updated_at = ? WHERE command_id = ? AND state IN ('uncertain', 'failed')",
+                        "UPDATE provider_turn_outbox SET state = 'pending', attempts = 0, last_error = NULL, failure_reason = NULL, updated_at = ? WHERE command_id = ? AND state IN ('uncertain', 'failed')",
                         params![updated_at, delivery_command_id],
                     )?,
                 ),
@@ -5037,7 +5058,7 @@ async fn persist_turn_delivery_resolution(
                     "dismissed",
                     last_error,
                     transaction.execute(
-                        "UPDATE provider_turn_outbox SET state = 'dismissed', updated_at = ? WHERE command_id = ? AND state IN ('pending', 'sending', 'uncertain', 'failed')",
+                        "UPDATE provider_turn_outbox SET state = 'dismissed', failure_reason = NULL, updated_at = ? WHERE command_id = ? AND state IN ('pending', 'sending', 'uncertain', 'failed')",
                         params![updated_at, delivery_command_id],
                     )?,
                 ),
@@ -5052,7 +5073,7 @@ async fn persist_turn_delivery_resolution(
                 "state": next_state,
                 "provider": provider,
                 "detail": detail,
-                "delivery": delivery_value(next_state, &provider, &mode, held, detail.as_deref()),
+                "delivery": delivery_value(next_state, &provider, &provider_instance_id, &mode, held, detail.as_deref()),
                 "updatedAt": updated_at,
             });
             if matches!(action, TurnDeliveryResolutionAction::Cancel) {
@@ -5632,11 +5653,13 @@ fn apply_messages_projector_tx(
             return Ok(());
         }
         transaction.execute(
-            "UPDATE projection_thread_messages SET delivery_state = ?, delivery_provider = ?, delivery_detail = ?, delivery_mode = COALESCE(?, delivery_mode), delivery_held = COALESCE(?, delivery_held), turn_id = COALESCE(?, turn_id), updated_at = ? WHERE message_id = ? AND thread_id = ?",
+            "UPDATE projection_thread_messages SET delivery_state = ?, delivery_provider = ?, delivery_provider_instance_id = COALESCE(?, delivery_provider_instance_id), delivery_detail = ?, delivery_reason = ?, delivery_mode = COALESCE(?, delivery_mode), delivery_held = COALESCE(?, delivery_held), turn_id = COALESCE(?, turn_id), updated_at = ? WHERE message_id = ? AND thread_id = ?",
             params![
                 required_str(payload, "state")?,
                 required_str(payload, "provider")?,
+                optional_string(payload.pointer("/delivery/providerInstanceId")),
                 optional_string(payload.get("detail")),
+                optional_string(payload.pointer("/delivery/reason")),
                 optional_string(payload.pointer("/delivery/mode").or_else(|| payload.get("mode"))),
                 payload.pointer("/delivery/held").or_else(|| payload.get("held")).and_then(Value::as_bool),
                 optional_string(payload.get("turnId")),
@@ -8162,7 +8185,7 @@ mod tests {
         assert_eq!(events[0].event.payload["turnId"], Value::Null);
         assert_eq!(
             events[1].event.payload["delivery"],
-            json!({"state":"queued", "provider":"codex", "mode":"start", "held":false})
+            json!({"state":"queued", "provider":"codex", "providerInstanceId":"codex", "mode":"start", "held":false})
         );
         assert!(
             engine
@@ -8200,6 +8223,98 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// The web's W1 waiting rule relies on equal admission timestamps and promotion
+    /// moving only the projected message's timestamp later, leaving outbox order intact.
+    #[tokio::test]
+    async fn delivery_timestamps_match_at_admission_and_only_message_moves_on_promotion() {
+        const ADMITTED_AT: &str = "2026-08-01T00:00:01Z";
+        const PROMOTED_AT: &str = "2026-08-01T00:00:04Z";
+
+        for queued_admission in [false, true] {
+            let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+            let mut command = delivery_turn("timestamp-command", &thread_id, "next task");
+            if let OrchestrationCommand::ThreadTurnStart { queued, .. } = &mut command {
+                *queued = Some(queued_admission);
+            }
+            let mut admission = delivery_admission(&command, &thread_id);
+            if queued_admission {
+                admission.provider_turn.as_mut().unwrap().state = TurnDeliveryState::Queued;
+            }
+            engine
+                .dispatch_with_admission(command, admission, || {})
+                .await
+                .expect("admission");
+
+            let row = engine
+                .repositories()
+                .get_provider_turn_delivery("timestamp-command".into())
+                .await
+                .unwrap()
+                .unwrap();
+            let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+            let message = snapshot
+                .messages
+                .iter()
+                .find(|message| message.message_id == "delivery-message")
+                .unwrap();
+            assert_eq!(row.created_at, ADMITTED_AT);
+            assert_eq!(row.created_at, message.created_at);
+            assert_eq!(
+                row.state,
+                if queued_admission {
+                    TurnDeliveryState::Queued
+                } else {
+                    TurnDeliveryState::Pending
+                }
+            );
+
+            if queued_admission {
+                engine
+                    .dispatch(
+                        serde_json::from_value(json!({
+                            "type":"thread.session.set", "commandId":"session", "threadId":thread_id,
+                            "session":{"threadId":thread_id, "status":"ready", "providerName":"codex",
+                                "providerInstanceId":"codex", "runtimeMode":"full-access",
+                                "activeTurnId":null, "lastError":null, "updatedAt":"2026-08-01T00:00:03Z"},
+                            "createdAt":"2026-08-01T00:00:03Z"
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .expect("session ready for promotion");
+                engine
+                    .dispatch(
+                        serde_json::from_value(json!({
+                            "type":"thread.turn.promote", "commandId":"promote",
+                            "threadId":thread_id, "messageId":"delivery-message",
+                            "createdAt":PROMOTED_AT
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .expect("promotion");
+
+                let promoted_row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("timestamp-command".into())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+                let promoted_message = snapshot
+                    .messages
+                    .iter()
+                    .find(|message| message.message_id == "delivery-message")
+                    .unwrap();
+                assert_eq!(promoted_row.state, TurnDeliveryState::Pending);
+                assert_eq!(promoted_row.created_at, row.created_at);
+                assert_eq!(promoted_message.created_at, PROMOTED_AT);
+                assert!(promoted_message.created_at.as_str() > ADMITTED_AT);
+            }
+            engine.shutdown().await;
+        }
+    }
+
     fn delivery_resolution(
         command_id: &str,
         thread_id: &str,
@@ -8216,6 +8331,124 @@ mod tests {
             "createdAt":created_at,
         }))
         .expect("delivery resolution command")
+    }
+
+    #[tokio::test]
+    async fn delivery_provider_instance_survives_queue_actions_and_legacy_replay() {
+        for (action, status) in [("promote", "ready"), ("steer", "running")] {
+            let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+            let mut command = delivery_turn("instance-command", &thread_id, "next task");
+            if let OrchestrationCommand::ThreadTurnStart {
+                queued,
+                model_selection,
+                ..
+            } = &mut command
+            {
+                *queued = Some(true);
+                *model_selection = Some(json!({"instanceId":"codex-personal", "model":"gpt-5"}));
+            }
+            let mut admission = delivery_admission(&command, &thread_id);
+            let delivery = admission.provider_turn.as_mut().unwrap();
+            delivery.state = TurnDeliveryState::Queued;
+            delivery.provider_instance_id = "codex-personal".to_owned();
+            engine
+                .dispatch_with_admission(command, admission, || {})
+                .await
+                .expect("queued admission");
+            engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.turn.interrupt", "commandId":"hold", "threadId":thread_id,
+                        "createdAt":"2026-08-01T00:00:02Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .expect("hold queued delivery");
+            engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.session.set", "commandId":"session", "threadId":thread_id,
+                        "session":{"threadId":thread_id, "status":status, "providerName":"codex",
+                            "providerInstanceId":"codex-personal", "runtimeMode":"full-access",
+                            "activeTurnId":if status == "running" { Some("turn-1") } else { None },
+                            "lastError":null, "updatedAt":"2026-08-01T00:00:03Z"},
+                        "createdAt":"2026-08-01T00:00:03Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .expect("session ready for queue action");
+            engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":format!("thread.turn.{action}"), "commandId":"queue-action",
+                        "threadId":thread_id, "messageId":"delivery-message",
+                        "createdAt":"2026-08-01T00:00:04Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .expect("queue action");
+
+            let deliveries = engine
+                .read_events(0)
+                .await
+                .expect("events")
+                .into_iter()
+                .filter(|event| event.event.event_type == "thread.turn-delivery-updated")
+                .collect::<Vec<_>>();
+            assert_eq!(deliveries.len(), 3, "admission, hold, and {action}");
+            for event in &deliveries {
+                assert_eq!(
+                    event.event.payload["delivery"]["providerInstanceId"],
+                    "codex-personal"
+                );
+                assert!(event.event.payload.get("providerInstanceId").is_none());
+            }
+            assert_eq!(deliveries[1].event.payload["delivery"]["held"], true);
+
+            // Replaying a later event from an older server must not erase the instance.
+            let mut legacy = deliveries.last().unwrap().event.clone();
+            legacy.event_id = Uuid::new_v4().to_string();
+            legacy.payload["delivery"]
+                .as_object_mut()
+                .unwrap()
+                .remove("providerInstanceId");
+            engine
+                .repositories()
+                .append_event(legacy)
+                .await
+                .expect("legacy event");
+            for rebuild in [false, true] {
+                if rebuild {
+                    engine.repositories().database().call(|connection| {
+                        connection.execute("DELETE FROM projection_thread_messages", [])?;
+                        connection.execute("DELETE FROM projection_state WHERE projector = 'projection.thread-messages'", [])?;
+                        Ok(())
+                    }).await.expect("reset message projection");
+                }
+                bootstrap_projectors(&engine.repositories(), &TestHooks::default())
+                    .await
+                    .expect("replay messages");
+                let message = engine
+                    .repositories()
+                    .get_message("delivery-message".to_owned())
+                    .await
+                    .expect("message lookup")
+                    .expect("message");
+                assert_eq!(
+                    message.delivery_provider_instance_id.as_deref(),
+                    Some("codex-personal")
+                );
+                assert_eq!(message.delivery_state.as_deref(), Some("pending"));
+                assert_eq!(
+                    message.delivery_mode.as_deref(),
+                    Some(if action == "steer" { "steer" } else { "start" })
+                );
+            }
+            engine.shutdown().await;
+        }
     }
 
     async fn admit_delivery(
@@ -8494,6 +8727,130 @@ mod tests {
             .expect("projected thread");
         assert_eq!(cleared.unresolved_delivery_state, None);
         assert_eq!(cleared.unresolved_delivery_detail, None);
+    }
+
+    async fn assert_delivery_reason(engine: &OrchestrationEngine, expected: Option<&str>) {
+        let reason = engine.repositories().database().call(|connection| {
+            Ok(connection.query_row(
+                "SELECT failure_reason FROM provider_turn_outbox WHERE command_id = 'reason-command'",
+                [], |row| row.get::<_, Option<String>>(0),
+            )?)
+        }).await.expect("outbox reason");
+        assert_eq!(reason.as_deref(), expected);
+        let message = engine
+            .repositories()
+            .get_message("reason-message".to_owned())
+            .await
+            .expect("message lookup")
+            .expect("message");
+        assert_eq!(message.delivery_reason.as_deref(), expected);
+        let events = engine.read_events(0).await.expect("events");
+        let event = events
+            .iter()
+            .rev()
+            .find(|event| event.event.event_type == "thread.turn-delivery-updated")
+            .expect("delivery event");
+        assert_eq!(
+            event.event.payload["delivery"].get("reason"),
+            expected.map(|value| json!(value)).as_ref()
+        );
+        assert_eq!(
+            event.event.payload["delivery"]["providerInstanceId"],
+            "codex"
+        );
+        assert!(event.event.payload.get("providerInstanceId").is_none());
+        assert_eq!(
+            message.delivery_provider_instance_id.as_deref(),
+            Some("codex")
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_failure_reason_replays_and_clears_on_retry_or_dismiss() {
+        use crate::orchestration::delivery::TurnDeliveryFailureReason;
+
+        for action in ["retry", "dismiss"] {
+            let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+            admit_delivery(
+                &engine,
+                "reason-command",
+                &thread_id,
+                "reason-message",
+                "2026-08-01T00:00:01Z",
+            )
+            .await;
+            assert_delivery_reason(&engine, None).await;
+            assert!(
+                engine
+                    .transition_turn_delivery_with_reason(
+                        TurnDeliveryTransition {
+                            turn_id: None,
+                            command_id: "reason-command".to_owned(),
+                            expected_states: vec![TurnDeliveryState::Pending],
+                            expected_attempt: 0,
+                            next_state: TurnDeliveryState::Failed,
+                            detail: Some("model refused".to_owned()),
+                            updated_at: "2026-08-01T00:00:02Z".to_owned(),
+                        },
+                        Some(TurnDeliveryFailureReason::ModelSelectionRefused)
+                    )
+                    .await
+                    .expect("refusal")
+            );
+            assert_delivery_reason(&engine, Some("modelSelectionRefused")).await;
+
+            engine.repositories().database().call(|connection| {
+                connection.execute("DELETE FROM projection_thread_messages", [])?;
+                connection.execute("DELETE FROM projection_state WHERE projector = 'projection.thread-messages'", [])?;
+                Ok(())
+            }).await.expect("reset message projection");
+            bootstrap_projectors(&engine.repositories(), &TestHooks::default())
+                .await
+                .expect("replay messages");
+            assert_delivery_reason(&engine, Some("modelSelectionRefused")).await;
+
+            engine
+                .dispatch(delivery_resolution(
+                    "resolve-reason",
+                    &thread_id,
+                    "reason-message",
+                    action,
+                    "2026-08-01T00:00:03Z",
+                ))
+                .await
+                .expect("resolve refusal");
+            assert_delivery_reason(&engine, None).await;
+            if action == "retry" {
+                let claimed = engine
+                    .repositories()
+                    .claim_provider_turn(
+                        "reason-command".to_owned(),
+                        "2026-08-01T00:00:04Z".to_owned(),
+                    )
+                    .await
+                    .expect("claim retried delivery")
+                    .expect("claimed");
+                assert!(
+                    engine
+                        .transition_turn_delivery_with_reason(
+                            TurnDeliveryTransition {
+                                turn_id: None,
+                                command_id: claimed.command_id,
+                                expected_states: vec![TurnDeliveryState::Sending],
+                                expected_attempt: claimed.attempts,
+                                next_state: TurnDeliveryState::Delivered,
+                                detail: None,
+                                updated_at: "2026-08-01T00:00:05Z".to_owned(),
+                            },
+                            Some(TurnDeliveryFailureReason::ModelSelectionRefused)
+                        )
+                        .await
+                        .expect("delivered ignores reason")
+                );
+                assert_delivery_reason(&engine, None).await;
+            }
+            engine.shutdown().await;
+        }
     }
 
     #[tokio::test]

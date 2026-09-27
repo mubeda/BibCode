@@ -259,6 +259,9 @@ pub enum ProviderDeliveryOutcome {
     DefinitelyNotSent { detail: String },
     Ambiguous { detail: String },
     Rejected { detail: String },
+    // A deterministic refusal of the turn's own model or options (`InvalidOption`),
+    // refused again on every unchanged attempt.
+    Refused { detail: String },
 }
 
 /// What a steer shows when the turn it was steering is no longer running.
@@ -1522,9 +1525,7 @@ async fn deliver_orchestration_turn_with_identity(
             match retry {
                 Ok(handle) => handle,
                 Err(error) if is_frozen => {
-                    return ProviderDeliveryOutcome::Rejected {
-                        detail: delivery_detail(&error, Some(&label)),
-                    };
+                    return frozen_failure_outcome(&error, Some(&label));
                 }
                 Err(error) => return delivery_enqueue_failure(&error, Some(&label)),
             }
@@ -1533,9 +1534,7 @@ async fn deliver_orchestration_turn_with_identity(
             let label =
                 frozen_delivery_label(settings_root, frozen_delivery.as_ref(), &error).await;
             return if is_frozen {
-                ProviderDeliveryOutcome::Rejected {
-                    detail: delivery_detail(&error, label.as_deref()),
-                }
+                frozen_failure_outcome(&error, label.as_deref())
             } else {
                 delivery_enqueue_failure(&error, label.as_deref())
             };
@@ -1544,14 +1543,67 @@ async fn deliver_orchestration_turn_with_identity(
     handle.completion().await
 }
 
+/// A frozen durable delivery that could not be handed to the provider fails once. A refusal of
+/// the turn's own model or options is `Refused`; every other failure is `Rejected`, with the same
+/// `delivery_detail` text.
+fn frozen_failure_outcome(
+    error: &ProviderRuntimeError,
+    label: Option<&str>,
+) -> ProviderDeliveryOutcome {
+    let detail = delivery_detail(error, label);
+    if matches!(error, ProviderRuntimeError::InvalidOption { .. }) {
+        ProviderDeliveryOutcome::Refused { detail }
+    } else {
+        ProviderDeliveryOutcome::Rejected { detail }
+    }
+}
+
 /// A durable turn is replayed unchanged, so a launch refused for the turn's own options fails the
 /// delivery once. Every other launch failure, such as a spawn error, is retried.
 fn launch_failure_outcome(error: &ProviderRuntimeError, label: &str) -> ProviderDeliveryOutcome {
     let detail = delivery_detail(error, Some(label));
     if matches!(error, ProviderRuntimeError::InvalidOption { .. }) {
-        ProviderDeliveryOutcome::Rejected { detail }
+        ProviderDeliveryOutcome::Refused { detail }
     } else {
         ProviderDeliveryOutcome::DefinitelyNotSent { detail }
+    }
+}
+
+#[cfg(test)]
+mod delivery_failure_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_options_are_refused_with_the_same_delivery_detail() {
+        let error = ProviderRuntimeError::InvalidOption {
+            provider: "codex".to_owned(),
+            detail: "invalid service tier".to_owned(),
+            refusal: "Fast Mode is not supported by the selected model.".to_owned(),
+        };
+        let expected = ProviderDeliveryOutcome::Refused {
+            detail: delivery_detail(&error, Some("Work Codex")),
+        };
+        assert_eq!(frozen_failure_outcome(&error, Some("Work Codex")), expected);
+        assert_eq!(launch_failure_outcome(&error, "Work Codex"), expected);
+    }
+
+    #[test]
+    fn other_failures_keep_their_frozen_and_launch_classification() {
+        let error = ProviderRuntimeError::Provider {
+            provider: "codex".to_owned(),
+            detail: "connection closed".to_owned(),
+        };
+        let detail = delivery_detail(&error, Some("Work Codex"));
+        assert_eq!(
+            frozen_failure_outcome(&error, Some("Work Codex")),
+            ProviderDeliveryOutcome::Rejected {
+                detail: detail.clone()
+            },
+        );
+        assert_eq!(
+            launch_failure_outcome(&error, "Work Codex"),
+            ProviderDeliveryOutcome::DefinitelyNotSent { detail },
+        );
     }
 }
 
@@ -11986,7 +12038,7 @@ mod tests {
         );
         assert_eq!(
             super::launch_failure_outcome(&error, "Work Claude"),
-            super::ProviderDeliveryOutcome::Rejected {
+            super::ProviderDeliveryOutcome::Refused {
                 detail: "Fast Mode is not supported by the selected model.".to_owned()
             }
         );

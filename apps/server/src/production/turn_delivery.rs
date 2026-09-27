@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     orchestration::{
-        OrchestrationCommand, OrchestrationEngine, ProviderTurnDelivery, TurnDeliveryMode,
-        TurnDeliveryState, TurnDeliveryTransition, engine::OptionalNullable,
+        OrchestrationCommand, OrchestrationEngine, ProviderTurnDelivery, TurnDeliveryFailureReason,
+        TurnDeliveryMode, TurnDeliveryState, TurnDeliveryTransition, engine::OptionalNullable,
     },
     production::provider_runtime::{
         ProviderDeliveryOutcome, ProviderReconciliationOutcome, ProviderRuntimeError,
@@ -1191,12 +1191,18 @@ async fn deliver_claimed(
         }
         _ => None,
     };
-    let (next_state, detail, task_outcome) = match route_result {
-        ProviderDeliveryOutcome::Rejected { detail } if is_steer => (
-            TurnDeliveryState::Queued,
-            Some(detail),
-            DeliveryTaskOutcome::Finished,
-        ),
+    let (next_state, detail, reason, task_outcome) = match route_result {
+        ProviderDeliveryOutcome::Rejected { detail }
+        | ProviderDeliveryOutcome::Refused { detail }
+            if is_steer =>
+        {
+            (
+                TurnDeliveryState::Queued,
+                Some(detail),
+                None,
+                DeliveryTaskOutcome::Finished,
+            )
+        }
         outcome => provider_delivery_outcome(outcome),
     };
     let transition = TurnDeliveryTransition {
@@ -1208,7 +1214,7 @@ async fn deliver_claimed(
         detail,
         updated_at: now(),
     };
-    persist_delivery_outcome(engine, shutdown, transition)
+    persist_delivery_outcome(engine, shutdown, transition, reason)
         .await
         .map(|()| task_outcome)
 }
@@ -1217,13 +1223,14 @@ async fn persist_delivery_outcome(
     engine: &OrchestrationEngine,
     shutdown: &CancellationToken,
     transition: TurnDeliveryTransition,
+    reason: Option<TurnDeliveryFailureReason>,
 ) -> Result<(), String> {
     let mut transition = transition;
     let mut backoff = RETRY_BACKOFF_MIN;
     loop {
         let result = tokio::select! {
             () = shutdown.cancelled() => return Err("provider delivery transition cancelled".to_owned()),
-            result = engine.transition_turn_delivery(transition.clone()) => result,
+            result = engine.transition_turn_delivery_with_reason(transition.clone(), reason) => result,
         };
         match result {
             Ok(true) => return Ok(()),
@@ -1287,26 +1294,41 @@ fn delivery_outcome(
 
 fn provider_delivery_outcome(
     outcome: ProviderDeliveryOutcome,
-) -> (TurnDeliveryState, Option<String>, DeliveryTaskOutcome) {
+) -> (
+    TurnDeliveryState,
+    Option<String>,
+    Option<TurnDeliveryFailureReason>,
+    DeliveryTaskOutcome,
+) {
     match outcome {
         ProviderDeliveryOutcome::Accepted { .. } => (
             TurnDeliveryState::Delivered,
+            None,
             None,
             DeliveryTaskOutcome::Finished,
         ),
         ProviderDeliveryOutcome::DefinitelyNotSent { detail } => (
             TurnDeliveryState::Pending,
             Some(detail),
+            None,
             DeliveryTaskOutcome::DefinitelyNotSent,
         ),
         ProviderDeliveryOutcome::Ambiguous { detail } => (
             TurnDeliveryState::Uncertain,
             Some(detail),
+            None,
             DeliveryTaskOutcome::Finished,
         ),
         ProviderDeliveryOutcome::Rejected { detail } => (
             TurnDeliveryState::Failed,
             Some(detail),
+            None,
+            DeliveryTaskOutcome::Finished,
+        ),
+        ProviderDeliveryOutcome::Refused { detail } => (
+            TurnDeliveryState::Failed,
+            Some(detail),
+            Some(TurnDeliveryFailureReason::ModelSelectionRefused),
             DeliveryTaskOutcome::Finished,
         ),
     }
@@ -1674,6 +1696,7 @@ mod tests {
             (
                 TurnDeliveryState::Delivered,
                 None,
+                None,
                 DeliveryTaskOutcome::Finished
             )
         );
@@ -1684,6 +1707,7 @@ mod tests {
             (
                 TurnDeliveryState::Pending,
                 Some("not admitted".to_owned()),
+                None,
                 DeliveryTaskOutcome::DefinitelyNotSent
             )
         );
@@ -1697,10 +1721,201 @@ mod tests {
         assert_eq!(
             provider_delivery_outcome(ProviderDeliveryOutcome::Rejected {
                 detail: "invalid request".to_owned(),
-            })
-            .0,
-            TurnDeliveryState::Failed
+            }),
+            (
+                TurnDeliveryState::Failed,
+                Some("invalid request".to_owned()),
+                None,
+                DeliveryTaskOutcome::Finished
+            )
         );
+        assert_eq!(
+            provider_delivery_outcome(ProviderDeliveryOutcome::Refused {
+                detail: "model refused".to_owned(),
+            }),
+            (
+                TurnDeliveryState::Failed,
+                Some("model refused".to_owned()),
+                Some(crate::orchestration::TurnDeliveryFailureReason::ModelSelectionRefused),
+                DeliveryTaskOutcome::Finished
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_delivery_persists_reason_through_transition_retries() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| Ok(run_migrations(connection, None)?))
+            .await
+            .expect("migrations");
+        seed_pending(&database, "refused", "thread", 1).await;
+        database.call(|connection| {
+            connection.execute(
+                "INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES ('message-1', 'thread', 'user', 'refused', 0, 'created', 'created')", [],
+            )?;
+            Ok(())
+        }).await.expect("message projection");
+        let hooks = TestHooks::default();
+        hooks.fail_next_delivery_transitions(2);
+        let engine = OrchestrationEngine::start(
+            database.clone(),
+            EngineOptions {
+                test_hooks: hooks.clone(),
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router: ProviderDeliveryRouter = Arc::new({
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderDeliveryOutcome::Refused {
+                    detail: "model refused".to_owned(),
+                }))
+            }
+        });
+        let service = TurnDeliveryService::start_with_delivery_router(
+            engine.clone(),
+            1,
+            router,
+            Arc::new(|_| Box::pin(ready(ProviderReconciliationOutcome::Absent))),
+        );
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("refused".to_owned())
+                    .await
+                    .expect("outbox")
+                    .expect("delivery");
+                if row.state == TurnDeliveryState::Failed {
+                    assert_eq!(row.attempts, 1);
+                    assert_eq!(row.last_error.as_deref(), Some("model refused"));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refusal persisted");
+        let reason = database
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT failure_reason FROM provider_turn_outbox WHERE command_id = 'refused'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )?)
+            })
+            .await
+            .expect("outbox reason");
+        assert_eq!(reason.as_deref(), Some("modelSelectionRefused"));
+        let events = engine.read_events(0).await.expect("events");
+        let refused = events
+            .iter()
+            .filter(|event| {
+                event.event.event_type == "thread.turn-delivery-updated"
+                    && event.event.payload["state"] == "failed"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            refused[0].event.payload["delivery"]["reason"],
+            "modelSelectionRefused"
+        );
+        let message = engine
+            .repositories()
+            .get_message("message-1".to_owned())
+            .await
+            .expect("message lookup")
+            .expect("message");
+        assert_eq!(
+            message.delivery_reason.as_deref(),
+            Some("modelSelectionRefused")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hooks.delivery_transition_attempts(), 3);
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn refused_steer_returns_to_queue_without_a_failure_reason() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| Ok(run_migrations(connection, None)?))
+            .await
+            .expect("migrations");
+        seed_delivery(
+            &database,
+            "refused-steer",
+            "thread",
+            1,
+            TurnDeliveryState::Sending,
+            1,
+        )
+        .await;
+        let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+            .await
+            .expect("engine");
+        database.call(|connection| {
+            connection.execute_batch(
+                "UPDATE provider_turn_outbox SET mode = 'steer';
+                 INSERT INTO projection_thread_sessions (thread_id, status, provider_name, active_turn_id, updated_at) VALUES ('thread', 'running', 'codex', 'turn-1', 'updated');
+                 INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+                 VALUES ('steer-event', 'thread', 'thread', 1, 'thread.turn-steer-requested', 'updated', 'server', '{\"threadId\":\"thread\",\"messageId\":\"message-1\",\"turnId\":\"turn-1\"}', '{}');
+                 INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES ('message-1', 'thread', 'user', 'steer', 0, 'created', 'created');",
+            )?;
+            Ok(())
+        }).await.expect("running steer target");
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("refused-steer".to_owned())
+            .await
+            .expect("outbox")
+            .expect("steer");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router: ProviderDeliveryRouter = Arc::new({
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderDeliveryOutcome::Refused {
+                    detail: "model refused".to_owned(),
+                }))
+            }
+        });
+        assert_eq!(
+            deliver_claimed(&engine, &router, row, &CancellationToken::new())
+                .await
+                .expect("requeue"),
+            DeliveryTaskOutcome::Finished
+        );
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("refused-steer".to_owned())
+            .await
+            .expect("outbox")
+            .expect("queued");
+        assert_eq!(row.state, TurnDeliveryState::Queued);
+        assert_eq!(row.mode, TurnDeliveryMode::Start);
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.last_error.as_deref(), Some("model refused"));
+        let reason = database.call(|connection| Ok(connection.query_row(
+            "SELECT failure_reason FROM provider_turn_outbox WHERE command_id = 'refused-steer'", [], |row| row.get::<_, Option<String>>(0),
+        )?)).await.expect("outbox reason");
+        assert_eq!(reason, None);
+        let message = engine
+            .repositories()
+            .get_message("message-1".to_owned())
+            .await
+            .expect("message lookup")
+            .expect("message");
+        assert_eq!(message.delivery_state.as_deref(), Some("queued"));
+        assert_eq!(message.delivery_reason, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -2109,6 +2324,7 @@ mod tests {
                 detail: None,
                 updated_at: now(),
             },
+            None,
         )
         .await
         .expect("accepted outcome is persisted despite the stale expected state");
@@ -2157,6 +2373,7 @@ mod tests {
                 detail: None,
                 updated_at: now(),
             },
+            None,
         )
         .await
         .expect_err("a stale acceptance must not deliver a later attempt");

@@ -3,6 +3,7 @@ import {
   EnvironmentId,
   MessageId,
   ProviderDriverKind,
+  ProviderInstanceId,
   TurnId,
 } from "@bibcode/contracts";
 import { act, createRef, type ComponentProps, type ReactNode, type Ref } from "react";
@@ -210,6 +211,8 @@ function buildProps() {
     onRevertUserMessage: () => {},
     onResolveTurnDelivery: () => {},
     resolvingTurnDeliveryMessageId: null,
+    blockingDelivery: null,
+    instanceLabels: new Map<ProviderInstanceId, string>(),
     queuedMessages: [],
     queuedStatuses: [],
     onSteerQueuedMessage: () => {},
@@ -257,6 +260,92 @@ function buildUserTimelineEntry(text: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it.each([
+    [true, "Waiting for an earlier message. Retry or dismiss it to send this one."],
+    [false, "Waiting for an earlier message. Dismiss it to send this one."],
+  ] as const)(
+    "explains a pending message behind a failure (offersRetry=%s)",
+    async (offersRetry, text) => {
+      const failed = buildUserTimelineEntry("Earlier message");
+      const pending = buildUserTimelineEntry("Later message");
+      const markup = await renderTimeline({
+        blockingDelivery: { ...failed.message, offersRetry },
+        timelineEntries: [
+          {
+            ...failed,
+            message: {
+              ...failed.message,
+              delivery: {
+                state: "failed",
+                provider: ProviderDriverKind.make("codex"),
+                ...(offersRetry ? {} : { reason: "modelSelectionRefused" as const }),
+              },
+            },
+          },
+          {
+            ...pending,
+            id: "pending-entry",
+            createdAt: "2026-03-17T19:12:29.000Z",
+            message: {
+              ...pending.message,
+              id: MessageId.make("pending-message"),
+              createdAt: "2026-03-17T19:12:29.000Z",
+              delivery: { state: "pending", provider: ProviderDriverKind.make("codex") },
+            },
+          },
+        ],
+      });
+
+      expect(markup).toContain(text);
+      expect(markup.indexOf("Later message")).toBeLessThan(markup.indexOf(text));
+    },
+  );
+
+  it("does not mark a pending message older than the blocker as waiting", async () => {
+    const pending = buildUserTimelineEntry("Earlier pending message");
+    const markup = await renderTimeline({
+      blockingDelivery: {
+        id: MessageId.make("blocker"),
+        createdAt: "2026-03-17T19:12:29.000Z",
+        offersRetry: true,
+      },
+      timelineEntries: [
+        {
+          ...pending,
+          message: {
+            ...pending.message,
+            delivery: { state: "pending", provider: ProviderDriverKind.make("codex") },
+          },
+        },
+      ],
+    });
+
+    expect(markup).not.toContain("Waiting for an earlier message");
+  });
+
+  it("names the routed provider instance in a failed notice", async () => {
+    const entry = buildUserTimelineEntry("Send to my personal instance.");
+    const instanceId = ProviderInstanceId.make("codex-personal");
+    const markup = await renderTimeline({
+      instanceLabels: new Map([[instanceId, "Codex Personal"]]),
+      timelineEntries: [
+        {
+          ...entry,
+          message: {
+            ...entry.message,
+            delivery: {
+              state: "failed",
+              provider: ProviderDriverKind.make("codex"),
+              providerInstanceId: instanceId,
+            },
+          },
+        },
+      ],
+    });
+
+    expect(markup).toContain("Codex Personal did not receive this message");
+  });
+
   it("renders delivery uncertainty immediately below the affected user message", async () => {
     const MessagesTimeline = await loadMessagesTimeline();
     const entry = buildUserTimelineEntry("Send this once.");

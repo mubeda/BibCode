@@ -4,6 +4,7 @@ import {
   type ActivityScopeRef,
   MessageId,
   type TurnDelivery,
+  type ServerProvider,
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
@@ -11,6 +12,8 @@ import {
   TurnId,
 } from "@bibcode/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { DEFAULT_SERVER_SETTINGS } from "@bibcode/contracts/settings";
+import { applyProviderInstanceSettings, deriveProviderInstanceEntries } from "../providerInstances";
 
 import type { ChatMessage, Thread } from "../types";
 import type { ComposerAttachment, ComposerImageAttachment } from "../composerDraftStore";
@@ -37,6 +40,10 @@ import {
   deriveLockedProvider,
   describeUnavailableEnvironment,
   findActiveDeliveryMessage,
+  deliveryOffersRetry,
+  deliveryProviderLabel,
+  findBlockingDelivery,
+  waitsBehind,
   findLastCancellableDeliveryMessage,
   selectQueuedMessages,
   isQueuedTimelineMessage,
@@ -1103,6 +1110,163 @@ describe("findActiveDeliveryMessage", () => {
   );
 });
 
+describe.each([undefined, "start", "steer"] as const)("deliveryOffersRetry (mode=%s)", (mode) => {
+  it.each([
+    ["queued", true],
+    ["pending", true],
+    ["sending", true],
+    ["delivered", true],
+    ["uncertain", true],
+    ["failed", false],
+    ["dismissed", true],
+  ] as const)("only suppresses Retry for a failed refusal (%s)", (state, refusedOffersRetry) => {
+    const delivery: TurnDelivery = { state, provider: ProviderDriverKind.make("codex"), mode };
+    expect(deliveryOffersRetry(delivery)).toBe(true);
+    expect(deliveryOffersRetry({ ...delivery, reason: "modelSelectionRefused" })).toBe(
+      refusedOffersRetry,
+    );
+  });
+});
+
+describe("findBlockingDelivery", () => {
+  const message = (
+    id: string,
+    state: TurnDelivery["state"],
+    mode: TurnDelivery["mode"] = "start",
+  ): ChatMessage => ({
+    id: MessageId.make(id),
+    role: "user",
+    text: id,
+    createdAt: now,
+    updatedAt: now,
+    streaming: false,
+    turnId: null,
+    delivery: { state, mode, provider: ProviderDriverKind.make("codex") },
+  });
+  const nonBlocking = [
+    message("queued", "queued"),
+    message("pending-steer", "pending", "steer"),
+    message("sending-steer", "sending", "steer"),
+    message("pending", "pending"),
+    message("sending", "sending"),
+    message("delivered", "delivered"),
+    message("dismissed", "dismissed"),
+    { ...message("legacy", "delivered"), delivery: undefined },
+  ];
+
+  it("ignores queued, active, resolved, and legacy messages", () => {
+    expect(findBlockingDelivery(nonBlocking)).toBeNull();
+    expect(findBlockingDelivery([])).toBeNull();
+  });
+
+  it.each([
+    ["failed", "start"],
+    ["uncertain", "steer"],
+    ["failed", "steer"],
+    ["uncertain", "start"],
+  ] as const)("finds the first unresolved %s %s", (state, mode) => {
+    const blocker = message("blocker", state, mode);
+    expect(
+      findBlockingDelivery([...nonBlocking, blocker, message("later-failure", "failed")]),
+    ).toBe(blocker);
+  });
+});
+
+describe("waitsBehind", () => {
+  const blocker = { id: MessageId.make("blocker"), createdAt: now };
+
+  it.each([
+    ["2026-03-29T00:00:01.000Z", true],
+    ["2026-03-28T23:59:59.000Z", false],
+    [now, false],
+    ["2026-03-28T21:00:00.000-03:00", false],
+    ["invalid time", false],
+  ])("uses strictly later parsed timestamps (%s)", (createdAt, expected) => {
+    expect(waitsBehind({ id: MessageId.make("message"), createdAt }, blocker)).toBe(expected);
+  });
+
+  it("does not block itself even if its timestamp is later", () => {
+    expect(waitsBehind({ ...blocker, createdAt: "2026-03-29T00:00:01.000Z" }, blocker)).toBe(false);
+  });
+
+  it("stays permissive when the blocker timestamp is invalid or the blocker is absent", () => {
+    const message = { id: MessageId.make("message"), createdAt: now };
+    expect(waitsBehind(message, { ...blocker, createdAt: "invalid time" })).toBe(false);
+    expect(waitsBehind(message, null)).toBe(false);
+  });
+});
+
+describe("deliveryProviderLabel", () => {
+  const instanceId = ProviderInstanceId.make("codex-personal");
+  const provider = ProviderDriverKind.make("codex");
+  const snapshot: ServerProvider = {
+    instanceId,
+    driver: provider,
+    displayName: "Codex Personal",
+    enabled: true,
+    installed: true,
+    version: null,
+    status: "ready",
+    auth: { status: "authenticated" },
+    checkedAt: now,
+    models: [],
+    slashCommands: [],
+    skills: [],
+    agents: [],
+  };
+
+  function instanceLabels(displayName?: string): ReadonlyMap<ProviderInstanceId, string> {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [instanceId]: { driver: provider, ...(displayName ? { displayName } : {}) },
+      },
+    };
+    const entries = applyProviderInstanceSettings(
+      deriveProviderInstanceEntries([snapshot]),
+      settings,
+    );
+    return new Map(entries.map((entry) => [entry.instanceId, entry.displayName]));
+  }
+
+  it("prefers the settings-configured name over the snapshot name", () => {
+    expect(
+      deliveryProviderLabel(
+        { provider, providerInstanceId: instanceId },
+        instanceLabels("My Codex"),
+      ),
+    ).toBe("My Codex");
+  });
+
+  it("uses the snapshot displayName without a configured name", () => {
+    expect(
+      deliveryProviderLabel({ provider, providerInstanceId: instanceId }, instanceLabels()),
+    ).toBe("Codex Personal");
+  });
+
+  it("falls back to the driver when the instance is missing", () => {
+    expect(
+      deliveryProviderLabel(
+        { provider, providerInstanceId: ProviderInstanceId.make("deleted-instance") },
+        instanceLabels(),
+      ),
+    ).toBe("Codex");
+  });
+
+  it("falls back to the driver for an old server with no instance id", () => {
+    expect(deliveryProviderLabel({ provider }, instanceLabels())).toBe("Codex");
+  });
+
+  it("formats an unknown driver when no display name is registered", () => {
+    expect(
+      deliveryProviderLabel(
+        { provider: ProviderDriverKind.make("custom-agent") },
+        instanceLabels(),
+      ),
+    ).toBe("Custom Agent");
+  });
+});
+
 describe("threadErrorAttribution", () => {
   it("names the provider that reported the failure", () => {
     expect(
@@ -1194,6 +1358,7 @@ describe("queued messages", () => {
     delivery: queued,
     hasPendingApproval: false,
     hasPendingUserInput: false,
+    waitingBehind: null,
   };
 
   it("keeps durable array order and includes both in-flight steer states only once", () => {
@@ -1239,6 +1404,61 @@ describe("queued messages", () => {
       canCancel: true,
       steering: false,
       primaryAction: "steer",
+    });
+  });
+
+  it.each([
+    [true, "Retry or dismiss the earlier message first"],
+    [false, "Dismiss the earlier message first"],
+  ] as const)("blocks the head when the earlier message offersRetry=%s", (offersRetry, reason) => {
+    for (const phase of ["running", "ready"] as const) {
+      expect(
+        deriveQueuedCardStatus({
+          ...base,
+          phase,
+          waitingBehind: { offersRetry },
+          hasPendingApproval: true,
+          hasPendingUserInput: true,
+        }),
+      ).toMatchObject({
+        label: "Waiting for an earlier message",
+        canSteer: false,
+        canSendNow: false,
+        steerDisabledReason: reason,
+        sendNowDisabledReason: reason,
+        canCancel: true,
+        primaryAction: phase === "running" ? "steer" : "send-now",
+      });
+    }
+  });
+
+  it.each(["pending", "sending"] as const)("keeps %s steering ahead of the blocker", (state) => {
+    expect(
+      deriveQueuedCardStatus({
+        ...base,
+        delivery: { ...queued, state, mode: "steer" },
+        waitingBehind: { offersRetry: false },
+      }),
+    ).toMatchObject({
+      label: "Steering…",
+      steerDisabledReason: "Steering…",
+      sendNowDisabledReason: "Steering…",
+      canSteer: false,
+      canSendNow: false,
+      canCancel: false,
+    });
+  });
+
+  it("keeps later cards waiting behind their queue predecessors", () => {
+    expect(
+      deriveQueuedCardStatus({ ...base, index: 1, waitingBehind: { offersRetry: false } }),
+    ).toMatchObject({
+      label: "Sends after the messages above.",
+      steerDisabledReason: "Send the messages above first",
+      sendNowDisabledReason: "Send the messages above first",
+      canSteer: false,
+      canSendNow: false,
+      primaryAction: null,
     });
   });
 

@@ -1,10 +1,12 @@
-import { PROVIDER_DISPLAY_NAMES, type TurnDelivery } from "@bibcode/contracts";
+import { type TurnDelivery } from "@bibcode/contracts";
 
-import { formatProviderDriverKindLabel } from "../../providerModels";
+import { deliveryOffersRetry } from "../ChatView.logic";
 import { Button } from "../ui/button";
 
 export interface TurnDeliveryNoticeProps {
   readonly delivery: TurnDelivery;
+  readonly providerLabel: string;
+  readonly waitingBehind?: { readonly offersRetry: boolean } | null;
   readonly onRetry: () => void;
   readonly onDismiss: () => void;
   readonly disabled: boolean;
@@ -12,23 +14,35 @@ export interface TurnDeliveryNoticeProps {
 
 export function TurnDeliveryNotice({
   delivery,
+  providerLabel,
+  waitingBehind,
   onRetry,
   onDismiss,
   disabled,
 }: TurnDeliveryNoticeProps) {
+  if (delivery.state === "pending" && waitingBehind) {
+    return (
+      <p role="status" className="w-full max-w-[80%] wrap-break-word text-xs text-muted-foreground">
+        {waitingBehind.offersRetry
+          ? "Waiting for an earlier message. Retry or dismiss it to send this one."
+          : "Waiting for an earlier message. Dismiss it to send this one."}
+      </p>
+    );
+  }
   if (delivery.state !== "uncertain" && delivery.state !== "failed") {
     return null;
   }
 
-  const provider =
-    PROVIDER_DISPLAY_NAMES[delivery.provider] ?? formatProviderDriverKindLabel(delivery.provider);
   const uncertain = delivery.state === "uncertain";
+  const offersRetry = deliveryOffersRetry(delivery);
   // A failed or uncertain delivery holds back the thread's later deliveries until the user
   // retries or dismisses it, and Retry resends it unchanged (same model and options). The copy
   // says both instead of promising that Retry clears the problem.
   const guidance = uncertain
-    ? `${provider} may have received this message, and later messages wait behind it. Retrying could deliver a duplicate; Dismiss skips it.`
-    : `${provider} did not receive this message, and later messages wait behind it. Retry sends it again unchanged; Dismiss skips it.`;
+    ? `${providerLabel} may have received this message, and later messages wait behind it. Retrying could deliver a duplicate; Dismiss skips it.`
+    : offersRetry
+      ? `${providerLabel} did not receive this message, and later messages wait behind it. Retry sends it again unchanged; Dismiss skips it.`
+      : "Sending it again unchanged would fail, and later messages wait behind it. Dismiss it, then send it again with another model or without that option.";
 
   return (
     <div
@@ -47,16 +61,18 @@ export function TurnDeliveryNotice({
         <p className="text-muted-foreground">{guidance}</p>
       </div>
       <div className="flex shrink-0 items-center gap-1 self-end sm:self-auto">
-        <Button
-          type="button"
-          size="xs"
-          variant="ghost"
-          disabled={disabled}
-          onClick={onRetry}
-          aria-label="Retry message delivery"
-        >
-          Retry
-        </Button>
+        {offersRetry ? (
+          <Button
+            type="button"
+            size="xs"
+            variant="ghost"
+            disabled={disabled}
+            onClick={onRetry}
+            aria-label="Retry message delivery"
+          >
+            Retry
+          </Button>
+        ) : null}
         <Button
           type="button"
           size="xs"
