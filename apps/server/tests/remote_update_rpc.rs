@@ -4,7 +4,9 @@ use bibcode_server::remote_update::{
     HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallMode,
     RemoteUpdateState, RemoteUpdateSupport, RemoteUpdateSupportReason,
 };
-use bibcode_server::{RpcExit, ServerConfig, ServerMessage, ServerRuntime};
+use bibcode_server::{
+    RemoteUpdateInstallKind, RpcExit, ServerConfig, ServerMessage, ServerRuntime,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -32,6 +34,25 @@ fn disable_provider_processes(root: &std::path::Path) {
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[test]
+fn the_status_contract_shape_round_trips_through_the_rust_snapshot() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../packages/contracts/fixtures/rpc-wire/contract-shapes/updater__status-success.json",
+    );
+    let fixture: Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("contract-shape fixture"))
+            .expect("fixture JSON");
+    let wire = fixture["exit"]["value"].clone();
+    let snapshot: bibcode_server::RemoteUpdateSnapshot =
+        serde_json::from_value(wire.clone()).expect("the Rust mirror decodes the TS shape");
+    assert_eq!(snapshot.download_percent, Some(42));
+    assert_eq!(
+        serde_json::to_value(&snapshot).expect("snapshot re-encodes"),
+        wire,
+        "the Rust mirror must stay byte-identical to the TypeScript contract"
+    );
+}
 
 async fn call_unary(socket: &mut WsStream, id: &str, method: &str) -> ServerMessage {
     call_unary_with(socket, id, method, json!({})).await
@@ -115,7 +136,11 @@ async fn headless_server_answers_manual_update_surface() {
     assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
     assert_eq!(
         descriptor["remoteUpdateSupport"],
-        json!({ "installMode": "manual", "reason": "manual-update-required" })
+        json!({
+            "installMode": "manual",
+            "reason": "manual-update-required",
+            "installKind": "unknown"
+        })
     );
 
     let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
@@ -171,6 +196,7 @@ impl RemoteUpdateDelegate for FixtureHostUpdater {
                 latest_version: Some("9.9.9".to_owned()),
                 state: RemoteUpdateState::UpdateAvailable,
                 error: None,
+                ..HostUpdaterStatus::default()
             }
         })
     }
@@ -185,6 +211,7 @@ impl RemoteUpdateDelegate for FixtureHostUpdater {
                 latest_version: Some("9.9.9".to_owned()),
                 state: RemoteUpdateState::Installing,
                 error: None,
+                ..HostUpdaterStatus::default()
             }
         })
     }
@@ -200,6 +227,7 @@ async fn desktop_integrated_server_routes_install_through_the_delegate() {
         .with_remote_update_support(RemoteUpdateSupport {
             install_mode: RemoteUpdateInstallMode::Interactive,
             reason: RemoteUpdateSupportReason::Available,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         });
     let handle = ServerRuntime::start_with_desktop_integration(
         config,

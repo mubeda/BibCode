@@ -19,6 +19,64 @@ const decodeActiveWorkError = Schema.decodeUnknownSync(RemoteUpdateActiveWorkErr
 const decodeActiveWorkRpcError = Schema.decodeUnknownSync(WsUpdaterActiveWorkRpc.errorSchema);
 
 describe("RemoteUpdateSnapshot", () => {
+  it("decodes an older server's snapshot with the new fields defaulted", () => {
+    const snapshot = decodeSnapshot({
+      serverVersion: "0.6.2",
+      latestVersion: "0.6.4",
+      state: "update-available",
+      error: null,
+      support: { installMode: "interactive", reason: "available" },
+    });
+    expect(snapshot.downloadPercent).toBeNull();
+    expect(snapshot.targetVersion).toBeNull();
+    expect(snapshot.installStage).toBeNull();
+    expect(snapshot.support.installKind).toBe("unknown");
+  });
+
+  it("decodes progress, target and stage, and keeps an unknown stage and kind as strings", () => {
+    const snapshot = decodeSnapshot({
+      serverVersion: "0.6.2",
+      latestVersion: "0.6.4",
+      state: "installing",
+      error: null,
+      support: { installMode: "manual", reason: "manual-update-required", installKind: "flatpak" },
+      downloadPercent: null,
+      targetVersion: "0.6.4",
+      installStage: "defragmenting-disk",
+    });
+    expect(snapshot.targetVersion).toBe("0.6.4");
+    expect(snapshot.installStage).toBe("defragmenting-disk");
+    expect(snapshot.support.installKind).toBe("flatpak");
+    expect(
+      decodeSnapshot({
+        serverVersion: "0.6.2",
+        latestVersion: "0.6.4",
+        state: "downloading",
+        error: null,
+        support: { installMode: "interactive", reason: "available", installKind: "unknown" },
+        downloadPercent: 42,
+        targetVersion: "0.6.4",
+        installStage: null,
+      }).downloadPercent,
+    ).toBe(42);
+  });
+
+  it.each([NaN, Infinity, -Infinity])(
+    "rejects non-finite download progress %s",
+    (downloadPercent) => {
+      expect(() =>
+        decodeSnapshot({
+          serverVersion: "0.6.2",
+          latestVersion: "0.6.4",
+          state: "downloading",
+          error: null,
+          support: { installMode: "interactive", reason: "available" },
+          downloadPercent,
+        }),
+      ).toThrow();
+    },
+  );
+
   it("decodes the desktop-hosted interactive shape", () => {
     const snapshot = decodeSnapshot({
       serverVersion: "0.4.2",

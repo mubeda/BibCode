@@ -50,7 +50,10 @@ const CHECKED_SNAPSHOT: RemoteUpdateSnapshot = {
   latestVersion: "0.5.0",
   state: "update-available",
   error: null,
-  support: { installMode: "interactive", reason: "available" },
+  support: { installMode: "interactive", reason: "available", installKind: "unknown" },
+  downloadPercent: null,
+  targetVersion: null,
+  installStage: null,
 };
 
 const makeRemoteUpdateCommandHarness = Effect.fn("TestRemoteUpdates.makeCommandHarness")(
@@ -298,6 +301,7 @@ function snapshotIn(
     support: {
       installMode,
       reason: installMode === "manual" ? "manual-update-required" : "available",
+      installKind: "unknown",
     },
   };
 }

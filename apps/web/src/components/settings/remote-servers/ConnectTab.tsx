@@ -517,7 +517,11 @@ function RemoteServerRowFromSession(
           ...queryStatus,
           snapshot: {
             ...queryStatus.snapshot,
-            support: { installMode: "manual", reason: "manual-update-required" },
+            support: {
+              ...queryStatus.snapshot.support,
+              installMode: "manual",
+              reason: "manual-update-required",
+            },
           },
         }
       : queryStatus;

@@ -926,7 +926,10 @@ const UP_TO_DATE_SNAPSHOT = {
   latestVersion: null,
   state: "up-to-date",
   error: null,
-  support: { installMode: "interactive", reason: "available" },
+  support: { installMode: "interactive", reason: "available", installKind: "unknown" },
+  downloadPercent: null,
+  targetVersion: null,
+  installStage: null,
 } as const;
 
 function updateCapableConfig() {
@@ -2015,7 +2018,11 @@ describe("Remote Servers tabs", () => {
         settledUpdateQuery({
           ...UP_TO_DATE_SNAPSHOT,
           state: "idle",
-          support: { installMode: "manual", reason: "manual-update-required" },
+          support: {
+            installMode: "manual",
+            reason: "manual-update-required",
+            installKind: "unknown",
+          },
         }),
       );
 

@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use bibcode_server::remote_update::{
-    HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallMode,
-    RemoteUpdateState, RemoteUpdateSupport, RemoteUpdateSupportReason,
+    HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallKind,
+    RemoteUpdateInstallMode, RemoteUpdateState, RemoteUpdateSupport, RemoteUpdateSupportReason,
 };
 use serde_json::Value;
 use tauri::{AppHandle, Manager, Runtime};
@@ -22,16 +22,19 @@ pub fn derive_remote_update_support(updater_enabled: bool) -> RemoteUpdateSuppor
         RemoteUpdateSupport {
             install_mode: RemoteUpdateInstallMode::Manual,
             reason: RemoteUpdateSupportReason::UnpackagedBuild,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         }
     } else if updater_enabled {
         RemoteUpdateSupport {
             install_mode: RemoteUpdateInstallMode::Interactive,
             reason: RemoteUpdateSupportReason::Available,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         }
     } else {
         RemoteUpdateSupport {
             install_mode: RemoteUpdateInstallMode::Manual,
             reason: RemoteUpdateSupportReason::UpdaterUnavailable,
+            install_kind: RemoteUpdateInstallKind::Unknown,
         }
     }
 }
@@ -62,6 +65,7 @@ pub fn map_desktop_update_state(state: &Value) -> HostUpdaterStatus {
         latest_version,
         state: mapped,
         error,
+        ..HostUpdaterStatus::default()
     }
 }
 

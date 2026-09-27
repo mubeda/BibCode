@@ -1005,7 +1005,11 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],
-            serde_json::json!({ "installMode": "manual", "reason": "manual-update-required" })
+            serde_json::json!({
+                "installMode": "manual",
+                "reason": "manual-update-required",
+                "installKind": "unknown"
+            })
         );
     }
 
