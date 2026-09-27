@@ -495,8 +495,12 @@ after deletion actually succeeds.
 
 ### Remote server updates
 
-The typed update surface consists of `updater.status`, `updater.check`, and
-`updater.install`. Each successful call returns a snapshot containing
+The typed update surface consists of `updater.activeWork`, `updater.status`,
+`updater.check`, and `updater.install`. `updater.activeWork` returns
+`{runningTurns, liveTerminals, queuedMessages}` counted across all clients through
+its own read method so the one-second status poll never waits on the store; a
+failed count answers the typed `RemoteUpdateActiveWorkError`.
+Successful status, check, and install calls return a snapshot containing
 `serverVersion`, nullable `latestVersion`, lifecycle `state`, nullable `error`,
 and `support` (`installMode` plus `reason`). A server that cannot install on
 behalf of the caller rejects `updater.install` with

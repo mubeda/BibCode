@@ -430,6 +430,10 @@
       "mode": "unary"
     },
     {
+      "name": "updater.activeWork",
+      "mode": "unary"
+    },
+    {
       "name": "updater.check",
       "mode": "unary"
     },
@@ -812,6 +816,8 @@
     "typed-failures/terminal__writeInput-02.json",
     "typed-failures/terminal__writeInput-03.json",
     "typed-failures/terminal__writeInput-04.json",
+    "typed-failures/updater__activeWork-00.json",
+    "typed-failures/updater__activeWork-01.json",
     "typed-failures/updater__check-00.json",
     "typed-failures/updater__check-01.json",
     "typed-failures/updater__install-00.json",
@@ -1176,6 +1182,8 @@
     "typed-failures/terminal__writeInput-02.json": "d30145df2096df3675ffde7a840acb67a4f2e26cb8d9a607b828688560d2ca82",
     "typed-failures/terminal__writeInput-03.json": "b2fbde91e8a8ad7b3e8fce9b4d378041efef24ffd25156a058c7cb69f6fd91e9",
     "typed-failures/terminal__writeInput-04.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
+    "typed-failures/updater__activeWork-00.json": "7fc92b6faf18401208f6e6854be77257d9cb687962080d6e8c254923fd9deb91",
+    "typed-failures/updater__activeWork-01.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
     "typed-failures/updater__check-00.json": "458ab3eaa56c31ebe2775b1dc1c0a6ba8d32115336f2ed7acec1b53d272af365",
     "typed-failures/updater__check-01.json": "67fe28f9afa4f2e8a20948477a9e72996dd013c6e33b3a768d31eb3a49061509",
     "typed-failures/updater__install-00.json": "a3133d22e751e404d2e1d96ec5ff1daae9d0f18319121b78105dc0438668e300",
@@ -1572,6 +1580,8 @@
     "typed-failures/terminal__writeInput-02.json",
     "typed-failures/terminal__writeInput-03.json",
     "typed-failures/terminal__writeInput-04.json",
+    "typed-failures/updater__activeWork-00.json",
+    "typed-failures/updater__activeWork-01.json",
     "typed-failures/updater__check-00.json",
     "typed-failures/updater__check-01.json",
     "typed-failures/updater__install-00.json",

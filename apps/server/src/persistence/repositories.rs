@@ -1033,6 +1033,30 @@ impl Repositories {
     ) -> Result<Option<ProjectionThreadSession>> {
         self.database.call(move |connection| connection.query_row("SELECT thread_id, status, provider_name, provider_instance_id, runtime_mode, active_turn_id, last_error, last_error_class, updated_at FROM projection_thread_sessions WHERE thread_id = ?", [thread_id], decode_thread_session).optional().map_err(Into::into)).await
     }
+
+    /// Sessions that are running or starting, and queued messages, for the update confirmation.
+    pub async fn count_active_work(&self) -> Result<(u64, u64)> {
+        self.database
+            .call(|connection| {
+                let running: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM projection_thread_sessions WHERE status IN ('running', 'starting')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let queued: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM provider_turn_outbox WHERE state = 'queued'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                // COUNT(*) is never negative.
+                Ok((
+                    u64::try_from(running).unwrap_or(0),
+                    u64::try_from(queued).unwrap_or(0),
+                ))
+            })
+            .await
+    }
+
     pub async fn list_thread_sessions_by_status(
         &self,
         statuses: Vec<String>,

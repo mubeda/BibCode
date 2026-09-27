@@ -54,6 +54,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.getProviderUsage"
         | "server.getSettings"
         | "server.getTraceDiagnostics"
+        | "updater.activeWork"
         | "updater.status"
         | "sourceControl.lookupRepository"
         | "subscribeDiscoveredLocalServers"
@@ -203,6 +204,10 @@ mod tests {
         );
         assert_eq!(
             required_scope("updater.status"),
+            Some(SCOPE_ORCHESTRATION_READ)
+        );
+        assert_eq!(
+            required_scope("updater.activeWork"),
             Some(SCOPE_ORCHESTRATION_READ)
         );
         for method in ["updater.check", "updater.install"] {

@@ -72,6 +72,10 @@ pub struct ServerTerminalServices {
 }
 
 impl ServerTerminalServices {
+    pub async fn live_terminal_count(&self) -> usize {
+        self.terminal.live_session_count().await
+    }
+
     #[cfg(test)]
     pub(crate) fn terminal_manager_for_test(&self) -> TerminalManager {
         self.terminal.clone()

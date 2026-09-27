@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use bibcode_server::remote_update::{
     HostUpdaterFuture, HostUpdaterStatus, RemoteUpdateDelegate, RemoteUpdateInstallMode,
@@ -34,11 +34,20 @@ type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn call_unary(socket: &mut WsStream, id: &str, method: &str) -> ServerMessage {
+    call_unary_with(socket, id, method, json!({})).await
+}
+
+async fn call_unary_with(
+    socket: &mut WsStream,
+    id: &str,
+    method: &str,
+    payload: Value,
+) -> ServerMessage {
     let request = json!({
         "_tag": "Request",
         "id": id,
         "tag": method,
-        "payload": {},
+        "payload": payload,
         "headers": []
     });
     socket
@@ -59,6 +68,28 @@ async fn call_unary(socket: &mut WsStream, id: &str, method: &str) -> ServerMess
             }
         }
     }
+}
+
+async fn wait_for_active_work(socket: &mut WsStream, next_id: &mut u64, expected: &Value) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let id = next_id.to_string();
+            *next_id += 1;
+            let ServerMessage::Exit {
+                exit: RpcExit::Success { value: Some(value) },
+                ..
+            } = call_unary(socket, &id, "updater.activeWork").await
+            else {
+                panic!("updater.activeWork must succeed for every client");
+            };
+            if value == *expected {
+                return value;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("active work reaches the expected counts within five seconds")
 }
 
 #[tokio::test]
@@ -201,6 +232,107 @@ async fn desktop_integrated_server_routes_install_through_the_delegate() {
     ));
 
     socket.close(None).await.expect("close socket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[tokio::test]
+async fn active_work_counts_work_from_every_client() {
+    let temp = TempDir::new().expect("data root");
+    disable_provider_processes(temp.path());
+    let handle = ServerRuntime::start(
+        ServerConfig::new(temp.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth(),
+    )
+    .await
+    .expect("server starts");
+    let (mut first, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("first client");
+    let (mut second, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("second client");
+
+    let ServerMessage::Exit {
+        exit: RpcExit::Success { value: Some(idle) },
+        ..
+    } = call_unary(&mut first, "1", "updater.activeWork").await
+    else {
+        panic!("updater.activeWork must succeed");
+    };
+    assert_eq!(
+        idle,
+        json!({ "runningTurns": 0, "liveTerminals": 0, "queuedMessages": 0 })
+    );
+
+    let ServerMessage::Exit {
+        exit: RpcExit::Success {
+            value: Some(from_second),
+        },
+        ..
+    } = call_unary(&mut second, "2", "updater.activeWork").await
+    else {
+        panic!("updater.activeWork must succeed for every client");
+    };
+    assert_eq!(from_second, idle);
+
+    let command = if cfg!(windows) {
+        json!({
+            "executable": "powershell.exe",
+            "args": ["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60"]
+        })
+    } else {
+        json!({"executable": "/bin/sh", "args": ["-c", "sleep 60"]})
+    };
+    let opened = call_unary_with(
+        &mut first,
+        "2",
+        "terminal.open",
+        json!({
+            "threadId": "active-work",
+            "terminalId": "term-1",
+            "cwd": temp.path(),
+            "command": command
+        }),
+    )
+    .await;
+    assert!(matches!(
+        opened,
+        ServerMessage::Exit {
+            exit: RpcExit::Success { .. },
+            ..
+        }
+    ));
+
+    let active = json!({ "runningTurns": 0, "liveTerminals": 1, "queuedMessages": 0 });
+    let mut second_request_id = 3;
+    assert_eq!(
+        wait_for_active_work(&mut second, &mut second_request_id, &active).await,
+        active
+    );
+
+    let closed = call_unary_with(
+        &mut first,
+        "3",
+        "terminal.close",
+        json!({"threadId": "active-work", "terminalId": "term-1"}),
+    )
+    .await;
+    assert!(matches!(
+        closed,
+        ServerMessage::Exit {
+            exit: RpcExit::Success { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        wait_for_active_work(&mut second, &mut second_request_id, &idle).await,
+        idle
+    );
+
+    first.close(None).await.expect("close first");
+    second.close(None).await.expect("close second");
     handle.shutdown();
     handle.join().await.expect("server joins");
 }
