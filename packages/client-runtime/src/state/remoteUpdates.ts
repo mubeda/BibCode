@@ -2,10 +2,12 @@ import { type EnvironmentId, type RemoteUpdateSnapshot, WS_METHODS } from "@bibc
 import type * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, type AtomRegistry } from "effect/unstable/reactivity";
 import { RpcClientError } from "effect/unstable/rpc";
 
 import {
@@ -13,13 +15,22 @@ import {
   createEnvironmentCommand,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
+  createRuntimeCommand,
   followStreamInEnvironment,
 } from "./runtime.ts";
-import type { EnvironmentRegistry } from "../connection/registry.ts";
+import {
+  isRemoteUpdateRunActive,
+  type RemoteUpdateConnectionView,
+  type RemoteUpdatePort,
+  type RemoteUpdateRunState,
+  runRemoteUpdate,
+} from "./remoteUpdateCoordinator.ts";
+import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import {
   type EnvironmentRpcInput,
   EnvironmentRpcUnavailableError,
+  config,
   request,
 } from "../rpc/client.ts";
 
@@ -276,6 +287,107 @@ export function createRemoteUpdateEnvironmentAtoms<R, ER>(
       }
     },
   };
+  const run = Atom.family((environmentId: EnvironmentId) =>
+    Atom.make<RemoteUpdateRunState | null>(null).pipe(
+      Atom.keepAlive,
+      Atom.withLabel(`environment-data:remote-update:run:${environmentId}`),
+    ),
+  );
+  const permits = Semaphore.makeUnsafe(MAX_CONCURRENT_REMOTE_UPDATE_CHECKS);
+
+  const registryPort = Effect.fn("RemoteUpdate.registryPort")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    const registry = yield* EnvironmentRegistry;
+    const initial = Option.getOrNull(yield* registry.state(environmentId).pipe(Effect.option));
+    const supervisor = Option.getOrNull(
+      yield* registry.run(environmentId, EnvironmentSupervisor).pipe(Effect.option),
+    );
+    let lastConnected: RemoteUpdateConnection | null =
+      initial?.phase === "connected" && supervisor !== null
+        ? { supervisor, generation: initial.generation }
+        : null;
+    // Seed before forking: the first read must describe the live connection even
+    // if the follower has not started delivering states yet.
+    const latest = yield* Ref.make<RemoteUpdateConnectionView>({
+      phase: initial?.phase ?? "available",
+      connectedEpoch: initial?.phase === "connected" ? 1 : 0,
+      blockedMessage: initial?.phase === "blocked" ? (initial.lastFailure?.message ?? null) : null,
+    });
+    yield* registry
+      .followStream(
+        environmentId,
+        Stream.unwrap(
+          EnvironmentSupervisor.pipe(
+            Effect.map((supervisor) =>
+              SubscriptionRef.changes(supervisor.state).pipe(
+                Stream.map((state) => ({ supervisor, state })),
+              ),
+            ),
+          ),
+        ),
+      )
+      .pipe(
+        Stream.runForEach(({ supervisor, state }) =>
+          Ref.update(latest, (current) => {
+            const newConnection =
+              state.phase === "connected" &&
+              (lastConnected?.supervisor !== supervisor ||
+                lastConnected.generation !== state.generation);
+            if (newConnection) lastConnected = { supervisor, generation: state.generation };
+            return {
+              phase: state.phase,
+              connectedEpoch: current.connectedEpoch + (newConnection ? 1 : 0),
+              blockedMessage:
+                state.phase === "blocked" ? (state.lastFailure?.message ?? null) : null,
+            };
+          }),
+        ),
+        Effect.forkScoped,
+      );
+    return {
+      connection: Ref.get(latest),
+      // The descriptor is immutable within a connection; reuse its initial config
+      // instead of transferring the full config again over a potentially slow link.
+      identity: registry.run(environmentId, config).pipe(
+        Effect.map((current) => ({
+          bootId: current.environment.bootId,
+          serverVersion: current.environment.serverVersion,
+          progress: current.environment.capabilities.remoteUpdateProgress,
+        })),
+      ),
+      status: registry.run(environmentId, request(WS_METHODS.updaterStatus, {})),
+      install: registry.run(environmentId, request(WS_METHODS.updaterInstall, {})),
+      retryNow: registry.retryNow(environmentId),
+    } satisfies RemoteUpdatePort;
+  });
+
+  const executeUpdate = Effect.fn("RemoteUpdate.update")(function* (
+    { environmentId }: { environmentId: EnvironmentId; input: {} },
+    registry: AtomRegistry.AtomRegistry,
+  ) {
+    const publish = (state: RemoteUpdateRunState) =>
+      Effect.sync(() => registry.set(run(environmentId), state));
+    yield* publish({ phase: "queued" });
+    return yield* permits.withPermits(1)(
+      Effect.gen(function* () {
+        const port = yield* registryPort(environmentId);
+        return yield* runRemoteUpdate(port, publish);
+      }),
+    );
+  }, Effect.scoped);
+  const update = createRuntimeCommand(runtime, {
+    label: "environment-data:remote-update:update",
+    execute: executeUpdate,
+    concurrency: { mode: "singleFlight", key: ({ environmentId }) => environmentId },
+  });
+
+  const dismiss = (registry: AtomRegistry.AtomRegistry, environmentId: EnvironmentId): void => {
+    if (!isRemoteUpdateRunActive(registry.get(run(environmentId)))) {
+      registry.set(run(environmentId), null);
+    }
+  };
+
   return {
     snapshot: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:remote-update:snapshot",
@@ -293,5 +405,8 @@ export function createRemoteUpdateEnvironmentAtoms<R, ER>(
         key: ({ environmentId }) => environmentId,
       },
     }),
+    run,
+    update,
+    dismiss,
   };
 }

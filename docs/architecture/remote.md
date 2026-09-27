@@ -562,6 +562,20 @@ apart the states that used to share one label:
 - **Manual updates** for a `manual` host, and **Up to date**, **Update to v…**,
   or **Updating…** (downloading or installing) for the rest.
 
+The `run` family in `createRemoteUpdateEnvironmentAtoms` retains one single-flight
+update run per environment, owned by the Atom runtime, so closing a view does not
+cancel it. At most two runs execute at once; a third shows **Queued**. The `update`
+command drives `packages/client-runtime/src/state/remoteUpdateCoordinator.ts`
+through a scoped follower that tracks both supervisor identity and connection
+generation through a restart, with no RPC spanning it. Identity comes from the
+current connection's initial config. The coordinator caps reads at 10 seconds,
+the install request at 30 seconds, download at 10 minutes, installation at
+2 minutes, and restart at 3 minutes. It asks the supervisor to retry only in
+backoff, at most every 5 seconds; a blocked connection ends the run with its
+failure message. It never reconnects an environment the user disconnected:
+an unreachable host ends as "hasn't come back". `dismiss` clears a terminal run
+and leaves an active run alone.
+
 `createRemoteUpdateEnvironmentAtoms` in
 `packages/client-runtime/src/state/remoteUpdates.ts` owns the check state: the
 `check` command records its own progress and, stamped with the connection
