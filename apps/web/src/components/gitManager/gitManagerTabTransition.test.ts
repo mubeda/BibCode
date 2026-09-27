@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   resolveGitManagerTabTransition,
+  resolveGitManagerTabTransitionBaseline,
   resolveGitManagerWorkingTree,
   type GitManagerTabTransitionInputs,
   type GitManagerWorkingTree,
@@ -9,7 +10,7 @@ import {
 
 const inputs = (
   workingTree: GitManagerWorkingTree,
-  mergePending = false,
+  mergePending: boolean | null = false,
 ): GitManagerTabTransitionInputs => ({ mergePending, workingTree });
 
 describe("resolveGitManagerWorkingTree", () => {
@@ -97,11 +98,94 @@ describe("resolveGitManagerTabTransition", () => {
     ).toBeNull();
   });
 
+  it("does not treat unknown refs as a merge ending on a clean checkout", () => {
+    expect(
+      resolveGitManagerTabTransition(inputs("clean", true), inputs("clean", null), "changes"),
+    ).toBeNull();
+    expect(
+      resolveGitManagerTabTransition(inputs("dirty", true), inputs("clean", null), "changes"),
+    ).toBeNull();
+  });
+
+  it("still applies opening rules when the initial merge state is unknown", () => {
+    expect(resolveGitManagerTabTransition(null, inputs("clean", null), "changes")).toBe("history");
+    expect(
+      resolveGitManagerTabTransition(inputs("loading", null), inputs("clean", false), "changes"),
+    ).toBe("history");
+    expect(
+      resolveGitManagerTabTransition(inputs("clean", null), inputs("clean", true), "history"),
+    ).toBe("changes");
+    expect(
+      resolveGitManagerTabTransition(inputs("loading", null), inputs("loading", true), "history"),
+    ).toBe("changes");
+  });
+
   it("never pulls the user off the Tags tab for a clean transition", () => {
     expect(resolveGitManagerTabTransition(null, inputs("clean"), "tags")).toBeNull();
     expect(resolveGitManagerTabTransition(inputs("dirty"), inputs("clean"), "tags")).toBeNull();
     expect(
       resolveGitManagerTabTransition(inputs("clean", true), inputs("clean"), "tags"),
     ).toBeNull();
+  });
+});
+
+describe("resolveGitManagerTabTransitionBaseline", () => {
+  it.each([
+    { workingTree: "clean", tab: null },
+    { workingTree: "dirty", tab: "history" },
+    { workingTree: "unreadable", tab: null },
+  ] as const)(
+    "compares settled statuses across loading after a $workingTree observation",
+    ({ workingTree, tab }) => {
+      const settled = inputs(workingTree);
+      const baseline = resolveGitManagerTabTransitionBaseline(settled, inputs("loading"));
+
+      expect(baseline).toEqual(settled);
+      expect(resolveGitManagerTabTransition(baseline, inputs("clean"), "changes")).toBe(tab);
+      expect(resolveGitManagerTabTransitionBaseline(baseline, inputs("clean"))).toEqual(
+        inputs("clean"),
+      );
+    },
+  );
+
+  it("keeps an initial loading observation so opening on a clean checkout still selects History", () => {
+    const baseline = resolveGitManagerTabTransitionBaseline(null, inputs("loading"));
+
+    expect(baseline).toEqual(inputs("loading"));
+    expect(resolveGitManagerTabTransition(baseline, inputs("clean"), "changes")).toBe("history");
+  });
+
+  it.each([false, true])("keeps a known merge state of %s while refs reload", (mergePending) => {
+    const settled = inputs("clean", mergePending);
+    const baseline = resolveGitManagerTabTransitionBaseline(settled, inputs("clean", null));
+
+    expect(baseline).toEqual(settled);
+    expect(resolveGitManagerTabTransition(baseline, settled, "history")).toBeNull();
+  });
+
+  it("retains pending merge knowledge until refs confirm it has ended", () => {
+    const baseline = resolveGitManagerTabTransitionBaseline(
+      inputs("dirty", true),
+      inputs("clean", null),
+    );
+
+    expect(baseline).toEqual(inputs("clean", true));
+    expect(resolveGitManagerTabTransition(baseline, inputs("clean", false), "changes")).toBe(
+      "history",
+    );
+  });
+
+  it("keeps the initial merge state unknown until refs load", () => {
+    const baseline = resolveGitManagerTabTransitionBaseline(null, inputs("loading", null));
+    const clean = resolveGitManagerTabTransitionBaseline(baseline, inputs("clean", null));
+
+    expect(baseline).toEqual(inputs("loading", null));
+    expect(clean).toEqual(inputs("clean", null));
+    expect(resolveGitManagerTabTransitionBaseline(clean, inputs("clean", false))).toEqual(
+      inputs("clean", false),
+    );
+    expect(resolveGitManagerTabTransitionBaseline(clean, inputs("clean", true))).toEqual(
+      inputs("clean", true),
+    );
   });
 });
