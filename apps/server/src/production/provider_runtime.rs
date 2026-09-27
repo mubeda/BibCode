@@ -18644,7 +18644,7 @@ done
                     .any(|message| { message.message_id == message_id && !message.is_streaming })
             );
             assert!(snapshot.activities.iter().any(|activity| {
-                activity.summary == "turn.completed" && activity.turn_id.as_deref() == Some(turn_id)
+                activity.summary == "Turn completed" && activity.turn_id.as_deref() == Some(turn_id)
             }));
         }
 
