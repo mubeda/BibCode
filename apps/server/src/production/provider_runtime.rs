@@ -5030,6 +5030,8 @@ async fn project_provider_event(
             } else {
                 event_activity_shape(&event.event_type)
             };
+            let summary =
+                event_activity_summary(&event.event_type, &event.payload, &launch.provider_label);
             let mut payload = event.payload;
             if let Some(request_id) = event.request_id {
                 if let Some(object) = payload.as_object_mut() {
@@ -5055,6 +5057,27 @@ async fn project_provider_event(
                     });
                 }
             }
+            if let Some(object) = payload.as_object_mut() {
+                if event.event_type == "runtime.warning"
+                    && let Some(message) = object
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                {
+                    let detail = object
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .filter(|detail| !detail.trim().is_empty() && *detail != message)
+                        .map_or_else(
+                            || message.to_owned(),
+                            |detail| format!("{message}\n{detail}"),
+                        );
+                    object.insert("detail".to_owned(), Value::String(detail));
+                }
+                object.insert("eventType".to_owned(), Value::String(event.event_type));
+            } else {
+                payload = json!({ "eventType": event.event_type, "detail": payload });
+            }
             OrchestrationCommand::ThreadActivityAppend {
                 command_id,
                 thread_id: event.thread_id,
@@ -5062,7 +5085,7 @@ async fn project_provider_event(
                     id: format!("activity:{}", Uuid::new_v4()),
                     tone: tone.to_owned(),
                     kind: kind.to_owned(),
-                    summary: event.event_type,
+                    summary,
                     payload,
                     turn_id: event.turn_id,
                     sequence: None,
@@ -5275,6 +5298,64 @@ fn provider_completion_error_class(payload: &Value) -> String {
         | "unknown") => class.to_owned(),
         _ => "unknown".to_owned(),
     }
+}
+
+fn event_activity_summary(event_type: &str, payload: &Value, provider_label: &str) -> String {
+    let provider_label = provider_label.trim();
+    let provider_label = if provider_label.is_empty() {
+        "Provider"
+    } else {
+        provider_label
+    };
+    // These are the catch-all events emitted by the provider runtimes and drivers.
+    // Activity-only events are consumed by the event pump before this projection.
+    let summary = match event_type {
+        "session.connecting" => "Connecting to provider",
+        "session.ready" => "Session ready",
+        "session.started" => "Session started",
+        "session.configured" => "Session configured",
+        "session.state.changed" => "Session status changed",
+        "session.exited" => "Session ended",
+        "session.stderr" => "Session output",
+        "thread.started" => "Conversation started",
+        "turn.started" => "Turn started",
+        "turn.completed" => match payload.get("state").and_then(Value::as_str) {
+            Some("failed") => "Turn failed",
+            Some("interrupted") => "Turn interrupted",
+            Some("cancelled") => "Turn cancelled",
+            _ => "Turn completed",
+        },
+        "turn.plan.updated" => "Plan updated",
+        "item.started" | "item.updated" | "item.completed" => {
+            // Claude carries the tool name in data; Codex supplies a title.
+            let tool_name = [payload.pointer("/data/toolName"), payload.get("title")]
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .find(|name| !name.is_empty())
+                .unwrap_or("Step");
+            let phase = match event_type {
+                "item.started" => "started",
+                "item.updated" => "updated",
+                _ => "completed",
+            };
+            return format!("{tool_name} {phase}");
+        }
+        "request.opened" => "Approval requested",
+        "request.resolved" => "Approval resolved",
+        "user-input.requested" => "Input requested",
+        "user-input.resolved" => "Input received",
+        "mcp.status.updated" => "Tool connections updated",
+        "runtime.warning" => return format!("{provider_label} warning"),
+        // Includes runtime.error and future error-shaped events classified by
+        // the same policy that assigns the activity's tone and kind.
+        event if event_activity_shape(event).1 == "provider.error" => {
+            return format!("{provider_label} error");
+        }
+        _ => "Provider event",
+    };
+    summary.to_owned()
 }
 
 fn event_activity_shape(event_type: &str) -> (&'static str, &'static str) {
@@ -16749,7 +16830,7 @@ done
                     .expect("root snapshot")
                     .activities
                     .iter()
-                    .any(|event| event.summary == "activity-root-barrier")
+                    .any(|event| event.payload["eventType"] == "activity-root-barrier")
                 {
                     break;
                 }
@@ -16889,7 +16970,7 @@ done
                     .expect("root snapshot")
                     .activities
                     .iter()
-                    .any(|event| event.summary == "provider.activity-apply-failed")
+                    .any(|event| event.payload["eventType"] == "provider.activity-apply-failed")
                 {
                     break;
                 }
@@ -19006,6 +19087,274 @@ done
         }
     }
 
+    async fn project_work_log_event(
+        engine: &super::OrchestrationEngine,
+        launch: &super::ProviderLaunchRequest,
+        event_type: &str,
+        payload: Value,
+    ) {
+        super::project_provider_event(
+            engine,
+            launch,
+            None,
+            None,
+            ProviderEvent {
+                native_event_id: None,
+                event_type: event_type.to_owned(),
+                thread_id: launch.thread_id.clone(),
+                turn_id: None,
+                item_id: None,
+                request_id: Some("request-1".to_owned()),
+                payload,
+                activity: Vec::new(),
+                activity_controls: Default::default(),
+            },
+        )
+        .await
+        .expect("work-log event projects");
+    }
+
+    #[tokio::test]
+    async fn provider_projection_uses_plain_work_log_titles() {
+        let engine = supervisor_engine().await;
+        let temp = TempDir::new().expect("temporary launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        launch.provider_label = "Codex".to_owned();
+
+        // Inventory of catch-all events emitted by the Codex, Claude, Cursor,
+        // Grok and OpenCode runtimes, plus the Claude driver's stderr event.
+        // runtime.warning and runtime.error have dedicated projection tests below.
+        for (event_type, summary) in [
+            ("session.ready", "Session ready"),
+            ("session.connecting", "Connecting to provider"),
+            ("session.started", "Session started"),
+            ("session.configured", "Session configured"),
+            ("session.state.changed", "Session status changed"),
+            ("session.exited", "Session ended"),
+            ("session.stderr", "Session output"),
+            ("thread.started", "Conversation started"),
+            ("turn.started", "Turn started"),
+            ("turn.completed", "Turn completed"),
+            ("turn.plan.updated", "Plan updated"),
+            ("item.started", "Step started"),
+            ("item.updated", "Step updated"),
+            ("item.completed", "Step completed"),
+            ("request.opened", "Approval requested"),
+            ("request.resolved", "Approval resolved"),
+            ("user-input.requested", "Input requested"),
+            ("user-input.resolved", "Input received"),
+            ("mcp.status.updated", "Tool connections updated"),
+        ] {
+            project_work_log_event(&engine, &launch, event_type, json!({})).await;
+            let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+            let activity = snapshot.activities.last().expect("work-log activity");
+            assert_eq!(activity.summary, summary, "{event_type}");
+            assert_eq!(activity.payload["eventType"], event_type);
+            assert_eq!(activity.payload["requestId"], "request-1");
+            if event_type == "session.ready" {
+                assert_eq!(activity.kind, "provider.session");
+                assert_eq!(activity.tone, "info");
+            }
+        }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_projection_uses_tool_names_in_item_titles() {
+        let engine = supervisor_engine().await;
+        let temp = TempDir::new().expect("temporary launch directory");
+        let mut launch = native_launch(&temp, "claudeAgent");
+        launch.thread_id = "t1".to_owned();
+
+        for (event_type, payload, summary) in [
+            (
+                "item.started",
+                json!({"title": "Tool", "data": {"toolName": "Read"}}),
+                "Read started",
+            ),
+            (
+                "item.updated",
+                json!({"data": {"toolName": "Read"}}),
+                "Read updated",
+            ),
+            (
+                "item.completed",
+                json!({"data": {"toolName": "Read"}}),
+                "Read completed",
+            ),
+            (
+                "item.started",
+                json!({"title": "Ran command"}),
+                "Ran command started",
+            ),
+            (
+                "item.completed",
+                json!({"title": "Ran command"}),
+                "Ran command completed",
+            ),
+            (
+                "item.completed",
+                json!({"data": {"toolName": " Read "}}),
+                "Read completed",
+            ),
+            ("item.completed", json!({"data": {}}), "Step completed"),
+            (
+                "item.completed",
+                json!({"title": "  ", "data": {"toolName": "  "}}),
+                "Step completed",
+            ),
+            (
+                "item.completed",
+                json!({"title": "Ran command", "data": {"toolName": 42}}),
+                "Ran command completed",
+            ),
+        ] {
+            project_work_log_event(&engine, &launch, event_type, payload).await;
+            let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+            let activity = snapshot.activities.last().expect("item activity");
+            assert_eq!(activity.summary, summary, "{event_type}");
+            assert_eq!(activity.kind, "provider.event");
+            assert_eq!(activity.tone, "tool");
+            assert_eq!(activity.payload["eventType"], event_type);
+        }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_projection_shows_warning_labels_and_details() {
+        let engine = supervisor_engine().await;
+        let temp = TempDir::new().expect("temporary launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+
+        for (label, payload, summary, detail) in [
+            (
+                "Codex",
+                json!({"message": "Rate limit reached. Retrying.", "status": 429}),
+                "Codex warning",
+                "Rate limit reached. Retrying.",
+            ),
+            (
+                " Work Codex ",
+                json!({"message": "A tool connection is unavailable."}),
+                "Work Codex warning",
+                "A tool connection is unavailable.",
+            ),
+            (
+                "",
+                json!({"message": "The provider is retrying.", "detail": ""}),
+                "Provider warning",
+                "The provider is retrying.",
+            ),
+            (
+                "   ",
+                json!({"detail": "The connection is slow."}),
+                "Provider warning",
+                "The connection is slow.",
+            ),
+            (
+                "Claude",
+                json!({"message": "The provider is retrying.", "detail": "Retry 2 of 3."}),
+                "Claude warning",
+                "The provider is retrying.\nRetry 2 of 3.",
+            ),
+        ] {
+            launch.provider_label = label.to_owned();
+            project_work_log_event(&engine, &launch, "runtime.warning", payload.clone()).await;
+            let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+            let activity = snapshot.activities.last().expect("warning activity");
+            assert_eq!(activity.summary, summary);
+            assert_eq!(activity.kind, "provider.warning");
+            assert_eq!(activity.tone, "warning");
+            assert_eq!(activity.payload["detail"], detail);
+            assert_eq!(activity.payload["message"], payload["message"]);
+            assert_eq!(activity.payload["status"], payload["status"]);
+            assert_eq!(activity.payload["eventType"], "runtime.warning");
+        }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_projection_keeps_unknown_event_ids_in_diagnostics() {
+        let engine = supervisor_engine().await;
+        let temp = TempDir::new().expect("temporary launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+
+        for payload in [
+            json!({"eventType": "untrusted.type", "detail": "Provider notice"}),
+            json!("Provider notice"),
+            Value::Null,
+        ] {
+            project_work_log_event(&engine, &launch, "future.someEvent", payload.clone()).await;
+            let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+            let activity = snapshot.activities.last().expect("unknown event activity");
+            assert_eq!(activity.summary, "Provider event");
+            assert_eq!(activity.kind, "provider.event");
+            assert_eq!(activity.payload["eventType"], "future.someEvent");
+            assert_eq!(activity.payload["requestId"], "request-1");
+            assert_eq!(
+                activity.payload["detail"],
+                if payload.is_object() {
+                    payload["detail"].clone()
+                } else {
+                    payload
+                }
+            );
+        }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_projection_names_errors_and_turn_outcomes_honestly() {
+        let engine = supervisor_engine().await;
+        let temp = TempDir::new().expect("temporary launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        launch.provider_label = "Work Codex".to_owned();
+
+        for (event_type, payload, summary, kind) in [
+            (
+                "runtime.error",
+                json!({"message": "Connection lost."}),
+                "Work Codex error",
+                "provider.error",
+            ),
+            (
+                "future.failed",
+                json!({}),
+                "Work Codex error",
+                "provider.error",
+            ),
+            (
+                "turn.completed",
+                json!({"state": "failed"}),
+                "Turn failed",
+                "provider.error",
+            ),
+            (
+                "turn.completed",
+                json!({"state": "interrupted"}),
+                "Turn interrupted",
+                "provider.turn",
+            ),
+            (
+                "turn.completed",
+                json!({"state": "cancelled"}),
+                "Turn cancelled",
+                "provider.turn",
+            ),
+        ] {
+            project_work_log_event(&engine, &launch, event_type, payload).await;
+            let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+            let activity = snapshot.activities.last().expect("error or turn activity");
+            assert_eq!(activity.summary, summary, "{event_type}");
+            assert_eq!(activity.kind, kind);
+        }
+        engine.shutdown().await;
+    }
+
     #[tokio::test]
     async fn provider_projection_maps_context_usage() {
         let engine = supervisor_engine().await;
@@ -19150,7 +19499,8 @@ done
                 .payload,
             json!({
                 "servers": [{ "name": "context7", "state": "connected" }],
-                "providerInstanceId": "codex-work"
+                "providerInstanceId": "codex-work",
+                "eventType": "mcp.status.updated"
             })
         );
         engine.shutdown().await;
