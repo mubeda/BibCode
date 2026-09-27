@@ -1,6 +1,6 @@
 import * as Schema from "effect/Schema";
 
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 export const RemoteUpdateInstallMode = Schema.Literals(["interactive", "manual", "supervised"]);
 export type RemoteUpdateInstallMode = typeof RemoteUpdateInstallMode.Type;
@@ -51,3 +51,17 @@ export class RemoteUpdateInstallError extends Schema.TaggedError<RemoteUpdateIns
     return "This server must be updated manually.";
   }
 }
+
+/** Work an update restart would stop, counted across all clients of the server. */
+export const RemoteUpdateActiveWork = Schema.Struct({
+  runningTurns: NonNegativeInt,
+  liveTerminals: NonNegativeInt,
+  queuedMessages: NonNegativeInt,
+});
+export type RemoteUpdateActiveWork = typeof RemoteUpdateActiveWork.Type;
+
+/** The server could not count its running work; clients fall back to a confirmation without counts. */
+export class RemoteUpdateActiveWorkError extends Schema.TaggedError<RemoteUpdateActiveWorkError>()(
+  "RemoteUpdateActiveWorkError",
+  { message: TrimmedNonEmptyString },
+) {}

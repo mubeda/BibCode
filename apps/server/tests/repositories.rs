@@ -315,6 +315,7 @@ fn public_repository_api_inventory_is_explicit() {
         "consume_auth_pairing_link",
         "complete_auth_pairing_offer",
         "confirm_pending_auth_session",
+        "count_active_work",
         "create_auth_pairing_link",
         "create_auth_pairing_link_with_offer",
         "create_auth_session",
@@ -2615,6 +2616,40 @@ async fn pending_auth_sessions_confirm_by_id_and_startup_cleanup_is_selective() 
             .as_deref(),
         Some(TIME_3),
     );
+}
+
+#[tokio::test]
+async fn active_work_counts_running_sessions_and_every_queued_message() {
+    let repositories = migrated_repositories().await;
+    assert_eq!(repositories.count_active_work().await.unwrap(), (0, 0));
+    for (thread_id, status) in [
+        ("busy", "running"),
+        ("booting", "starting"),
+        ("waiting", "ready"),
+    ] {
+        repositories
+            .upsert_thread_session(ProjectionThreadSession {
+                thread_id: thread_id.into(),
+                status: status.into(),
+                provider_name: Some("codex".into()),
+                provider_instance_id: Some("codex".into()),
+                runtime_mode: "approval-required".into(),
+                active_turn_id: None,
+                last_error: None,
+                last_error_class: None,
+                updated_at: T0.into(),
+            })
+            .await
+            .unwrap();
+    }
+    repositories.database().call(|connection| {
+        for (command, state) in [("q1", "queued"), ("q2", "queued"), ("sent", "delivered")] {
+            connection.execute("INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status) VALUES (?, 'thread', 'busy', ?, 0, 'accepted')", [command, T0])?;
+            connection.execute("INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, delivery_key, payload_json, state, mode, held, attempts, last_error, created_at, updated_at) VALUES (?, 'busy', ?, 'codex', 'codex', ?, '{}', ?, 'start', 0, 0, NULL, ?, ?)", [command, command, command, state, T0, T1])?;
+        }
+        Ok(())
+    }).await.unwrap();
+    assert_eq!(repositories.count_active_work().await.unwrap(), (2, 2));
 }
 
 #[tokio::test]

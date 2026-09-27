@@ -781,7 +781,7 @@ can take ownership of application restart.
 
 ### Remote server updates
 
-Every server answers the `updater.status`, `updater.check`, and
+Every server answers the `updater.activeWork`, `updater.status`, `updater.check`, and
 `updater.install` RPC methods (contract:
 `packages/contracts/src/remoteUpdate.ts`; Rust mirror:
 `apps/server/src/remote_update.rs`). All three environment-descriptor
@@ -790,7 +790,10 @@ producers—the well-known route (`apps/server/src/http.rs`),
 Connect/relay descriptor (`apps/server/src/lifecycle.rs`)—embed
 `remoteUpdateSupport` and advertise the surface with the default-false
 `remoteUpdateControl` capability. Clients therefore know the install mode
-before asking.
+before asking. `updater.activeWork` returns
+`{runningTurns, liveTerminals, queuedMessages}` counted across all clients through
+its own read method so the one-second status poll never waits on the store; a
+failed count answers the typed `RemoteUpdateActiveWorkError`.
 
 - Desktop-hosted in-process servers run in `interactive` mode.
   `updater.install` routes through the host's `DesktopUpdateManager` via the
@@ -804,7 +807,7 @@ before asking.
   `updater.install` fails with `remote_update_manual_required`. Clients render
   copyable operator instructions instead of an install action.
 
-`updater.status` requires `orchestration:read`; `updater.check` and
+`updater.activeWork` and `updater.status` require `orchestration:read`; `updater.check` and
 `updater.install` require `orchestration:operate`
 (`apps/server/src/auth/scope.rs`).
 Desktop delegate calls and each client-side per-environment update check are

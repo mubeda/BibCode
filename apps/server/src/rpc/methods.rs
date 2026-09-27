@@ -161,6 +161,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("terminal.restart"),
     mutation_unary("terminal.write"),
     mutation_unary("terminal.writeInput"),
+    read_unary("updater.activeWork"),
     mutation_unary("updater.check"),
     mutation_unary("updater.install"),
     read_unary("updater.status"),

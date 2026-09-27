@@ -3397,6 +3397,21 @@ impl TerminalManager {
         }
     }
 
+    /// Terminal sessions whose process is starting or running.
+    pub async fn live_session_count(&self) -> usize {
+        let sessions = self.inner.sessions.read().await;
+        let mut live = 0;
+        for session in sessions.values() {
+            if matches!(
+                session.lock().await.summary().status,
+                TerminalStatus::Starting | TerminalStatus::Running
+            ) {
+                live += 1;
+            }
+        }
+        live
+    }
+
     pub async fn subscribe_metadata(&self) -> TerminalMetadataAttachment {
         let events = self.inner.metadata.subscribe();
         let sessions = self.inner.sessions.read().await;
@@ -4430,6 +4445,28 @@ mod tests {
             .await
             .unwrap();
         (root, backend, manager)
+    }
+
+    #[tokio::test]
+    async fn live_session_count_counts_open_sessions_until_they_close() {
+        let (root, _backend, manager) = size_fixture(80, 24).await;
+        assert_eq!(manager.live_session_count().await, 1);
+        manager
+            .open(TerminalOpenInput::new(
+                "sizing",
+                "term-2",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(manager.live_session_count().await, 2);
+        manager.close("sizing", Some("term")).await.unwrap();
+        assert_eq!(manager.live_session_count().await, 1);
+        manager.close("sizing", Some("term-2")).await.unwrap();
+        assert_eq!(manager.live_session_count().await, 0);
+        manager.shutdown().await;
     }
 
     async fn next_attachment_event(attachment: &mut TerminalAttachment) -> TerminalEvent {

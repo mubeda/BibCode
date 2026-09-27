@@ -466,6 +466,10 @@ impl ProductionRuntime {
                 config.remote_update_support,
                 remote_update_delegate.clone(),
             ),
+            crate::production::remote_update_rpc::ActiveWorkCounter::new(
+                repositories.clone(),
+                terminal_services.clone(),
+            ),
         );
         finalize_rpc_registry(&registry, &control)?;
 
