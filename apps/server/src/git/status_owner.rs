@@ -568,7 +568,7 @@ impl StatusReadOwner {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
     }
 
-    fn observe_local_change(&self, canonical_cwd: &Path) {
+    pub(crate) fn observe_local_change(&self, canonical_cwd: &Path) {
         let observer = self
             .inner
             .local_change_observer
