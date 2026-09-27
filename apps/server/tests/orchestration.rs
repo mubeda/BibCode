@@ -1122,7 +1122,7 @@ async fn promote_replays_the_stored_turn_start() {
     );
     assert_eq!(
         events[1].event.payload["delivery"],
-        json!({"state":"pending", "provider":"codex", "mode":"start", "held":false})
+        json!({"state":"pending", "provider":"codex", "providerInstanceId":"codex", "mode":"start", "held":false})
     );
     let row = engine
         .repositories()
@@ -1179,7 +1179,7 @@ async fn cancel_withdraws_a_queued_message() {
     assert_eq!(events[0].event.payload["withdrawn"], true);
     assert_eq!(
         events[0].event.payload["delivery"],
-        json!({"state":"dismissed", "provider":"codex", "mode":"start", "held":true})
+        json!({"state":"dismissed", "provider":"codex", "providerInstanceId":"codex", "mode":"start", "held":true})
     );
     assert!(
         !load_snapshot(&engine.repositories())
@@ -1306,7 +1306,7 @@ async fn steer_emits_turn_steer_requested_and_flips_row() {
     assert_eq!(events[1].event.event_type, "thread.turn-delivery-updated");
     assert_eq!(
         events[1].event.payload["delivery"],
-        json!({"state":"pending","provider":"codex","mode":"steer","held":false})
+        json!({"state":"pending","provider":"codex","providerInstanceId":"codex","mode":"steer","held":false})
     );
     let row = engine
         .repositories()
