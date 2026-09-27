@@ -12,6 +12,9 @@ use std::{
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+#[cfg(test)]
+use super::watcher::test_timeout;
+
 use super::{
     GitCommandError, GitRepository, GitWatchError, GitWatchRequest, GitWatchService,
     GitWatcherHealth, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult,
@@ -53,6 +56,8 @@ struct Inner {
     active_status_schedulers: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     retirement_wait_started: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    retirement_wait_starts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     subscription_setup_wait_started: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -241,6 +246,8 @@ impl StatusBroadcaster {
                 active_status_schedulers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 #[cfg(test)]
                 retirement_wait_started: Arc::new(tokio::sync::Notify::new()),
+                #[cfg(test)]
+                retirement_wait_starts: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 subscription_setup_wait_started: Arc::new(tokio::sync::Notify::new()),
                 #[cfg(test)]
@@ -1326,7 +1333,7 @@ impl StatusBroadcaster {
             if self.active_watcher_count_for_test() == 0 {
                 return;
             }
-            finished.await;
+            test_timeout("status scheduler shutdown", finished).await;
         }
     }
 
@@ -1342,7 +1349,7 @@ impl StatusBroadcaster {
             {
                 return;
             }
-            started.await;
+            test_timeout("status scheduler startup", started).await;
         }
     }
 
@@ -1361,13 +1368,28 @@ impl StatusBroadcaster {
     }
 
     #[cfg(test)]
-    async fn wait_for_retirement_wait_started_for_test(&self) {
-        self.inner.retirement_wait_started.notified().await;
+    fn retirement_wait_count_for_test(&self) -> usize {
+        self.inner.retirement_wait_starts.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    async fn wait_for_retirement_wait_started_for_test(&self, baseline: usize) {
+        loop {
+            let started = self.inner.retirement_wait_started.notified();
+            if self.retirement_wait_count_for_test() > baseline {
+                return;
+            }
+            test_timeout("retirement wait startup", started).await;
+        }
     }
 
     #[cfg(test)]
     async fn wait_for_subscription_setup_wait_started_for_test(&self) {
-        self.inner.subscription_setup_wait_started.notified().await;
+        test_timeout(
+            "shutdown reaching subscription setup settlement",
+            self.inner.subscription_setup_wait_started.notified(),
+        )
+        .await;
     }
 
     #[cfg(test)]
@@ -1452,10 +1474,9 @@ impl StatusBroadcaster {
         let tasks = entry.tasks.clone();
         drop(state);
         tasks.spawn(async move {
-            cancellation.cancelled().await;
+            test_timeout("held lifecycle task cancellation", cancellation.cancelled()).await;
             let _ = cancellation_observed.send(());
-            release
-                .acquire()
+            test_timeout("held lifecycle task release", release.acquire())
                 .await
                 .expect("lifecycle-task release remains open")
                 .forget();
@@ -1478,12 +1499,12 @@ impl StatusBroadcaster {
         release: Arc<tokio::sync::Semaphore>,
         cancellation_observed: tokio::sync::mpsc::UnboundedSender<()>,
     ) {
-        let subscription = self
-            .inner
-            .watcher
-            .subscribe(request)
-            .await
-            .expect("test watcher hold subscribes");
+        let subscription = test_timeout(
+            "test watcher hold subscription",
+            self.inner.watcher.subscribe(request),
+        )
+        .await
+        .expect("test watcher hold subscribes");
         let cancellation = self
             .lock_state()
             .repositories
@@ -1499,10 +1520,9 @@ impl StatusBroadcaster {
             .tasks
             .clone();
         tasks.spawn(async move {
-            cancellation.cancelled().await;
+            test_timeout("held watcher cancellation", cancellation.cancelled()).await;
             let _ = cancellation_observed.send(());
-            release
-                .acquire()
+            test_timeout("held watcher release", release.acquire())
                 .await
                 .expect("watcher-hold release remains open")
                 .forget();
@@ -1731,7 +1751,12 @@ impl StatusBroadcaster {
                 return;
             }
             #[cfg(test)]
-            self.inner.retirement_wait_started.notify_waiters();
+            {
+                self.inner
+                    .retirement_wait_starts
+                    .fetch_add(1, Ordering::Release);
+                self.inner.retirement_wait_started.notify_waiters();
+            }
             for tasks in tasks {
                 tasks.wait().await;
             }
@@ -1830,7 +1855,7 @@ impl SubscribeAttemptGate {
             if self.entered.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
-            entered.await;
+            test_timeout("subscribe-attempt gate entry", entered).await;
         }
     }
 
@@ -1863,7 +1888,7 @@ impl RegistrationOutcomeProbe {
             if self.reported.load(std::sync::atomic::Ordering::Acquire) {
                 return self.retried.load(std::sync::atomic::Ordering::Acquire);
             }
-            reported.await;
+            test_timeout("subscription registration outcome", reported).await;
         }
     }
 }
@@ -1927,7 +1952,7 @@ impl SubscriptionRegistrationGate {
             if self.has_entered.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
-            entered.await;
+            test_timeout("subscription-registration gate entry", entered).await;
         }
     }
 
@@ -1961,13 +1986,12 @@ impl RetirementEpochGate {
         self.entered
             .store(true, std::sync::atomic::Ordering::Release);
         self.entered_notify.notify_waiters();
-        let mut released = self.released.lock().expect("epoch-gate release lock");
-        while !*released {
-            released = self
-                .release_notify
-                .wait(released)
-                .expect("epoch-gate release wait");
-        }
+        let released = self.released.lock().expect("epoch-gate release lock");
+        let (released, _) = self
+            .release_notify
+            .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+            .expect("epoch-gate release wait");
+        assert!(*released, "timed out waiting for epoch-gate release");
     }
 
     async fn wait_until_entered(&self) {
@@ -1976,7 +2000,7 @@ impl RetirementEpochGate {
             if self.entered.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
-            entered.await;
+            test_timeout("retirement-epoch gate entry", entered).await;
         }
     }
 
@@ -2282,13 +2306,16 @@ mod tests {
         }
 
         async fn wait_for_operation_count(&self, operation: &str, expected: usize) {
-            loop {
-                let changed = self.operation_changed.notified();
-                if self.operation_count(operation) >= expected {
-                    return;
+            test_timeout(&format!("{expected} {operation} operations"), async {
+                loop {
+                    let changed = self.operation_changed.notified();
+                    if self.operation_count(operation) >= expected {
+                        return;
+                    }
+                    changed.await;
                 }
-                changed.await;
-            }
+            })
+            .await;
         }
     }
 
@@ -3123,6 +3150,87 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn exhausted_watcher_preserves_snapshot_health_and_local_refresh() {
+        let sandbox = TestSandbox::new("git-broadcaster-exhausted-watcher");
+        let command = sandbox.executable_on_path("git");
+        let (_, environment) = isolated_git_environment(&sandbox);
+        let cwd = fs::canonicalize(initialize_test_repository(&sandbox, &command, &environment))
+            .expect("canonical repository");
+        let repository = GitRepository::with_runner_for_test(Arc::new(IsolatedGitRunner {
+            command,
+            environment,
+        }));
+        let broadcaster = StatusBroadcaster::with_watcher_for_test(
+            Arc::new(repository),
+            GitWatchService::with_exhausted_backend_for_test(),
+        );
+        let mut subscription = tokio::time::timeout(
+            Duration::from_secs(5),
+            broadcaster.subscribe(cwd.clone(), CancellationToken::new()),
+        )
+        .await
+        .expect("status subscription returns promptly when native watcher creation fails")
+        .expect("fallback status subscription");
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), subscription.recv())
+            .await
+            .expect("fallback subscription publishes its initial snapshot");
+        assert!(
+            matches!(snapshot, Some(VcsStatusStreamEvent::Snapshot { local, .. })
+            if local.is_repo && !local.has_working_tree_changes)
+        );
+        assert!(
+            broadcaster.lock_state().repositories[&cwd]
+                .git_manager_signal
+                .borrow()
+                .watcher_degraded
+        );
+
+        fs::write(
+            cwd.join("tracked.txt"),
+            "changed while native watching is unavailable\n",
+        )
+        .expect("local worktree edit");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            broadcaster.refresh_local(&cwd, &CancellationToken::new()),
+        )
+        .await
+        .expect("explicit local refresh completes under watcher fallback")
+        .expect("fallback local refresh");
+        let local = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let VcsStatusStreamEvent::LocalUpdated { local } = subscription
+                    .recv()
+                    .await
+                    .expect("fallback status stream remains open")
+                {
+                    break local;
+                }
+            }
+        })
+        .await
+        .expect("explicit refresh publishes LocalUpdated under watcher fallback");
+        assert!(local.has_working_tree_changes);
+        assert!(
+            local
+                .working_tree
+                .files
+                .iter()
+                .any(|file| file.path == "tracked.txt")
+        );
+        assert!(
+            broadcaster.lock_state().repositories[&cwd]
+                .git_manager_signal
+                .borrow()
+                .watcher_degraded
+        );
+        drop(subscription);
+        tokio::time::timeout(Duration::from_secs(5), broadcaster.shutdown())
+            .await
+            .expect("fallback lifecycle shuts down promptly");
+    }
+
     async fn assert_broken_repository_repair_is_watched(metadata: &str, damaged: &str) {
         let _native_watcher_permit = super::super::acquire_native_watcher_test_permit().await;
         let sandbox = TestSandbox::new("git-broadcaster-broken-repository-watch");
@@ -3155,11 +3263,15 @@ mod tests {
         let fetch_finished = broadcaster.inner.fetch_attachment_finished.notified();
         tokio::pin!(fetch_finished);
         fetch_finished.as_mut().enable();
-        let mut subscription = broadcaster
-            .subscribe(cwd.clone(), CancellationToken::new())
-            .await
-            .expect("broken repository status subscription");
-        let Some(VcsStatusStreamEvent::Snapshot { local, .. }) = subscription.recv().await else {
+        let mut subscription = test_timeout(
+            "status subscription setup",
+            broadcaster.subscribe(cwd.clone(), CancellationToken::new()),
+        )
+        .await
+        .expect("broken repository status subscription");
+        let Some(VcsStatusStreamEvent::Snapshot { local, .. }) =
+            test_timeout("subscription event", subscription.recv()).await
+        else {
             panic!("initial status snapshot");
         };
         assert!(!local.is_repo);
@@ -3172,8 +3284,7 @@ mod tests {
             .expect("initial fetch attachment finishes before the repair");
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let event = subscription
-                    .recv()
+                let event = test_timeout("subscription event", subscription.recv())
                     .await
                     .expect("initial remote observation");
                 if matches!(event, VcsStatusStreamEvent::RemoteUpdated { remote: None }) {
@@ -3216,8 +3327,7 @@ mod tests {
         fs::write(&metadata_path, original).expect("repair Git metadata");
         let repaired = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let event = subscription
-                    .recv()
+                let event = test_timeout("subscription event", subscription.recv())
                     .await
                     .expect("status subscription remains open");
                 if let VcsStatusStreamEvent::LocalUpdated { local } = event
@@ -3237,7 +3347,7 @@ mod tests {
             "repair retains the existing automatic-fetch attachment behavior"
         );
         drop(subscription);
-        broadcaster.shutdown().await;
+        test_timeout("broadcaster shutdown", broadcaster.shutdown()).await;
         assert_eq!(broadcaster.active_watcher_count_for_test(), 0);
     }
 
@@ -3264,11 +3374,15 @@ mod tests {
         }));
         let broadcaster =
             StatusBroadcaster::new(Arc::new(repository), Duration::from_secs(3_600), 4);
-        let mut subscription = broadcaster
-            .subscribe(cwd.clone(), CancellationToken::new())
-            .await
-            .expect("plain folder status subscription");
-        let Some(VcsStatusStreamEvent::Snapshot { local, .. }) = subscription.recv().await else {
+        let mut subscription = test_timeout(
+            "status subscription setup",
+            broadcaster.subscribe(cwd.clone(), CancellationToken::new()),
+        )
+        .await
+        .expect("plain folder status subscription");
+        let Some(VcsStatusStreamEvent::Snapshot { local, .. }) =
+            test_timeout("subscription event", subscription.recv()).await
+        else {
             panic!("initial status snapshot");
         };
         assert!(!local.is_repo);
@@ -3284,7 +3398,7 @@ mod tests {
                 .watcher_degraded
         );
         drop(subscription);
-        broadcaster.shutdown().await;
+        test_timeout("broadcaster shutdown", broadcaster.shutdown()).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3319,21 +3433,27 @@ mod tests {
         let first_broadcaster = broadcaster.clone();
         let first_cwd = repository.clone();
         let first = tokio::spawn(async move {
-            first_broadcaster
-                .subscribe(first_cwd, CancellationToken::new())
-                .await
+            test_timeout(
+                "status subscription setup",
+                first_broadcaster.subscribe(first_cwd, CancellationToken::new()),
+            )
+            .await
         });
         let second_broadcaster = broadcaster.clone();
         let second_cwd = repository.clone();
         let second = tokio::spawn(async move {
-            second_broadcaster
-                .subscribe(second_cwd, CancellationToken::new())
-                .await
-        });
-        local_status_started_rx
-            .recv()
+            test_timeout(
+                "status subscription setup",
+                second_broadcaster.subscribe(second_cwd, CancellationToken::new()),
+            )
             .await
-            .expect("initial local status read starts");
+        });
+        test_timeout(
+            "local_status_started_rx event",
+            local_status_started_rx.recv(),
+        )
+        .await
+        .expect("initial local status read starts");
 
         assert_eq!(broadcaster.active_watcher_count_for_test(), 1);
         assert_eq!(broadcaster.active_poller_count(), 0);
@@ -3361,20 +3481,20 @@ mod tests {
         assert!(local_status_started_rx.try_recv().is_err());
 
         release_local_status.add_permits(1);
-        let mut first_subscription = first
+        let mut first_subscription = test_timeout("first task completion", first)
             .await
             .expect("first subscription task joins")
             .expect("first status subscription starts");
-        let mut second_subscription = second
+        let mut second_subscription = test_timeout("second task completion", second)
             .await
             .expect("second subscription task joins")
             .expect("second status subscription starts");
         assert!(matches!(
-            first_subscription.recv().await,
+            test_timeout("first_subscription event", first_subscription.recv()).await,
             Some(VcsStatusStreamEvent::Snapshot { .. })
         ));
         assert!(matches!(
-            second_subscription.recv().await,
+            test_timeout("second_subscription event", second_subscription.recv()).await,
             Some(VcsStatusStreamEvent::Snapshot { .. })
         ));
         assert_eq!(broadcaster.active_watcher_count_for_test(), 1);
@@ -3403,7 +3523,7 @@ mod tests {
         let dirty = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(VcsStatusStreamEvent::LocalUpdated { local }) =
-                    first_subscription.recv().await
+                    test_timeout("first_subscription event", first_subscription.recv()).await
                     && local.has_working_tree_changes
                 {
                     break local;
@@ -3454,14 +3574,18 @@ mod tests {
         }));
         let broadcaster = StatusBroadcaster::new(Arc::new(git), Duration::from_secs(3_600), 4);
 
-        let first = broadcaster
-            .subscribe(repository.clone(), CancellationToken::new())
-            .await
-            .expect("first status subscription starts");
-        let second = broadcaster
-            .subscribe(repository.clone(), CancellationToken::new())
-            .await
-            .expect("second status subscription starts");
+        let first = test_timeout(
+            "status subscription setup",
+            broadcaster.subscribe(repository.clone(), CancellationToken::new()),
+        )
+        .await
+        .expect("first status subscription starts");
+        let second = test_timeout(
+            "status subscription setup",
+            broadcaster.subscribe(repository.clone(), CancellationToken::new()),
+        )
+        .await
+        .expect("second status subscription starts");
         assert_eq!(broadcaster.active_watcher_count_for_test(), 1);
         drop(first);
         assert_eq!(broadcaster.active_watcher_count_for_test(), 1);
@@ -3474,20 +3598,68 @@ mod tests {
         .expect("last subscriber tears down the shared watcher");
         assert_eq!(broadcaster.active_poller_count(), 0);
 
-        let mut reattached = broadcaster
-            .subscribe(repository, CancellationToken::new())
-            .await
-            .expect("fresh status subscription starts after teardown");
+        let mut reattached = test_timeout(
+            "status subscription setup",
+            broadcaster.subscribe(repository, CancellationToken::new()),
+        )
+        .await
+        .expect("fresh status subscription starts after teardown");
         assert!(matches!(
-            reattached.recv().await,
+            test_timeout("reattached event", reattached.recv()).await,
             Some(VcsStatusStreamEvent::Snapshot { .. })
         ));
         assert_eq!(broadcaster.active_watcher_count_for_test(), 1);
 
-        broadcaster.shutdown().await;
+        test_timeout("broadcaster shutdown", broadcaster.shutdown()).await;
         assert_eq!(broadcaster.active_poller_count(), 0);
         assert_eq!(broadcaster.active_watcher_count_for_test(), 0);
-        assert!(reattached.recv().await.is_none());
+        assert!(
+            test_timeout("reattached event", reattached.recv())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_wait_signal_is_observed_by_a_late_waiter() {
+        let broadcaster = StatusBroadcaster::new(
+            Arc::new(GitRepository::default()),
+            Duration::from_secs(3_600),
+            4,
+        );
+        let cwd = PathBuf::from("retiring-repository");
+        let tasks = TaskTracker::new();
+        let held_task = tasks.token();
+        tasks.close();
+        broadcaster
+            .lock_state()
+            .retiring
+            .insert(cwd.clone(), vec![tasks]);
+        let baseline = broadcaster.retirement_wait_count_for_test();
+        let retirement = broadcaster.await_retired_lifecycle(&cwd);
+        tokio::pin!(retirement);
+        assert!(futures_util::poll!(&mut retirement).is_pending());
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            broadcaster.wait_for_retirement_wait_started_for_test(baseline),
+        )
+        .await
+        .expect("a late waiter must observe the already-started retirement wait");
+        let next_baseline = broadcaster.retirement_wait_count_for_test();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                broadcaster.wait_for_retirement_wait_started_for_test(next_baseline),
+            )
+            .await
+            .is_err(),
+            "an earlier retirement wait must not satisfy a new baseline"
+        );
+        drop(held_task);
+        tokio::time::timeout(Duration::from_secs(5), retirement)
+            .await
+            .expect("retirement settles after the held task is released");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3516,12 +3688,14 @@ mod tests {
             release_remote: Arc::new(Semaphore::new(16)),
         }));
         let broadcaster = StatusBroadcaster::new(Arc::new(git), Duration::from_secs(3_600), 4);
-        let mut first = broadcaster
-            .subscribe(repository.clone(), CancellationToken::new())
-            .await
-            .expect("first status subscription starts");
+        let mut first = test_timeout(
+            "status subscription setup",
+            broadcaster.subscribe(repository.clone(), CancellationToken::new()),
+        )
+        .await
+        .expect("first status subscription starts");
         assert!(matches!(
-            first.recv().await,
+            test_timeout("first event", first.recv()).await,
             Some(VcsStatusStreamEvent::Snapshot { .. })
         ));
         broadcaster
@@ -3556,21 +3730,26 @@ mod tests {
         );
 
         drop(first);
-        old_cancellation_observed_rx
-            .recv()
-            .await
-            .expect("old lifecycle observes final-release cancellation");
+        test_timeout(
+            "old_cancellation_observed_rx event",
+            old_cancellation_observed_rx.recv(),
+        )
+        .await
+        .expect("old lifecycle observes final-release cancellation");
         let reattach_broadcaster = broadcaster.clone();
         let reattach_cwd = repository.clone();
+        let retirement_baseline = broadcaster.retirement_wait_count_for_test();
         let mut reattach = tokio::spawn(async move {
-            reattach_broadcaster
-                .subscribe(reattach_cwd, CancellationToken::new())
-                .await
+            test_timeout(
+                "status subscription setup",
+                reattach_broadcaster.subscribe(reattach_cwd, CancellationToken::new()),
+            )
+            .await
         });
 
         tokio::select! {
             biased;
-            () = broadcaster.wait_for_retirement_wait_started_for_test() => {
+            () = broadcaster.wait_for_retirement_wait_started_for_test(retirement_baseline) => {
                 assert!(
                     !reattach.is_finished(),
                     "reattachment remains fenced while the old watcher task is held"
@@ -3596,7 +3775,7 @@ mod tests {
             .expect("reattachment task joins")
             .expect("fresh status subscription starts");
         assert!(matches!(
-            reattached.recv().await,
+            test_timeout("reattached event", reattached.recv()).await,
             Some(VcsStatusStreamEvent::Snapshot { .. })
         ));
         assert_ne!(
@@ -3607,7 +3786,7 @@ mod tests {
             broadcaster.inner.watcher.only_health_for_test(),
             super::super::GitWatcherHealth::Healthy
         );
-        broadcaster.shutdown().await;
+        test_timeout("broadcaster shutdown", broadcaster.shutdown()).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4896,15 +5075,18 @@ mod tests {
             panic!("post-admission retirement lost lifecycle task-insertion ownership");
         }
 
-        let retirement_wait = broadcaster.inner.retirement_wait_started.notified();
-        tokio::pin!(retirement_wait);
-        retirement_wait.as_mut().enable();
+        let retirement_baseline = broadcaster.retirement_wait_count_for_test();
         let reattaching = {
             let broadcaster = broadcaster.clone();
             let cwd = cwd.clone();
             tokio::spawn(async move { broadcaster.subscribe(cwd, CancellationToken::new()).await })
         };
-        retirement_wait.await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            broadcaster.wait_for_retirement_wait_started_for_test(retirement_baseline),
+        )
+        .await
+        .expect("reattachment reaches the old lifecycle retirement wait");
         assert!(
             !reattaching.is_finished(),
             "reattachment remains fenced until lifecycle task insertion finishes"
@@ -4965,12 +5147,14 @@ mod tests {
             Duration::from_secs(3_600),
             4,
         );
-        let mut first = broadcaster
-            .subscribe(cwd.clone(), CancellationToken::new())
-            .await
-            .expect("first lifecycle starts");
+        let mut first = test_timeout(
+            "status subscription setup",
+            broadcaster.subscribe(cwd.clone(), CancellationToken::new()),
+        )
+        .await
+        .expect("first lifecycle starts");
         assert!(matches!(
-            first.recv().await,
+            test_timeout("first event", first.recv()).await,
             Some(VcsStatusStreamEvent::Snapshot { .. })
         ));
         let old_watcher_generation = broadcaster.inner.watcher.only_generation_for_test();
@@ -4986,22 +5170,32 @@ mod tests {
         let subscribing = {
             let broadcaster = broadcaster.clone();
             let cwd = cwd.clone();
-            tokio::spawn(async move { broadcaster.subscribe(cwd, CancellationToken::new()).await })
+            tokio::spawn(async move {
+                test_timeout(
+                    "status subscription setup",
+                    broadcaster.subscribe(cwd, CancellationToken::new()),
+                )
+                .await
+            })
         };
         post_wait_gate.wait_until_entered().await;
 
         drop(first);
-        cancellation_observed_rx
-            .recv()
-            .await
-            .expect("old lifecycle cancellation reaches its held task");
+        test_timeout(
+            "cancellation_observed_rx event",
+            cancellation_observed_rx.recv(),
+        )
+        .await
+        .expect("old lifecycle cancellation reaches its held task");
         post_wait_gate.release();
         let retried = registration_probe.wait().await;
         if !retried {
             held_task_release.add_permits(1);
-            let result = subscribing.await.expect("unfenced subscription joins");
+            let result = test_timeout("subscribing task completion", subscribing)
+                .await
+                .expect("unfenced subscription joins");
             drop(result);
-            broadcaster.shutdown().await;
+            test_timeout("broadcaster shutdown", broadcaster.shutdown()).await;
             panic!("registration created a lifecycle while old retirement was pending");
         }
         assert!(
@@ -5010,12 +5204,12 @@ mod tests {
         );
 
         held_task_release.add_permits(1);
-        let mut subscription = subscribing
+        let mut subscription = test_timeout("subscribing task completion", subscribing)
             .await
             .expect("retrying subscription task joins")
             .expect("subscription succeeds after retirement settles");
         assert!(matches!(
-            subscription.recv().await,
+            test_timeout("subscription event", subscription.recv()).await,
             Some(VcsStatusStreamEvent::Snapshot { .. })
         ));
         assert_ne!(
@@ -5035,7 +5229,7 @@ mod tests {
             "retry admits exactly the final subscriber"
         );
         drop(subscription);
-        broadcaster.shutdown().await;
+        test_timeout("broadcaster shutdown", broadcaster.shutdown()).await;
     }
 
     async fn assert_shutdown_waits_for_subscription_stage(
@@ -5072,16 +5266,19 @@ mod tests {
         let subscribe_broadcaster = broadcaster.clone();
         let subscribe_cwd = repository.clone();
         let subscribe = tokio::spawn(async move {
-            subscribe_broadcaster
-                .subscribe(subscribe_cwd, CancellationToken::new())
-                .await
+            test_timeout(
+                "status subscription setup",
+                subscribe_broadcaster.subscribe(subscribe_cwd, CancellationToken::new()),
+            )
+            .await
         });
-        started_rx
-            .recv()
+        test_timeout("started_rx event", started_rx.recv())
             .await
             .expect("subscription setup reaches the blocked stage");
         let shutdown_broadcaster = broadcaster.clone();
-        let mut shutdown = tokio::spawn(async move { shutdown_broadcaster.shutdown().await });
+        let mut shutdown = tokio::spawn(async move {
+            test_timeout("broadcaster shutdown", shutdown_broadcaster.shutdown()).await
+        });
 
         tokio::select! {
             biased;
@@ -5094,19 +5291,23 @@ mod tests {
             joined = &mut shutdown => {
                 joined.expect("shutdown task joins");
                 release.add_permits(1);
-                let result = subscribe.await.expect("subscription task joins");
+                let result = test_timeout("subscribe task completion", subscribe).await.expect("subscription task joins");
                 drop(result);
                 panic!("shutdown completed before the in-flight {blocked_operation} settled");
             }
         }
 
         release.add_permits(1);
-        let result = subscribe.await.expect("subscription task joins");
+        let result = test_timeout("subscribe task completion", subscribe)
+            .await
+            .expect("subscription task joins");
         assert!(
             result.is_err(),
             "subscription completed after shutdown began at {blocked_operation}"
         );
-        shutdown.await.expect("shutdown task joins");
+        test_timeout("shutdown task completion", shutdown)
+            .await
+            .expect("shutdown task joins");
         assert_eq!(broadcaster.active_poller_count(), 0);
         assert_eq!(broadcaster.active_watcher_count_for_test(), 0);
     }
@@ -5243,12 +5444,14 @@ mod tests {
             automatic_fetch_interval,
             4,
         );
-        let mut subscription = broadcaster
-            .subscribe(worktree, CancellationToken::new())
-            .await
-            .expect("status subscription");
+        let mut subscription = test_timeout(
+            "status subscription setup",
+            broadcaster.subscribe(worktree, CancellationToken::new()),
+        )
+        .await
+        .expect("status subscription");
         assert!(matches!(
-            subscription.recv().await,
+            test_timeout("subscription event", subscription.recv()).await,
             Some(VcsStatusStreamEvent::Snapshot { .. })
         ));
         runner
@@ -5292,7 +5495,7 @@ mod tests {
         );
 
         drop(subscription);
-        broadcaster.shutdown().await;
+        test_timeout("broadcaster shutdown", broadcaster.shutdown()).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -5630,15 +5833,18 @@ mod tests {
                 "the published retirement tracker must fence reattachment before epoch retirement"
             );
         }
-        let retirement_wait = broadcaster.inner.retirement_wait_started.notified();
-        tokio::pin!(retirement_wait);
-        retirement_wait.as_mut().enable();
+        let retirement_baseline = broadcaster.retirement_wait_count_for_test();
         let reattaching = {
             let broadcaster = broadcaster.clone();
             let cwd = cwd.clone();
             tokio::spawn(async move { broadcaster.subscribe(cwd, CancellationToken::new()).await })
         };
-        retirement_wait.await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            broadcaster.wait_for_retirement_wait_started_for_test(retirement_baseline),
+        )
+        .await
+        .expect("reattachment reaches the old lifecycle retirement wait");
         assert!(
             !reattaching.is_finished(),
             "reattachment must wait until the old epoch has been retired"
@@ -6465,13 +6671,17 @@ mod tests {
             fetch_interval,
             4,
         );
-        let mut subscription = broadcaster
-            .subscribe_git_manager_signal(cwd.clone(), CancellationToken::new())
-            .await
-            .expect("signal subscription");
+        let mut subscription = test_timeout(
+            "Git Manager signal subscription setup",
+            broadcaster.subscribe_git_manager_signal(cwd.clone(), CancellationToken::new()),
+        )
+        .await
+        .expect("signal subscription");
         let initial = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let signal = subscription.recv().await.expect("signal");
+                let signal = test_timeout("subscription event", subscription.recv())
+                    .await
+                    .expect("signal");
                 if signal.generation > 0 {
                     break signal;
                 }
@@ -6507,10 +6717,12 @@ mod tests {
                 .count(),
             before
         );
-        broadcaster.shut_down_watcher_for_test().await;
+        test_timeout("watcher shutdown", broadcaster.shut_down_watcher_for_test()).await;
         let degraded = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let signal = subscription.recv().await.expect("degraded signal");
+                let signal = test_timeout("subscription event", subscription.recv())
+                    .await
+                    .expect("degraded signal");
                 if signal.watcher_degraded {
                     break signal;
                 }
@@ -6520,7 +6732,7 @@ mod tests {
         .expect("health notification without waiting for a fetch tick");
         assert_eq!(degraded.generation, initial.generation);
         drop(subscription);
-        broadcaster.shutdown().await;
+        test_timeout("broadcaster shutdown", broadcaster.shutdown()).await;
     }
 
     struct SignalReadRunner {
