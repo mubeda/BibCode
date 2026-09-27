@@ -1786,16 +1786,16 @@ describe("isWorktreeSessionRunning", () => {
     ).toBe(false);
   });
 
-  it("counts only a running session, the card menu's Archive rule", () => {
+  it("counts a starting session on the card or another chat in the checkout", () => {
+    const card = thread("card", { session: session("starting") });
+    expect(isWorktreeSessionRunning(card, [card])).toBe(true);
+    const idleCard = thread("idle-card");
+    expect(isWorktreeSessionRunning(idleCard, [idleCard, card])).toBe(true);
+  });
+
+  it("ignores sessions that are neither running nor starting", () => {
     const card = thread("card");
-    for (const status of [
-      "idle",
-      "starting",
-      "ready",
-      "interrupted",
-      "stopped",
-      "error",
-    ] as const) {
+    for (const status of ["idle", "ready", "interrupted", "stopped", "error"] as const) {
       expect(
         isWorktreeSessionRunning(card, [card, thread("chat", { session: session(status) })]),
       ).toBe(false);

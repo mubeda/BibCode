@@ -555,6 +555,7 @@ describe("worktree catalog schemas", () => {
     const reasons = [
       "command-conflict",
       "cleanup-capacity",
+      "session-running",
       "ownership-conflict",
       "stale-plan",
       "dirty-confirmation-required",

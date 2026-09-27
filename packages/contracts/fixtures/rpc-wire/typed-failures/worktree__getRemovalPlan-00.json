@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeRemovalError",
-          "reason": "replacement-conflict",
+          "reason": "dirty-confirmation-required",
           "message": "cf`Y[s",
           "currentGeneration": 8
         }

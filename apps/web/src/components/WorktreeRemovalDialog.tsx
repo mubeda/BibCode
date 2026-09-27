@@ -1,17 +1,19 @@
 import { scopeProjectRef, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import type { EnvironmentThreadShell } from "@bibcode/client-runtime/state/shell";
 import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
-import type {
-  AdoptedWorktreeAvailability,
-  EnvironmentId,
-  ProjectId,
-  ScopedProjectRef,
-  ThreadId,
-  VcsWorktreeRegistrationState,
-  WorktreeRemovalMode,
-  WorktreeRemovalPlan,
-  WorktreeRemovalResult,
+import {
+  WorktreeRemovalError,
+  type AdoptedWorktreeAvailability,
+  type EnvironmentId,
+  type ProjectId,
+  type ScopedProjectRef,
+  type ThreadId,
+  type VcsWorktreeRegistrationState,
+  type WorktreeRemovalMode,
+  type WorktreeRemovalPlan,
+  type WorktreeRemovalResult,
 } from "@bibcode/contracts";
+import * as Schema from "effect/Schema";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { newCommandId } from "../lib/utils";
@@ -58,8 +60,18 @@ export interface WorktreeRemovalDialogProps {
 
 type ConfirmationStep = "choices" | "dirty" | "prune";
 
+const isWorktreeRemovalError = Schema.is(WorktreeRemovalError);
+
+function isSessionRunningRefusal(result: { readonly cause: unknown }): boolean {
+  const error = squashAtomCommandFailure(result as never);
+  return isWorktreeRemovalError(error) && error.reason === "session-running";
+}
+
 function failureMessage(result: { readonly cause: unknown }): string {
   const error = squashAtomCommandFailure(result as never);
+  if (isWorktreeRemovalError(error) && error.reason === "session-running") {
+    return WORKTREE_DELETE_BLOCKED_REASON;
+  }
   return error instanceof Error && error.message.trim().length > 0
     ? error.message
     : "The removal request failed.";
@@ -125,6 +137,7 @@ export function WorktreeRemovalDialog({
   const [isLoadingPlan, setIsLoadingPlan] = useState(false);
   const [isRemoving, setIsRemoving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [serverRefusedRunning, setServerRefusedRunning] = useState(false);
   const [planChanged, setPlanChanged] = useState(false);
   const [completed, setCompleted] = useState<WorktreeRemovalResult | null>(null);
   const asyncEpochRef = useRef(0);
@@ -151,10 +164,16 @@ export function WorktreeRemovalDialog({
     [liveTargetThread, projectThreads, target],
   );
 
+  // Once the store catches up, the reason follows live state through session stop.
+  if (serverRefusedRunning && worktreeSessionRunning) {
+    setServerRefusedRunning(false);
+  }
+
   const loadPlanForTarget = useCallback(
     async (requestTarget: WorktreeRemovalTarget, epoch: number) => {
       setIsLoadingPlan(true);
       setError(null);
+      setServerRefusedRunning(false);
       const result = await getRemovalPlan({
         environmentId: requestTarget.environmentId,
         input: { projectId: requestTarget.projectId, threadId: requestTarget.threadId },
@@ -178,6 +197,7 @@ export function WorktreeRemovalDialog({
     setIsLoadingPlan(false);
     setIsRemoving(false);
     setError(null);
+    setServerRefusedRunning(false);
     setPlanChanged(false);
     setCompleted(null);
     if (open && target && target.availability !== "removing") {
@@ -216,6 +236,7 @@ export function WorktreeRemovalDialog({
     asyncEpochRef.current = epoch;
     setIsRemoving(true);
     setError(null);
+    setServerRefusedRunning(false);
     const result = await removeFromBibCode({
       environmentId: requestTarget.environmentId,
       input: {
@@ -244,6 +265,7 @@ export function WorktreeRemovalDialog({
       asyncEpochRef.current = epoch;
       setIsRemoving(true);
       setError(null);
+      setServerRefusedRunning(false);
       setPlanChanged(false);
       const result = await remove({
         environmentId: requestTarget.environmentId,
@@ -261,7 +283,13 @@ export function WorktreeRemovalDialog({
       const isCurrent = epoch === asyncEpochRef.current;
       if (isCurrent) setIsRemoving(false);
       if (result._tag === "Failure") {
-        if (isCurrent) setError(failureMessage(result));
+        if (isCurrent) {
+          if (isSessionRunningRefusal(result)) {
+            setServerRefusedRunning(true);
+          } else {
+            setError(failureMessage(result));
+          }
+        }
         return;
       }
       if (result.value._tag === "PlanChanged") {
@@ -333,6 +361,7 @@ export function WorktreeRemovalDialog({
   // Only a destructive button on screen waits, so only then is the reason shown.
   const deletionBlocked =
     worktreeSessionRunning && completed === null && (step !== "choices" || destructiveEligible);
+  const showDeletionBlockedReason = deletionBlocked || (serverRefusedRunning && completed === null);
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -440,7 +469,7 @@ export function WorktreeRemovalDialog({
               </ul>
             </div>
           ) : null}
-          {deletionBlocked ? (
+          {showDeletionBlockedReason ? (
             <p id={deletionBlockedReasonId} role="status" className="text-sm text-warning">
               {WORKTREE_DELETE_BLOCKED_REASON}
             </p>
@@ -465,7 +494,7 @@ export function WorktreeRemovalDialog({
                 type="button"
                 variant="destructive"
                 disabled={isRemoving || deletionBlocked}
-                aria-describedby={deletionBlocked ? deletionBlockedReasonId : undefined}
+                aria-describedby={showDeletionBlockedReason ? deletionBlockedReasonId : undefined}
                 onClick={confirmDirty}
               >
                 Delete dirty worktree
@@ -485,7 +514,7 @@ export function WorktreeRemovalDialog({
                 type="button"
                 variant="destructive"
                 disabled={isRemoving || deletionBlocked}
-                aria-describedby={deletionBlocked ? deletionBlockedReasonId : undefined}
+                aria-describedby={showDeletionBlockedReason ? deletionBlockedReasonId : undefined}
                 onClick={() =>
                   void executeDestructiveRemoval(
                     plan.availability === "missing-registered"
@@ -517,7 +546,7 @@ export function WorktreeRemovalDialog({
                   type="button"
                   variant="destructive"
                   disabled={isRemoving || deletionBlocked}
-                  aria-describedby={deletionBlocked ? deletionBlockedReasonId : undefined}
+                  aria-describedby={showDeletionBlockedReason ? deletionBlockedReasonId : undefined}
                   onClick={beginDestructiveRemoval}
                 >
                   {destructiveLabel}

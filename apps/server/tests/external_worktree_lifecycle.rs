@@ -926,6 +926,13 @@ async fn detach_succeeds_when_cleanup_cannot_complete() {
 struct PendingCleanup;
 
 impl WorktreeRemovalQuiescer for PendingCleanup {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> bibcode_server::production::worktree_catalog_rpc::WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn quiesce(
         &self,
         _admission: WorktreeRemovalCleanupAdmission,

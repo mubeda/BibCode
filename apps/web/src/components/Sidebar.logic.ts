@@ -713,9 +713,9 @@ type WorktreeSessionThread = Pick<
 /**
  * Whether a provider session is running in a worktree card's checkout: the
  * card's own thread, or an unarchived chat open in the same worktree (its
- * "N more chats"). "Running" is the card menu's Archive rule,
- * `isWorkspaceThreadRunning` (session status `running`), which is stricter than
- * `archiveThread`'s refusal of a running session only while it has an active turn.
+ * "N more chats"). Deletion waits for both `running` and `starting` sessions,
+ * matching the server's removal refusal. The Working pill still uses
+ * `isWorkspaceThreadRunning` (session status `running`).
  *
  * Archived chats are skipped, as in `summarizeWorkspaceChats`, even though
  * archiving does not stop a session (the engine only records `thread.archived`),
@@ -732,12 +732,12 @@ export function isWorktreeSessionRunning<T extends WorktreeSessionThread>(
   threads: Iterable<T>,
 ): boolean {
   if (card.worktreePath === null) return false;
-  if (isWorkspaceThreadRunning(card)) return true;
+  if (isWorkspaceThreadRunning(card) || card.session?.status === "starting") return true;
   const key = workspaceCheckoutKey(card);
   for (const thread of threads) {
     if (
       thread.archivedAt === null &&
-      isWorkspaceThreadRunning(thread) &&
+      (isWorkspaceThreadRunning(thread) || thread.session?.status === "starting") &&
       workspaceCheckoutKey(thread) === key
     ) {
       return true;

@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ use crate::{
         canonical_command_digest,
         engine::{CommandAdmissionClaim, OptionalNullable, WorkspaceOwnershipLease},
     },
-    persistence::CommandReceipt,
+    persistence::{CommandReceipt, Repositories},
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
     worktree_catalog::{
         AdoptionValidationError, AdoptionValidationErrorReason, CatalogError, CatalogErrorReason,
@@ -40,9 +41,12 @@ use crate::{
 
 const MAX_BASELINE_PATHS: usize = 512;
 const PRODUCTION_MAX_IN_FLIGHT_WORKTREE_OPERATIONS: usize = 64;
+const REMOVAL_ADMISSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type WorktreeRemovalQuiesceFuture =
     Pin<Box<dyn Future<Output = WorktreeRemovalQuiesceLease> + Send + 'static>>;
+pub type WorktreeRemovalLiveSessionsFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'static>>;
 pub type WorktreeRemovalCleanupAdmissionFuture = Pin<
     Box<
         dyn Future<
@@ -182,6 +186,9 @@ impl Drop for WorktreeRemovalQuiesceLease {
 }
 
 pub trait WorktreeRemovalQuiescer: Send + Sync + 'static {
+    fn live_session_thread_ids(&self, thread_ids: Vec<String>)
+    -> WorktreeRemovalLiveSessionsFuture;
+
     fn admit_cleanup(&self) -> WorktreeRemovalCleanupAdmissionFuture {
         Box::pin(async { Ok(WorktreeRemovalCleanupAdmission::unlimited()) })
     }
@@ -301,6 +308,13 @@ impl WorktreeRemovalGit for GitRepository {
 struct NoopWorktreeRemovalQuiescer;
 
 impl WorktreeRemovalQuiescer for NoopWorktreeRemovalQuiescer {
+    fn live_session_thread_ids(
+        &self,
+        _thread_ids: Vec<String>,
+    ) -> WorktreeRemovalLiveSessionsFuture {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn quiesce(
         &self,
         _admission: WorktreeRemovalCleanupAdmission,
@@ -319,6 +333,10 @@ pub struct WorktreeCatalogRpcServices {
     removal_git: Option<Arc<dyn WorktreeRemovalGit>>,
     status_broadcaster: Option<StatusBroadcaster>,
     operations: WorktreeCatalogOperationRuntime,
+    #[cfg(test)]
+    removal_admission_timeout: Duration,
+    #[cfg(test)]
+    removal_drain_entered: Option<Arc<Semaphore>>,
 }
 
 #[derive(Clone)]
@@ -469,6 +487,10 @@ impl WorktreeCatalogRpcServices {
             removal_git,
             status_broadcaster: None,
             operations: WorktreeCatalogOperationRuntime::new(),
+            #[cfg(test)]
+            removal_admission_timeout: REMOVAL_ADMISSION_DRAIN_TIMEOUT,
+            #[cfg(test)]
+            removal_drain_entered: None,
         }
     }
 
@@ -1586,6 +1608,7 @@ enum WorktreeRemovalErrorReason {
     EnvironmentUnsupported,
     CommandConflict,
     CleanupCapacity,
+    SessionRunning,
     OwnershipConflict,
     StaleGeneration,
     StalePlan,
@@ -1833,6 +1856,14 @@ async fn remove_worktree_owned(
                 &input.thread_id,
             )
             .await?;
+            if !reservation.prepared_retry {
+                ensure_no_running_session(
+                    &services.orchestration.repositories(),
+                    services.removal_quiescer.as_ref(),
+                    &resolved.known_thread_ids,
+                )
+                .await?;
+            }
             affected_paths.push(
                 tokio::fs::canonicalize(&resolved.path)
                     .await
@@ -1863,6 +1894,43 @@ async fn remove_worktree_owned(
                 )));
             }
             validate_git_removal_preflight(&input, &plan, resumed_git_success).map_err(encode)?;
+            if !resumed_git_success {
+                // Removing fences new admissions; already-admitted work can still publish
+                // a starting/running session until its admission is released.
+                #[cfg(not(test))]
+                let drain_timeout = REMOVAL_ADMISSION_DRAIN_TIMEOUT;
+                #[cfg(test)]
+                let drain_timeout = services.removal_admission_timeout;
+                #[cfg(test)]
+                if let Some(entered) = &services.removal_drain_entered {
+                    entered.add_permits(1);
+                }
+                tokio::time::timeout(
+                    drain_timeout,
+                    registry.wait_for_removal_admissions(&guard.identity()),
+                )
+                .await
+                .map_err(|_| encode(removal_session_running()))?;
+                let request = WorktreeRemovalQuiesceRequest::repository(
+                    guard.identity(),
+                    input.project_id.clone(),
+                    plan.repository_key.clone(),
+                    resolved.known_thread_ids.clone(),
+                );
+                let repositories = services.orchestration.repositories();
+                let thread_ids = super::worktree_runtime::removal_thread_ids(
+                    repositories.clone(),
+                    &request,
+                )
+                .await
+                .map_err(|_| encode(removal_internal()))?;
+                ensure_no_running_session(
+                    &repositories,
+                    services.removal_quiescer.as_ref(),
+                    &thread_ids,
+                )
+                .await?;
+            }
             services
                 .orchestration
                 .prepare_worktree_removal_admission(
@@ -1988,6 +2056,31 @@ async fn remove_worktree_owned(
             ))))
         });
     outcome.finish(services).await
+}
+
+async fn ensure_no_running_session(
+    repositories: &Repositories,
+    quiescer: &dyn WorktreeRemovalQuiescer,
+    thread_ids: &[String],
+) -> Result<(), Value> {
+    let mut active_thread_ids = Vec::new();
+    for thread_id in thread_ids {
+        let session = repositories
+            .get_thread_session(thread_id.clone())
+            .await
+            .map_err(|_| encode(removal_internal()))?;
+        if session.is_some_and(|session| matches!(session.status.as_str(), "running" | "starting"))
+        {
+            active_thread_ids.push(thread_id.clone());
+        }
+    }
+    if active_thread_ids.is_empty() {
+        return Ok(());
+    }
+    match quiescer.live_session_thread_ids(active_thread_ids).await {
+        Ok(live_thread_ids) if live_thread_ids.is_empty() => Ok(()),
+        Ok(_) | Err(_) => Err(encode(removal_session_running())),
+    }
 }
 
 async fn resolve_removal_thread(
@@ -2628,6 +2721,14 @@ fn removal_error(
         message: crate::worktree_catalog::bounded_message(message.into()),
         current_generation,
     }
+}
+
+fn removal_session_running() -> WorktreeRemovalError {
+    removal_error(
+        WorktreeRemovalErrorReason::SessionRunning,
+        "Stop the running session before deleting this worktree.",
+        None,
+    )
 }
 
 fn removal_not_found() -> WorktreeRemovalError {
@@ -3388,7 +3489,15 @@ mod operation_runtime_tests {
 
 #[cfg(test)]
 mod mutation_invalidation_tests {
-    use std::{path::Path, process::Command, sync::Arc, time::Duration};
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use serde_json::json;
     use tempfile::TempDir;
@@ -3398,14 +3507,16 @@ mod mutation_invalidation_tests {
     use super::{
         WorktreeCatalogRpcServices, WorktreeRemovalQuiesceFuture, WorktreeRemovalQuiesceLease,
         WorktreeRemovalQuiesceRequest, WorktreeRemovalQuiescer, create_managed_worktree,
-        remove_from_bibcode,
+        get_removal_plan, remove_from_bibcode, remove_worktree,
     };
     use crate::{
         git::GitRepository,
         orchestration::{
             EngineOptions, OrchestrationCommand, OrchestrationEngine, engine::TestHooks,
         },
-        persistence::{Database, run_migrations},
+        persistence::{
+            CommandReceipt, Database, ProjectionThreadSession, Repositories, run_migrations,
+        },
         rpc::{RequestId, RpcRequest},
         worktree_catalog::{CatalogRefreshTrigger, WorktreeCatalogService},
     };
@@ -3498,6 +3609,13 @@ mod mutation_invalidation_tests {
     }
 
     impl WorktreeRemovalQuiescer for BlockingQuiescer {
+        fn live_session_thread_ids(
+            &self,
+            _thread_ids: Vec<String>,
+        ) -> super::WorktreeRemovalLiveSessionsFuture {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
         fn quiesce(
             &self,
             _admission: super::WorktreeRemovalCleanupAdmission,
@@ -3515,6 +3633,512 @@ mod mutation_invalidation_tests {
                 WorktreeRemovalQuiesceLease::complete()
             })
         }
+    }
+
+    struct SessionStoppingQuiescer {
+        repositories: Repositories,
+        calls: Arc<AtomicUsize>,
+        live_sessions: Arc<Mutex<Result<Vec<String>, String>>>,
+    }
+
+    impl WorktreeRemovalQuiescer for SessionStoppingQuiescer {
+        fn live_session_thread_ids(
+            &self,
+            thread_ids: Vec<String>,
+        ) -> super::WorktreeRemovalLiveSessionsFuture {
+            let live_sessions = Arc::clone(&self.live_sessions);
+            Box::pin(async move {
+                let live = live_sessions.lock().expect("live sessions lock").clone()?;
+                Ok(thread_ids
+                    .into_iter()
+                    .filter(|id| live.contains(id))
+                    .collect())
+            })
+        }
+
+        fn quiesce(
+            &self,
+            _admission: super::WorktreeRemovalCleanupAdmission,
+            request: WorktreeRemovalQuiesceRequest,
+        ) -> WorktreeRemovalQuiesceFuture {
+            let repositories = self.repositories.clone();
+            let live_sessions = Arc::clone(&self.live_sessions);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                for thread_id in request.known_thread_ids() {
+                    if let Ok(threads) = &mut *live_sessions.lock().expect("live sessions lock") {
+                        threads.retain(|live_thread_id| live_thread_id != thread_id);
+                    }
+                    if let Some(mut session) = repositories
+                        .get_thread_session(thread_id.clone())
+                        .await
+                        .expect("read session to stop")
+                    {
+                        session.status = "stopped".to_owned();
+                        session.active_turn_id = None;
+                        repositories
+                            .upsert_thread_session(session)
+                            .await
+                            .expect("stop session");
+                    }
+                }
+                WorktreeRemovalQuiesceLease::complete()
+            })
+        }
+    }
+
+    struct RemovalFixture {
+        handler: HandlerFixture,
+        linked: PathBuf,
+        quiesce_calls: Arc<AtomicUsize>,
+        live_sessions: Arc<Mutex<Result<Vec<String>, String>>>,
+    }
+
+    impl RemovalFixture {
+        async fn new() -> Self {
+            let mut handler =
+                HandlerFixture::new(Arc::new(super::NoopWorktreeRemovalQuiescer)).await;
+            let linked = handler._root.path().join("removed");
+            git(
+                &handler.main,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/remove",
+                    linked.to_str().expect("linked path"),
+                ],
+            );
+            let quiesce_calls = Arc::new(AtomicUsize::new(0));
+            let live_sessions = Arc::new(Mutex::new(Ok(Vec::new())));
+            handler.services =
+                handler
+                    .services
+                    .with_removal_quiescer(Arc::new(SessionStoppingQuiescer {
+                        repositories: handler.engine.repositories(),
+                        calls: Arc::clone(&quiesce_calls),
+                        live_sessions: Arc::clone(&live_sessions),
+                    }));
+            let fixture = Self {
+                handler,
+                linked,
+                quiesce_calls,
+                live_sessions,
+            };
+            fixture
+                .create_thread("project-1", "removed-thread", "workspace")
+                .await;
+            fixture
+                .handler
+                .catalog
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+                .expect("removal catalog");
+            fixture
+        }
+
+        async fn create_thread(&self, project_id: &str, thread_id: &str, kind: &str) {
+            self.handler
+                .engine
+                .dispatch(OrchestrationCommand::ThreadCreate {
+                    command_id: format!("create-{thread_id}"),
+                    thread_id: thread_id.to_owned(),
+                    project_id: project_id.to_owned(),
+                    title: thread_id.to_owned(),
+                    kind: Some(kind.to_owned()),
+                    model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+                    runtime_mode: "full-access".to_owned(),
+                    interaction_mode: "default".to_owned(),
+                    branch: Some("feature/remove".to_owned()),
+                    worktree_path: Some(self.linked.to_string_lossy().into_owned()),
+                    created_at: "2026-08-23T00:00:01Z".to_owned(),
+                })
+                .await
+                .expect("thread created");
+        }
+
+        fn set_live_sessions(&self, thread_ids: &[&str]) {
+            *self.live_sessions.lock().expect("live sessions lock") =
+                Ok(thread_ids.iter().map(|id| (*id).to_owned()).collect());
+        }
+
+        async fn set_session(&self, thread_id: &str, status: &str) {
+            self.handler
+                .engine
+                .repositories()
+                .upsert_thread_session(ProjectionThreadSession {
+                    thread_id: thread_id.to_owned(),
+                    status: status.to_owned(),
+                    provider_name: Some("codex".to_owned()),
+                    provider_instance_id: Some("codex".to_owned()),
+                    runtime_mode: "full-access".to_owned(),
+                    active_turn_id: (status == "running").then(|| "turn-running".to_owned()),
+                    last_error: None,
+                    last_error_class: None,
+                    updated_at: "2026-08-23T00:00:02Z".to_owned(),
+                })
+                .await
+                .expect("session projection");
+        }
+
+        async fn payload(&self) -> serde_json::Value {
+            let plan = get_removal_plan(
+                &self.handler.services,
+                request(
+                    "worktree.getRemovalPlan",
+                    json!({
+                        "projectId":"project-1", "threadId":"removed-thread"
+                    }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("removal plan");
+            json!({
+                "commandId":"remove-command", "projectId":"project-1", "threadId":"removed-thread",
+                "mode":"delete-git-worktree", "expectedGeneration":plan["generation"],
+                "planToken":plan["planToken"], "forceDirty":false, "confirmRepositoryWidePrune":false
+            })
+        }
+
+        async fn remove(&self, payload: serde_json::Value) -> crate::rpc::RpcResult {
+            remove_worktree(
+                &self.handler.services,
+                request("worktree.remove", payload),
+                CancellationToken::new(),
+            )
+            .await
+        }
+
+        async fn assert_refused(&self, result: crate::rpc::RpcResult) {
+            let error = result.expect_err("active session must refuse removal");
+            assert_eq!(
+                error,
+                json!({
+                    "_tag":"WorktreeRemovalError", "reason":"session-running",
+                    "message":"Stop the running session before deleting this worktree."
+                })
+            );
+            assert_eq!(self.quiesce_calls.load(Ordering::SeqCst), 0);
+            assert!(
+                self.linked.join("README.md").exists(),
+                "checkout contents retained"
+            );
+            let inventory = GitRepository::default()
+                .worktree_inventory(&self.handler.main, &CancellationToken::new())
+                .await
+                .expect("repository remains readable");
+            let linked = self
+                .linked
+                .canonicalize()
+                .expect("checkout remains present");
+            assert!(
+                inventory
+                    .records
+                    .iter()
+                    .any(|record| record.path.canonicalize().ok().as_ref() == Some(&linked)),
+                "checkout remains registered with Git"
+            );
+            let repositories = self.handler.engine.repositories();
+            let receipt = repositories
+                .get_command_receipt("remove-command".to_owned())
+                .await
+                .expect("receipt read")
+                .expect("reservation");
+            assert_eq!(receipt.status, "reserved", "no durable removal admission");
+            assert!(
+                repositories
+                    .get_thread("removed-thread".to_owned())
+                    .await
+                    .expect("thread read")
+                    .expect("thread")
+                    .deleted_at
+                    .is_none()
+            );
+            let registry = self.handler.catalog.availability_registry();
+            let _admission = registry
+                .acquire_admission("removed-thread", [self.linked.as_path()])
+                .await
+                .expect("availability restored after refusal");
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_deletes_the_checkout_with_a_stale_running_projection() {
+        let fixture = RemovalFixture::new().await;
+        fixture.set_session("removed-thread", "running").await;
+        let result = fixture
+            .remove(fixture.payload().await)
+            .await
+            .expect("stale running projection does not block removal");
+        assert_eq!(result["gitOutcome"], "removed");
+        assert_eq!(result["threadRemoved"], true);
+        assert!(!fixture.linked.exists());
+        assert_eq!(fixture.quiesce_calls.load(Ordering::SeqCst), 1);
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_does_not_pair_a_stale_status_with_another_threads_live_session() {
+        let fixture = RemovalFixture::new().await;
+        fixture
+            .create_thread("project-1", "panel-thread", "panel")
+            .await;
+        fixture.set_session("removed-thread", "running").await;
+        fixture.set_session("panel-thread", "ready").await;
+        fixture.set_live_sessions(&["panel-thread"]);
+        let result = fixture
+            .remove(fixture.payload().await)
+            .await
+            .expect("only the idle panel session is live");
+        assert_eq!(result["gitOutcome"], "removed");
+        assert_eq!(result["threadRemoved"], true);
+        assert!(!fixture.linked.exists());
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_refuses_running_owner_before_quiesce_or_git() {
+        let fixture = RemovalFixture::new().await;
+        fixture.set_live_sessions(&["removed-thread"]);
+        fixture.set_session("removed-thread", "running").await;
+        fixture
+            .assert_refused(fixture.remove(fixture.payload().await).await)
+            .await;
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_refuses_running_panel_in_the_same_checkout() {
+        let fixture = RemovalFixture::new().await;
+        fixture.set_live_sessions(&["panel-thread"]);
+        fixture
+            .create_thread("project-1", "panel-thread", "panel")
+            .await;
+        fixture.set_session("panel-thread", "running").await;
+        fixture
+            .assert_refused(fixture.remove(fixture.payload().await).await)
+            .await;
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_refuses_starting_session() {
+        let fixture = RemovalFixture::new().await;
+        fixture.set_live_sessions(&["removed-thread"]);
+        fixture.set_session("removed-thread", "starting").await;
+        fixture
+            .assert_refused(fixture.remove(fixture.payload().await).await)
+            .await;
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_refuses_running_session_in_another_project_sharing_the_repository() {
+        let fixture = RemovalFixture::new().await;
+        fixture.set_live_sessions(&["alias-panel"]);
+        fixture.handler.engine.dispatch(serde_json::from_value(json!({
+            "type":"project.create", "commandId":"project-alias-create", "projectId":"project-alias",
+            "title":"Alias", "workspaceRoot":fixture.linked, "defaultModelSelection":null,
+            "createdAt":"2026-08-23T00:00:01Z"
+        })).expect("alias project command")).await.expect("alias project");
+        fixture
+            .handler
+            .catalog
+            .refresh("project-alias", CatalogRefreshTrigger::Explicit)
+            .await
+            .expect("pin alias repository");
+        fixture
+            .create_thread("project-alias", "alias-panel", "panel")
+            .await;
+        fixture.set_session("alias-panel", "running").await;
+        fixture
+            .assert_refused(fixture.remove(fixture.payload().await).await)
+            .await;
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_refuses_when_running_session_liveness_cannot_be_read() {
+        let fixture = RemovalFixture::new().await;
+        fixture.set_session("removed-thread", "running").await;
+        *fixture.live_sessions.lock().expect("live sessions lock") =
+            Err("provider supervisor unavailable".to_owned());
+        fixture
+            .assert_refused(fixture.remove(fixture.payload().await).await)
+            .await;
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_stops_a_ready_session_through_quiesce_and_deletes_the_checkout() {
+        let fixture = RemovalFixture::new().await;
+        fixture.set_live_sessions(&["removed-thread"]);
+        fixture.set_session("removed-thread", "ready").await;
+        let result = fixture
+            .remove(fixture.payload().await)
+            .await
+            .expect("ready removal");
+        assert_eq!(result["gitOutcome"], "removed");
+        assert_eq!(result["threadRemoved"], true);
+        assert!(!fixture.linked.exists());
+        assert_eq!(fixture.quiesce_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            fixture
+                .live_sessions
+                .lock()
+                .expect("live sessions lock")
+                .as_ref()
+                .expect("liveness lookup")
+                .is_empty(),
+            "quiesce stops the live ready session"
+        );
+        assert_eq!(
+            fixture
+                .handler
+                .engine
+                .repositories()
+                .get_thread_session("removed-thread".to_owned())
+                .await
+                .expect("session read")
+                .expect("session")
+                .status,
+            "stopped"
+        );
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_waits_for_admitted_work_before_checking_the_session() {
+        let mut fixture = RemovalFixture::new().await;
+        fixture.set_live_sessions(&["removed-thread"]);
+        let entered = Arc::new(Semaphore::new(0));
+        fixture.handler.services.removal_drain_entered = Some(Arc::clone(&entered));
+        fixture.set_session("removed-thread", "ready").await;
+        let payload = fixture.payload().await;
+        let registry = fixture.handler.catalog.availability_registry();
+        let admission = registry
+            .acquire_admission("removed-thread", [fixture.linked.as_path()])
+            .await
+            .expect("turn admission");
+        let services = fixture.handler.services.clone();
+        let removal = tokio::spawn(async move {
+            remove_worktree(
+                &services,
+                request("worktree.remove", payload),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+            .await
+            .expect("removal reaches the admission drain")
+            .expect("drain signal")
+            .forget();
+        assert!(
+            !removal.is_finished(),
+            "removal waits for the held admission"
+        );
+        assert!(
+            registry.guard_thread("removed-thread").await.is_err(),
+            "new admissions are fenced"
+        );
+        assert_eq!(
+            fixture.quiesce_calls.load(Ordering::SeqCst),
+            0,
+            "drain precedes quiesce"
+        );
+        fixture.set_session("removed-thread", "running").await;
+        drop(admission);
+        fixture
+            .assert_refused(removal.await.expect("removal joins"))
+            .await;
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_refuses_when_an_admission_does_not_drain_before_the_deadline() {
+        let mut fixture = RemovalFixture::new().await;
+        fixture.set_live_sessions(&["removed-thread"]);
+        fixture.handler.services.removal_admission_timeout = Duration::from_millis(20);
+        let payload = fixture.payload().await;
+        let registry = fixture.handler.catalog.availability_registry();
+        let _admission = registry
+            .acquire_admission("removed-thread", [fixture.linked.as_path()])
+            .await
+            .expect("held admission");
+        let result = tokio::time::timeout(Duration::from_secs(2), fixture.remove(payload))
+            .await
+            .expect("bounded admission drain");
+        fixture.assert_refused(result).await;
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_resumes_after_git_success_even_with_a_running_session_and_replays() {
+        let fixture = RemovalFixture::new().await;
+        fixture.set_live_sessions(&["removed-thread"]);
+        let payload = fixture.payload().await;
+        fixture
+            .handler
+            .engine
+            .repositories()
+            .reserve_command_receipt(CommandReceipt {
+                command_id: "remove-command".to_owned(),
+                aggregate_kind: "project".to_owned(),
+                aggregate_id: "project-1".to_owned(),
+                accepted_at: "2026-08-23T00:00:02Z".to_owned(),
+                result_sequence: 0,
+                status: "prepared".to_owned(),
+                error: None,
+                payload_digest: Some(
+                    crate::orchestration::canonical_command_digest(&payload).expect("digest"),
+                ),
+            })
+            .await
+            .expect("prepared receipt");
+        git(
+            &fixture.handler.main,
+            &[
+                "worktree",
+                "remove",
+                fixture.linked.to_str().expect("linked path"),
+            ],
+        );
+        fixture.set_session("removed-thread", "running").await;
+        let result = fixture
+            .remove(payload.clone())
+            .await
+            .expect("resume durable detach");
+        assert_eq!(result["gitOutcome"], "removed");
+        assert_eq!(result["threadRemoved"], true);
+        assert_eq!(fixture.quiesce_calls.load(Ordering::SeqCst), 1);
+        fixture.set_session("removed-thread", "running").await;
+        fixture.set_live_sessions(&["removed-thread"]);
+        assert_eq!(
+            fixture
+                .remove(payload)
+                .await
+                .expect("accepted receipt replay"),
+            result
+        );
+        assert_eq!(fixture.quiesce_calls.load(Ordering::SeqCst), 1);
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn detach_only_still_stops_and_detaches_a_running_session() {
+        let fixture = RemovalFixture::new().await;
+        fixture.set_live_sessions(&["removed-thread"]);
+        fixture.set_session("removed-thread", "running").await;
+        let result = remove_from_bibcode(&fixture.handler.services, request("worktree.removeFromBibCode", json!({
+            "commandId":"detach-command", "projectId":"project-1", "threadId":"removed-thread"
+        })), CancellationToken::new()).await.expect("detach running session");
+        assert_eq!(result["gitOutcome"], "not-requested");
+        assert_eq!(result["threadRemoved"], true);
+        assert!(fixture.linked.join("README.md").exists());
+        assert_eq!(fixture.quiesce_calls.load(Ordering::SeqCst), 1);
+        fixture.handler.shutdown().await;
     }
 
     #[tokio::test]

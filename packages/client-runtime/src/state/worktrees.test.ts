@@ -1551,6 +1551,51 @@ describe("worktree removal commands", () => {
     }),
   );
 
+  it.effect("propagates a session-running refusal without refreshing the plan or retrying", () =>
+    Effect.gen(function* () {
+      let removalCalls = 0;
+      let planCalls = 0;
+      const failure = new WorktreeRemovalError({
+        reason: "session-running",
+        message: "Stop the running session before deleting this worktree.",
+      });
+      const client = {
+        [WS_METHODS.worktreeRemove]: () => {
+          removalCalls += 1;
+          return Effect.fail(failure);
+        },
+        [WS_METHODS.worktreeGetRemovalPlan]: () => {
+          planCalls += 1;
+          return Effect.die("A running session must not refresh the plan.");
+        },
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, client]]));
+
+      const result = yield* Effect.promise(() =>
+        harness.worktrees.remove.run(harness.atomRegistry, {
+          environmentId: ENVIRONMENT_ONE,
+          input: {
+            commandId: CommandId.make("command-session-running"),
+            projectId: PROJECT_ID,
+            threadId: ThreadId.make("thread-one"),
+            mode: "delete-git-worktree",
+            expectedGeneration: 9,
+            planToken: WorktreeRemovalPlanToken.make("plan-one"),
+            forceDirty: false,
+            confirmRepositoryWidePrune: false,
+          },
+        }),
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(Cause.squash(result.cause)).toBe(failure);
+      }
+      expect({ removalCalls, planCalls }).toEqual({ removalCalls: 1, planCalls: 0 });
+      harness.atomRegistry.dispose();
+    }),
+  );
+
   it.effect("exposes partial stale-registration cleanup without restoring the row", () =>
     Effect.gen(function* () {
       const client = {
