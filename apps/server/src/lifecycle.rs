@@ -19,7 +19,9 @@ use crate::{
         UnavailableDesktopUiProcessObserver,
     },
     http, logging,
-    maintenance::{UpdateMaintenance, maintenance_routes_enabled},
+    maintenance::{
+        UpdateMaintenance, maintenance_routes_enabled, update_maintenance_owner_enabled,
+    },
     persistence::{
         Database, Repositories, StatePaths, StorageInstanceId, StoreRuntimeGuard, prepare_store,
     },
@@ -73,6 +75,7 @@ pub struct ServerHandle {
     database: Option<Database>,
     _store_runtime_guard: StoreRuntimeGuard,
     _production_runtime: Option<Arc<ProductionRuntime>>,
+    update_maintenance: Option<Arc<UpdateMaintenance>>,
     _log_sink: Arc<logging::LogSinkLease>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
@@ -375,7 +378,7 @@ impl ServerRuntime {
         };
         let shutdown = CancellationToken::new();
         let admission_gate = rpc_registry.admission_gate();
-        let update_maintenance = if maintenance_routes_enabled(&config) {
+        let update_maintenance_owner = if update_maintenance_owner_enabled(&config) {
             production_runtime.as_ref().map(|runtime| {
                 UpdateMaintenance::new(
                     admission_gate.clone(),
@@ -390,6 +393,12 @@ impl ServerRuntime {
                     config.update_maintenance_lease,
                 )
             })
+        } else {
+            None
+        };
+        // HTTP gets the owner only on a loopback or desktop-owned WSL bind.
+        let update_maintenance = if maintenance_routes_enabled(&config) {
+            update_maintenance_owner.clone()
         } else {
             None
         };
@@ -429,6 +438,7 @@ impl ServerRuntime {
             database: Some(database),
             _store_runtime_guard: store_runtime_guard,
             _production_runtime: production_runtime,
+            update_maintenance: update_maintenance_owner,
             _log_sink: log_sink,
             shutdown,
             task: Some(task),
@@ -660,6 +670,14 @@ impl ServerHandle {
         self.startup_access.as_ref()
     }
 
+    /// The runtime's update-maintenance owner, for the desktop host's in-process
+    /// protection. `Some` for every desktop-mode production runtime with a bootstrap
+    /// token, whatever its bind; the HTTP routes may still be hidden.
+    #[must_use]
+    pub fn update_maintenance(&self) -> Option<Arc<UpdateMaintenance>> {
+        self.update_maintenance.clone()
+    }
+
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
@@ -674,6 +692,7 @@ impl ServerHandle {
             Ok(result) => result.map_err(ServerError::Serve),
             Err(error) => Err(ServerError::Join(error)),
         };
+        drop(self.update_maintenance.take());
         drop(self._production_runtime.take());
         if let Some(database) = self.database.take() {
             database.close().await;

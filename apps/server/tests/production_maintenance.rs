@@ -711,3 +711,179 @@ async fn shutdown_stops_a_detached_clone_and_removes_its_folder() {
     .await;
     assert!(closed.is_ok(), "Git was stopped");
 }
+
+#[tokio::test]
+async fn a_wide_bound_desktop_runtime_protects_in_process_while_http_maintenance_stays_hidden() {
+    let root = tempfile::tempdir().expect("wide data root");
+    disable_provider_processes(root.path());
+    let bootstrap = "wide-bootstrap";
+    let server = ServerRuntime::start(
+        ServerConfig::new(root.path())
+            .with_bind("0.0.0.0", 0)
+            .with_desktop(bootstrap)
+            .expect("desktop config"),
+    )
+    .await
+    .expect("wide desktop runtime");
+    let base = format!("http://127.0.0.1:{}", server.local_addr().port());
+    let client = reqwest::Client::new();
+
+    // The loopback-or-WSL HTTP invariant is unchanged.
+    let hidden = client
+        .post(format!("{base}{MAINTENANCE_UPDATE_PREPARE_PATH}"))
+        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, bootstrap)
+        .send()
+        .await
+        .expect("wide prepare response");
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+    let maintenance = server
+        .update_maintenance()
+        .expect("a desktop runtime owns update maintenance whatever its bind");
+    let prepared = timeout(Duration::from_secs(45), maintenance.prepare())
+        .await
+        .expect("in-process prepare stays within the 45 s bound")
+        .expect("in-process prepare succeeds");
+    assert_eq!(maintenance.status().await["phase"], "prepared");
+
+    let paths = StatePaths::from_config(&desktop_config(root.path(), bootstrap));
+    let inventory = inventory_verified_backups(&paths, prepared.storage_instance_id)
+        .await
+        .expect("verified backup inventory");
+    assert_eq!(inventory.verified.len(), 1);
+    assert_eq!(
+        inventory.verified[0].manifest.trigger,
+        BackupTrigger::PreUpdate
+    );
+    assert_eq!(
+        inventory.verified[0].manifest.backup_id.to_string(),
+        prepared.backup_id
+    );
+
+    let operation_id =
+        uuid::Uuid::parse_str(&prepared.operation_id).expect("operation id is a UUID");
+    maintenance
+        .commit(operation_id)
+        .await
+        .expect("in-process commit succeeds");
+    maintenance.shutdown_after_response();
+    timeout(Duration::from_secs(2), server.wait_for_shutdown())
+        .await
+        .expect("commit exits the quiesced runtime");
+    server.join().await.expect("wide runtime joins");
+}
+
+#[tokio::test]
+async fn in_process_cancel_exits_and_a_mismatched_operation_changes_nothing() {
+    let root = tempfile::tempdir().expect("cancel data root");
+    disable_provider_processes(root.path());
+    let server = ServerRuntime::start(
+        ServerConfig::new(root.path())
+            .with_bind("0.0.0.0", 0)
+            .with_desktop("cancel-bootstrap")
+            .expect("desktop config"),
+    )
+    .await
+    .expect("wide desktop runtime");
+    let maintenance = server.update_maintenance().expect("maintenance owner");
+    let prepared = maintenance.prepare().await.expect("prepare");
+
+    let mismatch = maintenance
+        .cancel(uuid::Uuid::nil())
+        .await
+        .expect_err("a foreign operation id is refused");
+    assert!(
+        matches!(
+            mismatch,
+            bibcode_server::MaintenanceError::OperationMismatch
+        ),
+        "{mismatch:?}"
+    );
+    let status = maintenance.status().await;
+    assert_eq!(status["phase"], "prepared");
+    assert_eq!(
+        status["result"]["operationId"],
+        prepared.operation_id.as_str()
+    );
+    assert!(
+        timeout(Duration::from_millis(50), server.wait_for_shutdown())
+            .await
+            .is_err(),
+        "a mismatched operation must not alter maintenance state"
+    );
+
+    maintenance
+        .cancel(uuid::Uuid::parse_str(&prepared.operation_id).expect("uuid"))
+        .await
+        .expect("cancel succeeds");
+    maintenance.shutdown_after_response();
+    timeout(Duration::from_secs(2), server.wait_for_shutdown())
+        .await
+        .expect("cancel exits instead of resuming");
+    server.join().await.expect("join");
+}
+
+#[tokio::test]
+async fn only_desktop_runtimes_with_a_bootstrap_token_own_update_maintenance() {
+    let web_root = tempfile::tempdir().expect("web data root");
+    disable_provider_processes(web_root.path());
+    let web = ServerRuntime::start(ServerConfig::new(web_root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("web runtime");
+    assert!(web.update_maintenance().is_none());
+    web.shutdown();
+    web.join().await.expect("web join");
+
+    let desktop_root = tempfile::tempdir().expect("desktop data root");
+    disable_provider_processes(desktop_root.path());
+    let desktop = ServerRuntime::start(desktop_config(desktop_root.path(), "loopback-bootstrap"))
+        .await
+        .expect("loopback desktop runtime");
+    assert!(desktop.update_maintenance().is_some());
+    desktop.shutdown();
+    desktop.join().await.expect("desktop join");
+}
+
+#[tokio::test]
+async fn a_loopback_desktop_runtime_shares_one_maintenance_owner_between_http_and_in_process() {
+    let root = tempfile::tempdir().expect("shared owner data root");
+    disable_provider_processes(root.path());
+    let bootstrap = "shared-owner-bootstrap";
+    let server = ServerRuntime::start(desktop_config(root.path(), bootstrap))
+        .await
+        .expect("loopback desktop runtime");
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{base}{MAINTENANCE_UPDATE_PREPARE_PATH}"))
+        .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, bootstrap)
+        .send()
+        .await
+        .expect("HTTP prepare response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response.json::<Value>().await.expect("HTTP prepare JSON");
+    let operation_id = response["operationId"].as_str().expect("HTTP operation id");
+
+    let maintenance = server
+        .update_maintenance()
+        .expect("loopback desktop runtime owns update maintenance");
+    let status = maintenance.status().await;
+    assert_eq!(status["phase"], "prepared");
+    assert_eq!(status["result"]["operationId"], operation_id);
+    let prepared = timeout(Duration::from_secs(45), maintenance.prepare())
+        .await
+        .expect("in-process prepare stays within the 45 s bound")
+        .expect("in-process prepare succeeds");
+    assert_eq!(prepared.operation_id, operation_id);
+
+    maintenance
+        .cancel(uuid::Uuid::parse_str(operation_id).expect("operation id is a UUID"))
+        .await
+        .expect("in-process cancel succeeds");
+    maintenance.shutdown_after_response();
+    timeout(Duration::from_secs(2), server.wait_for_shutdown())
+        .await
+        .expect("cancel exits the quiesced runtime");
+    server.join().await.expect("loopback runtime joins");
+}
