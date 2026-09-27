@@ -51,10 +51,8 @@ export function PairingRouteSurface({
   onInitialCredentialConsumed?: () => void;
   onAuthenticated: () => void;
 }) {
-  const autoPairTokenRef = useRef<string | null>(
-    peekPairingTokenFromUrl() ?? initialCredential ?? null,
-  );
-  const [credential, setCredential] = useState(() => autoPairTokenRef.current ?? "");
+  const [autoPairToken] = useState(() => peekPairingTokenFromUrl() ?? initialCredential ?? null);
+  const [credential, setCredential] = useState(autoPairToken ?? "");
   const [errorMessage, setErrorMessage] = useState(initialErrorMessage ?? "");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const autoSubmitAttemptedRef = useRef(false);
@@ -92,7 +90,7 @@ export function PairingRouteSurface({
   );
 
   useEffect(() => {
-    const token = autoPairTokenRef.current;
+    const token = autoPairToken;
     if (!token || autoSubmitAttemptedRef.current) {
       return;
     }
@@ -101,7 +99,7 @@ export function PairingRouteSurface({
     stripPairingTokenFromUrl();
     onInitialCredentialConsumed?.();
     void submitCredential(token);
-  }, [onInitialCredentialConsumed, submitCredential]);
+  }, [autoPairToken, onInitialCredentialConsumed, submitCredential]);
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
@@ -177,15 +175,15 @@ export function HostedPairingRouteSurface() {
   const connectPairingEnvironment = useAtomCommand(connectPairing, {
     reportFailure: false,
   });
-  const hostedPairingRequestRef = useRef(readHostedPairingRequest());
+  const [request] = useState(readHostedPairingRequest);
   const [status, setStatus] = useState<"confirm" | "pairing" | "paired" | "error">(() =>
-    hostedPairingRequestRef.current ? "confirm" : "error",
+    request ? "confirm" : "error",
   );
   const [errorKind, setErrorKind] = useState<"missing" | "resubmitted" | "connection" | null>(() =>
-    hostedPairingRequestRef.current ? null : "missing",
+    request ? null : "missing",
   );
   const [message, setMessage] = useState(() =>
-    hostedPairingRequestRef.current
+    request
       ? "Review the backend address before submitting this one-time pairing token."
       : MISSING_HOSTED_PAIRING_MESSAGE,
   );
@@ -193,8 +191,6 @@ export function HostedPairingRouteSurface() {
   const tokenSubmittedRef = useRef(false);
 
   const submitHostedPairingRequest = useCallback(async () => {
-    const request = hostedPairingRequestRef.current;
-
     if (!request) {
       setStatus("error");
       setErrorKind("missing");
@@ -229,7 +225,7 @@ export function HostedPairingRouteSurface() {
     setMessage(
       `${errorMessageFromUnknown(squashAtomCommandFailure(result))} This one-time token may already have been accepted; request a new pairing link before trying again.`,
     );
-  }, [connectPairingEnvironment]);
+  }, [connectPairingEnvironment, request]);
 
   useEffect(() => {
     if (tokenStrippedRef.current) {
@@ -239,8 +235,6 @@ export function HostedPairingRouteSurface() {
 
     stripPairingTokenFromUrl();
   }, []);
-
-  const request = hostedPairingRequestRef.current;
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
@@ -278,22 +272,24 @@ export function HostedPairingRouteSurface() {
           </div>
         ) : null}
 
-        <div className="mt-6 flex flex-wrap gap-2">
-          {status === "confirm" ? (
-            <Button size="sm" onClick={() => void submitHostedPairingRequest()}>
-              Pair this backend
-            </Button>
-          ) : status === "pairing" ? (
-            <Button disabled size="sm">
-              Pairing...
-            </Button>
-          ) : null}
-          {status === "paired" ? (
-            <Button size="sm" variant="outline" onClick={() => (window.location.href = "/")}>
-              Open app
-            </Button>
-          ) : null}
-        </div>
+        {status !== "error" ? (
+          <div className="mt-6 flex flex-wrap gap-2">
+            {status === "confirm" ? (
+              <Button size="sm" onClick={() => void submitHostedPairingRequest()}>
+                Pair this backend
+              </Button>
+            ) : status === "pairing" ? (
+              <Button disabled size="sm">
+                Pairing...
+              </Button>
+            ) : null}
+            {status === "paired" ? (
+              <Button size="sm" variant="outline" onClick={() => (window.location.href = "/")}>
+                Open app
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
       </section>
     </div>
   );
