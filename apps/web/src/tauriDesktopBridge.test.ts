@@ -1424,6 +1424,7 @@ describe("tauriDesktopBridge", () => {
       message: null,
       errorContext: null,
       canRetry: false,
+      requestedBy: null,
     });
 
     expect(window.open).toHaveBeenCalledWith(

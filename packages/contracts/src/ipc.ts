@@ -434,6 +434,11 @@ export const DesktopRuntimeInfoSchema = Schema.Struct({
   runningUnderArm64Translation: Schema.Boolean,
 });
 
+export interface DesktopUpdateRequester {
+  readonly label: string;
+  readonly detail: string | null;
+}
+
 export interface DesktopUpdateState {
   enabled: boolean;
   status: DesktopUpdateStatus;
@@ -451,6 +456,7 @@ export interface DesktopUpdateState {
   phase?: DesktopUpdatePhase;
   protection?: ReadonlyArray<DesktopUpdateProtection>;
   backendRecovery?: ReadonlyArray<DesktopBackendRecovery>;
+  requestedBy?: DesktopUpdateRequester | null;
 }
 
 export const DesktopUpdateStateSchema = Schema.Struct({
@@ -474,6 +480,9 @@ export const DesktopUpdateStateSchema = Schema.Struct({
   backendRecovery: Schema.Array(DesktopBackendRecoverySchema).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  requestedBy: Schema.NullOr(
+    Schema.Struct({ label: Schema.String, detail: Schema.NullOr(Schema.String) }),
+  ).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 
 export interface DesktopUpdateActionResult {
