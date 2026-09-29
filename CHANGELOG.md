@@ -43,6 +43,8 @@ switching branches with uncommitted work.
   intended, keeping Rust compilation from competing with running suites.
 - SSH tunnel test fixtures use numeric loopback without reverse-DNS lookups,
   making their readiness independent of the build host's DNS configuration.
+- Claude hook tests wait for server admission before toggling activity,
+  removing a timing assumption from stale-request checks.
 
 - Release, flaky-test diagnosis, and Linux desktop-validation procedures
   now live in shared repository documentation for Codex and Claude Code.

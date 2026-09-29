@@ -15,7 +15,6 @@ use std::{
     },
 };
 
-use axum::body::Bytes;
 use bibcode_server::{
     ServerConfig,
     activity::{
@@ -56,7 +55,6 @@ use bibcode_server::{
         TerminalStatus,
     },
 };
-use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -9632,6 +9630,74 @@ async fn post_claude_hook(
     panic!("Claude hook sink did not start: {last_error:?}");
 }
 
+async fn begin_incomplete_claude_hook(
+    endpoint: &str,
+    token: &str,
+    correlation: &str,
+    first_chunk: &[u8],
+    body_len: usize,
+) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let endpoint = reqwest::Url::parse(endpoint).expect("hook URL");
+        let host = endpoint.host_str().expect("hook host");
+        let port = endpoint.port().expect("hook port");
+        let mut socket = tokio::net::TcpStream::connect((host, port))
+            .await
+            .expect("hook socket");
+        let headers = format!(
+            "POST {} HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {token}\r\nX-BiBCode-Launch-Correlation: {correlation}\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+            endpoint.path(),
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("hook headers");
+        // Hyper sends Continue only when capture_claude_hook polls the body,
+        // after authenticating and capturing the activity admission generation.
+        let mut continued = [0_u8; 25];
+        socket
+            .read_exact(&mut continued)
+            .await
+            .expect("hook body admission response");
+        assert_eq!(&continued, b"HTTP/1.1 100 Continue\r\n\r\n");
+        socket
+            .write_all(first_chunk)
+            .await
+            .expect("first admitted body chunk");
+        socket
+    })
+    .await
+    .expect("Claude hook must admit the body before toggling activity")
+}
+
+async fn complete_claude_hook_body(
+    mut socket: tokio::net::TcpStream,
+    remainder: &[u8],
+) -> reqwest::StatusCode {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        socket
+            .write_all(remainder)
+            .await
+            .expect("release the admitted hook body");
+        let mut response = String::new();
+        BufReader::new(socket)
+            .read_line(&mut response)
+            .await
+            .expect("hook response status");
+        let status = response
+            .strip_prefix("HTTP/1.1 ")
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or_else(|| panic!("invalid hook response: {response:?}"));
+        reqwest::StatusCode::from_bytes(status.as_bytes()).expect("hook HTTP status")
+    })
+    .await
+    .expect("completed Claude hook body must receive a response")
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_activity_toggle_claude_hook_is_dormant_without_stopping_terminal() {
@@ -9660,96 +9726,47 @@ async fn agent_activity_toggle_claude_hook_is_dormant_without_stopping_terminal(
     let old_hook = serde_json::to_vec(&correlated_claude_root_hook(&fixture, &root))
         .expect("old-generation hook JSON");
     let split = old_hook.len() / 2;
-    let first = Bytes::from(old_hook[..split].to_vec());
-    let second = Bytes::from(old_hook[split..].to_vec());
-    let (first_chunk_sent, first_chunk_seen) = oneshot::channel::<()>();
-    let (release_body, released_body) = oneshot::channel::<()>();
-    let body = reqwest::Body::wrap_stream(
-        futures_util::stream::once(async move {
-            let _ = first_chunk_sent.send(());
-            Ok::<_, std::io::Error>(first)
-        })
-        .chain(futures_util::stream::once(async move {
-            let _ = released_body.await;
-            Ok::<_, std::io::Error>(second)
-        })),
-    );
-    let request = tokio::spawn(
-        reqwest::Client::new()
-            .post(&endpoint)
-            .bearer_auth(&token)
-            .header("X-BiBCode-Launch-Correlation", &correlation)
-            .header("content-type", "application/json")
-            .body(body)
-            .send(),
-    );
-
-    first_chunk_seen.await.expect("first body chunk sent");
-    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let request = begin_incomplete_claude_hook(
+        &endpoint,
+        &token,
+        &correlation,
+        &old_hook[..split],
+        old_hook.len(),
+    )
+    .await;
 
     // The hook sink bounds an incomplete body with a fixed deadline, so the
     // in-flight body only spans the two toggles: anything slower (an HTTP
     // round trip, a projection read) on a starved runner would let the
-    // server answer first and drop the client's release channel.
+    // server answer before the body is completed.
     let stopped = manager.set_agent_activity_enabled(false).await;
     assert_eq!(stopped.stopped, 1);
     assert_eq!(stopped.dormant, 1);
     assert!(!process.killed.load(Ordering::Acquire));
     let resumed = manager.set_agent_activity_enabled(true).await;
     assert_eq!(resumed.resumed, 1);
-    let released = release_body.send(());
-    let response = request.await.expect("request task");
-    assert!(
-        released.is_ok(),
-        "old-generation body was dropped before release; hook responded {:?}",
-        response.as_ref().map(reqwest::Response::status),
-    );
-    assert_eq!(
-        response.expect("hook response").status(),
-        reqwest::StatusCode::NO_CONTENT,
-    );
+    let response = complete_claude_hook_body(request, &old_hook[split..]).await;
+    assert_eq!(response, reqwest::StatusCode::NO_CONTENT);
     assert!(
         projection.snapshot(&scope).await.is_err(),
         "an old-generation hook body must not create activity after re-enable",
     );
 
-    let (first_chunk_sent, first_chunk_seen) = oneshot::channel::<()>();
-    let (release_body, released_body) = oneshot::channel::<()>();
-    let body = reqwest::Body::wrap_stream(
-        futures_util::stream::once(async move {
-            let _ = first_chunk_sent.send(());
-            Ok::<_, std::io::Error>(Bytes::from_static(b"{"))
-        })
-        .chain(futures_util::stream::once(async move {
-            let _ = released_body.await;
-            Ok::<_, std::io::Error>(Bytes::from_static(b"invalid JSON"))
-        })),
-    );
-    let request = tokio::spawn(
-        reqwest::Client::new()
-            .post(&endpoint)
-            .bearer_auth(&token)
-            .header("X-BiBCode-Launch-Correlation", &correlation)
-            .header("content-type", "application/json")
-            .body(body)
-            .send(),
-    );
-    first_chunk_seen
-        .await
-        .expect("first malformed body chunk sent");
-    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let malformed_remainder = b"invalid JSON";
+    let request = begin_incomplete_claude_hook(
+        &endpoint,
+        &token,
+        &correlation,
+        b"{",
+        1 + malformed_remainder.len(),
+    )
+    .await;
 
     let stopped = manager.set_agent_activity_enabled(false).await;
     assert_eq!(stopped.stopped, 1);
-    let released = release_body.send(());
-    let response = request.await.expect("malformed request task");
-    assert!(
-        released.is_ok(),
-        "malformed body was dropped before release; hook responded {:?}",
-        response.as_ref().map(reqwest::Response::status),
-    );
+    let response = complete_claude_hook_body(request, malformed_remainder).await;
     assert_eq!(
-        response.expect("malformed hook response").status(),
+        response,
         reqwest::StatusCode::NO_CONTENT,
         "a body completed while dormant must be rejected before JSON parsing",
     );
