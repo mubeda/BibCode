@@ -1504,17 +1504,7 @@ impl GitRepository {
         allow_non_zero_exit: bool,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
-        // Partial patches require canonical paths regardless of Git's display settings.
-        let mut canonical_args = strings(&[
-            "-c",
-            "diff.mnemonicPrefix=false",
-            "-c",
-            "diff.noprefix=false",
-            "-c",
-            "diff.srcPrefix=a/",
-            "-c",
-            "diff.dstPrefix=b/",
-        ]);
+        let mut canonical_args = strings(&super::CANONICAL_DIFF_CONFIG);
         canonical_args.extend_from_slice(args);
         self.execute_with_environment(
             operation,
