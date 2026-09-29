@@ -437,10 +437,11 @@ second Git Manager lock and no silently queued competing operation. The client
 uses each returned `GitManagerBlockedReason.message` verbatim in disabled-state
 and failure presentation instead of recreating Git or worktree policy.
 
-Git Manager and review-preview diff reads share command-local Git settings
-that always emit `a/` and `b/` path prefixes. User or repository settings such
-as `diff.mnemonicPrefix` and `diff.noprefix` cannot alter the patch format
-consumed by partial selection and the Diff panel's file parser.
+Git Manager, review-preview, and commit-context diff reads share command-local
+Git settings that always emit `a/` and `b/` path prefixes. User or repository
+settings such as `diff.mnemonicPrefix` and `diff.noprefix` cannot alter the
+patch format consumed by partial selection, the Diff panel's file parser,
+and generated commit subjects.
 
 History paging is pinned to repository tips. The first page resolves at most
 512 unique head, remote, and tag tips and returns their SHAs; later pages echo
