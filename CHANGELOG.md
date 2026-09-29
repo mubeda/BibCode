@@ -1,5 +1,62 @@
 # Changelog
 
+## [v0.7.1] - 2026-09-29
+
+BiBCode v0.7.1 adds remote branch checkout to Git Manager and improves
+switching branches with uncommitted work.
+
+### Git Manager
+
+- The branch picker searches fetched remote branches alongside local
+  branches, without regard to case. Select `origin/develop`, for example,
+  to create and check out a local `develop` branch that tracks it. Use
+  **Fetch** to discover branches added on the remote.
+- Remote branches appear in their own group, with checkout as their action.
+  Existing local branches are preserved; if the local name already exists,
+  the error explains how to select or rename it. Local and remote rows stay
+  distinct even when their displayed names match.
+- **Bring my changes** carries non-conflicting edits while preserving Git's
+  overwrite protection, occupied-worktree checks, and operation-in-progress
+  guards. **Leave my changes** saves a stash before switching. Failed
+  checkouts show their error inside the changes dialog and allow retry.
+- Partial staging of new files works when Git is configured to use mnemonic
+  diff prefixes or omit prefixes. Git Manager now requests a consistent
+  patch format, preserving unselected file contents through partial stage,
+  unstage, and discard operations.
+
+### Diffs and commit messages
+
+- Review diffs retain their file names when Git uses mnemonic, omitted, or
+  custom diff prefixes. Both review sources and Git Manager request the
+  same canonical patch format without changing your Git configuration.
+- Generated commit messages name the changed files correctly with those
+  Git display settings, instead of falling back to a generic subject.
+
+### Connections
+
+- Heartbeat scheduling no longer accumulates delays when timers wake
+  slightly late.
+
+### Release reliability and contributor documentation
+
+- CI and release verification now run package test tasks one at a time as
+  intended, keeping Rust compilation from competing with running suites.
+
+- Release, flaky-test diagnosis, and Linux desktop-validation procedures
+  now live in shared repository documentation for Codex and Claude Code.
+  Automated checks keep the two copies of the release skill synchronized.
+
+### Downloads
+
+Desktop installers and standalone server distributions are provided for
+macOS, Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm`
+packages are included for both architectures. Stable desktop updater
+payloads and signatures remain available through `latest.json`.
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.7.0...v0.7.1
+
 ## [v0.7.0] - 2026-09-27
 
 BiBCode v0.7.0 makes remote work more reliable: clones survive reconnects,

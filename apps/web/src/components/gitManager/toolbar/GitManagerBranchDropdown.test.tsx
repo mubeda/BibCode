@@ -87,6 +87,7 @@ async function renderDropdown(
         projectRef={projectRef}
         recentNames={[]}
         refs={refs}
+        remoteRefs={[]}
         selectedWorktreeCwd="/opaque/main"
         {...callbacks}
         {...overrides}
@@ -231,6 +232,30 @@ describe("GitManagerBranchDropdown", () => {
     await act(async () => rowButton("feature").click());
     expect(callbacks.onSelectBranch).toHaveBeenCalledWith(
       expect.objectContaining({ name: "feature" }),
+      false,
     );
+  });
+
+  it("offers remote checkout without local rename/delete actions, including matching local names", async () => {
+    const remote = branch("origin/develop");
+    useGitManagerStore.getState().setBranchFilterText(projectRef, "Develop");
+    const callbacks = await renderDropdown([branch("origin/develop")], {
+      remoteRefs: [remote, branch("upstream/develop"), branch("origin/main")],
+    });
+
+    expect(container.textContent).toContain("Remote branches");
+    expect(container.textContent).not.toContain("origin/main");
+    expect(container.querySelectorAll('[aria-label="Rename origin/develop"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[aria-label="Delete origin/develop"]')).toHaveLength(1);
+    expect(container.querySelector('[aria-label="Rename upstream/develop"]')).toBeNull();
+    const remoteButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Check out remote branch origin/develop"]',
+    );
+    expect(remoteButton).not.toBeNull();
+    await act(async () => remoteButton!.click());
+    expect(callbacks.onSelectBranch).toHaveBeenCalledWith(remote, true);
+
+    await act(async () => rowButton("Choose a branch to merge into main").click());
+    expect(container.textContent).not.toContain("Remote branches");
   });
 });

@@ -73,6 +73,9 @@ Use `vp test` for the built-in Vite+ test command. Use `vp run test` when the
 workspace package-script graph is specifically required. The graph keeps
 package test tasks concurrent, while server and desktop Rust test commands use
 the default parallel harness threads with Cargo compilation bounded by `-j 2`.
+CI and release verification use `vp run -r --concurrency-limit 1 test` to run
+one package task at a time. The direct recursive invocation is required:
+placing the limit on the root `test` wrapper leaves its nested graph concurrent.
 On Windows the launcher runs every Cargo test target through
 `scripts/run-windows-cargo-target.mjs`, which writes a sidecar manifest next to
 the binary declaring the Common Controls v6 dependency and

@@ -65,6 +65,11 @@ interface WorktreeOption {
   readonly path: string;
 }
 
+interface BranchCheckoutTarget {
+  readonly branch: GitManagerRefEntry;
+  readonly isRemote: boolean;
+}
+
 type GitManagerTagAction = "create" | "delete" | "push";
 
 interface TagDialogState {
@@ -301,7 +306,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     action: "create",
     tag: null,
   });
-  const [switchTarget, setSwitchTarget] = useState<GitManagerRefEntry | null>(null);
+  const [switchTarget, setSwitchTarget] = useState<BranchCheckoutTarget | null>(null);
   const [operationEvent, setOperationEvent] = useState<GitManagerOperationEvent | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
   const activeOperationRef = useRef<GitManagerOperationHandle | null>(null);
@@ -361,7 +366,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   }, []);
 
   const checkoutBranch = useCallback(
-    async (branch: GitManagerRefEntry, strategy: "stash" | "bring" | null) => {
+    async ({ branch, isRemote }: BranchCheckoutTarget, strategy: "stash" | "bring" | null) => {
       if (branchSyncDisabledReason !== null) {
         setOperationError(branchSyncDisabledReason);
         return false;
@@ -384,10 +389,15 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         _tag: "branch-checkout",
         cwd: selectedWorktreeCwd,
         projectId,
-        name: branch.name,
+        name: `refs/${isRemote ? "remotes" : "heads"}/${branch.name}`,
         strategy: strategy === "stash" ? null : strategy,
       });
-      if (success) setSelectedRef(stableProjectRef, branch.name);
+      if (success) {
+        setSelectedRef(
+          stableProjectRef,
+          isRemote ? branch.name.slice(branch.name.indexOf("/") + 1) : branch.name,
+        );
+      }
       return success;
     },
     [
@@ -401,12 +411,14 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     ],
   );
   const selectBranch = useCallback(
-    (branch: GitManagerRefEntry) => {
+    (branch: GitManagerRefEntry, isRemote: boolean) => {
+      setOperationError(null);
+      const target = { branch, isRemote };
       if (snapshot?.isDirty) {
-        setSwitchTarget(branch);
+        setSwitchTarget(target);
         return;
       }
-      void checkoutBranch(branch, null);
+      void checkoutBranch(target, null);
     },
     [checkoutBranch, snapshot?.isDirty],
   );
@@ -649,6 +661,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
             projectRef={stableProjectRef}
             recentNames={recentNames}
             refs={localBranches}
+            remoteRefs={snapshot?.remoteBranches ?? EMPTY_BRANCHES}
             selectedWorktreeCwd={selectedWorktreeCwd}
             onCreateBranch={createBranch}
             onDeleteBranch={deleteBranch}
@@ -797,9 +810,10 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       />
       <GitManagerSwitchWithChangesDialog
         branchDisabledReason={branchSyncDisabledReason}
-        branchName={switchTarget?.name ?? "branch"}
+        branchName={switchTarget?.branch.name ?? "branch"}
         busy={isOperationRunning}
         open={switchTarget !== null}
+        errorMessage={operationError}
         stashDisabledReason={stashMergeDisabledReason}
         onOpenChange={changeSwitchDialogOpen}
         onResolve={resolveSwitchWithChanges}

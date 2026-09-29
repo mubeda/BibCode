@@ -6,18 +6,19 @@ export interface BranchGroups {
   readonly default: ReadonlyArray<GitManagerRefEntry>;
   readonly recent: ReadonlyArray<GitManagerRefEntry>;
   readonly other: ReadonlyArray<GitManagerRefEntry>;
+  readonly remote: ReadonlyArray<GitManagerRefEntry>;
 }
 
 export function groupBranches(input: {
   readonly refs: ReadonlyArray<GitManagerRefEntry>;
+  readonly remoteRefs?: ReadonlyArray<GitManagerRefEntry>;
   readonly recentNames: ReadonlyArray<string>;
   readonly filter: string;
 }): BranchGroups {
   const query = input.filter.trim().toLocaleLowerCase();
-  const visible =
-    query.length === 0
-      ? input.refs
-      : input.refs.filter((ref) => ref.name.toLocaleLowerCase().includes(query));
+  const filterRefs = (refs: ReadonlyArray<GitManagerRefEntry>) =>
+    query.length === 0 ? refs : refs.filter((ref) => ref.name.toLocaleLowerCase().includes(query));
+  const visible = filterRefs(input.refs);
   const byName = new Map(visible.map((ref) => [ref.name, ref]));
   const defaultBranches = visible.filter((ref) => ref.isDefault);
   const assigned = new Set(defaultBranches.map((ref) => ref.name));
@@ -36,5 +37,6 @@ export function groupBranches(input: {
     default: defaultBranches,
     recent: recentBranches,
     other: visible.filter((ref) => !assigned.has(ref.name)),
+    remote: filterRefs(input.remoteRefs ?? []),
   };
 }

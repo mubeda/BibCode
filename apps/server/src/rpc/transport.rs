@@ -142,8 +142,7 @@ where
 pub(crate) async fn run_heartbeat(liveness: Arc<ConnectionLiveness>, shutdown: CancellationToken) {
     let mut checks = tokio::time::interval(HEARTBEAT_CHECK_INTERVAL);
     checks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    checks.tick().await;
-    let mut previous_check = Instant::now();
+    let mut previous_check = checks.tick().await;
     let mut next_ping = previous_check + HEARTBEAT_PING_INTERVAL;
     loop {
         tokio::select! {
@@ -170,7 +169,8 @@ pub(crate) async fn run_heartbeat(liveness: Arc<ConnectionLiveness>, shutdown: C
         }
         if now >= next_ping {
             liveness.request_ping();
-            next_ping = now + HEARTBEAT_PING_INTERVAL;
+            // Small check delays must not shift every subsequent Ping.
+            next_ping += HEARTBEAT_PING_INTERVAL;
         }
     }
 }
@@ -1022,6 +1022,37 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn heartbeat_ping_cadence_does_not_accumulate_check_jitter() {
+        let liveness = ConnectionLiveness::new();
+        let shutdown = CancellationToken::new();
+        let started = Instant::now();
+        let heartbeat = run_heartbeat(Arc::clone(&liveness), shutdown.clone());
+        tokio::pin!(heartbeat);
+        assert!(futures_util::poll!(&mut heartbeat).is_pending());
+
+        for second in (5..=45).step_by(5) {
+            // A small wake delay must not push the next Ping past its check.
+            let jitter_ms = if second == 15 { 2 } else { 0 };
+            let check_at = started + Duration::from_secs(second) + Duration::from_millis(jitter_ms);
+            tokio::time::advance(check_at - Instant::now()).await;
+            assert!(futures_util::poll!(&mut heartbeat).is_pending());
+            let ping_due = second % 15 == 0;
+            assert_eq!(
+                liveness.take_ping(),
+                ping_due,
+                "Ping cadence at {:?}",
+                started.elapsed()
+            );
+            if ping_due {
+                liveness.record_inbound();
+            }
+        }
+
+        shutdown.cancel();
+        heartbeat.await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_late_check_does_not_charge_the_gap() {
         let liveness = ConnectionLiveness::new();
         let shutdown = CancellationToken::new();
@@ -1035,7 +1066,17 @@ mod tests {
             !shutdown.is_cancelled(),
             "the stalled minute is not silence"
         );
-        tokio::time::sleep(Duration::from_secs(50)).await;
+        assert!(liveness.take_ping(), "one immediate Ping after the stall");
+        for elapsed in [5, 10, 15] {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                liveness.take_ping(),
+                elapsed == 15,
+                "restart the Ping cadence without a catch-up burst"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(35)).await;
         assert!(
             shutdown.is_cancelled(),
             "silence after the stall still counts"

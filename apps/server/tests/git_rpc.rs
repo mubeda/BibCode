@@ -1447,6 +1447,48 @@ async fn failed_worktree_creation_preserves_a_preexisting_branch() {
 }
 
 #[tokio::test]
+async fn commit_context_preserves_canonical_paths_for_staged_and_working_changes() {
+    let repo = init_repo();
+    commit_file(repo.path(), "tracked.txt", "base\n", "initial");
+    fs::write(repo.path().join("tracked.txt"), "rust change\n").expect("working change");
+    let repository = GitRepository::default();
+
+    for staged in [false, true] {
+        if staged {
+            git(repo.path(), &["add", "tracked.txt"]);
+        }
+        for (mnemonic, no_prefix, source, destination) in [
+            ("true", "false", "a/", "b/"),
+            ("false", "true", "a/", "b/"),
+            ("false", "false", "before/", "after/"),
+        ] {
+            git(repo.path(), &["config", "diff.mnemonicPrefix", mnemonic]);
+            git(repo.path(), &["config", "diff.noprefix", no_prefix]);
+            git(repo.path(), &["config", "diff.srcPrefix", source]);
+            git(repo.path(), &["config", "diff.dstPrefix", destination]);
+            let config_path = repo.path().join(".git/config");
+            let config_before = fs::read(&config_path).expect("repository config");
+
+            let context = repository
+                .commit_context(repo.path(), &cancellation())
+                .await
+                .expect("commit context");
+
+            assert!(
+                context.contains("diff --git a/tracked.txt b/tracked.txt"),
+                "staged={staged}, mnemonic={mnemonic}, no_prefix={no_prefix}: {context}"
+            );
+            assert!(context.contains("+rust change"));
+            assert_eq!(
+                fs::read(config_path).expect("config after commit context"),
+                config_before,
+                "commit context must not rewrite Git display settings"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn branch_commit_context_and_history_workflow_uses_real_git_state() {
     let repo = init_repo();
     commit_file(repo.path(), "tracked.txt", "base\n", "initial");
