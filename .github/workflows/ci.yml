@@ -147,7 +147,9 @@ jobs:
   native_desktop:
     name: Native desktop - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    # Cold host tests, optimized recovery probes, and a native bundle can
+    # exceed 90 minutes on the Intel macOS runner while Rust is still compiling.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
