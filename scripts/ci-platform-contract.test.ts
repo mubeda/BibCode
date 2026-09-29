@@ -135,6 +135,12 @@ describe("cross-platform CI contract", () => {
     expect(requireJob(workflow, "test")["timeout-minutes"]).toBeGreaterThanOrEqual(60);
   });
 
+  it("allows native CI to finish host tests, optimized recovery probes, and bundles", () => {
+    const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
+
+    expect(requireJob(workflow, "native_desktop")["timeout-minutes"]).toBeGreaterThanOrEqual(120);
+  });
+
   it("builds native desktop bundles on every supported runner and architecture", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
     const nativeJob = requireJob(workflow, "native_desktop");
