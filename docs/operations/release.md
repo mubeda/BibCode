@@ -411,6 +411,24 @@ gh run view "$failed_run" --log-failed
 gh run rerun "$failed_run" --failed
 ```
 
+Release API permission failures are not transient. The controller uses
+`GITHUB_TOKEN` with `contents: write`, but GitHub also requires workflow
+authorization when the release target's `.github/workflows/` files differ
+from the default branch. The built-in token cannot receive that permission;
+both [creation and updates](https://docs.github.com/en/rest/releases/releases)
+can fail with 403 or 404. Check the failed job's token permissions and compare
+the candidate with freshly fetched `origin/main`:
+
+```sh
+git fetch origin main
+git diff --name-only "$tag^{commit}" origin/main -- .github/workflows/
+```
+
+Resolve this with an appropriately authorized release identity, or obtain
+authorization for the unpublished-candidate replacement below. Pre-creating a
+draft does not fix the token's inability to update it. Keep the release target
+equal to the verified tag commit, and repeat draft inspection after recovery.
+
 Two timing failures in a row require reproducing and hardening the test before
 another release attempt; use [Flaky-test diagnosis](../testing/flaky-tests.md).
 The approval run repeats preflight, so retrying until the tag run passes does
