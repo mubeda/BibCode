@@ -129,10 +129,10 @@ describe("cross-platform CI contract", () => {
     ]);
   });
 
-  it("allows the full test job to finish a cold Rust workspace build", () => {
+  it("allows the full test job to finish sequential workspace and SSH verification", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
 
-    expect(requireJob(workflow, "test")["timeout-minutes"]).toBeGreaterThanOrEqual(45);
+    expect(requireJob(workflow, "test")["timeout-minutes"]).toBeGreaterThanOrEqual(60);
   });
 
   it("builds native desktop bundles on every supported runner and architecture", () => {
