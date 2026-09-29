@@ -41,6 +41,8 @@ switching branches with uncommitted work.
 
 - CI and release verification now run package test tasks one at a time as
   intended, keeping Rust compilation from competing with running suites.
+  The full CI test job has enough time for both Rust passes, SSH integration,
+  and cleanup without shortening any checks.
 - SSH tunnel test fixtures use numeric loopback without reverse-DNS lookups,
   making their readiness independent of the build host's DNS configuration.
 - Claude hook tests wait for server admission before toggling activity,
