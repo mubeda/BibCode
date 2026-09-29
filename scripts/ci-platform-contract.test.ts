@@ -69,6 +69,18 @@ function allStepCommands(job: WorkflowJob): string {
 }
 
 describe("cross-platform CI contract", () => {
+  it("serializes package tests directly in CI and release preflight", () => {
+    for (const [path, job] of [
+      [CI_WORKFLOW_PATH, "test"],
+      [RELEASE_WORKFLOW_PATH, "preflight"],
+    ] as const) {
+      const { workflow } = readWorkflow(path);
+      const testStep = requireJob(workflow, job).steps?.find((step) => step.name === "Test");
+
+      expect(testStep?.run).toBe("vp run -r --concurrency-limit 1 test");
+    }
+  });
+
   it("uses default Rust harness threads in standard package and CI commands", () => {
     const serverPackage = JSON.parse(NodeFS.readFileSync(SERVER_PACKAGE_JSON_PATH, "utf8")) as {
       readonly scripts: Record<string, string>;

@@ -28,6 +28,7 @@ describe("groupBranches", () => {
 
     const grouped = groupBranches({
       refs,
+      remoteRefs: [],
       recentNames: refs.slice(1, 8).map((ref) => ref.name),
       filter: "",
     });
@@ -51,11 +52,26 @@ describe("groupBranches", () => {
     const current = branch("Feature/API", { current: true });
     const grouped = groupBranches({
       refs: [branch("main", { isDefault: true }), current, branch("feature/ui")],
+      remoteRefs: [],
       recentNames: ["Feature/API"],
       filter: "api",
     });
 
-    expect(grouped).toEqual({ default: [], recent: [current], other: [] });
+    expect(grouped).toEqual({ default: [], recent: [current], other: [], remote: [] });
     expect(grouped.recent[0]?.current).toBe(true);
+  });
+
+  it("searches remote branches without mixing them into local or recent groups", () => {
+    const local = branch("origin/develop");
+    const remote = branch("origin/develop");
+    const upstream = branch("upstream/develop");
+    expect(
+      groupBranches({
+        refs: [branch("main", { isDefault: true }), local],
+        remoteRefs: [remote, upstream, branch("origin/release")],
+        recentNames: ["origin/develop"],
+        filter: "Develop",
+      }),
+    ).toEqual({ default: [], recent: [local], other: [], remote: [remote, upstream] });
   });
 });

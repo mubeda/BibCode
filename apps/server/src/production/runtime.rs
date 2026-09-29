@@ -964,6 +964,7 @@ async fn run_review_diff(cwd: &str, args: Vec<String>) -> Result<BoundedReviewDi
     crate::process::isolate_appimage_environment(&mut command);
     let mut child = command
         .args(["-C", cwd])
+        .args(crate::git::CANONICAL_DIFF_CONFIG)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2851,17 +2852,36 @@ mod tests {
             base_ref: None,
             ignore_whitespace: Some(false),
         };
-        let preview = GitReviewBackend
-            .get_diff_preview(&input)
-            .await
-            .expect("review succeeds")
-            .expect("review preview");
+        for (mnemonic, no_prefix, source, destination) in [
+            ("true", "false", "a/", "b/"),
+            ("false", "true", "a/", "b/"),
+            ("false", "false", "before/", "after/"),
+        ] {
+            git(&["config", "diff.mnemonicPrefix", mnemonic]);
+            git(&["config", "diff.noprefix", no_prefix]);
+            git(&["config", "diff.srcPrefix", source]);
+            git(&["config", "diff.dstPrefix", destination]);
+            let config_path = repository.path().join(".git/config");
+            let config_before = std::fs::read(&config_path).expect("repository config");
 
-        assert!(preview.sources[0].diff.contains("+++ b/tracked.txt"));
-        assert!(preview.sources[0].diff.contains("+staged"));
-        assert_eq!(preview.sources[1].base_ref.as_deref(), Some("main"));
-        assert!(preview.sources[1].diff.contains("+++ b/branch.txt"));
-        assert!(preview.sources[1].diff.contains("+feature"));
+            let preview = GitReviewBackend
+                .get_diff_preview(&input)
+                .await
+                .expect("review succeeds")
+                .expect("review preview");
+
+            assert!(preview.sources[0].diff.contains("--- a/tracked.txt"));
+            assert!(preview.sources[0].diff.contains("+++ b/tracked.txt"));
+            assert!(preview.sources[0].diff.contains("+staged"));
+            assert_eq!(preview.sources[1].base_ref.as_deref(), Some("main"));
+            assert!(preview.sources[1].diff.contains("+++ b/branch.txt"));
+            assert!(preview.sources[1].diff.contains("+feature"));
+            assert_eq!(
+                std::fs::read(config_path).expect("config after review"),
+                config_before,
+                "review must not rewrite the repository's display settings"
+            );
+        }
     }
 
     #[test]
@@ -2970,9 +2990,12 @@ mod tests {
                 concat!(
                     "#!/bin/sh\n",
                     "[ \"$1\" = -C ] || exit 1\n",
-                    "case \"$3\" in\n",
-                    "  diff) /usr/bin/env -0 > \"$2/tracked.environment\"; printf 'tracked review fixture\\n' ;;\n",
-                    "  -c) /usr/bin/env -0 > \"$2/untracked.environment\"; printf 'untracked.txt\\0' ;;\n",
+                    "review_cwd=\"$2\"\n",
+                    "shift 2\n",
+                    "while [ \"$1\" = -c ]; do shift 2; done\n",
+                    "case \"$1\" in\n",
+                    "  diff) /usr/bin/env -0 > \"$review_cwd/tracked.environment\"; printf 'tracked review fixture\\n' ;;\n",
+                    "  ls-files) /usr/bin/env -0 > \"$review_cwd/untracked.environment\"; printf 'untracked.txt\\0' ;;\n",
                     "  *) exit 1 ;;\n",
                     "esac\n",
                 ),

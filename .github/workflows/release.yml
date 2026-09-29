@@ -183,7 +183,7 @@ jobs:
       # deadlines that starved hosted runners have missed).
       - name: Test
         if: steps.release_meta.outputs.validate_only != 'true'
-        run: vp run --concurrency-limit 1 test
+        run: vp run -r --concurrency-limit 1 test
 
       - id: previous_tag
         name: Resolve previous release tag

@@ -58,16 +58,18 @@ the session at once, so the socket closes instead of staying open and silent.
 Plain and E2EE sessions share one heartbeat rule. Once a socket is
 authenticated (plain `/ws` after the upgrade, E2EE after `e2ee_authenticated`),
 the heartbeat asks the writer for a WebSocket Ping every 15 seconds, which it
-sends between frames or records. Every inbound frame, including the browser's
-automatic Pong, counts as activity. A data write counts only if it had to wait at
-least 100 ms for the peer to drain the socket before it completed; a write the
+sends between frames or records. Ping deadlines advance from their scheduled
+times, so small check delays do not accumulate. Every inbound frame, including
+the browser's automatic Pong, counts as activity. A data write counts only if it
+had to wait at least 100 ms for the peer to drain the socket before it completed; a write the
 socket accepts at once, or after a brief internal handoff, proves nothing about
 the peer, so small frames the server keeps sending to a frozen client never move
 the silence origin. No control write (Ping, Pong, interrupt, admission terminal or
 protocol error) is data progress. The heartbeat checks every 5 seconds and ends the session after
 45 seconds without activity, so a stopped reader is reaped within 50 seconds.
 A check that fires more than 10 seconds late, because the process was suspended
-or starved, restarts the silence clock and pings at once instead of reaping.
+or starved, restarts the silence clock and Ping schedule with one immediate Ping
+instead of reaping or sending catch-up Pings.
 A client close with code 4408, the client's liveness timeout, is logged at info
 level; other client closes are logged at debug level.
 Inbound activity counts per complete frame, so a single plain request that
@@ -388,6 +390,19 @@ command in the current supervised-process implementation—and exactly one
 `finished` or `failed` event. Client interrupt and socket cancellation reach the
 supervised child process.
 
+Branch selections send `branch-checkout.name` as a fully qualified
+`refs/heads/<branch>` or `refs/remotes/<remote>/<branch>` ref, keeping local
+names that resemble remote refs unambiguous. The server resolves that exact snapshot
+entry and uses a non-forcing tracking checkout, so a similarly named local
+branch cannot shadow the requested remote. A missing remote ref or an existing
+local destination produces an actionable failure; neither falls back to a
+different branch or replaces local history. Local branch names and unambiguous
+short remote names remain accepted by the operation. The explicit `bring`
+checkout strategy skips only the dirty-worktree guard: Git still rejects
+overwrites, and operation-in-progress and worktree-occupancy guards still apply.
+The `stash` UI choice completes the existing stash operation before checkout.
+Checkout failures remain visible inside an open dirty-changes dialog.
+
 History preserves pinned pages, ordering, selection, and scroll context while
 splicing new commits. Overlapping entries take the fresh page data. The first
 page is read once the signal's availability is known, then on a signal change
@@ -423,6 +438,12 @@ physical-repository lock. The non-waiting acquisition returns the structured
 second Git Manager lock and no silently queued competing operation. The client
 uses each returned `GitManagerBlockedReason.message` verbatim in disabled-state
 and failure presentation instead of recreating Git or worktree policy.
+
+Git Manager, review-preview, and commit-context diff reads share command-local
+Git settings that always emit `a/` and `b/` path prefixes. User or repository
+settings such as `diff.mnemonicPrefix` and `diff.noprefix` cannot alter the
+patch format consumed by partial selection, the Diff panel's file parser,
+and generated commit subjects.
 
 History paging is pinned to repository tips. The first page resolves at most
 512 unique head, remote, and tag tips and returns their SHAs; later pages echo

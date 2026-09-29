@@ -1077,7 +1077,7 @@ Run broad owners sequentially so one Cargo process owns the shared build
 directory at a time:
 
 ```sh
-vp run test
+vp run -r --concurrency-limit 1 test
 cargo test --workspace -j 2 -- --test-threads=2
 vp check
 vp run typecheck
@@ -1086,6 +1086,10 @@ cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
 cargo clippy --workspace --all-targets -- -D warnings
 git diff --check
 ```
+
+The direct recursive `-r` invocation keeps package test tasks sequential;
+putting the concurrency limit on the root `test` wrapper does not constrain
+its nested graph. Rust tests still use their package's default harness width.
 
 Use the repository's Windows/MSVC launcher when required by the native Windows
 page. The `-j 2` option bounds Cargo compilation jobs. The
@@ -1223,6 +1227,18 @@ Record each duration and the exact messages. SSH remotes have no stall guard;
 record SSH coverage separately if tested.
 
 ## Slow-link liveness scenario
+
+For transport or heartbeat changes, first run the paused-clock unit coverage
+and the real-socket liveness matrix:
+
+```sh
+cargo test -p bibcode-server --lib rpc::transport::tests -j 2
+cargo test -p bibcode-server --test rpc_liveness -j 2
+```
+
+The unit coverage checks Ping cadence under timer jitter and after a stalled
+runtime. The integration matrix keeps the production silence and transfer
+deadlines, including an idle client kept alive only by its WebSocket Pongs.
 
 Run this against an isolated development server (its own `BIBCODE_HOME`) or a
 standalone server reached from a browser, never against user data. Create a
@@ -1625,6 +1641,32 @@ starts.
    default such as `origin/HEAD` never appears as a branch row, including when a
    real local branch is named `origin`. Repeat the occupied-branch redirect from
    step 2 after these mutations to prove its owner was not lost.
+
+   Prepare a remote-only branch in the disposable fixture:
+
+   ```sh
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" push --quiet origin main:refs/heads/remote-checkout
+   ```
+
+   Choose **Fetch origin**, open the branch picker, and search `REMOTE-CHECKOUT`.
+   Confirm **Remote branches** contains `origin/remote-checkout`, with no Rename
+   or Delete action. Select it and verify the local branch and tracking ref:
+
+   ```sh
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" branch --show-current
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" rev-parse --symbolic-full-name '@{upstream}'
+   ```
+
+   Expect `remote-checkout` and `refs/remotes/origin/remote-checkout`. Return to
+   `main` through the picker and select that remote row again. The failure must
+   explain that the local branch exists and suggest selecting or renaming it;
+   `main`, the local branch tip, and its upstream must remain unchanged. Confirm
+   the local `remote-checkout` row still checks out normally, then return to
+   `main`. Repeat a remote-only checkout with pending changes: Cancel leaves
+   them untouched, **Bring my changes** carries non-conflicting edits, and
+   **Leave my changes** saves an ordinary stash before switching. A conflicting
+   edit must be preserved when Git refuses the switch.
+
 6. On `main`, choose **Fetch origin** and confirm the remote-only main commit is
    discovered; choose **Pull origin** and confirm it arrives locally. Check out
    `push-ready` and choose **Push origin**; check out `publish-ready` and choose

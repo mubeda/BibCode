@@ -7,7 +7,7 @@ four job groups:
   `cargo fmt --all --check`, Clippy with warnings denied, and the complete
   desktop build pipeline on Ubuntu 24.04.
 - **Test** runs every workspace package `test` script one task at a time with
-  `vp run --concurrency-limit 1 test`, then runs `cargo test --workspace -j 2`
+  `vp run -r --concurrency-limit 1 test`, then runs `cargo test --workspace -j 2`
   explicitly on Ubuntu 24.04. Serial tasks keep `rustc` from competing with a
   running server or desktop suite, whose 2-second test deadlines have failed
   on starved hosted runners. Its 45-minute job watchdog accommodates an
