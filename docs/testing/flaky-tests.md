@@ -4,6 +4,15 @@ Use the shared [failure classification and repair procedure](./cross-platform-va
 first. Keep the initial failure and its exact command. A passing retry alone
 does not distinguish a regression, a fixture race, and a host resource limit.
 
+For an in-flight HTTP body, a client-side stream poll proves only that the
+client produced bytes, not that the server admitted the request. The Claude
+terminal dormant-hook test uses `Expect: 100-continue` and waits for the
+server's interim response before toggling activity. Its handler authenticates
+and captures the activity generation before polling the body, and Hyper sends
+Continue only when the handler asks for body data. Verify that ordering in the
+handler and HTTP stack when changing this fixture; a sleep after a client-side
+signal cannot establish it.
+
 ## Alternate base and change
 
 For intermittent provider or terminal failures, rerun each failing case in
