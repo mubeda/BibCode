@@ -20,13 +20,15 @@ native matrices and relies on the pull-request CI workflow for the full test
 graph. `validate_only` and `publish` are mutually exclusive.
 
 Publication-capable preflight runs `vp check`, `vp run typecheck`, and
-`vp run --concurrency-limit 1 test`; validation-only preflight skips the
+`vp run -r --concurrency-limit 1 test`; validation-only preflight skips the
 duplicated full test graph after check and typecheck. The test graph runs one
 package task at a time so each Cargo invocation finishes compiling before its
 test binaries run: with the default concurrency the server suites ran while
 `rustc` was still building the desktop crate, and tests that hold 2-second
 deadlines (hook body reads, port-release probes) failed on starved hosted
-runners. The publication preflight has a 60-minute budget because a cold
+runners. The direct recursive `-r` invocation applies the limit to package
+tasks; a limit on the root `test` wrapper does not constrain its nested graph.
+The publication preflight has a 60-minute budget because a cold
 runner compiles the full Rust workspace through the package graph; measured
 hosted runs exceeded both 30 and 45 minutes without a failing test. The build
 matrix then creates native Tauri installers on the matching operating system:
@@ -528,7 +530,7 @@ Run the repository gates:
 ```powershell
 vp check
 vp run typecheck
-vp run --concurrency-limit 1 test
+vp run -r --concurrency-limit 1 test
 vp run release:smoke
 ```
 
