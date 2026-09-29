@@ -164,7 +164,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 
 | Command                                                                           | Result/exit code | Duration | Test totals or warning summary |
 | --------------------------------------------------------------------------------- | ---------------- | -------- | ------------------------------ |
-| `vp run -r --concurrency-limit 1 test`                                             |                  |          |                                |
+| `vp run -r --concurrency-limit 1 test`                                            |                  |          |                                |
 | `cargo test --workspace -j 2 -- --test-threads=2` or documented native equivalent |                  |          |                                |
 | `vp check`                                                                        |                  |          |                                |
 | `vp run typecheck`                                                                |                  |          |                                |
