@@ -64,6 +64,14 @@ Windows the same command runs two tests that saturate a Tokio blocking pool,
 checking that SSH output still arrives and that no pipe read stays parked after
 a drain gives up; only a Windows host or CI can run them.
 
+The tests for concurrent preparation and disconnect use a real child process
+serving HTTP on a numeric loopback address. Their Python fixture uses
+`socketserver.TCPServer` and rejects reverse lookups: `http.server.HTTPServer`
+resolves its server name before listening, which can make an otherwise local
+fixture depend on host DNS.
+The launch gate, tunnel readiness, operation order, and cleanup assertions keep
+their normal deadlines.
+
 The harness is compatibility evidence for OpenSSH join semantics. It does not
 exercise askpass, a real `sshd`, a remote login shell other than `/bin/sh`, or
 Windows `ssh.exe`; the live procedure below covers those. Its sshd-like mode
