@@ -1582,6 +1582,250 @@ async fn stale_missing_worktree_delete_emits_a_structured_blocked_failure_withou
 }
 
 #[tokio::test]
+async fn remote_branch_checkout_keeps_local_and_remote_namespaces_distinct() {
+    let fixture = Fixture::new().await;
+    let cwd = &fixture.repository_path;
+    let remote_tip = git_stdout(cwd, &["rev-parse", "HEAD"]);
+    git(cwd, &["push", "-q", "origin", "HEAD:refs/heads/develop"]);
+    git(
+        cwd,
+        &["commit", "-q", "--allow-empty", "-m", "local commit"],
+    );
+    git(cwd, &["branch", "origin/develop"]);
+    let local_name = "refs/remotes/origin/develop";
+    let shadow_worktree = fixture._root.path().join("shadow");
+    git(
+        cwd,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            local_name,
+            path(&shadow_worktree),
+        ],
+    );
+    let events = collect_events(fixture.operation(
+        "9",
+        json!({
+            "_tag": "branch-checkout", "cwd": cwd, "projectId": "project-1",
+            "name": "refs/remotes/origin/develop", "strategy": null
+        }),
+    ))
+    .await;
+    // Git rejects this ambiguous ref, but the unrelated local worktree must not block it.
+    assert_eq!(events.last().unwrap()["_tag"], "failed", "{events:?}");
+    assert!(events.last().unwrap()["blocked"].is_null(), "{events:?}");
+    assert_eq!(git_stdout(cwd, &["branch", "--show-current"]), "main");
+    git(cwd, &["worktree", "remove", path(&shadow_worktree)]);
+    git(cwd, &["branch", "-D", local_name]);
+
+    let events = collect_events(fixture.operation(
+        "10",
+        json!({
+            "_tag": "branch-checkout", "cwd": cwd, "projectId": "project-1",
+            "name": "refs/remotes/origin/develop", "strategy": null
+        }),
+    ))
+    .await;
+
+    assert_eq!(events.last().unwrap()["_tag"], "finished", "{events:?}");
+    assert_eq!(
+        git_stdout(cwd, &["branch", "--show-current"]).trim(),
+        "develop"
+    );
+    assert_eq!(git_stdout(cwd, &["rev-parse", "HEAD"]), remote_tip);
+    assert_eq!(
+        git_stdout(cwd, &["rev-parse", "--symbolic-full-name", "@{upstream}"]).trim(),
+        "refs/remotes/origin/develop"
+    );
+    let refs = fixture
+        .read("11", "gitManager.getRefs", json!({ "cwd": cwd }))
+        .await
+        .expect("refreshed refs");
+    assert_eq!(refs["headRef"], "develop");
+    assert!(
+        refs["localBranches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|branch| branch["name"] == "develop" && branch["upstream"] == "origin/develop")
+    );
+
+    git(cwd, &["branch", local_name, "main"]);
+    let events = collect_events(fixture.operation(
+        "12",
+        json!({
+            "_tag": "branch-checkout", "cwd": cwd, "projectId": "project-1",
+            "name": format!("refs/heads/{local_name}"), "strategy": null
+        }),
+    ))
+    .await;
+    assert_eq!(events.last().unwrap()["_tag"], "finished", "{events:?}");
+    assert_eq!(
+        git_stdout(cwd, &["branch", "--show-current"]).trim(),
+        local_name
+    );
+    assert_eq!(
+        git_stdout(cwd, &["rev-parse", "HEAD"]),
+        git_stdout(cwd, &["rev-parse", "refs/heads/main"])
+    );
+}
+
+#[tokio::test]
+async fn remote_branch_checkout_preserves_existing_local_branches_and_reports_missing_refs() {
+    let fixture = Fixture::new().await;
+    let cwd = &fixture.repository_path;
+    git(cwd, &["push", "-q", "origin", "HEAD:refs/heads/develop"]);
+    git(cwd, &["branch", "develop"]);
+    let local_tip = git_stdout(cwd, &["rev-parse", "refs/heads/develop"]);
+
+    for (name, code, message) in [
+        (
+            "refs/remotes/origin/develop",
+            "branch-exists",
+            "Select it in the local branches",
+        ),
+        (
+            "refs/remotes/origin/missing",
+            "remote-branch-not-found",
+            "Fetch and choose",
+        ),
+        (
+            "refs/heads/missing",
+            "local-branch-not-found",
+            "choose a branch again",
+        ),
+    ] {
+        let events = collect_events(fixture.operation(
+            "10",
+            json!({
+                "_tag": "branch-checkout", "cwd": cwd, "projectId": "project-1",
+                "name": name, "strategy": null
+            }),
+        ))
+        .await;
+        let failed = events.last().unwrap();
+        assert_eq!(failed["_tag"], "failed", "{events:?}");
+        assert_eq!(failed["code"], code, "{events:?}");
+        assert!(failed["message"].as_str().unwrap().contains(message));
+        assert_eq!(
+            git_stdout(cwd, &["branch", "--show-current"]).trim(),
+            "main"
+        );
+        assert_eq!(
+            git_stdout(cwd, &["rev-parse", "refs/heads/develop"]),
+            local_tip
+        );
+    }
+    assert!(
+        !git_output(cwd, &["config", "--get", "branch.develop.remote"])
+            .status
+            .success()
+    );
+}
+
+#[tokio::test]
+async fn remote_branch_checkout_requires_an_explicit_choice_to_bring_local_changes() {
+    let fixture = Fixture::new().await;
+    let cwd = &fixture.repository_path;
+    git(cwd, &["push", "-q", "origin", "HEAD:refs/heads/develop"]);
+    fs::write(cwd.join("tracked.txt"), "my unfinished work\n").unwrap();
+
+    for (strategy, terminal) in [(Value::Null, "failed"), (json!("bring"), "finished")] {
+        let events = collect_events(fixture.operation(
+            "10",
+            json!({
+                "_tag": "branch-checkout", "cwd": cwd, "projectId": "project-1",
+                "name": "refs/remotes/origin/develop", "strategy": strategy
+            }),
+        ))
+        .await;
+        assert_eq!(events.last().unwrap()["_tag"], terminal, "{events:?}");
+        assert_eq!(
+            fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+            "my unfinished work\n"
+        );
+        assert_eq!(
+            git_stdout(cwd, &["branch", "--show-current"]).trim(),
+            if terminal == "failed" {
+                "main"
+            } else {
+                "develop"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn remote_branch_checkout_bring_preserves_overwrite_and_operation_guards() {
+    let fixture = Fixture::new().await;
+    let cwd = &fixture.repository_path;
+    git(cwd, &["switch", "-q", "-c", "remote-source"]);
+    fs::write(cwd.join("tracked.txt"), "remote work\n").unwrap();
+    git(cwd, &["commit", "-qam", "remote change"]);
+    git(cwd, &["push", "-q", "origin", "HEAD:refs/heads/develop"]);
+    git(cwd, &["switch", "-q", "main"]);
+    let occupied = fixture._root.path().join("occupied");
+    git(
+        cwd,
+        &["worktree", "add", "-q", "-b", "occupied", path(&occupied)],
+    );
+    fs::write(cwd.join("tracked.txt"), "my unfinished work\n").unwrap();
+
+    for (name, code) in [
+        ("refs/remotes/origin/develop", "local-changes-overwritten"),
+        ("refs/heads/occupied", "worktree-checked-out"),
+    ] {
+        let events = collect_events(fixture.operation(
+            "10",
+            json!({
+                "_tag": "branch-checkout", "cwd": cwd, "projectId": "project-1",
+                "name": name, "strategy": "bring"
+            }),
+        ))
+        .await;
+        assert_eq!(events.last().unwrap()["_tag"], "failed", "{events:?}");
+        assert_eq!(events.last().unwrap()["code"], code, "{events:?}");
+        assert_eq!(git_stdout(cwd, &["branch", "--show-current"]), "main");
+        assert_eq!(
+            fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+            "my unfinished work\n"
+        );
+    }
+    assert!(
+        !git_output(cwd, &["show-ref", "--verify", "refs/heads/develop"])
+            .status
+            .success()
+    );
+
+    git(cwd, &["commit", "-qam", "local change"]);
+    assert!(
+        !git_output(cwd, &["merge", "remote-source"])
+            .status
+            .success()
+    );
+    assert!(merge_in_progress(cwd));
+    let conflicted_content = fs::read_to_string(cwd.join("tracked.txt")).unwrap();
+    let events = collect_events(fixture.operation(
+        "11",
+        json!({
+            "_tag": "branch-checkout", "cwd": cwd, "projectId": "project-1",
+            "name": "refs/remotes/origin/develop", "strategy": "bring"
+        }),
+    ))
+    .await;
+    assert_eq!(events.last().unwrap()["_tag"], "failed", "{events:?}");
+    assert_eq!(events.last().unwrap()["code"], "merge-in-progress");
+    assert!(merge_in_progress(cwd));
+    assert_eq!(git_stdout(cwd, &["branch", "--show-current"]), "main");
+    assert_eq!(
+        fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+        conflicted_content
+    );
+}
+
+#[tokio::test]
 async fn branch_and_sync_operations_execute_through_the_streaming_adapter() {
     let fixture = Fixture::new().await;
     let cwd = fixture.repository_path.clone();

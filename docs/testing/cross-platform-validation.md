@@ -1625,6 +1625,32 @@ starts.
    default such as `origin/HEAD` never appears as a branch row, including when a
    real local branch is named `origin`. Repeat the occupied-branch redirect from
    step 2 after these mutations to prove its owner was not lost.
+
+   Prepare a remote-only branch in the disposable fixture:
+
+   ```sh
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" push --quiet origin main:refs/heads/remote-checkout
+   ```
+
+   Choose **Fetch origin**, open the branch picker, and search `REMOTE-CHECKOUT`.
+   Confirm **Remote branches** contains `origin/remote-checkout`, with no Rename
+   or Delete action. Select it and verify the local branch and tracking ref:
+
+   ```sh
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" branch --show-current
+   git -C "$GIT_MANAGER_FIXTURE_ROOT/main" rev-parse --symbolic-full-name '@{upstream}'
+   ```
+
+   Expect `remote-checkout` and `refs/remotes/origin/remote-checkout`. Return to
+   `main` through the picker and select that remote row again. The failure must
+   explain that the local branch exists and suggest selecting or renaming it;
+   `main`, the local branch tip, and its upstream must remain unchanged. Confirm
+   the local `remote-checkout` row still checks out normally, then return to
+   `main`. Repeat a remote-only checkout with pending changes: Cancel leaves
+   them untouched, **Bring my changes** carries non-conflicting edits, and
+   **Leave my changes** saves an ordinary stash before switching. A conflicting
+   edit must be preserved when Git refuses the switch.
+
 6. On `main`, choose **Fetch origin** and confirm the remote-only main commit is
    discovered; choose **Pull origin** and confirm it arrives locally. Check out
    `push-ready` and choose **Push origin**; check out `publish-ready` and choose

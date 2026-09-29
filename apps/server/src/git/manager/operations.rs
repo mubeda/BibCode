@@ -1014,9 +1014,15 @@ fn blocked_reason_for_operation(
 ) -> Option<GitManagerBlockedReason> {
     let blocked = evaluate_guards(&GuardInput::from_snapshot(snapshot, false));
     let (branch, guard_operation) = match request {
-        GitManagerOperationRequest::BranchCheckout { name, .. } => {
-            (Some(name.as_str()), "checkout")
+        GitManagerOperationRequest::BranchCheckout { name, .. }
+            if name.starts_with("refs/remotes/") =>
+        {
+            (None, "checkout")
         }
+        GitManagerOperationRequest::BranchCheckout { name, .. } => (
+            Some(name.strip_prefix("refs/heads/").unwrap_or(name)),
+            "checkout",
+        ),
         GitManagerOperationRequest::BranchRename { name, .. } => {
             (Some(name.as_str()), "rename-branch")
         }
@@ -1065,15 +1071,22 @@ fn blocked_reason_for_operation(
         _ => return None,
     };
     let branch_reasons = branch.and_then(|branch| blocked.get(branch));
+    let bring_changes = matches!(
+        request,
+        GitManagerOperationRequest::BranchCheckout {
+            strategy: Some(GitManagerCheckoutStrategy::Bring),
+            ..
+        }
+    );
+    let applies = |reason: &&GitManagerBlockedReason| {
+        reason.operation == guard_operation
+            && !(bring_changes && reason.code == "dirty-working-tree")
+    };
     branch_reasons
-        .and_then(|reasons| {
-            reasons
-                .iter()
-                .find(|reason| reason.operation == guard_operation)
-        })
+        .and_then(|reasons| reasons.iter().find(applies))
         .or_else(|| {
             blocked.values().flatten().find(|reason| {
-                reason.operation == guard_operation
+                applies(reason)
                     && matches!(
                         reason.code.as_str(),
                         "merge-in-progress" | "no-remote" | "dirty-working-tree"
@@ -1110,33 +1123,62 @@ async fn execute_branch_or_sync_operation(
                 .await,
         )?,
         GitManagerOperationRequest::BranchCheckout { cwd, name, .. } => {
-            if snapshot
-                .local_branches
-                .iter()
-                .any(|reference| reference.name == *name)
+            let explicitly_remote = name.starts_with("refs/remotes/");
+            let local_name = name.strip_prefix("refs/heads/").unwrap_or(name);
+            if !explicitly_remote
+                && snapshot
+                    .local_branches
+                    .iter()
+                    .any(|reference| reference.name == local_name)
             {
                 one_output(
                     operation,
                     repository
-                        .git_manager_checkout_local_branch(cwd, name, cancellation)
+                        .git_manager_checkout_local_branch(cwd, local_name, cancellation)
                         .await,
                 )?
+            } else if name.starts_with("refs/heads/") {
+                return Err(operation_error(
+                    operation,
+                    "local-branch-not-found",
+                    "The selected local branch no longer exists. Refresh and choose a branch again.",
+                ));
             } else if let Some(remote_ref) = remote_tracking_ref(snapshot, name) {
                 let local_name = remote_ref
                     .name
                     .split_once('/')
                     .map_or(remote_ref.name.as_str(), |(_, branch)| branch);
+                if snapshot
+                    .local_branches
+                    .iter()
+                    .any(|reference| reference.name == local_name)
+                {
+                    return Err(operation_error(
+                        operation,
+                        "branch-exists",
+                        &format!(
+                            "A local branch named '{local_name}' already exists. Select it in the local branches list, or rename it before checking out '{}'.",
+                            remote_ref.name
+                        ),
+                    ));
+                }
                 one_output(
                     operation,
                     repository
                         .git_manager_checkout_remote_branch(
                             cwd,
                             local_name,
-                            &remote_ref.name,
+                            &format!("refs/remotes/{}", remote_ref.name),
                             cancellation,
                         )
                         .await,
                 )?
+            } else if explicitly_remote {
+                return Err(operation_error(
+                    operation,
+                    "remote-branch-not-found",
+                    "The selected remote branch no longer exists. Fetch and choose a branch again.",
+                ));
             } else {
                 one_output(
                     operation,
@@ -1684,6 +1726,12 @@ fn remote_tracking_ref<'a>(
     snapshot: &'a GitManagerRefsSnapshot,
     requested: &str,
 ) -> Option<&'a crate::git::GitManagerRefEntry> {
+    if let Some(name) = requested.strip_prefix("refs/remotes/") {
+        return snapshot
+            .remote_branches
+            .iter()
+            .find(|reference| reference.name == name);
+    }
     snapshot
         .remote_branches
         .iter()

@@ -455,7 +455,14 @@ The toolbar has three segments:
    worktrees. A first open or reload starts on the main checkout; a later
    selection is remembered while the current client session remains alive.
 2. **Branch** groups local branches into Default, Recent, and Other, and offers
-   create, checkout, rename, delete, and merge actions. **New branch** always
+   create, checkout, rename, delete, and merge actions. **Remote branches** lists
+   fetched remote-tracking branches such as `origin/develop`; search matches
+   both local and remote names without regard to case. Selecting a remote
+   branch creates and checks out a local branch with that upstream. If its
+   local name already exists, checkout stops and asks you to select or rename
+   that local branch; existing work is never replaced. Remote rows offer
+   checkout only. Use **Fetch** to discover branches added on the remote.
+   **New branch** always
    forks from the checked-out branch (or the current HEAD commit when HEAD is
    detached), never from the repository default, and the dialog names that base
    in a highlighted chip before you confirm. The same segment exposes
