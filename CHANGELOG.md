@@ -41,6 +41,8 @@ switching branches with uncommitted work.
 
 - CI and release verification now run package test tasks one at a time as
   intended, keeping Rust compilation from competing with running suites.
+- SSH tunnel test fixtures use numeric loopback without reverse-DNS lookups,
+  making their readiness independent of the build host's DNS configuration.
 
 - Release, flaky-test diagnosis, and Linux desktop-validation procedures
   now live in shared repository documentation for Codex and Claude Code.

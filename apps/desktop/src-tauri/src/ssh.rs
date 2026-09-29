@@ -6398,7 +6398,10 @@ printf '{"credential":"fixture-credential-%s"}\n' "$count"
     const GATED_LAUNCH_AND_SERVING_TUNNEL: &str = concat!(
         r##"if [ -z "$*" ]; then
   printf 'tunnel\n' >>"$dir/kinds.log"
-  exec python3 -c 'import http.server, sys
+  exec python3 -c 'import http.server, socket, socketserver, sys
+def unexpected_reverse_lookup(host):
+    raise AssertionError("numeric loopback fixture attempted reverse lookup: " + host)
+socket.getfqdn = unexpected_reverse_lookup
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -6407,7 +6410,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"{}")
     def log_message(self, *args):
         pass
-http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()' "${forward%%:*}"
+socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()' "${forward%%:*}"
 fi
 script=$(cat)
 case "$script" in
