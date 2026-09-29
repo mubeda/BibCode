@@ -916,6 +916,8 @@ async fn stacked_commit_generates_a_message_when_the_ui_leaves_it_empty() {
         vec!["config", "user.name", "BiBCode Test"],
         vec!["config", "user.email", "bibcode@example.invalid"],
         vec!["config", "core.autocrlf", "false"],
+        vec!["config", "diff.mnemonicPrefix", "true"],
+        vec!["config", "diff.noprefix", "false"],
     ] {
         assert!(
             std::process::Command::new("git")
@@ -968,15 +970,18 @@ async fn stacked_commit_generates_a_message_when_the_ui_leaves_it_empty() {
     ));
     send_json(&mut socket, json!({ "_tag": "Ack", "requestId": "9" })).await;
     let finished = next_server_message(&mut socket).await;
-    assert!(matches!(
-        finished,
-        ServerMessage::Chunk { request_id, values }
-            if request_id.as_str() == "9"
-                && values.len() == 1
-                && values[0]["kind"] == "action_finished"
-                && values[0]["result"]["commit"]["status"] == "created"
-                && values[0]["result"]["commit"]["subject"] == "Update generated.txt"
-    ));
+    assert!(
+        matches!(
+            &finished,
+            ServerMessage::Chunk { request_id, values }
+                if request_id.as_str() == "9"
+                    && values.len() == 1
+                    && values[0]["kind"] == "action_finished"
+                    && values[0]["result"]["commit"]["status"] == "created"
+                    && values[0]["result"]["commit"]["subject"] == "Update generated.txt"
+        ),
+        "expected a created commit with a generated subject, got {finished:?}"
+    );
 
     let subject = std::process::Command::new("git")
         .args(["log", "-1", "--pretty=%s"])

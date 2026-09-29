@@ -5513,22 +5513,26 @@ impl GitRepository {
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<String, GitCommandError> {
+        let mut staged_args = strings(&super::CANONICAL_DIFF_CONFIG);
+        staged_args.extend(strings(&["diff", "--cached", "--patch", "--stat"]));
         let staged = self
             .run(
                 "GitVcsDriver.commitContext.staged",
                 cwd,
-                &strings(&["diff", "--cached", "--patch", "--stat"]),
+                &staged_args,
                 cancellation,
             )
             .await?;
         if !staged.stdout.trim().is_empty() {
             return Ok(staged.stdout);
         }
+        let mut working_args = strings(&super::CANONICAL_DIFF_CONFIG);
+        working_args.extend(strings(&["diff", "--patch", "--stat"]));
         let working = self
             .run(
                 "GitVcsDriver.commitContext.working",
                 cwd,
-                &strings(&["diff", "--patch", "--stat"]),
+                &working_args,
                 cancellation,
             )
             .await?;
