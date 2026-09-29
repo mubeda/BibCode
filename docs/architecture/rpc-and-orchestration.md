@@ -58,16 +58,18 @@ the session at once, so the socket closes instead of staying open and silent.
 Plain and E2EE sessions share one heartbeat rule. Once a socket is
 authenticated (plain `/ws` after the upgrade, E2EE after `e2ee_authenticated`),
 the heartbeat asks the writer for a WebSocket Ping every 15 seconds, which it
-sends between frames or records. Every inbound frame, including the browser's
-automatic Pong, counts as activity. A data write counts only if it had to wait at
-least 100 ms for the peer to drain the socket before it completed; a write the
+sends between frames or records. Ping deadlines advance from their scheduled
+times, so small check delays do not accumulate. Every inbound frame, including
+the browser's automatic Pong, counts as activity. A data write counts only if it
+had to wait at least 100 ms for the peer to drain the socket before it completed; a write the
 socket accepts at once, or after a brief internal handoff, proves nothing about
 the peer, so small frames the server keeps sending to a frozen client never move
 the silence origin. No control write (Ping, Pong, interrupt, admission terminal or
 protocol error) is data progress. The heartbeat checks every 5 seconds and ends the session after
 45 seconds without activity, so a stopped reader is reaped within 50 seconds.
 A check that fires more than 10 seconds late, because the process was suspended
-or starved, restarts the silence clock and pings at once instead of reaping.
+or starved, restarts the silence clock and Ping schedule with one immediate Ping
+instead of reaping or sending catch-up Pings.
 A client close with code 4408, the client's liveness timeout, is logged at info
 level; other client closes are logged at debug level.
 Inbound activity counts per complete frame, so a single plain request that

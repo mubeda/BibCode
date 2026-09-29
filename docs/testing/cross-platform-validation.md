@@ -1228,6 +1228,18 @@ record SSH coverage separately if tested.
 
 ## Slow-link liveness scenario
 
+For transport or heartbeat changes, first run the paused-clock unit coverage
+and the real-socket liveness matrix:
+
+```sh
+cargo test -p bibcode-server --lib rpc::transport::tests -j 2
+cargo test -p bibcode-server --test rpc_liveness -j 2
+```
+
+The unit coverage checks Ping cadence under timer jitter and after a stalled
+runtime. The integration matrix keeps the production silence and transfer
+deadlines, including an idle client kept alive only by its WebSocket Pongs.
+
 Run this against an isolated development server (its own `BIBCODE_HOME`) or a
 standalone server reached from a browser, never against user data. Create a
 disposable repository whose newest commit adds a text file of about 4 MB, below
