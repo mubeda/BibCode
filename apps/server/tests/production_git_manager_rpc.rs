@@ -773,108 +773,119 @@ async fn stale_partial_requests_fail_closed_for_stage_unstage_and_discard() {
 
 #[tokio::test]
 async fn untracked_partial_selection_round_trips_through_intent_to_add() {
-    let fixture = Fixture::new().await;
-    let path = fixture.repository_path.join("new.txt");
-    fs::write(&path, "one\ntwo\nthree\nfour\n").expect("untracked content");
+    for prefix_config in ["diff.mnemonicPrefix", "diff.noprefix"] {
+        let fixture = Fixture::new().await;
+        git(
+            &fixture.repository_path,
+            &["config", "diff.mnemonicPrefix", "false"],
+        );
+        git(
+            &fixture.repository_path,
+            &["config", "diff.noprefix", "false"],
+        );
+        git(&fixture.repository_path, &["config", prefix_config, "true"]);
+        let path = fixture.repository_path.join("new.txt");
+        fs::write(&path, "one\ntwo\nthree\nfour\n").expect("untracked content");
 
-    let unstaged = fixture
-        .read(
-            "70",
-            "gitManager.getDiff",
-            json!({
-                "cwd": fixture.repository_path,
-                "source": { "_tag": "working-tree", "path": "new.txt", "staged": false }
-            }),
-        )
-        .await
-        .expect("untracked diff");
-    fixture
-        .mutate(
-            "71",
-            "gitManager.stagePartial",
-            json!({
-                "cwd": fixture.repository_path,
-                "projectId": "project-1",
-                "path": "new.txt",
-                "selectedLines": [0, 2],
-                "baseGeneration": unstaged["generation"]
-            }),
-        )
-        .await
-        .expect("partial stage of untracked file");
-    assert_eq!(
-        index_file_content(&fixture.repository_path, "new.txt"),
-        "one\nthree\n"
-    );
-    assert_eq!(
-        fs::read_to_string(&path).expect("untracked working content"),
-        "one\ntwo\nthree\nfour\n"
-    );
+        let unstaged = fixture
+            .read(
+                "70",
+                "gitManager.getDiff",
+                json!({
+                    "cwd": fixture.repository_path,
+                    "source": { "_tag": "working-tree", "path": "new.txt", "staged": false }
+                }),
+            )
+            .await
+            .expect("untracked diff");
+        fixture
+            .mutate(
+                "71",
+                "gitManager.stagePartial",
+                json!({
+                    "cwd": fixture.repository_path,
+                    "projectId": "project-1",
+                    "path": "new.txt",
+                    "selectedLines": [0, 2],
+                    "baseGeneration": unstaged["generation"]
+                }),
+            )
+            .await
+            .expect("partial stage of untracked file");
+        assert_eq!(
+            index_file_content(&fixture.repository_path, "new.txt"),
+            "one\nthree\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("untracked working content"),
+            "one\ntwo\nthree\nfour\n"
+        );
 
-    let staged = fixture
-        .read(
-            "72",
-            "gitManager.getDiff",
-            json!({
-                "cwd": fixture.repository_path,
-                "source": { "_tag": "working-tree", "path": "new.txt", "staged": true }
-            }),
-        )
-        .await
-        .expect("staged new-file diff");
-    fixture
-        .mutate(
-            "73",
-            "gitManager.unstagePartial",
-            json!({
-                "cwd": fixture.repository_path,
-                "projectId": "project-1",
-                "path": "new.txt",
-                "selectedLines": [0],
-                "baseGeneration": staged["generation"]
-            }),
-        )
-        .await
-        .expect("partial unstage of new file");
-    assert_eq!(
-        index_file_content(&fixture.repository_path, "new.txt"),
-        "three\n"
-    );
+        let staged = fixture
+            .read(
+                "72",
+                "gitManager.getDiff",
+                json!({
+                    "cwd": fixture.repository_path,
+                    "source": { "_tag": "working-tree", "path": "new.txt", "staged": true }
+                }),
+            )
+            .await
+            .expect("staged new-file diff");
+        fixture
+            .mutate(
+                "73",
+                "gitManager.unstagePartial",
+                json!({
+                    "cwd": fixture.repository_path,
+                    "projectId": "project-1",
+                    "path": "new.txt",
+                    "selectedLines": [0],
+                    "baseGeneration": staged["generation"]
+                }),
+            )
+            .await
+            .expect("partial unstage of new file");
+        assert_eq!(
+            index_file_content(&fixture.repository_path, "new.txt"),
+            "three\n"
+        );
 
-    let index_before_discard = index_file_content(&fixture.repository_path, "new.txt");
-    let unstaged = fixture
-        .read(
-            "74",
-            "gitManager.getDiff",
-            json!({
-                "cwd": fixture.repository_path,
-                "source": { "_tag": "working-tree", "path": "new.txt", "staged": false }
-            }),
-        )
-        .await
-        .expect("remaining new-file diff");
-    fixture
-        .mutate(
-            "75",
-            "gitManager.discardPartial",
-            json!({
-                "cwd": fixture.repository_path,
-                "projectId": "project-1",
-                "path": "new.txt",
-                "selectedLines": [1],
-                "baseGeneration": unstaged["generation"]
-            }),
-        )
-        .await
-        .expect("partial discard of new file");
-    assert_eq!(
-        fs::read_to_string(&path).expect("working content after discard"),
-        "one\nthree\nfour\n"
-    );
-    assert_eq!(
-        index_file_content(&fixture.repository_path, "new.txt"),
-        index_before_discard
-    );
+        let index_before_discard = index_file_content(&fixture.repository_path, "new.txt");
+        let unstaged = fixture
+            .read(
+                "74",
+                "gitManager.getDiff",
+                json!({
+                    "cwd": fixture.repository_path,
+                    "source": { "_tag": "working-tree", "path": "new.txt", "staged": false }
+                }),
+            )
+            .await
+            .expect("remaining new-file diff");
+        fixture
+            .mutate(
+                "75",
+                "gitManager.discardPartial",
+                json!({
+                    "cwd": fixture.repository_path,
+                    "projectId": "project-1",
+                    "path": "new.txt",
+                    "selectedLines": [1],
+                    "baseGeneration": unstaged["generation"]
+                }),
+            )
+            .await
+            .expect("partial discard of new file");
+        assert_eq!(
+            fs::read_to_string(&path).expect("working content after discard"),
+            "one\nthree\nfour\n"
+        );
+        assert_eq!(
+            index_file_content(&fixture.repository_path, "new.txt"),
+            index_before_discard
+        );
+    }
 }
 
 #[tokio::test]
