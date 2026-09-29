@@ -60,6 +60,19 @@ pub use worktree::{
     resolved_worktree_keys, worktree_key, worktree_repository_key,
 };
 
+/// Machine-parsed patches must not inherit Git's display prefixes. Command-local
+/// config also avoids Git 2.55's `stash show` corruption of explicit prefix options.
+pub(crate) const CANONICAL_DIFF_CONFIG: [&str; 8] = [
+    "-c",
+    "diff.mnemonicPrefix=false",
+    "-c",
+    "diff.noprefix=false",
+    "-c",
+    "diff.srcPrefix=a/",
+    "-c",
+    "diff.dstPrefix=b/",
+];
+
 /// Safety bound for server-owned checkout writes, independent of RPC/read deadlines.
 /// A started write must retain its lock and owner throughout this window.
 pub(crate) const CHECKOUT_WRITE_TIMEOUT: std::time::Duration =
