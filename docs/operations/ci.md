@@ -26,7 +26,9 @@ four job groups:
   publishing.
 - **Native desktop** builds the web application, tests the desktop Rust host,
   and creates an unpublished native bundle on Linux ARM64/x64, Windows ARM64/x64,
-  and macOS ARM64/x64 runners. The shared `scripts/run-msvc.mjs` launcher selects
+  and macOS ARM64/x64 runners. Its 120-minute job budget covers cold compilation
+  of the host tests, the macOS optimized exception-recovery probe, and the
+  native bundle without shortening any check. The shared `scripts/run-msvc.mjs` launcher selects
   the requested MSVC architecture. After the Rust host tests,
   the Windows row alone runs
   `vp test run apps/desktop/e2e/support/test-project.test.ts`. That step is the
