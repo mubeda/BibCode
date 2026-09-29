@@ -388,6 +388,19 @@ command in the current supervised-process implementation—and exactly one
 `finished` or `failed` event. Client interrupt and socket cancellation reach the
 supervised child process.
 
+Branch selections send `branch-checkout.name` as a fully qualified
+`refs/heads/<branch>` or `refs/remotes/<remote>/<branch>` ref, keeping local
+names that resemble remote refs unambiguous. The server resolves that exact snapshot
+entry and uses a non-forcing tracking checkout, so a similarly named local
+branch cannot shadow the requested remote. A missing remote ref or an existing
+local destination produces an actionable failure; neither falls back to a
+different branch or replaces local history. Local branch names and unambiguous
+short remote names remain accepted by the operation. The explicit `bring`
+checkout strategy skips only the dirty-worktree guard: Git still rejects
+overwrites, and operation-in-progress and worktree-occupancy guards still apply.
+The `stash` UI choice completes the existing stash operation before checkout.
+Checkout failures remain visible inside an open dirty-changes dialog.
+
 History preserves pinned pages, ordering, selection, and scroll context while
 splicing new commits. Overlapping entries take the fresh page data. The first
 page is read once the signal's availability is known, then on a signal change

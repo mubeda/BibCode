@@ -2,6 +2,7 @@
 
 import type {
   GitManagerRefEntry,
+  GitManagerOperationEvent,
   GitManagerRefsSnapshot,
   VcsWorktreeDescriptor,
 } from "@bibcode/contracts";
@@ -21,13 +22,42 @@ const h = vi.hoisted(() => ({
   menuItemProps: [] as Array<Record<string, unknown>>,
   refsAtom: vi.fn(() => ({ kind: "refs" })),
   signalAtom: vi.fn(() => ({ kind: "signal" })),
+  runOperation: vi.fn(),
+  failureMessage: null as string | null,
 }));
 
 vi.mock("../../state/gitManager", () => ({
+  runGitManagerOperation: h.runOperation,
   gitManagerEnvironment: {
     getRefs: h.refsAtom,
     signalWithDegradedFocusRefresh: h.signalAtom,
   },
+}));
+
+vi.mock("@legendapp/list/react", () => ({
+  LegendList: ({
+    data,
+    renderItem,
+    keyExtractor,
+  }: {
+    data: ReadonlyArray<unknown>;
+    renderItem: (input: { item: unknown; index: number }) => React.ReactNode;
+    keyExtractor: (item: unknown) => string;
+  }) => (
+    <>
+      {data.map((item, index) => (
+        <div key={keyExtractor(item)}>{renderItem({ item, index })}</div>
+      ))}
+    </>
+  ),
+}));
+
+vi.mock("~/components/ui/popover", () => ({
+  Popover: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  PopoverTrigger: ({ children, ...props }: React.ComponentProps<"button">) => (
+    <button {...props}>{children}</button>
+  ),
+  PopoverPopup: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
 }));
 
 vi.mock("../../state/entities", () => ({
@@ -178,10 +208,120 @@ beforeEach(() => {
   h.menuItemProps.length = 0;
   h.refsAtom.mockClear();
   h.signalAtom.mockClear();
+  h.runOperation.mockReset();
+  h.failureMessage = null;
+  h.runOperation.mockImplementation((_registry, { input }, onEvent) => {
+    const event: GitManagerOperationEvent =
+      h.failureMessage === null
+        ? {
+            _tag: "finished",
+            operation: input._tag,
+            message: "Finished.",
+          }
+        : {
+            _tag: "failed",
+            operation: input._tag,
+            code: "branch-exists",
+            message: h.failureMessage,
+            blocked: null,
+          };
+    onEvent(event);
+    return { cancel: vi.fn(), result: Promise.resolve({ _tag: "Success", value: event }) };
+  });
   useGitManagerStore.setState({ byProjectKey: {} });
 });
 
 describe("GitManagerToolbar", () => {
+  it.each([
+    ["origin/develop", true, null, false],
+    ["origin/develop", true, "bring", false],
+    ["origin/develop", true, "stash", false],
+    ["refs/remotes/origin/develop", false, null, false],
+    ["origin/develop", true, "bring", true],
+  ] as const)(
+    "checks out %s (remote: %s, strategy: %s, failure: %s) on its environment",
+    async (branchName, isRemote, strategy, fails) => {
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+      h.snapshot = {
+        ...refsSnapshot(),
+        isDirty: strategy !== null,
+        localBranches: [...refsSnapshot().localBranches, ...(isRemote ? [] : [ref(branchName)])],
+        remoteBranches: [ref("origin/develop")],
+      };
+      if (fails)
+        h.failureMessage =
+          "A local branch named 'develop' already exists. Select it in the local branches list.";
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () =>
+          root.render(
+            <GitManagerToolbar
+              projectRef={currentProject}
+              mainCheckoutCwd="/opaque/main"
+              selectedWorktreeCwd="/opaque/main"
+              worktrees={worktrees}
+              catalogPending={false}
+              catalogError={null}
+              repositoryUnavailable={null}
+              branchSyncDisabledReason={null}
+              stashMergeDisabledReason={null}
+              tagDisabledReason={null}
+              onSelectedWorktreeChange={() => undefined}
+            />,
+          ),
+        );
+        const click = async (text: string) => {
+          const button = [...document.querySelectorAll("button")].find(
+            (entry) => entry.textContent === text,
+          );
+          expect(button).toBeDefined();
+          await act(async () => button!.click());
+        };
+        await click(branchName);
+        if (strategy !== null) {
+          expect(h.runOperation).not.toHaveBeenCalled();
+          expect(document.body.textContent).toContain("Switch to origin/develop?");
+          await click(strategy === "bring" ? "Bring my changes" : "Leave my changes");
+        }
+        const targets = h.runOperation.mock.calls.map((call) => call[1]);
+        expect(targets.at(-1)).toEqual({
+          environmentId: "env-a",
+          input: {
+            _tag: "branch-checkout",
+            cwd: "/opaque/main",
+            projectId: "project-current",
+            name: `refs/${isRemote ? "remotes" : "heads"}/${branchName}`,
+            strategy: strategy === "bring" ? "bring" : null,
+          },
+        });
+        expect(targets.map((target) => target.input._tag)).toEqual(
+          strategy === "stash" ? ["stash-push", "branch-checkout"] : ["branch-checkout"],
+        );
+        expect(h.refreshRefs).toHaveBeenCalled();
+        if (fails) {
+          expect(document.querySelector('[role="dialog"] [role="alert"]')?.textContent).toBe(
+            h.failureMessage,
+          );
+          expect(
+            useGitManagerStore.getState().selectViewState(currentProject).selectedRef,
+          ).toBeNull();
+          h.failureMessage = null;
+          await click("Bring my changes");
+          expect(document.querySelector('[role="dialog"]')).toBeNull();
+        }
+        expect(useGitManagerStore.getState().selectViewState(currentProject).selectedRef).toBe(
+          isRemote ? "develop" : branchName,
+        );
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+        (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+      }
+    },
+  );
+
   it("opens on the current project's main checkout, not another project's cached worktree", () => {
     useGitManagerStore.getState().setSelectedWorktree(otherProject, "/opaque/other-worktree");
 

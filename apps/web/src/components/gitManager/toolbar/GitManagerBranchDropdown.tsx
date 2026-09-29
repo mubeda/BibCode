@@ -50,7 +50,12 @@ const KNOWN_BLOCKED_CODES = new Set([
 
 type BranchListItem =
   | { readonly kind: "header"; readonly key: string; readonly label: string }
-  | { readonly kind: "branch"; readonly key: string; readonly ref: GitManagerRefEntry };
+  | {
+      readonly kind: "branch";
+      readonly key: string;
+      readonly ref: GitManagerRefEntry;
+      readonly isRemote: boolean;
+    };
 
 function branchListItemKey(item: BranchListItem): string {
   return item.key;
@@ -85,6 +90,7 @@ function branchRowPropsEqual(
   const right = next.refEntry;
   return (
     previous.selectedWorktreeCwd === next.selectedWorktreeCwd &&
+    previous.isRemote === next.isRemote &&
     previous.mergeMode === next.mergeMode &&
     previous.branchDisabledReason === next.branchDisabledReason &&
     previous.mergeDisabledReason === next.mergeDisabledReason &&
@@ -107,11 +113,12 @@ function branchRowPropsEqual(
 
 interface GitManagerBranchRowProps {
   readonly refEntry: GitManagerRefEntry;
+  readonly isRemote: boolean;
   readonly selectedWorktreeCwd: string;
   readonly mergeMode: boolean;
   readonly branchDisabledReason: string | null;
   readonly mergeDisabledReason: string | null;
-  readonly onSelectBranch: (ref: GitManagerRefEntry) => void;
+  readonly onSelectBranch: (ref: GitManagerRefEntry, isRemote: boolean) => void;
   readonly onSwitchWorktree: (worktreePath: string) => void;
   readonly onMergeInto: (ref: GitManagerRefEntry) => void;
   readonly onRenameBranch: (ref: GitManagerRefEntry) => void;
@@ -120,6 +127,7 @@ interface GitManagerBranchRowProps {
 
 const GitManagerBranchRow = memo(function GitManagerBranchRow({
   refEntry,
+  isRemote,
   selectedWorktreeCwd,
   mergeMode,
   branchDisabledReason,
@@ -155,11 +163,13 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
     refEntry.blocked[0]?.message ??
     null;
   const descriptionId =
-    displayReason === null ? undefined : `git-manager-branch-${encodeURIComponent(refEntry.name)}`;
+    displayReason === null
+      ? undefined
+      : `git-manager-branch-${isRemote ? "remote" : "local"}-${encodeURIComponent(refEntry.name)}`;
   const branchActionDescriptionId =
     branchDisabledReason === null
       ? undefined
-      : `git-manager-branch-${encodeURIComponent(refEntry.name)}-actions`;
+      : `git-manager-branch-${isRemote ? "remote" : "local"}-${encodeURIComponent(refEntry.name)}-actions`;
   const disabled =
     capabilityDisabledReason !== null || blockedReason !== null || currentMergeReason !== null;
   const title = displayReason ?? undefined;
@@ -173,13 +183,23 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
       onSwitchWorktree(redirectPath);
       return;
     }
-    onSelectBranch(refEntry);
-  }, [disabled, mergeMode, onMergeInto, onSelectBranch, onSwitchWorktree, redirectPath, refEntry]);
+    onSelectBranch(refEntry, isRemote);
+  }, [
+    disabled,
+    isRemote,
+    mergeMode,
+    onMergeInto,
+    onSelectBranch,
+    onSwitchWorktree,
+    redirectPath,
+    refEntry,
+  ]);
 
   return (
     <>
       <div className="group flex h-[30px] min-w-0 items-center">
         <button
+          aria-label={isRemote ? `Check out remote branch ${refEntry.name}` : undefined}
           aria-describedby={descriptionId}
           className="flex h-full min-w-0 flex-1 items-center gap-2 px-2 text-left text-xs outline-none hover:bg-accent/55 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:opacity-60"
           disabled={disabled}
@@ -205,28 +225,32 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
             </span>
           )}
         </button>
-        <button
-          aria-describedby={branchActionDescriptionId}
-          aria-label={`Rename ${refEntry.name}`}
-          className="pointer-events-none h-full shrink-0 px-1.5 text-xs text-muted-foreground opacity-0 hover:bg-accent group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
-          disabled={branchDisabledReason !== null}
-          title={branchDisabledReason ?? undefined}
-          type="button"
-          onClick={() => onRenameBranch(refEntry)}
-        >
-          Rename
-        </button>
-        <button
-          aria-describedby={branchActionDescriptionId}
-          aria-label={`Delete ${refEntry.name}`}
-          className="pointer-events-none h-full shrink-0 px-1.5 text-xs text-destructive opacity-0 hover:bg-destructive/10 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
-          disabled={branchDisabledReason !== null}
-          title={branchDisabledReason ?? undefined}
-          type="button"
-          onClick={() => onDeleteBranch(refEntry)}
-        >
-          Delete
-        </button>
+        {isRemote ? null : (
+          <>
+            <button
+              aria-describedby={branchActionDescriptionId}
+              aria-label={`Rename ${refEntry.name}`}
+              className="pointer-events-none h-full shrink-0 px-1.5 text-xs text-muted-foreground opacity-0 hover:bg-accent group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+              disabled={branchDisabledReason !== null}
+              title={branchDisabledReason ?? undefined}
+              type="button"
+              onClick={() => onRenameBranch(refEntry)}
+            >
+              Rename
+            </button>
+            <button
+              aria-describedby={branchActionDescriptionId}
+              aria-label={`Delete ${refEntry.name}`}
+              className="pointer-events-none h-full shrink-0 px-1.5 text-xs text-destructive opacity-0 hover:bg-destructive/10 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+              disabled={branchDisabledReason !== null}
+              title={branchDisabledReason ?? undefined}
+              type="button"
+              onClick={() => onDeleteBranch(refEntry)}
+            >
+              Delete
+            </button>
+          </>
+        )}
       </div>
       {displayReason === null ? null : (
         <span className="sr-only" id={descriptionId}>
@@ -245,6 +269,7 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
 export interface GitManagerBranchDropdownProps {
   readonly projectRef: ScopedProjectRef;
   readonly refs: ReadonlyArray<GitManagerRefEntry>;
+  readonly remoteRefs: ReadonlyArray<GitManagerRefEntry>;
   readonly recentNames: ReadonlyArray<string>;
   readonly currentBranchName: string | null;
   /** Shown instead of a branch name when none is checked out. */
@@ -253,7 +278,7 @@ export interface GitManagerBranchDropdownProps {
   readonly selectedWorktreeCwd: string;
   readonly branchDisabledReason: string | null;
   readonly mergeDisabledReason: string | null;
-  readonly onSelectBranch: (ref: GitManagerRefEntry) => void;
+  readonly onSelectBranch: (ref: GitManagerRefEntry, isRemote: boolean) => void;
   readonly onSwitchWorktree: (worktreePath: string) => void;
   readonly onCreateBranch: () => void;
   readonly onMergeInto: (ref: GitManagerRefEntry) => void;
@@ -264,6 +289,7 @@ export interface GitManagerBranchDropdownProps {
 export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   projectRef,
   refs,
+  remoteRefs,
   recentNames,
   currentBranchName,
   noBranchLabel,
@@ -275,8 +301,8 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   onSwitchWorktree,
   onCreateBranch,
   onMergeInto,
-  onRenameBranch = onSelectBranch,
-  onDeleteBranch = onSelectBranch,
+  onRenameBranch,
+  onDeleteBranch,
 }: GitManagerBranchDropdownProps) {
   const storeKey = projectKey(projectRef);
   const selectFilterText = useCallback(
@@ -297,23 +323,33 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   const deferredFilterText = useDeferredValue(filterText);
   const [mergeMode, setMergeMode] = useState(false);
   const grouped = useMemo(
-    () => groupBranches({ refs, recentNames, filter: deferredFilterText }),
-    [deferredFilterText, recentNames, refs],
+    () => groupBranches({ refs, remoteRefs, recentNames, filter: deferredFilterText }),
+    [deferredFilterText, recentNames, refs, remoteRefs],
   );
   const listItems = useMemo<ReadonlyArray<BranchListItem>>(() => {
     const items: BranchListItem[] = [];
-    const appendGroup = (label: string, branches: ReadonlyArray<GitManagerRefEntry>) => {
+    const appendGroup = (
+      label: string,
+      branches: ReadonlyArray<GitManagerRefEntry>,
+      isRemote: boolean,
+    ) => {
       if (branches.length === 0) return;
       items.push({ kind: "header", key: `header:${label}`, label });
       for (const ref of branches) {
-        items.push({ kind: "branch", key: `branch:${ref.name}`, ref });
+        items.push({
+          kind: "branch",
+          key: `${isRemote ? "remote" : "local"}:${ref.name}`,
+          ref,
+          isRemote,
+        });
       }
     };
-    appendGroup("Default", grouped.default);
-    appendGroup("Recent", grouped.recent);
-    appendGroup("Other", grouped.other);
+    appendGroup("Default", grouped.default, false);
+    appendGroup("Recent", grouped.recent, false);
+    appendGroup("Other", grouped.other, false);
+    if (!mergeMode) appendGroup("Remote branches", grouped.remote, true);
     return items;
-  }, [grouped.default, grouped.other, grouped.recent]);
+  }, [grouped.default, grouped.other, grouped.recent, grouped.remote, mergeMode]);
   const stableProjectRef = useMemo(
     () =>
       ({
@@ -340,9 +376,9 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   }, [onCreateBranch, setOpenDropdown, stableProjectRef]);
   const handleMergeMode = useCallback(() => setMergeMode(true), []);
   const handleSelectBranch = useCallback(
-    (ref: GitManagerRefEntry) => {
+    (ref: GitManagerRefEntry, isRemote: boolean) => {
       setOpenDropdown(stableProjectRef, null);
-      onSelectBranch(ref);
+      onSelectBranch(ref, isRemote);
     },
     [onSelectBranch, setOpenDropdown, stableProjectRef],
   );
@@ -364,16 +400,18 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   const handleRenameBranch = useCallback(
     (ref: GitManagerRefEntry) => {
       setOpenDropdown(stableProjectRef, null);
-      onRenameBranch(ref);
+      if (onRenameBranch) onRenameBranch(ref);
+      else onSelectBranch(ref, false);
     },
-    [onRenameBranch, setOpenDropdown, stableProjectRef],
+    [onRenameBranch, onSelectBranch, setOpenDropdown, stableProjectRef],
   );
   const handleDeleteBranch = useCallback(
     (ref: GitManagerRefEntry) => {
       setOpenDropdown(stableProjectRef, null);
-      onDeleteBranch(ref);
+      if (onDeleteBranch) onDeleteBranch(ref);
+      else onSelectBranch(ref, false);
     },
-    [onDeleteBranch, setOpenDropdown, stableProjectRef],
+    [onDeleteBranch, onSelectBranch, setOpenDropdown, stableProjectRef],
   );
   const renderItem = useCallback(
     ({ item }: { item: BranchListItem; index: number }) =>
@@ -387,6 +425,7 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
           mergeMode={mergeMode}
           mergeDisabledReason={mergeDisabledReason}
           refEntry={item.ref}
+          isRemote={item.isRemote}
           selectedWorktreeCwd={selectedWorktreeCwd}
           onDeleteBranch={handleDeleteBranch}
           onMergeInto={handleMergeInto}

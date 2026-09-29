@@ -14,6 +14,7 @@ export interface GitManagerSwitchWithChangesDialogProps {
   readonly open: boolean;
   readonly branchName: string;
   readonly busy: boolean;
+  readonly errorMessage?: string | null;
   readonly branchDisabledReason?: string | null;
   readonly stashDisabledReason?: string | null;
   readonly onOpenChange: (open: boolean) => void;
@@ -24,6 +25,7 @@ export const GitManagerSwitchWithChangesDialog = memo(function GitManagerSwitchW
   open,
   branchName,
   busy,
+  errorMessage = null,
   branchDisabledReason = null,
   stashDisabledReason = null,
   onOpenChange,
@@ -51,6 +53,11 @@ export const GitManagerSwitchWithChangesDialog = memo(function GitManagerSwitchW
             <strong>Bring my changes</strong> switches branches while carrying the current
             working-tree changes across.
           </p>
+          {errorMessage === null ? null : (
+            <p role="alert" className="text-destructive">
+              {errorMessage}
+            </p>
+          )}
         </div>
         <DialogFooter>
           <Button
