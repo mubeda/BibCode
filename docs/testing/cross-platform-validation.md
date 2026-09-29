@@ -1077,7 +1077,7 @@ Run broad owners sequentially so one Cargo process owns the shared build
 directory at a time:
 
 ```sh
-vp run test
+vp run -r --concurrency-limit 1 test
 cargo test --workspace -j 2 -- --test-threads=2
 vp check
 vp run typecheck
@@ -1086,6 +1086,10 @@ cargo clean -p bibcode-server -p bibcode-desktop -p bibcode-updater-verifier
 cargo clippy --workspace --all-targets -- -D warnings
 git diff --check
 ```
+
+The direct recursive `-r` invocation keeps package test tasks sequential;
+putting the concurrency limit on the root `test` wrapper does not constrain
+its nested graph. Rust tests still use their package's default harness width.
 
 Use the repository's Windows/MSVC launcher when required by the native Windows
 page. The `-j 2` option bounds Cargo compilation jobs. The
