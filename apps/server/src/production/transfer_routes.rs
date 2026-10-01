@@ -47,15 +47,25 @@ pub fn download_handler_with_limits(
         Box::pin(async move {
             let Some(TransferClaims::Download { root, relative, .. }) = access.verify(&token)
             else {
+                tracing::warn!("download rejected: transfer capability is invalid or expired");
                 return Err(not_found());
             };
-            let (target, _) = paths::resolve_relative(&root, &relative).map_err(|_| not_found())?;
+            let (target, _) = paths::resolve_relative(&root, &relative).map_err(|error| {
+                tracing::warn!(%error, "download path resolution failed");
+                not_found()
+            })?;
             let (_, canonical) = paths::canonical_existing_within(&root, &target)
                 .await
-                .map_err(|_| not_found())?;
+                .map_err(|error| {
+                    tracing::warn!(%error, "download path validation failed");
+                    not_found()
+                })?;
             let metadata = tokio::fs::metadata(&canonical)
                 .await
-                .map_err(|_| not_found())?;
+                .map_err(|error| {
+                    tracing::warn!(path = %canonical.display(), %error, "download metadata read failed");
+                    not_found()
+                })?;
             let file_name = transfer::download_file_name(&canonical, metadata.is_dir());
             if metadata.is_dir() {
                 // The plan both enforces the archive limits and proves to `archive_body` that
@@ -80,7 +90,10 @@ pub fn download_handler_with_limits(
                             unit: TransferArchiveLimitUnit::Bytes,
                         });
                     }
-                    Err(_) => return Err(not_found()),
+                    Err(error) => {
+                        tracing::warn!(%error, "folder download preparation failed");
+                        return Err(not_found());
+                    }
                 };
                 Ok(TransferDownloadHttpOutcome::Stream(
                     TransferDownloadHttpResponse {
@@ -95,7 +108,10 @@ pub fn download_handler_with_limits(
             } else {
                 let file = tokio::fs::File::open(&canonical)
                     .await
-                    .map_err(|_| not_found())?;
+                    .map_err(|error| {
+                        tracing::warn!(path = %canonical.display(), %error, "download file open failed");
+                        not_found()
+                    })?;
                 // The length comes from the opened handle, not the earlier stat, so the header
                 // describes the bytes this response will actually read.
                 let content_length = file.metadata().await.map(|metadata| metadata.len()).ok();

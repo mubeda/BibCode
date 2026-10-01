@@ -20,6 +20,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     gitManagerTagOperations: false,
     gitManagerLiveSignal: false,
     gitManagerPullRequests: false,
+    gitPullRequestBranchSelection: false,
     pullRequestsReads: false,
     pullRequestsMutations: false,
     activityProtocolVersion: null,

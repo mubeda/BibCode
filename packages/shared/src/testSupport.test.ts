@@ -7,10 +7,14 @@ describe("test environment Pull Requests capabilities", () => {
     expect(makeTestExecutionEnvironmentCapabilities()).toMatchObject({
       pullRequestsReads: false,
       pullRequestsMutations: false,
+      gitPullRequestBranchSelection: false,
     });
     expect(makeTestExecutionEnvironmentCapabilities({ pullRequestsReads: true })).toMatchObject({
       pullRequestsReads: true,
       pullRequestsMutations: false,
     });
+    expect(
+      makeTestExecutionEnvironmentCapabilities({ gitPullRequestBranchSelection: true }),
+    ).toMatchObject({ gitPullRequestBranchSelection: true });
   });
 });

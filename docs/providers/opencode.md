@@ -54,6 +54,11 @@ resolved to its packaged native `opencode.exe` for managed launches so the
 server remains inside BiBCode's Job Object through shutdown; custom wrappers
 and non-Windows launch paths remain unchanged.
 
+Chat capability discovery sends the active workspace directory to OpenCode's
+command and agent endpoints. Skills from its user and repository configuration
+appear in the `/` menu's Skills group, separately from ordinary commands. The
+same directory selection applies to managed servers and configured endpoints.
+
 ## Existing OpenCode server
 
 Set **Server URL** to connect to an OpenCode server you already operate. Set

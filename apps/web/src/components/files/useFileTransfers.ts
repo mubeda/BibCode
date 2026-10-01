@@ -127,29 +127,33 @@ export function useFileTransfers({
         return;
       }
       void (async () => {
-        const minted = await createDownloadUrl({ environmentId, input: { cwd, relativePath } });
-        if (minted._tag === "Failure") {
-          if (!isAtomCommandInterrupted(minted)) {
-            showMutationError(
-              squashAtomCommandFailure(minted),
-              `Failed to prepare a download for "${name}"`,
-            );
-          }
-          return;
-        }
-        const url = resolveTransferUrl(httpBaseUrl, minted.value.relativeUrl);
-        if (url === null) {
-          showMutationError(
-            new Error("The server did not return a usable download URL."),
-            `Can’t download "${name}"`,
-          );
-          return;
-        }
         try {
           const outcome = await downloadWithBridge({
-            url,
-            fileName: minted.value.fileName,
             bridge: typeof window === "undefined" ? undefined : window.desktopBridge,
+            prepare: async () => {
+              const minted = await createDownloadUrl({
+                environmentId,
+                input: { cwd, relativePath },
+              });
+              if (minted._tag === "Failure") {
+                if (!isAtomCommandInterrupted(minted)) {
+                  showMutationError(
+                    squashAtomCommandFailure(minted),
+                    `Failed to prepare a download for "${name}"`,
+                  );
+                }
+                return null;
+              }
+              const url = resolveTransferUrl(httpBaseUrl, minted.value.relativeUrl);
+              if (url === null) {
+                showMutationError(
+                  new Error("The server did not return a usable download URL."),
+                  `Can’t download "${name}"`,
+                );
+                return null;
+              }
+              return { url, fileName: minted.value.fileName };
+            },
           });
           if (outcome._tag === "BrowserDownload") {
             triggerBrowserDownload(outcome.url, outcome.fileName);

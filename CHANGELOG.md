@@ -1,5 +1,87 @@
 # Changelog
 
+## [v0.7.2] - 2026-10-01
+
+BiBCode v0.7.2 restores skill discovery across AI providers and fixes request
+creation, terminal clipboard shortcuts, file-tree refreshes, and folder downloads.
+
+### AI skills and provider configuration
+
+- The Chat AI command menu discovers skills for the active workspace and provider
+  instance, including user-level skills outside the repository. Codex, Claude,
+  Cursor, and OpenCode use their effective user configuration instead of an
+  environment-wide catalog discovered from the server's own directory.
+- Switching workspaces or provider configuration cannot display an older
+  workspace's catalog. Loading, partial discovery, and failures have feedback
+  and Retry preserves the draft.
+- Cursor discovers nested and linked skills across its supported roots. Claude
+  skill visibility and invocation aliases are preserved. OpenCode requests use
+  the workspace directory and retain skill classification.
+- Configured sensitive environment values reach native provider launch and
+  discovery without being mistaken for redacted placeholders.
+
+### Pull and merge requests
+
+- Every creation entry point opens the shared review dialog. The target starts
+  unselected and must be chosen explicitly before any commit, push, or request
+  creation; typing a branch name alone cannot enable the action.
+- Source and target dropdowns show only fetched branches from origin, including
+  remote branches that also have a local copy. Local-only branches, other
+  remotes, and symbolic HEAD entries are excluded. Use Fetch to refresh the list.
+  An unpublished checkout is not preselected for ordinary request creation.
+- Selecting another source keeps the current checkout and working files intact.
+  Title and description suggestions come from that source's tip commit, rather
+  than the newest commit anywhere in the repository. Edited content survives
+  source changes, and changing source requires a new target selection.
+- The server receives the exact reviewed branches, rejects invalid or identical
+  choices before mutation, and never substitutes master or main as the target.
+  Selected local sources publish with an exact origin refspec without force or
+  tags; origin-only sources need no push.
+- Combined commit/push/request actions explain their fixed source and reread Git
+  before retrying, preserving completed commits and generated branches. Changed
+  sources require review again; existing requests are reused instead of duplicated.
+- Older servers that cannot honor source and target choices disable creation
+  with update guidance, including after reconnect. Plain Push remains separate
+  from request creation.
+
+### Terminals and files
+
+- Unix PTY launches preserve Rust's spawn handshake. Failed executable or
+  interpreter launches report an error instead of returning false success and
+  aborting the child process.
+- Ctrl+C copies selected AI-terminal output and Ctrl+V pastes through the
+  terminal's native clipboard handling. Ctrl+C without selection still interrupts.
+  Selecting text keeps keyboard focus; Add to chat is available on right-click.
+- Files refreshes no longer crash with “Unknown directory child index” when
+  an entry changes between a file and a folder. Surviving selection and focus
+  remain usable after the refresh.
+- Folder-download failures retain their reason and recovery guidance instead
+  of showing only a generic error. Sanitized diagnostics identify client,
+  desktop, and server failure stages without exposing signed download URLs.
+- Desktop downloads mint their access token after destination selection, so
+  waiting in the picker does not consume the token lifetime. Failed archive
+  production rejects the download stream, and failed desktop streams remove
+  partial files instead of saving an incomplete ZIP as a successful download.
+
+### Validation and documentation
+
+- Added behavioral regressions for workspace/user skill catalogs, provider
+  configuration, remote request selectors, reconnect compatibility, partial
+  retries, native clipboard behavior, tree transitions, and download failures.
+- Updated provider, architecture, source-control, observability, and native
+  validation documentation to describe the supported behavior and diagnostics.
+
+### Downloads
+
+Desktop installers and standalone server distributions are provided for macOS,
+Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are
+included for both architectures. Stable desktop updater payloads and signatures
+are available through `latest.json`.
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.7.1...v0.7.2
+
 ## [v0.7.1] - 2026-09-29
 
 BiBCode v0.7.1 adds remote branch checkout to Git Manager and improves

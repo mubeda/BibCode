@@ -154,11 +154,25 @@ never on a timer. Opening the pane or leaving it idle issues no provider call;
 choosing **Refresh** invokes the environment-scoped RPC, whose server handler
 runs the configured provider CLI when that provider is supported.
 
-**Create pull request** in the Git Manager pane opens a review dialog that
-reads local status only: it shows the detected provider, base and head
-branches, whether the branch must be published first, and a title and
-description seeded from the latest commit. The resolved default branch remains
-the base even when later remote-status updates arrive. Its wording follows the host: a
+**Create pull request** in Git Manager, Pull Requests, Source Control, and the
+chat Git actions opens the same review dialog. It reads local status and refs,
+shows the detected provider and separate **Source branch** and **Target branch**
+selectors. Both lists contain only origin-tracking branches; local-only branches,
+other remotes, and symbolic `HEAD` entries are excluded. The source starts at the
+current checkout only if it has a matching origin branch; otherwise it starts
+unselected, with guidance to push or fetch before selecting. Selecting another
+source never checks it out. Title and description suggestions
+come from that source's tip commit, using a pinned commit query rather than the
+repository-wide history. Changing source preserves edited content and replaces
+only untouched suggestions. The target branch
+starts unselected: the user must choose an option before creation is enabled.
+Typing a name alone does not select it. The searchable list requests remote refs,
+retains them even when a local branch has the same name, strips the origin prefix,
+and excludes the source
+branch unless the action will create a new feature branch. Fetch updates the
+available remote branches. Status refreshes and retries preserve the selection;
+reopening the dialog, changing repositories, or changing source branch requires
+a new selection. Its wording follows the host: a
 GitLab repository gets **Create merge request**, `!N` references and
 "merge request" throughout; a missing provider keeps "pull request", while an
 explicit unknown provider uses "change request". Until status has answered,
@@ -175,17 +189,32 @@ status has not named it yet, and leaves the provider check to the server. A
 disabled primary button explains why on hover and to screen readers. Nothing is
 pushed or created until
 the dialog's primary action runs the existing `git.runStackedAction`
-`create_pr` route with the reviewed `pullRequestTitle` and `pullRequestBody`.
-That route resolves the provider before it creates a branch, commits or pushes,
+`create_pr` route with the reviewed `pullRequestTitle`, `pullRequestBody`, and
+required `pullRequestBaseBranch`, plus `pullRequestHeadBranch` for the selected
+source. A selected local source is pushed explicitly to the same-named branch on
+origin without force or tags; a source that exists only on origin needs no push.
+Other checkout changes stay untouched. Combined commit/push/request actions use
+`commit_push_pr` through the same review; their source stays on the current or
+newly generated branch, with that constraint explained beside the field.
+The server rejects a missing, blank,
+invalid, or identical source/target branch before mutations; it never falls back
+to the repository default, `master`, or `main`. Both routes resolve the provider
+before creating a branch, committing or pushing,
 so an unidentified host fails with "Nothing was published." and the same
 guidance. A request it creates makes the Pull Requests list read its GitLab
 totals again.
-The dialog reports publishing and creation as separate phases, keeps a
-published branch visible when creation fails, and offers Retry; a retry never
+An older environment that does not advertise branch-selection support disables
+creation with instructions to update its BiBCode server. The action also checks
+the live connection's support before mutation, including after reconnect.
+The dialog renders separate publishing/creation phases when the connected server
+provides them. Native stacked actions currently emit start and terminal outcomes
+without per-phase progress. A failed combined action rereads Git before Retry:
+a clean tree resumes publication/request creation, an already-created feature
+branch is reused, and a changed source requires explicit target review again.
+A retry never
 duplicates a pull request because the server resolves an existing open pull
-request for the branch (`opened_existing`) before creating one. The Source
-Control right-panel menu still creates a pull request directly from its
-existing action path.
+request for the branch (`opened_existing`) before creating one. Plain **Push**
+continues to publish without creating a request.
 
 ### Pull Requests command inventory
 

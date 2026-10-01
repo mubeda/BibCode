@@ -695,7 +695,8 @@
       "source": "https://www.npmjs.com/package/@pierre/trees",
       "cohort": "pierre",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "green",
+      "notes": "Retain the canonical path-lookup patch while beta.6 descends through file nodes as directories. Remove it when an upstream release returns missing-path results for file/directory transitions and the Files refresh regressions pass without the patch."
     },
     {
       "key": "js:apps/web:@rolldown/plugin-babel",
@@ -1933,7 +1934,7 @@
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
       "status": "blocked",
-      "notes": "Version intent remains 0.9.0 while rust:patch:portable-pty makes third_party/portable-pty the effective local source. Retain until a registry release contains the required at-creation Job Object and termination-result fixes."
+      "notes": "Version intent remains 0.9.0 while rust:patch:portable-pty makes third_party/portable-pty the effective local source. Retain until a registry release contains the required at-creation Job Object, termination-result, and Unix spawn-handshake fixes."
     },
     {
       "key": "rust:workspace:portpicker",
@@ -2829,7 +2830,7 @@
       "cohort": "retained-rust-boundaries",
       "platforms": ["linux", "macos", "windows"],
       "status": "blocked",
-      "notes": "This crates.io path patch is the effective root source for portable-pty 0.9.0. Retain it until an upstream registry release contains the required at-creation Job Object and termination-result fixes."
+      "notes": "This crates.io path patch is the effective root source for portable-pty 0.9.0. Retain it until an upstream registry release contains the required at-creation Job Object, termination-result, and Unix spawn-handshake fixes."
     },
     {
       "key": "rust:third_party/portable-pty:libc",

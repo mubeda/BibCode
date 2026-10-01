@@ -228,6 +228,9 @@ import {
 import {
   ServerConfigStreamEvent,
   ServerConfig,
+  ServerProviderCapabilities,
+  ServerProviderCapabilitiesInput,
+  ServerProviderCapabilitiesError,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
   ServerLifecycleStreamEvent,
@@ -494,6 +497,7 @@ export const WS_METHODS = {
 
   // Server meta
   serverGetConfig: "server.getConfig",
+  serverGetProviderCapabilities: "server.getProviderCapabilities",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpsertKeybinding: "server.upsertKeybinding",
@@ -564,6 +568,15 @@ export const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
   success: ServerConfig,
   error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentRpcError]),
 });
+
+export const WsServerGetProviderCapabilitiesRpc = Rpc.make(
+  WS_METHODS.serverGetProviderCapabilities,
+  {
+    payload: ServerProviderCapabilitiesInput,
+    success: ServerProviderCapabilities,
+    error: Schema.Union([ServerProviderCapabilitiesError, EnvironmentRpcError]),
+  },
+);
 
 export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
   payload: Schema.Struct({
@@ -1613,6 +1626,7 @@ export const WsSubscribeActivityRpc = Rpc.make(WS_METHODS.subscribeActivity, {
 export const WsRpcGroup = RpcGroup.make(
   WsAuthConfirmPairingRpc,
   WsServerGetConfigRpc,
+  WsServerGetProviderCapabilitiesRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsServerUpsertKeybindingRpc,

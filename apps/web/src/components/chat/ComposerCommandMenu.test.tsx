@@ -348,3 +348,24 @@ describe("ComposerCommandMenu item behavior", () => {
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
   });
 });
+
+it("shows skill loading and retryable failures without claiming an empty catalog", async () => {
+  const retry = vi.fn();
+  const mounted = await mount(
+    renderMenu({ isLoading: true, loadingText: "Loading provider skills..." }),
+  );
+  expect(mounted.container.textContent).toContain("Loading provider skills...");
+  await act(async () =>
+    mounted.root.render(
+      renderMenu({ issueText: "Could not load provider skills.", onRetry: retry }),
+    ),
+  );
+  expect(mounted.container.textContent).toContain("Could not load provider skills.");
+  expect(mounted.container.textContent).not.toContain("No matching command.");
+  const button = Array.from(mounted.container.querySelectorAll("button")).find(
+    (button) => button.textContent === "Retry",
+  );
+  expect(button).toBeDefined();
+  await dispatch(button!, new MouseEvent("click", { bubbles: true }));
+  expect(retry).toHaveBeenCalledOnce();
+});

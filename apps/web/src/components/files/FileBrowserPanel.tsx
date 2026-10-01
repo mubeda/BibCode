@@ -18,6 +18,7 @@ import type { MouseEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { isBrowserPreviewFile, openFileInPreview } from "~/browser/openFileInPreview";
+import { sanitizeFrontendLogText } from "~/diagnostics/frontendLogCapture";
 import { usePreferredEditor } from "~/editorPreferences";
 import { useTheme } from "~/hooks/useTheme";
 import { inferProjectTitleFromPath } from "~/lib/projectPaths";
@@ -285,16 +286,25 @@ export default function FileBrowserPanel({
       typeof error === "object" && error !== null && "failure" in error
         ? (error as { failure?: unknown }).failure
         : undefined;
+    const message =
+      typeof error === "string"
+        ? error
+        : typeof error === "object" && error !== null && "message" in error
+          ? error.message
+          : undefined;
+    const description = sanitizeFrontendLogText(
+      failure === "resolved_path_outside_root"
+        ? "Can't operate on a symlink that points outside the workspace."
+        : typeof message === "string" && message.trim()
+          ? message
+          : "An error occurred.",
+    ).replace(/\/api\/transfers\/[^\s"'<>)]*/g, "/api/transfers/[REDACTED]");
+    console.error("[file-browser] operation failed", { title, message: description });
     toastManager.add(
       stackedThreadToast({
         type: "error",
         title,
-        description:
-          failure === "resolved_path_outside_root"
-            ? "Can't operate on a symlink that points outside the workspace."
-            : error instanceof Error
-              ? error.message
-              : "An error occurred.",
+        description,
       }),
     );
   }, []);

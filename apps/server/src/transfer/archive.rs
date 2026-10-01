@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use axum::body::Body;
+use futures_util::{StreamExt, stream};
 use tokio_util::io::{ReaderStream, SyncIoBridge};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -112,19 +113,27 @@ pub async fn plan_archive_with_limits(
 /// Streams a zip of `root`'s contents. `plan` is a proof token: callers must have already
 /// obtained a successful `ArchivePlan` (via `plan_archive`/`plan_archive_with_limits`) for
 /// `root` before starting the response, so this signature makes it impossible to stream an
-/// archive whose limits were never checked. I/O failures during streaming truncate the
-/// response and are logged since the HTTP response has already begun.
+/// archive whose limits were never checked. I/O failures during streaming fail the response
+/// body and are logged since the HTTP response has already begun.
 pub fn archive_body(plan: ArchivePlan, root: PathBuf) -> Body {
     tracing::debug!(root = %root.display(), entries = plan.entries, bytes = plan.bytes, "streaming folder download");
     let (writer, reader) = tokio::io::duplex(64 * 1024);
-    tokio::task::spawn_blocking(move || {
-        if let Err(error) = write_archive(&root, SyncIoBridge::new(writer)) {
+    let producer = tokio::task::spawn_blocking(move || {
+        write_archive(&root, SyncIoBridge::new(writer)).inspect_err(|error| {
             tracing::warn!(root = %root.display(), %error, "folder download stream failed");
-        }
+        })
     });
     // 64 KiB chunks rather than the 4 KiB `ReaderStream` default: a folder download is bulk
     // I/O, and the smaller default costs sixteen times the per-chunk framing for the same bytes.
-    Body::from_stream(ReaderStream::with_capacity(reader, DOWNLOAD_CHUNK_BYTES))
+    // Dropping the writer reports EOF even when ZIP creation failed. Keep the producer's result
+    // in the HTTP stream so clients discard an incomplete archive instead of saving it as success.
+    let completion = stream::once(async move {
+        producer
+            .await
+            .map_err(io::Error::other)?
+            .map(|()| axum::body::Bytes::new())
+    });
+    Body::from_stream(ReaderStream::with_capacity(reader, DOWNLOAD_CHUNK_BYTES).chain(completion))
 }
 
 fn write_archive<W: Write>(root: &Path, sink: W) -> io::Result<()> {
@@ -197,6 +206,23 @@ mod tests {
             .read_to_string(&mut content)
             .unwrap();
         assert_eq!(content, "hello");
+    }
+
+    #[tokio::test]
+    async fn archive_read_failure_rejects_the_body_instead_of_completing_a_partial_zip() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"content").unwrap();
+        let plan = plan_archive(&root).await.unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            axum::body::to_bytes(archive_body(plan, root), usize::MAX)
+                .await
+                .is_err(),
+            "an archive producer failure must not be reported as a successful HTTP body"
+        );
     }
 
     #[tokio::test]

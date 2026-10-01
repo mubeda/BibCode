@@ -16,6 +16,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const h = vi.hoisted(() => ({
+  capabilityCatalogs: [] as import("@bibcode/contracts").ServerProvider[],
   editorProps: null as Record<string, unknown> | null,
   menuProps: null as Record<string, unknown> | null,
   providerPickerProps: null as Record<string, unknown> | null,
@@ -124,6 +125,19 @@ vi.mock("./ComposerPreviewAnnotationCards", () => ({
   ComposerPreviewAnnotationCards: passthrough(),
 }));
 vi.mock("./ContextWindowMeter", () => ({ ContextWindowMeter: passthrough() }));
+
+vi.mock("../../state/providerCapabilities", () => ({
+  useProviderCapabilities: (target: { instanceId: string }) => ({
+    data: {
+      ...h.capabilityCatalogs.find((provider) => provider.instanceId === target.instanceId),
+      issues: [],
+    },
+    error: null,
+    isPending: false,
+    refresh: vi.fn(),
+    revalidateIfStale: vi.fn(),
+  }),
+}));
 
 vi.mock("../../lib/composerPathSearchState", () => ({
   useComposerPathSearch: () => ({ entries: [], error: null, isPending: false }),
@@ -243,6 +257,7 @@ function makeProps(
   promptRef: RefObject<string>,
   selectedProviderStatus: ServerProvider,
 ): ChatComposerProps {
+  h.capabilityCatalogs = providerStatuses;
   return {
     composerDraftTarget: threadRef,
     environmentId,

@@ -4,6 +4,17 @@ BiBCode uses Effect RPC over one authenticated WebSocket per connected
 environment. The same protocol is used by browser and Tauri clients; the
 desktop bridge is reserved for host-native capabilities.
 
+## Provider capabilities by workspace
+
+`server.getProviderCapabilities` is a read-only unary RPC with
+`{ instanceId, cwd }` input, authorized by `orchestration:read`. It returns the
+selected provider's commands, skills,
+agents, and partial-discovery issues for that directory and its user configuration.
+Invalid contexts and failed discovery use `ServerProviderCapabilitiesError`.
+The request cannot override server-owned provider settings or credentials. It
+uses the same authenticated environment RPC path in browser and desktop clients.
+See [provider capability ownership and lifecycle](./providers.md#workspace-capability-discovery).
+
 ## Session establishment
 
 `ConnectionResolver` first produces a `PreparedConnection`. Remote bearer and
@@ -471,6 +482,33 @@ fields and derive nouns and number prefixes from the provider kind through
 host-specific controls.
 
 ### Pull Requests flow
+
+`git.runStackedAction` carries the explicitly reviewed `pullRequestBaseBranch`
+for `create_pr` and `commit_push_pr`. The field is optional in the shared input
+schema because commit/push-only actions do not use it; the server requires it
+for request actions and rejects it on other actions. Target syntax and
+source/target identity are checked before branch, commit, push, or hosting
+mutations. There is no default-branch fallback. All client creation entry points
+use the shared review dialog, which requires a fresh explicit selection on open.
+Both branch selectors request `vcs.listRefs` with `refKind: "remote"` and
+`includeMatchingRemoteRefs: true`, then restrict results to origin branches.
+Ordinary request creation prefills the checkout only when it has a matching
+origin-tracking branch. Combined commit actions keep their fixed current or
+generated source because they explicitly publish it before creating the request.
+
+The same action accepts an optional `pullRequestHeadBranch`. An explicitly
+selected source is validated against local heads or origin-tracking branches
+before mutation. `create_pr` publishes an existing local source with an exact,
+non-forced origin refspec without tags; an origin-only source skips publication.
+Neither changes the checkout, index, or working files. A combined commit action
+accepts only the current source and then uses its current/generated branch.
+Callers omitting the source retain current-branch behavior. The review reads the
+selected source's tip from `gitManager.getRefs` and pins `getCommits` to that SHA,
+so unrelated branches cannot supply the request title or description.
+The authenticated environment advertises `gitPullRequestBranchSelection`
+(default false for older servers). The dialog requires it and the client action
+checks it again on the same live session used for the mutation stream. Older
+servers therefore cannot silently ignore the reviewed branch fields.
 
 | Method                       | Required scope          | Responsibility                                                          |
 | ---------------------------- | ----------------------- | ----------------------------------------------------------------------- |
@@ -1411,7 +1449,10 @@ publication lock; a PTY that finishes spawning after loss is killed by its
 uncommitted-process owner and is never inserted as a live session.
 
 Initial PTY spawn and prepared-command fallback both run on Tokio's blocking
-pool. The blocking task constructs the uncommitted-process guard before
+pool. Unix PTY cleanup marks inherited descriptors close-on-exec, preserving
+Rust's spawn-reporting socket until exec succeeds or reports an error. A failed
+executable or interpreter launch cannot publish a successful PTY process.
+The blocking task constructs the uncommitted-process guard before
 returning its result; the join carries that guard until session supervision
 takes ownership. The guard also retains the per-terminal operation lock, so
 cancelling the caller cannot admit a same-key replacement before the late
@@ -2220,7 +2261,12 @@ replacement that now occupies the old path.
   oversized folder is refused as a `ProjectTransferError` the panel can show;
   the route repeats the pre-scan before streaming because the tree can grow
   between mint and redemption. A file download carries `Content-Length`; a zip
-  is produced as it streams and stays chunked. `Content-Disposition` names the
+  is produced as it streams and stays chunked. Archive producer failures fail the
+  response stream rather than ending it successfully with a partial ZIP. Desktop
+  clients choose the destination before minting the download URL, so time spent
+  in the native picker does not consume the token lifetime. Native download
+  failures preserve bounded server error details and recovery guidance; transfer
+  capability URLs are excluded from error messages and logs. `Content-Disposition` names the
   entry with an ASCII-safe `filename` plus an RFC 5987 `filename*`, because a
   raw non-ASCII or control byte is not a legal header value and would fail the
   whole response. One file-name policy (`transfer::upload`) governs both

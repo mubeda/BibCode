@@ -282,6 +282,10 @@
       "mode": "unary"
     },
     {
+      "name": "server.getProviderCapabilities",
+      "mode": "unary"
+    },
+    {
       "name": "server.getProviderUsage",
       "mode": "unary"
     },
@@ -748,6 +752,8 @@
     "typed-failures/server__getProcessDiagnostics-01.json",
     "typed-failures/server__getProcessResourceHistory-00.json",
     "typed-failures/server__getProcessResourceHistory-01.json",
+    "typed-failures/server__getProviderCapabilities-00.json",
+    "typed-failures/server__getProviderCapabilities-01.json",
     "typed-failures/server__getProviderUsage-00.json",
     "typed-failures/server__getProviderUsage-01.json",
     "typed-failures/server__getSettings-00.json",
@@ -1062,6 +1068,8 @@
     "typed-failures/server__getProcessDiagnostics-01.json": "67fe28f9afa4f2e8a20948477a9e72996dd013c6e33b3a768d31eb3a49061509",
     "typed-failures/server__getProcessResourceHistory-00.json": "458ab3eaa56c31ebe2775b1dc1c0a6ba8d32115336f2ed7acec1b53d272af365",
     "typed-failures/server__getProcessResourceHistory-01.json": "67fe28f9afa4f2e8a20948477a9e72996dd013c6e33b3a768d31eb3a49061509",
+    "typed-failures/server__getProviderCapabilities-00.json": "6694d90ed2f7bf04588ccc3d47db8d39081bd9f613d7b602168090f8342f5107",
+    "typed-failures/server__getProviderCapabilities-01.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
     "typed-failures/server__getProviderUsage-00.json": "458ab3eaa56c31ebe2775b1dc1c0a6ba8d32115336f2ed7acec1b53d272af365",
     "typed-failures/server__getProviderUsage-01.json": "67fe28f9afa4f2e8a20948477a9e72996dd013c6e33b3a768d31eb3a49061509",
     "typed-failures/server__getSettings-00.json": "e6e06617f5b5a3097d9d1722ce42d138d793dd405de3488faf02109b4615530e",
@@ -1114,12 +1122,12 @@
     "stream-shapes/subscribePreviewEvents-03.json": "610d11c2c75756edfc18e224e5e91c6944162760c00c48c4d0de54fc4772acff",
     "stream-shapes/subscribePreviewEvents-04.json": "f501cfce13136cfa7ae7bad4febe03c8c2f251deb39b95d89a955a1c39b449aa",
     "stream-shapes/subscribeProjectEntries-00.json": "16f4733b371dc6218161dd4edea9bdd75720b67a9e18533b6bdf20d00e120db5",
-    "stream-shapes/subscribeServerConfig-00.json": "35a7bf28460ce325d07b2ce21f53329d1bb12049cf18d19dd7e3b9b201f6f06d",
+    "stream-shapes/subscribeServerConfig-00.json": "b720aa736a5bf7d732dec139d90f09d865a56768fdd31b40c6039bee7093fa96",
     "stream-shapes/subscribeServerConfig-01.json": "a1736b568373952030c3383ae56ebc777ff487d1732c6adfface416574e1dbf3",
     "stream-shapes/subscribeServerConfig-02.json": "ae146698c9d1a7fa8b20e6665efd2ef6300d7ecec411497f01271add5a3c32b4",
     "stream-shapes/subscribeServerConfig-03.json": "170831fd420c93bb7028261110e84a506b90762a469d9d9de9fed374b1856967",
-    "stream-shapes/subscribeServerLifecycle-00.json": "34f24b97635c4f352fe6d50af924700346afc99b8773acfa6f3485625d918a1d",
-    "stream-shapes/subscribeServerLifecycle-01.json": "3450debf6d54d8c3c30f7fbaa7a6d7656724c6bbc7848f476e7a987086b6a302",
+    "stream-shapes/subscribeServerLifecycle-00.json": "ff20ff797a23ad28a1ad6d3c1cc362cc534b3cc3738f0116e2a347dc0cc58d77",
+    "stream-shapes/subscribeServerLifecycle-01.json": "7e80569cd30f82ebbf85e2961a92fc0595d36498abd182b540d62e88695372df",
     "stream-shapes/subscribeTerminalEvents-00.json": "cbd00577e4b1aee3d7026ea6efc0c135670a5af101a6ea0610ca7ecaa1385832",
     "stream-shapes/subscribeTerminalEvents-01.json": "8910c9265e5eb8ab0cdd98289a899d28b720c08decad2ec7d2967346570eaee6",
     "stream-shapes/subscribeTerminalEvents-02.json": "218d03fab79954845f38c1ed752082aab5340619a28c684920da1af6a7360fa8",
@@ -1513,6 +1521,8 @@
     "typed-failures/server__getProcessDiagnostics-01.json",
     "typed-failures/server__getProcessResourceHistory-00.json",
     "typed-failures/server__getProcessResourceHistory-01.json",
+    "typed-failures/server__getProviderCapabilities-00.json",
+    "typed-failures/server__getProviderCapabilities-01.json",
     "typed-failures/server__getProviderUsage-00.json",
     "typed-failures/server__getProviderUsage-01.json",
     "typed-failures/server__getSettings-00.json",

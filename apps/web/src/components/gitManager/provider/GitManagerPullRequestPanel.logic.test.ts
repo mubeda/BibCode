@@ -208,25 +208,56 @@ describe("Git Manager provider pane logic", () => {
   });
 
   it("reuses the existing stacked create-pr action shape with the reviewed fields", () => {
-    expect(createPullRequestAction("action-1")).toEqual({
-      actionId: "action-1",
-      action: "create_pr",
-    });
-    expect(createPullRequestAction("action-2", { title: "  Reviewed  ", body: "Body\n" })).toEqual({
+    expect(
+      createPullRequestAction("action-2", {
+        title: "  Reviewed  ",
+        body: "Body\n",
+        baseBranch: "release/next",
+      }),
+    ).toEqual({
       actionId: "action-2",
       action: "create_pr",
       pullRequestTitle: "Reviewed",
+      pullRequestBaseBranch: "release/next",
       pullRequestBody: "Body\n",
     });
-    expect(createPullRequestAction("action-3", { title: "Reviewed", body: "   " })).toEqual({
+    expect(
+      createPullRequestAction("action-3", {
+        title: "Reviewed",
+        body: "   ",
+        baseBranch: "release/next",
+      }),
+    ).toEqual({
       actionId: "action-3",
       action: "create_pr",
       pullRequestTitle: "Reviewed",
+      pullRequestBaseBranch: "release/next",
     });
   });
 });
 
 describe("resolveCreatePullRequestReview", () => {
+  it.each(["closed", "merged"] as const)(
+    "allows a new request after the previous one was %s",
+    (state) => {
+      const review = resolveCreatePullRequestReview({
+        status: status({
+          pr: {
+            state,
+            number: 9,
+            title: "Previous",
+            url: "https://github.com/owner/repo/pull/9",
+            baseRef: "main",
+            headRef: "feature/reviewed",
+          },
+        }),
+        latestCommit: null,
+      });
+      expect(review.existingPullRequest).toBeNull();
+      expect(review.blockedReason).toBeNull();
+    },
+  );
+
   it("describes repository, branches, publish requirement, and commit-based defaults", () => {
     const review = resolveCreatePullRequestReview({
       status: status(),
@@ -236,7 +267,6 @@ describe("resolveCreatePullRequestReview", () => {
     expect(review).toEqual({
       provider: { kind: "github", name: "GitHub", baseUrl: "https://github.com" },
       head: "feature/reviewed",
-      base: "main",
       publishRequired: true,
       existingPullRequest: null,
       defaultTitle: "feat: reviewed change",
@@ -285,7 +315,7 @@ describe("resolveCreatePullRequestReview", () => {
 
   it.each([
     [status({ isRepo: false }), "This folder is not a Git repository."],
-    [status({ refName: null }), "Check out a branch before creating a pull request."],
+    [status({ refName: null }), "Select a source branch."],
     [status({ sourceControlProvider: undefined }), UNIDENTIFIED_HOST_REASON],
     [
       status({ sourceControlProvider: undefined, hasPrimaryRemote: false }),

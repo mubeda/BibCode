@@ -269,7 +269,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
         subtype: "success",
         request_id: message.request_id,
         response: {
-          commands: [],
+          commands: [{ name: "review", description: "Review code" }],
           agents: [],
           models: reloaded ? [
             {

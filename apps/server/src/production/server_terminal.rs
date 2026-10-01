@@ -344,6 +344,7 @@ pub fn register_server_terminal_rpc(registry: &mut RpcRegistry, services: Server
 fn register_control_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
     for method in [
         "server.getConfig",
+        "server.getProviderCapabilities",
         "server.getSettings",
         "server.getTraceDiagnostics",
         "server.refreshProviders",
