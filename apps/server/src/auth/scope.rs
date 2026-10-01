@@ -51,6 +51,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "server.getConfig"
         | "server.getProcessDiagnostics"
         | "server.getProcessResourceHistory"
+        | "server.getProviderCapabilities"
         | "server.getProviderUsage"
         | "server.getSettings"
         | "server.getTraceDiagnostics"
@@ -184,6 +185,10 @@ mod tests {
         assert!(missing.is_empty(), "missing RPC scopes: {missing:?}");
         assert_eq!(
             required_scope("server.getConfig"),
+            Some(SCOPE_ORCHESTRATION_READ)
+        );
+        assert_eq!(
+            required_scope("server.getProviderCapabilities"),
             Some(SCOPE_ORCHESTRATION_READ)
         );
         assert_eq!(

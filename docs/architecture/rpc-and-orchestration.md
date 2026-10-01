@@ -7,7 +7,8 @@ desktop bridge is reserved for host-native capabilities.
 ## Provider capabilities by workspace
 
 `server.getProviderCapabilities` is a read-only unary RPC with
-`{ instanceId, cwd }` input. It returns the selected provider's commands, skills,
+`{ instanceId, cwd }` input, authorized by `orchestration:read`. It returns the
+selected provider's commands, skills,
 agents, and partial-discovery issues for that directory and its user configuration.
 Invalid contexts and failed discovery use `ServerProviderCapabilitiesError`.
 The request cannot override server-owned provider settings or credentials. It
