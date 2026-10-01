@@ -99,6 +99,7 @@ pub struct ProductionRuntime {
     provider_runtime: Arc<ProviderRuntimeSupervisor>,
     turn_delivery: Arc<TurnDeliveryService>,
     operational_logs: OperationalLogs,
+    server_control: Arc<NativeServerControl>,
     provider_update_checks: ProviderUpdateCheckTask,
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
@@ -491,6 +492,7 @@ impl ProductionRuntime {
             provider_runtime,
             turn_delivery,
             operational_logs,
+            server_control: control,
             provider_update_checks,
             orchestration_effects,
             diagnostic_bundle,
@@ -626,6 +628,7 @@ impl ProductionRuntime {
         if *quiesced {
             return Ok(());
         }
+        self.server_control.shutdown_capability_discovery().await;
         let process_ownership = self.terminal_services.freeze_process_ownership().await;
         self.managed_endpoint.shutdown().await;
         self.workspace.shutdown().await;
@@ -2705,6 +2708,21 @@ mod tests {
             .expect("thread table should restore");
 
         runtime.shutdown().await;
+        let discovery = crate::production::server_terminal::ProductionServerControl::call(
+            runtime.server_control.as_ref(),
+            "server.getProviderCapabilities",
+            json!({"instanceId":"cursor","cwd":state.path()}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(discovery["_tag"], "ServerProviderCapabilitiesError");
+        assert!(
+            discovery["reason"]
+                .as_str()
+                .unwrap()
+                .contains("shutting down")
+        );
     }
 
     #[tokio::test]

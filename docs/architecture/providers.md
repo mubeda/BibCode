@@ -27,6 +27,52 @@ equivalent status source; clients keep the control visible but disabled.
 steering; Cursor, Grok, and OpenCode omit it. The server checks the same driver
 capability when admitting a steer of the oldest queued message.
 
+## Workspace capability discovery
+
+The composer reads `server.getProviderCapabilities({ instanceId, cwd })` for its
+active environment and repository or worktree. Global provider inventory remains
+the source for readiness and models; a scoped capability read never publishes
+that inventory. The server requires an enabled, supported instance and an
+existing absolute directory, and owns executable, environment, credential, and
+home resolution. Effective runtime environment values are materialized from the
+secret store; persisted and client-visible settings stay redacted.
+
+The result contains `slashCommands`, `skills`, `agents`, and `issues`. Codex
+initializes an App Server in the requested directory and calls `skills/list`
+without an account/model query, using the session launch's configured Codex
+home and shared/shadow-home preparation. Claude uses hook-disabled native
+initialization and `reload_skills` with user/project/local settings. Its reload
+results are matched to initialization command names and aliases so model-only
+skills stay hidden; manual-only skills remain available as native commands.
+Both native catalogs preserve their own visibility, plugin, and precedence rules. OpenCode
+reads `/command` and `/agent` with the session's encoded `directory` parameter,
+including for a configured remote endpoint; command entries with `source: skill`
+become slash skills. Its native catalog resolves collisions. Cursor scans
+`.cursor/skills`, `.agents/skills`, `.claude/skills`, and `.codex/skills` in the
+workspace, applicable ancestors up to its Git root, and the effective user home.
+Its traversal follows nested and symlinked directories, guards canonical paths
+against cycles, and deduplicates names with project precedence.
+
+`packages/client-runtime` owns the capability query family. Cache identity
+includes environment, provider instance, directory, and a configuration revision.
+Settings and provider-status events advance the revision, even when a changed
+secret remains redacted. Queries share active work, become stale after 30 seconds,
+and expire after five idle minutes. Opening a stale menu revalidates; reconnect
+uses the existing query transport recovery policy. Searching is local. Results
+from other contexts cannot replace the selected catalog, while the last success
+for the same context stays visible during refresh.
+
+Native probes use bounded waits and supervised cleanup on completion, failure,
+or cancellation. Tracked RPC tasks own that cleanup after a request disconnects.
+Runtime shutdown and update quiesce close discovery admission, cancel active
+probes, and drain their cleanup before shutting down providers and terminals.
+Discovery does not send a model prompt or persist another skill index. Partial
+catalogs retain native errors in `issues`; unreadable Cursor roots are reported,
+while absent optional roots are normal. Failed discovery raises
+`ServerProviderCapabilitiesError`; the composer offers Retry and preserves the
+draft. Native `$` (Codex) and `/` (Claude, Cursor, OpenCode) menus remain reachable
+with an empty catalog so newly installed skills can be discovered.
+
 ## Execution path
 
 The web app sends typed Effect RPC requests to the Rust server. New turns and

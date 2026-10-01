@@ -1815,15 +1815,44 @@ pub async fn desktop_bridge_download_to_folder(
     if !directory.is_dir() {
         return Err("Download folder does not exist.".to_owned());
     }
-    let response = transfer_http_client()?
+    let mut response = transfer_http_client()?
         .get(url)
         .send()
         .await
-        .map_err(|error| bridge_error("Download request failed", error))?;
+        .map_err(|error| {
+            let error = error.without_url();
+            tracing::warn!(?error, "desktop download request failed");
+            format!("Download request failed: {error}. Check the connection and try again.")
+        })?;
     if !response.status().is_success() {
+        let status = response.status().as_u16();
+        tracing::warn!(status, "desktop download request was refused");
+        // Error bodies can come from proxies too. Bound the read, display only JSON messages,
+        // and never put the signed URL or an arbitrary HTML response in diagnostics.
+        let message = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.ok()? {
+                if body.len() + chunk.len() > 16 * 1024 {
+                    return None;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let body: Value = serde_json::from_slice(&body).ok()?;
+            let message = body.get("message")?.as_str()?.trim();
+            (!message.is_empty()).then(|| message.chars().take(1024).collect::<String>())
+        })
+        .await
+        .ok()
+        .flatten();
+        let recovery = match status {
+            401 | 403 => "Reconnect to this environment and try again.",
+            404 => "Refresh Files and try again.",
+            413 => "Download a smaller subfolder instead.",
+            _ => "Try again. If it keeps failing, check the server diagnostics.",
+        };
         return Err(format!(
-            "Download failed with HTTP {}.",
-            response.status().as_u16()
+            "Download failed with HTTP {status}. {}{recovery}",
+            message.map_or_else(String::new, |message| format!("{message} ")),
         ));
     }
     // The partial-name shape and its stem budget both come from the server crate, so the two
@@ -1834,15 +1863,21 @@ pub async fn desktop_bridge_download_to_folder(
             DOWNLOAD_PARTIAL_SUFFIX,
         ),
     );
-    let mut file = tokio::fs::File::create(&partial)
-        .await
-        .map_err(|error| bridge_error("Could not create the download file", error))?;
+    let mut file = tokio::fs::File::create(&partial).await.map_err(|error| {
+        tracing::warn!(%error, "could not create desktop download file");
+        bridge_error("Could not create the download file", error)
+    })?;
     let mut stream = response.bytes_stream();
     let outcome: Result<(), String> = async {
         use futures_util::StreamExt as _;
         use tokio::io::AsyncWriteExt as _;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| bridge_error("Download stream failed", error))?;
+            let chunk = chunk.map_err(|error| {
+                format!(
+                    "Download stream failed: {}. Check the connection and try again. If it keeps failing, check the server diagnostics.",
+                    error.without_url(),
+                )
+            })?;
             file.write_all(&chunk)
                 .await
                 .map_err(|error| bridge_error("Could not write the download file", error))?;
@@ -1854,17 +1889,20 @@ pub async fn desktop_bridge_download_to_folder(
     .await;
     drop(file);
     if let Err(error) = outcome {
+        tracing::warn!(%error, "desktop download failed before completion");
         let _ = tokio::fs::remove_file(&partial).await;
         return Err(error);
     }
     let destination = match unique_destination(&directory, &file_name) {
         Ok(destination) => destination,
         Err(error) => {
+            tracing::warn!(%error, "could not reserve desktop download destination");
             let _ = tokio::fs::remove_file(&partial).await;
             return Err(error);
         }
     };
     if let Err(error) = tokio::fs::rename(&partial, &destination).await {
+        tracing::warn!(%error, "could not place desktop download file");
         let _ = tokio::fs::remove_file(&partial).await;
         let _ = tokio::fs::remove_file(&destination).await;
         return Err(bridge_error("Could not place the download file", error));
@@ -2515,6 +2553,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_to_folder_preserves_the_server_failure_reason() {
+        let (base_url, _requests) = spawn_http_test_server(
+            404,
+            "Not Found",
+            r#"{"_tag":"TransferNotFoundError","message":"Transfer was not found or its access token expired."}"#,
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let error = desktop_bridge_download_to_folder(
+            format!("{base_url}/api/transfers/secret-token"),
+            temp.path().to_string_lossy().into_owned(),
+            "folder.zip".to_owned(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("404"), "{error}");
+        assert!(error.contains("expired"), "{error}");
+        assert!(error.contains("try again"), "{error}");
+        assert!(!error.contains("secret-token"), "{error}");
+        assert!(temp_dir_entry_names(temp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_rejections_hide_raw_or_oversized_error_bodies() {
+        for (status, body) in [
+            (502, "<html>proxy error detail</html>".to_owned()),
+            (
+                500,
+                format!(r#"{{"message":"{}"}}"#, "server detail".repeat(2048)),
+            ),
+        ] {
+            let (base_url, _requests) = spawn_http_test_server(status, "Failure", body);
+            let temp = tempfile::tempdir().unwrap();
+            let error = desktop_bridge_download_to_folder(
+                format!("{base_url}/api/transfers/token"),
+                temp.path().to_string_lossy().into_owned(),
+                "folder.zip".to_owned(),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error.contains(&format!("HTTP {status}")), "{error}");
+            assert!(!error.contains("detail"), "{error}");
+            assert!(temp_dir_entry_names(temp.path()).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn download_stream_failure_removes_the_partial_file() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_test_http_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n7\r\npartial\r\n",
+                )
+                .unwrap();
+        });
+        let error = desktop_bridge_download_to_folder(
+            format!("http://{address}/api/transfers/secret-token"),
+            temp.path().to_string_lossy().into_owned(),
+            "folder.zip".to_owned(),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.contains("Download stream failed"), "{error}");
+        assert!(!error.contains("secret-token"), "{error}");
+        assert!(temp_dir_entry_names(temp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_request_failure_does_not_expose_the_signed_url() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_test_http_request(&mut stream);
+            // Closing before response headers simulates a dropped connection.
+        });
+        let error = desktop_bridge_download_to_folder(
+            format!("http://{address}/api/transfers/secret-token"),
+            temp.path().to_string_lossy().into_owned(),
+            "folder.zip".to_owned(),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.contains("Download request failed"), "{error}");
+        assert!(!error.contains("secret-token"), "{error}");
+        assert!(temp_dir_entry_names(temp.path()).is_empty());
+    }
+
+    #[tokio::test]
     async fn download_to_folder_avoids_overwriting_an_existing_file_with_the_same_name() {
         let (base_url, _requests) = spawn_json_test_server("new content");
         let temp = tempfile::tempdir().unwrap();
@@ -2669,8 +2807,9 @@ mod tests {
     fn spawn_http_test_server(
         status: u16,
         reason: &'static str,
-        body: &'static str,
+        body: impl Into<String>,
     ) -> (String, mpsc::Receiver<String>) {
+        let body = body.into();
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).expect("test server should bind loopback");
         let address = listener

@@ -1,4 +1,10 @@
-use std::{collections::HashSet, ffi::OsString, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    path::Path,
+    process::Stdio,
+    time::Duration,
+};
 
 use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
@@ -25,6 +31,9 @@ use crate::{
         opencode,
     },
 };
+
+mod capabilities;
+pub(crate) use capabilities::discover_capabilities;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CURSOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -72,11 +81,13 @@ struct ProviderSessionDefaults {
     service_tier: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ProviderCapabilities {
     slash_commands: Vec<Value>,
     skills: Vec<Value>,
     agents: Vec<Value>,
+    issues: Vec<String>,
 }
 
 struct ClaudeProbeMetadata {
@@ -535,8 +546,9 @@ async fn probe_one_snapshot(
             .unwrap_or_else(|| custom_models(&definition.custom_models));
         let capabilities = ProviderCapabilities {
             slash_commands: inventory.commands,
-            skills: Vec::new(),
+            skills: inventory.skills,
             agents: inventory.agents,
+            ..ProviderCapabilities::default()
         };
         return ProviderProbeResult::new(
             snapshot(
@@ -769,6 +781,7 @@ async fn probe_one_snapshot(
                     .unwrap_or(models);
                 capabilities.slash_commands = inventory.commands;
                 capabilities.agents = inventory.agents;
+                capabilities.skills = inventory.skills;
                 message = None;
             }
         }
@@ -913,13 +926,38 @@ fn parse_claude_initialization_response(
                     Some(result)
                 })
                 .collect(),
+            ..ProviderCapabilities::default()
         },
         models: claude::model::models_from_initialization(response, custom_models),
         skills_loaded: false,
     }
 }
 
-fn parse_claude_skills_response(response: &Value) -> Option<Vec<Value>> {
+fn parse_claude_skills_response(response: &Value, initialization: &Value) -> Option<Vec<Value>> {
+    // reload_skills includes model-only skills; initialize is the native user-visible menu.
+    let mut visible = HashMap::new();
+    let mut aliases = HashMap::new();
+    for command in initialization.get("commands")?.as_array()? {
+        let Some(name) = command.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = name.trim().trim_start_matches('/');
+        if name.is_empty() {
+            continue;
+        }
+        visible.entry(name.to_ascii_lowercase()).or_insert(name);
+        for alias in command
+            .get("aliases")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            aliases
+                .entry(alias.trim().trim_start_matches('/').to_ascii_lowercase())
+                .or_insert(name);
+        }
+    }
     let mut seen = HashSet::new();
     Some(
         response
@@ -927,13 +965,16 @@ fn parse_claude_skills_response(response: &Value) -> Option<Vec<Value>> {
             .as_array()?
             .iter()
             .filter_map(|skill| {
-                let name = skill.get("name")?.as_str()?.trim().trim_start_matches('/');
-                if name.is_empty() || !seen.insert(name.to_ascii_lowercase()) {
+                let id = skill.get("name")?.as_str()?.trim().trim_start_matches('/');
+                let key = id.to_ascii_lowercase();
+                // Native command lookup prefers every primary name over any alias.
+                let name = visible.get(&key).or_else(|| aliases.get(&key))?;
+                if !seen.insert(name.to_ascii_lowercase()) {
                     return None;
                 }
                 let mut result = json!({
                     "name": name,
-                    "path": format!("claude://skill/{name}"),
+                    "path": format!("claude://skill/{id}"),
                     "scope": "provider",
                     "enabled": true,
                     "invocation": "slash",
@@ -1056,6 +1097,23 @@ async fn probe_claude_metadata(
     environment: &[(OsString, OsString)],
     custom_models: &[String],
 ) -> Option<ClaudeProbeMetadata> {
+    probe_claude_metadata_with_cancellation(
+        executable,
+        cwd,
+        environment,
+        custom_models,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+async fn probe_claude_metadata_with_cancellation(
+    executable: &Path,
+    cwd: &Path,
+    environment: &[(OsString, OsString)],
+    custom_models: &[String],
+    cancellation: &CancellationToken,
+) -> Option<ClaudeProbeMetadata> {
     let launch = prepare_provider_launch(executable, CLAUDE_CAPABILITY_PROBE_ARGS).ok()?;
     let mut command = Command::new(launch.program);
     command
@@ -1068,44 +1126,52 @@ async fn probe_claude_metadata(
         .stderr(Stdio::null());
     sanitize_provider_subprocess_environment(&mut command);
     let mut child = supervised_command(command).spawn().ok()?;
-    let mut stdin = child.stdin().take()?;
-    let stdout = child.stdout().take()?;
-    let mut lines = BufReader::new(stdout).lines();
+    let probe = async {
+        let mut stdin = child.stdin().take()?;
+        let stdout = child.stdout().take()?;
+        let mut lines = BufReader::new(stdout).lines();
 
-    write_claude_control_request(&mut stdin, "bibcode-inventory", "initialize")
-        .await
-        .ok()?;
-    let initialization = timeout(
-        CLAUDE_CAPABILITIES_TIMEOUT,
-        read_claude_control_response(&mut lines, "bibcode-inventory"),
-    )
-    .await
-    .ok()
-    .flatten()?;
-    let mut metadata = parse_claude_initialization_response(&initialization, custom_models);
-
-    let skills = if write_claude_control_request(&mut stdin, "bibcode-skills", "reload_skills")
-        .await
-        .is_ok()
-    {
-        timeout(
-            CLAUDE_SKILLS_TIMEOUT,
-            read_claude_control_response(&mut lines, "bibcode-skills"),
+        write_claude_control_request(&mut stdin, "bibcode-inventory", "initialize")
+            .await
+            .ok()?;
+        let initialization = timeout(
+            CLAUDE_CAPABILITIES_TIMEOUT,
+            read_claude_control_response(&mut lines, "bibcode-inventory"),
         )
         .await
         .ok()
-        .flatten()
-        .and_then(|response| parse_claude_skills_response(&response))
-    } else {
-        None
+        .flatten()?;
+        let mut metadata = parse_claude_initialization_response(&initialization, custom_models);
+
+        let skills = if write_claude_control_request(&mut stdin, "bibcode-skills", "reload_skills")
+            .await
+            .is_ok()
+        {
+            timeout(
+                CLAUDE_SKILLS_TIMEOUT,
+                read_claude_control_response(&mut lines, "bibcode-skills"),
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(|response| parse_claude_skills_response(&response, &initialization))
+        } else {
+            None
+        };
+        let _ = stdin.shutdown().await;
+        if let Some(skills) = skills {
+            metadata.capabilities.skills = skills;
+            metadata.skills_loaded = true;
+        }
+        Some(metadata)
     };
-    let _ = stdin.shutdown().await;
+    let result = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => None,
+        result = probe => result,
+    };
     stop_supervised_child(&mut *child).await;
-    if let Some(skills) = skills {
-        metadata.capabilities.skills = skills;
-        metadata.skills_loaded = true;
-    }
-    Some(metadata)
+    result
 }
 
 async fn write_claude_control_request(
@@ -1199,7 +1265,7 @@ async fn probe_codex(
 ) -> Option<codex::CodexProviderSnapshot> {
     let launch = prepare_provider_launch(executable, ["app-server"]).ok()?;
     let mut command = Command::new(launch.program);
-    command.envs(environment.iter().cloned());
+    command.current_dir(cwd).envs(environment.iter().cloned());
     sanitize_provider_subprocess_environment(&mut command);
     command
         .args(launch.args)
@@ -1313,9 +1379,9 @@ async fn probe_opencode_with_timeout(
         .ok()?;
     let endpoint = endpoint.trim_end_matches('/');
     let (providers, agents, commands) = tokio::join!(
-        get_opencode_json(&client, endpoint, "/provider", server_password),
-        get_opencode_json(&client, endpoint, "/agent", server_password),
-        get_opencode_json(&client, endpoint, "/command", server_password),
+        get_opencode_json(&client, endpoint, "/provider", server_password, None),
+        get_opencode_json(&client, endpoint, "/agent", server_password, None),
+        get_opencode_json(&client, endpoint, "/command", server_password, None),
     );
     let providers = providers?;
     let agents = agents?;
@@ -1333,8 +1399,14 @@ async fn get_opencode_json(
     endpoint: &str,
     path: &str,
     server_password: Option<&str>,
+    cwd: Option<&Path>,
 ) -> Option<Value> {
-    let request = client.get(format!("{endpoint}{path}"));
+    let mut url = reqwest::Url::parse(&format!("{endpoint}{path}")).ok()?;
+    if let Some(cwd) = cwd {
+        url.query_pairs_mut()
+            .append_pair("directory", &cwd.to_string_lossy());
+    }
+    let request = client.get(url);
     let request = match server_password.filter(|value| !value.is_empty()) {
         Some(password) => request.basic_auth("opencode", Some(password)),
         None => request,
@@ -1362,6 +1434,7 @@ async fn opencode_is_healthy(endpoint: &str, server_password: Option<&str>) -> b
         endpoint.trim_end_matches('/'),
         "/global/health",
         server_password,
+        None,
     )
     .await
     .is_some()
@@ -1373,6 +1446,35 @@ async fn probe_local_opencode(
     custom_models: &[String],
     environment: &[(OsString, OsString)],
 ) -> Option<opencode::OpenCodeInventorySnapshot> {
+    with_local_opencode(
+        executable,
+        cwd,
+        environment,
+        &CancellationToken::new(),
+        |endpoint, password| async move {
+            probe_opencode_with_timeout(
+                &endpoint,
+                Some(&password),
+                custom_models,
+                LOCAL_OPENCODE_INVENTORY_TIMEOUT,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn with_local_opencode<T, F, Fut>(
+    executable: &Path,
+    cwd: &Path,
+    environment: &[(OsString, OsString)],
+    cancellation: &CancellationToken,
+    discover: F,
+) -> Option<T>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
     let executable = opencode::resolve_owned_executable(Platform::current(), executable);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let port = listener.local_addr().ok()?.port();
@@ -1397,34 +1499,20 @@ async fn probe_local_opencode(
     command.env("OPENCODE_SERVER_PASSWORD", &local_password);
     sanitize_provider_subprocess_environment(&mut command);
     let mut child = supervised_command(command).spawn().ok()?;
-    let mut ready = false;
-    for _ in 0..LOCAL_OPENCODE_STARTUP_ATTEMPTS {
-        if child.try_wait().ok().flatten().is_some() {
-            break;
-        }
-        if opencode_is_healthy(&endpoint, Some(&local_password)).await {
-            ready = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    let inventory = if ready && child.try_wait().ok().flatten().is_none() {
-        let snapshot = probe_opencode_with_timeout(
-            &endpoint,
-            Some(&local_password),
-            custom_models,
-            LOCAL_OPENCODE_INVENTORY_TIMEOUT,
-        )
-        .await;
-        child
-            .try_wait()
-            .ok()
-            .flatten()
-            .is_none()
-            .then_some(snapshot)
-            .flatten()
-    } else {
-        None
+    let inventory = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => None,
+        result = async {
+            for _ in 0..LOCAL_OPENCODE_STARTUP_ATTEMPTS {
+                if child.try_wait().ok().flatten().is_some() { return None; }
+                if opencode_is_healthy(&endpoint, Some(&local_password)).await {
+                    let snapshot = discover(endpoint, local_password).await;
+                    return child.try_wait().ok().flatten().is_none().then_some(snapshot).flatten();
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            None
+        } => result,
     };
     stop_supervised_child(&mut *child).await;
     inventory
@@ -2327,7 +2415,7 @@ mod tests {
                 { "name": "loop", "description": "Run repeatedly", "argumentHint": "[interval] [prompt]" },
                 { "name": "loop", "description": "Duplicate lower-priority skill" }
             ]
-        }))
+        }), &json!({"commands":[{"name":"loop"}]}))
         .expect("valid skills response");
 
         assert_eq!(skills.len(), 1);
@@ -2337,13 +2425,23 @@ mod tests {
     }
 
     #[test]
+    fn claude_skills_prioritize_primary_command_names_over_aliases() {
+        let skills = parse_claude_skills_response(
+            &json!({"skills":[{"name":"beta"}]}),
+            &json!({"commands":[{"name":"alpha","aliases":["beta"]},{"name":"beta"}]}),
+        )
+        .expect("valid native catalogs");
+        assert_eq!(skills[0]["name"], "beta");
+    }
+
+    #[test]
     fn claude_skills_probe_distinguishes_empty_inventory_from_parse_failure() {
         assert_eq!(
-            parse_claude_skills_response(&json!({ "skills": [] })),
+            parse_claude_skills_response(&json!({ "skills": [] }), &json!({"commands":[]})),
             Some(Vec::new())
         );
         assert_eq!(
-            parse_claude_skills_response(&json!({ "skills": "invalid" })),
+            parse_claude_skills_response(&json!({ "skills": "invalid" }), &json!({"commands":[]})),
             None
         );
     }

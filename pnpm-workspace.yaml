@@ -101,6 +101,7 @@ packageExtensions:
 
 patchedDependencies:
   "@effect/vitest@4.0.0-beta.107": patches/@effect__vitest@4.0.0-beta.107.patch
+  "@pierre/trees@1.0.0-beta.6": patches/@pierre__trees@1.0.0-beta.6.patch
   "@wdio/tauri-plugin@1.2.0": patches/@wdio__tauri-plugin@1.2.0.patch
 
 peerDependencyRules:

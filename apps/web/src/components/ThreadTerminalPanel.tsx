@@ -108,7 +108,6 @@ import {
 } from "./terminalTheme";
 import { ProviderTerminalActivityDock } from "./activity/ProviderTerminalActivityDock";
 
-const MULTI_CLICK_SELECTION_ACTION_DELAY_MS = 260;
 const terminalInputRegistry = createTerminalInputSchedulerRegistry();
 const terminalInputBindings = new Map<string, TerminalInputBinding>();
 // Retain dismissal across renderer/component remounts; terminal retirement
@@ -669,17 +668,6 @@ export function resolveTerminalSelectionActionPosition(options: {
   };
 }
 
-export function terminalSelectionActionDelayForClickCount(clickCount: number): number {
-  return clickCount >= 2 ? MULTI_CLICK_SELECTION_ACTION_DELAY_MS : 0;
-}
-
-export function shouldHandleTerminalSelectionMouseUp(
-  selectionGestureActive: boolean,
-  button: number,
-): boolean {
-  return selectionGestureActive && button === 0;
-}
-
 interface TerminalViewportProps {
   threadRef: ScopedThreadRef;
   threadId: ThreadId;
@@ -800,11 +788,8 @@ export function TerminalViewport({
   });
   const hasHandledExitRef = useRef(false);
   const selectionPointerRef = useRef<{ x: number; y: number } | null>(null);
-  const selectionGestureActiveRef = useRef(false);
   const selectionActionRequestIdRef = useRef(0);
   const selectionActionOpenRef = useRef(false);
-  const selectionActionTimerRef = useRef<number | null>(null);
-  const selectionActionFrameRef = useRef<number | null>(null);
   const keybindingsRef = useRef(keybindings);
   const inputSchedulerRef = useRef<TerminalInputScheduler | null>(null);
   const focusGenerationRef = useRef(0);
@@ -1319,14 +1304,6 @@ export function TerminalViewport({
 
     const clearSelectionAction = () => {
       selectionActionRequestIdRef.current += 1;
-      if (selectionActionTimerRef.current !== null) {
-        window.clearTimeout(selectionActionTimerRef.current);
-        selectionActionTimerRef.current = null;
-      }
-      if (selectionActionFrameRef.current !== null) {
-        window.cancelAnimationFrame(selectionActionFrameRef.current);
-        selectionActionFrameRef.current = null;
-      }
     };
 
     const readSelectionAction = (): {
@@ -1413,31 +1390,6 @@ export function TerminalViewport({
       inputScheduler.enqueue(data);
     };
 
-    // xterm's selection lives on the WebGL canvas, so the browser's native copy
-    // never sees it. Mirror the selection to the OS clipboard explicitly (on
-    // Ctrl/Cmd+C and on select) so it can be pasted into another terminal.
-    const copyTerminalSelection = (): boolean => {
-      const active = terminalRef.current;
-      if (!active?.hasSelection()) return false;
-      const text = active.getSelection();
-      if (text.length === 0) return false;
-      void navigator.clipboard?.writeText(text).catch(() => {});
-      return true;
-    };
-
-    // Ctrl/Cmd+V otherwise reaches xterm as the raw \x16 control byte; read the
-    // clipboard and paste it (bracketed-paste aware via terminal.paste).
-    const pasteIntoTerminal = () => {
-      void (async () => {
-        try {
-          const text = await navigator.clipboard.readText();
-          if (text.length > 0) terminalRef.current?.paste(text);
-        } catch {
-          // Clipboard read is unavailable or denied; nothing to paste.
-        }
-      })();
-    };
-
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type === "keydown") handleSizeTrigger("keypress");
       const currentKeybindings = keybindingsRef.current;
@@ -1455,20 +1407,35 @@ export function TerminalViewport({
 
       const clipboard = terminalClipboardShortcut(event);
       if (clipboard !== null) {
-        if (clipboard.action === "paste") {
+        if (clipboard.onlyWithSelection && !terminal.hasSelection()) return true;
+        if (clipboard.action === "copy" && event.shiftKey) {
           event.preventDefault();
           event.stopPropagation();
-          pasteIntoTerminal();
-          return false;
+          const textarea = terminal.textarea;
+          if (terminal.hasSelection() && textarea) {
+            // WebKit needs a DOM selection for execCommand; xterm uses this
+            // same textarea for its native right-click copy handling.
+            const { value, selectionStart, selectionEnd, selectionDirection } = textarea;
+            let copied = false;
+            try {
+              textarea.value = terminal.getSelection();
+              textarea.select();
+              copied = document.execCommand("copy");
+            } catch {
+              // Report a failed command after restoring pending input below.
+            } finally {
+              textarea.value = value;
+              textarea.setSelectionRange(selectionStart, selectionEnd, selectionDirection);
+            }
+            if (!copied) {
+              writeSystemMessage(terminal, `Copy failed. Try ${event.metaKey ? "Cmd" : "Ctrl"}+C.`);
+            }
+          }
         }
-        // Copy the selection when there is one; otherwise let a bare Ctrl+C
-        // fall through to the terminal as SIGINT.
-        if (copyTerminalSelection()) {
-          event.preventDefault();
-          event.stopPropagation();
-          return false;
-        }
-        return true;
+        // Let the browser dispatch trusted clipboard events to xterm's own
+        // handlers, including bracketed paste. Returning false only stops
+        // xterm turning the shortcut into terminal input.
+        return false;
       }
 
       const navigationData = terminalNavigationShortcutData(event);
@@ -1602,36 +1569,19 @@ export function TerminalViewport({
       clearSelectionAction();
     });
 
-    const handleMouseUp = (event: MouseEvent) => {
-      const shouldHandle = shouldHandleTerminalSelectionMouseUp(
-        selectionGestureActiveRef.current,
-        event.button,
-      );
-      selectionGestureActiveRef.current = false;
-      if (!shouldHandle) {
-        return;
-      }
-      // Copy-on-select: mirror the finished selection to the clipboard so it can
-      // be pasted (Ctrl/Cmd+V) into this or another terminal without a separate
-      // copy step.
-      copyTerminalSelection();
+    const handleContextMenu = (event: MouseEvent) => {
+      if (!localApi || !terminal.hasSelection()) return;
+      event.preventDefault();
+      event.stopPropagation();
       selectionPointerRef.current = { x: event.clientX, y: event.clientY };
-      const delay = terminalSelectionActionDelayForClickCount(event.detail);
-      selectionActionTimerRef.current = window.setTimeout(() => {
-        selectionActionTimerRef.current = null;
-        selectionActionFrameRef.current = window.requestAnimationFrame(() => {
-          selectionActionFrameRef.current = null;
-          void showSelectionAction();
-        });
-      }, delay);
+      void showSelectionAction();
     };
-    const handlePointerDown = (event: PointerEvent) => {
+    const handlePointerDown = () => {
       handleSizeTrigger("pointer");
       clearSelectionAction();
-      selectionGestureActiveRef.current = event.button === 0;
       terminal.focus();
     };
-    window.addEventListener("mouseup", handleMouseUp);
+    mount.addEventListener("contextmenu", handleContextMenu);
     mount.addEventListener("pointerdown", handlePointerDown);
     const handleFocus = () => handleSizeTrigger("focus");
     const handleWindowFocus = () => {
@@ -1677,7 +1627,7 @@ export function TerminalViewport({
       selectionDisposable.dispose();
       terminalLinksDisposable.dispose();
       clearSelectionAction();
-      window.removeEventListener("mouseup", handleMouseUp);
+      mount.removeEventListener("contextmenu", handleContextMenu);
       mount.removeEventListener("pointerdown", handlePointerDown);
       mount.removeEventListener("focusin", handleFocus);
       window.removeEventListener("focus", handleWindowFocus);

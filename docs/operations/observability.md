@@ -96,6 +96,15 @@ headers, common token/password assignments, and URL credentials are redacted.
 Git failures retain bounded stderr so errors such as malformed `.gitmodules`
 entries remain actionable both in the original notification and after restart.
 
+Files operation failures also enter the client's frontend warning/error capture
+with their notification title and sanitized detail. Download request and save
+failures produce warnings in the desktop host's local log; transfer validation,
+archive preparation, and archive stream failures are logged by the server that
+owns the workspace. For a remote download these can be different machines.
+Signed transfer capabilities are omitted from those diagnostics. An HTTP error
+notification retains the bounded server reason and recovery guidance; a failed
+archive stream is reported as a failed download, never a completed partial ZIP.
+
 Provider and terminal lifecycle summaries are written as bounded NDJSON under
 `userdata/logs/provider/events.log` and
 `userdata/logs/terminals/events.log`. Each file rotates at 4 MiB and retains

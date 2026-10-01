@@ -18,6 +18,7 @@ export interface ComposerCapabilityProfile {
 
 export function deriveComposerCapabilityProfile(
   provider: Pick<ServerProvider, "slashCommands" | "skills" | "agents"> | null,
+  nativeSkillInvocation?: "dollar" | "slash",
 ): ComposerCapabilityProfile {
   const slashCommands = provider?.slashCommands ?? [];
   const commandNames = new Set(slashCommands.map((command) => command.name.toLowerCase()));
@@ -40,14 +41,15 @@ export function deriveComposerCapabilityProfile(
   const mentionableAgents = (provider?.agents ?? []).filter(
     (agent) => agent.invocation === "mention",
   );
+  const providerSlash =
+    slashCommands.length > 0 || slashSkills.length > 0 || nativeSkillInvocation === "slash";
+  const providerDollarSkill = dollarSkills.length > 0 || nativeSkillInvocation === "dollar";
 
   return {
-    signature: `${slashCommands.length > 0 || slashSkills.length > 0 ? "slash" : ""}:${
-      dollarSkills.length > 0 ? "dollar" : ""
-    }`,
+    signature: `${providerSlash ? "slash" : ""}:${providerDollarSkill ? "dollar" : ""}`,
     trigger: {
-      providerSlash: slashCommands.length > 0 || slashSkills.length > 0,
-      providerDollarSkill: dollarSkills.length > 0,
+      providerSlash,
+      providerDollarSkill,
     },
     slashCommands,
     slashSkills,

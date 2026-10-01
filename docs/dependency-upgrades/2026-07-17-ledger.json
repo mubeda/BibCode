@@ -695,7 +695,8 @@
       "source": "https://www.npmjs.com/package/@pierre/trees",
       "cohort": "pierre",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "green",
+      "notes": "Retain the canonical path-lookup patch while beta.6 descends through file nodes as directories. Remove it when an upstream release returns missing-path results for file/directory transitions and the Files refresh regressions pass without the patch."
     },
     {
       "key": "js:apps/web:@rolldown/plugin-babel",

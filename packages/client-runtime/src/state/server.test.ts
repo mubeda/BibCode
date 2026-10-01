@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  ProviderInstanceId,
   type ServerConfig,
   type ServerLifecycleWelcomePayload,
   WS_METHODS,
@@ -10,8 +11,10 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Latch from "effect/Latch";
 import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
+import { vi } from "vite-plus/test";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { Atom, AtomRegistry } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import {
   applyServerConfigProjection,
@@ -191,4 +194,125 @@ describe("server provider usage commands", () => {
       atomRegistry.dispose();
     }),
   );
+});
+
+describe("workspace provider capabilities", () => {
+  it.effect("shares a context and isolates concurrent workspaces and configuration revisions", () =>
+    Effect.gen(function* () {
+      const environmentId = EnvironmentId.make("skills");
+      const calls: unknown[] = [];
+      const firstGate = Latch.makeUnsafe();
+      const connection = yield* SubscriptionRef.make({ phase: "connected", generation: 1 });
+      const supervisor = EnvironmentSupervisor.of({
+        target: { environmentId, label: "Skills" },
+        state: connection,
+        session: yield* SubscriptionRef.make(
+          Option.some({
+            client: {
+              [WS_METHODS.serverGetProviderCapabilities]: (input: { cwd: string }) =>
+                Effect.gen(function* () {
+                  calls.push(input);
+                  if (input.cwd === "/first") yield* firstGate.await;
+                  return {
+                    slashCommands: [],
+                    agents: [],
+                    issues: [],
+                    skills: [
+                      {
+                        name: "personal",
+                        path: "/home/skills/personal/SKILL.md",
+                        enabled: true,
+                        invocation: "dollar",
+                      },
+                      {
+                        name: input.cwd,
+                        path: `${input.cwd}/SKILL.md`,
+                        enabled: true,
+                        invocation: "dollar",
+                      },
+                    ],
+                  };
+                }),
+            },
+          } as never),
+        ),
+      } as never);
+      const environment = EnvironmentRegistry.of({
+        run: <A, E>(_: EnvironmentId, effect: Effect.Effect<A, E, EnvironmentSupervisor>) =>
+          Effect.provideService(effect, EnvironmentSupervisor, supervisor),
+        followStream: <A, E>(
+          _: EnvironmentId,
+          stream: Stream.Stream<A, E, EnvironmentSupervisor>,
+        ) => Stream.provideService(stream, EnvironmentSupervisor, supervisor),
+      } as never);
+      const atoms = createServerEnvironmentAtoms(
+        Atom.runtime(Layer.succeed(EnvironmentRegistry, environment)),
+        { initialConfigValueAtom: () => Atom.make(null) },
+      );
+      const registry = AtomRegistry.make();
+      const target = {
+        environmentId,
+        input: { instanceId: ProviderInstanceId.make("codex"), cwd: "/first", revision: 1 },
+      };
+      const first = atoms.providerCapabilities(target);
+      expect(atoms.providerCapabilities({ ...target })).toBe(first);
+      const second = atoms.providerCapabilities({
+        ...target,
+        input: { ...target.input, cwd: "/second" },
+      });
+      registry.mount(first);
+      registry.mount(second);
+      yield* Effect.promise(() =>
+        vi.waitFor(() => expect(AsyncResult.isSuccess(registry.get(second))).toBe(true)),
+      );
+      expect(AsyncResult.value(registry.get(first))).toEqual(Option.none());
+      yield* firstGate.open;
+      yield* Effect.promise(() =>
+        vi.waitFor(() => expect(AsyncResult.isSuccess(registry.get(first))).toBe(true)),
+      );
+      expect(Option.getOrThrow(AsyncResult.value(registry.get(second))).skills[1]?.name).toBe(
+        "/second",
+      );
+      expect(calls).toEqual(
+        expect.arrayContaining([
+          { instanceId: "codex", cwd: "/first" },
+          { instanceId: "codex", cwd: "/second" },
+        ]),
+      );
+      expect(calls).toHaveLength(2);
+      const changed = atoms.providerCapabilities({
+        ...target,
+        input: { ...target.input, revision: 2 },
+      });
+      expect(changed).not.toBe(first);
+      expect(
+        atoms.providerCapabilities({ ...target, environmentId: EnvironmentId.make("remote") }),
+      ).not.toBe(first);
+      expect(
+        atoms.providerCapabilities({
+          ...target,
+          input: { ...target.input, instanceId: ProviderInstanceId.make("codex-other") },
+        }),
+      ).not.toBe(first);
+      registry.mount(changed);
+      yield* Effect.promise(() => vi.waitFor(() => expect(calls).toHaveLength(3)));
+      registry.dispose();
+    }),
+  );
+
+  it("invalidates skills even when secret settings stay redacted", () => {
+    const initial = applyServerConfigProjection(Option.none(), {
+      version: 1,
+      type: "snapshot",
+      config: CONFIG,
+    });
+    const changed = applyServerConfigProjection(initial, {
+      version: 1,
+      type: "settingsUpdated",
+      payload: { settings: CONFIG.settings },
+    });
+    expect(Option.getOrThrow(changed).capabilitiesRevision).toBeGreaterThan(
+      Option.getOrThrow(initial).capabilitiesRevision,
+    );
+  });
 });

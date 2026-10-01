@@ -29,9 +29,13 @@ Protocol (ACP). It initializes the connection, authenticates with the
 workspace. Provider inventory uses `cursor-agent about` for installation and
 authentication status and queries ACP for available models.
 
-Cursor workspace slash commands, skills, and agents are discovered from the
-server-side workspace environment. Capabilities can vary with the installed
-Cursor CLI.
+Cursor slash commands, skills, and agents are discovered from the server-side
+workspace environment. Skills include `.cursor/skills`, `.agents/skills`,
+`.claude/skills`, and `.codex/skills` in both the project and effective user home,
+including nested and symlinked skill folders. For a directory below a Git root,
+applicable ancestor skills are included; unrelated sibling projects are excluded.
+Project definitions take precedence over user definitions with the same name.
+Use `/` to open the skill menu. Capabilities can vary with the installed Cursor CLI.
 
 ## Updates and version advisories
 

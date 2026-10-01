@@ -288,21 +288,29 @@ describe("command dispatch on a complete scope", () => {
     const onProgress = () => undefined;
     await useGitStackedAction(fullScope).run({
       actionId: "act-1",
-      action: "commit" as never,
+      action: "commit_push_pr",
       commitMessage: "msg",
       featureBranch: true,
       filePaths: ["a.ts"],
       commitStagedIndexAsIs: true,
+      pullRequestBaseBranch: "release/next",
+      pullRequestHeadBranch: "feature/other",
+      pullRequestTitle: "Reviewed title",
+      pullRequestBody: "Reviewed body",
       onProgress,
     });
     expect(h.trackCalls).toHaveLength(0);
     expect(h.commandCalls[0]!.input).toEqual({
       actionId: "act-1",
-      action: "commit",
+      action: "commit_push_pr",
       commitMessage: "msg",
       featureBranch: true,
       filePaths: ["a.ts"],
       commitStagedIndexAsIs: true,
+      pullRequestBaseBranch: "release/next",
+      pullRequestHeadBranch: "feature/other",
+      pullRequestTitle: "Reviewed title",
+      pullRequestBody: "Reviewed body",
       onProgress,
     });
     // onSuccess still refreshes status even though tracking is external.
