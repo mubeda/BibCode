@@ -73,6 +73,12 @@ Write executable fixtures with `tests/support/executable_fixture.rs` (lib tests:
 `TestSandbox::write_executable`), never in-process `fs::write`/`fs::copy`, to prevent
 fork-inherited writable descriptors from causing `ETXTBSY`.
 
+Keep script fixtures and their temporary directories alive until the launched
+process exits and is reaped; a returned PID alone does not prove the script ran.
+Unix PTY launch checks cover missing-interpreter errors and successful relative
+script completion. Preserve the spawn error handshake and close inherited
+non-stdio descriptors only when exec succeeds.
+
 Harnesses that start a production runtime or `NativeServerControl` with the
 default provider registry use
 [`tests/support/hermetic_providers.rs`](../../apps/server/tests/support/hermetic_providers.rs).

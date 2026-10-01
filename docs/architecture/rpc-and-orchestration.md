@@ -1449,7 +1449,10 @@ publication lock; a PTY that finishes spawning after loss is killed by its
 uncommitted-process owner and is never inserted as a live session.
 
 Initial PTY spawn and prepared-command fallback both run on Tokio's blocking
-pool. The blocking task constructs the uncommitted-process guard before
+pool. Unix PTY cleanup marks inherited descriptors close-on-exec, preserving
+Rust's spawn-reporting socket until exec succeeds or reports an error. A failed
+executable or interpreter launch cannot publish a successful PTY process.
+The blocking task constructs the uncommitted-process guard before
 returning its result; the join carries that guard until session supervision
 takes ownership. The guard also retains the per-terminal operation lock, so
 cancelling the caller cannot admit a same-key replacement before the late
