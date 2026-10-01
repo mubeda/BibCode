@@ -16,7 +16,7 @@ import * as Stream from "effect/Stream";
 import { AsyncResult, Atom, type AtomRegistry } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import { runStream } from "../rpc/client.ts";
+import { currentSession } from "../rpc/client.ts";
 import {
   createRuntimeCommand,
   runStreamInEnvironment,
@@ -81,6 +81,8 @@ export interface RunVcsStackedActionInput {
   readonly commitStagedIndexAsIs?: boolean;
   readonly pullRequestTitle?: string;
   readonly pullRequestBody?: string;
+  readonly pullRequestBaseBranch?: string;
+  readonly pullRequestHeadBranch?: string;
   readonly onProgress?: (event: GitActionProgressEvent) => void;
 }
 
@@ -94,6 +96,15 @@ export class VcsActionUnavailableError extends Schema.TaggedError<VcsActionUnava
 ) {
   override get message(): string {
     return `Source control operation '${this.operation.replaceAll("_", " ")}' is unavailable.`;
+  }
+}
+
+export class VcsPullRequestBranchSelectionUnsupportedError extends Schema.TaggedError<VcsPullRequestBranchSelectionUnsupportedError>()(
+  "VcsPullRequestBranchSelectionUnsupportedError",
+  { environmentId: EnvironmentId },
+) {
+  override get message(): string {
+    return "Update this environment's BiBCode server before creating a pull or merge request with the selected source and target branches.";
   }
 }
 
@@ -472,6 +483,12 @@ export function createVcsActionManager<R, E>(
           ...(input.filePaths?.length ? { filePaths: [...input.filePaths] } : {}),
           ...(input.commitStagedIndexAsIs ? { commitStagedIndexAsIs: true } : {}),
           ...(input.pullRequestTitle ? { pullRequestTitle: input.pullRequestTitle } : {}),
+          ...(input.pullRequestBaseBranch !== undefined
+            ? { pullRequestBaseBranch: input.pullRequestBaseBranch }
+            : {}),
+          ...(input.pullRequestHeadBranch !== undefined
+            ? { pullRequestHeadBranch: input.pullRequestHeadBranch }
+            : {}),
           ...(input.pullRequestBody !== undefined
             ? { pullRequestBody: input.pullRequestBody }
             : {}),
@@ -479,7 +496,25 @@ export function createVcsActionManager<R, E>(
         return consumeVcsActionProgress(
           runStreamInEnvironment(
             target.environmentId,
-            runStream(WS_METHODS.gitRunStackedAction, rpcInput),
+            Stream.unwrap(
+              Effect.gen(function* () {
+                const session = yield* currentSession();
+                if (input.action === "create_pr" || input.action === "commit_push_pr") {
+                  const config = yield* session.initialConfig;
+                  if (config.environment.capabilities.gitPullRequestBranchSelection !== true) {
+                    return yield* new VcsPullRequestBranchSelectionUnsupportedError({
+                      environmentId: target.environmentId,
+                    });
+                  }
+                }
+                // Keep negotiation and mutation on the same connection across reconnects.
+                return session.client[WS_METHODS.gitRunStackedAction](rpcInput);
+              }),
+            ).pipe(
+              Stream.withSpan("EnvironmentRpc.runStream", {
+                attributes: { "rpc.method": WS_METHODS.gitRunStackedAction },
+              }),
+            ),
           ),
           {
             target,

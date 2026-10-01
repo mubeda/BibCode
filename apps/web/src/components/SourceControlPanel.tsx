@@ -96,6 +96,10 @@ import {
   workingTreeFiles,
 } from "./SourceControlPanel.logic";
 import { SourceControlSection } from "./SourceControlSection";
+import {
+  GitManagerCreatePullRequestDialog,
+  type GitManagerCreatePullRequestDialogProps,
+} from "./gitManager/provider/GitManagerCreatePullRequestDialog";
 
 interface SourceControlPanelProps {
   mode: DiffPanelMode;
@@ -182,6 +186,10 @@ export default function SourceControlPanel({
     action: DefaultBranchConfirmableAction;
     branchName: string;
     includesCommit: boolean;
+  } | null>(null);
+  const [pendingPullRequest, setPendingPullRequest] = useState<{
+    scope: GitManagerCreatePullRequestDialogProps["scope"];
+    commitInput?: GitManagerCreatePullRequestDialogProps["commitInput"];
   } | null>(null);
   // Files staged for discard, awaiting the destructive-action confirm dialog.
   const [pendingDiscard, setPendingDiscard] = useState<PendingDiscard | null>(null);
@@ -327,6 +335,16 @@ export default function SourceControlPanel({
             ? { filePaths: files.map((file) => file.path) }
             : {}
         : {};
+      if (action === "create_pr" || action === "commit_push_pr") {
+        if (gitCwd === null) return;
+        setPendingPullRequest({
+          scope: { environmentId, cwd: gitCwd },
+          ...(actionCanCommit
+            ? { commitInput: { ...commitInput, ...(message ? { commitMessage: message } : {}) } }
+            : {}),
+        });
+        return;
+      }
       const toastId = toastManager.add({
         type: "loading",
         title: "Running source control action…",
@@ -371,7 +389,18 @@ export default function SourceControlPanel({
         data: { ...threadToastData, dismissAfterVisibleMs: 10_000 },
       });
     },
-    [draft.message, draft.clear, files, hasAreas, isDefaultRef, runAction, status, threadToastData],
+    [
+      draft.message,
+      draft.clear,
+      files,
+      hasAreas,
+      isDefaultRef,
+      runAction,
+      status,
+      threadToastData,
+      gitCwd,
+      environmentId,
+    ],
   );
 
   const runPull = useCallback(async () => {
@@ -1187,6 +1216,24 @@ export default function SourceControlPanel({
         ) : null}
       </div>
 
+      {pendingPullRequest !== null &&
+      pendingPullRequest.scope.environmentId === environmentId &&
+      pendingPullRequest.scope.cwd === gitCwd ? (
+        <GitManagerCreatePullRequestDialog
+          open
+          scope={pendingPullRequest.scope}
+          {...(pendingPullRequest.commitInput
+            ? { commitInput: pendingPullRequest.commitInput }
+            : {})}
+          onOpenChange={(open) => {
+            if (!open) setPendingPullRequest(null);
+          }}
+          onSettled={(result) => {
+            if (result.commit.status === "created") draft.clear();
+            setCommitSignal((value) => value + 1);
+          }}
+        />
+      ) : null}
       <Dialog
         open={pendingConfirm !== null}
         onOpenChange={(open) => !open && setPendingConfirm(null)}

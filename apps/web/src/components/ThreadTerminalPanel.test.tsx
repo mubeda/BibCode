@@ -115,8 +115,6 @@ vi.mock("~/components/ui/popover", () => ({
 import ThreadTerminalPanel, {
   TerminalViewport,
   resolveTerminalSelectionActionPosition,
-  shouldHandleTerminalSelectionMouseUp,
-  terminalSelectionActionDelayForClickCount,
 } from "./ThreadTerminalPanel";
 
 const TEST_ENVIRONMENT_ID = EnvironmentId.make("environment-terminal-panel");
@@ -390,26 +388,6 @@ describe("resolveTerminalSelectionActionPosition", () => {
     } finally {
       vi.unstubAllGlobals();
     }
-  });
-});
-
-describe("terminalSelectionActionDelayForClickCount", () => {
-  it("shows the action immediately for single clicks", () => {
-    expect(terminalSelectionActionDelayForClickCount(0)).toBe(0);
-    expect(terminalSelectionActionDelayForClickCount(1)).toBe(0);
-  });
-
-  it("delays the action for double and triple clicks", () => {
-    expect(terminalSelectionActionDelayForClickCount(2)).toBe(260);
-    expect(terminalSelectionActionDelayForClickCount(3)).toBe(260);
-  });
-});
-
-describe("shouldHandleTerminalSelectionMouseUp", () => {
-  it("handles only primary-button releases of an active selection gesture", () => {
-    expect(shouldHandleTerminalSelectionMouseUp(true, 0)).toBe(true);
-    expect(shouldHandleTerminalSelectionMouseUp(true, 2)).toBe(false);
-    expect(shouldHandleTerminalSelectionMouseUp(false, 0)).toBe(false);
   });
 });
 

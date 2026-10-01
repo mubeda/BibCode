@@ -358,6 +358,7 @@ impl ProviderSettingsStore {
                 let persisted_variable = &mut persisted_instance.environment[index];
                 if !variable.sensitive {
                     persisted_variable.value_redacted = false;
+                    variable.value_redacted = false;
                     continue;
                 }
                 if !variable.value.is_empty() {
@@ -370,7 +371,7 @@ impl ProviderSettingsStore {
                         })?;
                     persisted_variable.value.clear();
                     persisted_variable.value_redacted = true;
-                    variable.value_redacted = true;
+                    variable.value_redacted = false;
                     continue;
                 }
                 if variable.value_redacted {
@@ -391,6 +392,7 @@ impl ProviderSettingsStore {
                         }
                     })?;
                     variable.value = secret;
+                    variable.value_redacted = false;
                     persisted_variable.value.clear();
                     persisted_variable.value_redacted = true;
                 }
@@ -438,6 +440,7 @@ impl ProviderSettingsStore {
                             },
                         }
                     })?;
+                    variable.value_redacted = false;
                 }
             }
         }

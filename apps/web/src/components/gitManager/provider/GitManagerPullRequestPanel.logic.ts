@@ -82,18 +82,22 @@ export function resolveProviderPanePresentation(input: {
 export interface ReviewedPullRequest {
   readonly title: string;
   readonly body: string;
+  readonly baseBranch: string;
+  readonly headBranch?: string;
 }
 
 /**
- * The stacked `create_pr` action carrying the reviewed title and body. The body
+ * The stacked `create_pr` action carrying the reviewed branches, title and body. The body
  * is sent only when the user wrote one so the server keeps its empty default.
  */
-export function createPullRequestAction(actionId: string, reviewed?: ReviewedPullRequest) {
-  const title = reviewed?.title.trim() ?? "";
-  const body = reviewed?.body ?? "";
+export function createPullRequestAction(actionId: string, reviewed: ReviewedPullRequest) {
+  const title = reviewed.title.trim();
+  const body = reviewed.body;
   return {
     actionId,
     action: "create_pr" as const,
+    pullRequestBaseBranch: reviewed.baseBranch,
+    ...(reviewed.headBranch === undefined ? {} : { pullRequestHeadBranch: reviewed.headBranch }),
     ...(title.length > 0 ? { pullRequestTitle: title } : {}),
     ...(body.trim().length > 0 ? { pullRequestBody: body } : {}),
   };
@@ -136,7 +140,6 @@ export const UNIDENTIFIED_HOST_REASON =
 export interface CreatePullRequestReview {
   readonly provider: SourceControlProviderInfo | null;
   readonly head: string | null;
-  readonly base: string;
   readonly publishRequired: boolean;
   readonly existingPullRequest: ExistingPullRequestSummary | null;
   readonly defaultTitle: string;
@@ -148,35 +151,36 @@ export function resolveCreatePullRequestReview(input: {
   readonly status: VcsStatusResult;
   readonly latestCommit: GitManagerCommitEntry | null;
   readonly providerHint?: CreatePullRequestProviderHint | null;
+  readonly commitBeforeCreate?: boolean;
+  readonly headBranch?: string | null;
 }): CreatePullRequestReview {
   const { status, latestCommit } = input;
   // A cold or stale status may not name a host the caller already identified; the
   // hint stands in for it, and the server validates the provider when creating.
   const provider = status.sourceControlProvider ?? hintedProvider(input.providerHint ?? null);
   const noun = getChangeRequestTerminology(provider).singular;
-  const head = status.refName;
-  const base = status.defaultRefName ?? "main";
+  const head = input.headBranch === undefined ? status.refName : input.headBranch;
+  const isCurrentBranch = head === status.refName;
   const existingPullRequest =
-    status.pr === null
+    !isCurrentBranch || status.pr === null || status.pr.state !== "open"
       ? null
       : { number: status.pr.number, title: status.pr.title, url: status.pr.url };
   const blockedReason = !status.isRepo
     ? "This folder is not a Git repository."
-    : head === null
-      ? `Check out a branch before creating a ${noun}.`
-      : provider === null
-        ? status.hasPrimaryRemote
-          ? UNIDENTIFIED_HOST_REASON
-          : `Add an origin remote to create a ${noun}.`
-        : status.hasWorkingTreeChanges
+    : provider === null
+      ? status.hasPrimaryRemote
+        ? UNIDENTIFIED_HOST_REASON
+        : `Add an origin remote to create a ${noun}.`
+      : head === null
+        ? "Select a source branch."
+        : isCurrentBranch && status.hasWorkingTreeChanges && !input.commitBeforeCreate
           ? `Commit local changes before creating a ${noun}.`
           : null;
   const defaultTitle = latestCommit?.subject.trim() ?? "";
   return {
     provider,
     head,
-    base,
-    publishRequired: !status.hasUpstream || status.aheadCount > 0,
+    publishRequired: !isCurrentBranch || !status.hasUpstream || status.aheadCount > 0,
     existingPullRequest,
     defaultTitle: defaultTitle.length > 0 ? defaultTitle : head === null ? "" : `Update ${head}`,
     defaultBody: latestCommit?.body.trim() ?? "",

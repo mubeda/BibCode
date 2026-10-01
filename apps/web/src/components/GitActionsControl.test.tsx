@@ -19,6 +19,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import type { GitManagerCreatePullRequestDialogProps } from "./gitManager/provider/GitManagerCreatePullRequestDialog";
+
 type EffectCallback = () => void | (() => void);
 
 const browserRuntime =
@@ -188,6 +190,7 @@ interface CapturedInputProps {
 }
 
 const captured = vi.hoisted(() => ({
+  createPullRequest: null as GitManagerCreatePullRequestDialogProps | null,
   buttons: [] as unknown[],
   menus: [] as unknown[],
   menuItems: [] as unknown[],
@@ -197,6 +200,7 @@ const captured = vi.hoisted(() => ({
   textareas: [] as unknown[],
   inputs: [] as unknown[],
   clear() {
+    this.createPullRequest = null;
     this.buttons = [];
     this.menus = [];
     this.menuItems = [];
@@ -251,6 +255,13 @@ vi.mock("@effect/atom-react", () => ({
     (atom as { kind?: string }).kind === "server-config"
       ? testState.serverConfig
       : undefined,
+}));
+
+vi.mock("./gitManager/provider/GitManagerCreatePullRequestDialog", () => ({
+  GitManagerCreatePullRequestDialog: (props: GitManagerCreatePullRequestDialogProps) => {
+    captured.createPullRequest = props;
+    return null;
+  },
 }));
 
 vi.mock("@tanstack/react-router", () => ({
@@ -998,7 +1009,7 @@ staticDescribe("quick action", () => {
     );
   });
 
-  it("runs the commit-push-pr stack when the worktree has changes", async () => {
+  it("reviews the target before the commit-push-pr stack when the worktree has changes", async () => {
     testState.gitStatus = status({
       hasWorkingTreeChanges: true,
       workingTree: {
@@ -1013,13 +1024,16 @@ staticDescribe("quick action", () => {
     );
     quick?.onClick?.(clickEvent());
     await flushPromises();
-    expect(testState.stackedAction.run).toHaveBeenCalledWith(
-      expect.objectContaining({ action: "commit_push_pr" }),
-    );
-    expect(testState.toast.update).toHaveBeenCalledWith(
-      "toast-1",
-      expect.objectContaining({ type: "success", title: "Pushed feature/test" }),
-    );
+    render();
+    expect(testState.stackedAction.run).not.toHaveBeenCalled();
+    expect(captured.createPullRequest).toMatchObject({
+      open: true,
+      scope: { environmentId: ENVIRONMENT_ID, cwd: "/repo" },
+      commitInput: {},
+    });
+    captured.createPullRequest?.onOpenChange(false);
+    render();
+    expect(captured.createPullRequest).toBeNull();
   });
 });
 

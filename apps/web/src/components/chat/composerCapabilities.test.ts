@@ -203,3 +203,11 @@ describe("deriveComposerCapabilityProfile", () => {
     expect([...refreshed.mentionableAgentNames]).toEqual(["reviewer"]);
   });
 });
+
+it("keeps native skill menus reachable while a catalog is empty or loading", () => {
+  expect(deriveComposerCapabilityProfile(null, "dollar").trigger.providerDollarSkill).toBe(true);
+  expect(
+    deriveComposerCapabilityProfile(makeProviderInventory(), "slash").trigger.providerSlash,
+  ).toBe(true);
+  expect(deriveComposerCapabilityProfile(null, "slash").trigger.providerDollarSkill).toBe(false);
+});

@@ -2186,6 +2186,8 @@ struct StackedActionInput {
     commit_staged_index_as_is: Option<bool>,
     pull_request_title: Option<String>,
     pull_request_body: Option<String>,
+    pull_request_base_branch: Option<String>,
+    pull_request_head_branch: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2268,12 +2270,26 @@ fn validate_stacked_action_input(input: &StackedActionInput) -> Result<(), Value
             "Feature-branch checkout is only supported for commit actions.",
         ));
     }
-    if (input.pull_request_title.is_some() || input.pull_request_body.is_some())
+    if (input.pull_request_title.is_some()
+        || input.pull_request_body.is_some()
+        || input.pull_request_base_branch.is_some()
+        || input.pull_request_head_branch.is_some())
         && !matches!(input.action.as_str(), "create_pr" | "commit_push_pr")
     {
         return Err(request_error(
             "git.runStackedAction",
-            "A pull request title or body applies only to pull request actions.",
+            "A pull request title, body, source or target branch applies only to pull request actions.",
+        ));
+    }
+    if matches!(input.action.as_str(), "create_pr" | "commit_push_pr")
+        && input
+            .pull_request_base_branch
+            .as_deref()
+            .is_none_or(|branch| branch.trim().is_empty())
+    {
+        return Err(request_error(
+            "git.runStackedAction",
+            "Select a target branch before creating a pull request.",
         ));
     }
     Ok(())
@@ -2293,23 +2309,115 @@ async fn run_stacked_action(
     let wants_pr = matches!(input.action.as_str(), "create_pr" | "commit_push_pr");
     let feature_branch = input.feature_branch.unwrap_or(false);
     let commit_staged_index_as_is = input.commit_staged_index_as_is.unwrap_or(false);
+    let base_branch = input.pull_request_base_branch.as_deref().map(str::trim);
+    let requested_head = input.pull_request_head_branch.as_deref().map(str::trim);
+    for (branch, role) in [(base_branch, "target"), (requested_head, "source")] {
+        let Some(branch) = branch else { continue };
+        // Do not let Git expand checkout expressions such as @{-1}.
+        if branch.is_empty() || branch.starts_with('-') || branch.contains("@{") {
+            return Err(request_error(
+                "git.runStackedAction",
+                &format!("Select a valid {role} branch."),
+            ));
+        }
+        repository
+            .run(
+                "git.runStackedAction",
+                &input.cwd,
+                &[
+                    "check-ref-format".to_owned(),
+                    "--branch".to_owned(),
+                    branch.to_owned(),
+                ],
+                cancellation,
+            )
+            .await
+            .map_err(|error| {
+                if error
+                    .diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.exit_code)
+                    .is_some_and(|code| code > 0)
+                {
+                    request_error(
+                        "git.runStackedAction",
+                        &format!("Select a valid {role} branch."),
+                    )
+                } else {
+                    serialize_error(error)
+                }
+            })?;
+    }
     let initial_local = repository
         .local_status(&input.cwd, cancellation)
         .await
         .map_err(serialize_error)?;
+    if input.action == "commit_push_pr"
+        && requested_head.is_some_and(|head| Some(head) != initial_local.ref_name.as_deref())
+    {
+        return Err(request_error(
+            "git.runStackedAction",
+            "Commit and create a pull request uses the current branch. Select the current source branch.",
+        ));
+    }
+    let selected_head = requested_head.filter(|_| input.action == "create_pr");
+    let selected_head_is_local = if let Some(head) = selected_head {
+        let local_ref = format!("refs/heads/{head}");
+        let remote_ref = format!("refs/remotes/origin/{head}");
+        let refs = repository
+            .run(
+                "git.runStackedAction.sourceBranch",
+                &input.cwd,
+                &[
+                    "for-each-ref".to_owned(),
+                    "--format=%(refname)".to_owned(),
+                    local_ref.clone(),
+                    remote_ref.clone(),
+                ],
+                cancellation,
+            )
+            .await
+            .map_err(serialize_error)?;
+        let is_local = refs.stdout.lines().any(|reference| reference == local_ref);
+        if !is_local && !refs.stdout.lines().any(|reference| reference == remote_ref) {
+            return Err(request_error(
+                "git.runStackedAction",
+                "Select an existing local or origin source branch. Fetch to refresh remote branches.",
+            ));
+        }
+        Some(is_local)
+    } else {
+        None
+    };
+    if wants_pr
+        && !feature_branch
+        && base_branch == selected_head.or(initial_local.ref_name.as_deref())
+    {
+        return Err(request_error(
+            "git.runStackedAction",
+            "Select a target branch different from the source branch.",
+        ));
+    }
     if feature_branch && !initial_local.has_working_tree_changes {
         return Err(request_error(
             "git.runStackedAction",
             "Cannot create a feature branch because there are no changes to commit.",
         ));
     }
-    if input.action == "create_pr" && initial_local.has_working_tree_changes {
+    if input.action == "create_pr"
+        && initial_local.has_working_tree_changes
+        && selected_head.is_none_or(|head| Some(head) == initial_local.ref_name.as_deref())
+    {
         return Err(request_error(
             "git.runStackedAction",
             "Commit local changes before creating a PR.",
         ));
     }
-    if !feature_branch && (wants_pr || input.action == "push") && initial_local.ref_name.is_none() {
+    if !feature_branch
+        && (wants_pr || input.action == "push")
+        && selected_head.is_none()
+        && initial_local.ref_name.is_none()
+    {
         let detail = if wants_pr {
             "Cannot create a pull request from detached HEAD."
         } else {
@@ -2325,11 +2433,15 @@ async fn run_stacked_action(
         None
     };
     let wants_push = if input.action == "create_pr" {
-        let remote = repository
-            .remote_status(&input.cwd, cancellation)
-            .await
-            .map_err(serialize_error)?;
-        remote.is_none_or(|status| !status.has_upstream || status.ahead_count > 0)
+        if let Some(is_local) = selected_head_is_local {
+            is_local
+        } else {
+            let remote = repository
+                .remote_status(&input.cwd, cancellation)
+                .await
+                .map_err(serialize_error)?;
+            remote.is_none_or(|status| !status.has_upstream || status.ahead_count > 0)
+        }
     } else {
         matches!(
             input.action.as_str(),
@@ -2363,6 +2475,12 @@ async fn run_stacked_action(
         let preferred = sanitize_feature_branch_name(subject);
         let existing = local_branch_names(repository, &input.cwd, cancellation).await?;
         let name = resolve_feature_branch_name(&existing, &preferred);
+        if base_branch == Some(name.as_str()) {
+            return Err(request_error(
+                "git.runStackedAction",
+                "Select a target branch different from the source branch.",
+            ));
+        }
         repository
             .create_ref(&input.cwd, &name, true, cancellation)
             .await
@@ -2391,10 +2509,57 @@ async fn run_stacked_action(
         json!({ "status": "skipped_not_requested" })
     };
     let push = if wants_push {
-        let branch = repository
-            .push_current_branch(&input.cwd, cancellation)
-            .await
-            .map_err(serialize_error)?;
+        let branch = if let Some(head) = selected_head {
+            let mut args = vec![
+                "push".to_owned(),
+                "--no-force".to_owned(),
+                "--no-follow-tags".to_owned(),
+                "--no-tags".to_owned(),
+            ];
+            if Some(head) == initial_local.ref_name.as_deref() {
+                // Ref resolution can hide a configured upstream outside the
+                // fetch mapping of a single-branch clone. Preserve its config.
+                let upstream_remote = repository
+                    .run(
+                        "git.runStackedAction.sourceUpstream",
+                        &input.cwd,
+                        &[
+                            "config".to_owned(),
+                            "--default".to_owned(),
+                            String::new(),
+                            "--get".to_owned(),
+                            format!("branch.{head}.remote"),
+                        ],
+                        cancellation,
+                    )
+                    .await
+                    .map_err(serialize_error)?;
+                if upstream_remote.stdout.trim().is_empty() {
+                    args.push("--set-upstream".to_owned());
+                }
+            }
+            args.extend([
+                "--".to_owned(),
+                "origin".to_owned(),
+                format!("refs/heads/{head}:refs/heads/{head}"),
+            ]);
+            repository
+                .for_bounded_transfer()
+                .run(
+                    "git.runStackedAction.pushSourceBranch",
+                    &input.cwd,
+                    &args,
+                    cancellation,
+                )
+                .await
+                .map_err(serialize_error)?;
+            head.to_owned()
+        } else {
+            repository
+                .push_current_branch(&input.cwd, cancellation)
+                .await
+                .map_err(serialize_error)?
+        };
         json!({ "status": "pushed", "branch": branch })
     } else {
         json!({ "status": "skipped_not_requested" })
@@ -2404,12 +2569,14 @@ async fn run_stacked_action(
             .local_status(&input.cwd, cancellation)
             .await
             .map_err(serialize_error)?;
-        let head_branch = current_local.ref_name.as_deref().ok_or_else(|| {
-            request_error(
-                "git.runStackedAction",
-                "Cannot create a pull request from detached HEAD.",
-            )
-        })?;
+        let head_branch = selected_head
+            .or(current_local.ref_name.as_deref())
+            .ok_or_else(|| {
+                request_error(
+                    "git.runStackedAction",
+                    "Cannot create a pull request from detached HEAD.",
+                )
+            })?;
         if let Some(existing) = resolve_open_pull_request(
             pull_requests,
             &input.cwd,
@@ -2436,6 +2603,9 @@ async fn run_stacked_action(
                     .map(str::to_owned)
             }) {
                 Some(title) => title,
+                None if current_local.ref_name.as_deref() != Some(head_branch) => {
+                    format!("Update {head_branch}")
+                }
                 None => repository
                     .list_commits(&input.cwd, 1, 0, cancellation)
                     .await
@@ -2445,10 +2615,14 @@ async fn run_stacked_action(
                     .next()
                     .map_or_else(|| format!("Update {head_branch}"), |commit| commit.subject),
             };
-            let base_branch = current_local
-                .default_ref_name
-                .clone()
-                .unwrap_or_else(|| "main".to_owned());
+            let base_branch = base_branch
+                .ok_or_else(|| {
+                    request_error(
+                        "git.runStackedAction",
+                        "Select a target branch before creating a pull request.",
+                    )
+                })?
+                .to_owned();
             let created = pull_requests
                 .create(
                     CreatePullRequestInput {
@@ -4918,6 +5092,8 @@ esac
             commit_staged_index_as_is: None,
             pull_request_title: None,
             pull_request_body: None,
+            pull_request_base_branch: Some("main".to_owned()),
+            pull_request_head_branch: None,
         };
         assert!(
             run_stacked_action(
@@ -5049,17 +5225,52 @@ esac
             "unused-az",
         );
         let git_repository = GitRepository::default();
-        let reviewed = StackedActionInput {
-            action_id: "action-reviewed".to_owned(),
-            cwd: repository.clone(),
-            action: "create_pr".to_owned(),
-            commit_message: None,
-            file_paths: None,
-            feature_branch: None,
-            commit_staged_index_as_is: None,
-            pull_request_title: Some("  Reviewed title  ".to_owned()),
-            pull_request_body: Some("Reviewed body\n\nwith detail".to_owned()),
-        };
+        let reviewed: StackedActionInput = serde_json::from_value(json!({
+            "actionId":"action-reviewed", "cwd":repository, "action":"create_pr",
+            "pullRequestTitle":"  Reviewed title  ",
+            "pullRequestBody":"Reviewed body\n\nwith detail",
+            "pullRequestBaseBranch":"release/next"
+        }))
+        .unwrap();
+
+        // Invalid targets are refused before either stack publishes anything.
+        for action in ["create_pr", "commit_push_pr"] {
+            for target in [
+                None,
+                Some(" "),
+                Some("-bad"),
+                Some("bad..ref"),
+                Some("@{-1}"),
+                Some("HEAD"),
+                Some("feature/reviewed"),
+            ] {
+                let input: StackedActionInput = serde_json::from_value(json!({
+                    "actionId": "invalid-target", "cwd": repository, "action": action,
+                    "pullRequestBaseBranch": target,
+                }))
+                .unwrap();
+                let error = run_stacked_action(
+                    &git_repository,
+                    &pull_requests,
+                    &input,
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect_err("target required and validated");
+                assert!(
+                    error["detail"].as_str().unwrap().contains("target branch"),
+                    "{error}"
+                );
+                assert!(
+                    !calls.exists(),
+                    "no provider command before target validation"
+                );
+                assert!(
+                    !bare_remote.join("refs/heads/feature/reviewed").exists(),
+                    "no branch published"
+                );
+            }
+        }
 
         let result = run_stacked_action(
             &git_repository,
@@ -5075,7 +5286,7 @@ esac
         assert_eq!(result["pr"]["status"], "created");
         assert_eq!(result["pr"]["number"], 7);
         assert_eq!(result["pr"]["title"], "Reviewed title");
-        assert_eq!(result["pr"]["baseBranch"], "main");
+        assert_eq!(result["pr"]["baseBranch"], "release/next");
         assert_eq!(result["pr"]["headBranch"], "feature/reviewed");
         let recorded = tokio::fs::read_to_string(&calls).await.expect("gh calls");
         let invocations = recorded
@@ -5095,7 +5306,7 @@ esac
                 "pr",
                 "create",
                 "--base",
-                "main",
+                "release/next",
                 "--head",
                 "feature/reviewed",
                 "--title",
@@ -5125,9 +5336,99 @@ esac
         let recorded = tokio::fs::read_to_string(&calls).await.expect("gh calls");
         assert!(!recorded.contains("create"), "{recorded}");
 
+        // Explicit current-source publication keeps first-push upstream setup,
+        // without replacing an upstream the user already chose.
+        git(
+            &sandbox,
+            &repository,
+            &["switch", "-q", "-c", "feature/explicit-current"],
+        )
+        .await;
+        tokio::fs::remove_file(format!("{calls_text}.existing"))
+            .await
+            .unwrap();
+        let explicit_current: StackedActionInput = serde_json::from_value(json!({
+            "actionId": "explicit-current", "cwd": repository, "action": "create_pr",
+            "pullRequestHeadBranch": "feature/explicit-current", "pullRequestBaseBranch": "main",
+        }))
+        .unwrap();
+        for (configured_merge, expected_upstream) in [
+            (None, "refs/remotes/origin/feature/explicit-current"),
+            (Some("refs/heads/main"), "refs/remotes/origin/main"),
+            (
+                Some("refs/heads/unfetched"),
+                "refs/remotes/origin/unfetched",
+            ),
+        ] {
+            if let Some(merge) = configured_merge {
+                git(
+                    &sandbox,
+                    &repository,
+                    &["config", "branch.feature/explicit-current.merge", merge],
+                )
+                .await;
+            }
+            run_stacked_action(
+                &git_repository,
+                &pull_requests,
+                &explicit_current,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("explicit current-source publication");
+            let upstream = git_repository
+                .run(
+                    "test.selectedSourceUpstream",
+                    &repository,
+                    &[
+                        "for-each-ref".to_owned(),
+                        "--format=%(upstream)".to_owned(),
+                        "refs/heads/feature/explicit-current".to_owned(),
+                    ],
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(upstream.stdout.trim(), expected_upstream);
+        }
+        git(
+            &sandbox,
+            &repository,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+        )
+        .await;
+        run_stacked_action(
+            &git_repository,
+            &pull_requests,
+            &explicit_current,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("an unmapped upstream stays configured");
+        let configured_merge = git_repository
+            .run(
+                "test.selectedSourceMerge",
+                &repository,
+                &[
+                    "config".to_owned(),
+                    "--get".to_owned(),
+                    "branch.feature/explicit-current.merge".to_owned(),
+                ],
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(configured_merge.stdout.trim(), "refs/heads/unfetched");
+
         let misplaced = StackedActionInput {
             action: "commit".to_owned(),
+            pull_request_title: None,
             pull_request_body: None,
+            pull_request_base_branch: Some("main".to_owned()),
             ..reviewed
         };
         let error = run_stacked_action(
@@ -5137,11 +5438,316 @@ esac
             &CancellationToken::new(),
         )
         .await
-        .expect_err("a title outside a pull request action is rejected");
+        .expect_err("a target outside a pull request action is rejected");
         assert_eq!(
             error["detail"],
-            "A pull request title or body applies only to pull request actions."
+            "A pull request title, body, source or target branch applies only to pull request actions."
         );
+    }
+
+    #[tokio::test]
+    async fn create_pr_uses_selected_source_without_touching_dirty_checkout() {
+        let sandbox = crate::test_support::TestSandbox::new("git-vcs-selected-pr-source");
+        let repository = sandbox.root().join("repository");
+        let bare_remote = sandbox.root().join("remote.git");
+        for directory in [&repository, &bare_remote] {
+            tokio::fs::create_dir_all(directory).await.unwrap();
+        }
+        git(&sandbox, &bare_remote, &["init", "--bare", "-b", "main"]).await;
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "fixture@example.test"],
+            vec!["config", "user.name", "Fixture"],
+        ] {
+            git(&sandbox, &repository, &args).await;
+        }
+        tokio::fs::write(repository.join("base.txt"), "base\n")
+            .await
+            .unwrap();
+        git(&sandbox, &repository, &["add", "base.txt"]).await;
+        git(&sandbox, &repository, &["commit", "-q", "-m", "base"]).await;
+        let bare_remote_text = bare_remote.to_string_lossy().into_owned();
+        git(
+            &sandbox,
+            &repository,
+            &["remote", "add", "origin", &bare_remote_text],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &["push", "-q", "-u", "origin", "main"],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &["switch", "-q", "-c", "feature/source"],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &["push", "-q", "origin", "feature/source"],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &["commit", "-q", "--allow-empty", "-m", "Selected commit"],
+        )
+        .await;
+        git(
+            &sandbox,
+            &repository,
+            &["tag", "-a", "unrequested", "-m", "Do not publish"],
+        )
+        .await;
+        git(&sandbox, &repository, &["switch", "-q", "main"]).await;
+        git(
+            &sandbox,
+            &repository,
+            &["commit", "-q", "--allow-empty", "-m", "Current commit"],
+        )
+        .await;
+        for args in [
+            vec!["config", "push.default", "matching"],
+            vec!["config", "push.followTags", "true"],
+            vec![
+                "config",
+                "remote.origin.push",
+                "refs/heads/main:refs/heads/unrequested",
+            ],
+            vec![
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/owner/name.git",
+            ],
+            vec!["remote", "set-url", "--push", "origin", &bare_remote_text],
+        ] {
+            git(&sandbox, &repository, &args).await;
+        }
+        tokio::fs::write(repository.join("base.txt"), "staged\n")
+            .await
+            .unwrap();
+        git(&sandbox, &repository, &["add", "base.txt"]).await;
+        tokio::fs::write(repository.join("base.txt"), "dirty\n")
+            .await
+            .unwrap();
+        tokio::fs::write(repository.join("untracked.txt"), "untracked\n")
+            .await
+            .unwrap();
+        let original_index = std::fs::read(repository.join(".git/index")).unwrap();
+        let original_head = std::fs::read(repository.join(".git/refs/heads/main")).unwrap();
+        let original_remote = std::fs::read(bare_remote.join("refs/heads/main")).unwrap();
+        let selected_head =
+            std::fs::read(repository.join(".git/refs/heads/feature/source")).unwrap();
+        let calls = sandbox.root().join("gh-calls");
+        let calls_text = calls.to_string_lossy().into_owned();
+        let existing_marker = sandbox.root().join("existing");
+        let gh = sandbox.executable_script(
+            "gh",
+            &format!(
+                "printf '%s\\037' \"$@\" >> '{calls_text}'\nprintf '\\036' >> '{calls_text}'\ncase \"$1:$2\" in\n  pr:list) if [ -f '{}' ]; then printf '%s\\n' '[{{\"number\":9,\"title\":\"Existing\",\"url\":\"https://github.com/owner/name/pull/9\",\"baseRefName\":\"main\",\"headRefName\":\"feature/source\",\"state\":\"OPEN\"}}]'; else printf '[]\\n'; fi ;;\n  pr:create) printf '%s\\n' 'https://github.com/owner/name/pull/7' ;;\n  *) exit 64 ;;\nesac\n",
+                existing_marker.display(),
+            ),
+            "",
+        );
+        let pull_requests = PullRequestService::with_provider_commands(
+            gh.to_string_lossy(),
+            "unused-glab",
+            "unused-az",
+        );
+        let git_repository =
+            GitRepository::with_runner_for_test(Arc::new(CapturedGitRunner::new(&sandbox)));
+        let cancellation = CancellationToken::new();
+
+        for (action, source, feature_branch) in [
+            ("create_pr", "", false),
+            ("create_pr", "-bad", false),
+            ("create_pr", "bad..ref", false),
+            ("create_pr", "@{-1}", false),
+            ("create_pr", "HEAD", false),
+            ("create_pr", "missing", false),
+            ("create_pr", "feature", false),
+            ("create_pr", "unrequested", false),
+            ("create_pr", "main", false),
+            ("commit_push_pr", "feature/source", false),
+            ("commit_push_pr", "feature/source", true),
+            ("push", "feature/source", false),
+        ] {
+            let input: StackedActionInput = serde_json::from_value(json!({
+                "actionId": "invalid-source", "cwd": repository, "action": action,
+                "pullRequestHeadBranch": source,
+                "pullRequestBaseBranch": if action == "push" { None } else if source == "main" { Some("main") } else { Some("release/next") },
+                "featureBranch": feature_branch, "commitMessage": "Do not commit",
+            }))
+            .unwrap();
+            let error = run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
+                .await
+                .expect_err("invalid source rejected before mutations");
+            assert!(
+                error["detail"].as_str().unwrap().contains("branch"),
+                "{error}"
+            );
+            assert!(!calls.exists(), "no provider call for {source}");
+            assert_eq!(
+                std::fs::read(repository.join(".git/index")).unwrap(),
+                original_index
+            );
+            assert_eq!(
+                std::fs::read(repository.join(".git/refs/heads/main")).unwrap(),
+                original_head
+            );
+            assert_eq!(
+                std::fs::read(bare_remote.join("refs/heads/feature/source")).unwrap(),
+                original_remote
+            );
+        }
+
+        let input: StackedActionInput = serde_json::from_value(json!({
+            "actionId": "selected-source", "cwd": repository, "action": "create_pr",
+            "pullRequestHeadBranch": "feature/source", "pullRequestBaseBranch": "main",
+        }))
+        .unwrap();
+        let result = run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
+            .await
+            .expect("selected branch publishes with a dirty current checkout");
+        let result = serde_json::to_value(result).unwrap();
+        assert_eq!(result["push"]["branch"], "feature/source");
+        assert_eq!(result["pr"]["headBranch"], "feature/source");
+        assert_eq!(result["pr"]["baseBranch"], "main");
+        assert_eq!(result["pr"]["title"], "Update feature/source");
+        assert_eq!(
+            std::fs::read(bare_remote.join("refs/heads/feature/source")).unwrap(),
+            selected_head
+        );
+        assert_eq!(
+            std::fs::read(bare_remote.join("refs/heads/main")).unwrap(),
+            original_remote
+        );
+        assert!(!bare_remote.join("refs/heads/unrequested").exists());
+        assert!(!bare_remote.join("refs/tags/unrequested").exists());
+        let upstream = git_repository
+            .run(
+                "test.selectedSourceUpstream",
+                &repository,
+                &[
+                    "for-each-ref".to_owned(),
+                    "--format=%(upstream)".to_owned(),
+                    "refs/heads/feature/source".to_owned(),
+                ],
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(
+            upstream.stdout.trim().is_empty(),
+            "another source's upstream stays untouched"
+        );
+        let recorded = std::fs::read_to_string(&calls).unwrap();
+        assert!(
+            recorded.contains("--head\u{1f}feature/source\u{1f}"),
+            "{recorded}"
+        );
+        assert!(recorded.contains("--base\u{1f}main\u{1f}"), "{recorded}");
+        assert!(
+            recorded.contains("--title\u{1f}Update feature/source\u{1f}"),
+            "{recorded}"
+        );
+
+        git(
+            &sandbox,
+            &repository,
+            &["branch", "-f", "feature/source", "main"],
+        )
+        .await;
+        tokio::fs::write(&calls, "").await.unwrap();
+        run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
+            .await
+            .expect_err("a diverged source is never force-pushed");
+        assert_eq!(
+            std::fs::read(bare_remote.join("refs/heads/feature/source")).unwrap(),
+            selected_head
+        );
+        assert!(
+            std::fs::read_to_string(&calls).unwrap().is_empty(),
+            "no provider call after push rejection"
+        );
+        git(
+            &sandbox,
+            &repository,
+            &[
+                "branch",
+                "-f",
+                "feature/source",
+                std::str::from_utf8(&selected_head).unwrap().trim(),
+            ],
+        )
+        .await;
+
+        tokio::fs::write(&existing_marker, "1").await.unwrap();
+        tokio::fs::write(&calls, "").await.unwrap();
+        let retried = run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
+            .await
+            .expect("existing request resolves by selected head");
+        assert_eq!(
+            serde_json::to_value(retried).unwrap()["pr"]["status"],
+            "opened_existing"
+        );
+        let recorded = std::fs::read_to_string(&calls).unwrap();
+        assert!(
+            recorded.contains("--head\u{1f}feature/source\u{1f}"),
+            "{recorded}"
+        );
+        assert!(!recorded.contains("create"), "{recorded}");
+
+        // A fetched origin-only branch is already published; even an unusable
+        // push URL must not prevent creating its request.
+        git(&sandbox, &repository, &["branch", "-D", "feature/source"]).await;
+        git(
+            &sandbox,
+            &repository,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "/missing-push-remote.git",
+            ],
+        )
+        .await;
+        tokio::fs::remove_file(&existing_marker).await.unwrap();
+        let remote_only =
+            run_stacked_action(&git_repository, &pull_requests, &input, &cancellation)
+                .await
+                .expect("origin-only source needs no push or checkout");
+        let remote_only = serde_json::to_value(remote_only).unwrap();
+        assert_eq!(remote_only["push"]["status"], "skipped_not_requested");
+        assert_eq!(remote_only["pr"]["headBranch"], "feature/source");
+        let local = git_repository
+            .local_status(&repository, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(local.ref_name.as_deref(), Some("main"));
+        assert_eq!(
+            std::fs::read(repository.join(".git/refs/heads/main")).unwrap(),
+            original_head
+        );
+        assert_eq!(
+            std::fs::read(repository.join(".git/index")).unwrap(),
+            original_index
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("base.txt")).unwrap(),
+            "dirty\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("untracked.txt")).unwrap(),
+            "untracked\n"
+        );
+        assert!(!repository.join(".git/refs/heads/feature/source").exists());
     }
 
     /// The provider is resolved before anything is published: an unidentified host
@@ -5197,6 +5803,7 @@ esac
             .expect("feature file");
         git(&sandbox, &repository, &["add", "feature.txt"]).await;
         git(&sandbox, &repository, &["commit", "-q", "-m", "feature"]).await;
+        git(&sandbox, &repository, &["switch", "-q", "main"]).await;
         git(
             &sandbox,
             &repository,
@@ -5250,6 +5857,8 @@ esac
                         "cwd": repository,
                         "action": "create_pr",
                         "pullRequestTitle": "feature",
+                        "pullRequestBaseBranch": "release/next",
+                        "pullRequestHeadBranch": "feature/unpublished",
                     }),
                 ),
                 CancellationToken::new(),
@@ -5287,7 +5896,9 @@ esac
             "{calls}"
         );
         assert!(
-            calls.contains("target_branch=main") && calls.contains("title=feature"),
+            calls.contains("source_branch=feature/unpublished")
+                && calls.contains("target_branch=release/next")
+                && calls.contains("title=feature"),
             "{calls}"
         );
         assert_eq!(
@@ -5360,6 +5971,8 @@ esac
             commit_staged_index_as_is: None,
             pull_request_title: None,
             pull_request_body: None,
+            pull_request_base_branch: Some("main".to_owned()),
+            pull_request_head_branch: None,
         };
 
         let error = run_stacked_action(

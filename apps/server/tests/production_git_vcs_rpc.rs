@@ -1400,7 +1400,7 @@ async fn stacked_feature_branch_rejects_a_clean_worktree_without_creating_a_bran
 }
 
 #[tokio::test]
-async fn stacked_create_pr_rejects_dirty_worktree_before_push() {
+async fn stacked_create_pr_rejects_missing_targets_and_dirty_worktree_before_mutations() {
     let parallelism_permit = acquire_git_rpc_fixture().await;
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
@@ -1412,11 +1412,47 @@ async fn stacked_create_pr_rejects_dirty_worktree_before_push() {
 
     let (_parallelism_permit, handle, mut socket) =
         start_git_server(&temp, parallelism_permit).await;
+    for (request_id, action) in [("14", "create_pr"), ("15", "commit_push_pr")] {
+        let failed = run_stacked_action(
+            &mut socket,
+            request_id,
+            json!({
+                "actionId": format!("missing-target-{action}"),
+                "cwd": repository.path().to_string_lossy(),
+                "action": action,
+                "featureBranch": action == "commit_push_pr",
+            }),
+        )
+        .await;
+        assert_eq!(failed["kind"], "action_failed");
+        assert_eq!(
+            failed["message"],
+            "Select a target branch before creating a pull request."
+        );
+        send_json(
+            &mut socket,
+            json!({ "_tag": "Ack", "requestId": request_id }),
+        )
+        .await;
+        assert!(matches!(
+            next_server_message(&mut socket).await,
+            ServerMessage::Exit { .. }
+        ));
+        assert_eq!(
+            git_stdout(&repository, &["log", "-1", "--format=%s"]).trim(),
+            "base"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("tracked.txt")).unwrap(),
+            "dirty\n"
+        );
+    }
     let result = run_stacked_action(
         &mut socket,
         "16",
         json!({
             "actionId": "wire-action-dirty-pr",
+            "pullRequestBaseBranch": "release/next",
             "cwd": repository.path().to_string_lossy(),
             "action": "create_pr",
         }),

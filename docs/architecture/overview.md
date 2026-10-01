@@ -937,6 +937,13 @@ WebGL without abandoning input already accepted by the scheduler. A later
 renderer retargets error presentation, while the retained writer cannot keep
 the departed renderer or its terminal buffers reachable.
 
+Terminal clipboard shortcuts use xterm's trusted native copy/paste events,
+including bracketed paste, without requiring the asynchronous Clipboard API.
+Shifted copy selects xterm's hidden textarea for the native copy command, then
+restores its pending input. Bare Ctrl+C remains terminal input when nothing is
+selected. Selecting output keeps keyboard focus in the terminal; **Add to chat**
+is available from the selected text's explicit context menu.
+
 ### Terminal attachment fidelity
 
 Servers advertise `terminalSizeOwnership` (decoded as false for older servers).

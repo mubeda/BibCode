@@ -124,6 +124,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("server.getConfig"),
     read_unary("server.getProcessDiagnostics"),
     read_unary("server.getProcessResourceHistory"),
+    read_unary("server.getProviderCapabilities"),
     read_unary("server.getProviderUsage"),
     read_unary("server.getSettings"),
     read_unary("server.getTraceDiagnostics"),

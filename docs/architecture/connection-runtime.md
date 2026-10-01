@@ -662,10 +662,10 @@ the clone.
 
 ## Git Manager capability negotiation
 
-The negotiated environment descriptor carries nine additive Git Manager
-capabilities. Every field decodes to `false` when an older or third-party server
-omits it, and current WebSocket server configurations advertise all nine as
-`true`:
+The negotiated environment descriptor carries additive Git Manager and request
+branch-selection capabilities. Every field decodes to `false` when an older or
+third-party server omits it, and current WebSocket server configurations
+advertise them as `true`:
 
 | Capability                       | Surface it describes                                                         | Shipped false-or-missing behavior                                                                                                            |
 | -------------------------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -678,9 +678,10 @@ omits it, and current WebSocket server configurations advertise all nine as
 | `gitManagerTagOperations`        | Tag create, delete, and push                                                 | Declared and advertised, but the current React tag surface does not yet consult this field.                                                  |
 | `gitManagerLiveSignal`           | `subscribeGitManagerSignal`                                                  | Declared and advertised, but the current React panel does not yet use the field to suppress the subscription.                                |
 | `gitManagerPullRequests`         | Explicit pull-request and check reads                                        | Declared and advertised, but the current React provider pane does not yet consult this field.                                                |
+| `gitPullRequestBranchSelection`  | Reviewed source/target branches for request creation                         | Default false; the creation dialog and mutation session require support so an older server cannot ignore selected branches.                  |
 
 Consequently, the shipped older-server degradation is complete for the base
-panel, commit operations, and partial staging. The six remaining feature flags
+panel, commit operations, partial staging, and reviewed request creation. The six remaining feature flags
 preserve wire compatibility by decoding false, but they do not yet prevent the
 corresponding React controls from issuing an unavailable method. Treat that as
 a current compatibility limitation rather than assuming the advertised

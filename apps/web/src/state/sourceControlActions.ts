@@ -305,6 +305,8 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
       commitStagedIndexAsIs?: boolean;
       pullRequestTitle?: string;
       pullRequestBody?: string;
+      pullRequestBaseBranch?: string;
+      pullRequestHeadBranch?: string;
       onProgress?: (event: GitActionProgressEvent) => void;
     }) => {
       if (resolveScope(scope) === null) {
@@ -326,6 +328,12 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
         ...(input.filePaths?.length ? { filePaths: input.filePaths } : {}),
         ...(input.commitStagedIndexAsIs ? { commitStagedIndexAsIs: true } : {}),
         ...(input.pullRequestTitle ? { pullRequestTitle: input.pullRequestTitle } : {}),
+        ...(input.pullRequestBaseBranch !== undefined
+          ? { pullRequestBaseBranch: input.pullRequestBaseBranch }
+          : {}),
+        ...(input.pullRequestHeadBranch !== undefined
+          ? { pullRequestHeadBranch: input.pullRequestHeadBranch }
+          : {}),
         ...(input.pullRequestBody !== undefined ? { pullRequestBody: input.pullRequestBody } : {}),
         ...(input.onProgress ? { onProgress: input.onProgress } : {}),
       });

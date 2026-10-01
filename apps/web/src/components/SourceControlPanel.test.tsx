@@ -9,6 +9,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vite-
 import { joinWorkspacePath } from "./files/FileTreeContextMenu.logic";
 import type { WorkingTreeFile } from "./SourceControlPanel.logic";
 
+import type { GitManagerCreatePullRequestDialogProps } from "./gitManager/provider/GitManagerCreatePullRequestDialog";
+
 type EffectCallback = () => void | (() => void);
 
 const hooks = vi.hoisted(() => {
@@ -182,6 +184,7 @@ interface CapturedTextareaProps {
 }
 
 const captured = vi.hoisted(() => ({
+  createPullRequest: null as GitManagerCreatePullRequestDialogProps | null,
   buttons: [] as CapturedButtonProps[],
   menuItems: [] as CapturedMenuItemProps[],
   sections: [] as CapturedSectionProps[],
@@ -189,12 +192,20 @@ const captured = vi.hoisted(() => ({
   textareas: [] as CapturedTextareaProps[],
   commits: [] as Array<{ reloadToken: number; nowMs: number; gitCwd: string | null }>,
   clear() {
+    this.createPullRequest = null;
     this.buttons = [];
     this.menuItems = [];
     this.sections = [];
     this.dialogs = [];
     this.textareas = [];
     this.commits = [];
+  },
+}));
+
+vi.mock("./gitManager/provider/GitManagerCreatePullRequestDialog", () => ({
+  GitManagerCreatePullRequestDialog: (props: GitManagerCreatePullRequestDialogProps) => {
+    captured.createPullRequest = props;
+    return null;
   },
 }));
 
@@ -637,6 +648,35 @@ beforeEach(() => {
 });
 
 describe("SourceControlPanel", () => {
+  it("opens target review before publishing a merge request, and cancel does no work", async () => {
+    testState.statusQuery.data = status({
+      refName: "feature/test",
+      hasUpstream: false,
+      aheadCount: 1,
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+    });
+    const props = buildProps();
+    render(props);
+    const create = buttonsByText("Push & create MR")[0];
+    expect(create).toBeDefined();
+    create?.onClick?.();
+    await flushPromises();
+    render(props);
+    expect(testState.runAction).not.toHaveBeenCalled();
+    expect(captured.createPullRequest).toMatchObject({
+      open: true,
+      scope: { environmentId: props.threadRef.environmentId, cwd: props.gitCwd },
+    });
+    expect(captured.createPullRequest?.commitInput).toBeUndefined();
+    captured.createPullRequest?.onOpenChange(false);
+    render(props);
+    expect(captured.createPullRequest).toBeNull();
+    expect(testState.runAction).not.toHaveBeenCalled();
+    captured.menuItems.find((item) => flattenText(item.children) === "Push")?.onClick?.();
+    await flushPromises();
+    expect(testState.runAction).toHaveBeenCalledWith(expect.objectContaining({ action: "push" }));
+  });
+
   it("uses the shared workspace guard instead of starting Git work", () => {
     const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
     const markup = render(buildProps({ workspaceUnavailable: reason }));
