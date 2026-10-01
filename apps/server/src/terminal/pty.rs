@@ -2384,8 +2384,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn portable_backend_discovers_a_relative_executable_from_the_terminal_cwd() {
+    #[tokio::test]
+    async fn portable_backend_discovers_a_relative_executable_from_the_terminal_cwd() {
         let cwd = tempfile::tempdir().unwrap();
         let executable = cwd.path().join("provider-fixture");
         crate::test_support::executable_fixture::write_executable(
@@ -2404,6 +2404,74 @@ mod tests {
             })
             .unwrap();
         assert!(process.pid() > 0);
+        let mut exit = process.subscribe_exit();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while exit.borrow().is_none() {
+                exit.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("relative script exits before its fixture is removed");
+        assert_eq!(exit.borrow().as_ref().unwrap().exit_code, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_backend_reports_a_missing_script_interpreter_as_spawn_failure() {
+        let cwd = tempfile::tempdir().unwrap();
+        let executable = cwd.path().join("provider-fixture");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            "#!/bibcode-missing-interpreter\n",
+        );
+        let result = PortablePtyBackend.spawn(&PtySpawnInput {
+            executable: executable.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: cwd.path().to_path_buf(),
+            cols: 80,
+            rows: 24,
+            env: BTreeMap::new(),
+        });
+        assert!(
+            result.is_err(),
+            "failed exec must not publish a PTY process"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn portable_backend_closes_inherited_non_stdio_descriptors_on_exec() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let file = std::fs::File::open("/dev/null").unwrap();
+        // F_DUPFD deliberately creates an inheritable descriptor above the
+        // range the shell uses for its own script and redirection descriptors.
+        let descriptor = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!(descriptor >= 200);
+        // SAFETY: F_DUPFD returned a new descriptor owned by this fixture.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let process = PortablePtyBackend
+            .spawn(&PtySpawnInput {
+                executable: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    format!("test ! -e /dev/fd/{}", descriptor.as_raw_fd()),
+                ],
+                cwd: std::env::temp_dir(),
+                cols: 80,
+                rows: 24,
+                env: BTreeMap::new(),
+            })
+            .unwrap();
+        let mut exit = process.subscribe_exit();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while exit.borrow().is_none() {
+                exit.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("descriptor probe exits");
+        assert_eq!(exit.borrow().as_ref().unwrap().exit_code, Some(0));
     }
 
     #[tokio::test]

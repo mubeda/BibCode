@@ -345,7 +345,16 @@ async fn stores_sensitive_environment_values_outside_settings_json_and_roundtrip
         .expect("instance")
         .environment;
     assert_eq!(environment[0].value, "sk-or-secret");
-    assert!(environment[0].value_redacted);
+    assert!(
+        !environment[0].value_redacted,
+        "runtime values have been materialized"
+    );
+    let effective = store.get().await.expect("effective provider settings");
+    assert_eq!(
+        effective.provider_instances["codex_personal"].environment[0].value,
+        "sk-or-secret"
+    );
+    assert!(!effective.provider_instances["codex_personal"].environment[0].value_redacted);
 
     let raw = tokio::fs::read_to_string(temp.path().join("settings.json"))
         .await

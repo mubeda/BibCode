@@ -2,6 +2,7 @@ import {
   EnvironmentId,
   type GitActionProgressEvent,
   type GitRunStackedActionResult,
+  type GitRunStackedActionInput,
   type VcsStatusResult,
   WS_METHODS,
 } from "@bibcode/contracts";
@@ -18,6 +19,7 @@ import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import type { RpcSession } from "../rpc/session.ts";
 import type { AtomCommandResult } from "./runtime.ts";
 import { createVcsEnvironmentAtoms } from "./vcs.ts";
 import {
@@ -105,7 +107,194 @@ function progress<T extends GitActionProgressEvent>(event: T): T {
   return event;
 }
 
+function stackedActionSession(
+  branchSelection: boolean | undefined,
+  sent: GitRunStackedActionInput[],
+): RpcSession {
+  return {
+    initialConfig: Effect.succeed({
+      environment: {
+        capabilities:
+          branchSelection === undefined ? {} : { gitPullRequestBranchSelection: branchSelection },
+      },
+    } as never),
+    client: {
+      [WS_METHODS.gitRunStackedAction]: (input: GitRunStackedActionInput) => {
+        sent.push(input);
+        return Stream.make({
+          kind: "action_finished",
+          actionId: input.actionId,
+          cwd: input.cwd,
+          action: input.action,
+          result: { ...result, action: input.action },
+        });
+      },
+    } as never,
+    ready: Effect.void,
+    probe: Effect.void,
+    closed: Effect.never,
+    e2eeAuthenticated: Effect.succeed(null),
+  };
+}
+
+const makeStackedActionHarness = Effect.fn("makeStackedActionHarness")(function* (
+  initialSession: RpcSession,
+) {
+  const session = yield* SubscriptionRef.make(Option.some(initialSession));
+  const supervisor = EnvironmentSupervisor.of({ target: { environmentId }, session } as never);
+  const runStream: EnvironmentRegistry["Service"]["runStream"] = (selected, stream) => {
+    expect(selected).toBe(environmentId);
+    return Stream.provideService(stream, EnvironmentSupervisor, supervisor);
+  };
+  const manager = createVcsActionManager(
+    Atom.runtime(
+      Layer.succeed(EnvironmentRegistry, EnvironmentRegistry.of({ runStream } as never)),
+    ),
+  );
+  const registry = AtomRegistry.make();
+  return { session, manager, registry, command: manager.runStackedAction({ environmentId, cwd }) };
+});
+
 describe("vcsActionState", () => {
+  for (const capability of [undefined, false]) {
+    for (const requestAction of ["create_pr", "commit_push_pr"] as const) {
+      it.effect(
+        `rejects ${requestAction} before mutation when branch selection is ${String(capability)}`,
+        () =>
+          Effect.gen(function* () {
+            const sent: GitRunStackedActionInput[] = [];
+            const h = yield* makeStackedActionHarness(stackedActionSession(capability, sent));
+            const outcome = yield* Effect.promise(() =>
+              h.command.run(h.registry, {
+                actionId,
+                action: requestAction,
+                pullRequestBaseBranch: "release/next",
+                pullRequestHeadBranch: "feature/other",
+              }),
+            );
+            expect(outcome._tag).toBe("Failure");
+            if (AsyncResult.isFailure(outcome)) {
+              const error = Cause.squash(outcome.cause);
+              expect(error).toMatchObject({
+                _tag: "VcsPullRequestBranchSelectionUnsupportedError",
+                environmentId,
+              });
+              expect(error).toBeInstanceOf(Error);
+              expect((error as Error).message).toMatch(/update.*environment.*server/i);
+            }
+            expect(sent).toEqual([]);
+            expect(h.registry.get(h.manager.stateAtom({ environmentId, cwd })).isRunning).toBe(
+              false,
+            );
+            h.registry.dispose();
+          }),
+      );
+    }
+  }
+
+  it.effect("leaves commit and push actions available without branch-selection support", () =>
+    Effect.gen(function* () {
+      const sent: GitRunStackedActionInput[] = [];
+      const h = yield* makeStackedActionHarness({
+        ...stackedActionSession(undefined, sent),
+        initialConfig: Effect.die("Commit and push must not negotiate branch selection."),
+      });
+      for (const action of ["commit", "push", "commit_push"] as const) {
+        const outcome = yield* Effect.promise(() =>
+          h.command.run(h.registry, { actionId, action }),
+        );
+        expect(outcome._tag).toBe("Success");
+      }
+      expect(sent.map((input) => input.action)).toEqual(["commit", "push", "commit_push"]);
+      h.registry.dispose();
+    }),
+  );
+
+  it.effect("rechecks branch-selection support after an environment reconnects", () =>
+    Effect.gen(function* () {
+      const supported: GitRunStackedActionInput[] = [];
+      const unsupported: GitRunStackedActionInput[] = [];
+      const h = yield* makeStackedActionHarness(stackedActionSession(true, supported));
+      const input = {
+        actionId,
+        action: "create_pr" as const,
+        pullRequestBaseBranch: "release/next",
+      };
+      const first = yield* Effect.promise(() => h.command.run(h.registry, input));
+      expect(first._tag).toBe("Success");
+      yield* SubscriptionRef.set(h.session, Option.some(stackedActionSession(false, unsupported)));
+      const next = yield* Effect.promise(() => h.command.run(h.registry, input));
+      expect(next._tag).toBe("Failure");
+      expect(supported).toHaveLength(1);
+      expect(unsupported).toEqual([]);
+      h.registry.dispose();
+    }),
+  );
+
+  it.effect(
+    "sends the action only to the session whose branch-selection capability was checked",
+    () =>
+      Effect.gen(function* () {
+        const supported: GitRunStackedActionInput[] = [];
+        const unsupported: GitRunStackedActionInput[] = [];
+        const capableSession = stackedActionSession(true, supported);
+        const h = yield* makeStackedActionHarness(capableSession);
+        yield* SubscriptionRef.set(
+          h.session,
+          Option.some({
+            ...capableSession,
+            initialConfig: SubscriptionRef.set(
+              h.session,
+              Option.some(stackedActionSession(false, unsupported)),
+            ).pipe(Effect.andThen(capableSession.initialConfig)),
+          }),
+        );
+        const outcome = yield* Effect.promise(() =>
+          h.command.run(h.registry, {
+            actionId,
+            action: "create_pr",
+            pullRequestBaseBranch: "release/next",
+          }),
+        );
+        expect(outcome._tag).toBe("Success");
+        expect(supported).toHaveLength(1);
+        expect(unsupported).toEqual([]);
+        h.registry.dispose();
+      }),
+  );
+
+  it.effect("sends the explicitly reviewed target to the selected environment's RPC", () =>
+    Effect.gen(function* () {
+      const sent: GitRunStackedActionInput[] = [];
+      const { command, registry } = yield* makeStackedActionHarness(
+        stackedActionSession(true, sent),
+      );
+      const outcome = yield* Effect.promise(() =>
+        command.run(registry, {
+          actionId,
+          action: "create_pr",
+          pullRequestTitle: "Reviewed",
+          pullRequestBody: "Details",
+          pullRequestBaseBranch: "release/next",
+          pullRequestHeadBranch: "feature/other",
+        }),
+      );
+      expect(AsyncResult.isSuccess(outcome)).toBe(true);
+      expect(sent).toEqual([
+        {
+          actionId: createVcsActionTransportId({ environmentId, cwd }, actionId),
+          cwd,
+          action: "create_pr",
+          pullRequestTitle: "Reviewed",
+          pullRequestBody: "Details",
+          pullRequestBaseBranch: "release/next",
+          pullRequestHeadBranch: "feature/other",
+        },
+      ]);
+      registry.dispose();
+    }),
+  );
+
   it.effect("wires actual status refreshes independently from actual mutations", () =>
     Effect.gen(function* () {
       const firstRefreshStarted = yield* Deferred.make<void>();

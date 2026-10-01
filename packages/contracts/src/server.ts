@@ -107,6 +107,29 @@ export const ServerProviderAgent = Schema.Struct({
 });
 export type ServerProviderAgent = typeof ServerProviderAgent.Type;
 
+export const ServerProviderCapabilitiesInput = Schema.Struct({
+  instanceId: ProviderInstanceId,
+  cwd: TrimmedNonEmptyString,
+});
+export type ServerProviderCapabilitiesInput = typeof ServerProviderCapabilitiesInput.Type;
+
+export const ServerProviderCapabilities = Schema.Struct({
+  slashCommands: Schema.Array(ServerProviderSlashCommand),
+  skills: Schema.Array(ServerProviderSkill),
+  agents: Schema.Array(ServerProviderAgent),
+  issues: Schema.Array(TrimmedNonEmptyString),
+});
+export type ServerProviderCapabilities = typeof ServerProviderCapabilities.Type;
+
+export class ServerProviderCapabilitiesError extends Schema.TaggedError<ServerProviderCapabilitiesError>()(
+  "ServerProviderCapabilitiesError",
+  { reason: TrimmedNonEmptyString },
+) {
+  override get message(): string {
+    return this.reason;
+  }
+}
+
 /**
  * Availability of a configured provider instance from the runtime's POV.
  *

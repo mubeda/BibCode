@@ -91,6 +91,7 @@ pub struct OpenCodeInventorySnapshot {
     pub auth: Value,
     pub models: Vec<OpenCodeProviderModel>,
     pub commands: Vec<Value>,
+    pub skills: Vec<Value>,
     pub agents: Vec<Value>,
 }
 
@@ -161,6 +162,7 @@ pub fn build_inventory_snapshot(
         auth: json!({ "status": if connected.is_empty() { "unknown" } else { "authenticated" } }),
         models,
         commands: command_inventory(commands),
+        skills: skill_inventory(commands),
         agents: agent_inventory(agents),
     }
 }
@@ -170,6 +172,7 @@ pub fn command_inventory(commands: &Value) -> Vec<Value> {
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|command| command.get("source").and_then(Value::as_str) != Some("skill"))
         .filter_map(|command| {
             let name = command
                 .get("name")?
@@ -198,6 +201,64 @@ pub fn command_inventory(commands: &Value) -> Vec<Value> {
             Some(result)
         })
         .collect()
+}
+
+pub fn skill_inventory(commands: &Value) -> Vec<Value> {
+    commands
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|command| command.get("source").and_then(Value::as_str) == Some("skill"))
+        .filter_map(|command| {
+            let name = command
+                .get("name")?
+                .as_str()?
+                .trim()
+                .trim_start_matches('/');
+            if name.is_empty() {
+                return None;
+            }
+            let mut skill = json!({
+                "name": name,
+                "path": format!("opencode://skill/{name}"),
+                "scope": "provider",
+                "enabled": true,
+                "invocation": "slash",
+            });
+            if let Some(description) = command
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                skill["description"] = json!(description);
+            }
+            Some(skill)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod skill_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn skill_commands_are_not_flattened_into_ordinary_commands() {
+        let inventory = command_inventory(&json!([
+            {"name":"review","source":"command"},
+            {"name":"user-skill","source":"skill"},
+            {"name":"repo-skill","source":"skill"}
+        ]));
+        assert_eq!(inventory, vec![json!({"name":"review"})]);
+        let skills = skill_inventory(&json!([
+            {"name":"user-skill","source":"skill","template":"private skill content"},
+            {"name":"repo-skill","source":"skill"}
+        ]));
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0]["invocation"], "slash");
+        assert_eq!(skills[0]["path"], "opencode://skill/user-skill");
+        assert!(skills[0].get("template").is_none());
+    }
 }
 
 fn agent_inventory(agents: &Value) -> Vec<Value> {

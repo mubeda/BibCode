@@ -30,6 +30,7 @@ import type { TerminalThemeMode } from "./terminalTheme";
 
 interface FakeTerminalInstance {
   readonly options: Record<string, unknown>;
+  readonly textarea: HTMLTextAreaElement;
   cols: number;
   rows: number;
   readonly open: ReturnType<typeof vi.fn>;
@@ -306,6 +307,7 @@ vi.mock("./terminalWebgl", async (importOriginal) => ({
 vi.mock("@xterm/xterm", () => ({
   Terminal: class Terminal {
     readonly options: Record<string, unknown>;
+    readonly textarea = document.createElement("textarea");
     rows = 24;
     cols = 80;
     readonly writes: string[] = [];
@@ -1244,14 +1246,14 @@ beforeEach(() => {
   const removeElementListener = vi.spyOn(HTMLElement.prototype, "removeEventListener");
   assertComponentListenerCleanup = () => {
     for (const [type, listener] of addWindowListener.mock.calls) {
-      if (type === "mouseup") {
+      if (type === "focus") {
         expect(removeWindowListener).toHaveBeenCalledWith(type, listener);
       }
     }
     for (const [index, [type, listener]] of addElementListener.mock.calls.entries()) {
       const target = addElementListener.mock.instances[index];
       if (
-        type !== "pointerdown" ||
+        (type !== "pointerdown" && type !== "contextmenu") ||
         !(target instanceof HTMLElement) ||
         !target.classList.contains("overflow-hidden")
       ) {
@@ -1360,6 +1362,7 @@ afterEach(async () => {
   xtermState.terminals = [];
   xtermState.fitAddons = [];
   document.body.replaceChildren();
+  Reflect.deleteProperty(document, "execCommand");
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -3507,9 +3510,9 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(first.dispose).toHaveBeenCalledOnce();
     expect(second.dispose).toHaveBeenCalledOnce();
     expect(view.detachRendererSpy).toHaveBeenCalledTimes(2);
-    const mouseupAdds = addWindowListener.mock.calls.filter(([type]) => type === "mouseup");
-    const mouseupRemoves = removeWindowListener.mock.calls.filter(([type]) => type === "mouseup");
-    expect(mouseupRemoves).toHaveLength(mouseupAdds.length);
+    const focusAdds = addWindowListener.mock.calls.filter(([type]) => type === "focus");
+    const focusRemoves = removeWindowListener.mock.calls.filter(([type]) => type === "focus");
+    expect(focusRemoves).toHaveLength(focusAdds.length);
     const visibilityAdds = addDocumentListener.mock.calls.filter(
       ([type]) => type === "visibilitychange",
     );
@@ -3543,7 +3546,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(terminal.linkDisposable.dispose).toHaveBeenCalledOnce();
     expect(terminal.dispose).toHaveBeenCalledOnce();
     expect(observer.disconnect).toHaveBeenCalledOnce();
-    expect(removeWindowListener).toHaveBeenCalledWith("mouseup", expect.any(Function));
+    expect(removeWindowListener).toHaveBeenCalledWith("focus", expect.any(Function));
     expect(animationFrames.size).toBe(0);
   });
 
@@ -4190,7 +4193,110 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(terminal.keyHandler?.(new KeyboardEvent("keydown", { key: "Enter" }))).toBe(true);
   });
 
-  it("adds a normalized terminal selection through the native context menu", async () => {
+  it.each([
+    ["Linux", "c", { ctrlKey: true }],
+    ["Linux", "v", { ctrlKey: true }],
+    ["Linux", "V", { ctrlKey: true, shiftKey: true }],
+    ["Win32", "c", { ctrlKey: true }],
+    ["Win32", "v", { ctrlKey: true }],
+    ["Win32", "V", { ctrlKey: true, shiftKey: true }],
+    ["MacIntel", "c", { metaKey: true }],
+    ["MacIntel", "v", { metaKey: true }],
+    ["MacIntel", "V", { metaKey: true, shiftKey: true }],
+  ] as const)(
+    "leaves native clipboard events available for %s %s %j",
+    async (platform, key, modifiers) => {
+      vi.stubGlobal("navigator", { platform });
+      await mount(<TerminalViewport {...viewportProps()} />);
+      const terminal = xtermState.terminals[0]!;
+      terminal.hasActiveSelection = true;
+      terminal.selectionText = "selected terminal output";
+      const event = new KeyboardEvent("keydown", { key, ...modifiers, cancelable: true });
+
+      expect(terminal.keyHandler?.(event)).toBe(false);
+      expect(event.defaultPrevented).toBe(false);
+      expect(testState.writeCommand).not.toHaveBeenCalled();
+    },
+  );
+
+  it("copies with Ctrl+Shift+C through the native clipboard while preserving pending text", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.hasActiveSelection = true;
+    terminal.selectionText = "selected terminal output";
+    terminal.textarea.value = "pending input";
+    terminal.textarea.setSelectionRange(3, 5);
+    let copiedText: string | undefined;
+    const copy = vi.fn((command: string) => {
+      expect(command).toBe("copy");
+      copiedText = terminal.textarea.value.slice(
+        terminal.textarea.selectionStart,
+        terminal.textarea.selectionEnd,
+      );
+      return true;
+    });
+    Object.defineProperty(document, "execCommand", { configurable: true, value: copy });
+    const event = new KeyboardEvent("keydown", {
+      key: "C",
+      ctrlKey: true,
+      shiftKey: true,
+      cancelable: true,
+    });
+
+    expect(terminal.keyHandler?.(event)).toBe(false);
+    expect(event.defaultPrevented).toBe(true);
+    expect(copiedText).toBe("selected terminal output");
+    expect(terminal.textarea.value).toBe("pending input");
+    expect(terminal.textarea.selectionStart).toBe(3);
+    expect(terminal.textarea.selectionEnd).toBe(5);
+    expect(testState.writeCommand).not.toHaveBeenCalled();
+  });
+
+  it("keeps Ctrl+C as an interrupt without a selection and consumes explicit copy", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const interrupt = new KeyboardEvent("keydown", { key: "c", ctrlKey: true });
+    const copy = new KeyboardEvent("keydown", {
+      key: "C",
+      ctrlKey: true,
+      shiftKey: true,
+      cancelable: true,
+    });
+    expect(terminal.keyHandler?.(interrupt)).toBe(true);
+    expect(terminal.keyHandler?.(copy)).toBe(false);
+    expect(copy.defaultPrevented).toBe(true);
+  });
+
+  it.each([false, true])(
+    "preserves input and reports native copy failure (throws: %s)",
+    async (throws) => {
+      vi.stubGlobal("navigator", { platform: "Linux" });
+      await mount(<TerminalViewport {...viewportProps()} />);
+      const terminal = xtermState.terminals[0]!;
+      terminal.hasActiveSelection = true;
+      terminal.selectionText = "selected terminal output";
+      terminal.textarea.value = "pending input";
+      Object.defineProperty(document, "execCommand", {
+        configurable: true,
+        value: () => {
+          if (throws) throw new Error("clipboard denied");
+          return false;
+        },
+      });
+
+      terminal.keyHandler?.(
+        new KeyboardEvent("keydown", { key: "C", ctrlKey: true, shiftKey: true }),
+      );
+
+      expect(terminal.textarea.value).toBe("pending input");
+      expect(terminal.writes).toContain("\r\n[terminal] Copy failed. Try Ctrl+C.\r\n");
+      expect(testState.writeCommand).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps selection focused and offers Add to chat only on explicit context menu", async () => {
     testState.localApiAvailable = true;
     testState.contextMenuShow.mockResolvedValue("add-to-chat");
     const onAddTerminalContext = vi.fn();
@@ -4224,6 +4330,20 @@ describe("TerminalViewport mounted lifecycle", () => {
       await Promise.resolve();
     });
 
+    expect(testState.contextMenuShow).not.toHaveBeenCalled();
+    expect(terminal.clearSelection).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      mountElement.dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          button: 2,
+          clientX: 30,
+          clientY: 40,
+        }),
+      );
+    });
+
     expect(testState.contextMenuShow).toHaveBeenCalledWith(
       [{ id: "add-to-chat", label: "Add to chat" }],
       expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }),
@@ -4242,7 +4362,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     terminal.selectionHandler?.();
   });
 
-  it("cancels pending selection actions and ignores unavailable selection UI", async () => {
+  it("leaves context menus alone when selection UI is unavailable", async () => {
     const mounted = await mount(<TerminalViewport {...viewportProps()} />);
     await flushAnimationFrames();
     const terminal = xtermState.terminals[0]!;
@@ -4250,36 +4370,13 @@ describe("TerminalViewport mounted lifecycle", () => {
       '[data-terminal-xterm-mount="term-1"]',
     )!;
 
+    terminal.hasActiveSelection = true;
+    terminal.selectionText = "selected";
+    const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 });
     await act(async () => {
-      mountElement.dispatchEvent(
-        new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerId: 1 }),
-      );
-      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0, detail: 2 }));
-      mountElement.dispatchEvent(
-        new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerId: 2 }),
-      );
-
-      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0, detail: 1 }));
-      await new Promise((resolve) => window.setTimeout(resolve, 2));
-      expect(animationFrames.size).toBeGreaterThan(0);
-      mountElement.dispatchEvent(
-        new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerId: 3 }),
-      );
-      expect(animationFrames.size).toBe(0);
-
-      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 1, detail: 1 }));
-      terminal.dataHandler?.("");
-      terminal.hasActiveSelection = true;
-      terminal.selectionHandler?.();
+      mountElement.dispatchEvent(event);
     });
-
-    await act(async () => {
-      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0, detail: 1 }));
-      await new Promise((resolve) => window.setTimeout(resolve, 2));
-      for (const callback of animationFrames.values()) callback(0);
-      animationFrames.clear();
-      await Promise.resolve();
-    });
+    expect(event.defaultPrevented).toBe(false);
     expect(testState.contextMenuShow).not.toHaveBeenCalled();
   });
 
@@ -4302,12 +4399,8 @@ describe("TerminalViewport mounted lifecycle", () => {
     const requestSelectionAction = async () => {
       await act(async () => {
         mountElement.dispatchEvent(
-          new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerId: 1 }),
+          new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 }),
         );
-        window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0, detail: 1 }));
-        await new Promise((resolve) => window.setTimeout(resolve, 2));
-        for (const callback of animationFrames.values()) callback(0);
-        animationFrames.clear();
         await Promise.resolve();
       });
     };

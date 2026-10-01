@@ -142,6 +142,10 @@ export const GitRunStackedActionInput = Schema.Struct({
   pullRequestTitle: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(256))),
   /** Reviewed pull-request body; only meaningful for `create_pr` and `commit_push_pr`. */
   pullRequestBody: Schema.optional(Schema.String.check(Schema.isMaxLength(65_536))),
+  /** Explicitly selected target; required for `create_pr` and `commit_push_pr`. */
+  pullRequestBaseBranch: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Selected source branch; publication does not change the current checkout. */
+  pullRequestHeadBranch: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type GitRunStackedActionInput = typeof GitRunStackedActionInput.Type;
 

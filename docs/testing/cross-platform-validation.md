@@ -34,6 +34,48 @@ Inputs are execution data. Do not edit the living runbooks to insert them.
 Do not install, repair, or re-index repository tools outside the authority
 granted by `AGENTS.md` and the current request.
 
+## Provider skill discovery
+
+For changes to provider visibility or the chat command menu, run the focused
+capability and protocol checks from the repository root:
+
+```sh
+cargo test -p bibcode-server --lib skill -j 2
+cargo test -p bibcode-server --lib provider::cursor::capabilities -j 2
+cargo test -p bibcode-server --lib capability_shutdown -j 2
+cargo test -p bibcode-server --lib production_runtime_covers_core_routes_assets_diagnostics_and_shutdown -j 2
+cargo test -p bibcode-server --test server_settings_domain --test rpc_wire -j 2
+node scripts/run-local-vp.mjs test run packages/client-runtime/src/state/server.test.ts packages/client-runtime/src/state/queryTransport.test.ts apps/web/src/components/chat/ChatComposer.test.tsx apps/web/src/components/chat/ChatComposer.rerender.test.tsx apps/web/src/components/chat/ComposerCommandMenu.test.tsx apps/web/src/components/chat/composerCapabilities.test.ts packages/contracts/src/rpcRustParity.test.ts packages/contracts/scripts/export-rust-rpc-fixtures.test.ts
+```
+
+Automated native-provider fixtures must use temporary homes, explicit fake
+executables, and local HTTP fixtures, never the host's provider CLIs or user
+configuration. Cursor filesystem tests must also supply an explicit temporary
+home. Keep cancellation/reaping (including abandoned requests during shutdown),
+configured homes (including Codex shadow homes), local/remote OpenCode directory
+encoding, Claude visibility/aliases, and partial-catalog coverage alongside discovery.
+
+For packaged visual validation on each available supported provider:
+
+1. Open an empty repository with a known user-level skill outside that repository.
+   Verify it appears under `$` for Codex or `/` for Claude, Cursor, and OpenCode.
+2. Add a repository skill, then switch between two worktrees with distinct skills.
+   Both retain user skills; each shows only its applicable repository skills.
+   Include two concurrent chat panels and an environment switch.
+3. Check configured user homes, nested/symlinked Cursor skills, and remote
+   OpenCode directory selection where those setups are available. Confirm native
+   disabled/non-invocable skills stay hidden and name collisions have one effective
+   entry.
+4. Refresh providers, change instance settings, and reconnect. Reopen a stale
+   menu and confirm the catalog refreshes without losing draft text or inline
+   skills. Typing in its search must not launch another discovery per keypress.
+5. Make a fixture fail or return a partial catalog. Verify loading/Retry feedback,
+   retained same-context results, and successful recovery; an unavailable catalog
+   must not be presented as an authoritative empty list.
+
+Record unavailable provider/platform scenarios and visual evidence in the
+execution report. Hermetic tests do not establish a packaged native visual pass.
+
 ## Revision and worktree preflight
 
 Use GitHub CLI for GitHub metadata and Git for worktree/revision operations.
@@ -182,6 +224,18 @@ usual error must remain visible without a stuck retry indicator. Type while
 waiting for the first terminal snapshot and verify that the text reaches the
 shell. Reconnect the visible terminal and verify its output stays intact with no
 extra blank or flickering redraw.
+
+In the center terminal, right-panel terminal, and a provider's terminal view,
+select one line of output and copy with **Ctrl+C**, then paste with **Ctrl+V**
+(**Cmd+C/V** on macOS). Verify the exact selected text reaches the destination
+once. Also check **Ctrl+Shift+C/V**, and multiline paste with an application
+that enables bracketed paste. Selecting text must leave keyboard focus in the
+terminal and must not open the **Add to chat** menu or overwrite the clipboard.
+Right-click the selected text and choose **Add to chat**; the selection must
+still attach to the composer. With no selection, **Ctrl+C** must interrupt the
+running terminal program. Repeat copy/paste where asynchronous Clipboard API
+access is unavailable; native clipboard events must still work. These packaged
+checks supplement the focused terminal and keybinding component tests.
 
 Repeat attach, hide/show, reconnect, and reload at a bash prompt; queries from
 guarded replays must not enter the command line. Test snapshots with the OSC
@@ -1752,13 +1806,42 @@ starts.
     request and **Create merge request**; GitHub uses pull-request wording,
     `#N` and **Create pull request**.
     Choose that Create action: the review dialog must open with the detected
-    provider, base and head branches, whether the
-    branch will be published first, and a title and description seeded from
-    the latest commit, while no push, provider process, or pull request is
-    created. Cancel it and confirm the branch, its upstream, and the forge are
-    unchanged; only the dialog's explicit primary action may publish or create,
-    and its failure states must distinguish a failed publish from a published
-    branch whose pull request could not be created.
+    provider, a source-branch selector defaulting to the checkout, an empty
+    required target-branch selector,
+    whether the branch will be published first, and a title and description
+    seeded from the latest commit. Creation must remain disabled until an
+    option is selected; typing alone must not enable it. Choose a non-default
+    target (for example `release/next`) and confirm a status refresh preserves
+    the choice, clearing it disables creation again, and reopening starts
+    unselected. Repeat from Source Control's **Push & create PR/MR** and its
+    Create menu action, and from the chat Git action; combined commit/push/request
+    actions must also require target review before any mutation. No push,
+    provider process, or pull request may run just by opening the dialog.
+    Cancel it and confirm the branch, its upstream, and the forge are unchanged.
+    With a disposable configured forge, create once and verify the exact selected
+    non-default target; plain **Push** must never create a request. Only the
+    dialog's explicit primary action may publish or create.
+    Both selectors must contain only origin branches, including those with a
+    same-named local branch. Verify local-only branches, other remotes, and `HEAD`
+    are absent. A local-only checkout must leave the ordinary creation dialog's
+    source unselected and creation disabled, with push/fetch guidance.
+    Change the source to another published branch and then an origin-only branch.
+    Each change must clear the target, retain edited title/description, and seed
+    untouched fields from that source's tip rather than another branch's newer
+    commit. Select the target again and create: verify both exact branches at
+    the forge, with the current checkout and its working files unchanged.
+    Combined commit actions must explain why their source remains the current
+    or newly generated branch. Search and paging must reach branches beyond the
+    first page in both selectors.
+    Connect to an older server without `gitPullRequestBranchSelection`, or
+    reconnect to one after opening the dialog: creation must be disabled with
+    update guidance, and attempting the action must send no mutation.
+    Record whether a failed attempt published the branch; native stacked actions
+    currently report start/end outcomes without intermediate phase events.
+    Retry a failed combined commit/push/request action: it must reread Git, reuse
+    a created feature branch, skip committing a clean tree, and require target
+    reselection if the source branch changed. An unrelated external checkout
+    detected during Retry must not be committed or published automatically.
 12. Validate the two-project view isolation before the cache limit. Give `main`
     and `project-two` different Changes filters, selected files, and active tabs,
     then alternate between their project-header buttons. Each project must
@@ -2125,12 +2208,24 @@ sizes. Cover relevant:
   app saves that download as `report_v2.txt` rather than refusing it; against a
   Windows-hosted workspace, attempt to upload a file named `report:v2.txt` and
   verify the refusal names the rule instead of failing silently;
+- Remote folder download recovery: leave the native destination picker open
+  longer than five minutes, then confirm and verify a valid ZIP. Cancelling the
+  picker must not mint a download URL. With a controlled disconnected server,
+  expired token, missing folder, or archive read failure, verify an actionable
+  error and a corresponding local frontend/server log entry, with no signed
+  transfer URL in either. Restore the fixture and retry; no partial ZIP may be
+  reported as success or overwrite an existing download;
 - Files picking up a file created in the workspace by another tool while the
   packaged application stays open, both on its own within seconds and
   immediately via **Refresh**; while a controlled rescan is pending, verify the
   visible **Refreshing…** state and repeated-request coalescing; on Windows,
   cover a WSL-hosted workspace as well as a native one, because
   directory-timestamp fidelity differs across that boundary;
+- Files path-kind changes: replace a file with a directory containing nested
+  entries while the tree is open, then select a descendant and replace its
+  directory with a file. Exercise automatic refresh and **Refresh**; neither
+  may show an application error or require reload. Surviving expanded folders
+  and selections stay usable, and sibling rows still open normally;
 - Activity subagents and background tasks, including elapsed time and keyboard
   navigation;
 - with **Settings → General → Theme** on **System**, switch the operating system

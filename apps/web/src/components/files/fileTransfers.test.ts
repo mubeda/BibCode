@@ -17,8 +17,7 @@ describe("downloadWithBridge", () => {
       downloadToFolder: vi.fn(async () => "/home/me/Downloads/src.zip"),
     };
     const outcome = await downloadWithBridge({
-      url: "https://h/api/transfers/t",
-      fileName: "src.zip",
+      prepare: async () => ({ url: "https://h/api/transfers/t", fileName: "src.zip" }),
       bridge,
     });
     expect(bridge.downloadToFolder).toHaveBeenCalledWith({
@@ -31,14 +30,21 @@ describe("downloadWithBridge", () => {
 
   it("reports cancellation when no folder is picked", async () => {
     const bridge = { pickFolder: vi.fn(async () => null), downloadToFolder: vi.fn() };
-    expect(await downloadWithBridge({ url: "u", fileName: "f", bridge })).toEqual({
+    const prepare = vi.fn(async () => ({ url: "u", fileName: "f" }));
+    expect(await downloadWithBridge({ prepare, bridge })).toEqual({
       _tag: "Cancelled",
     });
+    expect(prepare).not.toHaveBeenCalled();
     expect(bridge.downloadToFolder).not.toHaveBeenCalled();
   });
 
   it("falls back to a browser download without a bridge", async () => {
-    expect(await downloadWithBridge({ url: "u", fileName: "f", bridge: undefined })).toEqual({
+    expect(
+      await downloadWithBridge({
+        prepare: async () => ({ url: "u", fileName: "f" }),
+        bridge: undefined,
+      }),
+    ).toEqual({
       _tag: "BrowserDownload",
       url: "u",
       fileName: "f",
@@ -47,7 +53,9 @@ describe("downloadWithBridge", () => {
 
   it("falls back to a browser download when the host cannot stream to a folder", async () => {
     const bridge = { pickFolder: vi.fn(async () => "/home/me/Downloads") };
-    expect(await downloadWithBridge({ url: "u", fileName: "f", bridge })).toEqual({
+    expect(
+      await downloadWithBridge({ prepare: async () => ({ url: "u", fileName: "f" }), bridge }),
+    ).toEqual({
       _tag: "BrowserDownload",
       url: "u",
       fileName: "f",

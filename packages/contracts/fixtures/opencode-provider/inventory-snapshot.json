@@ -38,6 +38,7 @@
     "auth": {
       "status": "authenticated"
     },
+    "skills": [],
     "commands": [
       {
         "name": "review",

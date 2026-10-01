@@ -1,5 +1,6 @@
 import { DEFAULT_SERVER_SETTINGS, EnvironmentId, ThreadId } from "@bibcode/contracts";
 import type { EditorId, ProjectEntry, VcsStatusResult } from "@bibcode/contracts";
+import { FileTree as FileTreeModel } from "@pierre/trees";
 import { renderToStaticMarkup } from "react-dom/server";
 import * as React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -750,6 +751,65 @@ describe("currentlyExpandedTreePaths", () => {
       "src/",
     ]);
   });
+
+  it("preserves expansion when a refresh replaces a file with nested directories", () => {
+    const model = new FileTreeModel({
+      paths: ["changed", "other/child/", "expanded/readme.md"],
+      flattenEmptyDirectories: false,
+      initialExpansion: 0,
+      initialExpandedPaths: ["expanded/"],
+    });
+    const nextEntries = [
+      entry("changed", "directory"),
+      entry("changed/child", "directory"),
+      entry("changed/child/new.txt", "file"),
+      entry("other/child", "directory"),
+      entry("expanded", "directory"),
+      entry("expanded/readme.md", "file"),
+    ];
+
+    // The real refresh reads incoming directory paths against the previous tree before resetting.
+    const initialExpandedPaths = currentlyExpandedTreePaths(
+      model,
+      expandedDirectoryTreePaths(nextEntries),
+    );
+    expect(initialExpandedPaths).toEqual(["expanded/"]);
+    model.resetPaths(["changed/child/new.txt", "other/child/", "expanded/readme.md"], {
+      initialExpandedPaths,
+    });
+    expect(model.getItem("changed/child/")?.isDirectory()).toBe(true);
+    expect(model.getVisibleRows(0, model.getVisibleCount() - 1).map((row) => row.path)).toEqual([
+      "changed/",
+      "expanded/",
+      "expanded/readme.md",
+      "other/",
+    ]);
+  });
+
+  it("drops a replaced directory's selected descendant while preserving surviving selection", () => {
+    const model = new FileTreeModel({
+      paths: ["changed/child.txt", "unchanged/child.txt"],
+      flattenEmptyDirectories: false,
+      initialExpansion: "open",
+    });
+    model.getItem("unchanged/child.txt")?.select();
+    model.getItem("changed/child.txt")?.select();
+    model.getItem("changed/child.txt")?.focus();
+
+    model.resetPaths(["changed", "unchanged/child.txt"], {
+      initialExpandedPaths: ["unchanged/"],
+    });
+
+    expect(model.getItem("changed/child.txt")).toBeNull();
+    expect(model.getItem("changed")?.isDirectory()).toBe(false);
+    expect(model.getSelectedPaths()).toEqual(["unchanged/child.txt"]);
+    expect(model.getFocusedPath()).toBe("unchanged/");
+    expect(model.getVisibleRows(0, model.getVisibleCount() - 1).map((row) => row.path)).toEqual([
+      "unchanged/",
+      "unchanged/child.txt",
+      "changed",
+    ]);
+  });
 });
 
 describe("path reset effect", () => {
@@ -1361,8 +1421,8 @@ describe("create entry", () => {
     );
   });
 
-  it("falls back to a generic message for non-Error failures", async () => {
-    testState.commandResults["createEntry"] = { _tag: "Failure", error: "weird" };
+  it("falls back to a generic message for failures without a message", async () => {
+    testState.commandResults["createEntry"] = { _tag: "Failure", error: { unexpected: true } };
     renderPanel();
     rowActionsFor("src", "directory").onNewFile();
     (lastDialogRequest()["onSubmit"] as (name: string) => void)("x.ts");
@@ -2044,6 +2104,25 @@ describe("download entry", () => {
     await flushPromises();
 
     expect(testState.toastAdd).not.toHaveBeenCalled();
+    expect(testState.commandCalls.some((call) => call.label === "createDownloadUrl")).toBe(false);
+  });
+
+  it("waits for the destination before minting a short-lived download URL", async () => {
+    const selected = deferred<string | null>();
+    const downloadToFolder = vi.fn(async () => "/home/me/Downloads/src.zip");
+    stubDesktopBridge({ pickFolder: () => selected.promise, downloadToFolder });
+    renderPanel();
+
+    rowActionsFor("src", "directory").onDownload();
+    await flushPromises();
+    expect(testState.commandCalls.some((call) => call.label === "createDownloadUrl")).toBe(false);
+
+    selected.resolve("/home/me/Downloads");
+    await flushPromises();
+    expect(downloadToFolder).toHaveBeenCalledOnce();
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Download saved" }),
+    );
   });
 
   it("hands the URL to the browser downloader without a desktop bridge", async () => {
@@ -2105,7 +2184,7 @@ describe("download entry", () => {
 
   it("refuses a minted URL that points away from this environment's server", async () => {
     // The desktop host streams this URL with host privileges, so a foreign origin must never
-    // reach it — the download is refused before the bridge is asked to do anything.
+    // reach its download command, even after choosing the destination.
     testState.commandResults["createDownloadUrl"] = {
       _tag: "Success",
       value: {
@@ -2116,7 +2195,7 @@ describe("download entry", () => {
       },
     };
     const downloadToFolder = vi.fn();
-    const pickFolder = vi.fn();
+    const pickFolder = vi.fn(async () => "/home/me/Downloads");
     stubDesktopBridge({ pickFolder, downloadToFolder });
     renderPanel();
 
@@ -2124,7 +2203,7 @@ describe("download entry", () => {
     await flushPromises();
 
     expect(downloadToFolder).not.toHaveBeenCalled();
-    expect(pickFolder).not.toHaveBeenCalled();
+    expect(pickFolder).toHaveBeenCalledOnce();
     expect(testState.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({
         type: "error",
@@ -2151,6 +2230,38 @@ describe("download entry", () => {
     );
   });
 
+  it.each([
+    "Could not write the download file: disk full",
+    { message: "Could not write the download file: disk full" },
+  ])(
+    "preserves native and structured failure details in the toast and diagnostics",
+    async (error) => {
+      const report = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        stubDesktopBridge({
+          pickFolder: vi.fn(async () => "/home/me/Downloads"),
+          downloadToFolder: vi.fn().mockRejectedValue(error),
+        });
+        renderPanel();
+        rowActionsFor("src", "directory").onDownload();
+        await flushPromises();
+
+        expect(testState.toastAdd).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: 'Failed to download "src"',
+            description: "Could not write the download file: disk full",
+          }),
+        );
+        expect(report).toHaveBeenCalledWith(
+          "[file-browser] operation failed",
+          expect.objectContaining({ message: "Could not write the download file: disk full" }),
+        );
+      } finally {
+        report.mockRestore();
+      }
+    },
+  );
+
   it("stays available while the workspace is unavailable", () => {
     renderPanel(baseProps({ workspaceUnavailable: "Workspace unavailable." }));
     const actions = rowMenuFor("src", "directory").props as {
@@ -2158,6 +2269,31 @@ describe("download entry", () => {
     };
     expect(actions.actions["onDownload"]).toEqual(expect.any(Function));
     expect(actions.actions["onUpload"]).toBeUndefined();
+  });
+
+  it("redacts signed transfer URLs from native failure diagnostics", async () => {
+    const report = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      stubDesktopBridge({
+        pickFolder: vi.fn(async () => "/home/me/Downloads"),
+        downloadToFolder: vi
+          .fn()
+          .mockRejectedValue(
+            "Download request failed (https://remote.example/api/transfers/secret-token)",
+          ),
+      });
+      renderPanel();
+      rowActionsFor("src", "directory").onDownload();
+      await flushPromises();
+
+      expect(report).toHaveBeenCalledOnce();
+      expect(JSON.stringify(report.mock.calls)).not.toContain("secret-token");
+      expect(testState.toastAdd).toHaveBeenCalledWith(
+        expect.objectContaining({ description: expect.stringContaining("[REDACTED]") }),
+      );
+    } finally {
+      report.mockRestore();
+    }
   });
 });
 

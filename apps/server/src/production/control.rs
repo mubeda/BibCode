@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Barrier, Notify};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     ServerConfig,
@@ -316,6 +316,9 @@ pub struct NativeServerControl {
     keybinding_issues: Arc<RwLock<Vec<Value>>>,
     providers: Arc<RwLock<Vec<Value>>>,
     provider_maintenance: ProviderMaintenance,
+    capability_tasks: TaskTracker,
+    capability_shutdown: CancellationToken,
+    capability_admission: Arc<std::sync::Mutex<()>>,
     full_provider_refresh_running: Arc<AtomicBool>,
     provider_refresh_state: Arc<std::sync::Mutex<ProviderRefreshState>>,
     activity_protocol_registered: Arc<AtomicBool>,
@@ -423,6 +426,9 @@ impl NativeServerControl {
             keybinding_issues: Arc::new(RwLock::new(loaded_keybindings.issues)),
             providers: Arc::new(RwLock::new(providers)),
             provider_maintenance,
+            capability_tasks: TaskTracker::new(),
+            capability_shutdown: CancellationToken::new(),
+            capability_admission: Arc::new(std::sync::Mutex::new(())),
             full_provider_refresh_running: Arc::new(AtomicBool::new(false)),
             provider_refresh_state: Arc::new(
                 std::sync::Mutex::new(ProviderRefreshState::default()),
@@ -726,6 +732,63 @@ impl NativeServerControl {
             None => self.providers.read().await.clone(),
         };
         json!({ "providers": providers })
+    }
+
+    pub(crate) async fn shutdown_capability_discovery(&self) {
+        {
+            let _guard = self
+                .capability_admission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.capability_shutdown.cancel();
+            self.capability_tasks.close();
+        }
+        self.capability_tasks.wait().await;
+    }
+
+    async fn provider_capabilities(
+        &self,
+        payload: &Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, Value> {
+        let failure =
+            |reason: String| json!({"_tag":"ServerProviderCapabilitiesError","reason":reason});
+        let instance_id = payload
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| failure("Select a provider to load skills.".to_owned()))?;
+        let cwd = payload
+            .get("cwd")
+            .and_then(Value::as_str)
+            .ok_or_else(|| failure("Select a workspace to load skills.".to_owned()))?;
+        let (generation, settings) = {
+            let _guard = self.settings_update_lock.lock().await;
+            let settings =
+                crate::server_settings::ProviderSettingsStore::new(&self.state_directory)
+                    .get()
+                    .await
+                    .map_err(|error| failure(error.to_string()))?;
+            (
+                self.settings_generation.load(Ordering::Acquire),
+                serde_json::to_value(settings).map_err(|error| failure(error.to_string()))?,
+            )
+        };
+        let result = provider_inventory::discover_capabilities(
+            &settings,
+            instance_id,
+            Path::new(cwd),
+            cancellation,
+        )
+        .await
+        .map_err(failure)?;
+        if self.settings_generation.load(Ordering::Acquire) != generation {
+            return Err(failure(
+                "Provider settings changed during skill discovery. Retry to reload the catalog."
+                    .to_owned(),
+            ));
+        }
+        Ok(result)
     }
 
     async fn publish_provider_update_state(
@@ -1545,6 +1608,41 @@ impl ProductionServerControl for NativeServerControl {
                     None => Ok(control.settings.read().await.clone()),
                 },
                 "server.updateSettings" => control.update_settings(payload).await,
+                "server.getProviderCapabilities" => {
+                    // This owner must finish supervised cleanup even if the RPC future is dropped.
+                    let task = {
+                        let _guard = control
+                            .capability_admission
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if control.capability_shutdown.is_cancelled() {
+                            return Err(
+                                json!({"_tag":"ServerProviderCapabilitiesError","reason":"Skill discovery is unavailable while the server is shutting down."}),
+                            );
+                        }
+                        let owner = control.clone();
+                        control.capability_tasks.spawn(async move {
+                            let cancellation = cancellation.child_token();
+                            let probe = owner.provider_capabilities(&payload, &cancellation);
+                            tokio::pin!(probe);
+                            tokio::select! {
+                                biased;
+                                () = owner.capability_shutdown.cancelled() => {
+                                    cancellation.cancel();
+                                    probe.await
+                                }
+                                result = &mut probe => result,
+                            }
+                        })
+                    };
+                    match task.await {
+                        Ok(result) => result,
+                        Err(error) if error.is_panic() => {
+                            std::panic::resume_unwind(error.into_panic())
+                        }
+                        Err(_) => Err(json!({"_tag":"RequestCancelled","method":method})),
+                    }
+                }
                 "server.refreshProviders" => {
                     // The task owns the manual-refresh guard through probe, publish,
                     // and completion recording even if the RPC future is dropped.
@@ -2315,6 +2413,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             "gitManagerTagOperations": true,
             "gitManagerLiveSignal": true,
             "gitManagerPullRequests": true,
+            "gitPullRequestBranchSelection": true,
             "pullRequestsReads": true,
             "pullRequestsMutations": true,
             "activityProtocolVersion": activity_protocol_registered.then_some(2),
@@ -2727,6 +2826,150 @@ mod tests {
         .await
         .expect("write settings");
         NativeServerControl::new(config, json!({"policy":"test"})).await
+    }
+
+    #[tokio::test]
+    async fn capability_rpc_keeps_user_skills_and_isolates_workspaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let control = scheduler_control(&temp).await;
+        let home = temp.path().join("home");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        for (root, name) in [
+            (&home, "personal"),
+            (&first, "first-repo"),
+            (&second, "second-repo"),
+        ] {
+            let directory = root.join(".agents/skills").join(name);
+            tokio::fs::create_dir_all(&directory).await.unwrap();
+            tokio::fs::write(directory.join("SKILL.md"), "# Skill")
+                .await
+                .unwrap();
+        }
+        let mut instances = control.settings.read().await["providerInstances"].clone();
+        instances["cursor"]["environment"] = json!([
+            {"name":"HOME","value":home,"sensitive":true},
+            {"name":"USERPROFILE","value":home}
+        ]);
+        instances["disabled"] = json!({"driver":"cursor","enabled":false,"config":{}});
+        control
+            .update_settings(json!({"patch":{"providerInstances":instances}}))
+            .await
+            .unwrap();
+        wait_for_full_refresh_idle(&control).await;
+        let before = control.providers.read().await.clone();
+        for (cwd, expected) in [(&first, "first-repo"), (&second, "second-repo")] {
+            let result = control
+                .call(
+                    "server.getProviderCapabilities",
+                    json!({"instanceId":"cursor","cwd":cwd}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let names = result["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|skill| skill["name"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(names, [expected, "personal"]);
+            assert_eq!(result["issues"], json!([]));
+        }
+        assert_eq!(
+            *control.providers.read().await,
+            before,
+            "scoped reads cannot publish global inventory"
+        );
+        for payload in [
+            json!({"instanceId":"cursor","cwd":"relative"}),
+            json!({"instanceId":"cursor","cwd":temp.path().join("missing")}),
+            json!({"instanceId":"unknown","cwd":first}),
+            json!({"instanceId":"disabled","cwd":first}),
+            json!({"instanceId":"grok","cwd":first}),
+        ] {
+            let error = control
+                .call(
+                    "server.getProviderCapabilities",
+                    payload,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error["_tag"], "ServerProviderCapabilitiesError");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capability_shutdown_reaps_abandoned_requests_and_closes_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let control = scheduler_control(&temp).await;
+        let sandbox = crate::test_support::TestSandbox::new("capability-shutdown");
+        let pid_file = sandbox.path("pid");
+        let binary = sandbox.executable_script(
+            "slow-provider",
+            "printf '%s' \"$$\" > \"$BIBCODE_TEST_PID\"\nexec sleep 60",
+            "",
+        );
+        let mut settings = control.settings.read().await.clone();
+        settings["providerInstances"]["codex"]["config"]["binaryPath"] = json!(binary);
+        settings["providerInstances"]["codex"]["environment"] = json!([
+            {"name":"HOME","value":sandbox.root()},
+            {"name":"BIBCODE_TEST_PID","value":pid_file}
+        ]);
+        tokio::fs::write(
+            &control.settings_path,
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .await
+        .unwrap();
+        let payload = json!({"instanceId":"codex","cwd":sandbox.root()});
+        let request = tokio::spawn(control.call(
+            "server.getProviderCapabilities",
+            payload.clone(),
+            CancellationToken::new(),
+        ));
+        let pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = tokio::fs::read_to_string(&pid_file).await
+                    && let Ok(pid) = raw.parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery child started");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            control.shutdown_capability_discovery(),
+        )
+        .await
+        .expect("shutdown drains discovery cleanup");
+        // SAFETY: signal 0 only checks liveness of the fixture PID.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "discovery child was not reaped"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let error = control
+            .call(
+                "server.getProviderCapabilities",
+                payload,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error["_tag"], "ServerProviderCapabilitiesError");
+        assert!(error["reason"].as_str().unwrap().contains("shutting down"));
     }
 
     async fn mutable_provider_registry(
@@ -6042,6 +6285,7 @@ mod tests {
             "gitManagerTagOperations",
             "gitManagerLiveSignal",
             "gitManagerPullRequests",
+            "gitPullRequestBranchSelection",
             "pullRequestsReads",
             "pullRequestsMutations",
         ] {

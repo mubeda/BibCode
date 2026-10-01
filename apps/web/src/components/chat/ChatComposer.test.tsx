@@ -72,6 +72,14 @@ const h = vi.hoisted(() => {
       error: null as string | null,
       isPending: false,
     },
+    capabilityCatalogs: [] as import("@bibcode/contracts").ServerProvider[],
+    capabilityOverride: undefined as
+      | import("@bibcode/contracts").ServerProviderCapabilities
+      | null
+      | undefined,
+    capabilityPending: false,
+    capabilityError: null as string | null,
+    retryCapabilities: vi.fn(),
     traitInputs: [] as unknown[],
     isMobile: false,
     terminalSurfaceOpen: false,
@@ -290,6 +298,27 @@ vi.mock("./McpStatusPopover", async (importOriginal) => ({
 // ---------------------------------------------------------------------------
 // State hooks and heavy state modules.
 // ---------------------------------------------------------------------------
+
+vi.mock("../../state/providerCapabilities", () => ({
+  useProviderCapabilities: (target: { instanceId: string }) => {
+    h.captures.push({ name: "useProviderCapabilities", props: { target } });
+    const catalog = h.capabilityCatalogs.find(
+      (provider) => provider.instanceId === target.instanceId,
+    );
+    return {
+      data:
+        h.capabilityOverride === undefined
+          ? catalog
+            ? { ...catalog, issues: [] }
+            : null
+          : h.capabilityOverride,
+      isPending: h.capabilityPending,
+      error: h.capabilityError,
+      refresh: h.retryCapabilities,
+      revalidateIfStale: vi.fn(),
+    };
+  },
+}));
 
 vi.mock("../../lib/composerPathSearchState", () => ({
   useComposerPathSearch: (target: unknown) => {
@@ -845,6 +874,7 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
   h.hostElements.length = 0;
   h.traitInputs.length = 0;
   publishSeededStoreState();
+  h.capabilityCatalogs = props.providerStatuses as ServerProvider[];
   const markup = renderToStaticMarkup(<ChatComposer {...props} />);
   flushQueuedEffects();
   return {
@@ -928,6 +958,9 @@ beforeEach(() => {
   h.captures.length = 0;
   h.hostElements.length = 0;
   h.editorSnapshot = null;
+  h.capabilityOverride = undefined;
+  h.capabilityPending = false;
+  h.capabilityError = null;
   h.pathSearch = { entries: [], error: null, isPending: false };
   h.isMobile = false;
   h.terminalSurfaceOpen = false;
@@ -1700,6 +1733,47 @@ describe("ChatComposer attachments", () => {
 // ---------------------------------------------------------------------------
 
 describe("ChatComposer command menu", () => {
+  it("uses the workspace catalog for both user skill suggestions and inline metadata", () => {
+    const personal = {
+      name: "personal",
+      path: "/home/me/.agents/skills/personal/SKILL.md",
+      enabled: true,
+      invocation: "dollar" as const,
+      scope: "user",
+    };
+    h.capabilityOverride = { slashCommands: [], agents: [], issues: [], skills: [personal] };
+    seedPrompt("$");
+    renderComposer({ gitCwd: "/another-worktree" });
+    expect(findCapture("useProviderCapabilities")["target"]).toMatchObject({
+      environmentId,
+      instanceId: codexInstanceId,
+      cwd: "/another-worktree",
+    });
+    const items = findCapture("ComposerCommandMenu")["items"] as Array<Record<string, unknown>>;
+    expect(items.map((item) => item["label"])).toEqual(["$personal"]);
+    expect(editorProps()["skills"]).toEqual([personal]);
+  });
+
+  it("keeps the skill menu and draft available during loading and failed discovery", () => {
+    h.capabilityOverride = null;
+    h.capabilityPending = true;
+    seedPrompt("$personal");
+    renderComposer();
+    expect(findCapture("ComposerCommandMenu")).toMatchObject({
+      isLoading: true,
+      loadingText: "Loading provider skills...",
+    });
+    h.capabilityPending = false;
+    h.capabilityError = "Could not load provider skills.";
+    renderComposer();
+    const menu = findCapture("ComposerCommandMenu");
+    expect(menu["issueText"]).toBe(h.capabilityError);
+    (menu["onRetry"] as () => void)();
+    expect(h.retryCapabilities).toHaveBeenCalledOnce();
+    expect(draftOf(threadRef)?.prompt).toBe("$personal");
+    expect(editorProps()["skills"]).toEqual([]);
+  });
+
   it("builds native file items from workspace entries while a reference trigger is active", () => {
     seedPrompt("hello @src");
     h.pathSearch = {
@@ -1762,7 +1836,7 @@ describe("ChatComposer command menu", () => {
     expect(menu["emptyStateText"]).toBe("No matching provider command or skill.");
   });
 
-  it("keeps unsupported dollar text and opens no menu", () => {
+  it("keeps an empty native skill menu reachable without changing dollar text", () => {
     const unsupportedProvider = {
       ...codexProvider,
       slashCommands: [],
@@ -1773,7 +1847,7 @@ describe("ChatComposer command menu", () => {
 
     renderComposer({ providerStatuses: [unsupportedProvider] });
 
-    expect(filterCaptures("ComposerCommandMenu")).toHaveLength(0);
+    expect(findCapture("ComposerCommandMenu")["items"]).toEqual([]);
     expect(draftOf(threadRef)?.prompt).toBe("$ordinary");
   });
 

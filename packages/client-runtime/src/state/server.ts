@@ -1,6 +1,7 @@
 import {
   type EnvironmentId,
   type ServerConfig,
+  type ServerProviderCapabilitiesInput,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
   WS_METHODS,
@@ -12,15 +13,20 @@ import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import {
   createAtomCommandScheduler,
   createEnvironmentRpcCommand,
+  createEnvironmentQueryAtomFamily,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
 } from "./runtime.ts";
+import { request } from "../rpc/client.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { applyServerConfigEvent } from "../rpc/sharedServerConfig.ts";
+
+export const PROVIDER_CAPABILITIES_STALE_TIME_MS = 30_000;
 
 export interface ServerConfigProjection {
   readonly config: ServerConfig;
   readonly latestEvent: ServerConfigStreamEvent;
+  readonly capabilitiesRevision: number;
 }
 
 export function applyServerConfigProjection(
@@ -31,7 +37,11 @@ export function applyServerConfigProjection(
     Option.getOrNull(Option.map(current, (projection) => projection.config)),
     event,
   );
-  return config === null ? Option.none() : Option.some({ config, latestEvent: event });
+  const previousRevision = Option.getOrNull(current)?.capabilitiesRevision ?? 0;
+  const capabilitiesRevision = previousRevision + (event.type === "keybindingsUpdated" ? 0 : 1);
+  return config === null
+    ? Option.none()
+    : Option.some({ config, latestEvent: event, capabilitiesRevision });
 }
 
 export function projectServerConfig(
@@ -105,6 +115,28 @@ export function createServerEnvironmentAtoms<R, E>(
 
   return {
     configValueAtom,
+    capabilitiesRevisionAtom: Atom.family((environmentId: EnvironmentId | null) =>
+      Atom.make((get) =>
+        environmentId === null
+          ? 0
+          : (Option.getOrNull(
+              AsyncResult.value(get(configProjection({ environmentId, input: {} }))),
+            )?.capabilitiesRevision ?? 0),
+      ),
+    ),
+    providerCapabilities: createEnvironmentQueryAtomFamily(runtime, {
+      label: "environment-data:server:provider-capabilities",
+      staleTimeMs: PROVIDER_CAPABILITIES_STALE_TIME_MS,
+      transportCutoffKey: ({
+        instanceId,
+        cwd,
+      }: ServerProviderCapabilitiesInput & { readonly revision: number }) => ({ instanceId, cwd }),
+      execute: ({
+        instanceId,
+        cwd,
+      }: ServerProviderCapabilitiesInput & { readonly revision: number }) =>
+        request(WS_METHODS.serverGetProviderCapabilities, { instanceId, cwd }),
+    }),
     settingsValueAtom,
     providersValueAtom,
     traceDiagnostics: createEnvironmentRpcQueryAtomFamily(runtime, {

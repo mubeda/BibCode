@@ -2,14 +2,24 @@ import type {
   EnvironmentId,
   GitActionProgressEvent,
   GitManagerCommitEntry,
+  GitRunStackedActionInput,
+  GitRunStackedActionResult,
   VcsStatusResult,
 } from "@bibcode/contracts";
 import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
+import { useDebouncedValue } from "@tanstack/react-pacer";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { GitPullRequestIcon } from "lucide-react";
-import { memo, type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, type ChangeEvent, useCallback, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
+import {
+  Combobox,
+  ComboboxInput,
+  ComboboxItem,
+  ComboboxList,
+  ComboboxPopup,
+} from "~/components/ui/combobox";
 import { PermissionButton } from "~/components/ui/permission-button";
 import {
   Dialog,
@@ -30,9 +40,11 @@ import {
 import { capitalize } from "effect/String";
 import { randomUUID } from "~/lib/utils";
 import { gitManagerEnvironment } from "~/state/gitManager";
+import { useServerConfigs } from "~/state/entities";
 import { useEnvironmentQuery } from "~/state/query";
 import { useGitStackedAction } from "~/state/sourceControlActions";
 import { vcsEnvironment } from "~/state/vcs";
+import { useAtomCommand } from "~/state/use-atom-command";
 
 import {
   createPullRequestAction,
@@ -68,7 +80,12 @@ export interface GitManagerCreatePullRequestDialogProps {
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly onOpenChange: (open: boolean) => void;
   /** Called once a pull request was created or found so the pane can refresh. */
-  readonly onSettled: () => void;
+  readonly onSettled: (result: GitRunStackedActionResult) => void;
+  /** Legacy combined actions review the request before committing and publishing. */
+  readonly commitInput?: Pick<
+    GitRunStackedActionInput,
+    "commitMessage" | "featureBranch" | "filePaths" | "commitStagedIndexAsIs"
+  >;
   /**
    * A host the caller already identified (the Pull Requests panel). It stands in for a
    * status that has not named the host yet; the server validates it when creating.
@@ -80,65 +97,113 @@ export interface GitManagerCreatePullRequestDialogProps {
  * The review surface in front of `create_pr`. Opening it reads local status
  * only; nothing is published or created until the primary action is chosen.
  */
-export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreatePullRequestDialog({
+export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreatePullRequestDialog(
+  props: GitManagerCreatePullRequestDialogProps,
+) {
+  return props.open ? (
+    <CreatePullRequestReviewDialog
+      key={JSON.stringify([props.scope.environmentId, props.scope.cwd])}
+      {...props}
+    />
+  ) : null;
+});
+
+function CreatePullRequestReviewDialog({
   open,
   scope,
   onOpenChange,
   onSettled,
   providerHint = null,
+  commitInput,
 }: GitManagerCreatePullRequestDialogProps) {
   const { environmentId, cwd } = scope;
+  const serverConfig = useServerConfigs().get(environmentId) ?? null;
+  const capabilityBlockedReason =
+    serverConfig === null
+      ? "Checking server support…"
+      : serverConfig.environment.capabilities.gitPullRequestBranchSelection === true
+        ? null
+        : "Update this environment's BiBCode server to select source and target branches.";
+  const [baseBranch, setBaseBranch] = useState<string | null>(null);
+  const [headBranch, setHeadBranch] = useState<string | null | undefined>(undefined);
+  const [headSearch, setHeadSearch] = useState<string | undefined>(undefined);
+  const selectedHead = useRef<string | null>(null);
+  const [branchSearch, setBranchSearch] = useState("");
   const statusAtom = useMemo(
     () => (open ? vcsEnvironment.status({ environmentId, input: { cwd } }) : null),
     [cwd, environmentId, open],
   );
+  const statusQuery = useEnvironmentQuery(statusAtom);
+  const refreshStatusQuery = statusQuery.refresh;
+  const status: VcsStatusResult | null = statusQuery.data ?? null;
+  const snapshotAtom = useMemo(
+    () =>
+      capabilityBlockedReason === null
+        ? gitManagerEnvironment.getRefs({ environmentId, input: { cwd } })
+        : null,
+    [capabilityBlockedReason, cwd, environmentId],
+  );
+  const snapshot = useEnvironmentQuery(snapshotAtom).data;
+  const defaultSource =
+    commitInput !== undefined ||
+    snapshot?.remoteBranches.some((branch) => branch.name === `origin/${status?.refName}`)
+      ? (status?.refName ?? null)
+      : null;
+  const sourceBranch = headBranch === undefined ? defaultSource : headBranch;
+  const sourceTip =
+    snapshot?.localBranches.find((branch) => branch.name === sourceBranch)?.tipSha ??
+    snapshot?.remoteBranches.find((branch) => branch.name === `origin/${sourceBranch}`)?.tipSha;
   const latestCommitAtom = useMemo(
     () =>
-      open
-        ? gitManagerEnvironment.getCommits({ environmentId, input: { cwd, offset: 0, limit: 1 } })
+      sourceTip
+        ? gitManagerEnvironment.getCommits({
+            environmentId,
+            input: { cwd, pinnedTips: [sourceTip], offset: 0, limit: 1 },
+          })
         : null,
-    [cwd, environmentId, open],
+    [cwd, environmentId, sourceTip],
   );
-  const statusQuery = useEnvironmentQuery(statusAtom);
   const latestCommitQuery = useEnvironmentQuery(latestCommitAtom);
-  const status: VcsStatusResult | null = statusQuery.data ?? null;
-  const latestCommit: GitManagerCommitEntry | null = latestCommitQuery.data?.commits[0] ?? null;
+  const candidateCommit = latestCommitQuery.data?.commits[0];
+  const latestCommit: GitManagerCommitEntry | null =
+    candidateCommit?.sha === sourceTip ? (candidateCommit ?? null) : null;
   const review = useMemo(
     () =>
       status === null
         ? null
-        : resolveCreatePullRequestReview({ status, latestCommit, providerHint }),
-    [latestCommit, providerHint, status],
+        : resolveCreatePullRequestReview({
+            status,
+            latestCommit,
+            providerHint,
+            commitBeforeCreate: commitInput !== undefined,
+            headBranch: sourceBranch,
+          }),
+    [commitInput, sourceBranch, latestCommit, providerHint, status],
   );
   const provider = review === null ? hintedProvider(providerHint) : review.provider;
   // Until status answers, only a caller's hint names the host; without one stay neutral.
   const noun = resolveStatusChangeRequestPresentation(provider, review !== null).longName;
   const waitReason = `Wait for the ${noun} to finish.`;
 
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
+  const [editedTitle, setTitle] = useState<string>();
+  const [editedBody, setBody] = useState<string>();
+  const title = editedTitle ?? review?.defaultTitle ?? "";
+  const body = editedBody ?? review?.defaultBody ?? "";
   const [progress, setProgress] = useState<CreatePullRequestProgress>(REVIEW_PROGRESS);
-  const seededDefaultsRef = useRef<string | null>(null);
   const running = progress.kind === "running";
-
-  // Seed the editable fields from the latest commit once per opened review, and
-  // start every review from a clean slate when the dialog closes.
-  useEffect(() => {
-    if (!open) {
-      seededDefaultsRef.current = null;
-      setTitle("");
-      setBody("");
-      setProgress(REVIEW_PROGRESS);
-      return;
+  const [previousHead, setPreviousHead] = useState(review?.head);
+  if (previousHead !== review?.head) {
+    setPreviousHead(review?.head);
+    if (progress.kind === "review" || progress.kind === "failed") {
+      setBaseBranch(null);
+      setBranchSearch("");
     }
-    if (review === null || seededDefaultsRef.current !== null) return;
-    seededDefaultsRef.current = latestCommit?.sha ?? "";
-    setTitle(review.defaultTitle);
-    setBody(review.defaultBody);
-  }, [latestCommit?.sha, open, review]);
+  }
 
   const stackedAction = useGitStackedAction(scope);
   const runStackedAction = stackedAction.run;
+  const refreshStatus = useAtomCommand(vcsEnvironment.refreshStatus, { reportFailure: false });
+  const attemptedHead = useRef<string | null>(null);
   const presentation =
     review === null
       ? null
@@ -150,6 +215,7 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
   const busy = presentation?.busy === true;
   const settled = presentation?.settled === true;
   const trimmedTitle = title.trim();
+  const blockedReason = capabilityBlockedReason ?? review?.blockedReason ?? null;
   const primaryDisabledReason =
     review === null
       ? "Reading repository status…"
@@ -157,12 +223,16 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
         ? waitReason
         : settled
           ? null
-          : (review.blockedReason ??
+          : (blockedReason ??
             (review.existingPullRequest !== null
               ? `A ${noun} already exists for this branch.`
               : trimmedTitle.length === 0
                 ? `Enter a title for the ${noun}.`
-                : null));
+                : baseBranch === null
+                  ? "Select a target branch."
+                  : !commitInput?.featureBranch && baseBranch === review.head
+                    ? "Select a target branch different from the source branch."
+                    : null));
 
   const onProgress = useCallback((event: GitActionProgressEvent) => {
     setProgress((current) => reduceCreatePullRequestProgress(current, event));
@@ -173,10 +243,54 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
       onOpenChange(false);
       return;
     }
-    if (primaryDisabledReason !== null) return;
+    if (primaryDisabledReason !== null || baseBranch === null) return;
+    const retrying = progress.kind === "failed";
     setProgress({ kind: "running", phase: null, pushed: false });
+    let remainingCommit = commitInput;
+    if (retrying && commitInput !== undefined) {
+      // Native failures can arrive without a phase. Read Git before resuming
+      // so a completed feature branch/commit is not attempted a second time.
+      const refreshed = await refreshStatus({ environmentId, input: { cwd } });
+      if (!AsyncResult.isSuccess(refreshed)) {
+        setProgress((current) =>
+          failCreatePullRequestProgress(
+            current,
+            failureMessage(squashAtomCommandFailure(refreshed), noun),
+          ),
+        );
+        return;
+      }
+      if (refreshed.value.refName !== selectedHead.current) {
+        setBaseBranch(null);
+        setBranchSearch("");
+        setProgress({
+          kind: "failed",
+          phase: null,
+          branchPublished: false,
+          message:
+            "The source branch changed. Select a target branch to review the current branch before retrying.",
+        });
+        refreshStatusQuery();
+        return;
+      }
+      if (!refreshed.value.hasWorkingTreeChanges) remainingCommit = undefined;
+      else if (refreshed.value.refName !== attemptedHead.current)
+        remainingCommit = { ...commitInput, featureBranch: false };
+    } else {
+      attemptedHead.current = sourceBranch;
+    }
     const result = await runStackedAction({
-      ...createPullRequestAction(randomUUID(), { title: trimmedTitle, body }),
+      ...createPullRequestAction(randomUUID(), {
+        title: trimmedTitle,
+        body,
+        baseBranch,
+        ...(!remainingCommit?.featureBranch && sourceBranch ? { headBranch: sourceBranch } : {}),
+      }),
+      ...(remainingCommit?.commitMessage ? { commitMessage: remainingCommit.commitMessage } : {}),
+      ...(remainingCommit?.featureBranch ? { featureBranch: true } : {}),
+      ...(remainingCommit?.filePaths ? { filePaths: [...remainingCommit.filePaths] } : {}),
+      ...(remainingCommit?.commitStagedIndexAsIs ? { commitStagedIndexAsIs: true } : {}),
+      action: remainingCommit === undefined ? "create_pr" : "commit_push_pr",
       onProgress,
     });
     if (AsyncResult.isSuccess(result)) {
@@ -191,13 +305,20 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
               result: result.value,
             }),
       );
-      onSettled();
+      onSettled(result.value);
       return;
     }
     const failure = squashAtomCommandFailure(result);
     setProgress((current) => failCreatePullRequestProgress(current, failureMessage(failure, noun)));
   }, [
     body,
+    baseBranch,
+    commitInput,
+    environmentId,
+    progress.kind,
+    refreshStatus,
+    sourceBranch,
+    refreshStatusQuery,
     cwd,
     onOpenChange,
     onProgress,
@@ -216,14 +337,12 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
     },
     [onOpenChange, running],
   );
-  const changeTitle = useCallback(
-    (event: ChangeEvent<HTMLInputElement>) => setTitle(event.target.value),
-    [],
-  );
-  const changeBody = useCallback(
-    (event: ChangeEvent<HTMLTextAreaElement>) => setBody(event.target.value),
-    [],
-  );
+  const changeTitle = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    setTitle(event.target.value);
+  }, []);
+  const changeBody = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => {
+    setBody(event.target.value);
+  }, []);
 
   const outcomeUrl =
     progress.kind === "created" || progress.kind === "existing"
@@ -231,7 +350,13 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
       : review?.existingPullRequest === null
         ? null
         : safeExternalUrl(review?.existingPullRequest?.url ?? null);
-  const fieldsDisabled = busy || settled || review?.blockedReason !== null;
+  const fieldsDisabled = busy || settled || review === null || blockedReason !== null;
+  const branchFieldsDisabled =
+    busy ||
+    settled ||
+    capabilityBlockedReason !== null ||
+    status?.isRepo !== true ||
+    provider === null;
   const statusText =
     presentation?.status ?? (review === null ? "Reading repository status…" : null);
 
@@ -244,7 +369,9 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
       >
         <DialogHeader className="pb-4">
           <DialogTitle>Create {noun}</DialogTitle>
-          <DialogDescription>Review the {noun} before anything is published.</DialogDescription>
+          <DialogDescription>
+            {capabilityBlockedReason ?? `Review the ${noun} before anything is published.`}
+          </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-5">
           <section
@@ -265,26 +392,50 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
                         : "Not identified yet"}
                 </dd>
               </div>
-              <div className="grid grid-cols-[6rem_minmax(0,1fr)] items-center gap-4 py-2.5">
-                <dt className="whitespace-nowrap text-muted-foreground">Base branch</dt>
-                <dd
-                  className="min-w-0 justify-self-end break-all rounded-md bg-background px-2 py-1 font-mono text-xs"
-                  data-testid="create-pr-base"
-                >
-                  {review?.base ?? "…"}
-                </dd>
-              </div>
-              <div className="grid grid-cols-[6rem_minmax(0,1fr)] items-center gap-4 py-2.5">
-                <dt className="whitespace-nowrap text-muted-foreground">Head branch</dt>
-                <dd
-                  className="min-w-0 justify-self-end break-all rounded-md bg-background px-2 py-1 text-right font-mono text-xs"
-                  data-testid="create-pr-head"
-                >
-                  {review === null ? "…" : (review.head ?? "No branch checked out")}
-                </dd>
-              </div>
             </dl>
           </section>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="git-manager-create-pr-head">Source branch</Label>
+            <BranchPicker
+              scope={scope}
+              id="git-manager-create-pr-head"
+              helpId="create-pr-source-help"
+              placeholder="Select a source branch…"
+              value={review?.head ?? null}
+              onChange={setHeadBranch}
+              search={headSearch ?? review?.head ?? ""}
+              onSearchChange={setHeadSearch}
+              disabled={branchFieldsDisabled || commitInput !== undefined}
+            />
+            <p id="create-pr-source-help" className="text-xs text-muted-foreground">
+              {commitInput?.featureBranch
+                ? `A new source branch will be created from ${review?.head ?? "the current branch"} for this commit.`
+                : commitInput !== undefined
+                  ? "Committing uses the current branch. To select another source, create a request without committing."
+                  : "Choose a branch on origin. Push or fetch first if it is missing. Your checkout stays unchanged."}
+            </p>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="git-manager-create-pr-base">Target branch (required)</Label>
+            <BranchPicker
+              scope={scope}
+              id="git-manager-create-pr-base"
+              helpId="create-pr-target-help"
+              placeholder="Select a target branch…"
+              value={baseBranch}
+              onChange={(value) => {
+                setBaseBranch(value);
+                selectedHead.current = review?.head ?? null;
+              }}
+              search={branchSearch}
+              onSearchChange={setBranchSearch}
+              excludedBranch={commitInput?.featureBranch ? null : (review?.head ?? null)}
+              disabled={branchFieldsDisabled}
+            />
+            <p id="create-pr-target-help" className="text-xs text-muted-foreground">
+              Choose the branch on origin that should receive these changes.
+            </p>
+          </div>
           <div
             className="rounded-lg border border-border/70 px-3 py-2.5 text-xs"
             data-testid="create-pr-publish"
@@ -293,9 +444,11 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
             <p className="mt-1 text-muted-foreground">
               {review === null
                 ? "Reading branch status…"
-                : review.publishRequired
-                  ? `${review.head ?? "The branch"} is not on the remote yet and will be published first.`
-                  : "The branch is already published."}
+                : review.head !== status?.refName
+                  ? `Any local commits on ${review.head ?? "the selected branch"} will be published to origin first.`
+                  : review.publishRequired
+                    ? `${review.head ?? "The branch"} is not on the remote yet and will be published first.`
+                    : "The branch is already published."}
             </p>
           </div>
           {review?.existingPullRequest === null ||
@@ -343,7 +496,7 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
               />
             </div>
           </section>
-          {statusText === null && review?.blockedReason === null ? null : (
+          {statusText === null && review?.blockedReason == null ? null : (
             <p
               aria-live="polite"
               className={
@@ -387,10 +540,162 @@ export const GitManagerCreatePullRequestDialog = memo(function GitManagerCreateP
             }}
           >
             <GitPullRequestIcon aria-hidden="true" />
-            {presentation?.primaryLabel ?? `Create ${noun}`}
+            {commitInput !== undefined && progress.kind === "review"
+              ? `Commit, publish and create ${noun}`
+              : (presentation?.primaryLabel ?? `Create ${noun}`)}
           </PermissionButton>
         </DialogFooter>
       </DialogPopup>
     </Dialog>
   );
-});
+}
+
+/** Shared branch lookup keeps both selectors searchable and paginated. */
+function BranchPicker({
+  scope,
+  id,
+  helpId,
+  placeholder,
+  value,
+  onChange,
+  search,
+  onSearchChange,
+  excludedBranch = null,
+  disabled,
+}: {
+  readonly scope: GitManagerCreatePullRequestDialogProps["scope"];
+  readonly id: string;
+  readonly helpId: string;
+  readonly placeholder: string;
+  readonly value: string | null;
+  readonly onChange: (value: string | null) => void;
+  readonly search: string;
+  readonly onSearchChange: (value: string) => void;
+  readonly excludedBranch?: string | null;
+  readonly disabled: boolean;
+}) {
+  const { environmentId, cwd } = scope;
+  const filterSearch = search === value ? "" : search.trim();
+  const [branchQuery] = useDebouncedValue(filterSearch, { wait: 200 });
+  const [branchPage, setBranchPage] = useState({ query: "", cursor: 0 });
+  const branchCursor = branchPage.query === branchQuery ? branchPage.cursor : 0;
+  const refsAtom = useMemo(
+    () =>
+      vcsEnvironment.listRefs({
+        environmentId,
+        input: {
+          cwd,
+          limit: 100,
+          cursor: branchCursor,
+          includeMatchingRemoteRefs: true,
+          refKind: "remote",
+          ...(branchQuery ? { query: branchQuery } : {}),
+        },
+      }),
+    [branchCursor, branchQuery, cwd, environmentId],
+  );
+  const refsQuery = useEnvironmentQuery(refsAtom);
+  const searchingBranches = refsQuery.isPending || branchQuery !== filterSearch;
+  const branches = useMemo(
+    () =>
+      [
+        ...new Set(
+          (refsQuery.data?.refs ?? []).flatMap((ref) => {
+            if (!ref.isRemote || ref.remoteName !== "origin") return [];
+            const name = ref.name.replace(/^origin\//, "");
+            return name === "HEAD" || name === excludedBranch ? [] : [name];
+          }),
+        ),
+      ]
+        .filter((name) =>
+          name.toLowerCase().includes(
+            filterSearch
+              .trim()
+              .replace(/^origin\//, "")
+              .toLowerCase(),
+          ),
+        )
+        .sort(),
+    [filterSearch, excludedBranch, refsQuery.data],
+  );
+  return (
+    <Combobox
+      items={branches}
+      filter={null}
+      value={value}
+      inputValue={search}
+      onValueChange={(value) => {
+        onChange(value);
+      }}
+      onInputValueChange={(value, details) => {
+        onSearchChange(value);
+        if (details.reason === "input-change") onChange(null);
+      }}
+      disabled={disabled}
+    >
+      <ComboboxInput
+        id={id}
+        placeholder={placeholder}
+        aria-required="true"
+        aria-describedby={helpId}
+        maxLength={256}
+        showClear
+      />
+      <ComboboxPopup data-text-surface="popover">
+        <ComboboxList>
+          {(branch: string) => (
+            <ComboboxItem key={branch} value={branch}>
+              {branch}
+            </ComboboxItem>
+          )}
+        </ComboboxList>
+        {searchingBranches ? (
+          <p role="status" className="p-2 text-sm">
+            Loading branches…
+          </p>
+        ) : null}
+        {refsQuery.error ? (
+          <div className="p-2 text-sm">
+            <p role="alert">Could not load branches.</p>
+            <Button size="sm" onClick={refsQuery.refresh}>
+              Retry
+            </Button>
+          </div>
+        ) : null}
+        {!searchingBranches && !refsQuery.error && branches.length === 0 ? (
+          <p className="p-2 text-sm text-muted-foreground">
+            No matching branches on origin. Fetch the repository to update the list.
+          </p>
+        ) : null}
+        {branchCursor > 0 || refsQuery.data?.nextCursor != null ? (
+          <div className="flex justify-between gap-2 p-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={branchCursor === 0 || searchingBranches}
+              onClick={() =>
+                setBranchPage({
+                  query: branchQuery,
+                  cursor: Math.max(0, branchCursor - 100),
+                })
+              }
+            >
+              Previous branches
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={refsQuery.data?.nextCursor == null || searchingBranches}
+              onClick={() => {
+                if (refsQuery.data?.nextCursor != null)
+                  setBranchPage({ query: branchQuery, cursor: refsQuery.data.nextCursor });
+              }}
+            >
+              Next branches
+            </Button>
+          </div>
+        ) : null}
+      </ComboboxPopup>
+    </Combobox>
+  );
+}

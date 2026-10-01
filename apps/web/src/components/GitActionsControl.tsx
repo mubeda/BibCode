@@ -50,6 +50,10 @@ import {
   resolveThreadBranchUpdate,
 } from "./GitActionsControl.logic";
 import { AnimatedHeight } from "./AnimatedHeight";
+import {
+  GitManagerCreatePullRequestDialog,
+  type GitManagerCreatePullRequestDialogProps,
+} from "./gitManager/provider/GitManagerCreatePullRequestDialog";
 import { Button } from "~/components/ui/button";
 import { Checkbox } from "~/components/ui/checkbox";
 import {
@@ -1009,6 +1013,10 @@ export default function GitActionsControl({
   const [excludedFiles, setExcludedFiles] = useState<ReadonlySet<string>>(new Set());
   const [isEditingFiles, setIsEditingFiles] = useState(false);
   const [isPublishDialogOpen, setIsPublishDialogOpen] = useState(false);
+  const [pendingPullRequest, setPendingPullRequest] = useState<{
+    scope: GitManagerCreatePullRequestDialogProps["scope"];
+    commitInput?: GitManagerCreatePullRequestDialogProps["commitInput"];
+  } | null>(null);
   const [pendingDefaultBranchAction, setPendingDefaultBranchAction] =
     useState<PendingDefaultBranchAction | null>(null);
   const activeGitActionProgressRef = useRef<ActiveGitActionProgress | null>(null);
@@ -1293,6 +1301,22 @@ export default function GitActionsControl({
         });
         return;
       }
+      if (action === "create_pr" || action === "commit_push_pr") {
+        if (activeEnvironmentId === null || gitCwd === null) return;
+        setPendingPullRequest({
+          scope: { environmentId: activeEnvironmentId, cwd: gitCwd },
+          ...(action === "commit_push_pr"
+            ? {
+                commitInput: {
+                  ...(commitMessage ? { commitMessage } : {}),
+                  ...(filePaths ? { filePaths } : {}),
+                  ...(featureBranch ? { featureBranch: true } : {}),
+                },
+              }
+            : {}),
+        });
+        return;
+      }
       onConfirmed?.();
 
       const progressStages = buildGitActionProgressStages({
@@ -1301,9 +1325,6 @@ export default function GitActionsControl({
         hasWorkingTreeChanges: !!actionStatus?.hasWorkingTreeChanges,
         featureBranch,
         terminology: changeRequestTerminology,
-        shouldPushBeforePr:
-          action === "create_pr" &&
-          (!actionStatus?.hasUpstream || (actionStatus?.aheadCount ?? 0) > 0),
       });
       const scopedToastData = threadToastData ? { ...threadToastData } : undefined;
       const actionId = randomUUID();
@@ -2001,6 +2022,23 @@ export default function GitActionsControl({
         </DialogPopup>
       </Dialog>
 
+      {pendingPullRequest !== null &&
+      pendingPullRequest.scope.environmentId === activeEnvironmentId &&
+      pendingPullRequest.scope.cwd === gitCwd ? (
+        <GitManagerCreatePullRequestDialog
+          open
+          scope={pendingPullRequest.scope}
+          {...(pendingPullRequest.commitInput
+            ? { commitInput: pendingPullRequest.commitInput }
+            : {})}
+          onOpenChange={(open) => {
+            if (!open) setPendingPullRequest(null);
+          }}
+          onSettled={(result) => {
+            void syncThreadBranchAfterGitAction(result);
+          }}
+        />
+      ) : null}
       <PublishRepositoryDialog
         open={isPublishDialogOpen}
         onOpenChange={setIsPublishDialogOpen}

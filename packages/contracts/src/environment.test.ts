@@ -77,14 +77,20 @@ describe("execution environment contracts", () => {
     expect(legacy.capabilities).toMatchObject({
       pullRequestsReads: false,
       pullRequestsMutations: false,
+      gitPullRequestBranchSelection: false,
     });
     const current = decodeExecutionEnvironmentDescriptor({
       ...legacy,
-      capabilities: { pullRequestsReads: true, pullRequestsMutations: true },
+      capabilities: {
+        pullRequestsReads: true,
+        pullRequestsMutations: true,
+        gitPullRequestBranchSelection: true,
+      },
     });
     expect(current.capabilities).toMatchObject({
       pullRequestsReads: true,
       pullRequestsMutations: true,
+      gitPullRequestBranchSelection: true,
     });
   });
   it("defaults ordered terminal input support to false when omitted", () => {

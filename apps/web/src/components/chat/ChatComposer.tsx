@@ -58,6 +58,7 @@ import {
   removeInlineTerminalContextPlaceholder,
 } from "../../lib/terminalContext";
 import { useComposerPathSearch } from "../../lib/composerPathSearchState";
+import { useProviderCapabilities } from "../../state/providerCapabilities";
 import { type ElementContextDraft } from "../../lib/elementContext";
 import { ComposerPendingElementContexts } from "./ComposerPendingElementContexts";
 import { ComposerPendingReviewComments } from "./ComposerPendingReviewComments";
@@ -784,8 +785,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   });
 
   // Resolve the active instance's snapshot by `instanceId` so a custom
-  // instance gets its own slash commands, skills, and model list — not
-  // the first snapshot for the same driver kind.
+  // instance gets its own model list and readiness state.
   const selectedProviderEntry = useMemo(
     () => providerInstanceEntries.find((entry) => entry.instanceId === selectedInstanceId),
     [providerInstanceEntries, selectedInstanceId],
@@ -794,9 +794,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     () => selectedProviderEntry?.snapshot ?? null,
     [selectedProviderEntry],
   );
+  const providerCapabilities = useProviderCapabilities({
+    environmentId,
+    instanceId: selectedInstanceId,
+    cwd: gitCwd,
+  });
+  const nativeSkillInvocation =
+    selectedProviderEntry?.driverKind === "codex"
+      ? "dollar"
+      : selectedProviderEntry &&
+          ["claudeAgent", "cursor", "opencode"].includes(selectedProviderEntry.driverKind)
+        ? "slash"
+        : undefined;
   const composerCapabilities = useMemo(
-    () => deriveComposerCapabilityProfile(selectedProviderStatus),
-    [selectedProviderStatus],
+    () => deriveComposerCapabilityProfile(providerCapabilities.data, nativeSkillInvocation),
+    [providerCapabilities.data, nativeSkillInvocation],
   );
   const composerInlineTokenContext = useMemo<ComposerInlineTokenContext>(
     () => ({
@@ -1039,6 +1051,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const composerMenuItems = composerMenuResult.items;
 
   const composerMenuOpen = Boolean(composerTrigger);
+  const { revalidateIfStale: revalidateProviderCapabilitiesIfStale } = providerCapabilities;
+  useEffect(() => {
+    if (composerMenuOpen) revalidateProviderCapabilitiesIfStale();
+  }, [composerMenuOpen, revalidateProviderCapabilitiesIfStale]);
   const composerMenuSearchKey = composerTrigger
     ? `${composerTrigger.kind}:${composerTrigger.query.trim().toLowerCase()}`
     : null;
@@ -1102,10 +1118,18 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     showPlanFollowUpPrompt,
   ]);
 
+  const isProviderCapabilityMenu =
+    composerTriggerKind === "provider-dollar-skill" ||
+    composerTriggerKind === "provider-slash" ||
+    composerTriggerKind === "provider-reference";
   const isComposerMenuLoading =
-    composerTriggerKind === "provider-reference" &&
-    pathTriggerQuery.length > 0 &&
-    workspaceEntries.isPending;
+    (isProviderCapabilityMenu && providerCapabilities.isPending) ||
+    (composerTriggerKind === "provider-reference" &&
+      pathTriggerQuery.length > 0 &&
+      workspaceEntries.isPending);
+  const capabilityIssue = isProviderCapabilityMenu
+    ? (providerCapabilities.error ?? providerCapabilities.data?.issues[0] ?? null)
+    : null;
 
   // ------------------------------------------------------------------
   // Provider traits UI
@@ -2428,6 +2452,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   items={composerMenuItems}
                   resolvedTheme={resolvedTheme}
                   isLoading={isComposerMenuLoading}
+                  loadingText={
+                    isProviderCapabilityMenu && providerCapabilities.isPending
+                      ? "Loading provider skills..."
+                      : "Searching workspace files..."
+                  }
+                  issueText={capabilityIssue}
+                  onRetry={providerCapabilities.refresh}
                   emptyStateText={composerMenuResult.emptyStateText}
                   activeItemId={activeComposerMenuItem?.id ?? null}
                   onHighlightedItemChange={onComposerMenuItemHighlighted}
@@ -2629,7 +2660,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     ? composerTerminalContexts
                     : []
                 }
-                skills={selectedProviderStatus?.skills ?? []}
+                skills={providerCapabilities.data?.skills ?? []}
                 agents={composerCapabilities.mentionableAgents}
                 {...(showMobilePendingAnswerActions ? { className: "max-sm:pb-11" } : {})}
                 onRemoveTerminalContext={removeComposerTerminalContextFromDraft}

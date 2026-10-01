@@ -58,6 +58,9 @@ export const ComposerCommandMenu = memo(function ComposerCommandMenu(props: {
   items: ReadonlyArray<ComposerCommandItem>;
   resolvedTheme: "light" | "dark";
   isLoading: boolean;
+  loadingText?: string;
+  issueText?: string | null;
+  onRetry?: () => void;
   emptyStateText?: string;
   activeItemId: string | null;
   onHighlightedItemChange: (itemId: string | null) => void;
@@ -86,6 +89,7 @@ export const ComposerCommandMenu = memo(function ComposerCommandMenu(props: {
     >
       <div
         ref={listRef}
+        data-text-surface
         aria-busy={props.isLoading ? "true" : "false"}
         data-composer-menu="true"
         data-composer-menu-loading={props.isLoading ? "true" : "false"}
@@ -123,19 +127,37 @@ export const ComposerCommandMenu = memo(function ComposerCommandMenu(props: {
                 role="status"
                 className="border-t border-border/60 px-3 py-1.5 text-xs text-muted-foreground"
               >
-                Searching workspace files...
+                {props.loadingText ?? "Searching workspace files..."}
               </p>
             ) : null}
           </>
-        ) : (
+        ) : props.isLoading || !props.issueText ? (
           <div className="px-5 py-3.5">
             <p className="text-muted-foreground text-xs">
               {props.isLoading
-                ? "Searching workspace files..."
+                ? (props.loadingText ?? "Searching workspace files...")
                 : (props.emptyStateText ?? "No matching command.")}
             </p>
           </div>
-        )}
+        ) : null}
+        {props.issueText ? (
+          <div className="flex items-center gap-3 border-t border-border/60 px-3 py-2">
+            <p role="status" className="min-w-0 flex-1 text-xs text-muted-foreground">
+              {props.issueText}
+            </p>
+            {props.onRetry ? (
+              <button
+                type="button"
+                className="shrink-0 rounded-md px-3 py-2 text-xs underline hover:bg-accent disabled:opacity-50"
+                disabled={props.isLoading}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={props.onRetry}
+              >
+                Retry
+              </button>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     </Command>
   );

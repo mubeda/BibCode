@@ -28,22 +28,24 @@ export type DownloadOutcome =
  * On the desktop the host asks for a destination folder and streams the transfer itself, so the
  * download never silently overwrites a local file (the host uniquifies the name). Everywhere else
  * the caller hands the URL to the browser, which applies its own download location and rules.
+ * Mint only after the picker settles so waiting for a destination cannot expire the token.
  */
 export async function downloadWithBridge(input: {
-  url: string;
-  fileName: string;
+  prepare: () => Promise<{ url: string; fileName: string } | null>;
   bridge: TransferBridge | undefined;
 }): Promise<DownloadOutcome> {
   const { bridge } = input;
   if (bridge?.downloadToFolder === undefined) {
-    return { _tag: "BrowserDownload", url: input.url, fileName: input.fileName };
+    const prepared = await input.prepare();
+    return prepared === null ? { _tag: "Cancelled" } : { _tag: "BrowserDownload", ...prepared };
   }
   const directory = await bridge.pickFolder({ initialPath: null });
   if (directory === null) return { _tag: "Cancelled" };
+  const prepared = await input.prepare();
+  if (prepared === null) return { _tag: "Cancelled" };
   const path = await bridge.downloadToFolder({
-    url: input.url,
+    ...prepared,
     directory,
-    fileName: input.fileName,
   });
   return { _tag: "Saved", path };
 }
