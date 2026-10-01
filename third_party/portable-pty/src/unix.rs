@@ -134,7 +134,7 @@ fn tty_name(fd: RawFd) -> Option<PathBuf> {
 
 /// On Big Sur, Cocoa leaks various file descriptors to child processes,
 /// so we need to make a pass through the open descriptors beyond just the
-/// stdio descriptors and close them all out.
+/// stdio descriptors and close them when exec succeeds.
 /// This is approximately equivalent to the darwin `posix_spawnattr_setflags`
 /// option POSIX_SPAWN_CLOEXEC_DEFAULT which is used as a bit of a cheat
 /// on macOS.
@@ -142,14 +142,15 @@ fn tty_name(fd: RawFd) -> Option<PathBuf> {
 /// also need to make an effort to clean up the mess.
 ///
 /// This function enumerates the open filedescriptors in the current process
-/// and then will forcibly call close(2) on each open fd that is numbered
-/// 3 or higher, effectively closing all descriptors except for the stdio
-/// streams.
+/// and marks each open fd numbered 3 or higher close-on-exec. Closing them
+/// during pre_exec would also close Rust's spawn-reporting socket, making a
+/// failed exec appear successful and causing the child to abort when reporting
+/// its error. Keep that socket alive until exec succeeds or reports failure.
 ///
 /// The implementation of this function relies on `/dev/fd` being available
-/// to provide the list of open fds.  Any errors in enumerating or closing
+/// to provide the list of open fds. Any errors in enumerating or marking
 /// the fds are silently ignored.
-pub fn close_random_fds() {
+pub fn cloexec_random_fds() {
     // FreeBSD, macOS and presumably other BSDish systems have /dev/fd as
     // a directory listing the current fd numbers for the process.
     //
@@ -169,9 +170,7 @@ pub fn close_random_fds() {
             }
         }
         for fd in fds {
-            unsafe {
-                libc::close(fd);
-            }
+            let _ = cloexec(fd);
         }
     }
 }
@@ -273,7 +272,7 @@ impl PtyFd {
                         }
                     }
 
-                    close_random_fds();
+                    cloexec_random_fds();
 
                     if let Some(mask) = configured_umask {
                         libc::umask(mask);

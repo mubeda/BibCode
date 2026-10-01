@@ -39,6 +39,10 @@ The intended source deviations from portable-pty 0.9.0 are limited to:
   must inspect every effective PTY entry, including non-UTF-8 command-local
   overrides, so the text-only iterator would leave bundled paths behind. The
   accessor adds no environment filtering or AppImage policy to this crate.
+- Unix PTY descriptor cleanup marks inherited descriptors close-on-exec instead
+  of closing them in `pre_exec`. This preserves Rust's spawn-reporting socket
+  until exec succeeds or fails, so a missing executable or interpreter produces
+  a spawn error rather than false success followed by a child abort.
 
 ## Updating
 
@@ -57,6 +61,6 @@ The intended source deviations from portable-pty 0.9.0 are limited to:
 
 Remove this fork and the workspace `[patch.crates-io]` entry once an upstream
 portable-pty release provides equivalent at-creation Job-list support, correct
-child-killer result propagation, and access to every raw effective environment
-entry. Retire individual deviations as their equivalents become available;
+child-killer result propagation, a preserved Unix spawn handshake, and access
+to every raw effective environment entry. Retire individual deviations as their equivalents become available;
 the Job-list API alone is not sufficient to remove the remaining fixes.
