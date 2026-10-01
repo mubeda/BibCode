@@ -604,7 +604,8 @@ describe("dependency upgrade ledger validation", () => {
       {
         key: "rust:workspace:portable-pty",
         target: "0.9.0",
-        releaseCondition: "at-creation Job Object and termination-result fixes",
+        releaseCondition:
+          "at-creation Job Object, termination-result, and Unix spawn-handshake fixes",
       },
       {
         key: "rust:workspace:minisign-verify",
@@ -627,6 +628,7 @@ describe("dependency upgrade ledger validation", () => {
 
     expect(Object.keys(workspace.patchedDependencies).sort()).toEqual([
       "@effect/vitest@4.0.0-beta.107",
+      "@pierre/trees@1.0.0-beta.6",
       "@wdio/tauri-plugin@1.2.0",
     ]);
   });
