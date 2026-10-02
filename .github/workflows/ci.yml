@@ -252,7 +252,7 @@ jobs:
 
       - name: Test Windows desktop E2E support contracts
         if: matrix.platform == 'win'
-        run: vp test run apps/desktop/e2e/support/test-project.test.ts
+        run: vp test run apps/desktop/e2e/support/test-project.test.ts apps/web/src/components/gitManager/gitManagerRepositoryAvailability.test.ts
 
       - name: Check Windows server test targets compile
         if: matrix.platform == 'win'
