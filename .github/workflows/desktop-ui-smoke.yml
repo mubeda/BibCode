@@ -1,8 +1,8 @@
-name: Packaged Desktop UI Smoke
+name: Issue 28 packaged route qualification
 
 on:
-  workflow_dispatch:
-  workflow_call:
+  push:
+    branches: [codex/qualify-issue28-linux]
 
 permissions:
   contents: read
@@ -16,49 +16,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: Linux arm64
-            runner: ubuntu-22.04-arm
-            platform: linux
-            arch: arm64
-            bundle: appimage
-            rustTarget: aarch64-unknown-linux-gnu
           - label: Linux x64
             runner: ubuntu-22.04
             platform: linux
             arch: x64
             bundle: appimage
             rustTarget: x86_64-unknown-linux-gnu
-          - label: Windows x64
-            runner: windows-2025
-            platform: win
-            arch: x64
-            bundle: nsis
-            rustTarget: x86_64-pc-windows-msvc
-          - label: Windows arm64
-            runner: windows-11-vs2026-arm
-            platform: win
-            arch: arm64
-            bundle: nsis
-            rustTarget: aarch64-pc-windows-msvc
-          - label: macOS arm64
-            runner: macos-26
-            platform: mac
-            arch: arm64
-            bundle: dmg
-            rustTarget: aarch64-apple-darwin
-          - label: macOS x64
-            runner: macos-26-intel
-            platform: mac
-            arch: x64
-            bundle: dmg
-            rustTarget: x86_64-apple-darwin
     env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
       BIBCODE_E2E_PLATFORM: ${{ matrix.platform }}
       BIBCODE_E2E_ARCH: ${{ matrix.arch }}
       BIBCODE_E2E_BUNDLE: ${{ matrix.bundle }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
@@ -99,14 +73,20 @@ jobs:
       - name: Install frozen dependencies
         run: vp install --frozen-lockfile
 
+      - name: Verify bounded supervisor and unprivileged namespace support
+        run: |
+          python3 -B scripts/qualify-no-default-route.test.py
+          python3 -B scripts/qualify-no-default-route.py preflight
+
       - name: Build packaged test application
-        run: vp run --filter @bibcode/desktop test:ui:build
+        timeout-minutes: 100
+        run: node scripts/build-issue28-app.mjs
 
       - name: Resolve Linux AppImage
         if: matrix.platform == 'linux'
         shell: bash
         run: |
-          app_path="$(find "$GITHUB_WORKSPACE/target/${{ matrix.rustTarget }}/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)"
+          app_path="$(find "$GITHUB_WORKSPACE/target/${{ matrix.rustTarget }}/debug/bundle/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)"
           test -n "$app_path"
           chmod +x "$app_path"
           echo "BIBCODE_E2E_APP_PATH=$app_path" >> "$GITHUB_ENV"
@@ -179,11 +159,7 @@ jobs:
         env:
           BIBCODE_E2E_ARTIFACT_DIR: ${{ runner.temp }}/bibcode-desktop-ui-artifacts
         run: |
-          if [[ "$BIBCODE_E2E_PLATFORM" == "linux" ]]; then
-            xvfb-run --auto-servernum vp run test:ui:desktop
-          else
-            vp run test:ui:desktop
-          fi
+          python3 -B scripts/qualify-no-default-route.py
 
       - name: Collect macOS application crash summaries
         if: always() && matrix.platform == 'mac'
@@ -235,23 +211,14 @@ jobs:
         shell: bash
         run: hdiutil detach "$BIBCODE_E2E_DMG_MOUNT_POINT"
 
-      - name: Upload packaged desktop application
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: desktop-package-${{ matrix.platform }}-${{ matrix.arch }}
-          path: |
-            target/${{ matrix.rustTarget }}/release/bundle/appimage/*.AppImage
-            target/${{ matrix.rustTarget }}/release/bundle/nsis/*.exe
-            target/${{ matrix.rustTarget }}/release/bundle/dmg/*.dmg
-          if-no-files-found: warn
-
       - name: Upload desktop UI screenshots and logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: desktop-ui-${{ matrix.platform }}-${{ matrix.arch }}
+          name: issue28-native-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*.png
-            ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*.log
-          if-no-files-found: warn
+            ${{ runner.temp }}/issue28-evidence/*.png
+            ${{ runner.temp }}/issue28-evidence/*.json
+            ${{ runner.temp }}/issue28-evidence/supervisor.log
+          if-no-files-found: error
+          retention-days: 7

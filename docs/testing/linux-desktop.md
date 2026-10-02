@@ -154,6 +154,36 @@ the user's running instance for this check.
 
 ## AppImage build and inspection
 
+### Disposable no-default-route qualification branch
+
+The temporary `codex/qualify-issue28-linux` branch narrows the packaged UI
+workflow to a guarded debug AppImage on the supported Linux x64 build host.
+Its workflow replacement is qualification tooling only and must not replace
+the normal multi-platform workflow on the development branch.
+
+Run the supervisor's process tests and unprivileged namespace preflight before
+building. The native check creates private user, PID, and network namespaces;
+the inner supervisor must be PID 1 in a different network namespace before
+changing routes. The host route table is never modified. Use AppImage's
+supported extraction mode inside the namespace and report that mode explicitly;
+this check supplies no FUSE mount or updater-relaunch evidence.
+
+Observe the real native advertised endpoints and OS routes, then use the
+Settings controls to capture the missing-default-route state in both themes.
+Add a route inside that same private namespace and press **Refresh addresses**
+without reopening the view; require the native default endpoint and sharing
+option to recover. Save the recovered state in both themes as well. Do not
+generate a pairing offer for this check.
+
+Retain only the allowlisted screenshots, route/endpoint observations, build and
+artifact identity, bounded supervisor output, and process cleanup results.
+Keep private driver logs and the archived authentication database out of
+uploaded evidence. SIGTERM/SIGINT and deadline expiry must reach bounded
+termination and reap of the owned supervisor. Review the four actual screenshots
+after native execution; unit tests or source inspection do not close this gap.
+
+### Supported packaging procedure
+
 Use the Ubuntu 22.04 release runners for release AppImage qualification. A
 supported runtime distribution may have a newer build-host library layout
 that the pinned bundler does not support. In particular, newer Arch
