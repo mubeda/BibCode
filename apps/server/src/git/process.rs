@@ -129,6 +129,8 @@ impl ProcessRunner {
         request: ProcessRequest,
         cancellation: &CancellationToken,
     ) -> Result<ProcessBytesOutput, ProcessError> {
+        #[cfg(feature = "hermetic-test-guard")]
+        let request = checked_guarded_request(request, EnvironmentInheritance::Inherit)?;
         let command_label = request.command.to_string_lossy().into_owned();
         let command = process_command(&request, EnvironmentInheritance::Inherit);
         let output = run_supervised(
@@ -195,6 +197,8 @@ impl ProcessRunner {
         cancellation: &CancellationToken,
         inheritance: EnvironmentInheritance,
     ) -> Result<ProcessOutput, ProcessError> {
+        #[cfg(feature = "hermetic-test-guard")]
+        let request = checked_guarded_request(request, inheritance)?;
         let command_label = request.command.to_string_lossy().into_owned();
         let command = process_command(&request, inheritance);
         let output = run_supervised(
@@ -246,6 +250,48 @@ impl ProcessRunner {
             stderr_truncated,
         })
     }
+}
+
+#[cfg(feature = "hermetic-test-guard")]
+fn checked_guarded_request(
+    mut request: ProcessRequest,
+    inheritance: EnvironmentInheritance,
+) -> Result<ProcessRequest, ProcessError> {
+    if !crate::hermetic_guard::is_guarded_program(&request.command) {
+        return Ok(request);
+    }
+    let search_path = request
+        .env
+        .iter()
+        .rev()
+        .find(|(name, _)| {
+            if cfg!(windows) {
+                name.to_string_lossy().eq_ignore_ascii_case("PATH")
+            } else {
+                name == "PATH"
+            }
+        })
+        .map(|(_, value)| value.clone())
+        .or_else(|| {
+            (inheritance == EnvironmentInheritance::Inherit)
+                .then(|| std::env::var_os("PATH"))
+                .flatten()
+        });
+    let path = crate::hermetic_guard::checked_launch_executable(
+        &request.command,
+        Some(&request.cwd),
+        search_path.as_deref(),
+    )
+    .ok_or_else(|| ProcessError::Spawn {
+        operation: request.operation.clone(),
+        command: request.command.display().to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "guarded executable was not found or was refused by the hermetic test guard",
+        ),
+    })?;
+    request.command = path;
+    Ok(request)
 }
 
 fn process_command(request: &ProcessRequest, inheritance: EnvironmentInheritance) -> Command {

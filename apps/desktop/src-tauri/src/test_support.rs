@@ -8,6 +8,9 @@ use tokio::sync::Notify;
 #[path = "../../../server/tests/support/reexec.rs"]
 pub(crate) mod reexec;
 
+#[path = "../../../server/tests/support/hermetic_providers.rs"]
+pub(crate) mod hermetic_providers;
+
 #[cfg(target_os = "linux")]
 fn appimage_test_child(test_name: &str) -> Option<reexec::ChildPhase> {
     const PHASE: &str = "desktop-appimage";

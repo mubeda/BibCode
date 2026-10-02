@@ -26,11 +26,20 @@ The tests are `#[ignore]`d because they need a fresh `bibcode`, which
 root:
 
 ```sh
-cargo build -p bibcode-server --bin bibcode
+cargo test -p bibcode-server --test cli_smoke --no-run -j 2
 cargo test -p bibcode-desktop --test ssh_environment -- --ignored
 ```
 
-CI's **Test** job runs the same two commands. Prerequisites: `python3`, `curl`
+The first command builds `bibcode` with the hermetic test guard through a dev
+unit. An ordinary `cargo build` would replace it with a feature-off binary, so
+do not substitute that command for this harness. CI's **Test** job runs the
+same two commands. Each fake remote seeds the shared hermetic provider settings
+before the real CLI boot, with disabled providers pinned to absent owned paths
+and network update checks disabled. The harness checks the launch-state
+`server.log` for guard diagnostics. Its stdin replay is a pipe, matching SSH
+stream semantics on macOS and Linux; the finite feeder ends at EOF or when its
+reader closes, while the fake still execs into the remote shell.
+Prerequisites: `python3`, `curl`
 or `wget`, `ps`, and `/bin/sh`. `BIBCODE_SSH_FIXTURE_BIBCODE` selects another
 binary; `BIBCODE_SSH_FIXTURE_PORT_START` moves the fake remote's port scan
 (default 47310, away from a local BiBCode on 3773). Each scenario stops the

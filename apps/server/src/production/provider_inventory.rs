@@ -1969,9 +1969,12 @@ mod tests {
 
     #[tokio::test]
     async fn quick_and_full_disabled_probes_attach_unknown_advisories() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let missing =
+            crate::test_support::hermetic_providers::missing_provider_executable(sandbox.path());
         let settings = json!({
             "providerInstances": {
-                "codex": { "driver": "codex", "enabled": false, "config": {} }
+                "codex": { "driver": "codex", "enabled": false, "config": {"binaryPath": missing} }
             }
         });
         let maintenance = ProviderMaintenance::new();
@@ -2474,6 +2477,9 @@ mod tests {
 
     #[tokio::test]
     async fn full_probe_does_not_serialize_independent_provider_inventories() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let missing =
+            crate::test_support::hermetic_providers::missing_provider_executable(sandbox.path());
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(6));
         let app = Router::new().route(
             "/{*path}",
@@ -2497,11 +2503,11 @@ mod tests {
         let settings = json!({
             "enableProviderUpdateChecks": false,
             "providers": {
-                "codex": { "enabled": false },
-                "claudeAgent": { "enabled": false },
-                "cursor": { "enabled": false },
-                "grok": { "enabled": false },
-                "opencode": { "enabled": false }
+                "codex": { "enabled": false, "binaryPath": missing },
+                "claudeAgent": { "enabled": false, "binaryPath": missing },
+                "cursor": { "enabled": false, "binaryPath": missing },
+                "grok": { "enabled": false, "binaryPath": missing },
+                "opencode": { "enabled": false, "binaryPath": missing }
             },
             "providerInstances": {
                 "first": {

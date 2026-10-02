@@ -64,6 +64,9 @@ jobs:
       - name: Rust clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Check production server without dev features
+        run: cargo check -p bibcode-server --lib --bins -j 2
+
       - name: Build desktop pipeline
         run: vp run build:desktop
 
@@ -123,7 +126,7 @@ jobs:
       # hop is faked (tests/fixtures/ssh, Python 3); no host is contacted.
       - name: SSH environment integration
         run: |
-          cargo build -p bibcode-server --bin bibcode -j 2
+          cargo test -p bibcode-server --test cli_smoke --no-run -j 2
           cargo test -p bibcode-desktop --test ssh_environment -j 2 -- --ignored
 
   release_smoke:

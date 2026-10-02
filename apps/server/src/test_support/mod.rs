@@ -22,6 +22,24 @@ pub(crate) use capability_probe::check_capability_probe_appimage_environment;
 pub(crate) use event::{FixtureEvent, within_fixture_deadline};
 pub(crate) use sandbox::{FixtureLease, TestSandbox};
 
+#[cfg(feature = "hermetic-test-guard")]
+pub(crate) fn reexec_without_provider_path(test_name: &str) -> bool {
+    const CASE: &str = "fixture-without-provider-path";
+    if TestSandbox::is_isolated_case(CASE, test_name) {
+        return false;
+    }
+    let sandbox = TestSandbox::new("provider-free-path");
+    let output =
+        sandbox.run_isolated_case(CASE, test_name, &[("PATH", sandbox.root().as_os_str())]);
+    assert!(
+        output.status.success(),
+        "isolated {test_name} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) const ISOLATING_AND_NO_OP_CASES: &[&str] = &["mixed", "unset-appimage"];
 
@@ -56,6 +74,12 @@ mod tests {
     /// whose pinned path still resolves, fails the remaining assertions.
     #[tokio::test]
     async fn hermetic_helper_pins_every_provider_driver_the_server_defines_as_built_in() {
+        #[cfg(feature = "hermetic-test-guard")]
+        if super::reexec_without_provider_path(
+            "test_support::tests::hermetic_helper_pins_every_provider_driver_the_server_defines_as_built_in",
+        ) {
+            return;
+        }
         use crate::{ServerConfig, production::control::NativeServerControl};
 
         let temp = tempfile::tempdir().expect("state directory");

@@ -412,7 +412,15 @@ async fn read_auth(codex_home: &Path) -> Option<CodexBackendAuth> {
 fn production_auth_reader() -> AuthReader {
     PRODUCTION_AUTH_READER
         .get_or_init(|| {
-            Arc::new(|path| Box::pin(async move { tokio::fs::read(path).await.map_err(|_| ()) }))
+            Arc::new(|path| {
+                Box::pin(async move {
+                    #[cfg(feature = "hermetic-test-guard")]
+                    if !crate::hermetic_guard::credential_path_allowed("codex auth.json", &path) {
+                        return Err(());
+                    }
+                    tokio::fs::read(path).await.map_err(|_| ())
+                })
+            })
         })
         .clone()
 }
@@ -617,6 +625,49 @@ fn merge_reset_credits(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "hermetic-test-guard")]
+    #[tokio::test]
+    async fn hermetic_guard_refuses_outside_codex_auth_before_reading() {
+        use crate::test_support::TestSandbox;
+        const CASE: &str = "guard-codex-auth";
+        const TEST: &str = "provider_usage::codex_backend::tests::hermetic_guard_refuses_outside_codex_auth_before_reading";
+        let sandbox = TestSandbox::new("guard-codex-auth");
+        let raw = r#"{"tokens":{"access_token":"fixture-token","account_id":"fixture-account"}}"#;
+        if TestSandbox::is_isolated_case(CASE, TEST) {
+            let outside = PathBuf::from(std::env::var_os("BIBCODE_GUARD_CREDENTIAL_HOME").unwrap());
+            assert!(read_auth(&outside).await.is_none());
+            std::fs::write(sandbox.path("auth.json"), raw).unwrap();
+            assert_eq!(
+                read_auth(sandbox.root()).await.unwrap().access_token,
+                "fixture-token"
+            );
+            return;
+        }
+        let allowed_root = sandbox.path("allowed");
+        std::fs::create_dir(&allowed_root).unwrap();
+        std::fs::write(sandbox.path("auth.json"), raw).unwrap();
+        let output = sandbox.run_isolated_case(
+            CASE,
+            TEST,
+            &[
+                ("TMPDIR", allowed_root.as_os_str()),
+                ("TMP", allowed_root.as_os_str()),
+                ("TEMP", allowed_root.as_os_str()),
+                ("BIBCODE_GUARD_CREDENTIAL_HOME", sandbox.root().as_os_str()),
+                ("BIBCODE_HERMETIC_GUARD", std::ffi::OsStr::new("report")),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("hermetic-test-guard: refused codex auth.json")
+        );
+    }
+
     use std::{
         sync::{
             Arc, Mutex,
