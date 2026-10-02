@@ -13,6 +13,16 @@ Continue only when the handler asks for body data. Verify that ordering in the
 handler and HTTP stack when changing this fixture; a sleep after a client-side
 signal cannot establish it.
 
+For a desktop start racing shutdown, observe the specific runtime that reached
+the pre-publish gate. The lifecycle regression blocks that runtime's join,
+waits for its stop-request event, and proves both callers remain pending until
+the join can finish. It captures the join result synchronously when `start`
+returns. A TCP connection probe is not an identity-safe cleanup oracle: the
+same address can already belong to another listener or remain open in an
+unrelated fork. Keep a controlled port-reuse counterexample distinct from a
+natural stress failure rate, and verify that deliberately removing the cleanup
+wait makes the runtime-join regression fail before restoring the real code.
+
 ## Alternate base and change
 
 For intermittent provider or terminal failures, rerun each failing case in
