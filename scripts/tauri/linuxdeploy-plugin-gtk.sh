@@ -38,6 +38,22 @@ for ((index = 0; index < ${#arguments[@]}; index += 1)); do
   esac
 done
 
+if [[ "$appdir_seen" == true ]]; then
+  if ! gdk_pixbuf_moduledir="$(pkg-config --variable=gdk_pixbuf_moduledir gdk-pixbuf-2.0)"; then
+    printf '%s\n' \
+      'BiBCode AppImage packaging error: cannot read GdkPixbuf build metadata. Install the Tauri Linux development prerequisites; see docs/testing/linux-desktop.md.' >&2
+    exit 1
+  fi
+  if [[ -z "$gdk_pixbuf_moduledir" || ! -d "$gdk_pixbuf_moduledir" ]]; then
+    printf 'BiBCode AppImage packaging error: the pinned GTK plugin requires the legacy GdkPixbuf loader directory, but this build host advertises a missing path: %s\n' \
+      "${gdk_pixbuf_moduledir:-<empty>}" >&2
+    printf '%s\n' \
+      'Newer GdkPixbuf/Glycin layouts are not supported by this pinned bundler. Build the AppImage on the matching-architecture Ubuntu 22.04 baseline, or use the official release AppImage.' \
+      'See docs/testing/linux-desktop.md. Do not create an empty loader tree, downgrade host libraries, or bypass the GTK plugin.' >&2
+    exit 1
+  fi
+fi
+
 "$upstream_plugin" "${upstream_arguments[@]}"
 
 if [[ "$appdir_seen" == false ]]; then
