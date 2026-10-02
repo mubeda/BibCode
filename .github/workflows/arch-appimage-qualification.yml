@@ -1,0 +1,52 @@
+name: Arch AppImage qualification
+
+on:
+  push:
+    branches: [codex/qualify-issue41-arch]
+
+permissions:
+  contents: read
+
+jobs:
+  arch_runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: archlinux@sha256:b21322c663be387c0ed9cbc7bbbfe18e41633ad4e7b7c77cfad45f128be20040
+    steps:
+      - name: Install signed packages inside the disposable Arch container
+        run: |
+          pacman -Syu --noconfirm --needed git python python-psutil python-pillow \
+            pkgconf gdk-pixbuf2 glycin librsvg gtk3 webkit2gtk-4.1 \
+            xorg-server-xvfb xorg-xauth xdotool imagemagick ttf-dejavu
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare an unprivileged isolated application account
+        run: |
+          useradd --no-create-home --user-group --uid 14841 --home-dir /tmp/issue41-owned/home appcheck
+          install -d -m 700 -o appcheck -g appcheck /tmp/issue41-owned
+          install -d -m 755 -o appcheck -g appcheck /tmp/issue41-evidence
+      - name: Verify real loader layout and published AppImage
+        timeout-minutes: 8
+        run: |
+          runuser -u appcheck -- env -i PATH=/usr/bin:/bin \
+            python3 scripts/qualify-arch-appimage.py --self-test
+          runuser -u appcheck -- env -i PATH=/usr/bin:/bin BIBCODE_ISSUE41_SOURCE="$GITHUB_SHA" \
+            python3 scripts/qualify-arch-appimage.py
+      - name: Upload allowlisted evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue41-arch-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/issue41-evidence/host.json
+            /tmp/issue41-evidence/diagnostic.json
+            /tmp/issue41-evidence/runtime.json
+            /tmp/issue41-evidence/cleanup.json
+            /tmp/issue41-evidence/selftest.json
+            /tmp/issue41-evidence/published-appimage-arch.png
+            /tmp/issue41-evidence/diagnostic.txt
+          if-no-files-found: error
+          retention-days: 7
