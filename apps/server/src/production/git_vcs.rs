@@ -199,6 +199,7 @@ pub const GIT_VCS_STREAM_METHODS: &[&str] = &[
 
 #[derive(Clone)]
 pub struct GitVcsRpcServices {
+    trace_diagnostics: Option<crate::diagnostics::TraceDiagnosticsStore>,
     repository: Arc<GitRepository>,
     broadcaster: StatusBroadcaster,
     summary: GitStatusSummaryService,
@@ -370,6 +371,7 @@ impl GitVcsRpcServices {
         });
         let clone_operations = CloneRuntime::new(Arc::clone(&repository));
         Self {
+            trace_diagnostics: None,
             broadcaster,
             summary,
             provider_hosts,
@@ -486,7 +488,8 @@ impl WorkspaceMutationObserver for GitVcsRpcServices {
     }
 }
 
-pub fn register_git_vcs_rpc(registry: &mut RpcRegistry, services: GitVcsRpcServices) {
+pub fn register_git_vcs_rpc(registry: &mut RpcRegistry, mut services: GitVcsRpcServices) {
+    services.trace_diagnostics = registry.trace_diagnostics();
     for method in GIT_VCS_UNARY_METHODS {
         let services = services.clone();
         registry.register_unary_with_context(*method, move |request, context, cancellation| {
@@ -1476,7 +1479,9 @@ impl GitVcsRpcServices {
         let pull_requests = self.pull_requests.clone();
         let created_request_observer = self.created_request_observer.clone();
         let availability = self.availability_registry.clone();
+        let trace_diagnostics = self.trace_diagnostics.clone();
         tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
             let input = match decode::<StackedActionInput>(request.payload, "git.runStackedAction")
             {
                 Ok(input) => input,
@@ -1517,6 +1522,7 @@ impl GitVcsRpcServices {
                 }
                 return;
             }
+            let mut safe_failure = None;
             let result = match validate_stacked_action_input(&input) {
                 Err(error) => Err(error),
                 Ok(()) => {
@@ -1545,12 +1551,33 @@ impl GitVcsRpcServices {
                                 )
                                 .await;
                             }
-                            result
+                            result.map_err(|failure| {
+                                safe_failure = Some(failure.diagnostic);
+                                failure.wire
+                            })
                         },
                     )
                     .await
                 }
             };
+            if let Err(error) = &result
+                && let Some(store) = &trace_diagnostics
+            {
+                let message = if is_workspace_unavailable(error) {
+                    "The workspace became unavailable during the Git action."
+                } else {
+                    safe_failure
+                        .as_deref()
+                        .unwrap_or("Git action could not complete.")
+                };
+                if let Err(error) = store.record_timed_failure(
+                    "git.runStackedAction",
+                    &json!({"detail": message}),
+                    started.elapsed(),
+                ) {
+                    tracing::warn!(error_kind = ?error.kind(), "failed to persist Git action diagnostics");
+                }
+            }
             if let Err(error) = &result
                 && is_workspace_unavailable(error)
             {
@@ -2295,12 +2322,62 @@ fn validate_stacked_action_input(input: &StackedActionInput) -> Result<(), Value
     Ok(())
 }
 
+/// Keeps diagnostic facts separate from the unchanged client error envelope.
+struct StackedActionFailure {
+    wire: Value,
+    diagnostic: Box<str>,
+}
+
+impl std::fmt::Debug for StackedActionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StackedActionFailure")
+            .field("diagnostic", &self.diagnostic)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<Value> for StackedActionFailure {
+    fn from(wire: Value) -> Self {
+        Self {
+            wire,
+            diagnostic: "Git action could not complete.".into(),
+        }
+    }
+}
+
+impl From<GitCommandError> for StackedActionFailure {
+    fn from(error: GitCommandError) -> Self {
+        let diagnostic = error
+            .safe_failure_message()
+            .unwrap_or_else(|| "Git could not complete the requested operation.".to_owned())
+            .into();
+        Self {
+            wire: serialize_error(error),
+            diagnostic,
+        }
+    }
+}
+
+impl From<crate::source_control::SourceControlProviderError> for StackedActionFailure {
+    fn from(error: crate::source_control::SourceControlProviderError) -> Self {
+        let diagnostic = error
+            .safe_failure_message()
+            .unwrap_or_else(|| "The source-control operation could not complete.".to_owned())
+            .into();
+        Self {
+            wire: serialize_error(error),
+            diagnostic,
+        }
+    }
+}
+
 async fn run_stacked_action(
     repository: &GitRepository,
     pull_requests: &PullRequestService,
     input: &StackedActionInput,
     cancellation: &CancellationToken,
-) -> Result<StackedActionResult, Value> {
+) -> Result<StackedActionResult, StackedActionFailure> {
     validate_stacked_action_input(input)?;
     let wants_commit = matches!(
         input.action.as_str(),
@@ -2318,7 +2395,8 @@ async fn run_stacked_action(
             return Err(request_error(
                 "git.runStackedAction",
                 &format!("Select a valid {role} branch."),
-            ));
+            )
+            .into());
         }
         repository
             .run(
@@ -2343,22 +2421,23 @@ async fn run_stacked_action(
                         "git.runStackedAction",
                         &format!("Select a valid {role} branch."),
                     )
+                    .into()
                 } else {
-                    serialize_error(error)
+                    StackedActionFailure::from(error)
                 }
             })?;
     }
     let initial_local = repository
         .local_status(&input.cwd, cancellation)
         .await
-        .map_err(serialize_error)?;
+        .map_err(StackedActionFailure::from)?;
     if input.action == "commit_push_pr"
         && requested_head.is_some_and(|head| Some(head) != initial_local.ref_name.as_deref())
     {
         return Err(request_error(
             "git.runStackedAction",
             "Commit and create a pull request uses the current branch. Select the current source branch.",
-        ));
+        ).into());
     }
     let selected_head = requested_head.filter(|_| input.action == "create_pr");
     let selected_head_is_local = if let Some(head) = selected_head {
@@ -2377,13 +2456,13 @@ async fn run_stacked_action(
                 cancellation,
             )
             .await
-            .map_err(serialize_error)?;
+            .map_err(StackedActionFailure::from)?;
         let is_local = refs.stdout.lines().any(|reference| reference == local_ref);
         if !is_local && !refs.stdout.lines().any(|reference| reference == remote_ref) {
             return Err(request_error(
                 "git.runStackedAction",
                 "Select an existing local or origin source branch. Fetch to refresh remote branches.",
-            ));
+            ).into());
         }
         Some(is_local)
     } else {
@@ -2396,13 +2475,15 @@ async fn run_stacked_action(
         return Err(request_error(
             "git.runStackedAction",
             "Select a target branch different from the source branch.",
-        ));
+        )
+        .into());
     }
     if feature_branch && !initial_local.has_working_tree_changes {
         return Err(request_error(
             "git.runStackedAction",
             "Cannot create a feature branch because there are no changes to commit.",
-        ));
+        )
+        .into());
     }
     if input.action == "create_pr"
         && initial_local.has_working_tree_changes
@@ -2411,7 +2492,8 @@ async fn run_stacked_action(
         return Err(request_error(
             "git.runStackedAction",
             "Commit local changes before creating a PR.",
-        ));
+        )
+        .into());
     }
     if !feature_branch
         && (wants_pr || input.action == "push")
@@ -2423,7 +2505,7 @@ async fn run_stacked_action(
         } else {
             "Cannot push from detached HEAD."
         };
-        return Err(request_error("git.runStackedAction", detail));
+        return Err(request_error("git.runStackedAction", detail).into());
     }
     // Resolve the provider before any branch, commit or push, so an unidentified
     // host never publishes the branch and then fails to create the request.
@@ -2439,7 +2521,7 @@ async fn run_stacked_action(
             let remote = repository
                 .remote_status(&input.cwd, cancellation)
                 .await
-                .map_err(serialize_error)?;
+                .map_err(StackedActionFailure::from)?;
             remote.is_none_or(|status| !status.has_upstream || status.ahead_count > 0)
         }
     } else {
@@ -2455,7 +2537,7 @@ async fn run_stacked_action(
                 let context = repository
                     .commit_context(&input.cwd, cancellation)
                     .await
-                    .map_err(serialize_error)?;
+                    .map_err(StackedActionFailure::from)?;
                 let message = summarize_commit_context(&context, input.file_paths.as_deref());
                 if message.is_empty() {
                     "Update working tree".to_owned()
@@ -2479,12 +2561,13 @@ async fn run_stacked_action(
             return Err(request_error(
                 "git.runStackedAction",
                 "Select a target branch different from the source branch.",
-            ));
+            )
+            .into());
         }
         repository
             .create_ref(&input.cwd, &name, true, cancellation)
             .await
-            .map_err(serialize_error)?;
+            .map_err(StackedActionFailure::from)?;
         json!({ "status": "created", "name": name })
     } else {
         json!({ "status": "skipped_not_requested" })
@@ -2500,7 +2583,7 @@ async fn run_stacked_action(
                 cancellation,
             )
             .await
-            .map_err(serialize_error)?;
+            .map_err(StackedActionFailure::from)?;
         sha.map_or_else(
             || json!({ "status": "skipped_no_changes" }),
             |sha| json!({ "status": "created", "commitSha": sha, "subject": message.lines().next().unwrap_or(message) }),
@@ -2533,7 +2616,7 @@ async fn run_stacked_action(
                         cancellation,
                     )
                     .await
-                    .map_err(serialize_error)?;
+                    .map_err(StackedActionFailure::from)?;
                 if upstream_remote.stdout.trim().is_empty() {
                     args.push("--set-upstream".to_owned());
                 }
@@ -2552,13 +2635,13 @@ async fn run_stacked_action(
                     cancellation,
                 )
                 .await
-                .map_err(serialize_error)?;
+                .map_err(StackedActionFailure::from)?;
             head.to_owned()
         } else {
             repository
                 .push_current_branch(&input.cwd, cancellation)
                 .await
-                .map_err(serialize_error)?
+                .map_err(StackedActionFailure::from)?
         };
         json!({ "status": "pushed", "branch": branch })
     } else {
@@ -2568,7 +2651,7 @@ async fn run_stacked_action(
         let current_local = repository
             .local_status(&input.cwd, cancellation)
             .await
-            .map_err(serialize_error)?;
+            .map_err(StackedActionFailure::from)?;
         let head_branch = selected_head
             .or(current_local.ref_name.as_deref())
             .ok_or_else(|| {
@@ -2609,7 +2692,7 @@ async fn run_stacked_action(
                 None => repository
                     .list_commits(&input.cwd, 1, 0, cancellation)
                     .await
-                    .map_err(serialize_error)?
+                    .map_err(StackedActionFailure::from)?
                     .commits
                     .into_iter()
                     .next()
@@ -2636,7 +2719,7 @@ async fn run_stacked_action(
                     cancellation,
                 )
                 .await
-                .map_err(serialize_error)?;
+                .map_err(StackedActionFailure::from)?;
             PullRequestStep::Created(resolved_pull_request_step(&created))
         }
     } else {
@@ -5259,8 +5342,11 @@ esac
                 .await
                 .expect_err("target required and validated");
                 assert!(
-                    error["detail"].as_str().unwrap().contains("target branch"),
-                    "{error}"
+                    error.wire["detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("target branch"),
+                    "{error:?}"
                 );
                 assert!(
                     !calls.exists(),
@@ -5441,7 +5527,7 @@ esac
         .await
         .expect_err("a target outside a pull request action is rejected");
         assert_eq!(
-            error["detail"],
+            error.wire["detail"],
             "A pull request title, body, source or target branch applies only to pull request actions."
         );
     }
@@ -5589,8 +5675,8 @@ esac
                 .await
                 .expect_err("invalid source rejected before mutations");
             assert!(
-                error["detail"].as_str().unwrap().contains("branch"),
-                "{error}"
+                error.wire["detail"].as_str().unwrap().contains("branch"),
+                "{error:?}"
             );
             assert!(!calls.exists(), "no provider call for {source}");
             assert_eq!(
@@ -5985,7 +6071,7 @@ esac
         .await
         .expect_err("an unidentified host is refused");
         assert_eq!(
-            error["detail"],
+            error.wire["detail"],
             "Nothing was published. BiBCode hasn't identified git.acme.example yet. Open Pull Requests for this project or run Rescan in Settings → Source Control, then try again."
         );
         let heads = std::fs::read_dir(repository.join(".git/refs/heads"))
@@ -6518,5 +6604,58 @@ esac
             .unwrap_err();
         assert_eq!(error["_tag"], "ExternalLauncherEditorSpawnError");
         assert_eq!(error["command"], "code");
+    }
+}
+
+#[cfg(test)]
+mod stacked_failure_tests {
+    use super::*;
+
+    #[test]
+    fn private_diagnostics_never_copy_wire_output_or_command_context() {
+        let secret = "private-output-credential-sentinel";
+        let git = GitCommandError {
+            tag: "GitCommandError",
+            operation: secret.into(),
+            command: secret.into(),
+            cwd: secret.into(),
+            diagnostics: Some(Box::new(crate::git::GitCommandDiagnostics {
+                exit_code: Some(23),
+                ..Default::default()
+            })),
+            detail: secret.into(),
+        };
+        let facts = crate::git::ProcessError::Spawn {
+            operation: secret.into(),
+            command: secret.into(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, secret),
+        }
+        .safe_facts();
+        let provider = crate::source_control::SourceControlProviderError {
+            tag: "SourceControlProviderError",
+            provider: ProviderKind::Gitlab,
+            operation: "createPullRequest".into(),
+            cwd: secret.into(),
+            command: Some(secret.into()),
+            reference: Some(secret.into()),
+            detail: secret.into(),
+            command_failure: Some(Box::new(crate::source_control::ProviderCommandFailure {
+                code: "host_rejected",
+                host_detail: Some(secret.into()),
+                process_failure: Some(facts),
+            })),
+        };
+        for failure in [
+            StackedActionFailure::from(git),
+            StackedActionFailure::from(provider),
+            StackedActionFailure::from(json!({"detail": secret})),
+        ] {
+            assert_eq!(
+                failure.wire["detail"], secret,
+                "client envelope is preserved"
+            );
+            assert!(!failure.diagnostic.contains(secret));
+            assert!(!format!("{failure:?}").contains(secret));
+        }
     }
 }

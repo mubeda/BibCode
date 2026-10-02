@@ -595,6 +595,42 @@ afterEach(() => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("DiagnosticsSettingsPanel rendering", () => {
+  it.each([
+    [-1, undefined, "Not recorded"],
+    [-1, true, "Not recorded"],
+    [0, undefined, "Not recorded"],
+    [0, false, "Not recorded"],
+    [45, false, "Not recorded"],
+    [0, true, "0 ms"],
+    [0.25, true, "&lt;1 ms"],
+    [0.25, undefined, "&lt;1 ms"],
+    [15, undefined, "15 ms"],
+  ] as const)(
+    "renders duration %s with measurement %s truthfully",
+    (durationMs, durationMeasured, expected) => {
+      seedAll();
+      h.traceQuery.data = traceData({
+        latestFailures: [
+          {
+            name: "timing-case",
+            cause: "launch denied",
+            durationMs,
+            ...(durationMeasured === undefined ? {} : { durationMeasured }),
+            endedAt: T0,
+            traceId: "timing-trace",
+            spanId: "timing-span",
+          },
+        ],
+      });
+      const markup = render();
+      const start = markup.indexOf("timing-case");
+      expect(start).toBeGreaterThan(-1);
+      const row = markup.slice(start, markup.indexOf("</tr>", start));
+      expect(row).toContain(expected);
+      if (expected === "Not recorded") expect(row).not.toContain("0 ms");
+    },
+  );
+
   it("renders formatted diagnostics for fully populated data", () => {
     seedAll();
     const markup = render();
@@ -623,6 +659,38 @@ describe("DiagnosticsSettingsPanel rendering", () => {
     // Expandable long cause offers the show-more affordance.
     expect(markup).toContain("Show full error");
   });
+
+  it.each([undefined, 0, 1])(
+    "uses only explicitly measured summary samples: %s",
+    (measuredCount) => {
+      seedAll();
+      h.traceQuery.data = traceData({
+        topSpansByCount: [
+          {
+            name: "summary-timing",
+            count: 4,
+            failureCount: 4,
+            totalDurationMs: 20,
+            averageDurationMs: 20,
+            maxDurationMs: 20,
+            ...(measuredCount === undefined ? {} : { measuredCount }),
+          },
+        ],
+      });
+      const markup = render();
+      const start = markup.indexOf("summary-timing");
+      expect(start).toBeGreaterThan(-1);
+      const row = markup.slice(start, markup.indexOf("</tr>", start));
+      if (measuredCount === 1) {
+        expect(row).toContain("1 timed");
+        expect(row.match(/20 ms/g)).toHaveLength(2);
+      } else {
+        expect(row.match(/Not recorded/g)).toHaveLength(2);
+        expect(row).not.toContain("20 ms");
+        expect(row).toContain(measuredCount === 0 ? "0 timed" : "Timing not recorded");
+      }
+    },
+  );
 
   it("keeps trace diagnostics and latest-failure rendering intact", () => {
     seedAll();

@@ -2290,6 +2290,31 @@ cleanup succeeds, the receipt moves to `removed`; a later retry after a
 thread-deletion failure returns success without inspecting or deleting a
 replacement that now occupies the old path.
 
+## Failure diagnostics and elapsed timing
+
+The configured local `TraceDiagnosticsStore` records failed unary handlers and
+terminal domain failures from stacked Git actions. Unary registration owns its
+handler timer. The stacked-action owner records the failure before converting
+it to an `action_failed` progress chunk; generic stream transport does not infer
+domain errors from arbitrary message bodies. Both owners reuse the registry's
+configured recorder and preserve the original result if diagnostic writing fails.
+
+Process errors provide private closed failure facts to source-control and Git
+Manager error mapping. User-facing launch messages may contain a known tool
+label and numeric OS error, but never raw error sources, command arguments or
+process output. A not-found launch category does not assert that the executable
+is absent rather than a required directory or interpreter.
+
+Native trace records and responses add optional `durationMeasured` on occurrences
+and recent failures, and `measuredCount` on span summaries. Existing finite numeric
+duration fields remain compatible with older clients. New failures measure
+server-handler/action elapsed time with the monotonic clock before logging;
+untimed events are explicitly unmeasured. Unmarked legacy zero durations are
+unavailable, while positive legacy durations remain measured. Unknown samples
+retain their failure/count evidence but do not contribute to latency statistics
+or slow rankings. An older server's summary lacks a known measured denominator,
+so current clients display its summary timing as unavailable.
+
 ## Invariants
 
 - The server owns one durable FIFO per thread. Reloads, disconnects, and server

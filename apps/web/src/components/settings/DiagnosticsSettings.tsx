@@ -51,8 +51,15 @@ function formatCount(value: number): string {
 }
 
 function formatDuration(value: number): string {
+  if (value > 0 && value < 1) return "<1 ms";
   if (value < 1_000) return `${Math.round(value)} ms`;
   return `${(value / 1_000).toFixed(value >= 10_000 ? 1 : 2)} s`;
+}
+
+function formatRecordedDuration(value: number, measured: boolean | undefined): string {
+  if (value < 0 || measured === false || (measured === undefined && value === 0))
+    return "Not recorded";
+  return formatDuration(value);
 }
 
 function formatRelative(value: DateTime.Utc | null): string {
@@ -87,7 +94,7 @@ function StatBlock({
 }) {
   return (
     <div className="min-w-0 border-border/60 px-4 py-3 sm:px-5">
-      <div className="flex min-w-0 items-center gap-1.5 text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground/70">
+      <div className="flex min-w-0 items-center gap-1.5 text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">
         <span className="min-w-0 truncate">{label}</span>
         {tooltip ? (
           <Tooltip>
@@ -217,7 +224,7 @@ function DiagnosticsTable({
             ))}
           </colgroup>
         ) : null}
-        <thead className="border-b border-border/60 text-xs uppercase tracking-[0.08em] text-muted-foreground/70">
+        <thead className="border-b border-border/60 text-xs uppercase tracking-[0.08em] text-muted-foreground">
           <tr>
             {headers.map((header, index) => (
               <th
@@ -285,11 +292,11 @@ function DiagnosticsLastChecked({ checkedAt }: { checkedAt: DateTime.Utc | null 
   const relative = checkedAt ? formatRelativeTime(DateTime.formatIso(checkedAt)) : null;
 
   if (!relative) {
-    return <span className="text-xs text-muted-foreground/50">Checking</span>;
+    return <span className="text-xs text-muted-foreground">Checking</span>;
   }
 
   return (
-    <span className="text-xs text-muted-foreground/60">
+    <span className="text-xs text-muted-foreground">
       {relative.suffix ? (
         <>
           Checked <span className="font-mono tabular-nums">{relative.value}</span> {relative.suffix}
@@ -646,7 +653,7 @@ export function DiagnosticsSettingsPanel() {
                   <ExpandableText text={failure.cause} />
                 </td>
                 <td className="px-4 py-3 align-top font-mono tabular-nums">
-                  {formatDuration(failure.durationMs)}
+                  {formatRecordedDuration(failure.durationMs, failure.durationMeasured)}
                 </td>
                 <td className="whitespace-nowrap px-4 py-3 align-top font-mono tabular-nums text-muted-foreground last:sm:pr-5">
                   {formatRelativeNoWrap(failure.endedAt)}
@@ -702,7 +709,7 @@ export function DiagnosticsSettingsPanel() {
                   {span.name}
                 </td>
                 <td className="px-4 py-3 align-top font-mono tabular-nums">
-                  {formatDuration(span.durationMs)}
+                  {formatRecordedDuration(span.durationMs, span.durationMeasured)}
                 </td>
                 <td className="w-px whitespace-nowrap px-4 py-3 align-top font-mono tabular-nums text-muted-foreground">
                   {formatRelativeNoWrap(span.endedAt)}
@@ -734,7 +741,7 @@ export function DiagnosticsSettingsPanel() {
                 <col className="w-[26%]" />
                 <col className="w-[30%]" />
               </colgroup>
-              <thead className="border-b border-border/60 text-xs uppercase tracking-[0.08em] text-muted-foreground/70">
+              <thead className="border-b border-border/60 text-xs uppercase tracking-[0.08em] text-muted-foreground">
                 <tr>
                   <th className="whitespace-nowrap px-4 py-2.5 font-semibold sm:pl-5">Time</th>
                   <th className="whitespace-nowrap px-4 py-2.5 font-semibold">Level</th>
@@ -796,15 +803,20 @@ export function DiagnosticsSettingsPanel() {
                 </td>
                 <td className="whitespace-nowrap px-4 py-3 align-top font-mono tabular-nums">
                   {formatCount(span.count)}
+                  <span className="block text-xs text-muted-foreground">
+                    {span.measuredCount === undefined
+                      ? "Timing not recorded"
+                      : `${formatCount(span.measuredCount)} timed`}
+                  </span>
                 </td>
                 <td className="whitespace-nowrap px-4 py-3 align-top font-mono tabular-nums">
                   {formatCount(span.failureCount)}
                 </td>
                 <td className="whitespace-nowrap px-4 py-3 align-top font-mono tabular-nums">
-                  {formatDuration(span.averageDurationMs)}
+                  {formatRecordedDuration(span.averageDurationMs, (span.measuredCount ?? 0) > 0)}
                 </td>
                 <td className="whitespace-nowrap px-4 py-3 align-top font-mono tabular-nums last:sm:pr-5">
-                  {formatDuration(span.maxDurationMs)}
+                  {formatRecordedDuration(span.maxDurationMs, (span.measuredCount ?? 0) > 0)}
                 </td>
               </tr>
             ))}
