@@ -158,9 +158,15 @@ Use the Ubuntu 22.04 release runners for release AppImage qualification. A
 supported runtime distribution may have a newer build-host library layout
 that the pinned bundler does not support. In particular, newer Arch
 GdkPixbuf packages can omit the legacy loader directory that the GTK plugin
-copies. If packaging fails there, record the package versions and missing
-path, and track the build-host incompatibility separately. Do not create an
-empty loader directory or bypass the pinned plugin to make packaging pass.
+copies. The wrapper checks `pkg-config --variable=gdk_pixbuf_moduledir
+gdk-pixbuf-2.0` before invoking the plugin, and refuses a missing/empty loader
+path with an actionable build-host diagnostic. Missing package metadata also
+fails before the plugin can modify the AppDir. Record the package versions and
+advertised path; build with the documented native-architecture Ubuntu 22.04
+baseline or use an official release AppImage on the newer runtime distribution.
+This does not add Glycin bundling support. Do not create an empty loader
+directory, downgrade desktop libraries, or bypass the pinned plugin to make
+packaging pass. `--plugin-api-version` discovery does not require GTK metadata.
 Successful local DEB/RPM packaging does not qualify the AppImage; its release
 build and artifact checks must still pass on the documented baseline.
 
