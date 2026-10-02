@@ -64,6 +64,11 @@ Windows the same command runs two tests that saturate a Tokio blocking pool,
 checking that SSH output still arrives and that no pipe read stays parked after
 a drain gives up; only a Windows host or CI can run them.
 
+The SIGTERM-ignoring pairing stand-in ignores TERM before executing Python,
+so interpreter startup cannot bypass the watchdog's TERM-to-KILL escalation.
+A delayed-interpreter regression keeps one PID through startup and verifies
+the original escalation bound and final process cleanup.
+
 The tests for concurrent preparation and disconnect use a real child process
 serving HTTP on a numeric loopback address. Their Python fixture uses
 `socketserver.TCPServer` and rejects reverse lookups: `http.server.HTTPServer`
