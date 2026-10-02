@@ -17,13 +17,17 @@ pub enum TurnDeliveryState {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TurnDeliveryFailureReason {
+    /// Paired only with a failed delivery refused for its original model or options.
     ModelSelectionRefused,
+    /// Paired only with a delivered retry that recovered into a fresh native conversation.
+    StartedNewConversation,
 }
 
 impl TurnDeliveryFailureReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ModelSelectionRefused => "modelSelectionRefused",
+            Self::StartedNewConversation => "startedNewConversation",
         }
     }
 }

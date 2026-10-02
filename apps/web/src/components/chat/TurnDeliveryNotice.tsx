@@ -20,6 +20,13 @@ export function TurnDeliveryNotice({
   onDismiss,
   disabled,
 }: TurnDeliveryNoticeProps) {
+  if (delivery.state === "delivered" && delivery.reason === "startedNewConversation") {
+    return (
+      <p role="status" className="w-full max-w-[80%] wrap-break-word text-xs text-muted-foreground">
+        Sent in a new conversation. The agent won't remember earlier messages in this thread.
+      </p>
+    );
+  }
   if (delivery.state === "pending" && waitingBehind) {
     return (
       <p role="status" className="w-full max-w-[80%] wrap-break-word text-xs text-muted-foreground">
