@@ -836,6 +836,19 @@ const queueEvents = {
       mode: "steer",
     },
   },
+  "delivery-new-conversation": {
+    type: "thread.turn-delivery-updated",
+    payload: {
+      ...queueEventPayload,
+      delivery: {
+        state: "delivered",
+        provider: "claudeAgent",
+        mode: "start",
+        reason: "startedNewConversation",
+      },
+      mode: "start",
+    },
+  },
   "delivery-withdrawn": {
     type: "thread.turn-delivery-updated",
     payload: {

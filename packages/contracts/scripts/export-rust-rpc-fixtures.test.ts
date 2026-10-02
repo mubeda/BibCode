@@ -111,7 +111,7 @@ describe("RPC wire fixture exporter", () => {
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(400);
+    expect(manifest.fixtures).toHaveLength(401);
     expect(manifest.fixtures).toContain("exit-response-too-large.json");
     expect(manifest.typedFailureFixtures).toContain("typed-failures/vcs__clone-04.json");
     expect(manifest.typedFailureFixtures).toEqual(
@@ -241,6 +241,27 @@ describe("RPC wire fixture exporter", () => {
       expect(contents).toBeDefined();
       expect(JSON.parse(contents!)).toMatchObject({ exit: { _tag: "Success", value: [event] } });
     }
+  });
+
+  it("exports the accepted fresh conversation notice in the delivery event", async () => {
+    await runExporter();
+    const path = "contract-shapes/orchestration__delivery-new-conversation-event.json";
+    const contents = io.writes.get(NodePath.join(outputDirectory, path));
+    expect(contents).toBeDefined();
+    expect(readManifest().fixtures).toContain(path);
+    expect(JSON.parse(contents!)).toMatchObject({
+      _tag: "Exit",
+      exit: {
+        value: [
+          {
+            type: "thread.turn-delivery-updated",
+            payload: {
+              delivery: { state: "delivered", reason: "startedNewConversation" },
+            },
+          },
+        ],
+      },
+    });
   });
 
   it.each([

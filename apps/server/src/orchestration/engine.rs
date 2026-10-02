@@ -4936,7 +4936,9 @@ async fn persist_turn_delivery_transition(
                 return Ok(None);
             }
             let next_state = turn_delivery_state_name(transition.next_state);
-            let reason = reason.filter(|_| transition.next_state == TurnDeliveryState::Failed)
+            let reason = reason.filter(|reason| matches!((transition.next_state, reason),
+                (TurnDeliveryState::Failed, TurnDeliveryFailureReason::ModelSelectionRefused)
+                | (TurnDeliveryState::Delivered, TurnDeliveryFailureReason::StartedNewConversation)))
                 .map(TurnDeliveryFailureReason::as_str);
             if transition.next_state == TurnDeliveryState::Queued {
                 let Some(row) = crate::persistence::requeue_provider_turn_on(
@@ -9003,6 +9005,95 @@ mod tests {
                 );
                 assert_delivery_reason(&engine, None).await;
             }
+            engine.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delivered_new_conversation_reason_is_state_scoped_and_replays_without_losing_text() {
+        use crate::orchestration::delivery::TurnDeliveryFailureReason;
+        for (state, reason, expected) in [
+            (
+                TurnDeliveryState::Delivered,
+                TurnDeliveryFailureReason::StartedNewConversation,
+                Some("startedNewConversation"),
+            ),
+            (
+                TurnDeliveryState::Failed,
+                TurnDeliveryFailureReason::StartedNewConversation,
+                None,
+            ),
+            (
+                TurnDeliveryState::Delivered,
+                TurnDeliveryFailureReason::ModelSelectionRefused,
+                None,
+            ),
+        ] {
+            let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+            admit_delivery(
+                &engine,
+                "reason-command",
+                &thread_id,
+                "reason-message",
+                "2026-08-01T00:00:01Z",
+            )
+            .await;
+            let original = engine
+                .repositories()
+                .get_message("reason-message".to_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                engine
+                    .transition_turn_delivery_with_reason(
+                        TurnDeliveryTransition {
+                            turn_id: None,
+                            command_id: "reason-command".to_owned(),
+                            expected_states: vec![TurnDeliveryState::Pending],
+                            expected_attempt: 0,
+                            next_state: state,
+                            detail: None,
+                            updated_at: "2026-08-01T00:00:02Z".to_owned(),
+                        },
+                        Some(reason)
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_delivery_reason(&engine, expected).await;
+            engine.repositories().database().call(|connection| {
+                connection.execute("DELETE FROM projection_thread_messages", [])?;
+                connection.execute("DELETE FROM projection_state WHERE projector = 'projection.thread-messages'", [])?;
+                Ok(())
+            }).await.unwrap();
+            bootstrap_projectors(&engine.repositories(), &TestHooks::default())
+                .await
+                .unwrap();
+            assert_delivery_reason(&engine, expected).await;
+            let replayed = engine
+                .repositories()
+                .get_message("reason-message".to_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(replayed.text, original.text);
+            assert_eq!(replayed.attachments, original.attachments);
+            assert!(
+                engine
+                    .transition_turn_delivery(TurnDeliveryTransition {
+                        turn_id: None,
+                        command_id: "reason-command".to_owned(),
+                        expected_states: vec![state],
+                        expected_attempt: 0,
+                        next_state: state,
+                        detail: None,
+                        updated_at: "2026-08-01T00:00:03Z".to_owned(),
+                    })
+                    .await
+                    .unwrap()
+            );
+            assert_delivery_reason(&engine, None).await;
             engine.shutdown().await;
         }
     }

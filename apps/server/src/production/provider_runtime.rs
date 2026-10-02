@@ -256,6 +256,7 @@ impl std::fmt::Debug for ProviderActivityControls {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderDeliveryOutcome {
     Accepted { turn_id: Option<String> },
+    AcceptedInNewConversation { turn_id: Option<String> },
     DefinitelyNotSent { detail: String },
     Ambiguous { detail: String },
     Rejected { detail: String },
@@ -446,6 +447,9 @@ pub enum ProviderRuntimeError {
     Spawn { provider: String, detail: String },
     #[error("{provider} provider operation failed: {detail}")]
     Provider { provider: String, detail: String },
+    /// Only absent/cursorless matching runtime state; conflicting identities remain rejected.
+    #[error("{provider} provider operation failed: {detail}")]
+    FrozenSessionUnavailable { provider: String, detail: String },
     /// The selected model or session refuses one of the request's own options, so the same
     /// request is refused again on every retry. Raised by:
     /// - the shape checks of Claude, Codex and OpenCode: an option without an id, and a value of
@@ -1478,9 +1482,10 @@ async fn deliver_orchestration_turn_with_identity(
     settings_root: &PathBuf,
     command: OrchestrationCommand,
     delivery_key: String,
-    frozen_delivery: Option<ProviderTurnDelivery>,
+    mut frozen_delivery: Option<ProviderTurnDelivery>,
 ) -> ProviderDeliveryOutcome {
     let is_frozen = frozen_delivery.is_some();
+    let mut started_new_conversation = false;
     let first = match frozen_delivery.clone() {
         Some(row) => supervisor.deliver_frozen_turn(command.clone(), row).await,
         None => {
@@ -1501,14 +1506,71 @@ async fn deliver_orchestration_turn_with_identity(
             };
         }
         Err(ProviderRuntimeError::SessionNotFound { .. }) => {
-            let request = match launch_request_for_command(
+            let request = launch_request_for_command(
                 engine,
                 settings_root,
                 &command,
                 frozen_delivery.as_ref(),
             )
-            .await
-            {
+            .await;
+            let request = if matches!(
+                &request,
+                Err(ProviderRuntimeError::FrozenSessionUnavailable { .. })
+            ) {
+                let Some(row) = frozen_delivery.as_ref() else {
+                    return ProviderDeliveryOutcome::DefinitelyNotSent {
+                        detail: "The message's frozen delivery identity is no longer available."
+                            .to_owned(),
+                    };
+                };
+                let Some(session_id) = row.provider_session_id.clone() else {
+                    return ProviderDeliveryOutcome::DefinitelyNotSent {
+                        detail: "The message's frozen conversation identity changed before retry."
+                            .to_owned(),
+                    };
+                };
+                match engine
+                    .repositories()
+                    .unfreeze_provider_turn_session(
+                        row.command_id.clone(),
+                        row.attempts,
+                        row.provider_instance_id.clone(),
+                        row.provider_kind.clone(),
+                        session_id,
+                        now(),
+                    )
+                    .await
+                {
+                    Ok(Some(row)) => frozen_delivery = Some(row),
+                    Ok(None) => {
+                        return ProviderDeliveryOutcome::DefinitelyNotSent {
+                            detail:
+                                "This message's delivery state changed before it could be retried."
+                                    .to_owned(),
+                        };
+                    }
+                    Err(error) => {
+                        return ProviderDeliveryOutcome::DefinitelyNotSent {
+                            detail: delivery_detail(
+                                &ProviderRuntimeError::Persistence(error.to_string()),
+                                None,
+                            ),
+                        };
+                    }
+                }
+                started_new_conversation = true;
+                build_launch_request_for_command(
+                    engine,
+                    settings_root,
+                    &command,
+                    frozen_delivery.as_ref(),
+                    true,
+                )
+                .await
+            } else {
+                request
+            };
+            let request = match request {
                 Ok(request) => request,
                 Err(error) => {
                     let label =
@@ -1575,7 +1637,12 @@ async fn deliver_orchestration_turn_with_identity(
             };
         }
     };
-    handle.completion().await
+    match handle.completion().await {
+        ProviderDeliveryOutcome::Accepted { turn_id } if started_new_conversation => {
+            ProviderDeliveryOutcome::AcceptedInNewConversation { turn_id }
+        }
+        outcome => outcome,
+    }
 }
 
 /// A frozen durable delivery that could not be handed to the provider fails once. A refusal of
@@ -1658,7 +1725,8 @@ pub(crate) fn delivery_detail(
         ProviderRuntimeError::InvalidOption { refusal, .. } => refusal.clone(),
         // Drivers and BiBCode's own delivery ordering both raise this one, so its detail, without
         // the "{driver id} provider operation failed:" prefix, is what it says.
-        ProviderRuntimeError::Provider { detail, .. } => detail.clone(),
+        ProviderRuntimeError::Provider { detail, .. }
+        | ProviderRuntimeError::FrozenSessionUnavailable { detail, .. } => detail.clone(),
         ProviderRuntimeError::Spawn { provider, detail } => {
             format!("{} could not start: {detail}", label(provider))
         }
@@ -2581,6 +2649,16 @@ async fn launch_request_for_command(
     command: &OrchestrationCommand,
     frozen_delivery: Option<&ProviderTurnDelivery>,
 ) -> Result<ProviderLaunchRequest, ProviderRuntimeError> {
+    build_launch_request_for_command(engine, settings_root, command, frozen_delivery, false).await
+}
+
+async fn build_launch_request_for_command(
+    engine: &OrchestrationEngine,
+    settings_root: &PathBuf,
+    command: &OrchestrationCommand,
+    frozen_delivery: Option<&ProviderTurnDelivery>,
+    recovering_lost_resume: bool,
+) -> Result<ProviderLaunchRequest, ProviderRuntimeError> {
     let OrchestrationCommand::ThreadTurnStart {
         thread_id,
         model_selection,
@@ -2635,13 +2713,17 @@ async fn launch_request_for_command(
     let persisted = repositories
         .get_provider_session_runtime(thread_id.clone())
         .await
-        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
-        .filter(|runtime| {
-            runtime.provider_name == provider
-                && runtime.provider_instance_id.as_deref() == Some(instance_id.as_str())
-        });
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
     let requires_resume = frozen_delivery.is_some_and(|row| row.provider_session_id.is_some());
-    if requires_resume && persisted.is_none() {
+    let runtime_matches = |runtime: &ProviderSessionRuntime| {
+        runtime.provider_name == provider
+            && runtime.provider_instance_id.as_deref() == Some(instance_id.as_str())
+    };
+    if (requires_resume || recovering_lost_resume)
+        && persisted
+            .as_ref()
+            .is_some_and(|runtime| !runtime_matches(runtime))
+    {
         return Err(ProviderRuntimeError::Provider {
             provider: provider.to_owned(),
             detail: format!(
@@ -2649,19 +2731,33 @@ async fn launch_request_for_command(
             ),
         });
     }
+    let persisted = persisted.filter(runtime_matches);
+    if requires_resume && persisted.is_none() {
+        return Err(ProviderRuntimeError::FrozenSessionUnavailable {
+            provider: provider.to_owned(),
+            detail: format!(
+                "durable turn requires resumable runtime state for provider instance {instance_id}"
+            ),
+        });
+    }
     let resume_cursor = persisted.and_then(|runtime| runtime.resume_cursor);
+    if recovering_lost_resume && resume_cursor.is_some() {
+        return Err(ProviderRuntimeError::Provider {
+            provider: provider.to_owned(),
+            detail: "The provider's conversation changed before this message could start a new conversation.".to_owned(),
+        });
+    }
     if let Some(row) = frozen_delivery
         && row.provider_session_id.is_some()
     {
-        let resume_cursor =
-            resume_cursor
-                .as_ref()
-                .ok_or_else(|| ProviderRuntimeError::Provider {
-                    provider: provider.to_owned(),
-                    detail: format!(
-                        "durable turn requires a resume cursor for provider instance {instance_id}"
-                    ),
-                })?;
+        let resume_cursor = resume_cursor.as_ref().ok_or_else(|| {
+            ProviderRuntimeError::FrozenSessionUnavailable {
+                provider: provider.to_owned(),
+                detail: format!(
+                    "durable turn requires a resume cursor for provider instance {instance_id}"
+                ),
+            }
+        })?;
         validate_frozen_session_identity(row, resume_cursor)?;
     }
     let options = selection_options(selection);
@@ -4351,9 +4447,9 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
         ProviderRuntimeError::UnsupportedCapability { .. } => "unsupported capability",
         ProviderRuntimeError::ActivityTargetUnsupported { .. } => "targeted activity unsupported",
         ProviderRuntimeError::Spawn { .. } => "provider spawn failure",
-        ProviderRuntimeError::Provider { .. } | ProviderRuntimeError::InvalidOption { .. } => {
-            "provider operation failure"
-        }
+        ProviderRuntimeError::Provider { .. }
+        | ProviderRuntimeError::InvalidOption { .. }
+        | ProviderRuntimeError::FrozenSessionUnavailable { .. } => "provider operation failure",
         ProviderRuntimeError::Persistence(_) => "persistence failure",
         ProviderRuntimeError::Orchestration(_) => "projection failure",
     };

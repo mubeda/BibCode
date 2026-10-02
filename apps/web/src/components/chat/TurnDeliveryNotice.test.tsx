@@ -47,6 +47,32 @@ const OPTION_REFUSAL =
   "claudeAgent provider operation failed: option fastMode is not supported by the selected model/session";
 
 describe("TurnDeliveryNotice", () => {
+  it("shows a quiet truthful notice after delivery in a new conversation", () => {
+    const markup = renderNotice({
+      ...delivery("delivered", "claudeAgent", null),
+      reason: "startedNewConversation",
+    });
+    expect(markup).toContain(
+      "Sent in a new conversation. The agent won&#x27;t remember earlier messages in this thread.",
+    );
+    expect(markup).toContain('role="status"');
+    expect(markup).toContain("text-muted-foreground");
+    expect(markup).not.toMatch(/text-destructive|text-warning|<button/u);
+    expect(renderNotice(delivery("delivered", "claudeAgent", null))).toBe("");
+  });
+
+  it.each(["pending", "sending", "failed", "uncertain", "dismissed"] as const)(
+    "does not claim a new conversation while delivery is %s",
+    (state) => {
+      expect(
+        renderNotice({
+          ...delivery(state),
+          reason: "startedNewConversation",
+        }),
+      ).not.toContain("Sent in a new conversation.");
+    },
+  );
+
   it("offers only Dismiss and explains how to resend a refused model selection", () => {
     const markup = renderNotice({
       ...delivery("failed", "claudeAgent", OPTION_REFUSAL),
