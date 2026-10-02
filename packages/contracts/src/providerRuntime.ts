@@ -96,6 +96,7 @@ export type RuntimeSessionExitKind = typeof RuntimeSessionExitKind.Type;
 const CanonicalRuntimeErrorClass = Schema.Literals([
   "provider_error",
   "transport_error",
+  "session_stopped",
   "permission_error",
   "validation_error",
   "unknown",

@@ -2223,7 +2223,7 @@ async fn queued_deliveries_survive_restart_without_provider_launch() {
                     "Provider session ended when BiBCode stopped. Review delivery status before continuing."
                 )
             );
-            assert_eq!(session.last_error_class.as_deref(), Some("transport_error"));
+            assert_eq!(session.last_error_class.as_deref(), Some("session_stopped"));
             let assistant = engine
                 .repositories()
                 .get_message("abandoned-assistant".into())

@@ -330,6 +330,11 @@ recovery must preserve queued state, payload, mode, and existing holds without
 launching a provider. A starting/connecting/running projection without a live
 runtime, including after graceful shutdown, must become an error with no active
 turn, settle its partial assistant messages, and hold every queued message.
+In light and dark themes, both restart reconciliation and workspace-loss
+settlement must show "BiBCode stopped this session" above their existing
+actionable explanation. A genuine provider disconnect must retain the
+lost-connection title. A newer unknown error classification must decode to the
+generic banner without dropping the session or live event.
 Repeat startup to verify no duplicate events, then promote the head and prove
 the pending start is claimable. Keep original request digests stable when
 admission resolves the queued flag.
