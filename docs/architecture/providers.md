@@ -223,7 +223,21 @@ an idle deadline generation before `ready` is published; successful projection o
 non-failed completion arms it. When a current deadline finds a busy session (an
 admitted delivery, a `running` or `starting` projection, or an active turn), it
 immediately re-arms for one idle timeout, and the next completion supersedes that
-re-arm. The next start delivery,
+re-arm.
+
+Idle retention is deliberately conservative in three cases: a send that ends
+without a turn after invalidating an earlier deadline; a launched or restored
+session that has never run a turn; and a failed turn. None arms a new idle
+deadline. Idle policy retains the session until a later successfully projected,
+non-failed completion arms one, or an explicit stop/lifecycle cleanup removes
+it. This retains resources longer but avoids treating those events as proof
+that the provider is idle. The existing admission/projection check cannot see
+all unprojected provider work, including a provider-initiated turn or a failed
+running-state write; that limitation remains explicit. Expiring these cases
+would first require an authoritative busy/idle signal and defined failure
+ordering. The current decision is to preserve this retention policy.
+
+The next start delivery,
 including **Send now** on a held queued message, detaches the dead session and
 releases its activity and process ownership through normal session cleanup.
 It retains the persisted resume cursor and follows the existing missing-session
