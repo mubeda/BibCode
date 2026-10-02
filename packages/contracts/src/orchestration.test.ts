@@ -1316,6 +1316,21 @@ it.effect("decodes orchestration session runtime mode defaults", () =>
   }),
 );
 
+it.effect("preserves intentional session stops in persisted snapshots", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeOrchestrationSession({
+      threadId: "thread-1",
+      status: "error",
+      providerName: "codex",
+      activeTurnId: null,
+      lastError: "Provider session ended when BiBCode stopped.",
+      lastErrorClass: "session_stopped",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(parsed.lastErrorClass, "session_stopped");
+  }),
+);
+
 it.effect("normalizes a newer persisted session error class", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeOrchestrationSession({
