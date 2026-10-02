@@ -47,11 +47,15 @@ export function classifyQualificationFailure(error: unknown) {
   const message = typeof source.message === "string" ? source.message.slice(0, 4096) : "";
   let kind = ownErrors.get(message) ?? "unclassified";
   if (kind === "unclassified") {
-    if (/no such element/i.test(message)) kind = "missing-element";
+    if (/no such element|element.*(?:wasn.t found|not found)/i.test(message))
+      kind = "missing-element";
+    else if (/click intercepted|other element would receive/i.test(message))
+      kind = "click-intercepted";
+    else if (/stale element/i.test(message)) kind = "stale-element";
     else if (/not interactable/i.test(message)) kind = "element-not-interactable";
     else if (/invalid session|session not created/i.test(message))
       kind = "browser-session-unavailable";
-    else if (/timeout|timed out/i.test(message)) kind = "timeout";
+    else if (/timeout|timed out|still not displayed after/i.test(message)) kind = "timeout";
   }
   return {
     kind,

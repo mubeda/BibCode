@@ -30,6 +30,16 @@ it("retains only closed failure categories even when every error field contains 
     "ENOENT",
   );
   expect(classifyQualificationFailure({ signal: "SIGABRT", status: 134 }).signal).toBe("SIGABRT");
+  for (const [message, kind] of [
+    ["element click intercepted: " + secret, "click-intercepted"],
+    ["element wasn't found: " + secret, "missing-element"],
+    ["stale element reference: " + secret, "stale-element"],
+    ["element still not displayed after 30000ms: " + secret, "timeout"],
+  ]) {
+    const projected = classifyQualificationFailure(new Error(message));
+    expect(projected.kind).toBe(kind);
+    expect(JSON.stringify(projected)).not.toContain(secret);
+  }
 });
 
 it("reports process exits and bounded guard refusal counts without any log text", () => {

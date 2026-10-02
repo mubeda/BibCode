@@ -233,6 +233,7 @@ const observationScript = String.raw`(() => {
 })();`;
 
 let browser: Awaited<ReturnType<typeof remote>> | undefined;
+let pairingCompleted = false;
 let success = false;
 const cleanupFailures: Array<{
   role: string;
@@ -393,18 +394,31 @@ try {
   await b.$("#pairing-token").setValue(credential);
   await b.$("button=Continue").click();
   await b.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
+  pairingCompleted = true;
 
-  phase("import-primary-project");
+  phase("open-project-menu");
   await b.$('[data-testid="sidebar-add-project-trigger"]').click();
-  await b
-    .$("//button[@data-add-project-action='true'][.//span[normalize-space()='Browse folder']]")
-    .click();
+  phase("choose-project-browse");
+  const browseFolder = b.$(
+    "//button[@data-add-project-action='true'][.//span[normalize-space()='Browse folder']]",
+  );
+  await browseFolder.waitForDisplayed();
+  await browseFolder.click();
+  phase("choose-project-path-entry");
+  await until(
+    async () =>
+      (await b.$("#add-project-host-path").isDisplayed()) ||
+      (await b.$("button=Type a path instead").isDisplayed()),
+  );
   if (!(await b.$("#add-project-host-path").isExisting())) {
     await b.$("button=Type a path instead").waitForDisplayed();
     await b.$("button=Type a path instead").click();
   }
+  phase("submit-project-path");
+  await b.$("#add-project-host-path").waitForDisplayed();
   await b.$("#add-project-host-path").setValue(plain.projectPath);
   await b.$("button=Open project").click();
+  phase("wait-project-composer");
   const editorSelector =
     '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]';
   await b.$(editorSelector).waitForDisplayed();
@@ -465,6 +479,28 @@ try {
   success = true;
 } catch (error) {
   write("failure", { phase: currentPhase, failure: classifyQualificationFailure(error) });
+  // Only the paired, disposable fixture can produce a failure screenshot.
+  // Never capture the credential form or any password/one-time-code input.
+  if (browser && pairingCompleted) {
+    try {
+      const safe = await bounded(
+        browser.execute(
+          () =>
+            document.querySelector(
+              '#pairing-token,input[type="password"],input[autocomplete="one-time-code"]',
+            ) === null,
+        ),
+        5_000,
+      );
+      if (safe)
+        await bounded(
+          browser.saveScreenshot(NodePath.join(evidenceRoot, "failure-after-pair.png")),
+          5_000,
+        );
+    } catch {
+      // Diagnostic capture cannot skip the owned process cleanup below.
+    }
+  }
 } finally {
   beforeCleanup = processes.map(({ child, log, role, spawnFailure }) =>
     projectQualificationProcess({
