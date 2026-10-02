@@ -36,12 +36,11 @@ describe("left panel typography", () => {
       expect(tag).toContain("showBadge={false}");
     }
     // The shared component composes iconClassName after its default initials class.
-    // Its non-sidebar defaults are intentionally not swept here.
     const icon = NodeFS.readFileSync(
       new URL("../chat/ProviderInstanceIcon.tsx", import.meta.url),
       "utf8",
     );
-    expect(icon).toContain('"text-[10px] font-semibold leading-none", props.iconClassName');
+    expect(textSizesBelowTextXs(icon)).toEqual([]);
   });
 
   it("sets 6 px spacing in both project SidebarMenu branches", () => {

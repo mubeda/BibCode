@@ -78,7 +78,7 @@ const StashFileRow = memo(function StashFileRow({
     <button
       aria-selected={selected}
       className={cn(
-        "flex h-[29px] w-full min-w-0 items-center gap-1.5 px-2 text-left text-[11px] focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
+        "flex h-[29px] w-full min-w-0 items-center gap-1.5 px-2 text-left text-xs focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
         selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/45",
       )}
       role="option"
@@ -89,7 +89,7 @@ const StashFileRow = memo(function StashFileRow({
     >
       <FileIcon aria-hidden="true" className="size-3 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1 truncate">{file.path}</span>
-      <span className="shrink-0 text-[10px] text-muted-foreground">
+      <span className="shrink-0 text-xs text-muted-foreground">
         +{file.insertions} −{file.deletions}
       </span>
     </button>
@@ -276,8 +276,8 @@ export const GitManagerStashDiff = memo(function GitManagerStashDiff({
           </Suspense>
         ) : renderablePatch?.kind === "raw" ? (
           <div className="space-y-2">
-            <p className="text-[11px] text-muted-foreground">{renderablePatch.reason}</p>
-            <pre className="overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/25 p-3 font-mono text-[11px]">
+            <p className="text-xs text-muted-foreground">{renderablePatch.reason}</p>
+            <pre className="overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/25 p-3 font-mono text-xs">
               {renderablePatch.text}
             </pre>
           </div>
