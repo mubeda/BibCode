@@ -442,3 +442,27 @@ perform shared cleanup and final Git audit. Include the actual
 `CFBundleExecutable`, bundle identifier, signing/notarization classification,
 DMG mount/detach evidence, renderer restoration evidence, screenshot paths,
 zero-survivor evidence, and whether anything was pushed.
+
+## Source-control launch diagnostics
+
+Use an isolated fixture environment and test-owned hosting executables to verify
+launch-not-found and permission-denied failures. Do not retry a real merge
+request, inspect provider credentials, or modify the desktop's launch PATH to
+create the failure. Use the maintained executable fixture writer and preserve
+its directory until the attempted child has settled.
+
+Verify that the create-request dialog retains the selected branches, title and
+description, shows the safe launch category and guidance, and offers an explicit
+Retry without submitting again automatically. A not-found category must not
+claim that a missing CLI is the unique cause. Preserve the existing indication
+of any already-published branch; a later failure does not imply rollback.
+
+Confirm one corresponding failed stacked action in Diagnostics. New unary and
+action failures have measured server-operation time. Historic zero-duration
+records and untimed events show **Not recorded**; measured positive durations
+below one millisecond show **<1 ms**. Untimed samples count as occurrences and
+failures but do not enter average, maximum or slow-span timing statistics.
+Capture only closed failure categories, numeric error codes, hydration outcome,
+and verified availability categories; omit raw PATH, credentials, process output
+and private repository details. Fixture validation does not establish the cause
+of an earlier user incident without that incident's native evidence.
