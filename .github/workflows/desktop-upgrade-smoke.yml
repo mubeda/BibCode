@@ -120,6 +120,10 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
         run: node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib updates::tests
 
+      - name: Test protected-current firewall worker
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
+        run: node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib firewall::tests
+
       - name: Clear protected-current desktop lint cache
         if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
         run: node scripts/run-msvc.mjs cargo clean -p bibcode-desktop

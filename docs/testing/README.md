@@ -43,7 +43,7 @@ the existing protected data/workspace roots, updater, deadlines, verification,
 and cleanup. The CLI equivalent requires both `--windows-diagnostics` and
 `--windows-protected-current`; non-Windows and WSL combinations are rejected.
 Before the native trial, this selection runs `vp check`, Rust formatting, the
-full `vpr typecheck` graph, the desktop bridge contract and update tests, and
+full `vpr typecheck` graph, the desktop bridge contract, update and firewall tests, and
 desktop all-target Clippy with warnings denied. It builds the web assets before
 native checks and tests, uses the maintained MSVC/Cargo test launcher, and clears
 the desktop lint cache before Clippy. Each gate must pass before installation.

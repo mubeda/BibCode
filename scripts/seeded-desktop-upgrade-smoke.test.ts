@@ -889,6 +889,7 @@ describe("seeded packaged desktop upgrade harness", () => {
       "vpr typecheck",
       "node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib bridge::tests::tauri_ipc_handlers_preserve_runtime_agnostic_bridge_contracts -- --exact",
       "node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib updates::tests",
+      "node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib firewall::tests",
       "node scripts/run-msvc.mjs cargo clean -p bibcode-desktop",
       "node scripts/run-msvc.mjs cargo clippy -p bibcode-desktop --all-targets -- -D warnings",
     ];
