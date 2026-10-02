@@ -1863,7 +1863,7 @@ mod tests {
             .unwrap();
         assert_eq!(session.status, "error");
         assert_eq!(session.active_turn_id, None);
-        assert_eq!(session.last_error_class.as_deref(), Some("transport_error"));
+        assert_eq!(session.last_error_class.as_deref(), Some("session_stopped"));
         assert!(
             session
                 .last_error

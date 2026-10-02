@@ -797,6 +797,8 @@ export function threadErrorAttribution(input: {
       return `${agent} reported an error`;
     case "transport_error":
       return `BiBCode lost its connection to ${provider ?? "the agent"}`;
+    case "session_stopped":
+      return "BiBCode stopped this session";
     case "permission_error":
       return `${agent} rejected the credentials`;
     case "validation_error":
