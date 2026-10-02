@@ -21,6 +21,7 @@ import { createSizedPng, instrumentCodexAttachmentLog } from "./support/chat-upl
 import { startThrottleProxy } from "../../../scripts/throttle-proxy.ts";
 import {
   classifyQualificationFailure,
+  mayCaptureQualificationFailure,
   projectPairingObservation,
   projectQualificationProcess,
 } from "./support/chat-upload-evidence.ts";
@@ -249,6 +250,7 @@ let browser: Awaited<ReturnType<typeof remote>> | undefined;
 let networkProof: BrowserNetworkProof | null = null;
 let onlineAfterPairFailure: boolean | null = null;
 let pairingCompleted = false;
+let credentialEntryAttempted = false;
 let pairingObservation: ReturnType<typeof projectPairingObservation> | null = null;
 let success = false;
 const cleanupFailures: Array<{
@@ -460,6 +462,7 @@ try {
   phase("pair-wait-token");
   await b.$("#pairing-token").waitForDisplayed();
   phase("pair-fill-token");
+  credentialEntryAttempted = true;
   await b.$("#pairing-token").setValue(credential);
   phase("pair-submit");
   await b.$("button=Continue").click();
@@ -620,8 +623,7 @@ try {
     onlineAfterPairFailure,
     pairingObservation,
   });
-  // Only the paired, disposable fixture can produce a failure screenshot.
-  // Never capture the credential form or any password/one-time-code input.
+  // Retain passive transport observations after a completed pairing.
   if (browser && pairingCompleted) {
     try {
       const observations = await bounded(
@@ -638,18 +640,50 @@ try {
         onlineAfterPairFailure,
         pairingObservation,
       });
+    } catch {
+      // Diagnostic capture cannot skip the owned process cleanup below.
+    }
+  }
+  // Before pairing, only the wait preceding any credential entry is eligible.
+  // A failed/partial entry remains ineligible even if the form subsequently disappears.
+  if (
+    browser &&
+    mayCaptureQualificationFailure({
+      phase: currentPhase,
+      credentialEntryAttempted,
+      pairingCompleted,
+      screenSafe: true,
+    })
+  ) {
+    try {
       const safe = await bounded(
         browser.execute(
-          () =>
+          (ownedOrigin: string) =>
+            location.origin === ownedOrigin &&
+            location.search === "" &&
+            location.hash === "" &&
             document.querySelector(
               '#pairing-token,input[type="password"],input[autocomplete="one-time-code"]',
             ) === null,
+          webOrigin,
         ),
         5_000,
       );
-      if (safe)
+      if (
+        mayCaptureQualificationFailure({
+          phase: currentPhase,
+          credentialEntryAttempted,
+          pairingCompleted,
+          screenSafe: safe === true,
+        })
+      )
         await bounded(
-          browser.saveScreenshot(NodePath.join(evidenceRoot, "failure-after-pair.png")),
+          browser.saveScreenshot(
+            NodePath.join(
+              evidenceRoot,
+              pairingCompleted ? "failure-after-pair.png" : "failure-before-credential.png",
+            ),
+          ),
           5_000,
         );
     } catch {

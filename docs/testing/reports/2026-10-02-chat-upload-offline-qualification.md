@@ -72,7 +72,18 @@ route/readiness category, control-presence/disabled/error booleans and bounded
 counts of the existing passive primary-socket observations. It never copies
 input values, page/error text, URLs, credentials or cookies, and does not capture
 the credential form. Missing diagnostic reads remain unknown; they cannot skip
-the existing owned cleanup. Native execution of this added observation is pending.
+the existing owned cleanup. The run below supplies native evidence for these observations.
+
+Run `37067543180` then located the timeout at `pair-wait-token`, before any
+credential was entered. The document was complete on `/pair`, but the token
+control, submit control, pending heading and sidebar were absent. This does not
+identify the displayed page or the failure cause. The next diagnostic permits
+an original `failure-before-credential.png` only at that exact pre-entry wait,
+before any attempted credential entry, and after confirming the owned origin,
+empty query/fragment, and absence of token/password/one-time-code inputs. A
+failed or partial entry cannot use this exception. The same location/input
+guard also applies to the existing post-pair capture. Other pre-pair stages
+remain ineligible; no credential-form capture or page-state mutation is added.
 
 Local validation uses fake namespace/ip/browser ports, plus the existing owned
 supervisor tests. No real namespace, link, route, browser/native UI, installer,

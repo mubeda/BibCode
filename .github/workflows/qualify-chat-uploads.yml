@@ -57,4 +57,5 @@ jobs:
             ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/supervisor.json
             ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/plain-smoke.png
             ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure-after-pair.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure-before-credential.png
           if-no-files-found: warn

@@ -5,6 +5,7 @@ import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
 import {
   classifyQualificationFailure,
+  mayCaptureQualificationFailure,
   projectPairingObservation,
   projectQualificationProcess,
 } from "./chat-upload-evidence.ts";
@@ -42,6 +43,29 @@ it("retains only closed failure categories even when every error field contains 
     expect(JSON.stringify(projected)).not.toContain(secret);
   }
 });
+
+it.each([
+  ["pair-wait-token", false, false, true, true],
+  ["pair-wait-token", true, false, true, false],
+  ["pair-submit", true, false, true, false],
+  ["pair-wait-sidebar", true, false, true, false],
+  ["pair-navigate", false, false, true, false],
+  ["real-composer-small-upload", true, true, true, true],
+  ["pair-wait-token", false, false, false, false],
+  ["real-composer-small-upload", true, true, false, false],
+] as const)(
+  "bounds failure capture for phase %s, entry %s, paired %s, safe %s",
+  (phase, credentialEntryAttempted, pairingCompleted, screenSafe, expected) => {
+    expect(
+      mayCaptureQualificationFailure({
+        phase,
+        credentialEntryAttempted,
+        pairingCompleted,
+        screenSafe,
+      }),
+    ).toBe(expected);
+  },
+);
 
 it("retains only closed pairing state without credentials, DOM text or URLs", () => {
   const secret = "pairing-secret-do-not-retain";

@@ -76,6 +76,20 @@ export function projectPairingObservation(input: unknown) {
   };
 }
 
+/** A pre-pair screenshot is allowed only before any attempted credential entry. */
+export function mayCaptureQualificationFailure(input: {
+  readonly phase: string;
+  readonly credentialEntryAttempted: boolean;
+  readonly pairingCompleted: boolean;
+  readonly screenSafe: boolean;
+}): boolean {
+  return (
+    input.screenSafe === true &&
+    (input.pairingCompleted === true ||
+      (input.phase === "pair-wait-token" && input.credentialEntryAttempted === false))
+  );
+}
+
 /** Never retain messages, stack, names, stdout, stderr, request arguments or auth objects. */
 export function classifyQualificationFailure(error: unknown) {
   const source =
