@@ -2314,7 +2314,23 @@ async fn broadcaster_cancellation_closes_subscription_and_missing_paths_report_l
         error.operation.as_ref(),
         "GitVcsDriver.statusDetailsLocal.status"
     );
-    assert!(error.detail.contains("failed to spawn git"));
+    assert!(
+        error
+            .detail
+            .starts_with("Could not start git: a required file or directory was not found")
+    );
+    assert!(error.detail.contains("repository folder is accessible"));
+    assert!(
+        !error
+            .detail
+            .contains(repo.path().to_string_lossy().as_ref())
+    );
+    assert!(!error.detail.contains("missing/repository"));
+    let diagnostics = error.diagnostics.expect("structured launch diagnostics");
+    assert_eq!(diagnostics.argument_count, Some(6));
+    assert_eq!(diagnostics.exit_code, None);
+    assert_eq!(diagnostics.stdout_length, None);
+    assert_eq!(diagnostics.stderr_length, None);
 }
 
 async fn wait_for_path(path: &Path) {

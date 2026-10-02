@@ -1297,11 +1297,14 @@ fn blocked_error(operation: &str, reason: GitManagerBlockedReason) -> Value {
     })
 }
 
-fn mutation_git_error(operation: &str, _error: GitCommandError) -> Value {
+fn mutation_git_error(operation: &str, error: GitCommandError) -> Value {
+    let message = error.safe_failure_message();
     operation_error(
         operation,
         "git-command-failed",
-        "Git could not complete the requested mutation.",
+        message
+            .as_deref()
+            .unwrap_or("Git could not complete the requested mutation."),
     )
 }
 
@@ -1748,11 +1751,14 @@ fn merge_preview_value(preview: merge::GitManagerMergePreviewResult) -> Value {
     value
 }
 
-fn git_error(operation: &str, _error: GitCommandError) -> Value {
+fn git_error(operation: &str, error: GitCommandError) -> Value {
+    let message = error.safe_failure_message();
     operation_error(
         operation,
         "git-command-failed",
-        "Git could not complete the requested read.",
+        message
+            .as_deref()
+            .unwrap_or("Git could not complete the requested read."),
     )
 }
 
@@ -1784,6 +1790,62 @@ mod tests {
     use tokio::sync::{Semaphore, oneshot};
 
     use super::*;
+
+    #[test]
+    fn git_failure_messages_keep_known_exit_status_without_forwarding_private_detail() {
+        let error = GitCommandError {
+            tag: "GitCommandError",
+            operation: "private-operation-sentinel".into(),
+            command: "private-command-sentinel".into(),
+            cwd: "private-cwd-sentinel".into(),
+            diagnostics: Some(Box::new(crate::git::GitCommandDiagnostics {
+                exit_code: Some(23),
+                ..Default::default()
+            })),
+            detail: "stdout-sentinel Bearer credential-sentinel".into(),
+        };
+        for value in [
+            git_error("gitManager.getRefs", error.clone()),
+            mutation_git_error("gitManager.commit", error),
+        ] {
+            let message = value["message"].as_str().expect("message");
+            assert!(message.contains("status 23"), "{message}");
+            assert!(!message.contains("sentinel"));
+            assert_eq!(value["code"], "git-command-failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn git_launch_failure_survives_repository_and_manager_boundaries() {
+        let sandbox = crate::test_support::TestSandbox::new("git-manager-launch-failure");
+        let repository = GitRepository::default();
+        let error = repository
+            .run(
+                "private-operation-sentinel",
+                &sandbox.root().join("absent-workspace"),
+                &["status".into()],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("absent owned cwd prevents the process from starting");
+        for value in [
+            git_error("gitManager.getRefs", error.clone()),
+            mutation_git_error("gitManager.commit", error),
+        ] {
+            let message = value["message"].as_str().expect("message");
+            assert!(message.contains("Could not start git"), "{message}");
+            assert!(
+                message.contains("required file or directory")
+                    || message.contains("required path is not a directory"),
+                "{message}"
+            );
+            assert!(message.contains("repository folder"));
+            assert!(!message.contains("not installed"));
+            assert!(!message.contains("sentinel"));
+            assert!(!message.contains(sandbox.root().to_string_lossy().as_ref()));
+            assert_eq!(value["code"], "git-command-failed");
+        }
+    }
     use crate::{
         persistence::{Database, ProjectionProject, Repositories, run_migrations},
         rpc::{ACTIVE_RPC_METHODS, MethodMode, RequestId},

@@ -10,6 +10,9 @@ import {
   ServerProvider,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
+  ServerTraceDiagnosticsRecentFailure,
+  ServerTraceDiagnosticsSpanOccurrence,
+  ServerTraceDiagnosticsSpanSummary,
 } from "./server.ts";
 import {
   expectDecodeFailure,
@@ -23,6 +26,13 @@ const decodeProviderUpdateError = Schema.decodeUnknownSync(ServerProviderUpdateE
 const decodeProcessDiagnosticsEntry = Schema.decodeUnknownSync(ServerProcessDiagnosticsEntry);
 const decodeProcessResourceTotals = Schema.decodeUnknownSync(ServerProcessResourceTotals);
 const encodeProviderUpdateError = Schema.encodeSync(ServerProviderUpdateError);
+const decodeTraceOccurrence = Schema.decodeUnknownSync(
+  Schema.toCodecJson(ServerTraceDiagnosticsSpanOccurrence),
+);
+const decodeTraceFailure = Schema.decodeUnknownSync(
+  Schema.toCodecJson(ServerTraceDiagnosticsRecentFailure),
+);
+const decodeTraceSummary = Schema.decodeUnknownSync(ServerTraceDiagnosticsSpanSummary);
 
 const baseProviderSnapshot = {
   instanceId: "codex",
@@ -37,6 +47,38 @@ const baseProviderSnapshot = {
   checkedAt: "2026-04-10T00:00:00.000Z",
   models: [],
 };
+
+describe("trace timing compatibility", () => {
+  it("preserves measured/unavailable metadata while accepting older numeric timing", () => {
+    const occurrence = {
+      name: "gitManager.getRefs",
+      durationMs: 0,
+      endedAt: "2026-10-02T00:00:00.000Z",
+      traceId: "trace",
+      spanId: "span",
+    };
+    for (const decode of [decodeTraceOccurrence, decodeTraceFailure]) {
+      const input = { ...occurrence, cause: "launch was denied" };
+      expect(decode(input).durationMeasured).toBeUndefined();
+      for (const durationMeasured of [false, true]) {
+        expect(decode({ ...input, durationMeasured }).durationMeasured).toBe(durationMeasured);
+      }
+      expect(() => decode({ ...input, durationMeasured: "yes" })).toThrow();
+      expect(() => decode({ ...input, durationMs: null })).toThrow();
+    }
+    const summary = {
+      name: "gitManager.getRefs",
+      count: 3,
+      failureCount: 3,
+      totalDurationMs: 10,
+      averageDurationMs: 10,
+      maxDurationMs: 10,
+    };
+    expect(decodeTraceSummary(summary).measuredCount).toBeUndefined();
+    expect(decodeTraceSummary({ ...summary, measuredCount: 1 }).measuredCount).toBe(1);
+    expect(() => decodeTraceSummary({ ...summary, measuredCount: -1 })).toThrow();
+  });
+});
 
 describe("ServerProvider", () => {
   it("keeps older snapshots compatible with the optional turn-steer capability", () => {

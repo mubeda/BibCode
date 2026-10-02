@@ -366,6 +366,9 @@ pub struct GitCommandError {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitCommandDiagnostics {
+    /// Native facts remain private; wire errors keep their established shape.
+    #[serde(skip)]
+    pub(crate) failure: Option<super::process::ProcessFailureFacts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub argument_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -374,6 +377,19 @@ pub struct GitCommandDiagnostics {
     pub stdout_length: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_length: Option<usize>,
+}
+
+impl GitCommandError {
+    pub(crate) fn safe_failure_message(&self) -> Option<String> {
+        let diagnostics = self.diagnostics.as_deref()?;
+        let failure = diagnostics.failure.or_else(|| {
+            diagnostics
+                .exit_code
+                .filter(|code| *code != 0)
+                .map(super::process::ProcessFailureFacts::exited)
+        })?;
+        Some(failure.message("git"))
+    }
 }
 
 impl std::fmt::Display for GitCommandError {
