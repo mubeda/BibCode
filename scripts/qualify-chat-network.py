@@ -184,15 +184,19 @@ def _setup(environment, run_owned, context, readlink, platform, clock, read_owne
     require(owned['lo'].get('ifindex') == loopback_index)
     for name, peer in [(IN, PEER), (PEER, IN)]:
         row = owned[name]
-        context.stage = 'after-peer-check'
+        context.stage = 'after-ifindex-check'
         require(type(row.get('ifindex')) is int and row['ifindex'] > 0)
-        require(row.get('link_index') == owned[peer].get('ifindex'))
+        context.stage = 'after-peer-relation-check'
+        require(row.get('link') == peer)
+        context.stage = 'after-peer-format-check'
+        require('link_index' not in row)
+        context.stage = 'after-peer-namespace-check'
         require('link_netnsid' not in row and 'link-netnsid' not in row)
         context.stage = 'after-veth-check'
         require(row.get('linkinfo', {}).get('info_kind') == 'veth')
         context.stage = 'after-carrier-check'
         require({'UP', 'LOWER_UP'}.issubset(row.get('flags', [])))
-    context.stage = 'after-peer-check'
+    context.stage = 'after-indices-check'
     require(len({row.get('ifindex') for row in links}) == 3)
     context.stage = 'after-addresses-check'
     check_addresses(addresses, True)

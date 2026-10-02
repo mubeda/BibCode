@@ -187,3 +187,19 @@ it("projects nonzero helper stdout into the browser receipt and malformed output
 it("refusal JSON syntax errors expose only the closed decoder message", () => {
   expect(() => parseNetworkFailure("foreign-secret")).toThrow("Contained refusal proof refused.");
 });
+
+it.each([
+  "after-ifindex-check",
+  "after-peer-relation-check",
+  "after-peer-format-check",
+  "after-peer-namespace-check",
+  "after-indices-check",
+] as const)("accepts only the closed peer predicate stage %s", (stage) => {
+  const proof = { ...refusal, stage, attemptedMutations: 6, completedMutations: 6 };
+  expect(parseNetworkFailure(JSON.stringify({ refused: true, failure: proof }))).toEqual(proof);
+  expect(() =>
+    parseNetworkFailure(
+      JSON.stringify({ refused: true, failure: { ...proof, stage: "after-peer-secret" } }),
+    ),
+  ).toThrow();
+});

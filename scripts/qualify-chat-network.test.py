@@ -19,9 +19,9 @@ OWNER = [sys.executable, ENV['BIBCODE_UPLOAD_NETWORK_HELPER'], 'inner', 'evidenc
 NAMESPACES = {f'/proc/{owner}/ns/{kind}': value for owner in ['self', '1']
               for kind, value in [('net', 'net:[2]'), ('pid', 'pid:[3]'), ('user', 'user:[4]')]}
 LO = {'ifindex': 1, 'ifname': 'lo'}
-PAIR = [LO, {'ifindex': 2, 'ifname': 'bcup-in', 'link_index': 3,
+PAIR = [LO, {'ifindex': 2, 'ifname': 'bcup-in', 'link': 'bcup-peer',
              'linkinfo': {'info_kind': 'veth'}, 'flags': ['UP', 'LOWER_UP']},
-        {'ifindex': 3, 'ifname': 'bcup-peer', 'link_index': 2,
+        {'ifindex': 3, 'ifname': 'bcup-peer', 'link': 'bcup-in',
          'linkinfo': {'info_kind': 'veth'}, 'flags': ['UP', 'LOWER_UP']}]
 ADDRESSES = [{'ifname': 'lo', 'addr_info': [{'family': 'inet', 'local': '127.0.0.1', 'prefixlen': 8}]},
              {'ifname': 'bcup-in', 'addr_info': [{'family': 'inet', 'local': '10.254.231.1', 'prefixlen': 30}]},
@@ -110,7 +110,7 @@ class NetworkTests(unittest.TestCase):
     def test_foreign_peer_address_or_default_postcondition_refuses(self):
         for change in ['peer', 'netns', 'address', 'route']:
             fake = FakeIp()
-            if change == 'peer': fake.after_links[1]['link_index'] = 8
+            if change == 'peer': fake.after_links[1]['link'] = 'wrong-peer'
             elif change == 'netns': fake.after_links[1]['link_netnsid'] = 0
             elif change == 'address': fake.after_addresses[1]['addr_info'][0]['local'] = '10.1.1.1'
             else: fake.after_routes.append({'dst': 'default', 'gateway': 'secret', 'dev': 'bcup-peer'})
@@ -138,9 +138,9 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(failure.exception.proof['stage'], 'namespace-net')
         self.assertEqual(failure.exception.proof['attemptedMutations'], 0)
         self.assertIsNone(failure.exception.proof['lastCommand'])
-        fake = FakeIp(); fake.after_links[1]['link_index'] = 9
+        fake = FakeIp(); fake.after_links[1]['link'] = 'wrong-peer'
         with self.assertRaises(network.NetworkRefused) as failure: self.setup_network(fake)
-        self.assertEqual(failure.exception.proof['stage'], 'after-peer-check')
+        self.assertEqual(failure.exception.proof['stage'], 'after-peer-relation-check')
         self.assertEqual(failure.exception.proof['completedMutations'], 6)
     def test_status_projection_never_retains_foreign_fields_or_raw_exceptions(self):
         secret = 'foreign-route-namespace-path-error-secret'
@@ -162,5 +162,48 @@ class NetworkTests(unittest.TestCase):
             self.assertIs(failure.exception.proof['netAdminEffective'], expected)
             self.assertEqual(fake.mutations, MUTATIONS[:1])
             self.assertNotIn('foreign-secret', json.dumps(failure.exception.proof))
+
+
+    def test_documented_reciprocal_local_names_accept_different_unique_indices(self):
+        fake = FakeIp(); fake.after_links[1]['ifindex'] = 23; fake.after_links[2]['ifindex'] = 29
+        self.assertTrue(self.setup_network(fake)['linksContained'])
+        self.assertEqual(fake.mutations, MUTATIONS)
+
+    def test_peer_representation_refusal_matrix_has_closed_predicate_stages(self):
+        cases = ['missing', 'null', 'wrong', 'self', 'lo', 'asymmetric', 'numeric', 'numeric-only', 'mixed', 'foreign', 'foreign-negative', 'foreign-hyphen', 'duplicate', 'invalid-index']
+        for case in cases:
+            with self.subTest(case=case):
+                fake = FakeIp(); row = fake.after_links[1]; stage = 'after-peer-relation-check'
+                if case == 'missing': row.pop('link')
+                elif case == 'null': row['link'] = None
+                elif case == 'wrong': row['link'] = 'foreign-name-secret'
+                elif case == 'self': row['link'] = 'bcup-in'
+                elif case == 'lo': row['link'] = 'lo'
+                elif case == 'asymmetric': fake.after_links[2]['link'] = 'bcup-peer'
+                elif case == 'numeric': row['link'] = 3
+                elif case == 'numeric-only': row.pop('link'); row['link_index'] = 3
+                elif case == 'mixed': row['link_index'] = 3; stage = 'after-peer-format-check'
+                elif case.startswith('foreign'):
+                    key = 'link-netnsid' if case == 'foreign-hyphen' else 'link_netnsid'
+                    row[key] = -1 if case == 'foreign-negative' else 0; stage = 'after-peer-namespace-check'
+                elif case == 'duplicate': fake.after_links[2]['ifindex'] = 2; stage = 'after-indices-check'
+                else: row['ifindex'] = True; stage = 'after-ifindex-check'
+                with self.assertRaises(network.NetworkRefused) as failure: self.setup_network(fake)
+                self.assertEqual(failure.exception.proof['stage'], stage)
+                self.assertEqual(failure.exception.proof['completedMutations'], 6)
+                self.assertNotIn('secret', json.dumps(failure.exception.proof))
+
+    def test_loopback_veth_carrier_address_and_route_checks_remain_required(self):
+        for case, stage in [('loopback', 'after-loopback-check'), ('veth', 'after-veth-check'), ('carrier', 'after-carrier-check'), ('address', 'after-addresses-check'), ('route', 'after-routes-check')]:
+            with self.subTest(case=case):
+                fake = FakeIp()
+                if case == 'loopback': fake.after_links[0]['ifindex'] = 99
+                elif case == 'veth': fake.after_links[1]['linkinfo']['info_kind'] = 'dummy'
+                elif case == 'carrier': fake.after_links[1]['flags'] = ['UP']
+                elif case == 'address': fake.after_addresses[1]['addr_info'][0]['prefixlen'] = 31
+                else: fake.after_routes.append({'dst': '10.1.0.0/16', 'dev': 'bcup-in', 'protocol': 'kernel'})
+                with self.assertRaises(network.NetworkRefused) as failure: self.setup_network(fake)
+                self.assertEqual(failure.exception.proof['stage'], stage)
+                self.assertEqual(fake.mutations, MUTATIONS)
 
 if __name__ == '__main__': unittest.main()

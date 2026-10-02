@@ -45,6 +45,23 @@ environment values or private logs are added to artifacts. The artifact path
 allowlist is unchanged. Workflow tests now include the fake network guard and
 browser boolean tests.
 
+The peer verifier uses the documented [upstream same-namespace JSON printer](https://github.com/iproute2/iproute2/blob/v5.15.0/lib/utils.c#L1246):
+reciprocal local `link` names must match the two fixed owned peers. Numeric
+`link_index` and either foreign-namespace marker are refused. This replaces one
+assumed numeric-reference predicate and adds one contradictory-format refusal;
+it is not the earlier diagnostic-only claim that all predicates were unchanged.
+Positive unique indices, original loopback identity, veth kind, carrier,
+addresses/routes, namespace ownership, literal commands and deadlines stay
+required. Closed failure stages distinguish index, relation, format, namespace
+marker and uniqueness without retaining raw shape values.
+
+The failed run's provenance omitted actual ip/package/image versions. The
+maintained Ubuntu 22.04 inventory and Ubuntu source package support the corrected
+publisher shape, but do not establish that exact runtime version. The observed
+prior receipt completed six commands; it was not a zero-mutation attempt. This
+repair and fake test success still require the next actual CI online/RPC/upload
+observations. No further matrix scenarios are added here.
+
 Local validation uses fake namespace/ip/browser ports, plus the existing owned
 supervisor tests. No real namespace, link, route, browser/native UI, installer,
 provider or CI run is performed by these new tests. Run:
