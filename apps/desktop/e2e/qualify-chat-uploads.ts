@@ -200,6 +200,11 @@ const observationScript = String.raw`(() => {
   window.WebSocket = class extends Original {
     constructor(...args) {
       super(...args); this.fixtureSocket = ++nextSocket;
+      const port = new URL(this.url).port;
+      record({ kind: 'created', socket: this.fixtureSocket,
+        endpoint: port === '4903' ? 'plain-proxy' : port === '4911' ? 'noise-proxy' : port === '4901' ? 'web-dev' : 'other' });
+      this.addEventListener('open', () => record({ kind: 'opened', socket: this.fixtureSocket }));
+      this.addEventListener('error', () => record({ kind: 'error', socket: this.fixtureSocket }));
       this.addEventListener('message', (event) => {
         if (typeof event.data !== 'string') return;
         try { const value = JSON.parse(event.data);
@@ -396,6 +401,8 @@ try {
   await b.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
   pairingCompleted = true;
 
+  phase("wait-primary-connected");
+  await b.$('[data-testid="environment-rail-local"] [data-status="connected"]').waitForDisplayed();
   phase("open-project-menu");
   await b.$('[data-testid="sidebar-add-project-trigger"]').click();
   phase("choose-project-browse");
@@ -483,6 +490,17 @@ try {
   // Never capture the credential form or any password/one-time-code input.
   if (browser && pairingCompleted) {
     try {
+      const observations = await bounded(
+        browser.execute(() =>
+          JSON.parse(JSON.stringify(Reflect.get(window, "__uploadObservations"))),
+        ),
+        5_000,
+      );
+      write("failure", {
+        phase: currentPhase,
+        failure: classifyQualificationFailure(error),
+        observations,
+      });
       const safe = await bounded(
         browser.execute(
           () =>
