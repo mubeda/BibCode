@@ -71,6 +71,16 @@ const decodeReplayEventsInput = Schema.decodeUnknownSync(OrchestrationReplayEven
 const decodeReplayEventsResult = Schema.decodeUnknownSync(
   OrchestrationRpcSchemas.replayEvents.output,
 );
+const decodeLegacyTurnDelivery = Schema.decodeUnknownSync(
+  Schema.Struct({
+    ...TurnDelivery.fields,
+    reason: Schema.optionalKey(
+      Schema.Literals(["modelSelectionRefused"]).pipe(
+        Schema.catchDecoding(() => Effect.succeedNone),
+      ),
+    ),
+  }),
+);
 
 describe("delivery failure reasons", () => {
   const delivery = { state: "failed", provider: "codex" };
@@ -80,6 +90,18 @@ describe("delivery failure reasons", () => {
       ...delivery,
       reason: "modelSelectionRefused",
     });
+  });
+
+  it("preserves the delivered notice for a new conversation", () => {
+    const delivered = { state: "delivered", provider: "codex", reason: "startedNewConversation" };
+    expect(decodeTurnDelivery(delivered)).toEqual(delivered);
+  });
+
+  it("lets an older client omit the new reason and keep the delivered message", () => {
+    const delivered = { state: "delivered", provider: "codex" };
+    expect(decodeLegacyTurnDelivery({ ...delivered, reason: "startedNewConversation" })).toEqual(
+      delivered,
+    );
   });
 
   it("decodes old deliveries without a reason", () => {
