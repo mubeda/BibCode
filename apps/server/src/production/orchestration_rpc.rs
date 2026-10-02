@@ -4881,14 +4881,18 @@ mod tests {
                 provider_instance_id.map(|value| json!(value)).as_ref()
             );
         }
-        for reason in [Some("modelSelectionRefused"), None] {
+        for (state, reason) in [
+            ("failed", Some("modelSelectionRefused")),
+            ("delivered", Some("startedNewConversation")),
+            ("delivered", None),
+        ] {
             let mut message = engine
                 .repositories()
                 .get_message("message-1".to_owned())
                 .await
                 .expect("message lookup")
                 .expect("message");
-            message.delivery_state = Some("failed".to_owned());
+            message.delivery_state = Some(state.to_owned());
             message.delivery_reason = reason.map(str::to_owned);
             engine
                 .repositories()

@@ -301,7 +301,10 @@ export type TurnDeliveryState = typeof TurnDeliveryState.Type;
 export const TurnDeliveryMode = Schema.Literals(["start", "steer"]);
 export type TurnDeliveryMode = typeof TurnDeliveryMode.Type;
 
-export const TurnDeliveryFailureReason = Schema.Literals(["modelSelectionRefused"]);
+export const TurnDeliveryFailureReason = Schema.Literals([
+  "modelSelectionRefused",
+  "startedNewConversation",
+]);
 export type TurnDeliveryFailureReason = typeof TurnDeliveryFailureReason.Type;
 
 export const TurnDelivery = Schema.Struct({
@@ -314,8 +317,8 @@ export const TurnDelivery = Schema.Struct({
   held: Schema.optional(Schema.Boolean),
   detail: Schema.optional(TrimmedNonEmptyString),
   /**
-   * Set only while state is failed. The provider refused the turn's model or one
-   * of its options, so the unchanged turn is refused again on every attempt.
+   * modelSelectionRefused belongs to failed: the unchanged model/options were refused.
+   * startedNewConversation belongs to delivered: retry recovered lost resume state.
    */
   reason: Schema.optionalKey(
     TurnDeliveryFailureReason.pipe(Schema.catchDecoding(() => Effect.succeedNone)),
