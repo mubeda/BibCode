@@ -5,9 +5,13 @@ import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeVM from "node:vm";
 import * as NodeURL from "node:url";
+import * as NodeModule from "node:module";
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import * as Schema from "effect/Schema";
+import * as Effect from "effect/Effect";
+import { it as effectIt } from "@effect/vitest";
+import { HostProcessPlatform } from "@bibcode/shared/hostProcess";
 import { AuthPairingLink } from "@bibcode/contracts";
 import { parse as parseToml, type TomlTable } from "smol-toml";
 import {
@@ -31,6 +35,9 @@ import {
   parseSeededDesktopUpgradeSmokeArgs,
   prepareSeededUpgradeBuild,
   redactAndBoundUpgradeEvidence,
+  writeRemoteUploadCapabilityReceipt,
+  readRemoteFixtureSecrets,
+  stopRemoteUploadFixture,
   removeSeededUpgradeDependencyTree,
   runBoundedCommand,
   seededUpgradeVitePlusExecutable,
@@ -55,6 +62,384 @@ const absolute = (...parts: ReadonlyArray<string>): string =>
 
 const decodePairingLink = Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingLink));
 const repositoryRoot = NodeURL.fileURLToPath(new URL("..", import.meta.url));
+
+describe("private held upload receipt and cleanup", () => {
+  const directory = "bibcode-update-witness-00000000-0000-4000-8000-000000000001";
+  const receipt = {
+    version: 1 as const,
+    relativeDirectory: directory,
+    relativeUrl: "/api/transfers/private-capability",
+  };
+  async function owned(
+    run: (root: string, workspace: string, upload: string, credentials: string) => Promise<void>,
+  ) {
+    const root = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "held-upload-receipt-"),
+    );
+    const workspace = NodePath.join(root, "workspace");
+    await NodeFS.promises.mkdir(workspace);
+    const credentials = NodePath.join(root, "credentials.json");
+    await NodeFS.promises.writeFile(
+      credentials,
+      JSON.stringify({ bootstrapToken: "private-grant" }),
+      { mode: 0o600 },
+    );
+    try {
+      await run(root, workspace, NodePath.join(root, "upload.json"), credentials);
+    } finally {
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  }
+  effectIt.effect(
+    "persists an immutable private capability receipt and reads all literal secrets",
+    () =>
+      Effect.gen(function* () {
+        const platform = yield* HostProcessPlatform;
+        yield* Effect.promise(() =>
+          owned(async (_root, _workspace, path, credentials) => {
+            await writeRemoteUploadCapabilityReceipt(path, receipt);
+            const bytes = await NodeFS.promises.readFile(path, "utf8");
+            expect(JSON.parse(bytes)).toEqual(receipt);
+            if (platform !== "win32")
+              expect((await NodeFS.promises.stat(path)).mode & 0o777).toBe(0o600);
+            await expect(
+              writeRemoteUploadCapabilityReceipt(path, {
+                ...receipt,
+                relativeUrl: "/api/transfers/replacement",
+              }),
+            ).rejects.toThrow("private upload receipt");
+            expect(await NodeFS.promises.readFile(path, "utf8")).toBe(bytes);
+            expect(
+              await readRemoteFixtureSecrets({
+                credentialReceiptPath: credentials,
+                uploadReceiptPath: path,
+                requireUploadReceipt: true,
+              }),
+            ).toEqual(
+              expect.arrayContaining(["private-grant", receipt.relativeUrl, "private-capability"]),
+            );
+          }),
+        );
+      }),
+  );
+  it.each(["malformed", "unexpected-fields", "traversal", "missing", "oversized"])(
+    "refuses %s receipts with closed errors",
+    async (kind) => {
+      await owned(async (_root, _workspace, path, credentials) => {
+        const text =
+          kind === "malformed"
+            ? '{"private-capability":'
+            : kind === "unexpected-fields"
+              ? JSON.stringify({ ...receipt, privateUnknown: "private-capability" })
+              : kind === "traversal"
+                ? JSON.stringify({ ...receipt, relativeDirectory: "../outside" })
+                : kind === "oversized"
+                  ? "private-capability".repeat(1000)
+                  : null;
+        if (text !== null) await NodeFS.promises.writeFile(path, text);
+        const error = await readRemoteFixtureSecrets({
+          credentialReceiptPath: credentials,
+          uploadReceiptPath: path,
+          requireUploadReceipt: true,
+        }).catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        expect(String(error)).not.toContain("private-capability");
+      });
+    },
+  );
+  it.each([
+    ["credentials", false],
+    ["credentials", true],
+    ["upload", false],
+    ["upload", true],
+  ] as const)(
+    "rejects present null %s even when required upload is %s",
+    async (kind, requireUploadReceipt) => {
+      await owned(async (_root, _workspace, path, credentials) => {
+        await NodeFS.promises.writeFile(kind === "credentials" ? credentials : path, "null");
+        const error = await readRemoteFixtureSecrets({
+          credentialReceiptPath: credentials,
+          uploadReceiptPath: path,
+          requireUploadReceipt,
+        }).catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        expect(String(error)).not.toContain("private-grant");
+      });
+    },
+  );
+  it("requires bootstrap receipt once the remote phase could have returned credentials", async () => {
+    await owned(async (_root, _workspace, path, credentials) => {
+      await NodeFS.promises.rm(credentials);
+      const input = {
+        credentialReceiptPath: credentials,
+        uploadReceiptPath: path,
+        requireUploadReceipt: false,
+        requireCredentialReceipt: true,
+      };
+      await expect(readRemoteFixtureSecrets(input)).rejects.toThrow(
+        "private remote credential receipt",
+      );
+    });
+  });
+  it("allows absent receipts before any remote phase could start", async () => {
+    await owned(async (_root, _workspace, path, credentials) => {
+      await NodeFS.promises.rm(credentials);
+      expect(
+        await readRemoteFixtureSecrets({
+          credentialReceiptPath: credentials,
+          uploadReceiptPath: path,
+          requireUploadReceipt: false,
+        }),
+      ).toEqual([]);
+    });
+  });
+  it("waits for actual process-stop settlement before removing only owned upload residue", async () => {
+    await owned(async (_root, workspace, path) => {
+      await writeRemoteUploadCapabilityReceipt(path, receipt);
+      const target = NodePath.join(workspace, directory);
+      await NodeFS.promises.mkdir(target);
+      await NodeFS.promises.writeFile(NodePath.join(target, "protection-witness.txt"), "o");
+      await NodeFS.promises.writeFile(
+        NodePath.join(target, ".protection-witness.txt.1-2-3.bibcode-upload.part"),
+        "o",
+      );
+      const gate = Promise.withResolvers<void>();
+      const stopping = stopRemoteUploadFixture({
+        workspaceRoot: workspace,
+        uploadReceiptPath: path,
+        stop: () => gate.promise,
+      });
+      expect(NodeFS.existsSync(target)).toBe(true);
+      gate.resolve();
+      await stopping;
+      expect(NodeFS.existsSync(target)).toBe(false);
+      expect(NodeFS.existsSync(workspace)).toBe(true);
+    });
+  });
+  it("refuses malformed bootstrap JSON without exposing the parse input", async () => {
+    await owned(async (_root, _workspace, path, credentials) => {
+      await writeRemoteUploadCapabilityReceipt(path, receipt);
+      await NodeFS.promises.writeFile(credentials, '{"private-grant":');
+      const error = await readRemoteFixtureSecrets({
+        credentialReceiptPath: credentials,
+        uploadReceiptPath: path,
+      }).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+      expect(String(error)).not.toContain("private-grant");
+    });
+  });
+  it("preserves residue when process cleanup fails or the directory contains unknown work", async () => {
+    await owned(async (_root, workspace, path) => {
+      await writeRemoteUploadCapabilityReceipt(path, receipt);
+      const target = NodePath.join(workspace, directory);
+      await NodeFS.promises.mkdir(target);
+      await NodeFS.promises.writeFile(NodePath.join(target, "unexpected.txt"), "preserve");
+      await expect(
+        stopRemoteUploadFixture({
+          workspaceRoot: workspace,
+          uploadReceiptPath: path,
+          stop: async () => {
+            throw new Error("stop refused");
+          },
+        }),
+      ).rejects.toThrow();
+      expect(NodeFS.existsSync(target)).toBe(true);
+      await expect(
+        stopRemoteUploadFixture({
+          workspaceRoot: workspace,
+          uploadReceiptPath: path,
+          stop: async () => {},
+        }),
+      ).rejects.toThrow();
+      expect(await NodeFS.promises.readFile(NodePath.join(target, "unexpected.txt"), "utf8")).toBe(
+        "preserve",
+      );
+    });
+  });
+});
+
+/** Execute the real retention/dispatch bodies with inert native ports and owned temporary files. */
+const remoteRetentionFixture = async () => {
+  const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "remote-retention-"));
+  const runRoot = NodePath.join(root, "remote");
+  const evidenceDirectory = NodePath.join(runRoot, "evidence");
+  await NodeFS.promises.mkdir(evidenceDirectory, { recursive: true });
+  const source = await NodeFS.promises.readFile(
+    new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+    "utf8",
+  );
+  const phaseStart = source.indexOf("const runWebDriverPhase = async");
+  const phaseEnd = source.indexOf("\nconst startMockUpdateServer", phaseStart);
+  const laneStart = source.indexOf("const runUpgradeLane = async");
+  const laneEnd = source.indexOf("\nconst copyBoundedEvidence", laneStart);
+  const ownerStart = source.indexOf(
+    "      await runUpgradeLane({\n        appBinaryPath: remoteApp,",
+  );
+  const ownerEnd = source.indexOf("\n      });", ownerStart) + "\n      });".length;
+  const finallyStart = source.indexOf("    const secrets = [signingKey, signingPassword];");
+  const finallyEnd = source.indexOf("\n  }\n  if (failure !== undefined)", finallyStart);
+  if (
+    [phaseStart, phaseEnd, laneStart, laneEnd, ownerStart, finallyStart, finallyEnd].some(
+      (index) => index < 0,
+    )
+  )
+    throw new Error("Remote evidence owner source is unavailable.");
+  const phaseInput = {
+    appBinaryPath: NodePath.join(root, "owned-app"),
+    backendPort: 14953,
+    candidateVersion: "0.7.3",
+    dataRoot: NodePath.join(runRoot, "data"),
+    evidenceDirectory,
+    expectedDataRoot: NodePath.join(runRoot, "data"),
+    lane: "remote-install",
+    phase: "seed-and-install",
+    platform: "linux",
+    projectId: "remote-fixture",
+    repositoryRoot,
+    restartTimeoutMs: 30_000,
+    resultPath: NodePath.join(runRoot, "before.json"),
+    runRoot,
+    workspaceRoot: NodePath.join(runRoot, "workspace"),
+    webdriverPort: 15053,
+    wsl: false,
+  };
+  const runCommand = vi.fn(async () => ({
+    exitCode: 1,
+    stdout: "fixture-private-returned-token",
+    stderr: "private receipt write failed",
+  }));
+  const copyBoundedEvidence = vi.fn(async () => {});
+  const cleanup = vi.fn(async () => {});
+  const context = NodeVM.createContext({
+    NodeFS,
+    NodePath,
+    NodeURL,
+    process: { env: {} },
+    REMOTE_UPDATE_DOWNLOAD_BUDGET_MS: 1,
+    REMOTE_UPDATE_INSTALL_BUDGET_MS: 1,
+    REMOTE_UPDATE_RESTART_BUDGET_MS: 1,
+    seededUpgradeVitePlusExecutable,
+    createSeededUpgradeDriverSpec,
+    createSeededUpgradeWdioConfig,
+    readRemoteFixtureSecrets,
+    redactAndBoundUpgradeEvidence,
+    assertWebDriverPhaseExit,
+    assertRemoteInstallPort,
+    SeededDesktopUpgradeSmokeError,
+    runCommand,
+    remotePhaseStarted: false,
+    signingKey: "private-signing-key",
+    signingPassword: "private-signing-password",
+    failure: undefined,
+    remoteApp: phaseInput.appBinaryPath,
+    runId: "fixture",
+    input: {
+      ...phaseInput,
+      updaterPort: 14950,
+      artifactDirectory: NodePath.join(root, "retained"),
+    },
+    layout: { remoteInstall: phaseInput },
+    requestLogPath: NodePath.join(root, "requests.jsonl"),
+    readObservation: async (path: string) =>
+      JSON.parse(await NodeFS.promises.readFile(path, "utf8")),
+    copyBoundedEvidence,
+    cleanup: { cleanup },
+  });
+  const evaluate = (body: string): Promise<unknown> =>
+    NodeVM.runInContext(NodeModule.stripTypeScriptTypes(`(async () => { ${body} })()`), context, {
+      timeout: 1_000,
+    }) as Promise<unknown>;
+  const runPhase = async (prepareFailure = false) => {
+    if (prepareFailure) {
+      await NodeFS.promises.writeFile(NodePath.join(runRoot, "seed-and-install-driver"), "owned");
+    }
+    return evaluate(
+      source.slice(phaseStart, phaseEnd) +
+        "\n" +
+        source.slice(laneStart, laneEnd) +
+        "\n" +
+        source.slice(ownerStart, ownerEnd),
+    );
+  };
+  return {
+    root,
+    runRoot,
+    evidenceDirectory,
+    runCommand,
+    copyBoundedEvidence,
+    cleanup,
+    runPhase,
+    finalize: () => evaluate(source.slice(finallyStart, finallyEnd) + "\n return failure;"),
+    dispose: () => NodeFS.promises.rm(root, { recursive: true, force: true }),
+  };
+};
+
+describe("remote phase receipt retention boundaries", () => {
+  it("refuses phase logs after credentials return but receipt publication fails", async () => {
+    const fixture = await remoteRetentionFixture();
+    try {
+      const error = await fixture.runPhase().catch((error: unknown) => error);
+      expect(
+        NodeFS.existsSync(NodePath.join(fixture.evidenceDirectory, "seed-and-install.log")),
+      ).toBe(false);
+      expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+      expect(String(error)).not.toContain("fixture-private-returned-token");
+    } finally {
+      await fixture.dispose();
+    }
+  });
+  it.each(["returned", "thrown"])(
+    "refuses final copies after a %s remote phase failure without a bootstrap receipt",
+    async (kind) => {
+      const fixture = await remoteRetentionFixture();
+      try {
+        if (kind === "thrown")
+          fixture.runCommand.mockRejectedValue(new Error("fixture launch failure"));
+        await fixture.runPhase().catch(() => undefined);
+        const finalError = await fixture.finalize();
+        expect(fixture.copyBoundedEvidence).not.toHaveBeenCalled();
+        expect(finalError).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        expect(fixture.cleanup).toHaveBeenCalledOnce();
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+  it("keeps earlier evidence when local phase preparation fails before any launch attempt", async () => {
+    const fixture = await remoteRetentionFixture();
+    try {
+      await expect(fixture.runPhase(true)).rejects.toThrow();
+      expect(fixture.runCommand).not.toHaveBeenCalled();
+      expect(await fixture.finalize()).toBeUndefined();
+      expect(fixture.copyBoundedEvidence).toHaveBeenCalledOnce();
+      expect(fixture.cleanup).toHaveBeenCalledOnce();
+    } finally {
+      await fixture.dispose();
+    }
+  });
+  it("retains redacted failure evidence with a valid bootstrap receipt before install dispatch", async () => {
+    const fixture = await remoteRetentionFixture();
+    try {
+      await NodeFS.promises.writeFile(
+        NodePath.join(fixture.runRoot, "remote-bootstrap.secret.json"),
+        JSON.stringify({ bootstrapToken: "fixture-private-returned-token" }),
+      );
+      await expect(fixture.runPhase()).rejects.toThrow();
+      const log = await NodeFS.promises.readFile(
+        NodePath.join(fixture.evidenceDirectory, "seed-and-install.log"),
+        "utf8",
+      );
+      expect(log).toContain("[REDACTED]");
+      expect(log).not.toContain("fixture-private-returned-token");
+      expect(await fixture.finalize()).toBeUndefined();
+      expect(fixture.copyBoundedEvidence).toHaveBeenCalledOnce();
+      expect(fixture.cleanup).toHaveBeenCalledOnce();
+    } finally {
+      await fixture.dispose();
+    }
+  });
+});
+
 const versionFixture = async () => {
   const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "seeded-versions-"));
   const originals = new Map(
@@ -112,6 +497,7 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
     remoteInstallDriverPath: "fixture:driver",
     remoteHarnessPath: "fixture:host",
     remoteSecretPath: absolute("remote", "private.json"),
+    remoteUploadSecretPath: absolute("remote", "upload-private.json"),
     remoteEvidencePath: absolute("remote", "evidence", "remote-rpc.json"),
   };
   const spec = createSeededUpgradeDriverSpec(input);
@@ -187,6 +573,8 @@ describe("generated remote sharing grant handoff", () => {
       endpoint: "http://127.0.0.1:43123",
       bootstrapToken: "fixture-distinct-grant",
       candidateVersion: "0.7.3",
+      workspaceRoot: fixture.input.workspaceRoot,
+      uploadReceiptPath: fixture.input.remoteUploadSecretPath,
       requireWide: true,
       onInstallDispatched: expect.any(Function),
     });
@@ -355,6 +743,7 @@ describe("seeded packaged desktop upgrade harness", () => {
         remoteInstallDriverPath: "file:///isolated/remote-install-driver.ts",
         remoteHarnessPath: "file:///isolated/seeded-desktop-upgrade-smoke.ts",
         remoteSecretPath: NodePath.join(directory, "private.json"),
+        remoteUploadSecretPath: NodePath.join(directory, "upload-private.json"),
         remoteEvidencePath: NodePath.join(directory, "evidence.json"),
       });
       const path = NodePath.join(directory, "remote.e2e.mjs");
@@ -415,6 +804,15 @@ describe("seeded packaged desktop upgrade harness", () => {
       phases: ["downloading", "installing", "succeeded"],
       sawPercent: true,
       sawStage: true,
+      heldUpload: {
+        admitted: true,
+        releasedOnWaitingStage: true,
+        completed: true,
+        bytesMatch: true,
+        noPartials: true,
+        requestClosed: true,
+        holdLimitMs: 20_000,
+      },
       preUpdateBackups: 1,
       requesterLogLines: 1,
       appImageMounts: 1,
@@ -428,6 +826,10 @@ describe("seeded packaged desktop upgrade harness", () => {
       { ...good, phases: [] },
       { ...good, sawPercent: false },
       { ...good, sawStage: false },
+      { ...good, heldUpload: { ...good.heldUpload, releasedOnWaitingStage: false } },
+      { ...good, heldUpload: { ...good.heldUpload, requestClosed: false } },
+      { ...good, heldUpload: { ...good.heldUpload, bytesMatch: false } },
+      { ...good, heldUpload: { ...good.heldUpload, noPartials: false } },
       { ...good, preUpdateBackups: 0 },
       { ...good, requesterLogLines: 2 },
       { ...good, appImageMounts: 2 },
@@ -1038,6 +1440,35 @@ describe("seeded packaged desktop upgrade harness", () => {
       await NodeFS.promises.rm(root, { recursive: true, force: true });
     }
   });
+
+  it.each(["raw", "truncated", "json", "slash-escaped", "unicode-slash", "encoded-token"] as const)(
+    "redacts %s signed transfer labels before evidence bounds",
+    (kind) => {
+      const capability = "capability-prefix-" + "private".repeat(60);
+      const full = "HTTP POST /api/transfers/" + capability;
+      const truncated = full.slice(0, 159) + "…";
+      const label =
+        kind === "raw"
+          ? full
+          : kind === "json"
+            ? JSON.stringify({ operation: truncated })
+            : kind === "slash-escaped"
+              ? truncated.replaceAll("/", "\\/")
+              : kind === "unicode-slash"
+                ? truncated.replaceAll("/", "\\u002f")
+                : kind === "encoded-token"
+                  ? truncated.replace("capability", "\\u0063apability")
+                  : truncated;
+      const evidence = redactAndBoundUpgradeEvidence(label, {
+        maxBytes: 512,
+        roots: [],
+        secrets: [capability],
+      });
+      expect(evidence).not.toContain("capability-prefix");
+      expect(evidence).not.toContain("privateprivate");
+      expect(evidence).toContain("[REDACTED]");
+    },
+  );
 
   it("redacts secrets and roots before bounding retained failure evidence", () => {
     const privateKey = "PRIVATE-TEST-KEY-MATERIAL";

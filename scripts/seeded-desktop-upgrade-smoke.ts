@@ -107,6 +107,15 @@ export function countAppImageMounts(procMounts: string, prefix: string): number 
     .split("\n")
     .filter((line) => NodePath.posix.basename(line.split(" ")[1] ?? "").startsWith(prefix)).length;
 }
+export interface RemoteHeldUploadEvidence {
+  readonly admitted: boolean;
+  readonly releasedOnWaitingStage: boolean;
+  readonly completed: boolean;
+  readonly bytesMatch: boolean;
+  readonly noPartials: boolean;
+  readonly requestClosed: boolean;
+  readonly holdLimitMs: number;
+}
 export interface RemoteInstallEvidence {
   readonly before: {
     readonly bootId: string;
@@ -121,6 +130,7 @@ export interface RemoteInstallEvidence {
   readonly phases: ReadonlyArray<string>;
   readonly sawPercent: boolean;
   readonly sawStage: boolean;
+  readonly heldUpload: RemoteHeldUploadEvidence;
   readonly preUpdateBackups: number;
   readonly requesterLogLines: number;
   readonly appImageMounts: number | null;
@@ -149,6 +159,18 @@ export function verifyRemoteInstallOutcome(
   if (!evidence.phases.includes("succeeded")) fail("the coordinator did not succeed.");
   if (!evidence.sawPercent || !evidence.sawStage)
     fail("download and protection progress was not observed.");
+  const held = evidence.heldUpload;
+  if (
+    !held ||
+    held.admitted !== true ||
+    held.releasedOnWaitingStage !== true ||
+    held.completed !== true ||
+    held.bytesMatch !== true ||
+    held.noPartials !== true ||
+    held.requestClosed !== true ||
+    held.holdLimitMs !== 20_000
+  )
+    fail("the owned held upload witness was not completed.");
   if (evidence.preUpdateBackups < 1) fail("no pre-update backup was observed.");
   if (evidence.requesterLogLines !== 1) fail("expected exactly one requester log entry.");
   if (evidence.appImageMounts !== null && evidence.appImageMounts !== 1)
@@ -399,6 +421,7 @@ export function createSeededUpgradeDriverSpec(input: {
   readonly remoteInstallDriverPath?: string;
   readonly remoteHarnessPath?: string;
   readonly remoteSecretPath?: string;
+  readonly remoteUploadSecretPath?: string;
   readonly remoteEvidencePath?: string;
   readonly appBinaryPath?: string;
   readonly platform?: SeededUpgradePlatform;
@@ -409,6 +432,7 @@ export function createSeededUpgradeDriverSpec(input: {
     (!input.remoteInstallDriverPath ||
       !input.remoteHarnessPath ||
       !input.remoteSecretPath ||
+      !input.remoteUploadSecretPath ||
       !input.remoteEvidencePath ||
       !input.appBinaryPath ||
       !input.platform)
@@ -640,6 +664,8 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
     const evidence = await runRemoteInstallDriver({
       ...credentials,
       candidateVersion: input.candidateVersion,
+      workspaceRoot: input.workspaceRoot,
+      uploadReceiptPath: input.remoteUploadSecretPath,
       requireWide: widened,
       onInstallDispatched: () => {
         NodeFS.writeFileSync(input.resultPath, JSON.stringify({ ...observation, installAttempted: true }));
@@ -1004,8 +1030,166 @@ export class ManagedProcessRegistry {
   }
 }
 
+export interface RemoteUploadCapabilityReceipt {
+  readonly version: 1;
+  readonly relativeDirectory: string;
+  readonly relativeUrl: string;
+}
+const uploadDirectoryPattern =
+  /^bibcode-update-witness-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const privateUploadError = () =>
+  new SeededDesktopUpgradeSmokeError("The private upload receipt is invalid or unavailable.");
+function decodeRemoteUploadReceipt(value: unknown): RemoteUploadCapabilityReceipt {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Object.keys(value).sort().join(",") !== "relativeDirectory,relativeUrl,version" ||
+    !("version" in value) ||
+    value.version !== 1 ||
+    !("relativeDirectory" in value) ||
+    typeof value.relativeDirectory !== "string" ||
+    !uploadDirectoryPattern.test(value.relativeDirectory) ||
+    !("relativeUrl" in value) ||
+    typeof value.relativeUrl !== "string" ||
+    value.relativeUrl.length > 4096 ||
+    !/^\/api\/transfers\/[A-Za-z0-9._~-]+$/.test(value.relativeUrl) ||
+    new URL(value.relativeUrl, "http://127.0.0.1").pathname !== value.relativeUrl
+  ) {
+    throw privateUploadError();
+  }
+  return { version: 1, relativeDirectory: value.relativeDirectory, relativeUrl: value.relativeUrl };
+}
+
+async function readBoundedPrivateReceipt(path: string): Promise<unknown | null> {
+  try {
+    const metadata = await NodeFS.promises.lstat(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw privateUploadError();
+    });
+    if (metadata === null) return null;
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw privateUploadError();
+    const file = await NodeFS.promises.open(path, "r");
+    try {
+      const bytes = Buffer.alloc(8193);
+      let total = 0;
+      while (total < bytes.length) {
+        const { bytesRead } = await file.read(bytes, total, bytes.length - total, total);
+        if (bytesRead === 0) break;
+        total += bytesRead;
+      }
+      if (total > 8192) throw privateUploadError();
+      const value: unknown = JSON.parse(bytes.subarray(0, total).toString("utf8"));
+      // Only ENOENT is absence. A present JSON null must never permit unredacted retention.
+      if (value === null) throw privateUploadError();
+      return value;
+    } finally {
+      await file.close();
+    }
+  } catch {
+    throw privateUploadError();
+  }
+}
+
+/** Exclusive and flushed before HTTP dispatch; this private record is never an artifact. */
+export async function writeRemoteUploadCapabilityReceipt(
+  path: string,
+  receipt: RemoteUploadCapabilityReceipt,
+): Promise<void> {
+  try {
+    const value = decodeRemoteUploadReceipt(receipt);
+    const file = await NodeFS.promises.open(path, "wx", 0o600);
+    try {
+      await file.writeFile(JSON.stringify(value) + "\n");
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+  } catch {
+    throw privateUploadError();
+  }
+}
+
+/** A malformed private receipt must prevent log retention, not become a raw JSON error. */
+export async function readRemoteFixtureSecrets(input: {
+  readonly credentialReceiptPath: string;
+  readonly uploadReceiptPath: string;
+  readonly requireCredentialReceipt?: boolean;
+  readonly requireUploadReceipt?: boolean;
+}): Promise<string[]> {
+  const credentials = await readBoundedPrivateReceipt(input.credentialReceiptPath);
+  const upload = await readBoundedPrivateReceipt(input.uploadReceiptPath);
+  const secrets: string[] = [];
+  if (credentials !== null) {
+    if (
+      typeof credentials !== "object" ||
+      Object.keys(credentials).some((key) => key !== "bootstrapToken" && key !== "endpoint") ||
+      !("bootstrapToken" in credentials) ||
+      typeof credentials.bootstrapToken !== "string" ||
+      credentials.bootstrapToken.length === 0 ||
+      credentials.bootstrapToken.length > 6144 ||
+      ("endpoint" in credentials && typeof credentials.endpoint !== "string")
+    ) {
+      throw new SeededDesktopUpgradeSmokeError("The private remote credential receipt is invalid.");
+    }
+    secrets.push(credentials.bootstrapToken);
+  } else if (input.requireCredentialReceipt) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "The private remote credential receipt is unavailable.",
+    );
+  }
+  if (upload !== null) {
+    if (credentials === null) throw privateUploadError();
+    const receipt = decodeRemoteUploadReceipt(upload);
+    secrets.push(receipt.relativeUrl, receipt.relativeUrl.slice("/api/transfers/".length));
+  } else if (input.requireUploadReceipt) throw privateUploadError();
+  return secrets;
+}
+
+/** Run only inside the existing lane process owner, so failed stop cannot unlink a live writer. */
+export async function stopRemoteUploadFixture(input: {
+  readonly workspaceRoot: string;
+  readonly uploadReceiptPath: string;
+  readonly stop: () => Promise<void>;
+}): Promise<void> {
+  await input.stop();
+  const value = await readBoundedPrivateReceipt(input.uploadReceiptPath);
+  if (value === null) return;
+  const receipt = decodeRemoteUploadReceipt(value);
+  const directory = NodePath.join(input.workspaceRoot, receipt.relativeDirectory);
+  try {
+    const metadata = await NodeFS.promises
+      .lstat(directory)
+      .catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw privateUploadError();
+      });
+    if (metadata === null) return;
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw privateUploadError();
+    const names = await NodeFS.promises.readdir(directory);
+    if (
+      !names.every(
+        (name) =>
+          name === "protection-witness.txt" ||
+          (name.startsWith(".protection-witness.txt.") && name.endsWith(".bibcode-upload.part")),
+      )
+    ) {
+      throw privateUploadError();
+    }
+    await NodeFS.promises.rm(directory, { recursive: true });
+  } catch {
+    throw new SeededDesktopUpgradeSmokeError(
+      "The stopped upload fixture could not be safely removed.",
+    );
+  }
+}
+
 const redactLiteral = (text: string, value: string): string =>
   value.length === 0 ? text : text.split(value).join("[REDACTED]");
+
+// Maintenance labels truncate at160 characters. Exact full-token replacement alone cannot
+// protect those prefixes, including their JSON/URI-escaped diagnostic representations.
+const signedTransferLabelPattern =
+  /(?:\/|\\+\/|\\+u002f|%(?:25)*2f)api(?:\/|\\+\/|\\+u002f|%(?:25)*2f)transfers(?:\/|\\+\/|\\+u002f|%(?:25)*2f)(?:[A-Za-z0-9._~-]|\\+u[0-9a-f]{4}|%[0-9a-f]{2})+(?:…)?/gi;
 
 export function redactAndBoundUpgradeEvidence(
   text: string,
@@ -1018,7 +1202,7 @@ export function redactAndBoundUpgradeEvidence(
   let redacted = [...input.secrets, ...input.roots]
     .filter((value) => value.length > 0)
     .sort((left, right) => right.length - left.length)
-    .reduce(redactLiteral, text);
+    .reduce(redactLiteral, text.replace(signedTransferLabelPattern, "/api/transfers/[REDACTED]"));
   const encoded = Buffer.from(redacted);
   if (encoded.byteLength <= input.maxBytes) return redacted;
   const suffix = "\n[TRUNCATED]";
@@ -1531,12 +1715,14 @@ const runWebDriverPhase = async (input: {
   readonly workspaceRoot: string;
   readonly webdriverPort: number;
   readonly wsl: boolean;
+  readonly onRemotePhaseStarted?: (() => void) | undefined;
 }): Promise<void> => {
   const phaseRoot = NodePath.join(input.runRoot, `${input.phase}-driver`);
   await NodeFS.promises.mkdir(phaseRoot, { recursive: true });
   const specPath = NodePath.join(phaseRoot, "seeded-upgrade.e2e.ts");
   const configPath = NodePath.join(phaseRoot, "wdio.conf.mjs");
   const remoteSecretPath = NodePath.join(input.runRoot, "remote-bootstrap.secret.json");
+  const remoteUploadSecretPath = NodePath.join(input.runRoot, "remote-upload.secret.json");
   const phaseTimeoutMs =
     input.lane === "remote-install" && input.phase === "seed-and-install"
       ? input.restartTimeoutMs +
@@ -1558,6 +1744,7 @@ const runWebDriverPhase = async (input: {
               NodePath.join(input.repositoryRoot, "scripts/seeded-desktop-upgrade-smoke.ts"),
             ).href,
             remoteSecretPath,
+            remoteUploadSecretPath,
             remoteEvidencePath: NodePath.join(input.evidenceDirectory, "remote-rpc.json"),
           }
         : {}),
@@ -1576,6 +1763,9 @@ const runWebDriverPhase = async (input: {
     }),
     { mode: 0o600 },
   );
+  // Once launch is attempted, even a failed phase may have returned a grant to WDIO output.
+  // Notify before dispatch; local spec/config preparation failures require no credential receipt.
+  if (input.lane === "remote-install") input.onRemotePhaseStarted?.();
   const result = await runCommand({
     command: seededUpgradeVitePlusExecutable,
     args: ["exec", "wdio", "run", configPath],
@@ -1595,22 +1785,6 @@ const runWebDriverPhase = async (input: {
     timeoutMs: phaseTimeoutMs,
   });
   const resultExists = NodeFS.existsSync(input.resultPath);
-  await NodeFS.promises.writeFile(
-    NodePath.join(input.evidenceDirectory, `${input.phase}.log`),
-    redactAndBoundUpgradeEvidence(`${result.stdout}\n${result.stderr}`, {
-      maxBytes: 64 * 1024,
-      roots: [input.dataRoot, input.runRoot],
-      secrets:
-        input.lane === "remote-install" && NodeFS.existsSync(remoteSecretPath)
-          ? [
-              String(
-                (await readObservation<{ bootstrapToken: string }>(remoteSecretPath))
-                  .bootstrapToken,
-              ),
-            ]
-          : [],
-    }),
-  );
   let installAttempted = false;
   if (input.phase === "seed-and-install" && resultExists) {
     try {
@@ -1622,6 +1796,23 @@ const runWebDriverPhase = async (input: {
       installAttempted = false;
     }
   }
+  const privateSecrets =
+    input.lane === "remote-install"
+      ? await readRemoteFixtureSecrets({
+          credentialReceiptPath: remoteSecretPath,
+          uploadReceiptPath: remoteUploadSecretPath,
+          requireCredentialReceipt: true,
+          requireUploadReceipt: installAttempted,
+        })
+      : [];
+  await NodeFS.promises.writeFile(
+    NodePath.join(input.evidenceDirectory, `${input.phase}.log`),
+    redactAndBoundUpgradeEvidence(`${result.stdout}\n${result.stderr}`, {
+      maxBytes: 64 * 1024,
+      roots: [input.dataRoot, input.runRoot],
+      secrets: privateSecrets,
+    }),
+  );
   assertWebDriverPhaseExit({
     exitCode: result.exitCode,
     installAttempted,
@@ -1768,6 +1959,7 @@ const runUpgradeLane = async (input: {
   readonly restartTimeoutMs: number;
   readonly webdriverPort: number;
   readonly wsl: boolean;
+  readonly onRemotePhaseStarted?: (() => void) | undefined;
 }): Promise<void> => {
   await NodeFS.promises.mkdir(input.layout.dataRoot, { recursive: true, mode: 0o700 });
   await NodeFS.promises.mkdir(input.layout.evidenceDirectory, { recursive: true, mode: 0o700 });
@@ -1792,6 +1984,7 @@ const runUpgradeLane = async (input: {
       : input.layout.workspaceRoot,
     webdriverPort: input.webdriverPort,
     wsl: input.wsl,
+    onRemotePhaseStarted: input.onRemotePhaseStarted,
   } as const;
   await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
   if (input.platform === "win") {
@@ -1998,6 +2191,7 @@ export async function runSeededDesktopUpgradeSmoke(
   };
   const requestLogPath = NodePath.join(runRoot, "updater-requests.jsonl");
   let failure: unknown;
+  let remotePhaseStarted = false;
   try {
     if (!input.wsl) {
       await requireCommandSuccess({
@@ -2170,9 +2364,19 @@ export async function runSeededDesktopUpgradeSmoke(
         await NodeFS.promises.rename(remoteApp, isolatedAppImage);
         remoteApp = isolatedAppImage;
       }
-      cleanup.add("isolated remote application", () =>
-        stopRemoteLaneApplication(remoteApp, input.platform, layout.remoteInstall.dataRoot),
-      );
+      cleanup.add("isolated remote application", async () => {
+        const uploadReceiptPath = NodePath.join(
+          NodePath.dirname(layout.remoteInstall.dataRoot),
+          "remote-upload.secret.json",
+        );
+        await stopRemoteUploadFixture({
+          workspaceRoot: layout.remoteInstall.workspaceRoot,
+          uploadReceiptPath,
+          stop: () =>
+            stopRemoteLaneApplication(remoteApp, input.platform, layout.remoteInstall.dataRoot),
+        });
+        await NodeFS.promises.rm(uploadReceiptPath, { force: true });
+      });
       await runUpgradeLane({
         appBinaryPath: remoteApp,
         backendPort: assertRemoteInstallPort(input.updaterPort + 3),
@@ -2185,6 +2389,9 @@ export async function runSeededDesktopUpgradeSmoke(
         restartTimeoutMs: input.restartTimeoutMs,
         webdriverPort: assertRemoteInstallPort(input.updaterPort + 103),
         wsl: false,
+        onRemotePhaseStarted: () => {
+          remotePhaseStarted = true;
+        },
       });
     }
   } catch (cause) {
@@ -2192,23 +2399,30 @@ export async function runSeededDesktopUpgradeSmoke(
   } finally {
     const secrets = [signingKey, signingPassword];
     let safeToRetainEvidence = true;
-    const privateReceipt = NodePath.join(
-      NodePath.dirname(layout.remoteInstall.dataRoot),
-      "remote-bootstrap.secret.json",
-    );
-    if (NodeFS.existsSync(privateReceipt)) {
-      try {
-        const receipt = await readObservation<{ bootstrapToken: unknown }>(privateReceipt);
-        if (typeof receipt.bootstrapToken !== "string" || receipt.bootstrapToken.length === 0) {
-          failure ??= new SeededDesktopUpgradeSmokeError(
-            "The private remote credential receipt is invalid.",
-          );
-          safeToRetainEvidence = false;
-        } else secrets.push(receipt.bootstrapToken);
-      } catch (error) {
-        failure ??= error;
-        safeToRetainEvidence = false;
-      }
+    const remoteRoot = NodePath.dirname(layout.remoteInstall.dataRoot);
+    let installAttempted = false;
+    try {
+      const marker = await readObservation<{ readonly installAttempted?: unknown }>(
+        NodePath.join(remoteRoot, "before.json"),
+      );
+      installAttempted = marker.installAttempted === true;
+    } catch {
+      /* Before the remote phase, no install marker is expected. */
+    }
+    try {
+      secrets.push(
+        ...(await readRemoteFixtureSecrets({
+          credentialReceiptPath: NodePath.join(remoteRoot, "remote-bootstrap.secret.json"),
+          uploadReceiptPath: NodePath.join(remoteRoot, "remote-upload.secret.json"),
+          requireCredentialReceipt: remotePhaseStarted,
+          requireUploadReceipt: installAttempted,
+        })),
+      );
+    } catch {
+      failure ??= new SeededDesktopUpgradeSmokeError(
+        "Private remote fixture receipts were invalid; evidence was not retained.",
+      );
+      safeToRetainEvidence = false;
     }
     if (safeToRetainEvidence)
       await copyBoundedEvidence({

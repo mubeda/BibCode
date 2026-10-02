@@ -5,6 +5,9 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as NodeOS from "node:os";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeCrypto from "node:crypto";
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http";
 import {
   AuthAccessTokenResult,
@@ -12,13 +15,24 @@ import {
   RemoteUpdateActiveWork,
   RemoteUpdateSnapshot,
   RemoteUpdateInstallError,
+  ProjectCreateUploadUrlResult,
 } from "@bibcode/contracts";
 import {
   runRemoteUpdate,
   type RemoteUpdatePort,
   type RemoteUpdateRunState,
 } from "@bibcode/client-runtime/state/remoteUpdateCoordinator";
-import { assertRemoteInstallPort } from "../seeded-desktop-upgrade-smoke.ts";
+import {
+  assertRemoteInstallPort,
+  writeRemoteUploadCapabilityReceipt,
+  SeededDesktopUpgradeSmokeError,
+  type RemoteHeldUploadEvidence,
+} from "../seeded-desktop-upgrade-smoke.ts";
+import {
+  beginHeldWorkspaceUpload,
+  HeldWorkspaceUploadError,
+  type HeldWorkspaceUpload,
+} from "./held-workspace-upload.ts";
 
 const ConfigIdentity = Schema.Struct({
   environment: Schema.Struct({
@@ -54,6 +68,7 @@ const decodeTicket = Schema.decodeUnknownSync(Schema.toCodecJson(AuthWebSocketTi
 const decodeActiveWork = Schema.decodeUnknownSync(RemoteUpdateActiveWork);
 const decodeSnapshot = Schema.decodeUnknownSync(RemoteUpdateSnapshot);
 const decodeSnapshotEffect = Schema.decodeUnknownEffect(RemoteUpdateSnapshot);
+const decodeUpload = Schema.decodeUnknownSync(ProjectCreateUploadUrlResult);
 const WideDescriptor = Schema.Struct({
   bootId: Schema.NullOr(Schema.String),
   storageInstanceId: Schema.NullOr(Schema.String),
@@ -101,8 +116,12 @@ export function identityFromConfig(input: unknown) {
     progress: environment.capabilities.remoteUpdateProgress ?? false,
   };
 }
-export function encodeRequest(id: string, tag: string): string {
-  return JSON.stringify({ _tag: "Request", id, tag, payload: {}, headers: [] });
+export function encodeRequest(
+  id: string,
+  tag: string,
+  payload: Readonly<Record<string, unknown>> = {},
+): string {
+  return JSON.stringify({ _tag: "Request", id, tag, payload, headers: [] });
 }
 /** Unrelated/control frames never settle a pending request. */
 export function decodeExit(input: unknown, id: string): unknown {
@@ -125,6 +144,8 @@ export interface RemoteInstallDriverInput {
   readonly endpoint: string;
   readonly bootstrapToken: string;
   readonly candidateVersion: string;
+  readonly workspaceRoot: string;
+  readonly uploadReceiptPath: string;
   /** Best-effort synchronous observation after the install request is dispatched. */
   readonly onInstallDispatched?: () => void;
   /** A live grant widened the host: identities must come from a boot reachable off loopback. */
@@ -144,13 +165,19 @@ export interface RemoteInstallDriverEvidence {
   readonly phases: ReadonlyArray<string>;
   readonly sawPercent: boolean;
   readonly sawStage: boolean;
+  readonly heldUpload: RemoteHeldUploadEvidence;
 }
 
 /** Runs the product coordinator through an authenticated, independently reconnecting test client. */
 export async function runRemoteInstallDriver(
   input: RemoteInstallDriverInput,
 ): Promise<RemoteInstallDriverEvidence> {
-  const endpoint = new URL(input.endpoint);
+  let endpoint: URL;
+  try {
+    endpoint = new URL(input.endpoint);
+  } catch {
+    throw new Error("Remote verification requires a test-owned loopback endpoint.");
+  }
   if (
     endpoint.protocol !== "http:" ||
     endpoint.hostname !== "127.0.0.1" ||
@@ -282,7 +309,11 @@ export async function runRemoteInstallDriver(
       opening = null;
     }
   };
-  const request = async (tag: string, signal?: AbortSignal): Promise<unknown> => {
+  const request = async (
+    tag: string,
+    signal?: AbortSignal,
+    payload: Readonly<Record<string, unknown>> = {},
+  ): Promise<unknown> => {
     if (signal?.aborted || socket?.readyState !== WebSocket.OPEN)
       throw new Error("Remote verification request interrupted.");
     const current = socket;
@@ -302,7 +333,7 @@ export async function runRemoteInstallDriver(
       };
       pending.set(id, { resolve, reject, dispose });
       signal?.addEventListener("abort", abort, { once: true });
-      current.send(encodeRequest(id, tag));
+      current.send(encodeRequest(id, tag, payload));
       if (tag === "updater.install") {
         try {
           input.onInstallDispatched?.();
@@ -388,6 +419,9 @@ export async function runRemoteInstallDriver(
       });
     }
   });
+  let held: HeldWorkspaceUpload | undefined;
+  let witnessRoot: string | undefined;
+  let httpAttempted = false;
   try {
     await open();
     const before = observedIdentity(await request("server.getConfig"));
@@ -401,6 +435,52 @@ export async function runRemoteInstallDriver(
     } catch {
       throw new Error("The candidate update was not available before remote installation.");
     }
+    try {
+      if (
+        !NodePath.isAbsolute(input.workspaceRoot) ||
+        !NodePath.isAbsolute(input.uploadReceiptPath)
+      )
+        throw new Error("Invalid fixture paths");
+      const workspace = await NodeFS.promises.realpath(input.workspaceRoot);
+      const relativeDirectory = "bibcode-update-witness-" + NodeCrypto.randomUUID();
+      const directory = NodePath.join(workspace, relativeDirectory);
+      await NodeFS.promises.mkdir(directory, { mode: 0o700 });
+      witnessRoot = directory;
+      const minted = decodeUpload(
+        await request("projects.createUploadUrl", undefined, {
+          cwd: directory,
+          relativeDirectory: "",
+          fileName: "protection-witness.txt",
+        }),
+      );
+      if (minted.maxBytes < 2) throw new Error("The held upload exceeds the advertised capacity.");
+      await writeRemoteUploadCapabilityReceipt(input.uploadReceiptPath, {
+        version: 1,
+        relativeDirectory,
+        relativeUrl: minted.relativeUrl,
+      });
+      // Publication of the private receipt has completed before even attempting this HTTP call.
+      httpAttempted = true;
+      held = await beginHeldWorkspaceUpload({
+        endpoint: endpoint.href,
+        relativeUrl: minted.relativeUrl,
+        relativePath: "protection-witness.txt",
+      });
+    } catch (error) {
+      if (
+        error instanceof SeededDesktopUpgradeSmokeError ||
+        error instanceof HeldWorkspaceUploadError
+      )
+        throw error;
+      // oxlint-disable-next-line preserve-caught-error -- Never retain capability-bearing HTTP/RPC causes.
+      throw new Error("The remote verification held upload could not be prepared.");
+    }
+    let heldFailure: string | null = null;
+    const heldCompletion = held.completion.catch((error: unknown) => {
+      heldFailure = error instanceof HeldWorkspaceUploadError ? error.reason : "transport";
+      return null;
+    });
+    let releasedOnWaitingStage = false;
     const port: RemoteUpdatePort = {
       connection: Effect.sync(() => ({
         phase,
@@ -455,25 +535,85 @@ export async function runRemoteInstallDriver(
             if (!phases.includes(state.phase)) phases.push(state.phase);
             if (state.phase === "downloading" && state.percent !== null) sawPercent = true;
             if (state.phase === "installing" && state.stage !== null) sawStage = true;
+            if (
+              state.phase === "installing" &&
+              state.stage === "waiting-for-mutations" &&
+              !releasedOnWaitingStage
+            ) {
+              releasedOnWaitingStage = true;
+              void held!.finish();
+            }
           }),
         ),
       );
     } finally {
+      // Never race a fixture failure against an already-dispatched update. The coordinator above
+      // reaches its terminal existing bound first; then every path releases and joins the body.
+      void held.finish();
       progressAbort.abort();
       await progressProbe;
+      await heldCompletion;
     }
     if (result.phase !== "succeeded")
       throw new Error(
         `Remote verification coordinator did not succeed. ${JSON.stringify(coordinatorFailureSummary(result, phases))}`,
       );
+    if (heldFailure !== null || !releasedOnWaitingStage)
+      throw new Error(
+        "Remote verification held upload did not complete its waiting-stage witness. " +
+          JSON.stringify({
+            coordinatorPhase: result.phase,
+            reason: heldFailure,
+            releasedOnWaitingStage,
+          }),
+      );
+    try {
+      const directory = witnessRoot!;
+      const names = await NodeFS.promises.readdir(directory);
+      const file = await NodeFS.promises.open(
+        NodePath.join(directory, "protection-witness.txt"),
+        "r",
+      );
+      let bytesMatch = false;
+      try {
+        const metadata = await file.stat();
+        const bytes = Buffer.alloc(3);
+        const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+        bytesMatch =
+          metadata.isFile() &&
+          metadata.size === 2 &&
+          bytesRead === 2 &&
+          bytes.subarray(0, 2).equals(Buffer.from("ok"));
+      } finally {
+        await file.close();
+      }
+      if (!bytesMatch || names.length !== 1 || names[0] !== "protection-witness.txt")
+        throw new Error("Invalid fixture contents");
+    } catch {
+      throw new Error("Remote verification held upload bytes or residue were invalid.");
+    }
     return {
       before,
       after: observedIdentity(await request("server.getConfig")),
       phases,
       sawPercent,
       sawStage,
+      heldUpload: {
+        admitted: true,
+        releasedOnWaitingStage: true,
+        completed: true,
+        bytesMatch: true,
+        noPartials: true,
+        requestClosed: true,
+        holdLimitMs: 20_000,
+      },
     };
   } finally {
+    if (held !== undefined) await held.finish().catch(() => undefined);
+    // Before HTTP there cannot be a server writer. Once attempted, only the lane process owner
+    // may clean this directory after joining its application, even if admission was ambiguous.
+    if (!httpAttempted && witnessRoot !== undefined)
+      await NodeFS.promises.rmdir(witnessRoot).catch(() => undefined);
     for (const waiter of pending.values()) {
       waiter.dispose();
       waiter.reject(new Error("Remote verification finished."));

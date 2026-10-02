@@ -1,0 +1,159 @@
+name: Qualify held-upload protection - Linux ARM64
+
+on:
+  push:
+    branches: [codex/qualify-held-upload]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  seeded_upgrade_smoke:
+    name: Seeded upgrade - ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    env:
+      CARGO_BUILD_JOBS: "2"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {
+              label: Linux arm64 AppImage,
+              runner: ubuntu-22.04-arm,
+              platform: linux,
+              arch: arm64,
+              bundle: appimage,
+            }
+    steps:
+      - name: Checkout complete release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Install Linux packaged-updater prerequisites
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget file libxdo-dev libssl-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev xdg-utils patchelf xvfb xdotool
+
+      - name: Install frozen dependencies
+        run: vp install --frozen-lockfile
+
+      - name: Check source formatting and lint
+        run: vp check
+
+      - name: Test held-upload fixture, receipts, and coordinator integration
+        run: |
+          vp test run \
+            scripts/lib/held-workspace-upload.test.ts \
+            scripts/lib/remote-install-driver.test.ts \
+            scripts/seeded-desktop-upgrade-smoke.test.ts
+
+      - name: Build web assets for native checks
+        run: vp run --filter @bibcode/web build
+
+      - name: Typecheck the full workspace
+        run: vp run typecheck
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Test real HTTP maintenance admission
+        run: cargo test -p bibcode-server --test production_maintenance -j 2
+
+      - name: Recompute affected-test Clippy diagnostics
+        run: |
+          set -euo pipefail
+          cargo clean -p bibcode-server
+          cargo clippy -p bibcode-server --test production_maintenance -j 2 -- -D warnings
+
+      - id: versions
+        name: Resolve previous stable and isolated candidate versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_line="$(node scripts/resolve-previous-release-tag.ts \
+            --channel stable --current-tag "v2147483647.0.0")"
+          previous_tag="${previous_line#previous_tag=}"
+          test -n "$previous_tag"
+          previous_version="${previous_tag#v}"
+          previous_core="${previous_version%%[-+]*}"
+          IFS=. read -r major minor patch <<< "$previous_core"
+          candidate_version="$major.$minor.$((patch + 1))-upgrade.${GITHUB_RUN_NUMBER}"
+          {
+            echo "candidate_version=$candidate_version"
+            echo "previous_tag=$previous_tag"
+            echo "previous_version=$previous_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate ephemeral updater signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/bibcode-seeded-upgrade.key"
+          key_password="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"
+          echo "::add-mask::$key_password"
+          (cd apps/desktop && vp exec tauri signer generate \
+            --ci --password "$key_password" --write-keys "$key_path" >/dev/null)
+          test -s "$key_path"
+          test -s "$key_path.pub"
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$key_path"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$key_password"
+            echo "BIBCODE_UPGRADE_PUBLIC_KEY_FILE=$key_path.pub"
+          } >> "$GITHUB_ENV"
+
+      - name: Run previous-stable, protected-baseline, and remote-install upgrades
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(node scripts/seeded-desktop-upgrade-smoke.ts
+            --platform "${{ matrix.platform }}"
+            --arch "${{ matrix.arch }}"
+            --bundle "${{ matrix.bundle }}"
+            --candidate-version "${{ steps.versions.outputs.candidate_version }}"
+            --previous-tag "${{ steps.versions.outputs.previous_tag }}"
+            --previous-version "${{ steps.versions.outputs.previous_version }}"
+            --public-key-file "$BIBCODE_UPGRADE_PUBLIC_KEY_FILE"
+            --run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}-${{ matrix.arch }}"
+            --work-root "$RUNNER_TEMP/bibcode-seeded-upgrade/work"
+            --artifact-dir "$RUNNER_TEMP/bibcode-seeded-upgrade/evidence"
+            --updater-port 43120
+            --restart-timeout-ms 180000)
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            xvfb-run --auto-servernum "${args[@]}"
+          else
+            "${args[@]}"
+          fi
+
+      - name: Upload bounded seeded-upgrade evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: seeded-upgrade-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/bibcode-seeded-upgrade/evidence/*
+          if-no-files-found: error
+          retention-days: 7
