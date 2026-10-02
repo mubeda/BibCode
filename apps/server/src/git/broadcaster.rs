@@ -2231,6 +2231,33 @@ mod tests {
     };
     use tokio::sync::{Notify, Semaphore, mpsc};
 
+    #[test]
+    fn fell_behind_errors_match_the_shared_client_retry_fixtures() {
+        for (kind, error) in [
+            ("live", fell_behind_error(Path::new("/repo"))),
+            ("setup", setup_admission_error(Path::new("/repo"))),
+        ] {
+            let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packages/contracts/fixtures/rpc-wire/contract-shapes")
+                .join(format!(
+                    "subscribeVcsStatus__fell-behind-{kind}-failure.json"
+                ));
+            let fixture: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(fixture_path).expect("generated Git status retry fixture"),
+            )
+            .expect("valid Git status retry fixture");
+
+            assert_eq!(fixture["_tag"], "Exit");
+            assert_eq!(fixture["exit"]["_tag"], "Failure");
+            assert_eq!(fixture["exit"]["cause"][0]["_tag"], "Fail");
+            assert_eq!(
+                serde_json::to_value(error).expect("serialize actual server stream failure"),
+                fixture["exit"]["cause"][0]["error"],
+                "the {kind} server failure must match the fixture driving client resubscription"
+            );
+        }
+    }
+
     fn signal_head_output(operation: &str) -> Option<ProcessOutput> {
         let stdout = match operation {
             "GitManager.signal.headRef" => "main\n",
