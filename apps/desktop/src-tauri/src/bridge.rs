@@ -36,9 +36,11 @@ use crate::security::{
 use crate::server_exposure::{
     BoxFuture, ExposureOperations, ServerExposureCoordinator, apply_exposure, recover_local,
 };
+#[cfg(not(test))]
+use crate::ssh::default_home_dir;
 use crate::ssh::{
     SshEnvironmentEnsureOptions, SshEnvironmentManager, SshEnvironmentTarget,
-    SshPasswordPromptManager, SshPasswordPromptResolution, default_home_dir, discover_ssh_hosts,
+    SshPasswordPromptManager, SshPasswordPromptResolution, discover_ssh_hosts,
 };
 use crate::tailscale::{
     TailscaleStatus, build_tailscale_https_base_url, probe_tailscale_https_endpoint,
@@ -50,6 +52,9 @@ use crate::updates::{DesktopUpdateInstallInput, DesktopUpdateManager};
 pub(crate) type DesktopRuntime = tauri::test::MockRuntime;
 #[cfg(not(test))]
 pub(crate) type DesktopRuntime = tauri::Wry;
+
+#[cfg(all(test, target_os = "linux"))]
+struct TestSystemThemeReader(std::sync::Arc<dyn Fn() -> Option<tauri::Theme> + Send + Sync>);
 
 const AUTH_ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const AUTH_ENVIRONMENT_BOOTSTRAP_TOKEN_TYPE: &str =
@@ -1988,6 +1993,11 @@ pub fn desktop_bridge_open_in_file_manager(
 pub fn desktop_bridge_discover_ssh_hosts(
     app: AppHandle<DesktopRuntime>,
 ) -> Result<Vec<Value>, String> {
+    // Mock apps must never fall back to the host's SSH directory. Reuse the
+    // required per-app isolated root, including its fail-closed missing fixture.
+    #[cfg(test)]
+    let home_dir = Some(crate::config::base_dir(&app)?.join("home"));
+    #[cfg(not(test))]
     let home_dir = app.path().home_dir().ok().or_else(default_home_dir);
     discover_ssh_hosts(home_dir)
         .map(|hosts| hosts.into_iter().map(|host| host.to_value()).collect())
@@ -2071,6 +2081,17 @@ pub async fn desktop_bridge_set_theme(
             // Tao's SetTheme(None) forces light. Query the portal directly on a
             // worker: a window theme getter would dispatch that blocking read
             // back to the main thread and would need its explicit theme cleared.
+            #[cfg(test)]
+            let reader = app
+                .try_state::<TestSystemThemeReader>()
+                .ok_or("mock Tauri apps must install an isolated system theme reader")?
+                .0
+                .clone();
+            #[cfg(test)]
+            let system_theme = crate::linux_theme::read_system_theme_with(move || reader())
+                .await
+                .map_err(|error| bridge_error("Could not update the Tauri window theme", error))?;
+            #[cfg(not(test))]
             let system_theme = crate::linux_theme::read_system_theme()
                 .await
                 .map_err(|error| bridge_error("Could not update the Tauri window theme", error))?;
@@ -4161,12 +4182,37 @@ mod tests {
     }
 
     #[test]
+    fn ssh_discovery_requires_an_isolated_mock_app_root() {
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let app = mock_builder()
+            .build(mock_context(noop_assets()))
+            .expect("mock Tauri app");
+
+        let error = desktop_bridge_discover_ssh_hosts(app.handle().clone())
+            .expect_err("missing discovery fixtures must not fall back to the host home");
+        assert!(error.contains("isolated test data root"), "{error}");
+    }
+
+    #[test]
     fn tauri_ipc_handlers_preserve_runtime_agnostic_bridge_contracts() {
         use crate::config::IsolatedTestDataRoot;
         use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
 
         let temp = tempfile::tempdir().expect("isolated desktop data root");
         let ssh_config = tempfile::NamedTempFile::new().expect("empty SSH config");
+        let discovery_ssh = temp.path().join("data-root/home/.ssh");
+        fs::create_dir_all(&discovery_ssh).expect("create isolated SSH discovery fixture");
+        fs::write(
+            discovery_ssh.join("config"),
+            "Host bridge-fixture\n  HostName 127.0.0.1\n",
+        )
+        .expect("write discovery config");
+        fs::write(
+            discovery_ssh.join("known_hosts"),
+            "bridge-known.invalid ssh-ed25519 fixture-key\n",
+        )
+        .expect("write discovery known hosts");
         // Use the generated application context so IPC exercises the same command
         // permissions as the production desktop shell.
         let mut context = crate::desktop_context();
@@ -4306,7 +4352,13 @@ mod tests {
             .expect_err("unprotected native catalog writes must fail closed"),
             "Could not update the protected connection catalog."
         );
-        let _ = invoke("desktop_bridge_discover_ssh_hosts", json!({}));
+        assert_eq!(
+            invoke("desktop_bridge_discover_ssh_hosts", json!({})).unwrap(),
+            json!([
+                {"alias":"bridge-fixture","hostname":"bridge-fixture","username":null,"port":null,"source":"ssh-config"},
+                {"alias":"bridge-known.invalid","hostname":"bridge-known.invalid","username":null,"port":null,"source":"known-hosts"},
+            ])
+        );
         assert!(invoke("desktop_bridge_get_wsl_state", json!({})).unwrap()["enabled"].is_boolean());
         assert!(
             invoke("desktop_bridge_get_server_exposure_state", json!({}))
@@ -4338,9 +4390,40 @@ mod tests {
                 .expect_err("unsupported theme"),
             "Unsupported desktop theme: unsupported"
         );
+        #[cfg(target_os = "linux")]
+        let system_theme_reads = {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            };
+
+            assert_eq!(
+                invoke("desktop_bridge_set_theme", json!({"theme":"system"}))
+                    .expect_err("missing test reader must never read the host portal"),
+                "mock Tauri apps must install an isolated system theme reader"
+            );
+            let reads = Arc::new(AtomicUsize::new(0));
+            let reader_calls = Arc::clone(&reads);
+            app.manage(TestSystemThemeReader(Arc::new(move || {
+                // Exercise both the configured scheme and unavailable-portal
+                // fallback through the real worker used by the IPC handler.
+                match reader_calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Some(tauri::Theme::Dark),
+                    1 => None,
+                    _ => panic!("explicit themes must not consult the system theme reader"),
+                }
+            })));
+            reads
+        };
         for theme in ["dark", "system", "light", "system"] {
             assert!(invoke("desktop_bridge_set_theme", json!({"theme":theme})).is_ok());
         }
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            system_theme_reads.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "only system selections should read the injected portal source"
+        );
         for command in [
             "desktop_bridge_get_update_state",
             "desktop_bridge_check_for_update",
