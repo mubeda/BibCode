@@ -342,24 +342,10 @@ try {
     },
   });
   const b = browser;
-  const cdp = await fetch(
-    "http://" +
-      b.options.hostname +
-      ":" +
-      b.options.port +
-      "/session/" +
-      b.sessionId +
-      "/goog/cdp/execute",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        cmd: "Page.addScriptToEvaluateOnNewDocument",
-        params: { source: observationScript },
-      }),
-    },
-  );
-  if (!cdp.ok) throw new Error("Browser transport observation could not be installed.");
+  phase("install-browser-observer");
+  await b.sendCommandAndGetResult("Page.addScriptToEvaluateOnNewDocument", {
+    source: observationScript,
+  });
   const plain = environments[0]!;
   phase("pair-primary");
   const credential = JSON.parse(

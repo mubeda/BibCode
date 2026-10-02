@@ -9,6 +9,17 @@ const systemCodes = new Set([
   "ETIMEDOUT",
   "ERR_MODULE_NOT_FOUND",
   "MODULE_NOT_FOUND",
+  "ERR_INVALID_URL",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+]);
+const errorNames = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "SyntaxError",
+  "TimeoutError",
+  "WebDriverError",
 ]);
 const signals = new Set([
   "SIGABRT",
@@ -44,6 +55,15 @@ export function classifyQualificationFailure(error: unknown) {
   }
   return {
     kind,
+    errorClass: typeof source.name === "string" && errorNames.has(source.name) ? source.name : null,
+    launchMarkers: {
+      sandbox: /sandbox|zygote|namespace|running as root/i.test(message),
+      endpoint: /invalid url|parse url|failed to fetch|connect|socket hang up/i.test(message),
+      origin: /allowed.?ips|allowed.?origins|origin|not allowed/i.test(message),
+      driver: /chromedriver|driver process|driver exited/i.test(message),
+      capabilities: /capabilit|invalid argument|session not created/i.test(message),
+      browserVersion: /chrome version|browser version/i.test(message),
+    },
     systemCode:
       typeof source.code === "string" && systemCodes.has(source.code) ? source.code : null,
     processExitCode:

@@ -21,6 +21,11 @@ it("retains only closed failure categories even when every error field contains 
   const projected = classifyQualificationFailure(error);
   expect(projected.kind).toBe("missing-element");
   expect(JSON.stringify(projected)).not.toContain(secret);
+  expect(projected.errorClass).toBeNull();
+  expect(classifyQualificationFailure(new TypeError("Invalid URL " + secret))).toMatchObject({
+    errorClass: "TypeError",
+    launchMarkers: { endpoint: true },
+  });
   expect(classifyQualificationFailure({ code: "ENOENT", message: secret }).systemCode).toBe(
     "ENOENT",
   );
