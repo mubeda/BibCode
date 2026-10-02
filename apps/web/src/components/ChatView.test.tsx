@@ -1,3 +1,4 @@
+import { attachmentAdmissionOwner } from "../state/attachmentAdmissions";
 // @vitest-environment happy-dom
 
 /**
@@ -48,11 +49,13 @@ import {
   type ServerProvider,
   ThreadId,
   TurnId,
+  UploadError,
 } from "@bibcode/contracts";
 import { DEFAULT_SERVER_SETTINGS } from "@bibcode/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { AsyncResult } from "effect/unstable/reactivity";
 import * as Cause from "effect/Cause";
+import { RpcClientError } from "effect/unstable/rpc";
 import * as Option from "effect/Option";
 import {
   scopedThreadKey,
@@ -65,6 +68,7 @@ const h = vi.hoisted(() => {
     captured: {} as Record<string, unknown>,
     atomValuesByKey: new Map<string, unknown>(),
     commandCalls: [] as Array<{ key: string; input: unknown }>,
+    commandHandlers: new Map<string, (input: unknown) => Promise<unknown>>(),
     commandOptions: [] as Array<{ key: string; options: unknown }>,
     commandResults: {} as Record<string, (input: unknown) => unknown>,
     defaultCommandResult: (() => undefined) as (input?: unknown) => unknown,
@@ -139,11 +143,16 @@ vi.mock("../state/use-atom-command", () => ({
   useAtomCommand: (command: { key?: string } | null | undefined, options?: unknown) => {
     const key = command && typeof command.key === "string" ? command.key : "unknown-command";
     h.commandOptions.push({ key, options });
-    return (input: unknown) => {
-      h.commandCalls.push({ key, input });
-      const respond = h.commandResults[key] ?? h.defaultCommandResult;
-      return Promise.resolve(respond(input));
-    };
+    let handler = h.commandHandlers.get(key);
+    if (!handler) {
+      handler = (input: unknown) => {
+        h.commandCalls.push({ key, input });
+        const respond = h.commandResults[key] ?? h.defaultCommandResult;
+        return Promise.resolve(respond(input));
+      };
+      h.commandHandlers.set(key, handler);
+    }
+    return handler;
   },
 }));
 
@@ -155,6 +164,10 @@ vi.mock("../state/threads", () => ({
     setRuntimeMode: { key: "thread.setRuntimeMode" },
     setInteractionMode: { key: "thread.setInteractionMode" },
     startTurn: { key: "thread.startTurn" },
+    attachmentAdmissionAuthority: { key: "thread.attachmentAdmissionAuthority" },
+    stageAttachments: { key: "thread.stageAttachments" },
+    releaseStagedAttachments: { key: "thread.releaseStagedAttachments" },
+    keepStagedAttachmentsAlive: { key: "thread.keepStagedAttachmentsAlive" },
     steerTurn: { key: "thread.steerTurn" },
     promoteTurn: { key: "thread.promoteTurn" },
     interruptTurn: { key: "thread.interruptTurn" },
@@ -945,13 +958,19 @@ function publishSeededStoreState(store: unknown): void {
 }
 
 beforeEach(() => {
+  attachmentAdmissionOwner.dispose();
   h.captured = {};
   h.atomValuesByKey.clear();
   h.atomValuesByKey.set("atom:keybindings", []);
   h.atomValuesByKey.set("atom:editors", []);
   h.commandCalls.length = 0;
+  h.commandHandlers.clear();
   h.commandOptions.length = 0;
-  h.commandResults = {};
+  h.commandResults = {
+    "thread.stageAttachments": () => AsyncResult.success({ _tag: "inline" }),
+    "thread.attachmentAdmissionAuthority": () =>
+      AsyncResult.success({ storageInstanceId: "test-store", hostIdentity: "test-host" }),
+  };
   h.defaultCommandResult = () => AsyncResult.success(undefined);
   h.environments = [];
   h.primaryEnvironment = null;
@@ -4862,6 +4881,253 @@ describe("ChatView", () => {
 });
 
 describe("ChatView handlers (captured from mocked children)", () => {
+  it("fences two mounted views from replaying the unresolved command independently", async () => {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    seedConnectedServerThread(makeThread({ branch: "main" }));
+    const file = new File(["fake"], "shared.png", { type: "image/png" });
+    const image = {
+      type: "image" as const,
+      id: "shared-file",
+      name: file.name,
+      mimeType: file.type,
+      sizeBytes: 4,
+      file,
+      previewUrl: "blob:shared",
+    };
+    h.commandResults["thread.stageAttachments"] = () =>
+      AsyncResult.success({
+        _tag: "staged",
+        attachments: [
+          {
+            type: "image",
+            id: image.id,
+            name: image.name,
+            mimeType: image.mimeType,
+            sizeBytes: 4,
+            uploadId: "shared-upload",
+          },
+        ],
+      });
+    let calls = 0;
+    let settleReplay!: (result: unknown) => void;
+    h.commandResults["thread.startTurn"] = () =>
+      ++calls === 1
+        ? AsyncResult.failure(
+            Cause.fail(
+              new RpcClientError.RpcClientError({
+                reason: new RpcClientError.RpcClientDefect({
+                  message: "reply lost",
+                  cause: new Error(),
+                }),
+              }),
+            ),
+          )
+        : new Promise((resolve) => {
+            settleReplay = resolve;
+          });
+    const containers = [document.createElement("div"), document.createElement("div")];
+    const roots = containers.map((container) => {
+      document.body.append(container);
+      return createRoot(container);
+    });
+    const mount = async (index: number) => {
+      await act(async () =>
+        roots[index]!.render(
+          <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+        ),
+      );
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      (composer.composerRef as RefObject<ChatComposerHandle | null>).current = composerHandle({
+        getSendContext: () => ({ ...composerHandle().getSendContext(), attachments: [image] }),
+      });
+      (composer.promptRef as RefObject<string>).current = "original shared send";
+      return composer.onSend as () => Promise<void>;
+    };
+    let replay: Promise<void> | null = null;
+    try {
+      const sendFirst = await mount(0);
+      await act(async () => sendFirst());
+      const sendSecond = await mount(1);
+      await act(async () => {
+        replay = sendFirst();
+        await Promise.resolve();
+      });
+      await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(2));
+      await act(async () => sendSecond());
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(2);
+      expect(commandCallsFor("thread.stageAttachments")).toHaveLength(1);
+      await act(async () => {
+        settleReplay(AsyncResult.success(undefined));
+        await replay;
+      });
+      const requests = commandCallsFor("thread.startTurn");
+      expect(requests[1]!.input).toEqual(requests[0]!.input);
+    } finally {
+      if (settleReplay) settleReplay(AsyncResult.success(undefined));
+      await act(async () => Promise.all(roots.map((root) => root.unmount())));
+      for (const container of containers) container.remove();
+    }
+  });
+  it.each(
+    [false, true].flatMap((pendingAtUnmount) =>
+      [false, true].map((notAccepted) => ({ pendingAtUnmount, notAccepted })),
+    ),
+  )(
+    "retains the exact logical admission across actual unmount/remount (pending $pendingAtUnmount, not accepted $notAccepted)",
+    async ({ pendingAtUnmount, notAccepted }) => {
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      Object.defineProperty(Element.prototype, "getAnimations", {
+        configurable: true,
+        value: () => [],
+      });
+      seedConnectedServerThread(makeThread({ branch: "main" }));
+      const file = new File(["fake"], "retained.png", { type: "image/png" });
+      const image = {
+        type: "image" as const,
+        id: "retained-file",
+        name: file.name,
+        mimeType: file.type,
+        sizeBytes: 4,
+        file,
+        previewUrl: "blob:retained",
+      };
+      h.commandResults["thread.stageAttachments"] = () =>
+        AsyncResult.success({
+          _tag: "staged",
+          attachments: [
+            {
+              type: "image",
+              id: image.id,
+              name: image.name,
+              mimeType: image.mimeType,
+              sizeBytes: 4,
+              uploadId: "original-upload",
+            },
+          ],
+        });
+      const lost = AsyncResult.failure(
+        Cause.fail(
+          new RpcClientError.RpcClientError({
+            reason: new RpcClientError.RpcClientDefect({
+              message: "reply lost",
+              cause: new Error(),
+            }),
+          }),
+        ),
+      );
+      let calls = 0;
+      let settleOld!: (result: unknown) => void;
+      h.commandResults["thread.startTurn"] = () =>
+        ++calls === 1
+          ? pendingAtUnmount
+            ? new Promise((resolve) => {
+                settleOld = resolve;
+              })
+            : lost
+          : calls === 2 && notAccepted
+            ? AsyncResult.failure(
+                Cause.fail(
+                  new UploadError({ reason: "not_found", message: "the upload is unavailable" }),
+                ),
+              )
+            : AsyncResult.success(undefined);
+      const firstContainer = document.createElement("div");
+      document.body.append(firstContainer);
+      const first = createRoot(firstContainer);
+      let second: Root | null = null;
+      try {
+        await act(async () =>
+          first.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          ),
+        );
+        let composer = capturedProps<Record<string, unknown>>("chatComposer");
+        expect(composer).toMatchObject({
+          isSendBusy: false,
+          isConnecting: false,
+          providerBindingConflictReason: null,
+        });
+        const getSendContext = vi.fn(() => ({
+          ...composerHandle().getSendContext(),
+          attachments: [image],
+        }));
+        (composer.composerRef as RefObject<ChatComposerHandle | null>).current = composerHandle({
+          getSendContext,
+        });
+        (composer.promptRef as RefObject<string>).current = "original text";
+        expect(
+          (composer.composerRef as RefObject<ChatComposerHandle | null>).current?.getSendContext()
+            .attachments,
+        ).toHaveLength(1);
+        let sending!: Promise<void>;
+        await act(async () => {
+          sending = (composer.onSend as () => Promise<void>)();
+          await Promise.resolve();
+        });
+        expect(getSendContext).toHaveBeenCalledTimes(2);
+        expect(h.commandCalls.map((call) => call.key)).toContain("thread.stageAttachments");
+        await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(1));
+        if (!pendingAtUnmount) await act(async () => sending);
+        await act(async () => first.unmount());
+        const secondContainer = document.createElement("div");
+        document.body.append(secondContainer);
+        second = createRoot(secondContainer);
+        await act(async () =>
+          second!.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          ),
+        );
+        composer = capturedProps<Record<string, unknown>>("chatComposer");
+        (composer.composerRef as RefObject<ChatComposerHandle | null>).current = composerHandle({
+          getSendContext: () => ({ ...composerHandle().getSendContext(), attachments: [image] }),
+        });
+        if (pendingAtUnmount) {
+          (composer.promptRef as RefObject<string>).current = "another send";
+          await act(async () => (composer.onSend as () => Promise<void>)());
+          const countBeforeOldOutcome = commandCallsFor("thread.startTurn").length;
+          await act(async () => {
+            settleOld(lost);
+            await sending;
+          });
+          expect(countBeforeOldOutcome).toBe(1);
+        }
+        await act(async () =>
+          useComposerDraftStore.getState().setPrompt(threadRef, "fresh edited work"),
+        );
+        composer = capturedProps<Record<string, unknown>>("chatComposer");
+        (composer.promptRef as RefObject<string>).current = "fresh edited work";
+        await act(async () => (composer.onSend as () => Promise<void>)());
+        const requests = commandCallsFor("thread.startTurn");
+        expect(requests).toHaveLength(2);
+        expect(requests[1]!.input).toEqual(requests[0]!.input);
+        expect(commandCallsFor("thread.stageAttachments")).toHaveLength(1);
+        expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe(
+          "fresh edited work",
+        );
+        if (notAccepted) {
+          composer = capturedProps<Record<string, unknown>>("chatComposer");
+          (composer.promptRef as RefObject<string>).current = "fresh edited work";
+          await act(async () => (composer.onSend as () => Promise<void>)());
+          const freshRequests = commandCallsFor("thread.startTurn");
+          expect(freshRequests).toHaveLength(3);
+          expect(
+            (freshRequests[2]!.input as { input: { commandId: string } }).input.commandId,
+          ).not.toBe((freshRequests[0]!.input as { input: { commandId: string } }).input.commandId);
+          expect(commandCallsFor("thread.stageAttachments")).toHaveLength(2);
+        }
+      } finally {
+        if (pendingAtUnmount && settleOld) settleOld(lost);
+        if (second) await act(async () => second!.unmount());
+        firstContainer.remove();
+      }
+    },
+  );
   function seedConnectedServerThread(thread: Thread = makeThread()): void {
     seedEnvironment(makeEnvironmentPresentation());
     seedProject(makeProject());

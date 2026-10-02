@@ -1,3 +1,4 @@
+import { InlineUploadChatAttachment, UploadChatAttachment } from "./orchestration.ts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -1475,4 +1476,25 @@ it("ModelSelection rejects a non-string legacy provider at the routing-key path"
     { provider: 42, model: "gpt-5.4" },
     { rootTag: "Composite", paths: [["instanceId"]] },
   );
+});
+
+it("decodes staged image and file inputs and refuses two byte sources", () => {
+  for (const [type, mimeType] of [
+    ["image", "image/png"],
+    ["file", "text/plain"],
+  ]) {
+    const staged = { type, id: "a-1", name: "a", mimeType, sizeBytes: 3, uploadId: "stage-1" };
+    expect(Schema.decodeUnknownSync(UploadChatAttachment)(staged)).toEqual(staged);
+    for (const dataUrl of [null, `data:${mimeType};base64,YWJj`]) {
+      expect(Schema.is(UploadChatAttachment)({ ...staged, dataUrl })).toBe(false);
+    }
+    const { uploadId: _uploadId, ...metadata } = staged;
+    expect(
+      Schema.is(InlineUploadChatAttachment)({
+        ...metadata,
+        dataUrl: `data:${mimeType};base64,YWJj`,
+      }),
+    ).toBe(true);
+    expect(Schema.is(UploadChatAttachment)({ ...staged, uploadId: null })).toBe(false);
+  }
 });
