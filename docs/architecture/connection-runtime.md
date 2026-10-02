@@ -63,6 +63,18 @@ for the wire methods, limits, and failure rules.
 The composition root is
 [`connection/layer.ts`](../../packages/client-runtime/src/connection/layer.ts).
 
+## Remote-update presentation lifetime
+
+The client-runtime update coordinator retains the per-environment run; React
+views do not own its cancellation or restart loop. The web confirmation-request
+Atom is separate transient intent, shared by Settings, sidebar, and Retry
+toasts. Its root-mounted dialog observes `activeWork` only while open; that
+query's zero idle retention gives every confirmation fresh counts. Row/card
+status observation pauses during a run, while the rail retains its existing
+bounded observation. A restart follows current connection generations without
+changing desired intent; explicit user disconnection is respected. Per-boot
+identity is never persisted or substituted for storage identity.
+
 ## Targets
 
 Canonical targets are defined in
