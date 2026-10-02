@@ -123,6 +123,15 @@ under their isolated data root through
 unreachable-target tests use an empty temporary SSH config (`-F`) and a literal
 loopback destination with an empty alias, avoiding user config and DNS.
 
+The desktop bridge IPC contract harness discovers SSH hosts from
+`home/.ssh/config` and `home/.ssh/known_hosts` beneath its per-app
+`IsolatedTestDataRoot`, and fails closed if that root is missing. On Linux it
+injects a per-app system-theme reader into the real theme command, exercising
+the blocking worker and unavailable-portal light fallback without contacting
+the session D-Bus service. A missing test reader is an error; explicit light
+and dark selections never consult it. Production commands retain native home
+discovery and portal reads.
+
 The server harnesses, including the library's `control.rs` and lifecycle tests,
 and the desktop harnesses follow these rules. The
 [approved hermetic test guard](../superpowers/specs/2026-09-26-hermetic-test-guard-design.md)
