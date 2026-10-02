@@ -8,6 +8,7 @@
     "test": "node run-local-vp.mjs test run"
   },
   "dependencies": {
+    "@bibcode/client-runtime": "workspace:*",
     "@bibcode/contracts": "workspace:*",
     "@bibcode/shared": "workspace:*",
     "@effect/platform-node": "catalog:",

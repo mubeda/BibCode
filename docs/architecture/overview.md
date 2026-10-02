@@ -894,6 +894,16 @@ independently bounded to 30 seconds. The client deadline includes supervisor
 acquisition, readiness, and RPC execution; timeout interrupts the whole lazy
 operation and releases one of the two update-check workers.
 
+The web runtime owns one remote-update confirmation request and one update run
+per environment. `AppRoot` hosts the confirmation independently of Settings and
+sidebar view lifetimes; fresh running-work counts are advisory. Both entry
+points and failure Retry actions require confirmation. Active progress replaces
+the update action, and settled row failure can be dismissed without cancelling
+an active run. Manual hosts show install/platform-specific operator steps. Host
+request notices are informational and link to sharing management. A browser
+whose primary server reconnects on a new boot/version offers an explicit Reload
+button and preserves unsent input until it is chosen.
+
 ### WebView engines
 
 The WebView engine is the operating system's, so it differs per platform:

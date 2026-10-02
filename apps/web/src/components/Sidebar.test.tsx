@@ -1057,6 +1057,59 @@ staticDescribe("Sidebar environment scoping", () => {
     expect(captured("EnvironmentContextCard")).toHaveLength(1);
   });
 
+  it("shows shared update progress in the card without observing its status query", () => {
+    seedTwoEnvironments();
+    h.state.environments[1] = environmentFixture({
+      environmentId: ENV_REMOTE,
+      label: "AI-SERVER",
+      serverConfig: {
+        environment: { serverVersion: "0.7.2", capabilities: { remoteUpdateControl: true } },
+      },
+    });
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    const run = { phase: "restarting", targetVersion: "0.7.3" };
+    h.state.remoteUpdateRuns.set(ENV_REMOTE, run);
+    render(<Sidebar />);
+    const badge = captured("EnvironmentContextCard")[0]!.props.updateBadge as React.ReactElement<{
+      run: unknown;
+      name: string;
+    }>;
+    expect(badge.props.run).toEqual(run);
+    expect(badge.props.name).toBe("AI-SERVER");
+    expect(h.state.remoteUpdateSnapshotQueries).not.toContain(ENV_REMOTE);
+  });
+
+  it("requests confirmation for the selected card's available update", () => {
+    seedTwoEnvironments();
+    h.state.environments[1] = environmentFixture({
+      environmentId: ENV_REMOTE,
+      label: "AI-SERVER",
+      serverConfig: {
+        environment: {
+          serverVersion: "0.7.2",
+          capabilities: { remoteUpdateControl: true, remoteUpdateProgress: true },
+        },
+      },
+    });
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    h.state.remoteUpdateSnapshots.set(ENV_REMOTE, {
+      latestVersion: "0.7.3",
+      state: "update-available",
+      support: { installMode: "interactive" },
+    });
+    render(<Sidebar />);
+    const badge = captured("EnvironmentContextCard")[0]!.props.updateBadge as React.ReactElement<{
+      onUpdate: () => void;
+    }>;
+    badge.props.onUpdate();
+    expect(h.state.requestRemoteUpdate).toHaveBeenCalledExactlyOnceWith({
+      environmentId: ENV_REMOTE,
+      name: "AI-SERVER",
+      targetVersion: "0.7.3",
+      progress: true,
+    });
+  });
+
   it('labels the add-project trigger "Add project on <name>" only for a remote selection', () => {
     seedTwoEnvironments();
     h.state.activeEnvironmentId = ENV_REMOTE;

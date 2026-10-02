@@ -214,6 +214,20 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Hide/remove non-destructive result:
 - Final on-disk verification:
 
+## Remote-server updates
+
+- Settings/card confirmation, fresh counts, Cancel, and Retry reconfirmation:
+- Progress/queued/restart/version checking, closing the view, and row Dismiss:
+- Manual archive/package/OS/architecture/SSH steps and Copy:
+- Browser explicit Reload and composer input retained:
+- Host request notice and Manage devices (native | tests-only | unavailable):
+- Fake-host UI/session evidence and light/dark screenshots:
+- Real seeded CI run link, target, lane and `widened` result:
+- Before/after boot, version, storage identity and project retention:
+- Observed percentages/stages, verified backup and requester log counts:
+- Linux scoped AppImage mount/runtime counts and cleanup evidence:
+- Exact commands, unavailable checks and residual risk:
+
 ## Clone from URL network scenario
 
 - Throttled remote size, rate, and clone duration (> 30 s) with dialog close after registration:

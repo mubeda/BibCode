@@ -31,6 +31,30 @@ function view(overrides: Partial<Parameters<typeof buildEnvironmentContextCardVi
 }
 
 describe("buildEnvironmentContextCardView", () => {
+  it("uses operator steps for a manually installed server", () => {
+    expect(
+      view({
+        serverConfig: {
+          environment: {
+            serverVersion: "0.7.2",
+            remoteUpdateSupport: { installMode: "manual" },
+            capabilities: {},
+          },
+        } as unknown as ServerConfig,
+      })?.manualUpdates,
+    ).toBe(true);
+    expect(
+      view({
+        serverConfig: {
+          environment: {
+            serverVersion: "0.7.2",
+            remoteUpdateSupport: { installMode: "interactive" },
+            capabilities: {},
+          },
+        } as unknown as ServerConfig,
+      })?.manualUpdates,
+    ).toBe(false);
+  });
   it("is hidden for primary and desktop-local targets", () => {
     expect(view({ target: { _tag: "PrimaryConnectionTarget" } as ConnectionTarget })).toBeNull();
     expect(

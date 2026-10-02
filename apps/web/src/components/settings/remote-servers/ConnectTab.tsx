@@ -15,7 +15,6 @@ import type {
   DesktopSshEnvironmentTarget,
   EnvironmentId,
 } from "@bibcode/contracts";
-import { REMOTE_UPDATE_MANUAL_REQUIRED } from "@bibcode/contracts";
 import {
   connectionStatusText,
   type CompatVerdict,
@@ -47,7 +46,23 @@ import {
   connectSshEnvironment as connectSshEnvironmentAtom,
 } from "~/connection/onboarding";
 import { desktopSshHostsStateAtom } from "~/state/desktopSshHosts";
-import { remoteUpdateEnvironment, useRemoteUpdateCheckState } from "~/state/remoteUpdates";
+import {
+  remoteUpdateEnvironment,
+  useRemoteUpdateCheckState,
+  useRemoteUpdateRun,
+  useRequestRemoteUpdateConfirmation,
+  useDismissRemoteUpdate,
+} from "~/state/remoteUpdates";
+import {
+  isRemoteUpdateRunActive,
+  type RemoteUpdateRunState,
+} from "@bibcode/client-runtime/state/remoteUpdateCoordinator";
+import {
+  manualUpdateSteps,
+  remoteUpdateActionLabel,
+  remoteUpdateFailureMessage,
+  visibleRemoteUpdateRun,
+} from "../remoteUpdatePresentation";
 import {
   type EnvironmentPresentation,
   useEnvironments,
@@ -94,7 +109,6 @@ import { SettingsSection } from "../settingsLayout";
 import {
   ServerUpdateBadge,
   type ServerUpdateStatus,
-  manualUpdateInstructions,
   serverUpdateBadgeVariant,
   serverUpdateStatusFromQuery,
 } from "../ServerUpdateBadge";
@@ -132,15 +146,15 @@ type RemoteServerRowProps = {
   updateStatus: ServerUpdateStatus;
   /** A check, or the first status read, is running: Check reads "Checking…" and waits. */
   checkInFlight: boolean;
-  /** An install request is being sent: Check and Update wait for it. */
-  installInFlight: boolean;
+  run: RemoteUpdateRunState | null;
   removingEnvironmentId: EnvironmentId | null;
   onConnect: (environmentId: EnvironmentId) => void;
   onDisconnect: (environmentId: EnvironmentId) => void;
   onRequestRemove: (environmentId: EnvironmentId, label: string) => void;
   onRequestRename: (request: RenameServerRequest) => void;
   onCheckForUpdate: () => void;
-  onInstallUpdate: () => void;
+  onRequestUpdate: () => void;
+  onDismissUpdate: () => void;
   /** Re-reads a failed update status. */
   onRetryUpdate: () => void;
 };
@@ -151,14 +165,15 @@ function RemoteServerRow({
   remoteUpdateControl,
   updateStatus,
   checkInFlight,
-  installInFlight,
+  run,
   removingEnvironmentId,
   onConnect,
   onDisconnect,
   onRequestRemove,
   onRequestRename,
   onCheckForUpdate,
-  onInstallUpdate,
+  onRequestUpdate,
+  onDismissUpdate,
   onRetryUpdate,
 }: RemoteServerRowProps) {
   const environmentId = environment.environmentId;
@@ -233,10 +248,20 @@ function RemoteServerRow({
   const compatBadge = describeCompatBadge(compat);
   const transportBadge = resolveTransportBadge(environment);
   const updateSnapshot = updateStatus.snapshot;
+  const runActive = isRemoteUpdateRunActive(run);
+  const failedRun = run?.phase === "failed" ? run : null;
   const updateVariant = serverUpdateBadgeVariant(updateStatus);
   const updateInstructions =
-    updateSnapshot?.support.installMode === "manual"
-      ? manualUpdateInstructions(updateSnapshot.serverVersion)
+    updateSnapshot !== null &&
+    (updateSnapshot.support.installMode === "manual" ||
+      failedRun?.failure.kind === "manual-required")
+      ? manualUpdateSteps({
+          installKind: updateSnapshot.support.installKind,
+          os: environment.serverConfig?.environment.platform?.os ?? "unknown",
+          arch: environment.serverConfig?.environment.platform?.arch ?? "other",
+          sshLaunched: environment.entry.target._tag === "SshConnectionTarget",
+          serverVersion: updateSnapshot.serverVersion,
+        })
       : null;
   const statusUnavailable =
     versionLabel === null && compatBadge === null && environment.connection.error !== null;
@@ -301,7 +326,12 @@ function RemoteServerRow({
               )
             ) : null}
             {remoteUpdateControl ? (
-              <ServerUpdateBadge {...updateStatus} onRetry={onRetryUpdate} />
+              <ServerUpdateBadge
+                {...updateStatus}
+                run={run}
+                name={environment.label}
+                onRetry={onRetryUpdate}
+              />
             ) : null}
             {metadataBits.length > 0 ? (
               <span className="text-xs text-muted-foreground">{metadataBits.join(" · ")}</span>
@@ -351,15 +381,22 @@ function RemoteServerRow({
               </span>
             </p>
           ) : null}
+          {failedRun ? (
+            <p role="alert" className="text-xs text-destructive">
+              {remoteUpdateFailureMessage(environment.label, failedRun.failure)}
+            </p>
+          ) : null}
           {updateInstructions ? (
             <Collapsible>
               <CollapsibleTrigger className="text-xs text-muted-foreground underline underline-offset-2">
-                Manual update steps
+                Show update steps
               </CollapsibleTrigger>
               <CollapsibleContent className="mt-2 space-y-2">
-                <pre className="overflow-x-auto rounded-md bg-muted p-2 text-xs whitespace-pre-wrap">
-                  {updateInstructions}
-                </pre>
+                <div className="overflow-x-auto rounded-md">
+                  <pre data-text-surface="card" className="bg-card p-2 text-xs whitespace-pre-wrap">
+                    {updateInstructions}
+                  </pre>
+                </div>
                 <Button
                   size="xs"
                   variant="outline"
@@ -369,7 +406,7 @@ function RemoteServerRow({
                     })
                   }
                 >
-                  Copy instructions
+                  Copy
                 </Button>
               </CollapsibleContent>
             </Collapsible>
@@ -380,7 +417,7 @@ function RemoteServerRow({
             <Button
               size="xs"
               variant="ghost"
-              disabled={checkInFlight || installInFlight}
+              disabled={checkInFlight || runActive}
               onClick={onCheckForUpdate}
             >
               {checkInFlight
@@ -392,10 +429,22 @@ function RemoteServerRow({
           ) : null}
           {remoteUpdateControl &&
           updateSnapshot?.support.installMode === "interactive" &&
-          updateVariant === "update-available" ? (
-            <Button size="xs" disabled={checkInFlight || installInFlight} onClick={onInstallUpdate}>
-              Update
+          updateVariant === "update-available" &&
+          run === null &&
+          updateSnapshot.latestVersion !== null ? (
+            <Button size="xs" disabled={checkInFlight} onClick={onRequestUpdate}>
+              {remoteUpdateActionLabel(updateSnapshot.latestVersion)}
             </Button>
+          ) : null}
+          {failedRun ? (
+            <>
+              <Button size="xs" variant="outline" onClick={onRequestUpdate}>
+                Retry
+              </Button>
+              <Button size="xs" variant="ghost" onClick={onDismissUpdate}>
+                Dismiss
+              </Button>
+            </>
           ) : null}
           {isWslEnvironment ? (
             <Tooltip>
@@ -471,9 +520,10 @@ function RemoteServerRowFromSession(
     | "remoteUpdateControl"
     | "updateStatus"
     | "checkInFlight"
-    | "installInFlight"
+    | "run"
     | "onCheckForUpdate"
-    | "onInstallUpdate"
+    | "onRequestUpdate"
+    | "onDismissUpdate"
     | "onRetryUpdate"
   > & {
     readonly updateRefreshEpoch: number;
@@ -485,16 +535,19 @@ function RemoteServerRowFromSession(
   );
   const environmentId = props.environment.environmentId;
   const remoteUpdateControl = selectRemoteUpdateControlCapability(props.environment.serverConfig);
+  const run = useRemoteUpdateRun(remoteUpdateControl ? environmentId : null);
+  const runActive = isRemoteUpdateRunActive(run);
+  const requestUpdate = useRequestRemoteUpdateConfirmation();
+  const dismissUpdate = useDismissRemoteUpdate();
   const updateQuery = useEnvironmentQuery(
-    remoteUpdateControl ? remoteUpdateEnvironment.snapshot({ environmentId, input: {} }) : null,
+    remoteUpdateControl && !runActive
+      ? remoteUpdateEnvironment.snapshot({ environmentId, input: {} })
+      : null,
   );
   const refreshUpdateStatus = updateQuery.refresh;
   const revalidateUpdateStatus = updateQuery.revalidate;
   const updateCheck = useRemoteUpdateCheckState(remoteUpdateControl ? environmentId : null);
   const runCheck = useAtomCommand(remoteUpdateEnvironment.check, { reportFailure: false });
-  const runInstall = useAtomCommand(remoteUpdateEnvironment.install, { reportFailure: false });
-  const [installPending, setInstallPending] = useState(false);
-  const [manualInstallRequired, setManualInstallRequired] = useState(false);
 
   // A fan-out check's epoch is an automatic re-read; it keeps a transport cut-off latched.
   useEffect(() => {
@@ -510,45 +563,11 @@ function RemoteServerRowFromSession(
     revalidateUpdateStatus();
   }, [environmentId, revalidateUpdateStatus, runCheck]);
 
-  const installUpdate = useCallback(async () => {
-    setInstallPending(true);
-    const result = await runInstall({ environmentId, input: {} });
-    setInstallPending(false);
-    if (result._tag === "Success") {
-      setManualInstallRequired(false);
-      revalidateUpdateStatus();
-      return;
-    }
-    const error = squashAtomCommandFailure(result);
-    if (
-      error !== null &&
-      typeof error === "object" &&
-      "code" in error &&
-      error.code === REMOTE_UPDATE_MANUAL_REQUIRED
-    ) {
-      setManualInstallRequired(true);
-      revalidateUpdateStatus();
-    }
-  }, [environmentId, revalidateUpdateStatus, runInstall]);
-
   const queryStatus = serverUpdateStatusFromQuery(updateQuery, {
     connected: props.environment.connection.phase === "connected",
     check: updateCheck,
   });
-  const updateStatus: ServerUpdateStatus =
-    manualInstallRequired && queryStatus.snapshot !== null
-      ? {
-          ...queryStatus,
-          snapshot: {
-            ...queryStatus.snapshot,
-            support: {
-              ...queryStatus.snapshot.support,
-              installMode: "manual",
-              reason: "manual-update-required",
-            },
-          },
-        }
-      : queryStatus;
+  const updateStatus = queryStatus;
   return (
     <RemoteServerRow
       {...rowProps}
@@ -557,9 +576,18 @@ function RemoteServerRowFromSession(
       updateStatus={updateStatus}
       // Background status re-reads keep the known snapshot, so they never flip Check.
       checkInFlight={serverUpdateBadgeVariant(updateStatus) === "checking"}
-      installInFlight={installPending}
+      run={visibleRemoteUpdateRun(run, updateStatus.snapshot)}
       onCheckForUpdate={() => void checkForUpdate()}
-      onInstallUpdate={() => void installUpdate()}
+      onRequestUpdate={() =>
+        requestUpdate({
+          environmentId,
+          name: props.environment.label,
+          targetVersion: updateStatus.snapshot?.latestVersion ?? null,
+          progress:
+            props.environment.serverConfig?.environment.capabilities.remoteUpdateProgress ?? false,
+        })
+      }
+      onDismissUpdate={() => dismissUpdate(environmentId)}
       onRetryUpdate={refreshUpdateStatus}
     />
   );

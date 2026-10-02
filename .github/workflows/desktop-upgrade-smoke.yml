@@ -105,6 +105,7 @@ jobs:
           set -euo pipefail
           key_path="$RUNNER_TEMP/bibcode-seeded-upgrade.key"
           key_password="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"
+          echo "::add-mask::$key_password"
           (cd apps/desktop && vp exec tauri signer generate \
             --ci --password "$key_password" --write-keys "$key_path" >/dev/null)
           test -s "$key_path"
@@ -115,7 +116,7 @@ jobs:
             echo "BIBCODE_UPGRADE_PUBLIC_KEY_FILE=$key_path.pub"
           } >> "$GITHUB_ENV"
 
-      - name: Run real previous-stable and protected-baseline upgrades
+      - name: Run previous-stable, protected-baseline, and remote-install upgrades
         shell: bash
         run: |
           set -euo pipefail
@@ -246,6 +247,7 @@ jobs:
           set -euo pipefail
           key_path="$RUNNER_TEMP/bibcode-seeded-wsl-upgrade.key"
           key_password="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"
+          echo "::add-mask::$key_password"
           (cd apps/desktop && vp exec tauri signer generate --ci --password "$key_password" --write-keys "$key_path" >/dev/null)
           {
             echo "TAURI_SIGNING_PRIVATE_KEY=$key_path"

@@ -29,7 +29,6 @@ import {
   ServerUpdateBadge,
   type ServerUpdateStatus,
   describeUpdateCheckFailure,
-  manualUpdateInstructions,
   serverUpdateBadgeVariant,
   serverUpdateStatusFromQuery,
 } from "./ServerUpdateBadge";
@@ -416,15 +415,23 @@ describe("ServerUpdateBadge", () => {
   });
 });
 
-describe("manualUpdateInstructions", () => {
-  it("gives copy-paste steps that mention the running version", () => {
-    const instructions = manualUpdateInstructions("0.4.2");
-    expect(instructions).toContain("bibcode serve");
-    expect(instructions).toContain("0.4.2");
-  });
-});
-
 describe("ServerUpdateBadge while an update runs", () => {
+  it("keeps a failed sidebar update actionable through confirmation Retry", () => {
+    const retry = vi.fn();
+    const container = mount(
+      <ServerUpdateBadge
+        {...status({})}
+        run={{ phase: "failed", failure: { kind: "not-back" } }}
+        onRetryRun={retry}
+      />,
+    );
+    const button = [...container.querySelectorAll("button")].find(
+      (candidate) => candidate.textContent === "Retry",
+    );
+    expect(button).toBeDefined();
+    act(() => button!.click());
+    expect(retry).toHaveBeenCalledOnce();
+  });
   it.each<[RemoteUpdateRunState, string]>([
     [{ phase: "queued" }, "Queued"],
     [{ phase: "starting" }, "Updating…"],

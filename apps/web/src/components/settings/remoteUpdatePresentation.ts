@@ -24,6 +24,78 @@ export interface RemoteUpdateConfirmation {
 
 const KEPT =
   "Conversations and queued messages are kept, and agents continue when you send the next message.";
+
+export interface ManualUpdateStepsInput {
+  readonly installKind: string;
+  readonly os: "darwin" | "linux" | "windows" | "unknown";
+  readonly arch: "arm64" | "x64" | "other";
+  readonly sshLaunched: boolean;
+  readonly serverVersion: string;
+}
+
+/** Operator steps use the host's distribution and shell, never the client's platform. */
+export function manualUpdateSteps(input: ManualUpdateStepsInput): string {
+  const running = `# Currently running: v${input.serverVersion}`;
+  const generic = [
+    "# Update this BiBCode server on its host:",
+    "# 1. Stop the running server (Ctrl+C or its service manager).",
+    "# 2. Install the new bibcode distribution for this host.",
+    "# 3. Restart it or its service:",
+    "bibcode serve",
+    "",
+    running,
+  ];
+  if (input.sshLaunched) {
+    return [
+      "# This server was started by BiBCode over SSH.",
+      "# 1. Install the new bibcode on the host; check bibcode --version.",
+      "# 2. Locate this connection's pid record under ~/.bibcode-ssh-launch/.",
+      "# Verify that it still belongs to this bibcode server before stopping it.",
+      "# 3. Reconnect from BiBCode to start the new server.",
+      "",
+      running,
+    ].join("\n");
+  }
+  if (input.os === "unknown" || input.arch === "other") return generic.join("\n");
+  const archiveArch = input.arch === "arm64" ? "aarch64" : "x86_64";
+  const release =
+    "# Replace VERSION with the release to install from https://github.com/mubeda/BibCode/releases.";
+  if (input.installKind === "archive") {
+    const asset = `bibcode-server-vVERSION-${input.os}-${archiveArch}.${input.os === "windows" ? "zip" : "tar.gz"}`;
+    const check =
+      input.os === "windows"
+        ? [
+            `Get-FileHash -Algorithm SHA256 '${asset}'`,
+            `# Compare its Hash with the ${asset} line in bibcode-server-SHA256SUMS.`,
+          ]
+        : [
+            `grep "  ${asset}$" bibcode-server-SHA256SUMS | ${input.os === "darwin" ? "shasum -a 256 -c" : "sha256sum --check -"}`,
+          ];
+    return [
+      release,
+      `# 1. Download ${asset} and bibcode-server-SHA256SUMS.`,
+      "# 2. Check the download:",
+      ...check,
+      "# 3. Stop the server, replace the extracted distribution, and restart it or its service:",
+      "bibcode serve",
+      "",
+      running,
+    ].join("\n");
+  }
+  if (input.installKind === "system-package" && input.os === "linux") {
+    return [
+      release,
+      "# 1. Download this host's package and check it against bibcode-server-SHA256SUMS.",
+      "# 2. Use the command for your distribution:",
+      `sudo apt install ./bibcode-server_VERSION_${input.arch === "arm64" ? "arm64" : "amd64"}.deb`,
+      `sudo dnf install ./bibcode-server-VERSION-1.${archiveArch}.rpm`,
+      "# 3. Restart the server or its service.",
+      "",
+      running,
+    ].join("\n");
+  }
+  return generic.join("\n");
+}
 const PROTECTION_STAGES = new Set([
   "waiting-for-mutations",
   "quiescing-runtime",

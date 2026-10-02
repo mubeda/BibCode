@@ -251,22 +251,20 @@ fn firewall_process_input(executable: String, args: Vec<String>) -> ProcessRunIn
 
 #[cfg(windows)]
 impl FirewallCommandRunner for ProcessFirewallCommandRunner {
-    fn run(
+    async fn run(
         &self,
         executable: String,
         args: Vec<String>,
-    ) -> impl std::future::Future<Output = Result<FirewallCommandOutput, String>> + Send {
-        async move {
-            let output = ProcessRunner
-                .run(firewall_process_input(executable.clone(), args))
-                .await
-                .map_err(|error| format!("failed to run {executable}: {error}"))?;
-            Ok(FirewallCommandOutput {
-                success: output.code == Some(0),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
-        }
+    ) -> Result<FirewallCommandOutput, String> {
+        let output = ProcessRunner
+            .run(firewall_process_input(executable.clone(), args))
+            .await
+            .map_err(|error| format!("failed to run {executable}: {error}"))?;
+        Ok(FirewallCommandOutput {
+            success: output.code == Some(0),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 }
 

@@ -2156,9 +2156,7 @@ pub async fn desktop_bridge_install_update(
     backend: State<'_, BackendSupervisor>,
     input: Option<DesktopUpdateInstallInput>,
 ) -> Result<Value, String> {
-    Ok(updates
-        .install_update(&app, backend.inner(), input.unwrap_or_default())
-        .await)
+    Ok(Box::pin(updates.install_update(&app, backend.inner(), input.unwrap_or_default())).await)
 }
 
 #[cfg(test)]

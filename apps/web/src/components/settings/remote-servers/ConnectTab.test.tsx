@@ -119,6 +119,10 @@ const h = vi.hoisted(() => {
     },
     remoteUpdateQueries: new Map<string, Record<string, unknown>>(),
     remoteUpdateCheckStates: new Map<string, unknown>(),
+    remoteUpdateRuns: new Map<string, unknown>(),
+    updateSnapshotQueries: [] as string[],
+    requestRemoteUpdate: vi.fn(),
+    dismissRemoteUpdate: vi.fn(),
     atoms: {
       desktopNetworkAccess: Symbol("desktopNetworkAccessStateAtom"),
       desktopSshHosts: Symbol("desktopSshHostsStateAtom"),
@@ -336,6 +340,7 @@ vi.mock("~/state/query", () => ({
     if (atom === h.atoms.desktopWsl) return h.wslQuery;
     if ((atom as { __kind?: string }).__kind === "accessChanges") return h.accessChangesQuery;
     if ((atom as { __kind?: string }).__kind === "remoteUpdateSnapshot") {
+      h.updateSnapshotQueries.push((atom as { environmentId: string }).environmentId);
       return (
         h.remoteUpdateQueries.get((atom as { environmentId: string }).environmentId) ?? h.nullQuery
       );
@@ -372,6 +377,10 @@ vi.mock("~/state/remoteUpdates", () => ({
       inFlight: false,
       failure: null,
     },
+  useRemoteUpdateRun: (environmentId: string | null) =>
+    environmentId === null ? null : (h.remoteUpdateRuns.get(environmentId) ?? null),
+  useRequestRemoteUpdateConfirmation: () => h.requestRemoteUpdate,
+  useDismissRemoteUpdate: () => h.dismissRemoteUpdate,
 }));
 
 vi.mock("~/state/environments", () => ({
@@ -1093,6 +1102,10 @@ beforeEach(() => {
   h.accessChangesQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   h.remoteUpdateQueries.clear();
   h.remoteUpdateCheckStates.clear();
+  h.remoteUpdateRuns.clear();
+  h.updateSnapshotQueries = [];
+  h.requestRemoteUpdate.mockReset();
+  h.dismissRemoteUpdate.mockReset();
   for (const command of Object.values(h.commands)) {
     command.mockReset();
     command.mockResolvedValue(success(undefined));
@@ -2051,6 +2064,95 @@ describe("Remote Servers tabs", () => {
   });
 
   describe("Check for Server Updates placement", () => {
+    it("requests confirmation instead of directly installing from Settings", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const id = EnvironmentId.make("update-confirm");
+      h.environments = [
+        environment({
+          id,
+          label: "Build server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      h.remoteUpdateQueries.set(
+        id,
+        settledUpdateQuery({
+          ...UP_TO_DATE_SNAPSHOT,
+          latestVersion: "0.7.3",
+          state: "update-available",
+        }),
+      );
+      await mountConnections(<ConnectTab />);
+      await act(async () => {
+        clickButton("Update to v0.7.3…");
+        await flush();
+      });
+      expect(h.requestRemoteUpdate).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          environmentId: id,
+          name: "Build server",
+          targetVersion: "0.7.3",
+        }),
+      );
+      expect(h.commands.remoteUpdateInstall).not.toHaveBeenCalled();
+    });
+    it("shows coordinator progress and stops observing its status query while active", () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const id = EnvironmentId.make("update-active");
+      h.environments = [
+        environment({
+          id,
+          label: "Build server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      h.remoteUpdateRuns.set(id, {
+        phase: "installing",
+        stage: "creating-verified-backup",
+        targetVersion: "0.7.3",
+      });
+      const markup = render(<ConnectTab />);
+      expect(markup).toContain("Backing up project data…");
+      expect(h.updateSnapshotQueries).not.toContain(id);
+      expect(control("button", "Check").props.disabled).toBe(true);
+    });
+    it("shows a failed run with Retry confirmation and Dismiss", async () => {
+      stubBrowserWindow();
+      h.hasCloudConfig = false;
+      const id = EnvironmentId.make("update-failed");
+      h.environments = [
+        environment({
+          id,
+          label: "Build server",
+          connection: { phase: "connected" },
+          serverConfig: updateCapableConfig(),
+        }),
+      ];
+      h.remoteUpdateQueries.set(id, settledUpdateQuery(UP_TO_DATE_SNAPSHOT));
+      h.remoteUpdateRuns.set(id, {
+        phase: "failed",
+        failure: { kind: "wrong-version", runningVersion: "0.7.2", targetVersion: "0.7.3" },
+      });
+      const container = await mountConnections(<ConnectTab />);
+      expect(container.textContent).toContain(
+        "Build server restarted on v0.7.2 instead of v0.7.3.",
+      );
+      await act(async () => {
+        clickButton("Retry");
+        await flush();
+      });
+      expect(h.requestRemoteUpdate).toHaveBeenCalledOnce();
+      expect(h.commands.remoteUpdateInstall).not.toHaveBeenCalled();
+      await act(async () => {
+        clickButton("Dismiss");
+        await flush();
+      });
+      expect(h.dismissRemoteUpdate).toHaveBeenCalledExactlyOnceWith(id);
+    });
     it("is hidden while the Phase 7 capability seam is off", () => {
       stubBrowserWindow();
       expect(render(<ConnectTab />)).not.toContain("Check for Server Updates");
@@ -2098,7 +2200,14 @@ describe("Remote Servers tabs", () => {
       const markup = render(<ConnectTab />);
       expect(markup.match(/data-variant="manual"/gu)).toHaveLength(1);
       expect(markup).toContain("Manual updates");
-      expect(markup).toContain("Copy instructions");
+      expect(markup).toContain("Show update steps");
+      expect(markup).toContain("Copy");
+      const content = document.createElement("div");
+      content.innerHTML = markup;
+      const steps = content.querySelector("pre");
+      expect(steps?.dataset.textSurface).toBe("card");
+      expect(steps?.classList.contains("bg-card")).toBe(true);
+      expect(steps?.parentElement?.classList.contains("overflow-x-auto")).toBe(true);
     });
 
     it("shows a failed check as Check failed with its reason, and Check again re-runs it", async () => {
