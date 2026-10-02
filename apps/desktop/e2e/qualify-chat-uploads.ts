@@ -7,6 +7,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { remote } from "webdriverio";
+import { EnvironmentMetadataHttpApi } from "../../../packages/contracts/src/environmentHttp.ts";
 
 import { prepareDesktopUiTestContext } from "./support/test-project.ts";
 import { createSizedPng, instrumentCodexAttachmentLog } from "./support/chat-upload-fixture.ts";
@@ -265,9 +266,14 @@ try {
     await until(async () => {
       try {
         return (
-          await fetch("http://127.0.0.1:" + environment.serverPort + "/.well-known/bibcode", {
-            signal: AbortSignal.timeout(1000),
-          })
+          await fetch(
+            "http://127.0.0.1:" +
+              environment.serverPort +
+              EnvironmentMetadataHttpApi.endpoints.descriptor.path,
+            {
+              signal: AbortSignal.timeout(1000),
+            },
+          )
         ).ok;
       } catch {
         return false;
