@@ -186,7 +186,9 @@ describe("generated remote sharing grant handoff", () => {
     expect(fixture.driver).toHaveBeenCalledWith({
       endpoint: "http://127.0.0.1:43123",
       bootstrapToken: "fixture-distinct-grant",
+      candidateVersion: "0.7.3",
       requireWide: true,
+      onInstallDispatched: expect.any(Function),
     });
     const receipt = fixture.files.get(fixture.input.remoteSecretPath);
     expect(receipt?.mode).toBe(0o600);

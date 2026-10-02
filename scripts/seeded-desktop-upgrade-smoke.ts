@@ -648,9 +648,16 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
     }, widened);
     // Private receipt is outside retained evidence; the controller uses it to redact logs.
     NodeFS.writeFileSync(input.remoteSecretPath, JSON.stringify(credentials), { mode: 0o600 });
-    NodeFS.writeFileSync(input.resultPath, JSON.stringify({ ...observation, installAttempted: true }));
+    NodeFS.writeFileSync(input.resultPath, JSON.stringify({ ...observation, installAttempted: false }));
     const { runRemoteInstallDriver } = await import(input.remoteInstallDriverPath);
-    const evidence = await runRemoteInstallDriver({ ...credentials, requireWide: widened });
+    const evidence = await runRemoteInstallDriver({
+      ...credentials,
+      candidateVersion: input.candidateVersion,
+      requireWide: widened,
+      onInstallDispatched: () => {
+        NodeFS.writeFileSync(input.resultPath, JSON.stringify({ ...observation, installAttempted: true }));
+      },
+    });
     const { captureRemoteInstallHostEvidence } = await import(input.remoteHarnessPath);
     const host = await captureRemoteInstallHostEvidence({ dataRoot: input.expectedDataRoot, appBinaryPath: input.appBinaryPath, platform: input.platform });
     NodeFS.writeFileSync(input.remoteEvidencePath, JSON.stringify({ ...evidence, ...host, widened }), { mode: 0o600 });
@@ -724,6 +731,10 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
         }
         if (lane === "protected-baseline" && state?.phase === "protecting") finish(null);
       })).then(async () => {
+        if (settled) return;
+        // Exercise installation as a new browser task, after native listener setup returns.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (settled) return;
         const install = await bridge.installUpdate();
         if (install?.completed !== true) return finish("install did not complete");
         if (lane === "previous-stable") setTimeout(() => finish(null), 750);

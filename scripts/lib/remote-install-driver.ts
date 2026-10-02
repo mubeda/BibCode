@@ -124,6 +124,9 @@ export function decodeExit(input: unknown, id: string): unknown {
 export interface RemoteInstallDriverInput {
   readonly endpoint: string;
   readonly bootstrapToken: string;
+  readonly candidateVersion: string;
+  /** Best-effort synchronous observation after the install request is dispatched. */
+  readonly onInstallDispatched?: () => void;
   /** A live grant widened the host: identities must come from a boot reachable off loopback. */
   readonly requireWide?: boolean;
 }
@@ -300,6 +303,13 @@ export async function runRemoteInstallDriver(
       pending.set(id, { resolve, reject, dispose });
       signal?.addEventListener("abort", abort, { once: true });
       current.send(encodeRequest(id, tag));
+      if (tag === "updater.install") {
+        try {
+          input.onInstallDispatched?.();
+        } catch {
+          /* Recording an attempt must not change the already-dispatched update. */
+        }
+      }
     });
   };
   const rpc = Effect.fn("RemoteInstall.rpc")(function* (tag: string) {
@@ -362,12 +372,35 @@ export async function runRemoteInstallDriver(
       progress: environment.capabilities.remoteUpdateProgress ?? false,
     };
   }, Effect.provide(FetchHttpClient.layer));
+  const checkCandidate = Effect.fn("RemoteInstall.checkCandidate")(function* () {
+    let snapshot = yield* rpc("updater.check").pipe(Effect.flatMap(decodeSnapshotEffect));
+    while (snapshot.state === "checking" && snapshot.support.installMode !== "manual") {
+      yield* Effect.sleep(250);
+      snapshot = yield* rpc("updater.status").pipe(Effect.flatMap(decodeSnapshotEffect));
+    }
+    if (
+      snapshot.state !== "update-available" ||
+      snapshot.support.installMode === "manual" ||
+      (snapshot.targetVersion ?? snapshot.latestVersion) !== input.candidateVersion
+    ) {
+      return yield* new RemoteInstallTransportError({
+        message: "The candidate update was not available before remote installation.",
+      });
+    }
+  });
   try {
     await open();
     const before = observedIdentity(await request("server.getConfig"));
     const work = decodeActiveWork(await request("updater.activeWork"));
     if (work.runningTurns !== 0 || work.liveTerminals !== 0 || work.queuedMessages !== 0)
       throw new Error("The remote verification host is not idle.");
+    // Match the UI's available-update prerequisite. A cold install can restart
+    // before the coordinator ever sees the host's authoritative target version.
+    try {
+      await Effect.runPromise(checkCandidate().pipe(Effect.timeout(30_000)));
+    } catch {
+      throw new Error("The candidate update was not available before remote installation.");
+    }
     const port: RemoteUpdatePort = {
       connection: Effect.sync(() => ({
         phase,

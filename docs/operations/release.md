@@ -270,10 +270,20 @@ protected baseline in a separate data/workspace root. It generates an **Another
 device** grant through the packaged UI and redeems it for a distinct test client.
 If widening is unavailable, evidence records `widened: false`; source/native
 transport tests then supply that leg, rather than claiming a wide live pass.
-The Node driver runs the product coordinator over authenticated loopback RPC;
-when widened, it waits for a candidate boot reachable through a local interface.
+The Node driver first checks the authenticated host's updater and requires the
+requested candidate to be available before starting the product coordinator.
+An already-running check is followed through status reads within one 30-second
+deadline; an unavailable, missing, mismatched, or failed candidate stops the lane
+before installation. This matches the UI's available-update prerequisite and
+ensures a fast local update cannot restart before the coordinator learns its
+target. The coordinator runs over authenticated loopback RPC; when widened, it
+waits for a candidate boot reachable through a local interface.
 A test-only metadata observer records brief percentages/stages without changing
 product coordinator deadlines.
+The remote lane records an install attempt only after its authenticated
+`updater.install` request is dispatched. A refused check or failed dispatch
+leaves that marker false, so a failed WebDriver phase cannot be mistaken for an
+installer handoff. Marker-write failures do not change the dispatched update.
 
 Evidence requires a new boot on the candidate, unchanged storage identity,
 observed download/protection progress, a verified pre-update backup, and exactly
