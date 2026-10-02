@@ -35,3 +35,4 @@ export * from "./preview.ts";
 export * from "./previewAutomation.ts";
 export * from "./rpcTransport.ts";
 export * from "./rpc.ts";
+export * from "./uploads.ts";
