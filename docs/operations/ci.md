@@ -5,7 +5,10 @@ four job groups:
 
 - **Check** runs `vp check`, workspace typechecking (`vpr typecheck`),
   `cargo fmt --all --check`, Clippy with warnings denied, and the complete
-  desktop build pipeline on Ubuntu 24.04.
+  desktop build pipeline on Ubuntu 24.04. A separate
+  `cargo check -p bibcode-server --lib --bins -j 2` also checks production
+  feature wiring without dev units: all-targets Clippy enables the hermetic
+  test guard, while ordinary server builds do not.
 - **Test** runs every workspace package `test` script one task at a time with
   `vp run -r --concurrency-limit 1 test`, then runs `cargo test --workspace -j 2`
   explicitly on Ubuntu 24.04. Serial tasks keep `rustc` from competing with a
@@ -16,10 +19,11 @@ four job groups:
   test binaries use the default parallel harness threads. Exact subprocess
   tests may still select `--test-threads=1` inside an isolated child process
   that intentionally owns process-global state.
-  The job then builds `bibcode` (`cargo build -p bibcode-server --bin bibcode`)
+  The job then builds the guarded `bibcode` through
+  `cargo test -p bibcode-server --test cli_smoke --no-run -j 2`
   and runs the ignored desktop SSH integration test
   (`cargo test -p bibcode-desktop --test ssh_environment -- --ignored`), which
-  needs that fresh binary and fakes only the SSH hop; see
+  needs that fresh guarded binary and fakes only the SSH hop; see
   [Desktop-managed SSH environments](../testing/ssh-environments.md).
 - **Release Smoke** runs `scripts/release-smoke.ts` to exercise release-only
   version rewriting, nightly metadata, and lockfile generation without
@@ -44,15 +48,15 @@ four job groups:
   the Windows command processor and writes its exact action record. Simulated
   target fixture assertions on other hosts are compatibility evidence, not a
   native Windows pass.
-  The Windows rows then run
-  `node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets` so
-  Unix-only test helpers or imports that are unused on Windows fail there under
-  `-D warnings` instead of surfacing only during native validation; Clippy's
   The repository-availability contract additionally executes the generated
   drive/UNC trust commands through native Windows PowerShell and Git, including
   spaces, dollar signs, backticks, and typographic quotes. Every Git/home
   configuration input is fixture-owned. Other platforms skip that native case;
   their string assertions remain compatibility evidence.
+  The Windows rows then run
+  `node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets` so
+  Unix-only test helpers or imports that are unused on Windows fail there under
+  `-D warnings` instead of surfacing only during native validation; Clippy's
   `--all-targets` pass otherwise runs on Linux alone.
 
 The Check and Test jobs install the Linux libraries required by Tauri. The

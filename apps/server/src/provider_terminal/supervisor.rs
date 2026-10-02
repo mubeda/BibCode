@@ -1163,8 +1163,13 @@ fn validated_executable(
     } else {
         instance.configured_binary.as_str()
     };
-    let requested = resolve_executable(&input.executable, &input.cwd, Some(&input.launch_env))?;
-    let allowed = resolve_executable(allowed, &input.cwd, None)?;
+    let requested = resolve_executable(
+        &input.executable,
+        &input.cwd,
+        Some(&input.launch_env),
+        false,
+    )?;
+    let allowed = resolve_executable(allowed, &input.cwd, None, true)?;
     paths_equal(&requested, &allowed).then_some(allowed)
 }
 
@@ -1172,6 +1177,7 @@ fn resolve_executable(
     executable: &str,
     cwd: &Path,
     launch_env: Option<&BTreeMap<String, String>>,
+    configured_provider: bool,
 ) -> Option<PathBuf> {
     let search_path = launch_env
         .and_then(|environment| environment_value(environment, "PATH").map(Into::into))
@@ -1185,6 +1191,19 @@ fn resolve_executable(
         })
         .flatten();
     let extensions = launch_executable_extensions(Platform::current(), path_extensions.as_deref());
+    #[cfg(feature = "hermetic-test-guard")]
+    if configured_provider || crate::hermetic_guard::is_guarded_program(Path::new(executable)) {
+        return crate::hermetic_guard::resolve_guarded_executable(
+            Path::new(executable),
+            Some(cwd),
+            search_path.as_deref(),
+            &extensions,
+            false,
+        )
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    }
+    #[cfg(not(feature = "hermetic-test-guard"))]
+    let _ = configured_provider;
     let path = locate_executable(executable, Some(cwd), search_path.as_deref(), &extensions)?;
     std::fs::canonicalize(path).ok()
 }
@@ -1231,6 +1250,63 @@ fn restrict_runtime_directory(_runtime_dir: &Path) -> Result<(), String> {
 
 #[cfg(all(test, unix))]
 mod tests {
+
+    #[cfg(feature = "hermetic-test-guard")]
+    #[test]
+    fn hermetic_guard_refuses_terminal_resolution_before_using_the_candidate() {
+        let Some(executable) = crate::hermetic_guard::refusal_fixture(
+            "provider_terminal::supervisor::tests::hermetic_guard_refuses_terminal_resolution_before_using_the_candidate",
+            "codex",
+        ) else {
+            return;
+        };
+        assert!(
+            super::resolve_executable(
+                executable.to_str().unwrap(),
+                executable.parent().unwrap(),
+                None,
+                true
+            )
+            .is_none()
+        );
+        let environment = std::collections::BTreeMap::from([(
+            "PATH".to_owned(),
+            executable.parent().unwrap().display().to_string(),
+        )]);
+        assert!(
+            super::resolve_executable(
+                "codex",
+                executable.parent().unwrap(),
+                Some(&environment),
+                true
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "hermetic-test-guard")]
+    #[test]
+    fn hermetic_guard_preserves_ordinary_shells_and_checks_configured_provider_aliases() {
+        let Some(executable) = crate::hermetic_guard::refusal_fixture(
+            "provider_terminal::supervisor::tests::hermetic_guard_preserves_ordinary_shells_and_checks_configured_provider_aliases",
+            "2.1.220",
+        ) else {
+            return;
+        };
+        assert!(
+            super::resolve_executable("/bin/sh", executable.parent().unwrap(), None, false)
+                .is_some()
+        );
+        assert!(
+            super::resolve_executable(
+                executable.to_str().unwrap(),
+                executable.parent().unwrap(),
+                None,
+                true
+            )
+            .is_none()
+        );
+    }
     use std::os::unix::{ffi::OsStrExt as _, fs::symlink};
 
     use super::{

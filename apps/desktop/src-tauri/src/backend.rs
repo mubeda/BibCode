@@ -2232,20 +2232,12 @@ fn prepare_isolated_test_server_settings(base_dir: &Path) -> Result<(), String> 
             ));
         }
     };
-    serde_json::to_writer(
-        &mut settings,
-        &json!({
-            "enableProviderUpdateChecks": false,
-            "providers": {
-                "codex": { "enabled": false },
-                "claudeAgent": { "enabled": false },
-                "cursor": { "enabled": false },
-                "grok": { "enabled": false },
-                "opencode": { "enabled": false }
-            }
-        }),
-    )
-    .map_err(|error| {
+    let mut fixture =
+        crate::test_support::hermetic_providers::hermetic_provider_settings(&state_dir);
+    for provider in crate::test_support::hermetic_providers::BUILTIN_PROVIDER_DRIVERS {
+        fixture["providers"][provider]["enabled"] = Value::Bool(false);
+    }
+    serde_json::to_writer(&mut settings, &fixture).map_err(|error| {
         format!(
             "failed to write isolated desktop test settings at {}: {error}",
             settings_path.display()
@@ -4058,6 +4050,15 @@ exit /b 9
             assert_eq!(
                 settings["providers"][provider]["enabled"], false,
                 "{provider} must not probe the developer host during desktop tests"
+            );
+            let binary = Path::new(
+                settings["providers"][provider]["binaryPath"]
+                    .as_str()
+                    .unwrap(),
+            );
+            assert!(
+                binary.is_absolute() && !binary.exists(),
+                "{provider} must resolve only the deliberately absent fixture binary"
             );
         }
     }

@@ -116,14 +116,27 @@ impl TestSandbox {
         test_name: &str,
         environment: &[(&str, &OsStr)],
     ) -> Output {
-        let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+        self.run_isolated_case_without_environment(case, test_name, environment, &[])
+    }
+
+    pub(crate) fn run_isolated_case_without_environment(
+        &self,
+        case: &str,
+        test_name: &str,
+        environment: &[(&str, &OsStr)],
+        removed: &[&str],
+    ) -> Output {
+        let mut command = Command::new(std::env::current_exe().expect("current test binary"));
+        command
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .envs(environment.iter().map(|(name, value)| (*name, *value)))
             .env("BIBCODE_TEST_ISOLATED_CASE", case)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("run isolated fixture case");
+            .stderr(Stdio::piped());
+        for name in removed {
+            command.env_remove(name);
+        }
+        let mut child = command.spawn().expect("run isolated fixture case");
         let mut stdout = child.stdout.take().expect("isolated child stdout");
         let mut stderr = child.stderr.take().expect("isolated child stderr");
         let stdout_reader = std::thread::spawn(move || {
@@ -171,13 +184,19 @@ impl TestSandbox {
 
     pub(crate) fn is_isolated_case(case: &str, test_name: &str) -> bool {
         let arguments = std::env::args_os().collect::<Vec<_>>();
-        std::env::var_os("BIBCODE_TEST_ISOLATED_CASE").as_deref() == Some(OsStr::new(case))
-            && arguments
-                .windows(2)
-                .any(|values| values == [OsStr::new("--exact"), OsStr::new(test_name)])
+        let selected =
+            std::env::var_os("BIBCODE_TEST_ISOLATED_CASE").as_deref() == Some(OsStr::new(case));
+        let valid_arguments = arguments
+            .windows(2)
+            .any(|values| values == [OsStr::new("--exact"), OsStr::new(test_name)])
             && arguments
                 .iter()
-                .any(|value| value == OsStr::new("--test-threads=1"))
+                .any(|value| value == OsStr::new("--test-threads=1"));
+        assert!(
+            !selected || valid_arguments,
+            "isolated fixture {case} requires --exact {test_name} and --test-threads=1; refusing recursive relaunch"
+        );
+        selected
     }
 
     pub(crate) fn process_input(
