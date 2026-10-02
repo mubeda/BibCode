@@ -77,6 +77,14 @@ its immutable SHA.
 
 ## Other Workflows
 
+- `.github/workflows/rpc-liveness-qualification.yml` is a disposable evidence
+  workflow restricted to its qualification branch. It builds baseline and fixed
+  socket-test logic against identical current production source before running
+  paired native Linux contention loops. It records executed-test counts, source
+  and binary hashes, private fixture cleanup, and owned-process reaping. Its
+  bounded artifact and focused driver self-tests supplement the ordinary CI Test
+  job; they do not replace that job or qualify packaged desktop behavior.
+
 - `.github/workflows/linux-git-compatibility.yml` builds the real server Git
   runner regression test on Ubuntu 22.04, then executes it against system Git
   in Debian 12/13, Ubuntu 22.04/24.04, Fedora 44, and Arch rolling containers.

@@ -1,0 +1,143 @@
+name: Issue 39 Linux qualification
+
+# Disposable evidence branch; keep the ordinary CI graph unchanged.
+on:
+  push:
+    branches:
+      - codex/qualify-issue39-linux
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    name: Baseline and fixed Pong-only sockets under contention
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout complete source history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Verify driver failure and cleanup seams
+        run: python3 -B scripts/rpc-liveness-qualification.test.py
+
+      - name: Build both versions before starting CPU contention
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/issue39-evidence"
+          binary_dir="$RUNNER_TEMP/issue39-binaries"
+          mkdir -p "$evidence_dir" "$binary_dir"
+          test_source=apps/server/tests/rpc_liveness.rs
+          cp "$test_source" "$binary_dir/fixed-source.rs"
+          restore_fixed() {
+            cp "$binary_dir/fixed-source.rs" "$test_source"
+          }
+          trap restore_fixed EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          git show 102691a329e84e7422348a44e192e560e57280fa:"$test_source" > "$test_source"
+          for phase in baseline fixed; do
+            if [[ "$phase" == fixed ]]; then restore_fixed; fi
+            timeout --kill-after=10s 20m cargo test --locked -p bibcode-server \
+              --test rpc_liveness --no-run -j 2 --message-format=json \
+              > "$evidence_dir/$phase-build.jsonl" 2> "$evidence_dir/$phase-build.log"
+            binary=$(python3 -B scripts/rpc-liveness-qualification.py artifact \
+              --build-json "$evidence_dir/$phase-build.jsonl")
+            cp "$binary" "$binary_dir/$phase"
+          done
+          restore_fixed
+          cmp "$test_source" "$binary_dir/fixed-source.rs"
+          timeout --kill-after=10s 20m cargo test --locked -p bibcode-server \
+            --lib --no-run -j 2 --message-format=json \
+            > "$evidence_dir/transport-build.jsonl" 2> "$evidence_dir/transport-build.log"
+          transport_binary=$(python3 -B scripts/rpc-liveness-qualification.py artifact \
+            --target-name bibcode_server --build-json "$evidence_dir/transport-build.jsonl")
+          cp "$transport_binary" "$binary_dir/transport"
+          cargo fmt --all --check
+
+      - name: Verify fixed controlled-clock observation and transport cases
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import importlib.util
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          spec = importlib.util.spec_from_file_location('qualification', 'scripts/rpc-liveness-qualification.py')
+          q = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(q)
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'issue39-evidence'
+          binary_dir = Path(os.environ['RUNNER_TEMP']) / 'issue39-binaries'
+          for binary, scope, expected, filename in [
+              ('fixed', 'pong_only_observation_', 3, 'controlled-clock.log'),
+              ('transport', 'rpc::transport::tests', 23, 'transport-unit.log'),
+          ]:
+              log_path = evidence / filename
+              with tempfile.TemporaryDirectory(prefix='issue39-focused-') as fixture:
+                  with log_path.open('wb') as log:
+                      subprocess.run([str(binary_dir / binary), scope, '--nocapture'],
+                          env=q.fixture_environment(Path(fixture)), stdout=log,
+                          stderr=subprocess.STDOUT, check=True, timeout=60)
+              if log_path.stat().st_size > 1024 * 1024:
+                  with log_path.open('rb') as log:
+                      bounded = log.read(1024 * 1024)
+                  log_path.write_bytes(bounded)
+                  raise RuntimeError('focused log overflow')
+              assert f'{expected} passed; 0 failed; 0 ignored' in log_path.read_text()
+          PY
+
+      - name: Run paired native Linux qualification
+        timeout-minutes: 82
+        run: |
+          python3 -B scripts/rpc-liveness-qualification.py run \
+            --evidence-root "$RUNNER_TEMP/issue39-evidence" \
+            --baseline-binary "$RUNNER_TEMP/issue39-binaries/baseline" \
+            --fixed-binary "$RUNNER_TEMP/issue39-binaries/fixed"
+
+      - name: Bound logs before upload
+        if: always()
+        run: |
+          python3 -B - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'issue39-evidence'
+          for path in [*root.glob('*.log'), *root.glob('*-build.jsonl')]:
+              limit = 8 * 1024 * 1024 if path.suffix == '.jsonl' else 1024 * 1024
+              if path.stat().st_size > limit:
+                  with path.open('rb') as source:
+                      source.seek(-limit, 2)
+                      bounded = source.read(limit)
+                  path.write_bytes(bounded)
+          PY
+
+      - name: Upload bounded qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue39-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue39-evidence/*.json
+            ${{ runner.temp }}/issue39-evidence/*.jsonl
+            ${{ runner.temp }}/issue39-evidence/*.log
+            ${{ runner.temp }}/issue39-evidence/baseline/*.json
+            ${{ runner.temp }}/issue39-evidence/baseline/*.log
+            ${{ runner.temp }}/issue39-evidence/fixed/*.json
+            ${{ runner.temp }}/issue39-evidence/fixed/*.log
+          if-no-files-found: error
+          retention-days: 7

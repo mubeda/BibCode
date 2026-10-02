@@ -23,6 +23,17 @@ unrelated fork. Keep a controlled port-reuse counterexample distinct from a
 natural stress failure rate, and verify that deliberately removing the cleanup
 wait makes the runtime-join regression fail before restoring the real code.
 
+For WebSocket heartbeat integration, separate exact cadence from connection
+survival. Controlled-clock transport tests pin the 15-second cadence and the
+restart after a scheduler stall; real sockets verify Pong-only survival for
+at least 60 seconds and four observed heartbeats before a final RPC exchange.
+The observation can wait up to 180 seconds when scheduling delays delivery.
+Do not require a fixed Ping count inside a fixed wall-clock minute: the server
+intentionally restarts its cadence after a late check. A contention harness
+process deadline must cover setup, observation, final exchange, and cleanup,
+and every selected invocation must actually execute the test. Keep controlled
+stall counterexamples distinct from naturally measured failure rates.
+
 ## Alternate base and change
 
 For intermittent provider or terminal failures, rerun each failing case in
