@@ -1,7 +1,10 @@
-// @effect-diagnostics nodeBuiltinImport:off - This test verifies path arguments with a real POSIX shell.
+// @effect-diagnostics nodeBuiltinImport:off - These tests verify path arguments with native shells and isolated Git configuration.
 import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import { VcsStatusResult } from "@bibcode/contracts";
-import { HostProcessPlatform } from "@bibcode/shared/hostProcess";
+import { HostProcessEnvironment, HostProcessPlatform } from "@bibcode/shared/hostProcess";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
@@ -195,4 +198,69 @@ describe("repository unavailable copy", () => {
       message: `Git doesn't trust this repository because another user owns it. Run ${command} to trust it.`,
     });
   });
+
+  it("round-trips drive and UNC trust commands through native Windows PowerShell and Git", ({
+    skip,
+  }) => {
+    if (Context.get(Context.empty(), HostProcessPlatform) !== "win32") {
+      skip(
+        "Native Windows PowerShell and Git are required; other platforms are compatibility only.",
+      );
+    }
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-windows-trust-"));
+    try {
+      const env = Object.fromEntries(
+        Object.entries(Context.get(Context.empty(), HostProcessEnvironment)).filter(
+          ([key]) => !key.toUpperCase().startsWith("GIT_"),
+        ),
+      );
+      Object.assign(env, {
+        HOME: root,
+        USERPROFILE: root,
+        XDG_CONFIG_HOME: NodePath.join(root, "config"),
+        GIT_CONFIG_GLOBAL: NodePath.join(root, "global.gitconfig"),
+        GIT_CONFIG_SYSTEM: NodePath.join(root, "system.gitconfig"),
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_TERMINAL_PROMPT: "0",
+      });
+      NodeFS.writeFileSync(NodePath.join(root, "system.gitconfig"), "");
+      const cases = [
+        { cwd: "C:\\work\\plain", expected: "C:/work/plain" },
+        {
+          cwd: "C:\\work\\space $literal `tick O'Brien",
+          expected: "C:/work/space $literal `tick O'Brien",
+        },
+        { cwd: "C:\\work\\O’Brien\\repo", expected: "C:/work/O’Brien/repo" },
+        {
+          cwd: "\\\\server\\share name\\repo $literal `tick O’Brien",
+          expected: "%(prefix)///server/share name/repo $literal `tick O’Brien",
+        },
+      ];
+      const commands = cases.map(({ cwd }) => {
+        const { command } = gitManagerRepositoryUnavailableCopy("untrusted", cwd);
+        if (command === null) throw new Error("Expected a trust command");
+        return `${command}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`;
+      });
+      NodeChildProcess.execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-EncodedCommand",
+          Buffer.from(commands.join("\n"), "utf16le").toString("base64"),
+        ],
+        { cwd: root, env, timeout: 15_000, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const registered = NodeChildProcess.execFileSync(
+        "git.exe",
+        ["config", "--global", "--get-all", "safe.directory"],
+        { cwd: root, env, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] },
+      )
+        .trimEnd()
+        .split(/\r?\n/);
+      expect(registered).toEqual(cases.map(({ expected }) => expected));
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

@@ -100,6 +100,22 @@ Computer Use capture:
 
 ## Focused Windows contracts
 
+Verify the Git Manager trust command with native Windows PowerShell and Git:
+
+```powershell
+node scripts/run-local-vp.mjs test run apps/web/src/components/gitManager/gitManagerRepositoryAvailability.test.ts
+```
+
+The Windows-only round-trip case executes the application-generated commands
+for drive and UNC paths containing spaces, dollar signs, backticks, and
+typographic quotes, then checks the exact `safe.directory` values stored by
+Git. It uses temporary global/system configuration and HOME, so it never adds
+trust to the user's Git configuration. The UNC check covers command parsing
+and registration, without contacting a network share. A real-share access or
+packaged-terminal/clipboard check is separate evidence. A skipped case or a
+PowerShell-on-Linux run is not a native Windows result. Both Windows CI rows
+run this contract alongside the desktop shell fixture tests.
+
 Select focused tests from affected source and verify at least:
 
 - case-only drive or path variants do not create duplicate worktree owners;
