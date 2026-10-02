@@ -1507,7 +1507,7 @@ current thread session; a live replacement is neither stopped nor settled.
 When no live session remains and the projection is starting, connecting, or
 running, it uses the shared restart reconciliation function at the loss time:
 streaming assistant text is retained and settled, the active turn is cleared,
-the turn ends as error, and the session reports `transport_error` with
+the turn ends as error, and the session reports `session_stopped` with
 "Provider session stopped because its workspace became unavailable. Review
 delivery status before continuing." A shutdown error does not skip settlement
 after detach. Cleanup also requests settlement without a captured identity, so
@@ -1790,7 +1790,7 @@ starts, startup reconciles abandoned live runtime rows and every projected
 session still starting, connecting, or running without a live runtime row,
 including rows removed by graceful shutdown. It settles the abandoned turn's
 streaming assistant messages, clears the active turn, and projects the existing
-restart error as `transport_error`. That error settlement holds queued messages
+restart error as `session_stopped`. That error settlement holds queued messages
 for explicit **Send now** and releases the pending-start claim gate. Completed
 reconciliation does not dispatch again on a later startup; ready/idle/stopped
 projections without live runtimes retain their existing state.
