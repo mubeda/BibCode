@@ -1748,9 +1748,12 @@ mod tests {
                 })
             },
         );
-        let control = Arc::new(
-            NativeServerControl::new(ServerConfig::new(root), json!({"policy":"test"})).await,
+        let config = ServerConfig::new(root);
+        crate::test_support::hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({}),
         );
+        let control = Arc::new(NativeServerControl::new(config, json!({"policy":"test"})).await);
         ServerTerminalServices::new(
             terminal,
             sampler,
@@ -2848,10 +2851,12 @@ mod tests {
                 })
             },
         );
-        let control = Arc::new(
-            NativeServerControl::new(ServerConfig::new(temp.path()), json!({"policy":"test"}))
-                .await,
+        let config = ServerConfig::new(temp.path());
+        crate::test_support::hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({}),
         );
+        let control = Arc::new(NativeServerControl::new(config, json!({"policy":"test"})).await);
         let services = ServerTerminalServices::new(
             terminal,
             sampler,

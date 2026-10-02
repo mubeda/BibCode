@@ -1811,6 +1811,16 @@ impl ClaudeCapabilityProbeRunner for SystemClaudeCapabilityProbeRunner {
     ) -> Pin<Box<dyn Future<Output = Result<ClaudeProbeOutput, String>> + Send + '_>> {
         let executable = executable.to_path_buf();
         Box::pin(async move {
+            #[cfg(feature = "hermetic-test-guard")]
+            let executable = crate::hermetic_guard::checked_provider_executable(
+                &executable,
+                std::env::current_dir().ok().as_deref(),
+                std::env::var_os("PATH").as_deref(),
+            )
+            .ok_or_else(|| {
+                "Spawn: probe executable was not found or was refused by the hermetic test guard"
+                    .to_owned()
+            })?;
             let mut command = tokio::process::Command::new(executable);
             command
                 .args(args)
@@ -1873,6 +1883,23 @@ impl ClaudeCapabilityProbeRunner for SystemClaudeCapabilityProbeRunner {
 
 #[cfg(all(test, unix))]
 mod tests {
+
+    #[cfg(all(feature = "hermetic-test-guard", unix))]
+    #[tokio::test]
+    async fn hermetic_guard_refuses_direct_claude_probe_before_spawn() {
+        let Some(executable) = crate::hermetic_guard::refusal_fixture(
+            "provider_terminal::claude::tests::hermetic_guard_refuses_direct_claude_probe_before_spawn",
+            "2.1.220",
+        ) else {
+            return;
+        };
+        assert!(
+            SystemClaudeCapabilityProbeRunner::default()
+                .run(&executable, vec![])
+                .await
+                .is_err()
+        );
+    }
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
@@ -2550,15 +2577,69 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn installed_v21220_binary_matches_the_approved_additive_hook_attestation() {
-        let Some(home) = std::env::var_os("HOME") else {
-            return;
-        };
-        let executable = PathBuf::from(home).join(".local/share/claude/versions/2.1.220");
+    fn attestation_fixture_executable() -> Option<PathBuf> {
+        let executable = PathBuf::from(std::env::var_os("BIBCODE_CLAUDE_ATTESTATION_FIXTURE")?);
         if !executable.is_file() {
+            return None;
+        }
+        #[cfg(feature = "hermetic-test-guard")]
+        let executable =
+            crate::hermetic_guard::checked_provider_executable(&executable, None, None)?;
+        Some(executable)
+    }
+
+    #[cfg(feature = "hermetic-test-guard")]
+    #[test]
+    fn attestation_fixture_never_uses_an_ambient_home_installation() {
+        const CASE: &str = "claude-attestation-owned-home";
+        const TEST: &str = "provider_terminal::claude::tests::attestation_fixture_never_uses_an_ambient_home_installation";
+        if TestSandbox::is_isolated_case(CASE, TEST) {
+            assert!(attestation_fixture_executable().is_none());
+            println!(
+                "BIBCODE_ATTESTATION_FIXTURE_CHILD_PID={}",
+                std::process::id()
+            );
             return;
         }
+        let sandbox = TestSandbox::new(CASE);
+        let path = sandbox.path(".local/share/claude/versions/2.1.220");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"owned installation tripwire; never executed").unwrap();
+        let output = sandbox.run_isolated_case_without_environment(
+            CASE,
+            TEST,
+            &[
+                ("HOME", sandbox.root().as_os_str()),
+                ("USERPROFILE", sandbox.root().as_os_str()),
+            ],
+            &["BIBCODE_CLAUDE_ATTESTATION_FIXTURE"],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .matches("BIBCODE_ATTESTATION_FIXTURE_CHILD_PID=")
+                .count(),
+            1,
+            "exactly one owned child must complete and be reaped"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let child_pid = stdout
+            .split("BIBCODE_ATTESTATION_FIXTURE_CHILD_PID=")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .expect("completed child PID marker");
+        eprintln!("attestation fixture: exactly one child {child_pid} completed and reaped");
+    }
+
+    #[tokio::test]
+    async fn installed_v21220_binary_matches_the_approved_additive_hook_attestation() {
+        let Some(executable) = attestation_fixture_executable() else {
+            return;
+        };
 
         assert!(
             approved_additive_hook_build(&executable, "2.1.220").await,
@@ -2568,13 +2649,9 @@ mod tests {
 
     #[tokio::test]
     async fn installed_v21220_probe_and_per_launch_attestation_fit_preparation_budget() {
-        let Some(home) = std::env::var_os("HOME") else {
+        let Some(executable) = attestation_fixture_executable() else {
             return;
         };
-        let executable = PathBuf::from(home).join(".local/share/claude/versions/2.1.220");
-        if !executable.is_file() {
-            return;
-        }
         let probe = CachedClaudeCapabilityProbe::new(Arc::new(
             SystemClaudeCapabilityProbeRunner::default(),
         ));

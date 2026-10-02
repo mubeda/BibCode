@@ -667,13 +667,19 @@ fn claude_oauth_access_token(credentials: &Value) -> Option<String> {
 impl ClaudeCredentialStore {
     async fn load(&self) -> Result<Option<Value>, ProviderUsageFetchError> {
         match self {
-            Self::File(path) => match tokio::fs::read_to_string(path).await {
-                Ok(raw) => serde_json::from_str(&raw)
-                    .map(Some)
-                    .map_err(|error| ProviderUsageFetchError::new(error.to_string())),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(ProviderUsageFetchError::new(error.to_string())),
-            },
+            Self::File(path) => {
+                #[cfg(feature = "hermetic-test-guard")]
+                if !crate::hermetic_guard::credential_path_allowed("claude credentials", path) {
+                    return Ok(None);
+                }
+                match tokio::fs::read_to_string(path).await {
+                    Ok(raw) => serde_json::from_str(&raw)
+                        .map(Some)
+                        .map_err(|error| ProviderUsageFetchError::new(error.to_string())),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(ProviderUsageFetchError::new(error.to_string())),
+                }
+            }
             #[cfg(target_os = "macos")]
             Self::Keychain { account, service } => {
                 read_claude_keychain_credentials(account, service)
@@ -723,7 +729,18 @@ fn claude_keychain_services(config_directory: Option<&str>) -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 async fn read_claude_keychain_credentials(account: &str, service: &str) -> Option<String> {
-    let command_spec = claude_keychain_read_command(account, service);
+    execute_claude_keychain_read(claude_keychain_read_command(account, service)).await
+}
+
+#[cfg(target_os = "macos")]
+async fn execute_claude_keychain_read(command_spec: MacOsKeychainCommand) -> Option<String> {
+    #[cfg(feature = "hermetic-test-guard")]
+    if !crate::hermetic_guard::refuse_access(
+        "macOS keychain",
+        std::path::Path::new(command_spec.program),
+    ) {
+        return None;
+    }
     let mut command = Command::new(command_spec.program);
     configure_background_command(&mut command);
     command
@@ -1206,6 +1223,82 @@ fn unix_timestamp_ms(value: OffsetDateTime) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "hermetic-test-guard", target_os = "macos"))]
+    #[tokio::test]
+    async fn hermetic_guard_refuses_keychain_before_executing_even_a_fixture_command() {
+        let Some(executable) = crate::hermetic_guard::refusal_fixture(
+            "provider_usage::tests::hermetic_guard_refuses_keychain_before_executing_even_a_fixture_command",
+            "security",
+        ) else {
+            return;
+        };
+        // Exercise the production execution boundary with an owned tripwire;
+        // no regression in the refusal can reach the real macOS keychain.
+        let program = Box::leak(executable.display().to_string().into_boxed_str());
+        assert!(
+            execute_claude_keychain_read(MacOsKeychainCommand {
+                program,
+                args: vec![]
+            })
+            .await
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "hermetic-test-guard")]
+    #[tokio::test]
+    async fn hermetic_guard_refuses_outside_claude_credentials_before_loading() {
+        use crate::test_support::TestSandbox;
+        const CASE: &str = "guard-claude-credentials";
+        const TEST: &str = "provider_usage::tests::hermetic_guard_refuses_outside_claude_credentials_before_loading";
+        let sandbox = TestSandbox::new("guard-claude-credentials");
+        let raw = r#"{"claudeAiOauth":{"accessToken":"fixture-token"}}"#;
+        if TestSandbox::is_isolated_case(CASE, TEST) {
+            let outside = PathBuf::from(std::env::var_os("BIBCODE_GUARD_CREDENTIAL_FILE").unwrap());
+            assert!(
+                ClaudeCredentialStore::File(outside)
+                    .load()
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let allowed = sandbox.path(".credentials.json");
+            std::fs::write(&allowed, raw).unwrap();
+            assert!(
+                ClaudeCredentialStore::File(allowed)
+                    .load()
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            return;
+        }
+        let allowed_root = sandbox.path("allowed");
+        std::fs::create_dir(&allowed_root).unwrap();
+        let outside = sandbox.path(".credentials.json");
+        std::fs::write(&outside, raw).unwrap();
+        let output = sandbox.run_isolated_case(
+            CASE,
+            TEST,
+            &[
+                ("TMPDIR", allowed_root.as_os_str()),
+                ("TMP", allowed_root.as_os_str()),
+                ("TEMP", allowed_root.as_os_str()),
+                ("BIBCODE_GUARD_CREDENTIAL_FILE", outside.as_os_str()),
+                ("BIBCODE_HERMETIC_GUARD", OsStr::new("report")),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("hermetic-test-guard: refused claude credentials")
+        );
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;

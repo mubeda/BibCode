@@ -464,10 +464,9 @@ async fn automatic_git_fetch_setting_changes_apply_without_restart() {
     let initial_remote_ref = git_stdout_in(&consumer, &["rev-parse", "origin/main"]);
 
     let config = test_config(&temp);
-    fs::create_dir_all(config.state_dir()).expect("server state directory");
-    fs::write(
-        config.state_dir().join("settings.json"),
-        r#"{
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
             "automaticGitFetchInterval": 0,
             "enableProviderUpdateChecks": false,
             "providers": {
@@ -477,9 +476,8 @@ async fn automatic_git_fetch_setting_changes_apply_without_restart() {
                 "grok": { "enabled": false },
                 "opencode": { "enabled": false }
             }
-        }"#,
-    )
-    .expect("disabled automatic fetch settings");
+        }),
+    );
     let handle = ServerRuntime::start(config).await.expect("server starts");
     let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
         .await
