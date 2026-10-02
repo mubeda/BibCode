@@ -86,6 +86,10 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "pullRequests.checkout"
         | "activity.cancelSubtree"
         | "activity.retrySubtreeCancellation"
+        | "uploads.begin"
+        | "uploads.append"
+        | "uploads.get"
+        | "uploads.cancel"
         | "orchestration.dispatchCommand"
         | "preview.close"
         | "preview.navigate"
@@ -306,5 +310,16 @@ mod tests {
             "cancelling a clone needs the same scope as starting one"
         );
         assert_eq!(required_scope("unknown.method"), None);
+    }
+    #[test]
+    fn staged_uploads_all_require_orchestration_operate() {
+        for method in [
+            "uploads.begin",
+            "uploads.append",
+            "uploads.get",
+            "uploads.cancel",
+        ] {
+            assert_eq!(required_scope(method), Some(SCOPE_ORCHESTRATION_OPERATE));
+        }
     }
 }

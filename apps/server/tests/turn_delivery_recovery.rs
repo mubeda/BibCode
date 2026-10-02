@@ -474,6 +474,7 @@ async fn attachment_abort_child() {
         supervisor,
         state_dir,
         delivery,
+        attachment_upload_registry(),
     );
     let rpc_config = ServerConfig::new(state.join("rpc-runtime"))
         .with_bind("127.0.0.1", 0)
@@ -831,6 +832,7 @@ async fn durable_boundary_crash_child() {
         supervisor,
         state.clone(),
         delivery,
+        attachment_upload_registry(),
     );
     let runtime = ServerRuntime::start_with_registry(
         ServerConfig::new(&state)
@@ -2406,4 +2408,12 @@ async fn codex_sending_steer_recovers_as_delivered_with_turn_attribution() {
 #[tokio::test]
 async fn claude_sending_steer_recovers_as_uncertain_without_resend() {
     sending_steer_restart("claudeAgent", TurnDeliveryState::Uncertain).await;
+}
+
+fn attachment_upload_registry() -> bibcode_server::transfer::staging::UploadRegistry {
+    bibcode_server::transfer::staging::UploadRegistry::new(
+        std::env::temp_dir().join(format!("bibcode-test-uploads-{}", uuid::Uuid::new_v4())),
+        bibcode_server::transfer::staging::UploadLimits::default(),
+        std::sync::Arc::new(tokio::time::Instant::now),
+    )
 }

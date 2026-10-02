@@ -824,6 +824,13 @@ WebSocket message at 64 MiB. Its authenticated session enters connected
 bookkeeping only inside the successful upgrade-owned task; a failed upgrade
 cannot leak a live connection count or revocation token.
 
+Chat attachment staging (`uploads.begin`, `uploads.append`, `uploads.get`, and
+`uploads.cancel`) uses the authenticated RPC channel. On host-key pairings its
+metadata, chunks, digests, acknowledgements, and staged turn admission stay
+inside Noise. Session ownership survives reconnect with the same credential;
+a different session cannot read, append, or bind another session's stage.
+Staging introduces no HTTP route or exception to this audit.
+
 #### Host-key HTTP audit
 
 Pinned profiles allow one pre-auth HTTP request: the unauthenticated

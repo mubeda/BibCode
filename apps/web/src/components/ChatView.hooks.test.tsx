@@ -1,3 +1,4 @@
+import { attachmentAdmissionOwner } from "../state/attachmentAdmissions";
 /**
  * Deep behavior tests for ChatView.
  *
@@ -30,11 +31,13 @@ import {
   type ServerProvider,
   ThreadId,
   TurnId,
+  UploadError,
 } from "@bibcode/contracts";
 import { DEFAULT_SERVER_SETTINGS } from "@bibcode/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { AsyncResult } from "effect/unstable/reactivity";
 import * as Cause from "effect/Cause";
+import { RpcClientError } from "effect/unstable/rpc";
 import {
   BearerConnectionTarget,
   PrimaryConnectionTarget,
@@ -61,7 +64,10 @@ const h = vi.hoisted(() => {
     },
     atomValuesByKey: new Map<string, unknown>(),
     commandCalls: [] as Array<{ key: string; input: unknown }>,
-    commandResults: {} as Record<string, (input: unknown) => unknown>,
+    commandResults: {} as Record<
+      string,
+      (input: unknown, runOptions?: { signal?: AbortSignal }) => unknown
+    >,
     defaultCommandResult: (() => undefined) as (input?: unknown) => unknown,
     terminalInputEnqueues: [] as Array<{
       data: string;
@@ -171,10 +177,10 @@ vi.mock("react", async (importOriginal) => {
 vi.mock("../state/use-atom-command", () => ({
   useAtomCommand: (command: { key?: string } | null | undefined, _options?: unknown) => {
     const key = command && typeof command.key === "string" ? command.key : "unknown-command";
-    return (input: unknown) => {
+    return (input: unknown, runOptions?: { signal?: AbortSignal }) => {
       h.commandCalls.push({ key, input });
       const respond = h.commandResults[key] ?? h.defaultCommandResult;
-      return Promise.resolve(respond(input));
+      return Promise.resolve(respond(input, runOptions));
     };
   },
 }));
@@ -187,6 +193,10 @@ vi.mock("../state/threads", () => ({
     setRuntimeMode: { key: "thread.setRuntimeMode" },
     setInteractionMode: { key: "thread.setInteractionMode" },
     startTurn: { key: "thread.startTurn" },
+    attachmentAdmissionAuthority: { key: "thread.attachmentAdmissionAuthority" },
+    stageAttachments: { key: "thread.stageAttachments" },
+    releaseStagedAttachments: { key: "thread.releaseStagedAttachments" },
+    keepStagedAttachmentsAlive: { key: "thread.keepStagedAttachmentsAlive" },
     steerTurn: { key: "thread.steerTurn" },
     promoteTurn: { key: "thread.promoteTurn" },
     interruptTurn: { key: "thread.interruptTurn" },
@@ -686,20 +696,25 @@ const HOST_STATE = {
   showScrollToBottom: { index: 0, expectInitial: isFalse },
   expandedImage: { index: 1, expectInitial: isNull },
   optimisticUserMessages: { index: 2, expectInitial: isEmptyArray },
-  maximizedRightPanelThreadKey: { index: 7, expectInitial: isNull },
-  terminalFocusRequestId: { index: 12, expectInitial: (value: unknown) => value === 0 },
-  pullRequestDialogState: { index: 13, expectInitial: isNull },
+  attachmentUploads: {
+    index: 3,
+    expectInitial: (value: unknown) =>
+      typeof value === "object" && value !== null && Object.keys(value).length === 0,
+  },
+  maximizedRightPanelThreadKey: { index: 8, expectInitial: isNull },
+  terminalFocusRequestId: { index: 13, expectInitial: (value: unknown) => value === 0 },
+  pullRequestDialogState: { index: 14, expectInitial: isNull },
   pendingUserInputAnswersByRequestId: {
-    index: 10,
+    index: 11,
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
   attachmentPreviewHandoffByMessageId: {
-    index: 14,
+    index: 15,
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
-  composerOverlayElement: { index: 18, expectInitial: isNull },
+  composerOverlayElement: { index: 19, expectInitial: isNull },
 } as const;
 
 function seedHostState(name: keyof typeof HOST_STATE, value: unknown): void {
@@ -1371,12 +1386,17 @@ function publishSeededStoreState(store: unknown): void {
 }
 
 beforeEach(() => {
+  attachmentAdmissionOwner.dispose();
   h.captured = {};
   h.atomValuesByKey.clear();
   h.atomValuesByKey.set("atom:keybindings", []);
   h.atomValuesByKey.set("atom:editors", []);
   h.commandCalls.length = 0;
-  h.commandResults = {};
+  h.commandResults = {
+    "thread.stageAttachments": () => AsyncResult.success({ _tag: "inline" }),
+    "thread.attachmentAdmissionAuthority": () =>
+      AsyncResult.success({ storageInstanceId: "test-store", hostIdentity: "test-host" }),
+  };
   h.defaultCommandResult = () => AsyncResult.success(undefined);
   h.terminalInputEnqueues.length = 0;
   h.environments = [];
@@ -1667,13 +1687,13 @@ describe("ChatView effects (captured and run manually)", () => {
       getBoundingClientRect: () => ({ height: 42 }),
     };
     seedHostState("composerOverlayElement", overlayElement);
-    h.stateSeeds.set(19, { value: 42, expectInitial: (value) => value === 0 });
+    h.stateSeeds.set(20, { value: 42, expectInitial: (value) => value === 0 });
     vi.stubGlobal("ResizeObserver", undefined);
 
     renderServerRoute();
     const cleanups = runEffects();
 
-    expect(h.setStateCalls.some((call) => call.index === 19 && call.applied === 42)).toBe(true);
+    expect(h.setStateCalls.some((call) => call.index === 20 && call.applied === 42)).toBe(true);
     for (const cleanup of cleanups) cleanup();
   });
 
@@ -3455,6 +3475,445 @@ describe("ChatView project script handlers", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("ChatView send flows", () => {
+  it("restages with a new command only after exact replay proves the earlier stage was not accepted", async () => {
+    seedConnectedServerThread();
+    renderServerRoute();
+    const contexts = makeOwnedComposerContexts("expired-replay");
+    const { promptRef } = installComposerHandle({
+      getSendContext: () => sendContextWithOwnedComposerContexts(contexts),
+    });
+    promptRef.current = "send after expired replay";
+    let uploads = 0;
+    h.commandResults["thread.stageAttachments"] = () =>
+      AsyncResult.success({
+        _tag: "staged",
+        attachments: [
+          {
+            type: "image",
+            id: contexts.image.id,
+            name: contexts.image.name,
+            mimeType: "image/png",
+            sizeBytes: 4,
+            uploadId: `stage-${++uploads}`,
+          },
+        ],
+      });
+    let admissions = 0;
+    h.commandResults["thread.startTurn"] = () =>
+      ++admissions === 1
+        ? AsyncResult.failure(
+            Cause.fail(
+              new RpcClientError.RpcClientError({
+                reason: new RpcClientError.RpcClientDefect({
+                  message: "reply lost",
+                  cause: new Error(),
+                }),
+              }),
+            ),
+          )
+        : admissions === 2
+          ? AsyncResult.failure(
+              Cause.fail(new UploadError({ reason: "not_found", message: "the upload expired" })),
+            )
+          : AsyncResult.success(undefined);
+    const send = capturedProps("chatComposer")["onSend"] as () => Promise<void>;
+    await send();
+    await send();
+    expect(commandCallsFor("thread.stageAttachments")).toHaveLength(1);
+    expect(commandCallsFor("thread.startTurn")[1]!.input).toEqual(
+      commandCallsFor("thread.startTurn")[0]!.input,
+    );
+    await send();
+    const requests = commandCallsFor("thread.startTurn").map(
+      (call) =>
+        (
+          call.input as {
+            input: { commandId: string; message: { attachments: Array<{ uploadId: string }> } };
+          }
+        ).input,
+    );
+    expect(commandCallsFor("thread.stageAttachments")).toHaveLength(2);
+    expect(requests[2]!.commandId).not.toBe(requests[0]!.commandId);
+    expect(requests[2]!.message.attachments[0]!.uploadId).toBe("stage-2");
+  });
+
+  it("does not release stages if route cleanup happens while ambiguous replay is pending", async () => {
+    seedConnectedServerThread();
+    renderServerRoute();
+    const cleanups = runEffects();
+    const contexts = makeOwnedComposerContexts("pending-replay");
+    const { promptRef } = installComposerHandle({
+      getSendContext: () => sendContextWithOwnedComposerContexts(contexts),
+    });
+    promptRef.current = "check earlier send";
+    h.commandResults["thread.stageAttachments"] = () =>
+      AsyncResult.success({
+        _tag: "staged",
+        attachments: [
+          {
+            type: "image",
+            id: contexts.image.id,
+            name: contexts.image.name,
+            mimeType: "image/png",
+            sizeBytes: 4,
+            uploadId: "stage-pending",
+          },
+        ],
+      });
+    let admissions = 0;
+    let settleReplay!: (result: unknown) => void;
+    h.commandResults["thread.startTurn"] = () =>
+      ++admissions === 1
+        ? AsyncResult.failure(
+            Cause.fail(
+              new RpcClientError.RpcClientError({
+                reason: new RpcClientError.RpcClientDefect({
+                  message: "reply lost",
+                  cause: new Error(),
+                }),
+              }),
+            ),
+          )
+        : new Promise((resolve) => {
+            settleReplay = resolve;
+          });
+    const send = capturedProps("chatComposer")["onSend"] as () => Promise<void>;
+    await send();
+    const replay = send();
+    await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(2));
+    for (const cleanup of cleanups) cleanup();
+    expect(commandCallsFor("thread.releaseStagedAttachments")).toHaveLength(0);
+    settleReplay(AsyncResult.success(undefined));
+    await replay;
+    expect(commandCallsFor("thread.releaseStagedAttachments")).toHaveLength(0);
+  });
+  it.each([false, true])(
+    "replays the exact ambiguous staged admission without reading consumed IDs (new edits %s)",
+    async (edited) => {
+      seedConnectedServerThread();
+      renderServerRoute();
+      const contexts = makeOwnedComposerContexts("ambiguous");
+      const { promptRef } = installComposerHandle({
+        getSendContext: () => sendContextWithOwnedComposerContexts(contexts),
+      });
+      promptRef.current = "original send";
+      h.commandResults["thread.stageAttachments"] = () =>
+        AsyncResult.success({
+          _tag: "staged",
+          attachments: [
+            {
+              type: "image",
+              id: contexts.image.id,
+              name: contexts.image.name,
+              mimeType: "image/png",
+              sizeBytes: 4,
+              uploadId: "consumed-stage",
+            },
+          ],
+        });
+      let admissions = 0;
+      h.commandResults["thread.startTurn"] = () =>
+        ++admissions === 1
+          ? AsyncResult.failure(
+              Cause.fail(
+                new RpcClientError.RpcClientError({
+                  reason: new RpcClientError.RpcClientDefect({
+                    message: "reply lost",
+                    cause: new Error("closed"),
+                  }),
+                }),
+              ),
+            )
+          : AsyncResult.success(undefined);
+      const send = capturedProps("chatComposer")["onSend"] as () => Promise<void>;
+      await send();
+      if (edited) {
+        promptRef.current = "fresh work";
+        useComposerDraftStore.getState().setPrompt(threadRef, "fresh work");
+      }
+      await send();
+      const requests = commandCallsFor("thread.startTurn");
+      expect(requests).toHaveLength(2);
+      expect(requests[0]!.input).toMatchObject({
+        input: {
+          commandId: expect.any(String),
+          message: { attachments: [{ uploadId: "consumed-stage" }] },
+        },
+      });
+      expect(requests[1]!.input).toEqual(requests[0]!.input);
+      expect(commandCallsFor("thread.stageAttachments")).toHaveLength(1);
+      expect(promptRef.current.replaceAll("\uFFFC", "")).toBe(edited ? "fresh work" : "");
+    },
+  );
+  it.each(["success", "failure"] as const)(
+    "retains stages through %s admission after route cleanup and cleans up only after the outcome",
+    async (outcome) => {
+      seedConnectedServerThread();
+      renderServerRoute();
+      const contexts = makeOwnedComposerContexts(`admission-${outcome}`);
+      seedOwnedComposerContexts("outgoing admission", contexts);
+      const { promptRef } = installComposerHandle({
+        getSendContext: () => sendContextWithOwnedComposerContexts(contexts),
+      });
+      promptRef.current = "outgoing admission";
+      const cleanups = runEffects();
+      h.commandResults["thread.stageAttachments"] = () =>
+        AsyncResult.success({
+          _tag: "staged",
+          attachments: [
+            {
+              type: "image",
+              id: contexts.image.id,
+              name: contexts.image.name,
+              mimeType: "image/png",
+              sizeBytes: 4,
+              uploadId: "stage-admission",
+            },
+          ],
+        });
+      let keeperSignal: AbortSignal | undefined;
+      h.commandResults["thread.keepStagedAttachmentsAlive"] = (_target, options) =>
+        new Promise((resolve) => {
+          keeperSignal = options?.signal;
+          keeperSignal?.addEventListener(
+            "abort",
+            () => resolve(AsyncResult.failure(Cause.interrupt())),
+            { once: true },
+          );
+        });
+      let settleAdmission!: (result: unknown) => void;
+      h.commandResults["thread.startTurn"] = () =>
+        new Promise((resolve) => {
+          settleAdmission = resolve;
+        });
+      const send = (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+      await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(1));
+      const otherRef = scopeThreadRef(environmentId, ThreadId.make("other-admission-thread"));
+      useComposerDraftStore.getState().setPrompt(otherRef, "new thread work");
+      for (const cleanup of cleanups) cleanup();
+      expect(commandCallsFor("thread.releaseStagedAttachments")).toHaveLength(0);
+      expect(keeperSignal?.aborted).toBe(false);
+      settleAdmission(
+        outcome === "success"
+          ? AsyncResult.success(undefined)
+          : AsyncResult.failure(Cause.fail(new Error("admission rejected"))),
+      );
+      await send;
+      expect(keeperSignal?.aborted).toBe(true);
+      expect(commandCallsFor("thread.releaseStagedAttachments")).toHaveLength(
+        outcome === "failure" ? 1 : 0,
+      );
+      expect(useComposerDraftStore.getState().getComposerDraft(otherRef)?.prompt).toBe(
+        "new thread work",
+      );
+      if (outcome === "failure") {
+        const restored = useComposerDraftStore.getState().getComposerDraft(threadRef)!;
+        expect(restored.prompt.replaceAll("\uFFFC", "")).toBe("outgoing admission");
+        expect(restored.attachments[0]?.file).toBe(contexts.image.file);
+        expect(restored.terminalContexts).toContainEqual(contexts.terminalContext);
+        expect(restored.previewAnnotations).toContainEqual(contexts.previewAnnotation);
+      }
+    },
+  );
+  it("marks attachment preparation as send-busy without claiming the provider is working", () => {
+    seedConnectedServerThread();
+    seedHostState("attachmentUploads", {
+      upload: {
+        threadKey: scopedThreadKey(threadRef),
+        attachmentCount: 1,
+        fileName: "a.png",
+        sentBytes: 0,
+        totalBytes: 1024,
+        phase: "uploading",
+      },
+    });
+    renderServerRoute();
+    expect(capturedProps("chatComposer")["isSendBusy"]).toBe(true);
+    expect(capturedProps("messagesTimeline")["isWorking"]).toBe(false);
+    expect(capturedProps("messagesTimeline")["attachmentUploads"]).toHaveProperty("upload");
+  });
+  it("staged Cancel restores contexts and fresh edits immediately without encoding or admitting", async () => {
+    seedConnectedServerThread();
+    renderServerRoute();
+    const outgoing = makeOwnedComposerContexts("upload-outgoing");
+    const fresh = makeOwnedComposerContexts("upload-fresh");
+    fresh.image.name = "fresh-image.png";
+    fresh.terminalContext.terminalId = "terminal-2";
+    fresh.terminalContext.text = "fresh build output";
+    fresh.elementContext.selector = ".fresh-button";
+    seedOwnedComposerContexts("outgoing text", outgoing);
+    const { promptRef } = installComposerHandle({
+      getSendContext: () => sendContextWithOwnedComposerContexts(outgoing),
+    });
+    promptRef.current = "outgoing text";
+    const read = vi.fn(() => {
+      throw new Error("staged uploads must not read data URLs");
+    });
+    vi.stubGlobal(
+      "FileReader",
+      class {
+        readAsDataURL = read;
+      },
+    );
+    let aborts = 0;
+    h.commandResults["thread.stageAttachments"] = (target, options) =>
+      new Promise((resolve) => {
+        const input = (target as { input: { onProgress: (progress: unknown) => void } }).input;
+        input.onProgress({
+          fileName: outgoing.image.name,
+          sentBytes: 2,
+          totalBytes: 4,
+          phase: "uploading",
+        });
+        options?.signal?.addEventListener(
+          "abort",
+          () => {
+            aborts++;
+            resolve(AsyncResult.failure(Cause.interrupt()));
+          },
+          { once: true },
+        );
+      });
+    const pending = (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+    await vi.waitFor(() => expect(commandCallsFor("thread.stageAttachments")).toHaveLength(1));
+    const progress = setStateCallsFor("attachmentUploads").at(-1)!.applied as Record<
+      string,
+      unknown
+    >;
+    const messageId = Object.keys(progress)[0]!;
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
+    expect(read).not.toHaveBeenCalled();
+    seedOwnedComposerContexts("fresh text", fresh);
+    promptRef.current = "fresh text";
+    (capturedProps("messagesTimeline")["onCancelAttachmentUpload"] as (id: MessageId) => void)(
+      MessageId.make(messageId),
+    );
+    const restored = useComposerDraftStore.getState().getComposerDraft(threadRef)!;
+    expect(restored.prompt.replaceAll("\uFFFC", "")).toBe("fresh text\n\noutgoing text");
+    expect(restored.attachments.map((value) => value.id)).toEqual([
+      fresh.image.id,
+      outgoing.image.id,
+    ]);
+    expect(restored.terminalContexts.map((value) => value.id)).toEqual([
+      fresh.terminalContext.id,
+      outgoing.terminalContext.id,
+    ]);
+    expect(restored.elementContexts.map((value) => value.id)).toEqual([
+      fresh.elementContext.id,
+      outgoing.elementContext.id,
+    ]);
+    expect(restored.previewAnnotations.map((value) => value.id)).toEqual([
+      fresh.previewAnnotation.id,
+      outgoing.previewAnnotation.id,
+    ]);
+    expect(restored.reviewComments.map((value) => value.id)).toEqual([
+      fresh.reviewComment.id,
+      outgoing.reviewComment.id,
+    ]);
+    await pending;
+    expect(aborts).toBe(1);
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
+    expect(
+      h.setStateCalls.some(
+        (call) =>
+          typeof call.applied === "object" &&
+          call.applied !== null &&
+          Object.values(call.applied).some(
+            (value) => typeof value === "string" && value.includes("Couldn't upload"),
+          ),
+      ),
+    ).toBe(false);
+  });
+
+  it("shows a local queued upload row before enqueue and removes it after acceptance", async () => {
+    seedConnectedServerThread(
+      makeThread({
+        session: makeSession({ status: "running", activeTurnId: TurnId.make("active") }),
+      }),
+    );
+    renderServerRoute();
+    const contexts = makeOwnedComposerContexts("queued-upload");
+    const { promptRef } = installComposerHandle({
+      getSendContext: () => sendContextWithOwnedComposerContexts(contexts),
+    });
+    promptRef.current = "queued upload";
+    let release!: (result: unknown) => void;
+    h.commandResults["thread.stageAttachments"] = (target) =>
+      new Promise((resolve) => {
+        release = resolve;
+        (target as { input: { onProgress: (progress: unknown) => void } }).input.onProgress({
+          fileName: contexts.image.name,
+          sentBytes: 0,
+          totalBytes: 4,
+          phase: "uploading",
+        });
+      });
+    const pending = (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+    await vi.waitFor(() => expect(commandCallsFor("thread.stageAttachments")).toHaveLength(1));
+    const rows = setStateCallsFor("optimisticUserMessages").at(-1)!.applied as ChatMessage[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).not.toHaveProperty("delivery");
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
+    expect(capturedProps("chatComposer")["onInterrupt"]).toBeTypeOf("function");
+    release(
+      AsyncResult.success({
+        _tag: "staged",
+        attachments: [
+          {
+            type: "image",
+            id: contexts.image.id,
+            name: contexts.image.name,
+            mimeType: "image/png",
+            sizeBytes: 4,
+            uploadId: "stage-1",
+          },
+        ],
+      }),
+    );
+    await pending;
+    expect(commandCallsFor("thread.startTurn")[0]!.input).toMatchObject({
+      input: { queued: true, message: { attachments: [{ uploadId: "stage-1" }] } },
+    });
+    expect(setStateCallsFor("optimisticUserMessages").at(-1)!.applied).toEqual([]);
+  });
+
+  it("reuses completed stages after a failed turn admission without another file read", async () => {
+    seedConnectedServerThread();
+    renderServerRoute();
+    const contexts = makeOwnedComposerContexts("retry-upload");
+    const { promptRef } = installComposerHandle({
+      getSendContext: () => sendContextWithOwnedComposerContexts(contexts),
+    });
+    promptRef.current = "retry this upload";
+    h.commandResults["thread.stageAttachments"] = () =>
+      AsyncResult.success({
+        _tag: "staged",
+        attachments: [
+          {
+            type: "image",
+            id: contexts.image.id,
+            name: contexts.image.name,
+            mimeType: "image/png",
+            sizeBytes: 4,
+            uploadId: "stage-1",
+          },
+        ],
+      });
+    let admissions = 0;
+    h.commandResults["thread.startTurn"] = () =>
+      ++admissions === 1
+        ? AsyncResult.failure(Cause.fail(new Error("temporarily unavailable")))
+        : AsyncResult.success(undefined);
+    const send = capturedProps("chatComposer")["onSend"] as () => Promise<void>;
+    await send();
+    expect(promptRef.current.replaceAll("\uFFFC", "")).toBe("retry this upload");
+    await send();
+    expect(commandCallsFor("thread.stageAttachments")).toHaveLength(2);
+    expect(commandCallsFor("thread.stageAttachments")[1]!.input).toMatchObject({
+      input: { reusable: [{ uploadId: "stage-1" }] },
+    });
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(2);
+  });
   it("uses shared defaults for a legacy draft that has no stored model selection", () => {
     const draftId = newDraftId();
     const capabilityRichProvider: ServerProvider = {

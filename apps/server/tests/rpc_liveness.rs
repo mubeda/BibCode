@@ -116,27 +116,44 @@ fn host_public_key(root: &Path) -> Vec<u8> {
 struct ThrottleProxy {
     address: SocketAddr,
     frozen: Arc<AtomicBool>,
+    accept_task: tokio::task::JoinHandle<()>,
 }
 
 impl ThrottleProxy {
     async fn start(target: SocketAddr, rate: u64) -> Self {
+        Self::start_duplex(target, rate, 0).await
+    }
+    async fn start_duplex(target: SocketAddr, rate: u64, up_rate: u64) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("proxy listens");
         let address = listener.local_addr().expect("proxy address");
         let frozen = Arc::new(AtomicBool::new(false));
         let accept_frozen = Arc::clone(&frozen);
-        tokio::spawn(async move {
-            while let Ok((client, _)) = listener.accept().await {
-                let frozen = Arc::clone(&accept_frozen);
-                tokio::spawn(relay(client, target, rate, frozen));
+        let accept_task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    result = listener.accept() => { let Ok((client, _)) = result else { break; }; connections.spawn(relay(client, target, rate, up_rate, Arc::clone(&accept_frozen))); }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
             }
         });
-        Self { address, frozen }
+        Self {
+            address,
+            frozen,
+            accept_task,
+        }
     }
 
     fn freeze(&self, frozen: bool) {
         self.frozen.store(frozen, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ThrottleProxy {
+    fn drop(&mut self) {
+        self.accept_task.abort();
     }
 }
 
@@ -149,7 +166,43 @@ async fn wait_while_frozen(frozen: &AtomicBool) -> bool {
     waited
 }
 
-async fn relay(client: TcpStream, target: SocketAddr, rate: u64, frozen: Arc<AtomicBool>) {
+async fn paced_copy<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
+    mut reader: R,
+    mut writer: W,
+    rate: u64,
+    frozen: Arc<AtomicBool>,
+) {
+    let mut buffer = vec![0_u8; PROXY_CHUNK];
+    let mut next_send = Instant::now();
+    loop {
+        if wait_while_frozen(&frozen).await {
+            next_send = Instant::now();
+        }
+        let read = match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        if rate != 0 {
+            next_send =
+                next_send.max(Instant::now()) + Duration::from_secs_f64(read as f64 / rate as f64);
+            sleep_until(next_send).await;
+        }
+        if wait_while_frozen(&frozen).await {
+            next_send = Instant::now();
+        }
+        if writer.write_all(&buffer[..read]).await.is_err() {
+            break;
+        }
+    }
+    let _ = writer.shutdown().await;
+}
+async fn relay(
+    client: TcpStream,
+    target: SocketAddr,
+    down_rate: u64,
+    up_rate: u64,
+    frozen: Arc<AtomicBool>,
+) {
     let upstream = TcpSocket::new_v4().expect("upstream socket");
     upstream
         .set_recv_buffer_size(PROXY_UPSTREAM_RECEIVE_BUFFER)
@@ -157,44 +210,12 @@ async fn relay(client: TcpStream, target: SocketAddr, rate: u64, frozen: Arc<Ato
     let Ok(server) = upstream.connect(target).await else {
         return;
     };
-    let (mut client_read, mut client_write) = client.into_split();
-    let (mut server_read, mut server_write) = server.into_split();
-    let up_frozen = Arc::clone(&frozen);
-    let up = tokio::spawn(async move {
-        let mut buffer = vec![0_u8; PROXY_CHUNK];
-        loop {
-            wait_while_frozen(&up_frozen).await;
-            let read = match client_read.read(&mut buffer).await {
-                Ok(0) | Err(_) => break,
-                Ok(read) => read,
-            };
-            wait_while_frozen(&up_frozen).await;
-            if server_write.write_all(&buffer[..read]).await.is_err() {
-                break;
-            }
-        }
-        let _ = server_write.shutdown().await;
-    });
-    let mut buffer = vec![0_u8; PROXY_CHUNK];
-    let mut next_send = Instant::now();
-    loop {
-        if wait_while_frozen(&frozen).await {
-            next_send = Instant::now();
-        }
-        let read = match server_read.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
-        };
-        let pace = Duration::from_secs_f64(read as f64 / rate as f64);
-        next_send = next_send.max(Instant::now()) + pace;
-        sleep_until(next_send).await;
-        wait_while_frozen(&frozen).await;
-        if client_write.write_all(&buffer[..read]).await.is_err() {
-            break;
-        }
+    let (client_read, client_write) = client.into_split();
+    let (server_read, server_write) = server.into_split();
+    tokio::select! {
+        () = paced_copy(client_read, server_write, up_rate, frozen.clone()) => {},
+        () = paced_copy(server_read, client_write, down_rate, frozen) => {},
     }
-    let _ = client_write.shutdown().await;
-    up.abort();
 }
 
 enum Framing {
@@ -1105,4 +1126,193 @@ async fn an_idle_client_silent_for_thirty_seconds_is_kept() {
     assert!(matches!(result, Outcome::Completed(_)), "{result:?}");
     handle.shutdown();
     handle.join().await.expect("server joins");
+}
+
+#[tokio::test]
+async fn proxy_upstream_rate_is_enforced() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = ThrottleProxy::start_duplex(listener.local_addr().unwrap(), 0, 32 * KIB).await;
+    let mut sender = TcpStream::connect(proxy.address).await.unwrap();
+    let read = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let start = Instant::now();
+        let mut bytes = vec![0_u8; 64 * 1024];
+        socket.read_exact(&mut bytes).await.unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 73));
+        start.elapsed()
+    });
+    sender.write_all(&vec![73; 64 * 1024]).await.unwrap();
+    let elapsed = timeout(Duration::from_secs(5), read)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        elapsed >= Duration::from_millis(1900),
+        "upstream was unpaced: {elapsed:?}"
+    );
+}
+
+async fn staged_upload_trial(mode: Mode, up_rate: u64) {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use bibcode_server::transfer::staging::{UploadClock, UploadLimits, UploadRegistry};
+    use sha2::{Digest, Sha256};
+    within_trial_deadline("staged upload", async {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("staged-chat");
+        let uploads = UploadRegistry::new(directory.clone(), UploadLimits::default(), Arc::new(Instant::now) as UploadClock);
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let (ended_tx, mut ended_rx) = tokio::sync::mpsc::channel(1);
+        let handle = start_server_with(&temp, |registry| {
+            bibcode_server::production::uploads_rpc::register_uploads_rpc(registry, uploads.clone());
+            registry.register_stream("fixture.watch", move |_, cancellation| {
+                let (sender, receiver) = tokio::sync::mpsc::channel(1);
+                let started = started_tx.clone(); let ended = ended_tx.clone();
+                tokio::spawn(async move { started.send(()).await.unwrap(); cancellation.cancelled().await; sender.closed().await; let _ = ended.send(Instant::now()).await; });
+                receiver
+            });
+        }).await;
+        let proxy = ThrottleProxy::start_duplex(handle.local_addr(), 0, up_rate).await;
+        let (mut socket, mut framing) = open(mode, proxy.address, &host_public_key(temp.path())).await;
+        watch_session(&mut socket, &mut framing).await;
+        started_rx.recv().await.unwrap();
+        let bytes: Vec<u8> = (0..3 * MIB).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        let digest: String = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+        send_text(&mut socket, &mut framing, &json!({"_tag":"Request","id":"1","tag":"uploads.begin","payload":{"target":{"_tag":"chat-attachment","type":"file","name":"slow.bin","mimeType":"application/octet-stream"},"sizeBytes":bytes.len(),"sha256":digest},"headers":[]}).to_string()).await;
+        let (_, begin) = wait_for_response(&mut socket, &mut framing, Instant::now(), "1", "Exit").await.unwrap();
+        assert_eq!(begin["exit"]["_tag"], "Success", "{begin}");
+        let upload_id = begin["exit"]["value"]["uploadId"].as_str().unwrap().to_owned();
+        let start = Instant::now();
+        let mut next = 0_usize;
+        let mut pending = std::collections::HashSet::new();
+        let mut received = 0_u64;
+        let mut assembly = Assembly::default();
+        let mut last_inbound = Instant::now();
+        let mut probe_sent = false;
+        let mut responsiveness_ping = None;
+        let mut pong_latency = None;
+        while received < bytes.len() as u64 {
+            while pending.len() < 2 && next < bytes.len() {
+                let end = (next + 64 * 1024).min(bytes.len()); let id = format!("{}", 1000 + next);
+                send_text(&mut socket, &mut framing, &json!({"_tag":"Request","id":id,"tag":"uploads.append","payload":{"uploadId":upload_id,"offset":next,"data":STANDARD.encode(&bytes[next..end])},"headers":[]}).to_string()).await;
+                pending.insert(id); next = end;
+            }
+            if received > 0 && responsiveness_ping.is_none() {
+                responsiveness_ping = Some(Instant::now());
+                send_text(&mut socket, &mut framing, r#"{"_tag":"Ping"}"#).await;
+            }
+            let deadline = last_inbound + if probe_sent { DEAD_AFTER } else { PROBE_AFTER };
+            let frame = tokio::select! {
+                frame = socket.next() => frame.expect("socket remains live").expect("WebSocket frame"),
+                () = sleep_until(deadline) => { assert!(!probe_sent, "client would close 4408 during staged upload"); send_text(&mut socket, &mut framing, r#"{"_tag":"Ping"}"#).await; probe_sent = true; continue; }
+            };
+            assert!(!matches!(frame, Message::Close(_)), "staged upload closed: {frame:?}");
+            if matches!(frame, Message::Text(_) | Message::Binary(_)) { last_inbound = Instant::now(); probe_sent = false; }
+            let Some(message) = reassemble(&mut framing, &mut assembly, frame) else { continue; };
+            let value: Value = serde_json::from_slice(&message).unwrap();
+            if value["_tag"] == "Pong" && let Some(ping) = responsiveness_ping { pong_latency.get_or_insert(ping.elapsed()); }
+            if value["_tag"] == "Exit" && pending.remove(value["requestId"].as_str().unwrap_or("")) {
+                assert_eq!(value["exit"]["_tag"], "Success", "{value}");
+                received = received.max(value["exit"]["value"]["receivedBytes"].as_u64().unwrap());
+            }
+            assert!(ended_rx.try_recv().is_err(), "server reaped active staged sender");
+        }
+        let elapsed = start.elapsed();
+        assert!(elapsed > Duration::from_secs(45), "upstream pacing did not constrain upload: {elapsed:?}");
+        // Two 64KiB base64 chunks at the configured uplink rate, plus 2s for
+        // WebSocket headers, scheduler delays and the independent response direction.
+        let latency_limit = Duration::from_secs_f64(2.0 * 64.0 * 1024.0 * 4.0 / 3.0 / up_rate as f64) + Duration::from_secs(2);
+        assert!(pong_latency.unwrap() <= latency_limit, "Ping delayed behind staged upload: {pong_latency:?}");
+        send_text(&mut socket, &mut framing, &json!({"_tag":"Request","id":"2","tag":"uploads.get","payload":{"uploadId":upload_id},"headers":[]}).to_string()).await;
+        let (_, get) = wait_for_response(&mut socket, &mut framing, start, "2", "Exit").await.unwrap();
+        assert_eq!(get["exit"]["_tag"], "Success", "{get}");
+        assert_eq!(get["exit"]["value"]["complete"], true);
+        assert_eq!(get["exit"]["value"]["receivedBytes"], bytes.len());
+        let stored = tokio::fs::read(directory.join(format!("{upload_id}.upload"))).await.unwrap();
+        assert_eq!(stored, bytes);
+        let stored_digest: String = Sha256::digest(&stored).iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(stored_digest, digest);
+        assert!(ended_rx.try_recv().is_err());
+        println!("staged {mode:?}: elapsed={elapsed:?}, pong={pong_latency:?}");
+        socket.close(None).await.unwrap(); uploads.shutdown().await;
+        handle.shutdown(); handle.join().await.unwrap();
+    }).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staged_three_mib_uploads_survive_plain_and_encrypted_slow_uplinks() {
+    tokio::join!(
+        staged_upload_trial(Mode::PlainSplit, 64 * KIB),
+        staged_upload_trial(Mode::Encrypted, 64 * KIB)
+    );
+}
+
+#[derive(Debug)]
+struct InlineTrialOutcome {
+    client_liveness_close: Option<u16>,
+    server_reaped: bool,
+    elapsed: Duration,
+}
+async fn inline_upload_trial(mode: Mode, up_rate: u64) -> InlineTrialOutcome {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    within_trial_deadline("inline upload residual", async {
+        let temp = TempDir::new().unwrap();
+        let (handle, mut started, mut ended) = start_observed_server(&temp).await;
+        let proxy = ThrottleProxy::start_duplex(handle.local_addr(), 0, up_rate).await;
+        let (mut socket, mut framing) = open(mode, proxy.address, &host_public_key(temp.path())).await;
+        watch_session(&mut socket, &mut framing).await;
+        started.recv().await.unwrap();
+        // This known fixture method accepts a large request and returns a small
+        // success; it exercises the same transport framing as an inline turn.
+        let request = json!({"_tag":"Request","id":"200","tag":"fixture.bytes","payload":{"bytes":0,"dataUrl":format!("data:application/octet-stream;base64,{}",STANDARD.encode(vec![91; 3 * MIB]))},"headers":[]}).to_string();
+        let frames: Vec<Message> = match &mut framing {
+            Framing::Whole | Framing::Records => vec![Message::Text(request.into())],
+            Framing::Encrypted(transport) => {
+                let chunks: Vec<_> = request.as_bytes().chunks(MAX_CHUNK_BYTES).collect();
+                chunks.iter().enumerate().map(|(i, chunk)| Message::Binary(encrypt_record(transport, u8::from(i + 1 != chunks.len()), chunk).into())).collect()
+            }
+        };
+        let (mut writer, mut reader) = socket.split();
+        let sender = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            for frame in frames { if writer.send(frame).await.is_err() { break; } }
+            // Keep the raw peer open, even when the monitor would close 4408,
+            // to measure the server's heartbeat/reap decision independently.
+            sleep(Duration::from_secs(100)).await;
+        }));
+        let start = Instant::now();
+        let mut last_inbound = start;
+        let mut client_liveness_close = None;
+        let mut assembly = Assembly::default();
+        let mut server_reaped = false;
+        loop {
+            let frame = tokio::select! {
+                _ = ended.recv() => { server_reaped = true; break; }
+                () = sleep_until(last_inbound + DEAD_AFTER), if client_liveness_close.is_none() => { client_liveness_close = Some(4408); continue; }
+                frame = reader.next() => frame,
+            };
+            let Some(Ok(frame)) = frame else { server_reaped = true; break; };
+            if matches!(frame, Message::Close(_)) { server_reaped = true; break; }
+            if matches!(frame, Message::Text(_) | Message::Binary(_)) { last_inbound = Instant::now(); }
+            let Some(message) = reassemble(&mut framing, &mut assembly, frame) else { continue; };
+            let value: Value = serde_json::from_slice(&message).unwrap();
+            if value["requestId"] == "200" && value["_tag"] == "Exit" { assert_eq!(value["exit"]["_tag"], "Success"); break; }
+        }
+        let outcome = InlineTrialOutcome { client_liveness_close, server_reaped, elapsed: start.elapsed() };
+        println!("inline {mode:?}: {outcome:?}");
+        drop(sender); drop(reader); handle.shutdown(); handle.join().await.unwrap();
+        outcome
+    }).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_three_mib_upload_records_the_existing_residual() {
+    let (plain, encrypted) = tokio::join!(
+        inline_upload_trial(Mode::PlainSplit, 64 * KIB),
+        inline_upload_trial(Mode::Encrypted, 64 * KIB)
+    );
+    assert!(plain.server_reaped);
+    assert_eq!(plain.client_liveness_close, Some(4408));
+    assert!(encrypted.elapsed > Duration::from_secs(30));
+    // Record, rather than prescribe, Noise's independent client/server result.
+    println!(
+        "inline client close: {:?}; server reaped: {}",
+        encrypted.client_liveness_close, encrypted.server_reaped
+    );
 }

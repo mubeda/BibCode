@@ -3349,40 +3349,47 @@ describe("ChatComposer effects", () => {
 });
 
 describe("queued steer shortcut", () => {
-  it.each([false, true])(
-    "consumes Mod+Shift+Enter before menu selection or newline (menu %s)",
-    (menu) => {
-      seedPrompt(menu ? ":model" : "draft unchanged");
-      const onSteerQueuedMessage = vi.fn();
-      const keybindings: ResolvedKeybindingsConfig = [
-        {
-          command: "thread.steerQueuedMessage",
-          shortcut: {
-            key: "enter",
-            modKey: true,
-            shiftKey: true,
-            metaKey: false,
-            ctrlKey: false,
-            altKey: false,
+  it.each(
+    ["MacIntel", "Win32"].flatMap((platform) => [false, true].map((menu) => ({ platform, menu }))),
+  )(
+    "consumes Mod+Shift+Enter before menu selection or newline on $platform (menu $menu)",
+    ({ platform, menu }) => {
+      const platformSpy = vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+      try {
+        seedPrompt(menu ? ":model" : "draft unchanged");
+        const onSteerQueuedMessage = vi.fn();
+        const keybindings: ResolvedKeybindingsConfig = [
+          {
+            command: "thread.steerQueuedMessage",
+            shortcut: {
+              key: "enter",
+              modKey: true,
+              shiftKey: true,
+              metaKey: false,
+              ctrlKey: false,
+              altKey: false,
+            },
+            whenAst: { type: "identifier", name: "editableFocus" },
           },
-          whenAst: { type: "identifier", name: "editableFocus" },
-        },
-      ];
-      const { spies } = renderComposer({ onSteerQueuedMessage, keybindings });
-      const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
-      const event = {
-        key: "Enter",
-        shiftKey: true,
-        ctrlKey: true,
-        metaKey: false,
-        altKey: false,
-        preventDefault: vi.fn(),
-      } as unknown as KeyboardEvent;
-      expect(onKey("Enter", event)).toBe(true);
-      expect(event.preventDefault).toHaveBeenCalled();
-      expect(onSteerQueuedMessage).toHaveBeenCalledOnce();
-      expect(spies.onSend).not.toHaveBeenCalled();
-      expect(draftOf(threadRef)?.prompt).toBe(menu ? ":model" : "draft unchanged");
+        ];
+        const { spies } = renderComposer({ onSteerQueuedMessage, keybindings });
+        const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+        const event = {
+          key: "Enter",
+          shiftKey: true,
+          ctrlKey: platform === "Win32",
+          metaKey: platform === "MacIntel",
+          altKey: false,
+          preventDefault: vi.fn(),
+        } as unknown as KeyboardEvent;
+        expect(onKey("Enter", event)).toBe(true);
+        expect(event.preventDefault).toHaveBeenCalled();
+        expect(onSteerQueuedMessage).toHaveBeenCalledOnce();
+        expect(spies.onSend).not.toHaveBeenCalled();
+        expect(draftOf(threadRef)?.prompt).toBe(menu ? ":model" : "draft unchanged");
+      } finally {
+        platformSpy.mockRestore();
+      }
     },
   );
 });

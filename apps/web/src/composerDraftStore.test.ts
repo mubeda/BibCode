@@ -81,7 +81,9 @@ import {
   useComposerThreadDraft,
   useEffectiveComposerModelState,
   DraftId,
+  PersistedComposerAttachment,
 } from "./composerDraftStore";
+const isPersistedComposerAttachment = Schema.is(PersistedComposerAttachment);
 import { type ReviewCommentContext } from "./reviewCommentContext";
 import { removeLocalStorageItem, setLocalStorageItem } from "./hooks/useLocalStorage";
 import {
@@ -205,6 +207,30 @@ function draftByKey(key: string) {
 }
 
 describe("composerDraftStore addAttachments", () => {
+  it("never persists a staged upload id or ambiguous inline/staged byte sources", () => {
+    const staged = {
+      type: "file",
+      id: "file-1",
+      name: "a.txt",
+      mimeType: "text/plain",
+      sizeBytes: 3,
+      uploadId: "stage-1",
+    };
+    expect(isPersistedComposerAttachment(staged)).toBe(false);
+    expect(
+      isPersistedComposerAttachment({ ...staged, dataUrl: "data:text/plain;base64,YWJj" }),
+    ).toBe(false);
+    expect(
+      isPersistedComposerAttachment({
+        type: "file",
+        id: "file-1",
+        name: "a.txt",
+        mimeType: "text/plain",
+        sizeBytes: 3,
+        dataUrl: "data:text/plain;base64,YWJj",
+      }),
+    ).toBe(true);
+  });
   const threadId = ThreadId.make("thread-dedupe");
   const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
   let originalRevokeObjectUrl: typeof URL.revokeObjectURL;
