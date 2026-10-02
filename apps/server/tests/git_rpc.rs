@@ -1783,9 +1783,7 @@ fn status_subscription_watcher_observes_commits_and_checkouts_inside_a_submodule
         "isolated-git-config",
         None,
         |command| {
-            command
-                .env("GIT_CONFIG_GLOBAL", config.path())
-                .env("GIT_CONFIG_NOSYSTEM", "1");
+            config.apply_to_command(command);
         },
     );
 }
