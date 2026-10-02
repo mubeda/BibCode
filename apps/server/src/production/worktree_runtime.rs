@@ -1839,7 +1839,9 @@ mod tests {
         );
         let registry = WorkspaceAvailabilityRegistry::new();
         let loss = WorkspaceLossTransition {
-            path: root.path().join("missing"),
+            // Registry admission captures physical identity; /var aliases on
+            // macOS must not make this fixture look like a stale transition.
+            path: std::fs::canonicalize(root.path()).unwrap().join("missing"),
             ..transition(1)
         };
         registry.mark_unavailable(loss.clone()).await.unwrap();

@@ -124,7 +124,7 @@ describe("cross-platform CI contract", () => {
       names.indexOf("Rust workspace tests"),
     );
     expect(sshStep?.run?.trim().split("\n")).toEqual([
-      "cargo build -p bibcode-server --bin bibcode -j 2",
+      "cargo test -p bibcode-server --test cli_smoke --no-run -j 2",
       "cargo test -p bibcode-desktop --test ssh_environment -j 2 -- --ignored",
     ]);
   });

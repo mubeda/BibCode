@@ -303,6 +303,9 @@ done
             for project_name in ["empty", "first", "second"] {
                 let cwd = sandbox.path(project_name);
                 std::fs::create_dir_all(&cwd).unwrap();
+                // The child shell reports physical PWD; use that same fixture
+                // spelling while still asserting the exact requested workspace.
+                let cwd = std::fs::canonicalize(cwd).unwrap();
                 let mut skills = vec![
                     json!({"name":"personal","path":shared.join("skills/personal/SKILL.md"),"enabled":true,"scope":"user"}),
                 ];
@@ -491,6 +494,8 @@ exec "$BIBCODE_TEST_EXECUTABLE" --exact production::provider_inventory::capabili
         for project in ["empty", "first & #", "second"] {
             let cwd = sandbox.path(project);
             std::fs::create_dir_all(&cwd).unwrap();
+            // The local HTTP fixture compares against its process current_dir.
+            let cwd = std::fs::canonicalize(cwd).unwrap();
             let result = discover_capabilities(&settings, "local", &cwd, &CancellationToken::new())
                 .await
                 .unwrap();

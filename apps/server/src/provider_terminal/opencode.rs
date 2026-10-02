@@ -1780,6 +1780,16 @@ impl OpenCodeCapabilityProbeRunner for SystemOpenCodeCapabilityProbeRunner {
     ) -> Pin<Box<dyn Future<Output = Result<OpenCodeProbeOutput, String>> + Send + '_>> {
         let executable = executable.to_path_buf();
         Box::pin(async move {
+            #[cfg(feature = "hermetic-test-guard")]
+            let executable = crate::hermetic_guard::checked_provider_executable(
+                &executable,
+                std::env::current_dir().ok().as_deref(),
+                std::env::var_os("PATH").as_deref(),
+            )
+            .ok_or_else(|| {
+                "probe executable was not found or was refused by the hermetic test guard"
+                    .to_owned()
+            })?;
             let mut command = tokio::process::Command::new(executable);
             command
                 .args(args)
@@ -1930,6 +1940,27 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
         launch: OpenCodeHelperLaunch,
     ) -> Pin<Box<dyn Future<Output = Result<OpenCodeHelperReady, String>> + Send + '_>> {
         Box::pin(async move {
+            #[cfg(feature = "hermetic-test-guard")]
+            let launch = {
+                let mut launch = launch;
+                let search_path =
+                    crate::production::provider_runtime::effective_provider_search_path(
+                        launch.env.iter().map(|(name, value)| {
+                            (std::ffi::OsStr::new(name), std::ffi::OsStr::new(value))
+                        }),
+                    );
+                let executable = crate::hermetic_guard::checked_provider_executable(
+                    Path::new(&launch.executable),
+                    Some(&launch.cwd),
+                    search_path.as_deref(),
+                )
+                .ok_or_else(|| {
+                    "failed to start OpenCode helper: executable was not found or was refused by the hermetic test guard"
+                        .to_owned()
+                })?;
+                launch.executable = executable.to_string_lossy().into_owned();
+                launch
+            };
             let reaper_permit = self.reaper.reserve()?;
             let mut command = CommandWrap::with_new(&launch.executable, |command| {
                 command
@@ -3441,6 +3472,36 @@ async fn read_bounded_json(mut response: reqwest::Response) -> Result<Value, Str
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(all(feature = "hermetic-test-guard", unix))]
+    #[tokio::test]
+    async fn hermetic_guard_refuses_direct_opencode_probe_and_helper_before_spawn() {
+        let Some(executable) = crate::hermetic_guard::refusal_fixture(
+            "provider_terminal::opencode::tests::hermetic_guard_refuses_direct_opencode_probe_and_helper_before_spawn",
+            "2.1.220",
+        ) else {
+            return;
+        };
+        assert!(
+            SystemOpenCodeCapabilityProbeRunner
+                .run(&executable, vec![])
+                .await
+                .is_err()
+        );
+        let launch = OpenCodeHelperLaunch {
+            executable: executable.display().to_string(),
+            args: vec![],
+            cwd: executable.parent().unwrap().to_path_buf(),
+            env: BTreeMap::new(),
+            process_attribution: ProcessAttributionRegistry::new(),
+        };
+        assert!(
+            SystemOpenCodeHelperLauncher::default()
+                .start(launch)
+                .await
+                .is_err()
+        );
+    }
     use std::{convert::Infallible, process::ExitStatus, sync::atomic::AtomicUsize};
 
     use axum::{

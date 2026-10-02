@@ -12359,10 +12359,13 @@ async fn native_factory_rejects_unknown_providers_without_a_fallback() {
 
 #[tokio::test]
 async fn native_factory_routes_resume_to_the_native_adapter_without_a_fallback() {
-    let factory = NativeProviderDriverFactory::new(TempDir::new().unwrap().path().to_path_buf());
+    let sandbox = TempDir::new().expect("missing native provider sandbox");
+    let factory = NativeProviderDriverFactory::new(sandbox.path().to_path_buf());
     let mut request = launch();
     request.provider = "opencode".to_owned();
-    request.binary_path = "bibcode-missing-opencode-resume-fixture".to_owned();
+    request.binary_path = hermetic_providers::missing_provider_executable(sandbox.path())
+        .to_string_lossy()
+        .into_owned();
     request.resume_cursor = Some(json!({"sessionId":"old-session"}));
     let error = match factory.create(request).await {
         Ok(_) => panic!("missing native provider unexpectedly spawned"),
@@ -12376,7 +12379,8 @@ async fn native_factory_routes_resume_to_the_native_adapter_without_a_fallback()
 
 #[tokio::test]
 async fn native_factory_routes_every_supported_provider_to_its_native_adapter() {
-    let factory = NativeProviderDriverFactory::new(TempDir::new().unwrap().path().to_path_buf());
+    let sandbox = TempDir::new().expect("missing native adapter sandbox");
+    let factory = NativeProviderDriverFactory::new(sandbox.path().to_path_buf());
 
     for provider in [
         "codex",
@@ -12388,7 +12392,9 @@ async fn native_factory_routes_every_supported_provider_to_its_native_adapter() 
     ] {
         let mut request = launch();
         request.provider = provider.to_owned();
-        request.binary_path = format!("bibcode-missing-{provider}-native-fixture");
+        request.binary_path = hermetic_providers::missing_provider_executable(sandbox.path())
+            .to_string_lossy()
+            .into_owned();
 
         let error = match factory.create(request).await {
             Ok(_) => panic!("missing {provider} executable unexpectedly spawned"),

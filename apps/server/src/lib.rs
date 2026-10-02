@@ -12,6 +12,8 @@ pub mod diagnostic_bundle;
 pub mod diagnostics;
 mod environment_identity;
 pub mod git;
+#[cfg(feature = "hermetic-test-guard")]
+mod hermetic_guard;
 mod http;
 mod json_size;
 mod lifecycle;
