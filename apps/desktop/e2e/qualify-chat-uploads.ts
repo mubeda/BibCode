@@ -1,0 +1,494 @@
+// @effect-diagnostics nodeBuiltinImport:off - This disposable CI qualification owns its processes and files.
+// @effect-diagnostics globalFetch:off - All requests target owned loopback fixture endpoints.
+// @effect-diagnostics globalTimers:off - Bounded qualification polling and child cleanup.
+// @effect-diagnostics globalDate:off - Execution evidence records real elapsed time.
+import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import { remote } from "webdriverio";
+
+import { prepareDesktopUiTestContext } from "./support/test-project.ts";
+import { createSizedPng, instrumentCodexAttachmentLog } from "./support/chat-upload-fixture.ts";
+import { startThrottleProxy } from "../../../scripts/throttle-proxy.ts";
+import {
+  classifyQualificationFailure,
+  projectQualificationProcess,
+} from "./support/chat-upload-evidence.ts";
+
+const root = NodePath.resolve(import.meta.dirname, "../../..");
+const fixture = process.env.BIBCODE_UPLOAD_FIXTURE;
+const evidence = process.env.BIBCODE_UPLOAD_EVIDENCE;
+const binary = process.env.BIBCODE_UPLOAD_SERVER;
+const chrome = process.env.BIBCODE_UPLOAD_CHROME;
+const driver = process.env.BIBCODE_UPLOAD_DRIVER;
+if (
+  process.env.CI !== "true" ||
+  !fixture ||
+  !evidence ||
+  !binary ||
+  !chrome ||
+  !driver ||
+  NodeFS.readlinkSync("/proc/self/ns/net") !== process.env.BIBCODE_UPLOAD_NETNS
+) {
+  throw new Error(
+    "This qualification requires its owned Linux CI namespace and prepared executables.",
+  );
+}
+const fixtureRoot = fixture;
+const evidenceRoot = evidence;
+const serverBinary = binary;
+const webOrigin = "http://localhost:4901";
+const processes: Array<{
+  child: NodeChildProcess.ChildProcess;
+  done: Promise<void>;
+  log: string;
+  role: string;
+  spawnFailure: ReturnType<typeof classifyQualificationFailure> | null;
+}> = [];
+const proxies: Array<Awaited<ReturnType<typeof startThrottleProxy>>> = [];
+let currentPhase = "prepare";
+const results: Array<Record<string, unknown>> = [];
+const write = (name: string, value: unknown) =>
+  NodeFS.writeFileSync(
+    NodePath.join(evidenceRoot, name + ".json"),
+    JSON.stringify(value, null, 2) + "\n",
+    { mode: 0o600 },
+  );
+const phase = (name: string) => {
+  currentPhase = name;
+  write("phase", { phase: name });
+};
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+async function bounded<A>(promise: Promise<A>, ms: number): Promise<A> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Owned operation exceeded its bound.")), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function until(check: () => Promise<boolean>, timeout = 30_000): Promise<void> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    for (const entry of processes)
+      if (entry.child.exitCode !== null || entry.child.signalCode !== null) {
+        throw new Error("An owned fixture process exited before qualification completed.");
+      }
+    await delay(100);
+  }
+  throw new Error("The required live observation did not arrive within its bound.");
+}
+function spawn(command: string, args: string[], env: NodeJS.ProcessEnv, name: string): void {
+  const log = NodePath.join(fixtureRoot, name + ".log");
+  const fd = NodeFS.openSync(log, "wx", 0o600);
+  const child = NodeChildProcess.spawn(command, args, {
+    cwd: root,
+    env,
+    stdio: ["ignore", fd, fd],
+  });
+  const entry = {
+    child,
+    log,
+    role: name,
+    spawnFailure: null as ReturnType<typeof classifyQualificationFailure> | null,
+    done: Promise.resolve(),
+  };
+  entry.done = new Promise<void>((resolve) => {
+    child.once("close", () => resolve());
+    child.once("error", (error) => {
+      entry.spawnFailure = classifyQualificationFailure(error);
+      resolve();
+    });
+  });
+  processes.push(entry);
+  NodeFS.closeSync(fd);
+}
+function prepareEnvironments() {
+  return ["plain", "noise"].map((kind, index) => {
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      BIBCODE_E2E_RUN_ROOT: NodePath.join(fixtureRoot, kind),
+      BIBCODE_E2E_ARTIFACT_DIR: NodePath.join(fixtureRoot, kind + "-private"),
+      BIBCODE_E2E_PLATFORM: "linux",
+    };
+    const context = prepareDesktopUiTestContext(childEnv);
+    const projectPath = NodePath.join(NodePath.dirname(context.projectPath), "Uploads " + kind);
+    NodeFS.renameSync(context.projectPath, projectPath);
+    childEnv.BIBCODE_E2E_PROJECT_PATH = projectPath;
+    childEnv.BIBCODE_UPLOAD_RECEIPTS = NodePath.join(context.runRoot, "upload-receipts.jsonl");
+    childEnv.PATH = context.shimDirectory + NodePath.delimiter + NodePath.join(fixtureRoot, "bin");
+    childEnv.BIBCODE_E2E_SLOW_TURN_MS = "3600000";
+    childEnv.CLAUDE_CONFIG_DIR = NodePath.join(context.fixtureUserHomePath, ".claude");
+    childEnv.CODEX_HOME = NodePath.join(context.fixtureUserHomePath, ".codex");
+    for (const [key, relative] of [
+      ["XDG_CONFIG_HOME", "config"],
+      ["XDG_DATA_HOME", "data"],
+      ["XDG_CACHE_HOME", "cache"],
+    ]) {
+      const path = NodePath.join(context.runRoot, relative!);
+      NodeFS.mkdirSync(path, { recursive: true, mode: 0o700 });
+      childEnv[key!] = path;
+    }
+    delete childEnv.BIBCODE_HERMETIC_GUARD;
+    const state = NodePath.join(context.stateRoot, "dev");
+    NodeFS.mkdirSync(state, { recursive: true, mode: 0o700 });
+    const providers = Object.fromEntries(
+      ["codex", "claudeAgent", "cursor", "grok", "opencode"].map((name) => [
+        name,
+        {
+          enabled: name === "codex",
+          binaryPath:
+            name === "codex"
+              ? NodePath.join(context.shimDirectory, "codex")
+              : NodePath.join(context.runRoot, "missing-provider"),
+        },
+      ]),
+    );
+    NodeFS.writeFileSync(
+      NodePath.join(state, "settings.json"),
+      JSON.stringify({
+        enableProviderUpdateChecks: false,
+        providers,
+        providerInstances: {
+          cursor: {
+            driver: "cursor",
+            enabled: false,
+            config: { binaryPath: NodePath.join(context.runRoot, "missing-provider") },
+          },
+        },
+      }),
+    );
+    instrumentCodexAttachmentLog(context.shimDirectory);
+    return {
+      kind,
+      env: childEnv,
+      context,
+      projectPath,
+      serverPort: index === 0 ? 4902 : 4910,
+      proxyPort: index === 0 ? 4903 : 4911,
+      receipts: childEnv.BIBCODE_UPLOAD_RECEIPTS!,
+      route: "",
+    };
+  });
+}
+const webEnv = {
+  ...process.env,
+  PORT: "4901",
+  HOST: "127.0.0.1",
+  VITE_DEV_SERVER_URL: webOrigin,
+  BIBCODE_PORT: "4903",
+  VITE_HTTP_URL: "http://localhost:4903",
+  VITE_WS_URL: "ws://localhost:4903",
+};
+
+const observationScript = String.raw`(() => {
+  const Original = window.WebSocket;
+  const events = [];
+  const inflight = new Map();
+  let maximumAppend = 0;
+  let nextSocket = 0;
+  window.__uploadObservations = { events, get maximumAppend() { return maximumAppend; } };
+  const record = (value) => { if (events.length < 20000) events.push({ time: Date.now(), ...value }); };
+  window.WebSocket = class extends Original {
+    constructor(...args) {
+      super(...args); this.fixtureSocket = ++nextSocket;
+      this.addEventListener('message', (event) => {
+        if (typeof event.data !== 'string') return;
+        try { const value = JSON.parse(event.data);
+          if (value._tag === 'Exit') inflight.delete(this.fixtureSocket + ':' + value.requestId);
+          if (value._tag === 'Chunk') {
+            for (const entry of value.values ?? []) {
+              if (entry?.environment?.capabilities?.attachmentStaging === true) record({ kind: 'capability', value: true });
+            }
+          }
+        } catch {}
+      });
+      this.addEventListener('close', (event) => {
+        for (const key of inflight.keys()) if (key.startsWith(this.fixtureSocket + ':')) inflight.delete(key);
+        record({ kind: 'closed', socket: this.fixtureSocket, code: event.code });
+      });
+    }
+    send(data) {
+      if (typeof data === 'string') try { const value = JSON.parse(data);
+        if (value._tag === 'Request' && ['uploads.begin', 'uploads.append', 'uploads.get', 'uploads.cancel'].includes(value.tag)) {
+          record({ kind: 'request', socket: this.fixtureSocket, method: value.tag });
+          if (value.tag === 'uploads.append') {
+            inflight.set(this.fixtureSocket + ':' + value.id, true);
+            maximumAppend = Math.max(maximumAppend, inflight.size);
+          }
+        }
+      } catch {}
+      return super.send(data);
+    }
+    close(code, reason) { record({ kind: 'close-called', socket: this.fixtureSocket, code, bufferedAmount: this.bufferedAmount }); return super.close(code, reason); }
+  };
+})();`;
+
+let browser: Awaited<ReturnType<typeof remote>> | undefined;
+let success = false;
+const cleanupFailures: Array<{
+  role: string;
+  failure: ReturnType<typeof classifyQualificationFailure>;
+}> = [];
+let beforeCleanup: ReturnType<typeof projectQualificationProcess>[] = [];
+try {
+  const environments = prepareEnvironments();
+  phase("start-owned-servers");
+  for (const environment of environments) {
+    spawn(
+      serverBinary,
+      [
+        "serve",
+        "--mode",
+        "web",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        String(environment.serverPort),
+        "--base-dir",
+        environment.context.stateRoot,
+        "--dev-url",
+        webOrigin,
+        "--no-browser",
+        "--no-startup-pairing-offer",
+      ],
+      environment.env,
+      environment.kind,
+    );
+    await until(async () => {
+      try {
+        return (
+          await fetch("http://127.0.0.1:" + environment.serverPort + "/.well-known/bibcode", {
+            signal: AbortSignal.timeout(1000),
+          })
+        ).ok;
+      } catch {
+        return false;
+      }
+    });
+    proxies.push(
+      await startThrottleProxy({
+        listenHost: "127.0.0.1",
+        listenPort: environment.proxyPort,
+        targetHost: "127.0.0.1",
+        targetPort: environment.serverPort,
+      }),
+    );
+  }
+  phase("start-web");
+  spawn(
+    process.execPath,
+    [
+      NodePath.join(root, "scripts/run-local-vp.mjs"),
+      "dev",
+      "--config",
+      "apps/web/vite.config.app.mjs",
+      "apps/web",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "4901",
+      "--strictPort",
+    ],
+    webEnv,
+    "web",
+  );
+  await until(async () => {
+    try {
+      return (await fetch(webOrigin, { signal: AbortSignal.timeout(1000) })).ok;
+    } catch {
+      return false;
+    }
+  });
+  phase("launch-browser");
+  // The pinned WDIO launcher explicitly consumes these driver flags even though
+  // its public DriverOptions type currently lists only common fields.
+  const driverOptions = { binary: driver, allowedIps: ["127.0.0.1"], allowedOrigins: [webOrigin] };
+  browser = await remote({
+    logLevel: "silent",
+    connectionRetryCount: 0,
+    connectionRetryTimeout: 30_000,
+    waitforTimeout: 30_000,
+    capabilities: {
+      browserName: "chrome",
+      webSocketUrl: false,
+      "goog:chromeOptions": {
+        binary: chrome,
+        args: [
+          "--headless=new",
+          "--disable-dev-shm-usage",
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-background-networking",
+          "--disable-component-update",
+          "--window-size=1280,960",
+          "--user-data-dir=" + NodePath.join(fixtureRoot, "browser-profile"),
+        ],
+      },
+      "wdio:chromedriverOptions": driverOptions,
+    },
+  });
+  const b = browser;
+  const cdp = await fetch(
+    "http://" +
+      b.options.hostname +
+      ":" +
+      b.options.port +
+      "/session/" +
+      b.sessionId +
+      "/goog/cdp/execute",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        cmd: "Page.addScriptToEvaluateOnNewDocument",
+        params: { source: observationScript },
+      }),
+    },
+  );
+  if (!cdp.ok) throw new Error("Browser transport observation could not be installed.");
+  const plain = environments[0]!;
+  phase("pair-primary");
+  const credential = JSON.parse(
+    NodeChildProcess.execFileSync(
+      serverBinary,
+      ["pairing", "issue", "--base-dir", plain.context.stateRoot, "--dev-url", webOrigin, "--json"],
+      { env: plain.env, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] },
+    ),
+  ).credential;
+  if (typeof credential !== "string" || credential.length < 8)
+    throw new Error("Owned pairing command returned no credential.");
+  await b.url(webOrigin + "/pair");
+  await b.$("#pairing-token").waitForDisplayed();
+  await b.$("#pairing-token").setValue(credential);
+  await b.$("button=Continue").click();
+  await b.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
+
+  phase("import-primary-project");
+  await b.$('[data-testid="sidebar-add-project-trigger"]').click();
+  await b
+    .$("//button[@data-add-project-action='true'][.//span[normalize-space()='Browse folder']]")
+    .click();
+  if (!(await b.$("#add-project-host-path").isExisting())) {
+    await b.$("button=Type a path instead").waitForDisplayed();
+    await b.$("button=Type a path instead").click();
+  }
+  await b.$("#add-project-host-path").setValue(plain.projectPath);
+  await b.$("button=Open project").click();
+  const editorSelector =
+    '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]';
+  await b.$(editorSelector).waitForDisplayed();
+  plain.route = await b.getUrl();
+
+  const pngPath = NodePath.join(fixtureRoot, "upload-smoke.png");
+  const png = createSizedPng(1024, "smoke");
+  NodeFS.writeFileSync(pngPath, png);
+  const digest = NodeCrypto.createHash("sha256").update(png).digest("hex");
+  phase("real-composer-small-upload");
+  const input = b.$('[data-center-surface-host][data-visible="true"] input[type="file"]');
+  await input.setValue(pngPath);
+  await until(async () =>
+    b.execute(() =>
+      Array.from(document.querySelectorAll('[data-chat-composer-form="true"] img')).some(
+        (element) =>
+          element instanceof HTMLImageElement &&
+          element.complete &&
+          element.naturalWidth === 1 &&
+          element.naturalHeight === 1,
+      ),
+    ),
+  );
+  await b.$(editorSelector).click();
+  await b.$(editorSelector).addValue("upload-smoke");
+  await b.keys("Enter");
+  await until(
+    async () =>
+      NodeFS.existsSync(plain.receipts) &&
+      NodeFS.readFileSync(plain.receipts, "utf8").includes('"prompt":"upload-smoke"'),
+  );
+  const receipts = NodeFS.readFileSync(plain.receipts, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const received = receipts.find((entry) => entry.prompt === "upload-smoke");
+  if (
+    received.attachments.length !== 1 ||
+    received.attachments[0].bytes !== png.length ||
+    received.attachments[0].sha256 !== digest
+  ) {
+    throw new Error("The provider did not receive the exact composer attachment.");
+  }
+  const observations = await b.execute(() =>
+    JSON.parse(JSON.stringify(Reflect.get(window, "__uploadObservations"))),
+  );
+  if (!observations.events.some((entry: { method?: string }) => entry.method === "uploads.begin")) {
+    throw new Error("The actual browser did not exercise staged uploads.");
+  }
+  await b.saveScreenshot(NodePath.join(evidenceRoot, "plain-smoke.png"));
+  results.push({
+    scenario: "plain-small-image",
+    providerBytes: png.length,
+    providerDigest: digest,
+    observations,
+  });
+  phase("smoke-complete");
+  success = true;
+} catch (error) {
+  write("failure", { phase: currentPhase, failure: classifyQualificationFailure(error) });
+} finally {
+  beforeCleanup = processes.map(({ child, log, role, spawnFailure }) =>
+    projectQualificationProcess({
+      role,
+      log,
+      spawnFailure,
+      exitCode: child.exitCode,
+      signal: child.signalCode,
+    }),
+  );
+  const cleanup = async (role: string, run: () => Promise<void>) => {
+    try {
+      await run();
+    } catch (error) {
+      success = false;
+      cleanupFailures.push({ role, failure: classifyQualificationFailure(error) });
+    }
+  };
+  if (browser)
+    await cleanup("browser", () =>
+      bounded(
+        browser!.deleteSession().then(() => undefined),
+        15_000,
+      ),
+    );
+  for (const proxy of proxies) await cleanup("proxy", () => bounded(proxy.close(), 5_000));
+  for (const { child, done, role } of processes.toReversed()) {
+    await cleanup(role, async () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      await bounded(done, 5_000).catch(async () => {
+        child.kill("SIGKILL");
+        await bounded(done, 5_000);
+      });
+    });
+  }
+  write("result", {
+    success,
+    phase: currentPhase,
+    source: process.env.BIBCODE_UPLOAD_SOURCE,
+    results,
+    beforeCleanup,
+    cleanupFailures,
+    scope:
+      "Chromium staged-upload smoke only; full slow-link matrix and WebKitGTK remain unmeasured.",
+    childProcessesClosed: processes.every(
+      ({ child }) => child.exitCode !== null || child.signalCode !== null,
+    ),
+  });
+}
+process.exitCode = success ? 0 : 1;
