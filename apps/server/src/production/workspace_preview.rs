@@ -17,6 +17,10 @@ use crate::{
         PreviewAutomationResponse, PreviewAutomationStreamEvent,
     },
     preview::{PreviewError, PreviewManager, PreviewNavStatus, PreviewViewportSetting},
+    transfer::{
+        download::{DownloadSlots, download_stream},
+        staging::UploadOwner,
+    },
     workspace::WorkspaceRpc,
 };
 
@@ -55,6 +59,7 @@ pub struct WorkspacePreviewRpcServices {
     preview: PreviewManager,
     automation: PreviewAutomationBroker,
     automation_state: Arc<Mutex<AutomationRpcState>>,
+    download_slots: DownloadSlots,
 }
 
 #[derive(Default)]
@@ -86,6 +91,7 @@ impl WorkspacePreviewRpcServices {
             preview,
             automation,
             automation_state: Arc::new(Mutex::new(AutomationRpcState::default())),
+            download_slots: DownloadSlots::default(),
         }
     }
 }
@@ -110,6 +116,24 @@ pub fn register_workspace_preview_rpc(
     }
     let preview = services.preview.clone();
     let workspace = services.workspace.clone();
+    let download_workspace = workspace.clone();
+    let slots = services.download_slots.clone();
+    registry.register_stream_with_context(
+        "projects.readDownload",
+        move |request, context, cancellation| {
+            download_stream(
+                download_workspace.clone(),
+                slots.clone(),
+                UploadOwner::from_context(&context),
+                request,
+                cancellation,
+            )
+        },
+    );
+    let asset_workspace = workspace.clone();
+    registry.register_stream_with_context("assets.read", move |request, _context, cancellation| {
+        crate::assets::read::asset_read_stream(asset_workspace.clone(), request, cancellation)
+    });
     registry.register_stream("previewAutomation.connect", move |request, cancellation| {
         services.automation_connect(request, cancellation)
     });

@@ -83,7 +83,7 @@ const h = vi.hoisted(() => {
     knownSessions: [] as unknown[],
     runningTerminalIds: [] as string[],
     queryDataByKey: new Map<string, unknown>(),
-    assetUrls: [] as string[],
+    assetUrls: [] as Array<string | null>,
     assetResources: [] as unknown[],
     previewSupported: false,
     previewState: {} as Record<string, unknown>,
@@ -1785,77 +1785,103 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
-  it("promotes blob attachment previews to settled server preview urls", async () => {
-    const images: Array<{ src: string; fire: (type: string) => void }> = [];
-    class FakeImage {
-      src = "";
-      listeners: Array<{ type: string; handler: () => void }> = [];
-      constructor() {
-        images.push({
-          src: "",
-          fire: (type: string) => {
-            for (const listener of this.listeners) {
-              if (listener.type === type) listener.handler();
-            }
-          },
-        });
-        const entry = images[images.length - 1]!;
-        Object.defineProperty(this, "src", {
-          get: () => entry.src,
-          set: (value: string) => {
-            entry.src = value;
-          },
-        });
+  it.each([
+    { serverUrl: "https://server/attachment-1.png", superseded: false },
+    { serverUrl: "blob:cache-lease", superseded: false },
+    { serverUrl: "blob:cache-lease", superseded: true },
+  ])(
+    "promotes $serverUrl without revoking cache leases or newer handoffs ($superseded)",
+    async ({ serverUrl, superseded }) => {
+      const revoked = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+      const images: Array<{ src: string; fire: (type: string) => void }> = [];
+      class FakeImage {
+        src = "";
+        listeners: Array<{ type: string; handler: () => void }> = [];
+        constructor() {
+          images.push({
+            src: "",
+            fire: (type: string) => {
+              for (const listener of this.listeners) {
+                if (listener.type === type) listener.handler();
+              }
+            },
+          });
+          const entry = images[images.length - 1]!;
+          Object.defineProperty(this, "src", {
+            get: () => entry.src,
+            set: (value: string) => {
+              entry.src = value;
+            },
+          });
+        }
+        addEventListener(type: string, handler: () => void) {
+          this.listeners.push({ type, handler });
+        }
       }
-      addEventListener(type: string, handler: () => void) {
-        this.listeners.push({ type, handler });
+      vi.stubGlobal("Image", FakeImage);
+
+      h.assetUrls = [serverUrl];
+      seedConnectedServerThread(
+        makeThread({
+          messages: [
+            {
+              id: MessageId.make("message-1"),
+              role: "user",
+              text: "hello",
+              turnId: null,
+              createdAt: now,
+              updatedAt: now,
+              streaming: false,
+              attachments: [
+                {
+                  type: "image",
+                  id: "attachment-1",
+                  name: "img.png",
+                  mimeType: "image/png",
+                  sizeBytes: 10,
+                },
+              ],
+            },
+          ],
+        }),
+      );
+      seedHostState("attachmentPreviewHandoffByMessageId", {
+        "message-1": ["blob:handoff-1"],
+      });
+
+      renderServerRoute();
+      const cleanups = runEffects();
+
+      expect(images).toHaveLength(1);
+      expect(images[0]!.src).toBe(serverUrl);
+      if (superseded) {
+        const holder = h.refObjects.find(
+          (ref) =>
+            typeof ref.current === "object" &&
+            ref.current !== null &&
+            "message-1" in ref.current &&
+            Array.isArray((ref.current as Record<string, unknown>)["message-1"]),
+        );
+        expect(holder).toBeDefined();
+        (holder!.current as Record<string, unknown>)["message-1"] = ["blob:new-local-handoff"];
       }
-    }
-    vi.stubGlobal("Image", FakeImage);
+      images[0]!.fire("load");
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
 
-    h.assetUrls = ["https://server/attachment-1.png"];
-    seedConnectedServerThread(
-      makeThread({
-        messages: [
-          {
-            id: MessageId.make("message-1"),
-            role: "user",
-            text: "hello",
-            turnId: null,
-            createdAt: now,
-            updatedAt: now,
-            streaming: false,
-            attachments: [
-              {
-                type: "image",
-                id: "attachment-1",
-                name: "img.png",
-                mimeType: "image/png",
-                sizeBytes: 10,
-              },
-            ],
-          },
-        ],
-      }),
-    );
-    seedHostState("attachmentPreviewHandoffByMessageId", {
-      "message-1": ["blob:handoff-1"],
-    });
-
-    renderServerRoute();
-    const cleanups = runEffects();
-
-    expect(images).toHaveLength(1);
-    expect(images[0]!.src).toBe("https://server/attachment-1.png");
-    images[0]!.fire("load");
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-
-    const handoffUpdates = setStateCallsFor("attachmentPreviewHandoffByMessageId");
-    expect(handoffUpdates.length).toBeGreaterThanOrEqual(1);
-    for (const cleanup of cleanups) cleanup();
-  });
+      const handoffUpdates = setStateCallsFor("attachmentPreviewHandoffByMessageId");
+      if (superseded) expect(handoffUpdates).toHaveLength(0);
+      else {
+        expect(handoffUpdates.length).toBeGreaterThanOrEqual(1);
+        expect(revoked).toHaveBeenCalledWith("blob:handoff-1");
+      }
+      expect(revoked).not.toHaveBeenCalledWith(serverUrl);
+      expect(revoked).not.toHaveBeenCalledWith("blob:new-local-handoff");
+      for (const cleanup of cleanups) cleanup();
+      revoked.mockRestore();
+    },
+  );
 
   it("relays preview bus actions to the preview panel toggle", () => {
     seedConnectedServerThread();
@@ -5983,6 +6009,8 @@ describe("ChatView banners and dialogs", () => {
     seedHostState("expandedImage", {
       images: [{ src: "blob:image-1", alt: "img" }],
       index: 0,
+      contextKey: scopedThreadKey(scopeThreadRef(environmentId, threadId)),
+      serverImageUrls: [],
     });
 
     const markup = renderServerRoute();
@@ -5994,6 +6022,25 @@ describe("ChatView banners and dialogs", () => {
     expect(closes).toHaveLength(1);
     expect(closes[0]!.applied).toBeNull();
   });
+  it.each(["other-context", "retired-cache"] as const)(
+    "does not display an expanded image from %s",
+    (retired) => {
+      seedConnectedServerThread();
+      const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+      seedHostState("expandedImage", {
+        images: [{ src: "blob:old-cache", name: "old.png" }],
+        index: 0,
+        contextKey:
+          retired === "other-context"
+            ? scopedThreadKey(scopeThreadRef(EnvironmentId.make("other"), threadId))
+            : scopedThreadKey(scopeThreadRef(environmentId, threadId)),
+        serverImageUrls: retired === "retired-cache" ? ["blob:old-cache"] : [],
+      });
+      expect(renderServerRoute()).not.toContain('data-mock="expanded-image-dialog"');
+      expect(revoke).not.toHaveBeenCalledWith("blob:old-cache");
+      revoke.mockRestore();
+    },
+  );
 
   it("expands timeline images through the timeline callback", () => {
     seedConnectedServerThread();
@@ -6007,6 +6054,73 @@ describe("ChatView banners and dialogs", () => {
 
     const expands = setStateCallsFor("expandedImage");
     expect(expands).toHaveLength(1);
+  });
+
+  it.each([
+    ["retarget", "https://new-host.invalid/api/assets/new-cap/image.png"],
+    ["pin", null],
+  ] as const)(
+    "retires an expanded HTTP server image when its source changes after %s",
+    (_, nextUrl) => {
+      const oldUrl = "https://old-host.invalid/api/assets/old-cap/image.png";
+      seedConnectedServerThread(
+        makeThread({
+          messages: [
+            {
+              id: MessageId.make("gallery-server-message"),
+              role: "user",
+              text: "image",
+              turnId: null,
+              createdAt: now,
+              updatedAt: now,
+              streaming: false,
+              attachments: [
+                {
+                  type: "image",
+                  id: "gallery-server-attachment",
+                  name: "old.png",
+                  mimeType: "image/png",
+                  sizeBytes: 10,
+                },
+              ],
+            },
+          ],
+        }),
+      );
+      const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+      h.assetUrls = [oldUrl];
+      renderServerRoute();
+      (capturedProps("messagesTimeline")["onImageExpand"] as (preview: unknown) => void)({
+        images: [{ src: oldUrl, name: "old.png" }],
+        index: 0,
+      });
+      const selected = setStateCallsFor("expandedImage").at(-1)!.applied;
+      seedHostState("expandedImage", selected);
+      expect(renderServerRoute()).toContain('data-mock="expanded-image-dialog"');
+      h.assetUrls = [nextUrl];
+      expect(renderServerRoute()).not.toContain('data-mock="expanded-image-dialog"');
+      expect(revoke).not.toHaveBeenCalledWith(oldUrl);
+      revoke.mockRestore();
+    },
+  );
+
+  it("keeps a locally owned handoff gallery when unrelated server sources retire", () => {
+    seedConnectedServerThread();
+    const localUrl = "blob:local-gallery-handoff";
+    const oldServerUrl = "https://old-host.invalid/api/assets/old-cap/unrelated.png";
+    seedHostState("attachmentPreviewHandoffByMessageId", { "gallery-local": [localUrl] });
+    h.assetUrls = [oldServerUrl];
+    const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    renderServerRoute();
+    (capturedProps("messagesTimeline")["onImageExpand"] as (preview: unknown) => void)({
+      images: [{ src: localUrl, name: "local.png" }],
+      index: 0,
+    });
+    seedHostState("expandedImage", setStateCallsFor("expandedImage").at(-1)!.applied);
+    h.assetUrls = [null];
+    expect(renderServerRoute()).toContain('data-mock="expanded-image-dialog"');
+    expect(revoke).not.toHaveBeenCalledWith(localUrl);
+    revoke.mockRestore();
   });
 
   it("opens the pull request dialog flow and prepares a draft thread", async () => {

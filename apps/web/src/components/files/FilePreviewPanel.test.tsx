@@ -114,6 +114,10 @@ const testState = vi.hoisted(() => {
     openPreview: vi.fn<(input: unknown) => Promise<unknown>>(),
     createAssetUrl: vi.fn<(input: unknown) => Promise<unknown>>(),
     openFileInPreview: vi.fn<(input: unknown) => Promise<{ _tag: string }>>(),
+    filePreviewAllowed: true,
+    downloadEntry: vi.fn(),
+    downloadDisabledReason: null as string | null,
+    downloadError: null as ((error: unknown, title: string) => void) | null,
     isBrowserPreviewFile: vi.fn<(path: string) => boolean>(),
     isPreviewSupported: false,
     fileQuery: { data: null, error: null, isPending: false, refresh: vi.fn() } as {
@@ -449,6 +453,47 @@ vi.mock("~/state/environments", () => ({
 vi.mock("~/state/preview", () => ({
   previewEnvironment: { open: testState.commands.openPreview },
 }));
+vi.mock("~/browser/useFilePreview", () => ({
+  useFilePreview: (options: { threadRef: unknown }) => ({
+    availability:
+      testState.filePreviewAllowed && testState.environmentHttpBaseUrl !== null
+        ? { enabled: true }
+        : {
+            enabled: false,
+            reason:
+              "Preview isn't available over encrypted connections yet. Download this file to open it.",
+          },
+    openFile: async (filePath: string) => {
+      const result = (await testState.openFileInPreview({
+        threadRef: options.threadRef,
+        filePath,
+      })) as { _tag: string; error?: unknown };
+      if (result._tag === "Failure")
+        testState.toastAdd({
+          stacked: true,
+          type: "error",
+          title: "Unable to open file in browser",
+          description: result.error instanceof Error ? result.error.message : String(result.error),
+        });
+      return result;
+    },
+  }),
+}));
+vi.mock("./useFileDownloads", () => ({
+  useFileDownloads: (options: { showMutationError: (error: unknown, title: string) => void }) => {
+    testState.downloadError = options.showMutationError;
+    return {
+      downloadEntry: testState.downloadEntry,
+      downloadDisabledReason: testState.downloadDisabledReason,
+    };
+  },
+}));
+vi.mock("~/components/ui/button", () => ({
+  Button: ({ children, ...props }: Record<string, unknown> & { children?: React.ReactNode }) => {
+    ui.record("Button", { children, ...props });
+    return <button {...props}>{children}</button>;
+  },
+}));
 
 vi.mock("~/state/projects", () => ({
   projectEnvironment: { writeFile: testState.commands.writeFile },
@@ -651,6 +696,9 @@ beforeEach(() => {
   testState.openPreview.mockReset().mockResolvedValue({ _tag: "Success" });
   testState.createAssetUrl.mockReset().mockResolvedValue({ _tag: "Success" });
   testState.openFileInPreview.mockReset().mockResolvedValue({ _tag: "Success" });
+  testState.filePreviewAllowed = true;
+  testState.downloadEntry.mockReset();
+  testState.downloadDisabledReason = null;
   testState.isBrowserPreviewFile.mockReset().mockReturnValue(false);
   testState.isPreviewSupported = false;
   testState.fileQuery = { data: null, error: null, isPending: true, refresh: vi.fn() };
@@ -994,6 +1042,32 @@ describe("open in preview browser", () => {
     testState.isBrowserPreviewFile.mockReturnValue(true);
     testState.environmentHttpBaseUrl = "http://127.0.0.1:4100";
   });
+  it("explains a pinned HTML preview while preserving text view and an allowed Download", async () => {
+    testState.filePreviewAllowed = false;
+    const markup = renderPanel(browserProps());
+    expect(markup).toContain("available over encrypted connections yet.");
+    const toggle = ui.byLabel("Toggle", "Open file in preview browser");
+    expect(toggle.disabled).toBe(true);
+    expect(toggle["aria-describedby"]).toEqual(expect.any(String));
+    (toggle.onPressedChange as () => void)();
+    await flushPromises();
+    expect(testState.openFileInPreview).not.toHaveBeenCalled();
+    const download = ui.byLabel("Button", "Download file");
+    (download.onClick as () => void)();
+    expect(testState.downloadEntry).toHaveBeenCalledWith("index.html");
+    expect(markup).toContain("data-file-editor-toolbar");
+  });
+  it("redacts a legacy native download capability from toolbar failure copy", () => {
+    renderPanel(browserProps());
+    testState.downloadError!(
+      "Request failed (https://host.invalid/api/transfers/private-cap)",
+      "Download failed",
+    );
+    expect(JSON.stringify(testState.toastAdd.mock.calls)).not.toContain("private-cap");
+    expect(testState.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({ description: expect.stringContaining("[REDACTED]") }),
+    );
+  });
 
   it("opens the file through the preview flow", async () => {
     const markup = renderPanel(browserProps());
@@ -1005,9 +1079,6 @@ describe("open in preview browser", () => {
     expect(testState.openFileInPreview).toHaveBeenCalledWith({
       threadRef,
       filePath: "/workspace/demo/index.html",
-      httpBaseUrl: "http://127.0.0.1:4100",
-      createAssetUrl: testState.createAssetUrl,
-      openPreview: testState.openPreview,
     });
     expect(testState.toastAdd).not.toHaveBeenCalled();
   });
@@ -1036,7 +1107,7 @@ describe("open in preview browser", () => {
       stacked: true,
       type: "error",
       title: "Unable to open file in browser",
-      description: "An error occurred.",
+      description: "nope",
     });
 
     testState.toastAdd.mockReset();

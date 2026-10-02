@@ -1,5 +1,6 @@
 use std::{path::Path, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bibcode_server::{
     ClientMessage, RequestId, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     mcp,
@@ -76,6 +77,199 @@ where
     )
     .await;
     next_server_message(socket).await
+}
+
+async fn collect_download<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    id: &str,
+    payload: Value,
+) -> Vec<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut message = request(socket, id, "projects.readDownload", payload).await;
+    let mut events = Vec::new();
+    loop {
+        match message {
+            ServerMessage::Chunk { request_id, values } => {
+                assert!(!values.is_empty());
+                events.extend(values);
+                send_json(socket, json!({"_tag":"Ack","requestId":request_id})).await;
+            }
+            ServerMessage::Exit {
+                exit: RpcExit::Success { .. },
+                ..
+            } => break,
+            other => panic!("download failed: {other:?}"),
+        }
+        message = next_server_message(socket).await;
+    }
+    events
+}
+
+#[tokio::test]
+async fn download_streams_exact_files_resume_empty_and_archives_over_effect_rpc() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("a"), b"abcdef").unwrap();
+    std::fs::write(temp.path().join("empty"), b"").unwrap();
+    std::fs::create_dir(temp.path().join("src")).unwrap();
+    std::fs::write(temp.path().join("src/a"), b"zipped").unwrap();
+    let mut registry = RpcRegistry::empty();
+    register_workspace_preview_rpc(
+        &mut registry,
+        WorkspacePreviewRpcServices::new(
+            WorkspaceRpc::new(WorkspaceService::default()),
+            PreviewManager::new(),
+            mcp::preview_automation::PreviewAutomationBroker::new(),
+        ),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .unwrap();
+    let values = collect_download(
+        &mut socket,
+        "1",
+        json!({"cwd":temp.path(),"relativePath":"a"}),
+    )
+    .await;
+    assert_eq!(values[0]["sizeBytes"], 6);
+    assert_eq!(
+        STANDARD
+            .decode(values[1]["data"].as_str().unwrap())
+            .unwrap(),
+        b"abcdef"
+    );
+    let resumed = collect_download(
+        &mut socket,
+        "2",
+        json!({"cwd":temp.path(),"relativePath":"a","offset":3,"expect":values[0]["version"]}),
+    )
+    .await;
+    assert_eq!(resumed[1]["offset"], 3);
+    assert_eq!(
+        STANDARD
+            .decode(resumed[1]["data"].as_str().unwrap())
+            .unwrap(),
+        b"def"
+    );
+    assert_eq!(resumed.last().unwrap()["totalBytes"], 6);
+    let empty = collect_download(
+        &mut socket,
+        "3",
+        json!({"cwd":temp.path(),"relativePath":"empty"}),
+    )
+    .await;
+    assert_eq!(empty.len(), 2);
+    assert_eq!(empty[1], json!({"_tag":"end","totalBytes":0}));
+    let values = collect_download(
+        &mut socket,
+        "4",
+        json!({"cwd":temp.path(),"relativePath":"src"}),
+    )
+    .await;
+    assert_eq!(values[0]["kind"], "archive");
+    assert!(values[0]["sizeBytes"].is_null());
+    let bytes: Vec<u8> = values
+        .iter()
+        .filter(|value| value["_tag"] == "bytes")
+        .flat_map(|value| STANDARD.decode(value["data"].as_str().unwrap()).unwrap())
+        .collect();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut content = Vec::new();
+    std::io::Read::read_to_end(&mut zip.by_name("a").unwrap(), &mut content).unwrap();
+    assert_eq!(content, b"zipped");
+    let denied = request(
+        &mut socket,
+        "5",
+        "projects.readDownload",
+        json!({"cwd":temp.path(),"relativePath":"a","offset":1}),
+    )
+    .await;
+    assert!(
+        matches!(denied,ServerMessage::Exit {exit:RpcExit::Failure {cause},..} if serde_json::to_value(&cause).unwrap()[0]["error"]["reason"]=="changed")
+    );
+    // Refused and empty streams leave the same connection available for ordinary calls.
+    assert!(matches!(
+        request(
+            &mut socket,
+            "6",
+            "projects.readFile",
+            json!({"cwd":temp.path(),"relativePath":"a"})
+        )
+        .await,
+        ServerMessage::Exit {
+            exit: RpcExit::Success { .. },
+            ..
+        }
+    ));
+    socket.close(None).await.unwrap();
+    handle.shutdown();
+    handle.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn asset_stream_packs_exact_fallback_over_effect_rpc_without_minting() {
+    let temp = TempDir::new().unwrap();
+    let mut registry = RpcRegistry::empty();
+    let workspace = WorkspaceRpc::with_dependencies(
+        WorkspaceService::default(),
+        bibcode_server::workspace::WorkspaceRpcDependencies {
+            asset_access: Some(bibcode_server::assets::AssetAccess::new(
+                vec![4; 32],
+                temp.path().join("attachments"),
+            )),
+            ..Default::default()
+        },
+    );
+    register_workspace_preview_rpc(
+        &mut registry,
+        WorkspacePreviewRpcServices::new(
+            workspace,
+            PreviewManager::new(),
+            mcp::preview_automation::PreviewAutomationBroker::new(),
+        ),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .unwrap();
+    match request(
+        &mut socket,
+        "1",
+        "assets.read",
+        json!({"resource":{"_tag":"project-favicon","cwd":temp.path()}}),
+    )
+    .await
+    {
+        ServerMessage::Chunk { values, request_id } => {
+            assert_eq!(values.len(), 3);
+            assert_eq!(values[0]["mimeType"], "image/svg+xml");
+            assert_eq!(
+                STANDARD
+                    .decode(values[1]["data"].as_str().unwrap())
+                    .unwrap(),
+                bibcode_server::assets::FALLBACK_FAVICON.as_bytes()
+            );
+            assert_eq!(values[2]["_tag"], "end");
+            send_json(&mut socket, json!({"_tag":"Ack","requestId":request_id})).await;
+        }
+        other => panic!("expected exact asset: {other:?}"),
+    }
+    assert!(matches!(
+        next_server_message(&mut socket).await,
+        ServerMessage::Exit {
+            exit: RpcExit::Success { .. },
+            ..
+        }
+    ));
+    socket.close(None).await.unwrap();
+    handle.shutdown();
+    handle.join().await.unwrap();
 }
 
 #[tokio::test]

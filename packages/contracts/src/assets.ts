@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
-import { ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { UploadData } from "./uploads.ts";
 
 const ASSET_PATH_MAX_LENGTH = 1024;
 
@@ -17,6 +18,23 @@ export const AssetResource = Schema.Union([
   }),
 ]);
 export type AssetResource = typeof AssetResource.Type;
+
+export const AssetReadInput = Schema.Struct({ resource: AssetResource });
+export type AssetReadInput = typeof AssetReadInput.Type;
+export const AssetReadEvent = Schema.Union([
+  Schema.TaggedStruct("start", { mimeType: TrimmedNonEmptyString, sizeBytes: NonNegativeInt }),
+  Schema.TaggedStruct("bytes", { offset: NonNegativeInt, data: UploadData }),
+  Schema.TaggedStruct("end", {}),
+]);
+export type AssetReadEvent = typeof AssetReadEvent.Type;
+export class AssetTooLargeError extends Schema.TaggedError<AssetTooLargeError>()(
+  "AssetTooLargeError",
+  {
+    resource: AssetResource,
+    limitBytes: NonNegativeInt,
+    message: TrimmedNonEmptyString,
+  },
+) {}
 
 export const AssetCreateUrlInput = Schema.Struct({
   resource: AssetResource,

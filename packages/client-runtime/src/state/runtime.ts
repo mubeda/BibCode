@@ -372,7 +372,10 @@ export async function executeAtomQuery<A, E>(
             settle(initial);
           }
           if (!settled) {
-            signal?.addEventListener("abort", abort, { once: true });
+            // Starting the atom can synchronously resume a caller that aborts.
+            // That event occurred before listener publication, so recheck it.
+            if (signal?.aborted) abort();
+            else signal?.addEventListener("abort", abort, { once: true });
           }
         } catch (defect) {
           settled = true;
@@ -383,6 +386,22 @@ export async function executeAtomQuery<A, E>(
   );
   reportAtomCommandResult(result, options, reporter);
   return result;
+}
+
+/** Reactive atom retention must never replay a settled or already entered command. */
+function createCommandInvocationFence() {
+  let active = true;
+  let entered = false;
+  return {
+    enter: () => {
+      if (!active || entered) return false;
+      entered = true;
+      return true;
+    },
+    retire: () => {
+      active = false;
+    },
+  };
 }
 
 export function createRuntimeCommand<R, ER, W, A, E>(
@@ -401,14 +420,16 @@ export function createRuntimeCommand<R, ER, W, A, E>(
     run: (registry, input, runOptions) =>
       settleAtomCommandResult(() =>
         scheduler.schedule(registry, concurrency, input, () => {
+          const invocation = createCommandInvocationFence();
+          const effect = options.execute(input, registry);
           const atom = runtime
-            .atom(options.execute(input, registry))
+            .atom(Effect.suspend(() => (invocation.enter() ? effect : Effect.interrupt)))
             .pipe(Atom.withLabel(options.label));
           return executeAtomQuery(registry, atom, {
             reportDefect: false,
             reportFailure: false,
             signal: runOptions?.signal,
-          });
+          }).finally(invocation.retire);
         }),
       ),
   };
@@ -430,14 +451,20 @@ export function createRuntimeStreamCommand<R, ER, W, A, E>(
     run: (registry, input, runOptions) =>
       settleAtomCommandResult(() =>
         scheduler.schedule(registry, concurrency, input, () => {
+          const invocation = createCommandInvocationFence();
+          const stream = options.execute(input, registry);
           const atom = runtime
-            .atom(options.execute(input, registry))
+            .atom(
+              Stream.suspend(() =>
+                invocation.enter() ? stream : Stream.fromEffect(Effect.interrupt),
+              ),
+            )
             .pipe(Atom.withLabel(options.label));
           return executeAtomQuery(registry, atom, {
             reportDefect: false,
             reportFailure: false,
             signal: runOptions?.signal,
-          });
+          }).finally(invocation.retire);
         }),
       ),
   };

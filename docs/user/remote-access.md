@@ -5,6 +5,21 @@ host-sharing controls under **Settings → Remote Servers**. Windows also keeps
 **Settings → Local environment** for WSL. Browser/hosted clients can connect to a
 reachable server but cannot perform desktop-owned listener, firewall, or SSH operations.
 
+Files downloads keep the server selected when the action starts, including
+while the desktop destination picker is open. Retargeting, removing and
+re-adding that server, or changing its encryption trust makes the earlier
+intent unavailable; choose the file again. A reconnect to the same server and
+workspace store can continue it. Encrypted downloads require the server's
+complete encrypted-transfer support and the desktop app's streaming save
+support; an unavailable menu explains which update is needed. They never use a
+legacy HTTP download as a fallback. Encrypted workspace uploads remain
+unavailable until their support is complete. See [Files](./workspace-ui.md) for
+Save, dismiss, Cancel and browser limits. File-derived HTML/PDF Preview
+is unavailable over encrypted connections, with an explained Download action;
+text editing remains available. Explicit typed URL and dev-server navigation
+are separate browser actions. Images use encrypted asset reads when supported
+and keep their name/icon fallback when unavailable.
+
 Each saved server's row in that list shows its connection state. While a server
 sends its settings slowly, the row reads "Receiving settings from <name> over a
 slow connection…" until it connects.

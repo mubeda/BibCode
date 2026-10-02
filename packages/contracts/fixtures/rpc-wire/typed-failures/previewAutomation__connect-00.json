@@ -1,0 +1,50 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "PreviewAutomationResultTooLargeError",
+          "operation": "waitFor",
+          "environmentId": "__proto__",
+          "threadId": "w/A2Yc&8F",
+          "providerSessionId": "\"",
+          "providerInstanceId": "k-j_-",
+          "clientId": "to",
+          "connectionId": "Tr.?xTT\\",
+          "requestId": "j0l",
+          "tabId": "`I.)R\\",
+          "timeoutMs": 2147483624,
+          "remoteTag": "|Dn&uF-",
+          "remoteMessageLength": 10,
+          "remoteDetailKind": "boolean",
+          "cause": [
+            -4861102363126491,
+            "M#\"\"R$|z",
+            {
+              "yxy\\yr#A X": "name__defi",
+              "q": 8387772751386469,
+              "\\": true,
+              "7a": -22,
+              "$#hasOwnPr": -9007199254740957,
+              "": [
+                -1.0526869795657889e-49,
+                -1.657214162943871e157,
+                6.772154168116639e-79,
+                2.8809332199666073e201,
+                true,
+                -4.256760208334158e-97,
+                4.2583891918793066e-213,
+                false
+              ]
+            },
+            false
+          ]
+        }
+      }
+    ]
+  }
+}

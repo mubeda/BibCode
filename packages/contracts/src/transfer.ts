@@ -1,7 +1,39 @@
 import * as Schema from "effect/Schema";
 
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { PROJECT_ENTRY_PATH_MAX_LENGTH } from "./project.ts";
+import { UploadData } from "./uploads.ts";
+
+export const ProjectFileVersion = Schema.Struct({
+  sizeBytes: NonNegativeInt,
+  modifiedAtNs: Schema.String.check(Schema.isPattern(/^-?[0-9]+$/)),
+});
+export type ProjectFileVersion = typeof ProjectFileVersion.Type;
+export const ProjectReadDownloadInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+  relativePath: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_ENTRY_PATH_MAX_LENGTH)),
+  offset: Schema.optional(NonNegativeInt),
+  expect: Schema.optional(ProjectFileVersion),
+});
+export type ProjectReadDownloadInput = typeof ProjectReadDownloadInput.Type;
+export const ProjectDownloadEvent = Schema.Union([
+  Schema.TaggedStruct("start", {
+    fileName: TrimmedNonEmptyString,
+    kind: Schema.Literals(["file", "archive"]),
+    sizeBytes: Schema.NullOr(NonNegativeInt),
+    version: Schema.NullOr(ProjectFileVersion),
+  }),
+  Schema.TaggedStruct("bytes", { offset: NonNegativeInt, data: UploadData }),
+  Schema.TaggedStruct("end", { totalBytes: NonNegativeInt }),
+]);
+export type ProjectDownloadEvent = typeof ProjectDownloadEvent.Type;
+export class ProjectDownloadError extends Schema.TaggedError<ProjectDownloadError>()(
+  "ProjectDownloadError",
+  {
+    reason: Schema.Literals(["changed", "capacity", "not_resumable"]),
+    message: TrimmedNonEmptyString,
+  },
+) {}
 
 export const ProjectCreateDownloadUrlInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,

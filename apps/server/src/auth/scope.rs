@@ -20,6 +20,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
     }
     match method {
         "assets.createUrl"
+        | "assets.read"
         | "filesystem.browse"
         | "gitManager.getCommits"
         | "gitManager.getDiff"
@@ -44,6 +45,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "orchestration.subscribeThread"
         | "preview.list"
         | "projects.createDownloadUrl"
+        | "projects.readDownload"
         | "projects.listEntries"
         | "projects.readFile"
         | "projects.searchEntries"

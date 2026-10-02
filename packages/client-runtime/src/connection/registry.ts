@@ -72,6 +72,10 @@ export class EnvironmentRegistry extends Context.Service<
       ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>
     >;
     readonly networkStatus: SubscriptionRef.SubscriptionRef<NetworkStatus>;
+    /** Opaque, client-local registration lifetime; lookup never creates a runtime. */
+    readonly registrationLifetime: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<object, EnvironmentNotRegisteredError>;
     readonly start: Effect.Effect<void>;
     readonly register: (
       registration: ConnectionRegistration,
@@ -195,6 +199,22 @@ export const make = Effect.gen(function* () {
   );
   const entries =
     yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>>(initialEntries);
+  const registrationLifetimes = new Map<EnvironmentId, object>(
+    [...initialEntries.keys()].map((environmentId) => [environmentId, Object.freeze({})]),
+  );
+  const registrationLifetime = Effect.fn("EnvironmentRegistry.registrationLifetime")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    // Publication and token mutation are one synchronous step under the existing
+    // lease owner. A reader must not acquire that lease: removal calls owned
+    // cleanup while holding it, and cleanup may need to validate a captured token.
+    return yield* Effect.suspend(() => {
+      const token = registrationLifetimes.get(environmentId);
+      return token === undefined || !SubscriptionRef.getUnsafe(entries).has(environmentId)
+        ? Effect.fail(new EnvironmentNotRegisteredError({ environmentId }))
+        : Effect.succeed(token);
+    });
+  });
   // One token per environment, replaced whenever the registry installs a new
   // runtime for it and removed with the environment. Followed streams re-bind
   // on token changes rather than on entry changes, so a rename (which
@@ -276,9 +296,12 @@ export const make = Effect.gen(function* () {
   const relabelEntryLocked = Effect.fn("EnvironmentRegistry.relabelEntryLocked")(function* (
     entry: ConnectionCatalogEntry,
   ) {
-    yield* SubscriptionRef.update(entries, (current) =>
-      new Map(current).set(entry.target.environmentId, entry),
-    );
+    yield* SubscriptionRef.update(entries, (current) => {
+      if (!registrationLifetimes.has(entry.target.environmentId)) {
+        registrationLifetimes.set(entry.target.environmentId, Object.freeze({}));
+      }
+      return new Map(current).set(entry.target.environmentId, entry);
+    });
   });
 
   const publishInstallationLocked = Effect.fn("EnvironmentRegistry.publishInstallationLocked")(
@@ -295,6 +318,7 @@ export const make = Effect.gen(function* () {
     environmentId: EnvironmentId,
   ) {
     yield* SubscriptionRef.update(entries, (current) => {
+      registrationLifetimes.delete(environmentId);
       const next = new Map(current);
       next.delete(environmentId);
       return next;
@@ -1021,6 +1045,7 @@ export const make = Effect.gen(function* () {
 
   return EnvironmentRegistry.of({
     entries,
+    registrationLifetime,
     networkStatus,
     start,
     register,

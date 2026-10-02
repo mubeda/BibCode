@@ -21,6 +21,50 @@ const BASE: BuildFileTreeMenuModelInput = {
   hasWorkspaceRoot: true,
 };
 
+describe("transfer availability reasons", () => {
+  it("keeps an applicable browser preview visible with its supplied disabled reason", () => {
+    const reason =
+      "Preview isn't available over encrypted connections yet. Download this file to open it.";
+    expect(
+      find({ ...BASE, isPreviewable: true, previewDisabledReason: reason }, "open-preview"),
+    ).toMatchObject({ enabled: false, disabledReason: reason });
+    expect(
+      find({ ...BASE, isPreviewable: false, previewDisabledReason: reason }, "open-preview"),
+    ).toBeUndefined();
+  });
+  it.each(["file", "directory"] as const)(
+    "explains refused %s downloads without disabling other actions",
+    (entryKind) => {
+      const input = {
+        ...BASE,
+        entryKind,
+        downloadDisabledReason: "Update Studio to transfer files over its encrypted connection",
+      };
+      expect(find(input, "download")).toMatchObject({
+        enabled: false,
+        disabledReason: input.downloadDisabledReason,
+      });
+      expect(find(input, "rename")?.enabled).toBe(true);
+      expect(find(input, "copy-relative-path")?.enabled).toBe(true);
+    },
+  );
+  it.each(["directory", "background"] as const)(
+    "gates legacy pinned uploads on %s with the supplied reason only",
+    (entryKind) => {
+      const input = {
+        ...BASE,
+        entryKind,
+        uploadDisabledReason: "Update Studio to transfer files over its encrypted connection",
+      };
+      expect(find(input, "upload")).toMatchObject({
+        enabled: false,
+        disabledReason: input.uploadDisabledReason,
+      });
+      expect(find(input, "new-file")?.enabled).toBe(true);
+    },
+  );
+});
+
 function flatten(input: BuildFileTreeMenuModelInput): FileTreeMenuItem[] {
   return buildFileTreeMenuModel(input).groups.flat();
 }

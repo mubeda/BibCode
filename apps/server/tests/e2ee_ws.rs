@@ -1499,3 +1499,131 @@ async fn authenticated_staged_upload_ownership_survives_reconnect_and_refuses_fo
     handle.shutdown();
     handle.join().await.unwrap();
 }
+
+#[tokio::test]
+async fn authenticated_download_slots_span_sockets_and_release_on_interrupt() {
+    let _permit = TEST_PERMIT.acquire().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let bytes = vec![73_u8; 2 * 1024 * 1024];
+    std::fs::write(temp.path().join("download.bin"), &bytes).unwrap();
+    let handle = start_server(&temp).await;
+    let client = Client::new();
+    let admin = exchange_plain_token(
+        &client,
+        &handle,
+        &handle.startup_access().unwrap().credential,
+    )
+    .await;
+    let mut credentials = Vec::new();
+    for label in ["download owner", "other reader"] {
+        let response = client
+            .post(http_url(&handle, "/api/auth/pairing-token"))
+            .bearer_auth(&admin)
+            .json(&json!({"label":label}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let grant = response.json::<Value>().await.unwrap()["credential"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        credentials.push(mint_e2ee_credential(&handle, temp.path(), &grant).await);
+    }
+    let host_key = read_host_public_key(temp.path());
+    let (mut owner, mut owner_transport, _) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
+    for id in ["10", "11", "12", "13"] {
+        send_encrypted(&mut owner,&mut owner_transport,json!({"_tag":"Request","id":id,"tag":"projects.readDownload","payload":{"cwd":temp.path(),"relativePath":"download.bin"},"headers":[]}).to_string().as_bytes()).await;
+        let start = recv_encrypted_json(&mut owner, &mut owner_transport).await;
+        assert_eq!(start["requestId"], id);
+        assert_eq!(start["_tag"], "Chunk");
+        assert_eq!(start["values"][0]["_tag"], "start");
+        // Leave each stream unacknowledged, with its reader blocked on the bounded queue.
+    }
+    let (mut sibling, mut sibling_transport, _) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
+    let refused = upload_rpc(
+        &mut sibling,
+        &mut sibling_transport,
+        "20",
+        "projects.readDownload",
+        json!({"cwd":temp.path(),"relativePath":"download.bin"}),
+    )
+    .await;
+    assert_eq!(
+        refused["exit"]["cause"][0]["error"]["_tag"],
+        "ProjectDownloadError"
+    );
+    assert_eq!(refused["exit"]["cause"][0]["error"]["reason"], "capacity");
+    let (mut other, mut other_transport, _) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[1]).await;
+    send_encrypted(&mut other,&mut other_transport,json!({"_tag":"Request","id":"30","tag":"projects.readDownload","payload":{"cwd":temp.path(),"relativePath":"download.bin"},"headers":[]}).to_string().as_bytes()).await;
+    let allowed = recv_encrypted_json(&mut other, &mut other_transport).await;
+    assert_eq!(allowed["_tag"], "Chunk");
+    assert_eq!(allowed["values"][0]["sizeBytes"], bytes.len());
+    send_encrypted(
+        &mut owner,
+        &mut owner_transport,
+        br#"{"_tag":"Interrupt","requestId":"10"}"#,
+    )
+    .await;
+    let interrupted = recv_encrypted_json(&mut owner, &mut owner_transport).await;
+    assert_eq!(interrupted["requestId"], "10");
+    assert_eq!(interrupted["_tag"], "Exit");
+    // Producer cleanup is async. Refusal may win before the old permit releases; retry boundedly.
+    let mut started = None;
+    for attempt in 0..100 {
+        let id = (100 + attempt).to_string();
+        send_encrypted(&mut sibling,&mut sibling_transport,json!({"_tag":"Request","id":id,"tag":"projects.readDownload","payload":{"cwd":temp.path(),"relativePath":"download.bin"},"headers":[]}).to_string().as_bytes()).await;
+        let response = recv_encrypted_json(&mut sibling, &mut sibling_transport).await;
+        if response["_tag"] == "Chunk" {
+            started = Some((id, response));
+            break;
+        }
+        assert_eq!(response["exit"]["cause"][0]["error"]["reason"], "capacity");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (id, mut chunk) = started.expect("interrupted owner slot releases");
+    let mut actual = Vec::new();
+    let mut ended = false;
+    loop {
+        if chunk["_tag"] == "Exit" {
+            assert_eq!(chunk["exit"]["_tag"], "Success");
+            break;
+        }
+        assert_eq!(chunk["_tag"], "Chunk");
+        for event in chunk["values"].as_array().unwrap() {
+            match event["_tag"].as_str().unwrap() {
+                "start" => assert_eq!(event["sizeBytes"], bytes.len()),
+                "bytes" => {
+                    assert_eq!(event["offset"], actual.len());
+                    actual.extend(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(event["data"].as_str().unwrap())
+                            .unwrap(),
+                    );
+                }
+                "end" => {
+                    assert_eq!(event["totalBytes"], bytes.len());
+                    ended = true;
+                }
+                other => panic!("unexpected event {other}"),
+            }
+        }
+        send_encrypted(
+            &mut sibling,
+            &mut sibling_transport,
+            json!({"_tag":"Ack","requestId":id}).to_string().as_bytes(),
+        )
+        .await;
+        chunk = recv_encrypted_json(&mut sibling, &mut sibling_transport).await;
+    }
+    assert!(ended);
+    assert_eq!(actual, bytes);
+    owner.close(None).await.unwrap();
+    sibling.close(None).await.unwrap();
+    other.close(None).await.unwrap();
+    handle.shutdown();
+    handle.join().await.unwrap();
+}

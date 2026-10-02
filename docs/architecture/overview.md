@@ -41,6 +41,24 @@ flowchart TB
   `window.desktopBridge` only when Tauri globals are present. Tauri commands and
   events implement privileged operations; browser fallbacks are limited to
   explicitly safe capabilities.
+  Hosts advertising `streamingDownloads` install all four optional disk-sink
+  methods together: begin, append, finish and abort. Append forwards a raw IPC
+  body and `x-bibcode-download-handle` header unchanged through each invoke route;
+  byte arrays never become JSON. The Tauri sink accepts only the main webview,
+  including when a Preview child is present. Native handles belong to its main
+  page generation. Writes of at most 1 MiB serialize per handle and acknowledge
+  completed disk I/O; dropped command waiters leave that work tracked. Finish
+  closes the partial before reserving a collision-free final name and renaming.
+  Both native download paths retain the created destination's path and open
+  file before any fallible identity probe; streamed cleanup keeps that owner
+  available for retry if rollback fails. Idle expiry rechecks activity while
+  holding the append I/O guard, so a delayed sweep cannot discard an acknowledged
+  refresh.
+  Abort, ten-minute idle expiry, main-page navigation and host shutdown join
+  started I/O before removing an identity-checked owned partial. A final publish
+  already admitted before cancellation finishes under its tracked owner; delayed
+  cleanup never deletes the published final. The server transfer capability is
+  separate from this receiving-host disk capability.
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
   orchestration, providers, terminals, Git, files, diagnostics, relay access,

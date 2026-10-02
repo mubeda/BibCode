@@ -33,7 +33,9 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   EnvironmentRpcRequestObserver,
   request,
+  requestInSession,
   runStream,
+  runStreamInSession,
   subscribe,
   subscribeInSession,
 } from "./client.ts";
@@ -89,6 +91,133 @@ const makeHarness = Effect.fn("TestEnvironmentRpc.makeHarness")(function* () {
 });
 
 describe("environment RPC", () => {
+  it.effect("preserves the original unary call arity when no options are supplied", () =>
+    Effect.gen(function* () {
+      const calls: unknown[][] = [];
+      const client = {
+        [WS_METHODS.projectsCreateDownloadUrl]: (...args: unknown[]) => {
+          calls.push(args);
+          return Effect.succeed({
+            relativeUrl: "/api/transfers/fixture/a",
+            fileName: "a",
+            kind: "file",
+            expiresAt: 1,
+          });
+        },
+      } as unknown as WsRpcProtocolClient;
+      const input = { cwd: "/repo", relativePath: "a" };
+      yield* requestInSession(
+        session(client),
+        TARGET.environmentId,
+        WS_METHODS.projectsCreateDownloadUrl,
+        input,
+      );
+      expect(calls).toEqual([[input]]);
+    }),
+  );
+
+  it.effect("forwards bounded finite-stream options on the exact carrying session", () =>
+    Effect.gen(function* () {
+      const observed: unknown[] = [];
+      const client = {
+        [WS_METHODS.projectsReadDownload]: (input: unknown, options: unknown) => {
+          observed.push({ input, options });
+          return Stream.make({ _tag: "end" as const, totalBytes: 0 });
+        },
+        [WS_METHODS.assetsRead]: (input: unknown, options: unknown) => {
+          observed.push({ input, options });
+          return Stream.make({ _tag: "end" as const });
+        },
+      } as unknown as WsRpcProtocolClient;
+      const carrying = session(client);
+      const options = { streamBufferSize: 2 };
+      expect(
+        yield* runStreamInSession(
+          carrying,
+          TARGET.environmentId,
+          WS_METHODS.projectsReadDownload,
+          { cwd: "/repo", relativePath: "a" },
+          options,
+        ).pipe(Stream.runCollect),
+      ).toEqual([{ _tag: "end", totalBytes: 0 }]);
+      expect(
+        yield* runStreamInSession(
+          carrying,
+          TARGET.environmentId,
+          WS_METHODS.assetsRead,
+          { resource: { _tag: "attachment", attachmentId: "a" } },
+          options,
+        ).pipe(Stream.runCollect),
+      ).toEqual([{ _tag: "end" }]);
+      const { activeSession, supervisor } = yield* makeHarness();
+      yield* SubscriptionRef.set(activeSession, Option.some(carrying));
+      yield* runStream(
+        WS_METHODS.assetsRead,
+        { resource: { _tag: "attachment", attachmentId: "b" } },
+        options,
+      ).pipe(
+        Stream.runDrain,
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+      );
+      expect(observed).toEqual([
+        { input: { cwd: "/repo", relativePath: "a" }, options: { streamBufferSize: 2 } },
+        {
+          input: { resource: { _tag: "attachment", attachmentId: "a" } },
+          options: { streamBufferSize: 2 },
+        },
+        {
+          input: { resource: { _tag: "attachment", attachmentId: "b" } },
+          options: { streamBufferSize: 2 },
+        },
+      ]);
+    }),
+  );
+
+  it.effect("keeps call options distinct from durable subscription retry policy", () =>
+    Effect.gen(function* () {
+      const calls: unknown[][] = [];
+      const client = {
+        [WS_METHODS.cloudGetRelayClientStatus]: (...args: unknown[]) => {
+          calls.push(args);
+          return Effect.succeed({ status: "available", version: "test" });
+        },
+        [WS_METHODS.subscribeTerminalEvents]: (...args: unknown[]) => {
+          calls.push(args);
+          return Stream.empty;
+        },
+        [WS_METHODS.subscribeServerConfig]: (...args: unknown[]) => {
+          calls.push(args);
+          return Stream.empty;
+        },
+      } as unknown as WsRpcProtocolClient;
+      const carrying = session(client);
+      const unaryOptions = { headers: { "x-test": "bounded" } };
+      yield* requestInSession(
+        carrying,
+        TARGET.environmentId,
+        WS_METHODS.cloudGetRelayClientStatus,
+        {},
+        unaryOptions,
+      );
+      yield* subscribeInSession(
+        carrying,
+        TARGET.environmentId,
+        WS_METHODS.subscribeTerminalEvents,
+        {},
+        { retryExpectedFailureAfter: "1 second" },
+        { streamBufferSize: 2 },
+      ).pipe(Stream.runDrain);
+      yield* subscribeInSession(
+        carrying,
+        TARGET.environmentId,
+        WS_METHODS.subscribeServerConfig,
+        {},
+        undefined,
+        { streamBufferSize: 2 },
+      ).pipe(Stream.runDrain);
+      expect(calls).toEqual([[{}, unaryOptions], [{}, { streamBufferSize: 2 }], [{}]]);
+    }),
+  );
   it.effect("observes unary requests until they complete", () =>
     Effect.gen(function* () {
       const observations: string[] = [];

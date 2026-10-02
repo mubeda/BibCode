@@ -1,0 +1,41 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "GitCommandError",
+          "operation": "\"+ok|",
+          "command": "]$",
+          "cwd": "f",
+          "exitCode": -2.153245913474673e-30,
+          "stderrLength": -1.2176812472565406e32,
+          "detail": "ls#",
+          "cause": {
+            "[}^7DT}kO": "wrbp",
+            "{lN": 29.539115191124374,
+            "a5:LO": -2.040249256405309e-284,
+            "zgsE($V-": 1026098847542277,
+            "": "~N",
+            "+": [
+              -534965105674244,
+              true,
+              false,
+              -3256337961666042,
+              null,
+              false,
+              8.115375746330074e-98,
+              null,
+              "C{)+{v\\U1<",
+              -6431171676907862
+            ],
+            "j6w?": false
+          }
+        }
+      }
+    ]
+  }
+}

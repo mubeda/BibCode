@@ -58,6 +58,18 @@ async function render(withClassName = true): Promise<void> {
 }
 
 describe("ProjectFavicon", () => {
+  it("does not reuse a historical borrowed Blob load after unmount", async () => {
+    harness.src = "blob:borrowed-cache-epoch";
+    await render();
+    await act(async () => container.querySelector("img")!.dispatchEvent(new Event("load")));
+    expect(container.querySelector("svg")).toBeNull();
+    harness.src = null;
+    await render();
+    harness.src = "blob:borrowed-cache-epoch";
+    await render();
+    expect(container.querySelector("img")?.className).toContain("hidden");
+    expect(container.querySelector("svg")).not.toBeNull();
+  });
   it("renders a folder when no asset URL exists", async () => {
     await render(false);
     expect(container.querySelector("svg")?.getAttribute("class")).not.toContain("undefined");

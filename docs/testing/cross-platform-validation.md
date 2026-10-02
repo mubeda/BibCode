@@ -791,24 +791,53 @@ the only uninterruptible segment.
 
 ### Direct E2EE interop gate
 
-When direct pairing, host identity, `/ws-e2ee`, Noise framing, or client E2EE
-session preparation changes, build the current Rust server and run the opt-in
-TypeScript-to-Rust interop suite:
+When direct pairing, host identity, `/ws-e2ee`, Noise framing, client E2EE
+session preparation, or finite in-channel file/asset reads change, build the
+current guarded Rust server and run the opt-in TypeScript-to-Rust suite. Copy
+the binary before another build can replace it, and retain its SHA and source
+provenance with the report. The following POSIX-shell recipe uses only an owned
+temporary directory; use the matching `.exe` path for a Windows build:
 
 ```sh
-cargo build -p bibcode-server
+cargo build -p bibcode-server --features hermetic-test-guard --bin bibcode -j 2
+bibcode_e2ee_fixture="$(mktemp -d "${TMPDIR:-/tmp}/bibcode-e2ee-qualified.XXXXXX")"
+cp target/debug/bibcode "$bibcode_e2ee_fixture/bibcode"
 cd packages/client-runtime
-BIBCODE_E2EE_SERVER_BIN="$(git rev-parse --show-toplevel)/target/debug/bibcode" vp test run src/e2ee/serverInterop.test.ts
+BIBCODE_E2EE_SERVER_BIN="$bibcode_e2ee_fixture/bibcode" \
+  BIBCODE_E2EE_REPORT_PATH="$bibcode_e2ee_fixture/lifecycle.jsonl" \
+  vp test run src/e2ee/testSupport.test.ts src/e2ee/serverInterop.test.ts
 cd ../..
 ```
+
+The harness rejects an executable without the hermetic guard, copies it into a
+private per-run fixture, clears ambient provider credentials, and pins HOME,
+provider configuration and disabled provider executable paths inside that
+fixture. Provider update/activity checks stay off. It starts only an owned
+loopback server on an allocated port and rejects the normal application port.
+Readiness, HTTP bootstrap, socket opening, frames and shutdown have bounded
+waits. Cleanup closes owned sockets, sends TERM, escalates to KILL if necessary,
+and joins the process before deleting its fixture. A process that cannot be
+joined leaves the fixture for investigation and fails the run. The optional
+lifecycle report contains only PID, endpoint, fixture and exit/guard status;
+never retain pairing codes, bootstrap/bearer credentials or private host keys.
+After archiving the binary hash, provenance, redacted lifecycle report and test
+log, remove only the temporary qualified-binary directory created above.
 
 The suite must mint through the real pairing endpoint, pin the persisted host
 key, authenticate the pending bootstrap channel, call `server.getConfig`, prove
 the delivered bearer cannot reconnect before confirmation, confirm through
 `auth.confirmPairing`, then reconnect with the active in-channel credential. It
-must also reassemble a fragmented request and reject a bad pairing token.
-Without `BIBCODE_E2EE_SERVER_BIN`, the same file intentionally reports skipped
-so ordinary `vp test` does not depend on a prebuilt binary.
+also checks ordered terminal input ownership, fragmented requests, bad pairing
+refusal, exact full/resumed/empty file bytes, valid ZIP contents, and exact SVG
+bytes/MIME. Every finite response is acknowledged and requires successful
+terminal Exit after end. These raw method checks are valid while the production
+`inChannelTransfers` capability remains false: the suite verifies the actual
+configuration and separately proves the pinned client operation refuses before
+read or HTTP mint. Do not spoof capability true or describe raw method success
+as complete user-facing transfer availability. Full UI, browser/native sinks
+and zero-cleartext/positive-control network canaries remain separate gates.
+Without `BIBCODE_E2EE_SERVER_BIN`, live cases intentionally skip while hermetic
+fixture/socket tests still run, so ordinary `vp test` needs no prebuilt binary.
 
 ### Cross-container remote-server gate
 
@@ -1361,6 +1390,158 @@ ends the clone. Record which method was used.
 
 Record each duration and the exact messages. SSH remotes have no stall guard;
 record SSH coverage separately if tested.
+
+## In-channel file and asset reader protocol checks
+
+For changes to `projects.readDownload`, `assets.read`, their shared filesystem
+checks, or read-task ownership, run the server and wire boundaries before UI
+qualification:
+
+```sh
+cargo test -p bibcode-server --lib transfer::download -j 2
+cargo test -p bibcode-server --lib assets -j 2
+cargo test -p bibcode-server --test production_workspace_preview_rpc --test workspace_rpc --test production_http_routes --test e2ee_ws --test rpc_wire -j 2
+vp test run packages/contracts/src/transfer.test.ts packages/contracts/src/assets.test.ts packages/contracts/src/rpcRustParity.test.ts packages/contracts/scripts/export-rust-rpc-fixtures.test.ts
+cargo test -p bibcode-server --test rpc_liveness -j 2 -- --nocapture
+```
+
+Require exact bytes and contiguous offsets, file-version resume and mutation
+refusal, explicit end plus successful Exit, empty/small Chunk packing, archive
+writer failure, and unchanged signed HTTP behavior. Authenticated sockets for
+one session share four download slots; another principal has its own quota.
+Interrupt and receiver disposal retain capacity until actual preparation and
+pending file I/O settle. Deterministic gated scan/read tests also prove shutdown
+fences new read admission and joins cleanup. Do not describe interruption as
+canceling an OS syscall. The real emitted asset truncation failure must match
+the shared wire vector that TypeScript decodes, including schema-required causes.
+
+Run timing trials after cold builds finish. Record the real encrypted download's
+rate, exact bytes, Ack/end/Exit evidence, elapsed time, mid-transfer Pong, and
+absence of client 4408 or server reap. Protocol evidence alone does not prove
+Files UI, cache, disk-sink, or capture behavior. Keep `inChannelTransfers`
+unadvertised until workspace commit and both reader families are available.
+
+## Desktop streamed disk sink checks
+
+For changes to native disk handles or raw IPC routing, run the focused host and
+adapter boundaries before qualifying the Files UI:
+
+```sh
+cargo test -p bibcode-desktop --lib streamed_download -j 2
+cargo test -p bibcode-desktop --lib download_commands_work_with_a_preview_child_open -j 2
+cd apps/web
+vp test run --project unit src/tauriDesktopBridge.test.ts src/tauriInvokeRouting.test.ts
+cd ../..
+```
+
+Require raw body/header identity through imported, global and test invoke routes,
+missing/JSON/oversized payload rejection, and all four optional methods only
+when `streamingDownloads` is advertised. The Tauri test must use the main
+webview while a Preview child exists and refuse a child caller. Temp-directory
+tests verify exact byte order, collision-safe publication, idempotent abort,
+page-generation fencing, ten-minute idle expiry, partial identity recovery and
+refusal to delete a replacement, plus shutdown admission fencing and joined
+real disk I/O after a caller leaves. Gate the first idle cleanup while a later
+candidate acknowledges append; the refreshed candidate must survive that sweep.
+Inject a probe failure after actual destination reservation, require cleanup or
+retained ownership for retry, and verify existing user files remain unchanged.
+Both download consumers use the shared owned reservation for publish/rollback.
+Do not describe cancellation as stopping
+an OS syscall. Run the broader desktop library, adapter package and static gates
+for changes crossing these boundaries.
+
+Native qualification remains separate: after the Files flow uses this sink,
+save a large file with Preview open, inspect exact final bytes and collision
+behavior, cancel mid-transfer, reload with an active partial, and close the host
+while writing. Record partial cleanup and final-file preservation on each target
+OS. Mock IPC and temp-directory tests do not constitute that packaged UI result.
+
+## Files download presentation and admission checks
+
+For Files routing, sinks, menus or root progress/Save/Cancel changes, run the
+closest browser/desktop consumer tests with the reviewed client owner:
+
+```sh
+cd packages/client-runtime
+vp test run src/operations/fileDownloadAdmission.test.ts src/operations/fileTransfers.test.ts src/state/fileTransfers.test.ts src/state/runtime.test.ts
+cd ../../apps/web
+vp test run --project unit src/components/files/useFileDownloads.test.tsx src/components/files/useFileTransfers.test.tsx src/components/files/FileTransferToasts.test.tsx src/components/files/fileTransferToastController.test.ts src/components/files/transferPresentation.test.ts src/components/files/downloadSinks.test.ts src/components/files/fileTransfers.test.ts src/components/files/FileBrowserPanel.test.tsx src/components/files/FileTreeContextMenu.logic.test.ts src/components/files/FileTreeContextMenu.test.tsx src/components/ui/toast.test.tsx src/routes/__root.test.tsx
+cd ../..
+vp check
+vp run typecheck
+```
+
+Require original intent before the destination picker, carrying-session fresh
+HTTP URL/base after it, and no mint/read/native begin for invalidated admission.
+An identical-ID re-add must invalidate the old intent without an old catalog
+notification retiring a genuinely fresh one. Test other environments separately.
+Check known and cumulative browser payload limits without allocating 2 GiB in a
+unit test, byte ownership, archive reset, raw write acknowledgement and final
+publication. Browser ready bytes remain busy until Save or discard; Save starts
+only from the action and a failed Save retains a retryable result. Root
+observers follow the operation map through panel/catalog changes. Verify
+rounded progress updates, stale callbacks, visible disabled explanations,
+preparing Cancel, joined cancellation, noncancellable finish, and all close
+paths. Hold a real legacy native HTTP promise: removal, retargeting, external
+Cancel and observer disposal must not release its claim before that promise
+settles. No Cancel is offered for that admitted legacy save. Any missing raw
+sink method disables pinned native save with the app-update reason, with no
+HTTP fallback. Pinned legacy upload entrypoints remain denied.
+
+After the complete server capability exists, run packaged positive/canary
+qualification on each native OS, with a disposable matching server and owned
+state/providers. Check exact saved bytes/collision, a large raw download with
+Preview open, active Cancel, reload/host-close cleanup, independent environments,
+panel navigation, ready Save/dismiss and actionable unavailable copy. Exercise
+Tab/Enter and Tab/Space on separate real Save/Cancel operations and retain
+light/dark screenshots. Browser memory and the 2 GiB boundary are separate live
+evidence. Keep old-client/old-server canary positive controls separate from
+new-client/old-server refusal, and require zero content HTTP traffic for pinned
+in-channel runs. Unit/DOM fixtures are not native, memory, capture or canary
+proof. Keep the production capability unadvertised until workspace commits and
+both readers are complete; record unrun live cases explicitly.
+
+## Asset leases and file Preview presentation checks
+
+For resolved asset consumers and imperative file-preview routing, run the
+client cache/preview boundaries and the web's compiled view/lease bindings:
+
+```sh
+cd packages/client-runtime
+vp test run src/state/assets.test.ts src/state/assetByteCache.test.ts src/state/assetByteCacheOwner.test.ts src/operations/filePreview.test.ts src/state/preview.test.ts
+cd ../../apps/web
+vp test run --project unit src/assets/assetUrls.hooks.test.tsx src/assets/assetUrls.lease.test.tsx src/components/ProjectFavicon.test.tsx src/components/ChatView.hooks.test.tsx src/browser/filePreviewAvailability.test.ts src/browser/openFileInPreview.test.ts src/browser/useFilePreview.test.tsx src/components/files/FileBrowserPanel.test.tsx src/components/files/FilePreviewPanel.test.tsx src/components/ChatMarkdown.behavior.test.tsx src/components/ChatMarkdown.test.tsx src/zero-coverage-pure.test.ts
+cd ../..
+vp check
+vp run typecheck
+```
+
+Require one shared read for duplicate visible resources, first-view unmount
+preserving the URL and last-view release returning ownership to the cache.
+Only the cache revokes borrowed URLs. Epoch/removal/retarget retires server
+images and gallery selections, including HTTP; local handoff cleanup cannot
+revoke a borrowed cache URL or clear a newer local handoff. Borrowed Blob URLs
+must not accumulate in the favicon's historical HTTP loaded-source set.
+
+Exercise all three file-preview entrypoints: Files rows/menus, file toolbar,
+and Markdown primary link/context menu. HTML/PDF refusal must be visible and
+associated, with no mint/open/HTTP/external/editor fallback; direct pinned image
+requests are also refused. Valid workspace paths offer the shared Download
+with its own busy/update explanation. Test a queued original intent against
+identical registration re-add/retarget, and the required opaque current-context
+predicate before each manual apply/remember/panel open. Missing/false predicate
+in an active view reports the shared check-Preview uncertainty; disposed or
+changed web views stay quiet. A successful server Opened event/native load may
+precede reply: no automatic retry, close, rollback or no-effect claim.
+
+Packaged qualification additionally needs Tab/Enter and Tab/Space reason and
+Download discovery at every applicable entry, light/dark fallback/disabled
+captures, lease/memory evidence across navigation and ordinary reconnect, and
+controlled old-client/old-server positive HTTP capture versus new-client/old-
+server refusal and pinned new-client content HTTP absence. Explicit typed URL/
+dev-server navigation is a separate allowed flow. Keep positive native/canary
+runs pending until the complete server capability and matching builds exist;
+DOM/cache/protocol tests do not substitute for that evidence.
 
 ## Staged chat attachment uploads
 

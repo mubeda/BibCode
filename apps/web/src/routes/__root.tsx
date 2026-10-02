@@ -18,6 +18,7 @@ import { AppStatusBar, SlowRequestsStatusBar } from "../components/status-bar/Ap
 import { RelayClientInstallDialog } from "../components/cloud/RelayClientInstallDialog";
 import { SshPasswordPromptDialog } from "../components/desktop/SshPasswordPromptDialog";
 import { ProviderUpdateLaunchNotification } from "../components/ProviderUpdateLaunchNotification";
+import { FileTransferToasts } from "../components/files/FileTransferToasts";
 import { Button } from "../components/ui/button";
 import {
   AnchoredToastProvider,
@@ -142,6 +143,7 @@ function RootRouteView() {
   return (
     <ToastProvider>
       <AnchoredToastProvider>
+        <FileTransferToasts />
         <DocumentTitleSync />
         {presentation.showRemoteDeviceControls ? <RelayClientInstallDialog /> : null}
         {presentation.showRemoteDeviceControls ? <SshPasswordPromptDialog /> : null}

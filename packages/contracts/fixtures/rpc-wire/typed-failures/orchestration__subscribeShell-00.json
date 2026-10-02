@@ -1,0 +1,37 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "OrchestrationGetSnapshotError",
+          "message": "len",
+          "cause": {
+            "\"&": [
+              true,
+              "B|'FT",
+              [
+                [
+                  1.2061706263548274e306,
+                  false,
+                  "",
+                  false,
+                  4135734448057549,
+                  " I",
+                  false,
+                  true,
+                  1.1264485136074158e304,
+                  true
+                ]
+              ]
+            ],
+            "lexkupG": {}
+          }
+        }
+      }
+    ]
+  }
+}

@@ -3,21 +3,201 @@
 // projects.createUploadUrl) and reporting outcomes, while the URL math, the desktop-vs-browser
 // branch, and the server's response vocabulary are decided here so they are unit testable.
 
+import {
+  FileTransferClientError,
+  type DownloadSink,
+  type DownloadStart,
+} from "@bibcode/client-runtime/operations";
+import type { DownloadResult } from "@bibcode/client-runtime/state/file-transfers";
+import type { DesktopBridge } from "@bibcode/contracts";
+import * as Effect from "effect/Effect";
+import { transferErrorMessage } from "./transferPresentation";
+
+export type BrowserDownloadReady = Extract<DownloadResult, { readonly blob: Blob }>;
+export type DesktopDownloadSaved = Extract<DownloadResult, { readonly path: string }>;
+export type StreamingDownloadBridge = Required<
+  Pick<
+    DesktopBridge,
+    "beginDownloadFile" | "appendDownloadFile" | "finishDownloadFile" | "abortDownloadFile"
+  >
+>;
+const BROWSER_DOWNLOAD_LIMIT = 2 * 1024 ** 3;
+const BROWSER_LIMIT_MESSAGE = "This download exceeds the 2 GiB browser limit. Use the desktop app.";
+
+/** A smaller budget permits deterministic boundary tests; it cannot raise the browser ceiling. */
+export function browserDownloadSink(options?: {
+  readonly maximumBytes?: number;
+}): DownloadSink<BrowserDownloadReady> {
+  const maximumBytes = options?.maximumBytes ?? BROWSER_DOWNLOAD_LIMIT;
+  if (
+    !Number.isSafeInteger(maximumBytes) ||
+    maximumBytes < 0 ||
+    maximumBytes > BROWSER_DOWNLOAD_LIMIT
+  )
+    throw new RangeError("Browser download budget must be at most 2 GiB.");
+  let parts: Uint8Array<ArrayBuffer>[] = [];
+  let fileName: string | null = null;
+  let storedBytes = 0;
+  const limit = () =>
+    new FileTransferClientError({ reason: "browser_limit", message: BROWSER_LIMIT_MESSAGE });
+  const begin = Effect.fn("BrowserDownloadSink.start")(function* (start: DownloadStart) {
+    if (start.sizeBytes !== null && start.sizeBytes > maximumBytes) return yield* limit();
+    parts = [];
+    storedBytes = 0;
+    fileName = start.fileName;
+  });
+  return {
+    start: begin,
+    reset: begin,
+    write: Effect.fn("BrowserDownloadSink.write")(function* (_offset, bytes) {
+      if (storedBytes + bytes.byteLength > maximumBytes) return yield* limit();
+      // One bounded chunk copy owns a stable ArrayBuffer even if the input view is reused.
+      parts.push(bytes.slice());
+      storedBytes += bytes.byteLength;
+    }),
+    finish: Effect.fn("BrowserDownloadSink.finish")(function* () {
+      if (fileName === null)
+        return yield* new FileTransferClientError({
+          reason: "save",
+          message: "Start the download again before saving it.",
+        });
+      const result = { fileName, blob: new Blob(parts, { type: "application/octet-stream" }) };
+      parts = [];
+      storedBytes = 0;
+      fileName = null;
+      return result;
+    }),
+    abort: Effect.fn("BrowserDownloadSink.abort")(() =>
+      Effect.sync(() => {
+        parts = [];
+        storedBytes = 0;
+        fileName = null;
+      }),
+    ),
+  };
+}
+
+export function streamingDownloadBridge(
+  bridge: TransferBridge | undefined,
+): StreamingDownloadBridge | null {
+  if (
+    bridge === undefined ||
+    typeof bridge.beginDownloadFile !== "function" ||
+    typeof bridge.appendDownloadFile !== "function" ||
+    typeof bridge.finishDownloadFile !== "function" ||
+    typeof bridge.abortDownloadFile !== "function"
+  )
+    return null;
+  return {
+    beginDownloadFile: bridge.beginDownloadFile,
+    appendDownloadFile: bridge.appendDownloadFile,
+    finishDownloadFile: bridge.finishDownloadFile,
+    abortDownloadFile: bridge.abortDownloadFile,
+  };
+}
+
+export function desktopDownloadSink(
+  bridge: StreamingDownloadBridge,
+  directory: string,
+): DownloadSink<DesktopDownloadSaved> {
+  let handle: string | null = null;
+  const nativeError = (error: unknown) =>
+    new FileTransferClientError({
+      reason: "save",
+      message: transferErrorMessage(
+        error,
+        "The download could not be saved. Pick another folder and try again.",
+      ),
+    });
+  const close = Effect.fn("DesktopDownloadSink.close")(function* () {
+    if (handle === null) return;
+    const current = handle;
+    yield* Effect.tryPromise({
+      try: () => bridge.abortDownloadFile({ handle: current }),
+      catch: nativeError,
+    });
+    if (handle === current) handle = null;
+  }, Effect.uninterruptible);
+  const begin = Effect.fn("DesktopDownloadSink.start")(function* (start: DownloadStart) {
+    if (handle !== null)
+      return yield* nativeError("Cancel the previous download before starting it again.");
+    const value = yield* Effect.tryPromise({
+      try: () => bridge.beginDownloadFile({ directory, fileName: start.fileName }),
+      catch: nativeError,
+    });
+    handle = value.handle;
+  }, Effect.uninterruptible);
+  return {
+    start: begin,
+    reset: Effect.fn("DesktopDownloadSink.reset")(function* (start) {
+      yield* close();
+      yield* begin(start);
+    }),
+    write: Effect.fn("DesktopDownloadSink.write")(function* (_offset, bytes) {
+      if (handle === null) return yield* nativeError("Start the download again before saving it.");
+      const current = handle;
+      yield* Effect.tryPromise({
+        try: () => bridge.appendDownloadFile({ handle: current, bytes }),
+        catch: nativeError,
+      });
+    }),
+    finish: Effect.fn("DesktopDownloadSink.finish")(function* () {
+      if (handle === null) return yield* nativeError("Start the download again before saving it.");
+      const current = handle;
+      const result = yield* Effect.tryPromise({
+        try: () => bridge.finishDownloadFile({ handle: current }),
+        catch: nativeError,
+      });
+      if (handle === current) handle = null;
+      return result;
+    }, Effect.uninterruptible),
+    abort: Effect.fn("DesktopDownloadSink.abort")(function* () {
+      yield* close().pipe(Effect.catch((error) => Effect.logWarning(error.message)));
+    }),
+  };
+}
+
+/** Save remains a user gesture; no Blob URL is allocated while the ready toast waits. */
+export function saveBrowserDownload(
+  value: BrowserDownloadReady,
+  documentRef: Document = document,
+  urls: Pick<typeof URL, "createObjectURL" | "revokeObjectURL"> = URL,
+): void {
+  const url = urls.createObjectURL(value.blob);
+  let anchor: HTMLAnchorElement | undefined;
+  let clicked = false;
+  try {
+    anchor = documentRef.createElement("a");
+    anchor.href = url;
+    anchor.download = value.fileName;
+    anchor.rel = "noopener";
+    documentRef.body.appendChild(anchor);
+    anchor.click();
+    clicked = true;
+  } finally {
+    anchor?.remove();
+    // Give the browser its next task to consume the clicked URL before releasing it.
+    if (clicked) setTimeout(() => urls.revokeObjectURL(url), 0);
+    else urls.revokeObjectURL(url);
+  }
+}
+
 /**
  * The part of `window.desktopBridge` a transfer needs. Structurally a subset of `DesktopBridge`, so
  * the panel can hand the live bridge straight in; the streaming commands are optional because an
  * older desktop host (or the browser) does not implement them.
  */
-export interface TransferBridge {
-  pickFolder: (options?: { initialPath?: string | null }) => Promise<string | null>;
-  pickFiles?: (options?: { title?: string }) => Promise<readonly string[]>;
-  downloadToFolder?: (input: {
-    url: string;
-    directory: string;
-    fileName: string;
-  }) => Promise<string>;
-  uploadFile?: (input: { url: string; path: string }) => Promise<{ status: number; body: string }>;
-}
+export type TransferBridge = Pick<
+  DesktopBridge,
+  | "pickFolder"
+  | "pickFiles"
+  | "downloadToFolder"
+  | "uploadFile"
+  | "beginDownloadFile"
+  | "appendDownloadFile"
+  | "finishDownloadFile"
+  | "abortDownloadFile"
+>;
 
 export type DownloadOutcome =
   | { _tag: "Saved"; path: string }

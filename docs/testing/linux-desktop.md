@@ -431,6 +431,20 @@ any unavailable native sessions. Restore settings only within the test session.
 
 ## Packaged UI scenarios
 
+Include the shared [Files download admission and presentation checks](./cross-platform-validation.md#files-download-presentation-and-admission-checks)
+when changing Files routing, raw save, ready Save/dismiss or Cancel. Keep unit
+and mock IPC results separate from packaged keyboard, memory and content
+capture evidence. Before the complete encrypted-transfer capability exists,
+record positive native/canary cases as pending rather than enabling it in a
+production descriptor; unavailable menu and older-host refusal remain
+qualifiable independently.
+
+Include the shared [asset/file Preview consumer checks](./cross-platform-validation.md#asset-leases-and-file-preview-presentation-checks)
+for image/icon lifetime or Files/toolbar/Markdown preview changes. Require
+visible refusal and keyboard-accessible reason/Download without a fallback.
+Keep mock/DOM proof separate from packaged screenshots, memory and HTTP/canary
+capture; record unavailable full-capability cases as pending.
+
 Include the shared [Pull Requests smoke](./cross-platform-validation.md#pull-requests-web-shell-validation):
 open the project-header sidebar button, inspect the repository list, open a
 request, and render a real text patch on Files changed/Changes with `tab=files`

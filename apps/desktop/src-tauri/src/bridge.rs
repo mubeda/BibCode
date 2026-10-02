@@ -1017,6 +1017,7 @@ pub fn desktop_bridge_get_bridge_metadata(app: AppHandle<DesktopRuntime>) -> Val
             "preview": crate::preview::host::is_supported(),
             "updater": app.updater().is_ok(),
             "menuEvents": true,
+            "streamingDownloads": true,
         },
     })
 }
@@ -1644,7 +1645,7 @@ fn validate_transfer_url(url: &str) -> Result<reqwest::Url, String> {
 }
 
 /// The tail `desktop_bridge_download_to_folder` gives its partial files.
-const DOWNLOAD_PARTIAL_SUFFIX: &str = "bibcode-download.part";
+pub(crate) const DOWNLOAD_PARTIAL_SUFFIX: &str = "bibcode-download.part";
 
 /// One path component may hold 255 bytes on every filesystem BiBCode supports.
 const MAX_PATH_COMPONENT_BYTES: usize = bibcode_server::transfer::upload::MAX_PATH_COMPONENT_BYTES;
@@ -1661,7 +1662,7 @@ const MAX_KEPT_EXTENSION_BYTES: usize = 16;
 /// Windows host renames instead: the file still arrives, under a name Windows can store. Only the
 /// rules that hold everywhere (a plain, non-empty, control-free name that fits a path component)
 /// can refuse the download, because those signal a bad name rather than an unportable one.
-fn validate_download_file_name(name: &str) -> Result<String, String> {
+pub(crate) fn validate_download_file_name(name: &str) -> Result<String, String> {
     download_file_name_for(name, cfg!(windows))
 }
 
@@ -1755,8 +1756,12 @@ fn transfer_http_client() -> Result<reqwest::Client, String> {
 /// `directory` by atomically creating the file (`name`, then `name (2).ext`,
 /// `name (3).ext`, ...) with `create_new`, which fails rather than silently
 /// overwriting an existing or concurrently reserved path. The caller renames
-/// the finished download over the returned (now-existing, empty) path.
-fn unique_destination(directory: &Path, file_name: &str) -> Result<PathBuf, String> {
+/// the finished download through the returned owner, which retains the opened
+/// reservation before fallible identity inspection and handles safe rollback.
+pub(crate) fn unique_destination(
+    directory: &Path,
+    file_name: &str,
+) -> Result<crate::streamed_download::DownloadDestination, String> {
     let (stem, extension) = match file_name.rsplit_once('.') {
         Some((stem, extension)) if !stem.is_empty() => (stem.to_owned(), format!(".{extension}")),
         _ => (file_name.to_owned(), String::new()),
@@ -1769,7 +1774,11 @@ fn unique_destination(directory: &Path, file_name: &str) -> Result<PathBuf, Stri
             .create_new(true)
             .open(&candidate)
         {
-            Ok(_) => return Ok(candidate),
+            Ok(file) => {
+                return Ok(crate::streamed_download::DownloadDestination::new(
+                    candidate, file,
+                ));
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 candidate = directory.join(format!("{stem} ({index}){extension}"));
                 index += 1;
@@ -1782,6 +1791,66 @@ fn unique_destination(directory: &Path, file_name: &str) -> Result<PathBuf, Stri
             }
         }
     }
+}
+
+fn require_main_download_webview(label: &str) -> Result<(), String> {
+    if label != "main" {
+        return Err("Only the main app can save this download.".into());
+    }
+    Ok(())
+}
+fn raw_download_append(request: &tauri::ipc::Request<'_>) -> Result<(String, Vec<u8>), String> {
+    let handle = request
+        .headers()
+        .get("x-bibcode-download-handle")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Download handle is missing.".to_owned())?;
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("Download bytes must use raw IPC.".into());
+    };
+    if bytes.len() > 1024 * 1024 {
+        return Err("Download chunk exceeds the 1 MiB limit.".into());
+    }
+    Ok((handle.to_owned(), bytes.clone()))
+}
+#[tauri::command]
+pub(crate) async fn desktop_bridge_begin_download_file(
+    webview: tauri::Webview<DesktopRuntime>,
+    state: State<'_, crate::streamed_download::DownloadFileManager>,
+    directory: String,
+    file_name: String,
+) -> Result<crate::streamed_download::BeginDownloadFileResult, String> {
+    require_main_download_webview(webview.label())?;
+    state.begin(directory.into(), file_name).await
+}
+#[tauri::command]
+pub(crate) async fn desktop_bridge_append_download_file(
+    webview: tauri::Webview<DesktopRuntime>,
+    state: State<'_, crate::streamed_download::DownloadFileManager>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    require_main_download_webview(webview.label())?;
+    let (handle, bytes) = raw_download_append(&request)?;
+    state.append(&handle, bytes).await
+}
+#[tauri::command]
+pub(crate) async fn desktop_bridge_finish_download_file(
+    webview: tauri::Webview<DesktopRuntime>,
+    state: State<'_, crate::streamed_download::DownloadFileManager>,
+    handle: String,
+) -> Result<crate::streamed_download::FinishDownloadFileResult, String> {
+    require_main_download_webview(webview.label())?;
+    state.finish(&handle).await
+}
+#[tauri::command]
+pub(crate) async fn desktop_bridge_abort_download_file(
+    webview: tauri::Webview<DesktopRuntime>,
+    state: State<'_, crate::streamed_download::DownloadFileManager>,
+    handle: String,
+) -> Result<(), String> {
+    require_main_download_webview(webview.label())?;
+    state.abort(&handle).await
 }
 
 #[tauri::command]
@@ -1898,7 +1967,7 @@ pub async fn desktop_bridge_download_to_folder(
         let _ = tokio::fs::remove_file(&partial).await;
         return Err(error);
     }
-    let destination = match unique_destination(&directory, &file_name) {
+    let mut destination = match unique_destination(&directory, &file_name) {
         Ok(destination) => destination,
         Err(error) => {
             tracing::warn!(%error, "could not reserve desktop download destination");
@@ -1906,12 +1975,18 @@ pub async fn desktop_bridge_download_to_folder(
             return Err(error);
         }
     };
-    if let Err(error) = tokio::fs::rename(&partial, &destination).await {
-        tracing::warn!(%error, "could not place desktop download file");
-        let _ = tokio::fs::remove_file(&partial).await;
-        let _ = tokio::fs::remove_file(&destination).await;
-        return Err(bridge_error("Could not place the download file", error));
-    }
+    let destination = tokio::task::spawn_blocking(move || {
+        let result = destination.publish(&partial);
+        if result.is_err() {
+            if let Err(error) = destination.rollback() {
+                tracing::warn!(%error, "could not clean up desktop download reservation");
+            }
+            let _ = fs::remove_file(&partial);
+        }
+        result
+    })
+    .await
+    .map_err(|_| "Could not finish the download.".to_owned())??;
     Ok(destination.to_string_lossy().into_owned())
 }
 
@@ -2490,26 +2565,32 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
 
         let first = unique_destination(temp.path(), "a.txt").expect("first reservation");
-        assert_eq!(first, temp.path().join("a.txt"));
+        assert_eq!(first.path, temp.path().join("a.txt"));
         assert!(
-            first.exists(),
+            first.path.exists(),
             "unique_destination should reserve the path it returns"
         );
 
         let second = unique_destination(temp.path(), "a.txt").expect("second reservation");
-        assert_eq!(second, temp.path().join("a (2).txt"));
-        assert!(second.exists());
+        assert_eq!(second.path, temp.path().join("a (2).txt"));
+        assert!(second.path.exists());
 
         let third = unique_destination(temp.path(), "a.txt").expect("third reservation");
-        assert_eq!(third, temp.path().join("a (3).txt"));
+        assert_eq!(third.path, temp.path().join("a (3).txt"));
 
         std::fs::write(temp.path().join("src.zip"), b"").unwrap();
         assert_eq!(
-            unique_destination(temp.path(), "src.zip").expect("src.zip reservation"),
+            unique_destination(temp.path(), "src.zip")
+                .expect("src.zip reservation")
+                .path
+                .clone(),
             temp.path().join("src (2).zip")
         );
         assert_eq!(
-            unique_destination(temp.path(), "Makefile").expect("Makefile reservation"),
+            unique_destination(temp.path(), "Makefile")
+                .expect("Makefile reservation")
+                .path
+                .clone(),
             temp.path().join("Makefile")
         );
     }
@@ -3871,6 +3952,7 @@ mod tests {
         );
         assert_eq!(metadata["features"]["sshProvisioning"], true);
         assert_eq!(metadata["features"]["menuEvents"], true);
+        assert_eq!(metadata["features"]["streamingDownloads"], true);
         assert_eq!(metadata["features"]["updater"], false);
         assert_eq!(
             desktop_bridge_get_bridge_metadata(release_app.handle().clone())["features"]["updater"],
@@ -4231,6 +4313,7 @@ mod tests {
             .manage(SshPasswordPromptManager::new())
             .manage(DesktopUpdateManager::new())
             .plugin(tauri_plugin_updater::Builder::new().build())
+            .manage(crate::streamed_download::DownloadFileManager::new())
             .invoke_handler(tauri::generate_handler![
                 desktop_bridge_get_bridge_metadata,
                 desktop_bridge_get_app_branding,
@@ -4275,6 +4358,10 @@ mod tests {
                 desktop_bridge_save_diagnostic_logs,
                 desktop_bridge_pick_files,
                 desktop_bridge_download_to_folder,
+                desktop_bridge_begin_download_file,
+                desktop_bridge_append_download_file,
+                desktop_bridge_finish_download_file,
+                desktop_bridge_abort_download_file,
                 desktop_bridge_upload_file,
                 desktop_bridge_confirm,
                 desktop_bridge_open_external,
@@ -4683,5 +4770,193 @@ mod tests {
                 "{command} should reject missing command arguments",
             );
         }
+    }
+
+    #[test]
+    fn download_commands_work_with_a_preview_child_open() {
+        use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
+        struct ChildCaller<'a>(&'a tauri::Webview<DesktopRuntime>);
+        impl AsRef<tauri::Webview<DesktopRuntime>> for ChildCaller<'_> {
+            fn as_ref(&self) -> &tauri::Webview<DesktopRuntime> {
+                self.0
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("report.zip"), b"old").unwrap();
+        let mut context = crate::desktop_context();
+        context.config_mut().identifier =
+            format!("com.bibcode.stream-tests-{}", std::process::id());
+        let app = mock_builder()
+            .manage(crate::streamed_download::DownloadFileManager::new())
+            .invoke_handler(tauri::generate_handler![
+                desktop_bridge_begin_download_file,
+                desktop_bridge_append_download_file,
+                desktop_bridge_finish_download_file,
+                desktop_bridge_abort_download_file
+            ])
+            .build(context)
+            .unwrap();
+        let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let child = app
+            .get_window("main")
+            .unwrap()
+            .add_child(
+                tauri::WebviewBuilder::new("preview-test", Default::default()),
+                tauri::LogicalPosition::new(0.0, 0.0),
+                tauri::LogicalSize::new(100.0, 100.0),
+            )
+            .unwrap();
+        let make_request = |cmd: &str, body: tauri::ipc::InvokeBody, handle: Option<&str>| {
+            let mut headers = tauri::http::HeaderMap::new();
+            if let Some(handle) = handle {
+                headers.insert("x-bibcode-download-handle", handle.parse().unwrap());
+            }
+            tauri::webview::InvokeRequest {
+                cmd: cmd.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: if cfg!(windows) {
+                    "http://tauri.localhost"
+                } else {
+                    "tauri://localhost"
+                }
+                .parse()
+                .unwrap(),
+                body,
+                headers,
+                invoke_key: INVOKE_KEY.into(),
+            }
+        };
+        let result = get_ipc_response(
+            &main,
+            make_request(
+                "desktop_bridge_begin_download_file",
+                tauri::ipc::InvokeBody::Json(
+                    json!({"directory":root.path(),"fileName":"report.zip"}),
+                ),
+                None,
+            ),
+        )
+        .unwrap()
+        .deserialize::<Value>()
+        .unwrap();
+        let handle = result["handle"].as_str().unwrap();
+        get_ipc_response(
+            &main,
+            make_request(
+                "desktop_bridge_append_download_file",
+                tauri::ipc::InvokeBody::Raw(b"abc".to_vec()),
+                Some(handle),
+            ),
+        )
+        .unwrap();
+        let partial = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.to_string_lossy().ends_with(".bibcode-download.part"))
+            .unwrap();
+        assert_eq!(std::fs::read(&partial).unwrap(), b"abc");
+        assert!(
+            get_ipc_response(
+                &ChildCaller(&child),
+                make_request(
+                    "desktop_bridge_append_download_file",
+                    tauri::ipc::InvokeBody::Raw(b"foreign".to_vec()),
+                    Some(handle)
+                )
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&partial).unwrap(), b"abc");
+        assert!(
+            get_ipc_response(
+                &main,
+                make_request(
+                    "desktop_bridge_append_download_file",
+                    tauri::ipc::InvokeBody::Raw(b"x".to_vec()),
+                    None
+                )
+            )
+            .is_err()
+        );
+        assert!(
+            get_ipc_response(
+                &main,
+                make_request(
+                    "desktop_bridge_append_download_file",
+                    tauri::ipc::InvokeBody::Json(json!({"bytes":[1,2]})),
+                    Some(handle)
+                )
+            )
+            .is_err()
+        );
+        assert!(
+            get_ipc_response(
+                &main,
+                make_request(
+                    "desktop_bridge_append_download_file",
+                    tauri::ipc::InvokeBody::Raw(vec![0; 1024 * 1024 + 1]),
+                    Some(handle)
+                )
+            )
+            .is_err()
+        );
+        get_ipc_response(
+            &main,
+            make_request(
+                "desktop_bridge_append_download_file",
+                tauri::ipc::InvokeBody::Raw(b"def".to_vec()),
+                Some(handle),
+            ),
+        )
+        .unwrap();
+        let finished = get_ipc_response(
+            &main,
+            make_request(
+                "desktop_bridge_finish_download_file",
+                tauri::ipc::InvokeBody::Json(json!({"handle":handle})),
+                None,
+            ),
+        )
+        .unwrap()
+        .deserialize::<Value>()
+        .unwrap();
+        assert_eq!(
+            std::fs::read(finished["path"].as_str().unwrap()).unwrap(),
+            b"abcdef"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("report.zip")).unwrap(),
+            b"old"
+        );
+        assert!(!partial.exists());
+        let result = get_ipc_response(
+            &main,
+            make_request(
+                "desktop_bridge_begin_download_file",
+                tauri::ipc::InvokeBody::Json(
+                    json!({"directory":root.path(),"fileName":"cancel.bin"}),
+                ),
+                None,
+            ),
+        )
+        .unwrap()
+        .deserialize::<Value>()
+        .unwrap();
+        get_ipc_response(
+            &main,
+            make_request(
+                "desktop_bridge_abort_download_file",
+                tauri::ipc::InvokeBody::Json(json!({"handle":result["handle"]})),
+                None,
+            ),
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(
+            app.state::<crate::streamed_download::DownloadFileManager>()
+                .shutdown(),
+        );
     }
 }

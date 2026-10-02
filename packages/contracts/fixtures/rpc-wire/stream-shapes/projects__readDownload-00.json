@@ -1,0 +1,13 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "_tag": "start",
+      "fileName": "x%{z",
+      "kind": "archive",
+      "sizeBytes": null,
+      "version": null
+    }
+  ]
+}

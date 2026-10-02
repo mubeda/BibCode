@@ -6,23 +6,21 @@ import type {
 } from "@bibcode/contracts";
 import { VirtualizedFile, type SelectedLineRange } from "@pierre/diffs";
 import { EditProvider, File, type FileOptions, Virtualizer } from "@pierre/diffs/react";
-import {
-  isAtomCommandInterrupted,
-  squashAtomCommandFailure,
-} from "@bibcode/client-runtime/state/runtime";
-import { ChevronRight, FolderTree, Globe2, LoaderCircle } from "lucide-react";
+import { ChevronRight, Download, FolderTree, Globe2, LoaderCircle } from "lucide-react";
 import * as Schema from "effect/Schema";
 import {
   type RefObject,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
   useSyncExternalStore,
 } from "react";
 
-import { isBrowserPreviewFile, openFileInPreview } from "~/browser/openFileInPreview";
+import { isBrowserPreviewFile } from "~/browser/openFileInPreview";
+import { useFilePreview } from "~/browser/useFilePreview";
 import ChatMarkdown from "~/components/ChatMarkdown";
 import { OpenInPicker } from "~/components/chat/OpenInPicker";
 import { useClientSettings } from "~/hooks/useSettings";
@@ -34,16 +32,16 @@ import { isPreviewSupportedInRuntime } from "~/previewStateStore";
 import { resolvePathLinkTarget } from "~/terminal-links";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { Toggle } from "~/components/ui/toggle";
+import { Button } from "~/components/ui/button";
+import { useFileDownloads } from "./useFileDownloads";
+import { fileActionErrorMessage } from "./fileActionError";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import { type DraftId, useComposerDraftStore } from "~/composerDraftStore";
 import { buildFileReviewComment } from "~/reviewCommentContext";
-import { assetEnvironment } from "~/state/assets";
-import { useEnvironmentHttpBaseUrl, usePrimaryEnvironmentId } from "~/state/environments";
-import { previewEnvironment } from "~/state/preview";
+import { usePrimaryEnvironmentId } from "~/state/environments";
 import { projectEnvironment } from "~/state/projects";
 import { useAtomCommand } from "~/state/use-atom-command";
-import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 
 import FileBrowserPanel from "./FileBrowserPanel";
 import {
@@ -659,12 +657,23 @@ export default function FilePreviewPanel({
   const { resolvedTheme } = useTheme();
   const wordWrap = useClientSettings((settings) => settings.wordWrap);
   const primaryEnvironmentId = usePrimaryEnvironmentId();
-  const environmentHttpBaseUrl = useEnvironmentHttpBaseUrl(environmentId);
-  const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
-    reportFailure: false,
+  const { availability: previewAvailability, openFile: openPreviewFile } = useFilePreview({
+    environmentId,
+    threadRef,
+    contextKey: JSON.stringify([cwd, relativePath]),
   });
-  const openPreview = useAtomCommand(previewEnvironment.open, {
-    reportFailure: false,
+  const previewDisabledReason = previewAvailability.enabled ? null : previewAvailability.reason;
+  const previewReasonId = useId();
+  const downloadReasonId = useId();
+  const showDownloadError = useCallback((error: unknown, title: string) => {
+    toastManager.add(
+      stackedThreadToast({ type: "error", title, description: fileActionErrorMessage(error) }),
+    );
+  }, []);
+  const { downloadEntry, downloadDisabledReason } = useFileDownloads({
+    environmentId,
+    cwd,
+    showMutationError: showDownloadError,
   });
   const file = useProjectFileQuery(environmentId, cwd, relativePath);
   const session = useFileEditingSession({
@@ -723,28 +732,8 @@ export default function FilePreviewPanel({
   };
 
   const handleOpenInBrowser = useCallback(() => {
-    if (!absolutePath || !environmentHttpBaseUrl) return;
-    void (async () => {
-      const result = await openFileInPreview({
-        threadRef,
-        filePath: absolutePath,
-        httpBaseUrl: environmentHttpBaseUrl,
-        createAssetUrl,
-        openPreview,
-      });
-      if (result._tag === "Success" || isAtomCommandInterrupted(result)) {
-        return;
-      }
-      const error = squashAtomCommandFailure(result);
-      toastManager.add(
-        stackedThreadToast({
-          type: "error",
-          title: "Unable to open file in browser",
-          description: error instanceof Error ? error.message : "An error occurred.",
-        }),
-      );
-    })();
-  }, [absolutePath, createAssetUrl, environmentHttpBaseUrl, openPreview, threadRef]);
+    if (absolutePath && previewDisabledReason === null) void openPreviewFile(absolutePath);
+  }, [absolutePath, openPreviewFile, previewDisabledReason]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
@@ -799,6 +788,8 @@ export default function FilePreviewPanel({
                   <Toggle
                     className="shrink-0"
                     pressed={false}
+                    disabled={previewDisabledReason !== null}
+                    aria-describedby={previewDisabledReason === null ? undefined : previewReasonId}
                     onPressedChange={handleOpenInBrowser}
                     aria-label="Open file in preview browser"
                     variant="ghost"
@@ -810,6 +801,21 @@ export default function FilePreviewPanel({
               />
               <TooltipPopup>Open file in preview browser</TooltipPopup>
             </Tooltip>
+          ) : null}
+          {relativePath && cwd ? (
+            <Button
+              size="xs"
+              variant="outline"
+              aria-label="Download file"
+              disabled={downloadDisabledReason !== null}
+              aria-describedby={downloadDisabledReason === null ? undefined : downloadReasonId}
+              onClick={() => {
+                if (downloadDisabledReason === null) downloadEntry(relativePath);
+              }}
+            >
+              <Download className="size-3.5" />
+              Download
+            </Button>
           ) : null}
           <Tooltip>
             <TooltipTrigger
@@ -830,6 +836,19 @@ export default function FilePreviewPanel({
               {explorerOpen ? "Hide file explorer" : "Show file explorer"}
             </TooltipPopup>
           </Tooltip>
+        </div>
+      ) : null}
+      {relativePath &&
+      ((canOpenInBrowser && previewDisabledReason !== null) || downloadDisabledReason !== null) ? (
+        <div className="flex flex-wrap gap-2 border-b px-3 py-2 text-xs text-foreground">
+          {canOpenInBrowser && previewDisabledReason !== null ? (
+            <span id={previewReasonId} tabIndex={0}>
+              {previewDisabledReason}
+            </span>
+          ) : null}
+          {downloadDisabledReason !== null ? (
+            <span id={downloadReasonId}>{downloadDisabledReason}</span>
+          ) : null}
         </div>
       ) : null}
       {relativePath !== null ? (

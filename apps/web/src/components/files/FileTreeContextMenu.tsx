@@ -1,4 +1,4 @@
-import { Fragment } from "react";
+import { Fragment, useId } from "react";
 import type * as React from "react";
 
 import { Menu, MenuItem, MenuPopup, MenuSeparator } from "~/components/ui/menu";
@@ -62,6 +62,7 @@ export default function FileTreeContextMenu({
   anchor,
   onClose,
 }: FileTreeContextMenuProps) {
+  const reasonPrefix = useId();
   const groups = model.groups
     .map((group) => group.filter((item) => Boolean(actions[ACTION_BY_ID[item.id]])))
     .filter((group) => group.length > 0);
@@ -90,17 +91,30 @@ export default function FileTreeContextMenu({
             {group.map((item) => {
               const handler = actions[ACTION_BY_ID[item.id]];
               return (
-                <MenuItem
-                  key={item.id}
-                  disabled={!item.enabled}
-                  variant={item.destructive ? "destructive" : "default"}
-                  onClick={() => {
-                    handler?.();
-                    onClose();
-                  }}
-                >
-                  {item.label}
-                </MenuItem>
+                <Fragment key={item.id}>
+                  <MenuItem
+                    disabled={!item.enabled}
+                    aria-describedby={
+                      item.disabledReason ? `${reasonPrefix}-${item.id}` : undefined
+                    }
+                    variant={item.destructive ? "destructive" : "default"}
+                    onClick={() => {
+                      if (!item.enabled) return;
+                      handler?.();
+                      onClose();
+                    }}
+                  >
+                    {item.label}
+                  </MenuItem>
+                  {item.disabledReason ? (
+                    <div
+                      id={`${reasonPrefix}-${item.id}`}
+                      className="max-w-72 px-2 pb-1 text-xs text-muted-foreground"
+                    >
+                      {item.disabledReason}
+                    </div>
+                  ) : null}
+                </Fragment>
               );
             })}
           </Fragment>

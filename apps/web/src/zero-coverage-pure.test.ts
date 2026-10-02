@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { type AssetCreateUrlResult, EnvironmentId, ThreadId } from "@bibcode/contracts";
+import { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
   AVAILABLE_CONNECTION_STATE,
@@ -45,7 +45,6 @@ import {
 } from "./components/preview/previewActionBus";
 import { isPreviewFocused } from "./lib/previewFocus";
 import { createEnvironmentPresentationAtoms } from "@bibcode/client-runtime/state/presentation";
-import type { AtomCommandResult } from "@bibcode/client-runtime/state/runtime";
 import type { SupervisorConnectionState } from "@bibcode/client-runtime/connection";
 
 const environmentId = EnvironmentId.make("environment-local");
@@ -119,73 +118,54 @@ describe("browser preview opening", () => {
     expect(h.openBrowser).not.toHaveBeenCalled();
   });
 
-  it("handles unavailable runtime, asset failures, invalid URLs, and success", async () => {
-    let assetResult: AtomCommandResult<AssetCreateUrlResult, Error> = AsyncResult.success({
-      relativeUrl: "/assets/file.html",
-      expiresAt: 0,
-    });
-    const createAssetUrl = vi.fn(async () => assetResult);
-    const openPreview = vi.fn(async () => AsyncResult.success(snapshot as never));
-
-    h.previewSupported = false;
-    const unavailable = await openFileInPreview({
+  it("handles unsupported runtime, guarded operation failures, policy refusal, and success", async () => {
+    const openFile = vi.fn(async () =>
+      AsyncResult.success({
+        url: "https://fresh.test/api/assets/file.html",
+        snapshot: snapshot as never,
+        isCurrentContext: () => true,
+      }),
+    );
+    const input = {
       threadRef,
       filePath: "file.html",
-      httpBaseUrl: "https://example.test",
-      createAssetUrl,
-      openPreview,
-    });
+      availability: { enabled: true as const },
+      openFile,
+      isCurrent: () => true,
+    };
+    h.previewSupported = false;
+    const unavailable = await openFileInPreview(input);
     expect(unavailable._tag).toBe("Failure");
-    if (unavailable._tag !== "Failure") throw new Error("expected unavailable preview failure");
+    if (unavailable._tag !== "Failure") throw new Error("Expected unavailable preview");
     expect(Cause.squash(unavailable.cause)).toBeInstanceOf(BrowserPreviewUnavailableError);
-    expect(createAssetUrl).not.toHaveBeenCalled();
+    expect(openFile).not.toHaveBeenCalled();
 
     h.previewSupported = true;
-    const assetFailure = new Error("asset failed");
-    assetResult = AsyncResult.failure(Cause.fail(assetFailure)) as AtomCommandResult<
-      AssetCreateUrlResult,
-      Error
-    >;
-    const failed = await openFileInPreview({
-      threadRef,
-      filePath: "file.html",
-      httpBaseUrl: "https://example.test",
-      createAssetUrl,
-      openPreview,
-    });
+    const failure = new Error("Preview operation refused");
+    openFile.mockResolvedValueOnce(AsyncResult.failure(Cause.fail(failure)) as never);
+    const failed = await openFileInPreview(input);
     expect(failed._tag).toBe("Failure");
-    if (failed._tag !== "Failure") throw new Error("expected asset creation failure");
-    expect(Cause.squash(failed.cause)).toBe(assetFailure);
+    if (failed._tag !== "Failure") throw new Error("Expected guarded operation failure");
+    expect(Cause.squash(failed.cause)).toBe(failure);
+    const denied = await openFileInPreview({
+      ...input,
+      availability: { enabled: false, reason: "Download this file instead." },
+    });
+    expect(denied._tag).toBe("Failure");
+    expect(openFile).toHaveBeenCalledOnce();
+    expect(h.applyPreviewServerSnapshot).not.toHaveBeenCalled();
 
-    assetResult = AsyncResult.success({ relativeUrl: "http://[", expiresAt: 0 });
-    const invalid = await openFileInPreview({
+    expect((await openFileInPreview({ ...input, filePath: "folder/file.html" }))._tag).toBe(
+      "Success",
+    );
+    expect(openFile).toHaveBeenLastCalledWith(
+      { environmentId, input: { threadId, filePath: "folder/file.html" } },
+      { signal: undefined },
+    );
+    expect(h.rememberPreviewUrl).toHaveBeenCalledWith(
       threadRef,
-      filePath: "file.html",
-      httpBaseUrl: "https://example.test",
-      createAssetUrl,
-      openPreview,
-    });
-    expect(invalid._tag).toBe("Failure");
-
-    assetResult = AsyncResult.success({ relativeUrl: "/assets/file.html", expiresAt: 0 });
-    const success = await openFileInPreview({
-      threadRef,
-      filePath: "folder/file.html",
-      httpBaseUrl: "https://example.test/base/",
-      createAssetUrl,
-      openPreview,
-    });
-    expect(success._tag).toBe("Success");
-    expect(createAssetUrl).toHaveBeenLastCalledWith({
-      environmentId,
-      input: {
-        resource: { _tag: "workspace-file", threadId, path: "folder/file.html" },
-      },
-    });
-    expect(openPreview).toHaveBeenLastCalledWith({
-      environmentId,
-      input: { threadId, url: "https://example.test/assets/file.html" },
-    });
+      "https://fresh.test/api/assets/file.html",
+    );
   });
 });
 

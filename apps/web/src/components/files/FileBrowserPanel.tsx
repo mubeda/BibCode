@@ -17,8 +17,9 @@ import { FolderClosed, FolderOpen, RefreshCw, Search } from "lucide-react";
 import type { MouseEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { isBrowserPreviewFile, openFileInPreview } from "~/browser/openFileInPreview";
-import { sanitizeFrontendLogText } from "~/diagnostics/frontendLogCapture";
+import { isBrowserPreviewFile } from "~/browser/openFileInPreview";
+import { useFilePreview } from "~/browser/useFilePreview";
+import { fileActionErrorMessage } from "./fileActionError";
 import { usePreferredEditor } from "~/editorPreferences";
 import { useTheme } from "~/hooks/useTheme";
 import { inferProjectTitleFromPath } from "~/lib/projectPaths";
@@ -26,19 +27,16 @@ import { cn, newProjectId } from "~/lib/utils";
 import { BIBCODE_PIERRE_ICONS } from "~/pierre-icons";
 import { isPreviewSupportedInRuntime } from "~/previewStateStore";
 import { useRightPanelStore } from "~/rightPanelStore";
-import { assetEnvironment } from "~/state/assets";
 import {
   useEnvironment,
   useEnvironmentConnectionState,
   useEnvironmentHttpBaseUrl,
   usePrimaryEnvironmentId,
 } from "~/state/environments";
-import { previewEnvironment } from "~/state/preview";
 import { projectEnvironment } from "~/state/projects";
 import { useEnvironmentQuery } from "~/state/query";
 import { shellEnvironment } from "~/state/shell";
 import { useAtomCommand } from "~/state/use-atom-command";
-import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 import { vcsEnvironment } from "~/state/vcs";
 import { resolveProviderSessionSelectionForInstance } from "~/providerSessionSelection";
 
@@ -250,8 +248,6 @@ export default function FileBrowserPanel({
   const openInEditor = useAtomCommand(shellEnvironment.openInEditor, "open in editor");
 
   const environmentHttpBaseUrl = useEnvironmentHttpBaseUrl(environmentId);
-  const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, { reportFailure: false });
-  const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const [preferredEditor] = usePreferredEditor(availableEditors);
 
   const remapFileSurfaces = useRightPanelStore((state) => state.remapFileSurfaces);
@@ -282,23 +278,7 @@ export default function FileBrowserPanel({
   // deliberate safety block (Agent A), so it gets a plain explanation; everything else shows the
   // server message.
   const showMutationError = useCallback((error: unknown, title: string) => {
-    const failure =
-      typeof error === "object" && error !== null && "failure" in error
-        ? (error as { failure?: unknown }).failure
-        : undefined;
-    const message =
-      typeof error === "string"
-        ? error
-        : typeof error === "object" && error !== null && "message" in error
-          ? error.message
-          : undefined;
-    const description = sanitizeFrontendLogText(
-      failure === "resolved_path_outside_root"
-        ? "Can't operate on a symlink that points outside the workspace."
-        : typeof message === "string" && message.trim()
-          ? message
-          : "An error occurred.",
-    ).replace(/\/api\/transfers\/[^\s"'<>)]*/g, "/api/transfers/[REDACTED]");
+    const description = fileActionErrorMessage(error);
     console.error("[file-browser] operation failed", { title, message: description });
     toastManager.add(
       stackedThreadToast({
@@ -312,16 +292,23 @@ export default function FileBrowserPanel({
   // Download and Upload are the panel's only awaitable, multi-step flows — a minted URL, a
   // transport that differs between desktop and browser, and a prompt the upload waits on — so
   // they live in their own hook. The panel still owns the dialog state the prompt writes into.
-  const { downloadEntry, uploadTo, handleUploadInputChange, uploadInputRef, closeDialog } =
-    useFileTransfers({
-      environmentId,
-      cwd,
-      httpBaseUrl: environmentHttpBaseUrl,
-      workspaceUnavailable,
-      showMutationError,
-      setDialogRequest,
-      refreshEntries: entriesQuery.revalidate,
-    });
+  const {
+    downloadEntry,
+    downloadDisabledReason,
+    uploadDisabledReason,
+    uploadTo,
+    handleUploadInputChange,
+    uploadInputRef,
+    closeDialog,
+  } = useFileTransfers({
+    environmentId,
+    cwd,
+    httpBaseUrl: environmentHttpBaseUrl,
+    workspaceUnavailable,
+    showMutationError,
+    setDialogRequest,
+    refreshEntries: entriesQuery.revalidate,
+  });
 
   useEffect(() => {
     workspaceUnavailableRef.current = workspaceUnavailable;
@@ -596,22 +583,19 @@ export default function FileBrowserPanel({
     [cwd, showMutationError],
   );
 
+  const { availability: previewAvailability, openFile: openPreviewFile } = useFilePreview({
+    environmentId,
+    threadRef,
+    contextKey: cwd,
+    onError: showMutationError,
+  });
+  const previewDisabledReason = previewAvailability.enabled ? null : previewAvailability.reason;
   const openPreviewFor = useCallback(
     (relativePath: string) => {
-      if (!environmentHttpBaseUrl) return;
-      void (async () => {
-        const result = await openFileInPreview({
-          threadRef,
-          filePath: joinWorkspacePath(cwd, relativePath),
-          httpBaseUrl: environmentHttpBaseUrl,
-          createAssetUrl,
-          openPreview,
-        });
-        if (result._tag === "Success" || isAtomCommandInterrupted(result)) return;
-        showMutationError(squashAtomCommandFailure(result), "Unable to open file in browser");
-      })();
+      if (previewDisabledReason !== null) return;
+      void openPreviewFile(joinWorkspacePath(cwd, relativePath));
     },
-    [createAssetUrl, cwd, environmentHttpBaseUrl, openPreview, showMutationError, threadRef],
+    [cwd, openPreviewFile, previewDisabledReason],
   );
 
   // An in-tree drop is a move, which the server exposes as a rename from → to, so it runs through
@@ -900,6 +884,9 @@ export default function FileBrowserPanel({
               isMarkdown: item.kind === "file" && isMarkdownPreviewFile(relativePath),
               isPrimaryEnv,
               hasWorkspaceRoot,
+              downloadDisabledReason,
+              uploadDisabledReason,
+              previewDisabledReason,
             });
             return (
               <FileTreeContextMenu
@@ -932,6 +919,8 @@ export default function FileBrowserPanel({
             isMarkdown: false,
             isPrimaryEnv,
             hasWorkspaceRoot,
+            downloadDisabledReason,
+            uploadDisabledReason,
           })}
           actions={{
             ...(workspaceUnavailable === null

@@ -84,6 +84,8 @@ const testState = vi.hoisted(() => ({
   },
   primaryEnvironmentId: null as string | null,
   environmentHttpBaseUrl: null as string | null,
+  transferRoute: "http" as "http" | "in-channel" | "unavailable",
+  transferPhase: null as string | null,
   environment: null as Record<string, unknown> | null,
   connectionPhase: "connected" as string | null,
   preferredEditor: null as string | null,
@@ -146,6 +148,36 @@ vi.mock("react", async (importOriginal) => {
     useRef: useRef as typeof actual.useRef,
   };
 });
+
+vi.mock("@effect/atom-react", async () => {
+  const React = await import("react");
+  const read = (atom: { kind: string }) =>
+    atom.kind === "availability"
+      ? {
+          route: testState.transferRoute,
+          connected: testState.environmentHttpBaseUrl !== null,
+          serverName: "Studio",
+        }
+      : testState.transferPhase === null
+        ? null
+        : { phase: testState.transferPhase, cancellable: true };
+  return {
+    RegistryContext: React.createContext({ get: read }),
+    useAtomValue: (atom: { kind: string }, select?: (value: ReturnType<typeof read>) => unknown) =>
+      select ? select(read(atom)) : read(atom),
+  };
+});
+vi.mock("~/state/fileTransfers", () => ({
+  fileTransfers: {
+    availability: () => ({ kind: "availability" }),
+    operation: () => ({ kind: "operation" }),
+    prepareDownload: { label: "prepareDownload" },
+    prepareHttpDownload: { label: "createDownloadUrl" },
+    download: { label: "download" },
+    releaseAdmission: vi.fn(),
+    dismiss: vi.fn(),
+  },
+}));
 
 vi.mock("@pierre/trees/react", () => ({
   useFileTree: (options: Record<string, unknown>) => {
@@ -227,6 +259,27 @@ vi.mock("~/state/environments", () => ({
 vi.mock("~/state/preview", () => ({
   previewEnvironment: { open: { label: "openPreview" } },
 }));
+vi.mock("~/browser/useFilePreview", () => ({
+  useFilePreview: (options: {
+    threadRef: unknown;
+    onError?: (error: unknown, title: string) => void;
+  }) => ({
+    availability:
+      testState.transferRoute === "http" && testState.environmentHttpBaseUrl !== null
+        ? { enabled: true }
+        : {
+            enabled: false,
+            reason:
+              "Preview isn't available over encrypted connections yet. Download this file to open it.",
+          },
+    openFile: async (filePath: string) => {
+      const result = await testState.openFileInPreview({ threadRef: options.threadRef, filePath });
+      if (result._tag === "Failure" && !(result as { interrupted?: boolean }).interrupted)
+        options.onError?.(result.error, "Unable to open file in browser");
+      return result;
+    },
+  }),
+}));
 
 // Two subscriptions run in the panel: vcs status and the out-of-band entry-change signal. They are
 // told apart by the atom each returns so a test can move one without disturbing the other.
@@ -263,7 +316,29 @@ vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: (command: { label?: string }) => (input: unknown) => {
     const label = command?.label ?? "unknown";
     testState.commandCalls.push({ label, input });
+    if (label === "prepareDownload")
+      return Promise.resolve({
+        _tag: "Success",
+        value: { operationId: 1, route: testState.transferRoute, serverName: "Studio" },
+      });
     const result = testState.commandResults[label] ?? { _tag: "Success", value: {} };
+    if (
+      label === "createDownloadUrl" &&
+      result &&
+      typeof result === "object" &&
+      "_tag" in result &&
+      result._tag === "Success"
+    ) {
+      const minted = (result as unknown as { value: { relativeUrl: string; fileName: string } })
+        .value;
+      return Promise.resolve({
+        _tag: "Success",
+        value: {
+          url: `${testState.environmentHttpBaseUrl}${minted.relativeUrl}`,
+          fileName: minted.fileName,
+        },
+      });
+    }
     return Promise.resolve(result);
   },
 }));
@@ -474,6 +549,8 @@ beforeEach(() => {
   testState.entriesQuery = { data: null, error: null, isPending: false, refresh: vi.fn() };
   testState.primaryEnvironmentId = environmentId;
   testState.environmentHttpBaseUrl = null;
+  testState.transferRoute = "http";
+  testState.transferPhase = null;
   testState.environment = null;
   testState.connectionPhase = "connected";
   testState.preferredEditor = null;
@@ -2004,6 +2081,23 @@ describe("open in preview", () => {
   beforeEach(() => {
     setEntries([entry("index.html", "file")]);
   });
+  it("keeps pinned HTML preview visible with its reason and refuses a direct row callback", async () => {
+    testState.environmentHttpBaseUrl = "https://server.invalid";
+    testState.transferRoute = "in-channel";
+    testState.isBrowserPreviewFile = vi.fn(() => true);
+    renderPanel();
+    const props = rowMenuFor("index.html", "file").props as {
+      model: { groups: Array<Array<{ id: string; enabled: boolean; disabledReason?: string }>> };
+    };
+    expect(props.model.groups.flat().find((item) => item.id === "open-preview")).toMatchObject({
+      enabled: false,
+      disabledReason:
+        "Preview isn't available over encrypted connections yet. Download this file to open it.",
+    });
+    rowActionsFor("index.html", "file").onOpenPreview();
+    await flushPromises();
+    expect(testState.openFileInPreview).not.toHaveBeenCalled();
+  });
 
   it("does nothing without an environment base URL", () => {
     testState.environmentHttpBaseUrl = null;
@@ -2022,7 +2116,6 @@ describe("open in preview", () => {
       expect.objectContaining({
         threadRef,
         filePath: "/workspace/demo/index.html",
-        httpBaseUrl: "http://127.0.0.1:4100",
       }),
     );
     expect(testState.toastAdd).not.toHaveBeenCalled();
@@ -2067,6 +2160,40 @@ describe("download entry", () => {
       },
     };
   });
+  it.each(["file", "directory"] as const)(
+    "explains unavailable encrypted downloads on %s rows and denies imperative callbacks",
+    async (kind) => {
+      testState.transferRoute = "unavailable";
+      renderPanel();
+      const path = kind === "file" ? "src/app.ts" : "src";
+      const props = rowMenuFor(path, kind).props as {
+        model: { groups: Array<Array<{ id: string; enabled: boolean; disabledReason?: string }>> };
+      };
+      expect(props.model.groups.flat().find((item) => item.id === "download")).toMatchObject({
+        enabled: false,
+        disabledReason: "Update Studio to transfer files over its encrypted connection",
+      });
+      rowActionsFor(path, kind).onDownload();
+      await flushPromises();
+      expect(
+        testState.commandCalls.some((call) =>
+          ["prepareDownload", "createDownloadUrl"].includes(call.label),
+        ),
+      ).toBe(false);
+    },
+  );
+  it("shows Save or dismiss for a ready result without changing other file actions", () => {
+    testState.transferPhase = "ready";
+    renderPanel();
+    const props = rowMenuFor("src/app.ts", "file").props as {
+      model: { groups: Array<Array<{ id: string; enabled: boolean; disabledReason?: string }>> };
+    };
+    expect(props.model.groups.flat().find((item) => item.id === "download")).toMatchObject({
+      enabled: false,
+      disabledReason: "Save or dismiss the ready download before starting another.",
+    });
+    expect(props.model.groups.flat().find((item) => item.id === "rename")?.enabled).toBe(true);
+  });
 
   it("mints a transfer URL and saves it through the desktop bridge", async () => {
     const downloadToFolder = vi.fn(async () => "/home/me/Downloads/src (1).zip");
@@ -2077,10 +2204,16 @@ describe("download entry", () => {
     rowActionsFor("src", "directory").onDownload();
     await flushPromises();
 
-    const minted = testState.commandCalls.find((call) => call.label === "createDownloadUrl");
-    expect(minted!.input).toEqual({
+    expect(testState.commandCalls.find((call) => call.label === "prepareDownload")!.input).toEqual({
       environmentId,
-      input: { cwd: "/workspace/demo", relativePath: "src" },
+      cwd: "/workspace/demo",
+      relativePath: "src",
+    });
+    expect(
+      testState.commandCalls.find((call) => call.label === "createDownloadUrl")!.input,
+    ).toEqual({
+      environmentId,
+      admission: { operationId: 1, route: "http", serverName: "Studio" },
     });
     expect(downloadToFolder).toHaveBeenCalledWith({
       url: "http://127.0.0.1:4100/api/transfers/t.k",
@@ -2182,17 +2315,12 @@ describe("download entry", () => {
     expect(testState.toastAdd).not.toHaveBeenCalled();
   });
 
-  it("refuses a minted URL that points away from this environment's server", async () => {
+  it("never calls native save when the runtime refuses an invalid download address", async () => {
     // The desktop host streams this URL with host privileges, so a foreign origin must never
     // reach its download command, even after choosing the destination.
     testState.commandResults["createDownloadUrl"] = {
-      _tag: "Success",
-      value: {
-        relativeUrl: "https://evil.example/api/transfers/t.k",
-        expiresAt: 1,
-        fileName: "src.zip",
-        kind: "archive",
-      },
+      _tag: "Failure",
+      error: new Error("The server returned an invalid download address."),
     };
     const downloadToFolder = vi.fn();
     const pickFolder = vi.fn(async () => "/home/me/Downloads");
@@ -2207,8 +2335,8 @@ describe("download entry", () => {
     expect(testState.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({
         type: "error",
-        title: 'Can’t download "src"',
-        description: "The server did not return a usable download URL.",
+        title: 'Failed to prepare a download for "src"',
+        description: "The server returned an invalid download address.",
       }),
     );
   });

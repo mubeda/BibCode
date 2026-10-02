@@ -1558,7 +1558,13 @@ function ChatViewContent(props: ChatViewProps) {
   // it beside the host does not clobber the ref that host shortcuts drive.
   const composerRef = isPanel ? localComposerRef : (sharedComposerHandle ?? localComposerRef);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
-  const [expandedImage, setExpandedImage] = useState<ExpandedImagePreview | null>(null);
+  const [expandedImage, setExpandedImage] = useState<
+    | (ExpandedImagePreview & {
+        readonly contextKey: string;
+        readonly serverImageUrls: ReadonlyArray<string>;
+      })
+    | null
+  >(null);
   const [optimisticUserMessages, setOptimisticUserMessages] = useState<ChatMessage[]>([]);
   const [attachmentUploads, setAttachmentUploads] = useState<
     Record<string, PendingAttachmentUpload & { readonly threadKey: string }>
@@ -2769,11 +2775,17 @@ function ChatViewContent(props: ChatViewProps) {
   }, [attachmentPreviewHandoffByMessageId]);
   const clearAttachmentPreviewHandoff = useCallback(
     (messageId: MessageId, previewUrls?: ReadonlyArray<string>) => {
+      const matchesExpected = (current: ReadonlyArray<string> | undefined) =>
+        previewUrls === undefined ||
+        (current !== undefined &&
+          current.length === previewUrls.length &&
+          current.every((url, index) => url === previewUrls[index]));
+      if (!matchesExpected(attachmentPreviewHandoffByMessageIdRef.current[messageId])) return;
       delete attachmentPreviewPromotionInFlightByMessageIdRef.current[messageId];
       const currentPreviewUrls =
         previewUrls ?? attachmentPreviewHandoffByMessageIdRef.current[messageId] ?? [];
       setAttachmentPreviewHandoffByMessageId((existing) => {
-        if (!(messageId in existing)) {
+        if (!(messageId in existing) || !matchesExpected(existing[messageId])) {
           return existing;
         }
         const next = { ...existing };
@@ -2899,8 +2911,7 @@ function ChatViewContent(props: ChatViewProps) {
       );
       if (
         serverPreviewUrls.length === 0 ||
-        serverPreviewUrls.length !== handoffPreviewUrls.length ||
-        serverPreviewUrls.some((previewUrl) => previewUrl.startsWith("blob:"))
+        serverPreviewUrls.length !== handoffPreviewUrls.length
       ) {
         continue;
       }
@@ -6533,9 +6544,18 @@ function ChatViewContent(props: ChatViewProps) {
       settings,
     ],
   );
-  const onExpandTimelineImage = useCallback((preview: ExpandedImagePreview) => {
-    setExpandedImage(preview);
-  }, []);
+  const onExpandTimelineImage = useCallback(
+    (preview: ExpandedImagePreview) => {
+      setExpandedImage({
+        ...preview,
+        contextKey: routeThreadKey,
+        serverImageUrls: preview.images
+          .filter((image) => serverAttachmentUrls.includes(image.src))
+          .map((image) => image.src),
+      });
+    },
+    [routeThreadKey, serverAttachmentUrls],
+  );
   const onOpenTurnDiff = useCallback(
     (turnId: TurnId, filePath?: string) => {
       if (!isServerThread || !activeThreadRef) return;
@@ -7068,13 +7088,15 @@ function ChatViewContent(props: ChatViewProps) {
         </RightPanelSheet>
       ) : null}
 
-      {expandedImage && (
+      {expandedImage !== null &&
+      expandedImage.contextKey === routeThreadKey &&
+      expandedImage.serverImageUrls.every((url) => serverAttachmentUrls.includes(url)) ? (
         <ExpandedImageDialog
           key={`${expandedImage.images[expandedImage.index]?.src ?? "image"}:${expandedImage.index}`}
           preview={expandedImage}
           onClose={closeExpandedImage}
         />
-      )}
+      ) : null}
     </div>
   );
 }

@@ -1,5 +1,8 @@
 /* oxlint-disable react/no-unstable-nested-components */
 
+import { useFilePreview } from "../browser/useFilePreview";
+import { useFileDownloads } from "./files/useFileDownloads";
+import { fileActionErrorMessage } from "./files/fileActionError";
 import { useAtomValue } from "@effect/atom-react";
 import { DiffsHighlighter, getSharedHighlighter, SupportedLanguages } from "@pierre/diffs";
 import {
@@ -30,6 +33,7 @@ import React, {
   memo,
   useEffect,
   useMemo,
+  useId,
   useRef,
   useState,
   type ReactNode,
@@ -66,21 +70,18 @@ import {
   normalizeMarkdownLinkDestination,
   resolveMarkdownFileLinkMeta,
   rewriteMarkdownFileUriHref,
+  workspaceDownloadRelativePath,
 } from "../markdown-links";
 import { readLocalApi } from "../localApi";
 import { cn } from "../lib/utils";
 import { useRightPanelStore } from "../rightPanelStore";
 import { useActiveEnvironmentId } from "../state/entities";
 import { serverEnvironment } from "../state/server";
-import { assetEnvironment } from "../state/assets";
-import { usePreparedConnection } from "../state/session";
 import { previewEnvironment } from "../state/preview";
 import { useAtomCommand } from "../state/use-atom-command";
-import { useAtomQueryRunner } from "../state/use-atom-query-runner";
 import { isPreviewSupportedInRuntime } from "../previewStateStore";
 import {
   isBrowserPreviewFile,
-  openFileInPreview,
   openUrlInPreview,
   BrowserPreviewUnavailableError,
 } from "../browser/openFileInPreview";
@@ -727,6 +728,10 @@ interface MarkdownFileLinkProps {
   threadRef?: ScopedThreadRef | undefined;
   onOpen: (targetPath: string) => Promise<AtomCommandResult<unknown, unknown>>;
   onOpenInBrowser?: (() => Promise<AtomCommandResult<unknown, unknown>>) | undefined;
+  previewDisabledReason?: string | null;
+  onDownload?: (() => void) | undefined;
+  downloadDisabledReason?: string | null;
+  isCurrentView?: (() => boolean) | undefined;
   className?: string | undefined;
 }
 
@@ -989,8 +994,13 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
   threadRef,
   onOpen,
   onOpenInBrowser,
+  previewDisabledReason = null,
+  onDownload,
+  downloadDisabledReason = null,
+  isCurrentView,
   className,
 }: MarkdownFileLinkProps) {
+  const previewReasonId = useId();
   const handleOpenInEditor = useCallback(() => {
     void (async () => {
       try {
@@ -1035,42 +1045,9 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
   }, [handleOpenInEditor, line, threadRef, workspaceRelativePath]);
 
   const handleOpenInBrowser = useCallback(() => {
-    if (!onOpenInBrowser) {
-      return;
-    }
-    void (async () => {
-      try {
-        const result = await onOpenInBrowser();
-        if (result._tag === "Success" || isAtomCommandInterrupted(result)) {
-          return;
-        }
-        reportMarkdownActionFailure(
-          { operation: "open-file-in-browser", target: targetPath },
-          result.cause,
-        );
-        const error = squashAtomCommandFailure(result);
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Unable to open file in browser",
-            description: error instanceof Error ? error.message : "An error occurred.",
-          }),
-        );
-      } catch (cause) {
-        reportMarkdownActionFailure(
-          { operation: "open-file-in-browser", target: targetPath },
-          cause,
-        );
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Unable to open file in browser",
-            description: cause instanceof Error ? cause.message : "An error occurred.",
-          }),
-        );
-      }
-    })();
-  }, [onOpenInBrowser, targetPath]);
+    if (!onOpenInBrowser || previewDisabledReason !== null || isCurrentView?.() === false) return;
+    void onOpenInBrowser();
+  }, [isCurrentView, onOpenInBrowser, previewDisabledReason]);
 
   const handleCopy = useCallback(
     (value: string, title: string) => {
@@ -1124,7 +1101,26 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
           [
             { id: "open", label: "Open in editor" },
             ...(onOpenInBrowser
-              ? ([{ id: "open-in-browser", label: "Open in integrated browser" }] as const)
+              ? ([
+                  {
+                    id: "open-in-browser",
+                    label: "Open in integrated browser",
+                    ...(previewDisabledReason === null
+                      ? {}
+                      : { disabled: true, description: previewDisabledReason }),
+                  },
+                ] as const)
+              : []),
+            ...(onDownload
+              ? [
+                  {
+                    id: "download",
+                    label: "Download",
+                    ...(downloadDisabledReason === null
+                      ? {}
+                      : { disabled: true, description: downloadDisabledReason }),
+                  },
+                ]
               : []),
             { id: "copy-relative", label: "Copy relative path" },
             { id: "copy-full", label: "Copy full path" },
@@ -1134,6 +1130,10 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
 
         if (clicked === "open") {
           handleOpenInEditor();
+          return;
+        }
+        if (clicked === "download") {
+          if (downloadDisabledReason === null && isCurrentView?.() !== false) onDownload?.();
           return;
         }
         if (clicked === "open-in-browser") {
@@ -1154,7 +1154,18 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
         );
       }
     },
-    [displayPath, handleCopy, handleOpenInBrowser, handleOpenInEditor, onOpenInBrowser, targetPath],
+    [
+      displayPath,
+      downloadDisabledReason,
+      handleCopy,
+      handleOpenInBrowser,
+      handleOpenInEditor,
+      isCurrentView,
+      onDownload,
+      onOpenInBrowser,
+      previewDisabledReason,
+      targetPath,
+    ],
   );
 
   return (
@@ -1165,6 +1176,10 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
             href={href}
             className={cn(CHAT_FILE_TAG_CHIP_CLASS_NAME, MARKDOWN_FILE_LINK_CLASS_NAME, className)}
             data-markdown-copy={copyMarkdown}
+            aria-disabled={onOpenInBrowser && previewDisabledReason !== null ? true : undefined}
+            aria-describedby={
+              onOpenInBrowser && previewDisabledReason !== null ? previewReasonId : undefined
+            }
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
@@ -1180,6 +1195,11 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
           </a>
         }
       />
+      {onOpenInBrowser && previewDisabledReason !== null ? (
+        <span id={previewReasonId} className="ml-2 inline text-xs text-foreground">
+          {previewDisabledReason}
+        </span>
+      ) : null}
       <TooltipPopup
         side="top"
         className="max-w-[min(40rem,calc(100vw-2rem))] font-mono text-xs leading-tight"
@@ -1209,6 +1229,10 @@ function areMarkdownFileLinkPropsEqual(
     previous.threadRef === next.threadRef &&
     previous.onOpen === next.onOpen &&
     previous.onOpenInBrowser === next.onOpenInBrowser &&
+    previous.previewDisabledReason === next.previewDisabledReason &&
+    previous.onDownload === next.onDownload &&
+    previous.downloadDisabledReason === next.downloadDisabledReason &&
+    previous.isCurrentView === next.isCurrentView &&
     previous.className === next.className
   );
 }
@@ -1224,14 +1248,29 @@ function ChatMarkdown({
   lineBreaks = false,
 }: ChatMarkdownProps) {
   const { resolvedTheme } = useTheme();
-  const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
-    reportFailure: false,
-  });
-  const openPreview = useAtomCommand(previewEnvironment.open, {
-    reportFailure: false,
-  });
-  const preparedConnection = usePreparedConnection(threadRef?.environmentId ?? null);
+  const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const environmentId = useActiveEnvironmentId();
+  const showFileError = useCallback((error: unknown, title: string) => {
+    // The expected file-action failure already has safe UI copy; do not retain raw
+    // Error/cause/stack in diagnostic capture (legacy downloads contain capabilities).
+    toastManager.add(
+      stackedThreadToast({ type: "error", title, description: fileActionErrorMessage(error) }),
+    );
+  }, []);
+  const filePreview = useFilePreview({
+    environmentId: threadRef?.environmentId ?? environmentId,
+    threadRef,
+    contextKey: cwd ?? "",
+    onError: showFileError,
+  });
+  const previewDisabledReason = filePreview.availability.enabled
+    ? null
+    : filePreview.availability.reason;
+  const { downloadEntry, downloadDisabledReason } = useFileDownloads({
+    environmentId: threadRef?.environmentId ?? environmentId,
+    cwd: cwd ?? "",
+    showMutationError: showFileError,
+  });
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const openInPreferredEditor = useOpenInPreferredEditor(
     environmentId,
@@ -1288,29 +1327,7 @@ function ChatMarkdown({
     },
     [openPreview, threadRef],
   );
-  const openMarkdownFileInPreview = useCallback(
-    (path: string) => {
-      if (!threadRef || preparedConnection._tag === "None") {
-        return Promise.resolve(
-          AsyncResult.failure<void, BrowserPreviewUnavailableError>(
-            Cause.fail(
-              new BrowserPreviewUnavailableError({
-                message: "Environment is not connected.",
-              }),
-            ),
-          ),
-        );
-      }
-      return openFileInPreview({
-        threadRef,
-        filePath: path,
-        httpBaseUrl: preparedConnection.value.httpBaseUrl,
-        createAssetUrl,
-        openPreview,
-      });
-    },
-    [createAssetUrl, openPreview, preparedConnection, threadRef],
-  );
+  const openMarkdownFileInPreview = filePreview.openFile;
   const markdownComponents = useMemo<Components>(
     () => ({
       p({ node: _node, children, ...props }) {
@@ -1455,6 +1472,7 @@ function ChatMarkdown({
           );
         }
 
+        const downloadPath = workspaceDownloadRelativePath(fileLinkMeta.filePath, cwd);
         const parentSuffix = fileLinkParentSuffixByPath.get(fileLinkMeta.filePath);
         const labelParts = [fileLinkMeta.basename];
         if (typeof parentSuffix === "string" && parentSuffix.length > 0) {
@@ -1486,6 +1504,10 @@ function ChatMarkdown({
                 ? () => openMarkdownFileInPreview(fileLinkMeta.filePath)
                 : undefined
             }
+            previewDisabledReason={previewDisabledReason}
+            onDownload={threadRef && downloadPath ? () => downloadEntry(downloadPath) : undefined}
+            downloadDisabledReason={downloadDisabledReason}
+            isCurrentView={filePreview.isCurrentView}
             className={props.className}
           />
         );
@@ -1526,6 +1548,7 @@ function ChatMarkdown({
       },
     }),
     [
+      cwd,
       diffThemeName,
       fileLinkParentSuffixByPath,
       isStreaming,
@@ -1534,6 +1557,10 @@ function ChatMarkdown({
       openInPreferredEditor,
       openExternalLinkInPreview,
       openMarkdownFileInPreview,
+      previewDisabledReason,
+      downloadDisabledReason,
+      downloadEntry,
+      filePreview.isCurrentView,
       resolvedTheme,
       skills,
       text,

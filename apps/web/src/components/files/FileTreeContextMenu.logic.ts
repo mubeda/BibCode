@@ -25,6 +25,8 @@ export interface FileTreeMenuItem {
   label: string;
   enabled: boolean;
   destructive?: boolean;
+  /** Visible explanation; availability is supplied by the owning transfer runtime. */
+  disabledReason?: string;
 }
 
 export interface BuildFileTreeMenuModelInput {
@@ -38,6 +40,9 @@ export interface BuildFileTreeMenuModelInput {
   isPrimaryEnv: boolean;
   /** Workspace root is known, so an absolute path (Copy Path / Add as Project) can be computed. */
   hasWorkspaceRoot: boolean;
+  downloadDisabledReason?: string | null;
+  uploadDisabledReason?: string | null;
+  previewDisabledReason?: string | null;
 }
 
 export interface FileTreeMenuModel {
@@ -51,12 +56,20 @@ const NEW_FOLDER: FileTreeMenuItem = { id: "new-folder", label: "New Folder…",
 
 export function buildFileTreeMenuModel(input: BuildFileTreeMenuModelInput): FileTreeMenuModel {
   const { entryKind, isPreviewable, isPrimaryEnv, hasWorkspaceRoot } = input;
+  const downloadReason = input.downloadDisabledReason ?? null;
+  const uploadReason = input.uploadDisabledReason ?? null;
+  const upload: FileTreeMenuItem = {
+    id: "upload",
+    label: "Upload Files…",
+    enabled: uploadReason === null,
+    ...(uploadReason === null ? {} : { disabledReason: uploadReason }),
+  };
 
   if (entryKind === "background") {
     return {
       groups: dropEmptyGroups([
         [NEW_FILE, NEW_FOLDER],
-        [{ id: "upload", label: "Upload Files…", enabled: true }],
+        [upload],
         [
           { id: "copy-path", label: "Copy Path", enabled: hasWorkspaceRoot },
           { id: "refresh", label: "Refresh", enabled: true },
@@ -93,13 +106,25 @@ export function buildFileTreeMenuModel(input: BuildFileTreeMenuModelInput): File
     });
   }
   if (isFile && isPreviewable) {
-    actionGroup.push({ id: "open-preview", label: "Open in Preview", enabled: true });
+    actionGroup.push({
+      id: "open-preview",
+      label: "Open in Preview",
+      enabled: input.previewDisabledReason == null,
+      ...(input.previewDisabledReason == null
+        ? {}
+        : { disabledReason: input.previewDisabledReason }),
+    });
   }
 
   const transferGroup: FileTreeMenuItem[] = [
-    { id: "download", label: "Download", enabled: true },
+    {
+      id: "download",
+      label: "Download",
+      enabled: downloadReason === null,
+      ...(downloadReason === null ? {} : { disabledReason: downloadReason }),
+    },
     isDirectory
-      ? { id: "upload", label: "Upload Files…", enabled: true }
+      ? upload
       : { id: "upload", label: "Upload Files… (choose a folder)", enabled: false },
   ];
 

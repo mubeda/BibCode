@@ -1,0 +1,27 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "ServerSettingsError",
+          "settingsPath": "&\"5",
+          "operation": "remove-stale-secret",
+          "providerInstanceId": "}{!#&d\"#",
+          "cause": [
+            -1.3913853592088464e-290,
+            null,
+            true,
+            ",?Hd4$S)",
+            [-1.447494366087697e244, false, "cee", ""],
+            null,
+            -4481854251904771
+          ]
+        }
+      }
+    ]
+  }
+}

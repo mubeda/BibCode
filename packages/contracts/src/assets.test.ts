@@ -4,6 +4,9 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   AssetAccessError,
+  AssetReadInput,
+  AssetReadEvent,
+  AssetTooLargeError,
   AssetAttachmentNotFoundError,
   AssetCreateUrlInput,
   AssetCreateUrlResult,
@@ -23,6 +26,30 @@ import {
 } from "./assets.ts";
 
 const decodeResource = Schema.decodeUnknownSync(AssetResource);
+const decodeReadInput = Schema.decodeUnknownSync(AssetReadInput);
+const decodeReadEvent = Schema.decodeUnknownSync(AssetReadEvent);
+const isReadEvent = Schema.is(AssetReadEvent);
+const decodeTooLargeError = Schema.decodeUnknownSync(AssetTooLargeError);
+
+it("validates exact asset streams and the response limit", () => {
+  const resource = { _tag: "attachment", attachmentId: "asset-1" } as const;
+  expect(decodeReadInput({ resource })).toEqual({ resource });
+  for (const event of [
+    { _tag: "start", mimeType: "image/png", sizeBytes: 3 },
+    { _tag: "bytes", offset: 0, data: "YWJj" },
+    { _tag: "end" },
+  ])
+    expect(decodeReadEvent(event)).toEqual(event);
+  expect(isReadEvent({ _tag: "bytes", offset: -1, data: "" })).toBe(false);
+  expect(isReadEvent({ _tag: "bytes", offset: 0, data: "A".repeat(1_398_105) })).toBe(false);
+  const error = decodeTooLargeError({
+    _tag: "AssetTooLargeError",
+    resource,
+    limitBytes: 10 * 1024 * 1024,
+    message: "Asset exceeds the 10 MiB limit.",
+  });
+  expect(error.limitBytes).toBe(10 * 1024 * 1024);
+});
 const encodeResource = Schema.encodeSync(AssetResource);
 const decodeCreateUrlInput = Schema.decodeUnknownSync(AssetCreateUrlInput);
 const decodeCreateUrlResult = Schema.decodeUnknownSync(AssetCreateUrlResult);

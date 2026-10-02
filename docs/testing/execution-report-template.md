@@ -256,6 +256,53 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Idle freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 50), observed before thaw:
 - Transfer freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 33), observed before thaw; subscription cleanup evidence:
 
+### In-channel file and asset reader protocol evidence
+
+- Exact byte/offset/end/Exit checks, file resume and changed-version refusal:
+- Archive pre-scan limits, failed writer, and cancellation cleanup:
+- Empty/small asset packing, 10 MiB initial/cumulative cap, HTML/PDF refusal:
+- Authenticated cross-socket four-slot limit and independent-principal quota:
+- Gated real scan/read cancellation: capacity retained through actual I/O completion:
+- Read shutdown fence, joined cleanup, and required asset-error cause parity:
+- Encrypted download rate, elapsed time, byte verification, Acks, mid-transfer Pong, 4408/reap outcome:
+- Capability advertisement state and remaining UI/cache/disk/capture qualification:
+
+### Desktop streamed disk sink evidence
+
+- Host `streamingDownloads` flag and all-four-method/older-host compatibility:
+- Raw body/header identity through imported/global/test invoke routing; malformed, JSON and oversized rejection:
+- Main webview with Preview child: accepted main caller and refused child caller:
+- Exact appended bytes, collision naming and preserved existing final:
+- Abort, idle expiry and main-page generation cleanup; stale handle refusal:
+- Delayed idle sweep versus acknowledged activity refresh; reservation-probe failure cleanup/retained retry:
+- Real pending disk I/O retained after caller cancellation; joined host shutdown and fenced admission:
+- Partial identity recovery and replacement-file cleanup refusal:
+- Packaged OS/Files UI save, cancel, reload and host-close results, or explicitly not run:
+
+### Files download UI and admission evidence
+
+- Initial route/name/authority capture before picker; guarded fresh HTTP URL/base or in-channel sink:
+- Picker retarget/pin/store/removal+identical re-add refusal; same-authority reconnect and label/credential compatibility:
+- Old catalog observer versus genuinely fresh intent, one environment slot and independent environments:
+- Browser known/cumulative cap, exact bytes, empty file/archive reset and real retained-memory measurement:
+- Ready Save/dismiss, Save retry, object URL cleanup and retained busy slot:
+- Root toast continuity across panel/catalog changes; rounded updates and disposed/old-operation callback fences:
+- Preparing/active Cancel, joined cleanup and final noncancellable publication:
+- Legacy native HTTP promise retained through removal/retarget/disposal until actual settlement; no misleading Cancel:
+- Any missing native raw method update explanation; unavailable row/folder/background copy and denied pinned upload entrypoints:
+- Packaged native save/collision/Preview/reload/host-close and real keyboard Save/Cancel, or explicitly not run:
+- Positive/canary controls, pinned content HTTP absence and capability advertisement state:
+
+### Asset and file Preview consumer evidence
+
+- Duplicate mounted asset reads, first/last view lease release, epoch teardown and only-cache URL revocation:
+- HTTP/Blob gallery retirement, local handoff preservation and Blob favicon history bound:
+- Files row/menu, file toolbar and Markdown primary/context disabled reasons, valid Download and no fallback:
+- Original queued lifetime/route/store before mint; cold/busy and same-ID re-add refusal:
+- Required current-context predicate before manual apply/remember/open; active uncertainty versus disposed-view silence:
+- Already admitted Opened/native effects, no automatic retry/close/rollback and preserved typed URL/dev-server navigation:
+- Actual keyboard/light-dark/retained-memory and pinned content HTTP/canary capture, or explicitly pending:
+
 ### Staged chat attachment upload evidence
 
 - Carrying-session `attachmentStaging`, plain/pinned E2EE transport, source byte count and digest:

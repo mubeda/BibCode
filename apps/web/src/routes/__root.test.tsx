@@ -266,6 +266,9 @@ vi.mock("../components/cloud/RelayClientInstallDialog", () => ({
 vi.mock("../components/ProviderUpdateLaunchNotification", () => ({
   ProviderUpdateLaunchNotification: () => <div data-mock="provider-update" />,
 }));
+vi.mock("../components/files/FileTransferToasts", () => ({
+  FileTransferToasts: () => <div data-mock="file-transfer-toasts" />,
+}));
 
 import { Route } from "./__root";
 import { activeEnvironmentIdAtom } from "../state/entities";
@@ -514,6 +517,15 @@ describe("RootRouteView", () => {
     expect(markup).toContain('data-mock="provider-update"');
     runEffects();
   });
+  it.each(["authenticated", "hosted-static"])(
+    "mounts download toasts outside the navigated panel in %s shell",
+    (status) => {
+      s.routeContext = { authGateState: { status } };
+      expect(renderComponent()).toContain('data-mock="file-transfer-toasts"');
+      s.pathname = "/pair";
+      expect(renderComponent()).not.toContain('data-mock="file-transfer-toasts"');
+    },
+  );
 
   it("mounts the relay installer in the browser but not the authenticated desktop shell", () => {
     s.routeContext = { authGateState: { status: "authenticated" } };

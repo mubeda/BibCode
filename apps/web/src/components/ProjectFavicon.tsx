@@ -33,8 +33,9 @@ function ProjectFaviconImage({
   readonly src: string;
   readonly className?: string | undefined;
 }) {
+  const borrowedBlob = src.startsWith("blob:");
   const [status, setStatus] = useState<"loading" | "loaded" | "error">(() =>
-    loadedProjectFaviconSrcs.has(src) ? "loaded" : "loading",
+    !borrowedBlob && loadedProjectFaviconSrcs.has(src) ? "loaded" : "loading",
   );
 
   return (
@@ -45,7 +46,7 @@ function ProjectFaviconImage({
         alt=""
         className={`size-3.5 shrink-0 rounded-sm object-contain ${status === "loaded" ? "" : "hidden"} ${className ?? ""}`}
         onLoad={() => {
-          loadedProjectFaviconSrcs.add(src);
+          if (!borrowedBlob) loadedProjectFaviconSrcs.add(src);
           setStatus("loaded");
         }}
         onError={() => setStatus("error")}

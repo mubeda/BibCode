@@ -19,7 +19,7 @@ use crate::{
         ActivityCancellationService, ActivityProjections, ActivityRepository,
         AgentActivityController, AgentActivitySource, register_activity_rpc,
     },
-    assets::{AssetAccess, ResolvedAsset},
+    assets::{AssetAccess, FALLBACK_FAVICON, ResolvedAsset},
     auth::AuthService,
     crypto::sha256_hex,
     diagnostic_bundle::DiagnosticBundleService,
@@ -1202,8 +1202,6 @@ fn now_iso() -> String {
         .format(&Rfc3339)
         .unwrap_or_else(|_| OffsetDateTime::now_utc().unix_timestamp().to_string())
 }
-
-const FALLBACK_FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="8" fill="#171717"/><path d="M17 19h30v8H36v22h-8V27H17z" fill="#fafafa"/></svg>"##;
 
 #[cfg(test)]
 mod tests {

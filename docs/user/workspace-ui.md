@@ -939,6 +939,38 @@ The Files surface is a full file manager for the active workspace:
   before the download starts. On the desktop app a
   download never overwrites an existing file with the same name; it saves as
   `name (2).ext` instead.
+- Encrypted connections require a server that supports encrypted file
+  transfers. If **Download** says **Update <server> to transfer files over its
+  encrypted connection**, update that server before trying again. An older
+  desktop app may instead ask you to **Update this app to save encrypted
+  downloads**. These downloads never switch to an HTTP transfer.
+  In a browser, an encrypted download is limited to 2 GiB and waits in a
+  **ready** toast for **Save**; closing that toast discards its bytes. Save
+  follows the browser's download-location rules. Each environment permits one
+  pending or ready download at a time, so Save or dismiss a ready result before
+  starting another. You can continue working or change panels while it runs.
+  **Cancel** stops an active encrypted download and waits for cleanup before
+  the slot can be reused. Once final saving begins, Cancel is unavailable.
+  A legacy desktop HTTP download cannot be cancelled after its save starts;
+  closing its progress toast does not stop that save.
+- **Open in Preview** opens an HTML/PDF file in the integrated browser only
+  on an unpinned connection. On an encrypted connection it stays visibly
+  unavailable with **Preview isn't available over encrypted connections yet.
+  Download this file to open it.** The file's text/editor view remains usable.
+  The file toolbar has **Download**; workspace file links in Markdown offer it
+  in their context menu when the workspace and relative path are known.
+  A denied Markdown preview link remains focusable so its explanation can be
+  read, and never redirects to an external browser or editor as a fallback.
+  Download can still require a server/app update or Save/dismiss of a ready
+  result; its explanation appears beside the action.
+  A preview response lost after the server admitted the open can mean it
+  already opened: **Check Preview before trying again**. The client does not
+  automatically retry or close that tab.
+- Chat images and project icons use the selected connection's asset route.
+  On encrypted connections without full asset support they retain the existing
+  name/folder fallback instead of fetching a signed HTTP image. Changing the
+  environment's authority retires its old server image/gallery selection;
+  local outgoing previews remain owned by their original draft/handoff.
 - **Upload Files…** on a folder row, or on the tree background for the
   workspace root, opens a file picker and uploads the chosen files into that
   folder. It is disabled on file rows. An upload that would replace an existing
@@ -951,6 +983,8 @@ The Files surface is a full file manager for the active workspace:
   in a dot or a space, or named after a device such as `CON` or `COM1`. A
   server on Linux or macOS accepts those names, because its filesystem stores
   them.
+  Upload remains unavailable on an encrypted connection until encrypted
+  workspace uploads are supported; its menu explains the required update.
 - Downloads follow the same reasoning from the other side. A workspace file
   whose name Windows cannot store is still downloadable: the desktop app on
   Windows saves it under the closest name Windows accepts (forbidden characters

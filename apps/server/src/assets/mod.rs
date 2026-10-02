@@ -9,6 +9,10 @@ use crate::provider::attachments::AttachmentMaterializer;
 use crate::signed_token;
 use crate::workspace::{WorkspaceError, paths};
 
+pub mod read;
+
+pub const FALLBACK_FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="8" fill="#171717"/><path d="M17 19h30v8H36v22h-8V27H17z" fill="#fafafa"/></svg>"##;
+
 pub const ASSET_ROUTE_PREFIX: &str = "/api/assets";
 /// Domain separation for [`crate::signed_token`]: asset tokens share the server secret with
 /// transfer tokens, and only this purpose keeps a read-only asset capability from verifying as
@@ -96,7 +100,32 @@ impl AssetAccess {
 
     pub async fn issue(&self, request: AssetIssueRequest) -> Result<IssuedAssetUrl, AssetError> {
         let expires_at = signed_token::now_millis().saturating_add(duration_millis(self.ttl));
-        let (claims, filename) = match request.resource {
+        let (claims, filename, _) = self.resolve_resource(request, expires_at).await?;
+        let token = self.sign(&claims)?;
+        Ok(IssuedAssetUrl {
+            relative_url: format!("{ASSET_ROUTE_PREFIX}/{token}/{}", percent_encode(&filename)),
+            expires_at,
+        })
+    }
+
+    /// Resolves exact resource authority without minting a bearer capability.
+    pub async fn read_exact(
+        &self,
+        request: AssetIssueRequest,
+    ) -> Result<ResolvedAsset, AssetError> {
+        let (claims, _, resolved) = self.resolve_resource(request, 0).await?;
+        if let Claims::WorkspaceSiblings { .. } = claims {
+            return Err(AssetError::UnsupportedPreviewType("HTML/PDF".to_owned()));
+        }
+        Ok(resolved)
+    }
+
+    async fn resolve_resource(
+        &self,
+        request: AssetIssueRequest,
+        expires_at: u64,
+    ) -> Result<(Claims, String, ResolvedAsset), AssetError> {
+        let resolved = match request.resource {
             AssetResource::WorkspaceFile { path, .. } => {
                 let root = request
                     .workspace_root
@@ -129,7 +158,7 @@ impl AssetAccess {
                 } else {
                     return Err(AssetError::UnsupportedPreviewType(path));
                 };
-                (claims, file_name(&file))
+                (claims, file_name(&file), ResolvedAsset::File(file))
             }
             AssetResource::Attachment { attachment_id } => {
                 let file = self
@@ -143,6 +172,7 @@ impl AssetAccess {
                         expires_at,
                     },
                     file_name(&file),
+                    ResolvedAsset::File(file),
                 )
             }
             AssetResource::ProjectFavicon { cwd } => {
@@ -162,14 +192,11 @@ impl AssetAccess {
                         expires_at,
                     },
                     filename,
+                    path.map_or(ResolvedAsset::ProjectFaviconFallback, ResolvedAsset::File),
                 )
             }
         };
-        let token = self.sign(&claims)?;
-        Ok(IssuedAssetUrl {
-            relative_url: format!("{ASSET_ROUTE_PREFIX}/{token}/{}", percent_encode(&filename)),
-            expires_at,
-        })
+        Ok(resolved)
     }
 
     pub async fn resolve(&self, token: &str, requested_path: &str) -> Option<ResolvedAsset> {
@@ -340,6 +367,74 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn asset_read_exact_images_attachments_fallback_and_refused_siblings() {
+        let root = tempfile::tempdir().unwrap();
+        let attachments = root.path().join("attachments");
+        std::fs::create_dir(&attachments).unwrap();
+        std::fs::write(attachments.join("asset-1"), b"attached").unwrap();
+        std::fs::write(root.path().join("image.svg"), b"<svg/>").unwrap();
+        std::fs::write(root.path().join("report.html"), b"hello").unwrap();
+        std::fs::write(root.path().join("report.pdf"), b"pdf").unwrap();
+        let access = AssetAccess::new(vec![8; 32], attachments.clone());
+        let attachment = access
+            .read_exact(AssetIssueRequest {
+                resource: AssetResource::Attachment {
+                    attachment_id: "asset-1".into(),
+                },
+                workspace_root: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            attachment,
+            ResolvedAsset::File(std::fs::canonicalize(attachments.join("asset-1")).unwrap())
+        );
+        assert!(matches!(
+            access
+                .read_exact(AssetIssueRequest {
+                    resource: AssetResource::ProjectFavicon {
+                        cwd: root.path().to_string_lossy().into_owned()
+                    },
+                    workspace_root: None
+                })
+                .await
+                .unwrap(),
+            ResolvedAsset::ProjectFaviconFallback
+        ));
+        for name in ["image.svg", "report.html", "report.pdf"] {
+            let result = access
+                .read_exact(AssetIssueRequest {
+                    resource: AssetResource::WorkspaceFile {
+                        thread_id: "thread".into(),
+                        path: name.into(),
+                    },
+                    workspace_root: Some(root.path().into()),
+                })
+                .await;
+            if name == "image.svg" {
+                assert!(matches!(result, Ok(ResolvedAsset::File(_))));
+            } else {
+                assert!(matches!(result, Err(AssetError::UnsupportedPreviewType(_))));
+            }
+        }
+        // Legacy sibling capability must remain available for old clients.
+        assert!(
+            access
+                .issue(AssetIssueRequest {
+                    resource: AssetResource::WorkspaceFile {
+                        thread_id: "thread".into(),
+                        path: "report.html".into()
+                    },
+                    workspace_root: Some(root.path().into())
+                })
+                .await
+                .unwrap()
+                .relative_url
+                .starts_with("/api/assets/")
+        );
+    }
 
     fn token_from(url: &IssuedAssetUrl) -> &str {
         url.relative_url.split('/').nth(3).unwrap()

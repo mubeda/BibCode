@@ -1251,6 +1251,89 @@ struct InlineTrialOutcome {
     server_reaped: bool,
     elapsed: Duration,
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encrypted_project_download_survives_a_slow_link_with_ack_and_responsive_ping() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use bibcode_server::{
+        preview::PreviewManager,
+        production::workspace_preview::{
+            WorkspacePreviewRpcServices, register_workspace_preview_rpc,
+        },
+        workspace::{WorkspaceRpc, WorkspaceService},
+    };
+    within_trial_deadline("encrypted project download",async {
+        let temp=TempDir::new().unwrap();
+        let expected:Vec<u8>=(0..3*MIB).map(|i|u8::try_from(i%251).unwrap()).collect();
+        std::fs::write(temp.path().join("slow.bin"),&expected).unwrap();
+        let (started_tx,mut started_rx)=tokio::sync::mpsc::channel(1);
+        let (ended_tx,mut ended_rx)=tokio::sync::mpsc::channel(1);
+        let handle=start_server_with(&temp,|registry| {
+            register_workspace_preview_rpc(registry,WorkspacePreviewRpcServices::new(WorkspaceRpc::new(WorkspaceService::default()),PreviewManager::new(),bibcode_server::mcp::preview_automation::PreviewAutomationBroker::new()));
+            registry.register_stream("fixture.watch",move |_,cancellation| {
+                let (sender,receiver)=tokio::sync::mpsc::channel(1);
+                let started=started_tx.clone();let ended=ended_tx.clone();
+                tokio::spawn(async move {started.send(()).await.unwrap();cancellation.cancelled().await;sender.closed().await;let _=ended.send(Instant::now()).await;});
+                receiver
+            });
+        }).await;
+        let rate=64*KIB;
+        let proxy=ThrottleProxy::start_duplex(handle.local_addr(),rate,0).await;
+        let (mut socket,mut framing)=open(Mode::Encrypted,proxy.address,&host_public_key(temp.path())).await;
+        watch_session(&mut socket,&mut framing).await;started_rx.recv().await.unwrap();
+        let start=Instant::now();
+        send_text(&mut socket,&mut framing,&json!({"_tag":"Request","id":"1","tag":"projects.readDownload","payload":{"cwd":temp.path(),"relativePath":"slow.bin"},"headers":[]}).to_string()).await;
+        let mut assembly=Assembly::default();
+        let mut received=Vec::new();
+        let mut last_inbound=Instant::now();
+        let mut probe_sent=false;
+        let mut ping_at=None;
+        let mut pong_latency=None;
+        let mut ping_bound=None;
+        let mut ended=false;
+        loop {
+            let deadline=last_inbound+if probe_sent {DEAD_AFTER}else{PROBE_AFTER};
+            let frame=tokio::select! {
+                frame=socket.next()=>frame.expect("download socket stays live").expect("WebSocket frame"),
+                ()=sleep_until(deadline)=>{assert!(!probe_sent,"client would close 4408 during download");send_text(&mut socket,&mut framing,r#"{"_tag":"Ping"}"#).await;probe_sent=true;continue;}
+            };
+            assert!(!matches!(frame,Message::Close(_)),"download socket closed");
+            if matches!(frame,Message::Text(_)|Message::Binary(_)) {last_inbound=Instant::now();probe_sent=false;}
+            let Some(message)=reassemble(&mut framing,&mut assembly,frame) else {continue;};
+            let value:Value=serde_json::from_slice(&message).unwrap();
+            assert!(ended_rx.try_recv().is_err(),"server reaped active downloader");
+            if value["_tag"]=="Pong" && let Some(sent)=ping_at {pong_latency.get_or_insert(Instant::now().duration_since(sent));}
+            if value["requestId"]!="1" {continue;}
+            if value["_tag"]=="Exit" {assert_eq!(value["exit"]["_tag"],"Success");break;}
+            assert_eq!(value["_tag"],"Chunk");
+            for event in value["values"].as_array().unwrap() {
+                match event["_tag"].as_str().unwrap() {
+                    "start"=>assert_eq!(event["sizeBytes"],expected.len()),
+                    "bytes"=>{
+                        assert_eq!(event["offset"],received.len());
+                        let bytes=STANDARD.decode(event["data"].as_str().unwrap()).unwrap();
+                        if ping_at.is_none() {
+                            ping_at=Some(Instant::now());
+                            // Ping before the Ack frees this stream's only wire slot.
+                            ping_bound=Some(Duration::from_secs_f64(bytes.len() as f64*4.0/3.0/rate as f64)+Duration::from_secs(2));
+                            send_text(&mut socket,&mut framing,r#"{"_tag":"Ping"}"#).await;
+                        }
+                        received.extend(bytes);
+                    }
+                    "end"=>{assert_eq!(event["totalBytes"],expected.len());ended=true;}
+                    other=>panic!("unexpected download event {other}"),
+                }
+            }
+            send_text(&mut socket,&mut framing,r#"{"_tag":"Ack","requestId":"1"}"#).await;
+        }
+        assert!(ended);assert_eq!(received,expected);
+        assert!(start.elapsed()>Duration::from_secs(45),"download link was not paced");
+        assert!(pong_latency.expect("mid-download Pong")<=ping_bound.unwrap(),"Ping delayed behind download: {pong_latency:?}");
+        assert!(ended_rx.try_recv().is_err());
+        println!("encrypted projects.readDownload: elapsed={:?}, pong={pong_latency:?}",start.elapsed());
+        socket.close(None).await.unwrap();handle.shutdown();handle.join().await.unwrap();
+    }).await;
+}
 async fn inline_upload_trial(mode: Mode, up_rate: u64) -> InlineTrialOutcome {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     within_trial_deadline("inline upload residual", async {

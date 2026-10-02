@@ -8,6 +8,8 @@ use crate::signed_token;
 use crate::workspace::WorkspaceError;
 
 pub mod archive;
+pub mod download;
+pub(crate) mod read_tasks;
 pub mod staging;
 pub mod upload;
 

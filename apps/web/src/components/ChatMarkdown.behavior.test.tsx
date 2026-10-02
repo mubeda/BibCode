@@ -7,6 +7,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { createFrontendLogCapture } from "../diagnostics/frontendLogCapture";
 
 const mocks = vi.hoisted(() => ({
   openEditor: vi.fn(),
@@ -18,6 +19,44 @@ const mocks = vi.hoisted(() => ({
   toastAdd: vi.fn(),
   previewSupported: true,
   localApiAvailable: true,
+  previewAllowed: true,
+  downloadEntry: vi.fn(),
+  downloadError: null as ((error: unknown, title: string) => void) | null,
+  downloadDisabledReason: null as string | null,
+}));
+vi.mock("../browser/useFilePreview", () => ({
+  useFilePreview: (options: {
+    threadRef: unknown;
+    onError?: (error: unknown, title: string) => void;
+  }) => ({
+    availability: mocks.previewAllowed
+      ? { enabled: true }
+      : {
+          enabled: false,
+          reason:
+            "Preview isn't available over encrypted connections yet. Download this file to open it.",
+        },
+    openFile: async (filePath: string) => {
+      try {
+        const result = await mocks.openFileInPreview({ threadRef: options.threadRef, filePath });
+        if (result._tag === "Failure" && !result.interrupted)
+          options.onError?.(Cause.squash(result.cause), "Unable to open file in browser");
+        return result;
+      } catch (error) {
+        options.onError?.(error, "Unable to open file in browser");
+        return AsyncResult.failure(Cause.fail(error));
+      }
+    },
+  }),
+}));
+vi.mock("./files/useFileDownloads", () => ({
+  useFileDownloads: (options: { showMutationError: (error: unknown, title: string) => void }) => {
+    mocks.downloadError = options.showMutationError;
+    return {
+      downloadEntry: mocks.downloadEntry,
+      downloadDisabledReason: mocks.downloadDisabledReason,
+    };
+  },
 }));
 
 vi.mock("@effect/atom-react", () => ({ useAtomValue: () => ({ availableEditors: [] }) }));
@@ -101,6 +140,9 @@ beforeEach(() => {
   });
   mocks.previewSupported = true;
   mocks.localApiAvailable = true;
+  mocks.previewAllowed = true;
+  mocks.downloadEntry.mockReset();
+  mocks.downloadDisabledReason = null;
   mocks.openEditor.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   mocks.openFileInPreview.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   mocks.openUrlInPreview.mockReset().mockResolvedValue(AsyncResult.success(undefined));
@@ -192,6 +234,40 @@ async function flush(): Promise<void> {
 }
 
 describe("ChatMarkdown file-link behavior", () => {
+  it("keeps a denied file preview focusable with its visible reason and no editor fallback", async () => {
+    mocks.previewAllowed = false;
+    const link = await mountFileLink();
+    expect(link.getAttribute("aria-disabled")).toBe("true");
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    const reason = document.getElementById(link.getAttribute("aria-describedby")!);
+    expect(reason?.textContent).toContain(
+      "Preview isn't available over encrypted connections yet.",
+    );
+    await act(async () => link.click());
+    await flush();
+    expect(mocks.openFileInPreview).not.toHaveBeenCalled();
+    expect(mocks.openEditor).not.toHaveBeenCalled();
+    expect(mocks.openFile).not.toHaveBeenCalled();
+  });
+  it("describes disabled preview and offers only a valid shared workspace Download in the menu", async () => {
+    mocks.previewAllowed = false;
+    const link = await mountFileLink();
+    mocks.contextMenuShow.mockResolvedValueOnce("open-in-browser");
+    await openContextMenu(link);
+    expect(mocks.contextMenuShow.mock.calls[0]![0]).toContainEqual(
+      expect.objectContaining({
+        id: "open-in-browser",
+        disabled: true,
+        description:
+          "Preview isn't available over encrypted connections yet. Download this file to open it.",
+      }),
+    );
+    expect(mocks.openFileInPreview).not.toHaveBeenCalled();
+    mocks.contextMenuShow.mockResolvedValueOnce("download");
+    await openContextMenu(link);
+    expect(mocks.downloadEntry).toHaveBeenCalledWith("src/index.ts");
+  });
   it("opens browser-preview-capable files from a normal click", async () => {
     const link = await mountFileLink();
 
@@ -346,7 +422,7 @@ describe("ChatMarkdown file-link behavior", () => {
     expect(mocks.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Unable to open file in browser" }),
     );
-    expect(consoleError).toHaveBeenCalled();
+    expect(consoleError).not.toHaveBeenCalled();
 
     mocks.openFileInPreview.mockResolvedValueOnce(AsyncResult.failure(Cause.fail("unknown")));
     await act(async () => link.click());
@@ -354,7 +430,7 @@ describe("ChatMarkdown file-link behavior", () => {
     expect(mocks.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({
         title: "Unable to open file in browser",
-        description: "An error occurred.",
+        description: "unknown",
       }),
     );
   });
@@ -517,5 +593,49 @@ describe("ChatMarkdown external-link behavior", () => {
     const withoutThread = await mountExternalLink(false);
     await openContextMenu(withoutThread);
     expect(mocks.contextMenuShow).not.toHaveBeenCalled();
+  });
+});
+
+describe("independent Markdown download boundaries", () => {
+  it("redacts a signed download capability before diagnostic capture", async () => {
+    const captured = createFrontendLogCapture();
+    const destination = { log: () => {}, warn: () => {}, error: (..._values: unknown[]) => {} };
+    captured.install({ console: destination, eventTarget: window });
+    vi.spyOn(console, "error").mockImplementation((...values) => destination.error(...values));
+    const link = await mountFileLink();
+    mocks.downloadEntry.mockImplementation(() =>
+      mocks.downloadError!(
+        new Error("Download failed (https://fixture.invalid/api/transfers/probe-only-secret)"),
+        "Download failed",
+      ),
+    );
+    mocks.contextMenuShow.mockResolvedValueOnce("download");
+    await openContextMenu(link);
+    const text = captured.snapshot();
+    expect(text).not.toContain("probe-only-secret");
+    expect(mocks.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Download failed",
+        description: expect.not.stringContaining("probe-only-secret"),
+      }),
+    );
+  });
+  it("does not offer a download for a case-distinct outside POSIX workspace", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () =>
+      root!.render(
+        <ChatMarkdown
+          text="[outside.pdf](/WORKSPACE/outside.pdf)"
+          cwd="/workspace"
+          threadRef={threadRef}
+        />,
+      ),
+    );
+    const link = container.querySelector<HTMLAnchorElement>(".chat-markdown-file-link")!;
+    mocks.contextMenuShow.mockResolvedValueOnce("download");
+    await openContextMenu(link);
+    expect(mocks.downloadEntry).not.toHaveBeenCalled();
   });
 });

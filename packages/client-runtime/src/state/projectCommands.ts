@@ -1,5 +1,11 @@
-import { type EnvironmentId, type ProjectReadFileResult, WS_METHODS } from "@bibcode/contracts";
+import {
+  type EnvironmentId,
+  type ProjectReadFileResult,
+  type ProjectCreateUploadUrlInput,
+  WS_METHODS,
+} from "@bibcode/contracts";
 import * as Crypto from "effect/Crypto";
+import * as Effect from "effect/Effect";
 import { Atom } from "effect/unstable/reactivity";
 
 import {
@@ -8,6 +14,8 @@ import {
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
+  createRuntimeCommand,
+  runInEnvironment,
 } from "./runtime.ts";
 import {
   type CreateProjectInput,
@@ -17,7 +25,30 @@ import {
   deleteProject,
   updateProject,
 } from "../operations/commands.ts";
-import type { EnvironmentRegistry } from "../connection/registry.ts";
+import { EnvironmentRegistry } from "../connection/registry.ts";
+import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { currentSession, EnvironmentRpcUnavailableError, requestInSession } from "../rpc/client.ts";
+import { readFileTransferSession } from "../operations/fileTransferSession.ts";
+
+const createUnpinnedUploadUrl = Effect.fn("Projects.createUnpinnedUploadUrl")(function* (
+  input: ProjectCreateUploadUrlInput,
+) {
+  const registry = yield* EnvironmentRegistry;
+  const supervisor = yield* EnvironmentSupervisor;
+  const carrying = yield* readFileTransferSession(registry, supervisor, yield* currentSession());
+  if (carrying.prepared.e2ee !== null)
+    return yield* new EnvironmentRpcUnavailableError({
+      environmentId: supervisor.target.environmentId,
+      message: "Uploads aren't available over encrypted connections yet.",
+    });
+  // The legacy caller still owns HTTP handoff after this mint; no upload commit policy is added.
+  return yield* requestInSession(
+    carrying.session,
+    supervisor.target.environmentId,
+    WS_METHODS.projectsCreateUploadUrl,
+    input,
+  );
+});
 
 export type {
   CreateProjectInput,
@@ -126,9 +157,12 @@ export function createProjectEnvironmentAtoms<R, E>(
       label: "environment-data:projects:create-download-url",
       tag: WS_METHODS.projectsCreateDownloadUrl,
     }),
-    createUploadUrl: createEnvironmentRpcCommand(runtime, {
+    createUploadUrl: createRuntimeCommand(runtime, {
       label: "environment-data:projects:create-upload-url",
-      tag: WS_METHODS.projectsCreateUploadUrl,
+      execute: (target: {
+        readonly environmentId: EnvironmentId;
+        readonly input: ProjectCreateUploadUrlInput;
+      }) => runInEnvironment(target.environmentId, createUnpinnedUploadUrl(target.input)),
     }),
     refreshEntries: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:projects:refresh-entries",

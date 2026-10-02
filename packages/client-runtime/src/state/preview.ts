@@ -1,13 +1,35 @@
-import { WS_METHODS } from "@bibcode/contracts";
-import { Atom } from "effect/unstable/reactivity";
+import { WS_METHODS, type EnvironmentId } from "@bibcode/contracts";
+import * as Cause from "effect/Cause";
+import * as Effect from "effect/Effect";
+import { AsyncResult, Atom, type AtomRegistry } from "effect/unstable/reactivity";
 
-import type { EnvironmentRegistry } from "../connection/registry.ts";
+import type { EnvironmentRegistry, EnvironmentNotRegisteredError } from "../connection/registry.ts";
+import {
+  captureHttpFilePreviewAuthority,
+  openCapturedHttpFilePreview,
+  type HttpFilePreviewInput,
+  type HttpFilePreviewResult,
+} from "../operations/filePreview.ts";
+import {
+  sameFileContentIdentity,
+  type FileContentIdentity,
+} from "../operations/fileTransferSession.ts";
+import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
 import {
   createAtomCommandScheduler,
+  createRuntimeCommand,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
+  runInEnvironment,
+  type AtomCommandResult,
+  type AtomCommandRunOptions,
 } from "./runtime.ts";
+
+export interface HttpFilePreviewCommandResult extends HttpFilePreviewResult {
+  /** Check immediately before manual UI publication; this cannot undo server effects. */
+  readonly isCurrentContext: () => boolean;
+}
 
 export const previewAutomationHostFocusConcurrencyKey = (value: {
   readonly environmentId: string;
@@ -27,6 +49,133 @@ export function createPreviewEnvironmentAtoms<R, E>(
     mode: "serial" as const,
     key: ({ environmentId, input }: { environmentId: string; input: { threadId: string } }) =>
       JSON.stringify([environmentId, input.threadId]),
+  };
+  type AuthorityResult = AtomCommandResult<
+    FileContentIdentity,
+    E | EnvironmentNotRegisteredError | EnvironmentRpcUnavailableError
+  >;
+  const notReady = (environmentId: EnvironmentId) =>
+    new EnvironmentRpcUnavailableError({
+      environmentId,
+      message: "The connection is not ready for this preview. Try opening the file again.",
+    });
+  const captureCurrentAuthority = (
+    registry: AtomRegistry.AtomRegistry,
+    environmentId: EnvironmentId,
+  ): AuthorityResult => {
+    // Lifecycle metadata remains safe after disposal; do not recreate atoms in a retired/cold registry.
+    const node = registry.getNodes().get(runtime);
+    if (node === undefined || node.currentState() !== "valid")
+      return AsyncResult.failure(Cause.fail(notReady(environmentId)));
+    const context = node.value();
+    if (!AsyncResult.isSuccess(context) || context.waiting)
+      return AsyncResult.failure(Cause.fail(notReady(environmentId)));
+    let accepting = true;
+    const capture = runtime
+      .atom(
+        Effect.suspend(() => {
+          if (!accepting) return Effect.interrupt;
+          accepting = false;
+          return runInEnvironment(environmentId, captureHttpFilePreviewAuthority());
+        }).pipe(
+          Effect.timeoutOrElse({
+            duration: "30 seconds",
+            orElse: () => Effect.fail(notReady(environmentId)),
+          }),
+        ),
+      )
+      .pipe(Atom.setIdleTTL(0), Atom.withLabel("environment-data:preview:call-entry-authority"));
+    let unmount = () => {};
+    try {
+      unmount = registry.mount(capture);
+      const result = registry.get(capture);
+      if (AsyncResult.isSuccess(result) && !result.waiting)
+        return AsyncResult.success(result.value);
+      if (AsyncResult.isFailure(result) && !result.waiting)
+        return AsyncResult.failure(result.cause);
+      return AsyncResult.failure(Cause.fail(notReady(environmentId)));
+    } finally {
+      accepting = false;
+      try {
+        // Unmount schedules removal. Invalidate the sealed cell now to stop any pending reader.
+        if (registry.getNodes().has(capture)) registry.refresh(capture);
+      } finally {
+        unmount();
+      }
+    }
+  };
+  const openFileCommand = createRuntimeCommand(runtime, {
+    label: "environment-data:preview:open-file",
+    execute: (target: {
+      readonly environmentId: EnvironmentId;
+      readonly input: HttpFilePreviewInput;
+      readonly authority: FileContentIdentity;
+      readonly isCurrentContext: () => boolean;
+    }) =>
+      runInEnvironment(
+        target.environmentId,
+        openCapturedHttpFilePreview(target.input, target.authority),
+      ).pipe(
+        Effect.map(
+          (result) =>
+            ({
+              ...result,
+              isCurrentContext: target.isCurrentContext,
+            }) satisfies HttpFilePreviewCommandResult,
+        ),
+      ),
+    scheduler: lifecycleScheduler,
+    concurrency: lifecycleConcurrency,
+  });
+  const openFile = {
+    label: openFileCommand.label,
+    run: async (
+      registry: AtomRegistry.AtomRegistry,
+      target: { readonly environmentId: EnvironmentId; readonly input: HttpFilePreviewInput },
+      options?: AtomCommandRunOptions,
+    ): ReturnType<typeof openFileCommand.run> => {
+      try {
+        const snapshot = {
+          environmentId: target.environmentId,
+          input: { threadId: target.input.threadId, filePath: target.input.filePath },
+        };
+        const captured = options?.signal?.aborted
+          ? AsyncResult.failure(Cause.interrupt())
+          : captureCurrentAuthority(registry, snapshot.environmentId);
+        if (captured._tag === "Failure")
+          return await lifecycleScheduler.schedule(registry, lifecycleConcurrency, snapshot, () =>
+            Promise.resolve(
+              options?.signal?.aborted
+                ? AsyncResult.failure(Cause.interrupt())
+                : AsyncResult.failure(captured.cause),
+            ),
+          );
+        const authority = captured.value;
+        const entryRuntime = registry.getNodes().get(runtime);
+        return await openFileCommand.run(
+          registry,
+          {
+            ...snapshot,
+            authority,
+            isCurrentContext: () => {
+              if (options?.signal?.aborted || entryRuntime?.currentState() !== "valid")
+                return false;
+              try {
+                const current = captureCurrentAuthority(registry, snapshot.environmentId);
+                return (
+                  current._tag === "Success" && sameFileContentIdentity(authority, current.value)
+                );
+              } catch {
+                return false;
+              }
+            },
+          },
+          options,
+        );
+      } catch (cause) {
+        return AsyncResult.failure(Cause.die(cause));
+      }
+    },
   };
   return {
     list: createEnvironmentRpcQueryAtomFamily(runtime, {
@@ -56,6 +205,7 @@ export function createPreviewEnvironmentAtoms<R, E>(
       scheduler: lifecycleScheduler,
       concurrency: lifecycleConcurrency,
     }),
+    openFile,
     navigate: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:preview:navigate",
       tag: WS_METHODS.previewNavigate,

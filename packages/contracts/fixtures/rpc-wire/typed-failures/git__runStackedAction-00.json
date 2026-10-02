@@ -1,0 +1,28 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "SourceControlProviderError",
+          "provider": "azure-devops",
+          "operation": "';",
+          "cwd": "p",
+          "reference": "+Ny}C$cE",
+          "detail": "/>H9",
+          "cause": [
+            "@ZnRHMm;w",
+            null,
+            -7229861502233284,
+            -4.247038539995302e-117,
+            "`MiB#Mp",
+            -4047223103266168
+          ]
+        }
+      }
+    ]
+  }
+}

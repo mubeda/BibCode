@@ -1,0 +1,21 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "TerminalResizeError",
+          "threadId": "~8",
+          "terminalId": "",
+          "terminalPid": 3.2229864679470793e-44,
+          "cols": 1000,
+          "rows": 492,
+          "cause": [null]
+        }
+      }
+    ]
+  }
+}

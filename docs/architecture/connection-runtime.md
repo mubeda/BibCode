@@ -669,6 +669,18 @@ for their first registration. Removal releases the inner subscription and
 switches to an empty stream while the follower keeps waiting; registering the
 same environment ID again re-binds it to the new supervisor. They key on the
 installation token, not the catalog entry, so a rename leaves them subscribed.
+
+The registry separately owns an opaque registration lifetime for each currently
+registered environment. `registrationLifetime` reads it without creating a
+supervisor or taking the environment lease, so removal cleanup can safely check
+a previously captured lifetime. The token changes only after actual removal
+and re-add; relabeling, credential updates, reconnects and runtime replacement
+preserve it. Token mutation and catalog publication happen in the same
+synchronous update under the existing registration owner. Tokens are private
+client objects, unique across registry instances, with no wire or persisted
+representation. This fences delayed consumers even when they see only the
+identical final catalog after removal and immediate re-add.
+
 Window focus and document visibility request one single-flight refresh per distinct physical
 project, even if several rows or panels render it.
 
@@ -679,12 +691,180 @@ one bulk lane per environment. These are responsiveness bounds, not correctness
 locks: the server's command receipts, mutation locks, generation checks,
 physical identity, and repository verification remain authoritative.
 
+The shared unary and finite-stream command factories fence each invocation when
+its scheduler admits it. The returned Effect or Stream can enter once while the
+invocation is live; settlement retires that entry. Retained reactive atoms cannot
+replay an already entered or settled command after runtime recovery. Every fresh
+explicit invocation gets its own fence, including identical inputs. Internal
+operation retry/reattach loops remain inside that one invocation. Query refresh
+and durable subscription recovery use their separate helpers and keep their
+existing behavior. This execution fence adds no queue, owner map or cleanup wait:
+operation-specific owners still retain work until their actual cleanup finishes.
+
 Atom commands accept an optional per-call abort signal. Aborting a running
 command disposes its atom, which interrupts its fiber; the RPC client then
 sends `Interrupt`, which the server maps to the request's cancellation token.
 An invocation aborted while still queued settles when its turn comes and never
 starts. On `singleFlight`, a caller that joins a running execution cannot abort
 it; on `latest`, the newest caller's abort interrupts the shared run.
+
+Finite file-content streams use the exact carrying RPC session and a bounded
+per-call buffer, separately from durable-subscription retry options. The content
+route is HTTP only when that prepared connection has no E2EE pin. A pinned
+connection requires the carrying config's `inChannelTransfers: true`; a missing
+or false capability is unavailable and cannot fall back to HTTP. The additive
+capability decodes to false for older servers and remains unadvertised until
+the complete transfer surface is implemented. Current web consumers still
+await their route-aware migration.
+
+File-content session capture verifies the registration lifetime, registry's supervisor, connected
+generation, prepared route, and session before and after awaiting its cached
+config. Content identity includes saved routing fields, host pin, and accepted
+store identity; labels and credentials do not invalidate it. A missing store
+identity permits only same-session reuse, never cross-session resume or cache
+reuse. SSH identity uses its saved host rather than its disposable tunnel port.
+
+The download operation validates start metadata, canonical bounded byte chunks,
+contiguous offsets and the final byte count. An `end` event is only a candidate
+completion: the RPC stream must terminate successfully before the sink finishes.
+File reconnects resume at the last sink-acknowledged offset with the original
+size/modification version. Archives may restart once through the sink's reset
+contract. A second archive cut or a typed server refusal ends the operation.
+Catalog removal, retargeting or accepted store changes cancel the logical read.
+Sink abort is joined on failure or cancellation; no cleanup timeout releases
+ownership while the old sink still holds work.
+
+The file-transfer state factory owns one active operation per environment across
+panels. Preparation claims this slot before a destination picker and returns an
+opaque admission token. The original path, route and content identity remain in
+the private invocation record. Consumption checks that identity before reading
+bytes or minting a URL; removing and re-adding an identical environment does not
+revive its old token. The guarded HTTP operation mints through one current
+unpinned session and pairs the result with that session's freshly checked base
+URL. Only same-origin addresses under `/api/transfers/` are accepted.
+
+Command promise cancellation can settle before the Effect finalizer, so the
+invocation retains admission until actual sink cleanup finishes. Progress and
+finalizers are fenced by that record's monotonically increasing ID. Consumed
+commands cannot replay when a failed runtime recovers. A ready browser Blob
+continues to occupy the slot until Save or dismiss; the transfer UI must explain
+this busy state and expose those actions. Panel unmount leaves active and ready
+work intact. The application-level operations map also retains outcomes for an
+environment removed during final publication.
+
+After successful stream completion and a terminal identity check, the read and
+its authority watcher are joined. A final cancellation check then synchronously
+admits the `finishing` phase before awaiting the sink's joined finish operation.
+Cancel is unavailable from this point: later retargeting or removal cannot
+reclassify a successful native publication as cancellation. A failed finish still
+reports failure after joined cleanup. Earlier removal cancels active reads and
+discards retained results. Legacy HTTP is a separate noncancellable handoff: the
+native `downloadToFolder` command has no cancel API, so its intent remains owned
+until the actual promise settles; a browser releases it after anchor handoff.
+Operation route and cancellability come from the original invocation, while
+availability projects the current coherent session and fails closed on runtime
+failure.
+
+The Files download hook captures the original admission before opening a native
+destination picker and consumes only the guarded HTTP URL or the in-channel
+sink on that admission. It never combines an earlier base URL with a later
+session. The browser sink owns bounded chunk copies, enforces a 2 GiB payload
+limit and creates one ready Blob after successful completion. Save allocates a
+temporary object URL only inside the user's action; Save or dismiss releases
+the ready operation. The native sink uses the complete four-method raw
+DesktopBridge interface, awaits each write acknowledgement and joins finish or
+abort. An older desktop host missing any method refuses an encrypted download
+with an app-update explanation rather than selecting HTTP.
+
+Root toast observers follow the operation map, including finalizing operations
+whose environment is no longer in the catalog. Scalar subscriptions limit
+progress renders to rounded copy changes. Preparing offers real Cancel;
+cancelling, finishing and an admitted legacy native HTTP download do not.
+Closing or disposing a noncancellable toast changes only its view. Retired
+callbacks check instance, operation and disposal fences before reading the
+registry or performing a Save action. HTTP outcomes retain the existing Files
+error/saved presenter; encrypted outcomes remain owned by the root observer
+after the initiating panel unmounts. Files menus explain unavailable and busy
+states visibly. Pending encrypted workspace uploads are denied at their legacy
+entrypoints; this consumer guard does not add workspace upload APIs or enable
+the server's complete transfer capability.
+
+The legacy `createUploadUrl` command also captures the actual coherent carrying
+session and refuses any prepared E2EE pin before HTTP capability minting,
+regardless of the advertised transfer capability. Missing context or a pin
+transition during config acquisition fails closed. Unpinned inputs, results and
+typed server refusals are unchanged. This guard does not bind the later legacy
+HTTP handoff to that snapshot or revoke a URL already minted; those separate
+post-mint/publication semantics remain part of the complete upload design.
+
+File-capability Preview opening uses the bounded `openHttpFilePreview` operation
+and the preview state factory's existing per-environment/thread lifecycle lane.
+The state command captures a full authority witness synchronously at the public
+call, before its queue position can wait behind an earlier operation. It accepts
+only a completed read from a warm runtime; cold runtime construction, pending
+config or a busy registration lease refuses with retry guidance. Its temporary
+read cell has a 30-second defensive bound, permits one evaluation, and is sealed,
+refreshed and unmounted on return so a delayed read cannot authorize a replacement.
+At queue admission the current unpinned session must still match that original
+registration/route/store witness. A verified same-store reconnect is allowed;
+unknown-store authority remains bound to its original physical session.
+It creates the asset capability through the actual admitted session, validates
+the current registration/host/store identity and fresh
+HTTP base, then opens the Preview on the same session. Pinned file resources
+(including images requested through this imperative path) are refused before
+minting; renderer images use the asset cache instead. Only same-origin HTTP(S)
+addresses in `/api/assets/` are accepted. Existing typed-URL and dev-server
+Preview commands remain separate and unchanged.
+
+The file-open command snapshots its input and uses the shared command invocation
+fence; a recovered atom runtime cannot silently reissue a non-idempotent open.
+A server Opened event and native navigation may
+precede the open reply. After an attempted open, transport loss or a changed
+authority yields `FilePreviewUncertainError`, directing the user to check Preview
+before trying again. Declared server refusals stay typed failures. There is no
+automatic retry, rollback or close, and final authority validation suppresses a
+stale imperative result. The state-only `HttpFilePreviewCommandResult` adds a
+required `isCurrentContext()` predicate over the original witness and caller
+registry/signal. It returns false for aborted or retired callers before atom
+reads, and for changed authority or an unavailable/busy capture. View owners
+check it synchronously alongside their scoped view guard immediately before
+manual snapshot, remembered-URL or panel publication; missing predicates never
+authorize publication. The direct nonqueued operation still returns only URL
+and snapshot. If the scoped view is still current but the predicate refuses,
+the adapter reports the shared `FILE_PREVIEW_UNCERTAIN_MESSAGE`; a disposed or
+changed view stays quietly interrupted. View owners pass cancellation and
+suppress obsolete toasts; cancellation
+does not prove that an already admitted Preview had no effect.
+
+The asset state factory owns scoped caches by environment registration, routing
+authority and accepted store identity. Duplicate readers share one URL; each
+lease releases one reference. Two read permits cover entire logical reads,
+including a single transport-cut reissue and its reconnect wait. The private
+read port opens explicit attempts, so each attempt has fresh validation and
+partial bytes are dropped before the next session is awaited. Duplicate starts,
+wrong offsets or sizes, noncanonical/oversized chunks, missing end, and failed
+terminal RPC exits cannot publish a URL. Each asset is limited to 10 MiB and
+keeps its announced MIME type. The cache applies a 64 MiB LRU budget only to
+unreferenced complete entries; visible entries are never evicted for budget.
+The final pending waiter cancels and joins its producer. Cache disposal fences
+new acquisitions, joins readers and revokes every completed URL once.
+
+Normal reconnect, label and credential changes keep complete byte entries for
+the same registration, host and store. A new registration lifetime, retarget,
+store change, or unavailable capability retires the old epoch before publishing
+a replacement. Missing sessions preserve authorized complete entries only;
+they authorize no new I/O. Without a store identity, reuse stays within the
+same physical session. Runtime teardown cannot resurrect an old owner.
+
+Resolved asset `url`/`urls` atoms observe only the chosen HTTP or byte-cache
+branch, returning null when unavailable and releasing byte leases with their
+consumer scope. The existing HTTP mint query retains its TTL/refresh policy but
+checks the carrying session before every RPC, including background refreshes.
+Resolved HTTP URLs require the minted token's authority to match the current
+base, preventing old-host tokens from being attached to a retargeted host.
+Blocking new mints does not retire URLs already held by raw consumers; their
+web-hook migration remains separate work.
+
 Add Project's clone command is `serial` per destination. Against a server
 without `vcsCloneReattach`, it is today's single `vcs.clone` call, and **Cancel
 clone**, or the dialog unmounting, aborts it, so the interrupt stops the clone.

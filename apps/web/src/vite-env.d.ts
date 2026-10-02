@@ -1,6 +1,7 @@
 /// <reference types="vite-plus/client" />
 
 import type { DesktopBridge, LocalApi } from "@bibcode/contracts";
+import type { TauriCommandArguments, TauriCommandOptions } from "./tauriInvokeRouting";
 
 interface ImportMetaEnv {
   readonly VITE_HTTP_URL: string;
@@ -18,7 +19,11 @@ interface ImportMeta {
 
 declare global {
   interface TauriCoreApi {
-    invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
+    invoke<T>(
+      command: string,
+      args?: TauriCommandArguments,
+      options?: TauriCommandOptions,
+    ): Promise<T>;
   }
 
   interface TauriEventApi {

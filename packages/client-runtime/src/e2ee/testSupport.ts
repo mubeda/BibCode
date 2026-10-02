@@ -69,52 +69,70 @@ export async function openEncryptedTestSocket(
     });
   };
 
-  await new Promise<void>((resolve, reject) => {
-    socket.addEventListener("open", () => resolve(), { once: true });
-    socket.addEventListener("error", () => reject(new Error("websocket open failed")), {
-      once: true,
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        socket.removeEventListener("open", opened);
+        socket.removeEventListener("error", failed);
+        socket.removeEventListener("close", failed);
+      };
+      const opened = () => {
+        cleanup();
+        resolve();
+      };
+      const failed = () => {
+        cleanup();
+        reject(new Error("E2EE WebSocket did not open"));
+      };
+      const timer = setTimeout(failed, FRAME_TIMEOUT_MS);
+      socket.addEventListener("open", opened, { once: true });
+      socket.addEventListener("error", failed, { once: true });
+      socket.addEventListener("close", failed, { once: true });
     });
-  });
 
-  const initiator = createNkInitiator({ responderStaticPublicKey: hostKey });
-  socket.send(ownedBuffer(initiator.writeMessageA(EMPTY)));
-  const payload = initiator.readMessageB(await nextFrame());
-  if (payload.length !== 0) {
-    socket.close();
-    throw new Error("message B carried a non-empty handshake payload");
-  }
-  const transport = initiator.split();
-  let assembler = new RecordAssembler(MAX_E2EE_PREAUTH_MESSAGE_BYTES);
-  let authenticated = false;
-  const nextMessage = async (): Promise<string> => {
-    for (;;) {
-      const record = transport.receive.decryptWithAd(EMPTY, await nextFrame());
-      const message = assembler.push(record);
-      if (message === null) continue;
-      const text = new TextDecoder().decode(message);
-      if (!authenticated) {
-        try {
-          const parsed = JSON.parse(text) as { type?: string };
-          if (parsed.type === "e2ee_authenticated") {
-            authenticated = true;
-            assembler = new RecordAssembler();
+    const initiator = createNkInitiator({ responderStaticPublicKey: hostKey });
+    socket.send(ownedBuffer(initiator.writeMessageA(EMPTY)));
+    const payload = initiator.readMessageB(await nextFrame());
+    if (payload.length !== 0) {
+      throw new Error("message B carried a non-empty handshake payload");
+    }
+    const transport = initiator.split();
+    let assembler = new RecordAssembler(MAX_E2EE_PREAUTH_MESSAGE_BYTES);
+    let authenticated = false;
+    const nextMessage = async (): Promise<string> => {
+      for (;;) {
+        const record = transport.receive.decryptWithAd(EMPTY, await nextFrame());
+        const message = assembler.push(record);
+        if (message === null) continue;
+        const text = new TextDecoder().decode(message);
+        if (!authenticated) {
+          try {
+            const parsed = JSON.parse(text) as { type?: string };
+            if (parsed.type === "e2ee_authenticated") {
+              authenticated = true;
+              assembler = new RecordAssembler();
+            }
+          } catch {
+            // The caller owns assertions for malformed encrypted messages.
           }
-        } catch {
-          // The caller owns assertions for malformed encrypted messages.
         }
+        return text;
       }
-      return text;
-    }
-  };
-  const sendRecords = (records: Iterable<Uint8Array>): void => {
-    for (const record of records) {
-      socket.send(ownedBuffer(transport.send.encryptWithAd(EMPTY, record)));
-    }
-  };
-  const sendMessage = (text: string): void => {
-    sendRecords(plaintextRecords(new TextEncoder().encode(text)));
-  };
-  return { nextMessage, sendMessage, sendRecords, close: () => socket.close() };
+    };
+    const sendRecords = (records: Iterable<Uint8Array>): void => {
+      for (const record of records) {
+        socket.send(ownedBuffer(transport.send.encryptWithAd(EMPTY, record)));
+      }
+    };
+    const sendMessage = (text: string): void => {
+      sendRecords(plaintextRecords(new TextEncoder().encode(text)));
+    };
+    return { nextMessage, sendMessage, sendRecords, close: () => socket.close() };
+  } catch (error) {
+    socket.close();
+    throw error;
+  }
 }
 
 export async function requestTestRpc(
@@ -141,5 +159,52 @@ export async function requestTestRpc(
       throw new Error(`server returned ClientProtocolError for request ${requestId}`);
     }
     if (message.requestId === requestId) return message;
+  }
+}
+
+/** Consumes the complete finite response; an end value alone never means success. */
+export async function streamTestRpc<A>(
+  channel: EncryptedTestSocket,
+  requestId: string,
+  tag: string,
+  payload: object,
+  decode: (value: unknown) => A,
+): Promise<ReadonlyArray<A>> {
+  const values: A[] = [];
+  let exited = false;
+  channel.sendMessage(
+    JSON.stringify({ _tag: "Request", id: requestId, tag, payload, headers: [] }),
+  );
+  try {
+    for (;;) {
+      const message = JSON.parse(await channel.nextMessage()) as {
+        readonly _tag?: string;
+        readonly requestId?: string;
+        readonly values?: unknown;
+        readonly exit?: { readonly _tag?: string };
+      };
+      if (message._tag === "ClientProtocolError")
+        throw new Error(`RPC stream ${tag} failed its protocol`);
+      if (message.requestId !== requestId) continue;
+      if (message._tag === "Chunk") {
+        if (!Array.isArray(message.values))
+          throw new Error(`RPC stream ${tag} sent an invalid chunk`);
+        for (const value of message.values) values.push(decode(value));
+        channel.sendMessage(JSON.stringify({ _tag: "Ack", requestId }));
+      } else if (message._tag === "Exit") {
+        exited = true;
+        if (message.exit?._tag !== "Success") throw new Error(`RPC stream ${tag} failed`);
+        return values;
+      } else throw new Error(`RPC stream ${tag} sent an unexpected response`);
+    }
+  } catch (error) {
+    if (!exited) {
+      try {
+        channel.sendMessage(JSON.stringify({ _tag: "Interrupt", requestId }));
+      } catch {
+        /* The transport may already be closed; preserve the original failure. */
+      }
+    }
+    throw error;
   }
 }

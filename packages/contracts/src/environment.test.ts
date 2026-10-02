@@ -60,6 +60,26 @@ const legacyClientDecoders = {
 const decodeTerminalCapabilities = Schema.decodeUnknownSync(ExecutionEnvironmentCapabilities);
 
 describe("execution environment contracts", () => {
+  it("keeps older servers transfer-unavailable and preserves an explicit in-channel capability", () => {
+    const older = decodeExecutionEnvironmentDescriptor({ ...descriptor, capabilities: {} });
+    expect(older.capabilities.inChannelTransfers).toBe(false);
+    for (const advertised of [false, true]) {
+      const current = decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        capabilities: { repositoryIdentity: true, inChannelTransfers: advertised },
+      });
+      expect(current.capabilities.inChannelTransfers).toBe(advertised);
+      expect(decodeLegacyExecutionEnvironmentDescriptor(current).capabilities).toEqual({
+        repositoryIdentity: true,
+      });
+    }
+    expect(() =>
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        capabilities: { inChannelTransfers: "true" },
+      }),
+    ).toThrow();
+  });
   it("defaults terminal size ownership off and preserves advertised support", () => {
     expect(decodeTerminalCapabilities({}).terminalSizeOwnership).toBe(false);
     expect(decodeTerminalCapabilities({ terminalSizeOwnership: true }).terminalSizeOwnership).toBe(

@@ -13,6 +13,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 const testState = vi.hoisted(() => ({
   commandCalls: [] as Array<{ label: string; input: unknown }>,
   commandResults: {} as Record<string, unknown>,
+  uploadDisabledReason: null as string | null,
+}));
+
+vi.mock("./useFileDownloads", () => ({
+  useFileDownloads: () => ({
+    downloadEntry: vi.fn(),
+    downloadDisabledReason: null,
+    uploadDisabledReason: testState.uploadDisabledReason,
+    getUploadDisabledReason: () => testState.uploadDisabledReason,
+  }),
 }));
 
 vi.mock("@bibcode/client-runtime/state/runtime", () => ({
@@ -106,6 +116,7 @@ let fetchMock: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   testState.commandCalls.length = 0;
+  testState.uploadDisabledReason = null;
   testState.commandResults = {
     createUploadUrl: {
       _tag: "Success",
@@ -127,6 +138,20 @@ function respond(status: number, body: string) {
 }
 
 describe("a refused mint", () => {
+  it("denies encrypted upload before opening a picker or minting", async () => {
+    testState.uploadDisabledReason =
+      "Update Studio to transfer files over its encrypted connection";
+    const pickFiles = vi.fn();
+    vi.stubGlobal("window", { desktopBridge: { pickFiles, uploadFile: vi.fn() } });
+    const h = renderTransfers();
+    h.transfers.uploadTo("");
+    pickOne(h.transfers, "a.txt");
+    await flushPromises();
+    expect(pickFiles).not.toHaveBeenCalled();
+    expect(testState.commandCalls).toHaveLength(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(h.showMutationError).toHaveBeenCalledWith(expect.any(Error), "Can’t upload files");
+  });
   it("names the file when the server refuses its name", async () => {
     // `operation_failed` is the code the server uses for a name it cannot store. Naming the
     // folder here would leave someone uploading a batch with no idea which file was wrong.
@@ -172,6 +197,23 @@ describe("a refused mint", () => {
 });
 
 describe("the replace prompt settles exactly once", () => {
+  it("denies an existing legacy retry when the runtime projection becomes pinned while its prompt waits", async () => {
+    fetchMock.mockResolvedValueOnce(respond(409, '{"_tag":"TransferEntryExistsError"}'));
+    const h = renderTransfers();
+    pickOne(h.transfers, "a.txt");
+    await flushPromises();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    testState.uploadDisabledReason =
+      "Update Studio to transfer files over its encrypted connection";
+    h.lastRequest().onConfirm();
+    h.transfers.closeDialog();
+    await flushPromises();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(h.showMutationError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: testState.uploadDisabledReason }),
+      'Can’t upload "a.txt"',
+    );
+  });
   it("retries once when the prompt is confirmed and then closed", async () => {
     fetchMock
       .mockResolvedValueOnce(respond(409, '{"_tag":"TransferEntryExistsError"}'))

@@ -211,3 +211,36 @@ export function resolveMarkdownFileLinkMeta(
     ...(columnNumber !== undefined ? { column: columnNumber } : {}),
   };
 }
+
+/** Proves a lexical workspace relation without guessing case-insensitive host semantics. */
+export function workspaceDownloadRelativePath(
+  path: string,
+  workspaceRoot: string | undefined,
+): string | null {
+  if (!workspaceRoot || path.includes("\0") || workspaceRoot.includes("\0")) return null;
+  const windows =
+    WINDOWS_DRIVE_PATH_PATTERN.test(workspaceRoot) || WINDOWS_UNC_PATH_PATTERN.test(workspaceRoot);
+  const parts = (value: string): string[] | null => {
+    let normalized = value;
+    if (windows) {
+      if (
+        WINDOWS_DRIVE_PATH_PATTERN.test(value) !== WINDOWS_DRIVE_PATH_PATTERN.test(workspaceRoot) ||
+        (!WINDOWS_DRIVE_PATH_PATTERN.test(value) && !WINDOWS_UNC_PATH_PATTERN.test(value))
+      )
+        return null;
+      normalized = value.replaceAll("\\", "/");
+      normalized = normalized.replace(/^[a-z]:/i, (drive) => drive.toUpperCase());
+    } else if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\")) {
+      return null;
+    }
+    const segments = normalized.split("/").filter((segment) => segment !== "" && segment !== ".");
+    if (segments.includes("..")) return null;
+    if (windows && WINDOWS_UNC_PATH_PATTERN.test(value) && segments.length < 2) return null;
+    return segments;
+  };
+  const root = parts(workspaceRoot);
+  const target = parts(path);
+  if (!root || !target || target.length <= root.length) return null;
+  if (!root.every((segment, index) => target[index] === segment)) return null;
+  return target.slice(root.length).join("/");
+}

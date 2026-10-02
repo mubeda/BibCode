@@ -7,6 +7,10 @@ import {
   ProjectCreateUploadUrlInput,
   ProjectCreateUploadUrlResult,
   ProjectTransferError,
+  ProjectFileVersion,
+  ProjectReadDownloadInput,
+  ProjectDownloadEvent,
+  ProjectDownloadError,
 } from "./transfer.ts";
 import { WS_METHODS } from "./rpc.ts";
 
@@ -14,8 +18,47 @@ const decodeDownloadInput = Schema.decodeUnknownSync(ProjectCreateDownloadUrlInp
 const decodeDownloadResult = Schema.decodeUnknownSync(ProjectCreateDownloadUrlResult);
 const decodeUploadInput = Schema.decodeUnknownSync(ProjectCreateUploadUrlInput);
 const decodeUploadResult = Schema.decodeUnknownSync(ProjectCreateUploadUrlResult);
+const decodeFileVersion = Schema.decodeUnknownSync(ProjectFileVersion);
+const isFileVersion = Schema.is(ProjectFileVersion);
+const decodeReadDownloadInput = Schema.decodeUnknownSync(ProjectReadDownloadInput);
+const isReadDownloadInput = Schema.is(ProjectReadDownloadInput);
+const decodeDownloadEvent = Schema.decodeUnknownSync(ProjectDownloadEvent);
+const isDownloadEvent = Schema.is(ProjectDownloadEvent);
+const decodeDownloadError = Schema.decodeUnknownSync(ProjectDownloadError);
 
 describe("transfer contracts", () => {
+  it("validates resumable downloads and their bounded stream events", () => {
+    const version = { sizeBytes: 6, modifiedAtNs: "-1234567890123456789" };
+    expect(decodeFileVersion(version)).toEqual(version);
+    expect(isFileVersion({ ...version, modifiedAtNs: "1.1" })).toBe(false);
+    expect(
+      decodeReadDownloadInput({
+        cwd: "/repo",
+        relativePath: "a",
+        offset: 3,
+        expect: version,
+      }).offset,
+    ).toBe(3);
+    expect(isReadDownloadInput({ cwd: "/repo", relativePath: "a", offset: -1 })).toBe(false);
+    for (const event of [
+      { _tag: "start", fileName: "a", kind: "file", sizeBytes: 6, version },
+      { _tag: "start", fileName: "src.zip", kind: "archive", sizeBytes: null, version: null },
+      { _tag: "bytes", offset: 3, data: "ZGVm" },
+      { _tag: "end", totalBytes: 6 },
+    ])
+      expect(decodeDownloadEvent(event)).toEqual(event);
+    expect(isDownloadEvent({ _tag: "bytes", offset: 0, data: "A".repeat(1_398_105) })).toBe(false);
+    for (const reason of ["changed", "capacity", "not_resumable"] as const) {
+      expect(
+        decodeDownloadError({
+          _tag: "ProjectDownloadError",
+          reason,
+          message: "Download refused.",
+        }).reason,
+      ).toBe(reason);
+    }
+    expect(WS_METHODS.projectsReadDownload).toBe("projects.readDownload");
+  });
   it("registers both methods", () => {
     expect(WS_METHODS.projectsCreateDownloadUrl).toBe("projects.createDownloadUrl");
     expect(WS_METHODS.projectsCreateUploadUrl).toBe("projects.createUploadUrl");

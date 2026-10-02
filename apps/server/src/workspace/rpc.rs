@@ -163,6 +163,7 @@ pub struct WorkspaceRpc {
     availability_registry: Option<WorkspaceAvailabilityRegistry>,
     watches: Arc<Mutex<HashMap<PathBuf, broadcast::Sender<()>>>>,
     watch_tasks: TaskTracker,
+    read_tasks: crate::transfer::read_tasks::ReadTaskOwner,
     watch_shutdown: CancellationToken,
     watch_timing: (Duration, Duration),
 }
@@ -219,6 +220,7 @@ impl WorkspaceRpc {
             availability_registry: None,
             watches: Arc::new(Mutex::new(HashMap::new())),
             watch_tasks: TaskTracker::new(),
+            read_tasks: crate::transfer::read_tasks::ReadTaskOwner::default(),
             watch_shutdown: CancellationToken::new(),
             watch_timing: (WATCH_POLL_INTERVAL, WATCH_COALESCE_WINDOW),
         }
@@ -788,6 +790,7 @@ impl WorkspaceRpc {
     /// Stops new entry-change subscriptions, cancels every active sweep, and waits for their
     /// filesystem watcher tasks to exit.
     pub async fn shutdown(&self) {
+        self.read_tasks.close();
         let registered = {
             let mut watches = self.watches.lock().await;
             self.watch_shutdown.cancel();
@@ -795,7 +798,15 @@ impl WorkspaceRpc {
             std::mem::take(&mut *watches)
         };
         drop(registered);
-        self.watch_tasks.wait().await;
+        tokio::join!(self.read_tasks.wait(), self.watch_tasks.wait());
+    }
+
+    pub(crate) fn spawn_read_work(
+        &self,
+        cancellation: CancellationToken,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        self.read_tasks.spawn(cancellation, work)
     }
 
     /// Retires the watch when nothing is listening. Returns whether it was retired.
@@ -996,46 +1007,57 @@ impl WorkspaceRpc {
         input: ProjectCreateDownloadUrlInput,
     ) -> Result<Value, Value> {
         let access = self.transfer_access(&input.cwd, &input.relative_path)?;
-        let _admission = self.acquire_path(&input.cwd).await?;
-        let root = normalize_root(Path::new(&input.cwd), false)
-            .await
-            .map_err(|error| transfer_wire(&input.cwd, &input.relative_path, &error))?;
-        let (target, relative) = paths::resolve_relative(&root, &input.relative_path)
-            .map_err(|error| transfer_wire(&input.cwd, &input.relative_path, &error))?;
-        let (_, canonical) = paths::canonical_existing_within(&root, &target)
-            .await
-            .map_err(|error| transfer_wire(&input.cwd, &input.relative_path, &error))?;
-        let metadata = tokio::fs::metadata(&canonical).await.map_err(|error| {
-            transfer_wire(
-                &input.cwd,
-                &input.relative_path,
-                &WorkspaceError::operation("stat", &canonical, error),
-            )
-        })?;
-        let kind = if metadata.is_dir() {
-            // Sizing the folder here is what makes an oversized download refusable: the panel
-            // shows this error, whereas the redeem-time refusal reaches the user only as a bare
-            // HTTP status. The route keeps its own pre-scan as defence in depth, because the
-            // tree can grow between the mint and the redemption.
-            self.dependencies
-                .archive_limits
-                .plan(&canonical)
-                .await
-                .map_err(|error| archive_limit_wire(&input.cwd, &input.relative_path, &error))?;
-            "archive"
-        } else {
-            "file"
-        };
-        let file_name = transfer::download_file_name(&canonical, metadata.is_dir());
+        let prepared = self
+            .prepare_rpc_download(&transfer::download::ProjectReadDownloadInput {
+                cwd: input.cwd.clone(),
+                relative_path: input.relative_path.clone(),
+                offset: None,
+                expect: None,
+            })
+            .await?;
         let issued = access
-            .issue_download(&root, &relative)
+            .issue_download(prepared.root(), prepared.relative())
             .map_err(|error| transfer_error_wire(&input.cwd, &input.relative_path, &error))?;
         Ok(json!({
             "relativeUrl": issued.relative_url,
             "expiresAt": issued.expires_at,
-            "fileName": file_name,
-            "kind": kind,
+            "fileName": prepared.file_name(),
+            "kind": prepared.kind(),
         }))
+    }
+
+    /// Admission covers validation and opening, never network backpressure or the stream lifetime.
+    pub(crate) async fn prepare_rpc_download(
+        &self,
+        input: &transfer::download::ProjectReadDownloadInput,
+    ) -> Result<transfer::download::PreparedDownload, Value> {
+        self.prepare_rpc_download_cancellable(input, CancellationToken::new())
+            .await
+    }
+    pub(crate) async fn prepare_rpc_download_cancellable(
+        &self,
+        input: &transfer::download::ProjectReadDownloadInput,
+        cancellation: CancellationToken,
+    ) -> Result<transfer::download::PreparedDownload, Value> {
+        if cancellation.is_cancelled() {
+            return Err(transfer_error_wire(
+                &input.cwd,
+                &input.relative_path,
+                &WorkspaceError::Cancelled.into(),
+            ));
+        }
+        let _admission = self.acquire_path(&input.cwd).await?;
+        transfer::download::prepare_download_cancellable(
+            Path::new(&input.cwd),
+            &input.relative_path,
+            self.dependencies.archive_limits,
+            cancellation,
+        )
+        .await
+        .map_err(|error| archive_limit_wire(&input.cwd, &input.relative_path, &error))
+    }
+    pub(crate) fn download_failure(cwd: &str, relative: &str, error: &TransferError) -> Value {
+        transfer_error_wire(cwd, relative, error)
     }
 
     /// Mints a short-lived signed URL for uploading a single named file into an existing folder.
@@ -1108,8 +1130,24 @@ impl WorkspaceRpc {
             .asset_access
             .as_ref()
             .ok_or_else(|| defect("assets.createUrl is not configured"))?;
+        let (workspace_root, admissions) = self.admit_asset_resource(&input.resource).await?;
+        let issued = asset_access
+            .issue(AssetIssueRequest {
+                resource: input.resource.clone(),
+                workspace_root,
+            })
+            .await
+            .map_err(|error| asset_wire_from_error(&input.resource, &error))?;
+        drop(admissions);
+        encode(issued).map_err(|error| defect(&error.to_string()))
+    }
+
+    async fn admit_asset_resource(
+        &self,
+        resource: &AssetResource,
+    ) -> Result<(Option<PathBuf>, Vec<WorkspaceAdmissionLease>), Value> {
         let mut admissions = Vec::new();
-        let workspace_root = match &input.resource {
+        let workspace_root = match resource {
             AssetResource::WorkspaceFile { thread_id, .. } => {
                 if let Some(admission) = self.acquire_thread(thread_id).await? {
                     admissions.push(admission);
@@ -1129,18 +1167,16 @@ impl WorkspaceRpc {
                         Some(root)
                     }
                     Ok(None) => {
-                        return Err(asset_wire(
-                            &input.resource,
-                            "AssetWorkspaceContextNotFoundError",
-                        ));
+                        return Err(asset_wire(resource, "AssetWorkspaceContextNotFoundError"));
                     }
                     Err(message) => {
                         let mut value =
-                            asset_wire(&input.resource, "AssetWorkspaceContextResolutionError");
+                            asset_wire(resource, "AssetWorkspaceContextResolutionError");
                         value
                             .as_object_mut()
                             .expect("asset error")
                             .insert("detail".to_owned(), json!(message));
+                        value["cause"] = json!({"name":"Error","message":message});
                         return Err(value);
                     }
                 }
@@ -1153,15 +1189,45 @@ impl WorkspaceRpc {
             }
             AssetResource::Attachment { .. } => None,
         };
-        let issued = asset_access
-            .issue(AssetIssueRequest {
-                resource: input.resource.clone(),
+        Ok((workspace_root, admissions))
+    }
+
+    pub(crate) async fn prepare_exact_asset(
+        &self,
+        resource: AssetResource,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::assets::read::AssetReader, Value> {
+        let access = self
+            .dependencies
+            .asset_access
+            .as_ref()
+            .ok_or_else(|| defect("assets.read is not configured"))?;
+        let (workspace_root, admissions) = self.admit_asset_resource(&resource).await?;
+        if cancellation.is_cancelled() {
+            return Err(asset_wire_from_error(
+                &resource,
+                &AssetError::Workspace(WorkspaceError::Cancelled),
+            ));
+        }
+        let resolved = access
+            .read_exact(AssetIssueRequest {
+                resource: resource.clone(),
                 workspace_root,
             })
             .await
-            .map_err(|error| asset_wire_from_error(&input.resource, &error))?;
+            .map_err(|error| asset_wire_from_error(&resource, &error))?;
+        if cancellation.is_cancelled() {
+            return Err(asset_wire_from_error(
+                &resource,
+                &AssetError::Workspace(WorkspaceError::Cancelled),
+            ));
+        }
+        let reader = crate::assets::read::AssetReader::open(resolved, resource).await;
         drop(admissions);
-        encode(issued).map_err(|error| defect(&error.to_string()))
+        reader
+    }
+    pub(crate) fn asset_failure(resource: &AssetResource, error: &AssetError) -> Value {
+        asset_wire_from_error(resource, error)
     }
 
     async fn run_workspace_mutation<Operation>(
@@ -1345,7 +1411,7 @@ fn asset_message(tag: &str) -> &'static str {
 }
 
 fn asset_wire_from_error(resource: &AssetResource, error: &AssetError) -> Value {
-    match error {
+    let mut value = match error {
         AssetError::WorkspaceContextRequired => {
             asset_wire(resource, "AssetWorkspaceContextNotFoundError")
         }
@@ -1382,7 +1448,23 @@ fn asset_wire_from_error(resource: &AssetResource, error: &AssetError) -> Value 
             },
         },
         AssetError::Encoding(_) => asset_wire(resource, "AssetSigningKeyLoadError"),
+    };
+    if matches!(
+        value["_tag"].as_str(),
+        Some(
+            "AssetWorkspaceContextResolutionError"
+                | "AssetWorkspaceRootNormalizationError"
+                | "AssetWorkspacePathValidationError"
+                | "AssetWorkspaceAssetInspectionError"
+                | "AssetWorkspaceResolutionError"
+                | "AssetProjectFaviconResolutionError"
+                | "AssetProjectFaviconInspectionError"
+                | "AssetSigningKeyLoadError"
+        )
+    ) {
+        value["cause"] = json!({"name":"Error","message":error.to_string()});
     }
+    value
 }
 
 fn transfer_wire(cwd: &str, relative_path: &str, error: &WorkspaceError) -> Value {
@@ -1434,7 +1516,7 @@ fn archive_limit_wire(cwd: &str, relative_path: &str, error: &TransferError) -> 
     })
 }
 
-fn transfer_error_wire(cwd: &str, relative_path: &str, error: &TransferError) -> Value {
+pub(crate) fn transfer_error_wire(cwd: &str, relative_path: &str, error: &TransferError) -> Value {
     match error {
         TransferError::Workspace(workspace) => transfer_wire(cwd, relative_path, workspace),
         _ => json!({

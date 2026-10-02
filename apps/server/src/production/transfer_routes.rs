@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::body::Body;
 use axum::http::StatusCode;
 use serde_json::json;
 
@@ -50,83 +49,48 @@ pub fn download_handler_with_limits(
                 tracing::warn!("download rejected: transfer capability is invalid or expired");
                 return Err(not_found());
             };
-            let (target, _) = paths::resolve_relative(&root, &relative).map_err(|error| {
-                tracing::warn!(%error, "download path resolution failed");
-                not_found()
-            })?;
-            let (_, canonical) = paths::canonical_existing_within(&root, &target)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(%error, "download path validation failed");
-                    not_found()
-                })?;
-            let metadata = tokio::fs::metadata(&canonical)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(path = %canonical.display(), %error, "download metadata read failed");
-                    not_found()
-                })?;
-            let file_name = transfer::download_file_name(&canonical, metadata.is_dir());
-            if metadata.is_dir() {
-                // The plan both enforces the archive limits and proves to `archive_body` that
-                // they were enforced, so an oversized folder fails before the response starts.
-                let plan = match transfer::archive::plan_archive_with_limits(
-                    &canonical,
+            let prepared = match transfer::download::prepare_download(
+                &root,
+                &relative,
+                transfer::archive::ArchiveLimits {
                     max_entries,
                     max_bytes,
-                )
-                .await
-                {
-                    Ok(plan) => plan,
-                    Err(transfer::TransferError::TooManyEntries { limit }) => {
-                        return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge {
-                            limit: u64::try_from(limit).unwrap_or(u64::MAX),
-                            unit: TransferArchiveLimitUnit::Entries,
-                        });
-                    }
-                    Err(transfer::TransferError::TooManyBytes { limit }) => {
-                        return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge {
-                            limit,
-                            unit: TransferArchiveLimitUnit::Bytes,
-                        });
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "folder download preparation failed");
-                        return Err(not_found());
-                    }
-                };
-                Ok(TransferDownloadHttpOutcome::Stream(
-                    TransferDownloadHttpResponse {
-                        file_name,
-                        content_type: "application/zip",
-                        // A zip is produced as it streams, so its length is unknown until the
-                        // last entry: the archive response stays chunked.
-                        content_length: None,
-                        body: transfer::archive::archive_body(plan, canonical),
-                    },
-                ))
-            } else {
-                let file = tokio::fs::File::open(&canonical)
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(path = %canonical.display(), %error, "download file open failed");
-                        not_found()
-                    })?;
-                // The length comes from the opened handle, not the earlier stat, so the header
-                // describes the bytes this response will actually read.
-                let content_length = file.metadata().await.map(|metadata| metadata.len()).ok();
-                Ok(TransferDownloadHttpOutcome::Stream(
-                    TransferDownloadHttpResponse {
-                        file_name,
-                        content_type: "application/octet-stream",
-                        content_length,
-                        body: Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
-                            file,
-                            transfer::archive::DOWNLOAD_CHUNK_BYTES,
-                        )),
-                    },
-                ))
-            }
+                },
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(transfer::TransferError::TooManyEntries { limit }) => {
+                    return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge {
+                        limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                        unit: TransferArchiveLimitUnit::Entries,
+                    });
+                }
+                Err(transfer::TransferError::TooManyBytes { limit }) => {
+                    return Ok(TransferDownloadHttpOutcome::ArchiveTooLarge {
+                        limit,
+                        unit: TransferArchiveLimitUnit::Bytes,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "download preparation failed");
+                    return Err(not_found());
+                }
+            };
+            let file_name = prepared.file_name().to_owned();
+            let content_type = match prepared.kind() {
+                transfer::download::DownloadKind::File => "application/octet-stream",
+                transfer::download::DownloadKind::Archive => "application/zip",
+            };
+            let content_length = prepared.size_bytes();
+            Ok(TransferDownloadHttpOutcome::Stream(
+                TransferDownloadHttpResponse {
+                    file_name,
+                    content_type,
+                    content_length,
+                    body: prepared.into_http_body(),
+                },
+            ))
         }) as BoxFuture<_>
     })
 }

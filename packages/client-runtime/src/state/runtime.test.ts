@@ -10,6 +10,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import { vi } from "vite-plus/test";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcClient from "effect/unstable/rpc/RpcClient";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
@@ -23,6 +24,7 @@ import {
   createEnvironmentRpcStreamCommand,
   createEnvironmentRpcSubscriptionAtomFamily,
   createRuntimeCommand,
+  createRuntimeStreamCommand,
   executeAtomCommand,
   executeAtomQuery,
   isAtomCommandInterrupted,
@@ -33,6 +35,95 @@ import {
   settlePromise,
   squashAtomCommandFailure,
 } from "./runtime.ts";
+
+describe("command invocation lifetime", () => {
+  const ticks = Effect.gen(function* () {
+    for (let n = 0; n < 40; n++) yield* Effect.yieldNow;
+  });
+  const harness = Effect.fn(function* () {
+    const failed = Atom.make(false);
+    const runtime = Atom.runtime((get) =>
+      get(failed) ? Layer.effectDiscard(Effect.fail("fixture offline")) : Layer.empty,
+    );
+    const registry = AtomRegistry.make();
+    yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+    const unmount = registry.mount(runtime);
+    yield* Effect.addFinalizer(() => Effect.sync(unmount));
+    yield* ticks;
+    return { runtime, registry, fail: (value: boolean) => registry.set(failed, value) };
+  });
+  for (const kind of ["unary", "stream"] as const) {
+    for (const scenario of ["before-entry", "after-entry", "fresh-explicit"] as const) {
+      it.effect(`${kind} preserves one invocation across ${scenario}`, () =>
+        Effect.gen(function* () {
+          const h = yield* harness();
+          let calls = 0;
+          const entered = yield* Deferred.make<void>();
+          const execute = () =>
+            Effect.sync(() => {
+              calls += 1;
+            }).pipe(
+              Effect.andThen(Deferred.succeed(entered, undefined)),
+              Effect.andThen(scenario === "after-entry" ? Effect.never : Effect.succeed("done")),
+            );
+          const command =
+            kind === "unary"
+              ? createRuntimeCommand(h.runtime, {
+                  label: "test.invocation",
+                  execute: (_input: string) => execute(),
+                })
+              : createRuntimeStreamCommand(h.runtime, {
+                  label: "test.invocation",
+                  execute: (_input: string) => Stream.fromEffect(execute()),
+                });
+          if (scenario === "before-entry") {
+            h.fail(true);
+            yield* ticks;
+            expect((yield* Effect.promise(() => command.run(h.registry, "identical")))._tag).toBe(
+              "Failure",
+            );
+            h.fail(false);
+            yield* ticks;
+            expect(calls).toBe(0);
+          } else if (scenario === "after-entry") {
+            const pending = command.run(h.registry, "identical");
+            yield* Deferred.await(entered);
+            h.fail(true);
+            expect((yield* Effect.promise(() => pending))._tag).toBe("Failure");
+            h.fail(false);
+            yield* ticks;
+            expect(calls).toBe(1);
+          } else {
+            expect((yield* Effect.promise(() => command.run(h.registry, "identical")))._tag).toBe(
+              "Success",
+            );
+            expect((yield* Effect.promise(() => command.run(h.registry, "identical")))._tag).toBe(
+              "Success",
+            );
+            expect(calls).toBe(2);
+          }
+        }),
+      );
+    }
+  }
+  it.effect("preserves an operation's own retry inside one explicit invocation", () =>
+    Effect.gen(function* () {
+      const h = yield* harness();
+      let attempts = 0;
+      const command = createRuntimeCommand(h.runtime, {
+        label: "test.inner-retry",
+        execute: (_input: void) =>
+          Effect.suspend(() =>
+            ++attempts === 1 ? Effect.fail("retry fixture") : Effect.succeed("done"),
+          ).pipe(Effect.retry({ times: 1 })),
+      });
+      expect((yield* Effect.promise(() => command.run(h.registry, undefined)))._tag).toBe(
+        "Success",
+      );
+      expect(attempts).toBe(2);
+    }),
+  );
+});
 
 describe("settleAsyncResult", () => {
   it("preserves successful values and typed failures", async () => {
@@ -452,6 +543,57 @@ describe("runtime command runner", () => {
   const hasNodeLabeled = (registry: AtomRegistry.AtomRegistry, label: string) =>
     [...registry.getNodes().values()].some((node) => node.atom.label?.[0] === label);
 
+  it.effect("observes an abort delivered reentrantly during actual command mount", () =>
+    Effect.gen(function* () {
+      const registry = AtomRegistry.make();
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+      const runtime = Atom.runtime(Layer.empty);
+      const warm = createRuntimeCommand(runtime, {
+        label: "test.abort-mount-warm",
+        execute: () => Effect.void,
+      });
+      yield* Effect.promise(() => warm.run(registry, undefined));
+      const controller = new AbortController();
+      const add = vi.spyOn(controller.signal, "addEventListener");
+      const remove = vi.spyOn(controller.signal, "removeEventListener");
+      const cleaning = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const done = yield* Deferred.make<void>();
+      let finalizers = 0;
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+      const command = createRuntimeCommand(runtime, {
+        label: "test.abort-during-mount",
+        execute: () =>
+          Effect.acquireUseRelease(
+            Effect.void,
+            () => Effect.sync(() => controller.abort()).pipe(Effect.andThen(Effect.never)),
+            () =>
+              Deferred.succeed(cleaning, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(
+                  Effect.sync(() => {
+                    finalizers += 1;
+                  }),
+                ),
+                Effect.andThen(Deferred.succeed(done, undefined)),
+              ),
+          ),
+      });
+      const pending = command.run(registry, undefined, { signal: controller.signal });
+      yield* Deferred.await(cleaning);
+      expect(isAtomCommandInterrupted(yield* Effect.promise(() => pending))).toBe(true);
+      expect(finalizers).toBe(0);
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(done);
+      expect(finalizers).toBe(1);
+      expect(hasNodeLabeled(registry, "test.abort-during-mount")).toBe(false);
+      expect(add).not.toHaveBeenCalled();
+      expect(remove).toHaveBeenCalledTimes(1);
+      add.mockRestore();
+      remove.mockRestore();
+    }),
+  );
+
   it.effect("interrupts a running command when its abort signal fires", () =>
     Effect.gen(function* () {
       const acquired = yield* Deferred.make<void>();
@@ -472,6 +614,8 @@ describe("runtime command runner", () => {
       });
       const registry = AtomRegistry.make();
       const controller = new AbortController();
+      const add = vi.spyOn(controller.signal, "addEventListener");
+      const remove = vi.spyOn(controller.signal, "removeEventListener");
       const settled = yield* Deferred.make<Awaited<ReturnType<typeof command.run>>>();
       void command.run(registry, undefined, { signal: controller.signal }).then((result) => {
         Deferred.doneUnsafe(settled, Effect.succeed(result));
@@ -484,6 +628,10 @@ describe("runtime command runner", () => {
 
       expect(isAtomCommandInterrupted(result)).toBe(true);
       expect(finalizers).toBe(1);
+      expect(add).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledTimes(1);
+      add.mockRestore();
+      remove.mockRestore();
       expect(hasNodeLabeled(registry, "test.abort-running")).toBe(false);
       registry.dispose();
     }),

@@ -2290,6 +2290,66 @@ cleanup succeeds, the receipt moves to `removed`; a later retry after a
 thread-deletion failure returns success without inspecting or deleting a
 replacement that now occupies the old path.
 
+## In-channel download and asset readers
+
+`projects.readDownload { cwd, relativePath, offset?, expect? }` and
+`assets.read { resource }` are finite, lossless server streams authorized by
+`orchestration:read`. They use the existing authenticated WebSocket RPC and
+Noise transport; neither reader mints an HTTP capability. Workspace upload
+commit and client routing must also be available before the server advertises
+`inChannelTransfers`. That capability remains unadvertised while those pieces
+are incomplete; legacy URL minting and signed HTTP routes remain available.
+
+A project download emits `start { fileName, kind, sizeBytes, version }`,
+contiguous base64 `bytes { offset, data }`, and `end { totalBytes }`. Files have
+a known size and a version containing that size and exact signed Unix
+nanoseconds in `modifiedAtNs`; archives have null size/version. Nonzero file
+offsets require the matching version and cannot exceed the current size.
+Changed files fail with `ProjectDownloadError.changed`, including changes
+detected before the final end. An archive cannot resume at a nonzero offset
+(`not_resumable`); the client must restart it. Successful completion requires
+the explicit end event and successful RPC exit, not bare EOF.
+
+HTTP minting, redemption, and RPC share filesystem preparation: normalized
+root and relative path, canonical containment, regular-file opening and
+directory pre-scan against the existing archive budgets. RPC path admission
+covers those checks and opening only, and releases before network waits.
+Single-file and exact-asset readers use native no-follow opens and opened-handle
+checks to refuse substituted leaf links and nonregular files; Unix nonblocking
+admission avoids waiting on a FIFO.
+ZIP workers write through a bounded duplex pipe; writer errors fail the
+stream, and cancellation closes the reader before joining the worker.
+
+Four downloads may be open per authenticated session across all its sockets;
+a fifth fails immediately with `ProjectDownloadError.capacity`. Socket loss,
+Interrupt, or receiver disposal stops its producer and releases the slot
+after reader cleanup. Preparation retains its slot and short path admission
+until the actual filesystem work settles; archive scans observe cancellation
+between entries. Concrete Tokio file readers await pending I/O before closing,
+because dropping a Busy file would detach its blocking worker. Interruption
+stops publication and later reads; it does not promise to cancel an OS syscall.
+WorkspaceRpc owns both download and asset tasks, fences their admission at
+shutdown, and waits for their cleanup alongside its watch tasks.
+Unsafe no-auth connections share one owner. Streams
+use a capacity-one server channel and RPC Ack flow control, retaining at most
+one chunk in flight, one queued, and one being read. Raw chunks start at
+64 KiB and adapt toward one second per handoff between 16 KiB and 1 MiB,
+with at most a doubling or halving per step. Clients consuming these streams
+must use `streamBufferSize: 2` to bound their own queued data.
+
+Asset reads share URL minting's resource resolution and thread/path admission,
+but serve only exact workspace images, validated attachment IDs, and project
+favicons including the shared fallback SVG. Workspace HTML/PDF sibling
+capabilities are refused with `AssetPreviewTypeValidationError`. Asset events
+are `start { mimeType, sizeBytes }`, contiguous base64 bytes, and `end`.
+Opened size and cumulative reads are capped at 10 MiB with `AssetTooLargeError`;
+announced-length mismatches cannot end successfully. A nonempty asset of at
+most 64 KiB packs all three events into one Chunk. Empty files pack start and
+end, with no bytes event. Every emitted Chunk contains at least one event.
+Asset failures include the encoded cause required by their public error schema;
+the actual truncation failure is checked against a shared Rust/TypeScript wire
+vector, rather than only generated schema samples.
+
 ## Invariants
 
 - The server owns one durable FIFO per thread. Reloads, disconnects, and server

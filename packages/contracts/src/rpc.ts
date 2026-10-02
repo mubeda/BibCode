@@ -59,13 +59,23 @@ import {
   FilesystemBrowseResult,
   FilesystemBrowseError,
 } from "./filesystem.ts";
-import { AssetAccessError, AssetCreateUrlInput, AssetCreateUrlResult } from "./assets.ts";
+import {
+  AssetAccessError,
+  AssetCreateUrlInput,
+  AssetCreateUrlResult,
+  AssetReadInput,
+  AssetReadEvent,
+  AssetTooLargeError,
+} from "./assets.ts";
 import {
   ProjectCreateDownloadUrlInput,
   ProjectCreateDownloadUrlResult,
   ProjectCreateUploadUrlInput,
   ProjectCreateUploadUrlResult,
   ProjectTransferError,
+  ProjectReadDownloadInput,
+  ProjectDownloadEvent,
+  ProjectDownloadError,
 } from "./transfer.ts";
 import {
   GitActionProgressEvent,
@@ -416,7 +426,9 @@ export const WS_METHODS = {
   // Filesystem methods
   filesystemBrowse: "filesystem.browse",
   assetsCreateUrl: "assets.createUrl",
+  assetsRead: "assets.read",
   projectsCreateDownloadUrl: "projects.createDownloadUrl",
+  projectsReadDownload: "projects.readDownload",
   projectsCreateUploadUrl: "projects.createUploadUrl",
 
   // VCS methods
@@ -876,6 +888,32 @@ export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   success: AssetCreateUrlResult,
   error: Schema.Union([
     AssetAccessError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
+export const WsAssetsReadRpc = Rpc.make(WS_METHODS.assetsRead, {
+  payload: AssetReadInput,
+  success: AssetReadEvent,
+  stream: true,
+  error: Schema.Union([
+    AssetAccessError,
+    AssetTooLargeError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
+export const WsProjectsReadDownloadRpc = Rpc.make(WS_METHODS.projectsReadDownload, {
+  payload: ProjectReadDownloadInput,
+  success: ProjectDownloadEvent,
+  stream: true,
+  error: Schema.Union([
+    ProjectTransferError,
+    ProjectDownloadError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
     EnvironmentRpcError,
@@ -1703,7 +1741,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,
+  WsAssetsReadRpc,
   WsProjectsCreateDownloadUrlRpc,
+  WsProjectsReadDownloadRpc,
   WsProjectsCreateUploadUrlRpc,
   WsSubscribeVcsStatusRpc,
   WsSubscribeVcsStatusSummaryRpc,

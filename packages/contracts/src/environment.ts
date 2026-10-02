@@ -29,6 +29,7 @@ export type ExecutionEnvironmentPlatform = typeof ExecutionEnvironmentPlatform.T
 
 export const ExecutionEnvironmentCapabilities = Schema.Struct({
   attachmentStaging: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  inChannelTransfers: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   repositoryIdentity: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   worktreeCatalog: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   worktreeCatalogRefreshReason: Schema.Boolean.pipe(

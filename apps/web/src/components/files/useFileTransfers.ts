@@ -1,7 +1,7 @@
 // The Files panel's Download and Upload flows.
 //
-// Both mint a short-lived signed URL (projects.createDownloadUrl / projects.createUploadUrl) and
-// then move the bytes over plain HTTP against the same environment base URL asset previews use.
+// Downloads use the runtime-owned admission and route. Legacy unpinned uploads mint a signed URL
+// and move bytes over HTTP; encrypted uploads remain unavailable until their full API exists.
 // The desktop host streams to and from native pickers so a remote workspace transfers
 // host-to-host; the browser falls back to an anchor download and a hidden file input.
 //
@@ -20,16 +20,14 @@ import { useCallback, useEffect, useRef } from "react";
 import { projectEnvironment } from "~/state/projects";
 import { useAtomCommand } from "~/state/use-atom-command";
 
-import { stackedThreadToast, toastManager } from "../ui/toast";
+import { toastManager } from "../ui/toast";
 import type { FileEntryDialogRequest } from "./FileEntryDialog";
-import { entryName } from "./FileTreeContextMenu.logic";
+import { useFileDownloads } from "./useFileDownloads";
 import {
   describeByteLimit,
-  downloadWithBridge,
   interpretUploadResponse,
   resolveTransferUrl,
   sendBrowserUpload,
-  triggerBrowserDownload,
   uploadUrlFor,
 } from "./fileTransfers";
 
@@ -74,6 +72,8 @@ export interface UseFileTransfersInput {
 export interface FileTransfers {
   /** Downloads a file, or a folder as a zip, to a destination the runtime chooses. */
   readonly downloadEntry: (relativePath: string) => void;
+  readonly downloadDisabledReason: string | null;
+  readonly uploadDisabledReason: string | null;
   /** Opens the file picker for `relativeDirectory` ("" is the workspace root). */
   readonly uploadTo: (relativeDirectory: string) => void;
   readonly handleUploadInputChange: (event: ChangeEvent<HTMLInputElement>) => void;
@@ -93,9 +93,8 @@ export function useFileTransfers({
   refreshEntries,
   toasts = toastManager,
 }: UseFileTransfersInput): FileTransfers {
-  const createDownloadUrl = useAtomCommand(projectEnvironment.createDownloadUrl, {
-    reportFailure: false,
-  });
+  const { downloadEntry, downloadDisabledReason, uploadDisabledReason, getUploadDisabledReason } =
+    useFileDownloads({ environmentId, cwd, showMutationError, toasts });
   const createUploadUrl = useAtomCommand(projectEnvironment.createUploadUrl, {
     reportFailure: false,
   });
@@ -118,62 +117,6 @@ export function useFileTransfers({
     dialogCancelRef.current = null;
     cancel?.();
   }, [setDialogRequest]);
-
-  const downloadEntry = useCallback(
-    (relativePath: string) => {
-      const name = entryName(relativePath);
-      if (!httpBaseUrl) {
-        showMutationError(new Error(NO_SERVER_MESSAGE), `Can’t download "${name}"`);
-        return;
-      }
-      void (async () => {
-        try {
-          const outcome = await downloadWithBridge({
-            bridge: typeof window === "undefined" ? undefined : window.desktopBridge,
-            prepare: async () => {
-              const minted = await createDownloadUrl({
-                environmentId,
-                input: { cwd, relativePath },
-              });
-              if (minted._tag === "Failure") {
-                if (!isAtomCommandInterrupted(minted)) {
-                  showMutationError(
-                    squashAtomCommandFailure(minted),
-                    `Failed to prepare a download for "${name}"`,
-                  );
-                }
-                return null;
-              }
-              const url = resolveTransferUrl(httpBaseUrl, minted.value.relativeUrl);
-              if (url === null) {
-                showMutationError(
-                  new Error("The server did not return a usable download URL."),
-                  `Can’t download "${name}"`,
-                );
-                return null;
-              }
-              return { url, fileName: minted.value.fileName };
-            },
-          });
-          if (outcome._tag === "BrowserDownload") {
-            triggerBrowserDownload(outcome.url, outcome.fileName);
-          } else if (outcome._tag === "Saved") {
-            // The host never overwrites: it uniquifies the name, so show the path it actually wrote.
-            toasts.add(
-              stackedThreadToast({
-                type: "success",
-                title: "Download saved",
-                description: outcome.path,
-              }),
-            );
-          }
-        } catch (error) {
-          showMutationError(error, `Failed to download "${name}"`);
-        }
-      })();
-    },
-    [createDownloadUrl, cwd, environmentId, httpBaseUrl, showMutationError, toasts],
-  );
 
   /** Resolves false unless the user confirms; see `closeDialog` for the cancel path. */
   const confirmReplace = useCallback(
@@ -214,6 +157,11 @@ export function useFileTransfers({
       const target = uploadTargetLabel(relativeDirectory);
       const refuse = (message: string) =>
         showMutationError(new Error(message), `Can’t upload "${file.name}"`);
+      const unavailable = getUploadDisabledReason();
+      if (unavailable !== null) {
+        refuse(unavailable);
+        return;
+      }
       if (!httpBaseUrl) {
         refuse(NO_SERVER_MESSAGE);
         return;
@@ -242,6 +190,11 @@ export function useFileTransfers({
         }
         let overwrite = false;
         for (;;) {
+          const currentRefusal = getUploadDisabledReason();
+          if (currentRefusal !== null) {
+            refuse(currentRefusal);
+            return;
+          }
           // The same token is reused for the replace retry: it already names this file.
           const response = await file.send(uploadUrlFor(transferUrl, overwrite));
           const step = interpretUploadResponse(response.status, response.body);
@@ -265,11 +218,24 @@ export function useFileTransfers({
         showMutationError(error, `Can’t upload "${file.name}"`);
       }
     },
-    [confirmReplace, createUploadUrl, cwd, environmentId, httpBaseUrl, showMutationError],
+    [
+      confirmReplace,
+      createUploadUrl,
+      cwd,
+      environmentId,
+      getUploadDisabledReason,
+      httpBaseUrl,
+      showMutationError,
+    ],
   );
 
   const uploadTo = useCallback(
     (relativeDirectory: string) => {
+      const unavailable = getUploadDisabledReason();
+      if (unavailable !== null) {
+        showMutationError(new Error(unavailable), "Can’t upload files");
+        return;
+      }
       const bridge = typeof window === "undefined" ? undefined : window.desktopBridge;
       const pickFiles = bridge?.pickFiles;
       const uploadFile = bridge?.uploadFile;
@@ -298,7 +264,7 @@ export function useFileTransfers({
         }
       })();
     },
-    [refreshEntries, showMutationError, uploadOne],
+    [getUploadDisabledReason, refreshEntries, showMutationError, uploadOne],
   );
 
   const handleUploadInputChange = useCallback(
@@ -324,8 +290,16 @@ export function useFileTransfers({
         }
       })();
     },
-    [refreshEntries, showMutationError, uploadOne],
+    [getUploadDisabledReason, refreshEntries, showMutationError, uploadOne],
   );
 
-  return { downloadEntry, uploadTo, handleUploadInputChange, uploadInputRef, closeDialog };
+  return {
+    downloadEntry,
+    downloadDisabledReason,
+    uploadDisabledReason,
+    uploadTo,
+    handleUploadInputChange,
+    uploadInputRef,
+    closeDialog,
+  };
 }

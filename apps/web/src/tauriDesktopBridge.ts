@@ -29,7 +29,13 @@ import { startBrowserSurfaceSync } from "./browser/browserSurfaceSync";
 import { formatAppDisplayName } from "./branding.logic";
 import { readBrowserClientSettings, writeBrowserClientSettings } from "./clientPersistenceStorage";
 import { showContextMenuFallback } from "./contextMenuFallback";
-import { invokeTauriCommand, type TauriCommandMock } from "./tauriInvokeRouting";
+import {
+  invokeTauriCommand,
+  type TauriCommandMock,
+  type TauriCommandArguments,
+  type TauriCommandOptions,
+  type TauriCommandInvoker,
+} from "./tauriInvokeRouting";
 import { createTauriPreviewBridge } from "./tauriPreviewBridge";
 
 const CONNECTION_CATALOG_STORAGE_KEY = "bibcode.connectionCatalog";
@@ -78,23 +84,33 @@ function isTauriDesktopCapabilityUnsupportedPayload(
   );
 }
 
-function tauriInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  const invoke = window.__TAURI__?.core?.invoke;
+function tauriInvoke<T>(
+  command: string,
+  args?: TauriCommandArguments,
+  options?: TauriCommandOptions,
+): Promise<T> {
+  const invoke: TauriCommandInvoker | undefined = window.__TAURI__?.core?.invoke;
   const registeredMock =
     import.meta.env.VITE_BIBCODE_DESKTOP_E2E === "1" ? window.__wdio_mocks__?.[command] : undefined;
   return invokeTauriCommand<T>({
     command,
     args,
+    ...(options === undefined ? {} : { options }),
     ...(typeof registeredMock === "function"
       ? { e2eMock: registeredMock as TauriCommandMock }
       : {}),
     ...(invoke
       ? {
-          globalInvoke: (invokeCommand, invokeArgs) => invoke<unknown>(invokeCommand, invokeArgs),
+          globalInvoke: (invokeCommand, invokeArgs, invokeOptions) =>
+            invokeOptions === undefined
+              ? invoke(invokeCommand, invokeArgs)
+              : invoke(invokeCommand, invokeArgs, invokeOptions),
         }
       : {}),
-    importedInvoke: (invokeCommand, invokeArgs) =>
-      importedTauriInvoke<unknown>(invokeCommand, invokeArgs),
+    importedInvoke: (invokeCommand, invokeArgs, invokeOptions) =>
+      invokeOptions === undefined
+        ? importedTauriInvoke<unknown>(invokeCommand, invokeArgs)
+        : importedTauriInvoke<unknown>(invokeCommand, invokeArgs, invokeOptions),
   });
 }
 
@@ -149,9 +165,13 @@ function normalizeTauriDesktopError(error: unknown): unknown {
   return error;
 }
 
-async function tauriInvokeDesktop<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+async function tauriInvokeDesktop<T>(
+  command: string,
+  args?: TauriCommandArguments,
+  options?: TauriCommandOptions,
+): Promise<T> {
   try {
-    return await tauriInvoke<T>(command, args);
+    return await tauriInvoke<T>(command, args, options);
   } catch (error) {
     throw normalizeTauriDesktopError(error);
   }
@@ -464,6 +484,7 @@ async function showTauriContextMenu<T extends string>(
 function createTauriDesktopBridge(
   previewSupported: boolean,
   connectionCatalogProtection: ConnectionCatalogProtectionCapability,
+  streamingDownloadsSupported: boolean,
 ): DesktopBridge {
   const preview = previewSupported
     ? createTauriPreviewBridge({
@@ -585,6 +606,28 @@ function createTauriDesktopBridge(
         directory: input.directory,
         fileName: input.fileName,
       }),
+    ...(streamingDownloadsSupported
+      ? ({
+          beginDownloadFile: (input) =>
+            tauriInvokeDesktop("desktop_bridge_begin_download_file", {
+              directory: input.directory,
+              fileName: input.fileName,
+            }),
+          appendDownloadFile: (input) =>
+            tauriInvokeDesktop<void>("desktop_bridge_append_download_file", input.bytes, {
+              headers: { "x-bibcode-download-handle": input.handle },
+            }),
+          finishDownloadFile: (input) =>
+            tauriInvokeDesktop("desktop_bridge_finish_download_file", { handle: input.handle }),
+          abortDownloadFile: (input) =>
+            tauriInvokeDesktop<void>("desktop_bridge_abort_download_file", {
+              handle: input.handle,
+            }),
+        } satisfies Pick<
+          DesktopBridge,
+          "beginDownloadFile" | "appendDownloadFile" | "finishDownloadFile" | "abortDownloadFile"
+        >)
+      : {}),
     uploadFile: (input) =>
       tauriInvokeDesktop<{ status: number; body: string }>("desktop_bridge_upload_file", {
         url: input.url,
@@ -656,6 +699,7 @@ async function installTauriDesktopBridge(): Promise<void> {
   const bridge = createTauriDesktopBridge(
     metadata?.features?.preview === true,
     connectionCatalogProtection,
+    metadata?.features?.streamingDownloads === true,
   );
   window.desktopBridge = bridge;
   const preview = bridge.preview;

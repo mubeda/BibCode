@@ -24,6 +24,7 @@ import {
 } from "../src/orchestration.ts";
 import { RemoteUpdateSnapshot } from "../src/remoteUpdate.ts";
 import { WS_METHODS, WsRpcGroup } from "../src/rpc.ts";
+import { AssetAccessError } from "../src/assets.ts";
 import { RpcResponseTooLargeError } from "../src/rpcTransport.ts";
 import {
   ServerProcessDiagnosticsResult,
@@ -587,6 +588,27 @@ const stripEffectOptionIds = (value: unknown): unknown =>
   ) as unknown;
 
 const dynamicFixtures = new Map<string, unknown>();
+// A real Rust assets.read truncation test compares its emitted failure with this vector;
+// the parity test decodes the same bytes with the public AssetAccessError schema.
+const assetTruncatedFailure = {
+  _tag: "AssetWorkspaceAssetInspectionError",
+  resource: { _tag: "attachment", attachmentId: "truncated" },
+  message: "Failed to inspect the workspace asset.",
+  cause: {
+    name: "Error",
+    message:
+      "workspace operation 'read-asset' failed at asset: Asset changed while it was read. Try again.",
+  },
+};
+Schema.decodeUnknownSync(AssetAccessError)(assetTruncatedFailure);
+dynamicFixtures.set(
+  "contract-shapes/assets__read-truncated-failure.json",
+  serializeWireFixture({
+    _tag: "Exit",
+    requestId,
+    exit: { _tag: "Failure", cause: [{ _tag: "Fail", error: assetTruncatedFailure }] },
+  } satisfies RpcMessage.ResponseExitEncoded),
+);
 for (const [kind, detail] of [
   ["live", "The Git status stream fell behind. Subscribe again."],
   ["setup", "The Git status subscription fell behind while it was being set up. Subscribe again."],
@@ -932,7 +954,13 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
     }
   }
 
-  for (const [index, member] of schemaMembers(rpc.errorSchema.ast).entries()) {
+  // Rpc.make(stream:true) places failures on StreamSchema.error; errorSchema is Never.
+  const failureAst =
+    StreamSchemaTypeId in (rpc.successSchema as object)
+      ? (rpc.successSchema as unknown as { readonly error: { readonly ast: SchemaAST.AST } }).error
+          .ast
+      : rpc.errorSchema.ast;
+  for (const [index, member] of schemaMembers(failureAst).entries()) {
     if (member._tag === "Never") continue;
     const fixtureKey = `${rpc._tag}:error:${index}`;
     const relativePath = `typed-failures/${safeMethodName}-${String(index).padStart(2, "0")}.json`;
@@ -963,16 +991,16 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 138) {
-  throw new Error(`Expected 138 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 140) {
+  throw new Error(`Expected 140 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
-if (streamMethodCount !== 20) {
-  throw new Error(`Expected 20 streaming RPC methods, found ${streamMethodCount}.`);
+if (streamMethodCount !== 22) {
+  throw new Error(`Expected 22 streaming RPC methods, found ${streamMethodCount}.`);
 }
-if (topLevelStreamShapeCount !== 71) {
+if (topLevelStreamShapeCount !== 77) {
   throw new Error(
-    `Expected 71 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
+    `Expected 77 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
   );
 }
 if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
@@ -980,8 +1008,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
     `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
   );
 }
-if (typedFailureFixtures.length !== 304) {
-  throw new Error(`Expected 304 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+if (typedFailureFixtures.length !== 363) {
+  throw new Error(`Expected 363 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
 if (orchestrationEventShapeCount !== 24) {
   throw new Error(`Expected 24 orchestration event shapes, found ${orchestrationEventShapeCount}.`);

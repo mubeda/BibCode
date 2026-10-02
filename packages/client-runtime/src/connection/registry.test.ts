@@ -199,6 +199,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     readonly afterStorageIdentityAccept?: (
       identity: Persistence.AcceptedStorageIdentity,
     ) => Effect.Effect<void>;
+    readonly onOwnedDataCleanup?: (environmentId: EnvironmentId) => Effect.Effect<void>;
   },
 ) {
   const storedTargets = yield* Ref.make(
@@ -476,7 +477,9 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   });
   const ownedDataCleanup = Persistence.EnvironmentOwnedDataCleanup.of({
     clear: (environmentId) =>
-      Ref.update(ownedDataClears, (environmentIds) => [...environmentIds, environmentId]),
+      Ref.update(ownedDataClears, (environmentIds) => [...environmentIds, environmentId]).pipe(
+        Effect.andThen(options?.onOwnedDataCleanup?.(environmentId) ?? Effect.void),
+      ),
   });
   const networkStatus = yield* SubscriptionRef.make<"unknown" | "offline" | "online">("online");
   const connectivity = Connectivity.Connectivity.of({
@@ -678,6 +681,152 @@ function awaitConnectionState(
 }
 
 describe("EnvironmentRegistry", () => {
+  describe("registration lifetime", () => {
+    it.effect(
+      "reads loaded registrations without creating a supervisor and separates IDs and registry instances",
+      () =>
+        Effect.gen(function* () {
+          const h = yield* makeHarness([RELAY_TARGET, SECOND_RELAY_TARGET]);
+          const read = Effect.gen(function* () {
+            const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+            const first = yield* registry.registrationLifetime(RELAY_TARGET.environmentId);
+            expect(yield* registry.registrationLifetime(RELAY_TARGET.environmentId)).toBe(first);
+            expect(
+              yield* registry.registrationLifetime(SECOND_RELAY_TARGET.environmentId),
+            ).not.toBe(first);
+            expect(
+              (yield* Effect.flip(registry.registrationLifetime(EnvironmentId.make("missing"))))
+                ._tag,
+            ).toBe("EnvironmentNotRegisteredError");
+            expect(yield* Ref.get(h.sessions)).toHaveLength(0);
+            return first;
+          });
+          const first = yield* read.pipe(Effect.provide(h.layer), Effect.scoped);
+          const second = yield* read.pipe(Effect.provide(h.layer), Effect.scoped);
+          expect(second).not.toBe(first);
+        }),
+    );
+
+    it.effect("survives rename, credential reinstall, disconnect and reconnect", () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness(
+          [BEARER_TARGET],
+          [BEARER_PROFILE],
+          [[BEARER_TARGET.connectionId, BEARER_CREDENTIAL]],
+        );
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          const first = yield* registry.registrationLifetime(BEARER_TARGET.environmentId);
+          yield* registry.rename(BEARER_TARGET.environmentId, "Renamed");
+          expect(yield* registry.registrationLifetime(BEARER_TARGET.environmentId)).toBe(first);
+          yield* registry.register(
+            new BearerConnectionRegistration({
+              target: BEARER_TARGET,
+              profile: BEARER_PROFILE,
+              credential: new BearerConnectionCredential({ token: "replacement-fixture" }),
+            }),
+          );
+          yield* awaitConnectionState(
+            registry,
+            BEARER_TARGET.environmentId,
+            (state) => state.phase === "connected",
+          );
+          expect(yield* registry.registrationLifetime(BEARER_TARGET.environmentId)).toBe(first);
+          yield* registry.disconnect(BEARER_TARGET.environmentId);
+          yield* registry.connect(BEARER_TARGET.environmentId);
+          expect(yield* registry.registrationLifetime(BEARER_TARGET.environmentId)).toBe(first);
+        }).pipe(Effect.provide(h.layer), Effect.scoped);
+      }),
+    );
+
+    it.effect("retires on removal and gives identical re-add a fresh token", () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness([RELAY_TARGET]);
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          const first = yield* registry.registrationLifetime(RELAY_TARGET.environmentId);
+          yield* registry.remove(RELAY_TARGET.environmentId);
+          expect(
+            (yield* Effect.flip(registry.registrationLifetime(RELAY_TARGET.environmentId)))._tag,
+          ).toBe("EnvironmentNotRegisteredError");
+          yield* registry.register(new RelayConnectionRegistration({ target: RELAY_TARGET }));
+          expect(yield* registry.registrationLifetime(RELAY_TARGET.environmentId)).not.toBe(first);
+        }).pipe(Effect.provide(h.layer), Effect.scoped);
+      }),
+    );
+
+    it.effect("reads during owned cleanup without waiting on the removal's own lease", () =>
+      Effect.gen(function* () {
+        let current: EnvironmentRegistry.EnvironmentRegistry["Service"] | undefined;
+        let observed = false;
+        const h = yield* makeHarness([RELAY_TARGET], [], [], {
+          onOwnedDataCleanup: (id) =>
+            Effect.gen(function* () {
+              expect(
+                (yield* Effect.flip(current!.registrationLifetime(id)).pipe(Effect.orDie))._tag,
+              ).toBe("EnvironmentNotRegisteredError");
+              observed = true;
+            }),
+        });
+        yield* Effect.gen(function* () {
+          current = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* current.remove(RELAY_TARGET.environmentId);
+          expect(observed).toBe(true);
+        }).pipe(Effect.provide(h.layer), Effect.scoped);
+      }),
+    );
+
+    it.effect("keeps lifetime intact when persistence refuses removal or replacement", () =>
+      Effect.gen(function* () {
+        const refusal = new Persistence.ConnectionPersistenceError({
+          operation: "remove-connection",
+          message: "fixture storage unavailable",
+        });
+        const h = yield* makeHarness([RELAY_TARGET], [], [], {
+          beforeRegistrationRemove: () => Effect.fail(refusal),
+          beforeRegistrationRegister: () => Effect.fail(refusal),
+        });
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          const first = yield* registry.registrationLifetime(RELAY_TARGET.environmentId);
+          yield* Effect.flip(registry.remove(RELAY_TARGET.environmentId));
+          expect(yield* registry.registrationLifetime(RELAY_TARGET.environmentId)).toBe(first);
+          yield* Effect.flip(
+            registry.register(new RelayConnectionRegistration({ target: RELAY_TARGET })),
+          );
+          expect(yield* registry.registrationLifetime(RELAY_TARGET.environmentId)).toBe(first);
+        }).pipe(Effect.provide(h.layer), Effect.scoped);
+      }),
+    );
+
+    it.effect(
+      "tracks platform removal and real rollback without treating runtime refresh as removal",
+      () =>
+        Effect.gen(function* () {
+          const h = yield* makeHarness([]);
+          yield* Effect.gen(function* () {
+            const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+            const platform = new PrimaryConnectionRegistration({ target: TARGET });
+            yield* registry.reconcilePlatform([platform]);
+            const first = yield* registry.registrationLifetime(TARGET.environmentId);
+            yield* registry.reconcilePlatform([platform]);
+            expect(yield* registry.registrationLifetime(TARGET.environmentId)).toBe(first);
+            yield* registry.reconcilePlatform([]);
+            yield* registry.reconcilePlatform([platform]);
+            expect(yield* registry.registrationLifetime(TARGET.environmentId)).not.toBe(first);
+            const saved = new RelayConnectionRegistration({ target: RELAY_TARGET });
+            yield* registry.register(saved);
+            const before = yield* registry.registrationLifetime(RELAY_TARGET.environmentId);
+            expect(yield* registry.rollbackRegistration(saved)).toBe(true);
+            yield* registry.register(saved);
+            expect(yield* registry.registrationLifetime(RELAY_TARGET.environmentId)).not.toBe(
+              before,
+            );
+          }).pipe(Effect.provide(h.layer), Effect.scoped);
+        }),
+    );
+  });
+
   it.effect("hydrates connection profiles into catalog entries", () =>
     Effect.gen(function* () {
       const aliasedTarget = new BearerConnectionTarget({

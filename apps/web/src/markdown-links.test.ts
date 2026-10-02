@@ -4,6 +4,7 @@ import {
   resolveMarkdownFileLinkMeta,
   resolveMarkdownFileLinkTarget,
   rewriteMarkdownFileUriHref,
+  workspaceDownloadRelativePath,
 } from "./markdown-links";
 
 describe("rewriteMarkdownFileUriHref", () => {
@@ -163,5 +164,31 @@ describe("resolveMarkdownFileLinkTarget", () => {
 
   it("preserves malformed percent escapes instead of throwing", () => {
     expect(resolveMarkdownFileLinkTarget("file:///tmp/bad%E0%A4%A.md")).toBe("/tmp/bad%E0%A4%A.md");
+  });
+});
+
+describe("workspaceDownloadRelativePath", () => {
+  it.each([
+    ["/workspace/docs/report.pdf", "/workspace", "docs/report.pdf"],
+    ["/workspace/./docs/report.pdf", "/workspace/", "docs/report.pdf"],
+    ["/report.pdf", "/", "report.pdf"],
+    ["c:/Workspace/docs/report.pdf", "C:\\Workspace", "docs/report.pdf"],
+    ["\\\\server\\share\\Workspace\\report.pdf", "\\\\server\\share\\Workspace", "report.pdf"],
+  ])("proves exact containment of %s in %s", (path, root, expected) => {
+    expect(workspaceDownloadRelativePath(path!, root)).toBe(expected);
+  });
+  it.each([
+    ["/WORKSPACE/outside.pdf", "/workspace"],
+    ["/workspace-other/outside.pdf", "/workspace"],
+    ["/workspace/a/../../outside.pdf", "/workspace"],
+    ["/workspace/report.pdf", "/workspace/../workspace"],
+    ["/workspace", "/workspace"],
+    ["/workspace/report.pdf", undefined],
+    ["relative/report.pdf", "relative"],
+    ["C:/workspace/report.pdf", "C:/Workspace"],
+    ["D:/Workspace/report.pdf", "C:/Workspace"],
+    ["/workspace/a\\b.pdf", "/workspace"],
+  ])("refuses an unproved root relation for %s and %s", (path, root) => {
+    expect(workspaceDownloadRelativePath(path!, root)).toBeNull();
   });
 });

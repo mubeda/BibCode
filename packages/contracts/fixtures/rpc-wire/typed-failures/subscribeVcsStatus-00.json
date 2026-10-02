@@ -1,0 +1,19 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "GitManagerError",
+          "operation": "MFA249",
+          "cwd": "4ns4AL9#e",
+          "detail": " yx",
+          "cause": -7
+        }
+      }
+    ]
+  }
+}

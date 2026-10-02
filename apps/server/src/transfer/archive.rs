@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use axum::body::Body;
 use futures_util::{StreamExt, stream};
 use tokio_util::io::{ReaderStream, SyncIoBridge};
+use tokio_util::sync::CancellationToken;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -45,6 +46,13 @@ impl ArchiveLimits {
     pub async fn plan(&self, root: &Path) -> Result<ArchivePlan, TransferError> {
         plan_archive_with_limits(root, self.max_entries, self.max_bytes).await
     }
+    pub async fn plan_cancellable(
+        &self,
+        root: &Path,
+        cancellation: CancellationToken,
+    ) -> Result<ArchivePlan, TransferError> {
+        plan_archive_cancellable(root, self.max_entries, self.max_bytes, cancellation).await
+    }
 }
 
 /// Walks `root` to size the archive before streaming it, enforcing the default limits.
@@ -58,18 +66,35 @@ pub async fn plan_archive_with_limits(
     max_entries: usize,
     max_bytes: u64,
 ) -> Result<ArchivePlan, TransferError> {
+    plan_archive_cancellable(root, max_entries, max_bytes, CancellationToken::new()).await
+}
+
+async fn plan_archive_cancellable(
+    root: &Path,
+    max_entries: usize,
+    max_bytes: u64,
+    cancellation: CancellationToken,
+) -> Result<ArchivePlan, TransferError> {
     let root = root.to_path_buf();
     let root_for_join_error = root.clone();
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        pause_plan_for_test(&root);
         let mut plan = ArchivePlan {
             entries: 0,
             bytes: 0,
         };
         let mut stack = vec![root.clone()];
         while let Some(directory) = stack.pop() {
+            if cancellation.is_cancelled() {
+                return Err(crate::workspace::WorkspaceError::Cancelled.into());
+            }
             let read = std::fs::read_dir(&directory)
                 .map_err(|error| TransferError::operation("read-dir", &directory, error))?;
             for entry in read {
+                if cancellation.is_cancelled() {
+                    return Err(crate::workspace::WorkspaceError::Cancelled.into());
+                }
                 let entry = entry.map_err(|error| {
                     TransferError::operation("read-dir-entry", &directory, error)
                 })?;
@@ -110,12 +135,93 @@ pub async fn plan_archive_with_limits(
     })?
 }
 
+#[cfg(test)]
+struct PlanPauseState {
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+#[cfg(test)]
+fn plan_pauses()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<PlanPauseState>>> {
+    static PAUSES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<PlanPauseState>>>,
+    > = std::sync::OnceLock::new();
+    PAUSES.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) struct PlanPause {
+    state: std::sync::Arc<PlanPauseState>,
+    entered: tokio::sync::oneshot::Receiver<()>,
+}
+#[cfg(test)]
+impl PlanPause {
+    pub(crate) async fn entered(&mut self) {
+        (&mut self.entered).await.expect("plan worker entered");
+    }
+    pub(crate) fn release(&self) {
+        *self.state.released.lock().unwrap() = true;
+        self.state.release.notify_all();
+    }
+}
+#[cfg(test)]
+impl Drop for PlanPause {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+#[cfg(test)]
+pub(crate) fn pause_next_plan(root: &Path) -> PlanPause {
+    let (sender, entered) = tokio::sync::oneshot::channel();
+    let state = std::sync::Arc::new(PlanPauseState {
+        entered: std::sync::Mutex::new(Some(sender)),
+        released: std::sync::Mutex::new(false),
+        release: std::sync::Condvar::new(),
+    });
+    plan_pauses()
+        .lock()
+        .unwrap()
+        .insert(std::fs::canonicalize(root).unwrap(), state.clone());
+    PlanPause { state, entered }
+}
+#[cfg(test)]
+fn pause_plan_for_test(root: &Path) {
+    let pause = plan_pauses().lock().unwrap().remove(root);
+    if let Some(pause) = pause {
+        if let Some(sender) = pause.entered.lock().unwrap().take() {
+            let _ = sender.send(());
+        }
+        let mut released = pause.released.lock().unwrap();
+        while !*released {
+            released = pause.release.wait(released).unwrap();
+        }
+    }
+}
+
 /// Streams a zip of `root`'s contents. `plan` is a proof token: callers must have already
 /// obtained a successful `ArchivePlan` (via `plan_archive`/`plan_archive_with_limits`) for
 /// `root` before starting the response, so this signature makes it impossible to stream an
 /// archive whose limits were never checked. I/O failures during streaming fail the response
 /// body and are logged since the HTTP response has already begun.
 pub fn archive_body(plan: ArchivePlan, root: PathBuf) -> Body {
+    let (reader, producer) = archive_reader(plan, root);
+    let completion = stream::once(async move {
+        producer
+            .await
+            .map_err(io::Error::other)?
+            .map(|()| axum::body::Bytes::new())
+    });
+    Body::from_stream(ReaderStream::with_capacity(reader, DOWNLOAD_CHUNK_BYTES).chain(completion))
+}
+
+/// Opens the bounded ZIP pipe; dropping its reader unblocks the owned worker on cancellation.
+pub fn archive_reader(
+    plan: ArchivePlan,
+    root: PathBuf,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<io::Result<()>>,
+) {
     tracing::debug!(root = %root.display(), entries = plan.entries, bytes = plan.bytes, "streaming folder download");
     let (writer, reader) = tokio::io::duplex(64 * 1024);
     let producer = tokio::task::spawn_blocking(move || {
@@ -127,13 +233,7 @@ pub fn archive_body(plan: ArchivePlan, root: PathBuf) -> Body {
     // I/O, and the smaller default costs sixteen times the per-chunk framing for the same bytes.
     // Dropping the writer reports EOF even when ZIP creation failed. Keep the producer's result
     // in the HTTP stream so clients discard an incomplete archive instead of saving it as success.
-    let completion = stream::once(async move {
-        producer
-            .await
-            .map_err(io::Error::other)?
-            .map(|()| axum::body::Bytes::new())
-    });
-    Body::from_stream(ReaderStream::with_capacity(reader, DOWNLOAD_CHUNK_BYTES).chain(completion))
+    (reader, producer)
 }
 
 fn write_archive<W: Write>(root: &Path, sink: W) -> io::Result<()> {

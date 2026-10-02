@@ -113,8 +113,8 @@ vi.mock("@bibcode/client-runtime/state/assets", () => ({
 
 vi.mock("../state/assets", () => ({
   assetEnvironment: {
-    createUrl: () => ({ key: "asset-url" }),
-    createUrls: () => ({ key: "asset-urls" }),
+    url: () => ({ key: "asset-url" }),
+    urls: () => ({ key: "asset-urls" }),
   },
 }));
 
@@ -349,23 +349,24 @@ describe("query and asset adapters", () => {
     expect(useEnvironmentQuery(queryAtom as never).error).toBe("The environment request failed.");
   });
 
-  it("resolves single and batched asset URLs across unavailable and failed states", () => {
+  it("binds single and batched resolved asset URLs without re-pairing prepared authority", () => {
     const resource = { _tag: "workspace-file", path: "index.html" } as never;
-    h.atomValues.set("asset-url", AsyncResult.success({ relativeUrl: "/assets/index.html" }));
-    h.atomValues.set("asset-urls", [
-      AsyncResult.success({ relativeUrl: "/assets/index.html" }),
-      AsyncResult.failure(Cause.fail("missing")),
-    ]);
+    h.atomValues.set("asset-url", null);
+    h.atomValues.set("asset-urls", [null, null]);
     expect(useAssetUrl(environmentId, resource)).toBeNull();
     expect(useAssetUrls(environmentId, [resource, resource])).toEqual([null, null]);
 
-    h.preparedConnection = Option.some({ httpBaseUrl: "https://example.test/base/" });
+    h.atomValues.set("asset-url", "https://example.test/assets/index.html");
+    h.atomValues.set("asset-urls", ["https://example.test/assets/index.html", null]);
+    h.preparedConnection = Option.some({ httpBaseUrl: "https://other.test/base/" });
     expect(useAssetUrl(environmentId, resource)).toBe("https://example.test/assets/index.html");
     expect(useAssetUrls(environmentId, [resource, resource])).toEqual([
       "https://example.test/assets/index.html",
       null,
     ]);
-    h.atomValues.set("asset-url", AsyncResult.failure(Cause.fail("missing")));
+    h.atomValues.set("asset-url", "blob:cache-owned");
+    expect(useAssetUrl(environmentId, resource)).toBe("blob:cache-owned");
+    h.atomValues.set("asset-url", null);
     expect(useAssetUrl(environmentId, resource)).toBeNull();
   });
 });

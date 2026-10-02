@@ -96,7 +96,7 @@ import type {
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration.ts";
-import { EnvironmentId, NonNegativeInt, PortSchema } from "./baseSchemas.ts";
+import { EnvironmentId, NonNegativeInt, PortSchema, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   AuthAccessTokenResult,
   type AuthEnvironmentScope,
@@ -369,6 +369,7 @@ export const DesktopAppStageLabelSchema = Schema.Literals(["Dev", "Latest", "Nig
 export const DesktopBridgeHostSchema = Schema.Literal("tauri");
 
 export interface DesktopBridgeFeatureFlags {
+  streamingDownloads?: boolean;
   localBackend: boolean;
   localBearerToken: boolean;
   clientSettings: boolean;
@@ -384,6 +385,7 @@ export interface DesktopBridgeFeatureFlags {
 }
 
 export const DesktopBridgeFeatureFlagsSchema = Schema.Struct({
+  streamingDownloads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   localBackend: Schema.Boolean,
   localBearerToken: Schema.Boolean,
   clientSettings: Schema.Boolean,
@@ -1256,6 +1258,24 @@ export const DesktopPreviewAutomationWaitForInputSchema = Schema.Struct({
 /** Tauri deep-link plugin runtime event carrying the opened URLs. */
 export const DESKTOP_DEEP_LINK_EVENT = "deep-link://new-url";
 
+export const DownloadFileHandle = TrimmedNonEmptyString;
+export type DownloadFileHandle = typeof DownloadFileHandle.Type;
+export const BeginDownloadFileInput = Schema.Struct({
+  directory: TrimmedNonEmptyString,
+  fileName: TrimmedNonEmptyString,
+});
+export type BeginDownloadFileInput = typeof BeginDownloadFileInput.Type;
+export const BeginDownloadFileResult = Schema.Struct({ handle: DownloadFileHandle });
+export type BeginDownloadFileResult = typeof BeginDownloadFileResult.Type;
+export const DownloadFileHandleInput = Schema.Struct({ handle: DownloadFileHandle });
+export type DownloadFileHandleInput = typeof DownloadFileHandleInput.Type;
+export const FinishDownloadFileResult = Schema.Struct({ path: TrimmedNonEmptyString });
+export type FinishDownloadFileResult = typeof FinishDownloadFileResult.Type;
+export interface AppendDownloadFileInput {
+  readonly handle: DownloadFileHandle;
+  readonly bytes: Uint8Array;
+}
+
 export interface DesktopBridge {
   getHostMetadata?: () => Promise<DesktopBridgeHostMetadata>;
   getAppBranding: () => DesktopAppBranding | null;
@@ -1334,6 +1354,10 @@ export interface DesktopBridge {
     directory: string;
     fileName: string;
   }) => Promise<string>;
+  beginDownloadFile?: (input: BeginDownloadFileInput) => Promise<BeginDownloadFileResult>;
+  appendDownloadFile?: (input: AppendDownloadFileInput) => Promise<void>;
+  finishDownloadFile?: (input: DownloadFileHandleInput) => Promise<FinishDownloadFileResult>;
+  abortDownloadFile?: (input: DownloadFileHandleInput) => Promise<void>;
   uploadFile?: (input: { url: string; path: string }) => Promise<{ status: number; body: string }>;
   confirm: (message: string) => Promise<boolean>;
   setTheme: (theme: DesktopTheme) => Promise<void>;

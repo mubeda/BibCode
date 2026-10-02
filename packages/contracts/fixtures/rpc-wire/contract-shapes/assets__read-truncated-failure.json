@@ -1,0 +1,24 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "AssetWorkspaceAssetInspectionError",
+          "resource": {
+            "_tag": "attachment",
+            "attachmentId": "truncated"
+          },
+          "message": "Failed to inspect the workspace asset.",
+          "cause": {
+            "name": "Error",
+            "message": "workspace operation 'read-asset' failed at asset: Asset changed while it was read. Try again."
+          }
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "AssetTooLargeError",
+          "resource": {
+            "_tag": "workspace-file",
+            "threadId": "ntG",
+            "path": "d5"
+          },
+          "limitBytes": 16,
+          "message": "1OSEHBi6F$l"
+        }
+      }
+    ]
+  }
+}

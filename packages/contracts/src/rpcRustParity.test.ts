@@ -12,6 +12,7 @@ import * as FastCheck from "fast-check";
 
 import { OrchestrationEvent, ORCHESTRATION_WS_METHODS } from "./orchestration.ts";
 import { WS_METHODS, WsRpcGroup } from "./rpc.ts";
+import { AssetAccessError } from "./assets.ts";
 import {
   ServerProcessDiagnosticsResult,
   ServerProcessResourceHistoryResult,
@@ -22,6 +23,7 @@ const StreamSchemaTypeId = "~effect/rpc/RpcSchema/StreamSchema";
 const decodeProcessDiagnostics = Schema.decodeUnknownSync(ServerProcessDiagnosticsResult);
 const decodeProcessResourceHistory = Schema.decodeUnknownSync(ServerProcessResourceHistoryResult);
 const decodeSignalProcessInput = Schema.decodeUnknownSync(ServerSignalProcessInput);
+const decodeAssetAccessError = Schema.decodeUnknownSync(AssetAccessError);
 
 interface Manifest {
   readonly methods: ReadonlyArray<{
@@ -52,6 +54,20 @@ describe("Rust RPC fixture parity", () => {
   const fixtureDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-wire");
   const readFixture = (name: string): unknown =>
     JSON.parse(NodeFS.readFileSync(NodePath.join(fixtureDirectory, name), "utf8")) as unknown;
+
+  it("decodes the actual Rust asset truncation stream failure with its required cause", () => {
+    const fixture = readFixture("contract-shapes/assets__read-truncated-failure.json") as {
+      readonly exit: { readonly cause: ReadonlyArray<{ readonly error: unknown }> };
+    };
+    const failure = decodeAssetAccessError(fixture.exit.cause[0]!.error);
+    expect(failure._tag).toBe("AssetWorkspaceAssetInspectionError");
+    if (failure._tag !== "AssetWorkspaceAssetInspectionError") throw new Error("Wrong failure.");
+    expect(failure.cause).toMatchObject({
+      name: "Error",
+      message:
+        "workspace operation 'read-asset' failed at asset: Asset changed while it was read. Try again.",
+    });
+  });
 
   it("pins the remote update snapshot wire shape the Rust mirror round-trips", () => {
     const fixture = readFixture("contract-shapes/updater__status-success.json") as {
@@ -351,7 +367,12 @@ describe("Rust RPC fixture parity", () => {
         }
       }
 
-      for (const [index, member] of schemaMembers(rpc.errorSchema.ast).entries()) {
+      const failureAst =
+        StreamSchemaTypeId in (rpc.successSchema as object)
+          ? (rpc.successSchema as unknown as { readonly error: { readonly ast: SchemaAST.AST } })
+              .error.ast
+          : rpc.errorSchema.ast;
+      for (const [index, member] of schemaMembers(failureAst).entries()) {
         try {
           Schema.toArbitrary(Schema.make(member))(FastCheck);
         } catch (cause) {

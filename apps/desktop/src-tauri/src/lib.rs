@@ -50,6 +50,10 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_save_diagnostic_logs,
             desktop_bridge_pick_files,
             desktop_bridge_download_to_folder,
+            desktop_bridge_begin_download_file,
+            desktop_bridge_append_download_file,
+            desktop_bridge_finish_download_file,
+            desktop_bridge_abort_download_file,
             desktop_bridge_upload_file,
             desktop_bridge_confirm,
             desktop_bridge_open_external,
@@ -99,6 +103,18 @@ pub fn run() {
         .manage(ssh::SshPasswordPromptManager::new())
         .manage(updates::DesktopUpdateManager::new())
         .manage(preview::PreviewHostState::new())
+        .manage(streamed_download::DownloadFileManager::new())
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main"
+                && payload.event() == tauri::webview::PageLoadEvent::Started
+            {
+                let downloads = webview
+                    .app_handle()
+                    .state::<streamed_download::DownloadFileManager>();
+                let generation = downloads.advance_page_generation();
+                downloads.schedule_generation_cleanup(generation);
+            }
+        })
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -111,6 +127,13 @@ pub fn run() {
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());
     let builder = builder.setup(move |app| {
+        let downloads = app
+            .state::<streamed_download::DownloadFileManager>()
+            .inner()
+            .clone();
+        tauri::async_runtime::spawn(async move {
+            downloads.start_sweeper();
+        });
         #[cfg(target_os = "linux")]
         {
             linux_text_rendering::apply_webview_hinting_override();
@@ -214,6 +237,10 @@ pub fn run() {
         bridge::desktop_bridge_save_diagnostic_logs,
         bridge::desktop_bridge_pick_files,
         bridge::desktop_bridge_download_to_folder,
+        bridge::desktop_bridge_begin_download_file,
+        bridge::desktop_bridge_append_download_file,
+        bridge::desktop_bridge_finish_download_file,
+        bridge::desktop_bridge_abort_download_file,
         bridge::desktop_bridge_upload_file,
         bridge::desktop_bridge_confirm,
         bridge::desktop_bridge_open_external,
@@ -254,6 +281,9 @@ pub fn run() {
 async fn prepare_desktop_runtime_for_exit<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
 ) -> Result<(), String> {
+    if let Some(downloads) = app_handle.try_state::<streamed_download::DownloadFileManager>() {
+        downloads.shutdown().await;
+    }
     if let Err(error) = window::persist_main_window_state(app_handle) {
         tracing::warn!("failed to persist Tauri main window state during exit: {error}");
     }
@@ -321,6 +351,7 @@ mod security;
 mod server_exposure;
 mod shell_environment;
 pub mod ssh;
+mod streamed_download;
 mod tailscale;
 #[cfg(test)]
 mod test_support;

@@ -53,6 +53,7 @@ const defaultLocalEnvironmentBootstrap = {
 };
 
 function installTauriHarness(options?: {
+  readonly streamingDownloads?: boolean;
   readonly previewSupported?: boolean;
   readonly protectedConnectionCatalog?: boolean;
   readonly rejectMetadata?: boolean;
@@ -77,7 +78,7 @@ function installTauriHarness(options?: {
   const listeners = new Map<string, TauriEventHandler>();
   const unlisteners = new Map<string, ReturnType<typeof vi.fn>>();
 
-  const invoke = vi.fn((command: string, args?: Record<string, unknown>) => {
+  const invoke = vi.fn((command: string, args?: Record<string, unknown>): Promise<unknown> => {
     switch (command) {
       case "desktop_bridge_get_bridge_metadata":
         if (options?.rejectMetadata) {
@@ -87,6 +88,9 @@ function installTauriHarness(options?: {
           host: "tauri",
           bridgeVersion: options?.bridgeVersion ?? 3,
           features: {
+            ...(options?.streamingDownloads === undefined
+              ? {}
+              : { streamingDownloads: options.streamingDownloads }),
             localBackend: true,
             localBearerToken: true,
             clientSettings: true,
@@ -346,6 +350,69 @@ function readIndexedDbConnectionCatalog(factory: IDBFactory): Promise<string | n
 }
 
 describe("tauriDesktopBridge", () => {
+  it("installs all streaming disk methods only when advertised and preserves raw bytes", async () => {
+    const harness = installTauriHarness({ streamingDownloads: true });
+    const { tauriDesktopBridgeReady } = await import("./tauriDesktopBridge");
+    await tauriDesktopBridgeReady;
+    const bridge = window.desktopBridge!;
+    expect(bridge.beginDownloadFile).toBeTypeOf("function");
+    expect(bridge.appendDownloadFile).toBeTypeOf("function");
+    expect(bridge.finishDownloadFile).toBeTypeOf("function");
+    expect(bridge.abortDownloadFile).toBeTypeOf("function");
+    const bytes = new Uint8Array([0, 1, 255]);
+    await bridge.beginDownloadFile!({ directory: "/fixture", fileName: "a.bin" });
+    await bridge.appendDownloadFile!({ handle: "owned", bytes });
+    await bridge.finishDownloadFile!({ handle: "owned" });
+    await bridge.abortDownloadFile!({ handle: "owned" });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_begin_download_file", {
+      directory: "/fixture",
+      fileName: "a.bin",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_append_download_file", bytes, {
+      headers: { "x-bibcode-download-handle": "owned" },
+    });
+    const append = harness.invoke.mock.calls.find(
+      ([command]) => command === "desktop_bridge_append_download_file",
+    );
+    expect(append?.[1]).toBe(bytes);
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_finish_download_file", {
+      handle: "owned",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_abort_download_file", {
+      handle: "owned",
+    });
+  });
+
+  it.each([undefined, false])(
+    "omits streaming methods on older or unavailable hosts (%s)",
+    async (streamingDownloads) => {
+      installTauriHarness(streamingDownloads === undefined ? {} : { streamingDownloads });
+      const { tauriDesktopBridgeReady } = await import("./tauriDesktopBridge");
+      await tauriDesktopBridgeReady;
+      const bridge = window.desktopBridge!;
+      for (const method of [
+        "beginDownloadFile",
+        "appendDownloadFile",
+        "finishDownloadFile",
+        "abortDownloadFile",
+      ] as const)
+        expect(bridge[method]).toBeUndefined();
+    },
+  );
+
+  it("preserves an actionable native disk error string", async () => {
+    const harness = installTauriHarness({ streamingDownloads: true });
+    const { tauriDesktopBridgeReady } = await import("./tauriDesktopBridge");
+    await tauriDesktopBridgeReady;
+    harness.invoke.mockImplementation((command) =>
+      command === "desktop_bridge_append_download_file"
+        ? Promise.reject("Disk is full.")
+        : Promise.resolve(null),
+    );
+    await expect(
+      window.desktopBridge!.appendDownloadFile!({ handle: "owned", bytes: new Uint8Array([1]) }),
+    ).rejects.toBe("Disk is full.");
+  });
   afterEach(() => {
     vi.resetModules();
     vi.unstubAllGlobals();
