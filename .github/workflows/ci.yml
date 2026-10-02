@@ -147,9 +147,10 @@ jobs:
   native_desktop:
     name: Native desktop - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
-    # Cold host tests, optimized recovery probes, and a native bundle can
-    # exceed 90 minutes on the Intel macOS runner while Rust is still compiling.
-    timeout-minutes: 120
+    # Host tests, the optimized example (with dev features), and the native
+    # bundle have distinct Cargo builds. Budget the complete cold sequence;
+    # Intel needs additional headroom without shortening any validation phase.
+    timeout-minutes: ${{ matrix.jobTimeoutMinutes }}
     strategy:
       fail-fast: false
       matrix:
@@ -159,31 +160,37 @@ jobs:
             platform: linux
             target: appimage
             arch: arm64
+            jobTimeoutMinutes: 120
           - label: Linux x64
             runner: ubuntu-22.04
             platform: linux
             target: appimage
             arch: x64
+            jobTimeoutMinutes: 120
           - label: Windows x64
             runner: windows-2025
             platform: win
             target: nsis
             arch: x64
+            jobTimeoutMinutes: 120
           - label: Windows arm64
             runner: windows-11-vs2026-arm
             platform: win
             target: nsis
             arch: arm64
+            jobTimeoutMinutes: 120
           - label: macOS arm64
             runner: macos-26
             platform: mac
             target: dmg
             arch: arm64
+            jobTimeoutMinutes: 120
           - label: macOS x64
             runner: macos-26-intel
             platform: mac
             target: dmg
             arch: x64
+            jobTimeoutMinutes: 240
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

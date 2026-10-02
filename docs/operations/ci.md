@@ -26,9 +26,17 @@ four job groups:
   publishing.
 - **Native desktop** builds the web application, tests the desktop Rust host,
   and creates an unpublished native bundle on Linux ARM64/x64, Windows ARM64/x64,
-  and macOS ARM64/x64 runners. Its 120-minute job budget covers cold compilation
-  of the host tests, the macOS optimized exception-recovery probe, and the
-  native bundle without shortening any check. The shared `scripts/run-msvc.mjs` launcher selects
+  and macOS ARM64/x64 runners. Each matrix row declares its complete-job budget:
+  240 minutes for macOS Intel, and 120 minutes for the other five targets.
+  That budget includes setup, host tests, the macOS optimized exception-recovery
+  probe, and native packaging without shortening any check or test-owned deadline.
+  Debug host tests cannot warm the optimized artifacts; the optimized example
+  also enables dev-dependency features (`tauri/test` and `tokio/test-util`) that
+  the ordinary production bundle does not use. Both optimized commands select
+  the same native target triple, but their feature differences require separate
+  compilation. Keep the real exception probe: a larger complete-job allowance
+  accommodates these deliberate checks without treating a cached build as the
+  cold-build baseline. The shared `scripts/run-msvc.mjs` launcher selects
   the requested MSVC architecture. After the Rust host tests,
   the Windows row alone runs
   `vp test run apps/desktop/e2e/support/test-project.test.ts`. That step is the
