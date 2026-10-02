@@ -50,7 +50,7 @@ interface ImagePaneProps {
 const ImagePane = memo(function ImagePane({ label, src }: ImagePaneProps) {
   return (
     <figure className="flex min-h-48 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-[repeating-conic-gradient(var(--color-muted)_0_25%,transparent_0_50%)_50%/16px_16px]">
-      <figcaption className="border-b border-border bg-background/90 px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+      <figcaption className="border-b border-border bg-background/90 px-2 py-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
         {label}
       </figcaption>
       <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-3">

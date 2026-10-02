@@ -74,7 +74,7 @@ function TagSection({
           />
           <span className="truncate">{title}</span>
           {count === null ? null : (
-            <span className="rounded bg-muted px-1.5 font-mono text-[10px] font-normal text-muted-foreground">
+            <span className="rounded bg-muted px-1.5 font-mono text-xs font-normal text-muted-foreground">
               {count}
             </span>
           )}
@@ -113,7 +113,7 @@ function LocalTagRows({
         <li key={row.name} className={ROW_CLASS} data-testid={`git-manager-local-tag-${row.name}`}>
           <TagIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1 truncate font-mono">{row.name}</span>
-          <span className="font-mono text-[10px] text-muted-foreground">{row.shortSha}</span>
+          <span className="font-mono text-xs text-muted-foreground">{row.shortSha}</span>
           <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover/tag-row:opacity-100">
             {canPush ? (
               <Button
@@ -212,11 +212,11 @@ function RemoteTagsSection({
                 <TagIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 flex-1 truncate font-mono">{row.name}</span>
                 {presence === null ? null : (
-                  <span className="rounded bg-muted px-1.5 text-[10px] text-muted-foreground">
+                  <span className="rounded bg-muted px-1.5 text-xs text-muted-foreground">
                     {presence}
                   </span>
                 )}
-                <span className="font-mono text-[10px] text-muted-foreground">{row.shortSha}</span>
+                <span className="font-mono text-xs text-muted-foreground">{row.shortSha}</span>
               </li>
             );
           })}
@@ -240,7 +240,7 @@ function RemoteTagsSection({
         </p>
       )}
       {summary.kind === "ready" && summary.message !== null ? (
-        <p className="px-2 py-1 text-[10px] text-muted-foreground">{summary.message}</p>
+        <p className="px-2 py-1 text-xs text-muted-foreground">{summary.message}</p>
       ) : null}
     </TagSection>
   );

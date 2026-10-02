@@ -132,7 +132,7 @@ export const GitManagerChangeRow = memo(function GitManagerChangeRow({
       )}
       <span
         aria-label={presentation.label}
-        className="inline-flex size-4 shrink-0 items-center justify-center font-mono text-[10px] text-muted-foreground"
+        className="inline-flex size-4 shrink-0 items-center justify-center font-mono text-xs text-muted-foreground"
         title={presentation.label}
       >
         <StatusIcon aria-hidden={true} className="size-3.5" />
@@ -142,19 +142,19 @@ export const GitManagerChangeRow = memo(function GitManagerChangeRow({
       {dir ? <span className="min-w-0 truncate text-muted-foreground">{dir}</span> : null}
       <span className="ml-auto flex shrink-0 items-center gap-1.5">
         {row.conflicted ? (
-          <span className="rounded bg-destructive/12 px-1 text-[10px] font-medium text-destructive">
+          <span className="rounded bg-destructive/12 px-1 text-xs font-medium text-destructive">
             Conflict
           </span>
         ) : null}
         {row.submodule ? (
-          <span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">
+          <span className="rounded bg-muted px-1 text-xs font-medium text-muted-foreground">
             Submodule
           </span>
         ) : null}
         <DiffStatLabel
           additions={row.insertions}
           deletions={row.deletions}
-          className="text-[10px]"
+          className="text-xs"
           layout="inline"
         />
       </span>

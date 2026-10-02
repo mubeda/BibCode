@@ -3,6 +3,23 @@ import { describe, expect, it } from "vite-plus/test";
 import { textSizesBelowTextXs } from "./uiTypography";
 
 describe("textSizesBelowTextXs", () => {
+  it("does not interpret expressions or percentages as pixel literals", () => {
+    expect(
+      textSizesBelowTextXs(
+        'fontSize: 2 * 8, fontSize: 10 + offset, font-size: 9%; font-size: calc(8px + 4px); fontSize: "50%", fontSize: "0.5rem" + suffix',
+      ),
+    ).toEqual([]);
+  });
+
+  it("finds undersized CSS and inline numeric font declarations", () => {
+    expect(
+      textSizesBelowTextXs(
+        'font-size: 11px !important; font-size: 0.6875rem; fontSize: 10, fontSize: "0.5em"',
+      ),
+    ).toEqual(["font-size: 11px", "font-size: 0.6875rem", "fontSize: 10", 'fontSize: "0.5em"']);
+    expect(textSizesBelowTextXs('font-size: 12px; fontSize: 12, fontSize: "0.75rem"')).toEqual([]);
+  });
+
   it("finds pixel sizes below 12 px, including fractional ones", () => {
     expect(
       textSizesBelowTextXs(

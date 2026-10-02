@@ -150,10 +150,10 @@ export const GitManagerOperationBanner = memo(function GitManagerOperationBanner
       )}
       {state.chunks.length === 0 ? null : (
         <div data-operation-output hidden={!state.expanded} id={outputId}>
-          <p className="mt-2 text-[10px] text-muted-foreground">
+          <p className="mt-2 text-xs text-muted-foreground">
             Output arrives in chunks after each Git command completes.
           </p>
-          <div className="mt-1 max-h-40 overflow-auto rounded bg-background p-2 font-mono text-[11px]">
+          <div className="mt-1 max-h-40 overflow-auto rounded bg-background p-2 font-mono text-xs">
             {state.chunks.map((chunk) => (
               <pre
                 className={chunk.stream === "stderr" ? "text-destructive" : undefined}
