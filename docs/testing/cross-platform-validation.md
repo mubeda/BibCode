@@ -964,6 +964,17 @@ the Git child; an interrupted or disconnected inline read (such as
 helper; and one explicit provider refresh after an idle interval that
 produced no provider process or browser network request.
 
+In a disposable repository, damage `.git/config` before opening the first status
+subscription, then repair it while that subscription remains open. Local status
+must recover and the same lifecycle must attach automatic fetch, without a
+restart or resubscription; repeat with a malformed `HEAD`. Confirm a subsequent
+automatic-fetch interval observes the remote change. Use the broadcaster's gated
+repair tests to cover rapid break/repair observations, overlapping local/full
+refreshes, a subscriber departing during common-directory resolution, a new
+subscriber joining, mutation epoch retirement, and final-release cancellation.
+Each current subscriber must attach to one shared physical-repository owner;
+departed subscribers and stale resolution results must not remain attached.
+
 For external Git Manager refresh, keep the automatic fetch interval at its
 180-second default. Default fixtures use ordinary `git init` without
 `--ref-format`, so supported older Git installations can run them. Reftable
