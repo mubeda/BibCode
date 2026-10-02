@@ -822,6 +822,17 @@ operation; otherwise it requests the normal application restart, whose exit
 path persists window state, stops backends through `stop_for_exit`, and shuts
 down SSH forwarding. Recovery never automatically retries or selects a new port.
 
+The restart guard intentionally retains a known check-then-exit limitation:
+it reads the update and project-data admission flags, but does not hold an
+atomic restart reservation through `request_restart`. An installation admitted
+after those reads can therefore be interrupted by the restart. This is an
+accepted risk matching an ordinary manual quit during installation, not a
+guarantee that restart and installation can never overlap. The guard continues
+to refuse operations already observed in flight. Closing the remaining window
+would require a shared admission protocol covering restart and every install
+entry point; the current decision is to retain the existing quit/recovery
+semantics rather than imply that independent flag reads provide that protocol.
+
 In a desktop renderer, a missing primary bootstrap is a typed topology-read
 failure, never a fallback to the development server or WebView origin. The
 platform poll retains the registered primary and its cached data and composer
