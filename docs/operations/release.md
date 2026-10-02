@@ -419,6 +419,21 @@ both [creation and updates](https://docs.github.com/en/rest/releases/releases)
 can fail with 403 or 404. Check the failed job's token permissions and compare
 the candidate with freshly fetched `origin/main`:
 
+Publication-capable preflight runs
+`bash scripts/check-release-workflow-permission.sh "$RELEASE_REF"` before its
+quality gates and native builds. The check resolves the repository's current
+default branch through GitHub, freshly fetches it, and compares its workflow
+tree with the immutable release commit. Lookup, fetch, or comparison errors
+fail closed. A known mismatch explains the required release identity or
+unpublished-candidate recovery before native builds consume their budget.
+The release job repeats the check immediately before draft/publication steps
+because the default branch can advance during builds. Validation-only runs
+skip it because they create no release. This is an early diagnostic, not a
+permission grant or transaction with GitHub: a later API failure still fails
+the job and must be diagnosed. It never changes a tag or release target.
+
+For manual diagnosis against `main`:
+
 ```sh
 git fetch origin main
 git diff --name-only "$tag^{commit}" origin/main -- .github/workflows/

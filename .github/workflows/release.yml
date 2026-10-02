@@ -171,6 +171,14 @@ jobs:
             fi
           fi
 
+      - name: Check release workflow permissions
+        if: steps.release_meta.outputs.validate_only != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ steps.release_meta.outputs.ref }}
+        run: bash scripts/check-release-workflow-permission.sh "$RELEASE_REF"
+
       - name: Check
         run: vp check
 
@@ -792,6 +800,14 @@ jobs:
           name: validated-release-assets
           path: release-assets/*
           if-no-files-found: error
+
+      - name: Recheck release workflow permissions
+        if: needs.preflight.outputs.validate_only != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REF: ${{ needs.preflight.outputs.ref }}
+        run: bash scripts/check-release-workflow-permission.sh "$RELEASE_REF"
 
       - name: Require inspected stable draft
         if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'
