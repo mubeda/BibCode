@@ -571,7 +571,7 @@ fn backend_slot_key(plan: &BackendLaunchPlan) -> String {
 }
 
 #[cfg(test)]
-type BackendStartPublishGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+type BackendStartPublishGate = (oneshot::Sender<ManagedBackend>, oneshot::Receiver<()>);
 
 /// Each start's slot key and the listener bind retry window it passed on.
 #[cfg(test)]
@@ -1530,7 +1530,7 @@ impl BackendSupervisor {
         )
         .await?;
         #[cfg(test)]
-        self.wait_for_start_publish_gate().await;
+        self.wait_for_start_publish_gate(&managed).await;
         let mut active_plan = plan;
         active_plan.config = config.clone();
         let monitor_plan = active_plan.clone();
@@ -1677,7 +1677,11 @@ impl BackendSupervisor {
     }
 
     #[cfg(test)]
-    fn set_start_publish_gate(&self, reached: oneshot::Sender<()>, release: oneshot::Receiver<()>) {
+    fn set_start_publish_gate(
+        &self,
+        reached: oneshot::Sender<ManagedBackend>,
+        release: oneshot::Receiver<()>,
+    ) {
         *self
             .start_publish_gate
             .lock()
@@ -1685,14 +1689,14 @@ impl BackendSupervisor {
     }
 
     #[cfg(test)]
-    async fn wait_for_start_publish_gate(&self) {
+    async fn wait_for_start_publish_gate(&self, managed: &ManagedBackend) {
         let gate = self
             .start_publish_gate
             .lock()
             .expect("backend start test gate mutex poisoned")
             .take();
         if let Some((reached, release)) = gate {
-            let _ = reached.send(());
+            let _ = reached.send(managed.clone());
             let _ = release.await;
         }
     }
@@ -5389,15 +5393,15 @@ exit /b 9
     /// Waits for `start` to reach its pre-publish gate. A start that ends
     /// first, for example because its port was taken, fails the test with
     /// its result instead of leaving the gate's sender parked forever.
-    async fn wait_for_start_at_publish_gate(
-        reached: oneshot::Receiver<()>,
-        start: &mut tokio::task::JoinHandle<Result<BackendRunConfig, String>>,
-    ) {
+    async fn wait_for_start_at_publish_gate<T: std::fmt::Debug>(
+        reached: oneshot::Receiver<ManagedBackend>,
+        start: &mut tokio::task::JoinHandle<T>,
+    ) -> ManagedBackend {
         within_test_gate_deadline(
             async {
                 tokio::select! {
                     reached = reached => {
-                        reached.expect("the start publish gate should stay registered");
+                        reached.expect("the start publish gate should stay registered")
                     }
                     ended = start => {
                         panic!("start ended before reaching the pre-publish gate: {ended:?}");
@@ -5406,7 +5410,7 @@ exit /b 9
             },
             "the start to reach its pre-publish gate",
         )
-        .await;
+        .await
     }
 
     #[tokio::test]
@@ -5422,16 +5426,40 @@ exit /b 9
         let plan = BackendLaunchPlan::local(temp.path().to_path_buf(), local_test_config(port));
 
         let start_supervisor = supervisor.clone();
+        let late_backend = Arc::new(std::sync::OnceLock::<ManagedBackend>::new());
+        let backend_at_return = late_backend.clone();
         let mut start = tokio::spawn(async move {
-            start_supervisor
+            let result = start_supervisor
                 .start_with_options(
                     plan,
                     BackendReadinessConfig::default(),
                     BackendRestartConfig::default(),
                 )
-                .await
+                .await;
+            let ManagedBackend::Runtime(runtime) = backend_at_return
+                .get()
+                .expect("the gate must identify the late runtime before release")
+            else {
+                panic!("local starts must use an in-process runtime");
+            };
+            // Do not yield between start returning and observing its own runtime.
+            let cleanup_result = runtime
+                .join_result
+                .try_lock()
+                .ok()
+                .and_then(|result| result.clone());
+            (result, cleanup_result)
         });
-        wait_for_start_at_publish_gate(wait_for_publish, &mut start).await;
+        let managed = wait_for_start_at_publish_gate(wait_for_publish, &mut start).await;
+        late_backend
+            .set(managed.clone())
+            .expect("late runtime should be captured once");
+        let ManagedBackend::Runtime(runtime) = managed else {
+            panic!("local starts must use an in-process runtime");
+        };
+        let cleanup_gate = runtime.join_result.lock().await;
+        assert!(cleanup_gate.is_none(), "the late runtime is still running");
+        let stop_requested_checkpoint = runtime.stop_requested_event.checkpoint();
 
         let stop_supervisor = supervisor.clone();
         let stop =
@@ -5452,9 +5480,22 @@ exit /b 9
         allow_publish
             .send(())
             .expect("blocked start should still be waiting");
-        let start_result = within_test_gate_deadline(start, "the late start to finish")
-            .await
-            .expect("start task should join");
+        wait_for_fixture_event(
+            &runtime.stop_requested_event,
+            stop_requested_checkpoint,
+            "the late runtime's stop request",
+        )
+        .await;
+        assert!(!start.is_finished(), "start must await this runtime's join");
+        assert!(
+            !stop.is_finished(),
+            "stop must await the late start's cleanup"
+        );
+        drop(cleanup_gate);
+        let (start_result, cleanup_result_at_start_return) =
+            within_test_gate_deadline(start, "the late start to finish")
+                .await
+                .expect("start task should join");
         within_test_gate_deadline(stop, "the stop to finish")
             .await
             .expect("stop task should join")
@@ -5481,10 +5522,9 @@ exit /b 9
                 .is_empty(),
             "late-created backend must not remain installed"
         );
-        assert!(
-            tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-                .await
-                .is_err(),
+        assert_eq!(
+            cleanup_result_at_start_return,
+            Some(Ok(())),
             "late-created backend must be cleaned before start returns"
         );
     }
