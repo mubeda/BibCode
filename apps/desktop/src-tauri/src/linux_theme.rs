@@ -11,7 +11,9 @@ use std::{
     },
 };
 
-use gtk::{gio, glib::Variant, glib::variant::ToVariant, prelude::GtkSettingsExt};
+#[cfg(not(test))]
+use gtk::gio;
+use gtk::{glib::Variant, glib::variant::ToVariant, prelude::GtkSettingsExt};
 use tauri::Theme;
 
 #[derive(Default)]
@@ -58,7 +60,7 @@ pub fn resolve_theme_to_apply(requested: Option<Theme>, system: Theme) -> Theme 
     requested.unwrap_or(system)
 }
 
-async fn read_system_theme_with(
+pub(crate) async fn read_system_theme_with(
     read: impl FnOnce() -> Option<Theme> + Send + 'static,
 ) -> tauri::Result<Theme> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -88,6 +90,7 @@ fn theme_from_portal_reply(reply: &Variant) -> Option<Theme> {
     })
 }
 
+#[cfg(not(test))]
 fn read_portal_theme() -> Option<Theme> {
     let connection = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok()?;
     let reply = connection
@@ -106,6 +109,7 @@ fn read_portal_theme() -> Option<Theme> {
     theme_from_portal_reply(&reply)
 }
 
+#[cfg(not(test))]
 pub async fn read_system_theme() -> tauri::Result<Theme> {
     // WebviewWindow::theme() dispatches back to Tauri's main thread, where tao
     // blocks on D-Bus. Read the same setting on a worker instead; tao still owns
