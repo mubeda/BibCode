@@ -468,6 +468,9 @@ importers:
 
   scripts:
     dependencies:
+      '@bibcode/client-runtime':
+        specifier: workspace:*
+        version: link:../packages/client-runtime
       '@bibcode/contracts':
         specifier: workspace:*
         version: link:../packages/contracts

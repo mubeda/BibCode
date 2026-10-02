@@ -134,7 +134,18 @@ import { useShortcutModifierState } from "../shortcutModifierState";
 import { readLocalApi } from "../localApi";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
-import { remoteUpdateEnvironment, useRemoteUpdateCheckState } from "../state/remoteUpdates";
+import {
+  remoteUpdateEnvironment,
+  useRemoteUpdateCheckState,
+  useRemoteUpdateRun,
+  useRequestRemoteUpdateConfirmation,
+} from "../state/remoteUpdates";
+import { isRemoteUpdateRunActive } from "@bibcode/client-runtime/state/remoteUpdateCoordinator";
+import { manualUpdateSteps, visibleRemoteUpdateRun } from "./settings/remoteUpdatePresentation";
+import {
+  ManualUpdateStepsDialog,
+  type ManualUpdateStepsRequest,
+} from "./settings/ManualUpdateStepsDialog";
 import { projectDataSafetyStore } from "../state/projectDataSafety";
 
 import { useThreadActions } from "../hooks/useThreadActions";
@@ -337,8 +348,12 @@ function SidebarEnvironmentContextCard() {
     environment?.serverConfig ?? null,
   );
   const updateEnvironmentId = remoteUpdateControl ? activeEnvironmentId : null;
+  const run = useRemoteUpdateRun(updateEnvironmentId);
+  const runActive = isRemoteUpdateRunActive(run);
+  const requestUpdate = useRequestRemoteUpdateConfirmation();
+  const [stepsRequest, setStepsRequest] = useState<ManualUpdateStepsRequest | null>(null);
   const updateQuery = useEnvironmentQuery(
-    updateEnvironmentId === null
+    updateEnvironmentId === null || runActive
       ? null
       : remoteUpdateEnvironment.snapshot({ environmentId: updateEnvironmentId, input: {} }),
   );
@@ -355,25 +370,60 @@ function SidebarEnvironmentContextCard() {
     [runCheck, refreshUpdateStatus],
   );
 
+  const confirmUpdate = () => {
+    if (environment === null || updateEnvironmentId === null) return;
+    requestUpdate({
+      environmentId: updateEnvironmentId,
+      name: environment.label,
+      targetVersion: updateQuery.data?.latestVersion ?? null,
+      progress: environment.serverConfig?.environment.capabilities.remoteUpdateProgress ?? false,
+    });
+  };
   return (
-    <EnvironmentContextCard
-      {...(updateEnvironmentId === null
-        ? {}
-        : {
-            updateBadge: (
-              <ServerUpdateBadge
-                {...serverUpdateStatusFromQuery(updateQuery, {
-                  connected: environment?.connection.phase === "connected",
-                  check: updateCheck,
-                })}
-                onRetry={refreshUpdateStatus}
-                onCheckAgain={() => void checkForUpdates(updateEnvironmentId)}
-              />
-            ),
-            onCheckForUpdates: (environmentId: EnvironmentId) =>
-              void checkForUpdates(environmentId),
-          })}
-    />
+    <>
+      <EnvironmentContextCard
+        updateInProgress={runActive}
+        {...(updateEnvironmentId === null
+          ? {}
+          : {
+              updateBadge: (
+                <ServerUpdateBadge
+                  {...serverUpdateStatusFromQuery(updateQuery, {
+                    connected: environment?.connection.phase === "connected",
+                    check: updateCheck,
+                  })}
+                  run={visibleRemoteUpdateRun(run, updateQuery.data)}
+                  name={environment?.label ?? "The server"}
+                  onUpdate={confirmUpdate}
+                  onRetryRun={confirmUpdate}
+                  onRetry={refreshUpdateStatus}
+                  onCheckAgain={() => void checkForUpdates(updateEnvironmentId)}
+                />
+              ),
+              onCheckForUpdates: (environmentId: EnvironmentId) =>
+                void checkForUpdates(environmentId),
+              onShowUpdateSteps: () => {
+                if (environment === null) return;
+                const descriptor = environment.serverConfig?.environment;
+                setStepsRequest({
+                  name: environment.label,
+                  steps: manualUpdateSteps({
+                    installKind:
+                      updateQuery.data?.support.installKind ??
+                      descriptor?.remoteUpdateSupport?.installKind ??
+                      "unknown",
+                    os: descriptor?.platform?.os ?? "unknown",
+                    arch: descriptor?.platform?.arch ?? "other",
+                    sshLaunched: environment.entry.target._tag === "SshConnectionTarget",
+                    serverVersion:
+                      updateQuery.data?.serverVersion ?? descriptor?.serverVersion ?? "unknown",
+                  }),
+                });
+              },
+            })}
+      />
+      <ManualUpdateStepsDialog request={stepsRequest} onClose={() => setStepsRequest(null)} />
+    </>
   );
 }
 
