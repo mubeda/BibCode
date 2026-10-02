@@ -439,6 +439,14 @@ Current release documentation states that Windows artifacts are not
 Authenticode-signed. An unsigned local artifact is expected evidence, not a
 signed pass. Do not use production secrets.
 
+In the CI-only seeded upgrade lanes, the updater host exiting is not proof of
+installation. Before cleanup and relaunch, the harness waits for the installed
+executable's exact candidate `ProductVersion`, a readable SHA-256, and no
+candidate-named updater installer. Its bounded `windows-install-handoff.log`
+records path/version/hash and installer PID/path observations without command
+lines or credentials. Inspect that artifact on timeout; the later public
+runtime-version and retained-data checks remain required.
+
 Build and run packaged E2E with the supported platform value
 `BIBCODE_E2E_PLATFORM=win`:
 
@@ -573,6 +581,22 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   restart it and confirm its sidebar card reads **Not checked yet**, then changes
   to **Up to date** or **Update to v…** within about a minute without **Check
   for updates**;
+  Use a desktop-hosted release shared through **Another device** as the second
+  host. From both Settings and its card, **Update to v…** must open a named
+  confirmation; with one terminal open there, counts must say it will stop.
+  Cancel starts nothing. Confirm, observe downloading/backup/restart/version
+  checking and success; closing Settings must not cancel the run. A failed
+  restart beyond the three-minute budget shows actionable failure; **Retry**
+  reconfirms with fresh counts, and row **Dismiss** clears settled feedback.
+  A manual host offers **Show update steps** and **Copy** matching its platform
+  and install kind. The host notice names the requester and **Manage devices**
+  opens sharing controls. Update a browser page's own host from another client;
+  verify its explicit Reload prompt preserves typed composer input. Capture
+  both themes. The notice may be classified as tests-only when no controlled
+  release host is available; do not run the CI seeded harness locally.
+  If remote protection fails on a WSL secondary, the error must instruct you
+  to finish the update on the host; remote clients cannot exclude that backend.
+
 - in **Settings → Remote Servers → Share this host**, generate an **Another
   device** offer. Confirm the local server restarts before the pairing offer is
   shown, and that the result contains the browser URL, `bibcode://` deep link,
