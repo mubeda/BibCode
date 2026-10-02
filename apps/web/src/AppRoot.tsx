@@ -16,6 +16,10 @@ import { useAtomCommand } from "./state/use-atom-command";
 import { useEnvironments } from "./state/environments";
 import { isDesktopLocalConnectionTarget } from "./connection/desktopLocal";
 import { useShareExposureReconciler } from "./state/shareExposureReconciler";
+import { RemoteUpdateConfirmationCoordinator } from "./components/settings/UpdateServerDialog";
+import { RemoteUpdateRequestNotifier } from "./components/RemoteUpdateRequestNotifier";
+import { ServerReloadPrompt } from "./components/ServerReloadPrompt";
+import { isDesktopHost } from "./env";
 
 export function ShareExposureReconciler() {
   useShareExposureReconciler();
@@ -155,6 +159,16 @@ export function AppRoot({ router }: { readonly router: AppRouter }) {
       <ThreadLifecycleReconciler />
       <ProjectDataRecoveryCoordinator />
       <RouterProvider router={router} />
+      <RemoteUpdateConfirmationCoordinator />
+      {isDesktopHost ? (
+        <RemoteUpdateRequestNotifier
+          onManageDevices={() => {
+            void router.navigate({ to: "/settings/remote-servers", search: { tab: "share" } });
+          }}
+        />
+      ) : (
+        <ServerReloadPrompt />
+      )}
       {supportsPreviewRuntimeCapability(previewBridge, "automation") ? (
         <PreviewAutomationHosts />
       ) : null}

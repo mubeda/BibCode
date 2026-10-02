@@ -14,7 +14,69 @@ import {
   remoteUpdateSuccessTitle,
   remoteUpdateUpToDateTitle,
   visibleRemoteUpdateRun,
+  manualUpdateSteps,
 } from "./remoteUpdatePresentation";
+
+describe("manualUpdateSteps", () => {
+  const base = { serverVersion: "0.7.2", sshLaunched: false } as const;
+  it("names the archive and checksum command for the host OS and architecture", () => {
+    const linux = manualUpdateSteps({
+      ...base,
+      installKind: "archive",
+      os: "linux",
+      arch: "arm64",
+    });
+    expect(linux).toContain("bibcode-server-vVERSION-linux-aarch64.tar.gz");
+    expect(linux).toContain("bibcode-server-SHA256SUMS");
+    expect(linux).toContain("sha256sum --check -");
+    expect(
+      manualUpdateSteps({ ...base, installKind: "archive", os: "darwin", arch: "x64" }),
+    ).toContain("shasum -a 256 -c");
+    const windows = manualUpdateSteps({
+      ...base,
+      installKind: "archive",
+      os: "windows",
+      arch: "x64",
+    });
+    expect(windows).toContain("bibcode-server-vVERSION-windows-x86_64.zip");
+    expect(windows).toContain("Get-FileHash");
+    expect(windows).not.toContain("grep");
+  });
+  it("gives platform package options and preserves running version context", () => {
+    const steps = manualUpdateSteps({
+      ...base,
+      installKind: "system-package",
+      os: "linux",
+      arch: "x64",
+    });
+    expect(steps).toContain("sudo apt install ./bibcode-server_VERSION_amd64.deb");
+    expect(steps).toContain("sudo dnf install ./bibcode-server-VERSION-1.x86_64.rpm");
+    expect(steps).toContain("Currently running: v0.7.2");
+  });
+  it("instructs an SSH operator to verify this server and reconnect without stopping every recorded pid", () => {
+    const steps = manualUpdateSteps({
+      ...base,
+      installKind: "unknown",
+      os: "linux",
+      arch: "x64",
+      sshLaunched: true,
+    });
+    expect(steps).toContain("~/.bibcode-ssh-launch/");
+    expect(steps).toContain("Reconnect");
+    expect(steps).toContain("Verify");
+    expect(steps).not.toContain("kill");
+  });
+  it("uses generic operator guidance when platform or install kind is unknown", () => {
+    const steps = manualUpdateSteps({
+      ...base,
+      installKind: "flatpak",
+      os: "unknown",
+      arch: "other",
+    });
+    expect(steps).toContain("bibcode serve");
+    expect(steps).not.toContain("linux-");
+  });
+});
 
 const base = {
   name: "Ai-server",

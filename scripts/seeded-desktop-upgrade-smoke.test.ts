@@ -2,12 +2,17 @@
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeVM from "node:vm";
 
-import { describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import * as Schema from "effect/Schema";
+import { AuthPairingLink } from "@bibcode/contracts";
 
 import {
   assertBaselineVersionIsOlder,
   assertWebDriverPhaseExit,
+  windowsCandidateIsInstalled,
   buildLocalUpdaterManifest,
   buildSeededUpgradeOverlay,
   canonicalizeSeededUpgradeWorkRoot,
@@ -26,12 +31,389 @@ import {
   verifySeededUpgradeOutcome,
   waitForUpgradeCondition,
   restartedApplicationCleanupPlan,
+  assertRemoteInstallPort,
+  countAppImageMounts,
+  scopedCleanupPids,
+  verifyRemoteInstallOutcome,
+  SeededDesktopUpgradeSmokeError,
+  type RemoteInstallEvidence,
+  runSeededDesktopUpgradeSmoke,
+  type SeededDesktopUpgradeSmokeInput,
 } from "./seeded-desktop-upgrade-smoke.ts";
 
 const absolute = (...parts: ReadonlyArray<string>): string =>
   NodePath.resolve("/tmp/bibcode-upgrade-smoke", ...parts);
 
+const decodePairingLink = Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingLink));
+const publicPairingGrant = {
+  id: "fixture-grant",
+  credential: "fixture-distinct-grant",
+  scopes: ["orchestration:read", "orchestration:operate"],
+  subject: "one-time-token",
+  createdAt: "2026-10-02T08:00:00Z",
+  expiresAt: "2026-10-02T08:05:00Z",
+  reach: "another-device",
+};
+
+/** Executes the generated credential callback and its receipt/driver handoff without a desktop. */
+const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
+  const input = {
+    candidateVersion: "0.7.3",
+    expectedDataRoot: absolute("remote", "data"),
+    lane: "remote-install" as const,
+    phase: "seed-and-install" as const,
+    projectId: "remote-project",
+    resultPath: absolute("remote", "before.json"),
+    workspaceRoot: absolute("remote", "workspace"),
+    platform: "linux" as const,
+    appBinaryPath: absolute("RemoteLane.AppImage"),
+    remoteInstallDriverPath: "fixture:driver",
+    remoteHarnessPath: "fixture:host",
+    remoteSecretPath: absolute("remote", "private.json"),
+    remoteEvidencePath: absolute("remote", "evidence", "remote-rpc.json"),
+  };
+  const spec = createSeededUpgradeDriverSpec(input);
+  const start = spec.indexOf("    const credentials = await browser.execute(");
+  const end = spec.indexOf("\n  });\n});", start);
+  if (start < 0 || end < 0) throw new Error("Generated remote credential scenario is missing.");
+  // Replace module loading only; run the actual browser callback and handoff statements.
+  const source = spec.slice(start, end).replaceAll("await import(", "await loadFixture(");
+  const files = new Map<string, { contents: string; mode?: number }>();
+  let responseIndex = 0;
+  const fetch = vi.fn(async (_url: URL, _options: { signal?: AbortSignal }) => ({
+    ok: true,
+    json: async () => responses[Math.min(responseIndex++, responses.length - 1)],
+  }));
+  const driver = vi.fn(async (_credentials: unknown) => ({ phases: ["succeeded"] }));
+  const execute = async (callback: (...args: unknown[]) => unknown, ...args: unknown[]) =>
+    callback(...args);
+  const context = {
+    input,
+    widened: true,
+    observation: { projectId: "remote-project" },
+    browser: { execute },
+    window: {
+      desktopBridge: {
+        getLocalEnvironmentBootstraps: () => [
+          {
+            id: "primary",
+            httpBaseUrl: "http://127.0.0.1:43123",
+            bootstrapToken: "fixture-desktop-bootstrap",
+          },
+        ],
+        getLocalEnvironmentBearerToken: async () => "fixture-desktop-bearer",
+      },
+    },
+    NodeFS: {
+      writeFileSync: (path: string, contents: string, options?: { mode: number }) =>
+        files.set(path, { contents, ...options }),
+    },
+    loadFixture: async (path: string) => {
+      if (path === input.remoteInstallDriverPath) return { runRemoteInstallDriver: driver };
+      if (path === input.remoteHarnessPath)
+        return { captureRemoteInstallHostEvidence: async () => ({ requesterLogLines: 1 }) };
+      throw new Error("Unexpected fixture module.");
+    },
+    fetch,
+    URL,
+    Date,
+    AbortController,
+    setTimeout,
+    clearTimeout,
+  };
+  return {
+    input,
+    context,
+    files,
+    fetch,
+    driver,
+    run: () =>
+      NodeVM.runInNewContext(`(async () => { ${source} })()`, context, {
+        timeout: 1_000,
+      }) as Promise<void>,
+  };
+};
+
+describe("generated remote sharing grant handoff", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("redeems the published grant shape and retains credentials only in the private receipt", async () => {
+    decodePairingLink(publicPairingGrant);
+    const fixture = remoteGrantFixture([[publicPairingGrant]]);
+    await fixture.run();
+    expect(fixture.driver).toHaveBeenCalledWith({
+      endpoint: "http://127.0.0.1:43123",
+      bootstrapToken: "fixture-distinct-grant",
+      requireWide: true,
+    });
+    const receipt = fixture.files.get(fixture.input.remoteSecretPath);
+    expect(receipt?.mode).toBe(0o600);
+    expect(JSON.parse(receipt!.contents)).toEqual({
+      endpoint: "http://127.0.0.1:43123",
+      bootstrapToken: "fixture-distinct-grant",
+    });
+    expect(NodePath.dirname(fixture.input.remoteSecretPath)).not.toBe(
+      NodePath.dirname(fixture.input.remoteEvidencePath),
+    );
+    for (const [path, file] of fixture.files) {
+      if (path !== fixture.input.remoteSecretPath)
+        expect(file.contents).not.toContain("fixture-distinct-grant");
+    }
+  });
+
+  it("waits for minting after native exposure has already widened", async () => {
+    vi.useFakeTimers();
+    const fixture = remoteGrantFixture([[], [publicPairingGrant]]);
+    const outcome = fixture.run().then(
+      () => null,
+      (error: Error) => error.message,
+    );
+    await vi.runAllTimersAsync();
+    expect(await outcome).toBeNull();
+    expect(fixture.fetch).toHaveBeenCalledTimes(2);
+    expect(fixture.driver).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    ["this-computer", [{ ...publicPairingGrant, reach: "this-computer" }]],
+    ["custom", [{ ...publicPairingGrant, reach: "custom" }]],
+    ["blank credential", [{ ...publicPairingGrant, credential: "  " }]],
+    ["missing id", [{ ...publicPairingGrant, id: undefined }]],
+    ["null entry", [null]],
+    ["no grant", []],
+  ])(
+    "fails closed within a bound for %s without using the desktop bootstrap",
+    async (_name, links) => {
+      vi.useFakeTimers();
+      const fixture = remoteGrantFixture([links]);
+      const outcome = fixture.run().then(
+        () => "unexpected success",
+        (error: Error) => error.message,
+      );
+      await vi.runAllTimersAsync();
+      expect(await outcome).toBe("Remote verification has no live native sharing grant.");
+      expect(fixture.driver).not.toHaveBeenCalled();
+      expect(fixture.files.size).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it("rejects malformed list responses without exposing their contents", async () => {
+    const fixture = remoteGrantFixture([{ privateDetail: "fixture-private-response" }]);
+    await expect(fixture.run()).rejects.toThrow(
+      "Remote verification pairing grant response invalid.",
+    );
+    expect(fixture.files.size).toBe(0);
+    expect(fixture.driver).not.toHaveBeenCalled();
+  });
+
+  it.each(["http", "body", "transport"])(
+    "sanitizes %s failures before any private handoff",
+    async (failure) => {
+      const fixture = remoteGrantFixture([[publicPairingGrant]]);
+      fixture.fetch.mockImplementation(async () => {
+        if (failure === "transport") throw new Error("fixture-private-network-detail");
+        return {
+          ok: failure !== "http",
+          json: async () => {
+            throw new Error("fixture-private-body-detail");
+          },
+        };
+      });
+      await expect(fixture.run()).rejects.toThrow("Remote verification pairing grant unavailable.");
+      expect(fixture.files.size).toBe(0);
+      expect(fixture.driver).not.toHaveBeenCalled();
+    },
+  );
+
+  it("aborts a stalled grant request before the embedded driver command deadline", async () => {
+    vi.useFakeTimers();
+    const fixture = remoteGrantFixture([]);
+    const aborted = vi.fn();
+    fixture.fetch.mockImplementation(
+      (_url, options) =>
+        new Promise((_resolve, reject) => {
+          options.signal?.addEventListener("abort", () => {
+            aborted();
+            reject(new Error("fixture-private-abort-detail"));
+          });
+        }),
+    );
+    const startedAt = vi.getMockedSystemTime()!.getTime();
+    const outcome = fixture.run().then(
+      () => ({
+        message: "unexpected success",
+        elapsed: vi.getMockedSystemTime()!.getTime() - startedAt,
+      }),
+      (error: Error) => ({
+        message: error.message,
+        elapsed: vi.getMockedSystemTime()!.getTime() - startedAt,
+      }),
+    );
+    await vi.runAllTimersAsync();
+    expect(await outcome).toMatchObject({
+      message: "Remote verification pairing grant unavailable.",
+    });
+    expect((await outcome).elapsed).toBeGreaterThan(0);
+    expect((await outcome).elapsed).toBeLessThan(30_000);
+    expect(aborted).toHaveBeenCalledOnce();
+    expect(fixture.driver).not.toHaveBeenCalled();
+    expect(fixture.files.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 describe("seeded packaged desktop upgrade harness", () => {
+  it("waits for the exact Windows candidate and installer exit before cleanup", () => {
+    const candidate = "0.7.3-upgrade.46";
+    const installed = {
+      exists: true,
+      productVersion: candidate,
+      sha256: "a".repeat(64),
+      installers: [],
+      error: null,
+    };
+    expect(windowsCandidateIsInstalled(installed, candidate)).toBe(true);
+    expect(windowsCandidateIsInstalled({ ...installed, productVersion: "0.7.2" }, candidate)).toBe(
+      false,
+    );
+    expect(
+      windowsCandidateIsInstalled({ ...installed, productVersion: "0.7.3-upgrade.45" }, candidate),
+    ).toBe(false);
+    expect(windowsCandidateIsInstalled({ ...installed, exists: false }, candidate)).toBe(false);
+    expect(windowsCandidateIsInstalled({ ...installed, sha256: null }, candidate)).toBe(false);
+    expect(
+      windowsCandidateIsInstalled({ ...installed, installers: [{ pid: 42 }] }, candidate),
+    ).toBe(false);
+    expect(windowsCandidateIsInstalled({ ...installed, error: "probe failed" }, candidate)).toBe(
+      false,
+    );
+    expect(windowsCandidateIsInstalled({}, candidate)).toBe(false);
+    expect(windowsCandidateIsInstalled(null, candidate)).toBe(false);
+  });
+
+  it("generates a syntactically valid isolated remote-install phase", async () => {
+    const directory = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "bibcode-remote-spec-"),
+    );
+    try {
+      const spec = createSeededUpgradeDriverSpec({
+        candidateVersion: "0.7.3",
+        expectedDataRoot: NodePath.join(directory, "data"),
+        lane: "remote-install",
+        phase: "seed-and-install",
+        projectId: "remote-project",
+        resultPath: NodePath.join(directory, "before.json"),
+        workspaceRoot: NodePath.join(directory, "workspace"),
+        platform: "linux",
+        appBinaryPath: NodePath.join(directory, "RemoteLane.AppImage"),
+        remoteInstallDriverPath: "file:///isolated/remote-install-driver.ts",
+        remoteHarnessPath: "file:///isolated/seeded-desktop-upgrade-smoke.ts",
+        remoteSecretPath: NodePath.join(directory, "private.json"),
+        remoteEvidencePath: NodePath.join(directory, "evidence.json"),
+      });
+      const path = NodePath.join(directory, "remote.e2e.mjs");
+      await NodeFS.promises.writeFile(path, spec);
+      const result = NodeChildProcess.spawnSync(process.execPath, ["--check", path], {
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(spec).not.toContain("bridge.installUpdate()");
+    } finally {
+      await NodeFS.promises.rm(directory, { recursive: true, force: true });
+    }
+  });
+  it("requires remote phase receipts and helper paths before generating its executable scenario", () => {
+    expect(() =>
+      createSeededUpgradeDriverSpec({
+        candidateVersion: "0.7.3",
+        expectedDataRoot: absolute("remote", "data"),
+        lane: "remote-install",
+        phase: "seed-and-install",
+        projectId: "remote-project",
+        resultPath: absolute("remote", "before.json"),
+        workspaceRoot: absolute("remote", "workspace"),
+      }),
+    ).toThrow(SeededDesktopUpgradeSmokeError);
+  });
+  it("rejects a local invocation before inspecting files or starting applications", async () => {
+    vi.stubEnv("CI", "false");
+    try {
+      await expect(
+        runSeededDesktopUpgradeSmoke({} as SeededDesktopUpgradeSmokeInput),
+      ).rejects.toThrow("CI-only");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it("keeps remote installation in its own root and avoids user/dev ports", () => {
+    const layout = createSeededUpgradeRunLayout(absolute("work"), "remote-test");
+    expect(layout.remoteInstall.dataRoot).toBe(absolute("work", "remote-test", "remote", "data"));
+    expect(layout.remoteInstall.dataRoot).not.toBe(layout.protectedBaseline.dataRoot);
+    for (const port of [3773, 5733, 13773, 18431, 18432, 0, 65536])
+      expect(() => assertRemoteInstallPort(port)).toThrow(SeededDesktopUpgradeSmokeError);
+    expect(assertRemoteInstallPort(43123)).toBe(43123);
+  });
+  it("counts only the isolated remote AppImage mount prefix", () => {
+    expect(
+      countAppImageMounts(
+        "image /tmp/.mount_Remote123 fuse ro 0 0\nimage /tmp/.mount_bibcod456 fuse ro 0 0\ntmpfs /tmp tmpfs rw 0 0",
+        ".mount_Remote",
+      ),
+    ).toBe(1);
+  });
+  it("requires a candidate restart, stable storage, protection progress, backup, and one isolated runtime", () => {
+    const good: RemoteInstallEvidence = {
+      before: { bootId: "b1", serverVersion: "0.7.2", storageInstanceId: "s1" },
+      after: { bootId: "b2", serverVersion: "0.7.3-upgrade.1", storageInstanceId: "s1" },
+      phases: ["downloading", "installing", "succeeded"],
+      sawPercent: true,
+      sawStage: true,
+      preUpdateBackups: 1,
+      requesterLogLines: 1,
+      appImageMounts: 1,
+      runtimeProcesses: 1,
+    };
+    expect(() => verifyRemoteInstallOutcome(good, "0.7.3-upgrade.1")).not.toThrow();
+    const invalid = [
+      { ...good, after: { ...good.after, bootId: "b1" } },
+      { ...good, after: { ...good.after, serverVersion: "0.7.2" } },
+      { ...good, after: { ...good.after, storageInstanceId: "s2" } },
+      { ...good, phases: [] },
+      { ...good, sawPercent: false },
+      { ...good, sawStage: false },
+      { ...good, preUpdateBackups: 0 },
+      { ...good, requesterLogLines: 2 },
+      { ...good, appImageMounts: 2 },
+      { ...good, runtimeProcesses: 2 },
+    ];
+    for (const evidence of invalid)
+      expect(() => verifyRemoteInstallOutcome(evidence, "0.7.3-upgrade.1")).toThrow(
+        SeededDesktopUpgradeSmokeError,
+      );
+  });
+  it("selects only process ids with this lane's exact data root", () => {
+    expect(
+      scopedCleanupPids(
+        [
+          {
+            pid: 10,
+            comm: "RemoteLane",
+            environ: "BIBCODE_HOME=/tmp/remote/data\u0000HOME=/home/test\u0000",
+          },
+          {
+            pid: 11,
+            comm: "bibcode-desktop",
+            environ: "BIBCODE_HOME=/tmp/remote/data-other\u0000",
+          },
+          { pid: 12, comm: "bibcode-desktop", environ: "HOME=/home/user\u0000" },
+        ],
+        "/tmp/remote/data",
+      ),
+    ).toEqual([10]);
+  });
   it("launches the native Vite+ executable on every host", () => {
     expect(seededUpgradeVitePlusExecutable).toBe("vp");
   });
@@ -154,6 +536,37 @@ describe("seeded packaged desktop upgrade harness", () => {
       wsl: false,
       workRoot: absolute("work"),
     });
+  });
+
+  it("reserves the ordinary remote-install lane's highest port before any launch", () => {
+    const base = [
+      "--platform",
+      "linux",
+      "--arch",
+      "x64",
+      "--bundle",
+      "appimage",
+      "--candidate-version",
+      "0.3.11",
+      "--previous-tag",
+      "v0.3.10",
+      "--previous-version",
+      "0.3.10",
+      "--public-key-file",
+      absolute("keys", "updater.key.pub"),
+      "--run-id",
+      "port-boundary",
+      "--work-root",
+      absolute("work"),
+      "--artifact-dir",
+      absolute("evidence"),
+      "--updater-port",
+      "65432",
+    ];
+    expect(parseSeededDesktopUpgradeSmokeArgs(base, "/repo").updaterPort).toBe(65_432);
+    expect(() =>
+      parseSeededDesktopUpgradeSmokeArgs(base.with(base.length - 1, "65433"), "/repo"),
+    ).toThrow(/leave room/);
   });
 
   it("accepts WSL mode only for the supported Windows x64 target", () => {

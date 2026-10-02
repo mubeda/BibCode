@@ -7,13 +7,19 @@ import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
+import * as NodeURL from "node:url";
+import {
+  REMOTE_UPDATE_DOWNLOAD_BUDGET_MS,
+  REMOTE_UPDATE_INSTALL_BUDGET_MS,
+  REMOTE_UPDATE_RESTART_BUDGET_MS,
+} from "@bibcode/client-runtime/state/remoteUpdateCoordinator";
 
 import { MOCK_UPDATE_LOOPBACK_HOST, MOCK_UPDATE_READY_PATH } from "./mock-update-server.ts";
 import { requireReleaseTarget, type TauriUpdaterTarget } from "./lib/release-targets.ts";
 
 export type SeededUpgradePlatform = "linux" | "mac" | "win";
 export type SeededUpgradeArch = "arm64" | "x64";
-export type SeededUpgradeLane = "previous-stable" | "protected-baseline";
+export type SeededUpgradeLane = "previous-stable" | "protected-baseline" | "remote-install";
 
 const MOCK_UPDATE_READY_TIMEOUT_MS = 60_000;
 
@@ -46,6 +52,7 @@ export interface SeededUpgradeRunLayout {
   readonly candidateBuildRoot: string;
   readonly previousStable: SeededUpgradeLaneLayout;
   readonly protectedBaseline: SeededUpgradeLaneLayout;
+  readonly remoteInstall: SeededUpgradeLaneLayout;
   readonly updaterRoot: string;
 }
 
@@ -70,6 +77,89 @@ export interface SeededUpgradeObservationAfter {
 
 export class SeededDesktopUpgradeSmokeError extends Error {
   override readonly name = "SeededDesktopUpgradeSmokeError";
+}
+
+export const REMOTE_INSTALL_FORBIDDEN_PORTS: ReadonlySet<number> = new Set([
+  3773, 5733, 13773, 18431, 18432,
+]);
+export function assertRemoteInstallPort(port: number): number {
+  if (
+    !Number.isInteger(port) ||
+    port < 1024 ||
+    port > 65535 ||
+    REMOTE_INSTALL_FORBIDDEN_PORTS.has(port)
+  ) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "The remote-install lane needs an unreserved high port.",
+    );
+  }
+  return port;
+}
+export function countAppImageMounts(procMounts: string, prefix: string): number {
+  return procMounts
+    .split("\n")
+    .filter((line) => NodePath.posix.basename(line.split(" ")[1] ?? "").startsWith(prefix)).length;
+}
+export interface RemoteInstallEvidence {
+  readonly before: {
+    readonly bootId: string;
+    readonly serverVersion: string;
+    readonly storageInstanceId: string;
+  };
+  readonly after: {
+    readonly bootId: string;
+    readonly serverVersion: string;
+    readonly storageInstanceId: string;
+  };
+  readonly phases: ReadonlyArray<string>;
+  readonly sawPercent: boolean;
+  readonly sawStage: boolean;
+  readonly preUpdateBackups: number;
+  readonly requesterLogLines: number;
+  readonly appImageMounts: number | null;
+  readonly runtimeProcesses: number | null;
+}
+export function verifyRemoteInstallOutcome(
+  evidence: RemoteInstallEvidence,
+  candidateVersion: string,
+): void {
+  const fail = (message: string): never => {
+    throw new SeededDesktopUpgradeSmokeError(`remote-install: ${message}`);
+  };
+  if (
+    evidence.before.bootId.length === 0 ||
+    evidence.after.bootId.length === 0 ||
+    evidence.before.bootId === evidence.after.bootId
+  )
+    fail("the host did not publish a new boot.");
+  if (evidence.after.serverVersion !== candidateVersion)
+    fail("the candidate version is not running.");
+  if (
+    evidence.before.storageInstanceId.length === 0 ||
+    evidence.after.storageInstanceId !== evidence.before.storageInstanceId
+  )
+    fail("storage identity was not retained.");
+  if (!evidence.phases.includes("succeeded")) fail("the coordinator did not succeed.");
+  if (!evidence.sawPercent || !evidence.sawStage)
+    fail("download and protection progress was not observed.");
+  if (evidence.preUpdateBackups < 1) fail("no pre-update backup was observed.");
+  if (evidence.requesterLogLines !== 1) fail("expected exactly one requester log entry.");
+  if (evidence.appImageMounts !== null && evidence.appImageMounts !== 1)
+    fail("expected one AppImage mount.");
+  if (evidence.runtimeProcesses !== null && evidence.runtimeProcesses !== 1)
+    fail("expected one AppImage runtime.");
+}
+export function scopedCleanupPids(
+  processes: ReadonlyArray<{
+    readonly pid: number;
+    readonly comm: string;
+    readonly environ: string;
+  }>,
+  home: string,
+): ReadonlyArray<number> {
+  return processes
+    .filter((entry) => entry.environ.split("\0").includes(`BIBCODE_HOME=${home}`))
+    .map((entry) => entry.pid);
 }
 
 const requireString = (values: Record<string, unknown>, name: string): string => {
@@ -146,7 +236,8 @@ export function parseSeededDesktopUpgradeSmokeArgs(
     throw new SeededDesktopUpgradeSmokeError("WSL upgrade coverage requires Windows x64.");
   }
   const updaterPort = parsePositiveInteger(values["updater-port"], "updater-port", 43_120);
-  if (updaterPort + 102 > 65_535) {
+  const highestPortOffset = values.wsl === true ? 102 : 103;
+  if (updaterPort + highestPortOffset > 65_535) {
     throw new SeededDesktopUpgradeSmokeError(
       "--updater-port must leave room for the isolated backend and WebDriver ports.",
     );
@@ -200,6 +291,7 @@ export function createSeededUpgradeRunLayout(
     candidateBuildRoot: NodePath.join(runRoot, "candidate-build"),
     previousStable: laneLayout(runRoot, "previous"),
     protectedBaseline: laneLayout(runRoot, "protected"),
+    remoteInstall: laneLayout(runRoot, "remote"),
     updaterRoot: NodePath.join(runRoot, "updater"),
   };
 }
@@ -296,7 +388,27 @@ export function createSeededUpgradeDriverSpec(input: {
   readonly resultPath: string;
   readonly workspaceRoot: string;
   readonly wsl?: boolean | undefined;
+  readonly remoteInstallDriverPath?: string;
+  readonly remoteHarnessPath?: string;
+  readonly remoteSecretPath?: string;
+  readonly remoteEvidencePath?: string;
+  readonly appBinaryPath?: string;
+  readonly platform?: SeededUpgradePlatform;
 }): string {
+  if (
+    input.lane === "remote-install" &&
+    input.phase === "seed-and-install" &&
+    (!input.remoteInstallDriverPath ||
+      !input.remoteHarnessPath ||
+      !input.remoteSecretPath ||
+      !input.remoteEvidencePath ||
+      !input.appBinaryPath ||
+      !input.platform)
+  ) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "The remote-install phase requires private receipts, helper paths, and its isolated application.",
+    );
+  }
   const serializedInput = JSON.stringify(input).replaceAll("<", "\\u003c");
   return `
 // Generated by scripts/seeded-desktop-upgrade-smoke.ts. Never persist database contents here.
@@ -461,8 +573,69 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
     const observation = await observe(${input.phase === "seed-and-install" ? "true" : "false"});
     NodeFS.writeFileSync(input.resultPath, JSON.stringify(observation));
     ${
-      input.phase === "seed-and-install"
+      input.phase === "seed-and-install" && input.lane === "remote-install"
         ? `
+    await browser.execute(() => { window.location.hash = "/settings/remote-servers?tab=share"; });
+    let widened = false;
+    try {
+      await browser.waitUntil(async () => browser.execute(() => [...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Generate pairing offer")), { timeout: 30000, interval: 100 });
+      const generated = await browser.execute(() => {
+        const button = [...document.querySelectorAll("button")].find((entry) => entry.textContent?.trim() === "Generate pairing offer");
+        if (!button || button.disabled) return false;
+        button.click(); return true;
+      });
+      if (generated) await browser.waitUntil(async () => browser.execute(async () => (await window.desktopBridge.getServerExposureState()).mode === "network-accessible"), { timeout: 60000, interval: 250 });
+      widened = generated;
+    } catch { widened = false; }
+    const credentials = await browser.execute(async (widened) => {
+      const bootstrap = window.desktopBridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary");
+      if (!bootstrap?.httpBaseUrl || !bootstrap.bootstrapToken) throw new Error("Remote verification bootstrap unavailable.");
+      if (widened) {
+        const bearer = await window.desktopBridge.getLocalEnvironmentBearerToken();
+        // Exposure precedes minting. Stay below the embedded driver's 30-second command bound.
+        const deadline = Date.now() + 20000;
+        while (Date.now() < deadline) {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), Math.min(5000, deadline - Date.now()));
+          let links;
+          try {
+            const response = await fetch(new URL("/api/auth/pairing-links", bootstrap.httpBaseUrl), {
+              headers: { authorization: "Bearer " + bearer },
+              signal: controller.signal,
+            });
+            if (!response.ok) throw new Error();
+            links = await response.json();
+          } catch {
+            throw new Error("Remote verification pairing grant unavailable.");
+          } finally {
+            clearTimeout(timeout);
+          }
+          if (!Array.isArray(links)) throw new Error("Remote verification pairing grant response invalid.");
+          // AuthPairingLink publishes reach and credential; offHost is server-private metadata.
+          const grant = links.find((link) => link !== null && typeof link === "object" &&
+            link.reach === "another-device" && typeof link.id === "string" && link.id.trim().length > 0 &&
+            typeof link.credential === "string" && link.credential.trim().length > 0);
+          if (grant && Date.now() < deadline) {
+            // Redeeming the offered grant keeps the wide listener alive across the update.
+            return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: grant.credential };
+          }
+          await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(250, deadline - Date.now()))));
+        }
+        throw new Error("Remote verification has no live native sharing grant.");
+      }
+      return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: bootstrap.bootstrapToken };
+    }, widened);
+    // Private receipt is outside retained evidence; the controller uses it to redact logs.
+    NodeFS.writeFileSync(input.remoteSecretPath, JSON.stringify(credentials), { mode: 0o600 });
+    NodeFS.writeFileSync(input.resultPath, JSON.stringify({ ...observation, installAttempted: true }));
+    const { runRemoteInstallDriver } = await import(input.remoteInstallDriverPath);
+    const evidence = await runRemoteInstallDriver({ ...credentials, requireWide: widened });
+    const { captureRemoteInstallHostEvidence } = await import(input.remoteHarnessPath);
+    const host = await captureRemoteInstallHostEvidence({ dataRoot: input.expectedDataRoot, appBinaryPath: input.appBinaryPath, platform: input.platform });
+    NodeFS.writeFileSync(input.remoteEvidencePath, JSON.stringify({ ...evidence, ...host, widened }), { mode: 0o600 });
+    `
+        : input.phase === "seed-and-install"
+          ? `
     const preparation = await browser.executeAsync((candidateVersion, done) => {
       const bridge = window.desktopBridge;
       const observed = [];
@@ -552,7 +725,7 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
     }));
     await new Promise((resolve) => setTimeout(resolve, 30000));
     `
-        : ""
+          : ""
     }
   });
 });
@@ -693,6 +866,99 @@ export async function waitForUpgradeCondition(input: {
   throw new SeededDesktopUpgradeSmokeError(
     `Timed out waiting for ${input.description} after ${input.timeoutMs}ms.`,
   );
+}
+
+/** The updater can exit its host before NSIS finishes replacing the installed executable. */
+export function windowsCandidateIsInstalled(
+  observation: unknown,
+  candidateVersion: string,
+): boolean {
+  if (typeof observation !== "object" || observation === null) return false;
+  const value = observation as Record<string, unknown>;
+  return (
+    value.exists === true &&
+    value.productVersion === candidateVersion &&
+    typeof value.sha256 === "string" &&
+    /^[a-f\d]{64}$/i.test(value.sha256) &&
+    Array.isArray(value.installers) &&
+    value.installers.length === 0 &&
+    value.error === null
+  );
+}
+
+// Read-only, CI-only evidence. Paths and versions cross as environment values,
+// never PowerShell source; process command lines and credentials are not collected.
+export const windowsUpgradeObservationScript = `
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$observation = [ordered]@{
+  observedAtUtc = [System.DateTime]::UtcNow.ToString('o')
+  path = $env:BIBCODE_SEEDED_APPLICATION_PATH
+  exists = $false
+  productVersion = $null
+  fileVersion = $null
+  sha256 = $null
+  installers = @()
+  error = $null
+}
+try {
+  $observation.exists = Test-Path -LiteralPath $observation.path -PathType Leaf
+  if ($observation.exists) {
+    $file = Get-Item -LiteralPath $observation.path
+    $observation.productVersion = $file.VersionInfo.ProductVersion
+    $observation.fileVersion = $file.VersionInfo.FileVersion
+    $observation.sha256 = (Get-FileHash -LiteralPath $observation.path -Algorithm SHA256).Hash
+  }
+  $suffix = '-' + $env:BIBCODE_SEEDED_CANDIDATE_VERSION + '-installer.exe'
+  $observation.installers = @(Get-CimInstance Win32_Process | Where-Object {
+    $_.Name.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase)
+  } | ForEach-Object {
+    [ordered]@{ pid = $_.ProcessId; parentPid = $_.ParentProcessId; path = $_.ExecutablePath }
+  })
+} catch {
+  $observation.error = $_.FullyQualifiedErrorId
+}
+$observation | ConvertTo-Json -Compress -Depth 4
+`;
+
+async function waitForWindowsInstalledCandidate(input: {
+  readonly appBinaryPath: string;
+  readonly candidateVersion: string;
+  readonly evidenceDirectory: string;
+  readonly timeoutMs: number;
+}): Promise<void> {
+  await waitForUpgradeCondition({
+    description: `Windows candidate ${input.candidateVersion} at the installed application path`,
+    intervalMs: 1_000,
+    timeoutMs: input.timeoutMs,
+    probe: async () => {
+      const result = await runBoundedCommand({
+        command: "powershell.exe",
+        args: ["-NoProfile", "-NonInteractive", "-Command", windowsUpgradeObservationScript],
+        cwd: NodePath.dirname(input.appBinaryPath),
+        env: {
+          ...process.env,
+          BIBCODE_SEEDED_APPLICATION_PATH: input.appBinaryPath,
+          BIBCODE_SEEDED_CANDIDATE_VERSION: input.candidateVersion,
+        },
+        timeoutMs: 10_000,
+      });
+      let observation: unknown;
+      try {
+        observation = JSON.parse(result.stdout.trim().replace(/^\uFEFF/, ""));
+      } catch {
+        observation = { error: "Windows version probe returned invalid JSON" };
+      }
+      await NodeFS.promises.appendFile(
+        NodePath.join(input.evidenceDirectory, "windows-install-handoff.log"),
+        `${JSON.stringify({ exitCode: result.exitCode, observation })}\n`,
+        { mode: 0o600 },
+      );
+      return (
+        result.exitCode === 0 && windowsCandidateIsInstalled(observation, input.candidateVersion)
+      );
+    },
+  });
 }
 
 export class ManagedProcessRegistry {
@@ -1104,6 +1370,7 @@ export const createSeededUpgradeWdioConfig = (input: {
   readonly restartTimeoutMs: number;
   readonly specPath: string;
   readonly webdriverPort: number;
+  readonly testTimeoutMs?: number;
 }): string => `
 export const config = {
   runner: "local",
@@ -1133,7 +1400,7 @@ export const config = {
     headers.delete("content-length");
     return { ...request, headers };
   },
-  mochaOpts: { ui: "bdd", timeout: ${Math.max(input.restartTimeoutMs, 120_000)} },
+  mochaOpts: { ui: "bdd", timeout: ${input.testTimeoutMs ?? Math.max(input.restartTimeoutMs, 120_000)} },
 };
 `;
 
@@ -1160,7 +1427,34 @@ const runWebDriverPhase = async (input: {
   await NodeFS.promises.mkdir(phaseRoot, { recursive: true });
   const specPath = NodePath.join(phaseRoot, "seeded-upgrade.e2e.ts");
   const configPath = NodePath.join(phaseRoot, "wdio.conf.mjs");
-  await NodeFS.promises.writeFile(specPath, createSeededUpgradeDriverSpec(input), { mode: 0o600 });
+  const remoteSecretPath = NodePath.join(input.runRoot, "remote-bootstrap.secret.json");
+  const phaseTimeoutMs =
+    input.lane === "remote-install" && input.phase === "seed-and-install"
+      ? input.restartTimeoutMs +
+        REMOTE_UPDATE_DOWNLOAD_BUDGET_MS +
+        REMOTE_UPDATE_INSTALL_BUDGET_MS +
+        REMOTE_UPDATE_RESTART_BUDGET_MS +
+        90_000
+      : input.restartTimeoutMs + (input.phase === "seed-and-install" ? 90_000 : 30_000);
+  await NodeFS.promises.writeFile(
+    specPath,
+    createSeededUpgradeDriverSpec({
+      ...input,
+      ...(input.lane === "remote-install"
+        ? {
+            remoteInstallDriverPath: NodeURL.pathToFileURL(
+              NodePath.join(input.repositoryRoot, "scripts/lib/remote-install-driver.ts"),
+            ).href,
+            remoteHarnessPath: NodeURL.pathToFileURL(
+              NodePath.join(input.repositoryRoot, "scripts/seeded-desktop-upgrade-smoke.ts"),
+            ).href,
+            remoteSecretPath,
+            remoteEvidencePath: NodePath.join(input.evidenceDirectory, "remote-rpc.json"),
+          }
+        : {}),
+    }),
+    { mode: 0o600 },
+  );
   await NodeFS.promises.writeFile(
     configPath,
     createSeededUpgradeWdioConfig({
@@ -1169,6 +1463,7 @@ const runWebDriverPhase = async (input: {
       restartTimeoutMs: input.restartTimeoutMs,
       specPath,
       webdriverPort: input.webdriverPort,
+      testTimeoutMs: phaseTimeoutMs,
     }),
     { mode: 0o600 },
   );
@@ -1188,10 +1483,7 @@ const runWebDriverPhase = async (input: {
           }
         : {}),
     },
-    timeoutMs:
-      input.phase === "seed-and-install"
-        ? input.restartTimeoutMs + 90_000
-        : input.restartTimeoutMs + 30_000,
+    timeoutMs: phaseTimeoutMs,
   });
   const resultExists = NodeFS.existsSync(input.resultPath);
   await NodeFS.promises.writeFile(
@@ -1199,7 +1491,15 @@ const runWebDriverPhase = async (input: {
     redactAndBoundUpgradeEvidence(`${result.stdout}\n${result.stderr}`, {
       maxBytes: 64 * 1024,
       roots: [input.dataRoot, input.runRoot],
-      secrets: [],
+      secrets:
+        input.lane === "remote-install" && NodeFS.existsSync(remoteSecretPath)
+          ? [
+              String(
+                (await readObservation<{ bootstrapToken: string }>(remoteSecretPath))
+                  .bootstrapToken,
+              ),
+            ]
+          : [],
     }),
   );
   let installAttempted = false;
@@ -1273,6 +1573,80 @@ const startMockUpdateServer = async (input: {
 const readObservation = async <A>(path: string): Promise<A> =>
   JSON.parse(await NodeFS.promises.readFile(path, "utf8")) as A;
 
+const linuxLaneProcesses = async (): Promise<
+  ReadonlyArray<{ pid: number; comm: string; environ: string }>
+> => {
+  const processes: Array<{ pid: number; comm: string; environ: string }> = [];
+  for (const entry of await NodeFS.promises.readdir("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      processes.push({
+        pid: Number(entry),
+        comm: (await NodeFS.promises.readFile(`/proc/${entry}/comm`, "utf8")).trim(),
+        environ: await NodeFS.promises.readFile(`/proc/${entry}/environ`, "utf8"),
+      });
+    } catch {
+      /* Exited or unreadable processes do not establish lane ownership. */
+    }
+  }
+  return processes;
+};
+/** Sample while the updater-restarted host is still live, before WebDriver teardown. */
+export async function captureRemoteInstallHostEvidence(input: {
+  readonly dataRoot: string;
+  readonly appBinaryPath: string;
+  readonly platform: SeededUpgradePlatform;
+}) {
+  const log = await NodeFS.promises.readFile(
+    NodePath.join(input.dataRoot, "userdata", "logs", "server.log"),
+    "utf8",
+  );
+  const processes = input.platform === "linux" ? await linuxLaneProcesses() : null;
+  const prefix = `.mount_${NodePath.basename(input.appBinaryPath).slice(0, 6)}`;
+  return {
+    requesterLogLines: log
+      .split("\n")
+      .filter((line) => line.includes("remote update install requested")).length,
+    appImageMounts:
+      input.platform === "linux"
+        ? countAppImageMounts(await NodeFS.promises.readFile("/proc/mounts", "utf8"), prefix)
+        : null,
+    runtimeProcesses:
+      processes === null
+        ? null
+        : processes.filter(
+            (entry) =>
+              scopedCleanupPids([entry], input.dataRoot).length === 1 &&
+              entry.comm === NodePath.basename(input.appBinaryPath).slice(0, 15),
+          ).length,
+  };
+}
+const stopRemoteLaneApplication = async (
+  appBinaryPath: string,
+  platform: SeededUpgradePlatform,
+  dataRoot: string,
+): Promise<void> => {
+  if (platform !== "linux") {
+    await stopRestartedApplication(appBinaryPath, platform);
+    return;
+  }
+  for (const pid of scopedCleanupPids(await linuxLaneProcesses(), dataRoot)) {
+    try {
+      const environment = await NodeFS.promises.readFile(`/proc/${pid}/environ`, "utf8");
+      if (!environment.split("\0").includes(`BIBCODE_HOME=${dataRoot}`)) continue;
+      process.kill(pid, "SIGTERM");
+    } catch (error) {
+      if (!["ESRCH", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    }
+  }
+  await waitForUpgradeCondition({
+    description: "isolated remote application shutdown",
+    intervalMs: 100,
+    timeoutMs: 30_000,
+    probe: async () => scopedCleanupPids(await linuxLaneProcesses(), dataRoot).length === 0,
+  });
+};
+
 const runUpgradeLane = async (input: {
   readonly appBinaryPath: string;
   readonly backendPort: number;
@@ -1311,11 +1685,45 @@ const runUpgradeLane = async (input: {
     wsl: input.wsl,
   } as const;
   await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
-  await stopRestartedApplication(input.appBinaryPath, input.platform);
+  if (input.platform === "win") {
+    await waitForWindowsInstalledCandidate({
+      appBinaryPath: input.appBinaryPath,
+      candidateVersion: input.candidateVersion,
+      evidenceDirectory: input.layout.evidenceDirectory,
+      timeoutMs: input.restartTimeoutMs,
+    });
+  }
+  if (input.lane === "remote-install") {
+    const remote = await readObservation<
+      Omit<RemoteInstallEvidence, "preUpdateBackups"> & { widened: boolean }
+    >(NodePath.join(input.layout.evidenceDirectory, "remote-rpc.json"));
+    await writePrivateJson(
+      NodePath.join(input.layout.evidenceDirectory, "remote-host.json"),
+      remote,
+    );
+    await stopRemoteLaneApplication(input.appBinaryPath, input.platform, input.layout.dataRoot);
+  } else await stopRestartedApplication(input.appBinaryPath, input.platform);
   await runWebDriverPhase({ ...shared, phase: "verify", resultPath: afterPath });
   const before = await readObservation<SeededUpgradeObservationBefore>(beforePath);
   const after = await readObservation<SeededUpgradeObservationAfter>(afterPath);
   verifySeededUpgradeOutcome(input.lane, before, after, input.candidateVersion);
+  if (input.lane === "remote-install") {
+    const remote = await readObservation<Omit<RemoteInstallEvidence, "preUpdateBackups">>(
+      NodePath.join(input.layout.evidenceDirectory, "remote-host.json"),
+    );
+    const evidence: RemoteInstallEvidence = {
+      ...remote,
+      preUpdateBackups: after.preUpdateBackups.filter(
+        (backup) =>
+          backup.trigger === "pre-update" && backup.storageInstanceId === before.storageInstanceId,
+      ).length,
+    };
+    verifyRemoteInstallOutcome(evidence, input.candidateVersion);
+    await writePrivateJson(
+      NodePath.join(input.layout.evidenceDirectory, "remote-install-result.json"),
+      evidence,
+    );
+  }
   await NodeFS.promises.writeFile(
     NodePath.join(input.layout.evidenceDirectory, "result.json"),
     `${JSON.stringify({
@@ -1341,6 +1749,7 @@ const copyBoundedEvidence = async (input: {
   const lanes = [
     ["previous-stable", input.layout.previousStable],
     ["protected-baseline", input.layout.protectedBaseline],
+    ["remote-install", input.layout.remoteInstall],
   ] as const;
   for (const [lane, layout] of lanes) {
     if (!NodeFS.existsSync(layout.evidenceDirectory)) continue;
@@ -1389,6 +1798,10 @@ const copyBoundedEvidence = async (input: {
 export async function runSeededDesktopUpgradeSmoke(
   input: SeededDesktopUpgradeSmokeInput,
 ): Promise<void> {
+  if (process.env.CI !== "true")
+    throw new SeededDesktopUpgradeSmokeError(
+      "This packaged-upgrade harness is CI-only; it can terminate desktop applications.",
+    );
   assertBaselineVersionIsOlder(input.previousVersion, input.candidateVersion);
   const runId = input.runId;
   const workRoot = await canonicalizeSeededUpgradeWorkRoot(input.workRoot);
@@ -1461,6 +1874,13 @@ export async function runSeededDesktopUpgradeSmoke(
   });
 
   const cleanup = new ManagedProcessRegistry();
+  const remoteSecretPath = NodePath.join(
+    NodePath.dirname(layout.remoteInstall.dataRoot),
+    "remote-bootstrap.secret.json",
+  );
+  cleanup.add("private remote credentials", () =>
+    NodeFS.promises.rm(remoteSecretPath, { force: true }),
+  );
   const signingEnvironment = {
     ...process.env,
     TAURI_SIGNING_PRIVATE_KEY: signingKey,
@@ -1609,15 +2029,64 @@ export async function runSeededDesktopUpgradeSmoke(
       webdriverPort: input.updaterPort + 102,
       wsl: input.wsl,
     });
+    if (!input.wsl) {
+      let remoteApp = await installBaselinePackage({
+        laneRoot: NodePath.dirname(layout.remoteInstall.dataRoot),
+        packagePath: protectedPackage,
+        platform: input.platform,
+      });
+      if (input.platform === "linux") {
+        const isolatedAppImage = NodePath.join(NodePath.dirname(remoteApp), "RemoteLane.AppImage");
+        await NodeFS.promises.rename(remoteApp, isolatedAppImage);
+        remoteApp = isolatedAppImage;
+      }
+      cleanup.add("isolated remote application", () =>
+        stopRemoteLaneApplication(remoteApp, input.platform, layout.remoteInstall.dataRoot),
+      );
+      await runUpgradeLane({
+        appBinaryPath: remoteApp,
+        backendPort: assertRemoteInstallPort(input.updaterPort + 3),
+        candidateVersion: input.candidateVersion,
+        lane: "remote-install",
+        layout: layout.remoteInstall,
+        platform: input.platform,
+        projectId: `seed-${runId}-remote`,
+        repositoryRoot: input.repositoryRoot,
+        restartTimeoutMs: input.restartTimeoutMs,
+        webdriverPort: assertRemoteInstallPort(input.updaterPort + 103),
+        wsl: false,
+      });
+    }
   } catch (cause) {
     failure = cause;
   } finally {
-    await copyBoundedEvidence({
-      artifactDirectory: input.artifactDirectory,
-      layout,
-      requestLogPath,
-      secrets: [signingKey, signingPassword],
-    }).catch(() => undefined);
+    const secrets = [signingKey, signingPassword];
+    let safeToRetainEvidence = true;
+    const privateReceipt = NodePath.join(
+      NodePath.dirname(layout.remoteInstall.dataRoot),
+      "remote-bootstrap.secret.json",
+    );
+    if (NodeFS.existsSync(privateReceipt)) {
+      try {
+        const receipt = await readObservation<{ bootstrapToken: unknown }>(privateReceipt);
+        if (typeof receipt.bootstrapToken !== "string" || receipt.bootstrapToken.length === 0) {
+          failure ??= new SeededDesktopUpgradeSmokeError(
+            "The private remote credential receipt is invalid.",
+          );
+          safeToRetainEvidence = false;
+        } else secrets.push(receipt.bootstrapToken);
+      } catch (error) {
+        failure ??= error;
+        safeToRetainEvidence = false;
+      }
+    }
+    if (safeToRetainEvidence)
+      await copyBoundedEvidence({
+        artifactDirectory: input.artifactDirectory,
+        layout,
+        requestLogPath,
+        secrets,
+      }).catch(() => undefined);
     try {
       await cleanup.cleanup();
     } catch (cleanupError) {
