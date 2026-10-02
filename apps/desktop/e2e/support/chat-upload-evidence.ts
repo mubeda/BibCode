@@ -13,6 +13,11 @@ const systemCodes = new Set([
   "EAI_AGAIN",
   "ENETUNREACH",
 ]);
+const webdriverErrorKinds = new Map([
+  ["invalid element state", "invalid-element-state"],
+  ["element not interactable", "element-not-interactable"],
+  ["invalid argument", "invalid-argument"],
+]);
 const errorNames = new Set([
   "Error",
   "TypeError",
@@ -20,6 +25,7 @@ const errorNames = new Set([
   "SyntaxError",
   "TimeoutError",
   "WebDriverError",
+  ...webdriverErrorKinds.keys(),
 ]);
 const signals = new Set([
   "SIGABRT",
@@ -95,7 +101,10 @@ export function classifyQualificationFailure(error: unknown) {
   const source =
     typeof error === "object" && error !== null ? (error as Record<string, unknown>) : {};
   const message = typeof source.message === "string" ? source.message.slice(0, 4096) : "";
-  let kind = ownErrors.get(message) ?? "unclassified";
+  let kind =
+    ownErrors.get(message) ??
+    (typeof source.name === "string" ? webdriverErrorKinds.get(source.name) : undefined) ??
+    "unclassified";
   if (kind === "unclassified") {
     if (/no such element|element.*(?:wasn.t found|not found)/i.test(message))
       kind = "missing-element";

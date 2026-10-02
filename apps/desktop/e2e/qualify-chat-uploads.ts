@@ -504,9 +504,14 @@ try {
   const png = createSizedPng(1024, "smoke");
   NodeFS.writeFileSync(pngPath, png);
   const digest = NodeCrypto.createHash("sha256").update(png).digest("hex");
-  phase("real-composer-small-upload");
-  const input = b.$('[data-center-surface-host][data-visible="true"] input[type="file"]');
-  await input.setValue(pngPath);
+  phase("wait-composer-file-enabled");
+  const input = await b.$('[data-center-surface-host][data-visible="true"] input[type="file"]');
+  await input.waitForEnabled();
+  phase("select-composer-file");
+  // The real input is hidden. Send the file through WebDriver's native upload command;
+  // setValue first sends Element Clear, which requires an interactable control.
+  await b.elementSendKeys(await input.elementId, pngPath);
+  phase("wait-composer-image-preview");
   await until(async () =>
     b.execute(() =>
       Array.from(document.querySelectorAll('[data-chat-composer-form="true"] img')).some(
@@ -518,14 +523,18 @@ try {
       ),
     ),
   );
+  phase("enter-composer-message");
   await b.$(editorSelector).click();
   await b.$(editorSelector).addValue("upload-smoke");
+  phase("send-composer-message");
   await b.keys("Enter");
+  phase("wait-provider-attachment");
   await until(
     async () =>
       NodeFS.existsSync(plain.receipts) &&
       NodeFS.readFileSync(plain.receipts, "utf8").includes('"prompt":"upload-smoke"'),
   );
+  phase("verify-provider-attachment");
   const receipts = NodeFS.readFileSync(plain.receipts, "utf8")
     .trim()
     .split("\n")

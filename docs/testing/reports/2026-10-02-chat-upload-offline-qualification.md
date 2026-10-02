@@ -85,6 +85,23 @@ failed or partial entry cannot use this exception. The same location/input
 guard also applies to the existing post-pair capture. Other pre-pair stages
 remain ineligible; no credential-form capture or page-state mutation is added.
 
+Run `37070417123` progressed through pairing, the real connected local rail and
+project import, then failed in the first image-attachment scenario. The original
+post-pair screenshot shows the connected project and an empty composer. The
+earlier missing-pairing-controls condition did not recur; its cause remains
+unresolved. The retained error did not yet identify a precise WebDriver code.
+
+The pinned WebdriverIO 9.29.1 source confirms that `setValue` first invokes
+`elementClear`. The actual composer file input is intentionally hidden, while
+[WebDriver clear requires interactability](https://w3c.github.io/webdriver/#element-clear).
+The test now waits for the real enabled state and uses
+[the native file Send Keys command](https://w3c.github.io/webdriver/#element-send-keys),
+which selects files and fires the ordinary input/change events. The test leaves
+the control hidden and respects its disabled state.
+Separate upload phases and three closed WebDriver response codes improve any
+next failure report without retaining raw paths/messages. Actual image selection
+and provider bytes remain to be verified in the next native run.
+
 Local validation uses fake namespace/ip/browser ports, plus the existing owned
 supervisor tests. No real namespace, link, route, browser/native UI, installer,
 provider or CI run is performed by these new tests. Run:

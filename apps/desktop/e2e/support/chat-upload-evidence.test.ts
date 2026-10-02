@@ -45,6 +45,20 @@ it("retains only closed failure categories even when every error field contains 
 });
 
 it.each([
+  ["invalid element state", "invalid-element-state"],
+  ["element not interactable", "element-not-interactable"],
+  ["invalid argument", "invalid-argument"],
+] as const)("retains the closed WebDriver response code %s without raw detail", (name, kind) => {
+  const secret = "file-or-credential-detail-do-not-retain";
+  const result = classifyQualificationFailure({ name, message: secret });
+  expect(result).toMatchObject({ kind, errorClass: name });
+  expect(JSON.stringify(result)).not.toContain(secret);
+  const unknown = classifyQualificationFailure({ name: name + secret, message: secret });
+  expect(unknown.kind).toBe("unclassified");
+  expect(unknown.errorClass).toBeNull();
+});
+
+it.each([
   ["pair-wait-token", false, false, true, true],
   ["pair-wait-token", true, false, true, false],
   ["pair-submit", true, false, true, false],
