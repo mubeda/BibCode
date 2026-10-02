@@ -111,7 +111,7 @@ describe("RPC wire fixture exporter", () => {
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(398);
+    expect(manifest.fixtures).toHaveLength(400);
     expect(manifest.fixtures).toContain("exit-response-too-large.json");
     expect(manifest.typedFailureFixtures).toContain("typed-failures/vcs__clone-04.json");
     expect(manifest.typedFailureFixtures).toEqual(
@@ -140,6 +140,42 @@ describe("RPC wire fixture exporter", () => {
 
     expect(io.writes).toEqual(firstRun);
   });
+
+  it.each([
+    ["live", "The Git status stream fell behind. Subscribe again."],
+    [
+      "setup",
+      "The Git status subscription fell behind while it was being set up. Subscribe again.",
+    ],
+  ] as const)(
+    "exports the %s Git status retry failure shared by Rust and the client",
+    async (kind, detail) => {
+      await runExporter();
+      const relativePath = `contract-shapes/subscribeVcsStatus__fell-behind-${kind}-failure.json`;
+      const contents = io.writes.get(NodePath.join(outputDirectory, relativePath));
+      expect(contents, "the explicit retry failure must be generated").toBeDefined();
+      expect(readManifest().fixtures).toContain(relativePath);
+      expect(JSON.parse(contents!)).toEqual({
+        _tag: "Exit",
+        requestId: "900719925474099312345",
+        exit: {
+          _tag: "Failure",
+          cause: [
+            {
+              _tag: "Fail",
+              error: {
+                _tag: "GitCommandError",
+                operation: "GitStatusBroadcaster.fellBehind",
+                command: "git",
+                cwd: "/repo",
+                detail,
+              },
+            },
+          ],
+        },
+      });
+    },
+  );
 
   it("writes a named-provider summary with a matching populated pull request", async () => {
     await runExporter();

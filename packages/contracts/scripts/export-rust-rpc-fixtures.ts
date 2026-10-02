@@ -16,6 +16,7 @@ import {
   ActivityCancelSubtreeInput,
   ActivityRetrySubtreeCancellationInput,
 } from "../src/activity.ts";
+import { GitCommandError } from "../src/git.ts";
 import {
   ClientOrchestrationCommand,
   OrchestrationEvent,
@@ -586,6 +587,34 @@ const stripEffectOptionIds = (value: unknown): unknown =>
   ) as unknown;
 
 const dynamicFixtures = new Map<string, unknown>();
+for (const [kind, detail] of [
+  ["live", "The Git status stream fell behind. Subscribe again."],
+  ["setup", "The Git status subscription fell behind while it was being set up. Subscribe again."],
+] as const) {
+  dynamicFixtures.set(
+    `contract-shapes/subscribeVcsStatus__fell-behind-${kind}-failure.json`,
+    serializeWireFixture({
+      _tag: "Exit",
+      requestId,
+      exit: {
+        _tag: "Failure",
+        cause: [
+          {
+            _tag: "Fail",
+            error: Schema.encodeSync(GitCommandError)(
+              new GitCommandError({
+                operation: "GitStatusBroadcaster.fellBehind",
+                command: "git",
+                cwd: "/repo",
+                detail,
+              }),
+            ),
+          },
+        ],
+      },
+    } satisfies RpcMessage.ResponseExitEncoded),
+  );
+}
 const fixtureRemoteUpdateSnapshot = {
   serverVersion: "0.6.2",
   latestVersion: "0.6.4",
