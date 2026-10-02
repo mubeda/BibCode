@@ -48,7 +48,7 @@ pub struct NativeProcessRecord {
 impl Default for NativeProcessSampler {
     fn default() -> Self {
         Self {
-            system: Arc::new(Mutex::new(System::new_all())),
+            system: Arc::new(Mutex::new(System::new())),
         }
     }
 }
@@ -931,6 +931,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_sampler_defers_host_enumeration_until_the_first_requested_sample() {
+        let sampler = NativeProcessSampler::default();
+        assert!(
+            sampler
+                .system
+                .lock()
+                .expect("fresh process sampler should lock")
+                .processes()
+                .is_empty(),
+            "constructing the boot sampler must not enumerate host processes"
+        );
+
+        let rows = sampler.sample().await.expect("first requested sample");
+        let current = rows
+            .iter()
+            .find(|row| row.pid == std::process::id())
+            .expect("first sample discovers the current process without a boot snapshot");
+        assert!(!current.command.is_empty());
+        assert!(current.rss_bytes > 0);
+        assert!(current.cpu_percent.is_finite());
+        assert!(current.started_at > 0);
+        assert_eq!(
+            current.ppid,
+            platform_process_record(std::process::id())
+                .expect("current process parent")
+                .ppid
+        );
+    }
+
+    #[tokio::test]
     async fn native_sampler_refreshes_repeatedly_and_keeps_the_current_process() {
         let sampler = NativeProcessSampler::default();
 
@@ -945,6 +975,38 @@ mod tests {
             assert!(current.rss_bytes > 0);
             assert!(current.started_at > 0);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_requested_sample_discovers_descendants_created_after_sampler_construction() {
+        let sampler = NativeProcessSampler::default();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn process sampling fixture");
+        let child_pid = child.id();
+        let sample = sampler.sample().await;
+        let _ = child.kill();
+        child.wait().expect("reap process sampling fixture");
+
+        let rows = sample.expect("first requested process sample");
+        let descendant = rows
+            .iter()
+            .find(|row| row.pid == child_pid)
+            .expect("full requested sample discovers a previously unknown descendant");
+        assert_eq!(descendant.ppid, std::process::id());
+        assert!(descendant.command.contains("sleep"));
+        assert!(descendant.started_at > 0);
+        let ownership = runtime_owned_process_identities(
+            &rows,
+            &[NativeProcessSampler::process_identity(std::process::id())
+                .expect("current process identity")],
+        );
+        assert!(ownership.contains(&ProcessIdentity {
+            pid: child_pid,
+            started_at: descendant.started_at,
+        }));
     }
 
     #[tokio::test]
