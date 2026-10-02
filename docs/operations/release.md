@@ -248,6 +248,14 @@ WSL primary when the runner declares WSL plus an installed distribution; an
 unavailable capability produces an explicit skip reason rather than emulated
 coverage.
 
+Each package is built from a disposable source checkout: the candidate and
+protected baseline use the tested commit, and the previous baseline uses its
+release tag. Before building, the maintained release-version helper pins the
+candidate to the requested candidate version and both baselines to the previous
+version. The harness verifies the package manifests, both Rust manifests,
+their Cargo lock entries, and the Tauri overlay agree, so native app and embedded
+server versions describe the same build. The calling checkout is not rewritten.
+
 The harness uses an isolated root outside the checkout, an ephemeral Tauri
 updater key, a loopback-only mock updater, the packaged app's embedded
 WebDriver, and bounded redacted evidence. It never opens or copies the SQLite
@@ -274,6 +282,9 @@ mount/runtime and cleans only processes still carrying that lane's exact
 `BIBCODE_HOME`. Host evidence is captured before WebDriver teardown; backup and
 project retention are read through public bridge/RPC observations. Credentials
 stay in a private receipt outside retained evidence and are redacted from logs.
+If the remote coordinator does not succeed, the phase log retains only its
+typed phase/failure kind, unique phase history, and bounded valid version
+strings. Host error messages and credential or identity details are omitted.
 The WSL-specific matrix retains its existing protected lane; it does not repeat
 the native remote-install scenario. First real remote-install execution is CI,
 separate from helper/unit/syntax checks.

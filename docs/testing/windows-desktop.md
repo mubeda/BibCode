@@ -751,3 +751,38 @@ Complete [the execution report template](./execution-report-template.md), then
 perform the shared cleanup and final Git audit. Report whether WSL was usable,
 which distributions were exercised, Authenticode status, any native command
 that could not run, and whether anything was pushed.
+
+## Disposable seeded-upgrade diagnostics
+
+The seeded-upgrade workflow has an explicit `windows_diagnostics` manual input.
+Its default is false; ordinary runs retain the full native matrix and WSL lane.
+Enabling it selects the existing Windows ARM64 and x64 runners with the same
+build/signing steps, lane sequence, installer arguments and deadlines. Never
+run the seeded harness locally.
+
+This mode applies a checked observational source patch to the disposable
+previous-stable and protected-baseline builds. The evidence identifies their
+source commits and patch/helper hashes as instrumented source rebuilds; it is
+not byte-identical published-installer evidence. The candidate stays unpatched.
+Source instrumentation runs before the canonical release-version preparation.
+After version assertions pass, the same provenance receipt records the baseline
+build version and hashes of the pinned release metadata. The candidate uses its
+own checkout, keeping its version preparation separate from either baseline.
+Native markers record admission, protection and pre-installer boundaries.
+Marker I/O failures cannot change the update result.
+
+A separate, bounded observer starts before the app. Its allowlisted records
+cover the lane application, candidate installer, process identity and exit
+status, plus matching existing Application Error and Windows Error Reporting
+records. It does not alter WER settings, collect dumps, read process command
+lines or retain environments/credentials. Missing, unverified, truncated or
+unavailable observation is an evidence gap, not proof of a clean exit or an
+installer that never started. Diagnostic cleanup cannot replace the original
+upgrade outcome.
+
+The native fixture step checks the PowerShell projection against test-owned
+XML before building the app. Other hosts skip that Windows-only check. For
+local tooling verification use `vp test run scripts/lib/windows-upgrade-diagnostics.test.ts scripts/seeded-desktop-upgrade-smoke.test.ts scripts/ci-platform-contract.test.ts`,
+plus the ordinary scripts typecheck and static checks. Record the diagnostic
+mode and observed boundaries in the execution report separately from the
+ordinary full-matrix upgrade qualification.

@@ -3,12 +3,18 @@ name: Seeded Packaged Desktop Upgrade
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      windows_diagnostics:
+        description: Collect bounded native Windows update diagnostics
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   seeded_upgrade_smoke:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_diagnostics }}
     name: Seeded upgrade - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
@@ -46,7 +52,7 @@ jobs:
             }
           - { label: macOS arm64, runner: macos-26, platform: mac, arch: arm64, bundle: dmg }
           - { label: macOS x64, runner: macos-26-intel, platform: mac, arch: x64, bundle: dmg }
-    steps:
+    steps: &seeded-upgrade-steps
       - name: Checkout complete release history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,6 +85,10 @@ jobs:
 
       - name: Install frozen dependencies
         run: vp install --frozen-lockfile
+
+      - name: Verify native Windows diagnostic fixtures
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_diagnostics
+        run: vp test run scripts/lib/windows-upgrade-diagnostics.test.ts
 
       - id: versions
         name: Resolve previous stable and isolated candidate versions
@@ -133,6 +143,9 @@ jobs:
             --artifact-dir "$RUNNER_TEMP/bibcode-seeded-upgrade/evidence"
             --updater-port 43120
             --restart-timeout-ms 180000)
+          if [[ "${{ github.event_name == 'workflow_dispatch' && inputs.windows_diagnostics }}" == "true" ]]; then
+            args+=(--windows-diagnostics)
+          fi
           if [[ "${{ matrix.platform }}" == "linux" ]]; then
             xvfb-run --auto-servernum "${args[@]}"
           else
@@ -148,7 +161,33 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  windows_upgrade_diagnostics:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_diagnostics }}
+    name: Seeded diagnostics - ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {
+              label: Windows arm64 NSIS,
+              runner: windows-11-vs2026-arm,
+              platform: win,
+              arch: arm64,
+              bundle: nsis,
+            }
+          - {
+              label: Windows x64 NSIS,
+              runner: windows-2025,
+              platform: win,
+              arch: x64,
+              bundle: nsis,
+            }
+    steps: *seeded-upgrade-steps
+
   windows_wsl_upgrade_smoke:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_diagnostics }}
     name: Seeded upgrade - Windows WSL primary
     runs-on: windows-2025
     timeout-minutes: 240

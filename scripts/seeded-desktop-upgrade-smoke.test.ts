@@ -4,13 +4,21 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeVM from "node:vm";
+import * as NodeURL from "node:url";
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import { AuthPairingLink } from "@bibcode/contracts";
+import { parse as parseToml, type TomlTable } from "smol-toml";
+import {
+  releasePackageFiles,
+  releaseRustPackageFiles,
+  releaseVersionFiles,
+} from "./update-release-package-versions.ts";
 
 import {
   assertBaselineVersionIsOlder,
+  assertSeededUpgradeBuildVersion,
   assertWebDriverPhaseExit,
   windowsCandidateIsInstalled,
   buildLocalUpdaterManifest,
@@ -21,6 +29,7 @@ import {
   createSeededUpgradeWdioConfig,
   ManagedProcessRegistry,
   parseSeededDesktopUpgradeSmokeArgs,
+  prepareSeededUpgradeBuild,
   redactAndBoundUpgradeEvidence,
   removeSeededUpgradeDependencyTree,
   runBoundedCommand,
@@ -45,6 +54,39 @@ const absolute = (...parts: ReadonlyArray<string>): string =>
   NodePath.resolve("/tmp/bibcode-upgrade-smoke", ...parts);
 
 const decodePairingLink = Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingLink));
+const repositoryRoot = NodeURL.fileURLToPath(new URL("..", import.meta.url));
+const versionFixture = async () => {
+  const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "seeded-versions-"));
+  const originals = new Map(
+    await Promise.all(
+      releaseVersionFiles.map(
+        async (path) =>
+          [
+            path,
+            await NodeFS.promises.readFile(NodePath.join(repositoryRoot, path), "utf8"),
+          ] as const,
+      ),
+    ),
+  );
+  const checkout = async (name: string, version: string) => {
+    const path = NodePath.join(root, name);
+    for (const [relativePath, content] of originals) {
+      const destination = NodePath.join(path, relativePath);
+      await NodeFS.promises.mkdir(NodePath.dirname(destination), { recursive: true });
+      await NodeFS.promises.writeFile(destination, content);
+    }
+    // A prior tag's helper must not own current harness preparation.
+    await NodeFS.promises.mkdir(NodePath.join(path, "scripts"));
+    await NodeFS.promises.writeFile(
+      NodePath.join(path, "scripts/update-release-package-versions.ts"),
+      'throw new Error("Do not run the old checkout helper");\n',
+    );
+    const overlayPath = NodePath.join(root, `${name}-overlay.json`);
+    await NodeFS.promises.writeFile(overlayPath, JSON.stringify({ version }));
+    return { checkout: path, repositoryRoot, overlayPath, version };
+  };
+  return { root, originals, checkout };
+};
 const publicPairingGrant = {
   id: "fixture-grant",
   credential: "fixture-distinct-grant",
@@ -534,8 +576,44 @@ describe("seeded packaged desktop upgrade harness", () => {
       runId: "run-17-mac-arm64",
       updaterPort: 4_312,
       wsl: false,
+      windowsDiagnostics: false,
       workRoot: absolute("work"),
     });
+  });
+
+  it("admits diagnostic capture only for native Windows lanes", () => {
+    const args = [
+      "--windows-diagnostics",
+      "--platform",
+      "win",
+      "--arch",
+      "x64",
+      "--bundle",
+      "nsis",
+      "--candidate-version",
+      "0.7.3-upgrade.1",
+      "--previous-tag",
+      "v0.7.2",
+      "--previous-version",
+      "0.7.2",
+      "--public-key-file",
+      absolute("public.key"),
+      "--run-id",
+      "diagnostics",
+      "--work-root",
+      absolute("work"),
+      "--artifact-dir",
+      absolute("evidence"),
+    ];
+    expect(parseSeededDesktopUpgradeSmokeArgs(args, absolute("repo")).windowsDiagnostics).toBe(
+      true,
+    );
+    expect(() => parseSeededDesktopUpgradeSmokeArgs([...args, "--wsl"], absolute("repo"))).toThrow(
+      "native Windows",
+    );
+    expect(() =>
+      parseSeededDesktopUpgradeSmokeArgs(args.with(2, "mac").with(6, "dmg"), absolute("repo")),
+    ).toThrow("native Windows");
   });
 
   it("reserves the ordinary remote-install lane's highest port before any launch", () => {
@@ -648,7 +726,7 @@ describe("seeded packaged desktop upgrade harness", () => {
     );
   });
 
-  it("creates disjoint roots for real previous and protected baseline lanes", () => {
+  it("creates disjoint owned checkouts for candidate and both baselines", () => {
     const layout = createSeededUpgradeRunLayout(absolute("work"), "run-17");
 
     expect(layout.previousStable.dataRoot).toBe(absolute("work", "run-17", "previous", "data"));
@@ -657,7 +735,115 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(layout.previousStable.dataRoot).not.toBe(layout.protectedBaseline.dataRoot);
     expect(layout.previousStable.checkout).not.toBe(layout.protectedBaseline.checkout);
     expect(layout.candidateBuildRoot).toBe(absolute("work", "run-17", "candidate-build"));
+    expect(layout.candidateCheckout).toBe(absolute("work", "run-17", "candidate-checkout"));
+    expect(layout.candidateCheckout).not.toBe(layout.previousStable.checkout);
+    expect(layout.candidateCheckout).not.toBe(layout.protectedBaseline.checkout);
     expect(layout.updaterRoot).toBe(absolute("work", "run-17", "updater"));
+  });
+
+  it("pins real checkout manifests and lock entries for every build without changing the caller", async () => {
+    const fixture = await versionFixture();
+    try {
+      for (const [name, version] of [
+        ["candidate", "9.9.9-upgrade.1"],
+        ["previous", "1.2.3"],
+        ["protected", "1.2.3"],
+      ] as const) {
+        const input = await fixture.checkout(name, version);
+        await prepareSeededUpgradeBuild(input);
+        await expect(assertSeededUpgradeBuildVersion(input)).resolves.toBeUndefined();
+        for (const relativePath of releasePackageFiles) {
+          const manifest = JSON.parse(
+            await NodeFS.promises.readFile(NodePath.join(input.checkout, relativePath), "utf8"),
+          );
+          expect(manifest.version).toBe(version);
+        }
+        for (const relativePath of releaseRustPackageFiles) {
+          const manifest = parseToml(
+            await NodeFS.promises.readFile(NodePath.join(input.checkout, relativePath), "utf8"),
+          );
+          expect((manifest.package as TomlTable).version).toBe(version);
+        }
+        const lock = parseToml(
+          await NodeFS.promises.readFile(NodePath.join(input.checkout, "Cargo.lock"), "utf8"),
+        );
+        expect(
+          (lock.package as TomlTable[])
+            .filter((pkg) => ["bibcode-desktop", "bibcode-server"].includes(String(pkg.name)))
+            .map((pkg) => [pkg.name, pkg.version]),
+        ).toEqual([
+          ["bibcode-desktop", version],
+          ["bibcode-server", version],
+        ]);
+      }
+      for (const [path, content] of fixture.originals) {
+        expect(await NodeFS.promises.readFile(NodePath.join(repositoryRoot, path), "utf8")).toBe(
+          content,
+        );
+      }
+    } finally {
+      await NodeFS.promises.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses the calling checkout and its physical alias before rewriting versions", async () => {
+    const fixture = await versionFixture();
+    try {
+      const input = await fixture.checkout("caller", "9.9.9-upgrade.1");
+      const alias = NodePath.join(fixture.root, "caller-alias");
+      await NodeFS.promises.symlink(input.checkout, alias, "junction");
+      for (const checkout of [input.checkout, alias]) {
+        await expect(
+          prepareSeededUpgradeBuild({
+            ...input,
+            repositoryRoot: input.checkout,
+            checkout,
+          }),
+        ).rejects.toThrow(/disposable checkout/);
+      }
+      for (const [path, content] of fixture.originals) {
+        expect(await NodeFS.promises.readFile(NodePath.join(input.checkout, path), "utf8")).toBe(
+          content,
+        );
+      }
+    } finally {
+      await NodeFS.promises.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an overlay mismatch before preparing a build", async () => {
+    const fixture = await versionFixture();
+    try {
+      const input = await fixture.checkout("candidate", "9.9.9-upgrade.1");
+      await NodeFS.promises.writeFile(input.overlayPath, '{"version":"0.0.1"}');
+      await expect(prepareSeededUpgradeBuild(input)).rejects.toThrow(/overlay version/);
+      for (const [path, content] of fixture.originals) {
+        expect(await NodeFS.promises.readFile(NodePath.join(input.checkout, path), "utf8")).toBe(
+          content,
+        );
+      }
+    } finally {
+      await NodeFS.promises.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when release metadata or overlay drifts after preparation", async () => {
+    const fixture = await versionFixture();
+    try {
+      const input = await fixture.checkout("candidate", "9.9.9-upgrade.1");
+      await prepareSeededUpgradeBuild(input);
+      for (const path of [
+        ...releaseVersionFiles.map((relativePath) => NodePath.join(input.checkout, relativePath)),
+        input.overlayPath,
+      ]) {
+        const content = await NodeFS.promises.readFile(path, "utf8");
+        await NodeFS.promises.writeFile(path, content.replaceAll(input.version, "0.0.1"));
+        await expect(assertSeededUpgradeBuildVersion(input)).rejects.toThrow(/version/);
+        await NodeFS.promises.writeFile(path, content);
+      }
+    } finally {
+      await NodeFS.promises.rm(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it("builds a deterministic public-key updater overlay without private key material", () => {

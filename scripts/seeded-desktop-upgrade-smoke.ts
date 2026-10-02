@@ -8,6 +8,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 import * as NodeURL from "node:url";
+import { parse as parseToml, type TomlTable } from "smol-toml";
 import {
   REMOTE_UPDATE_DOWNLOAD_BUDGET_MS,
   REMOTE_UPDATE_INSTALL_BUDGET_MS,
@@ -16,6 +17,18 @@ import {
 
 import { MOCK_UPDATE_LOOPBACK_HOST, MOCK_UPDATE_READY_PATH } from "./mock-update-server.ts";
 import { requireReleaseTarget, type TauriUpdaterTarget } from "./lib/release-targets.ts";
+import {
+  instrumentWindowsBaseline,
+  recordWindowsBuildVersion,
+  startWindowsUpgradeObserver,
+  withWindowsDiagnosticObserver,
+  writeWindowsDiagnosticRecord,
+} from "./lib/windows-upgrade-diagnostics.ts";
+import {
+  releaseCargoLockFile,
+  releasePackageFiles,
+  releaseRustPackageFiles,
+} from "./update-release-package-versions.ts";
 
 export type SeededUpgradePlatform = "linux" | "mac" | "win";
 export type SeededUpgradeArch = "arm64" | "x64";
@@ -37,6 +50,7 @@ export interface SeededDesktopUpgradeSmokeInput {
   readonly runId: string;
   readonly updaterPort: number;
   readonly wsl: boolean;
+  readonly windowsDiagnostics?: boolean;
   readonly workRoot: string;
 }
 
@@ -50,6 +64,7 @@ interface SeededUpgradeLaneLayout {
 
 export interface SeededUpgradeRunLayout {
   readonly candidateBuildRoot: string;
+  readonly candidateCheckout: string;
   readonly previousStable: SeededUpgradeLaneLayout;
   readonly protectedBaseline: SeededUpgradeLaneLayout;
   readonly remoteInstall: SeededUpgradeLaneLayout;
@@ -209,6 +224,7 @@ export function parseSeededDesktopUpgradeSmokeArgs(
         "updater-port": { type: "string" },
         "work-root": { type: "string" },
         wsl: { type: "boolean", default: false },
+        "windows-diagnostics": { type: "boolean", default: false },
       },
     }));
   } catch (cause) {
@@ -234,6 +250,9 @@ export function parseSeededDesktopUpgradeSmokeArgs(
   }
   if (values.wsl === true && (platform !== "win" || arch !== "x64")) {
     throw new SeededDesktopUpgradeSmokeError("WSL upgrade coverage requires Windows x64.");
+  }
+  if (values["windows-diagnostics"] === true && (platform !== "win" || values.wsl === true)) {
+    throw new SeededDesktopUpgradeSmokeError("Windows diagnostics require a native Windows lane.");
   }
   const updaterPort = parsePositiveInteger(values["updater-port"], "updater-port", 43_120);
   const highestPortOffset = values.wsl === true ? 102 : 103;
@@ -261,6 +280,7 @@ export function parseSeededDesktopUpgradeSmokeArgs(
     runId: requireString(values, "run-id"),
     updaterPort,
     wsl: values.wsl === true,
+    windowsDiagnostics: values["windows-diagnostics"] === true,
     workRoot: requireAbsolute(requireString(values, "work-root"), "work-root"),
   };
 }
@@ -289,6 +309,7 @@ export function createSeededUpgradeRunLayout(
   const runRoot = NodePath.join(NodePath.resolve(workRoot), runId);
   return {
     candidateBuildRoot: NodePath.join(runRoot, "candidate-build"),
+    candidateCheckout: NodePath.join(runRoot, "candidate-checkout"),
     previousStable: laneLayout(runRoot, "previous"),
     protectedBaseline: laneLayout(runRoot, "protected"),
     remoteInstall: laneLayout(runRoot, "remote"),
@@ -926,12 +947,16 @@ async function waitForWindowsInstalledCandidate(input: {
   readonly candidateVersion: string;
   readonly evidenceDirectory: string;
   readonly timeoutMs: number;
+  readonly windowsDiagnostics?: boolean;
 }): Promise<void> {
   await waitForUpgradeCondition({
     description: `Windows candidate ${input.candidateVersion} at the installed application path`,
     intervalMs: 1_000,
     timeoutMs: input.timeoutMs,
     probe: async () => {
+      const diagnosticPath = NodePath.join(input.evidenceDirectory, "windows-controller.log");
+      if (input.windowsDiagnostics)
+        writeWindowsDiagnosticRecord(diagnosticPath, { kind: "probe-starting" });
       const result = await runBoundedCommand({
         command: "powershell.exe",
         args: ["-NoProfile", "-NonInteractive", "-Command", windowsUpgradeObservationScript],
@@ -942,7 +967,22 @@ async function waitForWindowsInstalledCandidate(input: {
           BIBCODE_SEEDED_CANDIDATE_VERSION: input.candidateVersion,
         },
         timeoutMs: 10_000,
+      }).catch((cause: unknown) => {
+        if (input.windowsDiagnostics)
+          writeWindowsDiagnosticRecord(diagnosticPath, {
+            kind: "probe-error",
+            reason:
+              cause instanceof SeededDesktopUpgradeSmokeError && cause.message.includes("timed out")
+                ? "timeout"
+                : "spawn-error",
+          });
+        throw cause;
       });
+      if (input.windowsDiagnostics)
+        writeWindowsDiagnosticRecord(diagnosticPath, {
+          kind: "probe-complete",
+          exitStatus: result.exitCode >>> 0,
+        });
       let observation: unknown;
       try {
         observation = JSON.parse(result.stdout.trim().replace(/^\uFEFF/, ""));
@@ -1216,15 +1256,119 @@ const writeBuildOverlay = async (input: {
   });
 };
 
+interface SeededUpgradeBuildVersion {
+  readonly checkout: string;
+  readonly overlayPath: string;
+  readonly version: string;
+}
+
+const assertBuildOverlayVersion = async (input: SeededUpgradeBuildVersion): Promise<void> => {
+  const overlay = JSON.parse(await NodeFS.promises.readFile(input.overlayPath, "utf8")) as {
+    readonly version?: unknown;
+  };
+  if (overlay.version !== input.version) {
+    throw new SeededDesktopUpgradeSmokeError("The seeded-upgrade overlay version does not match.");
+  }
+};
+
+/** Checks both native metadata and the embedded server's compile-time version. */
+export async function assertSeededUpgradeBuildVersion(
+  input: SeededUpgradeBuildVersion,
+): Promise<void> {
+  await assertBuildOverlayVersion(input);
+  const assertVersion = (version: unknown, path: string): void => {
+    if (version !== input.version) {
+      throw new SeededDesktopUpgradeSmokeError(
+        `The seeded-upgrade version does not match: ${path}.`,
+      );
+    }
+  };
+  for (const path of releasePackageFiles) {
+    const metadata = JSON.parse(
+      await NodeFS.promises.readFile(NodePath.join(input.checkout, path), "utf8"),
+    ) as { readonly version?: unknown };
+    assertVersion(metadata.version, path);
+  }
+  for (const path of releaseRustPackageFiles) {
+    const metadata = parseToml(
+      await NodeFS.promises.readFile(NodePath.join(input.checkout, path), "utf8"),
+    );
+    assertVersion((metadata.package as TomlTable | undefined)?.version, path);
+  }
+  const lock = parseToml(
+    await NodeFS.promises.readFile(NodePath.join(input.checkout, releaseCargoLockFile), "utf8"),
+  );
+  const packages = Array.isArray(lock.package) ? (lock.package as TomlTable[]) : [];
+  for (const name of ["bibcode-desktop", "bibcode-server"]) {
+    const matches = packages.filter((entry) => entry.name === name);
+    if (matches.length !== 1) {
+      throw new SeededDesktopUpgradeSmokeError(
+        `Expected one seeded-upgrade version in Cargo.lock for ${name}.`,
+      );
+    }
+    assertVersion(matches[0]!.version, `${releaseCargoLockFile}:${name}`);
+  }
+}
+
+/** Uses the maintained release transaction, never a prior tag's copy or the caller's manifests. */
+export async function prepareSeededUpgradeBuild(
+  input: SeededUpgradeBuildVersion & { readonly repositoryRoot: string },
+): Promise<void> {
+  const [checkout, caller] = await Promise.all([
+    NodeFS.promises.realpath(input.checkout),
+    NodeFS.promises.realpath(input.repositoryRoot),
+  ]);
+  const nested = (parent: string, child: string): boolean => {
+    const relative = NodePath.relative(parent, child);
+    return (
+      relative === "" ||
+      (!relative.startsWith(`..${NodePath.sep}`) &&
+        relative !== ".." &&
+        !NodePath.isAbsolute(relative))
+    );
+  };
+  if (nested(caller, checkout) || nested(checkout, caller)) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "Version preparation requires a separate disposable checkout.",
+    );
+  }
+  await assertBuildOverlayVersion(input);
+  await requireCommandSuccess({
+    command: process.execPath,
+    args: [
+      NodeURL.fileURLToPath(new URL("./update-release-package-versions.ts", import.meta.url)),
+      input.version,
+      "--root",
+      checkout,
+    ],
+    cwd: input.repositoryRoot,
+    timeoutMs: 30_000,
+  });
+  await assertSeededUpgradeBuildVersion(input);
+}
+
 const buildPackagedApplication = async (input: {
   readonly arch: SeededUpgradeArch;
   readonly bundle: SeededDesktopUpgradeSmokeInput["bundle"];
   readonly checkout: string;
   readonly overlayPath: string;
   readonly platform: SeededUpgradePlatform;
+  readonly repositoryRoot: string;
   readonly signingEnvironment: NodeJS.ProcessEnv;
   readonly targetDirectory: string;
+  readonly version: string;
+  readonly windowsDiagnosticsEvidenceDirectory?: string;
 }): Promise<void> => {
+  await prepareSeededUpgradeBuild(input);
+  if (
+    input.windowsDiagnosticsEvidenceDirectory &&
+    !recordWindowsBuildVersion({
+      checkout: input.checkout,
+      evidenceDirectory: input.windowsDiagnosticsEvidenceDirectory,
+      version: input.version,
+    })
+  )
+    console.warn("Windows build-version provenance could not be recorded.");
   await requireCommandSuccess({
     command: seededUpgradeVitePlusExecutable,
     args: ["install", "--frozen-lockfile"],
@@ -1404,6 +1548,19 @@ export const config = {
 };
 `;
 
+const webDriverPhaseTimeoutMs = (
+  lane: SeededUpgradeLane,
+  phase: "seed-and-install" | "verify",
+  restartTimeoutMs: number,
+): number =>
+  lane === "remote-install" && phase === "seed-and-install"
+    ? restartTimeoutMs +
+      REMOTE_UPDATE_DOWNLOAD_BUDGET_MS +
+      REMOTE_UPDATE_INSTALL_BUDGET_MS +
+      REMOTE_UPDATE_RESTART_BUDGET_MS +
+      90_000
+    : restartTimeoutMs + (phase === "seed-and-install" ? 90_000 : 30_000);
+
 const runWebDriverPhase = async (input: {
   readonly appBinaryPath: string;
   readonly backendPort: number;
@@ -1422,20 +1579,14 @@ const runWebDriverPhase = async (input: {
   readonly workspaceRoot: string;
   readonly webdriverPort: number;
   readonly wsl: boolean;
+  readonly windowsDiagnostics?: boolean;
 }): Promise<void> => {
   const phaseRoot = NodePath.join(input.runRoot, `${input.phase}-driver`);
   await NodeFS.promises.mkdir(phaseRoot, { recursive: true });
   const specPath = NodePath.join(phaseRoot, "seeded-upgrade.e2e.ts");
   const configPath = NodePath.join(phaseRoot, "wdio.conf.mjs");
   const remoteSecretPath = NodePath.join(input.runRoot, "remote-bootstrap.secret.json");
-  const phaseTimeoutMs =
-    input.lane === "remote-install" && input.phase === "seed-and-install"
-      ? input.restartTimeoutMs +
-        REMOTE_UPDATE_DOWNLOAD_BUDGET_MS +
-        REMOTE_UPDATE_INSTALL_BUDGET_MS +
-        REMOTE_UPDATE_RESTART_BUDGET_MS +
-        90_000
-      : input.restartTimeoutMs + (input.phase === "seed-and-install" ? 90_000 : 30_000);
+  const phaseTimeoutMs = webDriverPhaseTimeoutMs(input.lane, input.phase, input.restartTimeoutMs);
   await NodeFS.promises.writeFile(
     specPath,
     createSeededUpgradeDriverSpec({
@@ -1477,6 +1628,15 @@ const runWebDriverPhase = async (input: {
       BIBCODE_PORT: String(input.backendPort),
       BIBCODE_E2E_PLATFORM: input.platform,
       RUST_LOG: "bibcode=debug",
+      ...(input.windowsDiagnostics
+        ? {
+            BIBCODE_SEEDED_WINDOWS_DIAGNOSTICS: "1",
+            BIBCODE_SEEDED_WINDOWS_MARKERS: NodePath.join(
+              input.evidenceDirectory,
+              "windows-native-markers.log",
+            ),
+          }
+        : {}),
       ...(input.wsl
         ? {
             WSLENV: [process.env.WSLENV, "BIBCODE_HOME/p"].filter(Boolean).join(":"),
@@ -1659,6 +1819,7 @@ const runUpgradeLane = async (input: {
   readonly restartTimeoutMs: number;
   readonly webdriverPort: number;
   readonly wsl: boolean;
+  readonly windowsDiagnostics?: boolean;
 }): Promise<void> => {
   await NodeFS.promises.mkdir(input.layout.dataRoot, { recursive: true, mode: 0o700 });
   await NodeFS.promises.mkdir(input.layout.evidenceDirectory, { recursive: true, mode: 0o700 });
@@ -1683,16 +1844,53 @@ const runUpgradeLane = async (input: {
       : input.layout.workspaceRoot,
     webdriverPort: input.webdriverPort,
     wsl: input.wsl,
+    windowsDiagnostics: input.windowsDiagnostics === true,
   } as const;
-  await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
-  if (input.platform === "win") {
-    await waitForWindowsInstalledCandidate({
-      appBinaryPath: input.appBinaryPath,
-      candidateVersion: input.candidateVersion,
-      evidenceDirectory: input.layout.evidenceDirectory,
-      timeoutMs: input.restartTimeoutMs,
-    });
-  }
+  const seedAndInstall = async () => {
+    const diagnosticPath = NodePath.join(input.layout.evidenceDirectory, "windows-controller.log");
+    const mark = (
+      boundary: "seed-driver-start" | "seed-driver-end" | "handoff-start" | "handoff-end",
+    ) => {
+      if (input.windowsDiagnostics)
+        writeWindowsDiagnosticRecord(diagnosticPath, { kind: "controller", boundary });
+    };
+    mark("seed-driver-start");
+    try {
+      await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
+    } finally {
+      mark("seed-driver-end");
+    }
+    if (input.platform === "win") {
+      mark("handoff-start");
+      try {
+        await waitForWindowsInstalledCandidate({
+          appBinaryPath: input.appBinaryPath,
+          candidateVersion: input.candidateVersion,
+          evidenceDirectory: input.layout.evidenceDirectory,
+          timeoutMs: input.restartTimeoutMs,
+          windowsDiagnostics: input.windowsDiagnostics === true,
+        });
+      } finally {
+        mark("handoff-end");
+      }
+    }
+  };
+  if (input.windowsDiagnostics && input.platform === "win") {
+    await withWindowsDiagnosticObserver(
+      () =>
+        startWindowsUpgradeObserver({
+          repositoryRoot: input.repositoryRoot,
+          evidenceDirectory: input.layout.evidenceDirectory,
+          appBinaryPath: input.appBinaryPath,
+          candidateVersion: input.candidateVersion,
+          timeoutMs:
+            webDriverPhaseTimeoutMs(input.lane, "seed-and-install", input.restartTimeoutMs) +
+            input.restartTimeoutMs +
+            10_000,
+        }),
+      seedAndInstall,
+    );
+  } else await seedAndInstall();
   if (input.lane === "remote-install") {
     const remote = await readObservation<
       Omit<RemoteInstallEvidence, "preUpdateBackups"> & { widened: boolean }
@@ -1933,15 +2131,46 @@ export async function runSeededDesktopUpgradeSmoke(
         timeoutMs: 120_000,
       });
     });
+    await requireCommandSuccess({
+      command: "git",
+      args: ["worktree", "add", "--detach", layout.candidateCheckout, currentCommit],
+      cwd: input.repositoryRoot,
+      timeoutMs: 120_000,
+    });
+    cleanup.add("candidate checkout", async () => {
+      await removeSeededUpgradeDependencyTree(layout.candidateCheckout);
+      await requireCommandSuccess({
+        command: "git",
+        args: ["worktree", "remove", "--force", layout.candidateCheckout],
+        cwd: input.repositoryRoot,
+        timeoutMs: 120_000,
+      });
+    });
+
+    if (input.windowsDiagnostics) {
+      for (const [sourceRef, baseline] of [
+        [input.previousTag, layout.previousStable],
+        [currentCommit, layout.protectedBaseline],
+      ] as const) {
+        instrumentWindowsBaseline({
+          repositoryRoot: input.repositoryRoot,
+          checkout: baseline.checkout,
+          evidenceDirectory: baseline.evidenceDirectory,
+          sourceRef,
+        });
+      }
+    }
 
     await buildPackagedApplication({
       arch: input.arch,
       bundle: input.bundle,
-      checkout: input.repositoryRoot,
+      checkout: layout.candidateCheckout,
       overlayPath: candidateOverlay,
       platform: input.platform,
+      repositoryRoot: input.repositoryRoot,
       signingEnvironment,
       targetDirectory: layout.candidateBuildRoot,
+      version: input.candidateVersion,
     });
     if (!input.wsl) {
       await buildPackagedApplication({
@@ -1950,8 +2179,13 @@ export async function runSeededDesktopUpgradeSmoke(
         checkout: layout.previousStable.checkout,
         overlayPath: previousOverlay,
         platform: input.platform,
+        repositoryRoot: input.repositoryRoot,
         signingEnvironment,
         targetDirectory: layout.previousStable.buildRoot,
+        version: input.previousVersion,
+        ...(input.windowsDiagnostics
+          ? { windowsDiagnosticsEvidenceDirectory: layout.previousStable.evidenceDirectory }
+          : {}),
       });
     }
     await buildPackagedApplication({
@@ -1960,8 +2194,13 @@ export async function runSeededDesktopUpgradeSmoke(
       checkout: layout.protectedBaseline.checkout,
       overlayPath: protectedOverlay,
       platform: input.platform,
+      repositoryRoot: input.repositoryRoot,
       signingEnvironment,
       targetDirectory: layout.protectedBaseline.buildRoot,
+      version: input.previousVersion,
+      ...(input.windowsDiagnostics
+        ? { windowsDiagnosticsEvidenceDirectory: layout.protectedBaseline.evidenceDirectory }
+        : {}),
     });
     await publishCandidateUpdater({
       arch: input.arch,
@@ -2003,6 +2242,7 @@ export async function runSeededDesktopUpgradeSmoke(
         restartTimeoutMs: input.restartTimeoutMs,
         webdriverPort: input.updaterPort + 101,
         wsl: false,
+        windowsDiagnostics: input.windowsDiagnostics === true,
       });
     }
 
@@ -2028,6 +2268,7 @@ export async function runSeededDesktopUpgradeSmoke(
       restartTimeoutMs: input.restartTimeoutMs,
       webdriverPort: input.updaterPort + 102,
       wsl: input.wsl,
+      windowsDiagnostics: input.windowsDiagnostics === true,
     });
     if (!input.wsl) {
       let remoteApp = await installBaselinePackage({
@@ -2048,6 +2289,7 @@ export async function runSeededDesktopUpgradeSmoke(
         backendPort: assertRemoteInstallPort(input.updaterPort + 3),
         candidateVersion: input.candidateVersion,
         lane: "remote-install",
+        windowsDiagnostics: input.windowsDiagnostics === true,
         layout: layout.remoteInstall,
         platform: input.platform,
         projectId: `seed-${runId}-remote`,

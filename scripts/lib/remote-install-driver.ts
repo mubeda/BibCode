@@ -60,6 +60,39 @@ const WideDescriptor = Schema.Struct({
 });
 const readWideDescriptor = HttpClientResponse.schemaBodyJson(WideDescriptor);
 
+// Diagnostic versions are bounded SemVer, never an arbitrary host-provided string.
+const versionNumber = "(?:0|[1-9]\\d*)";
+const prereleaseIdentifier = "(?:0|[1-9]\\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)";
+const diagnosticVersionPattern = new RegExp(
+  `^${versionNumber}\\.${versionNumber}\\.${versionNumber}` +
+    `(?:-${prereleaseIdentifier}(?:\\.${prereleaseIdentifier})*)?` +
+    "(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
+);
+const diagnosticVersion = (version: string | null): string | null =>
+  version !== null && version.length <= 128 && diagnosticVersionPattern.test(version)
+    ? version
+    : null;
+
+const coordinatorFailureSummary = (
+  state: RemoteUpdateRunState,
+  phases: ReadonlyArray<RemoteUpdateRunState["phase"]>,
+) => {
+  const failure = state.phase === "failed" ? state.failure : null;
+  return {
+    phase: state.phase,
+    failureKind: failure?.kind ?? null,
+    phases,
+    runningVersion:
+      failure !== null && "runningVersion" in failure
+        ? diagnosticVersion(failure.runningVersion)
+        : null,
+    targetVersion:
+      failure !== null && "targetVersion" in failure
+        ? diagnosticVersion(failure.targetVersion)
+        : null,
+  };
+};
+
 export function identityFromConfig(input: unknown) {
   const { environment } = decodeIdentity(input);
   return {
@@ -353,7 +386,7 @@ export async function runRemoteInstallDriver(
         }
       }),
     };
-    const phases: string[] = [];
+    const phases: Array<RemoteUpdateRunState["phase"]> = [];
     let sawPercent = false;
     let sawStage = false;
     // Local transfers can finish between the coordinator's one-second polls. This
@@ -397,7 +430,9 @@ export async function runRemoteInstallDriver(
       await progressProbe;
     }
     if (result.phase !== "succeeded")
-      throw new Error("Remote verification coordinator did not succeed.");
+      throw new Error(
+        `Remote verification coordinator did not succeed. ${JSON.stringify(coordinatorFailureSummary(result, phases))}`,
+      );
     return {
       before,
       after: observedIdentity(await request("server.getConfig")),

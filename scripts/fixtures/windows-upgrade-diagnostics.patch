@@ -1,0 +1,120 @@
+--- a/apps/desktop/src-tauri/src/updates.rs
++++ b/apps/desktop/src-tauri/src/updates.rs
+@@ -1,3 +1,5 @@
++include!("seeded_upgrade_diagnostics.rs");
++
+ use std::{
+     collections::BTreeSet,
+     sync::{Arc, Mutex, MutexGuard},
+@@ -674,6 +676,7 @@
+         backend: &BackendSupervisor,
+         input: DesktopUpdateInstallInput,
+     ) -> Value {
++        seeded_upgrade_marker("install-entered");
+         let unavailable_state = {
+             let mut inner = self.lock_inner();
+             if !backend.backend_recovery().is_empty() {
+@@ -734,6 +737,7 @@
+                 "state": state,
+             });
+         };
++        seeded_upgrade_marker("install-admitted");
+         let snapshot = match backend.begin_update_snapshot().await {
+             Ok(snapshot) => snapshot,
+             Err(error) => {
+@@ -893,6 +897,7 @@
+             let message = append_recovery_error(error, recovery_error);
+             return self.finish_failed_install(app, downloaded, protection, message);
+         }
++        seeded_upgrade_marker("backend-stop-entered");
+         if let Err(error) = backend.stop_update_snapshot(&snapshot).await {
+             let recovery_error = backend
+                 .restart_update_snapshot(&snapshot)
+@@ -903,14 +908,17 @@
+             return self.finish_failed_install(app, downloaded, protection, message);
+         }
+ 
++        seeded_upgrade_marker("backend-stop-completed");
+         self.replace_inner(|inner| {
+             inner.phase = UpdatePhase::Installing;
+             inner.protection = protection.clone();
+         })
+         .emit(app);
+ 
++        seeded_upgrade_marker("plugin-install-entered");
+         match self.install_downloaded(&downloaded) {
+             Ok(()) => {
++                seeded_upgrade_marker("plugin-install-returned-ok");
+                 let state = self.replace_inner(|inner| {
+                     inner.status = Some(STATUS_DOWNLOADED.to_string());
+                     inner.downloaded_version = Some(downloaded.version);
+@@ -936,6 +944,7 @@
+                 result
+             }
+             Err(error) => {
++                seeded_upgrade_marker("plugin-install-returned-error");
+                 let recovery_error = backend
+                     .restart_update_snapshot(&snapshot)
+                     .await
+--- a/apps/server/src/maintenance.rs
++++ b/apps/server/src/maintenance.rs
+@@ -1,3 +1,5 @@
++include!("seeded_upgrade_diagnostics.rs");
++
+ use std::{collections::BTreeMap, sync::Arc, time::Duration};
+ 
+ use serde::{Deserialize, Serialize};
+@@ -462,31 +464,37 @@
+             UpdatePreparationStage::QuiescingRuntime,
+         )
+         .await;
++        seeded_upgrade_marker("quiesce-entered");
+         tokio::time::timeout_at(deadline, self.runtime.quiesce_for_update())
+             .await
+             .map_err(|_| MaintenanceError::Preparation("runtime quiesce timed out".to_owned()))?
+             .map_err(MaintenanceError::Preparation)?;
+ 
++        seeded_upgrade_marker("quiesce-completed");
+         self.set_preparing_stage(
+             preparing.operation_id,
+             UpdatePreparationStage::AcquiringStoreLock,
+         )
+         .await;
++        seeded_upgrade_marker("store-lock-entered");
+         let cancellation = CancellationToken::new();
+         let remaining = deadline.saturating_duration_since(Instant::now());
+         let _operation_guard =
+             StoreOperationGuard::acquire(&self.paths.base_dir, cancellation.clone(), remaining)
+                 .await
+                 .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
++        seeded_upgrade_marker("store-lock-acquired");
+         self.set_preparing_stage(
+             preparing.operation_id,
+             UpdatePreparationStage::CheckpointingDatabase,
+         )
+         .await;
++        seeded_upgrade_marker("checkpoint-entered");
+         self.database
+             .checkpoint_wal()
+             .await
+             .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
++        seeded_upgrade_marker("checkpoint-completed");
+         self.set_preparing_stage(
+             preparing.operation_id,
+             UpdatePreparationStage::CreatingVerifiedBackup,
+@@ -498,6 +506,7 @@
+             classification: self.classification,
+             paths: self.paths.clone(),
+         };
++        seeded_upgrade_marker("backup-entered");
+         let backup = tokio::time::timeout_at(
+             deadline,
+             create_verified_backup(
+@@ -510,6 +519,7 @@
+         .await
+         .map_err(|_| MaintenanceError::Preparation("verified backup timed out".to_owned()))?
+         .map_err(|error| MaintenanceError::Preparation(error.to_string()))?;
++        seeded_upgrade_marker("backup-completed");
+         let expires_at = (OffsetDateTime::now_utc()
+             + time::Duration::try_from(self.lease)
+                 .map_err(|error| MaintenanceError::Preparation(error.to_string()))?)

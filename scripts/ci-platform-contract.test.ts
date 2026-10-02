@@ -32,6 +32,7 @@ interface WorkflowStep {
 }
 
 interface WorkflowJob {
+  readonly if?: string;
   readonly env?: Record<string, string>;
   readonly needs?: string | ReadonlyArray<string>;
   readonly outputs?: Record<string, string>;
@@ -688,6 +689,44 @@ describe("packaged desktop UI smoke contract", () => {
 });
 
 describe("seeded packaged desktop upgrade contract", () => {
+  it("limits explicit diagnostic dispatches to both Windows targets while retaining the normal matrix", () => {
+    const { workflow } = readWorkflow(DESKTOP_UPGRADE_WORKFLOW_PATH);
+    const normal = requireJob(workflow, "seeded_upgrade_smoke");
+    const diagnostic = requireJob(workflow, "windows_upgrade_diagnostics");
+    const wsl = requireJob(workflow, "windows_wsl_upgrade_smoke");
+    const dispatch = workflow.on?.workflow_dispatch as {
+      inputs?: { windows_diagnostics?: { type?: string; default?: boolean } };
+    };
+    expect(dispatch.inputs?.windows_diagnostics).toMatchObject({ type: "boolean", default: false });
+    expect(diagnostic.if).toBe(
+      "${{ github.event_name == 'workflow_dispatch' && inputs.windows_diagnostics }}",
+    );
+    expect(normal.if).toBe(
+      "${{ github.event_name != 'workflow_dispatch' || !inputs.windows_diagnostics }}",
+    );
+    expect(wsl.if).toBe(normal.if);
+    expect(diagnostic.strategy?.matrix?.include).toEqual([
+      {
+        label: "Windows arm64 NSIS",
+        runner: "windows-11-vs2026-arm",
+        platform: "win",
+        arch: "arm64",
+        bundle: "nsis",
+      },
+      {
+        label: "Windows x64 NSIS",
+        runner: "windows-2025",
+        platform: "win",
+        arch: "x64",
+        bundle: "nsis",
+      },
+    ]);
+    expect(normal.strategy?.matrix?.include).toHaveLength(6);
+    expect(diagnostic.steps).toEqual(normal.steps);
+    expect(normal["timeout-minutes"]).toBe(240);
+    expect(diagnostic["timeout-minutes"]).toBe(240);
+  });
+
   it("exposes the seeded upgrade harness as a repository command", () => {
     const packageJson = JSON.parse(NodeFS.readFileSync(PACKAGE_JSON_PATH, "utf8")) as {
       readonly scripts?: Record<string, string>;
