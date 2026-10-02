@@ -35,7 +35,12 @@ is a namespace comparison, not a byte-for-byte host routing proof.
 
 Only `networkProof` and `onlineAfterPairFailure` are added to current allowlisted
 result/failure JSON: booleans/null, bounded numeric measurements and closed
-containment fields. No raw command output, MAC/IP/route table, URLs, credentials,
+containment fields. A helper refusal now also records a closed failure-stage enum,
+attempted/completed mutation counts, bounded last-command exit/status booleans
+and effective CAP_NET_ADMIN as boolean/null. Typed child refusals survive a
+nonzero exit; an invalid or missing receipt retains unknown counts rather than
+guessing that no mutation occurred. Capability observation grants no capability
+and changes no guard or command. No raw command output, MAC/IP/route table, URLs, credentials,
 environment values or private logs are added to artifacts. The artifact path
 allowlist is unchanged. Workflow tests now include the fake network guard and
 browser boolean tests.

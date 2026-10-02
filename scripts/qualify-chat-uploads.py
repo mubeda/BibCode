@@ -154,9 +154,12 @@ def network():
     spec.loader.exec_module(module)
     try:
         proof = module.setup(os.environ, run_owned_command)
+    except module.NetworkRefused as failure:
+        print(json.dumps({'refused': True, 'failure': failure.proof}))
+        return 1
     except Exception:
         # Never emit exception, raw ip output, routes or environment identities.
-        print(json.dumps({'refused': True}))
+        print(json.dumps({'refused': True, 'failure': {'stage': 'helper-process', 'attemptedMutations': None, 'completedMutations': None, 'netAdminEffective': None, 'lastCommand': None}}))
         return 1
     print(json.dumps(proof))
     return 0

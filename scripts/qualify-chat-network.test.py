@@ -64,7 +64,7 @@ class FakeIp:
 class NetworkTests(unittest.TestCase):
     def setup_network(self, fake, env=None, namespaces=None, **kwargs):
         return network.setup(env or ENV, fake, readlink=(namespaces or NAMESPACES).__getitem__,
-                             platform='linux', read_owner=lambda: '\0'.join(OWNER).encode(), **kwargs)
+                             platform='linux', read_owner=lambda: '\0'.join(OWNER).encode(), read_capabilities=kwargs.pop('read_capabilities', lambda: b'CapEff:\t0000000000001000\n'), **kwargs)
     def test_wrong_namespace_refuses_before_ip_mutations(self):
         for path, wrong in [('/proc/self/ns/net', 'net:[1]'), ('/proc/1/ns/net', 'net:[8]'),
                             ('/proc/self/ns/pid', 'pid:[8]'), ('/proc/1/ns/user', 'user:[8]')]:
@@ -123,5 +123,44 @@ class NetworkTests(unittest.TestCase):
         def unjoined(*_args, **_kwargs):
             return {'exitCode': 0, 'timedOut': False, 'cancelledSignal': None, 'supervisorReaped': False}, b'[]'
         with self.assertRaises(network.NetworkRefused): self.setup_network(unjoined)
+
+
+    def test_failure_receipt_counts_each_attempt_and_joined_completion(self):
+        stages = ['mutation-pair', 'mutation-address-in', 'mutation-address-peer', 'mutation-up-in', 'mutation-up-peer', 'mutation-default']
+        for step, stage in enumerate(stages, 1):
+            fake = FakeIp(); fake.fail_at = step
+            with self.assertRaises(network.NetworkRefused) as failure: self.setup_network(fake)
+            self.assertEqual(failure.exception.proof, {'stage': stage, 'attemptedMutations': step, 'completedMutations': step - 1, 'netAdminEffective': True,
+                'lastCommand': {'exitCode': 124, 'timedOut': True, 'cancelled': False, 'reaped': True}})
+    def test_guard_and_postcondition_failure_stages_preserve_accurate_counts(self):
+        fake = FakeIp(); ns = {**NAMESPACES, '/proc/self/ns/net': 'net:[9]'}
+        with self.assertRaises(network.NetworkRefused) as failure: self.setup_network(fake, namespaces=ns)
+        self.assertEqual(failure.exception.proof['stage'], 'namespace-net')
+        self.assertEqual(failure.exception.proof['attemptedMutations'], 0)
+        self.assertIsNone(failure.exception.proof['lastCommand'])
+        fake = FakeIp(); fake.after_links[1]['link_index'] = 9
+        with self.assertRaises(network.NetworkRefused) as failure: self.setup_network(fake)
+        self.assertEqual(failure.exception.proof['stage'], 'after-peer-check')
+        self.assertEqual(failure.exception.proof['completedMutations'], 6)
+    def test_status_projection_never_retains_foreign_fields_or_raw_exceptions(self):
+        secret = 'foreign-route-namespace-path-error-secret'
+        def malformed(*_args, **_kwargs):
+            return {'exitCode': secret, 'timedOut': secret, 'cancelledSignal': secret, 'supervisorReaped': secret, 'argv': secret, 'stderr': secret}, secret.encode()
+        with self.assertRaises(network.NetworkRefused) as failure: self.setup_network(malformed)
+        self.assertNotIn(secret, json.dumps(failure.exception.proof))
+        self.assertEqual(failure.exception.proof['lastCommand'], {'exitCode': None, 'timedOut': None, 'cancelled': None, 'reaped': None})
+        def raised(*_args, **_kwargs): raise RuntimeError(secret)
+        with self.assertRaises(network.NetworkRefused) as failure: self.setup_network(raised)
+        self.assertNotIn(secret, json.dumps(failure.exception.proof))
+        self.assertEqual(failure.exception.proof['stage'], 'before-links-read')
+
+
+    def test_capability_observation_is_boolean_or_unknown_without_altering_guard(self):
+        for raw, expected in [(b'CapEff:\t0000000000000000\n', False), (b'CapEff:\t0000000000001000\n', True), (b'foreign-secret', None)]:
+            fake = FakeIp(); fake.fail_at = 1
+            with self.assertRaises(network.NetworkRefused) as failure: self.setup_network(fake, read_capabilities=lambda: raw)
+            self.assertIs(failure.exception.proof['netAdminEffective'], expected)
+            self.assertEqual(fake.mutations, MUTATIONS[:1])
+            self.assertNotIn('foreign-secret', json.dumps(failure.exception.proof))
 
 if __name__ == '__main__': unittest.main()

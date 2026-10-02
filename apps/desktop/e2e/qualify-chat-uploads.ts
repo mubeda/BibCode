@@ -10,7 +10,8 @@ import { remote } from "webdriverio";
 import {
   BrowserConnectivityFailure,
   ensureBrowserOnline,
-  parseNetworkProof,
+  readNetworkCommandResult,
+  NetworkSetupFailure,
   type BrowserNetworkProof,
 } from "./support/browser-network.ts";
 import { EnvironmentMetadataHttpApi } from "../../../packages/contracts/src/environmentHttp.ts";
@@ -409,7 +410,15 @@ try {
           !NodePath.isAbsolute(python) ||
           helper !== NodePath.join(root, "scripts/qualify-chat-uploads.py")
         ) {
-          reject(new Error("Contained network helper configuration refused."));
+          reject(
+            new NetworkSetupFailure({
+              stage: "helper-config",
+              attemptedMutations: 0,
+              completedMutations: 0,
+              netAdminEffective: null,
+              lastCommand: null,
+            }),
+          );
           return;
         }
         // execFile joins the short-lived helper; PID1 retains authority over all command descendants.
@@ -424,14 +433,10 @@ try {
             encoding: "utf8",
           },
           (error, stdout) => {
-            if (error) {
-              reject(new Error("Contained network helper refused."));
-              return;
-            }
             try {
-              resolve(parseNetworkProof(stdout));
-            } catch {
-              reject(new Error("Contained network proof refused."));
+              resolve(readNetworkCommandResult(error !== null, stdout));
+            } catch (failure) {
+              reject(failure);
             }
           },
         );

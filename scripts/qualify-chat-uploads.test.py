@@ -162,5 +162,15 @@ class NetworkHandoffTests(unittest.TestCase):
         with mock.patch.object(qualification.os, 'getpid', return_value=1), mock.patch.object(qualification.os, 'readlink', return_value='net:[1]'):
             with self.assertRaises(RuntimeError): qualification.network_environment('net:[1]', sys.executable)
 
+
+    def test_actual_helper_refusal_emits_only_the_closed_receipt(self):
+        capture = io.StringIO()
+        with mock.patch.dict(qualification.os.environ, {'CI': 'false', 'BIBCODE_UPLOAD_HOST_NETNS': 'secret'}), mock.patch.object(qualification, 'run_owned_command') as run, contextlib.redirect_stdout(capture):
+            self.assertEqual(qualification.network(), 1)
+        run.assert_not_called()
+        receipt = json.loads(capture.getvalue())
+        self.assertEqual(receipt, {'refused': True, 'failure': {'stage': 'platform-check', 'attemptedMutations': 0, 'completedMutations': 0, 'netAdminEffective': None, 'lastCommand': None}})
+        self.assertNotIn('secret', capture.getvalue())
+
 if __name__ == '__main__':
     unittest.main()
