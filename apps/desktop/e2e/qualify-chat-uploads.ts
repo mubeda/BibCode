@@ -7,6 +7,12 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { remote } from "webdriverio";
+import {
+  BrowserConnectivityFailure,
+  ensureBrowserOnline,
+  parseNetworkProof,
+  type BrowserNetworkProof,
+} from "./support/browser-network.ts";
 import { EnvironmentMetadataHttpApi } from "../../../packages/contracts/src/environmentHttp.ts";
 
 import { prepareDesktopUiTestContext } from "./support/test-project.ts";
@@ -238,6 +244,8 @@ const observationScript = String.raw`(() => {
 })();`;
 
 let browser: Awaited<ReturnType<typeof remote>> | undefined;
+let networkProof: BrowserNetworkProof | null = null;
+let onlineAfterPairFailure: boolean | null = null;
 let pairingCompleted = false;
 let success = false;
 const cleanupFailures: Array<{
@@ -383,6 +391,52 @@ try {
   await b.sendCommandAndGetResult("Page.addScriptToEvaluateOnNewDocument", {
     source: observationScript,
   });
+  phase("observe-browser-connectivity");
+  networkProof = await ensureBrowserOnline({
+    readOnline: () =>
+      bounded(
+        b.execute(() => navigator.onLine),
+        2_000,
+      ),
+    now: () => performance.now(),
+    sleep: delay,
+    setup: () =>
+      new Promise((resolve, reject) => {
+        const python = process.env.BIBCODE_UPLOAD_PYTHON;
+        const helper = process.env.BIBCODE_UPLOAD_NETWORK_HELPER;
+        if (
+          !python ||
+          !NodePath.isAbsolute(python) ||
+          helper !== NodePath.join(root, "scripts/qualify-chat-uploads.py")
+        ) {
+          reject(new Error("Contained network helper configuration refused."));
+          return;
+        }
+        // execFile joins the short-lived helper; PID1 retains authority over all command descendants.
+        NodeChildProcess.execFile(
+          python,
+          [helper, "network"],
+          {
+            env: process.env,
+            timeout: 30_000,
+            killSignal: "SIGTERM",
+            maxBuffer: 4096,
+            encoding: "utf8",
+          },
+          (error, stdout) => {
+            if (error) {
+              reject(new Error("Contained network helper refused."));
+              return;
+            }
+            try {
+              resolve(parseNetworkProof(stdout));
+            } catch {
+              reject(new Error("Contained network proof refused."));
+            }
+          },
+        );
+      }),
+  });
   const plain = environments[0]!;
   phase("pair-primary");
   const credential = JSON.parse(
@@ -485,7 +539,24 @@ try {
   phase("smoke-complete");
   success = true;
 } catch (error) {
-  write("failure", { phase: currentPhase, failure: classifyQualificationFailure(error) });
+  if (error instanceof BrowserConnectivityFailure) networkProof = error.proof;
+  if (browser && pairingCompleted) {
+    try {
+      const value: unknown = await bounded(
+        browser.execute(() => navigator.onLine),
+        2_000,
+      );
+      onlineAfterPairFailure = typeof value === "boolean" ? value : null;
+    } catch {
+      /* Diagnostic reads cannot bypass cleanup. */
+    }
+  }
+  write("failure", {
+    phase: currentPhase,
+    failure: classifyQualificationFailure(error),
+    networkProof,
+    onlineAfterPairFailure,
+  });
   // Only the paired, disposable fixture can produce a failure screenshot.
   // Never capture the credential form or any password/one-time-code input.
   if (browser && pairingCompleted) {
@@ -500,6 +571,8 @@ try {
         phase: currentPhase,
         failure: classifyQualificationFailure(error),
         observations,
+        networkProof,
+        onlineAfterPairFailure,
       });
       const safe = await bounded(
         browser.execute(
@@ -559,6 +632,8 @@ try {
     phase: currentPhase,
     source: process.env.BIBCODE_UPLOAD_SOURCE,
     results,
+    networkProof,
+    onlineAfterPairFailure,
     beforeCleanup,
     cleanupFailures,
     scope:

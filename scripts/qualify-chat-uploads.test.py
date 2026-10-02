@@ -141,5 +141,26 @@ class SupervisorTests(unittest.TestCase):
                         pass
 
 
+
+
+
+class NetworkHandoffTests(unittest.TestCase):
+    def test_only_owned_pid1_publishes_resolved_namespace_helper_configuration(self):
+        values = {'net': 'net:[2]', 'pid': 'pid:[3]', 'user': 'user:[4]'}
+        real_readlink = os.readlink
+        with mock.patch.object(qualification.os, 'getpid', return_value=1), mock.patch.object(qualification.os, 'readlink', side_effect=lambda path: values[str(path).rsplit('/', 1)[1]] if str(path).startswith('/proc/') else real_readlink(path)):
+            env = qualification.network_environment('net:[1]', sys.executable)
+        self.assertEqual(env['BIBCODE_UPLOAD_HOST_NETNS'], 'net:[1]')
+        self.assertEqual(env['BIBCODE_UPLOAD_NETNS'], 'net:[2]')
+        self.assertEqual(env['BIBCODE_UPLOAD_PIDNS'], 'pid:[3]')
+        self.assertEqual(env['BIBCODE_UPLOAD_USERNS'], 'user:[4]')
+        self.assertTrue(Path(env['BIBCODE_UPLOAD_PYTHON']).is_absolute())
+        self.assertEqual(env['BIBCODE_UPLOAD_NETWORK_HELPER'], str(SOURCE.resolve()))
+    def test_non_pid1_or_same_as_host_never_publishes_helper_configuration(self):
+        with mock.patch.object(qualification.os, 'getpid', return_value=2):
+            with self.assertRaises(RuntimeError): qualification.network_environment('net:[1]', sys.executable)
+        with mock.patch.object(qualification.os, 'getpid', return_value=1), mock.patch.object(qualification.os, 'readlink', return_value='net:[1]'):
+            with self.assertRaises(RuntimeError): qualification.network_environment('net:[1]', sys.executable)
+
 if __name__ == '__main__':
     unittest.main()

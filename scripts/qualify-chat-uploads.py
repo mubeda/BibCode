@@ -82,8 +82,8 @@ def run_owned_command(command, timeout=630, grace=10):
             'supervisorReaped': process is not None and process.poll() is not None}, output
 
 
-def run_ip(*args):
-    return subprocess.check_output(['ip', *args], text=True, timeout=10)
+def run_ip(ip, *args):
+    return subprocess.check_output([ip, *args], text=True, timeout=10)
 
 
 def resolve_node_runtime():
@@ -133,7 +133,36 @@ def prepare_tools(fixture, node, git, dirname):
         path.chmod(0o700)
 
 
-def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_namespace, source):
+def network_environment(host_namespace, ip):
+    """Only the checked private PID1 may publish identities to its child helper."""
+    if os.getpid() != 1:
+        raise RuntimeError('Network helper requires its owned PID1')
+    identities = {kind: os.readlink('/proc/self/ns/' + kind) for kind in ['net', 'pid', 'user']}
+    if identities['net'] == host_namespace or any(os.readlink('/proc/1/ns/' + kind) != value for kind, value in identities.items()):
+        raise RuntimeError('Network helper namespace ownership refused')
+    return {'BIBCODE_UPLOAD_HOST_NETNS': host_namespace, 'BIBCODE_UPLOAD_NETNS': identities['net'],
+            'BIBCODE_UPLOAD_PIDNS': identities['pid'], 'BIBCODE_UPLOAD_USERNS': identities['user'],
+            'BIBCODE_UPLOAD_IP': str(Path(ip).resolve(strict=True)),
+            'BIBCODE_UPLOAD_PYTHON': str(Path(sys.executable).resolve(strict=True)),
+            'BIBCODE_UPLOAD_NETWORK_HELPER': str(Path(__file__).resolve(strict=True))}
+
+
+def network():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('contained_network', Path(__file__).with_name('qualify-chat-network.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        proof = module.setup(os.environ, run_owned_command)
+    except Exception:
+        # Never emit exception, raw ip output, routes or environment identities.
+        print(json.dumps({'refused': True}))
+        return 1
+    print(json.dumps(proof))
+    return 0
+
+
+def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_namespace, source, ip):
     private_namespace = os.readlink('/proc/self/ns/net')
     if os.getpid() != 1 or private_namespace == host_namespace:
         raise RuntimeError('Refusing to run outside the owned PID/network namespaces')
@@ -142,8 +171,9 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
     process = None
     status = 1
     try:
-        run_ip('link', 'set', 'lo', 'up')
-        if json.loads(run_ip('-j', 'route', 'show', 'default')):
+        trusted_network = network_environment(host_namespace, ip)
+        run_ip(ip, 'link', 'set', 'lo', 'up')
+        if json.loads(run_ip(ip, '-j', 'route', 'show', 'default')):
             raise RuntimeError('The qualification namespace unexpectedly has an external route')
         for directory in ['home', 'config', 'cache', 'data', 'runtime', 'bin']:
             (fixture / directory).mkdir(mode=0o700)
@@ -158,6 +188,7 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
             'BIBCODE_UPLOAD_NETNS': private_namespace, 'BIBCODE_UPLOAD_SERVER': server,
             'BIBCODE_UPLOAD_CHROME': chrome, 'BIBCODE_UPLOAD_DRIVER': driver,
             'BIBCODE_UPLOAD_SOURCE': source,
+            **trusted_network,
         }
         with (fixture / 'private-controller.log').open('xb') as output:
             process = subprocess.Popen([node, 'apps/desktop/e2e/qualify-chat-uploads.ts'],
@@ -273,7 +304,7 @@ def outer():
     command = [programs['unshare'], '--user', '--map-current-user', '--keep-caps', '--net', '--pid', '--mount-proc',
                '--fork', '--kill-child', sys.executable, __file__, 'inner', str(evidence), str(fixture),
                node, server, programs['google-chrome'], programs['chromedriver'], programs['git'], programs['dirname'],
-               namespace, os.environ['GITHUB_SHA']]
+               namespace, os.environ['GITHUB_SHA'], str(Path(programs['ip']).resolve(strict=True))]
     result, _ = run_owned_command(command, timeout=660, grace=15)
     result['hostNetworkNamespaceUnchanged'] = os.readlink('/proc/self/ns/net') == namespace
     write_json(evidence / 'supervisor.json', result)
@@ -283,6 +314,8 @@ def outer():
 
 
 if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == 'network':
+        sys.exit(network())
     if len(sys.argv) > 1 and sys.argv[1] == 'preflight':
         sys.exit(preflight())
     if len(sys.argv) > 1 and sys.argv[1] == 'inner':
