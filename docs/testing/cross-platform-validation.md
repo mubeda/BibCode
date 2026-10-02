@@ -296,6 +296,18 @@ cargo test -p bibcode-server migrations -j 2
 Deliver a queued message at completion and let its turn run past the idle timeout;
 the session must stay live until one idle timeout after that turn completes.
 
+With a fake provider withholding acknowledgement, stop the session through
+workspace loss so its frozen delivery becomes uncertain, then restore the
+workspace and explicitly confirm **Retry**. A deleted or cursorless matching
+runtime must launch a fresh native conversation, preserve the user message and
+FIFO order, and show "Sent in a new conversation. The agent won't remember earlier
+messages in this thread." under the delivered message in muted text. Verify the
+native invocation starts a new session without resume, and capture light/dark
+screenshots. A still-resumable runtime must retain its conversation and show no
+new notice; conflicting runtime identities, stale attempt/state guards, steers,
+and already delivered rows must not trigger a fresh launch. Nonaccepted outcomes
+and unknown-reason decoding retain their existing behavior.
+
 Verify enqueue without a turn-start event or working projection, oldest-first
 promotion once per settle, explicit Send now clearing only its row's hold,
 interrupt/error holds, approval and user-input gates, and withdrawal without

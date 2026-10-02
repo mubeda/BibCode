@@ -1712,10 +1712,12 @@ and hold metadata for snapshots and event replay; it is a view of the outbox,
 which remains the queue's source of truth.
 
 The outbox's nullable `failure_reason` and the message projection's nullable
-`delivery_reason` carry the typed delivery reason, set only for a failed
-delivery. The engine writes the reason with the state and delivery event in one
+`delivery_reason` carry a state-scoped typed reason: `modelSelectionRefused` only
+for a failed delivery, and `startedNewConversation` only for a delivered retry.
+The engine writes the reason with the state and delivery event in one
 transaction; `thread.turn-delivery-updated` projects its nested `delivery.reason`
-into messages and snapshots. Retry and dismiss clear it, and every later
+into messages and snapshots. Retry and dismiss clear failed-delivery reasons;
+delivered rows remain terminal. Every later
 delivery update replaces the projected reason, clearing it when absent. Event
 replay restores the reason. Old rows and events have no reason, and contracts
 decode unknown reason values as an absent key. Delivery events and projected
@@ -1797,12 +1799,27 @@ Workspace-loss settlement uses the same error rule: every queued row is held,
 and pending or sending steer rows latch the hold. The queued head shows
 **Waiting for you**; **Send now** works once no running or starting session
 exists and the workspace admits work again. Settlement wakes the delivery
-worker to re-examine pending, non-queued starts. While the workspace is
+worker to re-examine pending, non-queued starts. A refusal before provider routing
+is definitely not sent and may retry with backoff. Loss after routing has begun
+is uncertain: cancelling the route cannot undo a possible provider write. That
+message stays behind the existing explicit uncertain-retry confirmation, even
+after the workspace returns. While the workspace is
 unavailable, admission refuses and delivery retries with backoff; after recovery,
 the existing provider-loss relaunch starts a replacement session. A retry bound
-to the stopped session's native identity can still fail because stopping deleted
-its resume state. The settled turn retains its partial assistant text and ends
-as error.
+to the stopped session's native identity recovers when its exact provider/instance
+runtime is absent or has no resume cursor. A guarded update clears only that
+sending start's native identity at its current attempt, retaining the command
+receipt, FIFO position, payload, model/options and delivery key. It refuses changed
+delivery ownership or newly restored/conflicting runtime identity; another native
+session's cursor remains a rejection. The retry starts without resume, freezes to
+the new native session, and immediate acceptance records `startedNewConversation`
+with the delivered state. The user message shows "Sent in a new conversation. The
+agent won't remember earlier messages in this thread." in muted status text. A
+still-resumable frozen session resumes normally without that notice. Automatic
+reconciliation never unfreezes ambiguous work. Nonaccepted fresh attempts keep
+their existing outcomes and no notice; the fact is not retained for a later
+accepted attempt. Unfrozen fresh starts remain outside this recovery policy. The
+settled turn retains its partial assistant text and ends as error.
 
 `ThreadTurnSteer` validates the queued head, a running session with an active
 turn, and the driver-owned capability shared with inventory. It atomically
