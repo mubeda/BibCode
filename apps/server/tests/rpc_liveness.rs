@@ -22,7 +22,7 @@ use std::{
 };
 
 use bibcode_server::{RpcRegistry, ServerConfig, ServerHandle, ServerRuntime};
-use futures_util::{SinkExt, StreamExt, future::join_all};
+use futures_util::{SinkExt, Stream, StreamExt, future::join_all};
 use serde_json::{Value, json};
 use snow::TransportState;
 use tempfile::TempDir;
@@ -33,7 +33,7 @@ use tokio::{
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+    tungstenite::{Error as WebSocketError, Message, client::IntoClientRequest, http::HeaderValue},
 };
 
 const KIB: u64 = 1024;
@@ -799,10 +799,7 @@ async fn start_observed_server(
                 started.send(()).await.expect("watch started");
                 cancellation.cancelled().await;
                 sender.closed().await;
-                ended
-                    .send(Instant::now())
-                    .await
-                    .expect("watch teardown observed");
+                let _ = ended.send(Instant::now()).await;
             });
             receiver
         });
@@ -970,6 +967,88 @@ async fn an_idle_client_is_reaped_while_the_server_keeps_pushing_small_frames() 
 /// they alone must keep the session past the 45 s silence limit. They are also what
 /// keeps a fast transfer alive when no data write waits long enough to count.
 const PONG_ONLY_WINDOW: Duration = Duration::from_secs(60);
+const PONG_ONLY_DEADLINE: Duration = Duration::from_secs(180);
+const PONG_ONLY_MIN_PINGS: usize = 4;
+
+/// Exercises the socket reader without sending application messages during the window.
+async fn observe_answered_heartbeats<S>(socket: &mut S, mode: Mode)
+where
+    S: Stream<Item = Result<Message, WebSocketError>> + Unpin,
+{
+    let window = sleep(PONG_ONLY_WINDOW);
+    tokio::pin!(window);
+    let mut window_elapsed = false;
+    let mut pings = 0;
+    timeout(PONG_ONLY_DEADLINE, async {
+        // A late server check restarts the Ping cadence. Observe enough actual
+        // heartbeats as well as the minimum survival window, without demanding
+        // a cadence from a process that may have been descheduled.
+        while !window_elapsed || pings < PONG_ONLY_MIN_PINGS {
+            tokio::select! {
+                // Reading flushes the automatic Pong queued for the previous Ping.
+                frame = socket.next() => match frame {
+                    Some(Ok(Message::Ping(_))) => pings += 1,
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                        panic!("{mode:?} session ended while the client answered Pings: {frame:?}");
+                    }
+                    Some(Ok(_)) => {}
+                },
+                () = &mut window, if !window_elapsed => window_elapsed = true,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{mode:?}: heartbeat observation exceeded {PONG_ONLY_DEADLINE:?} (saw {pings} Pings)"
+        )
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn pong_only_observation_waits_for_heartbeats_after_a_scheduler_stall() {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut socket = futures_util::stream::poll_fn(move |cx| receiver.poll_recv(cx));
+    let observation = observe_answered_heartbeats(&mut socket, Mode::PlainSplit);
+    tokio::pin!(observation);
+    assert!(futures_util::poll!(&mut observation).is_pending());
+    sender.send(Ok(Message::Ping(Vec::new().into()))).unwrap();
+    sender.send(Ok(Message::Ping(Vec::new().into()))).unwrap();
+    assert!(futures_util::poll!(&mut observation).is_pending());
+
+    // A stalled process may receive fewer Pings while its wall-clock window expires.
+    // Production restarts its heartbeat cadence rather than emitting a catch-up burst.
+    tokio::time::advance(Duration::from_secs(70)).await;
+    assert!(futures_util::poll!(&mut observation).is_pending());
+    sender.send(Ok(Message::Ping(Vec::new().into()))).unwrap();
+    assert!(futures_util::poll!(&mut observation).is_pending());
+    sender.send(Ok(Message::Ping(Vec::new().into()))).unwrap();
+    assert!(futures_util::poll!(&mut observation).is_ready());
+}
+
+#[tokio::test(start_paused = true)]
+async fn pong_only_observation_keeps_the_full_survival_window() {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut socket = futures_util::stream::poll_fn(move |cx| receiver.poll_recv(cx));
+    let observation = observe_answered_heartbeats(&mut socket, Mode::Encrypted);
+    tokio::pin!(observation);
+    assert!(futures_util::poll!(&mut observation).is_pending());
+    for _ in 0..PONG_ONLY_MIN_PINGS {
+        sender.send(Ok(Message::Ping(Vec::new().into()))).unwrap();
+    }
+    assert!(futures_util::poll!(&mut observation).is_pending());
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert!(futures_util::poll!(&mut observation).is_pending());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(futures_util::poll!(&mut observation).is_ready());
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "heartbeat observation exceeded")]
+async fn pong_only_observation_remains_bounded_when_heartbeats_never_arrive() {
+    let mut socket = futures_util::stream::pending();
+    observe_answered_heartbeats(&mut socket, Mode::PlainSplit).await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_idle_client_that_answers_pings_is_kept_past_the_silence_limit() {
@@ -982,26 +1061,7 @@ async fn an_idle_client_that_answers_pings_is_kept_past_the_silence_limit() {
             mut framing,
             mut ended,
         } = open_watched_session(mode, 1024 * KIB).await;
-        let read_until = Instant::now() + PONG_ONLY_WINDOW;
-        let mut pings = 0;
-        loop {
-            // Each read also sends the Pong queued for the previous Ping.
-            let frame = tokio::select! {
-                frame = socket.next() => frame,
-                () = sleep_until(read_until) => break,
-            };
-            match frame {
-                Some(Ok(Message::Ping(_))) => pings += 1,
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                    panic!("{mode:?} session ended while the client answered Pings: {frame:?}")
-                }
-                Some(Ok(_)) => {}
-            }
-        }
-        assert!(
-            pings >= 3,
-            "{mode:?}: the server pings every 15 s (saw {pings})"
-        );
+        observe_answered_heartbeats(&mut socket, mode).await;
         assert!(
             ended.try_recv().is_err(),
             "{mode:?}: not reaped while the client answered Pings"
