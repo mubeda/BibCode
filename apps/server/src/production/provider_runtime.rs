@@ -2115,7 +2115,7 @@ async fn reconcile_abandoned_provider_session(
             && projected.runtime_mode == session.runtime_mode
             && projected.active_turn_id.is_none()
             && projected.last_error.as_deref() == Some(restart_error)
-            && projected.last_error_class.as_deref() == Some("transport_error")
+            && projected.last_error_class.as_deref() == Some("session_stopped")
             && projected.updated_at == settled_at
     });
     if let Some(turn_id) = abandoned_turn_id {
@@ -2133,7 +2133,7 @@ async fn reconcile_abandoned_provider_session(
         session.active_turn_id = None;
         session.last_error = Some(restart_error.to_owned());
         // BiBCode stopped the session; the provider did not fail.
-        session.last_error_class = Some("transport_error".to_owned());
+        session.last_error_class = Some("session_stopped".to_owned());
         session.updated_at = settled_at.clone();
         engine
             .dispatch(OrchestrationCommand::ThreadSessionSet {
@@ -2362,7 +2362,7 @@ mod workspace_loss_tests {
             let session = self.session().await;
             assert_eq!(session.status, "error");
             assert_eq!(session.active_turn_id, None);
-            assert_eq!(session.last_error_class.as_deref(), Some("transport_error"));
+            assert_eq!(session.last_error_class.as_deref(), Some("session_stopped"));
             assert_eq!(session.last_error.as_deref(), Some(LOSS_ERROR));
             assert_eq!(session.provider_name.as_deref(), Some("codex"));
             assert_eq!(session.provider_instance_id.as_deref(), Some("codex"));

@@ -197,8 +197,9 @@ rejection cannot auto-start the interrupted input.
 
 A failed turn carries both a message and a class. `turn.completed` uses the
 contract-canonical `errorMessage`, and `errorClass` — a `RuntimeErrorClass` of
-`provider_error`, `transport_error`, `permission_error`, `validation_error` or
-`unknown` — records **who reported** the failure. Both are projected onto the
+`provider_error`, `transport_error`, `session_stopped`, `permission_error`,
+`validation_error` or `unknown` — records **who reported** the failure or that
+BiBCode deliberately stopped the session. Both are projected onto the
 thread session as `lastError` and `lastErrorClass`.
 
 Decoders accept a newer, unrecognized provider class as `unknown` so a newer
@@ -206,9 +207,13 @@ server cannot make an older client reject the entire live event or persisted
 session. Encoders remain strict and emit only the canonical values above.
 
 The class is required because `lastError` is mixed-provenance: it carries a
-provider's own failure and also BiBCode's restart notice, which is classified
-`transport_error`. Without it a surface cannot tell an upstream outage from a
-BiBCode defect. A driver that does not classify its failure projects as
+provider's own failure and also BiBCode's restart or workspace-loss notice.
+Those intentional stops use `session_stopped` and the title "BiBCode stopped
+this session"; an unexpected provider disconnect retains `transport_error`
+and its lost-connection title. The body retains its actionable explanation.
+No title is inferred from message text. Older clients decode the new class as
+`unknown` and retain their generic banner. A driver that does not classify its
+failure projects as
 `provider_error`, since anything reaching that projection came off a provider's
 wire.
 

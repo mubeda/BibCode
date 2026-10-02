@@ -10823,6 +10823,7 @@ async fn restart_reconciles_abandoned_running_provider_sessions() {
         .unwrap();
     assert_eq!(session.status, "error");
     assert_eq!(session.active_turn_id, None);
+    assert_eq!(session.last_error_class.as_deref(), Some("session_stopped"));
     assert!(
         session
             .last_error

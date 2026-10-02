@@ -383,8 +383,8 @@ export const OrchestrationSession = Schema.Struct({
   activeTurnId: Schema.NullOr(TurnId),
   lastError: Schema.NullOr(TrimmedNonEmptyString),
   /**
-   * Which side reported `lastError`. `lastError` is mixed-provenance — it
-   * carries both a provider's own failure and BiBCode's restart notice — so
+   * Who reported `lastError`, or whether BiBCode deliberately stopped the session.
+   * It carries both a provider's own failure and BiBCode's restart notice, so
    * this is what lets a surface attribute the error instead of guessing.
    */
   lastErrorClass: Schema.optional(Schema.NullOr(RuntimeErrorClass)),
