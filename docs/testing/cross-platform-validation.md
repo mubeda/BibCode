@@ -1362,6 +1362,73 @@ ends the clone. Record which method was used.
 Record each duration and the exact messages. SSH remotes have no stall guard;
 record SSH coverage separately if tested.
 
+## Staged chat attachment uploads
+
+For changes to upload pacing, resume, turn binding or progress/Cancel, run the
+closest client/UI seams as well as the real Rust upload liveness binary:
+
+```sh
+cd packages/client-runtime
+node ../../scripts/run-local-vp.mjs test run src/operations/uploadStager.test.ts src/operations/attachmentStaging.test.ts src/connection/nextSession.test.ts src/state/vcsClone.test.ts src/state/vcsClone.registry.test.ts
+cd ../../apps/web
+vp test run --project unit src/lib/formatTransferBytes.test.ts src/components/ChatView.logic.test.ts src/components/chat/AttachmentUploadNotice.test.tsx src/components/chat/MessagesTimeline.test.tsx src/test/uiTypography.source.test.ts
+cd ../..
+cargo test -p bibcode-server --test rpc_liveness -j 2
+```
+
+Use the isolated server/web/proxy topology in the slow-link scenario below,
+with test-owned protocol provider fixtures and disposable data. Repeat for
+plain RPC and a pinned E2EE profile. Verify that the carrying session advertises
+`attachmentStaging`; never add the flag only to a descriptor fixture.
+
+1. Send a valid 10 MiB image with `up=65536`, then `up=16384` and unlimited
+   downstream. Confirm acknowledged raw-byte progress, at most two append
+   requests in flight, no 4408 during the upload, and identical received bytes
+   and digest in the provider fixture's input log. Keep another thread streaming
+   and verify its **Stop** still works while upload requests are outstanding.
+2. Freeze a link mid-upload. Record the client 4408 within 33 seconds, visible
+   **Reconnecting…**, the acknowledged checkpoint, and resume after thaw.
+   Repeat a multi-file send lasting more than ten minutes and verify early
+   completed stages remain bindable without another byte upload. Restart the
+   disposable server after an earlier file completes: its lost stage restarts
+   once under the shared per-file budget and a
+   second loss reports failure with the outgoing work restored.
+3. Cancel separate uploads with pointer, Tab/Enter and Tab/Space. Require one
+   abort per activation, no error banner, and usable restored image previews.
+   Type fresh composer content while staging; cancellation/failure keeps both
+   that work and the outgoing prompt, attachments, terminal/element contexts,
+   preview annotations and review comments. Check the route/unmount fence so
+   late progress cannot affect another thread.
+4. Queue an attachment message while a provider turn runs. It has a local pending
+   upload row, not a claimed server queue entry, and leaves **Stop** available.
+   On admission, remove that local row once. Exercise failed turn admission and
+   unchanged retry without another upload; changed files or expired stages must
+   stage again. Cancel/failure releases unbound uploads or leaves only expiring
+   entries when disconnected.
+   Hold turn admission pending before binding and change route/unmount: no
+   uploads.cancel may retire its IDs. Verify success, and failure restoring the
+   old draft without modifying the new thread. Drop an accepted admission reply,
+   then retry: command/message IDs, timestamp and raw upload IDs must replay
+   unchanged, without get/re-upload of consumed IDs. A typed non-accepted
+   not_found permits fresh IDs on a subsequent explicit send. Preserve edited
+   composer work during reconciliation.
+   Unmount/remount the actual ChatView both before and after the ambiguous
+   result settles; require the original command and zero restaging. Mount two
+   views of the same scoped thread and prove a pending admission/replay fences
+   the other. Repeat typed not_found followed by explicit fresh Send after
+   remount. Verify blocked/removed environments and host/storage rotation leave
+   unresolved intent recoverable and do not send to the replacement authority.
+   Cookie/credential rotation on the same store may replay unchanged under the
+   current operate permission, with foreign unaccepted stages refused.
+5. Against an old server without the capability, confirm the existing inline
+   data-URL path and zero `uploads.*` probes. Capture light/dark progress and
+   reconnect/Cancel screenshots. Record the browser's Ping/Pong and queued-data
+   behavior after `close()` separately from upload success. Report unavailable
+   native WebKitGTK measurements explicitly as **not measured**.
+
+Record these results in the report template's staged upload subsection. This
+scenario does not validate Phase B file-panel uploads/downloads or asset routing.
+
 ## Slow-link liveness scenario
 
 For transport or heartbeat changes, first run the paused-clock unit coverage

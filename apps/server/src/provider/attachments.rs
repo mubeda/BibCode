@@ -16,7 +16,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use url::Url;
 use uuid::Uuid;
 
-use crate::orchestration::AttachmentReference;
+use crate::{
+    orchestration::AttachmentReference,
+    transfer::staging::{UploadBinding, UploadError, UploadOwner, UploadRegistry, UploadTarget},
+};
 
 pub(crate) const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_ATTACHMENTS: usize = 8;
@@ -35,6 +38,8 @@ pub(crate) struct AttachmentMaterializer {
     attachments_dir: PathBuf,
     root_initialized: Arc<AtomicBool>,
     root_transaction: Arc<Mutex<()>>,
+    #[cfg(test)]
+    force_copy: bool,
     #[cfg(test)]
     after_stage_write: Option<Arc<AttachmentPrepareTestPause>>,
     #[cfg(test)]
@@ -65,7 +70,8 @@ pub(crate) struct PreparedAttachmentBatch {
     references: Vec<AttachmentReference>,
     owned_finals: Vec<PathBuf>,
     owned_stages: Vec<PathBuf>,
-    _root_transaction: Option<OwnedMutexGuard<()>>,
+    bound_uploads: Vec<Arc<UploadBinding>>,
+    _root_transaction: Option<Arc<OwnedMutexGuard<()>>>,
 }
 
 impl PreparedAttachmentBatch {
@@ -75,7 +81,8 @@ impl PreparedAttachmentBatch {
             references: Vec::with_capacity(capacity),
             owned_finals: Vec::new(),
             owned_stages: Vec::new(),
-            _root_transaction: root_transaction,
+            bound_uploads: Vec::new(),
+            _root_transaction: root_transaction.map(Arc::new),
         }
     }
 
@@ -89,6 +96,11 @@ impl PreparedAttachmentBatch {
 
     pub(crate) fn commit(mut self) {
         self.owned_finals.clear();
+        for binding in self.bound_uploads.drain(..) {
+            Arc::try_unwrap(binding)
+                .expect("publication released its binding lease")
+                .commit();
+        }
     }
 
     fn remove_stage(
@@ -136,6 +148,8 @@ pub(crate) struct MaterializedAttachment {
 
 #[derive(Debug, Error)]
 pub(crate) enum AttachmentMaterializationError {
+    #[error(transparent)]
+    Upload(#[from] UploadError),
     #[error("invalid attachment metadata: {0}")]
     InvalidMetadata(String),
     #[error("invalid attachment id {0}")]
@@ -168,6 +182,8 @@ struct AttachmentInput {
     size_bytes: u64,
     #[serde(default)]
     data_url: Option<String>,
+    #[serde(default)]
+    upload_id: Option<String>,
 }
 
 impl AttachmentMaterializer {
@@ -184,10 +200,18 @@ impl AttachmentMaterializer {
             // add an OS file lock if shared multi-process state roots become supported.
             root_transaction: Arc::new(Mutex::new(())),
             #[cfg(test)]
+            force_copy: false,
+            #[cfg(test)]
             after_stage_write: None,
             #[cfg(test)]
             after_final_publication: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_forced_copy_for_test(mut self) -> Self {
+        self.force_copy = true;
+        self
     }
 
     #[cfg(test)]
@@ -211,6 +235,8 @@ impl AttachmentMaterializer {
         &self,
         attachments: Vec<Value>,
         reusable: &ReusableAttachments,
+        owner: &UploadOwner,
+        uploads: &UploadRegistry,
     ) -> Result<PreparedAttachmentBatch, AttachmentMaterializationError> {
         if attachments.is_empty() {
             return Ok(PreparedAttachmentBatch::new(0, None));
@@ -225,51 +251,93 @@ impl AttachmentMaterializer {
             self.scavenge_stages(&root).await?;
             self.root_initialized.store(true, Ordering::Release);
         }
+        let mut upload_ids = HashSet::new();
         for value in attachments {
+            let upload_id_present = value.get("uploadId").is_some();
             let data_url_present = value.get("dataUrl").is_some();
             let attachment: AttachmentInput = serde_json::from_value(value).map_err(|error| {
                 AttachmentMaterializationError::InvalidMetadata(error.to_string())
             })?;
             validate_attachment(&attachment)?;
-            let content_digest = match (data_url_present, attachment.data_url.as_deref()) {
-                (true, Some(data_url)) => {
-                    let bytes = decode_data_url(data_url, &attachment.mime_type)?;
-                    if bytes.len() != usize::try_from(attachment.size_bytes).unwrap_or(usize::MAX) {
-                        return Err(AttachmentMaterializationError::InvalidMetadata(
-                            "claimed size does not match decoded data".to_owned(),
-                        ));
-                    }
-                    self.publish(&root, &attachment.id, &bytes, &mut prepared)
-                        .await?;
-                    crate::crypto::sha256_hex(&bytes)
-                }
-                (false, None) => {
-                    let recorded_digest = reusable.get(&attachment.id).ok_or_else(|| {
-                        AttachmentMaterializationError::NotReusable(attachment.id.clone())
-                    })?;
-                    let existing = self.read_canonical(&root, &attachment.id).await?;
-                    if existing.len()
-                        != usize::try_from(attachment.size_bytes).unwrap_or(usize::MAX)
-                    {
-                        return Err(AttachmentMaterializationError::InvalidMetadata(
-                            "claimed size does not match prepared file".to_owned(),
-                        ));
-                    }
-                    let digest = crate::crypto::sha256_hex(&existing);
-                    if recorded_digest
-                        .as_ref()
-                        .is_some_and(|recorded| *recorded != digest)
-                    {
-                        return Err(AttachmentMaterializationError::InvalidMetadata(
-                            "prepared file does not match the attachment sent earlier".to_owned(),
-                        ));
-                    }
-                    digest
-                }
-                _ => {
+            let content_digest = if upload_id_present {
+                if data_url_present {
                     return Err(AttachmentMaterializationError::InvalidMetadata(
-                        "dataUrl must be a base64 string when present".to_owned(),
+                        "Attachment cannot contain both dataUrl and uploadId".into(),
                     ));
+                }
+                let id = attachment
+                    .upload_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        AttachmentMaterializationError::InvalidMetadata(
+                            "uploadId must be a nonempty string".into(),
+                        )
+                    })?;
+                if !upload_ids.insert(id.to_owned()) {
+                    return Err(AttachmentMaterializationError::InvalidMetadata(
+                        "A staged upload cannot appear twice in a turn".into(),
+                    ));
+                }
+                let target = UploadTarget::ChatAttachment {
+                    attachment_type: attachment.attachment_type.clone(),
+                    name: attachment.name.clone(),
+                    mime_type: attachment.mime_type.clone(),
+                };
+                let binding = Arc::new(
+                    uploads
+                        .bind(owner, id, &target, attachment.size_bytes)
+                        .await?,
+                );
+                let content_digest = binding.digest().to_owned();
+                self.publish_staged(&root, &attachment.id, &binding, &mut prepared)
+                    .await?;
+                prepared.bound_uploads.push(binding);
+                content_digest
+            } else {
+                match (data_url_present, attachment.data_url.as_deref()) {
+                    (true, Some(data_url)) => {
+                        let bytes = decode_data_url(data_url, &attachment.mime_type)?;
+                        if bytes.len()
+                            != usize::try_from(attachment.size_bytes).unwrap_or(usize::MAX)
+                        {
+                            return Err(AttachmentMaterializationError::InvalidMetadata(
+                                "claimed size does not match decoded data".to_owned(),
+                            ));
+                        }
+                        self.publish(&root, &attachment.id, &bytes, &mut prepared)
+                            .await?;
+                        crate::crypto::sha256_hex(&bytes)
+                    }
+                    (false, None) => {
+                        let recorded_digest = reusable.get(&attachment.id).ok_or_else(|| {
+                            AttachmentMaterializationError::NotReusable(attachment.id.clone())
+                        })?;
+                        let existing = self.read_canonical(&root, &attachment.id).await?;
+                        if existing.len()
+                            != usize::try_from(attachment.size_bytes).unwrap_or(usize::MAX)
+                        {
+                            return Err(AttachmentMaterializationError::InvalidMetadata(
+                                "claimed size does not match prepared file".to_owned(),
+                            ));
+                        }
+                        let digest = crate::crypto::sha256_hex(&existing);
+                        if recorded_digest
+                            .as_ref()
+                            .is_some_and(|recorded| *recorded != digest)
+                        {
+                            return Err(AttachmentMaterializationError::InvalidMetadata(
+                                "prepared file does not match the attachment sent earlier"
+                                    .to_owned(),
+                            ));
+                        }
+                        digest
+                    }
+                    _ => {
+                        return Err(AttachmentMaterializationError::InvalidMetadata(
+                            "dataUrl must be a base64 string when present".to_owned(),
+                        ));
+                    }
                 }
             };
             let canonical_path = self.canonical_path(&root, &attachment.id).await?;
@@ -358,7 +426,7 @@ impl AttachmentMaterializer {
         let root = self.canonical_root(false).await?;
         let mut materialized = Vec::with_capacity(attachments.len());
         for attachment in attachments {
-            if attachment.get("dataUrl").is_some() {
+            if attachment.get("dataUrl").is_some() || attachment.get("uploadId").is_some() {
                 return Err(AttachmentMaterializationError::InvalidMetadata(
                     "prepared attachments cannot contain dataUrl".to_owned(),
                 ));
@@ -583,33 +651,97 @@ impl AttachmentMaterializer {
             });
         }
         drop(file);
-        let final_path = root.join(id);
-        match std::fs::hard_link(&staged, &final_path) {
-            Ok(()) => {
-                #[cfg(test)]
-                if let Some(pause) = &self.after_final_publication {
-                    pause.reached.notify_one();
-                    pause.resume.notified().await;
-                }
-                prepared.owned_finals.push(final_path);
-                prepared.remove_stage(&staged, id)?;
-                Ok(())
+        let publication = publish_stage_file(
+            staged.clone(),
+            root.join(id),
+            false,
+            prepared._root_transaction.clone(),
+            None,
+        )
+        .await
+        .map_err(|source| AttachmentMaterializationError::Write {
+            id: id.into(),
+            source,
+        })?;
+        if let Some(path) = publication.into_owned_path() {
+            prepared.owned_finals.push(path);
+            #[cfg(test)]
+            if let Some(pause) = &self.after_final_publication {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
             }
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = self.read_canonical(root, id).await;
-                prepared.remove_stage(&staged, id)?;
-                match existing {
-                    Ok(existing) if existing == bytes => Ok(()),
-                    Ok(_) => Err(AttachmentMaterializationError::InvalidMetadata(
-                        "attachment id already exists with different content".to_owned(),
-                    )),
-                    Err(error) => Err(error),
-                }
+            prepared.remove_stage(&staged, id)?;
+            Ok(())
+        } else {
+            let existing = self.read_canonical(root, id).await;
+            prepared.remove_stage(&staged, id)?;
+            match existing {
+                Ok(existing) if existing == bytes => Ok(()),
+                Ok(_) => Err(AttachmentMaterializationError::InvalidMetadata(
+                    "attachment id already exists with different content".into(),
+                )),
+                Err(error) => Err(error),
             }
-            Err(source) => Err(AttachmentMaterializationError::Write {
-                id: id.to_owned(),
+        }
+    }
+
+    async fn publish_staged(
+        &self,
+        root: &Path,
+        id: &str,
+        binding: &Arc<UploadBinding>,
+        prepared: &mut PreparedAttachmentBatch,
+    ) -> Result<(), AttachmentMaterializationError> {
+        let source = tokio::fs::File::open(binding.path())
+            .await
+            .map_err(|source| AttachmentMaterializationError::Read {
+                id: id.into(),
                 source,
-            }),
+            })?;
+        let mut bytes = Vec::new();
+        source
+            .take((MAX_ATTACHMENT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|source| AttachmentMaterializationError::Read {
+                id: id.into(),
+                source,
+            })?;
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(AttachmentMaterializationError::InvalidMetadata(
+                "Staged file exceeds attachment limit".into(),
+            ));
+        }
+        if crate::crypto::sha256_hex(&bytes) != binding.digest() {
+            return Err(AttachmentMaterializationError::InvalidMetadata(
+                "Staged file digest changed".into(),
+            ));
+        }
+        #[cfg(test)]
+        let force_copy = self.force_copy;
+        #[cfg(not(test))]
+        let force_copy = false;
+        let publication = publish_stage_file(
+            binding.path().to_path_buf(),
+            root.join(id),
+            force_copy,
+            prepared._root_transaction.clone(),
+            Some(binding.clone()),
+        )
+        .await
+        .map_err(|source| AttachmentMaterializationError::Write {
+            id: id.into(),
+            source,
+        })?;
+        if let Some(path) = publication.into_owned_path() {
+            prepared.owned_finals.push(path);
+            Ok(())
+        } else if self.read_canonical(root, id).await? == bytes {
+            Ok(())
+        } else {
+            Err(AttachmentMaterializationError::InvalidMetadata(
+                "attachment id already exists with different content".into(),
+            ))
         }
     }
 
@@ -684,10 +816,9 @@ pub(crate) fn id_only_attachment_ids(
         return Err(too_many_attachments());
     }
     let mut ids = Vec::<String>::new();
-    for attachment in attachments
-        .iter()
-        .filter(|attachment| attachment.get("dataUrl").is_none())
-    {
+    for attachment in attachments.iter().filter(|attachment| {
+        attachment.get("dataUrl").is_none() && attachment.get("uploadId").is_none()
+    }) {
         let Some(id) = attachment.get("id").and_then(Value::as_str) else {
             continue;
         };
@@ -767,6 +898,23 @@ fn validate_attachment(attachment: &AttachmentInput) -> Result<(), AttachmentMat
         ));
     }
     Ok(())
+}
+
+pub(crate) fn validate_upload_metadata(
+    attachment_type: &str,
+    name: &str,
+    mime_type: &str,
+    size_bytes: u64,
+) -> Result<(), AttachmentMaterializationError> {
+    validate_attachment(&AttachmentInput {
+        attachment_type: attachment_type.into(),
+        id: "staging".into(),
+        name: name.into(),
+        mime_type: mime_type.into(),
+        size_bytes,
+        data_url: None,
+        upload_id: None,
+    })
 }
 
 fn decode_data_url(
@@ -853,6 +1001,109 @@ fn is_image_mime(mime: &str) -> bool {
         .is_some_and(|kind| kind.eq_ignore_ascii_case("image/"))
 }
 
+#[cfg(test)]
+static PUBLICATION_PAUSES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, Arc<AttachmentPrepareTestPause>>>,
+> = std::sync::OnceLock::new();
+
+/// Owns a published final through blocking I/O and result delivery. A canceled
+/// awaiting caller drops the result, so publication cannot outlive rollback.
+struct AttachmentPublication {
+    owned_path: Option<PathBuf>,
+    _root_transaction: Option<Arc<OwnedMutexGuard<()>>>,
+    _binding: Option<Arc<UploadBinding>>,
+}
+impl AttachmentPublication {
+    fn into_owned_path(mut self) -> Option<PathBuf> {
+        self.owned_path.take()
+    }
+}
+impl Drop for AttachmentPublication {
+    fn drop(&mut self) {
+        if let Some(path) = &self.owned_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+async fn publish_stage_file(
+    staged: PathBuf,
+    final_path: PathBuf,
+    force_copy: bool,
+    root_transaction: Option<Arc<OwnedMutexGuard<()>>>,
+    binding: Option<Arc<UploadBinding>>,
+) -> std::io::Result<AttachmentPublication> {
+    #[cfg(test)]
+    let pause = PUBLICATION_PAUSES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(&final_path)
+        .cloned();
+    tokio::task::spawn_blocking(move || {
+        let linked = if force_copy {
+            Err(std::io::Error::other("forced copy"))
+        } else {
+            std::fs::hard_link(&staged, &final_path)
+        };
+        let publication = match linked {
+            Ok(()) => Ok::<AttachmentPublication, std::io::Error>(AttachmentPublication {
+                owned_path: Some(final_path),
+                _root_transaction: root_transaction,
+                _binding: binding,
+            }),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(AttachmentPublication {
+                    owned_path: None,
+                    _root_transaction: root_transaction,
+                    _binding: binding,
+                })
+            }
+            Err(_) => {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&final_path);
+                let mut file = match file {
+                    Ok(file) => file,
+                    Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Ok(AttachmentPublication {
+                            owned_path: None,
+                            _root_transaction: root_transaction,
+                            _binding: binding,
+                        });
+                    }
+                    Err(source) => return Err(source),
+                };
+                let publication = AttachmentPublication {
+                    owned_path: Some(final_path),
+                    _root_transaction: root_transaction,
+                    _binding: binding,
+                };
+                let source = std::fs::File::open(staged)?;
+                let copied = std::io::copy(
+                    &mut std::io::Read::take(source, (MAX_ATTACHMENT_BYTES + 1) as u64),
+                    &mut file,
+                )?;
+                if copied > MAX_ATTACHMENT_BYTES as u64 {
+                    return Err(std::io::Error::other(
+                        "staged attachment exceeds size limit",
+                    ));
+                }
+                std::io::Write::flush(&mut file)?;
+                Ok(publication)
+            }
+        }?;
+        #[cfg(test)]
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            tokio::runtime::Handle::current().block_on(pause.resume.notified());
+        }
+        Ok(publication)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 fn create_stage_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -913,8 +1164,21 @@ fn escape_xml(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn inline_upload_owner() -> super::UploadOwner {
+        super::UploadOwner::Unauthenticated
+    }
+    fn inline_upload_registry() -> super::UploadRegistry {
+        super::UploadRegistry::new(
+            std::path::PathBuf::from("unused-upload-stages"),
+            crate::transfer::staging::UploadLimits::default(),
+            std::sync::Arc::new(tokio::time::Instant::now),
+        )
+    }
+    use super::{UploadOwner, UploadRegistry, UploadTarget};
+    use std::time::Duration;
+
     use base64::Engine as _;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::{collections::HashSet, path::PathBuf, process::Command, sync::Arc};
     use tempfile::TempDir;
 
@@ -955,6 +1219,8 @@ mod tests {
                                 "dataUrl":"data:text/plain;base64,bm90ZXM="
                             })],
                             &ReusableAttachments::new(),
+                            &inline_upload_owner(),
+                            &inline_upload_registry(),
                         )
                         .await
                 });
@@ -1040,6 +1306,8 @@ mod tests {
                         "dataUrl":"data:text/plain;base64,bm90ZXM="
                     })],
                     &ReusableAttachments::new(),
+                    &inline_upload_owner(),
+                    &inline_upload_registry(),
                 )
                 .await
         });
@@ -1134,6 +1402,8 @@ mod tests {
                     "dataUrl": "data:text/plain;base64,bm90ZXM="
                 })],
                 &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect("file upload prepares");
@@ -1175,6 +1445,8 @@ mod tests {
                     }),
                 ],
                 &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect("attachments prepare");
@@ -1212,6 +1484,8 @@ mod tests {
                     "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
                 })],
                 &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect("upload prepares");
@@ -1338,6 +1612,8 @@ mod tests {
                         "dataUrl": "data:image/png;base64,c2VjcmV0"
                     })],
                     &ReusableAttachments::new(),
+                    &inline_upload_owner(),
+                    &inline_upload_registry(),
                 )
                 .await
                 .expect_err("publishing over a symlink must fail");
@@ -1381,6 +1657,8 @@ mod tests {
                     "dataUrl": "data:text/plain;base64,bm90ZXM="
                 })],
                 &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect_err("a junction root must fail before publication");
@@ -1402,7 +1680,12 @@ mod tests {
         ];
         for upload in invalid {
             materializer
-                .prepare(vec![upload], &ReusableAttachments::new())
+                .prepare(
+                    vec![upload],
+                    &ReusableAttachments::new(),
+                    &inline_upload_owner(),
+                    &inline_upload_registry(),
+                )
                 .await
                 .expect_err("invalid upload must fail");
         }
@@ -1424,6 +1707,8 @@ mod tests {
                     "dataUrl":format!("data:{max_mime};base64,")
                 })],
                 &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect("contract maxima prepare")
@@ -1453,6 +1738,8 @@ mod tests {
                         "dataUrl":format!("data:{mime_type};base64,")
                     })],
                     &ReusableAttachments::new(),
+                    &inline_upload_owner(),
+                    &inline_upload_registry(),
                 )
                 .await
                 .expect_err("metadata outside the wire contract rejects");
@@ -1465,7 +1752,7 @@ mod tests {
         let materializer = AttachmentMaterializer::new(state.path().join("attachments"));
         let body = "A".repeat(super::MAX_ENCODED_ATTACHMENT_BYTES + 4);
         let error = materializer
-            .prepare(vec![json!({"type":"file","id":"notes-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":1,"dataUrl":format!("data:text/plain;base64,{body}")})], &ReusableAttachments::new())
+            .prepare(vec![json!({"type":"file","id":"notes-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":1,"dataUrl":format!("data:text/plain;base64,{body}")})], &ReusableAttachments::new(), &inline_upload_owner(), &inline_upload_registry())
             .await
             .expect_err("encoded body rejects before decode");
         assert_eq!(
@@ -1474,23 +1761,23 @@ mod tests {
         );
         for id in ["CON", "nul", &"a".repeat(129)] {
             materializer
-                .prepare(vec![json!({"type":"file","id":id,"name":"notes.txt","mimeType":"text/plain","sizeBytes":0,"dataUrl":"data:text/plain;base64,"})], &ReusableAttachments::new())
+                .prepare(vec![json!({"type":"file","id":id,"name":"notes.txt","mimeType":"text/plain","sizeBytes":0,"dataUrl":"data:text/plain;base64,"})], &ReusableAttachments::new(), &inline_upload_owner(), &inline_upload_registry())
                 .await
                 .expect_err("invalid Windows-safe id rejects");
         }
         materializer
-            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"IMAGE/PNG","sizeBytes":0,"dataUrl":"data:IMAGE/PNG;base64,"})], &ReusableAttachments::new())
+            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"IMAGE/PNG","sizeBytes":0,"dataUrl":"data:IMAGE/PNG;base64,"})], &ReusableAttachments::new(), &inline_upload_owner(), &inline_upload_registry())
             .await
             .expect("image MIME matching is ASCII-case-insensitive")
             .commit();
         let reconnect = materializer
-            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"image/png","sizeBytes":0})], &reusable(&["image-1"]))
+            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"image/png","sizeBytes":0})], &reusable(&["image-1"]), &inline_upload_owner(), &inline_upload_registry())
             .await
             .expect("a missing dataUrl reconnects to the prepared file");
         assert_eq!(reconnect.attachments()[0]["id"], "image-1");
         reconnect.commit();
         let null_error = materializer
-            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"image/png","sizeBytes":0,"dataUrl":null})], &ReusableAttachments::new())
+            .prepare(vec![json!({"type":"image","id":"image-1","name":"screen.png","mimeType":"image/png","sizeBytes":0,"dataUrl":null})], &ReusableAttachments::new(), &inline_upload_owner(), &inline_upload_registry())
             .await
             .expect_err("an explicit null dataUrl is not a reconnect");
         assert!(
@@ -1504,7 +1791,12 @@ mod tests {
             .expect_err("residual null dataUrl rejects");
         let attachments = (0..9).map(|index| json!({"type":"file","id":format!("notes-{index}"),"name":"notes.txt","mimeType":"text/plain","sizeBytes":0,"dataUrl":"data:text/plain;base64,"})).collect();
         materializer
-            .prepare(attachments, &ReusableAttachments::new())
+            .prepare(
+                attachments,
+                &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
+            )
             .await
             .expect_err("more than eight attachments rejects");
     }
@@ -1584,6 +1876,8 @@ mod tests {
                     "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
                 })],
                 &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect("upload prepares")
@@ -1593,7 +1887,12 @@ mod tests {
         });
 
         let refused = materializer
-            .prepare(vec![reference.clone()], &ReusableAttachments::new())
+            .prepare(
+                vec![reference.clone()],
+                &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
+            )
             .await
             .expect_err("an existing file the caller may not reuse is refused");
         assert!(
@@ -1606,6 +1905,8 @@ mod tests {
             .prepare(
                 vec![reference.clone()],
                 &ReusableAttachments::from([("notes-1".to_owned(), Some(digest.clone()))]),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect("a reusable id sends the stored file again");
@@ -1615,7 +1916,12 @@ mod tests {
         );
         reused.commit();
         materializer
-            .prepare(vec![reference.clone()], &reusable(&["notes-1"]))
+            .prepare(
+                vec![reference.clone()],
+                &reusable(&["notes-1"]),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
+            )
             .await
             .expect("a reference without a recorded digest is checked by size")
             .commit();
@@ -1626,6 +1932,8 @@ mod tests {
                     "notes-1".to_owned(),
                     Some(crate::crypto::sha256_hex(b"other")),
                 )]),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect_err("a stored file that differs from the recorded digest is refused");
@@ -1643,6 +1951,8 @@ mod tests {
                     "sizeBytes":1, "dataUrl":format!("data:text/plain;base64,{oversized}")
                 })],
                 &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect_err("decoded size is capped independently of the claim");
@@ -1652,12 +1962,22 @@ mod tests {
             "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
         });
         materializer
-            .prepare(vec![upload.clone()], &ReusableAttachments::new())
+            .prepare(
+                vec![upload.clone()],
+                &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
+            )
             .await
             .expect("initial upload prepares")
             .commit();
         materializer
-            .prepare(vec![upload], &ReusableAttachments::new())
+            .prepare(
+                vec![upload],
+                &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
+            )
             .await
             .expect("identical retry prepares")
             .commit();
@@ -1668,6 +1988,8 @@ mod tests {
                     "sizeBytes":5, "dataUrl":"data:text/plain;base64,b3RoZXI="
                 })],
                 &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect_err("different retry cannot overwrite");
@@ -1695,7 +2017,7 @@ mod tests {
                 owner.prepare(vec![
                     upload.clone(),
                     json!({"type":"file","id":"missing","name":"missing.txt","mimeType":"text/plain","sizeBytes":0}),
-                ], &reusable(&["missing"]))
+                ], &reusable(&["missing"]), &inline_upload_owner(), &inline_upload_registry())
                 .await
             }
         });
@@ -1704,7 +2026,12 @@ mod tests {
             .expect("the owner publishes its first item");
         let adopted = tokio::spawn(async move {
             adopter
-                .prepare(vec![upload], &ReusableAttachments::new())
+                .prepare(
+                    vec![upload],
+                    &ReusableAttachments::new(),
+                    &inline_upload_owner(),
+                    &inline_upload_registry(),
+                )
                 .await
         });
         tokio::task::yield_now().await;
@@ -1731,12 +2058,22 @@ mod tests {
         let different = json!({"type":"file","id":"different-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":5,"dataUrl":"data:text/plain;base64,b3RoZXI="});
         let original = json!({"type":"file","id":"different-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":5,"dataUrl":"data:text/plain;base64,bm90ZXM="});
         materializer
-            .prepare(vec![original], &ReusableAttachments::new())
+            .prepare(
+                vec![original],
+                &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
+            )
             .await
             .expect("first body publishes")
             .commit();
         materializer
-            .prepare(vec![different], &ReusableAttachments::new())
+            .prepare(
+                vec![different],
+                &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
+            )
             .await
             .expect_err("a different body cannot adopt the published id");
 
@@ -1744,7 +2081,7 @@ mod tests {
             .prepare(vec![
                 json!({"type":"file","id":"cleanup-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":5,"dataUrl":"data:text/plain;base64,bm90ZXM="}),
                 json!({"type":"file","id":"cleanup-2","name":"notes.txt","mimeType":"text/plain","sizeBytes":4,"dataUrl":"data:text/plain;base64,bm90ZXM="}),
-            ], &ReusableAttachments::new())
+            ], &ReusableAttachments::new(), &inline_upload_owner(), &inline_upload_registry())
             .await
             .expect_err("later batch failure cleans earlier publication");
         assert!(!state.path().join("attachments/cleanup-1").exists());
@@ -1759,7 +2096,7 @@ mod tests {
             .prepare(vec![
                 json!({"type":"file","id":"rollback-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":5,"dataUrl":"data:text/plain;base64,bm90ZXM="}),
                 json!({"type":"file","id":"missing","name":"missing.txt","mimeType":"text/plain","sizeBytes":0}),
-            ], &reusable(&["missing"]))
+            ], &reusable(&["missing"]), &inline_upload_owner(), &inline_upload_registry())
             .await
             .expect_err("a later reconnect failure rolls back earlier publication");
         assert!(
@@ -1787,6 +2124,8 @@ mod tests {
                     "sizeBytes":0, "dataUrl":"data:text/plain;base64,"
                 })],
                 &ReusableAttachments::new(),
+                &inline_upload_owner(),
+                &inline_upload_registry(),
             )
             .await
             .expect("initial batch prepares")
@@ -1805,7 +2144,7 @@ mod tests {
                     "type":"file", "id":"cancelled", "name":"large.bin",
                     "mimeType":"application/octet-stream", "sizeBytes":super::MAX_ATTACHMENT_BYTES,
                     "dataUrl":format!("data:application/octet-stream;base64,{body}")
-                })], &ReusableAttachments::new())
+                })], &ReusableAttachments::new(), &inline_upload_owner(), &inline_upload_registry())
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1849,6 +2188,438 @@ mod tests {
         assert_eq!(
             super::prompt_parts(Some(""), vec![image.clone()]),
             vec![image]
+        );
+    }
+    use crate::transfer::staging::{
+        UploadAppendInput, UploadBeginInput, UploadErrorReason, UploadLimits,
+    };
+    fn upload_fixture() -> (
+        tempfile::TempDir,
+        UploadRegistry,
+        AttachmentMaterializer,
+        UploadOwner,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let uploads = UploadRegistry::new(
+            temp.path().join("attachment-uploads"),
+            UploadLimits::default(),
+            Arc::new(tokio::time::Instant::now),
+        );
+        let materializer = AttachmentMaterializer::new(temp.path().join("attachments"));
+        (
+            temp,
+            uploads,
+            materializer,
+            UploadOwner::Session("a".into()),
+        )
+    }
+    async fn stage_notes(uploads: &UploadRegistry, owner: &UploadOwner, complete: bool) -> Value {
+        let begun = uploads
+            .begin(
+                owner,
+                UploadBeginInput {
+                    target: UploadTarget::ChatAttachment {
+                        attachment_type: "file".into(),
+                        name: "notes.txt".into(),
+                        mime_type: "text/plain".into(),
+                    },
+                    size_bytes: 5,
+                    sha256: None,
+                },
+            )
+            .await
+            .unwrap();
+        if complete {
+            uploads
+                .append(
+                    owner,
+                    UploadAppendInput {
+                        upload_id: begun.upload_id.clone(),
+                        offset: 0,
+                        data: STANDARD.encode(b"notes"),
+                        sha256: Some(crate::crypto::sha256_hex(b"notes")),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        json!({"type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain",
+        "sizeBytes":5, "uploadId":begun.upload_id})
+    }
+    #[tokio::test]
+    async fn staged_binding_rolls_back_without_consuming_bytes_and_commit_releases_them() {
+        let (temp, uploads, m, owner) = upload_fixture();
+        let input = stage_notes(&uploads, &owner, true).await;
+        let id = input["uploadId"].as_str().unwrap();
+        let batch = m
+            .prepare(
+                vec![input.clone()],
+                &ReusableAttachments::new(),
+                &owner,
+                &uploads,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(temp.path().join("attachments/notes-1"))
+                .await
+                .unwrap(),
+            b"notes"
+        );
+        assert!(batch.attachments()[0].get("uploadId").is_none());
+        assert!(batch.attachments()[0].get("dataUrl").is_none());
+        drop(batch);
+        assert!(!temp.path().join("attachments/notes-1").exists());
+        assert!(uploads.get(&owner, id).await.unwrap().complete);
+        let batch = m
+            .prepare(
+                vec![input.clone()],
+                &ReusableAttachments::new(),
+                &owner,
+                &uploads,
+            )
+            .await
+            .unwrap();
+        let prepared = batch.attachments().to_vec();
+        batch.commit();
+        assert_eq!(
+            uploads.get(&owner, id).await.unwrap_err().reason,
+            UploadErrorReason::NotFound
+        );
+        assert!(
+            !temp
+                .path()
+                .join("attachment-uploads")
+                .join(format!("{id}.upload"))
+                .exists()
+        );
+        let delivered = m.materialize(prepared).await.unwrap();
+        assert_eq!(
+            STANDARD.decode(&delivered[0].base64_data).unwrap(),
+            b"notes"
+        );
+    }
+    #[tokio::test]
+    async fn staged_binding_refuses_incomplete_foreign_and_changed_metadata() {
+        let (_temp, uploads, m, owner) = upload_fixture();
+        let unfinished = stage_notes(&uploads, &owner, false).await;
+        assert!(
+            m.prepare(
+                vec![unfinished],
+                &ReusableAttachments::new(),
+                &owner,
+                &uploads
+            )
+            .await
+            .is_err()
+        );
+        let input = stage_notes(&uploads, &owner, true).await;
+        let other = UploadOwner::Session("other".into());
+        assert!(
+            m.prepare(
+                vec![input.clone()],
+                &ReusableAttachments::new(),
+                &other,
+                &uploads
+            )
+            .await
+            .is_err()
+        );
+        for (field, value) in [
+            ("sizeBytes", json!(4)),
+            ("name", json!("other.txt")),
+            ("mimeType", json!("application/octet-stream")),
+            ("type", json!("image")),
+        ] {
+            let mut changed = input.clone();
+            changed[field] = value;
+            assert!(
+                m.prepare(vec![changed], &ReusableAttachments::new(), &owner, &uploads)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            uploads
+                .get(&owner, input["uploadId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .complete
+        );
+    }
+    #[tokio::test]
+    async fn staged_binding_refuses_null_or_two_sources_before_the_reuse_branch() {
+        let (_temp, uploads, m, owner) = upload_fixture();
+        let input = stage_notes(&uploads, &owner, true).await;
+        for source in [json!(null), json!("data:text/plain;base64,bm90ZXM=")] {
+            let mut ambiguous = input.clone();
+            ambiguous["dataUrl"] = source;
+            assert!(
+                m.prepare(
+                    vec![ambiguous],
+                    &ReusableAttachments::new(),
+                    &owner,
+                    &uploads
+                )
+                .await
+                .is_err()
+            );
+        }
+        let mut invalid = input.clone();
+        invalid["uploadId"] = Value::Null;
+        assert!(
+            m.prepare(vec![invalid], &ReusableAttachments::new(), &owner, &uploads)
+                .await
+                .is_err()
+        );
+        assert!(
+            m.prepare(vec![input], &ReusableAttachments::new(), &owner, &uploads)
+                .await
+                .is_ok()
+        );
+    }
+    #[tokio::test]
+    async fn copy_fallback_and_adopted_finals_preserve_rollback_ownership() {
+        let (temp, uploads, materializer, owner) = upload_fixture();
+        let m = materializer.with_forced_copy_for_test();
+        let first = stage_notes(&uploads, &owner, true).await;
+        m.prepare(vec![first], &ReusableAttachments::new(), &owner, &uploads)
+            .await
+            .unwrap()
+            .commit();
+        let second = stage_notes(&uploads, &owner, true).await;
+        let batch = m
+            .prepare(
+                vec![second.clone()],
+                &ReusableAttachments::new(),
+                &owner,
+                &uploads,
+            )
+            .await
+            .unwrap();
+        drop(batch); // identical pre-existing final was adopted, not created by this batch
+        assert_eq!(
+            tokio::fs::read(temp.path().join("attachments/notes-1"))
+                .await
+                .unwrap(),
+            b"notes"
+        );
+        assert!(
+            uploads
+                .get(&owner, second["uploadId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .complete
+        );
+        tokio::fs::write(temp.path().join("attachments/notes-1"), b"other")
+            .await
+            .unwrap();
+        assert!(
+            m.prepare(vec![second], &ReusableAttachments::new(), &owner, &uploads)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tokio::fs::read(temp.path().join("attachments/notes-1"))
+                .await
+                .unwrap(),
+            b"other"
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_bound_upload_cannot_expire_out_from_under_a_committing_batch() {
+        let (temp, uploads, m, owner) = upload_fixture();
+        let input = stage_notes(&uploads, &owner, true).await;
+        let id = input["uploadId"].as_str().unwrap().to_owned();
+        let batch = m
+            .prepare(vec![input], &ReusableAttachments::new(), &owner, &uploads)
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(601)).await;
+        let sweep_registry = uploads.clone();
+        let sweep = tokio::spawn(async move { sweep_registry.sweep().await });
+        tokio::task::yield_now().await;
+        batch.commit(); // sweep may skip a locked binding or wait; it cannot delete its final
+        sweep.await.unwrap().unwrap();
+        assert_eq!(
+            tokio::fs::read(temp.path().join("attachments/notes-1"))
+                .await
+                .unwrap(),
+            b"notes"
+        );
+        assert_eq!(
+            uploads.get(&owner, &id).await.unwrap_err().reason,
+            UploadErrorReason::NotFound
+        );
+    }
+    #[tokio::test]
+    async fn staged_duplicate_ids_fail_without_deadlock_or_consuming_the_upload() {
+        let (_temp, uploads, m, owner) = upload_fixture();
+        let input = stage_notes(&uploads, &owner, true).await;
+        let id = input["uploadId"].as_str().unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            m.prepare(
+                vec![input.clone(), input.clone()],
+                &ReusableAttachments::new(),
+                &owner,
+                &uploads,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert!(uploads.get(&owner, id).await.unwrap().complete);
+    }
+    #[tokio::test]
+    async fn staged_commit_fences_cancel_and_preserves_the_durable_final() {
+        let (temp, uploads, m, owner) = upload_fixture();
+        let input = stage_notes(&uploads, &owner, true).await;
+        let id = input["uploadId"].as_str().unwrap().to_owned();
+        let batch = m
+            .prepare(vec![input], &ReusableAttachments::new(), &owner, &uploads)
+            .await
+            .unwrap();
+        let cancel_registry = uploads.clone();
+        let cancel_owner = owner.clone();
+        let cancel_id = id.clone();
+        let cancel =
+            tokio::spawn(async move { cancel_registry.cancel(&cancel_owner, &cancel_id).await });
+        tokio::task::yield_now().await;
+        assert!(!cancel.is_finished());
+        batch.commit();
+        cancel.await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("attachments/notes-1")).unwrap(),
+            b"notes"
+        );
+        assert_eq!(
+            uploads.get(&owner, &id).await.unwrap_err().reason,
+            UploadErrorReason::NotFound
+        );
+    }
+    #[tokio::test]
+    async fn canceled_blocking_publication_cannot_erase_a_later_adopters_final() {
+        let (temp, uploads, materializer, owner) = upload_fixture();
+        let materializer = materializer.with_forced_copy_for_test();
+        let input = stage_notes(&uploads, &owner, true).await;
+        let pause = Arc::new(super::AttachmentPrepareTestPause::default());
+        let path = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("attachments/notes-1");
+        struct ResumeOnDrop(Arc<super::AttachmentPrepareTestPause>);
+        impl Drop for ResumeOnDrop {
+            fn drop(&mut self) {
+                self.0.resume.notify_one();
+            }
+        }
+        let _resume_on_drop = ResumeOnDrop(pause.clone());
+        super::PUBLICATION_PAUSES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(path.clone(), pause.clone());
+        let first_m = materializer.clone();
+        let first_u = uploads.clone();
+        let first_o = owner.clone();
+        let first_input = input.clone();
+        let first = tokio::spawn(async move {
+            first_m
+                .prepare(
+                    vec![first_input],
+                    &ReusableAttachments::new(),
+                    &first_o,
+                    &first_u,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("publication pause reached");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        // The blocking job retains both root and upload locks until its owned
+        // final has been removed, even after its RPC future disappears.
+        assert!(materializer.root_transaction.try_lock().is_err());
+        let second_m = materializer.clone();
+        let second_u = uploads.clone();
+        let second_o = owner.clone();
+        let second = tokio::spawn(async move {
+            second_m
+                .prepare(
+                    vec![input],
+                    &ReusableAttachments::new(),
+                    &second_o,
+                    &second_u,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+        super::PUBLICATION_PAUSES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&path);
+        pause.resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), second).await;
+
+        result
+            .expect("later adopter completes after canceled publication cleanup")
+            .unwrap()
+            .unwrap()
+            .commit();
+        assert_eq!(std::fs::read(path).unwrap(), b"notes");
+    }
+    #[tokio::test]
+    async fn staged_image_admission_preserves_native_image_bytes_and_durable_metadata() {
+        let (_temp, uploads, m, owner) = upload_fixture();
+        let bytes = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN5kAAAAASUVORK5CYII=").unwrap();
+        let begun = uploads
+            .begin(
+                &owner,
+                UploadBeginInput {
+                    target: UploadTarget::ChatAttachment {
+                        attachment_type: "image".into(),
+                        name: "pixel.png".into(),
+                        mime_type: "image/png".into(),
+                    },
+                    size_bytes: bytes.len() as u64,
+                    sha256: None,
+                },
+            )
+            .await
+            .unwrap();
+        uploads
+            .append(
+                &owner,
+                UploadAppendInput {
+                    upload_id: begun.upload_id.clone(),
+                    offset: 0,
+                    data: STANDARD.encode(&bytes),
+                    sha256: Some(crate::crypto::sha256_hex(&bytes)),
+                },
+            )
+            .await
+            .unwrap();
+        let batch = m.prepare(vec![json!({"type":"image","id":"pixel-1","name":"pixel.png","mimeType":"image/png","sizeBytes":bytes.len(),"uploadId":begun.upload_id})], &ReusableAttachments::new(), &owner, &uploads).await.unwrap();
+        let prepared = batch.attachments().to_vec();
+        assert!(prepared[0].get("uploadId").is_none());
+        assert!(prepared[0].get("dataUrl").is_none());
+        batch.commit();
+        let images = m.materialize(prepared).await.unwrap();
+        assert_eq!(images[0].attachment_type, "image");
+        assert_eq!(STANDARD.decode(&images[0].base64_data).unwrap(), bytes);
+        assert_eq!(
+            uploads
+                .get(&owner, &begun.upload_id)
+                .await
+                .unwrap_err()
+                .reason,
+            UploadErrorReason::NotFound
         );
     }
 }

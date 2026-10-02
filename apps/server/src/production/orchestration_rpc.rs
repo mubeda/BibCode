@@ -33,6 +33,7 @@ use crate::{
         response_too_large_failure,
     },
     server_settings::ProviderSettingsStore,
+    transfer::staging::{UploadOwner, UploadRegistry},
     worktree_catalog::WorkspaceAvailabilityRegistry,
 };
 
@@ -66,6 +67,7 @@ pub fn register_orchestration_rpc_with_delivery(
     provider: Arc<ProviderRuntimeSupervisor>,
     settings_root: PathBuf,
     turn_delivery: Arc<TurnDeliveryService>,
+    uploads: UploadRegistry,
 ) {
     let attachments = AttachmentMaterializer::new(settings_root.join("attachments"));
     register_orchestration_rpc_inner(
@@ -76,6 +78,7 @@ pub fn register_orchestration_rpc_with_delivery(
             settings_root,
             attachments,
             turn_delivery,
+            uploads,
         }),
         None,
     );
@@ -88,6 +91,7 @@ pub fn register_orchestration_rpc_with_delivery_and_availability(
     settings_root: PathBuf,
     turn_delivery: Arc<TurnDeliveryService>,
     availability: WorkspaceAvailabilityRegistry,
+    uploads: UploadRegistry,
 ) {
     let attachments = AttachmentMaterializer::new(settings_root.join("attachments"));
     register_orchestration_rpc_inner(
@@ -98,6 +102,7 @@ pub fn register_orchestration_rpc_with_delivery_and_availability(
             settings_root,
             attachments,
             turn_delivery,
+            uploads,
         }),
         Some(availability),
     );
@@ -109,6 +114,7 @@ struct ProviderRegistration {
     settings_root: PathBuf,
     attachments: AttachmentMaterializer,
     turn_delivery: Arc<TurnDeliveryService>,
+    uploads: UploadRegistry,
 }
 
 fn register_orchestration_rpc_inner(
@@ -121,59 +127,66 @@ fn register_orchestration_rpc_inner(
     let availability = availability
         .map(|availability| WorkspaceAdmissionController::new(availability, engine.repositories()));
     let dispatch = engine.clone();
-    registry.register_unary("orchestration.dispatchCommand", move |request, _| {
-        let dispatch = dispatch.clone();
-        let provider = provider.clone();
-        let availability = availability.clone();
-        async move {
-            let payload_digest = canonical_command_digest(&request.payload)
-                .map_err(|error| invalid_request(&request.tag, error))?;
-            let command = decode_public_orchestration_command(&dispatch, request.payload)
-                .await
-                .map_err(|error| invalid_request(&request.tag, error))?;
-            let command_claim = dispatch
-                .acquire_command_admission(command.command_id())
-                .await
-                .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
-            if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
-                let workspace_admission = if let Some(availability) = &availability {
-                    Some(
-                        availability
-                            .acquire_thread(thread_id, std::iter::empty())
-                            .await
-                            .map_err(workspace_admission_error)?,
+    registry.register_unary_with_context(
+        "orchestration.dispatchCommand",
+        move |request, context, _| {
+            let dispatch = dispatch.clone();
+            let owner = UploadOwner::from_context(&context);
+            let provider = provider.clone();
+            let availability = availability.clone();
+            async move {
+                let payload_digest = canonical_command_digest(&request.payload)
+                    .map_err(|error| invalid_request(&request.tag, error))?;
+                let command = decode_public_orchestration_command(&dispatch, request.payload)
+                    .await
+                    .map_err(|error| invalid_request(&request.tag, error))?;
+                let command_claim = dispatch
+                    .acquire_command_admission(command.command_id())
+                    .await
+                    .map_err(|error| {
+                        orchestration_error("OrchestrationDispatchCommandError", error)
+                    })?;
+                if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
+                    let workspace_admission = if let Some(availability) = &availability {
+                        Some(
+                            availability
+                                .acquire_thread(thread_id, std::iter::empty())
+                                .await
+                                .map_err(workspace_admission_error)?,
+                        )
+                    } else {
+                        None
+                    };
+                    let provider = provider.ok_or_else(|| {
+                        invalid_request(
+                            &request.tag,
+                            "thread.turn.start requires durable provider delivery",
+                        )
+                    })?;
+                    return dispatch_turn_command(
+                        dispatch,
+                        provider,
+                        command,
+                        payload_digest,
+                        request.tag,
+                        workspace_admission,
+                        command_claim,
+                        &owner,
                     )
-                } else {
-                    None
-                };
-                let provider = provider.ok_or_else(|| {
-                    invalid_request(
-                        &request.tag,
-                        "thread.turn.start requires durable provider delivery",
-                    )
-                })?;
-                return dispatch_turn_command(
+                    .await;
+                }
+                dispatch_prepared_command(
                     dispatch,
                     provider,
                     command,
                     payload_digest,
                     request.tag,
-                    workspace_admission,
                     command_claim,
                 )
-                .await;
+                .await
             }
-            dispatch_prepared_command(
-                dispatch,
-                provider,
-                command,
-                payload_digest,
-                request.tag,
-                command_claim,
-            )
-            .await
-        }
-    });
+        },
+    );
 
     let replay = engine.clone();
     registry.register_unary("orchestration.replayEvents", move |request, _| {
@@ -501,6 +514,10 @@ async fn dispatch_prepared_command(
     serde_json::to_value(result).map_err(|error| invalid_request(&request_tag, error.to_string()))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Durable admission explicitly carries the workspace lease, command claim, and authenticated upload owner."
+)]
 async fn dispatch_turn_command(
     dispatch: OrchestrationEngine,
     provider: ProviderRegistration,
@@ -509,6 +526,7 @@ async fn dispatch_turn_command(
     request_tag: String,
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
     command_claim: crate::orchestration::engine::CommandAdmissionClaim,
+    owner: &UploadOwner,
 ) -> RpcResult {
     let existing_receipt = dispatch
         .repositories()
@@ -559,6 +577,7 @@ async fn dispatch_turn_command(
         request_tag.clone(),
         workspace_admission,
         command_claim.clone(),
+        owner,
     )
     .await;
     if result.is_err() {
@@ -570,6 +589,10 @@ async fn dispatch_turn_command(
     result
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Durable admission explicitly carries the workspace lease, command claim, and authenticated upload owner."
+)]
 async fn dispatch_reserved_turn_command(
     dispatch: OrchestrationEngine,
     provider: ProviderRegistration,
@@ -578,12 +601,23 @@ async fn dispatch_reserved_turn_command(
     request_tag: String,
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
     command_claim: crate::orchestration::engine::CommandAdmissionClaim,
+    owner: &UploadOwner,
 ) -> RpcResult {
     let reusable = reusable_thread_attachments(&dispatch, &command, &request_tag).await?;
-    let (mut command, prepared_batch) =
-        prepare_attachments(&provider.attachments, command, &reusable)
-            .await
-            .map_err(|error| invalid_request(&request_tag, error.to_string()))?;
+    let (mut command, prepared_batch) = prepare_attachments(
+        &provider.attachments,
+        command,
+        &reusable,
+        owner,
+        &provider.uploads,
+    )
+    .await
+    .map_err(|error| match error {
+        AttachmentMaterializationError::Upload(upload) => {
+            serde_json::to_value(upload).expect("upload error serializes")
+        }
+        other => invalid_request(&request_tag, other.to_string()),
+    })?;
     let attachment_refs = prepared_batch
         .as_ref()
         .map(|batch| batch.references().to_vec())
@@ -793,6 +827,8 @@ async fn prepare_attachments(
     attachments: &AttachmentMaterializer,
     mut command: OrchestrationCommand,
     reusable: &ReusableAttachments,
+    owner: &UploadOwner,
+    uploads: &UploadRegistry,
 ) -> Result<(OrchestrationCommand, Option<PreparedAttachmentBatch>), AttachmentMaterializationError>
 {
     if let OrchestrationCommand::ThreadTurnStart { message, .. } = &mut command {
@@ -800,7 +836,12 @@ async fn prepare_attachments(
             return Ok((command, None));
         }
         let prepared = attachments
-            .prepare(std::mem::take(&mut message.attachments), reusable)
+            .prepare(
+                std::mem::take(&mut message.attachments),
+                reusable,
+                owner,
+                uploads,
+            )
             .await?;
         message.attachments = prepared.attachments().to_vec();
         return Ok((command, Some(prepared)));
@@ -1480,6 +1521,14 @@ struct FullDiffInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_upload_registry() -> UploadRegistry {
+        UploadRegistry::new(
+            std::env::temp_dir().join(format!("bibcode-test-uploads-{}", uuid::Uuid::new_v4())),
+            crate::transfer::staging::UploadLimits::default(),
+            Arc::new(tokio::time::Instant::now),
+        )
+    }
+
     use crate::{
         RequestId, RpcExit, ServerConfig, ServerMessage, ServerRuntime,
         activity::{ActivityProjection, ActivityRepository},
@@ -2366,6 +2415,7 @@ mod tests {
         payload_digest: String,
         request_tag: String,
         workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
+        owner: &UploadOwner,
     ) -> RpcResult {
         let command_claim = engine
             .acquire_command_admission(command.command_id())
@@ -2379,6 +2429,7 @@ mod tests {
             request_tag,
             workspace_admission,
             command_claim,
+            owner,
         )
         .await
     }
@@ -2401,6 +2452,7 @@ mod tests {
                 settings_root: settings_root.clone(),
                 attachments: AttachmentMaterializer::new(settings_root.join("attachments")),
                 turn_delivery,
+                uploads: test_upload_registry(),
             },
             provider,
         )
@@ -2449,6 +2501,7 @@ mod tests {
                 digest.clone(),
                 "orchestration.dispatchCommand".into(),
                 None,
+                &UploadOwner::Unauthenticated,
             )
             .await
             .unwrap();
@@ -2511,6 +2564,7 @@ mod tests {
                 digest,
                 "orchestration.dispatchCommand".into(),
                 None,
+                &UploadOwner::Unauthenticated,
             )
             .await
             .unwrap();
@@ -2857,6 +2911,7 @@ mod tests {
             "ignored legacy digest".to_owned(),
             "orchestration.dispatchCommand".to_owned(),
             None,
+            &UploadOwner::Unauthenticated,
         )
         .await
         .expect("legacy accepted turn replays its stored result");
@@ -2871,6 +2926,7 @@ mod tests {
             "different ignored legacy digest".to_owned(),
             "orchestration.dispatchCommand".to_owned(),
             None,
+            &UploadOwner::Unauthenticated,
         )
         .await
         .expect_err("legacy rejected turn remains rejected");
@@ -2963,6 +3019,7 @@ mod tests {
                 payload_digest,
                 "orchestration.dispatchCommand".to_owned(),
                 None,
+                &UploadOwner::Unauthenticated,
             )
             .await
         });
@@ -3044,6 +3101,7 @@ mod tests {
                 first_digest,
                 "orchestration.dispatchCommand".to_owned(),
                 None,
+                &UploadOwner::Unauthenticated,
             )
             .await
         });
@@ -3062,6 +3120,7 @@ mod tests {
                 digest,
                 "orchestration.dispatchCommand".to_owned(),
                 None,
+                &UploadOwner::Unauthenticated,
             )
             .await
         });
@@ -3257,6 +3316,7 @@ mod tests {
             settings_root: state.path().to_path_buf(),
             attachments: AttachmentMaterializer::new(state.path().join("attachments")),
             turn_delivery: delivery.clone(),
+            uploads: test_upload_registry(),
         };
         let command = decode_command(json!({
             "type":"thread.meta.update",
@@ -3481,6 +3541,7 @@ mod tests {
             provider.clone(),
             state.path().to_path_buf(),
             delivery.clone(),
+            test_upload_registry(),
         );
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(state.path())
@@ -3641,6 +3702,7 @@ mod tests {
             state.path().to_path_buf(),
             delivery.clone(),
             availability.clone(),
+            test_upload_registry(),
         );
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(state.path())
@@ -4620,10 +4682,15 @@ mod tests {
                 "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
             }]}, "createdAt": CREATED_AT,
         }));
-        let (command, prepared) =
-            prepare_attachments(&attachments, command, &ReusableAttachments::new())
-                .await
-                .expect("upload prepares");
+        let (command, prepared) = prepare_attachments(
+            &attachments,
+            command,
+            &ReusableAttachments::new(),
+            &UploadOwner::Unauthenticated,
+            &test_upload_registry(),
+        )
+        .await
+        .expect("upload prepares");
         engine.dispatch(command).await.expect("turn dispatches");
         prepared.expect("attachment batch").commit();
         let snapshot = thread_snapshot(&engine, &thread_id)
@@ -4651,8 +4718,7 @@ mod tests {
                     "sizeBytes":5, "dataUrl":"data:text/plain,notes"
                 }]}, "createdAt": CREATED_AT,
             })),
-            &ReusableAttachments::new(),
-        )
+            &ReusableAttachments::new(), &UploadOwner::Unauthenticated, &test_upload_registry())
         .await
         .expect_err("malformed upload rejects before dispatch");
         assert_eq!(
@@ -5023,6 +5089,256 @@ mod tests {
         );
         cancellation.cancel();
         drop(stream);
+        engine.shutdown().await;
+    }
+    use crate::transfer::staging::{
+        UploadAppendInput, UploadBeginInput, UploadErrorReason, UploadLimits, UploadTarget,
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use std::time::Duration;
+    async fn stage_notes(uploads: &UploadRegistry, owner: &UploadOwner, complete: bool) -> Value {
+        let begun = uploads
+            .begin(
+                owner,
+                UploadBeginInput {
+                    target: UploadTarget::ChatAttachment {
+                        attachment_type: "file".into(),
+                        name: "notes.txt".into(),
+                        mime_type: "text/plain".into(),
+                    },
+                    size_bytes: 5,
+                    sha256: None,
+                },
+            )
+            .await
+            .unwrap();
+        if complete {
+            uploads
+                .append(
+                    owner,
+                    UploadAppendInput {
+                        upload_id: begun.upload_id.clone(),
+                        offset: 0,
+                        data: STANDARD.encode(b"notes"),
+                        sha256: Some(crate::crypto::sha256_hex(b"notes")),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        json!({"type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain",
+        "sizeBytes":5, "uploadId":begun.upload_id})
+    }
+    #[tokio::test]
+    async fn failed_staged_turn_retries_the_same_command_without_appending_again() {
+        let hooks = TestHooks::default();
+        let (database, engine, thread_id) = delivery_engine(hooks.clone()).await;
+        let state = tempfile::tempdir().unwrap();
+        let uploads = UploadRegistry::new(
+            state.path().join("attachment-uploads"),
+            UploadLimits::default(),
+            Arc::new(tokio::time::Instant::now),
+        );
+        let owner = UploadOwner::Session("sender".into());
+        let input = stage_notes(&uploads, &owner, true).await;
+        let upload_id = input["uploadId"].as_str().unwrap().to_owned();
+        let (sent, mut received) = tokio::sync::mpsc::channel(1);
+        let root = state.path().join("attachments");
+        let delivery = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            Arc::new(move |command| {
+                let sent = sent.clone();
+                let root = root.clone();
+                Box::pin(async move {
+                    let OrchestrationCommand::ThreadTurnStart { message, .. } = command else {
+                        panic!("expected turn start");
+                    };
+                    let images = AttachmentMaterializer::new(root)
+                        .materialize(message.attachments)
+                        .await
+                        .unwrap();
+                    sent.send(images[0].base64_data.clone()).await.unwrap();
+                    Ok(())
+                })
+            }),
+        ));
+        let (mut registration, provider) = provider_registration(
+            database,
+            &engine,
+            state.path().to_path_buf(),
+            delivery.clone(),
+        );
+        registration.uploads = uploads.clone();
+        let command = decode_command(
+            json!({"type":"thread.turn.start", "commandId":"staged-retry",
+        "threadId":thread_id, "message":{"messageId":"m-staged", "role":"user", "text":"review",
+        "attachments":[input]}, "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+        "createdAt":CREATED_AT}),
+        );
+        let digest = canonical_command_digest(&command).unwrap();
+        hooks.fail_next_projector("projection.thread-messages", Some("thread.message-sent"));
+        let failed = dispatch_turn_for_test(
+            engine.clone(),
+            registration.clone(),
+            command.clone(),
+            digest.clone(),
+            "orchestration.dispatchCommand".into(),
+            None,
+            &owner,
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(uploads.get(&owner, &upload_id).await.unwrap().complete);
+        assert!(!state.path().join("attachments/notes-1").exists());
+        assert!(received.try_recv().is_err());
+        dispatch_turn_for_test(
+            engine.clone(),
+            registration,
+            command,
+            digest,
+            "orchestration.dispatchCommand".into(),
+            None,
+            &owner,
+        )
+        .await
+        .unwrap();
+        let encoded = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(STANDARD.decode(encoded).unwrap(), b"notes");
+        assert_eq!(
+            uploads.get(&owner, &upload_id).await.unwrap_err().reason,
+            UploadErrorReason::NotFound
+        );
+        delivery.shutdown().await;
+        provider.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+    #[tokio::test]
+    async fn queued_staged_turn_binds_before_enqueue_and_keeps_only_durable_metadata() {
+        let (database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(decode_command(
+                json!({"type":"thread.session.set", "commandId":"session",
+        "threadId":thread_id, "session":{"threadId":thread_id,"status":"running",
+        "providerName":"codex","activeTurnId":null,"lastError":null,"updatedAt":CREATED_AT},
+        "createdAt":CREATED_AT}),
+            ))
+            .await
+            .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let uploads = UploadRegistry::new(
+            state.path().join("attachment-uploads"),
+            UploadLimits::default(),
+            Arc::new(tokio::time::Instant::now),
+        );
+        let owner = UploadOwner::Session("sender".into());
+        let input = stage_notes(&uploads, &owner, true).await;
+        let id = input["uploadId"].as_str().unwrap().to_owned();
+        let service = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        ));
+        service.shutdown().await; // inspect durable admission before any delivery worker
+        let (mut registration, provider) =
+            provider_registration(database, &engine, state.path().to_path_buf(), service);
+        registration.uploads = uploads.clone();
+        let command = decode_command(
+            json!({"type":"thread.turn.start","commandId":"queued-stage",
+        "threadId":thread_id,"queued":true,"message":{"messageId":"queued-stage-message",
+        "role":"user","text":"later","attachments":[input]},"createdAt":CREATED_AT}),
+        );
+        let digest = canonical_command_digest(&command).unwrap();
+        dispatch_turn_for_test(
+            engine.clone(),
+            registration,
+            command,
+            digest,
+            "orchestration.dispatchCommand".into(),
+            None,
+            &owner,
+        )
+        .await
+        .unwrap();
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("queued-stage".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, TurnDeliveryState::Queued);
+        let attachments = row.payload["message"]["attachments"].as_array().unwrap();
+        assert!(attachments[0].get("uploadId").is_none());
+        assert!(attachments[0].get("dataUrl").is_none());
+        assert_eq!(
+            uploads.get(&owner, &id).await.unwrap_err().reason,
+            UploadErrorReason::NotFound
+        );
+        let ready = AttachmentMaterializer::new(state.path().join("attachments"))
+            .materialize(attachments.clone())
+            .await
+            .unwrap();
+        assert_eq!(STANDARD.decode(&ready[0].base64_data).unwrap(), b"notes");
+        provider.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+    #[tokio::test]
+    async fn vanished_staged_dispatch_returns_typed_not_found_and_releases_the_command_claim() {
+        let (database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        let state = tempfile::tempdir().unwrap();
+        let uploads = UploadRegistry::new(
+            state.path().join("attachment-uploads"),
+            UploadLimits::default(),
+            Arc::new(tokio::time::Instant::now),
+        );
+        let owner = UploadOwner::Session("sender".into());
+        let input = stage_notes(&uploads, &owner, true).await;
+        uploads
+            .cancel(&owner, input["uploadId"].as_str().unwrap())
+            .await
+            .unwrap();
+        let service = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        ));
+        let (mut registration, provider) = provider_registration(
+            database,
+            &engine,
+            state.path().to_path_buf(),
+            service.clone(),
+        );
+        registration.uploads = uploads;
+        let command = decode_command(
+            json!({"type":"thread.turn.start","commandId":"missing-stage","threadId":thread_id,"message":{"messageId":"missing-stage-message","role":"user","text":"review","attachments":[input]},"modelSelection":{"instanceId":"codex","model":"gpt-5"},"createdAt":CREATED_AT}),
+        );
+        let digest = canonical_command_digest(&command).unwrap();
+        let error = dispatch_turn_for_test(
+            engine.clone(),
+            registration,
+            command,
+            digest,
+            "orchestration.dispatchCommand".into(),
+            None,
+            &owner,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error["_tag"], "UploadError");
+        assert_eq!(error["reason"], "not_found");
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("missing-stage".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        service.shutdown().await;
+        provider.shutdown().await.unwrap();
         engine.shutdown().await;
     }
 }
