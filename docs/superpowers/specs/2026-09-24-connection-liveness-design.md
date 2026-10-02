@@ -297,6 +297,12 @@ answering RPC `Ping`.
 
 ## Residuals
 
+The approved [staged attachment upload design](./2026-09-26-upload-liveness-design.md)
+and [combined upload implementation plan](../plans/2026-09-27-uploads-and-e2ee-transfers.md)
+address the chat-attachment case through acknowledged RPC chunks and resume.
+The original measurements and legacy-inline/editor/prompt residuals below remain
+historical evidence; this amendment does not change the transport deadlines.
+
 - The kernel send queue still delays control messages unless `TCP_NOTSENT_LOWAT` is set
   (liveness is unaffected). Links under about 2 KiB/s can still be declared dead at 30 s.
 - Requests are not split, so a large upload delays the client's Pings; the server counts inbound
