@@ -2,8 +2,12 @@
 
 This temporary QA branch adds an observation and contained fixture repair to the
 existing browser smoke. It changes no production connectivity policy. The
-reported paired HTTP/HMR-only run is consistent with the actual
-`navigator.onLine` gate, but has not established that browser value.
+earlier paired HTTP/HMR-only run suggested the actual `navigator.onLine` gate.
+Later native runs observed the browser offline. After the local-peer JSON repair,
+run `37064845388` observed the real browser transition from offline to online,
+verified the contained topology, and then timed out during pairing. That run
+closed all owned processes and retained an unchanged host-network namespace
+identity; it did not complete the upload smoke.
 
 Before navigation or pairing, the controller reads the real strict boolean from
 Chromium. Already online skips the helper and adds no network mutation. Only an
@@ -20,7 +24,7 @@ identity, foreign link/route, reserved name or unknown baseline refuses before
 mutation. Read-only baseline inspections require lo alone and no foreign IPv4
 or IPv6 main route. Six literal add-only commands create `bcup-in`/`bcup-peer`,
 assign `10.254.231.1/30` and `.2/30`, bring both up and add the sole default through
-the same-namespace peer. Postconditions require reciprocal veth indices,
+the same-namespace peer. Postconditions require reciprocal local peer names and unique indices,
 unchanged loopback identity, both carrier flags, only expected addresses plus
 kernel IPv6 link-local addresses/routes, and the contained default. No host
 bridge, namespace transfer, NAT, forwarding, replace, flush or delete operation
@@ -59,8 +63,16 @@ The failed run's provenance omitted actual ip/package/image versions. The
 maintained Ubuntu 22.04 inventory and Ubuntu source package support the corrected
 publisher shape, but do not establish that exact runtime version. The observed
 prior receipt completed six commands; it was not a zero-mutation attempt. This
-repair and fake test success still require the next actual CI online/RPC/upload
-observations. No further matrix scenarios are added here.
+repair subsequently passed the actual online/topology observations described
+above. Paired RPC, upload and the remaining live matrix still need verification.
+
+Pairing now records separate credential-issuance, navigation, token-control,
+submission and sidebar-wait phases. A failed pairing may retain only a closed
+route/readiness category, control-presence/disabled/error booleans and bounded
+counts of the existing passive primary-socket observations. It never copies
+input values, page/error text, URLs, credentials or cookies, and does not capture
+the credential form. Missing diagnostic reads remain unknown; they cannot skip
+the existing owned cleanup. Native execution of this added observation is pending.
 
 Local validation uses fake namespace/ip/browser ports, plus the existing owned
 supervisor tests. No real namespace, link, route, browser/native UI, installer,

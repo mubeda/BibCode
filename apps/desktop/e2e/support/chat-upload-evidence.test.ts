@@ -5,6 +5,7 @@ import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
 import {
   classifyQualificationFailure,
+  projectPairingObservation,
   projectQualificationProcess,
 } from "./chat-upload-evidence.ts";
 
@@ -40,6 +41,57 @@ it("retains only closed failure categories even when every error field contains 
     expect(projected.kind).toBe(kind);
     expect(JSON.stringify(projected)).not.toContain(secret);
   }
+});
+
+it("retains only closed pairing state without credentials, DOM text or URLs", () => {
+  const secret = "pairing-secret-do-not-retain";
+  const projected = projectPairingObservation({
+    route: "pair",
+    readyState: "complete",
+    tokenInputPresent: true,
+    tokenInputDisabled: false,
+    submitPresent: true,
+    submitDisabled: false,
+    errorNoticePresent: true,
+    pendingHeadingPresent: false,
+    sidebarPresent: false,
+    observerPresent: true,
+    plainSocketCreated: 1,
+    plainSocketOpened: 0,
+    credential: secret,
+    errorText: secret,
+    url: "http://localhost/pair?code=" + secret,
+  });
+  expect(projected).toEqual({
+    route: "pair",
+    readyState: "complete",
+    tokenInputPresent: true,
+    tokenInputDisabled: false,
+    submitPresent: true,
+    submitDisabled: false,
+    errorNoticePresent: true,
+    pendingHeadingPresent: false,
+    sidebarPresent: false,
+    observerPresent: true,
+    plainSocketCreated: 1,
+    plainSocketOpened: 0,
+  });
+  expect(JSON.stringify(projected)).not.toContain(secret);
+  const unknown = projectPairingObservation({
+    route: secret,
+    readyState: secret,
+    tokenInputPresent: secret,
+    plainSocketCreated: -1,
+    plainSocketOpened: 20001,
+  });
+  expect(Object.values(unknown).every((value) => value === null)).toBe(true);
+  expect(Object.values(projectPairingObservation(null)).every((value) => value === null)).toBe(
+    true,
+  );
+  expect(projectPairingObservation({ route: ["pair"], readyState: ["complete"] })).toMatchObject({
+    route: null,
+    readyState: null,
+  });
 });
 
 it("reports process exits and bounded guard refusal counts without any log text", () => {

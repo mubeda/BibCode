@@ -40,6 +40,42 @@ const ownErrors = new Map([
   ["The actual browser did not exercise staged uploads.", "staged-path-not-observed"],
 ]);
 
+/** Pairing diagnostics describe controls and lifecycle only; never copy input or page text. */
+export function projectPairingObservation(input: unknown) {
+  const source =
+    typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
+  const boolean = (key: string): boolean | null =>
+    typeof source[key] === "boolean" ? source[key] : null;
+  const count = (key: string): number | null => {
+    const value = source[key];
+    return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 20000
+      ? value
+      : null;
+  };
+  return {
+    route:
+      typeof source.route === "string" &&
+      ["pair", "root", "local-project", "other"].includes(source.route)
+        ? source.route
+        : null,
+    readyState:
+      typeof source.readyState === "string" &&
+      ["loading", "interactive", "complete"].includes(source.readyState)
+        ? source.readyState
+        : null,
+    tokenInputPresent: boolean("tokenInputPresent"),
+    tokenInputDisabled: boolean("tokenInputDisabled"),
+    submitPresent: boolean("submitPresent"),
+    submitDisabled: boolean("submitDisabled"),
+    errorNoticePresent: boolean("errorNoticePresent"),
+    pendingHeadingPresent: boolean("pendingHeadingPresent"),
+    sidebarPresent: boolean("sidebarPresent"),
+    observerPresent: boolean("observerPresent"),
+    plainSocketCreated: count("plainSocketCreated"),
+    plainSocketOpened: count("plainSocketOpened"),
+  };
+}
+
 /** Never retain messages, stack, names, stdout, stderr, request arguments or auth objects. */
 export function classifyQualificationFailure(error: unknown) {
   const source =

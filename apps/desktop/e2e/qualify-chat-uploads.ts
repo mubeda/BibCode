@@ -21,6 +21,7 @@ import { createSizedPng, instrumentCodexAttachmentLog } from "./support/chat-upl
 import { startThrottleProxy } from "../../../scripts/throttle-proxy.ts";
 import {
   classifyQualificationFailure,
+  projectPairingObservation,
   projectQualificationProcess,
 } from "./support/chat-upload-evidence.ts";
 
@@ -248,6 +249,7 @@ let browser: Awaited<ReturnType<typeof remote>> | undefined;
 let networkProof: BrowserNetworkProof | null = null;
 let onlineAfterPairFailure: boolean | null = null;
 let pairingCompleted = false;
+let pairingObservation: ReturnType<typeof projectPairingObservation> | null = null;
 let success = false;
 const cleanupFailures: Array<{
   role: string;
@@ -443,7 +445,7 @@ try {
       }),
   });
   const plain = environments[0]!;
-  phase("pair-primary");
+  phase("pair-issue-token");
   const credential = JSON.parse(
     NodeChildProcess.execFileSync(
       serverBinary,
@@ -453,10 +455,15 @@ try {
   ).credential;
   if (typeof credential !== "string" || credential.length < 8)
     throw new Error("Owned pairing command returned no credential.");
+  phase("pair-navigate");
   await b.url(webOrigin + "/pair");
+  phase("pair-wait-token");
   await b.$("#pairing-token").waitForDisplayed();
+  phase("pair-fill-token");
   await b.$("#pairing-token").setValue(credential);
+  phase("pair-submit");
   await b.$("button=Continue").click();
+  phase("pair-wait-sidebar");
   await b.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
   pairingCompleted = true;
 
@@ -545,6 +552,56 @@ try {
   success = true;
 } catch (error) {
   if (error instanceof BrowserConnectivityFailure) networkProof = error.proof;
+  if (browser && currentPhase.startsWith("pair-")) {
+    try {
+      const observed: unknown = await bounded(
+        browser.execute(() => {
+          const token = document.getElementById("pairing-token");
+          const form = token?.closest("form");
+          const submit = form?.querySelector('button[type="submit"]');
+          const transport = Reflect.get(window, "__uploadObservations") as
+            | { events?: Array<{ kind?: string; endpoint?: string; socket?: number }> }
+            | undefined;
+          const events = Array.isArray(transport?.events) ? transport.events : null;
+          const plainIds = new Set(
+            events
+              ?.filter((entry) => entry?.kind === "created" && entry.endpoint === "plain-proxy")
+              .map((entry) => entry.socket) ?? [],
+          );
+          return {
+            route:
+              location.pathname === "/pair"
+                ? "pair"
+                : location.pathname === "/"
+                  ? "root"
+                  : location.pathname.startsWith("/local/")
+                    ? "local-project"
+                    : "other",
+            readyState: document.readyState,
+            tokenInputPresent: token instanceof HTMLInputElement,
+            tokenInputDisabled: token instanceof HTMLInputElement ? token.disabled : null,
+            submitPresent: submit instanceof HTMLButtonElement,
+            submitDisabled: submit instanceof HTMLButtonElement ? submit.disabled : null,
+            errorNoticePresent: form?.querySelector(".text-destructive") !== null && form != null,
+            pendingHeadingPresent: Array.from(document.querySelectorAll("h1")).some(
+              (heading) => heading.textContent?.trim() === "Pairing with this environment",
+            ),
+            sidebarPresent:
+              document.querySelector('[data-testid="sidebar-add-project-trigger"]') !== null,
+            observerPresent: events !== null,
+            plainSocketCreated: events === null ? null : plainIds.size,
+            plainSocketOpened:
+              events?.filter((entry) => entry?.kind === "opened" && plainIds.has(entry.socket))
+                .length ?? null,
+          };
+        }),
+        2_000,
+      );
+      pairingObservation = projectPairingObservation(observed);
+    } catch {
+      /* Missing diagnostics remain unknown and cannot interrupt owned cleanup. */
+    }
+  }
   if (browser && pairingCompleted) {
     try {
       const value: unknown = await bounded(
@@ -561,6 +618,7 @@ try {
     failure: classifyQualificationFailure(error),
     networkProof,
     onlineAfterPairFailure,
+    pairingObservation,
   });
   // Only the paired, disposable fixture can produce a failure screenshot.
   // Never capture the credential form or any password/one-time-code input.
@@ -578,6 +636,7 @@ try {
         observations,
         networkProof,
         onlineAfterPairFailure,
+        pairingObservation,
       });
       const safe = await bounded(
         browser.execute(
@@ -639,6 +698,7 @@ try {
     results,
     networkProof,
     onlineAfterPairFailure,
+    pairingObservation,
     beforeCleanup,
     cleanupFailures,
     scope:
