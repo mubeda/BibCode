@@ -839,6 +839,38 @@ describe("GitManagerCreatePullRequestDialog", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("retains the reviewed GitLab draft after a safely classified launch failure", async () => {
+    h.status = status({
+      sourceControlProvider: {
+        kind: "gitlab",
+        name: "GitLab",
+        baseUrl: "https://gitlab.example.test",
+      },
+    });
+    const { onSettled } = await renderDialog();
+    await chooseTarget("release/next");
+    await setValue("git-manager-create-pr-title", "Reviewed merge request");
+    await setValue("git-manager-create-pr-body", "Keep this draft");
+    const message =
+      "Could not start glab: a required file or directory was not found (OS error 2). Check that the executable is available to this environment and that the repository folder is accessible.";
+    h.script = [
+      {
+        outcome: "failure",
+        message,
+        events: [{ ...base, kind: "action_failed", phase: null, message }],
+      },
+    ];
+    await act(async () => button("Publish and create merge request").click());
+    expect(text("create-pr-status")).toContain(message);
+    expect(input("git-manager-create-pr-head").value).toBe("feature/reviewed");
+    expect(input("git-manager-create-pr-base").value).toBe("release/next");
+    expect(input("git-manager-create-pr-title").value).toBe("Reviewed merge request");
+    expect(input("git-manager-create-pr-body").value).toBe("Keep this draft");
+    expect(button("Retry").disabled).toBe(false);
+    expect(h.runs).toHaveLength(1);
+    expect(onSettled).not.toHaveBeenCalled();
+  });
+
   it("cancels freely before starting and refuses to close while publishing", async () => {
     const { onOpenChange } = await renderDialog();
     await act(async () => button("Cancel").click());

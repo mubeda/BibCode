@@ -265,6 +265,8 @@ export const ServerTraceDiagnosticsSpanSummary = Schema.Struct({
   name: TrimmedNonEmptyString,
   count: NonNegativeInt,
   failureCount: NonNegativeInt,
+  /** Duration totals/averages include only these samples. Absent on older servers. */
+  measuredCount: Schema.optional(NonNegativeInt),
   totalDurationMs: Schema.Finite,
   averageDurationMs: Schema.Finite,
   maxDurationMs: Schema.Finite,
@@ -285,6 +287,8 @@ export const ServerTraceDiagnosticsRecentFailure = Schema.Struct({
   name: TrimmedNonEmptyString,
   cause: TrimmedNonEmptyString,
   durationMs: Schema.Finite,
+  /** False means the numeric compatibility value is not an elapsed measurement. */
+  durationMeasured: Schema.optional(Schema.Boolean),
   endedAt: Schema.DateTimeUtc,
   traceId: TrimmedNonEmptyString,
   spanId: TrimmedNonEmptyString,
@@ -294,6 +298,8 @@ export type ServerTraceDiagnosticsRecentFailure = typeof ServerTraceDiagnosticsR
 export const ServerTraceDiagnosticsSpanOccurrence = Schema.Struct({
   name: TrimmedNonEmptyString,
   durationMs: Schema.Finite,
+  /** Absent on older servers; an unmarked zero cannot establish measured timing. */
+  durationMeasured: Schema.optional(Schema.Boolean),
   endedAt: Schema.DateTimeUtc,
   traceId: TrimmedNonEmptyString,
   spanId: TrimmedNonEmptyString,

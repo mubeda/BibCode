@@ -11247,6 +11247,7 @@ fn git_error(
     argument_count: usize,
     error: ProcessError,
 ) -> GitCommandError {
+    let failure = error.safe_facts();
     let (exit_code, stdout_length, stderr_length, detail) = match error {
         ProcessError::NonZeroExit {
             exit_code,
@@ -11269,7 +11270,7 @@ fn git_error(
             None,
             "Git command output exceeded its limit.".into(),
         ),
-        other => (None, None, None, other.to_string()),
+        _ => (None, None, None, failure.message("git")),
     };
     GitCommandError {
         tag: "GitCommandError",
@@ -11277,6 +11278,7 @@ fn git_error(
         command: "git".into(),
         cwd: display_path(cwd).into(),
         diagnostics: Some(Box::new(GitCommandDiagnostics {
+            failure: Some(failure),
             argument_count: Some(argument_count),
             exit_code,
             stdout_length,
@@ -11433,6 +11435,7 @@ fn command_output_error(
         command: "git".into(),
         cwd: display_path(cwd).into(),
         diagnostics: Some(Box::new(GitCommandDiagnostics {
+            failure: None,
             argument_count: Some(argument_count),
             exit_code: Some(output.exit_code),
             stdout_length: Some(output.stdout.len()),

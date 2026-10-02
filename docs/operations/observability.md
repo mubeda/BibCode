@@ -97,10 +97,30 @@ It reports parse errors, span counts, slow spans, common failures, recent
 failures, and warning/error events. A missing file is reported explicitly as
 `trace-file-not-found`; it is not presented as a healthy empty trace.
 
+Unary failures and failed stacked Git actions record elapsed server-handler or
+action time from the monotonic clock, before diagnostic persistence. A stacked
+action records its domain failure once at the action owner; an `action_failed`
+stream event is not mistaken for a successful operation merely because it is
+carried in a normal RPC chunk. Logging failure never changes the action result.
+
+`durationMs` remains numeric for client compatibility. `durationMeasured` says
+whether an occurrence's duration was measured; untimed events and historic
+unmarked zero durations are unavailable, not verified instantaneous work.
+Unmarked positive legacy durations remain usable. Span summaries include
+`measuredCount`; only those samples contribute to totals, averages, maxima and
+slow-span rankings. Failure and occurrence counts still include untimed records.
+Diagnostics displays unavailable timing as **Not recorded**, and a measured
+positive duration below one millisecond as **<1 ms**. For an older server with no
+measurement fields, the UI treats zero occurrence durations and summary timing
+as unavailable; it can still display positive occurrence durations.
+
 RPC error details are bounded before they reach this store. Authorization
 headers, common token/password assignments, and URL credentials are redacted.
-Git failures retain bounded stderr so errors such as malformed `.gitmodules`
-entries remain actionable both in the original notification and after restart.
+Existing unary Git failures retain bounded, redacted stderr so errors such as
+malformed `.gitmodules` entries remain actionable after restart. Stacked Git
+actions record only closed process facts and fixed failure categories, without
+copying command arguments, repository paths, provider output or MR draft text
+into the new action diagnostic.
 
 Files operation failures also enter the client's frontend warning/error capture
 with their notification title and sanitized detail. Download request and save
