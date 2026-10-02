@@ -8,6 +8,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 import * as NodeURL from "node:url";
+import * as NodeCrypto from "node:crypto";
 import { parse as parseToml, type TomlTable } from "smol-toml";
 import {
   REMOTE_UPDATE_DOWNLOAD_BUDGET_MS,
@@ -51,6 +52,7 @@ export interface SeededDesktopUpgradeSmokeInput {
   readonly updaterPort: number;
   readonly wsl: boolean;
   readonly windowsDiagnostics?: boolean;
+  readonly windowsProtectedCurrent?: boolean;
   readonly workRoot: string;
 }
 
@@ -225,6 +227,7 @@ export function parseSeededDesktopUpgradeSmokeArgs(
         "work-root": { type: "string" },
         wsl: { type: "boolean", default: false },
         "windows-diagnostics": { type: "boolean", default: false },
+        "windows-protected-current": { type: "boolean", default: false },
       },
     }));
   } catch (cause) {
@@ -254,6 +257,11 @@ export function parseSeededDesktopUpgradeSmokeArgs(
   if (values["windows-diagnostics"] === true && (platform !== "win" || values.wsl === true)) {
     throw new SeededDesktopUpgradeSmokeError("Windows diagnostics require a native Windows lane.");
   }
+  if (values["windows-protected-current"] === true && values["windows-diagnostics"] !== true) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "Protected-current selection requires native Windows diagnostics.",
+    );
+  }
   const updaterPort = parsePositiveInteger(values["updater-port"], "updater-port", 43_120);
   const highestPortOffset = values.wsl === true ? 102 : 103;
   if (updaterPort + highestPortOffset > 65_535) {
@@ -281,6 +289,7 @@ export function parseSeededDesktopUpgradeSmokeArgs(
     updaterPort,
     wsl: values.wsl === true,
     windowsDiagnostics: values["windows-diagnostics"] === true,
+    windowsProtectedCurrent: values["windows-protected-current"] === true,
     workRoot: requireAbsolute(requireString(values, "work-root"), "work-root"),
   };
 }
@@ -2011,6 +2020,13 @@ export async function runSeededDesktopUpgradeSmoke(
     throw new SeededDesktopUpgradeSmokeError(
       "This packaged-upgrade harness is CI-only; it can terminate desktop applications.",
     );
+  if (
+    input.windowsProtectedCurrent &&
+    (input.platform !== "win" || !input.windowsDiagnostics || input.wsl)
+  )
+    throw new SeededDesktopUpgradeSmokeError(
+      "Protected-current selection requires native Windows diagnostics.",
+    );
   assertBaselineVersionIsOlder(input.previousVersion, input.candidateVersion);
   const runId = input.runId;
   const workRoot = await canonicalizeSeededUpgradeWorkRoot(input.workRoot);
@@ -2099,7 +2115,7 @@ export async function runSeededDesktopUpgradeSmoke(
   const requestLogPath = NodePath.join(runRoot, "updater-requests.jsonl");
   let failure: unknown;
   try {
-    if (!input.wsl) {
+    if (!input.wsl && !input.windowsProtectedCurrent) {
       await requireCommandSuccess({
         command: "git",
         args: ["worktree", "add", "--detach", layout.previousStable.checkout, input.previousTag],
@@ -2163,6 +2179,7 @@ export async function runSeededDesktopUpgradeSmoke(
         [input.previousTag, layout.previousStable],
         [currentCommit, layout.protectedBaseline],
       ] as const) {
+        if (input.windowsProtectedCurrent && baseline === layout.previousStable) continue;
         instrumentWindowsBaseline({
           repositoryRoot: input.repositoryRoot,
           checkout: baseline.checkout,
@@ -2170,6 +2187,36 @@ export async function runSeededDesktopUpgradeSmoke(
           sourceRef,
         });
       }
+    }
+
+    if (input.windowsProtectedCurrent) {
+      await writePrivateJson(
+        NodePath.join(
+          layout.protectedBaseline.evidenceDirectory,
+          "windows-selection-provenance.json",
+        ),
+        {
+          schemaVersion: 1,
+          selection: "windows-protected-current",
+          trigger: "local-bridge",
+          sourceCommit: currentCommit,
+          bridgeSha256: NodeCrypto.createHash("sha256")
+            .update(
+              NodeFS.readFileSync(
+                NodePath.join(
+                  layout.protectedBaseline.checkout,
+                  "apps/desktop/src-tauri/src/bridge.rs",
+                ),
+              ),
+            )
+            .digest("hex"),
+          baselineVersion: input.previousVersion,
+          candidateVersion: input.candidateVersion,
+          selectedLanes: ["protected-baseline"],
+          excludedLanes: ["previous-stable", "remote-install"],
+          coverageStatus: "selected-not-yet-verified",
+        },
+      );
     }
 
     await buildPackagedApplication({
@@ -2183,7 +2230,7 @@ export async function runSeededDesktopUpgradeSmoke(
       targetDirectory: layout.candidateBuildRoot,
       version: input.candidateVersion,
     });
-    if (!input.wsl) {
+    if (!input.wsl && !input.windowsProtectedCurrent) {
       await buildPackagedApplication({
         arch: input.arch,
         bundle: input.bundle,
@@ -2230,7 +2277,7 @@ export async function runSeededDesktopUpgradeSmoke(
     });
     cleanup.add("local test updater", () => terminateChild(updater));
 
-    if (!input.wsl) {
+    if (!input.wsl && !input.windowsProtectedCurrent) {
       const previousPackage = await baselinePackage(
         layout.previousStable.buildRoot,
         input.platform,
@@ -2281,7 +2328,7 @@ export async function runSeededDesktopUpgradeSmoke(
       wsl: input.wsl,
       windowsDiagnostics: input.windowsDiagnostics === true,
     });
-    if (!input.wsl) {
+    if (!input.wsl && !input.windowsProtectedCurrent) {
       let remoteApp = await installBaselinePackage({
         laneRoot: NodePath.dirname(layout.remoteInstall.dataRoot),
         packagePath: protectedPackage,

@@ -32,6 +32,32 @@ Native release reports also separate desktop-installer evidence from standalone-
 archive/package evidence. Each architecture requires its own native result; one
 architecture never proves another.
 
+### Windows protected-current upgrade diagnostic
+
+The temporary `windows_protected_current` dispatch input in
+[`desktop-upgrade-smoke.yml`](../../.github/workflows/desktop-upgrade-smoke.yml)
+selects only the native Windows diagnostic jobs. It builds the current commit
+twice: the protected baseline uses the previous version, and the candidate uses
+the candidate version. Installation uses the ordinary local desktop bridge and
+the existing protected data/workspace roots, updater, deadlines, verification,
+and cleanup. The CLI equivalent requires both `--windows-diagnostics` and
+`--windows-protected-current`; non-Windows and WSL combinations are rejected.
+Before the native trial, this selection runs `vp check`, Rust formatting, the
+full `vpr typecheck` graph, the desktop bridge contract and update tests, and
+desktop all-target Clippy with warnings denied. It builds the web assets before
+native checks and tests, uses the maintained MSVC/Cargo test launcher, and clears
+the desktop lint cache before Clippy. Each gate must pass before installation.
+
+This selection excludes the previous-release and remote-install lanes. It does
+not establish previous-release compatibility or remote RPC installation.
+`protected-baseline-windows-selection-provenance.json` records the current source
+commit, bridge hash, versions, local-bridge trigger, and selected/excluded lanes.
+Its coverage status records selection only; the ordinary lane result and retained
+version, storage identity, project, and pre-update backup checks establish a pass.
+Keep source provenance and failure evidence when the lane fails. Both dispatch
+inputs default to false; the ordinary three-lane matrix and the existing Windows
+diagnostic selection remain available unchanged.
+
 ## Living documentation and execution reports
 
 The runbooks define current procedure and supported behavior. Branch names,

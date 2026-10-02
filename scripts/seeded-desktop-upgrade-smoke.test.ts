@@ -5,11 +5,14 @@ import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeVM from "node:vm";
 import * as NodeURL from "node:url";
+import * as NodeModule from "node:module";
+import * as NodeCrypto from "node:crypto";
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import { AuthPairingLink } from "@bibcode/contracts";
 import { parse as parseToml, type TomlTable } from "smol-toml";
+import { parse as parseYaml } from "yaml";
 import {
   releasePackageFiles,
   releaseRustPackageFiles,
@@ -55,6 +58,131 @@ const absolute = (...parts: ReadonlyArray<string>): string =>
 
 const decodePairingLink = Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingLink));
 const repositoryRoot = NodeURL.fileURLToPath(new URL("..", import.meta.url));
+
+/** Run the actual orchestration body with inert host boundaries; never start a command or app. */
+const orchestrationFixture = async (
+  options: {
+    windowsProtectedCurrent?: boolean;
+    windowsDiagnostics?: boolean;
+    wsl?: boolean;
+    laneFailure?: Error;
+  } = {},
+) => {
+  const input: SeededDesktopUpgradeSmokeInput = {
+    arch: "x64",
+    artifactDirectory: absolute("evidence"),
+    bundle: "nsis",
+    candidateVersion: "0.7.3-upgrade.1",
+    platform: "win",
+    previousTag: "v0.7.2",
+    previousVersion: "0.7.2",
+    publicKeyFile: absolute("public.key"),
+    repositoryRoot: absolute("repo"),
+    restartTimeoutMs: 180_000,
+    runId: "selected",
+    updaterPort: 43120,
+    workRoot: absolute("work"),
+    wsl: options.wsl ?? false,
+    windowsDiagnostics: options.windowsDiagnostics ?? true,
+    windowsProtectedCurrent: options.windowsProtectedCurrent ?? false,
+  };
+  const layout = createSeededUpgradeRunLayout(input.workRoot, input.runId);
+  const head = "a".repeat(40);
+  const commands: string[][] = [];
+  const builds: Array<{ checkout: string; version: string }> = [];
+  const instruments: Array<{ checkout: string; sourceRef: string }> = [];
+  const lanes: Array<{ lane: string; layout: unknown; appBinaryPath: string }> = [];
+  const cleaned: string[] = [];
+  const evidence = new Map<string, unknown>();
+  const source = await NodeFS.promises.readFile(
+    new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf("export async function runSeededDesktopUpgradeSmoke(");
+  const end = source.indexOf("\nasync function main()", start);
+  if (start < 0 || end < 0) throw new Error("Upgrade orchestrator source is missing.");
+  const body = NodeModule.stripTypeScriptTypes(source.slice(start, end).replace("export ", ""));
+  const context = {
+    NodePath,
+    NodeCrypto,
+    SeededDesktopUpgradeSmokeError,
+    ManagedProcessRegistry,
+    assertBaselineVersionIsOlder,
+    assertRemoteInstallPort,
+    createSeededUpgradeRunLayout,
+    MOCK_UPDATE_LOOPBACK_HOST: "127.0.0.1",
+    process: {
+      env: {
+        CI: "true",
+        TAURI_SIGNING_PRIVATE_KEY: "private-key-sentinel",
+        TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "private-password-sentinel",
+      },
+    },
+    NodeFS: {
+      existsSync: () => false,
+      readFileSync: () => Buffer.from("candidate bridge bytes"),
+      promises: {
+        mkdir: async () => undefined,
+        readFile: async () => "public-key",
+        rm: async (path: string) => {
+          cleaned.push(path);
+        },
+      },
+    },
+    canonicalizeSeededUpgradeWorkRoot: async (path: string) => path,
+    writeBuildOverlay: async () => undefined,
+    writePrivateJson: async (path: string, value: unknown) => {
+      evidence.set(path, value);
+    },
+    runCommand: async () => ({ stdout: head }),
+    requireCommandSuccess: async ({ args }: { args: string[] }) => {
+      commands.push(args);
+    },
+    removeSeededUpgradeDependencyTree: async (path: string) => {
+      cleaned.push(path);
+    },
+    instrumentWindowsBaseline: (value: { checkout: string; sourceRef: string }) => {
+      instruments.push(value);
+    },
+    buildPackagedApplication: async (value: { checkout: string; version: string }) => {
+      builds.push(value);
+    },
+    publishCandidateUpdater: async () => undefined,
+    startMockUpdateServer: async () => ({}),
+    terminateChild: async () => {
+      cleaned.push("updater");
+    },
+    baselinePackage: async (buildRoot: string) => NodePath.join(buildRoot, "installer.exe"),
+    installBaselinePackage: async ({ laneRoot }: { laneRoot: string }) =>
+      NodePath.join(laneRoot, "installed", "bibcode-desktop.exe"),
+    runUpgradeLane: async (value: { lane: string; layout: unknown; appBinaryPath: string }) => {
+      lanes.push(value);
+      if (options.laneFailure) throw options.laneFailure;
+    },
+    stopRemoteLaneApplication: async () => {
+      cleaned.push("remote-app");
+    },
+    copyBoundedEvidence: async () => {
+      cleaned.push("evidence-copied");
+    },
+  };
+  const run = NodeVM.runInNewContext(`${body}\nrunSeededDesktopUpgradeSmoke`, context, {
+    timeout: 1_000,
+  }) as (input: SeededDesktopUpgradeSmokeInput) => Promise<void>;
+  return {
+    input,
+    layout,
+    head,
+    commands,
+    builds,
+    instruments,
+    lanes,
+    cleaned,
+    evidence,
+    run: (overrides: Partial<SeededDesktopUpgradeSmokeInput> = {}) =>
+      run({ ...input, ...overrides }),
+  };
+};
 const versionFixture = async () => {
   const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "seeded-versions-"));
   const originals = new Map(
@@ -579,6 +707,7 @@ describe("seeded packaged desktop upgrade harness", () => {
       updaterPort: 4_312,
       wsl: false,
       windowsDiagnostics: false,
+      windowsProtectedCurrent: false,
       workRoot: absolute("work"),
     });
   });
@@ -647,6 +776,150 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(() =>
       parseSeededDesktopUpgradeSmokeArgs(base.with(base.length - 1, "65433"), "/repo"),
     ).toThrow(/leave room/);
+  });
+
+  it("accepts protected-current selection only with native Windows diagnostics", () => {
+    const args = [
+      "--platform",
+      "win",
+      "--arch",
+      "x64",
+      "--bundle",
+      "nsis",
+      "--candidate-version",
+      "0.7.3",
+      "--previous-tag",
+      "v0.7.2",
+      "--previous-version",
+      "0.7.2",
+      "--public-key-file",
+      absolute("public.key"),
+      "--run-id",
+      "protected-current",
+      "--work-root",
+      absolute("work"),
+      "--artifact-dir",
+      absolute("evidence"),
+    ];
+    expect(parseSeededDesktopUpgradeSmokeArgs(args, absolute("repo")).windowsProtectedCurrent).toBe(
+      false,
+    );
+    expect(
+      parseSeededDesktopUpgradeSmokeArgs(
+        [...args, "--windows-diagnostics", "--windows-protected-current"],
+        absolute("repo"),
+      ).windowsProtectedCurrent,
+    ).toBe(true);
+    expect(() =>
+      parseSeededDesktopUpgradeSmokeArgs(
+        [...args, "--windows-protected-current"],
+        absolute("repo"),
+      ),
+    ).toThrow("native Windows diagnostics");
+    expect(() =>
+      parseSeededDesktopUpgradeSmokeArgs(
+        [...args, "--windows-diagnostics", "--windows-protected-current", "--wsl"],
+        absolute("repo"),
+      ),
+    ).toThrow("native Windows");
+    expect(() =>
+      parseSeededDesktopUpgradeSmokeArgs(
+        [
+          ...args.with(1, "mac").with(5, "dmg"),
+          "--windows-diagnostics",
+          "--windows-protected-current",
+        ],
+        absolute("repo"),
+      ),
+    ).toThrow("native Windows");
+  });
+
+  it("dispatches the protected-current opt-in only through the Windows diagnostic jobs", async () => {
+    const workflow = parseYaml(
+      await NodeFS.promises.readFile(
+        new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
+        "utf8",
+      ),
+    ) as {
+      on: { workflow_dispatch: { inputs: Record<string, { type: string; default: boolean }> } };
+      jobs: Record<string, { if: string; steps: Array<{ run?: string }> }>;
+    };
+    expect(workflow.on.workflow_dispatch.inputs.windows_protected_current).toMatchObject({
+      type: "boolean",
+      default: false,
+    });
+    for (const [event, diagnostic, protectedCurrent, expectedDiagnostic] of [
+      ["pull_request", false, false, false],
+      ["workflow_dispatch", false, false, false],
+      ["workflow_dispatch", true, false, true],
+      ["workflow_dispatch", false, true, true],
+      ["workflow_dispatch", true, true, true],
+    ] as const) {
+      const enabled = (job: string): boolean =>
+        NodeVM.runInNewContext(workflow.jobs[job]!.if.slice(3, -2), {
+          github: { event_name: event },
+          inputs: {
+            windows_diagnostics: diagnostic,
+            windows_protected_current: protectedCurrent,
+          },
+        }) as boolean;
+      expect(enabled("windows_upgrade_diagnostics")).toBe(expectedDiagnostic);
+      expect(enabled("seeded_upgrade_smoke")).toBe(!expectedDiagnostic);
+      expect(enabled("windows_wsl_upgrade_smoke")).toBe(!expectedDiagnostic);
+    }
+    const run = workflow.jobs.windows_upgrade_diagnostics!.steps.find((step) =>
+      step.run?.includes("--restart-timeout-ms"),
+    )?.run;
+    expect(run).toContain("args+=(--windows-protected-current)");
+  });
+
+  it("gates the protected-current native trial on candidate-only validation with web assets", async () => {
+    const workflow = parseYaml(
+      await NodeFS.promises.readFile(
+        new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
+        "utf8",
+      ),
+    ) as { jobs: Record<string, { steps: Array<{ name: string; if?: string; run?: string }> }> };
+    const steps = workflow.jobs.windows_upgrade_diagnostics!.steps;
+    const commands = [
+      "vp check",
+      "rustup component add rustfmt clippy",
+      "cargo fmt --all --check",
+      "vp run --filter @bibcode/web build",
+      "vpr typecheck",
+      "node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib bridge::tests::tauri_ipc_handlers_preserve_runtime_agnostic_bridge_contracts -- --exact",
+      "node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib updates::tests",
+      "node scripts/run-msvc.mjs cargo clean -p bibcode-desktop",
+      "node scripts/run-msvc.mjs cargo clippy -p bibcode-desktop --all-targets -- -D warnings",
+    ];
+    const normalize = (command: string | undefined) => command?.trim().replaceAll(/\s+/g, " ");
+    const positions = commands.map((command) => {
+      const position = steps.findIndex((step) => normalize(step.run) === command);
+      expect(position, command).toBeGreaterThan(-1);
+      const step = steps[position]!;
+      for (const enabled of [false, true]) {
+        expect(
+          NodeVM.runInNewContext(step.if!, {
+            github: { event_name: "workflow_dispatch" },
+            inputs: { windows_diagnostics: true, windows_protected_current: enabled },
+          }),
+        ).toBe(enabled);
+      }
+      expect(
+        NodeVM.runInNewContext(step.if!, {
+          github: { event_name: "pull_request" },
+          inputs: { windows_protected_current: true },
+        }),
+      ).toBe(false);
+      return position;
+    });
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
+    expect(positions[0]).toBeGreaterThan(
+      steps.findIndex((step) => step.run === "vp install --frozen-lockfile"),
+    );
+    expect(positions.at(-1)).toBeLessThan(
+      steps.findIndex((step) => step.run?.includes("--restart-timeout-ms")),
+    );
   });
 
   it("accepts WSL mode only for the supported Windows x64 target", () => {
@@ -741,6 +1014,114 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(layout.candidateCheckout).not.toBe(layout.previousStable.checkout);
     expect(layout.candidateCheckout).not.toBe(layout.protectedBaseline.checkout);
     expect(layout.updaterRoot).toBe(absolute("work", "run-17", "updater"));
+  });
+
+  it("builds and runs only the existing protected-current layout when explicitly selected", async () => {
+    const fixture = await orchestrationFixture({ windowsProtectedCurrent: true });
+    await fixture.run();
+    expect(fixture.builds.map(({ checkout, version }) => ({ checkout, version }))).toEqual([
+      { checkout: fixture.layout.candidateCheckout, version: fixture.input.candidateVersion },
+      {
+        checkout: fixture.layout.protectedBaseline.checkout,
+        version: fixture.input.previousVersion,
+      },
+    ]);
+    expect(fixture.commands.filter((args) => args[1] === "add")).toEqual([
+      ["worktree", "add", "--detach", fixture.layout.protectedBaseline.checkout, fixture.head],
+      ["worktree", "add", "--detach", fixture.layout.candidateCheckout, fixture.head],
+    ]);
+    expect(fixture.instruments).toHaveLength(1);
+    expect(fixture.instruments[0]).toMatchObject({
+      checkout: fixture.layout.protectedBaseline.checkout,
+      sourceRef: fixture.head,
+    });
+    expect(fixture.lanes).toHaveLength(1);
+    expect(fixture.lanes[0]).toMatchObject({
+      lane: "protected-baseline",
+      layout: fixture.layout.protectedBaseline,
+      backendPort: fixture.input.updaterPort + 2,
+      webdriverPort: fixture.input.updaterPort + 102,
+      restartTimeoutMs: 180_000,
+      wsl: false,
+      windowsDiagnostics: true,
+    });
+    expect(fixture.cleaned).toContain("updater");
+    expect(fixture.cleaned).toContain(fixture.layout.protectedBaseline.checkout);
+    expect(fixture.cleaned).toContain(fixture.layout.candidateCheckout);
+    expect(fixture.cleaned).not.toContain("remote-app");
+  });
+
+  it("retains safe selection provenance and owned cleanup when the protected lane fails", async () => {
+    const failure = new Error("ordinary protected lane failed");
+    const fixture = await orchestrationFixture({
+      windowsProtectedCurrent: true,
+      laneFailure: failure,
+    });
+    await expect(fixture.run()).rejects.toBe(failure);
+    const provenance = fixture.evidence.get(
+      NodePath.join(
+        fixture.layout.protectedBaseline.evidenceDirectory,
+        "windows-selection-provenance.json",
+      ),
+    );
+    expect(provenance).toEqual({
+      schemaVersion: 1,
+      selection: "windows-protected-current",
+      trigger: "local-bridge",
+      sourceCommit: fixture.head,
+      bridgeSha256: NodeCrypto.createHash("sha256").update("candidate bridge bytes").digest("hex"),
+      baselineVersion: fixture.input.previousVersion,
+      candidateVersion: fixture.input.candidateVersion,
+      selectedLanes: ["protected-baseline"],
+      excludedLanes: ["previous-stable", "remote-install"],
+      coverageStatus: "selected-not-yet-verified",
+    });
+    expect(JSON.stringify(provenance)).not.toMatch(
+      /private-key-sentinel|private-password-sentinel/,
+    );
+    expect(fixture.lanes).toHaveLength(1);
+    expect(fixture.cleaned).toEqual([
+      "evidence-copied",
+      "updater",
+      fixture.layout.candidateCheckout,
+      fixture.layout.protectedBaseline.checkout,
+      NodePath.join(
+        NodePath.dirname(fixture.layout.remoteInstall.dataRoot),
+        "remote-bootstrap.secret.json",
+      ),
+    ]);
+  });
+
+  it.each([{ platform: "linux" as const }, { windowsDiagnostics: false }, { wsl: true }])(
+    "rejects invalid direct protected-current input before host work: %j",
+    async (overrides) => {
+      const fixture = await orchestrationFixture({ windowsProtectedCurrent: true });
+      await expect(fixture.run(overrides)).rejects.toThrow("native Windows diagnostics");
+      expect(fixture.commands).toEqual([]);
+      expect(fixture.builds).toEqual([]);
+      expect(fixture.lanes).toEqual([]);
+    },
+  );
+
+  it.each([
+    { windowsDiagnostics: false, wsl: false },
+    { windowsDiagnostics: true, wsl: false },
+    { windowsDiagnostics: false, wsl: true },
+  ])("preserves ordinary and WSL orchestration when the selector is off: %j", async (options) => {
+    const fixture = await orchestrationFixture(options);
+    await fixture.run();
+    expect(fixture.lanes.map(({ lane }) => lane)).toEqual(
+      options.wsl
+        ? ["protected-baseline"]
+        : ["previous-stable", "protected-baseline", "remote-install"],
+    );
+    expect(fixture.builds.map(({ checkout }) => checkout)).toEqual([
+      fixture.layout.candidateCheckout,
+      ...(options.wsl ? [] : [fixture.layout.previousStable.checkout]),
+      fixture.layout.protectedBaseline.checkout,
+    ]);
+    expect(fixture.instruments).toHaveLength(options.windowsDiagnostics ? 2 : 0);
+    expect(fixture.evidence.size).toBe(0);
   });
 
   it("pins real checkout manifests and lock entries for every build without changing the caller", async () => {

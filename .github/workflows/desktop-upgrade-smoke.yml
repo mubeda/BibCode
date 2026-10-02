@@ -8,13 +8,17 @@ on:
         description: Collect bounded native Windows update diagnostics
         type: boolean
         default: false
+      windows_protected_current:
+        description: Run only the current-source Windows protected baseline through the local bridge
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   seeded_upgrade_smoke:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_diagnostics }}
+    if: ${{ github.event_name != 'workflow_dispatch' || !(inputs.windows_diagnostics || inputs.windows_protected_current) }}
     name: Seeded upgrade - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
@@ -86,9 +90,49 @@ jobs:
       - name: Install frozen dependencies
         run: vp install --frozen-lockfile
 
+      - name: Check protected-current candidate
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
+        run: vp check
+
+      - name: Install protected-current Rust validation components
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
+        run: rustup component add rustfmt clippy
+
+      - name: Check protected-current Rust formatting
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
+        run: cargo fmt --all --check
+
+      - name: Build protected-current web assets for native validation
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
+        run: vp run --filter @bibcode/web build
+
+      - name: Typecheck protected-current workspace
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
+        run: vpr typecheck
+
+      - name: Test protected-current desktop bridge contract
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
+        run: >
+          node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib
+          bridge::tests::tauri_ipc_handlers_preserve_runtime_agnostic_bridge_contracts -- --exact
+
+      - name: Test protected-current desktop update behavior
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
+        run: node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib updates::tests
+
+      - name: Clear protected-current desktop lint cache
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
+        run: node scripts/run-msvc.mjs cargo clean -p bibcode-desktop
+
+      - name: Lint protected-current desktop targets
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_protected_current
+        run: node scripts/run-msvc.mjs cargo clippy -p bibcode-desktop --all-targets -- -D warnings
+
       - name: Verify native Windows diagnostic fixtures
-        if: github.event_name == 'workflow_dispatch' && inputs.windows_diagnostics
-        run: vp test run scripts/lib/windows-upgrade-diagnostics.test.ts
+        if: github.event_name == 'workflow_dispatch' && (inputs.windows_diagnostics || inputs.windows_protected_current)
+        run: >
+          vp test run scripts/lib/windows-upgrade-diagnostics.test.ts
+          scripts/lib/windows-install-task.test.ts scripts/seeded-desktop-upgrade-smoke.test.ts
 
       - id: versions
         name: Resolve previous stable and isolated candidate versions
@@ -143,8 +187,11 @@ jobs:
             --artifact-dir "$RUNNER_TEMP/bibcode-seeded-upgrade/evidence"
             --updater-port 43120
             --restart-timeout-ms 180000)
-          if [[ "${{ github.event_name == 'workflow_dispatch' && inputs.windows_diagnostics }}" == "true" ]]; then
+          if [[ "${{ github.event_name == 'workflow_dispatch' && (inputs.windows_diagnostics || inputs.windows_protected_current) }}" == "true" ]]; then
             args+=(--windows-diagnostics)
+          fi
+          if [[ "${{ github.event_name == 'workflow_dispatch' && inputs.windows_protected_current }}" == "true" ]]; then
+            args+=(--windows-protected-current)
           fi
           if [[ "${{ matrix.platform }}" == "linux" ]]; then
             xvfb-run --auto-servernum "${args[@]}"
@@ -162,7 +209,7 @@ jobs:
           retention-days: 7
 
   windows_upgrade_diagnostics:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_diagnostics }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.windows_diagnostics || inputs.windows_protected_current) }}
     name: Seeded diagnostics - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
@@ -187,7 +234,7 @@ jobs:
     steps: *seeded-upgrade-steps
 
   windows_wsl_upgrade_smoke:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_diagnostics }}
+    if: ${{ github.event_name != 'workflow_dispatch' || !(inputs.windows_diagnostics || inputs.windows_protected_current) }}
     name: Seeded upgrade - Windows WSL primary
     runs-on: windows-2025
     timeout-minutes: 240
