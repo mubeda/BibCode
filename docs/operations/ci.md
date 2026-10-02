@@ -43,7 +43,7 @@ four job groups:
   cold-build baseline. The shared `scripts/run-msvc.mjs` launcher selects
   the requested MSVC architecture. After the Rust host tests,
   the Windows row alone runs
-  `vp test run apps/desktop/e2e/support/test-project.test.ts`. That step is the
+  `vp test run apps/desktop/e2e/support/test-project.test.ts apps/web/src/components/gitManager/gitManagerRepositoryAvailability.test.ts`. That step is the
   supported native proof that the generated Cursor `.cmd` shim executes through
   the Windows command processor and writes its exact action record. Simulated
   target fixture assertions on other hosts are compatibility evidence, not a
@@ -53,6 +53,11 @@ four job groups:
   Unix-only test helpers or imports that are unused on Windows fail there under
   `-D warnings` instead of surfacing only during native validation; Clippy's
   `--all-targets` pass otherwise runs on Linux alone.
+  The repository-availability contract additionally executes the generated
+  drive/UNC trust commands through native Windows PowerShell and Git, including
+  spaces, dollar signs, backticks, and typographic quotes. Every Git/home
+  configuration input is fixture-owned. Other platforms skip that native case;
+  their string assertions remain compatibility evidence.
 
 The Check and Test jobs install the Linux libraries required by Tauri. The
 native matrix installs them only on Linux and otherwise uses each platform's
