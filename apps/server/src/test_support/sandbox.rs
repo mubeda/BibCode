@@ -7,7 +7,6 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-#[cfg(unix)]
 use std::{
     ffi::OsStr,
     io::Read,
@@ -40,7 +39,9 @@ impl TestSandbox {
             .expect("test sandbox temporary root");
         Self {
             root,
-            environment: std::env::vars_os().collect(),
+            environment: std::env::vars_os()
+                .filter(|(name, _)| !super::isolated_git_config::is_git_environment_variable(name))
+                .collect(),
             active: Arc::new(AtomicUsize::new(0)),
             maximum: Arc::new(AtomicUsize::new(0)),
         }
@@ -109,7 +110,6 @@ impl TestSandbox {
             .unwrap_or_else(|| panic!("{name} executable was not found on captured PATH"))
     }
 
-    #[cfg(unix)]
     pub(crate) fn run_isolated_case(
         &self,
         case: &str,
@@ -169,7 +169,6 @@ impl TestSandbox {
         }
     }
 
-    #[cfg(unix)]
     pub(crate) fn is_isolated_case(case: &str, test_name: &str) -> bool {
         let arguments = std::env::args_os().collect::<Vec<_>>();
         std::env::var_os("BIBCODE_TEST_ISOLATED_CASE").as_deref() == Some(OsStr::new(case))

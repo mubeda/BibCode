@@ -69,6 +69,15 @@ perform real provider update checks, or use the user's HOME, shell rc files,
 or `~/.ssh`. Use test-owned executables, configuration, and temporary roots.
 Real Git may operate on disposable repositories with isolated Git configuration.
 
+`TestSandbox` removes every inherited variable with a case-insensitive `GIT_`
+prefix before applying explicit fixture environment overrides. This includes
+discovery, worktree, index, object-store, and numbered configuration variables.
+For command-based Git fixtures and isolated test re-execution, use
+`IsolatedGitConfig::apply_to_command` from `tests/support/isolated_git_config.rs`
+before adding intentional overrides; it removes inherited Git variables and
+pins the fixture's configuration. Keep the configuration fixture alive until
+the command exits. Production Git commands retain their normal inheritance.
+
 Write executable fixtures with `tests/support/executable_fixture.rs` (lib tests:
 `TestSandbox::write_executable`), never in-process `fs::write`/`fs::copy`, to prevent
 fork-inherited writable descriptors from causing `ETXTBSY`.

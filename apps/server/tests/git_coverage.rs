@@ -241,10 +241,10 @@ fn relaunch_with_isolated_git_config(test_name: &str) -> bool {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let config = IsolatedGitConfig::new();
 
-    let output = Command::new(std::env::current_exe().expect("current test executable"))
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    config.apply_to_command(&mut command);
+    let output = command
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env("GIT_CONFIG_GLOBAL", config.path())
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env(ISOLATED_GIT_TEST, "1")
         .output()
         .expect("run test with isolated Git config");
