@@ -1230,6 +1230,17 @@ Do not run destructive worktree scenarios against a user repository.
 
 ## Clone from URL network scenario
 
+Before the network-transfer checks, select a remote server and enter a Git URL
+and parent folder. Press **Browse…** beside **Parent folder** and confirm the
+browser names that server, starts at the entered folder, and lists its directories
+through that environment's connection. Choose a folder, clone, and verify the
+checkout is beneath that folder on the same server. Reopen the form and cancel
+parent browsing with both **Cancel** and **Back**; the URL and parent path must
+remain intact. Exercise loading, empty folders, permission denial, and a dropped
+server connection; confirm **Refresh** can retry and returning to the form keeps
+its input. Capture the flow in light and dark. Local/WSL native picking must still
+work, and manual parent entry must remain available.
+
 Create a disposable bare repository large enough that a clone at about
 600 KB/s takes well over 30 seconds (for example 20 MB or more of
 incompressible files). Serve it over smart HTTP (`git http-backend` behind a

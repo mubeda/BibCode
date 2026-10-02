@@ -338,6 +338,7 @@ function ParentDirectoryField({
   onChange,
   onPick,
   onKeyDown,
+  buttonLabel,
 }: {
   readonly id: string;
   readonly value: string;
@@ -348,6 +349,7 @@ function ParentDirectoryField({
   readonly onChange: (path: string) => void;
   readonly onPick: () => void;
   readonly onKeyDown?: (event: KeyboardEvent<HTMLInputElement>) => void;
+  readonly buttonLabel?: string;
 }) {
   return (
     <div className="space-y-1.5">
@@ -369,15 +371,16 @@ function ParentDirectoryField({
         />
         {canPick ? (
           <Button
-            aria-label="Choose parent folder"
+            aria-label={buttonLabel ?? "Choose parent folder"}
             className="shrink-0"
             disabled={busy}
             onClick={onPick}
-            size="icon"
+            size={buttonLabel ? "sm" : "icon"}
             title="Choose parent folder"
             variant="outline"
           >
             <FolderOpenIcon aria-hidden />
+            {buttonLabel}
           </Button>
         ) : null}
       </div>
@@ -562,6 +565,7 @@ export function AddProjectCloneStep({
         {visibleUrlError ? <ErrorMessage>{visibleUrlError}</ErrorMessage> : null}
       </div>
       <ParentDirectoryField
+        buttonLabel="Browse…"
         busy={busy}
         canPick={canPickParent}
         error={visibleParentError}
