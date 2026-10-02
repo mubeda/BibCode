@@ -137,6 +137,15 @@ directories; **Type a path instead** switches to manual entry of an absolute
 or home-relative path. Selecting a folder adds that folder as one project and
 does not scan for nested repositories.
 
+In **Clone from URL**, **Browse…** beside **Parent folder** opens the native
+picker for local and mapped WSL locations, or a directory browser on the selected
+server for remote hosts and browser clients. The browser names the server and
+starts at the entered parent folder. Choose a folder to return to the clone form;
+the repository is cloned beneath it on that same server. **Cancel** or **Back**
+keeps the Git URL and parent folder as entered. Manual path entry remains available.
+If browsing fails or the connection drops, use **Refresh** in the browser or
+return to the form; its input is retained.
+
 While a clone runs, the clone form stays open with **Cancel clone**. If the
 connection to the host drops, the clone keeps running there: the form shows
 "Lost the connection to <host>. The clone continues on the server;

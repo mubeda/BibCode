@@ -42,12 +42,17 @@ vi.mock("./add-project/useAddProjectWorkflow", async () => {
 
 vi.mock("./RemoteDirectoryBrowser", () => ({
   RemoteDirectoryBrowser: (props: {
+    readonly environmentId: string;
+    readonly initialPath: string;
     readonly secondaryAction?: { readonly label: string; readonly onClick: () => void };
     readonly selectLabel?: string;
     readonly onSelect: (path: string) => void;
     readonly onCancel?: () => void;
   }) => (
     <div>
+      <p>
+        Browsing {props.environmentId}: {props.initialPath}
+      </p>
       {props.onCancel ? (
         <button type="button" onClick={props.onCancel}>
           Cancel
@@ -187,6 +192,39 @@ afterAll(() => {
 });
 
 describe("AddProjectDialog mounted interactions", () => {
+  it("offers Browse on a remote clone form without native picking", async () => {
+    testState.workflow.step = "clone";
+    testState.workflow.canPickParent = false;
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      environmentId: EnvironmentId.make("remote-selected"),
+      label: "Build server",
+      isPrimary: false,
+    };
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+
+    await click(buttonWithText("Browse…"));
+    expect(testState.workflow.pickCloneParent).toHaveBeenCalledTimes(1);
+    expect(document.querySelector<HTMLInputElement>("#add-project-clone-parent")).not.toBeNull();
+  });
+
+  it("identifies the server and starts the parent browser at the entered clone path", async () => {
+    testState.workflow.step = "clone-parent-browse";
+    testState.workflow.cloneParent = "/srv/entered";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      environmentId: EnvironmentId.make("remote-selected"),
+      label: "Build server",
+      isPrimary: false,
+    };
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+
+    expect(document.body.textContent).toContain("Choose parent folder on Build server");
+    expect(document.body.textContent).toContain("Browsing remote-selected: /srv/entered");
+    await click(buttonWithText("Cancel"));
+    expect(testState.workflow.back).toHaveBeenCalledTimes(1);
+  });
+
   it("renders the start step and opens clone and create steps", async () => {
     await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
     expect(document.body.textContent).toContain("Add a project");

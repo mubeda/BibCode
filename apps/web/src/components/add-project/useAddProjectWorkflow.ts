@@ -285,6 +285,7 @@ export function useAddProjectWorkflowState(
   );
   const [selectedEnvironmentId, setSelectedEnvironmentId] = useState(initialHost.environmentId);
   const [step, setStep] = useState<AddProjectStep>("start");
+  const [parentBrowseGeneration, setParentBrowseGeneration] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [hostPath, setHostPathState] = useState(initialHost.baseDirectory);
   const [cloneUrl, setCloneUrlState] = useState("");
@@ -311,6 +312,7 @@ export function useAddProjectWorkflowState(
     (host: AddProjectHostOption, nextError: string | null = null) => {
       setSelectedEnvironmentId(host.environmentId);
       setStep("start");
+      setParentBrowseGeneration(null);
       setBusy(false);
       busyRef.current = false;
       setCloneProgress("idle");
@@ -444,7 +446,8 @@ export function useAddProjectWorkflowState(
     busyRef.current = false;
     setBusy(false);
     setCloneProgress("idle");
-    setStep("start");
+    setStep((previous) => (previous === "clone-parent-browse" ? "clone" : "start"));
+    setParentBrowseGeneration(null);
     setError(null);
     setNotice(null);
   }, []);
@@ -523,6 +526,21 @@ export function useAddProjectWorkflowState(
 
   const selectBrowsedFolder = useCallback(
     async (path: string) => {
+      if (step === "clone-parent-browse") {
+        if (
+          parentBrowseGeneration === null ||
+          !isCurrent(parentBrowseGeneration) ||
+          busyRef.current
+        ) {
+          return;
+        }
+        generationRef.current += 1;
+        setParentBrowseGeneration(null);
+        setCloneParentState(path);
+        setStep("clone");
+        setError(null);
+        return;
+      }
       const generation = beginAsync();
       if (generation === null) {
         return;
@@ -535,7 +553,15 @@ export function useAddProjectWorkflowState(
         }),
       );
     },
-    [beginAsync, completeOperation, input.operations, selectedHost.environmentId],
+    [
+      beginAsync,
+      completeOperation,
+      input.operations,
+      isCurrent,
+      parentBrowseGeneration,
+      selectedHost.environmentId,
+      step,
+    ],
   );
 
   const openClone = useCallback(() => {
@@ -552,6 +578,11 @@ export function useAddProjectWorkflowState(
   const pickParent = useCallback(
     async (kind: "clone" | "create") => {
       if (!shouldUseNativePicker(selectedHost)) {
+        if (kind === "clone" && openRef.current && !busyRef.current) {
+          setParentBrowseGeneration(generationRef.current);
+          setStep("clone-parent-browse");
+          setError(null);
+        }
         return;
       }
       const generation = beginAsync();
