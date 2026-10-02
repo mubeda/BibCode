@@ -1581,7 +1581,7 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
                     json!({
                         "threadId": "thread-restart",
                         "terminalId": "term-restart",
-                        "data": "exit\r\n",
+                        "data": "exit 0\r\n",
                     }),
                 )
                 .await,

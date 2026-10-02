@@ -82,6 +82,8 @@ pub(crate) struct EditorProbeEnv {
     pub home: Option<PathBuf>,
     pub flatpak_export_dirs: Vec<PathBuf>,
     pub local_app_data: Option<PathBuf>,
+    #[cfg(test)]
+    pub absolute_candidates_root: Option<PathBuf>,
 }
 
 impl EditorProbeEnv {
@@ -104,6 +106,8 @@ impl EditorProbeEnv {
             home,
             flatpak_export_dirs,
             local_app_data,
+            #[cfg(test)]
+            absolute_candidates_root: None,
         }
     }
 }
@@ -235,6 +239,12 @@ fn resolve_candidate(
                 .map(|path| (path.to_string_lossy().into_owned(), None))
         }
         EditorCandidate::Absolute(absolute) => {
+            #[cfg(test)]
+            if let Some(root) = env.absolute_candidates_root.as_ref() {
+                let path = root.join(absolute.trim_start_matches('/'));
+                return is_executable_file(&path)
+                    .then(|| (path.to_string_lossy().into_owned(), None));
+            }
             let path = Path::new(absolute);
             is_executable_file(path).then(|| ((*absolute).to_owned(), None))
         }
@@ -274,6 +284,7 @@ mod tests {
             home: None,
             flatpak_export_dirs: Vec::new(),
             local_app_data: None,
+            absolute_candidates_root: Some(path_dir.to_path_buf()),
         }
     }
 
@@ -313,6 +324,7 @@ mod tests {
             home: None,
             flatpak_export_dirs: vec![exports.clone()],
             local_app_data: None,
+            absolute_candidates_root: Some(temp.path().to_path_buf()),
         };
 
         let resolved = resolve_editor("zed", &env).expect("flatpak zed resolves");
@@ -361,11 +373,31 @@ mod tests {
             home: Some(home),
             flatpak_export_dirs: Vec::new(),
             local_app_data: None,
+            absolute_candidates_root: Some(temp.path().to_path_buf()),
         };
 
         assert_eq!(
             resolve_editor("zed", &env).unwrap().program,
             cli.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn absolute_bundle_candidate_uses_the_fixture_root_and_disappears_when_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("Applications/Zed.app/Contents/MacOS");
+        fs::create_dir_all(&bundle).unwrap();
+        let cli = executable(&bundle, "cli");
+        let mut env = env_with(temp.path());
+        env.path_entries.clear();
+        assert_eq!(
+            resolve_editor("zed", &env).unwrap().program,
+            cli.to_string_lossy()
+        );
+        fs::remove_file(cli).unwrap();
+        assert!(
+            resolve_editor("zed", &env).is_none(),
+            "a removed fixture must not fall through to the host's app bundle"
         );
     }
 

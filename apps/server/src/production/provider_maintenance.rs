@@ -962,94 +962,59 @@ mod tests {
         assert!(concurrent_requests.load(Ordering::SeqCst) >= 2);
     }
 
-    fn output_command(sandbox: &TestSandbox, bytes: usize) -> ProviderUpdateCommand {
-        if cfg!(windows) {
-            ProviderUpdateCommand {
-                display: "powershell test output".to_owned(),
-                executable: sandbox
-                    .executable_on_path("powershell.exe")
-                    .to_string_lossy()
-                    .into_owned(),
-                args: vec![
-                    "-NoProfile".to_owned(),
-                    "-NonInteractive".to_owned(),
-                    "-Command".to_owned(),
-                    format!("[Console]::Out.Write('x' * {bytes})"),
-                ],
-                lock_key: "test-output",
-            }
+    fn update_command_fixture(
+        sandbox: &TestSandbox,
+        name: &'static str,
+        script: String,
+    ) -> ProviderUpdateCommand {
+        let executable = sandbox.path(if cfg!(windows) {
+            format!("{name}.cmd")
         } else {
-            ProviderUpdateCommand {
-                display: "sh test output".to_owned(),
-                executable: sandbox
-                    .executable_on_path("sh")
-                    .to_string_lossy()
-                    .into_owned(),
-                args: vec![
-                    "-c".to_owned(),
-                    format!("head -c {bytes} /dev/zero | tr '\\0' x"),
-                ],
-                lock_key: "test-output",
-            }
+            name.to_owned()
+        });
+        crate::test_support::executable_fixture::write_executable(&executable, script);
+        ProviderUpdateCommand {
+            display: name.to_owned(),
+            executable: executable.display().to_string(),
+            args: vec![],
+            lock_key: name,
         }
+    }
+
+    fn output_command(sandbox: &TestSandbox, bytes: usize) -> ProviderUpdateCommand {
+        let script = if cfg!(windows) {
+            format!(
+                "@echo off\r\n\"{}\" -NoProfile -NonInteractive -Command \"[Console]::Out.Write('x' * {bytes})\"\r\nexit /b %ERRORLEVEL%\r\n",
+                sandbox.executable_on_path("powershell.exe").display()
+            )
+        } else {
+            format!("#!/bin/sh\nhead -c {bytes} /dev/zero | tr '\\0' x\n")
+        };
+        update_command_fixture(sandbox, "test-output", script)
     }
 
     fn exit_command(sandbox: &TestSandbox, code: i32) -> ProviderUpdateCommand {
-        if cfg!(windows) {
-            ProviderUpdateCommand {
-                display: format!("powershell exit {code}"),
-                executable: sandbox
-                    .executable_on_path("powershell.exe")
-                    .to_string_lossy()
-                    .into_owned(),
-                args: vec![
-                    "-NoProfile".to_owned(),
-                    "-NonInteractive".to_owned(),
-                    "-Command".to_owned(),
-                    format!("exit {code}"),
-                ],
-                lock_key: "test-exit",
-            }
+        let script = if cfg!(windows) {
+            format!("@exit /b {code}\r\n")
         } else {
-            ProviderUpdateCommand {
-                display: format!("sh exit {code}"),
-                executable: sandbox
-                    .executable_on_path("sh")
-                    .to_string_lossy()
-                    .into_owned(),
-                args: vec!["-c".to_owned(), format!("exit {code}")],
-                lock_key: "test-exit",
-            }
-        }
+            format!("#!/bin/sh\nexit {code}\n")
+        };
+        update_command_fixture(sandbox, "test-exit", script)
     }
 
     fn sleep_command(sandbox: &TestSandbox) -> ProviderUpdateCommand {
-        if cfg!(windows) {
-            ProviderUpdateCommand {
-                display: "powershell sleep".to_owned(),
-                executable: sandbox
-                    .executable_on_path("powershell.exe")
-                    .to_string_lossy()
-                    .into_owned(),
-                args: vec![
-                    "-NoProfile".to_owned(),
-                    "-NonInteractive".to_owned(),
-                    "-Command".to_owned(),
-                    "Start-Sleep -Seconds 2".to_owned(),
-                ],
-                lock_key: "test-sleep",
-            }
+        let script = if cfg!(windows) {
+            format!(
+                "@echo off\r\n\"{}\" -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2\"\r\nexit /b %ERRORLEVEL%\r\n",
+                sandbox.executable_on_path("powershell.exe").display()
+            )
         } else {
-            ProviderUpdateCommand {
-                display: "sleep 2".to_owned(),
-                executable: sandbox
-                    .executable_on_path("sleep")
-                    .to_string_lossy()
-                    .into_owned(),
-                args: vec!["2".to_owned()],
-                lock_key: "test-sleep",
-            }
-        }
+            format!(
+                "#!/bin/sh\nexec '{}' 2\n",
+                sandbox.executable_on_path("sleep").display()
+            )
+        };
+        update_command_fixture(sandbox, "test-sleep", script)
     }
 
     #[tokio::test]

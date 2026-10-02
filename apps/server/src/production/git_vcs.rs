@@ -4187,6 +4187,7 @@ mod tests {
             home: None,
             flatpak_export_dirs: Vec::new(),
             local_app_data: None,
+            absolute_candidates_root: None,
         };
         let error = open_in_editor_with(
             json!({
@@ -6222,6 +6223,7 @@ esac
                 home: None,
                 flatpak_export_dirs: Vec::new(),
                 local_app_data: None,
+                absolute_candidates_root: None,
             };
             open_in_editor_with(
                 json!({ "cwd": capture, "editor": "file-manager" }),
@@ -6280,6 +6282,7 @@ esac
                 home: None,
                 flatpak_export_dirs: Vec::new(),
                 local_app_data: None,
+                absolute_candidates_root: None,
             };
             let error = open_in_editor_with(
                 json!({ "cwd": "/repo", "editor": "file-manager" }),
@@ -6394,6 +6397,7 @@ esac
             home: None,
             flatpak_export_dirs: Vec::new(),
             local_app_data: None,
+            absolute_candidates_root: None,
         };
         let captured = std::sync::Mutex::new(None);
         let result = open_in_editor_with(
@@ -6429,6 +6433,7 @@ esac
             home: None,
             flatpak_export_dirs: vec![exports],
             local_app_data: None,
+            absolute_candidates_root: None,
         }
     }
 
@@ -6504,6 +6509,7 @@ esac
             home: None,
             flatpak_export_dirs: Vec::new(),
             local_app_data: None,
+            absolute_candidates_root: None,
         };
         let error =
             open_in_editor_with(json!({ "cwd": "/repo", "editor": "vscode" }), &env, |_| {

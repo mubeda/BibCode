@@ -1855,6 +1855,16 @@ impl CodexCapabilityProbeRunner for SystemCodexCapabilityProbeRunner {
     ) -> Pin<Box<dyn Future<Output = Result<CodexProbeOutput, String>> + Send + '_>> {
         let executable = executable.to_path_buf();
         Box::pin(async move {
+            #[cfg(feature = "hermetic-test-guard")]
+            let executable = crate::hermetic_guard::checked_provider_executable(
+                &executable,
+                std::env::current_dir().ok().as_deref(),
+                std::env::var_os("PATH").as_deref(),
+            )
+            .ok_or_else(|| {
+                "probe executable was not found or was refused by the hermetic test guard"
+                    .to_owned()
+            })?;
             let mut command = tokio::process::Command::new(executable);
             command
                 .args(args)
@@ -2030,6 +2040,27 @@ impl SystemCodexHelperLauncher {
 impl CodexHelperLauncher for SystemCodexHelperLauncher {
     fn start(&self, launch: CodexHelperLaunch) -> CodexHelperStartFuture<'_> {
         Box::pin(async move {
+            #[cfg(feature = "hermetic-test-guard")]
+            let launch = {
+                let mut launch = launch;
+                let search_path =
+                    crate::production::provider_runtime::effective_provider_search_path(
+                        launch.env.iter().map(|(name, value)| {
+                            (std::ffi::OsStr::new(name), std::ffi::OsStr::new(value))
+                        }),
+                    );
+                let executable = crate::hermetic_guard::checked_provider_executable(
+                    Path::new(&launch.executable),
+                    Some(&launch.cwd),
+                    search_path.as_deref(),
+                )
+                .ok_or_else(|| {
+                    "failed to start Codex App Server helper: executable was not found or was refused by the hermetic test guard"
+                        .to_owned()
+                })?;
+                launch.executable = executable.to_string_lossy().into_owned();
+                launch
+            };
             let supervisor = SYSTEM_CODEX_HELPER_SUPERVISOR
                 .wait_ready()
                 .await
@@ -2725,6 +2756,38 @@ impl CodexRemoteClient for SystemCodexRemoteClient {
 mod tests {
     use super::*;
     use crate::test_support::{FixtureEvent, TestSandbox};
+
+    #[cfg(feature = "hermetic-test-guard")]
+    #[tokio::test]
+    async fn hermetic_guard_refuses_direct_codex_probe_and_helper_before_spawn() {
+        let Some(executable) = crate::hermetic_guard::refusal_fixture(
+            "provider_terminal::codex::tests::hermetic_guard_refuses_direct_codex_probe_and_helper_before_spawn",
+            "2.1.220",
+        ) else {
+            return;
+        };
+        assert!(
+            SystemCodexCapabilityProbeRunner::default()
+                .run(&executable, vec![])
+                .await
+                .is_err()
+        );
+        let launch = CodexHelperLaunch {
+            executable: executable.display().to_string(),
+            args: vec![],
+            cwd: executable.parent().unwrap().to_path_buf(),
+            env: BTreeMap::new(),
+            endpoint: "unused".to_owned(),
+            socket_path: executable.with_extension("socket"),
+            process_attribution: ProcessAttributionRegistry::new(),
+        };
+        assert!(
+            SystemCodexHelperLauncher::default()
+                .start(launch)
+                .await
+                .is_err()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
