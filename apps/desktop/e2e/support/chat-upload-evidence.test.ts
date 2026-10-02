@@ -58,13 +58,13 @@ it("reports process exits and bounded guard refusal counts without any log text"
     NodeFS.writeFileSync(path, "x".repeat(200_000));
     expect(
       projectQualificationProcess({
-        role: "web",
+        role: "driver",
         exitCode: 2,
         signal: null,
         spawnFailure: null,
         log: path,
       }),
-    ).toMatchObject({ logBytesScanned: 65536, logTruncated: true, exitCode: 2 });
+    ).toMatchObject({ role: "driver", logBytesScanned: 65536, logTruncated: true, exitCode: 2 });
   } finally {
     NodeFS.rmSync(root, { recursive: true, force: true });
   }

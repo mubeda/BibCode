@@ -104,7 +104,7 @@ export function projectQualificationProcess(input: {
     /* Missing log evidence stays explicitly unavailable. */
   }
   return {
-    role: ["plain", "noise", "web"].includes(input.role) ? input.role : "unknown",
+    role: ["plain", "noise", "web", "driver"].includes(input.role) ? input.role : "unknown",
     exitCode: input.exitCode,
     signal: input.signal !== null && signals.has(input.signal) ? input.signal : null,
     spawnFailure: input.spawnFailure,

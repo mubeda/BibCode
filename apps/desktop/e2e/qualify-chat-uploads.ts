@@ -313,34 +313,65 @@ try {
       return false;
     }
   });
-  phase("launch-browser");
-  // The pinned WDIO launcher explicitly consumes these driver flags even though
-  // its public DriverOptions type currently lists only common fields.
-  const driverOptions = { binary: driver, allowedIps: ["127.0.0.1"], allowedOrigins: [webOrigin] };
-  browser = await remote({
-    logLevel: "silent",
-    connectionRetryCount: 0,
-    connectionRetryTimeout: 30_000,
-    waitforTimeout: 30_000,
-    capabilities: {
-      browserName: "chrome",
-      webSocketUrl: false,
-      "goog:chromeOptions": {
-        binary: chrome,
-        args: [
-          "--headless=new",
-          "--disable-dev-shm-usage",
-          "--no-first-run",
-          "--no-default-browser-check",
-          "--disable-background-networking",
-          "--disable-component-update",
-          "--window-size=1280,960",
-          "--user-data-dir=" + NodePath.join(fixtureRoot, "browser-profile"),
-        ],
-      },
-      "wdio:chromedriverOptions": driverOptions,
-    },
+  phase("start-browser-driver");
+  // Own the driver before session creation so a failed handshake cannot leave
+  // its process outside the harness's joined cleanup.
+  spawn(
+    driver,
+    ["--port=4915", "--allowed-ips=127.0.0.1", "--allowed-origins=" + webOrigin],
+    process.env,
+    "driver",
+  );
+  await until(async () => {
+    try {
+      const response = await fetch("http://127.0.0.1:4915/status", {
+        signal: AbortSignal.timeout(1000),
+      });
+      if (!response.ok) return false;
+      const status = (await response.json()) as { value?: { ready?: boolean } };
+      return status.value?.ready === true;
+    } catch {
+      return false;
+    }
   });
+  phase("launch-browser");
+  browser = await bounded(
+    remote({
+      hostname: "127.0.0.1",
+      port: 4915,
+      path: "/",
+      logLevel: "silent",
+      connectionRetryCount: 0,
+      connectionRetryTimeout: 30_000,
+      waitforTimeout: 30_000,
+      // WDIO 9's explicit length is rejected by Node 26's dispatcher adapter.
+      // Let fetch compute the length from the unchanged request body.
+      transformRequest: (options) => {
+        const headers = new Headers(options.headers);
+        headers.delete("Content-Length");
+        return { ...options, headers };
+      },
+      capabilities: {
+        browserName: "chrome",
+        webSocketUrl: false,
+        "wdio:enforceWebDriverClassic": true,
+        "goog:chromeOptions": {
+          binary: chrome,
+          args: [
+            "--headless=new",
+            "--disable-dev-shm-usage",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--window-size=1280,960",
+            "--user-data-dir=" + NodePath.join(fixtureRoot, "browser-profile"),
+          ],
+        },
+      },
+    }),
+    45_000,
+  );
   const b = browser;
   phase("install-browser-observer");
   await b.sendCommandAndGetResult("Page.addScriptToEvaluateOnNewDocument", {

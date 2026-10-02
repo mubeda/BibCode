@@ -163,7 +163,9 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
             process = subprocess.Popen([node, 'apps/desktop/e2e/qualify-chat-uploads.ts'],
                                        env=environment, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
-            status = process.wait(timeout=3600)
+            # This branch runs only the small-image smoke. Slow-link matrix
+            # runs need their own explicit budget after this short loop works.
+            status = process.wait(timeout=600)
     finally:
         observed = namespace_children()
         for number in [signal.SIGTERM, signal.SIGKILL]:
@@ -272,7 +274,7 @@ def outer():
                '--fork', '--kill-child', sys.executable, __file__, 'inner', str(evidence), str(fixture),
                node, server, programs['google-chrome'], programs['chromedriver'], programs['git'], programs['dirname'],
                namespace, os.environ['GITHUB_SHA']]
-    result, _ = run_owned_command(command, timeout=3660, grace=15)
+    result, _ = run_owned_command(command, timeout=660, grace=15)
     result['hostNetworkNamespaceUnchanged'] = os.readlink('/proc/self/ns/net') == namespace
     write_json(evidence / 'supervisor.json', result)
     print(json.dumps({'exitCode': result['exitCode'], 'evidence': str(evidence),
