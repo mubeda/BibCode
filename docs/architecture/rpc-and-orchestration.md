@@ -197,6 +197,17 @@ Readiness failure, watcher loss, overflow, or unavailable delivery preserves the
 subscription in sticky fallback health. An ordinary later event cannot mark it
 healthy.
 
+When a local or full status observation, including a new subscription's snapshot,
+sees a previously unavailable repository become available, its active lifecycle
+reattaches automatic fetch if it has no fetch identity. One owned common-directory
+resolution runs at a time; rapid break/repair observations coalesce into a trailing
+resolution of the latest available state. Resolution and publication cross the
+same mutation epoch fence as status reads, so a retired read waits for settlement
+and resolves again. Publication verifies the lifecycle and attaches only its
+current subscribers to the shared physical-repository fetch owner. Final release
+and shutdown cancel and drain that owned work. Healthy unchanged observations and
+already attached lifecycles perform no additional attachment discovery.
+
 Working-tree and metadata signals use a 125 ms trailing debounce. A signal that
 arrives during a physical local read retains exactly one trailing read. Explicit
 mutation and workspace invalidations bypass that debounce, as do structured
