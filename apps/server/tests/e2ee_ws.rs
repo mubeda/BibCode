@@ -1377,3 +1377,125 @@ async fn interleave_v1_is_confirmed_only_when_the_client_lists_it() {
         "no features without the request: {reply}"
     );
 }
+
+async fn upload_rpc(
+    socket: &mut TestSocket,
+    transport: &mut TransportState,
+    id: &str,
+    method: &str,
+    payload: Value,
+) -> Value {
+    send_encrypted(
+        socket,
+        transport,
+        json!({"_tag":"Request","id":id,"tag":method,"payload":payload,"headers":[]})
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    loop {
+        let response = recv_encrypted_json(socket, transport).await;
+        if response["requestId"] == id {
+            return response;
+        }
+    }
+}
+#[tokio::test]
+async fn authenticated_staged_upload_ownership_survives_reconnect_and_refuses_foreign_access() {
+    let _permit = TEST_PERMIT.acquire().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let handle = start_server(&temp).await;
+    let client = Client::new();
+    // The startup grant is single-use. Exchange it once, then mint distinct
+    // pairing grants so these sockets represent genuinely different principals.
+    let admin = exchange_plain_token(
+        &client,
+        &handle,
+        &handle.startup_access().unwrap().credential,
+    )
+    .await;
+    let mut credentials = Vec::new();
+    for label in ["upload owner", "foreign uploader"] {
+        let response = client
+            .post(http_url(&handle, "/api/auth/pairing-token"))
+            .bearer_auth(&admin)
+            .json(&json!({"label":label}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let grant = response.json::<Value>().await.unwrap()["credential"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        credentials.push(mint_e2ee_credential(&handle, temp.path(), &grant).await);
+    }
+    let host_key = read_host_public_key(temp.path());
+    let (mut first, mut first_transport, reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
+    assert_eq!(reply["type"], "e2ee_authenticated");
+    let begun = upload_rpc(&mut first, &mut first_transport, "1", "uploads.begin", json!({"target":{"_tag":"chat-attachment","type":"file","name":"notes.txt","mimeType":"text/plain"},"sizeBytes":3})).await;
+    assert_eq!(begun["exit"]["_tag"], "Success", "{begun}");
+    let id = begun["exit"]["value"]["uploadId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    first.close(None).await.unwrap();
+    let (mut foreign, mut foreign_transport, _) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[1]).await;
+    for (method, payload) in [
+        ("uploads.get", json!({"uploadId":id})),
+        (
+            "uploads.append",
+            json!({"uploadId":id,"offset":0,"data":"YWJj"}),
+        ),
+    ] {
+        let denied = upload_rpc(&mut foreign, &mut foreign_transport, "3", method, payload).await;
+        assert_eq!(denied["exit"]["_tag"], "Failure", "{denied}");
+        assert_eq!(denied["exit"]["cause"][0]["error"]["_tag"], "UploadError");
+        assert_eq!(denied["exit"]["cause"][0]["error"]["reason"], "not_found");
+    }
+    let cancel = upload_rpc(
+        &mut foreign,
+        &mut foreign_transport,
+        "4",
+        "uploads.cancel",
+        json!({"uploadId":id}),
+    )
+    .await;
+    assert_eq!(cancel["exit"]["value"], json!({}));
+    let (mut owner, mut owner_transport, _) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
+    let status = upload_rpc(
+        &mut owner,
+        &mut owner_transport,
+        "5",
+        "uploads.get",
+        json!({"uploadId":id}),
+    )
+    .await;
+    assert_eq!(status["exit"]["value"]["receivedBytes"], 0);
+    let appended = upload_rpc(&mut owner, &mut owner_transport, "6", "uploads.append", json!({"uploadId":id,"offset":0,"data":"YWJj","sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"})).await;
+    assert_eq!(appended["exit"]["value"]["receivedBytes"], 3, "{appended}");
+    let status = upload_rpc(
+        &mut owner,
+        &mut owner_transport,
+        "7",
+        "uploads.get",
+        json!({"uploadId":id}),
+    )
+    .await;
+    assert_eq!(status["exit"]["value"]["complete"], true);
+    upload_rpc(
+        &mut owner,
+        &mut owner_transport,
+        "8",
+        "uploads.cancel",
+        json!({"uploadId":id}),
+    )
+    .await;
+    owner.close(None).await.unwrap();
+    foreign.close(None).await.unwrap();
+    handle.shutdown();
+    handle.join().await.unwrap();
+}

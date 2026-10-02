@@ -8,6 +8,7 @@ use crate::signed_token;
 use crate::workspace::WorkspaceError;
 
 pub mod archive;
+pub mod staging;
 pub mod upload;
 
 /// How long an issued transfer token remains valid.
