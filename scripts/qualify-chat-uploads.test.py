@@ -1,5 +1,7 @@
 """Real-process supervisor tests; no namespace, installer, or UI execution."""
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -19,6 +21,18 @@ spec.loader.exec_module(qualification)
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_preflight_cancellation_does_not_start_another_owned_probe(self):
+        cancelled = {'exitCode': 143, 'timedOut': False, 'cancelledSignal': signal.SIGTERM, 'supervisorReaped': True}
+        succeeded = {'exitCode': 0, 'timedOut': False, 'cancelledSignal': None, 'supervisorReaped': True}
+        with mock.patch.object(qualification, 'host_programs', return_value={'unshare': '/unshare', 'ip': '/ip'}), \
+             mock.patch.object(qualification.subprocess, 'check_output', return_value='--keep-caps'), \
+             mock.patch.object(qualification.os, 'readlink', return_value='net:[owned-test-host]'), \
+             mock.patch.object(qualification, 'run_owned_command', side_effect=[(cancelled, b''), (succeeded, b'')]) as run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = qualification.preflight()
+        self.assertEqual(result, 143)
+        self.assertEqual(run.call_count, 1)
+
     def test_actual_generated_provider_enters_app_server_under_restricted_path(self):
         node = qualification.resolve_node_runtime()
         helper = SOURCE.parent.parent / 'apps/desktop/e2e/support/test-project.ts'

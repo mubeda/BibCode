@@ -203,16 +203,55 @@ def host_programs():
 
 def preflight():
     programs = host_programs()
+    help_text = subprocess.check_output([programs['unshare'], '--help'], text=True, timeout=5)
+    if '--keep-caps' not in help_text:
+        raise RuntimeError('The runner unshare does not support preserving its own user-namespace capabilities')
     old_namespace = os.readlink('/proc/self/ns/net')
-    code = ('import os,subprocess,json,sys; '
-            'assert os.getpid()==1; assert os.readlink("/proc/self/ns/net")!=sys.argv[1]; '
-            'subprocess.run([sys.argv[2],"link","set","lo","up"],check=True,timeout=5); '
-            'assert json.loads(subprocess.check_output([sys.argv[2],"-j","route","show","default"],text=True,timeout=5))==[]')
-    command = [programs['unshare'], '--user', '--map-current-user', '--net', '--pid', '--mount-proc',
-               '--fork', '--kill-child', sys.executable, '-c', code, old_namespace, programs['ip']]
-    result, _ = run_owned_command(command, timeout=15, grace=5)
-    print(json.dumps({'phase': 'namespace-preflight', **result}))
-    return result['exitCode']
+    code = """
+import os,subprocess,json,sys
+from pathlib import Path
+result = {'pid1': os.getpid() == 1, 'privateNamespace': os.readlink('/proc/self/ns/net') != sys.argv[1], 'uid': os.geteuid()}
+cap = next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('CapEff:'))
+result['netAdminBeforeExec'] = bool(int(cap, 16) & (1 << 12))
+if not result['pid1'] or not result['privateNamespace']:
+    print(json.dumps(result)); sys.exit(1)
+link = subprocess.run([sys.argv[2], 'link', 'set', 'lo', 'up'], capture_output=True, text=True, timeout=5)
+result['loopbackExit'] = link.returncode
+result['loopbackPermissionDenied'] = 'Operation not permitted' in link.stderr
+if link.returncode != 0:
+    print(json.dumps(result)); sys.exit(1)
+routes = subprocess.check_output([sys.argv[2], '-j', 'route', 'show', 'default'], text=True, timeout=5)
+result['noDefaultRoute'] = json.loads(routes) == []
+print(json.dumps(result)); sys.exit(0 if result['noDefaultRoute'] else 1)
+"""
+    records = []
+    for keep in [False, True]:
+        command = [programs['unshare'], '--user', '--map-current-user']
+        if keep:
+            command.append('--keep-caps')
+        command += ['--net', '--pid', '--mount-proc', '--fork', '--kill-child', sys.executable,
+                    '-c', code, old_namespace, programs['ip']]
+        result, output = run_owned_command(command, timeout=15, grace=5)
+        observation = None
+        for line in output.decode('utf8', errors='replace').splitlines():
+            try:
+                candidate = json.loads(line)
+                if isinstance(candidate, dict) and isinstance(candidate.get('pid1'), bool):
+                    observation = {key: value for key, value in candidate.items()
+                                   if key in ['pid1', 'privateNamespace', 'uid', 'netAdminBeforeExec',
+                                              'loopbackExit', 'loopbackPermissionDenied', 'noDefaultRoute']
+                                   and isinstance(value, (bool, int))}
+            except (ValueError, TypeError):
+                pass
+        record = {'phase': 'namespace-preflight', 'keepUserNamespaceCapabilities': keep,
+                  **result, 'observation': observation,
+                  'unsharePermissionDenied': b'unshare failed: Operation not permitted' in output}
+        records.append(record)
+        print(json.dumps(record))
+        if result['cancelledSignal'] is not None or result['timedOut'] or not result['supervisorReaped']:
+            return result['exitCode'] or 1
+    # Actual qualification uses the observed preserving configuration below.
+    return records[-1]['exitCode']
 
 
 def outer():
@@ -229,7 +268,7 @@ def outer():
                 for name, path in programs.items() if name in ['google-chrome', 'chromedriver']}
     write_json(evidence / 'provenance.json', {'source': os.environ['GITHUB_SHA'], 'versions': versions,
                                              'fixtureRoot': str(fixture), 'guardMode': 'default Abort'})
-    command = [programs['unshare'], '--user', '--map-current-user', '--net', '--pid', '--mount-proc',
+    command = [programs['unshare'], '--user', '--map-current-user', '--keep-caps', '--net', '--pid', '--mount-proc',
                '--fork', '--kill-child', sys.executable, __file__, 'inner', str(evidence), str(fixture),
                node, server, programs['google-chrome'], programs['chromedriver'], programs['git'], programs['dirname'],
                namespace, os.environ['GITHUB_SHA']]
