@@ -30,6 +30,22 @@ export type SeededUpgradeArch = "arm64" | "x64";
 export type SeededUpgradeLane = "previous-stable" | "protected-baseline" | "remote-install";
 export type SeededUpgradeTrigger = "local-bridge" | "remote-rpc";
 
+const credentialFailureMilestones = [
+  "credential-wide-bootstrap-read-failed",
+  "credential-loopback-bootstrap-read-failed",
+  "credential-wide-bootstrap-unavailable",
+  "credential-loopback-bootstrap-unavailable",
+  "credential-wide-bearer-failed",
+  "credential-wide-request-failed",
+  "credential-wide-request-aborted",
+  "credential-wide-http-401",
+  "credential-wide-http-403",
+  "credential-wide-http-other",
+  "credential-wide-body-invalid",
+  "credential-wide-list-invalid",
+  "credential-wide-grant-deadline",
+] as const;
+
 const seededStepMilestones = [
   "spec-loaded",
   "test-entered",
@@ -40,7 +56,11 @@ const seededStepMilestones = [
   "baseline-verified",
   "sharing-started",
   "sharing-finished",
-  "credential-request-started",
+  "credential-wide-request-started",
+  "credential-loopback-request-started",
+  "credential-wide-result-invalid",
+  "credential-loopback-result-invalid",
+  ...credentialFailureMilestones,
   "credential-request-returned",
   "credential-receipt-published",
 ] as const;
@@ -848,12 +868,21 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
       widened = generated;
     } catch { widened = false; }
     publishStep("sharing-finished");
-    publishStep("credential-request-started");
-    const credentials = await browser.execute(async (widened) => {
-      const bootstrap = window.desktopBridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary");
-      if (!bootstrap?.httpBaseUrl || !bootstrap.bootstrapToken) throw new Error("Remote verification bootstrap unavailable.");
+    publishStep(widened ? "credential-wide-request-started" : "credential-loopback-request-started");
+    const credentialResult = await browser.execute(async (widened) => {
+      const refuse = (stage) => ({
+        _tag: "seeded-credential-failure",
+        milestone: (widened ? "credential-wide-" : "credential-loopback-") + stage,
+      });
+      let bootstrap;
+      try {
+        bootstrap = window.desktopBridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary");
+      } catch { return refuse("bootstrap-read-failed"); }
+      if (!bootstrap?.httpBaseUrl || !bootstrap.bootstrapToken) return refuse("bootstrap-unavailable");
       if (widened) {
-        const bearer = await window.desktopBridge.getLocalEnvironmentBearerToken();
+        let bearer;
+        try { bearer = await window.desktopBridge.getLocalEnvironmentBearerToken(); }
+        catch { return refuse("bearer-failed"); }
         // Exposure precedes minting. Stay below the embedded driver's 30-second command bound.
         const deadline = Date.now() + 20000;
         while (Date.now() < deadline) {
@@ -861,18 +890,20 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
           const timeout = setTimeout(() => controller.abort(), Math.min(5000, deadline - Date.now()));
           let links;
           try {
-            const response = await fetch(new URL("/api/auth/pairing-links", bootstrap.httpBaseUrl), {
-              headers: { authorization: "Bearer " + bearer },
-              signal: controller.signal,
-            });
-            if (!response.ok) throw new Error();
-            links = await response.json();
-          } catch {
-            throw new Error("Remote verification pairing grant unavailable.");
+            let response;
+            try {
+              response = await fetch(new URL("/api/auth/pairing-links", bootstrap.httpBaseUrl), {
+                headers: { authorization: "Bearer " + bearer },
+                signal: controller.signal,
+              });
+            } catch { return refuse(controller.signal.aborted ? "request-aborted" : "request-failed"); }
+            if (!response.ok) return refuse(response.status === 401 ? "http-401" : response.status === 403 ? "http-403" : "http-other");
+            try { links = await response.json(); }
+            catch { return refuse(controller.signal.aborted ? "request-aborted" : "body-invalid"); }
           } finally {
             clearTimeout(timeout);
           }
-          if (!Array.isArray(links)) throw new Error("Remote verification pairing grant response invalid.");
+          if (!Array.isArray(links)) return refuse("list-invalid");
           // AuthPairingLink publishes reach and credential; offHost is server-private metadata.
           const grant = links.find((link) => link !== null && typeof link === "object" &&
             link.reach === "another-device" && typeof link.id === "string" && link.id.trim().length > 0 &&
@@ -883,10 +914,34 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
           }
           await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(250, deadline - Date.now()))));
         }
-        throw new Error("Remote verification has no live native sharing grant.");
+        return refuse("grant-deadline");
       }
       return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: bootstrap.bootstrapToken };
     }, widened);
+    // Reconstruct only finite callback facts; arbitrary WebDriver results are never receipts.
+    const resultIsRecord = credentialResult !== null && typeof credentialResult === "object" && !Array.isArray(credentialResult);
+    const resultKeys = resultIsRecord ? Object.keys(credentialResult) : [];
+    const field = (name) => resultIsRecord ? Object.getOwnPropertyDescriptor(credentialResult, name)?.value : undefined;
+    const failureMilestone = field("milestone");
+    if (resultKeys.length === 2 && field("_tag") === "seeded-credential-failure" &&
+        ${JSON.stringify(credentialFailureMilestones)}.includes(failureMilestone) &&
+        failureMilestone.startsWith(widened ? "credential-wide-" : "credential-loopback-")) {
+      publishStep(failureMilestone);
+      const message = failureMilestone.endsWith("bootstrap-unavailable") ? "Remote verification bootstrap unavailable."
+        : failureMilestone.endsWith("bootstrap-read-failed") ? "Remote verification bootstrap read failed."
+        : failureMilestone.endsWith("bearer-failed") ? "Remote verification bearer acquisition failed."
+        : failureMilestone.endsWith("list-invalid") ? "Remote verification pairing grant response invalid."
+        : failureMilestone.endsWith("grant-deadline") ? "Remote verification has no live native sharing grant."
+        : "Remote verification pairing grant unavailable.";
+      throw new Error(message);
+    }
+    const endpoint = field("endpoint"), bootstrapToken = field("bootstrapToken");
+    if (resultKeys.length !== 2 || typeof endpoint !== "string" || endpoint.length === 0 ||
+        typeof bootstrapToken !== "string" || bootstrapToken.length === 0) {
+      publishStep(widened ? "credential-wide-result-invalid" : "credential-loopback-result-invalid");
+      throw new Error("Remote verification credential response invalid.");
+    }
+    const credentials = { endpoint, bootstrapToken };
     publishStep("credential-request-returned");
     // Private receipt is outside retained evidence; the controller uses it to redact logs.
     NodeFS.writeFileSync(input.remoteSecretPath, JSON.stringify(credentials), { mode: 0o600 });

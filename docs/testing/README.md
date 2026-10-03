@@ -65,6 +65,15 @@ invalid snapshot means the generated step is unknown; a valid milestone proves
 only that the checkpoint was reached. An absent or unrecorded install marker
 does not prove that dispatch never occurred. Diagnostic write failures preserve
 the original failure and cleanup, and this record never establishes a lane pass.
+Credential checkpoints distinguish the wide or loopback branch actually selected
+by the harness. A returned callback can identify only fixed refusals at its
+bootstrap, bearer, request, HTTP-status, body/list-shape or grant-deadline boundary.
+HTTP refusals distinguish 401, 403 and other statuses; abort evidence comes from
+that request's own signal. These facts never include error text or response data.
+Malformed callback results are refused before private credential publication. A
+rejected WebDriver call retains its started checkpoint: its internal stage and
+cause remain unknown. These diagnostics add no authentication attempt, exposure
+change, retry or deadline extension.
 RPC residue removal requires two consecutive successful observations that the
 desktop process name targeted by the existing CI cleanup plan is absent. Kill
 results alone cannot authorize removal. Each read-only observation must finish

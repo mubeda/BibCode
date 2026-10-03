@@ -1852,6 +1852,7 @@ describe("closed RPC phase diagnostics", () => {
 
   it.each([
     "valid",
+    "credential-failure",
     "foreign-field",
     "wrong-owner",
     "unknown-step",
@@ -1881,6 +1882,7 @@ describe("closed RPC phase diagnostics", () => {
         if (kind === "foreign-field") snapshot.private = "private-status-canary";
         if (kind === "wrong-owner") snapshot.lane = "previous-stable";
         if (kind === "unknown-step") snapshot.milestone = "private-status-canary";
+        if (kind === "credential-failure") snapshot.milestone = "credential-wide-http-401";
         if (kind === "symlink") {
           const target = NodePath.join(fixture.root, "private-link-target");
           await NodeFS.promises.mkdir(target);
@@ -1903,11 +1905,18 @@ describe("closed RPC phase diagnostics", () => {
       await expect(fixture.runDirectPhase()).rejects.toThrow("credential receipt is unavailable");
       expect(lines).toHaveLength(1);
       expect(JSON.parse(String(lines[0])).generatedStep).toEqual(
-        kind === "valid"
-          ? { availability: "valid", milestone: "credential-request-returned" }
+        kind === "valid" || kind === "credential-failure"
+          ? {
+              availability: "valid",
+              milestone:
+                kind === "valid" ? "credential-request-returned" : "credential-wide-http-401",
+            }
           : { availability: "invalid", milestone: null },
       );
       expect(JSON.stringify(lines)).not.toContain("canary");
+      await fixture.finalize();
+      expect(fixture.copyBoundedEvidence).not.toHaveBeenCalled();
+      expect(fixture.cleanup).toHaveBeenCalledOnce();
     } finally {
       output.mockRestore();
       await fixture.dispose();
@@ -2126,7 +2135,7 @@ describe("generated private step snapshots", () => {
   effectIt.effect.each([
     { kind: "observation-failure", milestone: "observation-started" },
     { kind: "baseline-failure", milestone: "observation-returned" },
-    { kind: "grant-failure", milestone: "credential-request-started" },
+    { kind: "grant-failure", milestone: "credential-loopback-request-started" },
     { kind: "receipt-failure", milestone: "credential-request-returned" },
     { kind: "published", milestone: "credential-receipt-published" },
     { kind: "snapshot-failure", milestone: null },
@@ -2287,6 +2296,7 @@ const publicPairingGrant = {
 const remoteGrantFixture = (
   responses: ReadonlyArray<unknown>,
   selection?: { lane: "previous-stable"; trigger: "remote-rpc" },
+  diagnostics = false,
 ) => {
   const lane: SeededUpgradeHarness.SeededUpgradeLane = selection?.lane ?? "remote-install";
   const input = {
@@ -2305,9 +2315,13 @@ const remoteGrantFixture = (
     remoteSecretPath: absolute("remote", "private.json"),
     remoteUploadSecretPath: absolute("remote", "upload-private.json"),
     remoteEvidencePath: absolute("remote", "evidence", "remote-rpc.json"),
+    ...(diagnostics ? { stepStatusPath: absolute("remote", "step-status.private.json") } : {}),
   };
   const spec = createSeededUpgradeDriverSpec(input);
-  const start = spec.indexOf("    const credentials = await browser.execute(");
+  const callbackStart = spec.search(
+    /    const (?:credentialResult|credentials) = await browser.execute\(/,
+  );
+  const start = spec.lastIndexOf("    publishStep(", callbackStart);
   const end = spec.indexOf("\n  });\n});", start);
   if (start < 0 || end < 0) throw new Error("Generated remote credential scenario is missing.");
   // Replace module loading only; run the actual browser callback and handoff statements.
@@ -2318,14 +2332,17 @@ const remoteGrantFixture = (
   const source =
     publisher + spec.slice(start, end).replaceAll("await import(", "await loadFixture(");
   const files = new Map<string, { contents: string; mode?: number }>();
+  const descriptors = new Map<number, string>();
+  let descriptorSequence = 0;
   let responseIndex = 0;
   const fetch = vi.fn(async (_url: URL, _options: { signal?: AbortSignal }) => ({
     ok: true,
     json: async () => responses[Math.min(responseIndex++, responses.length - 1)],
   }));
   const driver = vi.fn(async (_credentials: unknown) => ({ phases: ["succeeded"] }));
-  const execute = async (callback: (...args: unknown[]) => unknown, ...args: unknown[]) =>
-    callback(...args);
+  const execute = vi.fn(async (callback: (...args: unknown[]) => unknown, ...args: unknown[]) =>
+    callback(...args),
+  );
   const context = {
     input,
     widened: true,
@@ -2344,8 +2361,27 @@ const remoteGrantFixture = (
       },
     },
     NodeFS: {
-      writeFileSync: (path: string, contents: string, options?: { mode: number }) =>
-        files.set(path, { contents, ...options }),
+      openSync: (path: string, flags: string, mode: number) => {
+        if (flags !== "wx" || files.has(path)) throw new Error("Fixture file already exists.");
+        files.set(path, { contents: "", mode });
+        const fd = ++descriptorSequence;
+        descriptors.set(fd, path);
+        return fd;
+      },
+      writeFileSync: (pathOrFd: string | number, contents: string, options?: { mode: number }) => {
+        const path = typeof pathOrFd === "number" ? descriptors.get(pathOrFd)! : pathOrFd;
+        files.set(path, { ...files.get(path), contents, ...options });
+      },
+      closeSync: (fd: number) => {
+        descriptors.delete(fd);
+      },
+      renameSync: (from: string, to: string) => {
+        files.set(to, files.get(from)!);
+        files.delete(from);
+      },
+      unlinkSync: (path: string) => {
+        files.delete(path);
+      },
     },
     loadFixture: async (path: string) => {
       if (path === input.remoteInstallDriverPath) return { runRemoteInstallDriver: driver };
@@ -2366,6 +2402,7 @@ const remoteGrantFixture = (
     files,
     fetch,
     driver,
+    descriptors,
     run: () =>
       NodeVM.runInNewContext(`(async () => { ${source} })()`, context, {
         timeout: 1_000,
@@ -2397,7 +2434,7 @@ describe("generated remote sharing grant handoff", () => {
     };
     const spec = createSeededUpgradeDriverSpec(input);
     const start = spec.indexOf("    const observation = await observe(true);");
-    const end = spec.indexOf("    const credentials = await browser.execute(", start);
+    const end = spec.search(/    const (?:credentialResult|credentials) = await browser.execute\(/);
     if (start < 0 || end < 0) throw new Error("Remote seed admission block missing");
     const execute = vi.fn(async () => false);
     const publisher = spec.slice(
@@ -2564,6 +2601,223 @@ describe("generated remote sharing grant handoff", () => {
     expect(fixture.driver).not.toHaveBeenCalled();
     expect(fixture.files.size).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("finite credential callback diagnostics", () => {
+  afterEach(() => vi.useRealTimers());
+
+  const owned = () =>
+    remoteGrantFixture(
+      [[publicPairingGrant]],
+      {
+        lane: "previous-stable",
+        trigger: "remote-rpc",
+      },
+      true,
+    );
+  const checkpoint = (fixture: ReturnType<typeof owned>) =>
+    JSON.parse(fixture.files.get(fixture.input.stepStatusPath!)!.contents) as { milestone: string };
+
+  it.each([
+    ["bootstrap-read", "credential-wide-bootstrap-read-failed"],
+    ["bootstrap-missing", "credential-wide-bootstrap-unavailable"],
+    ["bearer", "credential-wide-bearer-failed"],
+    ["request", "credential-wide-request-failed"],
+    ["http-401", "credential-wide-http-401"],
+    ["http-403", "credential-wide-http-403"],
+    ["http-other", "credential-wide-http-other"],
+    ["body", "credential-wide-body-invalid"],
+    ["list", "credential-wide-list-invalid"],
+    ["deadline", "credential-wide-grant-deadline"],
+    ["abort", "credential-wide-request-aborted"],
+  ])("records only the actual finite refusal: %s", async (kind, milestone) => {
+    vi.useFakeTimers();
+    const fixture = owned();
+    const privateFailure = new Error("private-credential-error-canary");
+    if (kind === "bootstrap-read")
+      fixture.context.window.desktopBridge.getLocalEnvironmentBootstraps = () => {
+        throw privateFailure;
+      };
+    if (kind === "bootstrap-missing")
+      fixture.context.window.desktopBridge.getLocalEnvironmentBootstraps = () => [];
+    if (kind === "bearer")
+      fixture.context.window.desktopBridge.getLocalEnvironmentBearerToken = async () => {
+        throw privateFailure;
+      };
+    fixture.fetch.mockImplementation(async (_url, options) => {
+      if (kind === "request") throw privateFailure;
+      if (kind === "abort")
+        return new Promise((_resolve, reject) => {
+          options.signal?.addEventListener("abort", () => reject(privateFailure), { once: true });
+        });
+      return {
+        ok: !kind?.startsWith("http-"),
+        status: kind === "http-401" ? 401 : kind === "http-403" ? 403 : 503,
+        json: async () => {
+          if (kind === "body") throw privateFailure;
+          if (kind === "list") return { private: "private-response-canary" };
+          return kind === "deadline" ? [] : [publicPairingGrant];
+        },
+      };
+    });
+    const outcome = fixture.run().then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await vi.runAllTimersAsync();
+    expect(await outcome).not.toBeNull();
+    expect(checkpoint(fixture).milestone).toBe(milestone);
+    expect(fixture.files.has(fixture.input.remoteSecretPath)).toBe(false);
+    expect(fixture.driver).not.toHaveBeenCalled();
+    expect(fixture.context.browser.execute).toHaveBeenCalledOnce();
+    expect(JSON.stringify([...fixture.files.values()])).not.toContain("canary");
+    expect(fixture.descriptors.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(fixture.fetch.mock.calls.length).toBeLessThanOrEqual(kind === "deadline" ? 80 : 1);
+  });
+
+  it.each([false, true])(
+    "keeps rejected WebDriver state unknown on widened=%s",
+    async (widened) => {
+      const fixture = owned();
+      fixture.context.widened = widened;
+      const failure = new Error("private-webdriver-canary");
+      fixture.context.browser.execute.mockRejectedValue(failure);
+      await expect(fixture.run()).rejects.toBe(failure);
+      expect(checkpoint(fixture).milestone).toBe(
+        widened ? "credential-wide-request-started" : "credential-loopback-request-started",
+      );
+      expect(fixture.fetch).not.toHaveBeenCalled();
+      expect(fixture.files.has(fixture.input.remoteSecretPath)).toBe(false);
+      expect(fixture.driver).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    null,
+    [],
+    { private: "private-result-canary" },
+    { _tag: "seeded-credential-failure", milestone: "private-result-canary" },
+    {
+      _tag: "seeded-credential-failure",
+      milestone: "credential-wide-bearer-failed",
+      extra: "private-result-canary",
+    },
+    { _tag: "seeded-credential-failure", milestone: "credential-loopback-bootstrap-unavailable" },
+    {
+      endpoint: "private-endpoint-canary",
+      bootstrapToken: "private-token-canary",
+      extra: "private-result-canary",
+    },
+  ])(
+    "refuses malformed callback results before creating any credential receipt: %j",
+    async (value) => {
+      const fixture = owned();
+      fixture.context.browser.execute.mockResolvedValue(value);
+      await expect(fixture.run()).rejects.toThrow(
+        "Remote verification credential response invalid.",
+      );
+      expect(checkpoint(fixture).milestone).toBe("credential-wide-result-invalid");
+      expect(fixture.files.has(fixture.input.remoteSecretPath)).toBe(false);
+      expect(fixture.driver).not.toHaveBeenCalled();
+      expect(JSON.stringify([...fixture.files.values()])).not.toContain("canary");
+    },
+  );
+
+  it.each([false, true])(
+    "preserves the successful credential handoff on widened=%s",
+    async (widened) => {
+      const fixture = owned();
+      fixture.context.widened = widened;
+      await fixture.run();
+      expect(checkpoint(fixture).milestone).toBe("credential-receipt-published");
+      const credentials = JSON.parse(fixture.files.get(fixture.input.remoteSecretPath)!.contents);
+      expect(credentials.bootstrapToken).toBe(
+        widened ? "fixture-distinct-grant" : "fixture-desktop-bootstrap",
+      );
+      expect(fixture.driver).toHaveBeenCalledOnce();
+      expect(fixture.context.browser.execute).toHaveBeenCalledOnce();
+      expect(fixture.descriptors.size).toBe(0);
+    },
+  );
+
+  it.each(["read", "missing"])(
+    "records loopback bootstrap %s refusal without adding bearer or HTTP calls",
+    async (kind) => {
+      const fixture = owned();
+      fixture.context.widened = false;
+      fixture.context.window.desktopBridge.getLocalEnvironmentBootstraps = () => {
+        if (kind === "read") throw new Error("private-bootstrap-canary");
+        return [];
+      };
+      const bearer = vi.fn(async () => "private-bearer-canary");
+      fixture.context.window.desktopBridge.getLocalEnvironmentBearerToken = bearer;
+      await expect(fixture.run()).rejects.toThrow(/Remote verification bootstrap/);
+      expect(checkpoint(fixture).milestone).toBe(
+        kind === "read"
+          ? "credential-loopback-bootstrap-read-failed"
+          : "credential-loopback-bootstrap-unavailable",
+      );
+      expect(bearer).not.toHaveBeenCalled();
+      expect(fixture.fetch).not.toHaveBeenCalled();
+      expect(fixture.driver).not.toHaveBeenCalled();
+      expect(fixture.files.has(fixture.input.remoteSecretPath)).toBe(false);
+    },
+  );
+
+  it("does not inspect private error fields when classifying a rejected bearer", async () => {
+    const fixture = owned();
+    let reads = 0;
+    const failure = {
+      name: "private-name-canary",
+      cause: "private-cause-canary",
+      stack: "private-stack-canary",
+    };
+    Object.defineProperty(failure, "message", {
+      get() {
+        reads++;
+        throw new Error("private-getter-canary");
+      },
+    });
+    fixture.context.window.desktopBridge.getLocalEnvironmentBearerToken = async () => {
+      throw failure;
+    };
+    await expect(fixture.run()).rejects.toThrow("Remote verification bearer acquisition failed.");
+    expect(checkpoint(fixture).milestone).toBe("credential-wide-bearer-failed");
+    expect(reads).toBe(0);
+    expect(JSON.stringify([...fixture.files.values()])).not.toContain("canary");
+  });
+
+  it("rejects callback result accessors without invoking or retaining them", async () => {
+    const fixture = owned();
+    let reads = 0;
+    const result = { _tag: "seeded-credential-failure" };
+    Object.defineProperty(result, "milestone", {
+      enumerable: true,
+      get() {
+        reads++;
+        throw new Error("private-result-canary");
+      },
+    });
+    fixture.context.browser.execute.mockResolvedValue(result);
+    await expect(fixture.run()).rejects.toThrow("Remote verification credential response invalid.");
+    expect(checkpoint(fixture).milestone).toBe("credential-wide-result-invalid");
+    expect(reads).toBe(0);
+    expect(fixture.files.has(fixture.input.remoteSecretPath)).toBe(false);
+    expect(fixture.driver).not.toHaveBeenCalled();
+  });
+
+  it("keeps the classified refusal when checkpoint publication is unavailable", async () => {
+    const fixture = owned();
+    fixture.context.NodeFS.openSync = () => {
+      throw new Error("private-file-canary");
+    };
+    fixture.fetch.mockResolvedValue({ ok: false, json: async () => [] });
+    await expect(fixture.run()).rejects.toThrow("Remote verification pairing grant unavailable.");
+    expect(fixture.files.size).toBe(0);
+    expect(fixture.descriptors.size).toBe(0);
+    expect(fixture.driver).not.toHaveBeenCalled();
   });
 });
 
