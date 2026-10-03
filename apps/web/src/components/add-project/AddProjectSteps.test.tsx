@@ -248,6 +248,7 @@ describe("Add Project presentational steps", () => {
       <AddProjectHostPathStep
         hostLabel="Build server"
         path="/srv/code/demo"
+        platform="Linux"
         error={null}
         busy={false}
         onPathChange={vi.fn()}
