@@ -46,6 +46,7 @@ import { visualScenes } from "./support/release-visual-evidence.ts";
 import {
   readVisualViewport,
   readVisualWitness,
+  projectVisualNameClearObservation,
   type VisualObservationInput,
 } from "./support/release-visual-observation.ts";
 import { correctDesktopUiOuterSize } from "./support/window-size.ts";
@@ -215,6 +216,7 @@ export async function runDeliveryRetryQualification() {
   const captures: object[] = [];
   const capturedVisuals = new Set<string>();
   let createRefObservationInput: VisualObservationInput | null = null;
+  let createRefClearObservation: ReturnType<typeof projectVisualNameClearObservation> = null;
   const networkProofs: object[] = [];
   const write = (name: string, value: unknown) =>
     NodeFS.writeFileSync(
@@ -870,6 +872,9 @@ export async function runDeliveryRetryQualification() {
             );
           },
           partialStageMatches: () => visualPartialStageMatches(visualInput),
+          recordClearObservation: (value) => {
+            createRefClearObservation = projectVisualNameClearObservation(value);
+          },
           capture: async (scene) => {
             if (scene === "worktree-create-ref")
               createRefObservationInput = {
@@ -1090,6 +1095,8 @@ export async function runDeliveryRetryQualification() {
       startupObservation,
       worktreeObservation,
       createRefObservation,
+      createRefClearObservation:
+        phase === "visual-worktree-create-ref" ? createRefClearObservation : null,
     });
   } finally {
     const processes = owner.processes.map(({ child, role, log, spawnFailure }) =>

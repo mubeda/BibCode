@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - Writes only finite original PNG evidence in the owned root.
 import * as NodeFS from "node:fs";
+import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
 import {
   bounded,
@@ -16,6 +17,8 @@ import {
   readVisualWitness,
   readVisualImageLoaded,
   readVisualPageScroll,
+  observeVisualNameClear,
+  projectVisualNameClearObservation,
   type VisualObservationInput,
 } from "./release-visual-observation.ts";
 export interface VisualCaptureInput extends VisualObservationInput {
@@ -66,6 +69,7 @@ export interface VisualCoreInput {
   openWorktreeDialog: () => Promise<void>;
   verifyManaged: () => Promise<void>;
   partialStageMatches: () => boolean;
+  recordClearObservation?: (value: ReturnType<typeof projectVisualNameClearObservation>) => void;
 }
 /** One fixed eight-scene sequence. Every UI mutation is an ordinary WebDriver action. */
 export async function runVisualCore(input: VisualCoreInput): Promise<object> {
@@ -113,7 +117,50 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
   await input.openWorktreeDialog();
   const popup = '[data-slot="dialog-popup"][role="dialog"]';
   await click('//*[@data-slot="dialog-popup"]//button[normalize-space()="Branch"]');
-  await browser.$(`${popup} input[placeholder="Worktree name"]`).setValue("");
+  const clearInput = {
+    origin: "http://127.0.0.1:4885",
+    threadId: input.threadId,
+    admission: NodeCrypto.randomUUID(),
+  };
+  let observedStart = false;
+  if (input.recordClearObservation) {
+    try {
+      observedStart =
+        (await bounded(
+          browser.execute(observeVisualNameClear, { ...clearInput, operation: "start" as const }),
+          2_000,
+        )) === true;
+    } catch {
+      // Unavailable diagnostics never change the original public command.
+    }
+  }
+  try {
+    await browser.$(`${popup} input[placeholder="Worktree name"]`).setValue("");
+  } finally {
+    if (input.recordClearObservation) {
+      let observation = null;
+      if (observedStart) {
+        try {
+          const value = await bounded(
+            browser.execute(observeVisualNameClear, {
+              ...clearInput,
+              operation: "finish" as const,
+              admitted: true,
+            }),
+            2_000,
+          );
+          observation = projectVisualNameClearObservation(value);
+        } catch {
+          // The original clear failure and existing cleanup remain authoritative.
+        }
+      }
+      try {
+        input.recordClearObservation(observation);
+      } catch {
+        // A diagnostic callback cannot replace the original public command result.
+      }
+    }
+  }
   // Exact refs select automatically and remove their result row. Wait on the
   // derived name/reuse hint in the capture witness; do not click a vanished row.
   await browser.$(`${popup} input[aria-label="Create From"]`).setValue("visual-held");

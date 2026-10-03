@@ -6,6 +6,161 @@ export interface VisualObservationInput {
   threadId: string;
   branch: string;
 }
+
+/** One disposable observer of real events around the existing owned clear command. */
+export function observeVisualNameClear(input: {
+  origin: string;
+  threadId: string;
+  admission: string;
+  admitted?: boolean;
+  operation: "start" | "finish";
+}): true | Record<string, unknown> | null {
+  const marker = "__bibcodeOwnedVisualNameClear";
+  try {
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.admission)
+    )
+      return null;
+    const anchor = marker + ":" + input.admission;
+    const safe =
+      input.origin === "http://127.0.0.1:4885" &&
+      location.origin === input.origin &&
+      location.search === "" &&
+      location.hash === "" &&
+      /^[A-Za-z0-9._:-]{1,128}$/.test(input.threadId) &&
+      location.pathname === "/local/" + input.threadId;
+    const descriptor = Object.getOwnPropertyDescriptor(window, marker);
+    const anchorDescriptor = Object.getOwnPropertyDescriptor(window, anchor);
+    if (input.operation === "finish") {
+      // Remove our listeners even after route loss, without reading that page.
+      if (
+        input.admitted !== true ||
+        !anchorDescriptor ||
+        !Object.hasOwn(anchorDescriptor, "value") ||
+        anchorDescriptor.configurable !== false ||
+        anchorDescriptor.writable !== false ||
+        typeof anchorDescriptor.value !== "function"
+      )
+        return null;
+      return anchorDescriptor.value(safe);
+    }
+    if (
+      input.operation !== "start" ||
+      !safe ||
+      descriptor !== undefined ||
+      anchorDescriptor !== undefined
+    )
+      return null;
+    const selector = '[data-slot="dialog-popup"][role="dialog"] input[placeholder="Worktree name"]';
+    const controls = document.querySelectorAll(selector);
+    if (controls.length !== 1 || !(controls[0] instanceof HTMLInputElement)) return null;
+    const ownedPathname = "/local/" + input.threadId;
+    let name: HTMLInputElement | null = controls[0];
+    const emptyBefore = name.value === "";
+    let inputs = 0,
+      changes = 0,
+      trustedInputs = 0,
+      trustedChanges = 0;
+    let onInput: ((event: Event) => void) | null = (event: Event) => {
+      if (event.target !== name) return;
+      inputs = Math.min(2, inputs + 1);
+      if (event.isTrusted) trustedInputs = Math.min(2, trustedInputs + 1);
+    };
+    let onChange: ((event: Event) => void) | null = (event: Event) => {
+      if (event.target !== name) return;
+      changes = Math.min(2, changes + 1);
+      if (event.isTrusted) trustedChanges = Math.min(2, trustedChanges + 1);
+    };
+    const finish = (safeLocation: boolean) => {
+      if (name === null) return null;
+      const ownedName = name;
+      const ownedInput = onInput;
+      const ownedChange = onChange;
+      name = null;
+      onInput = null;
+      onChange = null;
+      if (ownedInput) ownedName.removeEventListener("input", ownedInput, true);
+      if (ownedChange) ownedName.removeEventListener("change", ownedChange, true);
+      const currentMarker = Object.getOwnPropertyDescriptor(window, marker);
+      if (
+        !currentMarker ||
+        !Object.hasOwn(currentMarker, "value") ||
+        currentMarker.value !== finish
+      )
+        return null;
+      Reflect.deleteProperty(window, marker);
+      if (!safeLocation || location.pathname !== ownedPathname) return null;
+      const current = document.querySelectorAll(selector);
+      const sameInput = current.length === 1 && current[0] === ownedName;
+      const count = (value: number) => (value === 0 ? "none" : value === 1 ? "one" : "multiple");
+      return {
+        nameCount: count(current.length),
+        sameInput,
+        emptyBefore,
+        emptyAfter: sameInput ? ownedName.value === "" : null,
+        inputEvents: count(inputs),
+        changeEvents: count(changes),
+        trustedInputEvents: count(trustedInputs),
+        trustedChangeEvents: count(trustedChanges),
+        observerClosed: true,
+      };
+    };
+    // One immutable lifetime anchor survives only until the owned browser teardown.
+    Object.defineProperty(window, anchor, { value: finish });
+    Object.defineProperty(window, marker, { value: finish, configurable: true });
+    name.addEventListener("input", onInput, true);
+    name.addEventListener("change", onChange, true);
+    return true;
+  } catch {
+    return null;
+  }
+}
+
+/** Closed failure metadata only; never native input values or capture approval. */
+export function projectVisualNameClearObservation(input: unknown): Record<string, unknown> | null {
+  try {
+    if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+    const keys = [
+      "nameCount",
+      "sameInput",
+      "emptyBefore",
+      "emptyAfter",
+      "inputEvents",
+      "changeEvents",
+      "trustedInputEvents",
+      "trustedChangeEvents",
+      "observerClosed",
+    ];
+    const ownKeys = Reflect.ownKeys(input);
+    if (
+      ownKeys.length !== keys.length ||
+      !ownKeys.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const snapshot: Record<string, unknown> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      const value = descriptor.value;
+      if (
+        [
+          "nameCount",
+          "inputEvents",
+          "changeEvents",
+          "trustedInputEvents",
+          "trustedChangeEvents",
+        ].includes(key)
+      ) {
+        if (value !== "none" && value !== "one" && value !== "multiple") return null;
+      } else if (!(typeof value === "boolean" || (key === "emptyAfter" && value === null)))
+        return null;
+      snapshot[key] = value;
+    }
+    return snapshot;
+  } catch {
+    return null;
+  }
+}
 /** Serialized as one read-only WebDriver function. Returns closed booleans, never page values. */
 export function readVisualWitness(input: VisualObservationInput): Record<string, boolean> | null {
   if (

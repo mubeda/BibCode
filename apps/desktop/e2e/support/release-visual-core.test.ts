@@ -5,7 +5,7 @@ import * as NodePath from "node:path";
 import * as NodeZlib from "node:zlib";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { captureVisualScene, type VisualCaptureInput } from "./release-visual-core.ts";
-import { readVisualWitness } from "./release-visual-observation.ts";
+import { readVisualWitness, observeVisualNameClear } from "./release-visual-observation.ts";
 
 function png() {
   const chunk = (type: string, data: Buffer) => {
@@ -130,6 +130,119 @@ describe("original visual capture boundary", () => {
 });
 
 import { runVisualCore, type VisualCoreInput } from "./release-visual-core.ts";
+it.each([
+  "ok",
+  "start-reject",
+  "start-unadmitted",
+  "finish-reject",
+  "clear-reject",
+  "callback-reject",
+  "clear-and-callback-reject",
+])(
+  "observes the existing clear command before typing the ref without replacing its failure: %s",
+  async (mode) => {
+    const order: string[] = [];
+    let admission: string | undefined;
+    const snapshots: unknown[] = [];
+    const stopped = new Error("Inert capture stop.");
+    const clearFailure = new Error("Inert original clear failure.");
+    const callbackFailure = new Error("Inert unavailable observation callback.");
+    const clearRejected = mode === "clear-reject" || mode === "clear-and-callback-reject";
+    const snapshot = {
+      nameCount: "one",
+      sameInput: true,
+      emptyBefore: false,
+      emptyAfter: true,
+      inputEvents: "none",
+      changeEvents: "one",
+      trustedInputEvents: "none",
+      trustedChangeEvents: "none",
+      observerClosed: true,
+    };
+    const input = {
+      browser: {
+        $$: () => ({ length: Promise.resolve(1) }),
+        $: (selector: string) => ({
+          isFocused: async () => true,
+          waitForDisplayed: async () => {},
+          waitForEnabled: async () => {},
+          click: async () => {},
+          setValue: async (value: string) => {
+            if (selector.includes('placeholder="Worktree name"')) {
+              expect(value).toBe("");
+              order.push("existing-empty-setValue");
+              if (clearRejected) throw clearFailure;
+            } else {
+              expect(value).toBe("visual-held");
+              order.push("type-exact-ref");
+            }
+          },
+        }),
+        keys: async () => {},
+        execute: async (
+          read: unknown,
+          value: { operation: string; admission: string; admitted?: boolean },
+        ) => {
+          expect(read).toBe(observeVisualNameClear);
+          expect(value).toMatchObject({
+            origin: "http://127.0.0.1:4885",
+            threadId: "owned",
+            operation: value.operation,
+          });
+          expect(value.admission).toMatch(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+          );
+          if (value.operation === "start") {
+            admission = value.admission;
+            expect(value).not.toHaveProperty("admitted");
+          } else {
+            expect(value.admission).toBe(admission);
+            expect(value.admitted).toBe(true);
+          }
+          order.push(value.operation + "-observer");
+          if (
+            (mode === "start-reject" && value.operation === "start") ||
+            (mode === "finish-reject" && value.operation === "finish")
+          )
+            throw new Error("Inert unavailable observation.");
+          return value.operation === "start" ? mode !== "start-unadmitted" : snapshot;
+        },
+      },
+      owner: {
+        until: async (read: () => Promise<boolean>) => {
+          expect(await read()).toBe(true);
+        },
+      },
+      threadId: "owned",
+      branch: "codex/delivery-retry-light",
+      step: () => {},
+      verifyManaged: async () => {},
+      openWorktreeDialog: async () => {},
+      recordClearObservation: (value: unknown) => {
+        snapshots.push(value);
+        order.push("record-closed-observation");
+        if (mode === "callback-reject" || mode === "clear-and-callback-reject")
+          throw callbackFailure;
+      },
+      capture: async (scene: string) => {
+        if (scene === "worktree-create-ref") throw stopped;
+      },
+    } as unknown as VisualCoreInput;
+    await expect(runVisualCore(input)).rejects.toBe(clearRejected ? clearFailure : stopped);
+    expect(snapshots).toEqual([
+      mode === "start-reject" || mode === "start-unadmitted" || mode === "finish-reject"
+        ? null
+        : snapshot,
+    ]);
+    expect(order).toEqual([
+      "start-observer",
+      "existing-empty-setValue",
+      ...(mode === "start-reject" || mode === "start-unadmitted" ? [] : ["finish-observer"]),
+      "record-closed-observation",
+      ...(clearRejected ? [] : ["type-exact-ref"]),
+    ]);
+  },
+);
 it("checks the shared managed-worktree identity before the first exact scene and propagates capture failure", async () => {
   const order: string[] = [];
   const stopped = new Error("fixture capture stopped");

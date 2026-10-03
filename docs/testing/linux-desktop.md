@@ -838,6 +838,29 @@ unavailable, malformed or extra fields remain unknown (`null`). This observation
 never approves a screenshot and retains no page text, input, path, URL or driver
 error. Other phases do not perform this read.
 
+The same failure receipt also records `createRefClearObservation`, captured by
+one disposable event observer around the existing Worktree name
+`setValue("")` command. Only the single name control at the owned local route
+is observed; its received `input`/`change` and trusted-event counts saturate at
+`none`, `one` or `multiple`, and value reads export only empty-before/after
+booleans. Finish removes the listeners before typing Create From. A replaced
+control is reported without reading its value. Unsafe locations, unavailable
+observations or malformed fields remain `null`; probe failure does not replace
+the original command failure or approve capture. Inert endpoint regressions
+exercise the installed WDIO command sequence against the mounted controlled
+dialog, but do not prove which events native Chrome delivered. Establish that
+from this closed native observation before attributing a name mismatch to the
+clear command.
+
+Admission refuses preexisting marker and lifetime-anchor properties. Only an
+acknowledged start can finish its exact host-issued observation lifetime; finish
+uses its immutable anchor, never a mutable or foreign marker callback. A replaced
+marker remains untouched while only the admitted listeners are removed. Element
+and listener references are released on finish; one small closed anchor per planned
+clear remains until the existing owned browser teardown. The lifetime identifier
+never enters retained receipts or logs. A throwing diagnostic callback cannot
+interrupt the existing input sequence or replace its original clear failure.
+
 As for delivery Retry, acceptance requires the outer input hashes unchanged,
 zero guard refusals, joined browser/server cleanup, no namespace survivors and
 the unchanged host network identity. The private fixture is deleted only after

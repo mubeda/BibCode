@@ -114,6 +114,8 @@ describe("visual preparation source boundaries", () => {
     );
     const reads = [...sequence.matchAll(/browser\.execute\(([^,)]+)/g)].map((match) => match[1]);
     expect(reads).toEqual([
+      "observeVisualNameClear",
+      "observeVisualNameClear",
       "readVisualImageLoaded",
       "readVisualPageScroll",
       "readVisualPageScroll",

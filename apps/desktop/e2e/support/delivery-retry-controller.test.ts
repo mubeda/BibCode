@@ -15,7 +15,10 @@ import { bounded } from "./qualification-owner.ts";
 import { resolveWorktreeCreateInput } from "../../../web/src/components/CreateWorktreeDialog.logic.ts";
 import { readSelectedDeliveryWorktree } from "./delivery-retry-workspace.ts";
 import { prepareDesktopUiTestContext } from "./test-project.ts";
-import { readVisualWitness } from "./release-visual-observation.ts";
+import {
+  projectVisualNameClearObservation,
+  readVisualWitness,
+} from "./release-visual-observation.ts";
 
 const environment = {
   CI: "true",
@@ -52,6 +55,7 @@ function createRefFailureBoundary(
     noInput?: boolean;
     pending?: boolean;
     reject?: boolean;
+    clearObservation?: unknown;
   } = {},
 ) {
   const writes: Array<Record<string, unknown>> = [];
@@ -105,6 +109,7 @@ function createRefFailureBoundary(
       phase: options.phase ?? "visual-worktree-create-ref",
       theme: "light",
       createRefObservationInput: options.noInput ? null : observationInput,
+      createRefClearObservation: options.clearObservation ?? null,
       error: new Error("The required live observation did not arrive within its bound."),
       bounded,
       readVisualWitness,
@@ -118,6 +123,61 @@ function createRefFailureBoundary(
 }
 
 describe("closed create-ref failure facts", () => {
+  it("projects the actual clear-observation callback before storing failure metadata", () => {
+    const start = controller.indexOf("          recordClearObservation: (value) => {");
+    const end = controller.indexOf("          capture: async (scene) => {", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const record = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "let createRefClearObservation = null; const record = ({" +
+          controller.slice(start, end) +
+          "}).recordClearObservation; (value) => { record(value); return createRefClearObservation; }",
+      ),
+      { projectVisualNameClearObservation },
+    ) as (value: unknown) => unknown;
+    const valid = {
+      nameCount: "one",
+      sameInput: true,
+      emptyBefore: false,
+      emptyAfter: true,
+      inputEvents: "none",
+      changeEvents: "one",
+      trustedInputEvents: "none",
+      trustedChangeEvents: "none",
+      observerClosed: true,
+    };
+    expect(record(valid)).toEqual(valid);
+    expect(record(null)).toBeNull();
+    expect(record({ ...valid, rawInput: "private-input-canary" })).toBeNull();
+    const accessor = { ...valid };
+    const read = vi.fn(() => "private-input-canary");
+    Object.defineProperty(accessor, "emptyAfter", { enumerable: true, get: read });
+    expect(record(accessor)).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+  });
+  it("retains the already closed clear-command facts only at the exact ref boundary", async () => {
+    const clearObservation = {
+      nameCount: "one",
+      sameInput: true,
+      emptyBefore: false,
+      emptyAfter: true,
+      inputEvents: "none",
+      changeEvents: "one",
+      trustedInputEvents: "none",
+      trustedChangeEvents: "none",
+      observerClosed: true,
+    };
+    const f = createRefFailureBoundary({ clearObservation });
+    await f.run();
+    expect(f.writes[0]?.createRefClearObservation).toEqual(clearObservation);
+    const unrelated = createRefFailureBoundary({
+      clearObservation,
+      phase: "visual-git-changes-diff",
+    });
+    await unrelated.run();
+    expect(unrelated.writes[0]?.createRefClearObservation).toBeNull();
+  });
   it("retains the failing exact scene facts without turning them into capture approval", async () => {
     const f = createRefFailureBoundary();
     await f.run();

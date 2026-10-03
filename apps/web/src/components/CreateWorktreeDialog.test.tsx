@@ -16,6 +16,7 @@ import * as React from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { actualClearObserver, pinnedSetValue } from "../../test/pinned-wdio-input";
 
 type EffectCallback = () => void | (() => void);
 
@@ -92,6 +93,7 @@ interface CapturedButtonProps {
 }
 
 interface CapturedInputProps {
+  readonly "aria-label"?: string;
   readonly placeholder?: string;
   readonly value?: string;
   readonly onChange?: (event: { target: { value: string } }) => void;
@@ -239,6 +241,7 @@ vi.mock("./ui/input", () => ({
     captured.inputs.push(props);
     return (
       <input
+        aria-label={props["aria-label"]}
         value={props.value}
         placeholder={props.placeholder}
         readOnly={typeof document === "undefined"}
@@ -269,7 +272,12 @@ vi.mock("./ui/dialog", () => ({
   DialogPopup: (props: CapturedDialogPopupProps) => {
     captured.popups.push(props);
     return (
-      <div data-testid="dialog-popup" onKeyDown={props.onKeyDown}>
+      <div
+        data-testid="dialog-popup"
+        data-slot="dialog-popup"
+        role="dialog"
+        onKeyDown={props.onKeyDown}
+      >
         {props.children}
       </div>
     );
@@ -1523,6 +1531,112 @@ if (browserRuntime) {
         container.remove();
       }
     });
+
+    it.each(["prototype-input", "scripted-input", "change-only"])(
+      "observes pinned empty setValue at the real controlled dialog boundary without claiming native events: %s",
+      async (clearMode) => {
+        testState.refs = [{ name: "visual-held", isRemote: false, worktreePath: "/owned/held" }];
+        const { container, root } = await mountDialog();
+        const location = {
+          origin: "http://127.0.0.1:4885",
+          pathname: "/local/owned",
+          search: "",
+          hash: "",
+        };
+        const observer = actualClearObserver({ window, document, location, HTMLInputElement });
+        const observe = (operation: "start" | "finish") =>
+          observer.observeVisualNameClear({
+            origin: location.origin,
+            threadId: "owned",
+            admission:
+              "00000000-0000-4000-8000-" +
+              String(
+                ["prototype-input", "scripted-input", "change-only"].indexOf(clearMode) + 1,
+              ).padStart(12, "0"),
+            admitted: operation === "finish",
+            operation,
+          });
+        const wire: Array<{ command: string; target: string; empty?: boolean }> = [];
+        try {
+          await setInputValue(
+            requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']"),
+            "codex/delivery retry light",
+          );
+          await renderDialog(root, false);
+          await renderDialog(root, true);
+          await React.act(async () => requiredButton(container, "Branch").click());
+          const name = requiredElement<HTMLInputElement>(
+            container,
+            "input[placeholder='Worktree name']",
+          );
+          const source = requiredElement<HTMLInputElement>(
+            container,
+            "input[aria-label='Create From']",
+          );
+          const endpoint = (element: HTMLInputElement, target: string) => ({
+            elementId: target,
+            elementClear: async (id: string) => {
+              wire.push({ command: "clear", target: id });
+              await React.act(async () => {
+                element.focus();
+                if (clearMode === "prototype-input") {
+                  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(
+                    element,
+                    "",
+                  );
+                } else element.value = "";
+                element.dispatchEvent(
+                  new Event(clearMode === "change-only" ? "change" : "input", { bubbles: true }),
+                );
+                element.blur();
+              });
+            },
+            elementSendKeys: async (id: string, text: string) => {
+              wire.push({ command: "send-keys", target: id, empty: text === "" });
+              if (text !== "") await setInputValue(element, text);
+            },
+          });
+          expect(observe("start")).toBe(true);
+          await pinnedSetValue(endpoint(name, "name"), "");
+          const snapshot = observer.projectVisualNameClearObservation(observe("finish"));
+          expect(snapshot).toMatchObject({
+            nameCount: "one",
+            sameInput: true,
+            emptyBefore: false,
+            emptyAfter: true,
+            inputEvents: clearMode === "change-only" ? "none" : "one",
+            changeEvents: clearMode === "change-only" ? "one" : "none",
+            trustedInputEvents: "none",
+            trustedChangeEvents: "none",
+            observerClosed: true,
+          });
+          await pinnedSetValue(endpoint(source, "source"), "visual-held");
+          expect(wire).toEqual([
+            { command: "clear", target: "name" },
+            { command: "send-keys", target: "name", empty: true },
+            { command: "clear", target: "source" },
+            { command: "send-keys", target: "source", empty: false },
+          ]);
+          expect(name.value).toBe(
+            clearMode === "prototype-input" ? "visual-held" : "codex/delivery retry light",
+          );
+          expect(source.value).toBe("visual-held");
+          expect(container.querySelector('p[role="status"]')?.textContent).toContain(
+            '"visual-held-2"',
+          );
+          expect(
+            Array.from(container.querySelectorAll("button")).filter(
+              (candidate) => candidate.textContent?.trim() === "visual-held",
+            ),
+          ).toHaveLength(0);
+          expect(testState.createWorktree).not.toHaveBeenCalled();
+        } finally {
+          observe("finish");
+          await React.act(async () => root.unmount());
+          container.remove();
+        }
+      },
+    );
 
     it("preserves a manually edited name and leaves branch reuse off", async () => {
       testState.refs = [{ name: "feature/login", isRemote: false }];

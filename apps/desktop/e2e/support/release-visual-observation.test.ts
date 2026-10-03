@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { readVisualWitness } from "./release-visual-observation.ts";
+import * as Observations from "./release-visual-observation.ts";
 import { validateVisualWitness } from "./release-visual-evidence.ts";
 const input = {
   scene: "command-palette" as const,
@@ -9,6 +10,34 @@ const input = {
   threadId: "owned",
   branch: "codex/delivery-retry-light",
 };
+let clearAdmissionOrdinal = 0;
+let clearAdmitted = false;
+const clearInput = {
+  origin: input.origin,
+  threadId: input.threadId,
+  admission: "00000000-0000-4000-8000-000000000000",
+};
+function renewClearAdmission() {
+  clearInput.admission =
+    "00000000-0000-4000-8000-" + (++clearAdmissionOrdinal).toString(16).padStart(12, "0");
+  clearAdmitted = false;
+}
+function observeClear(operation: "start" | "finish") {
+  const value =
+    Reflect.get(
+      Observations,
+      "observeVisualNameClear",
+    )?.({
+      ...clearInput,
+      operation,
+      admitted: clearAdmitted,
+    }) ?? null;
+  if (operation === "start") clearAdmitted = value === true;
+  return value;
+}
+function projectClear(value: unknown) {
+  return Reflect.get(Observations, "projectVisualNameClearObservation")?.(value) ?? null;
+}
 function palette() {
   vi.stubGlobal("location", {
     origin: input.origin,
@@ -38,9 +67,216 @@ function palette() {
   document.querySelector<HTMLInputElement>("input")!.focus();
 }
 afterEach(() => {
+  observeClear("finish");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   document.body.innerHTML = "";
+});
+
+describe("owned name-clear event observation", () => {
+  function clearField() {
+    renewClearAdmission();
+    palette();
+    document.body.innerHTML =
+      '<div data-slot="dialog-popup" role="dialog"><input placeholder="Worktree name" value="Owned fixture name"></div>';
+    return document.querySelector<HTMLInputElement>('input[placeholder="Worktree name"]')!;
+  }
+  it("counts only received target events and exports empty booleans after closing the observer", () => {
+    const name = clearField();
+    const remove = vi.spyOn(name, "removeEventListener");
+    expect(observeClear("start")).toBe(true);
+    expect(
+      Object.getOwnPropertyDescriptor(
+        window,
+        "__bibcodeOwnedVisualNameClear:" + clearInput.admission,
+      ),
+    ).toMatchObject({
+      configurable: false,
+      writable: false,
+      enumerable: false,
+    });
+    name.value = "";
+    name.dispatchEvent(new Event("change", { bubbles: true }));
+    const observation = projectClear(observeClear("finish"));
+    expect(remove.mock.calls.map(([type, , capture]) => [type, capture])).toEqual([
+      ["input", true],
+      ["change", true],
+    ]);
+    expect(observation).toEqual({
+      nameCount: "one",
+      sameInput: true,
+      emptyBefore: false,
+      emptyAfter: true,
+      inputEvents: "none",
+      changeEvents: "one",
+      trustedInputEvents: "none",
+      trustedChangeEvents: "none",
+      observerClosed: true,
+    });
+    expect(JSON.stringify(observation)).not.toMatch(/Owned|fixture|4885|owned/);
+    expect(observeClear("finish")).toBeNull();
+    renewClearAdmission();
+    expect(observeClear("start")).toBe(true);
+    expect(projectClear(observeClear("finish"))).toMatchObject({
+      inputEvents: "none",
+      changeEvents: "none",
+    });
+  });
+  it("saturates event counts and ignores another input", () => {
+    const name = clearField();
+    const other = document.createElement("input");
+    document.body.append(other);
+    expect(observeClear("start")).toBe(true);
+    other.dispatchEvent(new Event("change", { bubbles: true }));
+    for (let index = 0; index < 4; index++)
+      name.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(projectClear(observeClear("finish"))).toMatchObject({
+      inputEvents: "multiple",
+      changeEvents: "none",
+      emptyAfter: false,
+    });
+  });
+  it("refuses a different lifetime without consuming the admitted observer", () => {
+    const name = clearField();
+    const remove = vi.spyOn(name, "removeEventListener");
+    expect(observeClear("start")).toBe(true);
+    const admission = clearInput.admission;
+    renewClearAdmission();
+    clearAdmitted = true;
+    expect(observeClear("finish")).toBeNull();
+    expect(remove).not.toHaveBeenCalled();
+    clearInput.admission = admission;
+    expect(projectClear(observeClear("finish"))).toMatchObject({ observerClosed: true });
+    expect(remove).toHaveBeenCalledTimes(2);
+  });
+  it("reports replacement without reading the new input value", () => {
+    const name = clearField();
+    expect(observeClear("start")).toBe(true);
+    const replacement = document.createElement("input");
+    replacement.placeholder = "Worktree name";
+    Object.defineProperty(replacement, "value", {
+      get: () => {
+        throw new Error("No replacement value read.");
+      },
+    });
+    name.replaceWith(replacement);
+    expect(projectClear(observeClear("finish"))).toMatchObject({
+      nameCount: "one",
+      sameInput: false,
+      emptyAfter: null,
+      observerClosed: true,
+    });
+  });
+  it.each(["origin", "search", "hash", "pathname"])(
+    "refuses unsafe %s without a DOM query and still closes an owned observer",
+    (key) => {
+      clearField();
+      expect(observeClear("start")).toBe(true);
+      vi.stubGlobal("location", {
+        origin: input.origin,
+        pathname: "/local/owned",
+        search: "",
+        hash: "",
+        [key]: "outside-owned-location",
+      });
+      const query = vi.spyOn(document, "querySelectorAll");
+      expect(observeClear("finish")).toBeNull();
+      expect(query).not.toHaveBeenCalled();
+      vi.stubGlobal("location", {
+        origin: input.origin,
+        pathname: "/local/owned",
+        search: "",
+        hash: "",
+      });
+      renewClearAdmission();
+      expect(observeClear("start")).toBe(true);
+    },
+  );
+  it.each(["marker", "anchor"])(
+    "refuses a preexisting %s without invoking its private callback",
+    (kind) => {
+      clearField();
+      const marker = "__bibcodeOwnedVisualNameClear";
+      const key = kind === "marker" ? marker : marker + ":" + clearInput.admission;
+      const foreign = vi.fn(() => "private-function-canary");
+      Object.defineProperty(window, key, { value: foreign, configurable: true });
+      try {
+        expect(observeClear("start")).toBeNull();
+        expect(observeClear("finish")).toBeNull();
+        expect(foreign).not.toHaveBeenCalled();
+        expect(Object.getOwnPropertyDescriptor(window, key)?.value).toBe(foreign);
+      } finally {
+        Reflect.deleteProperty(window, key);
+      }
+    },
+  );
+  it("cleans only its installed listeners after marker replacement and preserves the foreign callback", () => {
+    const name = clearField();
+    const marker = "__bibcodeOwnedVisualNameClear";
+    const remove = vi.spyOn(name, "removeEventListener");
+    expect(observeClear("start")).toBe(true);
+    const foreign = vi.fn(() => "private-function-canary");
+    Object.defineProperty(window, marker, { value: foreign, configurable: true });
+    const query = vi.spyOn(document, "querySelectorAll");
+    try {
+      expect(observeClear("finish")).toBeNull();
+      expect(remove.mock.calls.map(([type, , capture]) => [type, capture])).toEqual([
+        ["input", true],
+        ["change", true],
+      ]);
+      expect(query).not.toHaveBeenCalled();
+      expect(foreign).not.toHaveBeenCalled();
+      expect(Object.getOwnPropertyDescriptor(window, marker)?.value).toBe(foreign);
+      expect(observeClear("finish")).toBeNull();
+      expect(remove).toHaveBeenCalledTimes(2);
+      expect(foreign).not.toHaveBeenCalled();
+    } finally {
+      Reflect.deleteProperty(window, marker);
+    }
+  });
+  it.each([0, 2])("refuses %s controls and never substitutes another target", (count) => {
+    clearField();
+    document.body.innerHTML =
+      '<div data-slot="dialog-popup" role="dialog">' +
+      '<input placeholder="Worktree name">'.repeat(count) +
+      "</div>";
+    expect(observeClear("start")).toBeNull();
+    expect(observeClear("finish")).toBeNull();
+  });
+  it("admits only exact own enumerable data facts", () => {
+    const valid = {
+      nameCount: "one",
+      sameInput: true,
+      emptyBefore: false,
+      emptyAfter: true,
+      inputEvents: "none",
+      changeEvents: "one",
+      trustedInputEvents: "none",
+      trustedChangeEvents: "none",
+      observerClosed: true,
+    };
+    expect(projectClear(valid)).toEqual(valid);
+    expect(projectClear(Object.assign(Object.create(null), valid))).toEqual(valid);
+    for (const key of Object.keys(valid)) {
+      let reads = 0;
+      const bad = { ...valid };
+      Object.defineProperty(bad, key, {
+        enumerable: true,
+        get: () => {
+          reads++;
+          return "inert-canary";
+        },
+      });
+      expect(projectClear(bad)).toBeNull();
+      expect(reads).toBe(0);
+    }
+    const extra = { ...valid };
+    Object.defineProperty(extra, Symbol("extra"), { value: true });
+    expect(projectClear(extra)).toBeNull();
+    const revoked = Proxy.revocable(valid, {});
+    revoked.revoke();
+    expect(projectClear(revoked.proxy)).toBeNull();
+  });
 });
 describe("read-only visual observations", () => {
   it("admits the actually focused single public palette action without returning input contents", () => {
