@@ -627,6 +627,10 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Missing observations stay null; presence is not proof of authentication or
   visibility. No input values, URLs, page/error text, credentials or network logs
   are retained, and unavailable diagnostics cannot skip joined cleanup.
+  Import diagnostics also retain the path control's disabled/busy flag and a
+  finite category for the form's existing validation messages. Missing forms are
+  unknown; other errors are unclassified. The path value and error text never
+  leave the page, and these failure-only reads do not resubmit the form.
   Each action waits for its displayed target and the pinned WebDriverIO public
   clickability check under the existing readiness bounds, then invokes the existing
   public click command once. A displayed, enabled control may still be covered by a transient toast;

@@ -194,3 +194,19 @@ cleanup are unchanged. Literal preview/driver-port/primary/browser phases improv
 attribution without collecting raw output. The controller replay covers completion
 and second-theme startup failure, including final cleanup. Native dark acceptance
 still requires the reviewed rerun.
+
+Trial `37108813770` at `03fcfa66`, attempts 1 and 2, stopped earlier at
+`primary-import-composer` in light mode. Both retained a loaded app/sidebar and
+the still-present import form, with no JavaScript/resource errors or captures;
+all process/namespace/input/fixture cleanup checks passed. The unchanged second
+attempt repeated that boundary. The importer source is unchanged from earlier
+successful light runs; neither attempt exercised the between-theme lifetime fix.
+This evidence does not establish the error inside the form or its cause.
+
+The existing two-second failure observation now also reports whether the import
+input is busy and whether its alert exactly matches one of the four existing
+path-validation messages. Missing forms remain unknown and all other messages
+become a single unknown category. No input value, error text, URL or credential
+leaves the browser. Actual callback and projection tests include private strings,
+oversized messages, busy/idle and missing forms. This is diagnosis only: startup
+ordering, importer actions, deadlines, permissions and cleanup remain unchanged.

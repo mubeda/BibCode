@@ -46,6 +46,15 @@ export function projectRemoteUiSetupObservation(input: unknown) {
     submitDisabled: flag("submitDisabled"),
     sidebarPresent: flag("sidebarPresent"),
     importPathPresent: flag("importPathPresent"),
+    importBusy: flag("importBusy"),
+    importError: choice("importError", [
+      "none",
+      "path-required",
+      "host-loading",
+      "unsupported-windows",
+      "path-relative",
+      "unknown",
+    ]),
     themeControlPresent: flag("themeControlPresent"),
     pairingPendingPresent: flag("pairingPendingPresent"),
     pairingError: choice("pairingError", [

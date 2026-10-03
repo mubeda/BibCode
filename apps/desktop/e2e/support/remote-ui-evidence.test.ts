@@ -22,6 +22,8 @@ it("projects only closed setup facts and preserves unknown versus absent observa
     submitDisabled: false,
     sidebarPresent: false,
     importPathPresent: false,
+    importBusy: false,
+    importError: "host-loading",
     themeControlPresent: false,
     pairingPendingPresent: false,
     pairingError: "unknown",
@@ -31,6 +33,8 @@ it("projects only closed setup facts and preserves unknown versus absent observa
     ...known,
     route: "http://private/secret",
     pairingError: "private-credential",
+    importError: "private-import-path",
+    importBusy: "false",
     tokenPresent: "false",
     submitPresent: undefined,
     submitDisabled: 0,
@@ -40,13 +44,15 @@ it("projects only closed setup facts and preserves unknown versus absent observa
   expect(projected).toMatchObject({
     route: null,
     pairingError: null,
+    importError: null,
+    importBusy: null,
     tokenPresent: null,
     submitPresent: null,
     submitDisabled: null,
     sidebarPresent: false,
   });
   expect(JSON.stringify(projected)).not.toContain("private-");
-  expect(Object.values(projectRemoteUiSetupObservation({})!)).toEqual(Array(10).fill(null));
+  expect(Object.values(projectRemoteUiSetupObservation({})!)).toEqual(Array(12).fill(null));
 });
 
 it("defaults to an honestly partial core and requires an explicit full matrix selection", () => {

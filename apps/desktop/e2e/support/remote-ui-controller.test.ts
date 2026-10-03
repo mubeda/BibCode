@@ -641,6 +641,82 @@ it.each([
   },
 );
 
+it.each([
+  [null, "none"],
+  ["Enter a project path.", "path-required"],
+  ["Host platform information is still loading.", "host-loading"],
+  ["Windows-style paths are only supported on Windows.", "unsupported-windows"],
+  ["Enter an absolute or home-relative path.", "path-relative"],
+  ["private-path https://private-host private-credential", "unknown"],
+  ["x".repeat(300), "unknown"],
+])("observes only a finite import error and busy flag %#", (message, category) => {
+  const start = controller.indexOf(
+    "browser.execute(() => {",
+    controller.indexOf("} catch (error) {", controller.indexOf('phase("complete")')),
+  );
+  const tail = controller.slice(start);
+  const end = tail.search(/\n\s*\}\),\n\s*2_000,/);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(0);
+  const callback = tail.slice("browser.execute(".length, end) + "\n}";
+  let present = true;
+  let busy = false;
+  const input = {
+    get value() {
+      throw new Error("No project path reads.");
+    },
+    hasAttribute: (attribute: string) => {
+      expect(attribute).toBe("disabled");
+      return busy;
+    },
+    closest: (selector: string) => {
+      expect(selector).toBe("form");
+      return {
+        querySelector: (selector: string) => {
+          expect(selector).toBe('[role="alert"]');
+          return message === null ? null : { textContent: message };
+        },
+      };
+    },
+  };
+  const read = NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes("(" + callback + ")"), {
+    window: {},
+    HTMLButtonElement: class {
+      disabled = false;
+    },
+    location: {
+      pathname: "/",
+      get href() {
+        throw new Error("No URL reads.");
+      },
+    },
+    document: {
+      readyState: "complete",
+      getElementById: (id: string) => (id === "add-project-host-path" && present ? input : null),
+      querySelector: () => null,
+    },
+  });
+  for (const state of [false, true]) {
+    busy = state;
+    const result = read();
+    expect(result.setup).toMatchObject({
+      importPathPresent: true,
+      importBusy: state,
+      importError: category,
+    });
+    expect(projectRemoteUiSetupObservation(result.setup)).toEqual(result.setup);
+    expect(JSON.stringify(result)).not.toMatch(
+      /private-|Enter a project|Host platform|Windows-style|home-relative|x{20}/,
+    );
+  }
+  present = false;
+  expect(read().setup).toMatchObject({
+    importPathPresent: false,
+    importBusy: null,
+    importError: null,
+  });
+});
+
 it.each(["unavailable", "no-browser", "write-failure", "manual-assertion"])(
   "retains unavailable setup honestly and still runs joined cleanup on %s",
   async (mode) => {

@@ -1390,6 +1390,24 @@ try {
                         )
                       ? "request-failed"
                       : "unknown";
+          const importPath = document.getElementById("add-project-host-path");
+          const importForm = importPath?.closest("form");
+          const importAlert = importForm?.querySelector('[role="alert"]');
+          const importContent = importAlert?.textContent ?? "";
+          const importMessage = importContent.length <= 256 ? importContent.trim() : null;
+          const importError = !importForm
+            ? null
+            : !importAlert
+              ? "none"
+              : importMessage === "Enter a project path."
+                ? "path-required"
+                : importMessage === "Host platform information is still loading."
+                  ? "host-loading"
+                  : importMessage === "Windows-style paths are only supported on Windows."
+                    ? "unsupported-windows"
+                    : importMessage === "Enter an absolute or home-relative path."
+                      ? "path-relative"
+                      : "unknown";
           return {
             startup: observer?.read?.() ?? null,
             setup: {
@@ -1405,7 +1423,9 @@ try {
               submitDisabled: submit instanceof HTMLButtonElement ? submit.disabled : null,
               sidebarPresent:
                 document.querySelector('[data-testid="sidebar-add-project-trigger"]') !== null,
-              importPathPresent: document.getElementById("add-project-host-path") !== null,
+              importPathPresent: importPath !== null,
+              importBusy: importPath?.hasAttribute("disabled") ?? null,
+              importError,
               themeControlPresent:
                 document.querySelector('[aria-label="Theme preference"]') !== null,
               pairingPendingPresent:
