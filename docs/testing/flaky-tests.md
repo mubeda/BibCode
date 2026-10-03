@@ -34,6 +34,55 @@ process deadline must cover that bound plus setup and teardown, and every
 selected invocation must actually execute the test. Keep the controlled-stall
 counterexample distinct from naturally observed failures.
 
+## Unix recovery-test watchdog
+
+The private `turn_delivery_recovery` child helper uses an exactly selected,
+ignored re-executed monitor fixture as its Unix process-group leader. The test
+parent alone holds the monitor stdin writer as a lifetime lease; parent death
+closes it and the monitor kills its own group. Requested children have null
+stdin and cannot retain that writer. This test-only lease is separate from
+production `ProcessRunner` ownership. Descendants that start another group or
+session are excluded and need their explicit fixture owner to clean them up.
+
+Build once and obtain the executable from Cargo artifact JSON. Confirm actual
+selected names and ignored flags with its `--list`, then run:
+
+```sh
+cargo test -p bibcode-server --test turn_delivery_recovery --no-run --message-format=json -j 2
+cargo test -p bibcode-server --test turn_delivery_recovery child_deadline_ -j 2 -- --nocapture
+cargo test -p bibcode-server --test turn_delivery_recovery child_watchdog_ -j 2 -- --nocapture
+cargo test -p bibcode-server --test turn_delivery_recovery -j 2
+```
+
+Run natively on both Linux and macOS. The `watchdog_tests` parent SIGKILL and
+SIGINT cases wait for the exact parent, monitor/group, child, and grandchild
+readiness proof before signaling only their owned parent. They prove owned
+PID/group disappearance and keep an independently owned peer alive. Linux
+subreaping is confined to exact re-executed fixtures; it is not macOS evidence.
+Normal enumeration and an unmarked exact monitor invocation must be harmless.
+An empty filter or a fixture entry marker alone is not a pass.
+
+Keep the real child's raw wait status and exact output assertions, including
+SIGABRT at the durable crash boundary. The monitor's cleanup SIGKILL is not the
+requested child's status. Incremental binary output framing preserves already
+produced timeout diagnostics; monitor/libtest output is not child output or a
+completion record. Root exit must return without waiting for a same-group
+descendant to close its pipes, and continuous descendant output must remain
+inside the original absolute deadline. Startup, framing, cancellation, and
+timeout paths must close the lease, kill only the retained owned group, and
+reap its monitor before reporting a result. Keep the existing short deadlines
+and bounded cleanup assertions; separately clean any deliberately escaped
+fixture PID.
+
+For overhead evidence, finish separate base/change builds before alternating
+paired invocations with identical toolchain, environment, output workloads,
+filters, and harness width on each native host. Include the output-volume and
+short-deadline cases, verify the executed names/counts, and report sample count,
+median/p95, absolute and relative deltas, failures/timeouts, and full-target
+duration. A Linux pass or cross-target compilation does not establish macOS
+acceptance. Store these measurements and native observations in the execution
+report.
+
 ## Alternate base and change
 
 For intermittent provider or terminal failures, rerun each failing case in
