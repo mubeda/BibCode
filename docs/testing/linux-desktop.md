@@ -622,6 +622,16 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Missing observations stay null; presence is not proof of authentication or
   visibility. No input values, URLs, page/error text, credentials or network logs
   are retained, and unavailable diagnostics cannot skip joined cleanup.
+  Each action waits for its displayed target and the pinned WebDriverIO public
+  clickability check under the existing readiness bounds, then invokes the existing
+  public click command once. A displayed, enabled control may still be covered by a transient toast;
+  it must not be clicked through an overlay. A persistent obstruction fails before
+  dispatch, and a rejected click command is not retried by the qualifier. The pinned
+  driver's existing internal scroll/interception fallback is unchanged; this is
+  not a claim of one wire-level attempt. Keep toast
+  lifetime and modal behavior unchanged, with separate Dismiss and Check phases
+  for the final failure/retry flow. Do not force clicks, remove overlays, or close
+  notifications merely to make the test pass.
   Remote pairing uses the real Add Server
   flow through an owned loopback tunnel. The fresh-terminal setup uses genuine
   authenticated public RPC and a pinned owned executable; dialog counts and all

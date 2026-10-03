@@ -116,3 +116,29 @@ failure facts make the next boundary distinguishable without raw data capture.
 This is a harness setup repair, not retrospective proof of the native timeout's
 exact substep or completion of any UI acceptance case. Root owns the next native
 activation after the exact source packet and required gates are reviewed.
+
+Trial `37103463042` at `73146078` passed primary pairing/import and retained
+fourteen original light-theme PNGs. Closed assertions verified row/card cancel,
+an actual terminal's fresh one-to-zero count and reaping, one install, 42 percent
+download progress across remount, backup/restart, observed version 9.9.1 and the
+retained draft. The failure/retry flow then reached three install requests before
+a click-intercepted failure. Dismiss and the following Check were the remaining
+clicks before the next capture; the exact blocker and which of those clicks failed
+were not retained. All cleanup/input-hash/host-namespace proofs passed. These are
+partial light-theme results; dark, manual and full-only cases were not run.
+
+Source inspection found the click helper waited for displayed/enabled state but
+not an unobscured hit target. The earlier failure PNG shows a transient toast
+above the saved-server row; this supports an overlap hypothesis without proving
+the final native blocker. The dialog owner unmounts on confirm/cancel, and toast
+actions do not dismiss the toast. An inert replay of the actual helper with the
+pinned WebDriverIO clickability predicate reproduced premature dispatch for a
+covered target. The helper now replaces enabled-only readiness with the public
+clickability wait under the same existing bound, followed by one call to the
+existing public click command. Persistent overlap refuses dispatch; a rejected
+click command remains a failure. Pinned WebDriverIO already has an internal
+scroll/retry on interception, which remains unchanged; the one-call control does
+not establish one wire-level attempt inside that dependency.
+Dismiss and Check have literal subphases. No new sleep, click retry, toast dismissal,
+product change or native activation is part of this repair. The fourteen original
+images remain unchanged and do not establish completion of either UI matrix.

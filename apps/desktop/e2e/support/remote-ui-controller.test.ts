@@ -17,6 +17,138 @@ const controller = NodeFS.readFileSync(
   "utf8",
 );
 
+it.each(["ready", "toast-clears", "backdrop-clears", "covered", "disabled", "click-rejects"])(
+  "uses actual pinned clickability readiness before one native click: %s",
+  async (mode) => {
+    const webdriver = NodeFS.readFileSync(
+      new URL("../../node_modules/webdriverio/build/node.js", import.meta.url),
+      "utf8",
+    );
+    const waitStart = webdriver.indexOf("async function waitForClickable(");
+    const waitEnd = webdriver.indexOf("// src/commands/element/waitForDisplayed.ts", waitStart);
+    expect(waitStart).toBeGreaterThan(0);
+    expect(waitEnd).toBeGreaterThan(waitStart);
+    const waitSource = webdriver.slice(waitStart, waitEnd);
+    const browserReader = /(getBrowserObject\d*)\(this\)/.exec(waitSource)?.[1];
+    expect(browserReader).toBeDefined();
+    const wait = NodeVM.runInNewContext(waitSource + "\nwaitForClickable", {
+      [browserReader!]: () => ({ isMobile: false }),
+    });
+    const predicateSource = NodeFS.readFileSync(
+      new URL(
+        "../../node_modules/webdriverio/build/scripts/isElementClickable.js",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    let elapsed = 0,
+      clicks = 0;
+    const overlay = {};
+    const nativeFailure = new Error("inert native click failure");
+    const elementNode = {
+      disabled: mode === "disabled",
+      clientWidth: 50,
+      clientHeight: 20,
+      getBoundingClientRect: () => ({ left: 100, top: 100, width: 50, height: 20 }),
+      getClientRects: () => [{ left: 100, top: 100, width: 50, height: 20 }],
+      scrollIntoView: () => {},
+      contains: (node: unknown) => node === elementNode,
+    };
+    const clickable = NodeVM.runInNewContext(
+      predicateSource.slice(0, predicateSource.indexOf("export {")) + "\nisElementClickable",
+      {
+        window: { innerHeight: 960, innerWidth: 1280, scrollX: 0, scrollY: 0, scroll: () => {} },
+        document: {
+          elementFromPoint: () =>
+            mode === "covered" ||
+            (mode === "toast-clears" && elapsed < 500) ||
+            (mode === "backdrop-clears" && elapsed < 1000)
+              ? overlay
+              : elementNode,
+        },
+      },
+    );
+    const target = {
+      selector: "owned target",
+      options: { waitforTimeout: 30_000, waitforInterval: 250 },
+      waitForDisplayed: async () => {},
+      waitForEnabled: async () => {
+        if (elementNode.disabled) throw new Error("inert readiness deadline");
+      },
+      waitForClickable: wait,
+      isClickable: async () => clickable(elementNode),
+      waitUntil: async (
+        read: () => Promise<boolean>,
+        options: { timeout: number; interval: number },
+      ) => {
+        expect(options.timeout).toBe(30_000);
+        expect(options.interval).toBe(250);
+        while (elapsed < options.timeout) {
+          if (await read()) return true;
+          elapsed += options.interval;
+        }
+        throw new Error("inert readiness deadline");
+      },
+      click: async () => {
+        clicks++;
+        if (!clickable(elementNode) || mode === "click-rejects") throw nativeFailure;
+      },
+    };
+    const start = controller.indexOf("const element = (selector:");
+    const end = controller.indexOf("const text = async", start);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(controller.slice(start, end) + "\nclick"),
+      { required: () => ({ $: () => target }) },
+    );
+    if (mode === "covered" || mode === "disabled") {
+      await expect(run("owned-target")).rejects.toThrow("inert readiness deadline");
+      expect(clicks).toBe(0);
+    } else if (mode === "click-rejects") {
+      await expect(run("owned-target")).rejects.toBe(nativeFailure);
+      expect(clicks).toBe(1);
+    } else {
+      await run("owned-target");
+      expect(clicks).toBe(1);
+    }
+    if (mode === "toast-clears") expect(elapsed).toBe(500);
+    if (mode === "backdrop-clears") expect(elapsed).toBe(1000);
+  },
+);
+
+it.each(["Dismiss", "Check"])("identifies the final failure-flow %s boundary", async (action) => {
+  const start = controller.indexOf("async function failureFlow()");
+  const end = controller.indexOf("async function restartFailures()", start);
+  const phases: string[] = [];
+  const stopped = new Error("inert target failure");
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(controller.slice(start, end) + "\nfailureFlow"),
+    {
+      phase: (value: string) => phases.push(value),
+      currentTheme: "light",
+      composer: "composer",
+      dialog: "dialog",
+      fakeHost: async () => ({ label: "QA Failure light" }),
+      addHost: async () => {},
+      importProject: async () => {},
+      required: () => ({ $: () => ({ setValue: async () => {}, waitForExist: async () => {} }) }),
+      openConfirmation: async () => {},
+      confirm: async () => {},
+      cancel: async () => {},
+      exactRequests: async () => {},
+      status: async () => {},
+      text: async () => {},
+      capture: async () => {},
+      delay: async () => {},
+      row: () => "owned-row",
+      click: async (selector: string) => {
+        if (selector.startsWith("owned-row") && selector.includes(`="${action}`)) throw stopped;
+      },
+    },
+  );
+  await expect(run()).rejects.toBe(stopped);
+  expect(phases.at(-1)).toBe(action === "Dismiss" ? "failure-dismiss" : "failure-check-again");
+});
+
 it.each(["primary", "update-a", "update-b", "update-c"])(
   "keeps the actual %s host and grant in the same explicitly selected profile",
   async (role) => {

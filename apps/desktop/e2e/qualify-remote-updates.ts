@@ -111,7 +111,7 @@ const element = (selector: string) => {
 const click = async (selector: string) => {
   const target = element(selector);
   await target.waitForDisplayed();
-  await target.waitForEnabled();
+  await target.waitForClickable();
   await target.click();
 };
 const text = async (selector: string, expected: string, timeout = 30_000) => {
@@ -788,11 +788,13 @@ async function failureFlow() {
   await exactRequests(host, 3);
   await status(host, "error", { error: "Controlled fixture install failure" });
   await text(row(host.label), "Nothing was installed");
+  phase("failure-dismiss");
   await click(`${row(host.label)}//button[normalize-space()="Dismiss"]`);
   await required()
     .$(`${row(host.label)}//button[normalize-space()="Dismiss"]`)
     .waitForExist({ reverse: true });
   await status(host, "update-available");
+  phase("failure-check-again");
   await click(
     `${row(host.label)}//button[normalize-space()="Check again" or normalize-space()="Check"]`,
   );
