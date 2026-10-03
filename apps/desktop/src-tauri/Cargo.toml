@@ -80,6 +80,7 @@ gtk.workspace = true
 cairo-rs.workspace = true
 
 [dev-dependencies]
+bibcode-server = { workspace = true, features = ["hermetic-test-guard"] }
 futures-util.workspace = true
 tauri = { workspace = true, features = ["test"] }
 tempfile.workspace = true

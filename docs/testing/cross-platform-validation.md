@@ -34,6 +34,31 @@ Inputs are execution data. Do not edit the living runbooks to insert them.
 Do not install, repair, or re-index repository tools outside the authority
 granted by `AGENTS.md` and the current request.
 
+## Native process sampling
+
+When native process sampling or its boot initialization changes, run the focused
+sampling, attribution, and ownership checks:
+
+```sh
+cargo test -p bibcode-server --lib diagnostics::native::tests:: -j 2
+cargo test -p bibcode-server --lib diagnostics::resource_sampler::tests:: -j 2
+cargo test -p bibcode-server --lib production::server_terminal::tests::embedded_host_cleanup_preserves_unmanaged_host_descendants -j 2 -- --exact
+```
+
+Construction must leave the native process table empty. The first requested
+sample must discover the current process and previously unknown descendants with
+their names, creation identities, and parents; subsequent samples must refresh
+resource observations. Attribution must retain its core/UI/external scopes, and
+cleanup must preserve unrelated host processes. Direct PID identity lookup and
+empty ownership cleanup must not require a host-wide sample.
+
+For a boot-sampling performance change, compare eager and lazy construction on
+the same host using the pinned `sysinfo` version, recording process count,
+sample count, percentile method, construction latency, and the first requested
+refresh latency. Keep measurements and machine details in the execution report.
+Moving discovery out of construction must preserve full on-demand descendant
+discovery; constructor timing alone does not prove whole-server startup latency.
+
 ## Provider skill discovery
 
 For changes to provider visibility or the chat command menu, run the focused
@@ -1204,6 +1229,17 @@ packaged application:
 Do not run destructive worktree scenarios against a user repository.
 
 ## Clone from URL network scenario
+
+Before the network-transfer checks, select a remote server and enter a Git URL
+and parent folder. Press **Browse…** beside **Parent folder** and confirm the
+browser names that server, starts at the entered folder, and lists its directories
+through that environment's connection. Choose a folder, clone, and verify the
+checkout is beneath that folder on the same server. Reopen the form and cancel
+parent browsing with both **Cancel** and **Back**; the URL and parent path must
+remain intact. Exercise loading, empty folders, permission denial, and a dropped
+server connection; confirm **Refresh** can retry and returning to the form keeps
+its input. Capture the flow in light and dark. Local/WSL native picking must still
+work, and manual parent entry must remain available.
 
 Create a disposable bare repository large enough that a clone at about
 600 KB/s takes well over 30 seconds (for example 20 MB or more of

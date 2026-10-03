@@ -464,10 +464,9 @@ async fn automatic_git_fetch_setting_changes_apply_without_restart() {
     let initial_remote_ref = git_stdout_in(&consumer, &["rev-parse", "origin/main"]);
 
     let config = test_config(&temp);
-    fs::create_dir_all(config.state_dir()).expect("server state directory");
-    fs::write(
-        config.state_dir().join("settings.json"),
-        r#"{
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
             "automaticGitFetchInterval": 0,
             "enableProviderUpdateChecks": false,
             "providers": {
@@ -477,9 +476,8 @@ async fn automatic_git_fetch_setting_changes_apply_without_restart() {
                 "grok": { "enabled": false },
                 "opencode": { "enabled": false }
             }
-        }"#,
-    )
-    .expect("disabled automatic fetch settings");
+        }),
+    );
     let handle = ServerRuntime::start(config).await.expect("server starts");
     let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
         .await
@@ -2963,20 +2961,9 @@ fn relaunch_with_isolated_git_config(test_name: &str) -> bool {
     let config = IsolatedGitConfig::new();
 
     let mut command = Command::new(std::env::current_exe().expect("current test executable"));
-    for (name, _) in std::env::vars_os() {
-        if name
-            .to_string_lossy()
-            .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_"))
-        {
-            command.env_remove(name);
-        }
-    }
+    config.apply_to_command(&mut command);
     let output = command
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env("GIT_CONFIG_GLOBAL", config.path())
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .env(ISOLATED_GIT_TEST, "1")
         .output()
         .expect("run test with isolated Git config");

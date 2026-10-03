@@ -69,6 +69,15 @@ perform real provider update checks, or use the user's HOME, shell rc files,
 or `~/.ssh`. Use test-owned executables, configuration, and temporary roots.
 Real Git may operate on disposable repositories with isolated Git configuration.
 
+`TestSandbox` removes every inherited variable with a case-insensitive `GIT_`
+prefix before applying explicit fixture environment overrides. This includes
+discovery, worktree, index, object-store, and numbered configuration variables.
+For command-based Git fixtures and isolated test re-execution, use
+`IsolatedGitConfig::apply_to_command` from `tests/support/isolated_git_config.rs`
+before adding intentional overrides; it removes inherited Git variables and
+pins the fixture's configuration. Keep the configuration fixture alive until
+the command exits. Production Git commands retain their normal inheritance.
+
 Write executable fixtures with `tests/support/executable_fixture.rs` (lib tests:
 `TestSandbox::write_executable`), never in-process `fs::write`/`fs::copy`, to prevent
 fork-inherited writable descriptors from causing `ETXTBSY`.
@@ -114,11 +123,54 @@ under their isolated data root through
 unreachable-target tests use an empty temporary SSH config (`-F`) and a literal
 loopback destination with an empty alias, avoiding user config and DNS.
 
+The desktop bridge IPC contract harness discovers SSH hosts from
+`home/.ssh/config` and `home/.ssh/known_hosts` beneath its per-app
+`IsolatedTestDataRoot`, and fails closed if that root is missing. On Linux it
+injects a per-app system-theme reader into the real theme command, exercising
+the blocking worker and unavailable-portal light fallback without contacting
+the session D-Bus service. A missing test reader is an error; explicit light
+and dark selections never consult it. Production commands retain native home
+discovery and portal reads.
+
 The server harnesses, including the library's `control.rs` and lifecycle tests,
-and the desktop harnesses follow these rules. The
-[approved hermetic test guard](../superpowers/specs/2026-09-26-hermetic-test-guard-design.md)
-will enforce the no-host-provider-or-hosting-CLI rule across tests; it is not
-implemented yet.
+and the desktop harnesses follow these rules. Cargo dev units enable the
+[approved hermetic test guard](../superpowers/specs/2026-09-26-hermetic-test-guard-design.md),
+which refuses host provider/hosting executable resolution and credential reads.
+It defaults to Abort mode: a forbidden resolution or read writes the program,
+path, and current thread name directly to stderr and aborts the test process.
+This applies to spawned threads/tasks and re-executed or CLI test binaries too;
+there is no off switch. For fixture diagnosis, set
+`BIBCODE_HERMETIC_GUARD=report` on the test child only. Report mode still refuses
+the operation, treating it as unavailable; it never executes the host CLI or
+loads the host credentials. Repair every diagnostic before the default run.
+
+Allowed executable/credential roots are the canonical temporary directory,
+the server crate's compile-time `tests/fixtures`, a runtime
+`CARGO_MANIFEST_DIR/tests/fixtures` when supplied, and the Cargo profile derived
+from the running executable only when `.fingerprint` is present. Canonical
+checks reject symlinks escaping those roots. A guarded bare name on inherited
+PATH is refused before lookup unless every existing entry is an absolute
+allowed root; missing entries are ignored, while empty, relative, or unreadable
+entries fail closed. An explicit fixture search path is checked after lookup,
+and spawning uses the checked absolute candidate without an OS-search fallback.
+On Windows, explicit extensionless names use launch extensions. Keychain access
+is always refused in dev units; use fixture files instead.
+The optional reviewed-Claude attestation and preparation-budget checks select
+only `BIBCODE_CLAUDE_ATTESTATION_FIXTURE`, with the same root checks; they never
+fall back to an installation in the developer's HOME. Keep their child HOME
+and credential context disposable, and record the fixture provenance separately
+when explicitly qualifying those optional checks.
+
+Before any `NativeServerControl` or `ServerRuntime` construction, seed the exact
+`ServerConfig::state_dir()` using `support/hermetic_providers.rs`; disabled
+providers still need absent absolute fixture paths and disabled update checks.
+For legitimate CLI behavior, pin a fake under an allowed root or re-execute the
+test with a narrow fixture PATH. Never fix a diagnostic by using Report mode in
+CI, allowing a host directory, or running a real provider/hosting CLI. Server
+and desktop dev-dependencies activate the guard, including workspace tests;
+normal dependencies and production builds leave it disabled. CI also checks
+`cargo check -p bibcode-server --lib --bins -j 2` separately so production cfg
+paths remain compiled, and builds SSH's CLI via the guarded `cli_smoke` dev unit.
 
 ## Static rendering and Zustand
 

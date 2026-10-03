@@ -2871,12 +2871,14 @@ async fn hardening_startup_cleans_only_direct_marked_private_runtime_artifacts_w
 #[tokio::test]
 async fn hardening_executable_uses_client_path_for_validation_and_pins_canonical_spawn_target() {
     let fixture = tempfile::tempdir().expect("fixture root");
-    let configured = std::env::split_paths(&std::env::var_os("PATH").expect("server PATH"))
-        .map(|directory| directory.join("sh"))
-        .find(|candidate| candidate.is_file())
-        .expect("shell on server PATH")
+    let trusted_dir = fixture.path().join("trusted");
+    std::fs::create_dir(&trusted_dir).expect("trusted fixture directory");
+    let configured = trusted_dir.join("sh");
+    std::fs::write(&configured, b"trusted recorded provider fixture")
+        .expect("configured fixture executable");
+    let configured = configured
         .canonicalize()
-        .expect("canonical configured shell");
+        .expect("canonical configured fixture");
     let attacker_dir = fixture.path().join("attacker");
     std::fs::create_dir_all(&attacker_dir).expect("attacker dir");
     std::fs::write(attacker_dir.join("sh"), b"attacker").expect("attacker shell");

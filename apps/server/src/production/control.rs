@@ -3032,25 +3032,16 @@ mod tests {
         let executable =
             compile_cursor_update_fixture(directory.path(), "2026.06.19-653a7fb").await;
         let config = ServerConfig::new(directory.path());
-        tokio::fs::create_dir_all(config.state_dir())
-            .await
-            .expect("state directory exists");
-        tokio::fs::write(
-            config.state_dir().join("settings.json"),
-            serde_json::to_vec(&json!({
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({
                 "enableProviderUpdateChecks": true,
-                "providerInstances": {
-                    "cursor-work": {
-                        "driver": "cursor",
-                        "enabled": true,
-                        "config": { "binaryPath": executable }
-                    }
-                }
-            }))
-            .expect("settings JSON"),
-        )
-        .await
-        .expect("write settings");
+                "providerInstances": {"cursor-work": {
+                    "driver": "cursor", "enabled": true,
+                    "config": {"binaryPath": executable}
+                }}
+            }),
+        );
         let mut control = NativeServerControl::new(config, json!({})).await;
         let (installer_url, requests) = cursor_installer_registry().await;
         control.provider_maintenance =
@@ -4683,6 +4674,12 @@ mod tests {
 
     #[tokio::test]
     async fn agent_activity_malformed_legacy_value_is_rejected_before_normalization() {
+        #[cfg(feature = "hermetic-test-guard")]
+        if crate::test_support::reexec_without_provider_path(
+            "production::control::tests::agent_activity_malformed_legacy_value_is_rejected_before_normalization",
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -4834,7 +4831,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        tokio::fs::remove_file(&settings_path)
+            .await
+            .expect("replace the fixture with a persistence blocker");
         tokio::fs::create_dir_all(&settings_path)
             .await
             .expect("directory blocks atomic settings rename");
@@ -5752,6 +5753,7 @@ mod tests {
         )
         .await
         .expect("disabled provider fixture");
+        hermetic_providers::ensure_hermetic_settings(&config.state_dir());
         let control = NativeServerControl::new(config, json!({"policy": "test"})).await;
         let (generation, settings) = control.settings_snapshot().await;
 
@@ -5854,6 +5856,7 @@ mod tests {
         )
         .await
         .expect("disabled provider fixture");
+        hermetic_providers::ensure_hermetic_settings(&config.state_dir());
         let control = NativeServerControl::new(config, json!({"policy": "test"})).await;
 
         let initial_full_probe = control.install_next_full_provider_probe_pause().await;
@@ -5869,6 +5872,7 @@ mod tests {
 
         let stale_quick_probe = control.install_next_quick_provider_probe_pause().await;
         let stale_control = control.clone();
+        let stale_binary = missing_provider_executable(&temp);
         let stale_update = tokio::spawn(async move {
             stale_control
                 .update_settings(json!({
@@ -5878,7 +5882,7 @@ mod tests {
                             "stale_instance": {
                                 "driver": "codex",
                                 "enabled": false,
-                                "config": {}
+                                "config": {"binaryPath": stale_binary}
                             }
                         }
                     }
@@ -5895,7 +5899,7 @@ mod tests {
                         "current_instance": {
                             "driver": "codex",
                             "enabled": false,
-                            "config": {}
+                            "config": {"binaryPath": missing_provider_executable(&temp)}
                         }
                     }
                 }
@@ -5988,6 +5992,12 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_settings_surface_structured_errors_and_refuse_mutation() {
+        #[cfg(feature = "hermetic-test-guard")]
+        if crate::test_support::reexec_without_provider_path(
+            "production::control::tests::malformed_settings_surface_structured_errors_and_refuse_mutation",
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -6038,6 +6048,12 @@ mod tests {
 
     #[tokio::test]
     async fn schema_invalid_settings_surface_structured_errors_and_preserve_original_bytes() {
+        #[cfg(feature = "hermetic-test-guard")]
+        if crate::test_support::reexec_without_provider_path(
+            "production::control::tests::schema_invalid_settings_surface_structured_errors_and_preserve_original_bytes",
+        ) {
+            return;
+        }
         let cases = [
             ("top-level array", br#"[]"#.as_slice()),
             (
@@ -6137,6 +6153,12 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_settings_patch_is_transactional_and_publishes_no_events() {
+        #[cfg(feature = "hermetic-test-guard")]
+        if crate::test_support::reexec_without_provider_path(
+            "production::control::tests::invalid_settings_patch_is_transactional_and_publishes_no_events",
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -6197,13 +6219,13 @@ mod tests {
     async fn settings_validation_accepts_fractional_fetch_intervals() {
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
-        let settings_path = config.state_dir().join("settings.json");
         tokio::fs::create_dir_all(config.state_dir())
             .await
             .expect("state directory exists");
-        tokio::fs::write(&settings_path, br#"{"automaticGitFetchInterval":0.1}"#)
-            .await
-            .expect("fractional interval fixture");
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({"automaticGitFetchInterval": 0.1}),
+        );
         let control = NativeServerControl::new(config, json!({"policy": "test"})).await;
 
         let settings = control
@@ -6216,6 +6238,12 @@ mod tests {
 
     #[tokio::test]
     async fn settings_validation_preserves_open_unknown_keys_and_legacy_options() {
+        #[cfg(feature = "hermetic-test-guard")]
+        if crate::test_support::reexec_without_provider_path(
+            "production::control::tests::settings_validation_preserves_open_unknown_keys_and_legacy_options",
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -6243,6 +6271,7 @@ mod tests {
         .await
         .expect("open settings fixture");
 
+        hermetic_providers::ensure_hermetic_settings(&config.state_dir());
         let control = NativeServerControl::new(config, json!({"policy": "test"})).await;
         let settings = control
             .call("server.getSettings", json!({}), CancellationToken::new())

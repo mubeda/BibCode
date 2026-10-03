@@ -17,13 +17,13 @@ const TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange"
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const BOOTSTRAP_TOKEN_TYPE: &str = "urn:bibcode:params:oauth:token-type:environment-bootstrap";
 
+#[path = "support/hermetic_providers.rs"]
+mod hermetic_providers;
+
 fn disable_provider_processes(root: &std::path::Path) {
-    let settings = root.join("userdata/settings.json");
-    std::fs::create_dir_all(settings.parent().expect("settings parent"))
-        .expect("settings directory");
-    std::fs::write(
-        settings,
-        serde_json::to_vec(&json!({
+    hermetic_providers::write_hermetic_settings(
+        &root.join("userdata"),
+        json!({
             "providers": {
                 "codex": {"enabled": false},
                 "claudeAgent": {"enabled": false},
@@ -31,10 +31,8 @@ fn disable_provider_processes(root: &std::path::Path) {
                 "grok": {"enabled": false},
                 "opencode": {"enabled": false}
             }
-        }))
-        .expect("settings JSON"),
-    )
-    .expect("settings fixture");
+        }),
+    );
 }
 
 type WsStream =

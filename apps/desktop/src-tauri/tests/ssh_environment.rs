@@ -15,7 +15,7 @@
 //! `cargo test -p bibcode-desktop` neither builds nor checks:
 //!
 //! ```sh
-//! cargo build -p bibcode-server --bin bibcode
+//! cargo test -p bibcode-server --test cli_smoke --no-run -j 2
 //! cargo test -p bibcode-desktop --test ssh_environment -- --ignored
 //! ```
 //!
@@ -46,6 +46,9 @@ use tauri::{
     App,
     test::{MockRuntime, mock_builder, mock_context, noop_assets},
 };
+
+#[path = "../../../server/tests/support/hermetic_providers.rs"]
+mod hermetic_providers;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(90);
 /// Serializes scenarios across test threads; each owns real remote servers.
@@ -179,6 +182,16 @@ impl Harness {
             .expect("fixture root");
         let state = root.path().join(alias);
         fs::create_dir_all(&state).expect("fixture state directory");
+        hermetic_providers::write_hermetic_settings(
+            &state.join("remote-home/.bibcode/userdata"),
+            serde_json::json!({ "providers": {
+                "codex": { "enabled": false },
+                "claudeAgent": { "enabled": false },
+                "cursor": { "enabled": false },
+                "grok": { "enabled": false },
+                "opencode": { "enabled": false }
+            }}),
+        );
         let port_start = parse_port_start(
             std::env::var("BIBCODE_SSH_FIXTURE_PORT_START")
                 .ok()
@@ -238,12 +251,27 @@ impl Harness {
         manager: &SshEnvironmentManager,
         options: Option<SshEnvironmentEnsureOptions>,
     ) -> Result<SshEnvironmentBootstrap, String> {
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             STEP_TIMEOUT,
             manager.ensure_environment(self.app.handle(), &self.prompts, self.target(), options),
         )
         .await
-        .unwrap_or_else(|_| Err(format!("ensure_environment exceeded {STEP_TIMEOUT:?}")))
+        .unwrap_or_else(|_| Err(format!("ensure_environment exceeded {STEP_TIMEOUT:?}")));
+        for entry in fs::read_dir(self.remote_home().join(".bibcode-ssh-launch"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = entry.path().join("server.log");
+            if let Ok(log) = fs::read_to_string(&path) {
+                assert!(
+                    !log.contains("hermetic-test-guard:"),
+                    "remote CLI fixture must remain hermetic at {}:\n{log}",
+                    path.display()
+                );
+            }
+        }
+        result
     }
 
     async fn disconnect(&self, manager: &SshEnvironmentManager) {
@@ -414,7 +442,7 @@ fn port_start_override_must_be_a_port_that_leaves_room_for_the_scan() {
 }
 
 #[tokio::test]
-#[ignore = "needs a fresh bibcode: cargo build -p bibcode-server --bin bibcode"]
+#[ignore = "needs a guarded bibcode: cargo test -p bibcode-server --test cli_smoke --no-run"]
 async fn add_then_reconnect_mints_fresh_tokens_with_standard_scopes() {
     let harness = Harness::new("sshd-add").await;
     let manager = harness.manager(SshOperationDeadlines::default());
@@ -483,7 +511,7 @@ async fn add_then_reconnect_mints_fresh_tokens_with_standard_scopes() {
 }
 
 #[tokio::test]
-#[ignore = "needs a fresh bibcode: cargo build -p bibcode-server --bin bibcode"]
+#[ignore = "needs a guarded bibcode: cargo test -p bibcode-server --test cli_smoke --no-run"]
 async fn desktop_restart_mints_a_fresh_token() {
     let harness = Harness::new("sshd-restart").await;
     let before_restart = harness.manager(SshOperationDeadlines::default());
@@ -516,7 +544,7 @@ async fn desktop_restart_mints_a_fresh_token() {
 }
 
 #[tokio::test]
-#[ignore = "needs a fresh bibcode: cargo build -p bibcode-server --bin bibcode"]
+#[ignore = "needs a guarded bibcode: cargo test -p bibcode-server --test cli_smoke --no-run"]
 async fn dead_tunnel_reconnects_and_mints_a_fresh_token() {
     let harness = Harness::new("sshd-deadtunnel").await;
     let manager = harness.manager(SshOperationDeadlines::default());
@@ -555,7 +583,7 @@ async fn dead_tunnel_reconnects_and_mints_a_fresh_token() {
 }
 
 #[tokio::test]
-#[ignore = "needs a fresh bibcode: cargo build -p bibcode-server --bin bibcode"]
+#[ignore = "needs a guarded bibcode: cargo test -p bibcode-server --test cli_smoke --no-run"]
 async fn remote_server_stopped_under_a_live_tunnel_is_relaunched() {
     let harness = Harness::new("sshd-relaunch").await;
     let manager = harness.manager(SshOperationDeadlines::default());
@@ -614,7 +642,7 @@ async fn remote_server_stopped_under_a_live_tunnel_is_relaunched() {
 /// (`SshOperationDeadlines::pairing_watchdog_bound`) plus the TERM-to-KILL
 /// grace; this allows 3 s past the bound.
 #[tokio::test]
-#[ignore = "needs a fresh bibcode: cargo build -p bibcode-server --bin bibcode"]
+#[ignore = "needs a guarded bibcode: cargo test -p bibcode-server --test cli_smoke --no-run"]
 async fn pairing_timeout_terminates_the_ssh_child_and_the_remote_command() {
     let harness = Harness::with_sshd_sessions("hang-pairing").await;
     let deadlines = SshOperationDeadlines {
@@ -668,7 +696,7 @@ async fn pairing_timeout_terminates_the_ssh_child_and_the_remote_command() {
 }
 
 #[tokio::test]
-#[ignore = "needs a fresh bibcode: cargo build -p bibcode-server --bin bibcode"]
+#[ignore = "needs a guarded bibcode: cargo test -p bibcode-server --test cli_smoke --no-run"]
 async fn timed_out_pairing_retries_leave_no_remote_command() {
     let harness = Harness::with_sshd_sessions("hang-pairing-retries").await;
     let deadlines = SshOperationDeadlines {

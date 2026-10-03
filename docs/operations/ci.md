@@ -5,7 +5,10 @@ four job groups:
 
 - **Check** runs `vp check`, workspace typechecking (`vpr typecheck`),
   `cargo fmt --all --check`, Clippy with warnings denied, and the complete
-  desktop build pipeline on Ubuntu 24.04.
+  desktop build pipeline on Ubuntu 24.04. A separate
+  `cargo check -p bibcode-server --lib --bins -j 2` also checks production
+  feature wiring without dev units: all-targets Clippy enables the hermetic
+  test guard, while ordinary server builds do not.
 - **Test** runs every workspace package `test` script one task at a time with
   `vp run -r --concurrency-limit 1 test`, then runs `cargo test --workspace -j 2`
   explicitly on Ubuntu 24.04. Serial tasks keep `rustc` from competing with a
@@ -16,19 +19,28 @@ four job groups:
   test binaries use the default parallel harness threads. Exact subprocess
   tests may still select `--test-threads=1` inside an isolated child process
   that intentionally owns process-global state.
-  The job then builds `bibcode` (`cargo build -p bibcode-server --bin bibcode`)
+  The job then builds the guarded `bibcode` through
+  `cargo test -p bibcode-server --test cli_smoke --no-run -j 2`
   and runs the ignored desktop SSH integration test
   (`cargo test -p bibcode-desktop --test ssh_environment -- --ignored`), which
-  needs that fresh binary and fakes only the SSH hop; see
+  needs that fresh guarded binary and fakes only the SSH hop; see
   [Desktop-managed SSH environments](../testing/ssh-environments.md).
 - **Release Smoke** runs `scripts/release-smoke.ts` to exercise release-only
   version rewriting, nightly metadata, and lockfile generation without
   publishing.
 - **Native desktop** builds the web application, tests the desktop Rust host,
   and creates an unpublished native bundle on Linux ARM64/x64, Windows ARM64/x64,
-  and macOS ARM64/x64 runners. Its 120-minute job budget covers cold compilation
-  of the host tests, the macOS optimized exception-recovery probe, and the
-  native bundle without shortening any check. The shared `scripts/run-msvc.mjs` launcher selects
+  and macOS ARM64/x64 runners. Each matrix row declares its complete-job budget:
+  240 minutes for macOS Intel, and 120 minutes for the other five targets.
+  That budget includes setup, host tests, the macOS optimized exception-recovery
+  probe, and native packaging without shortening any check or test-owned deadline.
+  Debug host tests cannot warm the optimized artifacts; the optimized example
+  also enables dev-dependency features (`tauri/test` and `tokio/test-util`) that
+  the ordinary production bundle does not use. Both optimized commands select
+  the same native target triple, but their feature differences require separate
+  compilation. Keep the real exception probe: a larger complete-job allowance
+  accommodates these deliberate checks without treating a cached build as the
+  cold-build baseline. The shared `scripts/run-msvc.mjs` launcher selects
   the requested MSVC architecture. After the Rust host tests,
   the Windows row alone runs
   `vp test run apps/desktop/e2e/support/test-project.test.ts`. That step is the

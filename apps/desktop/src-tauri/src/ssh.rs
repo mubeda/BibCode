@@ -4412,6 +4412,8 @@ case "$1" in
     case "${FIXTURE_PAIRING:-ok}" in
       hang) exec sleep 600 ;;
       ignore-term)
+        # Ignore TERM before interpreter startup; exec preserves SIG_IGN.
+        trap '' TERM
         exec python3 -c 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)'
         ;;
       fail) printf '{"credential":"fixture-credential"}\n'; exit 7 ;;
@@ -4866,6 +4868,49 @@ while True:
                             "{mode}: {run:?}: stand-in {pid} was left behind"
                         );
                     }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn pairing_watchdog_escalates_when_the_interpreter_starts_late() {
+            let python = find_on_path("python3").expect("Python fixture interpreter");
+            let python = fs::canonicalize(python).expect("absolute Python fixture interpreter");
+            for shell in shells() {
+                let host = ScriptHost::with_limit(Duration::from_secs(10));
+                let _cleanup = host.cleanup();
+                // Keep one PID through the delay and both execs, so the
+                // stand-in must inherit TERM immunity before Python starts.
+                write_executable(
+                    &host.dir.path().join("bin/python3"),
+                    r#"#!/bin/sh
+exec "$BIBCODE_FIXTURE_PYTHON" -c 'import os, sys, time
+time.sleep(1.2)
+os.execv(sys.argv[1], sys.argv[1:])' "$BIBCODE_FIXTURE_PYTHON" "$@"
+"#,
+                );
+                let run = host.run(
+                    &shell,
+                    REMOTE_PAIRING_SCRIPT,
+                    &["1"],
+                    &[
+                        ("FIXTURE_PAIRING", "ignore-term".to_string()),
+                        ("BIBCODE_FIXTURE_PYTHON", python.display().to_string()),
+                    ],
+                    ScriptOutput::Files,
+                );
+                assert_eq!(run.code(), Some(124), "{run:?}");
+                assert!(
+                    run.elapsed >= Duration::from_secs(2) && run.elapsed < Duration::from_secs(5),
+                    "the delayed interpreter must survive TERM until watchdog KILL: {run:?}"
+                );
+                let stand_ins = host.pids("pairing.pids");
+                assert_eq!(stand_ins.len(), 1, "{run:?}");
+                for pid in stand_ins {
+                    assert!(
+                        wait_until_gone(pid, Duration::from_millis(500)).await,
+                        "{run:?}: stand-in {pid} was left behind"
+                    );
                 }
             }
         }

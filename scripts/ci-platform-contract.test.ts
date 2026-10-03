@@ -36,11 +36,11 @@ interface WorkflowJob {
   readonly needs?: string | ReadonlyArray<string>;
   readonly outputs?: Record<string, string>;
   readonly "runs-on"?: string;
-  readonly "timeout-minutes"?: number;
+  readonly "timeout-minutes"?: number | string;
   readonly strategy?: {
     readonly "fail-fast"?: boolean;
     readonly matrix?: {
-      readonly include?: ReadonlyArray<Record<string, string>>;
+      readonly include?: ReadonlyArray<Record<string, string | number>>;
     };
   };
   readonly steps?: ReadonlyArray<WorkflowStep>;
@@ -124,7 +124,7 @@ describe("cross-platform CI contract", () => {
       names.indexOf("Rust workspace tests"),
     );
     expect(sshStep?.run?.trim().split("\n")).toEqual([
-      "cargo build -p bibcode-server --bin bibcode -j 2",
+      "cargo test -p bibcode-server --test cli_smoke --no-run -j 2",
       "cargo test -p bibcode-desktop --test ssh_environment -j 2 -- --ignored",
     ]);
   });
@@ -137,8 +137,16 @@ describe("cross-platform CI contract", () => {
 
   it("allows native CI to finish host tests, optimized recovery probes, and bundles", () => {
     const { workflow } = readWorkflow(CI_WORKFLOW_PATH);
-
-    expect(requireJob(workflow, "native_desktop")["timeout-minutes"]).toBeGreaterThanOrEqual(120);
+    const job = requireJob(workflow, "native_desktop");
+    expect(job["timeout-minutes"]).toBe("${{ matrix.jobTimeoutMinutes }}");
+    const matrix = job.strategy?.matrix?.include ?? [];
+    expect(matrix).toHaveLength(6);
+    for (const row of matrix) {
+      // Intel's cold optimized probe and native package use distinct dependency
+      // feature sets, in addition to the unoptimized host test graph.
+      const minimum = row.platform === "mac" && row.arch === "x64" ? 240 : 120;
+      expect(row.jobTimeoutMinutes, String(row.label)).toBeGreaterThanOrEqual(minimum);
+    }
   });
 
   it("builds native desktop bundles on every supported runner and architecture", () => {
