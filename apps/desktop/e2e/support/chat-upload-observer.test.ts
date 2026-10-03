@@ -397,6 +397,7 @@ it("installs the measured decoder through the actual controller's pre-document s
   const end = source.indexOf("\n\nlet browser:", start);
   const script = NodeVM.runInNewContext(source.slice(start, end) + "\nobservationScript", {
     browserStartupObservationScript: "",
+    qualificationMode: "upload-smoke",
     chatUploadObservationScript,
   });
   const f = fixture(script);

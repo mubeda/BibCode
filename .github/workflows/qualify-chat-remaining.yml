@@ -1,0 +1,73 @@
+name: Issue 17 remaining browser qualification
+
+on:
+  push:
+    branches: [codex/qualify-chat-remaining]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  remaining:
+    name: Linux Chromium old inline and native transport
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+      - name: Install frozen current frontend tooling
+        run: vp install --frozen-lockfile
+      - name: Check inert proofs and owned process helpers
+        run: |
+          python3 -B scripts/qualify-chat-uploads.test.py
+          python3 -B scripts/qualify-chat-network.test.py
+          python3 -B scripts/qualify-chat-uploads.py preflight
+          vp test run apps/desktop/e2e/support/chat-inline-fallback.test.ts apps/desktop/e2e/support/chat-inline-mechanics.test.ts apps/desktop/e2e/support/chat-inline-receiver.test.ts apps/desktop/e2e/support/chat-remaining-qualification.test.ts apps/desktop/e2e/support/chat-upload-fixture.test.ts apps/desktop/e2e/support/chat-upload-evidence.test.ts apps/desktop/e2e/support/browser-network.test.ts apps/desktop/e2e/support/browser-startup.test.ts apps/desktop/e2e/support/browser-startup-probe.test.ts
+      - name: Checkout immutable actual old source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: cd66fda5700294a320fe76256c486bd7a7a0b3a5
+          path: .qa-old-inline-source
+          persist-credentials: false
+      - name: Build separate native old input from its locked source
+        run: cargo build --locked --manifest-path .qa-old-inline-source/Cargo.toml -p bibcode-server --bin bibcode --target-dir "${{ runner.temp }}/issue17-old-inline-target" -j 2
+      - name: Verify old source CLI schema auth and binary receipt
+        run: python3 -B scripts/qualify-chat-uploads.py prepare-old-input
+      - name: Run only the two remaining qualification families
+        env:
+          BIBCODE_UPLOAD_MODE: remaining-qualification
+          BIBCODE_UPLOAD_OLD_SERVER: ${{ runner.temp }}/issue17-old-inline-input/bibcode
+          BIBCODE_UPLOAD_OLD_RECEIPT: ${{ runner.temp }}/issue17-old-inline-input.json
+        run: python3 -B scripts/qualify-chat-uploads.py
+      - name: Retain only closed evidence and original controlled scenes
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue17-remaining-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue17-old-inline-input.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/inline-fallback-light.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/inline-fallback-dark.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure-after-pair.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure-before-credential.png
+          if-no-files-found: warn

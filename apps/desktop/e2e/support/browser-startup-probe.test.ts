@@ -11,6 +11,10 @@ import {
 } from "./browser-startup-probe.ts";
 
 describe("credential-free startup probe", () => {
+  it("admits remaining qualification only through its explicit separate profile", () => {
+    expect(parseQualificationMode("remaining-qualification")).toBe("remaining-qualification");
+    expect(parseQualificationMode(undefined)).toBe("upload-smoke");
+  });
   it.each([
     "null",
     "[]",
@@ -282,6 +286,7 @@ describe("credential-free startup probe", () => {
     let receipt: Record<string, unknown> = {};
     NodeVM.runInNewContext(source.slice(start, end), {
       success,
+      oldInput: null,
       selectedMatrixCase: null,
       qualificationMode: "startup-only",
       currentPhase: "pair-wait-token",

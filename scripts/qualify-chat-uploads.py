@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Disposable Linux browser upload qualification; never runs on a local host."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -168,7 +170,7 @@ def network():
 def qualification_mode(value):
     if value is None or value == 'upload-smoke':
         return 'upload-smoke'
-    if value in ['startup-only', 'upload-matrix']:
+    if value in ['startup-only', 'upload-matrix', 'remaining-qualification']:
         return value
     raise RuntimeError('The qualification mode is invalid')
 
@@ -178,7 +180,7 @@ def case_settings(mode, selected):
     if mode != 'upload-matrix':
         if selected not in [None, '']:
             raise RuntimeError('The upload matrix case is invalid')
-        return {'case': None, 'inner_timeout': 600, 'outer_timeout': 660}
+        return {'case': None, 'inner_timeout': 900, 'outer_timeout': 960} if mode == 'remaining-qualification' else {'case': None, 'inner_timeout': 600, 'outer_timeout': 660}
     manifest = json.loads((Path(__file__).resolve().parent.parent / 'apps/desktop/e2e/support/chat-upload-matrix-cases.json').read_text())
     match = next((entry for entry in manifest if entry['case'] == selected), None)
     if (match is None or match.get('innerTimeoutSeconds') != 1800 or match.get('outerTimeoutSeconds') != 1860
@@ -188,9 +190,143 @@ def case_settings(mode, selected):
     return {'case': match['case'], 'inner_timeout': 1800, 'outer_timeout': 1860}
 
 
-def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_namespace, source, ip):
+def verify_old_inline_input(server, receipt_path):
+    """A CI-owned source receipt is separate from observed server/UI qualification."""
+    try:
+        with os.fdopen(os.open(receipt_path, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as receipt_file:
+            if not stat.S_ISREG(os.fstat(receipt_file.fileno()).st_mode):
+                raise ValueError()
+            raw = receipt_file.read(4097)
+        if len(raw) > 4096:
+            raise ValueError()
+        receipt = json.loads(raw)
+        keys = {'source', 'serverVersion', 'binarySha256', 'build', 'hermeticGuard', 'contractProof'}
+        proof_keys = {'serveFlags', 'pairingIssue', 'inlineDataUrl', 'capabilityAbsent', 'operateScope'}
+        if (not isinstance(receipt, dict) or set(receipt) != keys
+                or receipt['source'] != 'cd66fda5700294a320fe76256c486bd7a7a0b3a5'
+                or receipt['serverVersion'] != '0.7.2' or receipt['build'] != 'immutable-source'
+                or receipt['hermeticGuard'] != 'unavailable-in-old-source'
+                or not isinstance(receipt['binarySha256'], str) or len(receipt['binarySha256']) != 64
+                or any(char not in '0123456789abcdef' for char in receipt['binarySha256'])
+                or not isinstance(receipt['contractProof'], dict)
+                or set(receipt['contractProof']) != proof_keys
+                or any(value is not True for value in receipt['contractProof'].values())):
+            raise ValueError()
+        hasher = hashlib.sha256()
+        with os.fdopen(os.open(server, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as binary:
+            before = os.fstat(binary.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_mode & 0o222 or not 0 < before.st_size <= 512 * 1024 ** 2:
+                raise ValueError()
+            total = 0
+            while chunk := binary.read(65536):
+                total += len(chunk)
+                if total > before.st_size:
+                    raise ValueError()
+                hasher.update(chunk)
+            after = os.fstat(binary.fileno())
+        if (total != before.st_size or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or hasher.hexdigest() != receipt['binarySha256']):
+            raise ValueError()
+        return receipt
+    except (OSError, ValueError, TypeError, KeyError):
+        raise RuntimeError('Old inline input refused') from None
+
+
+def old_inline_contract_proof(files, version, serve_help, pairing_help):
+    """Compatibility source/CLI proof; not observed application or provider success."""
+    expected = {'manifest', 'lifecycle', 'control', 'environment', 'orchestration', 'scope', 'model', 'library'}
+    if (not isinstance(files, dict) or set(files) != expected
+            or any(not isinstance(value, str) or len(value) > 2 * 1024 ** 2 for value in files.values())
+            or not isinstance(version, str) or version.strip() != 'bibcode 0.7.2'
+            or not isinstance(serve_help, str) or len(serve_help) > 65536
+            or not isinstance(pairing_help, str) or len(pairing_help) > 65536):
+        raise RuntimeError('Old inline input refused')
+    position = files['scope'].find('"orchestration.dispatchCommand"')
+    tail = files['scope'][position:] if position >= 0 else ''
+    arm = tail.split('=>', 1)[1].split(',', 1)[0] if '=>' in tail else ''
+    proof = {
+        'serveFlags': all(flag in serve_help for flag in ['--mode', '--host', '--port', '--base-dir', '--dev-url', '--no-browser', '--no-startup-pairing-offer']),
+        'pairingIssue': all(flag in pairing_help for flag in ['--base-dir', '--dev-url', '--json']) and 'issue_administrative_pairing_link' in files['library'],
+        'inlineDataUrl': 'dataUrl' in files['orchestration'] and 'uploadId' not in files['orchestration'],
+        'capabilityAbsent': all('attachmentStaging' not in files[key] for key in ['lifecycle', 'control', 'environment']),
+        'operateScope': 'Some(SCOPE_ORCHESTRATION_OPERATE)' in arm and '"orchestration:operate"' in files['model'],
+    }
+    if ('version = "0.7.2"' not in files['manifest'] or 'hermetic-test-guard' in files['manifest']
+            or any(value is not True for value in proof.values())):
+        raise RuntimeError('Old inline input refused')
+    return proof
+
+
+def prepare_old_inline_input():
+    """CI-only producer for the immutable second checkout and separate native build."""
+    if sys.platform != 'linux' or os.environ.get('CI') != 'true' or not os.environ.get('GITHUB_RUN_ID', '').isdigit():
+        raise RuntimeError('Old inline preparation refused')
+    try:
+        checkout = (Path(os.environ['GITHUB_WORKSPACE']) / '.qa-old-inline-source').resolve(strict=True)
+        runner = Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
+        built = runner / 'issue17-old-inline-target/debug/bibcode'
+        receipt_path = runner / 'issue17-old-inline-input.json'
+        git = shutil.which('git')
+        if not git or not built.is_file() or built.is_symlink() or not 0 < built.stat().st_size <= 512 * 1024 ** 2:
+            raise ValueError()
+        git_env = {**os.environ, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_OPTIONAL_LOCKS': '0'}
+        for key in list(git_env):
+            if key.upper().startswith('GIT_') and key not in ['GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_OPTIONAL_LOCKS']:
+                del git_env[key]
+        def revision():
+            sha = subprocess.check_output([git, '-C', str(checkout), 'rev-parse', 'HEAD'], env=git_env, text=True, timeout=5).strip()
+            dirty = subprocess.check_output([git, '-C', str(checkout), 'status', '--porcelain', '--untracked-files=all'], env=git_env, text=True, timeout=5)
+            if sha != 'cd66fda5700294a320fe76256c486bd7a7a0b3a5' or dirty:
+                raise ValueError()
+            return sha
+        source = revision()
+        native_input = runner / 'issue17-old-inline-input'
+        native_input.mkdir(mode=0o700, exist_ok=False)
+        binary = native_input / 'bibcode'
+        shutil.copyfile(built, binary)
+        binary.chmod(0o500)
+        paths = {'manifest': 'apps/server/Cargo.toml', 'lifecycle': 'apps/server/src/lifecycle.rs', 'control': 'apps/server/src/production/control.rs', 'environment': 'packages/contracts/src/environment.ts', 'orchestration': 'packages/contracts/src/orchestration.ts', 'scope': 'apps/server/src/auth/scope.rs', 'model': 'apps/server/src/auth/model.rs', 'library': 'apps/server/src/lib.rs'}
+        files = {}
+        for key, relative in paths.items():
+            path = checkout / relative
+            if path.stat().st_size > 2 * 1024 ** 2:
+                raise ValueError()
+            files[key] = path.read_text()
+        private = runner / 'issue17-old-inline-preparation'
+        private.mkdir(mode=0o700, exist_ok=False)
+        home = private / 'home'; home.mkdir(mode=0o700)
+        environment = {'PATH': os.environ['PATH'], 'LANG': 'C.UTF-8', 'HOME': str(home), 'USERPROFILE': str(home), 'CODEX_HOME': str(home / '.codex'), 'CLAUDE_CONFIG_DIR': str(home / '.claude'), 'XDG_CONFIG_HOME': str(home / 'config'), 'XDG_CACHE_HOME': str(home / 'cache'), 'XDG_DATA_HOME': str(home / 'data')}
+        outputs = []
+        for index, arguments in enumerate([['--version'], ['serve', '--help'], ['pairing', 'issue', '--help']]):
+            output_path = private / ('cli-' + str(index))
+            with output_path.open('xb') as output:
+                process = subprocess.run([str(binary), *arguments], env=environment, cwd=private, stdout=output, stderr=output, timeout=10, check=False)
+            if process.returncode != 0 or output_path.stat().st_size > 65536:
+                raise ValueError()
+            outputs.append(output_path.read_text())
+        proof = old_inline_contract_proof(files, *outputs)
+        revision()
+        hasher = hashlib.sha256()
+        with binary.open('rb') as opened:
+            while chunk := opened.read(65536):
+                hasher.update(chunk)
+        receipt = {'source': source, 'serverVersion': '0.7.2', 'binarySha256': hasher.hexdigest(), 'build': 'immutable-source', 'hermeticGuard': 'unavailable-in-old-source', 'contractProof': proof}
+        with receipt_path.open('x') as output:
+            os.chmod(receipt_path, 0o600)
+            output.write(json.dumps(receipt, indent=2) + '\n')
+        verify_old_inline_input(str(binary), str(receipt_path))
+        receipt_path.chmod(0o400)
+        print(json.dumps({'oldInputPrepared': True, **receipt}))
+        return 0
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+        raise RuntimeError('Old inline preparation refused') from None
+
+
+def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_namespace, source, ip, old_receipt_json=None):
     mode = qualification_mode(os.environ.get('BIBCODE_UPLOAD_MODE'))
     selection = case_settings(mode, os.environ.get('BIBCODE_UPLOAD_CASE'))
+    old_receipt = json.loads(old_receipt_json) if old_receipt_json is not None else None
     private_namespace = os.readlink('/proc/self/ns/net')
     if os.getpid() != 1 or private_namespace == host_namespace:
         raise RuntimeError('Refusing to run outside the owned PID/network namespaces')
@@ -218,13 +354,14 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
             'BIBCODE_UPLOAD_SOURCE': source,
             'BIBCODE_UPLOAD_MODE': mode,
             **({'BIBCODE_UPLOAD_CASE': selection['case']} if selection['case'] is not None else {}),
+            **({'BIBCODE_UPLOAD_OLD_INPUT': json.dumps(old_receipt)} if mode == 'remaining-qualification' else {}),
             **trusted_network,
         }
         with (fixture / 'private-controller.log').open('xb') as output:
             process = subprocess.Popen([node, 'apps/desktop/e2e/qualify-chat-uploads.ts'],
                                        env=environment, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
-            # Only a fixed selected matrix case has the reviewed long budget.
+            # Only explicit fixed profiles receive their reviewed diagnostic budgets.
             status = process.wait(timeout=selection['inner_timeout'])
     finally:
         observed = namespace_children()
@@ -322,7 +459,16 @@ def outer():
     programs = host_programs()
     run_id = os.environ['GITHUB_RUN_ID']
     node = resolve_node_runtime()
-    server = str(Path(os.environ['BIBCODE_UPLOAD_SERVER']).resolve(strict=True))
+    old_receipt = None
+    if mode == 'remaining-qualification':
+        old_server = os.environ.get('BIBCODE_UPLOAD_OLD_SERVER')
+        old_receipt_path = os.environ.get('BIBCODE_UPLOAD_OLD_RECEIPT')
+        if not old_server or not old_receipt_path:
+            raise RuntimeError('Old inline input refused')
+        old_receipt = verify_old_inline_input(old_server, old_receipt_path)
+        server = str(Path(old_server).resolve(strict=True))
+    else:
+        server = str(Path(os.environ['BIBCODE_UPLOAD_SERVER']).resolve(strict=True))
     evidence = Path(os.environ['RUNNER_TEMP']) / ('issue17-browser-' + run_id)
     # Evidence carries the run ID; keep owned TMPDIR short for native Unix sockets.
     fixture = Path('/tmp') / ('bibcode-upload-' + uuid.uuid4().hex)
@@ -331,13 +477,21 @@ def outer():
     namespace = os.readlink('/proc/self/ns/net')
     versions = {name: subprocess.check_output([path, '--version'], text=True, timeout=10).splitlines()[0]
                 for name, path in programs.items() if name in ['google-chrome', 'chromedriver']}
+    webkit_driver_available = shutil.which('WebKitWebDriver') is not None
     write_json(evidence / 'provenance.json', {'source': os.environ['GITHUB_SHA'], 'versions': versions,
                                              'qualificationMode': mode, 'matrixCase': selection['case'],
-                                             'fixtureRoot': str(fixture), 'guardMode': 'default Abort'})
+                                             'fixtureRoot': str(fixture),
+                                             'guardMode': 'unavailable-in-old-source' if old_receipt is not None else 'default Abort',
+                                             'oldInput': old_receipt,
+                                             'webkitgtk': {'measurement': 'not-measured', 'driverAvailable': webkit_driver_available,
+                                                           'reason': 'owned-profile-unavailable' if webkit_driver_available else 'driver-not-installed'}})
+    if mode == 'remaining-qualification' and webkit_driver_available:
+        raise RuntimeError('Available WebKitGTK driver requires its owned native profile')
     command = [programs['unshare'], '--user', '--map-current-user', '--keep-caps', '--net', '--pid', '--mount-proc',
                '--fork', '--kill-child', sys.executable, __file__, 'inner', str(evidence), str(fixture),
                node, server, programs['google-chrome'], programs['chromedriver'], programs['git'], programs['dirname'],
-               namespace, os.environ['GITHUB_SHA'], str(Path(programs['ip']).resolve(strict=True))]
+               namespace, os.environ['GITHUB_SHA'], str(Path(programs['ip']).resolve(strict=True)),
+               json.dumps(old_receipt)]
     result, _ = run_owned_command(command, timeout=selection['outer_timeout'], grace=15)
     result['hostNetworkNamespaceUnchanged'] = os.readlink('/proc/self/ns/net') == namespace
     write_json(evidence / 'supervisor.json', result)
@@ -347,6 +501,8 @@ def outer():
 
 
 if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == 'prepare-old-input':
+        sys.exit(prepare_old_inline_input())
     if len(sys.argv) > 1 and sys.argv[1] == 'network':
         sys.exit(network())
     if len(sys.argv) > 1 and sys.argv[1] == 'preflight':

@@ -277,6 +277,8 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Old-server inline fallback, no `uploads.*` probes, failed-admission reuse, and abandoned-stage cleanup:
 - Light/dark upload and reconnect/Cancel screenshots:
 - Browser queued-data-after-close/Ping-Pong probe; WebKitGTK measured or explicitly not measured:
+- Remaining-only profile source/immutable old-input source and binary digest; source/CLI/schema/auth receipt versus actually observed old-server fallback; old guard absence and retained isolation; valid Request/image attribution and zero uploads probes:
+- Synthetic plain native probe versus product RPC/Noise; native Ping write admission, matching Pong position, receiver data digest and observed Close, browser queue/close event, exact joined listener/socket/proxy cleanup:
 
 ## SSH environment evidence
 

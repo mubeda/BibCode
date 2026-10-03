@@ -4,6 +4,7 @@ import ast
 import contextlib
 import io
 import json
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -23,6 +24,49 @@ spec.loader.exec_module(qualification)
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_old_contract_proof_distinguishes_source_cli_and_scope_from_native_success(self):
+        files = {'manifest': 'version = "0.7.2"', 'lifecycle': 'capabilities', 'control': 'capabilities', 'environment': 'capabilities', 'orchestration': 'dataUrl', 'scope': '"orchestration.dispatchCommand" => Some(SCOPE_ORCHESTRATION_OPERATE),', 'model': '"orchestration:operate"', 'library': 'issue_administrative_pairing_link'}
+        serve = '--mode --host --port --base-dir --dev-url --no-browser --no-startup-pairing-offer'
+        pairing = '--base-dir --dev-url --json'
+        self.assertEqual(qualification.old_inline_contract_proof(files, 'bibcode 0.7.2\n', serve, pairing), {'serveFlags': True, 'pairingIssue': True, 'inlineDataUrl': True, 'capabilityAbsent': True, 'operateScope': True})
+        for key, changed in [('manifest', 'version = "0.7.2"\nhermetic-test-guard'), ('control', 'attachmentStaging'), ('orchestration', 'dataUrl uploadId'), ('scope', '"orchestration.dispatchCommand" => Some(SCOPE_ORCHESTRATION_READ),')]:
+            with self.assertRaisesRegex(RuntimeError, 'Old inline input refused'):
+                qualification.old_inline_contract_proof({**files, key: changed}, 'bibcode 0.7.2', serve, pairing)
+        with self.assertRaisesRegex(RuntimeError, 'Old inline input refused'):
+            qualification.old_inline_contract_proof(files, 'bibcode 0.7.2', serve.replace('--no-startup-pairing-offer', ''), pairing)
+
+    def test_old_input_preparation_refuses_local_execution_before_any_cli_or_git(self):
+        with mock.patch.dict(os.environ, {'CI': 'false'}), mock.patch.object(qualification.subprocess, 'run') as run, mock.patch.object(qualification.subprocess, 'check_output') as read:
+            with self.assertRaisesRegex(RuntimeError, 'Old inline preparation refused'):
+                qualification.prepare_old_inline_input()
+            run.assert_not_called()
+            read.assert_not_called()
+
+    def test_remaining_profile_is_explicit_and_does_not_select_a_matrix_case(self):
+        self.assertEqual(qualification.qualification_mode('remaining-qualification'), 'remaining-qualification')
+        self.assertEqual(qualification.case_settings('remaining-qualification', None), {'case': None, 'inner_timeout': 900, 'outer_timeout': 960})
+        with self.assertRaisesRegex(RuntimeError, 'matrix case'):
+            qualification.case_settings('remaining-qualification', 'plain-64-light-delivery')
+
+    def test_old_inline_input_requires_exact_source_closed_contract_and_actual_binary_digest(self):
+        with tempfile.TemporaryDirectory(prefix='bibcode-inline-input-') as temporary:
+            root = Path(temporary)
+            binary = root / 'old-server'
+            binary.write_bytes(b'owned-inert-binary')
+            binary.chmod(0o500)
+            digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+            receipt_path = root / 'old-input.json'
+            receipt = {'source': 'cd66fda5700294a320fe76256c486bd7a7a0b3a5', 'serverVersion': '0.7.2', 'binarySha256': digest, 'build': 'immutable-source', 'hermeticGuard': 'unavailable-in-old-source', 'contractProof': {'serveFlags': True, 'pairingIssue': True, 'inlineDataUrl': True, 'capabilityAbsent': True, 'operateScope': True}}
+            receipt_path.write_text(json.dumps(receipt))
+            self.assertEqual(qualification.verify_old_inline_input(str(binary), str(receipt_path)), receipt)
+            for key, value in [('source', 'a' * 40), ('binarySha256', '0' * 64), ('hermeticGuard', 'default Abort')]:
+                receipt_path.write_text(json.dumps({**receipt, key: value}))
+                with self.assertRaisesRegex(RuntimeError, 'Old inline input refused'):
+                    qualification.verify_old_inline_input(str(binary), str(receipt_path))
+            receipt_path.write_text(json.dumps({**receipt, 'privatePath': 'private'}))
+            with self.assertRaisesRegex(RuntimeError, 'Old inline input refused'):
+                qualification.verify_old_inline_input(str(binary), str(receipt_path))
+
     def test_actual_budget_and_private_environment_producers_use_selected_case(self):
         module = ast.parse(SOURCE.read_text())
         inner = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'inner')

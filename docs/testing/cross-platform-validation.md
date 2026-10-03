@@ -1473,6 +1473,40 @@ reason and do not establish a received frame, completed handshake, or cause.
 Record these results in the report template's staged upload subsection. This
 scenario does not validate Phase B file-panel uploads/downloads or asset routing.
 
+The separate `qualify-chat-remaining.yml` profile selects explicit
+`remaining-qualification` mode and does not select or repeat a first-matrix case.
+It builds an immutable older source checkout into a separate Cargo target,
+checks its public CLI/schema/auth inputs, and verifies the actual binary digest
+against a closed receipt before namespace admission. A missing current hermetic
+guard is reported as unavailable in that old source; owned HOME, fake-provider
+paths, settings, process supervision and the private no-external-route namespace
+remain required. A receipt is preparation evidence, not an old-server pass.
+
+Require the actual carrying config to lack staging, a real public file-input
+send of a 10 MiB PNG, complete valid inline request/image metadata, zero
+`uploads.*` requests or staged references, exact provider bytes/digest, usable
+composer, no error or staging notice, and controlled light/dark originals.
+Malformed Request IDs or image metadata quarantine the observed turn before
+valid image counters are added. Do not inject application state or toggle a
+product capability to simulate an older server.
+
+Then use the separately owned fixed-loopback plain WebSocket receiver behind
+the existing 16 KiB/s upstream proxy. The synthetic 3 MiB ASCII message measures
+native browser transport mechanics, not product RPC, encrypted Noise, or provider
+delivery. Record the browser's bounded queue samples and explicit close call
+separately from receiver bytes/digest and actual native control/Close frames.
+A normally returning native Ping write during incomplete message data is socket
+admission evidence; matching masked Pong receipt is independently attributed
+before or after final message completion. Do not call a later Pong interleaved.
+For queued-before-close, require positive browser queued data before the call,
+the complete matching data digest at the receiver, then an observed Close, and
+a clean browser Close event. Both listeners/sockets and proxies must be joined
+on success and every failure. Native WebKitGTK remains explicitly not measured
+when its driver is unavailable. The profile records actual driver availability
+before admission and refuses an available driver lacking its owned native
+profile; this plain Chromium probe must
+never be presented as a WebKitGTK or Noise result.
+
 The contained Chromium QA observer reports only closed metadata. Plain sockets
 use actual negotiated framing to account text messages and binary final,
 continuation and independent control records; capability comes from the actual

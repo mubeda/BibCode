@@ -48,6 +48,20 @@ import {
 } from "./support/chat-upload-matrix.ts";
 import { startThrottleProxy } from "../../../scripts/throttle-proxy.ts";
 import {
+  inlineFallbackObservationScript,
+  projectInlineFallbackObservation,
+} from "./support/chat-inline-fallback.ts";
+import {
+  browserInlineMechanicsScript,
+  type BrowserInlineAction,
+} from "./support/chat-inline-mechanics.ts";
+import { startInlineProbeReceiver } from "./support/chat-inline-receiver.ts";
+import {
+  runRemainingQualification,
+  projectBrowserInlineObservation,
+  projectOldInlineInput,
+} from "./support/chat-remaining-qualification.ts";
+import {
   classifyQualificationFailure,
   mayCaptureQualificationFailure,
   projectPairingObservation,
@@ -59,6 +73,21 @@ const selectedMatrixCase =
   qualificationMode === "upload-matrix"
     ? parseChatMatrixCase(process.env.BIBCODE_UPLOAD_CASE)
     : null;
+const oldInput =
+  qualificationMode === "remaining-qualification"
+    ? (() => {
+        try {
+          return projectOldInlineInput(JSON.parse(process.env.BIBCODE_UPLOAD_OLD_INPUT ?? "null"));
+        } catch {
+          return null;
+        }
+      })()
+    : null;
+if (
+  (qualificationMode === "remaining-qualification" && oldInput === null) ||
+  (qualificationMode !== "remaining-qualification" && process.env.BIBCODE_UPLOAD_OLD_INPUT)
+)
+  throw new Error("The old inline input is invalid.");
 if (qualificationMode !== "upload-matrix" && process.env.BIBCODE_UPLOAD_CASE)
   throw new Error("The upload matrix case is invalid.");
 
@@ -93,6 +122,7 @@ const processes: Array<{
   spawnFailure: ReturnType<typeof classifyQualificationFailure> | null;
 }> = [];
 const proxies: Array<Awaited<ReturnType<typeof startThrottleProxy>>> = [];
+const inlineReceivers: Array<Awaited<ReturnType<typeof startInlineProbeReceiver>>> = [];
 let currentPhase = "prepare";
 const results: Array<Record<string, unknown>> = [];
 const write = (name: string, value: unknown) =>
@@ -157,7 +187,8 @@ function spawn(command: string, args: string[], env: NodeJS.ProcessEnv, name: st
   NodeFS.closeSync(fd);
 }
 function prepareEnvironments() {
-  return ["plain", "noise"].map((kind, index) => {
+  const kinds = qualificationMode === "remaining-qualification" ? ["plain"] : ["plain", "noise"];
+  return kinds.map((kind, index) => {
     const childEnv: NodeJS.ProcessEnv = {
       ...process.env,
       BIBCODE_E2E_RUN_ROOT: NodePath.join(fixtureRoot, kind),
@@ -508,6 +539,196 @@ async function runMatrix(
   phase("matrix-case-complete");
 }
 
+async function runRemaining(
+  b: MatrixBrowser,
+  plain: ReturnType<typeof prepareEnvironments>[number],
+  proof: BrowserNetworkProof,
+): Promise<void> {
+  if (!oldInput) throw new Error("Remaining qualification evidence refused.");
+  const png = createSizedPng(10 * 1024 ** 2, "inline-fallback");
+  const pngPath = NodePath.join(fixtureRoot, "upload-inline-fallback.png");
+  NodeFS.writeFileSync(pngPath, png, { mode: 0o600 });
+  const digest = NodeCrypto.createHash("sha256").update(png).digest("hex");
+  const readUi = () =>
+    bounded(
+      b.execute(readChatMatrixDom, {
+        outgoing: "upload-inline-fallback",
+        newer: "unused-newer-draft",
+      }),
+      5000,
+    );
+  const observe = async () => {
+    const observed = projectInlineFallbackObservation(
+      await bounded(
+        b.execute(() => {
+          const observer = Reflect.get(window, "__inlineFallbackObservations") as
+            | { read?: () => unknown }
+            | undefined;
+          return observer?.read?.() ?? null;
+        }),
+        5000,
+      ),
+    );
+    if (!observed) throw new Error("Remaining qualification evidence refused.");
+    return observed;
+  };
+  const capability = async () => {
+    const observed = projectChatUploadObservation(
+      await bounded(
+        b.execute(() => {
+          const observer = Reflect.get(window, "__uploadObservations") as
+            | { read?: () => unknown }
+            | undefined;
+          return observer?.read?.() ?? null;
+        }),
+        5000,
+      ),
+    );
+    return observed?.plain.capability ?? null;
+  };
+  const receipt = async () => {
+    if (!NodeFS.existsSync(plain.receipts)) return { count: 0, matched: false };
+    if (NodeFS.statSync(plain.receipts).size > 65536)
+      throw new Error("Remaining qualification evidence refused.");
+    const entries = NodeFS.readFileSync(plain.receipts, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.prompt === "upload-inline-fallback");
+    return {
+      count: entries.length,
+      matched:
+        entries.length === 1 &&
+        entries[0].attachments.length === 1 &&
+        entries[0].attachments[0].bytes === png.length &&
+        entries[0].attachments[0].sha256 === digest,
+    };
+  };
+  const result = await runRemainingQualification({
+    until,
+    capability,
+    inline: observe,
+    receipt,
+    sendImage: async () => {
+      phase("remaining-inline-image");
+      const input = b.$('[data-center-surface-host][data-visible="true"] input[type="file"]');
+      await input.waitForEnabled();
+      await b.elementSendKeys(await input.elementId, pngPath);
+      await until(async () => (await readUi()).validPreview);
+      await b.$(matrixEditor).click();
+      await b.$(matrixEditor).addValue("upload-inline-fallback");
+      await b.keys("Enter");
+    },
+    ui: async () => {
+      const ui = await readUi();
+      const extra = await bounded(
+        b.execute(() => {
+          const view = document.querySelector('[data-center-surface-host][data-visible="true"]');
+          const input = view?.querySelector('input[type="file"]');
+          return {
+            uploadNotice: Array.from(view?.querySelectorAll('p[role="status"]') ?? []).some(
+              (node) =>
+                node.parentElement?.querySelector("button")?.textContent?.trim() === "Cancel",
+            ),
+            composerUsable: input instanceof HTMLInputElement && !input.disabled,
+          };
+        }),
+        5000,
+      );
+      return { deliveredImage: ui.deliveredImage, error: ui.error, ...extra };
+    },
+    captureTheme: async (theme) => {
+      phase("remaining-inline-" + theme);
+      await b.$('[data-testid="environment-rail-manage"]').click();
+      await b.$("button=General").waitForDisplayed();
+      await b.$("button=General").click();
+      await b.$('[aria-label="Theme preference"]').click();
+      await b
+        .$(`//*[@role="option" and normalize-space()="${theme === "light" ? "Light" : "Dark"}"]`)
+        .click();
+      if (
+        await b
+          .$("button=Back")
+          .isDisplayed()
+          .catch(() => false)
+      )
+        await b.$("button=Back").click();
+      await b.$(matrixEditor).waitForDisplayed();
+      await until(async () =>
+        b.execute(
+          (dark) => document.documentElement.classList.contains("dark") === dark,
+          theme === "dark",
+        ),
+      );
+      if (
+        !(await readUi()).deliveredImage ||
+        !(await bounded(
+          b.execute(qualificationScreenSafe, { origin: webOrigin, dark: theme === "dark" }),
+          5000,
+        ))
+      )
+        throw new Error("Remaining qualification evidence refused.");
+      await b.saveScreenshot(NodePath.join(evidenceRoot, "inline-fallback-" + theme + ".png"));
+    },
+    transport: async (action: BrowserInlineAction) => {
+      phase("remaining-" + action);
+      const receiver = await startInlineProbeReceiver(action, proof);
+      inlineReceivers.push(receiver);
+      const proxy = await startThrottleProxy({
+        listenHost: "127.0.0.1",
+        listenPort: 4917,
+        targetHost: "127.0.0.1",
+        targetPort: 4916,
+      });
+      proxies.push(proxy);
+      proxy.update({ up: 16384, down: 0, frozen: false });
+      await b.url("http://127.0.0.1:4916/");
+      await bounded(
+        b.execute((selected) => {
+          const observer = Reflect.get(window, "__inlineMechanics") as
+            | { start?: (action: string) => void }
+            | undefined;
+          if (!observer?.start) throw new Error("Inline probe unavailable.");
+          observer.start(selected);
+        }, action),
+        5000,
+      );
+      let browserObservation: ReturnType<typeof projectBrowserInlineObservation> = null;
+      await until(async () => {
+        const raw = await bounded(
+          b.execute(() => {
+            const observer = Reflect.get(window, "__inlineMechanics") as
+              | { read?: () => unknown }
+              | undefined;
+            return observer?.read?.() ?? null;
+          }),
+          5000,
+        );
+        if (raw === null) return false;
+        browserObservation = projectBrowserInlineObservation(raw);
+        if (!browserObservation) throw new Error("Remaining qualification evidence refused.");
+        return true;
+      }, 250000);
+      await until(async () => receiver.read().closeFrameReceived, 5000);
+      await bounded(proxy.close(), 5000);
+      await bounded(receiver.close(), 5000);
+      const native = receiver.read();
+      if (
+        !native.upgraded ||
+        native.upgradeCount !== 1 ||
+        native.messageDigest !== native.expectedDigest ||
+        native.expectedBytes !== 3145728 ||
+        !native.complete ||
+        !browserObservation
+      )
+        throw new Error("Remaining qualification evidence refused.");
+      return { browser: browserObservation, native, ownedCleanupJoined: true };
+    },
+  });
+  results.push({ ...result, oldInput, providerBytes: png.length, providerDigest: digest });
+  phase("remaining-qualification-complete");
+}
+
 const webEnv = {
   ...process.env,
   PORT: "4901",
@@ -518,7 +739,12 @@ const webEnv = {
   VITE_WS_URL: "ws://localhost:4903",
 };
 
-const observationScript = browserStartupObservationScript + chatUploadObservationScript;
+const observationScript =
+  browserStartupObservationScript +
+  chatUploadObservationScript +
+  (qualificationMode === "remaining-qualification"
+    ? inlineFallbackObservationScript + browserInlineMechanicsScript
+    : "");
 
 let browser: Awaited<ReturnType<typeof remote>> | undefined;
 let networkProof: BrowserNetworkProof | null = null;
@@ -831,7 +1057,10 @@ try {
     await b.$(editorSelector).waitForDisplayed();
     plain.route = await b.getUrl();
 
-    if (selectedMatrixCase) {
+    if (qualificationMode === "remaining-qualification") {
+      await runRemaining(b, plain, networkProof);
+      success = true;
+    } else if (selectedMatrixCase) {
       await runMatrix(b, selectedMatrixCase, environments);
       success = true;
     } else {
@@ -1096,6 +1325,8 @@ try {
       ),
     );
   for (const proxy of proxies) await cleanup("proxy", () => bounded(proxy.close(), 5_000));
+  for (const receiver of inlineReceivers)
+    await cleanup("inline-receiver", () => bounded(receiver.close(), 5_000));
   for (const { child, done, role } of processes.toReversed()) {
     await cleanup(role, async () => {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
@@ -1113,6 +1344,7 @@ try {
     startupProbePassed: qualificationMode === "startup-only" ? success : null,
     phase: currentPhase,
     source: process.env.BIBCODE_UPLOAD_SOURCE,
+    oldInput,
     results,
     networkProof,
     onlineAfterPairFailure,
@@ -1124,9 +1356,11 @@ try {
     scope:
       qualificationMode === "startup-only"
         ? "Credential-free startup-only observation; no pairing grant, project import or upload qualification."
-        : qualificationMode === "upload-matrix"
-          ? "One selected Chromium upload matrix case; retention, fallback, max batch, admission/remount, heartbeat and WebKitGTK remain unmeasured."
-          : "Chromium staged-upload smoke only; full slow-link matrix and WebKitGTK remain unmeasured.",
+        : qualificationMode === "remaining-qualification"
+          ? "Actual immutable old-source inline fallback and plain Chromium native transport probes; WebKitGTK not measured."
+          : qualificationMode === "upload-matrix"
+            ? "One selected Chromium upload matrix case; retention, fallback, max batch, admission/remount, heartbeat and WebKitGTK remain unmeasured."
+            : "Chromium staged-upload smoke only; full slow-link matrix and WebKitGTK remain unmeasured.",
     childProcessesClosed: processes.every(
       ({ child }) => child.exitCode !== null || child.signalCode !== null,
     ),
