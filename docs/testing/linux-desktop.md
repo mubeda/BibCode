@@ -691,6 +691,12 @@ uncertain, and restores the path before retrying. The ordinary fixture is
 unchanged unless `BIBCODE_E2E_CLAUDE_RETRY=1` is explicitly set. Its private
 receipts distinguish fresh/resumed launches and the received/withheld input.
 
+Import selects the exact Claude `opus` model row and waits for the trigger's
+accessible provider-and-model label before sending the baseline. The visible
+model name alone does not identify the provider. Closed `import-*` phase codes
+identify the last attempted UI boundary without retaining workspace paths,
+page text, credentials or raw errors; provider receipt assertions still apply.
+
 The Retry button must open the real browser confirmation. Read its exact copy
 through WebDriver's alert API, dismiss once and prove no new input/launch, then
 click again and accept. Do not replace `window.confirm`, call a private handler

@@ -149,29 +149,44 @@ export async function runDeliveryRetryQualification() {
   }
 
   async function importProject(project: string) {
+    step("import-open-project-menu");
     await click('[data-testid="sidebar-add-project-trigger"]');
+    step("import-browse-folder");
     await click(
       "//button[@data-add-project-action='true'][.//span[normalize-space()='Browse folder']]",
     );
+    step("import-path-choice");
     await owner.until(
       async () =>
         (await b().$("#add-project-host-path").isDisplayed()) ||
         (await b().$("button=Type a path instead").isDisplayed()),
     );
-    if (!(await b().$("#add-project-host-path").isExisting()))
+    if (!(await b().$("#add-project-host-path").isExisting())) {
+      step("import-type-path");
       await click("button=Type a path instead");
+    }
+    step("import-path-ready");
+    await b().$("#add-project-host-path").waitForDisplayed();
+    step("import-fill-path");
     await b().$("#add-project-host-path").setValue(project);
+    step("import-submit-project");
     await click("button=Open project");
+    step("import-wait-composer");
     await b().$(composer).waitForDisplayed();
+    step("import-open-model-picker");
     await click(`${form} [data-chat-provider-model-picker="true"]`);
     const model =
-      '[data-model-picker-content="true"] [data-model-picker-instance-id="claudeAgent"]';
-    await b().$(model).waitForDisplayed();
-    await b().$(model).click();
-    check(
-      (await b().$(`${form} [data-chat-provider-model-picker="true"]`).getText()).includes(
-        "Claude",
-      ),
+      '[data-model-picker-content="true"] [data-model-picker-instance-id="claudeAgent"][data-model-picker-model-slug="opus"]';
+    step("import-select-claude-opus");
+    await click(model);
+    step("import-verify-claude-opus");
+    // The visible trigger text is model-only; its accessible label includes the
+    // actual selected provider and full model name from the owned Claude fixture.
+    await owner.until(
+      async () =>
+        (await b()
+          .$(`${form} [data-chat-provider-model-picker="true"]`)
+          .getAttribute("aria-label")) === "Claude · Opus 5",
     );
   }
 
