@@ -32,6 +32,10 @@ import {
   instrumentCodexAttachmentLog,
   STAGED_SMOKE_IMAGE_BYTES,
 } from "./support/chat-upload-fixture.ts";
+import {
+  chatUploadObservationScript,
+  projectChatUploadObservation,
+} from "./support/chat-upload-observer.ts";
 import { startThrottleProxy } from "../../../scripts/throttle-proxy.ts";
 import {
   classifyQualificationFailure,
@@ -214,55 +218,7 @@ const webEnv = {
   VITE_WS_URL: "ws://localhost:4903",
 };
 
-const observationScript =
-  browserStartupObservationScript +
-  String.raw`(() => {
-  const Original = window.WebSocket;
-  const events = [];
-  const inflight = new Map();
-  let maximumAppend = 0;
-  let nextSocket = 0;
-  window.__uploadObservations = { events, get maximumAppend() { return maximumAppend; } };
-  const record = (value) => { if (events.length < 20000) events.push({ time: Date.now(), ...value }); };
-  window.WebSocket = class extends Original {
-    constructor(...args) {
-      super(...args); this.fixtureSocket = ++nextSocket;
-      const port = new URL(this.url).port;
-      record({ kind: 'created', socket: this.fixtureSocket,
-        endpoint: port === '4903' ? 'plain-proxy' : port === '4911' ? 'noise-proxy' : port === '4901' ? 'web-dev' : 'other' });
-      this.addEventListener('open', () => record({ kind: 'opened', socket: this.fixtureSocket }));
-      this.addEventListener('error', () => record({ kind: 'error', socket: this.fixtureSocket }));
-      this.addEventListener('message', (event) => {
-        if (typeof event.data !== 'string') return;
-        try { const value = JSON.parse(event.data);
-          if (value._tag === 'Exit') inflight.delete(this.fixtureSocket + ':' + value.requestId);
-          if (value._tag === 'Chunk') {
-            for (const entry of value.values ?? []) {
-              if (entry?.environment?.capabilities?.attachmentStaging === true) record({ kind: 'capability', value: true });
-            }
-          }
-        } catch {}
-      });
-      this.addEventListener('close', (event) => {
-        for (const key of inflight.keys()) if (key.startsWith(this.fixtureSocket + ':')) inflight.delete(key);
-        record({ kind: 'closed', socket: this.fixtureSocket, code: event.code });
-      });
-    }
-    send(data) {
-      if (typeof data === 'string') try { const value = JSON.parse(data);
-        if (value._tag === 'Request' && ['uploads.begin', 'uploads.append', 'uploads.get', 'uploads.cancel'].includes(value.tag)) {
-          record({ kind: 'request', socket: this.fixtureSocket, method: value.tag });
-          if (value.tag === 'uploads.append') {
-            inflight.set(this.fixtureSocket + ':' + value.id, true);
-            maximumAppend = Math.max(maximumAppend, inflight.size);
-          }
-        }
-      } catch {}
-      return super.send(data);
-    }
-    close(code, reason) { record({ kind: 'close-called', socket: this.fixtureSocket, code, bufferedAmount: this.bufferedAmount }); return super.close(code, reason); }
-  };
-})();`;
+const observationScript = browserStartupObservationScript + chatUploadObservationScript;
 
 let browser: Awaited<ReturnType<typeof remote>> | undefined;
 let networkProof: BrowserNetworkProof | null = null;
@@ -622,12 +578,15 @@ try {
     ) {
       throw new Error("The provider did not receive the exact composer attachment.");
     }
-    const observations = await b.execute(() =>
-      JSON.parse(JSON.stringify(Reflect.get(window, "__uploadObservations"))),
+    const observations = projectChatUploadObservation(
+      await b.execute(() => {
+        const observer = Reflect.get(window, "__uploadObservations") as
+          | { read?: () => unknown }
+          | undefined;
+        return observer?.read?.() ?? null;
+      }),
     );
-    if (
-      !observations.events.some((entry: { method?: string }) => entry.method === "uploads.begin")
-    ) {
+    if (observations === null || observations.plain.requests.begin === 0) {
       throw new Error("The actual browser did not exercise staged uploads.");
     }
     await b.saveScreenshot(NodePath.join(evidenceRoot, "plain-smoke.png"));
@@ -651,14 +610,21 @@ try {
             const form = token?.closest("form");
             const submit = form?.querySelector('button[type="submit"]');
             const transport = Reflect.get(window, "__uploadObservations") as
-              | { events?: Array<{ kind?: string; endpoint?: string; socket?: number }> }
+              | {
+                  read?: () => {
+                    available?: boolean;
+                    plain?: { created?: number; opened?: number };
+                  };
+                }
               | undefined;
-            const events = Array.isArray(transport?.events) ? transport.events : null;
-            const plainIds = new Set(
-              events
-                ?.filter((entry) => entry?.kind === "created" && entry.endpoint === "plain-proxy")
-                .map((entry) => entry.socket) ?? [],
-            );
+            let observedTransport: ReturnType<
+              NonNullable<NonNullable<typeof transport>["read"]>
+            > | null = null;
+            try {
+              observedTransport = transport?.read?.() ?? null;
+            } catch {
+              /* Missing evidence stays unknown. */
+            }
             let startup: unknown = null;
             if (includeStartup) {
               try {
@@ -691,11 +657,9 @@ try {
               ),
               sidebarPresent:
                 document.querySelector('[data-testid="sidebar-add-project-trigger"]') !== null,
-              observerPresent: events !== null,
-              plainSocketCreated: events === null ? null : plainIds.size,
-              plainSocketOpened:
-                events?.filter((entry) => entry?.kind === "opened" && plainIds.has(entry.socket))
-                  .length ?? null,
+              observerPresent: observedTransport?.available === true,
+              plainSocketCreated: observedTransport?.plain?.created ?? null,
+              plainSocketOpened: observedTransport?.plain?.opened ?? null,
             };
           },
           currentPhase === "pair-wait-token" && credentialEntryAttempted === false,
@@ -738,11 +702,16 @@ try {
   // Retain passive transport observations after a completed pairing.
   if (browser && pairingCompleted) {
     try {
-      const observations = await bounded(
-        browser.execute(() =>
-          JSON.parse(JSON.stringify(Reflect.get(window, "__uploadObservations"))),
+      const observations = projectChatUploadObservation(
+        await bounded(
+          browser.execute(() => {
+            const observer = Reflect.get(window, "__uploadObservations") as
+              | { read?: () => unknown }
+              | undefined;
+            return observer?.read?.() ?? null;
+          }),
+          5_000,
         ),
-        5_000,
       );
       write("failure", {
         phase: currentPhase,

@@ -227,3 +227,38 @@ admission, and the existing PID1 owner still tears down the private namespace.
 Actual-controller ordering and honest proof controls are inert validation only.
 No new native success/cause completion or upload qualification is claimed before
 the reviewed next run.
+
+Normal smoke run `37092557926` at `71b7fefd` passed: actual `uploads.begin`,
+`append` and `get`, exact 524,288 provider bytes/SHA and original inspected PNG,
+with all cleanup/namespace/guard checks passing. The former `maximumAppend:2`
+remains unqualified because its inbound decoder missed binary replies. Startup
+run `37092190298` reached actual pairing readiness with the boot shell gone,
+actual `before:null`/`after:true` and owned cleanup passing. Its network log
+reached the 4,096-entry cap: zero classified network failures is partial, not
+complete-zero. Neither run establishes the full slow-link matrix.
+
+The next prepared slice replaces the passive text-only observer with a bounded
+self-contained installer and strict metadata projection. Plain text and actual
+negotiated binary final/continuation/control framing now correlate appends with
+same-socket terminal replies. Configuration capability is taken only from the
+actual requested config stream's nested snapshot. Transient request IDs are
+bounded to 128 characters, maps to 64 entries per socket and lifetimes to 16
+sockets; IDs and bodies never enter artifacts. Outgoing inspection permits the
+maximum legal 1 MiB raw/1,398,104-character append plus 64 KiB envelope allowance;
+incoming assembly caps at 256 KiB/2,048 records. Oversized incoming data is
+discarded through final while independent controls remain observable.
+
+Malformed, unsupported, overflow, unknown and partial observations are explicit;
+none become a complete measured zero. Reply counts, raw chunk size ranges,
+acknowledged offset and reply timing are closed numeric fields. Outstanding
+high-water is reported both aggregate and per socket; it is not automatically a
+per-file window. Close abandons unanswered appends instead of acknowledging them.
+Buffered browser bytes are sampled only at explicit close calls. Noise records
+stay opaque and application metrics are unavailable; no key/state injection,
+proxy accounting, native Ping/Pong, drip fixture, fault or deadline extension
+lands here. Existing smoke/provider requirements and capture eligibility remain.
+
+Actual installer/installed serializer/production codec/privacy tests are inert
+proof only. A new reviewed native run is required before these observer values
+qualify measurements. Full plain/Noise slow-link, Cancel, retention, remount,
+ambiguous admission and fallback scenarios and WebKitGTK remain pending.

@@ -1429,6 +1429,28 @@ plain RPC and a pinned E2EE profile. Verify that the carrying session advertises
 Record these results in the report template's staged upload subsection. This
 scenario does not validate Phase B file-panel uploads/downloads or asset routing.
 
+The contained Chromium QA observer reports only closed metadata. Plain sockets
+use actual negotiated framing to account text messages and binary final,
+continuation and independent control records; capability comes from the actual
+configuration stream. Require a complete summary before interpreting append
+high-water or reply timing: malformed, unsupported, overflow, unknown or partial
+messages make those measurements partial. Keep aggregate and per-socket
+high-water distinct; neither alone establishes a per-file window when multiple
+operations share a socket. Outstanding requests abandoned on close are not
+acknowledgements. Successful append reply timing is separate from RPC Pong or
+native WebSocket heartbeat latency. The observer retains no raw payload, wire
+identifier, URL, header, cause or filename.
+
+Noise application envelopes and record flags remain opaque to that observer.
+Mark encrypted append/capability/acknowledgement/RPC-control counters unavailable;
+use actual UI progress, verified pinned routing and provider bytes/digest as
+separate behavior evidence. No private-state/key injection or guessed ciphertext
+counter substitutes are permitted. Browser bufferedAmount sampled at an explicit
+close call describes queued browser data at that instant, not proxy/server memory
+or confirmed delivery. Native Ping/Pong, queued-byte drain and selective-reply
+fault measurements require their own reviewed fixture support; the current
+smoke does not establish them.
+
 ## Slow-link liveness scenario
 
 For transport or heartbeat changes, first run the paused-clock unit coverage
