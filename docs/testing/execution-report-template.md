@@ -225,6 +225,12 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Real seeded CI run link, target, lane and `widened` result:
 - Before/after boot, version, storage identity and project retention:
 - Observed percentages/stages, verified backup and requester log counts:
+- Failed seeded RPC phase, when available: closed diagnostic lane/phase/trigger,
+  command outcome/exit, receipt category, install-marker state, and generated-step
+  availability/milestone (missing or invalid means unknown; checkpoints do not
+  establish a pass or prove that later steps did not run):
+- Receipt-based raw-evidence retention result for both RPC owners; include only
+  the closed diagnostic when required receipts are missing or invalid:
 - Linux scoped AppImage mount/runtime counts and cleanup evidence:
 - Exact commands, unavailable checks and residual risk:
 

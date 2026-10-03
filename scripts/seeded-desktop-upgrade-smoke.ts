@@ -30,6 +30,21 @@ export type SeededUpgradeArch = "arm64" | "x64";
 export type SeededUpgradeLane = "previous-stable" | "protected-baseline" | "remote-install";
 export type SeededUpgradeTrigger = "local-bridge" | "remote-rpc";
 
+const seededStepMilestones = [
+  "spec-loaded",
+  "test-entered",
+  "bridge-wait",
+  "bridge-ready",
+  "observation-started",
+  "observation-returned",
+  "baseline-verified",
+  "sharing-started",
+  "sharing-finished",
+  "credential-request-started",
+  "credential-request-returned",
+  "credential-receipt-published",
+] as const;
+
 const MOCK_UPDATE_READY_TIMEOUT_MS = 60_000;
 
 export interface SeededDesktopUpgradeSmokeInput {
@@ -587,6 +602,7 @@ export function createSeededUpgradeDriverSpec(input: {
   readonly remoteEvidencePath?: string;
   readonly appBinaryPath?: string;
   readonly platform?: SeededUpgradePlatform;
+  readonly stepStatusPath?: string;
 }): string {
   const trigger =
     input.trigger ?? (input.lane === "remote-install" ? "remote-rpc" : "local-bridge");
@@ -621,7 +637,32 @@ import * as NodeFS from "node:fs";
 
 const input = ${serializedInput};
 
+// Private, best-effort checkpoint only. It never authorizes raw evidence retention.
+function publishStep(milestone) {
+  if (typeof input.stepStatusPath !== "string" ||
+      !${JSON.stringify(seededStepMilestones)}.includes(milestone)) return;
+  const temporary = input.stepStatusPath + ".tmp";
+  let owned = false;
+  try {
+    const fd = NodeFS.openSync(temporary, "wx", 0o600);
+    owned = true;
+    try {
+      NodeFS.writeFileSync(fd, JSON.stringify({
+        version: 1, lane: input.lane, phase: input.phase,
+        trigger: ${JSON.stringify(trigger)}, milestone,
+      }) + "\\n");
+    } finally { NodeFS.closeSync(fd); }
+    NodeFS.renameSync(temporary, input.stepStatusPath);
+  } catch {
+    // Diagnostic failure must not change the test, its exception, or cleanup.
+  } finally {
+    if (owned) try { NodeFS.unlinkSync(temporary); } catch {}
+  }
+}
+publishStep("spec-loaded");
+
 async function waitForDesktopBridge() {
+  publishStep("bridge-wait");
   await browser.waitUntil(
     async () => browser.execute(() => Boolean(window.desktopBridge)),
     {
@@ -630,10 +671,12 @@ async function waitForDesktopBridge() {
       timeoutMsg: "The packaged desktop bridge did not become ready.",
     },
   );
+  publishStep("bridge-ready");
 }
 
 async function observe(seed) {
   await waitForDesktopBridge();
+  publishStep("observation-started");
   return browser.execute(async (parameters, seed) => {
     const bridge = window.desktopBridge;
     if (!bridge) throw new Error("The packaged desktop bridge is unavailable.");
@@ -775,19 +818,23 @@ async function observe(seed) {
 
 describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
   it("uses public desktop and authenticated RPC boundaries", async () => {
+    publishStep("test-entered");
     const observation = await observe(${input.phase === "seed-and-install" ? "true" : "false"});
+    publishStep("observation-returned");
     ${
       input.phase === "seed-and-install" && input.baselineVersion !== undefined
         ? `
     if (observation.appVersion !== input.baselineVersion) {
       throw new Error("The starting app version did not match the planned baseline.");
-    }`
+    }
+    publishStep("baseline-verified");`
         : ""
     }
     NodeFS.writeFileSync(input.resultPath, JSON.stringify(observation));
     ${
       input.phase === "seed-and-install" && trigger === "remote-rpc"
         ? `
+    publishStep("sharing-started");
     await browser.execute(() => { window.location.hash = "/settings/remote-servers?tab=share"; });
     let widened = false;
     try {
@@ -800,6 +847,8 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
       if (generated) await browser.waitUntil(async () => browser.execute(async () => (await window.desktopBridge.getServerExposureState()).mode === "network-accessible"), { timeout: 60000, interval: 250 });
       widened = generated;
     } catch { widened = false; }
+    publishStep("sharing-finished");
+    publishStep("credential-request-started");
     const credentials = await browser.execute(async (widened) => {
       const bootstrap = window.desktopBridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary");
       if (!bootstrap?.httpBaseUrl || !bootstrap.bootstrapToken) throw new Error("Remote verification bootstrap unavailable.");
@@ -838,8 +887,10 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
       }
       return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: bootstrap.bootstrapToken };
     }, widened);
+    publishStep("credential-request-returned");
     // Private receipt is outside retained evidence; the controller uses it to redact logs.
     NodeFS.writeFileSync(input.remoteSecretPath, JSON.stringify(credentials), { mode: 0o600 });
+    publishStep("credential-receipt-published");
     NodeFS.writeFileSync(input.resultPath, JSON.stringify({ ...observation, installAttempted: false }));
     const { runRemoteInstallDriver } = await import(input.remoteInstallDriverPath);
     const evidence = await runRemoteInstallDriver({
@@ -1325,6 +1376,127 @@ export async function readRemoteFixtureSecrets(input: {
     secrets.push(receipt.relativeUrl, receipt.relativeUrl.slice("/api/transfers/".length));
   } else if (input.requireUploadReceipt) throw privateUploadError();
   return secrets;
+}
+
+type SeededPhaseIdentity = {
+  readonly lane: SeededUpgradeLane;
+  readonly phase: "seed-and-install" | "verify";
+  readonly trigger: SeededUpgradeTrigger;
+};
+
+const readSeededStepStatus = async (path: string, owner: SeededPhaseIdentity) => {
+  try {
+    const value = await readBoundedPrivateReceipt(path);
+    if (value === null) return { availability: "missing", milestone: null } as const;
+    if (typeof value === "object" && !Array.isArray(value)) {
+      const row = value as Record<string, unknown>;
+      const keys = ["version", "lane", "phase", "trigger", "milestone"];
+      if (
+        Object.keys(row).length === keys.length &&
+        keys.every((key) => Object.hasOwn(row, key)) &&
+        row.version === 1 &&
+        row.lane === owner.lane &&
+        row.phase === owner.phase &&
+        row.trigger === owner.trigger &&
+        seededStepMilestones.some((milestone) => milestone === row.milestone)
+      )
+        return {
+          availability: "valid",
+          milestone: row.milestone as (typeof seededStepMilestones)[number],
+        } as const;
+    }
+  } catch {
+    // Missing and invalid status are distinct; neither proves a step did not run.
+  }
+  return { availability: "invalid", milestone: null } as const;
+};
+
+const readSeededInstallMarkerState = async (path: string) => {
+  try {
+    const value = await readBoundedPrivateReceipt(path);
+    if (value === null) return "absent";
+    if (typeof value !== "object" || Array.isArray(value)) return "unreadable";
+    if (!("installAttempted" in value)) return "not-recorded";
+    if (value.installAttempted === true) return "recorded";
+    if (value.installAttempted === false) return "not-recorded";
+  } catch {
+    // A malformed or unreadable marker cannot establish dispatch or non-dispatch.
+  }
+  return "unreadable";
+};
+
+const seededReceiptFailureCategory = (error: unknown) => {
+  try {
+    const message =
+      typeof error === "object" && error !== null
+        ? Object.getOwnPropertyDescriptor(error, "message")?.value
+        : undefined;
+    if (message === "The private remote credential receipt is unavailable.")
+      return "credential-unavailable";
+    if (message === "The private remote credential receipt is invalid.")
+      return "credential-invalid";
+    if (message === "The private upload receipt is invalid or unavailable.")
+      return "private-receipt-invalid-or-unavailable";
+  } catch {
+    // No accessor, arbitrary message, stack, cause or command output is retained.
+  }
+  return "validation-failed";
+};
+
+/** Independent closed metadata only; this never copies logs or changes receipt admission. */
+export async function emitSeededPhaseDiagnostic(
+  input: SeededPhaseIdentity & {
+    readonly commandOutcome: "returned" | "threw";
+    readonly commandExitCode: number | null;
+    readonly receiptCheck: "not-checked" | "validated" | "failed";
+    readonly receiptError: unknown;
+    readonly markerPath: string;
+    readonly stepStatusPath: string;
+  },
+): Promise<void> {
+  try {
+    const { lane, phase, trigger, commandOutcome, commandExitCode, receiptCheck } = input;
+    if (
+      !["previous-stable", "protected-baseline", "remote-install"].includes(lane) ||
+      !["seed-and-install", "verify"].includes(phase) ||
+      !["local-bridge", "remote-rpc"].includes(trigger) ||
+      !["returned", "threw"].includes(commandOutcome) ||
+      !["not-checked", "validated", "failed"].includes(receiptCheck)
+    )
+      return;
+    const exitCode =
+      commandOutcome === "returned" &&
+      Number.isSafeInteger(commandExitCode) &&
+      commandExitCode !== null &&
+      commandExitCode >= -(2 ** 31) &&
+      commandExitCode <= 2 ** 32 - 1
+        ? commandExitCode
+        : null;
+    const marker = await readSeededInstallMarkerState(input.markerPath);
+    const generatedStep = await readSeededStepStatus(input.stepStatusPath, {
+      lane,
+      phase,
+      trigger,
+    });
+    console.log(
+      JSON.stringify({
+        version: 1,
+        kind: "seeded-upgrade-phase-diagnostic",
+        lane,
+        phase,
+        trigger,
+        command: { outcome: commandOutcome, exitCode },
+        receipt:
+          receiptCheck === "failed"
+            ? seededReceiptFailureCategory(input.receiptError)
+            : receiptCheck,
+        marker,
+        generatedStep,
+      }),
+    );
+  } catch {
+    // A diagnostic read/serialization/output failure cannot replace the original failure.
+  }
 }
 
 /** Run only inside the existing lane process owner, so failed stop cannot unlink a live writer. */
@@ -2176,6 +2348,7 @@ const runWebDriverPhase = async (input: {
   await NodeFS.promises.mkdir(phaseRoot, { recursive: true });
   const specPath = NodePath.join(phaseRoot, "seeded-upgrade.e2e.ts");
   const configPath = NodePath.join(phaseRoot, "wdio.conf.mjs");
+  const stepStatusPath = NodePath.join(phaseRoot, "step-status.private.json");
   const phaseTimeoutMs =
     input.trigger === "remote-rpc" && input.phase === "seed-and-install"
       ? input.restartTimeoutMs +
@@ -2190,6 +2363,7 @@ const runWebDriverPhase = async (input: {
       ...driverInput,
       ...(rpcFixture !== undefined
         ? {
+            stepStatusPath,
             remoteInstallDriverPath: NodeURL.pathToFileURL(
               NodePath.join(input.repositoryRoot, "scripts/lib/remote-install-driver.ts"),
             ).href,
@@ -2219,51 +2393,79 @@ const runWebDriverPhase = async (input: {
   // Once launch is attempted, even a failed phase may have returned a grant to WDIO output.
   // Notify before dispatch; local spec/config preparation failures require no credential receipt.
   rpcFixture?.markPhaseStarted();
-  const result = await runCommand({
-    command: seededUpgradeVitePlusExecutable,
-    args: ["exec", "wdio", "run", configPath],
-    cwd: NodePath.join(input.repositoryRoot, "apps", "desktop"),
-    env: {
-      ...process.env,
-      BIBCODE_HOME: input.dataRoot,
-      BIBCODE_PORT: String(input.backendPort),
-      BIBCODE_E2E_PLATFORM: input.platform,
-      RUST_LOG: "bibcode=debug",
-      ...(input.wsl
-        ? {
-            WSLENV: [process.env.WSLENV, "BIBCODE_HOME/p"].filter(Boolean).join(":"),
-          }
-        : {}),
-    },
-    timeoutMs: phaseTimeoutMs,
-  });
-  const resultExists = NodeFS.existsSync(input.resultPath);
-  let installAttempted = false;
-  if (input.phase === "seed-and-install" && resultExists) {
-    try {
-      const marker = JSON.parse(await NodeFS.promises.readFile(input.resultPath, "utf8")) as {
-        readonly installAttempted?: unknown;
-      };
-      installAttempted = marker.installAttempted === true;
-    } catch {
-      installAttempted = false;
+  let commandOutcome: "returned" | "threw" = "threw";
+  let commandExitCode: number | null = null;
+  let receiptCheck: "not-checked" | "validated" | "failed" = "not-checked";
+  try {
+    const result = await runCommand({
+      command: seededUpgradeVitePlusExecutable,
+      args: ["exec", "wdio", "run", configPath],
+      cwd: NodePath.join(input.repositoryRoot, "apps", "desktop"),
+      env: {
+        ...process.env,
+        BIBCODE_HOME: input.dataRoot,
+        BIBCODE_PORT: String(input.backendPort),
+        BIBCODE_E2E_PLATFORM: input.platform,
+        RUST_LOG: "bibcode=debug",
+        ...(input.wsl
+          ? {
+              WSLENV: [process.env.WSLENV, "BIBCODE_HOME/p"].filter(Boolean).join(":"),
+            }
+          : {}),
+      },
+      timeoutMs: phaseTimeoutMs,
+    });
+    commandOutcome = "returned";
+    commandExitCode = result.exitCode;
+    const resultExists = NodeFS.existsSync(input.resultPath);
+    let installAttempted = false;
+    if (input.phase === "seed-and-install" && resultExists) {
+      try {
+        const marker = JSON.parse(await NodeFS.promises.readFile(input.resultPath, "utf8")) as {
+          readonly installAttempted?: unknown;
+        };
+        installAttempted = marker.installAttempted === true;
+      } catch {
+        installAttempted = false;
+      }
     }
+    receiptCheck = rpcFixture !== undefined ? "failed" : "not-checked";
+    const privateSecrets = rpcFixture !== undefined ? await rpcFixture.readSecrets() : [];
+    if (rpcFixture !== undefined) receiptCheck = "validated";
+    await NodeFS.promises.writeFile(
+      NodePath.join(input.evidenceDirectory, `${input.phase}.log`),
+      redactAndBoundUpgradeEvidence(`${result.stdout}\n${result.stderr}`, {
+        maxBytes: 64 * 1024,
+        roots: [input.dataRoot, input.runRoot],
+        secrets: privateSecrets,
+      }),
+    );
+    assertWebDriverPhaseExit({
+      exitCode: result.exitCode,
+      installAttempted,
+      lane: input.lane,
+      phase: input.phase,
+    });
+  } catch (failure) {
+    if (rpcFixture !== undefined) {
+      try {
+        await emitSeededPhaseDiagnostic({
+          lane: input.lane,
+          phase: input.phase,
+          trigger: input.trigger,
+          commandOutcome,
+          commandExitCode,
+          receiptCheck,
+          receiptError: failure,
+          markerPath: NodePath.join(input.runRoot, "before.json"),
+          stepStatusPath,
+        });
+      } catch {
+        // Even an unavailable diagnostic dependency must not change failure or cleanup.
+      }
+    }
+    throw failure;
   }
-  const privateSecrets = rpcFixture !== undefined ? await rpcFixture.readSecrets() : [];
-  await NodeFS.promises.writeFile(
-    NodePath.join(input.evidenceDirectory, `${input.phase}.log`),
-    redactAndBoundUpgradeEvidence(`${result.stdout}\n${result.stderr}`, {
-      maxBytes: 64 * 1024,
-      roots: [input.dataRoot, input.runRoot],
-      secrets: privateSecrets,
-    }),
-  );
-  assertWebDriverPhaseExit({
-    exitCode: result.exitCode,
-    installAttempted,
-    lane: input.lane,
-    phase: input.phase,
-  });
 };
 
 const startMockUpdateServer = async (input: {

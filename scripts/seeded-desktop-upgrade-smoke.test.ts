@@ -65,6 +65,7 @@ const absolute = (...parts: ReadonlyArray<string>): string =>
   NodePath.resolve("/tmp/bibcode-upgrade-smoke", ...parts);
 
 const decodePairingLink = Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingLink));
+const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const repositoryRoot = NodeURL.fileURLToPath(new URL("..", import.meta.url));
 
 interface ObservedUpgradeLane {
@@ -1643,6 +1644,7 @@ const remoteRetentionFixture = async () => {
     seededUpgradeVitePlusExecutable,
     createSeededUpgradeDriverSpec,
     createSeededUpgradeWdioConfig,
+    emitSeededPhaseDiagnostic: SeededUpgradeHarness.emitSeededPhaseDiagnostic,
     readRemoteFixtureSecrets,
     redactAndBoundUpgradeEvidence,
     assertWebDriverPhaseExit,
@@ -1693,6 +1695,19 @@ const remoteRetentionFixture = async () => {
     copyBoundedEvidence,
     cleanup,
     runPhase,
+    phaseInput,
+    remoteRpc,
+    runDirectPhase: (overrides: Record<string, unknown> = {}) => {
+      context.phaseDiagnosticInput = {
+        ...phaseInput,
+        trigger: "remote-rpc",
+        rpcFixture: remoteRpc,
+        ...overrides,
+      };
+      return evaluate(
+        source.slice(phaseStart, phaseEnd) + "\nawait runWebDriverPhase(phaseDiagnosticInput);",
+      );
+    },
     finalize: () => evaluate(source.slice(finallyStart, finallyEnd) + "\n return failure;"),
     dispose: () => NodeFS.promises.rm(root, { recursive: true, force: true }),
   };
@@ -1762,6 +1777,468 @@ describe("remote phase receipt retention boundaries", () => {
       await fixture.dispose();
     }
   });
+});
+
+describe("closed RPC phase diagnostics", () => {
+  it.each([0, 17, 3221225477])(
+    "preserves returned exit %s without retaining unsafe output",
+    async (exitCode) => {
+      const fixture = await remoteRetentionFixture();
+      const lines: unknown[] = [];
+      const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+        lines.push(line);
+      });
+      try {
+        fixture.runCommand.mockResolvedValue({
+          exitCode,
+          stdout: "private-diagnostic-canary",
+          stderr: "private-error-canary",
+        });
+        await expect(fixture.runDirectPhase()).rejects.toThrow(
+          "The private remote credential receipt is unavailable.",
+        );
+        expect(lines).toHaveLength(1);
+        expect(JSON.parse(String(lines[0]))).toEqual({
+          version: 1,
+          kind: "seeded-upgrade-phase-diagnostic",
+          lane: "remote-install",
+          phase: "seed-and-install",
+          trigger: "remote-rpc",
+          command: { outcome: "returned", exitCode },
+          receipt: "credential-unavailable",
+          marker: "absent",
+          generatedStep: { availability: "missing", milestone: null },
+        });
+        expect(JSON.stringify(lines)).not.toContain("canary");
+        expect(
+          NodeFS.existsSync(NodePath.join(fixture.evidenceDirectory, "seed-and-install.log")),
+        ).toBe(false);
+        await fixture.finalize();
+        expect(fixture.copyBoundedEvidence).not.toHaveBeenCalled();
+        expect(fixture.cleanup).toHaveBeenCalledOnce();
+      } finally {
+        output.mockRestore();
+        await fixture.dispose();
+      }
+    },
+  );
+
+  it("keeps thrown command identity and reports a recorded marker without guessing a dispatch outcome", async () => {
+    const fixture = await remoteRetentionFixture();
+    const failure = new Error("private-diagnostic-canary");
+    const lines: unknown[] = [];
+    const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(line);
+    });
+    try {
+      fixture.runCommand.mockRejectedValue(failure);
+      await NodeFS.promises.writeFile(
+        NodePath.join(fixture.runRoot, "before.json"),
+        JSON.stringify({ installAttempted: true, private: "private-marker-canary" }),
+      );
+      await expect(fixture.runDirectPhase()).rejects.toBe(failure);
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(String(lines[0]))).toMatchObject({
+        command: { outcome: "threw", exitCode: null },
+        receipt: "not-checked",
+        marker: "recorded",
+      });
+      expect(JSON.stringify(lines)).not.toContain("canary");
+    } finally {
+      output.mockRestore();
+      await fixture.dispose();
+    }
+  });
+
+  it.each([
+    "valid",
+    "foreign-field",
+    "wrong-owner",
+    "unknown-step",
+    "null",
+    "oversized",
+    "symlink",
+  ])("reconstructs only a valid owned step snapshot: %s", async (kind) => {
+    const fixture = await remoteRetentionFixture();
+    const lines: unknown[] = [];
+    const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(line);
+    });
+    try {
+      fixture.runCommand.mockImplementation(async () => {
+        const statusPath = NodePath.join(
+          fixture.runRoot,
+          "seed-and-install-driver",
+          "step-status.private.json",
+        );
+        const snapshot: Record<string, unknown> = {
+          version: 1,
+          lane: "remote-install",
+          phase: "seed-and-install",
+          trigger: "remote-rpc",
+          milestone: "credential-request-returned",
+        };
+        if (kind === "foreign-field") snapshot.private = "private-status-canary";
+        if (kind === "wrong-owner") snapshot.lane = "previous-stable";
+        if (kind === "unknown-step") snapshot.milestone = "private-status-canary";
+        if (kind === "symlink") {
+          const target = NodePath.join(fixture.root, "private-link-target");
+          await NodeFS.promises.mkdir(target);
+          await NodeFS.promises.writeFile(
+            NodePath.join(target, "status.json"),
+            JSON.stringify(snapshot),
+          );
+          await NodeFS.promises.symlink(target, statusPath, "junction");
+        } else
+          await NodeFS.promises.writeFile(
+            statusPath,
+            kind === "null"
+              ? "null"
+              : kind === "oversized"
+                ? " ".repeat(8193) + JSON.stringify(snapshot)
+                : JSON.stringify(snapshot),
+          );
+        return { exitCode: 1, stdout: "private-output-canary", stderr: "" };
+      });
+      await expect(fixture.runDirectPhase()).rejects.toThrow("credential receipt is unavailable");
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(String(lines[0])).generatedStep).toEqual(
+        kind === "valid"
+          ? { availability: "valid", milestone: "credential-request-returned" }
+          : { availability: "invalid", milestone: null },
+      );
+      expect(JSON.stringify(lines)).not.toContain("canary");
+    } finally {
+      output.mockRestore();
+      await fixture.dispose();
+    }
+  });
+
+  it("keeps owner identity separate and refuses an untrusted console context", async () => {
+    const previous = await remoteRetentionFixture(),
+      current = await remoteRetentionFixture();
+    const lines: unknown[] = [];
+    const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(line);
+    });
+    try {
+      await previous
+        .runDirectPhase({ lane: "previous-stable", baselineVersion: "0.7.2" })
+        .catch(() => undefined);
+      await current.runDirectPhase().catch(() => undefined);
+      expect(lines.map((line) => JSON.parse(String(line)).lane)).toEqual([
+        "previous-stable",
+        "remote-install",
+      ]);
+      await current.runDirectPhase({ lane: "private-context-canary" }).catch(() => undefined);
+      expect(lines).toHaveLength(2);
+      expect(JSON.stringify(lines)).not.toContain("canary");
+    } finally {
+      output.mockRestore();
+      await previous.dispose();
+      await current.dispose();
+    }
+  });
+
+  it("does not replace the original receipt failure when console publication fails", async () => {
+    const fixture = await remoteRetentionFixture();
+    const output = vi.spyOn(console, "log").mockImplementation(() => {
+      throw new Error("private-console-canary");
+    });
+    try {
+      await expect(fixture.runDirectPhase()).rejects.toThrow(
+        "The private remote credential receipt is unavailable.",
+      );
+      expect(output).toHaveBeenCalledOnce();
+      await fixture.finalize();
+      expect(fixture.cleanup).toHaveBeenCalledOnce();
+      expect(fixture.copyBoundedEvidence).not.toHaveBeenCalled();
+    } finally {
+      output.mockRestore();
+      await fixture.dispose();
+    }
+  });
+
+  it("publishes the captured validated context without reading it again", async () => {
+    const fixture = await remoteRetentionFixture();
+    const lines: unknown[] = [];
+    const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(line);
+    });
+    let laneReads = 0;
+    const input: Parameters<typeof SeededUpgradeHarness.emitSeededPhaseDiagnostic>[0] = {
+      lane: "remote-install",
+      phase: "verify",
+      trigger: "remote-rpc",
+      commandOutcome: "threw",
+      commandExitCode: null,
+      receiptCheck: "not-checked",
+      receiptError: new Error("private-cause-canary"),
+      markerPath: NodePath.join(fixture.root, "absent-marker"),
+      stepStatusPath: NodePath.join(fixture.root, "absent-status"),
+    };
+    Object.defineProperty(input, "lane", {
+      get: () => (++laneReads === 1 ? "remote-install" : "private-context-canary"),
+    });
+    try {
+      await SeededUpgradeHarness.emitSeededPhaseDiagnostic(input);
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(String(lines[0])).lane).toBe("remote-install");
+      expect(laneReads).toBe(1);
+      expect(JSON.stringify(lines)).not.toContain("canary");
+      expect(Buffer.byteLength(String(lines[0]))).toBeLessThan(1024);
+    } finally {
+      output.mockRestore();
+      await fixture.dispose();
+    }
+  });
+
+  it.each([
+    [{}, "not-recorded"],
+    [{ installAttempted: false }, "not-recorded"],
+    [{ installAttempted: true }, "recorded"],
+    [{ installAttempted: "private-marker-canary" }, "unreadable"],
+    [null, "unreadable"],
+    [[], "unreadable"],
+  ])(
+    "reports marker state without turning unavailable evidence into non-dispatch: %j",
+    async (marker, expected) => {
+      const fixture = await remoteRetentionFixture();
+      const lines: unknown[] = [];
+      const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+        lines.push(line);
+      });
+      try {
+        await NodeFS.promises.writeFile(
+          NodePath.join(fixture.runRoot, "before.json"),
+          JSON.stringify(marker),
+        );
+        await fixture.runDirectPhase().catch(() => undefined);
+        expect(JSON.parse(String(lines[0])).marker).toBe(expected);
+        expect(JSON.stringify(lines)).not.toContain("canary");
+      } finally {
+        output.mockRestore();
+        await fixture.dispose();
+      }
+    },
+  );
+
+  it.each([
+    ["null", "private-receipt-invalid-or-unavailable"],
+    [
+      JSON.stringify({ bootstrapToken: "private-token-canary", extra: "private-field-canary" }),
+      "credential-invalid",
+    ],
+  ])("classifies only the local receipt validation boundary", async (encoded, expected) => {
+    const fixture = await remoteRetentionFixture();
+    const lines: unknown[] = [];
+    const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(line);
+    });
+    try {
+      await NodeFS.promises.writeFile(fixture.remoteRpc.credentialReceiptPath, encoded!);
+      await expect(fixture.runDirectPhase()).rejects.toThrow(SeededDesktopUpgradeSmokeError);
+      expect(JSON.parse(String(lines[0])).receipt).toBe(expected);
+      expect(JSON.stringify(lines)).not.toContain("canary");
+      await fixture.finalize();
+      expect(fixture.copyBoundedEvidence).not.toHaveBeenCalled();
+      expect(fixture.cleanup).toHaveBeenCalledOnce();
+    } finally {
+      output.mockRestore();
+      await fixture.dispose();
+    }
+  });
+
+  it("does not invoke error accessors or serialize foreign error fields", async () => {
+    const fixture = await remoteRetentionFixture();
+    let getterReads = 0;
+    const failure = {
+      name: "private-name-canary",
+      cause: "private-cause-canary",
+      stack: "private-stack-canary",
+    };
+    Object.defineProperty(failure, "message", {
+      get: () => {
+        getterReads++;
+        throw new Error("private-getter-canary");
+      },
+    });
+    const lines: unknown[] = [];
+    const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(line);
+    });
+    try {
+      const caught = await fixture
+        .runDirectPhase({
+          rpcFixture: {
+            ...fixture.remoteRpc,
+            readSecrets: async () => {
+              throw failure;
+            },
+          },
+        })
+        .catch((error: unknown) => error);
+      expect(caught === failure).toBe(true);
+      expect(getterReads).toBe(0);
+      expect(JSON.parse(String(lines[0])).receipt).toBe("validation-failed");
+      expect(JSON.stringify(lines)).not.toContain("canary");
+    } finally {
+      output.mockRestore();
+      await fixture.dispose();
+    }
+  });
+
+  it("keeps existing validated raw-log redaction and local-bridge behavior", async () => {
+    const fixture = await remoteRetentionFixture();
+    const lines: unknown[] = [];
+    const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(line);
+    });
+    try {
+      await NodeFS.promises.writeFile(
+        fixture.remoteRpc.credentialReceiptPath,
+        JSON.stringify({ bootstrapToken: "fixture-private-returned-token" }),
+      );
+      await expect(fixture.runDirectPhase()).rejects.toThrow(/WebDriver phase exited/);
+      expect(JSON.parse(String(lines[0])).receipt).toBe("validated");
+      const log = await NodeFS.promises.readFile(
+        NodePath.join(fixture.evidenceDirectory, "seed-and-install.log"),
+        "utf8",
+      );
+      expect(log).toContain("[REDACTED]");
+      expect(log).not.toContain("fixture-private-returned-token");
+      await expect(
+        fixture.runDirectPhase({
+          lane: "protected-baseline",
+          trigger: "local-bridge",
+          rpcFixture: undefined,
+        }),
+      ).rejects.toThrow(/WebDriver phase exited/);
+      expect(lines).toHaveLength(1);
+    } finally {
+      output.mockRestore();
+      await fixture.dispose();
+    }
+  });
+});
+
+describe("generated private step snapshots", () => {
+  effectIt.effect.each([
+    { kind: "observation-failure", milestone: "observation-started" },
+    { kind: "baseline-failure", milestone: "observation-returned" },
+    { kind: "grant-failure", milestone: "credential-request-started" },
+    { kind: "receipt-failure", milestone: "credential-request-returned" },
+    { kind: "published", milestone: "credential-receipt-published" },
+    { kind: "snapshot-failure", milestone: null },
+  ] as const)(
+    "records only reached generated steps and preserves behavior: $kind",
+    ({ kind, milestone }) =>
+      Effect.gen(function* () {
+        const platform = yield* HostProcessPlatform;
+        yield* Effect.promise(async () => {
+          const root = await NodeFS.promises.mkdtemp(
+            NodePath.join(NodeOS.tmpdir(), "seeded-step-status-"),
+          );
+          try {
+            const stepStatusPath = NodePath.join(root, "step-status.private.json"),
+              credentialPath = NodePath.join(root, "credentials.private.json");
+            const input = {
+              candidateVersion: "0.7.3-upgrade.1",
+              baselineVersion: "0.7.2",
+              expectedDataRoot: root,
+              lane: "previous-stable" as const,
+              trigger: "remote-rpc" as const,
+              phase: "seed-and-install" as const,
+              projectId: "owned",
+              resultPath: NodePath.join(root, "before.json"),
+              workspaceRoot: root,
+              platform: "win" as const,
+              appBinaryPath: NodePath.join(root, "owned.exe"),
+              remoteInstallDriverPath: "fixture:driver",
+              remoteHarnessPath: "fixture:host",
+              remoteSecretPath: credentialPath,
+              remoteUploadSecretPath: NodePath.join(root, "upload.private.json"),
+              remoteEvidencePath: NodePath.join(root, "remote.json"),
+              stepStatusPath,
+            };
+            const spec = createSeededUpgradeDriverSpec(input);
+            const end = spec.indexOf("    const { runRemoteInstallDriver }");
+            expect(end).toBeGreaterThan(0);
+            let run: (() => Promise<void>) | undefined;
+            const privateFailure = new Error("private-step-canary");
+            const creationModes: Array<unknown> = [];
+            NodeVM.runInNewContext(
+              spec.slice(0, end).replace('import * as NodeFS from "node:fs";', "") + "\n  });\n});",
+              {
+                NodeFS: {
+                  ...NodeFS,
+                  openSync: (...args: Parameters<typeof NodeFS.openSync>) => {
+                    if (String(args[0]).startsWith(stepStatusPath)) {
+                      creationModes.push(args[2]);
+                      if (kind === "snapshot-failure") throw privateFailure;
+                    }
+                    return NodeFS.openSync(...args);
+                  },
+                  writeFileSync: (...args: Parameters<typeof NodeFS.writeFileSync>) => {
+                    if (kind === "receipt-failure" && args[0] === credentialPath)
+                      throw privateFailure;
+                    return NodeFS.writeFileSync(...args);
+                  },
+                },
+                describe: (_name: string, callback: () => void) => callback(),
+                it: (_name: string, callback: () => Promise<void>) => {
+                  run = callback;
+                },
+                browser: {
+                  waitUntil: async () => {},
+                  execute: async (_callback: unknown, ...args: unknown[]) => {
+                    if (args.length === 2) {
+                      if (kind === "observation-failure") throw privateFailure;
+                      return { appVersion: kind === "baseline-failure" ? "0.7.1" : "0.7.2" };
+                    }
+                    if (args.length === 1) {
+                      if (kind === "grant-failure") throw privateFailure;
+                      return {
+                        endpoint: "http://127.0.0.1:43121",
+                        bootstrapToken: "private-credential-canary",
+                      };
+                    }
+                    return false;
+                  },
+                },
+              },
+            );
+            expect(run).toBeTypeOf("function");
+            if (kind === "published" || kind === "snapshot-failure") await run!();
+            else
+              await expect(run!()).rejects.toThrow(
+                kind === "baseline-failure" ? /planned baseline/ : /private-step-canary/,
+              );
+            expect(NodeFS.existsSync(stepStatusPath)).toBe(milestone !== null);
+            expect(creationModes.length).toBeGreaterThan(0);
+            expect(creationModes.every((mode) => mode === 0o600)).toBe(true);
+            if (milestone !== null) {
+              const encoded = await NodeFS.promises.readFile(stepStatusPath, "utf8");
+              expect(decodeUnknownJson(encoded)).toEqual({
+                version: 1,
+                lane: "previous-stable",
+                phase: "seed-and-install",
+                trigger: "remote-rpc",
+                milestone,
+              });
+              expect(encoded).not.toContain("canary");
+              if (platform !== "win32")
+                expect((await NodeFS.promises.stat(stepStatusPath)).mode & 0o777).toBe(0o600);
+            }
+            expect(NodeFS.existsSync(credentialPath)).toBe(
+              kind === "published" || kind === "snapshot-failure",
+            );
+          } finally {
+            await NodeFS.promises.rm(root, { recursive: true, force: true });
+          }
+        });
+      }),
+  );
 });
 
 const versionFixture = async () => {
@@ -1834,7 +2311,12 @@ const remoteGrantFixture = (
   const end = spec.indexOf("\n  });\n});", start);
   if (start < 0 || end < 0) throw new Error("Generated remote credential scenario is missing.");
   // Replace module loading only; run the actual browser callback and handoff statements.
-  const source = spec.slice(start, end).replaceAll("await import(", "await loadFixture(");
+  const publisher = spec.slice(
+    spec.indexOf("function publishStep("),
+    spec.indexOf('publishStep("spec-loaded");'),
+  );
+  const source =
+    publisher + spec.slice(start, end).replaceAll("await import(", "await loadFixture(");
   const files = new Map<string, { contents: string; mode?: number }>();
   let responseIndex = 0;
   const fetch = vi.fn(async (_url: URL, _options: { signal?: AbortSignal }) => ({
@@ -1918,8 +2400,12 @@ describe("generated remote sharing grant handoff", () => {
     const end = spec.indexOf("    const credentials = await browser.execute(", start);
     if (start < 0 || end < 0) throw new Error("Remote seed admission block missing");
     const execute = vi.fn(async () => false);
+    const publisher = spec.slice(
+      spec.indexOf("function publishStep("),
+      spec.indexOf('publishStep("spec-loaded");'),
+    );
     const run = NodeVM.runInNewContext(
-      `(async () => { ${spec.slice(start, end)} })()`,
+      `${publisher}\n(async () => { ${spec.slice(start, end)} })()`,
       {
         input,
         observe: async () => ({ appVersion: "0.7.1" }),

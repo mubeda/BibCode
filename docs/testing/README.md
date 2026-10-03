@@ -55,6 +55,16 @@ after the existing observation/seeding step and before update-path credential,
 grant or installer-driver commands. The controller checks it again at completion.
 Their private receipts and joined cleanup belong to separate lane roots. A
 missing required or malformed receipt prevents public evidence retention.
+On an RPC phase failure, the console may still contain one closed JSON diagnostic:
+lane, phase, trigger, whether the command returned or threw, its available exit
+code, the receipt-check category, the install-marker state, and the last validated
+generated-spec milestone. It contains no raw output, errors, paths or credentials
+and does not authorize log retention or weaken either owner's receipt checks.
+The milestone comes from a bounded private per-phase snapshot. A missing or
+invalid snapshot means the generated step is unknown; a valid milestone proves
+only that the checkpoint was reached. An absent or unrecorded install marker
+does not prove that dispatch never occurred. Diagnostic write failures preserve
+the original failure and cleanup, and this record never establishes a lane pass.
 RPC residue removal requires two consecutive successful observations that the
 desktop process name targeted by the existing CI cleanup plan is absent. Kill
 results alone cannot authorize removal. Each read-only observation must finish
