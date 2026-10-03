@@ -26,6 +26,10 @@ def scenario_settings(name):
         return {'controller': 'apps/desktop/e2e/qualify-remote-updates.ts',
                 'inner_timeout': 1800, 'outer_timeout': 1860,
                 'evidence_prefix': 'issue16-ui-', 'fixture_prefix': 'bibcode-remote-ui-'}
+    if name == 'delivery-retry-ui':
+        return {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+                'inner_timeout': 600, 'outer_timeout': 660,
+                'evidence_prefix': 'issue19-delivery-', 'fixture_prefix': 'bc-dr-'}
     raise RuntimeError('Unknown qualification scenario')
 
 def ui_input_hashes(server, fake_host, web_root):
@@ -45,13 +49,14 @@ def ui_input_hashes(server, fake_host, web_root):
         if path.is_file():
             result.update(path.relative_to(root).as_posix().encode() + b'\0' + digest(path).encode() + b'\n')
             count += 1
-    return {'serverSha256': digest(server), 'fakeHostSha256': digest(fake_host),
+    return {'serverSha256': digest(server),
+            **({'fakeHostSha256': digest(fake_host)} if fake_host is not None else {}),
             'webSha256': result.hexdigest(), 'webFiles': count}
 
-def cleanup_ui_fixture(fixture, evidence, supervisor):
+def cleanup_ui_fixture(fixture, evidence, supervisor, scenario='remote-updates-ui'):
     """Delete only this allocated UI root after both owners prove joined cleanup."""
     if (supervisor.get('supervisorReaped') is not True or fixture.parent != Path('/tmp')
-            or not fixture.name.startswith('bibcode-remote-ui-') or fixture.is_symlink()):
+            or not fixture.name.startswith(scenario_settings(scenario)['fixture_prefix']) or fixture.is_symlink()):
         return False
     try:
         receipt = evidence / 'namespace-cleanup.json'
@@ -220,8 +225,20 @@ def network():
     return 0
 
 
+def inner_resources(arguments):
+    """Only the existing empty/four-item forms and the new two-item delivery form."""
+    if len(arguments) == 0:
+        return 'chat-upload', None, None, 'core'
+    if len(arguments) == 4 and arguments[0] == 'remote-updates-ui':
+        return arguments[0], arguments[1], arguments[2], ui_matrix_selection(arguments[3])
+    if len(arguments) == 2 and arguments[0] == 'delivery-retry-ui':
+        return arguments[0], None, arguments[1], 'core'
+    raise RuntimeError('Unknown qualification owner payload')
+
+
 def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_namespace, source, ip,
-          scenario='chat-upload', fake_host='', web_root='', ui_matrix='core'):
+          *scenario_arguments):
+    scenario, fake_host, web_root, ui_matrix = inner_resources(scenario_arguments)
     selection = scenario_settings(scenario)
     ui_matrix = ui_matrix_selection(ui_matrix)
     private_namespace = os.readlink('/proc/self/ns/net')
@@ -255,6 +272,10 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
             environment.update({'BIBCODE_RELEASE_UI_FAKE_HOST': str(Path(fake_host).resolve(strict=True)),
                                 'BIBCODE_RELEASE_UI_WEB': str(Path(web_root).resolve(strict=True)),
                                 'BIBCODE_RELEASE_UI_MATRIX': ui_matrix})
+        elif scenario == 'delivery-retry-ui':
+            environment.update({'BIBCODE_DELIVERY_UI_WEB': str(Path(web_root).resolve(strict=True)),
+                                'GIT_CONFIG_NOSYSTEM': '1',
+                                'GIT_CONFIG_GLOBAL': str(fixture / 'empty-git-config')})
         with os.fdopen(os.open(fixture / 'private-controller.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
             process = subprocess.Popen([node, selection['controller']],
                                        env=environment, stdout=output, stderr=subprocess.STDOUT,
@@ -358,7 +379,8 @@ def outer(scenario='chat-upload', ui_matrix='core'):
     node = resolve_node_runtime()
     server = str(Path(os.environ['BIBCODE_UPLOAD_SERVER']).resolve(strict=True))
     evidence = Path(os.environ['RUNNER_TEMP']) / (selection['evidence_prefix'] + run_id)
-    fixture = Path('/tmp') / (selection['fixture_prefix'] + run_id + '-' + uuid.uuid4().hex)
+    # Evidence carries the run ID; keep this owned TMPDIR short for Chromium's Unix socket.
+    fixture = Path('/tmp') / (selection['fixture_prefix'] + uuid.uuid4().hex)
     evidence.mkdir(mode=0o700, exist_ok=False)
     fixture.mkdir(mode=0o700, exist_ok=False)
     namespace = os.readlink('/proc/self/ns/net')
@@ -375,14 +397,19 @@ def outer(scenario='chat-upload', ui_matrix='core'):
         provenance.update({'scenario': scenario, 'selection': ui_matrix,
                            'inputs': ui_input_hashes(server, fake_host, web_root)})
         command.extend([scenario, fake_host, web_root, ui_matrix])
+    elif scenario == 'delivery-retry-ui':
+        fake_host = None
+        web_root = str(Path(os.environ['BIBCODE_DELIVERY_UI_WEB']).resolve(strict=True))
+        provenance.update({'scenario': scenario, 'inputs': ui_input_hashes(server, None, web_root)})
+        command.extend([scenario, web_root])
     else:
         provenance['fixtureRoot'] = str(fixture)
     write_json(evidence / 'provenance.json', provenance)
     result, _ = run_owned_command(command, timeout=selection['outer_timeout'], grace=15)
     result['hostNetworkNamespaceUnchanged'] = os.readlink('/proc/self/ns/net') == namespace
-    if scenario == 'remote-updates-ui':
+    if scenario in ['remote-updates-ui', 'delivery-retry-ui']:
         result['buildInputsUnchanged'] = ui_input_hashes(server, fake_host, web_root) == provenance['inputs']
-        result['privateFixtureDeleted'] = cleanup_ui_fixture(fixture, evidence, result)
+        result['privateFixtureDeleted'] = cleanup_ui_fixture(fixture, evidence, result, scenario)
         if not result['privateFixtureDeleted'] or not result['hostNetworkNamespaceUnchanged'] or not result['buildInputsUnchanged']:
             result['exitCode'] = result['exitCode'] or 1
     write_json(evidence / 'supervisor.json', result)

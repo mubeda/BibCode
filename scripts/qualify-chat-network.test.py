@@ -55,18 +55,20 @@ def actual_owner_handoff(root, scenario, matrix='core'):
              'evidence': root / 'evidence', 'fixture': root, 'node': sys.executable, 'server': sys.executable,
              'namespace': 'net:[1]', 'provenance': {},
              'os': types.SimpleNamespace(environ={'GITHUB_SHA': 'a' * 40,
-                 'BIBCODE_RELEASE_UI_FAKE_HOST': str(fake), 'BIBCODE_RELEASE_UI_WEB': str(web)})}
+                 'BIBCODE_RELEASE_UI_FAKE_HOST': str(fake), 'BIBCODE_RELEASE_UI_WEB': str(web),
+                 'BIBCODE_DELIVERY_UI_WEB': str(web)})}
     exec(compile(ast.Module(body=[command, selection], type_ignores=[]), 'actual-owner-command', 'exec'), scope)
     command = scope['command']
     owner = command[command.index('inner') - 2:]
     arguments = inspect.signature(qualifier.inner).bind(Path(owner[3]), Path(owner[4]), *owner[5:])
     arguments.apply_defaults()
     inner = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'inner')
+    resources = next(node for node in inner.body if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == 'inner_resources')
     environment = next(node for node in ast.walk(inner) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'environment' for target in node.targets))
     selected_environment = next(node for node in ast.walk(inner) if isinstance(node, ast.If) and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) and call.func.value.id == 'environment' and call.func.attr == 'update' for call in ast.walk(node)))
     scope = {**qualifier.__dict__, **arguments.arguments, 'private_namespace': 'net:[2]',
              'trusted_network': ENV, 'os': types.SimpleNamespace(environ={'PATH': '/owned/tools'}, pathsep=':')}
-    exec(compile(ast.Module(body=[environment, selected_environment], type_ignores=[]), 'actual-owner-environment', 'exec'), scope)
+    exec(compile(ast.Module(body=[resources, environment, selected_environment], type_ignores=[]), 'actual-owner-environment', 'exec'), scope)
     return owner, scope['environment']
 
 class FakeIp:
@@ -102,7 +104,7 @@ class NetworkTests(unittest.TestCase):
                              platform='linux', read_owner=lambda: ('\0'.join(OWNER if owner is None else owner) + '\0').encode(), read_capabilities=kwargs.pop('read_capabilities', lambda: b'CapEff:\t0000000000001000\n'), **kwargs)
 
     def test_actual_chat_and_both_ui_producers_satisfy_the_existing_containment_contract(self):
-        for scenario, matrix, length in [('chat-upload', 'core', 14), ('remote-updates-ui', 'core', 18), ('remote-updates-ui', 'full', 18)]:
+        for scenario, matrix, length in [('chat-upload', 'core', 14), ('remote-updates-ui', 'core', 18), ('remote-updates-ui', 'full', 18), ('delivery-retry-ui', 'core', 16)]:
             with self.subTest(scenario=scenario, matrix=matrix), tempfile.TemporaryDirectory(prefix='bibcode-owner-contract-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario, matrix)
                 self.assertEqual(len(owner), length)
@@ -111,7 +113,7 @@ class NetworkTests(unittest.TestCase):
                 self.assertTrue(proof['linksContained'])
 
     def test_owner_argument_forms_refuse_extra_empty_and_truncated_arguments(self):
-        for scenario in ['chat-upload', 'remote-updates-ui']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui']:
             with tempfile.TemporaryDirectory(prefix='bibcode-owner-arity-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 for invalid in [owner + [''], owner + ['unexpected'], owner[:-1]]:
@@ -142,8 +144,27 @@ class NetworkTests(unittest.TestCase):
                 with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=environment, owner=invalid)
                 self.assertEqual(fake.calls, [])
 
+    def test_delivery_assets_and_selector_are_bound_to_the_exact_owner_before_ip_reads(self):
+        with tempfile.TemporaryDirectory(prefix='delivery-owner-identity-') as directory:
+            owner, env = actual_owner_handoff(Path(directory), 'delivery-retry-ui')
+            other = Path(directory) / 'other-web'; other.mkdir()
+            alias = Path(directory) / 'alias-web'; alias.symlink_to(Path(owner[15]))
+            cases = []
+            for index, value in [(14, 'remote-updates-ui'), (14, '../arbitrary'), (15, str(other.resolve()))]:
+                changed = list(owner); changed[index] = value; cases.append((changed, env))
+            missing = dict(env); missing.pop('BIBCODE_DELIVERY_UI_WEB'); cases.append((owner, missing))
+            for value in ['relative-web', str(alias), sys.executable]:
+                changed = list(owner); changed[15] = value
+                cases.append((changed, {**env, 'BIBCODE_DELIVERY_UI_WEB': value}))
+            cases.append((owner, {**env, 'BIBCODE_RELEASE_UI_MATRIX': 'core'}))
+            cases.append((owner[:14], env))
+            for invalid, environment in cases:
+                fake = FakeIp()
+                with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=environment, owner=invalid)
+                self.assertEqual(fake.calls, [])
+
     def test_original_owner_anchors_remain_required_for_both_forms(self):
-        for scenario in ['chat-upload', 'remote-updates-ui']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui']:
             with tempfile.TemporaryDirectory(prefix='bibcode-owner-anchor-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 for index, value in [(0, '/missing-python'), (1, '/missing-helper'), (2, 'outer'), (11, 'net:[99]'), (13, '/missing-ip')]:

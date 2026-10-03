@@ -673,6 +673,42 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
 Capture original-resolution screenshots plus focused crops and keep diagnostic
 frames separate from acceptance evidence.
 
+### Controlled delivery Retry interaction
+
+The CI-only `delivery-retry-ui` selection in `scripts/qualify-chat-uploads.py`
+uses the guarded real CLI, immutable web assets and an opt-in fake Claude. It
+shares the reviewed private namespace, browser options and joined resource
+owner; it is not a local desktop command. Its fixed payload contains the web
+directory without an unused update-fake-host argument. Private fixture roots
+use a short case prefix plus the complete UUID, with exclusive `0700` creation;
+run IDs remain in evidence paths, keeping Chromium's branded and unbranded
+Unix socket names within their limit.
+
+In each theme, the driver pairs and imports through the public UI, completes a
+baseline message, and arms one withheld provider acknowledgement. It renames
+only the owned checkout to trigger actual workspace loss, waits for Delivery
+uncertain, and restores the path before retrying. The ordinary fixture is
+unchanged unless `BIBCODE_E2E_CLAUDE_RETRY=1` is explicitly set. Its private
+receipts distinguish fresh/resumed launches and the received/withheld input.
+
+The Retry button must open the real browser confirmation. Read its exact copy
+through WebDriver's alert API, dismiss once and prove no new input/launch, then
+click again and accept. Do not replace `window.confirm`, call a private handler
+or send the retry RPC directly. No DOM or screenshot command runs while the
+prompt is open. The same public message row/text and unsent draft must survive;
+one fresh no-resume launch and the exact quiet new-conversation notice establish
+the accepted retry. The controller records the actual bounded no-resend window,
+not a claim about every future moment.
+
+Retain only the six declared uncertain/cancelled/delivered PNGs, their closed
+capture proofs and source/input/cleanup receipts. Pairing material, profiles,
+provider/session IDs, raw logs and protocol bodies stay outside the artifact
+allowlist. Inspect original pixels in both themes. Browser interaction does
+not qualify Tauri's native dialog, and this focused lane is not the final
+merged-tree screenshot sweep. A pass also requires supervisor/namespace cleanup
+and unchanged input hashes; the inner result alone is insufficient. Failed
+cleanup preserves private files until owned processes have been reaped.
+
 ## Process-group cleanup
 
 Capture PID, PPID, process group, start time, executable, and command line for

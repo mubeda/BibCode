@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -21,7 +22,73 @@ qualification = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(qualification)
 
 
+class FixturePathBudgetTests(unittest.TestCase):
+    def actual_paths(self, scenario, run_id):
+        module = ast.parse(SOURCE.read_text())
+        outer = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'outer')
+        assignments = [node for node in outer.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in ['fixture', 'evidence'] for target in node.targets)]
+        self.assertEqual(len(assignments), 2)
+        scope = {'Path': Path, 'selection': qualification.scenario_settings(scenario), 'run_id': run_id,
+                 'uuid': types.SimpleNamespace(uuid4=lambda: types.SimpleNamespace(hex='a' * 32)),
+                 'os': types.SimpleNamespace(environ={'RUNNER_TEMP': '/owned-evidence'})}
+        exec(compile(ast.Module(body=assignments, type_ignores=[]), 'actual-private-root-producer', 'exec'), scope)
+        return scope['fixture'], scope['evidence']
+
+    def test_actual_roots_fit_branded_and_unbranded_chromium_unix_socket_paths(self):
+        # Chromium branch 8037 FormatTemporaryFileName + SingletonSocket; Linux sun_path[108].
+        # Portable SetupSockAddr requires byte length below 108, including room for NUL.
+        for scenario in ['remote-updates-ui', 'chat-upload', 'delivery-retry-ui']:
+            for run_id in ['37096649000', '9' * 20, '9' * 128]:
+                fixture, _ = self.actual_paths(scenario, run_id)
+                for brand in ['com.google.Chrome', 'org.chromium.Chromium']:
+                    with self.subTest(scenario=scenario, run_digits=len(run_id), brand=brand):
+                        socket = fixture / (brand + '.XXXXXX') / 'SingletonSocket'
+                        self.assertLess(len(str(socket).encode('utf8')), 108)
+
+    def test_only_private_root_omits_run_id_while_evidence_keeps_it(self):
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui']:
+            selection = qualification.scenario_settings(scenario)
+            roots = []
+            for run_id in ['37096649000', '9' * 128]:
+                fixture, evidence = self.actual_paths(scenario, run_id)
+                self.assertEqual(fixture, Path('/tmp') / (selection['fixture_prefix'] + 'a' * 32))
+                self.assertEqual(evidence, Path('/owned-evidence') / (selection['evidence_prefix'] + run_id))
+                roots.append(fixture)
+            self.assertEqual(roots[0], roots[1])
+
+    def test_actual_private_directory_creation_stays_exclusive_and_0700(self):
+        module = ast.parse(SOURCE.read_text())
+        outer = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'outer')
+        expression = next(node.value for node in outer.body if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute) and isinstance(node.value.func.value, ast.Name) and node.value.func.value.id == 'fixture' and node.value.func.attr == 'mkdir')
+        with tempfile.TemporaryDirectory(prefix='bibcode-private-root-mode-') as directory:
+            fixture = Path(directory) / 'owned'
+            create = lambda: eval(compile(ast.Expression(expression), 'actual-private-root-create', 'eval'), {'fixture': fixture})
+            create()
+            self.assertEqual(fixture.stat().st_mode & 0o777, 0o700)
+            with self.assertRaises(FileExistsError): create()
+
+
 class ScenarioSelectionTests(unittest.TestCase):
+    def test_delivery_retry_has_a_fixed_bounded_entrypoint_without_fake_host(self):
+        try:
+            selected = qualification.scenario_settings('delivery-retry-ui')
+        except RuntimeError:
+            selected = None
+        self.assertEqual(selected, {
+            'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+            'inner_timeout': 600, 'outer_timeout': 660,
+            'evidence_prefix': 'issue19-delivery-', 'fixture_prefix': 'bc-dr-',
+        })
+
+    def test_delivery_build_receipt_needs_only_real_server_and_immutable_web(self):
+        with tempfile.TemporaryDirectory(prefix='delivery-inputs-') as directory:
+            root = Path(directory)
+            server = root / 'server'; server.write_bytes(b'owned-server')
+            web = root / 'web'; web.mkdir(); (web / 'index.html').write_text('owned-web')
+            result = qualification.ui_input_hashes(server, None, web)
+            self.assertEqual(set(result), {'serverSha256', 'webSha256', 'webFiles'})
+            self.assertEqual(result['webFiles'], 1)
+
     def test_ui_build_receipt_contains_hashes_and_counts_without_paths(self):
         with tempfile.TemporaryDirectory(prefix='bibcode-ui-inputs-') as directory:
             root = Path(directory)

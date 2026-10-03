@@ -1,0 +1,89 @@
+name: Issue 19 actual delivery Retry interaction
+
+on:
+  push:
+    branches: [codex/qualify-delivery-retry]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  delivery_retry:
+    name: Linux Chromium Retry Dismiss and Accept in both themes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+      - name: Install frozen dependencies
+        run: vp install --frozen-lockfile
+      - name: Check owned helpers and namespace admission
+        run: |
+          python3 -B scripts/qualify-chat-uploads.test.py
+          python3 -B scripts/qualify-chat-network.test.py
+          python3 -B scripts/qualify-chat-uploads.py preflight
+          vp test run scripts/qualify-delivery-retry-workflow.test.ts apps/desktop/e2e/support/provider-shims.test.ts apps/desktop/e2e/support/qualification-owner.test.ts apps/desktop/e2e/support/remote-ui-evidence.test.ts apps/desktop/e2e/support/delivery-retry-evidence.test.ts apps/desktop/e2e/support/delivery-retry-flow.test.ts apps/desktop/e2e/support/delivery-retry-controller.test.ts apps/desktop/e2e/support/browser-network.test.ts
+      - name: Build the source UI once with owned loopback targets
+        env:
+          VITE_WS_URL: ws://127.0.0.1:4885
+          VITE_HTTP_URL: http://127.0.0.1:4885
+          VITE_DEV_SERVER_URL: http://127.0.0.1:4885
+        run: vp run --filter @bibcode/web build
+      - name: Required static gates
+        run: |
+          vp check
+          vp exec tsc --noEmit -p apps/desktop/e2e/tsconfig.json
+          vp exec tsc --noEmit -p scripts/tsconfig.json
+      - name: Build guarded production CLI
+        run: cargo build -p bibcode-server --bin bibcode --features hermetic-test-guard -j 2
+      - name: Copy immutable inputs outside Cargo output
+        run: |
+          python3 - <<'PYTHON'
+          import os, shutil
+          from pathlib import Path
+          target = Path(os.environ['RUNNER_TEMP']) / 'issue19-delivery-build'
+          target.mkdir(mode=0o700)
+          shutil.copy2('target/debug/bibcode', target / 'bibcode')
+          shutil.copytree('apps/web/dist', target / 'web')
+          (target / 'bibcode').chmod(0o500)
+          PYTHON
+      - name: Run contained actual Retry interaction
+        env:
+          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue19-delivery-build/bibcode
+          BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue19-delivery-build/web
+        run: python3 -B scripts/qualify-chat-uploads.py --scenario delivery-retry-ui
+      - name: Retain explicit safe evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue19-delivery-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/assertions.json
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/uncertain-light.png
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/uncertain-dark.png
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/retry-cancelled-light.png
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/retry-cancelled-dark.png
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/new-conversation-light.png
+            ${{ runner.temp }}/issue19-delivery-${{ github.run_id }}/new-conversation-dark.png

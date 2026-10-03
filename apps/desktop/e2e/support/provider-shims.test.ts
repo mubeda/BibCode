@@ -568,6 +568,96 @@ describe("generated provider shims", () => {
     ]);
   });
 
+  it("opts Claude into one withheld input and records the later fresh conversation", () => {
+    const fixture = prepareProviderFixture();
+    fixture.environment.BIBCODE_E2E_CLAUDE_RETRY = "1";
+    const control = NodePath.join(fixture.context.runRoot, "delivery-retry");
+    NodeFS.mkdirSync(control, { mode: 0o700 });
+    NodeFS.writeFileSync(NodePath.join(control, "withhold-next"), "hold", { mode: 0o600 });
+    const args = ["--print", "--input-format", "stream-json", "--output-format", "stream-json"];
+    const message = {
+      type: "user",
+      uuid: "owned-input",
+      message: { content: [{ type: "text", text: "owned withheld text" }] },
+    };
+    const withheld = exchangeJsonLines(
+      fixture,
+      "claudeAgent",
+      [...args, "--session-id", "old-session"],
+      [message],
+    );
+    expect(withheld).toEqual([]);
+    expect(NodeFS.existsSync(NodePath.join(control, "withhold-next"))).toBe(false);
+    expect(NodeFS.existsSync(NodePath.join(control, "withhold-next.consumed"))).toBe(true);
+    const accepted = exchangeJsonLines(
+      fixture,
+      "claudeAgent",
+      [...args, "--session-id", "new-session"],
+      [message],
+    );
+    expect(accepted.map((entry) => entry.type)).toEqual(["user", "stream_event", "result"]);
+    expect(accepted[1]).toMatchObject({ session_id: "new-session" });
+    expect(accepted[2]).toMatchObject({ session_id: "new-session" });
+    expect(accepted[1]!.uuid).not.toBe(accepted[2]!.uuid);
+    const receipts = NodeFS.readFileSync(NodePath.join(control, "receipts.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(receipts).toEqual([
+      { kind: "launch", sessionId: "old-session", fresh: true, resumed: false },
+      { kind: "input", sessionId: "old-session", prompt: "owned withheld text", withheld: true },
+      { kind: "launch", sessionId: "new-session", fresh: true, resumed: false },
+      { kind: "input", sessionId: "new-session", prompt: "owned withheld text", withheld: false },
+    ]);
+  });
+
+  it("records opted-in Claude resume honestly and keeps response IDs unique", () => {
+    const fixture = prepareProviderFixture();
+    fixture.environment.BIBCODE_E2E_CLAUDE_RETRY = "1";
+    const control = NodePath.join(fixture.context.runRoot, "delivery-retry");
+    NodeFS.mkdirSync(control, { mode: 0o700 });
+    const responses = exchangeJsonLines(
+      fixture,
+      "claudeAgent",
+      ["--print", "--resume", "existing-session"],
+      [
+        { type: "user", uuid: "one", message: { content: "first" } },
+        { type: "user", uuid: "two", message: { content: "second" } },
+      ],
+    );
+    const generated = responses.filter((entry) => entry.type !== "user");
+    expect(new Set(generated.map((entry) => entry.uuid)).size).toBe(4);
+    expect(generated.every((entry) => entry.session_id === "existing-session")).toBe(true);
+    const launch = JSON.parse(
+      NodeFS.readFileSync(NodePath.join(control, "receipts.jsonl"), "utf8").split("\n")[0]!,
+    );
+    expect(launch).toEqual({
+      kind: "launch",
+      sessionId: "existing-session",
+      fresh: false,
+      resumed: true,
+    });
+  });
+
+  it("keeps default Claude fixture responses unchanged when retry controls are not enabled", () => {
+    const fixture = prepareProviderFixture();
+    delete fixture.environment.BIBCODE_E2E_CLAUDE_RETRY;
+    const control = NodePath.join(fixture.context.runRoot, "delivery-retry");
+    NodeFS.mkdirSync(control, { mode: 0o700 });
+    NodeFS.writeFileSync(NodePath.join(control, "withhold-next"), "hold");
+    const responses = exchangeJsonLines(
+      fixture,
+      "claudeAgent",
+      ["--print"],
+      [{ type: "user", session_id: "default-session", message: { content: "default text" } }],
+    );
+    expect(responses.map((entry) => entry.type)).toEqual(["user", "stream_event", "result"]);
+    expect(responses[1]!.uuid).toBe("bibcode-ui-claude-stream");
+    expect(responses[2]!.uuid).toBe("bibcode-ui-claude-result");
+    expect(NodeFS.existsSync(NodePath.join(control, "withhold-next"))).toBe(true);
+    expect(NodeFS.existsSync(NodePath.join(control, "receipts.jsonl"))).toBe(false);
+  });
+
   it("speaks Cursor ACP session and prompt protocols", () => {
     const fixture = prepareProviderFixture();
     const responses = exchangeJsonLines(

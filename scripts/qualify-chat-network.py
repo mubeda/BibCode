@@ -82,11 +82,19 @@ def _setup(environment, run_owned, context, readlink, platform, clock, read_owne
     try:
         # /proc terminates argv once; stripping all NULs would hide an extra empty argument.
         owner = read_owner().decode('utf8').removesuffix('\0').split('\0')
-        require(len(owner) in [14, 18] and owner[2] == 'inner')
+        require(len(owner) in [14, 16, 18] and owner[2] == 'inner')
         ui_keys = ['BIBCODE_RELEASE_UI_FAKE_HOST', 'BIBCODE_RELEASE_UI_WEB', 'BIBCODE_RELEASE_UI_MATRIX']
+        delivery_key = 'BIBCODE_DELIVERY_UI_WEB'
         if len(owner) == 14:
-            require(not any(key in environment for key in ui_keys))
+            require(not any(key in environment for key in ui_keys + [delivery_key]))
+        elif len(owner) == 16:
+            require(owner[14] == 'delivery-retry-ui' and not any(key in environment for key in ui_keys))
+            web = Path(owner[15])
+            require(web.is_absolute())
+            canonical = web.resolve(strict=True)
+            require(canonical.is_dir() and str(canonical) == owner[15] == environment.get(delivery_key))
         else:
+            require(delivery_key not in environment)
             require(owner[14] == 'remote-updates-ui')
             require(owner[17] in ['core', 'full'] and owner[17] == environment.get(ui_keys[2]))
             for index, key, directory in [(15, ui_keys[0], False), (16, ui_keys[1], True)]:

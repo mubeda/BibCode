@@ -527,6 +527,9 @@ export function appendProviderInput(provider, prompt, kind = "start", turnId) {
 
 const claudeFixtureSource = String.raw`
 import readline from "node:readline";
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { appendProviderInput, promptTextFromParts } from "./provider-input-log-fixture.mjs";
 
 if (process.argv.includes("--version")) {
@@ -541,6 +544,37 @@ if (process.argv.includes("auth") && process.argv.includes("status")) {
   }) + "\n");
   process.exit(0);
 }
+
+const retryOption = process.env.BIBCODE_E2E_CLAUDE_RETRY;
+if (retryOption !== undefined && retryOption !== "1") throw new Error("Unknown Claude fixture mode.");
+const retryEnabled = retryOption === "1";
+let retryRoot;
+if (retryEnabled) {
+  const root = fs.realpathSync(process.env.BIBCODE_E2E_RUN_ROOT);
+  retryRoot = path.join(root, "delivery-retry");
+  if (fs.realpathSync(retryRoot) !== retryRoot || !fs.statSync(retryRoot).isDirectory()) {
+    throw new Error("Owned Claude fixture controls are unavailable.");
+  }
+}
+const argument = (name) => {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+};
+const launchedSession = argument("--resume") ?? argument("--session-id") ?? "bibcode-ui-claude-session";
+const recordRetry = (value) => {
+  if (!retryEnabled) return;
+  const target = path.join(retryRoot, "receipts.jsonl");
+  const encoded = JSON.stringify(value) + "\n";
+  if (encoded.length > 8192) throw new Error("Claude fixture receipt exceeded its bound.");
+  if (fs.existsSync(target)) {
+    const metadata = fs.lstatSync(target);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size + Buffer.byteLength(encoded) > 65536) {
+      throw new Error("Claude fixture receipt target refused.");
+    }
+  }
+  fs.appendFileSync(target, encoded, { mode: 0o600 });
+};
+recordRetry({ kind: "launch", sessionId: launchedSession, fresh: argument("--session-id") !== undefined && argument("--resume") === undefined, resumed: argument("--resume") !== undefined });
 
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const streamResponse = ${JSON.stringify(STREAMED_RESPONSE)};
@@ -606,13 +640,28 @@ reader.on("line", (line) => {
   if (message.type !== "user") {
     return;
   }
-  const sessionId = message.session_id ?? "bibcode-ui-claude-session";
-  appendProviderInput("claudeAgent", promptTextFromParts(message.message?.content));
+  const sessionId = message.session_id ?? (retryEnabled ? launchedSession : "bibcode-ui-claude-session");
+  const prompt = promptTextFromParts(message.message?.content);
+  appendProviderInput("claudeAgent", prompt);
+  let withheld = false;
+  if (retryEnabled) {
+    const marker = path.join(retryRoot, "withhold-next");
+    try {
+      const metadata = fs.lstatSync(marker);
+      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 64) throw new Error("Claude fixture marker refused.");
+      fs.renameSync(marker, marker + ".consumed");
+      withheld = true;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    recordRetry({ kind: "input", sessionId, prompt, withheld });
+  }
+  if (withheld) return;
   send(message);
   send({
     type: "stream_event",
     session_id: sessionId,
-    uuid: "bibcode-ui-claude-stream",
+    uuid: retryEnabled ? randomUUID() : "bibcode-ui-claude-stream",
     parent_tool_use_id: null,
     event: {
       type: "content_block_delta",
@@ -627,7 +676,7 @@ reader.on("line", (line) => {
     errors: [],
     stop_reason: "end_turn",
     session_id: sessionId,
-    uuid: "bibcode-ui-claude-result"
+    uuid: retryEnabled ? randomUUID() : "bibcode-ui-claude-result"
   });
 });
 `.trimStart();
