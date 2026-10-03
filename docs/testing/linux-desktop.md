@@ -609,6 +609,19 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   canonical input identities and matching core/full selection. An owner-shape
   refusal precedes all network reads/mutations; preserve that receipt and repair
   the handoff instead of bypassing its ownership checks.
+  The browser primary uses `localhost` for both its page and configured HTTP/WS
+  target. Its fake host alone opts into the fixed `http://localhost:4901` dev
+  origin on port `4887`, with the same dev profile selected by the grant command.
+  Provider-disable settings must cover that active `dev` state directory before
+  startup, and restarts reuse the configuration. Remote fake hosts remain in
+  normal `userdata` mode. Do not widen CORS, rewrite cookies or add a grant-only
+  dev URL to repair a pairing failure.
+  Pairing, import and theme setup have separate phases. A failure may retain a
+  bounded closed setup observation alongside the startup receipt: route/readiness
+  categories, control presence/disabled flags and a known pairing-error category.
+  Missing observations stay null; presence is not proof of authentication or
+  visibility. No input values, URLs, page/error text, credentials or network logs
+  are retained, and unavailable diagnostics cannot skip joined cleanup.
   Remote pairing uses the real Add Server
   flow through an owned loopback tunnel. The fresh-terminal setup uses genuine
   authenticated public RPC and a pinned owned executable; dialog counts and all

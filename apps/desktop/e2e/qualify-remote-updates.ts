@@ -35,6 +35,7 @@ import {
   validateCaptureWitness,
   inspectScreenshot,
   countInstallRequests,
+  projectRemoteUiSetupObservation,
   type RemoteUiTheme,
   type RemoteUiScene,
 } from "./support/remote-ui-evidence.ts";
@@ -142,6 +143,7 @@ interface Host {
   readonly env: NodeJS.ProcessEnv;
   readonly child: QualificationProcess;
   readonly closeTunnel?: () => Promise<void>;
+  readonly devUrl?: typeof webOrigin;
 }
 
 function privateEnvironment(directory: string): NodeJS.ProcessEnv {
@@ -246,16 +248,39 @@ async function fakeHost(
     BIBCODE_E2E_PLATFORM: "linux",
   };
   const project = prepareDesktopUiTestContext(setup).projectPath;
-  const child = owner.spawn(fakeHostBinary, [base, String(port), version, label], env, role, true);
+  const devArgs = role === "primary" ? ["--dev-url", webOrigin] : [];
+  const child = owner.spawn(
+    fakeHostBinary,
+    [base, String(port), version, label, ...devArgs],
+    env,
+    role,
+    true,
+  );
   await readyHost(port, version);
-  const host = { label, port, clientPort: port, base, env, child, project };
+  const host: Host = {
+    label,
+    port,
+    clientPort: port,
+    base,
+    env,
+    child,
+    project,
+    ...(role === "primary" ? { devUrl: webOrigin } : {}),
+  };
   return role === "primary" ? host : addOwnedTunnel(host);
 }
 
 async function grant(host: Host): Promise<string> {
   const value = (await owner.json(
     serverBinary,
-    ["pairing", "issue", "--base-dir", host.base, "--json"],
+    [
+      "pairing",
+      "issue",
+      "--base-dir",
+      host.base,
+      ...(host.devUrl ? ["--dev-url", host.devUrl] : []),
+      "--json",
+    ],
     host.env,
   )) as { credential?: unknown };
   if (typeof value.credential !== "string" || value.credential.length < 8)
@@ -271,6 +296,7 @@ async function offer(host: Host): Promise<string> {
       "offer",
       "--base-dir",
       host.base,
+      ...(host.devUrl ? ["--dev-url", host.devUrl] : []),
       "--endpoint",
       endpoint(host.clientPort),
       "--reach",
@@ -369,11 +395,17 @@ async function removeHost(host: Host) {
 }
 
 async function importProject(host: Host) {
+  const primaryPhase = (name: string) => {
+    if (host.devUrl) phase(name);
+  };
+  primaryPhase("primary-import-workspace");
   await workspace();
+  primaryPhase("primary-import-menu");
   await click('[data-testid="sidebar-add-project-trigger"]');
   await click(
     "//button[@data-add-project-action='true'][.//span[normalize-space()='Browse folder']]",
   );
+  primaryPhase("primary-import-path-mode");
   await owner.until(
     async () =>
       (await required().$("#add-project-host-path").isDisplayed()) ||
@@ -381,19 +413,26 @@ async function importProject(host: Host) {
   );
   if (!(await required().$("#add-project-host-path").isExisting()))
     await click("button=Type a path instead");
+  primaryPhase("primary-import-path-input");
   await required().$("#add-project-host-path").waitForDisplayed();
   await required().$("#add-project-host-path").setValue(host.project);
+  primaryPhase("primary-import-submit");
   await click("button=Open project");
+  primaryPhase("primary-import-composer");
   await required().$(composer).waitForDisplayed();
 }
 
 async function setTheme(theme: RemoteUiTheme) {
+  phase("primary-theme-settings");
   await settings();
+  phase("primary-theme-general");
   await click("button=General");
+  phase("primary-theme-select");
   await click('[aria-label="Theme preference"]');
   await click(
     `//*[@role="option" and normalize-space()="${theme === "light" ? "Light" : "Dark"}"]`,
   );
+  phase("primary-theme-applied");
   await required().waitUntil(
     async () =>
       await required().execute(
@@ -401,6 +440,7 @@ async function setTheme(theme: RemoteUiTheme) {
         theme === "dark",
       ),
   );
+  phase("primary-theme-remote-servers");
   await click("button=Remote Servers");
 }
 
@@ -1204,8 +1244,8 @@ try {
       ],
       {
         ...process.env,
-        VITE_WS_URL: "ws://127.0.0.1:4887",
-        VITE_HTTP_URL: "http://127.0.0.1:4887",
+        VITE_WS_URL: "ws://localhost:4887",
+        VITE_HTTP_URL: "http://localhost:4887",
         VITE_DEV_SERVER_URL: webOrigin,
       },
       "web",
@@ -1229,14 +1269,23 @@ try {
       source: browserStartupObservationScript,
     });
     networkProofs.push(await verifyOwnedBrowserOnline(browser, preparedNetwork));
-    phase("pair-primary");
+    phase("primary-pair-navigate");
     await browser.url(webOrigin + "/pair");
+    phase("primary-pair-wait-token");
     await browser.$("#pairing-token").waitForDisplayed();
-    await browser.$("#pairing-token").setValue(await grant(primary));
+    phase("primary-pair-issue-grant");
+    const credential = await grant(primary);
+    phase("primary-pair-fill-token");
+    await browser.$("#pairing-token").setValue(credential);
+    phase("primary-pair-submit");
     await click("button=Continue");
+    phase("primary-pair-wait-sidebar");
     await browser.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
+    phase("primary-import");
     await importProject(primary);
+    phase("primary-theme");
     await setTheme(theme);
+    phase("primary-return-workspace");
     await workspace();
     const flows = {
       success: successFlow,
@@ -1265,19 +1314,66 @@ try {
 } catch (error) {
   if (error instanceof BrowserConnectivityFailure) networkProofs.push(error.proof);
   let startup: unknown = null;
+  let setup: ReturnType<typeof projectRemoteUiSetupObservation> = null;
   if (browser) {
     try {
-      startup = projectBrowserStartupObservation(
-        await bounded(
-          browser.execute(() => {
-            const observer = Reflect.get(window, "__browserStartupObservation") as
-              | { read?: () => unknown }
-              | undefined;
-            return observer?.read?.() ?? null;
-          }),
-          2_000,
-        ),
+      const observed = await bounded(
+        browser.execute(() => {
+          const observer = Reflect.get(window, "__browserStartupObservation") as
+            | { read?: () => unknown }
+            | undefined;
+          const token = document.getElementById("pairing-token");
+          const form = token?.closest("form");
+          const submit = form?.querySelector('button[type="submit"]');
+          const error = form?.querySelector(".text-destructive");
+          // Compare one bounded error surface locally; no text or input value leaves the page.
+          const content = error?.textContent ?? "";
+          const message = content.length <= 256 ? content.trim() : null;
+          const pairingError = !form
+            ? null
+            : !error
+              ? "none"
+              : message === "Enter a pairing token to continue."
+                ? "credential-required"
+                : message === "Invalid pairing token. Check the token and try again."
+                  ? "credential-rejected"
+                  : message === "Timed out waiting for authenticated session after bootstrap."
+                    ? "session-timeout"
+                    : message !== null &&
+                        /^Primary environment request failed during (exchange-bootstrap-credential|fetch-session-state|fetch-environment-descriptor) \(HTTP [1-5]\d{2}\)\.$/.test(
+                          message,
+                        )
+                      ? "request-failed"
+                      : "unknown";
+          return {
+            startup: observer?.read?.() ?? null,
+            setup: {
+              route:
+                location.pathname === "/pair"
+                  ? "pair"
+                  : location.pathname === "/settings" || location.pathname.startsWith("/settings/")
+                    ? "settings"
+                    : "other",
+              readyState: document.readyState,
+              tokenPresent: token !== null,
+              submitPresent: submit != null,
+              submitDisabled: submit instanceof HTMLButtonElement ? submit.disabled : null,
+              sidebarPresent:
+                document.querySelector('[data-testid="sidebar-add-project-trigger"]') !== null,
+              importPathPresent: document.getElementById("add-project-host-path") !== null,
+              themeControlPresent:
+                document.querySelector('[aria-label="Theme preference"]') !== null,
+              pairingPendingPresent:
+                document.querySelector("h1")?.textContent?.trim() ===
+                "Pairing with this environment",
+              pairingError,
+            },
+          };
+        }),
+        2_000,
       );
+      startup = projectBrowserStartupObservation(observed.startup);
+      setup = projectRemoteUiSetupObservation(observed.setup);
     } catch {
       /* Closed unavailable evidence; no fallback app state. */
     }
@@ -1287,6 +1383,7 @@ try {
     theme: currentTheme,
     failure: classifyQualificationFailure(error),
     startup,
+    setup,
   });
 } finally {
   const beforeCleanup = owner.processes.map(({ child, role, log, spawnFailure }) =>

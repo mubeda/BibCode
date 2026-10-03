@@ -2,18 +2,349 @@
 import * as NodeFS from "node:fs";
 import * as NodeVM from "node:vm";
 import * as NodeModule from "node:module";
+import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
 import {
   remoteUiPlan,
   remoteUiScenes,
   remoteUiThemes,
   screenshotName,
+  projectRemoteUiSetupObservation,
 } from "./remote-ui-evidence.ts";
 
 const controller = NodeFS.readFileSync(
   new URL("../qualify-remote-updates.ts", import.meta.url),
   "utf8",
 );
+
+it.each(["primary", "update-a", "update-b", "update-c"])(
+  "keeps the actual %s host and grant in the same explicitly selected profile",
+  async (role) => {
+    const spawns: string[][] = [],
+      grants: string[][] = [];
+    const start = controller.indexOf("async function fakeHost(");
+    const end = controller.indexOf("async function offer(", start);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(controller.slice(start, end) + "\n({ fakeHost, grant })"),
+      {
+        NodePath,
+        fixture: "/owned-fixture",
+        currentTheme: "light",
+        serial: 0,
+        webOrigin: "http://localhost:4901",
+        fakeHostBinary: "/owned-fake-host",
+        serverBinary: "/owned-server",
+        unusedPort: async () => {},
+        readyHost: async () => {},
+        privateEnvironment: () => ({}),
+        prepareDesktopUiTestContext: () => ({ projectPath: "/owned-project" }),
+        addOwnedTunnel: async (host: unknown) => host,
+        check: (value: unknown) => {
+          expect(value).toBe(true);
+        },
+        owner: {
+          spawn: (_binary: string, args: string[]) => {
+            spawns.push(args);
+            return {};
+          },
+          json: async (_binary: string, args: string[]) => {
+            grants.push(args);
+            return { credential: "inert-fixture-credential" };
+          },
+        },
+      },
+    );
+    const host = await run.fakeHost(role, role === "primary" ? 4887 : 4888, "QA Host");
+    await run.grant(host);
+    const devArgs = role === "primary" ? ["--dev-url", "http://localhost:4901"] : [];
+    expect(spawns).toEqual([[host.base, String(host.port), "9.9.0", "QA Host", ...devArgs]]);
+    expect(grants).toEqual([["pairing", "issue", "--base-dir", host.base, ...devArgs, "--json"]]);
+  },
+);
+
+it("keeps the actual build and preview primary targets coherent with the browser cookie host", () => {
+  const yaml = NodeModule.createRequire(
+    new URL("../../../../scripts/package.json", import.meta.url),
+  )("yaml");
+  const workflow = yaml.parse(
+    NodeFS.readFileSync(
+      new URL("../../../../.github/workflows/qualify-release-ui.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const configuration = workflow.jobs.remote_ui.steps.find(
+    (step: { name: string }) =>
+      step.name === "Build the source UI once with owned loopback targets",
+  ).env;
+  for (const key of ["VITE_HTTP_URL", "VITE_WS_URL"])
+    expect(controller).toContain(`${key}: ${JSON.stringify(configuration[key])}`);
+  const source = NodeFS.readFileSync(
+    new URL("../../../web/src/environments/primary/target.ts", import.meta.url),
+    "utf8",
+  );
+  const read = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      source
+        .slice(source.indexOf("const LOOPBACK_HOSTNAMES"))
+        .replaceAll("import.meta.env", "configuration")
+        .replaceAll("export function ", "function ") +
+        "\n(() => ({ target: readPrimaryEnvironmentTarget(), authUrl: resolvePrimaryEnvironmentHttpUrl('/api/auth/browser-session') }))",
+    ),
+    {
+      configuration,
+      window: { location: new URL(configuration.VITE_DEV_SERVER_URL + "/pair") },
+      URL,
+      URLSearchParams,
+    },
+  );
+  const result = read();
+  expect(new URL(result.authUrl).origin).toBe(configuration.VITE_DEV_SERVER_URL);
+  expect(new URL(result.authUrl).hostname).toBe(new URL(result.target.target.httpBaseUrl).hostname);
+  expect(new URL(result.authUrl).hostname).toBe(new URL(result.target.target.wsBaseUrl).hostname);
+});
+
+it.each([
+  [null, "none"],
+  ["Enter a pairing token to continue.", "credential-required"],
+  ["Invalid pairing token. Check the token and try again.", "credential-rejected"],
+  ["Timed out waiting for authenticated session after bootstrap.", "session-timeout"],
+  [
+    "Primary environment request failed during exchange-bootstrap-credential (HTTP 403).",
+    "request-failed",
+  ],
+  ["Primary environment request failed during fetch-session-state (HTTP 500).", "request-failed"],
+  ["Primary environment request failed during private-value (HTTP 500).", "unknown"],
+  ["private-credential /private/path https://private-host", "unknown"],
+  ["x".repeat(300), "unknown"],
+])(
+  "keeps setup error data inside the page and returns only a closed category %#",
+  (message, category) => {
+    const start = controller.indexOf(
+      "browser.execute(() => {",
+      controller.indexOf("} catch (error) {", controller.indexOf('phase("complete")')),
+    );
+    const tail = controller.slice(start);
+    const end = tail.search(/\n\s*\}\),\n\s*2_000,/);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(0);
+    const callback = tail.slice("browser.execute(".length, end) + "\n}";
+    class Button {
+      disabled = false;
+    }
+    const submit = new Button();
+    let formPresent = true;
+    const token = {
+      get value() {
+        throw new Error("Input values must never be read.");
+      },
+      closest: () => ({
+        querySelector: (selector: string) =>
+          selector.includes("submit") ? submit : message === null ? null : { textContent: message },
+      }),
+    };
+    const read = NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes("(" + callback + ")"), {
+      window: {},
+      HTMLButtonElement: Button,
+      location: {
+        pathname: "/pair",
+        get search() {
+          throw new Error("No query reads.");
+        },
+        get href() {
+          throw new Error("No URL reads.");
+        },
+      },
+      document: {
+        readyState: "complete",
+        getElementById: (id: string) => (id === "pairing-token" && formPresent ? token : null),
+        querySelector: () => null,
+      },
+    });
+    const result = read();
+    expect(result.setup.pairingError).toBe(category);
+    expect(result.setup.tokenPresent).toBe(true);
+    expect(result.setup.submitDisabled).toBe(false);
+    expect(projectRemoteUiSetupObservation(result.setup)).toEqual(result.setup);
+    expect(JSON.stringify(result)).not.toMatch(/private-|credential \/|HTTP 403|https:\/\//);
+    formPresent = false;
+    expect(read().setup).toMatchObject({
+      tokenPresent: false,
+      submitPresent: false,
+      submitDisabled: null,
+      pairingError: null,
+    });
+  },
+);
+
+it.each(["unavailable", "no-browser", "write-failure"])(
+  "retains unavailable setup honestly and still runs joined cleanup on %s",
+  async (mode) => {
+    const start = controller.indexOf("} catch (error) {", controller.indexOf('phase("complete")'));
+    const end = controller.indexOf("\nprocess.exitCode", start);
+    const writes: Array<{ name: string; value: Record<string, unknown> }> = [];
+    let closed = false;
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        'async function fail() { try { throw new Error("inert failure"); ' +
+          controller.slice(start, end) +
+          "}\nfail",
+      ),
+      {
+        BrowserConnectivityFailure: class extends Error {},
+        networkProofs: [],
+        currentPhase: "primary-pair-submit",
+        currentTheme: "light",
+        success: false,
+        browser:
+          mode === "no-browser"
+            ? undefined
+            : {
+                execute: async () => {
+                  throw new Error("private-browser-unavailable");
+                },
+                deleteSession: async () => {},
+              },
+        bounded: (promise: Promise<unknown>, timeout: number) => {
+          expect(timeout).toBe(2_000);
+          return promise;
+        },
+        projectBrowserStartupObservation: () => {
+          throw new Error("Unavailable must not be projected.");
+        },
+        projectRemoteUiSetupObservation,
+        classifyQualificationFailure: () => ({ kind: "timeout" }),
+        owner: {
+          processes: [],
+          failures: [],
+          childrenClosed: () => closed,
+          close: async () => {
+            closed = true;
+          },
+        },
+        tunnels: [],
+        plan: remoteUiPlan("core"),
+        captures: [],
+        assertions: [],
+        bundleVersion: "0.7.2",
+        process: { env: {} },
+        write: (name: string, value: Record<string, unknown>) => {
+          writes.push({ name, value });
+          if (name === "failure" && mode === "write-failure")
+            throw new Error("inert write failure");
+        },
+      },
+    );
+    if (mode === "write-failure") await expect(run()).rejects.toThrow("inert write failure");
+    else await run();
+    expect(closed).toBe(true);
+    expect(writes.find(({ name }) => name === "failure")?.value).toMatchObject({
+      startup: null,
+      setup: null,
+    });
+    expect(writes.find(({ name }) => name === "result")?.value).toMatchObject({
+      success: false,
+      childProcessesClosed: true,
+    });
+    expect(JSON.stringify(writes)).not.toContain("private-");
+  },
+);
+
+it("separates real primary import/theme waits without relabeling remote host imports", async () => {
+  const start = controller.indexOf("async function importProject(");
+  const end = controller.indexOf("async function capture(", start);
+  const phases: string[] = [];
+  const browser = {
+    $: () => ({
+      isDisplayed: async () => true,
+      isExisting: async () => true,
+      waitForDisplayed: async () => {},
+      setValue: async () => {},
+    }),
+    waitUntil: async (read: () => Promise<boolean>) => {
+      expect(await read()).toBe(true);
+    },
+    execute: async (read: (dark: boolean) => boolean, dark: boolean) => read(dark),
+  };
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      controller.slice(start, end) + "\n({ importProject, setTheme })",
+    ),
+    {
+      phase: (name: string) => phases.push(name),
+      required: () => browser,
+      workspace: async () => {},
+      settings: async () => {},
+      click: async () => {},
+      owner: { until: browser.waitUntil },
+      composer: "owned-composer",
+      document: { documentElement: { classList: { contains: () => true } } },
+    },
+  );
+  await run.importProject({ project: "/owned-project", devUrl: "http://localhost:4901" });
+  expect(phases).toEqual([
+    "primary-import-workspace",
+    "primary-import-menu",
+    "primary-import-path-mode",
+    "primary-import-path-input",
+    "primary-import-submit",
+    "primary-import-composer",
+  ]);
+  phases.length = 0;
+  await run.importProject({ project: "/owned-project" });
+  expect(phases).toEqual([]);
+  await run.setTheme("dark");
+  expect(phases).toEqual([
+    "primary-theme-settings",
+    "primary-theme-general",
+    "primary-theme-select",
+    "primary-theme-applied",
+    "primary-theme-remote-servers",
+  ]);
+});
+
+it.each([
+  ["grant", "primary-pair-issue-grant"],
+  ["fill", "primary-pair-fill-token"],
+  ["submit", "primary-pair-submit"],
+  ["sidebar", "primary-pair-wait-sidebar"],
+  ["import", "primary-import"],
+  ["theme", "primary-theme"],
+])("reports the exact primary setup boundary for an inert %s failure", async (failAt, expected) => {
+  const start = controller.indexOf(
+    "    phase(",
+    controller.indexOf("networkProofs.push(await verifyOwnedBrowserOnline("),
+  );
+  const end = controller.indexOf("    const flows = {", start);
+  const observed: string[] = [];
+  const stop = async (step: string) => {
+    if (step === failAt) throw new Error("inert setup failure");
+  };
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      "async function setup() {" + controller.slice(start, end) + "}\nsetup",
+    ),
+    {
+      phase: (value: string) => observed.push(value),
+      webOrigin: "http://localhost:4901",
+      primary: {},
+      theme: "light",
+      browser: {
+        url: async () => {},
+        $: (selector: string) => ({
+          waitForDisplayed: () => stop(selector.includes("sidebar") ? "sidebar" : "token"),
+          setValue: () => stop("fill"),
+        }),
+      },
+      grant: () => stop("grant").then(() => "inert-credential"),
+      click: () => stop("submit"),
+      importProject: () => stop("import"),
+      setTheme: () => stop("theme"),
+      workspace: async () => {},
+    },
+  );
+  await expect(run()).rejects.toThrow("inert setup failure");
+  expect(observed.at(-1)).toBe(expected);
+});
 
 it.each(["stale-connected", "stays-disconnected", "unknown", "reconnected"])(
   "same-version negative control requires this restart's browser transition: %s",

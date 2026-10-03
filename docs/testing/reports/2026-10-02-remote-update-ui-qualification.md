@@ -90,3 +90,29 @@ brands and current/longer run IDs; a native rerun must still confirm the effect.
 Separately, the two temporary QA workflow artifact actions now match the existing
 audited repository v7.0.1 pin. The dependency ledger and other actions are
 unchanged; this corrects a static gate mismatch and is not a browser-cause claim.
+
+The shortened-root trial `37099388138` at `325500ea` did launch Chromium and
+load the application: actual online was true, the boot shell was absent, and the
+retained observer recorded no JS/resource error or rejection. It then timed out
+in `pair-primary` after the real pairing CLI exited zero. That broad phase also
+included project import and theme selection, so the exact original failed call
+remains unknown. No scenes or UI assertions were captured. Cleanup, input hashes
+and host namespace proofs all passed; no private logs were inspected.
+
+An inert execution of the actual workflow configuration, HTTP target resolver,
+primary registration and socket URL functions reproduced a configuration defect:
+cookie bootstrap went through `localhost`, while the configured primary socket
+used `127.0.0.1`. Direct primary descriptor requests additionally used cookie
+credentials against the fake host's normal, noncredentialed CORS mode. Existing
+source and pure CORS tests define the supported explicit dev-origin path.
+
+The QA repair aligns both browser targets to `localhost`, selects only the
+primary fake host's fixed development origin and `dev` state, and makes its real
+grant select that same profile. Provider-disable settings use the active config's
+state directory, and restarts retain the config. Remote/default hosts remain in
+`userdata`; production auth/CORS is unchanged. Actual producer controls failed
+before the repair. Separate pairing/import/theme phases and closed, bounded
+failure facts make the next boundary distinguishable without raw data capture.
+This is a harness setup repair, not retrospective proof of the native timeout's
+exact substep or completion of any UI acceptance case. Root owns the next native
+activation after the exact source packet and required gates are reviewed.

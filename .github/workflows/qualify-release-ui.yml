@@ -47,8 +47,8 @@ jobs:
           vp test run apps/desktop/e2e/support/qualification-owner.test.ts apps/desktop/e2e/support/remote-ui-evidence.test.ts apps/desktop/e2e/support/remote-ui-rpc.test.ts apps/desktop/e2e/support/remote-ui-controller.test.ts apps/desktop/e2e/support/chat-upload-fixture.test.ts apps/desktop/e2e/support/chat-upload-evidence.test.ts apps/desktop/e2e/support/browser-network.test.ts apps/desktop/e2e/support/browser-startup.test.ts
       - name: Build the source UI once with owned loopback targets
         env:
-          VITE_WS_URL: ws://127.0.0.1:4887
-          VITE_HTTP_URL: http://127.0.0.1:4887
+          VITE_WS_URL: ws://localhost:4887
+          VITE_HTTP_URL: http://localhost:4887
           VITE_DEV_SERVER_URL: http://localhost:4901
         run: vp run --filter @bibcode/web build
       - name: Required static gates

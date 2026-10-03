@@ -8,7 +8,46 @@ import {
   countInstallRequests,
   inspectScreenshot,
   remoteUiPlan,
+  projectRemoteUiSetupObservation,
 } from "./remote-ui-evidence.ts";
+
+it("projects only closed setup facts and preserves unknown versus absent observations", () => {
+  for (const input of [undefined, null, [], "private-credential"])
+    expect(projectRemoteUiSetupObservation(input)).toBeNull();
+  const known = {
+    route: "pair",
+    readyState: "complete",
+    tokenPresent: true,
+    submitPresent: true,
+    submitDisabled: false,
+    sidebarPresent: false,
+    importPathPresent: false,
+    themeControlPresent: false,
+    pairingPendingPresent: false,
+    pairingError: "unknown",
+  };
+  expect(projectRemoteUiSetupObservation(known)).toEqual(known);
+  const projected = projectRemoteUiSetupObservation({
+    ...known,
+    route: "http://private/secret",
+    pairingError: "private-credential",
+    tokenPresent: "false",
+    submitPresent: undefined,
+    submitDisabled: 0,
+    rawText: "private-payload",
+    cookie: "private-cookie",
+  });
+  expect(projected).toMatchObject({
+    route: null,
+    pairingError: null,
+    tokenPresent: null,
+    submitPresent: null,
+    submitDisabled: null,
+    sidebarPresent: false,
+  });
+  expect(JSON.stringify(projected)).not.toContain("private-");
+  expect(Object.values(projectRemoteUiSetupObservation({})!)).toEqual(Array(10).fill(null));
+});
 
 it("defaults to an honestly partial core and requires an explicit full matrix selection", () => {
   const core = remoteUiPlan(undefined);

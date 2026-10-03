@@ -31,6 +31,34 @@ export const remoteUiScenes = [
 ] as const;
 export type RemoteUiScene = (typeof remoteUiScenes)[number];
 
+/** Closed, presence-only failure facts. Missing/invalid observations stay unavailable. */
+export function projectRemoteUiSetupObservation(input: unknown) {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+  const row = input as Record<string, unknown>;
+  const choice = (key: string, values: readonly string[]) =>
+    typeof row[key] === "string" && values.includes(row[key]) ? row[key] : null;
+  const flag = (key: string) => (typeof row[key] === "boolean" ? row[key] : null);
+  return {
+    route: choice("route", ["pair", "settings", "other"]),
+    readyState: choice("readyState", ["loading", "interactive", "complete"]),
+    tokenPresent: flag("tokenPresent"),
+    submitPresent: flag("submitPresent"),
+    submitDisabled: flag("submitDisabled"),
+    sidebarPresent: flag("sidebarPresent"),
+    importPathPresent: flag("importPathPresent"),
+    themeControlPresent: flag("themeControlPresent"),
+    pairingPendingPresent: flag("pairingPendingPresent"),
+    pairingError: choice("pairingError", [
+      "none",
+      "credential-required",
+      "credential-rejected",
+      "session-timeout",
+      "request-failed",
+      "unknown",
+    ]),
+  };
+}
+
 export function remoteUiPlan(input: string | undefined) {
   const selection = input ?? "core";
   if (selection !== "core" && selection !== "full") throw new Error("Unknown remote UI selection.");
