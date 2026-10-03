@@ -1,12 +1,17 @@
 // @effect-diagnostics nodeBuiltinImport:off - Execute the inert import boundary without a live browser.
 import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeVM from "node:vm";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { deliveryConfiguration } from "../qualify-delivery-retry.ts";
 import { deliveryScenes, deliveryThemes } from "./delivery-retry-evidence.ts";
 import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
 import { bounded } from "./qualification-owner.ts";
+import { resolveWorktreeCreateInput } from "../../../web/src/components/CreateWorktreeDialog.logic.ts";
+import { readSelectedDeliveryWorktree } from "./delivery-retry-workspace.ts";
+import { prepareDesktopUiTestContext } from "./test-project.ts";
 
 const environment = {
   CI: "true",
@@ -24,6 +29,7 @@ describe("delivery controller admission", () => {
   it("consumes only explicit owned inputs and has a finite six-image manifest", () => {
     expect(deliveryConfiguration(environment, () => "net:[owned]")).toEqual({
       source: "a".repeat(40),
+      selection: "delivery-retry-ui",
       fixture: "/owned/fixture",
       evidence: "/owned/evidence",
       binary: "/owned/bibcode",
@@ -53,6 +59,24 @@ describe("delivery controller admission", () => {
       }),
     ).toThrow(/configuration refused/);
     expect(reads).toBe(0);
+  });
+  it("accepts the fixed visual batch and rejects unknown selectors before any namespace read", () => {
+    expect(
+      deliveryConfiguration(
+        { ...environment, BIBCODE_DELIVERY_UI_SELECTION: "release-visual-core" },
+        () => "net:[owned]",
+      ).selection,
+    ).toBe("release-visual-core");
+    for (const selection of ["", "full", "release-visual-full", "../controller.ts"]) {
+      let reads = 0;
+      expect(() =>
+        deliveryConfiguration({ ...environment, BIBCODE_DELIVERY_UI_SELECTION: selection }, () => {
+          reads++;
+          return "net:[owned]";
+        }),
+      ).toThrow(/configuration refused/);
+      expect(reads).toBe(0);
+    }
   });
   it("refuses a different or unavailable namespace with closed errors", () => {
     expect(() => deliveryConfiguration(environment, () => "net:[foreign]")).toThrow(
@@ -144,9 +168,9 @@ function worktreeOpeningBoundary(
   const helpersEnd = controller.indexOf("  const row =", helpersStart);
   const openingStart = controller.indexOf(
     "    const create =",
-    controller.indexOf("  async function createOwnedWorkspace("),
+    controller.indexOf("  async function openWorktreeDialog("),
   );
-  const openingEnd = controller.indexOf('    step("worktree-name");', openingStart);
+  const openingEnd = controller.indexOf("\n  }", openingStart);
   expect(openingStart).toBeGreaterThan(0);
   expect(openingEnd).toBeGreaterThan(openingStart);
   const run = NodeVM.runInNewContext(
@@ -352,7 +376,16 @@ it.each([
       click: () => click(selector),
       setValue: async (value: string) => {
         expect(dialogOpened).toBe(true);
-        expect(value).toBe(identity.branch);
+        const resolved = resolveWorktreeCreateInput({
+          mode: "smart",
+          nameText: value,
+          selectedBranchRefName: null,
+          githubItem: null,
+          advancedBaseBranchOverride: null,
+          defaultBaseBranch: "main",
+        });
+        expect(resolved?.branchName).toBe(identity.branch);
+        expect(resolved?.title).toBe("codex/delivery retry light");
         named = true;
       },
     }),
@@ -367,16 +400,37 @@ it.each([
     execute: async (read: unknown, input: unknown) => {
       if (read === selectedReader) {
         expect(created).toBe(true);
+        expect(input).toEqual({
+          origin: "http://127.0.0.1:4885",
+          branch: identity.branch,
+          boundThreadId: modelSelected ? "owned-thread" : null,
+        });
         return mode === "no-selected-card"
           ? null
           : { threadId: modelSelected && mode === "selection-changed" ? "other" : "owned-thread" };
       }
       expect(branchHovered).toBe(true);
       expect(input).toBe("Worktree: selected (codex/delivery-retry-light)");
-      return mode !== "wrong-tooltip";
+      const observe = NodeVM.runInNewContext(
+        "(" + (read as (input: unknown) => boolean).toString() + ")",
+        {
+          document: {
+            querySelectorAll: (selector: string) =>
+              selector === '[data-slot="tooltip-popup"]'
+                ? [
+                    {
+                      getClientRects: () => [{}],
+                      textContent: mode === "wrong-tooltip" ? "other" : input,
+                    },
+                  ]
+                : [],
+          },
+        },
+      );
+      return observe(input);
     },
   };
-  const start = controller.indexOf("  async function createOwnedWorkspace(");
+  const start = controller.indexOf("  async function openWorktreeDialog(");
   const end = controller.indexOf("  async function type(", start);
   expect(start).toBeGreaterThan(0);
   const run = NodeVM.runInNewContext(
@@ -431,6 +485,161 @@ it.each([
   }
   expect(phases.every((phase) => /^worktree-[a-z-]+$/.test(phase))).toBe(true);
 });
+
+describe.each(["visual", "pre-loss", "recovery"])(
+  "bound workspace controller read: %s",
+  (phase) => {
+    it.each(["owned-thread", "replaced-thread"])(
+      "retains the captured card ID after its title changes: %s",
+      async (selectedId) => {
+        const workspace = { branch: "codex/delivery-retry-light", threadId: "owned-thread" };
+        const anchor =
+          phase === "visual"
+            ? "          verifyManaged: async () => {"
+            : phase === "pre-loss"
+              ? '        step("workspace-verify-identity");'
+              : '        step("workspace-wait-recovered");';
+        const opening = controller.indexOf(anchor);
+        const start = phase === "visual" ? opening + anchor.length : opening;
+        const end = controller.indexOf(
+          phase === "visual"
+            ? "            check("
+            : phase === "pre-loss"
+              ? "        check(\n          JSON.stringify("
+              : "        check(\n          readOwnedDeliveryWorktree(",
+          start,
+        );
+        expect(opening).toBeGreaterThan(0);
+        expect(end).toBeGreaterThan(start);
+        const read = NodeVM.runInNewContext("(" + readSelectedDeliveryWorktree.toString() + ")", {
+          location: {
+            origin: "http://127.0.0.1:4885",
+            pathname: "/local/" + selectedId,
+            search: "",
+            hash: "",
+          },
+          document: {
+            querySelectorAll: () => [
+              {
+                getAttribute: (name: string) =>
+                  name === "data-testid" ? "thread-card-button-" + selectedId : "owned-branch",
+              },
+            ],
+            querySelector: () => ({
+              querySelector: () => ({ textContent: "delivery baseline light" }),
+            }),
+            getElementById: () => ({ querySelector: () => ({ textContent: workspace.branch }) }),
+          },
+        });
+        const browser = {
+          execute: async (reader: unknown, input: unknown) => {
+            expect(reader).toBe(readSelectedDeliveryWorktree);
+            expect(input).toEqual({
+              origin: "http://127.0.0.1:4885",
+              branch: workspace.branch,
+              boundThreadId: workspace.threadId,
+            });
+            return read(input);
+          },
+          $: () => ({ isExisting: async () => false }),
+        };
+        const run = NodeVM.runInNewContext(
+          NodeModule.stripTypeScriptTypes(
+            "async function verify() {" + controller.slice(start, end) + "}\nverify",
+          ),
+          {
+            origin: "http://127.0.0.1:4885",
+            workspace,
+            readSelectedDeliveryWorktree,
+            step: () => {},
+            check: (value: unknown) => {
+              if (!value) throw new Error("Owned refusal.");
+            },
+            owner: {
+              until: async (observe: () => Promise<boolean>) => {
+                if (!(await observe())) throw new Error("Owned refusal.");
+              },
+            },
+            browser,
+            b: () => browser,
+          },
+        ) as () => Promise<void>;
+        if (selectedId === "owned-thread") await expect(run()).resolves.toBeUndefined();
+        else await expect(run()).rejects.toThrow("Owned refusal.");
+      },
+    );
+  },
+);
+
+describe.each(["delivery-retry-ui", "release-visual-core"])(
+  "selector fixture construction: %s",
+  (selection) => {
+    it("preserves every provider byte and the server PATH while omitting only the visual Cursor editor", () => {
+      const root = NodeFS.realpathSync(
+        NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "visual-editor-")),
+      );
+      try {
+        // Pre-existing test-owned metadata avoids launching Git: this test only
+        // exercises the ordinary fixture's filesystem construction and selection.
+        NodeFS.mkdirSync(NodePath.join(root, "projects with spaces/BiBCode UI Fixture/.git"), {
+          recursive: true,
+        });
+        const env = {
+          BIBCODE_E2E_RUN_ROOT: root,
+          BIBCODE_E2E_ARTIFACT_DIR: NodePath.join(root, "private"),
+          BIBCODE_E2E_PLATFORM: "linux",
+          PATH: "/owned/original-tools",
+        };
+        const context = prepareDesktopUiTestContext(env);
+        const before = new Map(
+          NodeFS.readdirSync(context.shimDirectory).map((name) => [
+            name,
+            NodeFS.readFileSync(NodePath.join(context.shimDirectory, name)),
+          ]),
+        );
+        expect(before.has("cursor")).toBe(true);
+        expect(before.has("cursor-agent")).toBe(true);
+        expect(before.has("claude")).toBe(true);
+        const start = controller.indexOf("      const context = prepareDesktopUiTestContext(env);");
+        const end = controller.indexOf("      delete childEnv.BIBCODE_HERMETIC_GUARD;", start);
+        expect(start).toBeGreaterThan(0);
+        expect(end).toBeGreaterThan(start);
+        const construct = NodeVM.runInNewContext(
+          NodeModule.stripTypeScriptTypes(
+            "function prepare() {" + controller.slice(start, end) + "\nreturn childEnv; }\nprepare",
+          ),
+          {
+            env,
+            runRoot: root,
+            config: { selection, fixture: "/owned/fixture" },
+            NodeFS,
+            NodePath,
+            prepareDesktopUiTestContext: () => context,
+            prepareVisualProject: () => {},
+          },
+        ) as () => NodeJS.ProcessEnv;
+        const childEnv = construct();
+        expect(NodeFS.existsSync(NodePath.join(context.shimDirectory, "cursor"))).toBe(
+          selection === "delivery-retry-ui",
+        );
+        expect(NodeFS.readdirSync(context.shimDirectory)).toEqual(
+          [...before.keys()].filter(
+            (name) => selection !== "release-visual-core" || name !== "cursor",
+          ),
+        );
+        for (const [name, bytes] of before) {
+          if (selection === "release-visual-core" && name === "cursor") continue;
+          expect(NodeFS.readFileSync(NodePath.join(context.shimDirectory, name))).toEqual(bytes);
+        }
+        expect(childEnv.PATH).toBe(
+          context.shimDirectory + NodePath.delimiter + "/owned/fixture/bin",
+        );
+      } finally {
+        NodeFS.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  },
+);
 
 function importBoundary(
   options: {

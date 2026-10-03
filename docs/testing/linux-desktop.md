@@ -762,6 +762,82 @@ merged-tree screenshot sweep. A pass also requires supervisor/namespace cleanup
 and unchanged input hashes; the inner result alone is insufficient. Failed
 cleanup preserves private files until owned processes have been reaped.
 
+### First release visual batch
+
+The manual-only `qualify-release-visuals.yml` preparation lane selects
+`release-visual-core` through the same Python owner and real-server controller
+as delivery Retry. It retains the existing 600-second inner and 660-second
+outer bounds. Compile inputs beforehand. Do not add further scenes or widen
+those bounds to make this batch pass.
+
+The fixed output is eight light/dark pairs: `workspace-composite`,
+`workspace-card-menu`, `worktree-create-ref`, `git-changes-diff`,
+`git-history-stashes`, `git-branch-menu`, `files-editor-comment`, and
+`command-palette`. Root must assemble and independently approve the immutable
+release source before treating a later run as final-source evidence. This lane
+has no automatic push trigger; a preparation result does not qualify the full
+release matrix, Playwright, or Tauri/native dialogs.
+
+Each theme uses the existing real pairing, public project import, exact Claude
+model selection, and managed-worktree create/select/tooltip/Git identity
+checks. The same keyboard worktree opener serves the create-ref preview; its
+real dialog selects an occupied controlled ref and is cancelled. Missing
+selection or Git identity remains a failure. Initial binding requires the
+distinct human-readable title, visible exact branch description, selected card
+and matching local route; subsequent reads require the captured immutable card
+ID even after the provider changes its title. The real `tooltip-popup` must show
+the verified worktree path hint. Never replace these checks with renderer stores,
+a synthetic click, or a primary-checkout substitute.
+
+The card-menu scene requires a genuine no-editor fixture before server
+admission. Only this selector removes the ordinary fixture's exact generated
+`cursor` editor launcher; the default fixture retains it, and `cursor-agent`,
+Claude and all other provider bytes and the actual server PATH remain intact.
+Provider disablement does not change editor inventory. Home must focus the
+disabled Open in row with its visible **No local opener is available for this
+workspace.** explanation, alongside the grouped Pull and Copy Branch Name
+actions. Any other real opener, including a host Zed installation found outside
+PATH, leaves Open in enabled and refuses this scene. Do not hide candidates or
+substitute a different disabled reason to pass; that runner needs a separately
+approved truthful fixture.
+
+Before server admission, seed only the new clean private repository: Pierre
+text fixtures, nested source, two small PNG input swatches, local branches/tag,
+one discovered worktree, a private bare origin and twelve real stashes. Git
+commands use the pinned executable, private HOME, disabled system/global Git
+configuration and hooks, five-second command bounds and 64 KiB output caps.
+Reject pre-existing/dirty or aliased seed paths; retained evidence never includes
+Git output or fixture paths. After the managed worktree identity is verified,
+write only its controlled text/image changes. Public partial staging must put
+exactly the first text hunk in the index while retaining the other two in the
+working tree.
+
+The browser uses public keyboard, pointer, scroll, input and menu actions.
+The Files scene opens its real nested file and adds a line comment through the
+editor gutter. The palette filters to and highlights Open settings without
+executing it. A genuine image diff is inspected before returning to the text
+Changes scene; its pixels are not in that scene's PNG. The Files context menu
+and workspace terminal/other-chat substate also remain outside these eight
+captures. These omissions stay explicit in the closed interaction receipt;
+this batch does not visually qualify hidden components from a source inventory.
+
+Require the exact 1280 by 960 viewport and every scene's current read-only
+witness, in addition to the selected environment/workspace, real theme, visible
+unobstructed target, absent credential/boot controls and a nonblank original PNG.
+Recheck the witness after the screenshot returns before retaining its unchanged
+bytes. Missing, duplicated, stale, unknown or failed facts refuse capture;
+there is no screenshot fallback. Only the sixteen named PNGs and seven closed
+JSON receipt files enter the artifact allowlist. Inspect the originals
+independently before accepting visual quality. No private logs, provider inputs,
+credentials or profiles are retained.
+
+As for delivery Retry, acceptance requires the outer input hashes unchanged,
+zero guard refusals, joined browser/server cleanup, no namespace survivors and
+the unchanged host network identity. The private fixture is deleted only after
+both owners prove joined cleanup. A partial or failed run records only the
+captures it actually completed and keeps its failure classification; it cannot
+claim all eight pairs from the manifest alone.
+
 ## Process-group cleanup
 
 Capture PID, PPID, process group, start time, executable, and command line for

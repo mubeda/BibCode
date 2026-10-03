@@ -118,13 +118,17 @@ export function readOwnedDeliveryWorktree(input: DeliveryWorktreeInput): Deliver
 export function readSelectedDeliveryWorktree(input: {
   origin: string;
   branch: string;
+  boundThreadId: string | null;
 }): { threadId: string } | null {
   if (
     input.origin !== "http://127.0.0.1:4885" ||
     location.origin !== input.origin ||
     location.search !== "" ||
     location.hash !== "" ||
-    !/^codex\/delivery-retry-(light|dark)$/.test(input.branch)
+    !/^codex\/delivery-retry-(light|dark)$/.test(input.branch) ||
+    (input.boundThreadId !== null &&
+      (typeof input.boundThreadId !== "string" ||
+        !/^[A-Za-z0-9._:-]{1,128}$/.test(input.boundThreadId)))
   )
     return null;
   const selected = document.querySelectorAll(
@@ -133,10 +137,17 @@ export function readSelectedDeliveryWorktree(input: {
   if (selected.length !== 1) return null;
   const card = selected[0]!;
   const id = card.getAttribute("data-testid")?.slice("thread-card-button-".length) ?? "";
-  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id) || location.pathname !== "/local/" + id) return null;
+  if (
+    !/^[A-Za-z0-9._:-]{1,128}$/.test(id) ||
+    location.pathname !== "/local/" + id ||
+    (input.boundThreadId !== null && input.boundThreadId !== id)
+  )
+    return null;
   const row = document.querySelector(`[data-testid="thread-row-${id}"]`);
   if (
-    row?.querySelector(`[data-testid="thread-title-${id}"]`)?.textContent?.trim() !== input.branch
+    input.boundThreadId === null &&
+    row?.querySelector(`[data-testid="thread-title-${id}"]`)?.textContent?.trim() !==
+      input.branch.replaceAll("-", " ")
   )
     return null;
   const descriptions = (card.getAttribute("aria-describedby") ?? "")

@@ -104,7 +104,7 @@ class NetworkTests(unittest.TestCase):
                              platform='linux', read_owner=lambda: ('\0'.join(OWNER if owner is None else owner) + '\0').encode(), read_capabilities=kwargs.pop('read_capabilities', lambda: b'CapEff:\t0000000000001000\n'), **kwargs)
 
     def test_actual_chat_and_both_ui_producers_satisfy_the_existing_containment_contract(self):
-        for scenario, matrix, length in [('chat-upload', 'core', 14), ('remote-updates-ui', 'core', 18), ('remote-updates-ui', 'full', 18), ('delivery-retry-ui', 'core', 16)]:
+        for scenario, matrix, length in [('chat-upload', 'core', 14), ('remote-updates-ui', 'core', 18), ('remote-updates-ui', 'full', 18), ('delivery-retry-ui', 'core', 16), ('release-visual-core', 'core', 16)]:
             with self.subTest(scenario=scenario, matrix=matrix), tempfile.TemporaryDirectory(prefix='bibcode-owner-contract-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario, matrix)
                 self.assertEqual(len(owner), length)
@@ -113,7 +113,7 @@ class NetworkTests(unittest.TestCase):
                 self.assertTrue(proof['linksContained'])
 
     def test_owner_argument_forms_refuse_extra_empty_and_truncated_arguments(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core']:
             with tempfile.TemporaryDirectory(prefix='bibcode-owner-arity-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 for invalid in [owner + [''], owner + ['unexpected'], owner[:-1]]:
@@ -163,8 +163,25 @@ class NetworkTests(unittest.TestCase):
                 with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=environment, owner=invalid)
                 self.assertEqual(fake.calls, [])
 
+    def test_visual_selector_cannot_be_forged_or_downgraded_before_ip_reads(self):
+        with tempfile.TemporaryDirectory(prefix='visual-owner-identity-') as directory:
+            owner, env = actual_owner_handoff(Path(directory), 'release-visual-core')
+            self.assertEqual(env.get('BIBCODE_DELIVERY_UI_SELECTION'), 'release-visual-core')
+            cases = []
+            for value in ['delivery-retry-ui', 'remote-updates-ui', 'release-visual-full']:
+                changed = list(owner); changed[14] = value; cases.append((changed, env))
+            for value in ['', 'full', 'delivery-retry-ui']:
+                cases.append((owner, {**env, 'BIBCODE_DELIVERY_UI_SELECTION': value}))
+            missing = dict(env); missing.pop('BIBCODE_DELIVERY_UI_SELECTION'); cases.append((owner, missing))
+            missing_web = dict(env); missing_web.pop('BIBCODE_DELIVERY_UI_WEB'); cases.append((owner, missing_web))
+            cases.append((owner[:14], env))
+            for invalid, environment in cases:
+                fake = FakeIp()
+                with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=environment, owner=invalid)
+                self.assertEqual(fake.calls, [])
+
     def test_original_owner_anchors_remain_required_for_both_forms(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core']:
             with tempfile.TemporaryDirectory(prefix='bibcode-owner-anchor-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 for index, value in [(0, '/missing-python'), (1, '/missing-helper'), (2, 'outer'), (11, 'net:[99]'), (13, '/missing-ip')]:

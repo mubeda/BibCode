@@ -28,6 +28,8 @@ export const pierreVisualFixture = {
   diffFileName: "pierre-step5.ts",
   editFileName: "pierre-edit.ts",
   originalFileContents: EDIT_BASELINE,
+  originalDiffContents: DIFF_BASELINE,
+  modifiedDiffContents: DIFF_MODIFIED,
   editedFileContents: 'export const editableMessage = "edited packaged text";\n',
 } as const;
 

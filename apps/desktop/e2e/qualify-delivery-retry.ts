@@ -36,6 +36,16 @@ import {
   readSelectedDeliveryWorktree,
 } from "./support/delivery-retry-workspace.ts";
 
+import {
+  prepareVisualProject,
+  prepareVisualWorktree,
+  visualPartialStageMatches,
+} from "./support/release-visual-fixture.ts";
+import { captureVisualScene, runVisualCore } from "./support/release-visual-core.ts";
+import { visualScenes } from "./support/release-visual-evidence.ts";
+import { readVisualViewport } from "./support/release-visual-observation.ts";
+import { correctDesktopUiOuterSize } from "./support/window-size.ts";
+
 const root = NodePath.resolve(import.meta.dirname, "../../..");
 const origin = "http://127.0.0.1:4885";
 const surface = '[data-center-surface-host][data-visible="true"]';
@@ -46,6 +56,7 @@ export function deliveryConfiguration(
   environment: NodeJS.ProcessEnv,
   readNamespace = () => NodeFS.readlinkSync("/proc/self/ns/net"),
 ) {
+  const selection = environment.BIBCODE_DELIVERY_UI_SELECTION ?? "delivery-retry-ui";
   const values = {
     fixture: environment.BIBCODE_UPLOAD_FIXTURE,
     evidence: environment.BIBCODE_UPLOAD_EVIDENCE,
@@ -55,6 +66,7 @@ export function deliveryConfiguration(
     driver: environment.BIBCODE_UPLOAD_DRIVER,
   };
   if (
+    !["delivery-retry-ui", "release-visual-core"].includes(selection) ||
     environment.CI !== "true" ||
     !/^[0-9a-f]{40}$/.test(environment.BIBCODE_UPLOAD_SOURCE ?? "") ||
     Object.values(values).some((value) => !value || !NodePath.isAbsolute(value)) ||
@@ -66,7 +78,8 @@ export function deliveryConfiguration(
   } catch {
     throw new Error("Owned delivery qualification namespace refused.");
   }
-  return { ...values, source: environment.BIBCODE_UPLOAD_SOURCE! } as {
+  return { ...values, selection, source: environment.BIBCODE_UPLOAD_SOURCE! } as {
+    selection: "delivery-retry-ui" | "release-visual-core";
     fixture: string;
     evidence: string;
     binary: string;
@@ -158,6 +171,7 @@ export async function runDeliveryRetryQualification() {
   let success = false;
   const assertions: object[] = [];
   const captures: object[] = [];
+  const capturedVisuals = new Set<string>();
   const networkProofs: object[] = [];
   const write = (name: string, value: unknown) =>
     NodeFS.writeFileSync(
@@ -396,13 +410,8 @@ export async function runDeliveryRetryQualification() {
     );
   }
 
-  async function createOwnedWorkspace(
-    context: ReturnType<typeof prepareDesktopUiTestContext>,
-    runRoot: string,
-  ) {
-    const branch = `codex/delivery-retry-${theme}`;
+  async function openWorktreeDialog() {
     const create = 'button[aria-label^="New worktree in "]';
-    const popup = '[data-slot="dialog-popup"][role="dialog"]';
     step("worktree-open-count");
     check((await b().$$(create).length) === 1);
     const createButton = b().$(create);
@@ -421,10 +430,20 @@ export async function runDeliveryRetryQualification() {
     check((await b().$$(create).length) === 1 && (await createButton.isFocused()));
     step("worktree-open-enter");
     await b().keys("Enter");
+  }
+
+  async function createOwnedWorkspace(
+    context: ReturnType<typeof prepareDesktopUiTestContext>,
+    runRoot: string,
+  ) {
+    const branch = `codex/delivery-retry-${theme}`;
+    const popup = '[data-slot="dialog-popup"][role="dialog"]';
+    await openWorktreeDialog();
     step("worktree-name");
     const name = b().$(`${popup} input[placeholder="Worktree name"]`);
     await name.waitForDisplayed();
-    await name.setValue(branch);
+    // Keep the title distinct so the actual card retains its branch/path hint.
+    await name.setValue(branch.replaceAll("-", " "));
     step("worktree-create");
     await click(
       '//*[@data-slot="dialog-popup"]//button[starts-with(normalize-space(.),"Create worktree")]',
@@ -433,7 +452,11 @@ export async function runDeliveryRetryQualification() {
     step("worktree-select-identity");
     let selected: { threadId: string } | null = null;
     await owner.until(async () => {
-      selected = await b().execute(readSelectedDeliveryWorktree, { origin, branch });
+      selected = await b().execute(readSelectedDeliveryWorktree, {
+        origin,
+        branch,
+        boundThreadId: null,
+      });
       return selected !== null;
     });
     check(selected !== null);
@@ -453,7 +476,7 @@ export async function runDeliveryRetryQualification() {
     await owner.until(async () =>
       b().execute(
         (expected) =>
-          Array.from(document.querySelectorAll('[role="tooltip"]')).some(
+          Array.from(document.querySelectorAll('[data-slot="tooltip-popup"]')).some(
             (element) =>
               element.getClientRects().length > 0 && element.textContent?.trim() === expected,
           ),
@@ -463,7 +486,8 @@ export async function runDeliveryRetryQualification() {
     await selectClaudeModel("worktree");
     step("worktree-ready");
     check(
-      (await b().execute(readSelectedDeliveryWorktree, { origin, branch }))?.threadId === threadId,
+      (await b().execute(readSelectedDeliveryWorktree, { origin, branch, boundThreadId: threadId }))
+        ?.threadId === threadId,
     );
     return { ...identity, threadId };
   }
@@ -595,10 +619,21 @@ export async function runDeliveryRetryQualification() {
       };
       const context = prepareDesktopUiTestContext(env);
       const control = NodePath.join(runRoot, "delivery-retry");
-      NodeFS.mkdirSync(control, { mode: 0o700 });
+      if (config.selection === "delivery-retry-ui") NodeFS.mkdirSync(control, { mode: 0o700 });
+      if (config.selection === "release-visual-core") {
+        // This selector witnesses a genuine installation without an editor.
+        // Cursor's editor launcher is distinct from the cursor-agent provider.
+        NodeFS.unlinkSync(NodePath.join(context.shimDirectory, "cursor"));
+        prepareVisualProject({
+          root: runRoot,
+          project: context.projectPath,
+          home: context.fixtureUserHomePath,
+          git: NodePath.join(config.fixture, "bin", "git"),
+        });
+      }
       const childEnv: NodeJS.ProcessEnv = {
         ...env,
-        BIBCODE_E2E_CLAUDE_RETRY: "1",
+        ...(config.selection === "delivery-retry-ui" ? { BIBCODE_E2E_CLAUDE_RETRY: "1" } : {}),
         PATH: context.shimDirectory + NodePath.delimiter + NodePath.join(config.fixture, "bin"),
         CLAUDE_CONFIG_DIR: NodePath.join(context.fixtureUserHomePath, ".claude"),
         RUST_LOG: "warn",
@@ -710,6 +745,31 @@ export async function runDeliveryRetryQualification() {
       step("import");
       await importProject(context.projectPath);
       const workspace = await createOwnedWorkspace(context, runRoot);
+      const visualInput = {
+        root: runRoot,
+        project: context.projectPath,
+        home: context.fixtureUserHomePath,
+        git: NodePath.join(config.fixture, "bin", "git"),
+        branch: workspace.branch,
+      };
+      if (config.selection === "release-visual-core") {
+        step("visual-fixture-managed");
+        check(prepareVisualWorktree(visualInput).path === workspace.path);
+        step("visual-viewport");
+        const observed = await bounded(browser.execute(readVisualViewport), 2_000);
+        const outer = await browser.getWindowSize();
+        const corrected = correctDesktopUiOuterSize(
+          outer,
+          { width: 1280, height: 960 },
+          observed,
+          observed.devicePixelRatio,
+        );
+        await browser.setWindowSize(corrected.width, corrected.height);
+        await owner.until(async () => {
+          const viewport = await bounded(browser!.execute(readVisualViewport), 2_000);
+          return viewport.width === 1280 && viewport.height === 960;
+        });
+      }
       const baseline = `delivery baseline ${theme}`;
       const prompt = `delivery held message ${theme}`;
       const draft = `delivery preserved draft ${theme}`;
@@ -725,142 +785,200 @@ export async function runDeliveryRetryQualification() {
       );
       await browser.$(`${form} button[aria-label="Send message"]`).waitForDisplayed();
       check(!(await browser.$(surface).getText()).includes(newConversationNotice));
-      step("hold-input");
-      NodeFS.writeFileSync(NodePath.join(control, "withhold-next"), "hold", {
-        mode: 0o600,
-        flag: "wx",
-      });
-      await send(prompt);
-      await owner.until(async () => {
-        const value = readDeliveryReceipts(control);
-        return (
-          value.complete &&
-          value.entries.some(
-            (entry) => entry.kind === "input" && entry.prompt === prompt && entry.withheld,
-          )
+      if (config.selection === "release-visual-core") {
+        await type("Owned visual review draft");
+        const proof = await runVisualCore({
+          browser,
+          owner,
+          threadId: workspace.threadId,
+          branch: workspace.branch,
+          step,
+          openWorktreeDialog,
+          verifyManaged: async () => {
+            await owner.until(
+              async () =>
+                (
+                  await b().execute(readSelectedDeliveryWorktree, {
+                    origin,
+                    branch: workspace.branch,
+                    boundThreadId: workspace.threadId,
+                  })
+                )?.threadId === workspace.threadId,
+            );
+            check(
+              JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
+                JSON.stringify({
+                  path: workspace.path,
+                  branch: workspace.branch,
+                  commonDirectory: workspace.commonDirectory,
+                }),
+            );
+          },
+          partialStageMatches: () => visualPartialStageMatches(visualInput),
+          capture: async (scene) => {
+            captures.push(
+              await captureVisualScene({
+                browser: b(),
+                owner,
+                evidence: config.evidence,
+                captured: capturedVisuals,
+                scene,
+                theme,
+                origin,
+                threadId: workspace.threadId,
+                branch: workspace.branch,
+              }),
+            );
+            write("assertions", { captures, assertions });
+          },
+        });
+        assertions.push({ theme, ...proof });
+      } else {
+        step("hold-input");
+        NodeFS.writeFileSync(NodePath.join(control, "withhold-next"), "hold", {
+          mode: 0o600,
+          flag: "wx",
+        });
+        await send(prompt);
+        await owner.until(async () => {
+          const value = readDeliveryReceipts(control);
+          return (
+            value.complete &&
+            value.entries.some(
+              (entry) => entry.kind === "input" && entry.prompt === prompt && entry.withheld,
+            )
+          );
+        });
+        const message = await readMessage(prompt);
+        check(message && message.text === prompt);
+        const id = message!.id;
+        await type(draft);
+        step("workspace-verify-identity");
+        check(
+          (
+            await browser.execute(readSelectedDeliveryWorktree, {
+              origin,
+              branch: workspace.branch,
+              boundThreadId: workspace.threadId,
+            })
+          )?.threadId === workspace.threadId,
         );
-      });
-      const message = await readMessage(prompt);
-      check(message && message.text === prompt);
-      const id = message!.id;
-      await type(draft);
-      step("workspace-verify-identity");
-      check(
-        (await browser.execute(readSelectedDeliveryWorktree, { origin, branch: workspace.branch }))
-          ?.threadId === workspace.threadId,
-      );
-      check(
-        JSON.stringify(
+        check(
+          JSON.stringify(
+            readOwnedDeliveryWorktree({
+              root: runRoot,
+              project: context.projectPath,
+              home: context.fixtureUserHomePath,
+              git: NodePath.join(config.fixture, "bin", "git"),
+              branch: workspace.branch,
+            }),
+          ) ===
+            JSON.stringify({
+              path: workspace.path,
+              branch: workspace.branch,
+              commonDirectory: workspace.commonDirectory,
+            }),
+        );
+        step("workspace-loss");
+        await withUnavailableWorkspace(runRoot, workspace.path, async () => {
+          step("workspace-wait-loss");
+          await owner.until(async () => {
+            check(
+              NodeFS.statSync(context.projectPath).isDirectory() &&
+                NodeFS.statSync(workspace.commonDirectory).isDirectory(),
+            );
+            const warning = browser!.$(
+              `[data-testid="worktree-availability-${workspace.threadId}"]`,
+            );
+            return (
+              (await warning.isExisting()) &&
+              (await warning.getText()).includes(
+                "The worktree directory is missing. Git registration remains.",
+              ) &&
+              (await browser!.$(row(id)).getText()).includes("Delivery uncertain")
+            );
+          });
+        });
+        step("uncertain");
+        const before = readDeliveryReceipts(control);
+        check(before.complete);
+        const holdStarted = performance.now();
+        while (performance.now() - holdStarted < 10_000) {
+          unchanged(before, readDeliveryReceipts(control));
+          await delay(100);
+        }
+        unchanged(before, readDeliveryReceipts(control));
+        const uncertaintyWindowMs = Math.floor(performance.now() - holdStarted);
+        step("workspace-wait-recovered");
+        await owner.until(
+          async () =>
+            (
+              await browser!.execute(readSelectedDeliveryWorktree, {
+                origin,
+                branch: workspace.branch,
+                boundThreadId: workspace.threadId,
+              })
+            )?.threadId === workspace.threadId &&
+            !(await browser!
+              .$(`[data-testid="worktree-availability-${workspace.threadId}"]`)
+              .isExisting()),
+        );
+        check(
           readOwnedDeliveryWorktree({
             root: runRoot,
             project: context.projectPath,
             home: context.fixtureUserHomePath,
             git: NodePath.join(config.fixture, "bin", "git"),
             branch: workspace.branch,
-          }),
-        ) ===
-          JSON.stringify({
-            path: workspace.path,
-            branch: workspace.branch,
-            commonDirectory: workspace.commonDirectory,
-          }),
-      );
-      step("workspace-loss");
-      await withUnavailableWorkspace(runRoot, workspace.path, async () => {
-        step("workspace-wait-loss");
-        await owner.until(async () => {
-          check(
-            NodeFS.statSync(context.projectPath).isDirectory() &&
-              NodeFS.statSync(workspace.commonDirectory).isDirectory(),
-          );
-          const warning = browser!.$(`[data-testid="worktree-availability-${workspace.threadId}"]`);
-          return (
-            (await warning.isExisting()) &&
-            (await warning.getText()).includes(
-              "The worktree directory is missing. Git registration remains.",
-            ) &&
-            (await browser!.$(row(id)).getText()).includes("Delivery uncertain")
-          );
+          }).path === workspace.path,
+        );
+        unchanged(before, readDeliveryReceipts(control));
+        step("uncertain");
+        check((await readMessage(prompt))?.id === id && (await draftIs(draft)));
+        await capture("uncertain", id, prompt, draft);
+        step("dismiss-prompt");
+        const retry = () => click(`${row(id)} button[aria-label="Retry message delivery"]`);
+        const dismissed = await resolveActualRetryPrompt(browser, retry, "dismiss");
+        const cancelStarted = performance.now();
+        while (performance.now() - cancelStarted < 1000) {
+          unchanged(before, readDeliveryReceipts(control));
+          await delay(100);
+        }
+        unchanged(before, readDeliveryReceipts(control));
+        const cancelWindowMs = Math.floor(performance.now() - cancelStarted);
+        check(
+          (await browser.$(row(id)).getText()).includes("Delivery uncertain") &&
+            (await draftIs(draft)),
+        );
+        await capture("retry-cancelled", id, prompt, draft);
+        step("accept-prompt");
+        const accepted = await resolveActualRetryPrompt(browser, retry, "accept");
+        await owner.until(async () =>
+          (await browser!.$(row(id)).getText()).includes(newConversationNotice),
+        );
+        const proof = verifyFreshRetry(before, readDeliveryReceipts(control), prompt);
+        check((await readMessage(prompt))?.id === id && (await draftIs(draft)));
+        assertions.push({
+          theme,
+          ordinaryDeliveredHasNoNotice: true,
+          selectedManagedWorktree: true,
+          registeredGitIdentityMatched: true,
+          primaryGitAnchorPreserved: true,
+          catalogLossObserved: true,
+          workspaceRestoredBeforeRetry: true,
+          uncertaintyWindowMs,
+          cancelWindowMs,
+          noAutomaticResend: true,
+          dismissed,
+          accepted,
+          cancelNoDispatch: true,
+          sameMessage: true,
+          exactText: true,
+          draftRetained: true,
+          ...proof,
         });
-      });
-      step("uncertain");
-      const before = readDeliveryReceipts(control);
-      check(before.complete);
-      const holdStarted = performance.now();
-      while (performance.now() - holdStarted < 10_000) {
-        unchanged(before, readDeliveryReceipts(control));
-        await delay(100);
+        await capture("new-conversation", id, prompt, draft);
       }
-      unchanged(before, readDeliveryReceipts(control));
-      const uncertaintyWindowMs = Math.floor(performance.now() - holdStarted);
-      step("workspace-wait-recovered");
-      await owner.until(
-        async () =>
-          (
-            await browser!.execute(readSelectedDeliveryWorktree, {
-              origin,
-              branch: workspace.branch,
-            })
-          )?.threadId === workspace.threadId &&
-          !(await browser!
-            .$(`[data-testid="worktree-availability-${workspace.threadId}"]`)
-            .isExisting()),
-      );
-      check(
-        readOwnedDeliveryWorktree({
-          root: runRoot,
-          project: context.projectPath,
-          home: context.fixtureUserHomePath,
-          git: NodePath.join(config.fixture, "bin", "git"),
-          branch: workspace.branch,
-        }).path === workspace.path,
-      );
-      unchanged(before, readDeliveryReceipts(control));
-      step("uncertain");
-      check((await readMessage(prompt))?.id === id && (await draftIs(draft)));
-      await capture("uncertain", id, prompt, draft);
-      step("dismiss-prompt");
-      const retry = () => click(`${row(id)} button[aria-label="Retry message delivery"]`);
-      const dismissed = await resolveActualRetryPrompt(browser, retry, "dismiss");
-      const cancelStarted = performance.now();
-      while (performance.now() - cancelStarted < 1000) {
-        unchanged(before, readDeliveryReceipts(control));
-        await delay(100);
-      }
-      unchanged(before, readDeliveryReceipts(control));
-      const cancelWindowMs = Math.floor(performance.now() - cancelStarted);
-      check(
-        (await browser.$(row(id)).getText()).includes("Delivery uncertain") &&
-          (await draftIs(draft)),
-      );
-      await capture("retry-cancelled", id, prompt, draft);
-      step("accept-prompt");
-      const accepted = await resolveActualRetryPrompt(browser, retry, "accept");
-      await owner.until(async () =>
-        (await browser!.$(row(id)).getText()).includes(newConversationNotice),
-      );
-      const proof = verifyFreshRetry(before, readDeliveryReceipts(control), prompt);
-      check((await readMessage(prompt))?.id === id && (await draftIs(draft)));
-      assertions.push({
-        theme,
-        ordinaryDeliveredHasNoNotice: true,
-        selectedManagedWorktree: true,
-        registeredGitIdentityMatched: true,
-        primaryGitAnchorPreserved: true,
-        catalogLossObserved: true,
-        workspaceRestoredBeforeRetry: true,
-        uncertaintyWindowMs,
-        cancelWindowMs,
-        noAutomaticResend: true,
-        dismissed,
-        accepted,
-        cancelNoDispatch: true,
-        sameMessage: true,
-        exactText: true,
-        draftRetained: true,
-        ...proof,
-      });
-      await capture("new-conversation", id, prompt, draft);
       step("theme-cleanup");
       await owner.cleanup("browser", () =>
         bounded(
@@ -874,7 +992,11 @@ export async function runDeliveryRetryQualification() {
       check(owner.failures.length === 0);
     }
     check(
-      captures.length === deliveryThemes.length * deliveryScenes.length && assertions.length === 2,
+      captures.length ===
+        deliveryThemes.length *
+          (config.selection === "release-visual-core"
+            ? visualScenes.length
+            : deliveryScenes.length) && assertions.length === 2,
     );
     success = true;
   } catch (error) {
@@ -926,6 +1048,7 @@ export async function runDeliveryRetryQualification() {
       phase,
       theme,
       source: config.source,
+      selection: config.selection,
       captures,
       assertions,
       networkProofs,
@@ -933,7 +1056,9 @@ export async function runDeliveryRetryQualification() {
       cleanupFailures: owner.failures,
       childProcessesClosed: owner.childrenClosed(),
       scope:
-        "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
+        config.selection === "release-visual-core"
+          ? "First eight Linux Chromium scene pairs only. Original PNGs require independent review; unpictured surfaces and the remaining issue29 matrix are unqualified. No Playwright, Tauri or final-release acceptance claim."
+          : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
     });
   }
   return success ? 0 : 1;

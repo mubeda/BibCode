@@ -37,7 +37,7 @@ class FixturePathBudgetTests(unittest.TestCase):
     def test_actual_roots_fit_branded_and_unbranded_chromium_unix_socket_paths(self):
         # Chromium branch 8037 FormatTemporaryFileName + SingletonSocket; Linux sun_path[108].
         # Portable SetupSockAddr requires byte length below 108, including room for NUL.
-        for scenario in ['remote-updates-ui', 'chat-upload', 'delivery-retry-ui']:
+        for scenario in ['remote-updates-ui', 'chat-upload', 'delivery-retry-ui', 'release-visual-core']:
             for run_id in ['37096649000', '9' * 20, '9' * 128]:
                 fixture, _ = self.actual_paths(scenario, run_id)
                 for brand in ['com.google.Chrome', 'org.chromium.Chromium']:
@@ -46,7 +46,7 @@ class FixturePathBudgetTests(unittest.TestCase):
                         self.assertLess(len(str(socket).encode('utf8')), 108)
 
     def test_only_private_root_omits_run_id_while_evidence_keeps_it(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core']:
             selection = qualification.scenario_settings(scenario)
             roots = []
             for run_id in ['37096649000', '9' * 128]:
@@ -69,6 +69,39 @@ class FixturePathBudgetTests(unittest.TestCase):
 
 
 class ScenarioSelectionTests(unittest.TestCase):
+    def test_first_visual_batch_reuses_the_managed_worktree_controller_and_original_bounds(self):
+        try:
+            selected = qualification.scenario_settings('release-visual-core')
+        except RuntimeError:
+            selected = None
+        self.assertEqual(selected, {
+            'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+            'inner_timeout': 600, 'outer_timeout': 660,
+            'evidence_prefix': 'issue29-core-', 'fixture_prefix': 'bc-vc-',
+        })
+
+    def test_first_visual_batch_requires_its_exact_two_argument_owner_payload(self):
+        self.assertEqual(qualification.inner_resources(['release-visual-core', '/owned/web']),
+                         ('release-visual-core', None, '/owned/web', 'core'))
+        for arguments in [['release-visual-core'], ['release-visual-core', '/owned/web', 'full']]:
+            with self.assertRaisesRegex(RuntimeError, 'Unknown qualification owner payload'):
+                qualification.inner_resources(arguments)
+
+    def test_visual_fixture_cleanup_refuses_live_children_and_cross_scenario_roots(self):
+        with tempfile.TemporaryDirectory() as evidence_dir:
+            evidence = Path(evidence_dir)
+            fixture = Path(tempfile.mkdtemp(prefix='bc-vc-unit-', dir='/tmp'))
+            try:
+                (evidence / 'namespace-cleanup.json').write_text(json.dumps({'remaining': [[7, 'S']], 'controllerReaped': True}))
+                self.assertFalse(qualification.cleanup_ui_fixture(fixture, evidence, {'supervisorReaped': True}, 'release-visual-core'))
+                (evidence / 'namespace-cleanup.json').write_text(json.dumps({'remaining': [], 'controllerReaped': True}))
+                self.assertFalse(qualification.cleanup_ui_fixture(fixture, evidence, {'supervisorReaped': True}, 'delivery-retry-ui'))
+                self.assertTrue(fixture.exists())
+                self.assertTrue(qualification.cleanup_ui_fixture(fixture, evidence, {'supervisorReaped': True}, 'release-visual-core'))
+                self.assertFalse(fixture.exists())
+            finally:
+                shutil.rmtree(fixture, ignore_errors=True)
+
     def test_delivery_retry_has_a_fixed_bounded_entrypoint_without_fake_host(self):
         try:
             selected = qualification.scenario_settings('delivery-retry-ui')
