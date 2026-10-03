@@ -5,6 +5,11 @@ import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
 import {
+  decodeReloadPrimaryWorkspace,
+  readReloadPrimaryThread,
+  readReloadPrimaryWorkspace,
+} from "./remote-ui-primary-workspace.ts";
+import {
   manualUpdateSteps,
   remoteUpdateConfirmation,
 } from "../../../web/src/components/settings/remoteUpdatePresentation.ts";
@@ -932,6 +937,7 @@ it.each([
       phase: (value: string) => observed.push(value),
       webOrigin: "http://localhost:4901",
       primary: {},
+      plan: { flows: ["success"] },
       theme: "light",
       browser: {
         url: async () => {},
@@ -973,6 +979,35 @@ it.each([
       phase: (value: string) => phases.push(value),
       currentTheme: "light",
       composer: "owned-composer",
+      NodePath,
+      check: (value: unknown) => {
+        if (!value) throw failure;
+      },
+      decodeReloadPrimaryWorkspace,
+      readReloadPrimaryWorkspace,
+      readReloadPrimaryThread,
+      EnvironmentOrchestrationHttpApi: {
+        endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
+      },
+      primaryRead: {
+        projectName: "BiBCode UI Fixture",
+        environmentId: "primary",
+        projectId: "owned-project",
+        threadId: "owned-thread",
+        sessionLinePresent: true,
+        requireSelected: true,
+      },
+      primaryWorkspace: {
+        environmentId: "primary",
+        projectId: "owned-project",
+        threadId: "owned-thread",
+        sessionLinePresent: true,
+      },
+      owner: {
+        until: async (read: () => Promise<boolean>) => {
+          expect(await read()).toBe(true);
+        },
+      },
       workspace: async () => boundary("workspace"),
       click: async () => boundary("select-primary"),
       required: () => ({
@@ -980,11 +1015,29 @@ it.each([
           waitForDisplayed: async () => boundary("composer"),
           setValue: async () => boundary("draft"),
         }),
-        execute: async () => boundary("document"),
+        execute: async (read: unknown) =>
+          read === readReloadPrimaryWorkspace
+            ? {
+                environmentId: "primary",
+                projectId: "owned-project",
+                threadId: "owned-thread",
+                sessionLinePresent: true,
+              }
+            : boundary("document"),
       }),
     },
   );
-  await expect(run({})).rejects.toBe(failure);
+  await expect(
+    run(
+      { project: "/owned/BiBCode UI Fixture" },
+      {
+        environmentId: "primary",
+        projectId: "owned-project",
+        threadId: "owned-thread",
+        sessionLinePresent: true,
+      },
+    ),
+  ).rejects.toBe(failure);
   expect(phases.at(-1)).toBe(expectedPhase);
 });
 
@@ -1112,6 +1165,12 @@ it.each(["core", "full"])(
         queuedFlow: async () => called.push("queued"),
         manualFlow: async () => called.push("manual"),
         reloadFlow: async () => called.push("reload"),
+        primaryWorkspace: {
+          environmentId: "primary",
+          projectId: "owned-project",
+          threadId: "owned-thread",
+          sessionLinePresent: true,
+        },
       },
     );
     await run();
@@ -1134,6 +1193,10 @@ it("keeps CI activation limited to its QA branch or manual selection, core by de
   expect(workflow.on.workflow_dispatch.inputs.matrix.default).toBe("core");
   expect(workflow.on.workflow_dispatch.inputs.matrix.options).toEqual(["core", "full"]);
   const steps = workflow.jobs.remote_ui.steps as Array<Record<string, unknown>>;
+  const helpers = steps.find(
+    (step) => step.name === "Check owned helpers and namespace admission",
+  )!;
+  expect(helpers.run).toContain("apps/desktop/e2e/support/remote-ui-primary-workspace.test.ts");
   const fallback = "${{ inputs.matrix || 'core' }}";
   expect(workflow.jobs.remote_ui.env.BIBCODE_RELEASE_UI_MATRIX).toBe(fallback);
   expect(workflow.jobs.remote_ui.name).toContain(fallback);
@@ -1997,4 +2060,269 @@ it("keeps broad phases, original operations and capture failures fail-closed", a
     primary.failure,
   );
   expect(primary.calls).toEqual([]);
+});
+
+it.each(["empty-index", "removed-thread", "already-primary"])(
+  "requires public bound primary-card navigation before the Reload composer: %s",
+  async (initial) => {
+    const start = controller.indexOf(
+      '  phase("reload-open-workspace");',
+      controller.indexOf("async function reloadFlow("),
+    );
+    const end = controller.indexOf("  const draft =", start);
+    const phases: string[] = [],
+      actions: string[] = [];
+    const binding = {
+      environmentId: "primary",
+      projectId: "owned-project",
+      threadId: "owned-thread",
+      sessionLinePresent: true,
+    };
+    let route =
+      initial === "already-primary"
+        ? "/primary/owned-thread"
+        : initial === "empty-index"
+          ? "/"
+          : "/removed-remote/old-thread";
+    const browser = {
+      $: () => ({
+        waitForDisplayed: async () => {
+          if (route !== "/primary/owned-thread") throw new Error("Owned composer absent.");
+        },
+      }),
+      execute: async (read: unknown, input: Record<string, unknown>) => {
+        if (read === readReloadPrimaryThread || input.requireSelected === false) return true;
+        return route === "/primary/owned-thread" ? binding : null;
+      },
+    };
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function prep(){" + controller.slice(start, end) + "}\nprep",
+      ),
+      {
+        phase: (value: string) => phases.push(value),
+        workspace: async () => actions.push("workspace"),
+        click: async (selector: string) => {
+          actions.push(selector);
+          if (selector === '[data-testid="primary-card-button-owned-project"]')
+            route = "/primary/owned-thread";
+          else expect(selector).toBe('[data-testid="environment-rail-local"]');
+        },
+        required: () => browser,
+        composer: "owned-composer",
+        primary: { project: "/owned/BiBCode UI Fixture" },
+        primaryWorkspace: binding,
+        readReloadPrimaryWorkspace,
+        readReloadPrimaryThread,
+        EnvironmentOrchestrationHttpApi: {
+          endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
+        },
+        decodeReloadPrimaryWorkspace,
+        NodePath,
+        primaryRead: { projectName: "BiBCode UI Fixture", ...binding, requireSelected: true },
+        owner: { until: async (read: () => Promise<boolean>) => expect(await read()).toBe(true) },
+        check: (value: unknown) => {
+          if (value !== true) throw new Error("Owned primary identity refused.");
+        },
+      },
+    );
+    await expect(run()).resolves.toBeUndefined();
+    expect(route).toBe("/primary/owned-thread");
+    expect(actions).toEqual(
+      initial === "already-primary"
+        ? ["workspace", '[data-testid="environment-rail-local"]']
+        : [
+            "workspace",
+            '[data-testid="environment-rail-local"]',
+            '[data-testid="primary-card-button-owned-project"]',
+          ],
+    );
+    expect(phases.at(-1)).toBe("reload-composer-ready");
+  },
+);
+
+it.each(["core", "full", "malformed"])(
+  "captures the initial owned primary only for full Reload: %s",
+  async (mode) => {
+    const start = controller.indexOf("    let primaryWorkspace: ReloadPrimaryWorkspace");
+    const end = controller.indexOf('    phase("primary-theme");', start);
+    let calls = 0;
+    const phases: string[] = [];
+    const refusal = new Error("Owned initial identity refused.");
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function bind(){" + controller.slice(start, end) + "return primaryWorkspace;}\nbind",
+      ),
+      {
+        plan: { flows: mode === "core" ? ["success"] : ["reload"] },
+        primary: { project: "/owned/BiBCode UI Fixture" },
+        NodePath,
+        phase: (value: string) => phases.push(value),
+        decodeReloadPrimaryWorkspace,
+        readReloadPrimaryWorkspace,
+        readReloadPrimaryThread,
+        EnvironmentOrchestrationHttpApi: {
+          endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
+        },
+        owner: {
+          until: async (read: () => Promise<boolean>) => {
+            if (!(await read())) throw refusal;
+          },
+        },
+        required: () => ({
+          execute: async (read: unknown, input: unknown) => {
+            calls++;
+            expect(read).toBe(readReloadPrimaryWorkspace);
+            expect(input).toEqual({
+              projectName: "BiBCode UI Fixture",
+              environmentId: null,
+              projectId: null,
+              threadId: null,
+              sessionLinePresent: null,
+              requireSelected: true,
+            });
+            return mode === "malformed"
+              ? { environmentId: "primary", projectId: "owned-project" }
+              : {
+                  environmentId: "primary",
+                  projectId: "owned-project",
+                  threadId: "owned-thread",
+                  sessionLinePresent: true,
+                };
+          },
+        }),
+      },
+    );
+    if (mode === "malformed") await expect(run()).rejects.toBe(refusal);
+    else
+      expect(await run()).toEqual(
+        mode === "core"
+          ? null
+          : {
+              environmentId: "primary",
+              projectId: "owned-project",
+              threadId: "owned-thread",
+              sessionLinePresent: true,
+            },
+      );
+    expect(calls).toBe(mode === "core" ? 0 : 1);
+  },
+);
+
+it.each(["missing-card", "foreign-thread", "missing-primary-thread"])(
+  "refuses lost primary proof before draft/restart: %s",
+  async (mode) => {
+    const start = controller.indexOf(
+      '  phase("reload-open-workspace");',
+      controller.indexOf("async function reloadFlow("),
+    );
+    const end = controller.indexOf("  const draft =", start);
+    const binding = {
+      environmentId: "primary",
+      projectId: "owned-project",
+      threadId: "owned-thread",
+      sessionLinePresent: true,
+    };
+    const phases: string[] = [],
+      clicks: string[] = [];
+    const refusal = new Error("Owned selection refused.");
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function prep(){" + controller.slice(start, end) + "}\nprep",
+      ),
+      {
+        phase: (value: string) => phases.push(value),
+        workspace: async () => {},
+        primaryWorkspace: binding,
+        primaryRead: { projectName: "BiBCode UI Fixture", ...binding, requireSelected: true },
+        decodeReloadPrimaryWorkspace,
+        readReloadPrimaryWorkspace,
+        readReloadPrimaryThread,
+        EnvironmentOrchestrationHttpApi: {
+          endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
+        },
+        composer: "owned-composer",
+        check: (value: unknown) => {
+          if (value !== true) throw refusal;
+        },
+        click: async (selector: string) => clicks.push(selector),
+        required: () => ({
+          execute: async (_read: unknown, input: { requireSelected: boolean }) =>
+            _read === readReloadPrimaryThread
+              ? mode !== "missing-primary-thread"
+              : input.requireSelected
+                ? { ...binding, threadId: "foreign-thread" }
+                : mode === "missing-card"
+                  ? null
+                  : true,
+          $: () => ({
+            waitForDisplayed: async () => {
+              throw new Error("Composer must not be reached.");
+            },
+          }),
+        }),
+        owner: {
+          until: async (read: () => Promise<boolean>) => {
+            if (!(await read())) throw refusal;
+          },
+        },
+      },
+    );
+    await expect(run()).rejects.toBe(refusal);
+    expect(phases.at(-1)).toBe(
+      mode === "missing-card"
+        ? "reload-primary-card-ready"
+        : mode === "missing-primary-thread"
+          ? "reload-primary-thread-proof"
+          : "reload-primary-identity",
+    );
+    expect(clicks).toEqual(
+      mode !== "foreign-thread"
+        ? ['[data-testid="environment-rail-local"]']
+        : [
+            '[data-testid="environment-rail-local"]',
+            '[data-testid="primary-card-button-owned-project"]',
+          ],
+    );
+  },
+);
+
+it("checks the same captured identity again after real replacement document/composer", async () => {
+  const start = controller.indexOf('  phase("reload-restored-composer");');
+  const end = controller.indexOf("  check((await required().$(composer).getText())", start);
+  const binding = {
+    environmentId: "primary",
+    projectId: "owned-project",
+    threadId: "owned-thread",
+    sessionLinePresent: true,
+  };
+  for (const threadId of ["owned-thread", "replacement-thread"]) {
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function restored(){" + controller.slice(start, end) + "}\nrestored",
+      ),
+      {
+        phase: () => {},
+        composer: "owned-composer",
+        primaryWorkspace: binding,
+        primaryRead: { projectName: "BiBCode UI Fixture", ...binding, requireSelected: true },
+        decodeReloadPrimaryWorkspace,
+        readReloadPrimaryWorkspace,
+        readReloadPrimaryThread,
+        EnvironmentOrchestrationHttpApi: {
+          endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
+        },
+        check: (value: unknown, code: string) => {
+          expect(code).toBe("actual-reload-keeps-primary-identity");
+          if (value !== true) throw new Error("Restored identity refused.");
+        },
+        required: () => ({
+          $: () => ({ waitForDisplayed: async () => {} }),
+          execute: async () => ({ ...binding, threadId }),
+        }),
+      },
+    );
+    if (threadId === "owned-thread") await expect(run()).resolves.toBeUndefined();
+    else await expect(run()).rejects.toThrow("Restored identity refused.");
+  }
 });

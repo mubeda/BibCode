@@ -5,7 +5,10 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeNet from "node:net";
 import { startThrottleProxy } from "../../../scripts/throttle-proxy.ts";
-import { EnvironmentMetadataHttpApi } from "../../../packages/contracts/src/environmentHttp.ts";
+import {
+  EnvironmentMetadataHttpApi,
+  EnvironmentOrchestrationHttpApi,
+} from "../../../packages/contracts/src/environmentHttp.ts";
 import { REMOTE_UPDATE_RESTART_BUDGET_MS } from "../../../packages/client-runtime/src/state/remoteUpdateCoordinator.ts";
 import type { TerminalOpenInput } from "../../../packages/contracts/src/terminal.ts";
 import {
@@ -41,6 +44,12 @@ import {
   type RemoteUiScene,
 } from "./support/remote-ui-evidence.ts";
 import { callFixtureRpc } from "./support/remote-ui-rpc.ts";
+import {
+  decodeReloadPrimaryWorkspace,
+  readReloadPrimaryThread,
+  readReloadPrimaryWorkspace,
+  type ReloadPrimaryWorkspace,
+} from "./support/remote-ui-primary-workspace.ts";
 
 const root = NodePath.resolve(import.meta.dirname, "../../..");
 const fixtureRoot = process.env.BIBCODE_UPLOAD_FIXTURE;
@@ -1270,12 +1279,50 @@ async function restartPrimaryWithBrowserTransition(primary: Host, version: strin
   } as const;
 }
 
-async function reloadFlow(primary: Host) {
+async function reloadFlow(primary: Host, primaryWorkspace: ReloadPrimaryWorkspace | null) {
+  check(primaryWorkspace !== null, "owned-primary-workspace-bound");
+  const primaryRead = {
+    projectName: NodePath.basename(primary.project),
+    ...primaryWorkspace,
+    requireSelected: true,
+  };
   phase("browser-reload");
   phase("reload-open-workspace");
   await workspace();
   phase("reload-select-primary");
   await click('[data-testid="environment-rail-local"]');
+  const selected = decodeReloadPrimaryWorkspace(
+    await required().execute(readReloadPrimaryWorkspace, primaryRead),
+    primaryWorkspace,
+  );
+  if (selected === null) {
+    phase("reload-primary-card-ready");
+    await owner.until(
+      async () =>
+        (await required().execute(readReloadPrimaryWorkspace, {
+          ...primaryRead,
+          requireSelected: false,
+        })) === true,
+    );
+    phase("reload-primary-thread-proof");
+    check(
+      await required().execute(readReloadPrimaryThread, {
+        ...primaryWorkspace,
+        snapshotPath: EnvironmentOrchestrationHttpApi.endpoints.snapshot.path,
+      }),
+      "owned-primary-thread-exists",
+    );
+    phase("reload-primary-card-select");
+    await click(`[data-testid="primary-card-button-${primaryWorkspace.projectId}"]`);
+  }
+  phase("reload-primary-identity");
+  await owner.until(
+    async () =>
+      decodeReloadPrimaryWorkspace(
+        await required().execute(readReloadPrimaryWorkspace, primaryRead),
+        primaryWorkspace,
+      ) !== null,
+  );
   phase("reload-composer-ready");
   await required().$(composer).waitForDisplayed();
   const draft = `unsent reload draft ${currentTheme}`;
@@ -1334,6 +1381,14 @@ async function reloadFlow(primary: Host) {
   );
   phase("reload-restored-composer");
   await required().$(composer).waitForDisplayed();
+  phase("reload-restored-primary-identity");
+  check(
+    decodeReloadPrimaryWorkspace(
+      await required().execute(readReloadPrimaryWorkspace, primaryRead),
+      primaryWorkspace,
+    ) !== null,
+    "actual-reload-keeps-primary-identity",
+  );
   check((await required().$(composer).getText()).includes(draft), "actual-reload-keeps-draft");
   check(
     !(await required()
@@ -1434,6 +1489,23 @@ try {
     await browser.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
     phase("primary-import");
     await importProject(primary);
+    let primaryWorkspace: ReloadPrimaryWorkspace | null = null;
+    if (plan.flows.some((flow) => flow === "reload")) {
+      phase("primary-bind-reload-workspace");
+      await owner.until(async () => {
+        primaryWorkspace = decodeReloadPrimaryWorkspace(
+          await required().execute(readReloadPrimaryWorkspace, {
+            projectName: NodePath.basename(primary.project),
+            environmentId: null,
+            projectId: null,
+            threadId: null,
+            sessionLinePresent: null,
+            requireSelected: true,
+          }),
+        );
+        return primaryWorkspace !== null;
+      });
+    }
     phase("primary-theme");
     await setTheme(theme);
     phase("primary-return-workspace");
@@ -1444,7 +1516,7 @@ try {
       "restart-failures": restartFailures,
       queued: queuedFlow,
       manual: manualFlow,
-      reload: () => reloadFlow(primary),
+      reload: () => reloadFlow(primary, primaryWorkspace),
     };
     for (const flow of plan.flows) await flows[flow]();
     check(

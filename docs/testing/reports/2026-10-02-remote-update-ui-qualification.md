@@ -278,3 +278,75 @@ callback invocation; baseline action journals, arguments and default budgets
 remain equal at every observer position and through the actual success wiring.
 Original primary/broad-phase writes, UI/read failures and capture/privacy gates
 remain fail-closed. No telemetry subsystem or product/native remedy is added.
+
+Full trial `37147159024` at `9fa9f614` retained twenty-one light originals and
+failed at `reload-composer-ready`, with timeout/Error, completed app/sidebar,
+no import/pairing controls and good joined cleanup. It did not reach the actual
+Reload click. The retained route category does not identify its exact route.
+
+An actual rail/selection-reset/file-route/TanStack memory-router/controller
+replay reproduces the composer boundary for empty index and removed remote
+thread routes. Selecting Local changes presentation without navigating; index
+shows No active thread and a missing remote route admits no ChatView. Invoking
+the actual public primary-card callback navigates to the existing primary thread.
+This establishes the controller's rail-only assumption, not the exact native
+route or geometry. Entity/atom/chat-rendering ports are inert and no product
+application or network was started.
+
+Full selection now binds the initially imported primary project/thread/route,
+uses its existing public card only when not already selected, and verifies the
+same identity before draft/restart and after actual replacement. Public markup
+and the captured nullable session-line footprint refuse missing/ambiguous or
+changed cards. An authenticated public snapshot read proves the bound live
+default thread before any inactive-card click, refusing missing/unbackfilled
+thread state before the primary callback could create a new default thread.
+Unsafe URLs/IDs/accessor facts
+and changed identities are refused; no bound values enter retained evidence.
+Core preparation, product memory/no-active/unavailable semantics and the original
+same-version/new-boot/ten-second windows/draft/Reload/request/ownership/capture
+acceptance remain intact. Native qualification is pending.
+
+The initial October 3 continuation passed the checkout-local workflow helper gate:
+204 tests across nine files, desktop e2e TypeScript checking, and formatting/lint
+for all seven scoped files. TypeScript emits only existing Effect suggestions
+outside this patch. Independent source review found and resolved one ambiguity:
+an inactive duplicate of the selected project card could evade selected-card
+uniqueness. Its regression failed before the added exact-project uniqueness
+guard, then passed for initial capture, selected verification and candidate
+admission. A later independent review found an uncovered empty-thread case:
+the old helper required a session line although the actual primary card omits
+it when both session and preview are absent. That invalidates the initial
+packet's readiness claim. A regression through the actual `SidebarPrimaryCard`
+and production preview helpers reproduced the rejection before the correction.
+The corrected binding retains session-line presence as a boolean, accepts its
+legitimate absence, and still rejects changed or inconsistent footprints. The
+existing typed authenticated primary snapshot endpoint now supplies a bounded,
+read-only current-thread proof before any inactive-card click. Raw snapshots,
+input and errors stay in the page; no provider session, grant or mutation is
+added. The v2 focused gate passed 210 tests across nine files, desktop
+e2e TypeScript and the seven-file formatting/lint check. Independent v2 review
+then found that its HTTP fixture followed the intended camelCase contract
+instead of the actual producer. `ProductionRuntime::json` serializes
+`load_snapshot` directly; unrenamed `ProjectionProject` and `ProjectionThread`
+rows expose `project_id`, `thread_id`, `deleted_at`, `archived_at` and
+`worktree_path`. The HTTP route returns that body unchanged. This is an
+existing, unresolved disagreement with `EnvironmentOrchestrationHttpApi`'s
+`OrchestrationReadModel` contract; no product/API repair is made here.
+
+The v3 fixture derives field names from those current Serialize declarations
+and decodes existing persistence fixture rows according to the current row
+shape. The valid raw HTTP shape reproduced the v2 reader's rejection before
+the correction. The QA reader now admits only that one actual snake_case
+shape; missing fields, duplicates, foreign IDs, non-default/deleted/archived
+threads and the camelCase DTO remain refused. Boolean-only output, cookie
+authentication, budgets and the one public card action remain intact. The v3
+focused gate passes 212 tests across nine files, desktop e2e TypeScript and
+the seven-file formatting/lint check. Root review and
+whole-workspace `vp check`,
+`vp run typecheck` and a fresh full browser qualification remain with the root
+agent; these focused checks do not establish native success.
+
+Root's focused visual inspection also found the Retry action visibly clipped at
+the right edge of the authoritative 1280x817 `not-back-light.png` original. This
+is a #16/UI.md follow-up for a later focused toast source check. It is not an
+assumed cause of the composer boundary and no toast policy changes here.

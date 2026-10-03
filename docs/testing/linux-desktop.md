@@ -607,6 +607,26 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   leaves the page. These are current post-failure facts, not proof of the earlier
   native click's blocker. Preserve the one public action, owner and every
   existing wait, request-count, version and draft assertion.
+  Full Reload captures the initially imported primary project, thread and route
+  from public selected-card markup. The rail changes sidebar presentation only;
+  it cannot establish an active chat. After selecting Local, select the same
+  bound existing primary card only if its owned route is not already selected,
+  then verify that identity before composer/draft work and after replacement.
+  Capture the actual presence or absence of the primary session line; an empty
+  existing thread has no session or preview and legitimately omits that line.
+  Require the same public footprint throughout. Before an inactive-card click,
+  use the existing authenticated primary `/api/orchestration/snapshot` read to
+  prove exactly one live default thread matches the bound project/thread IDs.
+  This HTTP producer currently serializes raw Rust projection rows. Read only
+  its actual `project_id`, `thread_id`, `deleted_at`, `archived_at` and
+  `worktree_path` fields; do not treat the contract's camelCase DTO as an alias.
+  Report the existing endpoint/contract disagreement without changing product
+  protocols as part of qualification.
+  Keep the read in the page and return only a boolean; missing, duplicated,
+  foreign, deleted, archived or failed proof prevents the click. Refuse
+  missing/ambiguous/unbackfilled cards and changed identities; never create a
+  thread, fabricate a session, pick another card or mutate renderer stores.
+  Binding and snapshot values never enter retained evidence.
   Reload diagnostics similarly identify workspace/primary selection, composer
   readiness, the same-version connection transition, changed-version offer and
   actual replacement document. They add only fixed phase markers: preserve all
