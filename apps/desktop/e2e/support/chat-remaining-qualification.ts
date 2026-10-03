@@ -3,8 +3,11 @@ import { OLD_INLINE_SOURCE } from "./chat-inline-fallback.ts";
 import type {
   BrowserInlineAction,
   BrowserInlineObservation,
+  BrowserInlineProgress,
   NativeInlineObservation,
 } from "./chat-inline-mechanics.ts";
+import type { ProxyMeasurements } from "../../../../scripts/throttle-proxy.ts";
+import type { startInlineProbeReceiver } from "./chat-inline-receiver.ts";
 export interface OldInlineInput {
   readonly source: typeof OLD_INLINE_SOURCE;
   readonly serverVersion: "0.7.2";
@@ -107,6 +110,223 @@ export function projectBrowserInlineObservation(value: unknown): BrowserInlineOb
     receivedCleanClose: row.receivedCleanClose as boolean,
     samples,
   };
+}
+export function projectBrowserInlineProgress(value: unknown): BrowserInlineProgress | null {
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+    const names = [
+      "action",
+      "finished",
+      "failed",
+      "timedOut",
+      "readyState",
+      "sentBytes",
+      "bufferedBytes",
+      "closeCalled",
+      "receivedCloseCode",
+      "receivedCleanClose",
+      "sampleCount",
+    ];
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.length !== names.length ||
+      !keys.every((key) => typeof key === "string" && names.includes(key))
+    )
+      return null;
+    const row = Object.create(null) as Record<string, unknown>;
+    for (const name of names) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, name);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      row[name] = descriptor.value;
+    }
+    const integer = (input: unknown, limit: number) =>
+      Number.isSafeInteger(input) && (input as number) >= 0 && (input as number) <= limit;
+    if (
+      !["mid-message-pong", "queued-before-close", "refused"].includes(row.action as string) ||
+      !["unavailable", "connecting", "open", "closing", "closed"].includes(
+        row.readyState as string,
+      ) ||
+      !["finished", "failed", "timedOut", "closeCalled", "receivedCleanClose"].every(
+        (key) => typeof row[key] === "boolean",
+      ) ||
+      ![0, 3145728].includes(row.sentBytes as number) ||
+      !(row.bufferedBytes === null || integer(row.bufferedBytes, 4194304)) ||
+      !(row.receivedCloseCode === null || integer(row.receivedCloseCode, 4999)) ||
+      !integer(row.sampleCount, 256)
+    )
+      return null;
+    return {
+      action: row.action as BrowserInlineProgress["action"],
+      finished: row.finished as boolean,
+      failed: row.failed as boolean,
+      timedOut: row.timedOut as boolean,
+      readyState: row.readyState as BrowserInlineProgress["readyState"],
+      sentBytes: row.sentBytes as number,
+      bufferedBytes: row.bufferedBytes as number | null,
+      closeCalled: row.closeCalled as boolean,
+      receivedCloseCode: row.receivedCloseCode as number | null,
+      receivedCleanClose: row.receivedCleanClose as boolean,
+      sampleCount: row.sampleCount as number,
+    };
+  } catch {
+    // Foreign reflection failures remain refused diagnostics, never probe failures.
+    return null;
+  }
+}
+type InlineReceiverRead = ReturnType<Awaited<ReturnType<typeof startInlineProbeReceiver>>["read"]>;
+type InlineProbeStage =
+  | "start"
+  | "browser-result"
+  | "receiver-close"
+  | "cleanup"
+  | "native-proof"
+  | "complete";
+function inlineProbeSnapshot(
+  action: BrowserInlineAction,
+  stage: InlineProbeStage,
+  outcome: "running" | "failed" | "complete",
+  browser: BrowserInlineProgress | null,
+  browserProgressState: "not-observed" | "observed" | "refused",
+  browserResultReceived: boolean,
+  ownedCleanupJoined: boolean,
+  native: InlineReceiverRead,
+  proxy: ProxyMeasurements,
+) {
+  const direction = (row: ProxyMeasurements["up"]) => ({
+    complete: row.complete,
+    overflow: row.overflow,
+    receivedBytes: row.receivedBytes,
+    destinationAcceptedBytes: row.destinationAcceptedBytes,
+    queuedBytes: row.queuedBytes,
+    discardedBytes: row.discardedBytes,
+    backpressureEvents: row.backpressureEvents,
+    drainEvents: row.drainEvents,
+    abandonedDrainWaits: row.abandonedDrainWaits,
+  });
+  return {
+    action,
+    stage,
+    outcome,
+    browser,
+    browserProgressState,
+    browserResultReceived,
+    ownedCleanupJoined,
+    native: {
+      parserValid: native.complete,
+      upgraded: native.upgraded,
+      upgradeCount: native.upgradeCount,
+      timedOut: native.timedOut,
+      messageBytes: native.messageBytes,
+      messageFinished: native.messageFinished,
+      digest: !native.messageFinished
+        ? "not-complete"
+        : native.messageDigest === native.expectedDigest
+          ? "matched"
+          : "mismatched",
+      nativePingWritesMidMessage: native.nativePingWritesMidMessage,
+      nativePongMidMessage: native.nativePongMidMessage,
+      nativePongAfterMessage: native.nativePongAfterMessage,
+      closeWritten: native.closeWritten,
+      closeFrameReceived: native.closeFrameReceived,
+      closeAfterMessage: native.closeAfterMessage,
+      partialFrame: native.partialFrame,
+    },
+    proxy: {
+      complete: proxy.complete,
+      overflow: proxy.overflow,
+      connections: {
+        created: proxy.connections.created,
+        active: proxy.connections.active,
+        closed: proxy.connections.closed,
+      },
+      up: direction(proxy.up),
+      down: direction(proxy.down),
+    },
+  };
+}
+export type InlineProbeProgress = ReturnType<typeof inlineProbeSnapshot>;
+/** The existing controller seam, retaining only closed progress without changing probe admission or bounds. */
+export async function observeInlineTransportProbe(port: {
+  readonly action: BrowserInlineAction;
+  readonly start: () => Promise<void>;
+  readonly readBrowser: () => Promise<{ result: unknown; progress: unknown }>;
+  readonly readNative: () => InlineReceiverRead;
+  readonly readProxy: () => ProxyMeasurements;
+  readonly until: RemainingQualificationPort["until"];
+  readonly closeProxy: () => Promise<void>;
+  readonly closeReceiver: () => Promise<void>;
+  readonly capture: (value: InlineProbeProgress) => void;
+}) {
+  if (port.action !== "mid-message-pong" && port.action !== "queued-before-close")
+    throw new Error("Inline probe action refused.");
+  let stage: InlineProbeStage = "start";
+  let browser: BrowserInlineObservation | null = null;
+  let progress: BrowserInlineProgress | null = null;
+  let browserProgressState: InlineProbeProgress["browserProgressState"] = "not-observed";
+  let ownedCleanupJoined = false;
+  const capture = (outcome: InlineProbeProgress["outcome"]) => {
+    try {
+      port.capture(
+        inlineProbeSnapshot(
+          port.action,
+          stage,
+          outcome,
+          progress,
+          browserProgressState,
+          browser !== null,
+          ownedCleanupJoined,
+          port.readNative(),
+          port.readProxy(),
+        ),
+      );
+    } catch {
+      // New diagnostic callbacks cannot interrupt the probe or replace its original failure.
+    }
+  };
+  try {
+    capture("running");
+    await port.start();
+    stage = "browser-result";
+    capture("running");
+    await port.until(async () => {
+      const raw = await port.readBrowser();
+      progress = projectBrowserInlineProgress(raw.progress);
+      if (progress?.action !== port.action) progress = null;
+      browserProgressState =
+        raw.progress === null ? "not-observed" : progress ? "observed" : "refused";
+      capture("running");
+      if (raw.result === null) return false;
+      browser = projectBrowserInlineObservation(raw.result);
+      if (!browser) throw new Error("Remaining qualification evidence refused.");
+      return true;
+    }, 250000);
+    stage = "receiver-close";
+    capture("running");
+    await port.until(async () => port.readNative().closeFrameReceived, 5000);
+    stage = "cleanup";
+    capture("running");
+    await port.closeProxy();
+    await port.closeReceiver();
+    ownedCleanupJoined = true;
+    stage = "native-proof";
+    capture("running");
+    const native = port.readNative();
+    if (
+      !native.upgraded ||
+      native.upgradeCount !== 1 ||
+      native.messageDigest !== native.expectedDigest ||
+      native.expectedBytes !== 3145728 ||
+      !native.complete ||
+      !browser
+    )
+      throw new Error("Remaining qualification evidence refused.");
+    stage = "complete";
+    capture("complete");
+    return { browser, native, ownedCleanupJoined: true };
+  } catch (error) {
+    capture("failed");
+    throw error;
+  }
 }
 export interface RemainingQualificationPort {
   readonly capability: () => Promise<boolean | null>;

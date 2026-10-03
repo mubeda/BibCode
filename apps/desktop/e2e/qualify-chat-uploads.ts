@@ -58,8 +58,9 @@ import {
 import { startInlineProbeReceiver } from "./support/chat-inline-receiver.ts";
 import {
   runRemainingQualification,
-  projectBrowserInlineObservation,
+  observeInlineTransportProbe,
   projectOldInlineInput,
+  type InlineProbeProgress,
 } from "./support/chat-remaining-qualification.ts";
 import {
   classifyQualificationFailure,
@@ -125,6 +126,7 @@ const proxies: Array<Awaited<ReturnType<typeof startThrottleProxy>>> = [];
 const inlineReceivers: Array<Awaited<ReturnType<typeof startInlineProbeReceiver>>> = [];
 let currentPhase = "prepare";
 const results: Array<Record<string, unknown>> = [];
+const inlineProbeProgress: InlineProbeProgress[] = [];
 const write = (name: string, value: unknown) =>
   NodeFS.writeFileSync(
     NodePath.join(evidenceRoot, name + ".json"),
@@ -682,47 +684,45 @@ async function runRemaining(
       });
       proxies.push(proxy);
       proxy.update({ up: 16384, down: 0, frozen: false });
-      await b.url("http://127.0.0.1:4916/");
-      await bounded(
-        b.execute((selected) => {
-          const observer = Reflect.get(window, "__inlineMechanics") as
-            | { start?: (action: string) => void }
-            | undefined;
-          if (!observer?.start) throw new Error("Inline probe unavailable.");
-          observer.start(selected);
-        }, action),
-        5000,
-      );
-      let browserObservation: ReturnType<typeof projectBrowserInlineObservation> = null;
-      await until(async () => {
-        const raw = await bounded(
-          b.execute(() => {
-            const observer = Reflect.get(window, "__inlineMechanics") as
-              | { read?: () => unknown }
-              | undefined;
-            return observer?.read?.() ?? null;
-          }),
-          5000,
-        );
-        if (raw === null) return false;
-        browserObservation = projectBrowserInlineObservation(raw);
-        if (!browserObservation) throw new Error("Remaining qualification evidence refused.");
-        return true;
-      }, 250000);
-      await until(async () => receiver.read().closeFrameReceived, 5000);
-      await bounded(proxy.close(), 5000);
-      await bounded(receiver.close(), 5000);
-      const native = receiver.read();
-      if (
-        !native.upgraded ||
-        native.upgradeCount !== 1 ||
-        native.messageDigest !== native.expectedDigest ||
-        native.expectedBytes !== 3145728 ||
-        !native.complete ||
-        !browserObservation
-      )
-        throw new Error("Remaining qualification evidence refused.");
-      return { browser: browserObservation, native, ownedCleanupJoined: true };
+      return observeInlineTransportProbe({
+        action,
+        start: async () => {
+          await b.url("http://127.0.0.1:4916/");
+          await bounded(
+            b.execute((selected) => {
+              const observer = Reflect.get(window, "__inlineMechanics") as
+                | { start?: (action: string) => void }
+                | undefined;
+              if (!observer?.start) throw new Error("Inline probe unavailable.");
+              observer.start(selected);
+            }, action),
+            5000,
+          );
+        },
+        readBrowser: () =>
+          bounded(
+            b.execute(() => {
+              const observer = Reflect.get(window, "__inlineMechanics") as
+                | { read?: () => unknown; progress?: () => unknown }
+                | undefined;
+              return {
+                result: observer?.read?.() ?? null,
+                progress: observer?.progress?.() ?? null,
+              };
+            }),
+            5000,
+          ),
+        readNative: receiver.read,
+        readProxy: proxy.measurements,
+        until,
+        closeProxy: () => bounded(proxy.close(), 5000),
+        closeReceiver: () => bounded(receiver.close(), 5000),
+        capture: (observed) => {
+          const index = inlineProbeProgress.findIndex((entry) => entry.action === action);
+          if (index < 0) inlineProbeProgress.push(observed);
+          else inlineProbeProgress[index] = observed;
+        },
+      });
     },
   });
   results.push({ ...result, oldInput, providerBytes: png.length, providerDigest: digest });
@@ -1232,6 +1232,7 @@ try {
     startupObservation,
     startupNetworkObservation,
     qualificationMode,
+    ...(qualificationMode === "remaining-qualification" ? { inlineProbeProgress } : {}),
   });
   // Retain passive transport observations after a completed pairing.
   if (browser && pairingCompleted) {
@@ -1257,6 +1258,7 @@ try {
         startupObservation,
         startupNetworkObservation,
         qualificationMode,
+        ...(qualificationMode === "remaining-qualification" ? { inlineProbeProgress } : {}),
       });
     } catch {
       // Diagnostic capture cannot skip the owned process cleanup below.
@@ -1346,6 +1348,7 @@ try {
     source: process.env.BIBCODE_UPLOAD_SOURCE,
     oldInput,
     results,
+    ...(qualificationMode === "remaining-qualification" ? { inlineProbeProgress } : {}),
     networkProof,
     onlineAfterPairFailure,
     pairingObservation,

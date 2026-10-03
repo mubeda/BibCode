@@ -7,6 +7,7 @@ import {
   runBrowserInlineMechanics,
   browserInlineMechanicsScript,
   type BrowserInlineObservation,
+  type BrowserInlineProgress,
 } from "./chat-inline-mechanics.ts";
 
 const digest = (bytes: Uint8Array) => NodeCrypto.createHash("sha256").update(bytes).digest("hex");
@@ -142,8 +143,13 @@ describe("native inline mechanics attribution", () => {
   });
 });
 
-function browserFixture(action: unknown, installer = false) {
+function browserFixture(
+  action: unknown,
+  installer = false,
+  progress?: (value: BrowserInlineProgress) => void,
+) {
   let socket: Socket | undefined, done: BrowserInlineObservation | undefined;
+  let doneCalls = 0;
   const callbacks = new Map<number, () => void>();
   let next = 0;
   class Socket {
@@ -178,11 +184,15 @@ function browserFixture(action: unknown, installer = false) {
   NodeVM.runInNewContext(
     installer
       ? browserInlineMechanicsScript
-      : `(${runBrowserInlineMechanics.toString()})(action, done)`,
+      : `(${runBrowserInlineMechanics.toString()})(action, done, progress)`,
     {
       window: page,
       action,
-      done: (value: BrowserInlineObservation) => (done = value),
+      done: (value: BrowserInlineObservation) => {
+        doneCalls++;
+        done = value;
+      },
+      progress,
       performance: { now: () => 0 },
       WebSocket: Socket,
       setTimeout: schedule,
@@ -198,9 +208,85 @@ function browserFixture(action: unknown, installer = false) {
     read: () => (installer ? page.__inlineMechanics.read() : done),
     callbacks,
     page,
+    doneCalls: () => doneCalls,
   };
 }
 describe("closed browser mechanics callback", () => {
+  it.each(["mid-message-pong", "queued-before-close"])(
+    "contains a throwing live diagnostic callback through the unchanged %s action and terminal cleanup",
+    (action) => {
+      let f: ReturnType<typeof browserFixture> | undefined;
+      expect(() => {
+        f = browserFixture(action, false, () => {
+          throw new Error("Controlled diagnostic callback failure.");
+        });
+      }).not.toThrow();
+      f!.socket!.readyState = 1;
+      expect(() => f!.socket!.onopen!()).not.toThrow();
+      expect(f!.socket!.sentBytes).toBe(3145728);
+      expect(f!.socket!.closeCodes).toEqual(action === "queued-before-close" ? [1000] : []);
+      f!.socket!.readyState = 3;
+      expect(() => f!.socket!.onclose!({ code: 1000, wasClean: true })).not.toThrow();
+      expect(f!.read()).toMatchObject({
+        failed: false,
+        receivedCloseCode: 1000,
+        receivedCleanClose: true,
+      });
+      expect(f!.callbacks.size).toBe(0);
+      expect(f!.doneCalls()).toBe(1);
+    },
+  );
+  it("contains a throwing terminal diagnostic callback while closing the socket, clearing timers and delivering the deadline result once", () => {
+    const f = browserFixture("mid-message-pong", false, (value) => {
+      if (value.finished) throw new Error("Controlled terminal diagnostic failure.");
+    });
+    f.socket!.readyState = 1;
+    f.socket!.onopen!();
+    const deadline = f.callbacks.values().next().value!;
+    expect(() => deadline()).not.toThrow();
+    expect(f.socket!.closeCodes).toEqual([1000]);
+    expect(f.callbacks.size).toBe(0);
+    expect(f.doneCalls()).toBe(1);
+    expect(f.read()).toMatchObject({ failed: true, receivedCloseCode: null });
+    f.socket!.onerror!();
+    expect(f.doneCalls()).toBe(1);
+  });
+  it("retains bounded live queue state before a terminal result and records its existing deadline", () => {
+    const f = browserFixture(null, true);
+    const progress = () => {
+      const read = Reflect.get(f.page.__inlineMechanics, "progress") as (() => unknown) | undefined;
+      return read?.() ?? null;
+    };
+    expect(progress()).toBeNull();
+    f.page.__inlineMechanics.start("mid-message-pong");
+    expect(progress()).toMatchObject({
+      readyState: "connecting",
+      finished: false,
+      timedOut: false,
+    });
+    f.socket!.readyState = 1;
+    f.socket!.onopen!();
+    expect(f.read()).toBeNull();
+    expect(progress()).toMatchObject({
+      readyState: "open",
+      sentBytes: 3145728,
+      bufferedBytes: 3145728,
+      sampleCount: 1,
+      finished: false,
+    });
+    const deadline = f.callbacks.values().next().value!;
+    deadline();
+    expect(progress()).toMatchObject({
+      readyState: "open",
+      finished: true,
+      timedOut: true,
+      failed: true,
+    });
+    expect(f.read()).toMatchObject({ failed: true, receivedCloseCode: null });
+    expect(f.socket!.closeCodes).toEqual([1000]);
+    expect(f.callbacks.size).toBe(0);
+    expect(JSON.stringify(progress())).not.toMatch(/ws:\/\/|AAAA|url|reason|error/i);
+  });
   it("keeps installation inert and admits one explicit action per document", () => {
     const f = browserFixture(null, true);
     expect(f.socket).toBeUndefined();

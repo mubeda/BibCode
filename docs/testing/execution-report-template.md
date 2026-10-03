@@ -279,6 +279,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Browser queued-data-after-close/Ping-Pong probe; WebKitGTK measured or explicitly not measured:
 - Remaining-only profile source/immutable old-input source and binary digest; source/CLI/schema/auth receipt versus actually observed old-server fallback; old guard absence and retained isolation; valid Request/image attribution and zero uploads probes:
 - Synthetic plain native probe versus product RPC/Noise; native Ping write admission, matching Pong position, receiver data digest and observed Close, browser queue/close event, exact joined listener/socket/proxy cleanup:
+- Remaining probe failure witness: controller stage, browser terminal/deadline/ready-state and queue counters, receiver bytes/frame/digest-match/Ping/Pong/Close, proxy counters, and separately reported outer cleanup; partial evidence must not be treated as a pass or cause:
 
 ## SSH environment evidence
 

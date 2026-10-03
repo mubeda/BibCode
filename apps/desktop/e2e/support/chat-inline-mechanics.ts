@@ -176,11 +176,25 @@ export interface BrowserInlineObservation {
   readonly receivedCleanClose: boolean;
   readonly samples: ReadonlyArray<{ readonly elapsedMs: number; readonly bufferedBytes: number }>;
 }
+export interface BrowserInlineProgress {
+  readonly action: BrowserInlineObservation["action"];
+  readonly finished: boolean;
+  readonly failed: boolean;
+  readonly timedOut: boolean;
+  readonly readyState: "unavailable" | "connecting" | "open" | "closing" | "closed";
+  readonly sentBytes: number;
+  readonly bufferedBytes: number | null;
+  readonly closeCalled: boolean;
+  readonly receivedCloseCode: number | null;
+  readonly receivedCleanClose: boolean;
+  readonly sampleCount: number;
+}
 
 /** Self-contained WebDriver executeAsync boundary: fixed endpoint and payload, closed observations only. */
 export function runBrowserInlineMechanics(
   action: BrowserInlineAction,
   done: (value: BrowserInlineObservation) => void,
+  progress?: (value: BrowserInlineProgress) => void,
 ): void {
   const started = performance.now();
   const result = {
@@ -198,9 +212,42 @@ export function runBrowserInlineMechanics(
     samples: [] as Array<{ elapsedMs: number; bufferedBytes: number }>,
   };
   let socket: WebSocket | undefined,
-    finished = false;
+    finished = false,
+    timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined,
     sampleTimer: ReturnType<typeof setInterval> | undefined;
+  const publish = () => {
+    try {
+      const buffered = socket?.bufferedAmount;
+      progress?.({
+        action: result.action,
+        finished,
+        failed: result.failed,
+        timedOut,
+        readyState:
+          socket?.readyState === 0
+            ? "connecting"
+            : socket?.readyState === 1
+              ? "open"
+              : socket?.readyState === 2
+                ? "closing"
+                : socket?.readyState === 3
+                  ? "closed"
+                  : "unavailable",
+        sentBytes: result.sentBytes,
+        bufferedBytes:
+          Number.isSafeInteger(buffered) && buffered! >= 0 && buffered! <= 4194304
+            ? buffered!
+            : null,
+        closeCalled: result.closeCalled,
+        receivedCloseCode: result.receivedCloseCode,
+        receivedCleanClose: result.receivedCleanClose,
+        sampleCount: result.samples.length,
+      });
+    } catch {
+      // A diagnostic callback cannot change the action, terminal result or owned cleanup.
+    }
+  };
   const sample = () => {
     const buffered = socket?.bufferedAmount;
     const elapsedMs = Math.round(performance.now() - started);
@@ -213,15 +260,19 @@ export function runBrowserInlineMechanics(
       elapsedMs > 250000
     ) {
       result.failed = true;
+      publish();
       return;
     }
     if (result.samples.length < 256) result.samples.push({ elapsedMs, bufferedBytes: buffered! });
     else result.failed = true;
+    publish();
   };
   const finish = (failed: boolean) => {
     if (finished) return;
     finished = true;
     result.failed ||= failed;
+    // Capture the terminal cause and state before the existing cleanup close.
+    publish();
     clearTimeout(timer);
     clearInterval(sampleTimer);
     try {
@@ -237,7 +288,11 @@ export function runBrowserInlineMechanics(
   }
   try {
     socket = new WebSocket("ws://127.0.0.1:4917/inline-probe");
-    timer = setTimeout(() => finish(true), 240000);
+    publish();
+    timer = setTimeout(() => {
+      timedOut = true;
+      finish(true);
+    }, 240000);
     socket.onopen = () => {
       try {
         socket!.send("A".repeat(3 * 1024 ** 2));
@@ -249,6 +304,7 @@ export function runBrowserInlineMechanics(
           result.bufferedBeforeClose = socket!.bufferedAmount;
           socket!.close(1000);
           result.closeCalled = true;
+          publish();
         }
       } catch {
         finish(true);
@@ -267,10 +323,11 @@ export function runBrowserInlineMechanics(
 
 /** One inert observer per document; only the explicit remaining profile starts it. */
 export const browserInlineMechanicsScript = `;(() => {
-  let started = false, result = null;
+  let started = false, result = null, progress = null;
   const probe = (${runBrowserInlineMechanics.toString()});
   Object.defineProperty(window, "__inlineMechanics", { value: {
-    start(action) { if (started) throw new Error("Inline probe already started."); started = true; probe(action, value => { result = value; }); },
-    read() { return result; }
+    start(action) { if (started) throw new Error("Inline probe already started."); started = true; probe(action, value => { result = value; }, value => { progress = value; }); },
+    read() { return result; },
+    progress() { return progress; }
   }});
 })();`;

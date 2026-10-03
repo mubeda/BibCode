@@ -97,7 +97,8 @@ export async function startInlineProbeReceiver(
     upgraded = false,
     upgradeCount = 0,
     pingSent = false,
-    closeSent = false;
+    closeSent = false,
+    timedOut = false;
   let probeTimer: ReturnType<typeof setTimeout> | undefined;
   const server = NodeHttp.createServer({ maxHeaderSize: 8192 }, (request, response) => {
     response.writeHead(request.method === "GET" && request.url === "/" ? 200 : 403, {
@@ -165,7 +166,10 @@ export async function startInlineProbeReceiver(
         accept +
         "\r\n\r\n",
     );
-    probeTimer = setTimeout(() => socket.destroy(), 245000);
+    probeTimer = setTimeout(() => {
+      timedOut = true;
+      socket.destroy();
+    }, 245000);
     const receive = (bytes: Buffer) => {
       if (stopped) return;
       recorder.push(bytes);
@@ -224,6 +228,8 @@ export async function startInlineProbeReceiver(
       complete: recorder.read().complete && upgradeCount === 1,
       upgraded,
       upgradeCount,
+      timedOut,
+      closeWritten: closeSent,
       expectedBytes: messageBytes,
       expectedDigest,
     }),

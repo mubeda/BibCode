@@ -1516,6 +1516,19 @@ before admission and refuses an available driver lacking its owned native
 profile; this plain Chromium probe must
 never be presented as a WebKitGTK or Noise result.
 
+Remaining-profile failure and result receipts retain one latest closed
+`inlineProbeProgress` witness per action, including the controller stage,
+browser terminal/deadline flags and ready-state enums, queue counters, receiver
+bytes/frame/digest-match/Ping/Pong/Close state, and bounded proxy counters.
+This is partial diagnostic evidence, not a qualification pass or a cause.
+The witness is captured before outer cleanup; a false `ownedCleanupJoined`
+does not contradict a later successful supervisor/namespace cleanup receipt.
+No payload, URL, HTML, header, arbitrary error or credentials are retained.
+Live metrics require the exact own enumerable data fields. Refused metrics and
+throwing diagnostic callbacks cannot change terminal acceptance or owned cleanup.
+Both probes retain their existing actions and absolute deadlines; a missing
+terminal browser result and a missing receiver Close remain distinct stages.
+
 The contained Chromium QA observer reports only closed metadata. Plain sockets
 use actual negotiated framing to account text messages and binary final,
 continuation and independent control records; capability comes from the actual
