@@ -1,8 +1,200 @@
 // @effect-diagnostics nodeBuiltinImport:off - Matrix selection tests compare actual fixed producer data.
 import * as NodeFS from "node:fs";
+import * as NodeModule from "node:module";
+import * as NodeVM from "node:vm";
 import { expect, it } from "vite-plus/test";
 import { parseChatMatrixCase, chatMatrixCases, matrixArtifactNames } from "./chat-upload-matrix.ts";
 import { parseQualificationMode } from "./browser-startup-probe.ts";
+
+const noiseActions = [
+  "cli",
+  "json",
+  "link",
+  "payload",
+  "identity",
+  "settings",
+  "trigger-ready",
+  "trigger",
+  "alias",
+  "code",
+  "acknowledgement",
+  "acknowledgement-click",
+  "connect",
+  "dialog-closed",
+  "environment",
+  "environment-selected",
+] as const;
+
+async function runActualNoiseSetup(failure?: (typeof noiseActions)[number], visible = true) {
+  const source = NodeFS.readFileSync(
+    new URL("../qualify-chat-uploads.ts", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf('    phase("matrix-noise-');
+  const end = source.indexOf("\n  }\n  if (", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const trace: string[] = [];
+  const phases: string[] = [];
+  const failureError = new Error("Controlled inert boundary failure.");
+  const action = (name: string) => {
+    trace.push(name);
+    if (failure === name && name !== "json" && name !== "payload") throw failureError;
+  };
+  const payload = {
+    hostKey: failure === "identity" ? null : "a".repeat(43),
+    endpoint: "http://127.0.0.1:4911/",
+  };
+  const link =
+    failure === "link"
+      ? null
+      : `bibcode://pair?code=${Buffer.from(
+          failure === "payload" ? "invalid-json" : JSON.stringify(payload),
+        ).toString("base64url")}`;
+  const selectors = [
+    "button=Remote Servers",
+    'button[aria-label="Add Server"]',
+    '[role="dialog"] input[placeholder="e.g. Linux workstation"]',
+    '[role="dialog"] textarea[placeholder="bibcode://pair?code=…"]',
+    '[role="dialog"] [role="checkbox"]',
+    '[role="dialog"] button=Add Server',
+    '[role="dialog"]',
+    '[role="radio"][aria-label="QA Upload Noise"]',
+  ];
+  let triggerClicks = 0;
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      `async function control() {${source.slice(start, end)}}\ncontrol`,
+    ),
+    {
+      phase: (name: string) => phases.push(name),
+      URL,
+      Buffer,
+      JSON: {
+        parse: (text: string) => {
+          const name = trace.includes("json") ? "payload" : "json";
+          action(name);
+          return JSON.parse(text);
+        },
+      },
+      target: { context: { stateRoot: "/owned/state" }, env: { OWNED: "inert" } },
+      proxy: { port: 4911 },
+      serverBinary: "/owned/bibcode",
+      webOrigin: "http://localhost:4901",
+      NodeChildProcess: {
+        execFileSync: (program: string, args: string[], options: unknown) => {
+          action("cli");
+          expect(program).toBe("/owned/bibcode");
+          expect(Array.from(args)).toEqual([
+            "pairing",
+            "offer",
+            "--base-dir",
+            "/owned/state",
+            "--dev-url",
+            "http://localhost:4901",
+            "--endpoint",
+            "http://127.0.0.1:4911",
+            "--reach",
+            "this-computer",
+            "--name",
+            "QA Upload Noise",
+            "--json",
+          ]);
+          expect(options).toEqual({
+            env: { OWNED: "inert" },
+            encoding: "utf8",
+            timeout: 10000,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          return failure === "json" ? "invalid-json" : JSON.stringify({ link });
+        },
+      },
+      b: {
+        $: (selector: string) => {
+          expect(selectors).toContain(selector);
+          return {
+            click: async () => {
+              const name =
+                selector === selectors[0]
+                  ? "settings"
+                  : selector === selectors[1]
+                    ? (++triggerClicks, "trigger")
+                    : selector === selectors[4]
+                      ? "acknowledgement-click"
+                      : selector === selectors[5]
+                        ? "connect"
+                        : "environment";
+              action(name);
+            },
+            waitForDisplayed: async (options?: unknown) => {
+              if (selector === selectors[1]) {
+                expect(options).toBeUndefined();
+                action("trigger-ready");
+              } else {
+                expect(options).toEqual({ reverse: true });
+                action("dialog-closed");
+              }
+            },
+            setValue: async (value: string) => {
+              const alias = selector === selectors[2];
+              expect(value).toBe(alias ? "QA Upload Noise" : link);
+              action(alias ? "alias" : "code");
+            },
+            isDisplayed: async () => {
+              action("acknowledgement");
+              return visible;
+            },
+            getAttribute: async (attribute: string) => {
+              expect(attribute).toBe("aria-checked");
+              action("environment-selected");
+              return "true";
+            },
+          };
+        },
+      },
+      until: async (predicate: () => Promise<boolean>) => {
+        expect(await predicate()).toBe(true);
+      },
+    },
+  ) as () => Promise<void>;
+  let failed = false;
+  try {
+    await run();
+  } catch {
+    failed = true;
+  }
+  return { failed, trace, phases, triggerClicks };
+}
+
+it.each(noiseActions.filter((name) => name !== "acknowledgement"))(
+  "actual Noise setup records the last attempted fixed boundary: %s",
+  async (boundary) => {
+    const result = await runActualNoiseSetup(boundary);
+    expect(result.failed).toBe(true);
+    expect(result.phases.at(-1)).toBe(`matrix-noise-${boundary}`);
+  },
+);
+
+it("actual Noise setup preserves the successful action trace and fixed checkpoints", async () => {
+  const result = await runActualNoiseSetup();
+  expect(result.failed).toBe(false);
+  expect(result.trace).toEqual(
+    noiseActions.filter((name) => name !== "link" && name !== "identity"),
+  );
+  expect(result.phases).toEqual(noiseActions.map((name) => `matrix-noise-${name}`));
+  expect(result.triggerClicks).toBe(1);
+});
+
+it("actual Noise setup preserves the existing hidden or failed acknowledgement observation", async () => {
+  for (const result of [
+    await runActualNoiseSetup(undefined, false),
+    await runActualNoiseSetup("acknowledgement"),
+  ]) {
+    expect(result.failed).toBe(false);
+    expect(result.trace).not.toContain("acknowledgement-click");
+    expect(result.trace.at(-1)).toBe("environment-selected");
+  }
+});
 
 it("keeps matrix selection explicit and bounded with a covering set of fourteen cases", () => {
   expect(parseQualificationMode(undefined)).toBe("upload-smoke");

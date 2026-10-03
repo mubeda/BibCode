@@ -262,3 +262,21 @@ Actual installer/installed serializer/production codec/privacy tests are inert
 proof only. A new reviewed native run is required before these observer values
 qualify measurements. Full plain/Noise slow-link, Cancel, retention, remount,
 ambiguous admission and fallback scenarios and WebKitGTK remain pending.
+
+Matrix run `37113729253` at `a75b195d` passed the plain 64 KiB/s light delivery:
+exact 10 MiB provider bytes/SHA, 423 successful appends, maximum outstanding two,
+complete plain/proxy measurements and clean ownership. The Noise 64 KiB/s dark
+case failed at the former `matrix-noise-offer` phase before any observed Noise
+socket or upload. That phase covered CLI issuance through environment selection;
+the closed failure therefore does not identify issuance as its cause.
+
+Diagnostic-only fixed phases now precede the existing CLI, JSON, link, payload,
+identity, settings, trigger readiness/click, alias/code fields, acknowledgement,
+connect, dialog disappearance and environment selection operations. They retain
+only literal operation names, never offer output, credentials, IDs or error text.
+The CLI arguments, validation, selectors/actions/order, deadlines and cleanup
+are unchanged; no new browser read, grant, retry, screenshot or timing repair is
+introduced. Inert actual-controller tests establish failure attribution and the
+unchanged successful action trace. Another reviewed native run must supply the
+actual failing boundary; a missing dialog-readiness wait remains an unproven
+timing hypothesis, not a product or fixture fix.

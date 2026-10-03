@@ -269,30 +269,32 @@ async function runMatrix(
   );
   let pinnedNoisePathObserved = false;
   if (selection.transport === "noise") {
-    phase("matrix-noise-offer");
-    const issued = JSON.parse(
-      NodeChildProcess.execFileSync(
-        serverBinary,
-        [
-          "pairing",
-          "offer",
-          "--base-dir",
-          target.context.stateRoot,
-          "--dev-url",
-          webOrigin,
-          "--endpoint",
-          "http://127.0.0.1:4911",
-          "--reach",
-          "this-computer",
-          "--name",
-          "QA Upload Noise",
-          "--json",
-        ],
-        { env: target.env, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] },
-      ),
-    ) as { link?: unknown };
+    phase("matrix-noise-cli");
+    const offerOutput = NodeChildProcess.execFileSync(
+      serverBinary,
+      [
+        "pairing",
+        "offer",
+        "--base-dir",
+        target.context.stateRoot,
+        "--dev-url",
+        webOrigin,
+        "--endpoint",
+        "http://127.0.0.1:4911",
+        "--reach",
+        "this-computer",
+        "--name",
+        "QA Upload Noise",
+        "--json",
+      ],
+      { env: target.env, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    phase("matrix-noise-json");
+    const issued = JSON.parse(offerOutput) as { link?: unknown };
+    phase("matrix-noise-link");
     if (typeof issued.link !== "string" || !issued.link.startsWith("bibcode://pair?"))
       throw new Error("Matrix evidence assertion failed.");
+    phase("matrix-noise-payload");
     const code = new URL(issued.link).searchParams.get("code");
     const payload = code
       ? (JSON.parse(Buffer.from(code, "base64url").toString("utf8")) as {
@@ -300,6 +302,7 @@ async function runMatrix(
           endpoint?: unknown;
         })
       : null;
+    phase("matrix-noise-identity");
     const offeredEndpoint =
       typeof payload?.endpoint === "string" ? new URL(payload.endpoint) : null;
     if (
@@ -311,21 +314,32 @@ async function runMatrix(
       offeredEndpoint.hash !== ""
     )
       throw new Error("Matrix evidence assertion failed.");
+    phase("matrix-noise-settings");
     await b.$("button=Remote Servers").click();
+    phase("matrix-noise-trigger-ready");
     await b.$('button[aria-label="Add Server"]').waitForDisplayed();
+    phase("matrix-noise-trigger");
     await b.$('button[aria-label="Add Server"]').click();
     const dialog = '[role="dialog"]';
+    phase("matrix-noise-alias");
     await b.$(`${dialog} input[placeholder="e.g. Linux workstation"]`).setValue("QA Upload Noise");
+    phase("matrix-noise-code");
     await b.$(`${dialog} textarea[placeholder="bibcode://pair?code=…"]`).setValue(issued.link);
+    phase("matrix-noise-acknowledgement");
     const acknowledgement = b.$(`${dialog} [role="checkbox"]`);
     if (await acknowledgement.isDisplayed().catch(() => false)) {
       // This fixture owns the actual bidirectional TCP forwarder into this same private namespace.
+      phase("matrix-noise-acknowledgement-click");
       if (proxy.port !== 4911) throw new Error("Matrix evidence assertion failed.");
       await acknowledgement.click();
     }
+    phase("matrix-noise-connect");
     await b.$(`${dialog} button=Add Server`).click();
+    phase("matrix-noise-dialog-closed");
     await b.$(dialog).waitForDisplayed({ reverse: true });
+    phase("matrix-noise-environment");
     await b.$('[role="radio"][aria-label="QA Upload Noise"]').click();
+    phase("matrix-noise-environment-selected");
     await until(
       async () =>
         (await b.$('[role="radio"][aria-label="QA Upload Noise"]').getAttribute("aria-checked")) ===
