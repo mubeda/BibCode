@@ -17,6 +17,10 @@ import {
 import { EnvironmentMetadataHttpApi } from "../../../packages/contracts/src/environmentHttp.ts";
 
 import { prepareDesktopUiTestContext } from "./support/test-project.ts";
+import {
+  browserStartupObservationScript,
+  projectBrowserStartupObservation,
+} from "./support/browser-startup.ts";
 import { createSizedPng, instrumentCodexAttachmentLog } from "./support/chat-upload-fixture.ts";
 import { startThrottleProxy } from "../../../scripts/throttle-proxy.ts";
 import {
@@ -198,7 +202,9 @@ const webEnv = {
   VITE_WS_URL: "ws://localhost:4903",
 };
 
-const observationScript = String.raw`(() => {
+const observationScript =
+  browserStartupObservationScript +
+  String.raw`(() => {
   const Original = window.WebSocket;
   const events = [];
   const inflight = new Map();
@@ -252,6 +258,7 @@ let onlineAfterPairFailure: boolean | null = null;
 let pairingCompleted = false;
 let credentialEntryAttempted = false;
 let pairingObservation: ReturnType<typeof projectPairingObservation> | null = null;
+let startupObservation: ReturnType<typeof projectBrowserStartupObservation> | null = null;
 let success = false;
 const cleanupFailures: Array<{
   role: string;
@@ -567,49 +574,71 @@ try {
   if (browser && currentPhase.startsWith("pair-")) {
     try {
       const observed: unknown = await bounded(
-        browser.execute(() => {
-          const token = document.getElementById("pairing-token");
-          const form = token?.closest("form");
-          const submit = form?.querySelector('button[type="submit"]');
-          const transport = Reflect.get(window, "__uploadObservations") as
-            | { events?: Array<{ kind?: string; endpoint?: string; socket?: number }> }
-            | undefined;
-          const events = Array.isArray(transport?.events) ? transport.events : null;
-          const plainIds = new Set(
-            events
-              ?.filter((entry) => entry?.kind === "created" && entry.endpoint === "plain-proxy")
-              .map((entry) => entry.socket) ?? [],
-          );
-          return {
-            route:
-              location.pathname === "/pair"
-                ? "pair"
-                : location.pathname === "/"
-                  ? "root"
-                  : location.pathname.startsWith("/local/")
-                    ? "local-project"
-                    : "other",
-            readyState: document.readyState,
-            tokenInputPresent: token instanceof HTMLInputElement,
-            tokenInputDisabled: token instanceof HTMLInputElement ? token.disabled : null,
-            submitPresent: submit instanceof HTMLButtonElement,
-            submitDisabled: submit instanceof HTMLButtonElement ? submit.disabled : null,
-            errorNoticePresent: form?.querySelector(".text-destructive") !== null && form != null,
-            pendingHeadingPresent: Array.from(document.querySelectorAll("h1")).some(
-              (heading) => heading.textContent?.trim() === "Pairing with this environment",
-            ),
-            sidebarPresent:
-              document.querySelector('[data-testid="sidebar-add-project-trigger"]') !== null,
-            observerPresent: events !== null,
-            plainSocketCreated: events === null ? null : plainIds.size,
-            plainSocketOpened:
-              events?.filter((entry) => entry?.kind === "opened" && plainIds.has(entry.socket))
-                .length ?? null,
-          };
-        }),
+        browser.execute(
+          (includeStartup: boolean) => {
+            const token = document.getElementById("pairing-token");
+            const form = token?.closest("form");
+            const submit = form?.querySelector('button[type="submit"]');
+            const transport = Reflect.get(window, "__uploadObservations") as
+              | { events?: Array<{ kind?: string; endpoint?: string; socket?: number }> }
+              | undefined;
+            const events = Array.isArray(transport?.events) ? transport.events : null;
+            const plainIds = new Set(
+              events
+                ?.filter((entry) => entry?.kind === "created" && entry.endpoint === "plain-proxy")
+                .map((entry) => entry.socket) ?? [],
+            );
+            let startup: unknown = null;
+            if (includeStartup) {
+              try {
+                const observer = Reflect.get(window, "__browserStartupObservation") as
+                  | { read?: () => unknown }
+                  | undefined;
+                startup = observer?.read?.() ?? null;
+              } catch {
+                /* The existing pairing receipt remains available. */
+              }
+            }
+            return {
+              startup,
+              route:
+                location.pathname === "/pair"
+                  ? "pair"
+                  : location.pathname === "/"
+                    ? "root"
+                    : location.pathname.startsWith("/local/")
+                      ? "local-project"
+                      : "other",
+              readyState: document.readyState,
+              tokenInputPresent: token instanceof HTMLInputElement,
+              tokenInputDisabled: token instanceof HTMLInputElement ? token.disabled : null,
+              submitPresent: submit instanceof HTMLButtonElement,
+              submitDisabled: submit instanceof HTMLButtonElement ? submit.disabled : null,
+              errorNoticePresent: form?.querySelector(".text-destructive") !== null && form != null,
+              pendingHeadingPresent: Array.from(document.querySelectorAll("h1")).some(
+                (heading) => heading.textContent?.trim() === "Pairing with this environment",
+              ),
+              sidebarPresent:
+                document.querySelector('[data-testid="sidebar-add-project-trigger"]') !== null,
+              observerPresent: events !== null,
+              plainSocketCreated: events === null ? null : plainIds.size,
+              plainSocketOpened:
+                events?.filter((entry) => entry?.kind === "opened" && plainIds.has(entry.socket))
+                  .length ?? null,
+            };
+          },
+          currentPhase === "pair-wait-token" && credentialEntryAttempted === false,
+        ),
         2_000,
       );
       pairingObservation = projectPairingObservation(observed);
+      if (currentPhase === "pair-wait-token" && credentialEntryAttempted === false) {
+        startupObservation = projectBrowserStartupObservation(
+          typeof observed === "object" && observed !== null && "startup" in observed
+            ? observed.startup
+            : null,
+        );
+      }
     } catch {
       /* Missing diagnostics remain unknown and cannot interrupt owned cleanup. */
     }
@@ -631,6 +660,7 @@ try {
     networkProof,
     onlineAfterPairFailure,
     pairingObservation,
+    startupObservation,
   });
   // Retain passive transport observations after a completed pairing.
   if (browser && pairingCompleted) {
@@ -648,6 +678,7 @@ try {
         networkProof,
         onlineAfterPairFailure,
         pairingObservation,
+        startupObservation,
       });
     } catch {
       // Diagnostic capture cannot skip the owned process cleanup below.
@@ -742,6 +773,7 @@ try {
     networkProof,
     onlineAfterPairFailure,
     pairingObservation,
+    startupObservation,
     beforeCleanup,
     cleanupFailures,
     scope:

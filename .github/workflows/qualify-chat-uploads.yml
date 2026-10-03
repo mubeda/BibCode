@@ -36,7 +36,7 @@ jobs:
           python3 -B scripts/qualify-chat-uploads.test.py
           python3 -B scripts/qualify-chat-network.test.py
           python3 -B scripts/qualify-chat-uploads.py preflight
-          vp test run apps/desktop/e2e/support/chat-upload-fixture.test.ts apps/desktop/e2e/support/chat-upload-evidence.test.ts apps/desktop/e2e/support/browser-network.test.ts
+          vp test run apps/desktop/e2e/support/chat-upload-fixture.test.ts apps/desktop/e2e/support/chat-upload-evidence.test.ts apps/desktop/e2e/support/browser-network.test.ts apps/desktop/e2e/support/browser-startup.test.ts
       - name: Build guarded fixture server
         run: cargo build -p bibcode-server --bin bibcode --features hermetic-test-guard -j 2
       - name: Run isolated real browser upload smoke

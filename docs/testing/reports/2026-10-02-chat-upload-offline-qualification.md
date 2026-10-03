@@ -119,3 +119,35 @@ record before/after online observations, connected backend RPC, original upload
 assertions, safe screenshots and joined namespace cleanup. False staying false
 is a bounded diagnostic failure. No actual online transition, native success or
 upload qualification is claimed by hermetic tests.
+
+Run `37075649092` at `7a03` stopped before credential entry with the original
+startup logo visible. Its document was complete and the contained browser had
+become online, but no pairing controls were present. This does not establish
+whether application imports were pending, rejected, or followed by a first
+render that never committed. A successful HTML response from Vite is not proof
+that its dynamic application graph has finished loading.
+
+The QA pre-document observer now retains only fixed boot/load flags, capped
+standard-error counts, a fixed dynamic-import failure marker, and completed
+resource counts/status classes/bounded durations for predefined module buckets.
+It neither requests modules nor modifies the DOM or application state. Resource
+completion does not prove evaluation; absent observations remain unknown, and
+unsupported or truncated observation is explicit. Raw URLs, error strings,
+console data, input values, query fields and credentials are not retained.
+Counters describe the current document; a navigation replaces its observer,
+so no absence claim about an earlier document follows from a zero count.
+
+The new projection is collected only on the existing `pair-wait-token` failure
+before any attempted credential entry, inside the existing two-second read.
+Pairing/upload waits, credential ordering, screenshot eligibility, provider
+byte/digest assertions and owned cleanup stay unchanged. No warmup, preload,
+reload, timeout increase or product startup change is part of this diagnostic.
+Run the additional inert callback/projection tests with:
+
+```sh
+vp test run apps/desktop/e2e/support/browser-startup.test.ts
+```
+
+These observations are prepared for independent review; no new native result or
+startup cause is claimed. The next ordinary smoke must still reach an actual
+successful upload before the slow-link matrix is expanded.
