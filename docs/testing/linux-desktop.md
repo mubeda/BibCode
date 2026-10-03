@@ -684,10 +684,25 @@ use a short case prefix plus the complete UUID, with exclusive `0700` creation;
 run IDs remain in evidence paths, keeping Chromium's branded and unbranded
 Unix socket names within their limit.
 
-In each theme, the driver pairs and imports through the public UI, completes a
-baseline message, and arms one withheld provider acknowledgement. It renames
-only the owned checkout to trigger actual workspace loss, waits for Delivery
-uncertain, and restores the path before retrying. The ordinary fixture is
+In each theme, the driver pairs and imports through the public UI, then creates
+and selects a genuine managed worktree through **New worktree**. Its configured
+worktree base stays inside the private fixture. Bind the selected card's public
+thread/branch/title and worktree tooltip to one registered, non-primary Git
+worktree with the same reachable common directory. Read Git with the pinned
+fixture executable, private HOME, disabled system/global settings, bounded output
+and joined synchronous commands; never retain paths, IDs or Git output.
+The workflow's explicit helper gate includes `delivery-retry-workspace.test.ts`
+for real disposable Git identity/refusal and restoration controls.
+
+After selecting the exact Claude model on that worktree, complete a baseline
+message and arm one withheld provider acknowledgement. Rename only the validated
+managed worktree, keeping the project and common Git directory available. Require
+the selected card's actual missing-registered notice and the original message's
+Delivery uncertain state within the existing bound. Restore on success or failure;
+verify the same selected card and Git identity recover before Retry. Moving the
+primary repository root cannot substitute: default threads have no adopted
+worktree path, and losing the only Git anchor degrades catalog scans instead of
+authorizing workspace-loss teardown. The ordinary fixture is
 unchanged unless `BIBCODE_E2E_CLAUDE_RETRY=1` is explicitly set. Its private
 receipts distinguish fresh/resumed launches and the received/withheld input.
 
@@ -696,6 +711,11 @@ accessible provider-and-model label before sending the baseline. The visible
 model name alone does not identify the provider. Closed `import-*` phase codes
 identify the last attempted UI boundary without retaining workspace paths,
 page text, credentials or raw errors; provider receipt assertions still apply.
+The same model selection is repeated on the created worktree. Fixed `worktree-*`
+and `workspace-*` phases locate preparation, identity, loss and recovery failures.
+Closed successful receipts distinguish managed selection, matching Git identity,
+preserved primary anchor, observed catalog loss and restoration; they do not
+replace the actual Retry/draft/new-conversation acceptance below.
 
 Pairing and theme changes also record literal subphases before each action or
 read. If either fails, one read-only observation may take up to two seconds;

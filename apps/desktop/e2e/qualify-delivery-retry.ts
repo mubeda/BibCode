@@ -31,6 +31,10 @@ import {
   type DeliveryReceipts,
 } from "./support/delivery-retry-evidence.ts";
 import { resolveActualRetryPrompt } from "./support/delivery-retry-flow.ts";
+import {
+  readOwnedDeliveryWorktree,
+  readSelectedDeliveryWorktree,
+} from "./support/delivery-retry-workspace.ts";
 
 const root = NodePath.resolve(import.meta.dirname, "../../..");
 const origin = "http://127.0.0.1:4885";
@@ -281,13 +285,17 @@ export async function runDeliveryRetryQualification() {
     await click("button=Open project");
     step("import-wait-composer");
     await b().$(composer).waitForDisplayed();
-    step("import-open-model-picker");
+    await selectClaudeModel("import");
+  }
+
+  async function selectClaudeModel(scope: "import" | "worktree") {
+    step(`${scope}-open-model-picker`);
     await click(`${form} [data-chat-provider-model-picker="true"]`);
     const model =
       '[data-model-picker-content="true"] [data-model-picker-instance-id="claudeAgent"][data-model-picker-model-slug="opus"]';
-    step("import-select-claude-opus");
+    step(`${scope}-select-claude-opus`);
     await click(model);
-    step("import-verify-claude-opus");
+    step(`${scope}-verify-claude-opus`);
     // The visible trigger text is model-only; its accessible label includes the
     // actual selected provider and full model name from the owned Claude fixture.
     await owner.until(
@@ -296,6 +304,68 @@ export async function runDeliveryRetryQualification() {
           .$(`${form} [data-chat-provider-model-picker="true"]`)
           .getAttribute("aria-label")) === "Claude · Opus 5",
     );
+  }
+
+  async function createOwnedWorkspace(
+    context: ReturnType<typeof prepareDesktopUiTestContext>,
+    runRoot: string,
+  ) {
+    const branch = `codex/delivery-retry-${theme}`;
+    const create = 'button[aria-label^="New worktree in "]';
+    const popup = '[data-slot="dialog-popup"][role="dialog"]';
+    step("worktree-open-dialog");
+    check((await b().$$(create).length) === 1);
+    await b()
+      .$(
+        '//*[@data-testid="new-worktree-button"]/ancestor::div[contains(concat(" ", normalize-space(@class), " "), " group/project-header ")][1]',
+      )
+      .moveTo();
+    await click(create);
+    step("worktree-name");
+    const name = b().$(`${popup} input[placeholder="Worktree name"]`);
+    await name.waitForDisplayed();
+    await name.setValue(branch);
+    step("worktree-create");
+    await click(
+      '//*[@data-slot="dialog-popup"]//button[starts-with(normalize-space(.),"Create worktree")]',
+    );
+    await b().$(popup).waitForDisplayed({ reverse: true });
+    step("worktree-select-identity");
+    let selected: { threadId: string } | null = null;
+    await owner.until(async () => {
+      selected = await b().execute(readSelectedDeliveryWorktree, { origin, branch });
+      return selected !== null;
+    });
+    check(selected !== null);
+    const threadId = (selected as { threadId: string } | null)!.threadId;
+    step("worktree-git-identity");
+    const identity = readOwnedDeliveryWorktree({
+      root: runRoot,
+      project: context.projectPath,
+      home: context.fixtureUserHomePath,
+      git: NodePath.join(config.fixture, "bin", "git"),
+      branch,
+    });
+    step("worktree-visible-path");
+    await b()
+      .$(`[data-testid="thread-row-${threadId}"] [id$="-branch"] [data-slot="tooltip-trigger"]`)
+      .moveTo();
+    await owner.until(async () =>
+      b().execute(
+        (expected) =>
+          Array.from(document.querySelectorAll('[role="tooltip"]')).some(
+            (element) =>
+              element.getClientRects().length > 0 && element.textContent?.trim() === expected,
+          ),
+        `Worktree: ${NodePath.basename(identity.path)} (${branch})`,
+      ),
+    );
+    await selectClaudeModel("worktree");
+    step("worktree-ready");
+    check(
+      (await b().execute(readSelectedDeliveryWorktree, { origin, branch }))?.threadId === threadId,
+    );
+    return { ...identity, threadId };
   }
 
   async function type(text: string) {
@@ -458,6 +528,8 @@ export async function runDeliveryRetryQualification() {
         config: { binaryPath: claude },
       };
       configured.enableProviderUpdateChecks = false;
+      configured.worktreeBaseDirectory = NodePath.join(runRoot, "managed-worktrees");
+      NodeFS.mkdirSync(configured.worktreeBaseDirectory, { mode: 0o700 });
       NodeFS.writeFileSync(settingsPath, JSON.stringify(configured), { mode: 0o600 });
       await new Promise<void>((resolve, reject) => {
         const probe = NodeNet.createServer();
@@ -537,6 +609,7 @@ export async function runDeliveryRetryQualification() {
       await setTheme();
       step("import");
       await importProject(context.projectPath);
+      const workspace = await createOwnedWorkspace(context, runRoot);
       const baseline = `delivery baseline ${theme}`;
       const prompt = `delivery held message ${theme}`;
       const draft = `delivery preserved draft ${theme}`;
@@ -571,12 +644,45 @@ export async function runDeliveryRetryQualification() {
       check(message && message.text === prompt);
       const id = message!.id;
       await type(draft);
-      step("workspace-loss");
-      await withUnavailableWorkspace(runRoot, context.projectPath, () =>
-        owner.until(async () =>
-          (await browser!.$(row(id)).getText()).includes("Delivery uncertain"),
-        ),
+      step("workspace-verify-identity");
+      check(
+        (await browser.execute(readSelectedDeliveryWorktree, { origin, branch: workspace.branch }))
+          ?.threadId === workspace.threadId,
       );
+      check(
+        JSON.stringify(
+          readOwnedDeliveryWorktree({
+            root: runRoot,
+            project: context.projectPath,
+            home: context.fixtureUserHomePath,
+            git: NodePath.join(config.fixture, "bin", "git"),
+            branch: workspace.branch,
+          }),
+        ) ===
+          JSON.stringify({
+            path: workspace.path,
+            branch: workspace.branch,
+            commonDirectory: workspace.commonDirectory,
+          }),
+      );
+      step("workspace-loss");
+      await withUnavailableWorkspace(runRoot, workspace.path, async () => {
+        step("workspace-wait-loss");
+        await owner.until(async () => {
+          check(
+            NodeFS.statSync(context.projectPath).isDirectory() &&
+              NodeFS.statSync(workspace.commonDirectory).isDirectory(),
+          );
+          const warning = browser!.$(`[data-testid="worktree-availability-${workspace.threadId}"]`);
+          return (
+            (await warning.isExisting()) &&
+            (await warning.getText()).includes(
+              "The worktree directory is missing. Git registration remains.",
+            ) &&
+            (await browser!.$(row(id)).getText()).includes("Delivery uncertain")
+          );
+        });
+      });
       step("uncertain");
       const before = readDeliveryReceipts(control);
       check(before.complete);
@@ -587,6 +693,30 @@ export async function runDeliveryRetryQualification() {
       }
       unchanged(before, readDeliveryReceipts(control));
       const uncertaintyWindowMs = Math.floor(performance.now() - holdStarted);
+      step("workspace-wait-recovered");
+      await owner.until(
+        async () =>
+          (
+            await browser!.execute(readSelectedDeliveryWorktree, {
+              origin,
+              branch: workspace.branch,
+            })
+          )?.threadId === workspace.threadId &&
+          !(await browser!
+            .$(`[data-testid="worktree-availability-${workspace.threadId}"]`)
+            .isExisting()),
+      );
+      check(
+        readOwnedDeliveryWorktree({
+          root: runRoot,
+          project: context.projectPath,
+          home: context.fixtureUserHomePath,
+          git: NodePath.join(config.fixture, "bin", "git"),
+          branch: workspace.branch,
+        }).path === workspace.path,
+      );
+      unchanged(before, readDeliveryReceipts(control));
+      step("uncertain");
       check((await readMessage(prompt))?.id === id && (await draftIs(draft)));
       await capture("uncertain", id, prompt, draft);
       step("dismiss-prompt");
@@ -614,6 +744,11 @@ export async function runDeliveryRetryQualification() {
       assertions.push({
         theme,
         ordinaryDeliveredHasNoNotice: true,
+        selectedManagedWorktree: true,
+        registeredGitIdentityMatched: true,
+        primaryGitAnchorPreserved: true,
+        catalogLossObserved: true,
+        workspaceRestoredBeforeRetry: true,
         uncertaintyWindowMs,
         cancelWindowMs,
         noAutomaticResend: true,

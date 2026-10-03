@@ -78,6 +78,177 @@ const exactModel =
   '[data-model-picker-content="true"] [data-model-picker-instance-id="claudeAgent"][data-model-picker-model-slug="opus"]';
 const project = "/private-owned-workspace";
 
+it("targets the selected managed worktree, preserving the primary Git anchor during loss", async () => {
+  const start = controller.indexOf('      step("workspace-loss");');
+  const end = controller.indexOf('      step("uncertain");', start);
+  expect(start).toBeGreaterThan(0);
+  const calls: string[] = [];
+  const selected = {
+    path: "/private-owned-root/worktrees/selected",
+    threadId: "owned-thread",
+    branch: "codex/delivery-retry-light",
+    commonDirectory: "/private-owned-root/project/.git",
+  };
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      "async function loss() {" + controller.slice(start, end) + "}\nloss",
+    ),
+    {
+      step: (name: string) => calls.push(name),
+      runRoot: "/private-owned-root",
+      context: { projectPath: "/private-owned-root/project" },
+      workspace: selected,
+      id: "owned-message",
+      row: () => "owned-message-row",
+      check: (value: unknown) => expect(value).toBe(true),
+      NodeFS: {
+        statSync: (path: string) => {
+          expect(["/private-owned-root/project", selected.commonDirectory]).toContain(path);
+          return { isDirectory: () => true };
+        },
+      },
+      withUnavailableWorkspace: async (
+        root: string,
+        path: string,
+        observe: () => Promise<void>,
+      ) => {
+        expect(root).toBe("/private-owned-root");
+        expect(path).toBe(selected.path);
+        await observe();
+        calls.push("restored");
+      },
+      owner: {
+        until: async (read: () => Promise<boolean>) => {
+          expect(await read()).toBe(true);
+        },
+      },
+      browser: {
+        $: () => ({
+          isExisting: async () => true,
+          getText: async () =>
+            "Delivery uncertain\nThe worktree directory is missing. Git registration remains.",
+        }),
+      },
+    },
+  );
+  await run();
+  expect(calls).toContain("restored");
+});
+
+it.each([
+  "selected",
+  "no-project",
+  "ambiguous-project",
+  "no-selected-card",
+  "unsafe-git",
+  "wrong-tooltip",
+  "selection-changed",
+])("creates and binds a real managed-worktree UI flow before delivery: %s", async (mode) => {
+  const phases: string[] = [],
+    clicks: string[] = [];
+  let headerHovered = false,
+    branchHovered = false,
+    modelSelected = false,
+    created = false,
+    named = false;
+  const identity = {
+    path: "/owned/run/worktrees/selected",
+    branch: "codex/delivery-retry-light",
+    commonDirectory: "/owned/run/project/.git",
+  };
+  const selectedReader = () => null;
+  const browser = {
+    $$: () => ({
+      length: Promise.resolve(mode === "no-project" ? 0 : mode === "ambiguous-project" ? 2 : 1),
+    }),
+    $: (selector: string) => ({
+      moveTo: async () => {
+        if (selector.includes("group/project-header")) headerHovered = true;
+        else branchHovered = true;
+      },
+      waitForDisplayed: async (options?: { reverse?: boolean }) => {
+        if (options?.reverse) expect(created).toBe(true);
+      },
+      setValue: async (value: string) => {
+        expect(value).toBe(identity.branch);
+        named = true;
+      },
+    }),
+    execute: async (read: unknown, input: unknown) => {
+      if (read === selectedReader) {
+        expect(created).toBe(true);
+        return mode === "no-selected-card"
+          ? null
+          : { threadId: modelSelected && mode === "selection-changed" ? "other" : "owned-thread" };
+      }
+      expect(branchHovered).toBe(true);
+      expect(input).toBe("Worktree: selected (codex/delivery-retry-light)");
+      return mode !== "wrong-tooltip";
+    },
+  };
+  const start = controller.indexOf("  async function createOwnedWorkspace(");
+  const end = controller.indexOf("  async function type(", start);
+  expect(start).toBeGreaterThan(0);
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(controller.slice(start, end) + "\ncreateOwnedWorkspace"),
+    {
+      theme: "light",
+      origin: "http://127.0.0.1:4885",
+      config: { fixture: "/owned" },
+      NodePath: { join: (...parts: string[]) => parts.join("/"), basename: () => "selected" },
+      step: (name: string) => phases.push(name),
+      b: () => browser,
+      check: (value: unknown) => {
+        if (!value) throw new Error("Owned refusal.");
+      },
+      click: async (selector: string) => {
+        expect(headerHovered).toBe(true);
+        clicks.push(selector);
+        if (selector.includes("starts-with")) {
+          expect(named).toBe(true);
+          created = true;
+        }
+      },
+      owner: {
+        until: async (read: () => Promise<boolean>) => {
+          if (!(await read())) throw new Error("Owned refusal.");
+        },
+      },
+      readSelectedDeliveryWorktree: selectedReader,
+      readOwnedDeliveryWorktree: (input: Record<string, unknown>) => {
+        expect(input).toMatchObject({
+          root: "/owned/run",
+          project: "/owned/run/project",
+          home: "/owned/run/home",
+          git: "/owned/bin/git",
+          branch: identity.branch,
+        });
+        if (mode === "unsafe-git") throw new Error("Owned refusal.");
+        return identity;
+      },
+      selectClaudeModel: async (scope: string) => {
+        expect(scope).toBe("worktree");
+        modelSelected = true;
+      },
+    },
+  );
+  const execute = () =>
+    run(
+      { projectPath: "/owned/run/project", fixtureUserHomePath: "/owned/run/home" },
+      "/owned/run",
+    );
+  if (mode === "selected") {
+    expect(await execute()).toEqual({ ...identity, threadId: "owned-thread" });
+    expect(phases.at(-1)).toBe("worktree-ready");
+    expect(modelSelected).toBe(true);
+    expect(clicks).toHaveLength(2);
+  } else {
+    await expect(execute()).rejects.toThrow("Owned refusal.");
+    if (mode === "no-project" || mode === "ambiguous-project") expect(clicks).toEqual([]);
+  }
+  expect(phases.every((phase) => /^worktree-[a-z-]+$/.test(phase))).toBe(true);
+});
+
 function importBoundary(
   options: {
     selectedLabel?: string | null;

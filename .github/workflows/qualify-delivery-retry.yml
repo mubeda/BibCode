@@ -36,7 +36,7 @@ jobs:
           python3 -B scripts/qualify-chat-uploads.test.py
           python3 -B scripts/qualify-chat-network.test.py
           python3 -B scripts/qualify-chat-uploads.py preflight
-          vp test run scripts/qualify-delivery-retry-workflow.test.ts apps/desktop/e2e/support/provider-shims.test.ts apps/desktop/e2e/support/qualification-owner.test.ts apps/desktop/e2e/support/remote-ui-evidence.test.ts apps/desktop/e2e/support/delivery-retry-evidence.test.ts apps/desktop/e2e/support/delivery-retry-flow.test.ts apps/desktop/e2e/support/delivery-retry-controller.test.ts apps/desktop/e2e/support/browser-network.test.ts
+          vp test run scripts/qualify-delivery-retry-workflow.test.ts apps/desktop/e2e/support/provider-shims.test.ts apps/desktop/e2e/support/qualification-owner.test.ts apps/desktop/e2e/support/remote-ui-evidence.test.ts apps/desktop/e2e/support/delivery-retry-evidence.test.ts apps/desktop/e2e/support/delivery-retry-flow.test.ts apps/desktop/e2e/support/delivery-retry-controller.test.ts apps/desktop/e2e/support/delivery-retry-workspace.test.ts apps/desktop/e2e/support/browser-network.test.ts
       - name: Build the source UI once with owned loopback targets
         env:
           VITE_WS_URL: ws://127.0.0.1:4885
