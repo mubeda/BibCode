@@ -224,58 +224,71 @@ export function readNetworkCommandResult(failed: boolean, output: string): Netwo
   throw new NetworkSetupFailure(failure);
 }
 
-/** Actual browser observations gate setup and navigation; this never writes browser/app state. */
-export async function ensureBrowserOnline(port: {
-  readonly readOnline: () => Promise<unknown>;
+/** Prepare the fresh owned namespace before any browser or service exists. */
+export async function prepareNetworkBeforeBrowser(port: {
   readonly setup: () => Promise<NetworkContainmentProof>;
   readonly now: () => number;
-  readonly sleep: (ms: number) => Promise<void>;
 }): Promise<BrowserNetworkProof> {
   const started = port.now();
-  let before: boolean | null = null,
-    after: boolean | null = null;
-  let setupRan = false;
   let containment: NetworkContainmentProof | null = null;
   let setupFailure: NetworkFailureProof | null = null;
   const proof = (): BrowserNetworkProof => ({
-    before,
-    after,
-    setupRan,
+    before: null,
+    after: null,
+    setupRan: true,
     containment,
     setupFailure,
     elapsedMs: Math.max(0, Math.floor(port.now() - started)),
   });
-  const observe = async () => {
-    const value = await port.readOnline();
-    if (typeof value !== "boolean") throw new Error("Browser connectivity observation refused.");
-    return value;
-  };
   try {
-    before = await observe();
-    after = before;
-    if (before) return proof();
-    setupRan = true;
-    containment = await port.setup();
-    const deadline = port.now() + 10_000;
-    while (true) {
-      after = await observe();
-      if (port.now() > deadline) throw new Error("Browser connectivity observation refused.");
-      if (after) return proof();
-      const remaining = deadline - port.now();
-      if (remaining <= 0) throw new Error("Browser connectivity observation refused.");
-      await port.sleep(Math.min(100, remaining));
-    }
+    containment = parseNetworkProof(JSON.stringify(await port.setup()));
+    return proof();
   } catch (error) {
-    if (setupRan && containment === null) {
-      setupFailure = projectNetworkFailure(unknownNetworkFailure);
-      if (error instanceof NetworkSetupFailure) {
-        try {
-          setupFailure = projectNetworkFailure(error.failure);
-        } catch {
-          /* Unknown proof stays closed. */
-        }
+    setupFailure = projectNetworkFailure(unknownNetworkFailure);
+    if (error instanceof NetworkSetupFailure) {
+      try {
+        setupFailure = projectNetworkFailure(error.failure);
+      } catch {
+        /* Unknown stays closed. */
       }
     }
+    throw new BrowserConnectivityFailure(proof());
+  }
+}
+
+/** One actual read, with no topology mutation, fallback, sleep or retry after browser creation. */
+export async function verifyPreparedBrowserOnline(
+  prepared: BrowserNetworkProof,
+  port: {
+    readonly readOnline: () => Promise<unknown>;
+    readonly now: () => number;
+    readonly startedAt: number;
+  },
+): Promise<BrowserNetworkProof> {
+  let after: boolean | null = null;
+  const proof = (): BrowserNetworkProof => ({
+    before: null,
+    after,
+    setupRan: prepared.setupRan,
+    containment: prepared.containment,
+    setupFailure: prepared.setupFailure,
+    elapsedMs: Math.max(0, Math.floor(port.now() - port.startedAt)),
+  });
+  try {
+    if (
+      prepared.before !== null ||
+      prepared.after !== null ||
+      !prepared.setupRan ||
+      prepared.containment === null ||
+      prepared.setupFailure !== null
+    )
+      throw new Error("Prepared browser observation refused.");
+    const value = await port.readOnline();
+    if (typeof value !== "boolean") throw new Error("Prepared browser observation refused.");
+    after = value;
+    if (!after) throw new Error("Prepared browser observation refused.");
+    return proof();
+  } catch {
     throw new BrowserConnectivityFailure(proof());
   }
 }

@@ -200,3 +200,30 @@ the unauthenticated page observation, so there is no capture-to-login boundary.
 
 Prepared inert validation does not qualify startup or upload natively. Parent
 review/activation and the next actual closed evidence are still required.
+
+Startup-only run `37089272748` at `9a3a` retained seven actual
+`Network.loadingFailed` events, all classified network-changed (six scripts and
+one other), with available/nontruncated/nonmalformed capture. The browser remained
+actually online; a TypeError rejection carried the fixed dynamic-import failure
+marker and the original boot shell persisted. Ownership/guard/cleanup proofs
+passed. This supports changing when the fixture topology is prepared; it does
+not justify a wait increase, IPv6/address adjustment or product startup change.
+
+The same contained helper now runs before any owned server, proxy, browser driver
+or Chrome is created. Its ownership, baseline, capability, reciprocal link,
+address/route predicates and exact ip commands are unchanged. After Chrome
+starts, one actual read must return online; no helper, mutation, repair fallback,
+sleep or retry runs at that boundary. Both qualification modes use this order.
+
+The existing closed `networkProof` fields remain compatible, but `before` is now
+null: browser online state was unobserved before setup because no browser existed.
+Preparation has `after:null`; successful browser verification sets actual
+`after:true`, while offline/invalid observations retain false/null and fail.
+It must not be presented as an observed false-to-true browser transition. The
+elapsed proof interval includes preparation and intervening service/browser
+startup through that single verification. Setup refusal prevents service/browser
+admission, and the existing PID1 owner still tears down the private namespace.
+
+Actual-controller ordering and honest proof controls are inert validation only.
+No new native success/cause completion or upload qualification is claimed before
+the reviewed next run.

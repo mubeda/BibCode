@@ -9,7 +9,8 @@ import * as NodePath from "node:path";
 import { remote } from "webdriverio";
 import {
   BrowserConnectivityFailure,
-  ensureBrowserOnline,
+  prepareNetworkBeforeBrowser,
+  verifyPreparedBrowserOnline,
   readNetworkCommandResult,
   NetworkSetupFailure,
   type BrowserNetworkProof,
@@ -278,6 +279,51 @@ const cleanupFailures: Array<{
 }> = [];
 let beforeCleanup: ReturnType<typeof projectQualificationProcess>[] = [];
 try {
+  const networkStartedAt = performance.now();
+  phase("prepare-contained-network");
+  networkProof = await prepareNetworkBeforeBrowser({
+    now: () => performance.now(),
+    setup: () =>
+      new Promise((resolve, reject) => {
+        const python = process.env.BIBCODE_UPLOAD_PYTHON;
+        const helper = process.env.BIBCODE_UPLOAD_NETWORK_HELPER;
+        if (
+          !python ||
+          !NodePath.isAbsolute(python) ||
+          helper !== NodePath.join(root, "scripts/qualify-chat-uploads.py")
+        ) {
+          reject(
+            new NetworkSetupFailure({
+              stage: "helper-config",
+              attemptedMutations: 0,
+              completedMutations: 0,
+              netAdminEffective: null,
+              lastCommand: null,
+            }),
+          );
+          return;
+        }
+        // execFile joins the short-lived helper; PID1 retains authority over all command descendants.
+        NodeChildProcess.execFile(
+          python,
+          [helper, "network"],
+          {
+            env: process.env,
+            timeout: 30_000,
+            killSignal: "SIGTERM",
+            maxBuffer: 4096,
+            encoding: "utf8",
+          },
+          (error, stdout) => {
+            try {
+              resolve(readNetworkCommandResult(error !== null, stdout));
+            } catch (failure) {
+              reject(failure);
+            }
+          },
+        );
+      }),
+  });
   const environments = prepareEnvironments();
   phase("start-owned-servers");
   for (const environment of environments) {
@@ -422,54 +468,14 @@ try {
     source: observationScript,
   });
   phase("observe-browser-connectivity");
-  networkProof = await ensureBrowserOnline({
+  networkProof = await verifyPreparedBrowserOnline(networkProof, {
     readOnline: () =>
       bounded(
         b.execute(() => navigator.onLine),
         2_000,
       ),
     now: () => performance.now(),
-    sleep: delay,
-    setup: () =>
-      new Promise((resolve, reject) => {
-        const python = process.env.BIBCODE_UPLOAD_PYTHON;
-        const helper = process.env.BIBCODE_UPLOAD_NETWORK_HELPER;
-        if (
-          !python ||
-          !NodePath.isAbsolute(python) ||
-          helper !== NodePath.join(root, "scripts/qualify-chat-uploads.py")
-        ) {
-          reject(
-            new NetworkSetupFailure({
-              stage: "helper-config",
-              attemptedMutations: 0,
-              completedMutations: 0,
-              netAdminEffective: null,
-              lastCommand: null,
-            }),
-          );
-          return;
-        }
-        // execFile joins the short-lived helper; PID1 retains authority over all command descendants.
-        NodeChildProcess.execFile(
-          python,
-          [helper, "network"],
-          {
-            env: process.env,
-            timeout: 30_000,
-            killSignal: "SIGTERM",
-            maxBuffer: 4096,
-            encoding: "utf8",
-          },
-          (error, stdout) => {
-            try {
-              resolve(readNetworkCommandResult(error !== null, stdout));
-            } catch (failure) {
-              reject(failure);
-            }
-          },
-        );
-      }),
+    startedAt: networkStartedAt,
   });
   const plain = environments[0]!;
   if (qualificationMode === "startup-only") {

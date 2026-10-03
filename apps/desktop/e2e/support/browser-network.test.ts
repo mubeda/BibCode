@@ -1,7 +1,13 @@
+// @effect-diagnostics nodeBuiltinImport:off - Inert qualification tests inspect their actual controller source.
+import * as NodeFS from "node:fs";
+import * as NodeVM from "node:vm";
+import * as NodeModule from "node:module";
+import * as NodePath from "node:path";
 import { expect, it, vi } from "vite-plus/test";
 import {
   BrowserConnectivityFailure,
-  ensureBrowserOnline,
+  prepareNetworkBeforeBrowser,
+  verifyPreparedBrowserOnline,
   parseNetworkProof,
   parseNetworkFailure,
   NetworkSetupFailure,
@@ -19,6 +25,108 @@ const containment = {
   interfaceCount: 3,
   elapsedMs: 1,
 } as const;
+
+it.each(["online", "offline", "setup-refused"])(
+  "actual controller orders contained preparation and refuses safely: %s",
+  async (outcome) => {
+    const source = NodeFS.readFileSync(
+      new URL("../qualify-chat-uploads.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf("try {\n", source.indexOf("let beforeCleanup:"));
+    const end = source.indexOf("  const plain = environments[0]!;", start);
+    expect(start).toBeGreaterThan(0);
+    const calls: string[] = [];
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function controller() {" +
+          source.slice(start + "try {".length, end) +
+          "}\ncontroller",
+      ),
+      {
+        prepareEnvironments: () => {
+          calls.push("fixture");
+          return [
+            {
+              kind: "plain",
+              serverPort: 4902,
+              proxyPort: 4903,
+              context: { stateRoot: "/owned/state" },
+              env: {},
+            },
+          ];
+        },
+        phase: () => {},
+        spawn: (_command: string, _args: unknown, _env: unknown, role: string) => {
+          calls.push(role);
+        },
+        until: async () => {},
+        bounded: (promise: Promise<unknown>) => promise,
+        startThrottleProxy: async () => ({}),
+        proxies: [],
+        process: {
+          execPath: "/owned/node",
+          env: {
+            BIBCODE_UPLOAD_PYTHON: "/owned/python",
+            BIBCODE_UPLOAD_NETWORK_HELPER: "/owned/scripts/qualify-chat-uploads.py",
+          },
+        },
+        NodePath,
+        root: "/owned",
+        serverBinary: "/owned/server",
+        webOrigin: "http://localhost:4901",
+        webEnv: {},
+        driver: "/owned/driver",
+        chrome: "/owned/chrome",
+        fixtureRoot: "/owned/fixture",
+        qualificationMode: "startup-only",
+        observationScript: "",
+        networkProof: null,
+        remote: async () => {
+          calls.push("browser");
+          return {
+            sendCommandAndGetResult: async () => {},
+            execute: async () => {
+              calls.push("online");
+              return outcome !== "offline";
+            },
+          };
+        },
+        performance: { now: () => 0 },
+        delay: async () => {},
+        prepareNetworkBeforeBrowser,
+        verifyPreparedBrowserOnline,
+        NodeChildProcess: {
+          execFile: (
+            _program: string,
+            _args: unknown,
+            _options: unknown,
+            callback: (error: Error | null, stdout: string) => void,
+          ) => {
+            calls.push("setup");
+            callback(
+              outcome === "setup-refused" ? new Error("private") : null,
+              outcome === "setup-refused" ? "invalid-private-proof" : JSON.stringify(containment),
+            );
+          },
+        },
+        readNetworkCommandResult,
+        NetworkSetupFailure,
+      },
+    );
+    if (outcome === "online") await run();
+    else await expect(run()).rejects.toBeInstanceOf(BrowserConnectivityFailure);
+    expect(calls[0]).toBe("setup");
+    if (outcome === "setup-refused") {
+      expect(calls).toEqual(["setup"]);
+    } else {
+      expect(calls.indexOf("setup")).toBeLessThan(calls.indexOf("plain"));
+      expect(calls.indexOf("setup")).toBeLessThan(calls.indexOf("browser"));
+      expect(calls.filter((value) => value === "online")).toHaveLength(1);
+    }
+    expect(calls.filter((value) => value === "setup")).toHaveLength(1);
+  },
+);
 function fixture(values: unknown[]) {
   let time = 0;
   return {
@@ -30,62 +138,65 @@ function fixture(values: unknown[]) {
     }),
   };
 }
-it("already online skips every helper/network mutation", async () => {
+it("prepares once before a browser exists and reports its online state unobserved", async () => {
   const f = fixture([true]);
-  const proof = await ensureBrowserOnline(f);
-  expect(f.setup).not.toHaveBeenCalled();
+  const prepared = await prepareNetworkBeforeBrowser(f);
+  expect(prepared).toMatchObject({ before: null, after: null, setupRan: true, containment });
+  expect(f.setup).toHaveBeenCalledOnce();
+  expect(f.readOnline).not.toHaveBeenCalled();
   expect(f.sleep).not.toHaveBeenCalled();
-  expect(proof).toMatchObject({ before: true, after: true, setupRan: false, containment: null });
-});
-it("only actual offline invokes setup once and waits for true before navigation", async () => {
-  const f = fixture([false, false, true]);
-  const navigate = vi.fn();
-  await ensureBrowserOnline(f).then(navigate);
-  expect(f.setup).toHaveBeenCalledOnce();
-  expect(f.readOnline).toHaveBeenCalledTimes(3);
-  expect(navigate).toHaveBeenCalledWith(
-    expect.objectContaining({ before: false, after: true, setupRan: true, containment }),
-  );
-});
-it("offline deadline fails closed without navigation or repeat setup", async () => {
-  const f = fixture([false]);
-  const navigate = vi.fn();
-  let failure: unknown;
-  try {
-    await ensureBrowserOnline(f).then(navigate);
-  } catch (error) {
-    failure = error;
-  }
-  expect(failure).toBeInstanceOf(BrowserConnectivityFailure);
-  expect((failure as BrowserConnectivityFailure).proof).toMatchObject({
-    before: false,
-    after: false,
-    setupRan: true,
-    elapsedMs: 10000,
+  const proof = await verifyPreparedBrowserOnline(prepared, {
+    readOnline: f.readOnline,
+    now: f.now,
+    startedAt: 0,
   });
+  expect(proof).toMatchObject({ before: null, after: true, setupRan: true, containment });
+  expect(JSON.parse(JSON.stringify(proof)).before).toBeNull();
+  expect(f.readOnline).toHaveBeenCalledOnce();
   expect(f.setup).toHaveBeenCalledOnce();
-  expect(navigate).not.toHaveBeenCalled();
 });
-it.each([undefined, null, "false", 0, {}])(
-  "invalid online observation %s never mutates",
+it.each([false, undefined, null, "false", 0, {}])(
+  "post-creation online observation %s never repairs or retries",
   async (value) => {
     const f = fixture([value]);
-    await expect(ensureBrowserOnline(f)).rejects.toBeInstanceOf(BrowserConnectivityFailure);
-    expect(f.setup).not.toHaveBeenCalled();
+    const prepared = await prepareNetworkBeforeBrowser(f);
+    let failure: unknown;
+    try {
+      await verifyPreparedBrowserOnline(prepared, {
+        readOnline: f.readOnline,
+        now: f.now,
+        startedAt: 0,
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(BrowserConnectivityFailure);
+    expect((failure as BrowserConnectivityFailure).proof).toMatchObject({
+      before: null,
+      after: value === false ? false : null,
+      setupRan: true,
+      setupFailure: null,
+    });
+    expect(f.setup).toHaveBeenCalledOnce();
+    expect(f.readOnline).toHaveBeenCalledOnce();
+    expect(f.sleep).not.toHaveBeenCalled();
   },
 );
-it("setup and post-setup observation failures retain only projected safe evidence", async () => {
-  const f = fixture([false]);
+it("failed preparation never observes or starts a browser and retains only closed failure", async () => {
+  const f = fixture([true]);
   f.setup.mockRejectedValueOnce(new Error("credential-secret raw routes"));
   try {
-    await ensureBrowserOnline(f);
+    await prepareNetworkBeforeBrowser(f);
   } catch (error) {
     expect(JSON.stringify(error)).not.toContain("credential-secret");
-    expect((error as BrowserConnectivityFailure).proof.setupRan).toBe(true);
+    expect((error as BrowserConnectivityFailure).proof).toMatchObject({
+      before: null,
+      after: null,
+      setupRan: true,
+      containment: null,
+    });
   }
-  await expect(ensureBrowserOnline(fixture([false, "true"]))).rejects.toBeInstanceOf(
-    BrowserConnectivityFailure,
-  );
+  expect(f.readOnline).not.toHaveBeenCalled();
 });
 it("proof decoder refuses extra fields, false containment and unbounded numeric values", () => {
   expect(parseNetworkProof(JSON.stringify(containment))).toEqual(containment);
@@ -96,21 +207,6 @@ it("proof decoder refuses extra fields, false containment and unbounded numeric 
     { ...containment, interfaceCount: 4 },
   ])
     expect(() => parseNetworkProof(JSON.stringify(value))).toThrow();
-});
-
-it("does not navigate when true arrives after the observation deadline", async () => {
-  const f = fixture([false]);
-  f.readOnline
-    .mockImplementationOnce(async () => false)
-    .mockImplementationOnce(async () => {
-      await f.sleep(10_001);
-      return true;
-    });
-  const navigate = vi.fn();
-  await expect(ensureBrowserOnline(f).then(navigate)).rejects.toBeInstanceOf(
-    BrowserConnectivityFailure,
-  );
-  expect(navigate).not.toHaveBeenCalled();
 });
 
 const refusal = {
@@ -128,7 +224,7 @@ it("retains strict helper refusal stage/counts/status through the existing brows
     ),
   );
   try {
-    await ensureBrowserOnline(f);
+    await prepareNetworkBeforeBrowser(f);
   } catch (error) {
     expect((error as BrowserConnectivityFailure).proof.setupFailure).toEqual(refusal);
     expect((error as BrowserConnectivityFailure).proof.containment).toBeNull();
@@ -152,7 +248,7 @@ it("does not retain foreign fields added to a typed helper exception", async () 
   Object.assign(failure.failure, { path: "secret" });
   f.setup.mockRejectedValueOnce(failure);
   try {
-    await ensureBrowserOnline(f);
+    await prepareNetworkBeforeBrowser(f);
   } catch (error) {
     expect(JSON.stringify(error)).not.toContain("secret");
     expect((error as BrowserConnectivityFailure).proof.setupFailure).toEqual(refusal);
@@ -176,7 +272,7 @@ it("projects nonzero helper stdout into the browser receipt and malformed output
     const f = fixture([false]);
     f.setup.mockImplementationOnce(async () => readNetworkCommandResult(true, output));
     try {
-      await ensureBrowserOnline(f);
+      await prepareNetworkBeforeBrowser(f);
     } catch (error) {
       expect((error as BrowserConnectivityFailure).proof.setupFailure).toEqual(expected);
       expect(JSON.stringify(error)).not.toContain("secret");
