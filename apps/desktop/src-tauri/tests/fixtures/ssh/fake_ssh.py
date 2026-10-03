@@ -256,9 +256,25 @@ def main():
         script_path = os.path.join(state, "stdin-%d.sh" % os.getpid())
         with open(script_path, "w") as handle:
             handle.write(script)
-        replay = os.open(script_path, os.O_RDONLY)
-        os.dup2(replay, 0)
-        os.close(replay)
+        # OpenSSH delivers stdin as a stream. A regular file shares seek state
+        # across shell forks; macOS sh can replay a comment suffix after its
+        # background launch. Keep the fake's exec ownership and replay a pipe.
+        payload = script.encode()
+        reader, writer = os.pipe()
+        feeder = os.fork()
+        if feeder == 0:
+            os.close(reader)
+            try:
+                while payload:
+                    payload = payload[os.write(writer, payload):]
+            except BrokenPipeError:
+                pass
+            finally:
+                os.close(writer)
+                os._exit(0)
+        os.close(writer)
+        os.dup2(reader, 0)
+        os.close(reader)
 
     user = os.environ.get("USER", "fixture")
     environment = {
@@ -272,6 +288,10 @@ def main():
         "SSH_FIXTURE_BIBCODE": real,
         "SSH_FIXTURE_HANG_PAIRING": "1" if alias.startswith("hang-pairing") else "0",
     }
+    # Preserve the explicitly selected dev-guard diagnostic mode for the owned
+    # remote CLI; production SSH scripts do not manage this test-only variable.
+    if "BIBCODE_HERMETIC_GUARD" in os.environ:
+        environment["BIBCODE_HERMETIC_GUARD"] = os.environ["BIBCODE_HERMETIC_GUARD"]
     if not remote:
         return fail("fake ssh: interactive sessions are not supported")
     if sshd_sessions:

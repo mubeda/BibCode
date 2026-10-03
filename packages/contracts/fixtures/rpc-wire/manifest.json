@@ -1297,6 +1297,8 @@
     "contract-shapes/server__getProcessDiagnostics-success.json",
     "contract-shapes/server__getProcessResourceHistory-success.json",
     "contract-shapes/server__signalProcess-request.json",
+    "contract-shapes/subscribeVcsStatus__fell-behind-live-failure.json",
+    "contract-shapes/subscribeVcsStatus__fell-behind-setup-failure.json",
     "contract-shapes/terminal__beginInput-request.json",
     "contract-shapes/terminal__open-provider-activity-request.json",
     "contract-shapes/terminal__open-without-provider-activity-request.json",

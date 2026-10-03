@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off - Cross-language parity reads generated RPC fixtures.
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+
 import {
   EnvironmentId,
   GitCommandError,
@@ -12,6 +16,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
@@ -28,6 +33,7 @@ import { isAtomCommandInterrupted, runAtomCommand } from "./runtime.ts";
 import { createVcsEnvironmentAtoms } from "./vcs.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
+const decodeGitCommandError = Schema.decodeUnknownSync(GitCommandError);
 const TARGET = {
   environmentId: ENVIRONMENT_ID,
   input: { cwd: "/repo" },
@@ -123,17 +129,28 @@ function waitFor(predicate: () => boolean, message: string) {
   });
 }
 
-describe("VCS status atoms", () => {
-  const fellBehind = new GitCommandError({
-    operation: "GitStatusBroadcaster.fellBehind",
-    command: "git",
-    cwd: "/repo",
-    detail: "The Git status stream fell behind. Subscribe again.",
-  });
+function readFellBehindFailure(kind: "live" | "setup"): GitCommandError {
+  const fixture = JSON.parse(
+    NodeFS.readFileSync(
+      NodePath.resolve(
+        import.meta.dirname,
+        "../../../contracts/fixtures/rpc-wire/contract-shapes",
+        `subscribeVcsStatus__fell-behind-${kind}-failure.json`,
+      ),
+      "utf8",
+    ),
+  ) as {
+    readonly exit: { readonly cause: readonly [{ readonly error: unknown }] };
+  };
+  return decodeGitCommandError(fixture.exit.cause[0].error);
+}
 
-  it.effect(
-    "retains its last status through a fell-behind retry and replaces it with the snapshot",
-    () =>
+describe("VCS status atoms", () => {
+  const fellBehind = readFellBehindFailure("live");
+
+  it.effect.each(["live", "setup"] as const)(
+    "retains its last status through a %s fell-behind wire failure and replaces it with the snapshot",
+    (kind) =>
       Effect.gen(function* () {
         let calls = 0;
         const failure = yield* Deferred.make<never, GitCommandError>();
@@ -164,7 +181,7 @@ describe("VCS status atoms", () => {
           observed.push(value._tag),
         );
 
-        yield* Deferred.fail(failure, fellBehind);
+        yield* Deferred.fail(failure, readFellBehindFailure(kind));
         for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
         yield* TestClock.adjust(249);
         expect(calls).toBe(1);

@@ -41,7 +41,29 @@ function makeToolDirectory(): string {
   temporaryDirectories.push(directory);
   NodeFS.copyFileSync(WRAPPER_SOURCE, NodePath.join(directory, "linuxdeploy-plugin-gtk.sh"));
   NodeFS.chmodSync(NodePath.join(directory, "linuxdeploy-plugin-gtk.sh"), 0o755);
+  NodeFS.mkdirSync(NodePath.join(directory, "loaders"));
+  NodeFS.writeFileSync(
+    NodePath.join(directory, "pkg-config"),
+    '#!/bin/sh\n[ "$*" = "--variable=gdk_pixbuf_moduledir gdk-pixbuf-2.0" ] || exit 64\nprintf "%s/loaders\\n" "$(dirname -- "$0")"\n',
+    { mode: 0o755 },
+  );
   return directory;
+}
+
+function runWrapper(
+  directory: string,
+  args: string[],
+  options: NodeChildProcess.SpawnSyncOptionsWithStringEncoding = { encoding: "utf8" },
+) {
+  return NodeChildProcess.spawnSync(NodePath.join(directory, "linuxdeploy-plugin-gtk.sh"), args, {
+    ...options,
+    env: {
+      ...process.env,
+      ...options.env,
+      PATH: `${directory}${NodePath.delimiter}${options.env?.PATH ?? process.env.PATH ?? ""}`,
+    },
+    timeout: 10_000,
+  });
 }
 
 function writeUpstream(directory: string, source: string): void {
@@ -54,6 +76,63 @@ afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     NodeFS.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+// These preflight cases exit before the Linux-only GNU sed hook rewrite, so
+// macOS can also exercise the real shell's error and discovery paths.
+// oxlint-disable-next-line bibcode/no-global-process-runtime -- Requires a Unix shell.
+describe.skipIf(process.platform === "win32")("GdkPixbuf build-host preflight", () => {
+  it("rejects an advertised but absent loader directory before the upstream plugin mutates the AppDir", () => {
+    const directory = makeToolDirectory();
+    const loaders = NodePath.join(directory, "loaders");
+    NodeFS.rmdirSync(loaders);
+    writeUpstream(directory, '#!/bin/sh\ntouch "$0.called"\nexit 23\n');
+
+    const result = runWrapper(directory, ["--appdir", NodePath.join(directory, "app")]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(loaders);
+    expect(result.stderr).toContain("Ubuntu 22.04");
+    expect(result.stderr).toContain("docs/testing/linux-desktop.md");
+    expect(NodeFS.existsSync(NodePath.join(directory, `${UPSTREAM_FILENAME}.called`))).toBe(false);
+    expect(NodeFS.existsSync(loaders)).toBe(false);
+  });
+
+  it("passes a supported loader layout to the pinned plugin without hiding its failure", () => {
+    const directory = makeToolDirectory();
+    writeUpstream(directory, '#!/bin/sh\ntouch "$0.called"\nexit 23\n');
+
+    const result = runWrapper(directory, [`--appdir=${NodePath.join(directory, "app")}`]);
+
+    expect(result.status).toBe(23);
+    expect(NodeFS.existsSync(NodePath.join(directory, `${UPSTREAM_FILENAME}.called`))).toBe(true);
+  });
+
+  it("diagnoses missing GdkPixbuf metadata without manufacturing a loader directory", () => {
+    const directory = makeToolDirectory();
+    writeUpstream(directory, '#!/bin/sh\ntouch "$0.called"\nexit 23\n');
+    NodeFS.writeFileSync(NodePath.join(directory, "pkg-config"), "#!/bin/sh\nexit 2\n");
+
+    const result = runWrapper(directory, ["--appdir", NodePath.join(directory, "app")]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("GdkPixbuf build metadata");
+    expect(NodeFS.existsSync(NodePath.join(directory, `${UPSTREAM_FILENAME}.called`))).toBe(false);
+  });
+
+  it("preserves plugin discovery without requiring GTK development libraries", () => {
+    const directory = makeToolDirectory();
+    NodeFS.writeFileSync(NodePath.join(directory, "pkg-config"), "#!/bin/sh\nexit 2\n");
+    writeUpstream(
+      directory,
+      '#!/bin/sh\n[ "$1" = "--plugin-api-version" ] || exit 91\nprintf "0\\n"\n',
+    );
+
+    const result = runWrapper(directory, ["--plugin-api-version"]);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("0\n");
+  });
 });
 
 // oxlint-disable-next-line bibcode/no-global-process-runtime -- This integration test runs a Linux shell wrapper.
@@ -101,14 +180,10 @@ ${UPSTREAM_HOOK}HOOK
       const appdirArguments =
         argumentForm === "separate" ? ["--appdir", appDirectory] : [`--appdir=${appDirectory}`];
 
-      const result = NodeChildProcess.spawnSync(
-        NodePath.join(toolDirectory, "linuxdeploy-plugin-gtk.sh"),
-        [...appdirArguments, "--output", "appimage"],
-        {
-          encoding: "utf8",
-          env: { ...process.env, FAKE_PLUGIN_MARKER: markerPath },
-        },
-      );
+      const result = runWrapper(toolDirectory, [...appdirArguments, "--output", "appimage"], {
+        encoding: "utf8",
+        env: { ...process.env, FAKE_PLUGIN_MARKER: markerPath },
+      });
 
       expect(result.status, result.stderr).toBe(0);
       expect(NodeFS.readFileSync(markerPath, "utf8")).toBe(
@@ -147,11 +222,7 @@ ${UPSTREAM_HOOK}HOOK
     NodeFS.writeFileSync(hookPath, UPSTREAM_HOOK);
     writeUpstream(toolDirectory, "#!/usr/bin/env bash\nexit 0\n");
 
-    const result = NodeChildProcess.spawnSync(
-      NodePath.join(toolDirectory, "linuxdeploy-plugin-gtk.sh"),
-      ["--appdir", appDirectory],
-      { encoding: "utf8" },
-    );
+    const result = runWrapper(toolDirectory, ["--appdir", appDirectory], { encoding: "utf8" });
 
     expect(result.status, result.stderr).toBe(0);
     expect(NodeFS.readFileSync(hookPath, "utf8")).toBe(REWRITTEN_HOOK);
@@ -199,11 +270,7 @@ ${UPSTREAM_HOOK}HOOK
         { mode: 0o755 },
       );
       writeUpstream(toolDirectory, "#!/usr/bin/env bash\nexit 0\n");
-      const rewrite = NodeChildProcess.spawnSync(
-        NodePath.join(toolDirectory, "linuxdeploy-plugin-gtk.sh"),
-        ["--appdir", appDirectory],
-        { encoding: "utf8" },
-      );
+      const rewrite = runWrapper(toolDirectory, ["--appdir", appDirectory], { encoding: "utf8" });
       expect(rewrite.status, rewrite.stderr).toBe(0);
 
       for (const backend of [undefined, "x11"]) {
@@ -280,11 +347,7 @@ ${UPSTREAM_HOOK}HOOK
     writeUpstream(toolDirectory, "#!/usr/bin/env bash\nexit 0\n");
     const entriesBefore = NodeFS.readdirSync(appDirectory, { recursive: true }).sort();
 
-    const result = NodeChildProcess.spawnSync(
-      NodePath.join(toolDirectory, "linuxdeploy-plugin-gtk.sh"),
-      ["--appdir", appDirectory],
-      { encoding: "utf8" },
-    );
+    const result = runWrapper(toolDirectory, ["--appdir", appDirectory], { encoding: "utf8" });
 
     expect(result.status, result.stderr).toBe(1);
     expect(result.stderr).toContain("BiBCode AppImage packaging error");
@@ -317,11 +380,7 @@ exit 91
 `,
     );
 
-    const result = NodeChildProcess.spawnSync(
-      NodePath.join(toolDirectory, "linuxdeploy-plugin-gtk.sh"),
-      ["--plugin-api-version"],
-      { encoding: "utf8" },
-    );
+    const result = runWrapper(toolDirectory, ["--plugin-api-version"], { encoding: "utf8" });
 
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toBe("0\n");
@@ -335,11 +394,7 @@ exit 91
     NodeFS.writeFileSync(libraryPath, "preexisting");
     writeUpstream(toolDirectory, "#!/usr/bin/env bash\nexit 23\n");
 
-    const result = NodeChildProcess.spawnSync(
-      NodePath.join(toolDirectory, "linuxdeploy-plugin-gtk.sh"),
-      [`--appdir=${appDirectory}`],
-      { encoding: "utf8" },
-    );
+    const result = runWrapper(toolDirectory, [`--appdir=${appDirectory}`], { encoding: "utf8" });
 
     expect(result.status).toBe(23);
     expect(NodeFS.readFileSync(libraryPath, "utf8")).toBe("preexisting");

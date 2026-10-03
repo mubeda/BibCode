@@ -764,6 +764,77 @@ describe("useAddProjectWorkflowState", () => {
     expect(view.current.cloneParent).toBe("/home/me/code");
   });
 
+  it("browses a clone parent on the selected server and clones beneath the chosen folder", async () => {
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.selectHost(ENV_REMOTE));
+    act(() => view.current.openClone());
+    act(() => view.current.setCloneUrl("https://example.test/demo.git"));
+    act(() => view.current.setCloneParent("/srv/existing"));
+    await act(async () => view.current.pickCloneParent());
+
+    expect(view.current.step).toBe("clone-parent-browse");
+    expect(view.current.selectedHost.environmentId).toBe(ENV_REMOTE);
+    expect(view.current.cloneParent).toBe("/srv/existing");
+    expect(testState.pickFolder).not.toHaveBeenCalled();
+
+    await act(async () => view.current.selectBrowsedFolder("/srv/chosen"));
+    expect(view.current.step).toBe("clone");
+    expect(view.current.cloneUrl).toBe("https://example.test/demo.git");
+    expect(view.current.cloneParent).toBe("/srv/chosen");
+    expect(testState.operations.addFolder).not.toHaveBeenCalled();
+    await act(async () => view.current.submitClone());
+    expect(testState.operations.clone).toHaveBeenCalledWith(
+      expect.objectContaining({
+        environmentId: ENV_REMOTE,
+        url: "https://example.test/demo.git",
+        parentDir: "/srv/chosen",
+      }),
+    );
+  });
+
+  it("returns from parent browsing to the clone form without changing its input", async () => {
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.selectHost(ENV_REMOTE));
+    act(() => view.current.openClone());
+    act(() => view.current.setCloneUrl("https://example.test/demo.git"));
+    act(() => view.current.setCloneParent("/srv/entered"));
+    await act(async () => view.current.pickCloneParent());
+    act(() => view.current.back());
+
+    expect(view.current.step).toBe("clone");
+    expect(view.current.cloneUrl).toBe("https://example.test/demo.git");
+    expect(view.current.cloneParent).toBe("/srv/entered");
+    expect(testState.operations.addFolder).not.toHaveBeenCalled();
+    expect(testState.operations.clone).not.toHaveBeenCalled();
+  });
+
+  it("ignores a stale parent selection after changing the selected server", async () => {
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.selectHost(ENV_REMOTE));
+    act(() => view.current.openClone());
+    await act(async () => view.current.pickCloneParent());
+    const staleSelection = view.current.selectBrowsedFolder;
+    act(() => view.current.selectHost(ENV_PRIMARY));
+    act(() => view.current.openClone());
+    act(() => view.current.setCloneParent("/local/entered"));
+    await act(async () => staleSelection("/remote/stale"));
+
+    expect(view.current.selectedHost.environmentId).toBe(ENV_PRIMARY);
+    expect(view.current.step).toBe("clone");
+    expect(view.current.cloneParent).toBe("/local/entered");
+    expect(testState.operations.addFolder).not.toHaveBeenCalled();
+  });
+
+  it("browses clone parents for a primary browser client without native dialogs", async () => {
+    testState.hosts = [{ ...primaryHost, nativePickerAvailable: false }];
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.openClone());
+    await act(async () => view.current.pickCloneParent());
+
+    expect(view.current.step).toBe("clone-parent-browse");
+    expect(testState.pickFolder).not.toHaveBeenCalled();
+  });
+
   it("keeps a running clone on the form until Cancel interrupts it", async () => {
     const harness = makeIntegratedOperations();
     const signals = interruptibleClone(harness);

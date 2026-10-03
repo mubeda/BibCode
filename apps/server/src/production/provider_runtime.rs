@@ -12,6 +12,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[cfg(not(feature = "hermetic-test-guard"))]
+use crate::process::locate_executable;
 use crate::{
     activity::{
         ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher,
@@ -37,7 +39,7 @@ use crate::{
     persistence::{ProjectionThreadMessage, ProviderSessionRuntime, Repositories},
     process::{
         Platform, PreparedLaunch, configure_supervised_background_command_wrap,
-        launch_executable_extensions, locate_executable,
+        launch_executable_extensions,
         supervised::{
             SupervisedOverflow, SupervisedRunRequest, log_cleanup_failures, run_supervised,
             terminate_and_wait,
@@ -7083,13 +7085,28 @@ pub(crate) fn resolve_provider_executable_in_path(
     input: &str,
     search_path: Option<&OsStr>,
 ) -> Option<PathBuf> {
-    let path = PathBuf::from(input);
-    if path.is_file() {
-        return Some(path);
+    #[cfg(feature = "hermetic-test-guard")]
+    {
+        let cwd = std::env::current_dir().ok();
+        let extensions = launch_executable_extensions(Platform::current(), None);
+        crate::hermetic_guard::resolve_guarded_executable(
+            Path::new(input),
+            cwd.as_deref(),
+            search_path,
+            &extensions,
+            true,
+        )
     }
-    let cwd = std::env::current_dir().ok();
-    let extensions = launch_executable_extensions(Platform::current(), None);
-    locate_executable(input, cwd.as_deref(), search_path, &extensions)
+    #[cfg(not(feature = "hermetic-test-guard"))]
+    {
+        let path = PathBuf::from(input);
+        if path.is_file() {
+            return Some(path);
+        }
+        let cwd = std::env::current_dir().ok();
+        let extensions = launch_executable_extensions(Platform::current(), None);
+        locate_executable(input, cwd.as_deref(), search_path, &extensions)
+    }
 }
 
 pub(crate) fn prepare_provider_launch<I, S>(
@@ -7100,6 +7117,17 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    #[cfg(feature = "hermetic-test-guard")]
+    let executable = crate::hermetic_guard::checked_provider_executable(
+        executable,
+        std::env::current_dir().ok().as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+    .ok_or_else(|| {
+        "provider executable was not found or was refused by the hermetic test guard".to_owned()
+    })?;
+    #[cfg(feature = "hermetic-test-guard")]
+    let executable = executable.as_path();
     Ok(wrap_launch_program(Platform::current(), executable)?.prepare(arguments))
 }
 
@@ -21595,7 +21623,13 @@ printf '2.1.0 (Claude Code)\n'
                     "provider-fixture",
                     Some(search_directory.as_os_str())
                 ),
-                Some(std::path::PathBuf::from("provider-fixture"))
+                Some(if cfg!(feature = "hermetic-test-guard") {
+                    // The guard returns the checked absolute candidate; ordinary
+                    // production resolution retains its existing relative spelling.
+                    std::fs::canonicalize(&executable).expect("canonical fixture")
+                } else {
+                    std::path::PathBuf::from("provider-fixture")
+                })
             );
             let inaccessible_cwd = directory.path().join("removed-cwd");
             std::fs::create_dir(&inaccessible_cwd).expect("create temporary current directory");

@@ -8,6 +8,8 @@ mod event;
 pub(crate) mod executable_fixture;
 #[path = "../../tests/support/hermetic_providers.rs"]
 pub(crate) mod hermetic_providers;
+#[path = "../../tests/support/isolated_git_config.rs"]
+pub(crate) mod isolated_git_config;
 #[cfg(target_os = "linux")]
 #[path = "../../tests/support/reexec.rs"]
 pub(crate) mod reexec;
@@ -19,6 +21,24 @@ pub(crate) mod websocket_frames;
 pub(crate) use capability_probe::check_capability_probe_appimage_environment;
 pub(crate) use event::{FixtureEvent, within_fixture_deadline};
 pub(crate) use sandbox::{FixtureLease, TestSandbox};
+
+#[cfg(feature = "hermetic-test-guard")]
+pub(crate) fn reexec_without_provider_path(test_name: &str) -> bool {
+    const CASE: &str = "fixture-without-provider-path";
+    if TestSandbox::is_isolated_case(CASE, test_name) {
+        return false;
+    }
+    let sandbox = TestSandbox::new("provider-free-path");
+    let output =
+        sandbox.run_isolated_case(CASE, test_name, &[("PATH", sandbox.root().as_os_str())]);
+    assert!(
+        output.status.success(),
+        "isolated {test_name} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) const ISOLATING_AND_NO_OP_CASES: &[&str] = &["mixed", "unset-appimage"];
@@ -54,6 +74,12 @@ mod tests {
     /// whose pinned path still resolves, fails the remaining assertions.
     #[tokio::test]
     async fn hermetic_helper_pins_every_provider_driver_the_server_defines_as_built_in() {
+        #[cfg(feature = "hermetic-test-guard")]
+        if super::reexec_without_provider_path(
+            "test_support::tests::hermetic_helper_pins_every_provider_driver_the_server_defines_as_built_in",
+        ) {
+            return;
+        }
         use crate::{ServerConfig, production::control::NativeServerControl};
 
         let temp = tempfile::tempdir().expect("state directory");
@@ -296,6 +322,210 @@ mod tests {
         assert_eq!(
             second.get("BIBCODE_FIXTURE_LABEL"),
             Some(&"second".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_git_operations_ignore_hostile_discovery_and_config_environment() {
+        use std::{collections::BTreeMap, ffi::OsStr, fs, path::Path, process::Command};
+
+        fn snapshot(root: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn visit(
+                root: &Path,
+                directory: &Path,
+                files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>,
+            ) {
+                for entry in fs::read_dir(directory).expect("read disposable repository") {
+                    let path = entry.expect("repository entry").path();
+                    if path.is_dir() {
+                        visit(root, &path, files);
+                    } else {
+                        files.insert(
+                            path.strip_prefix(root).unwrap().to_path_buf(),
+                            fs::read(path).expect("snapshot repository file"),
+                        );
+                    }
+                }
+            }
+            let mut files = BTreeMap::new();
+            visit(root, root, &mut files);
+            files
+        }
+
+        const CASE: &str = "hostile-git-environment";
+        const TEST: &str = "test_support::tests::sandbox_git_operations_ignore_hostile_discovery_and_config_environment";
+        let sandbox = TestSandbox::new("git-environment");
+        let git = sandbox.executable_on_path("git");
+        if TestSandbox::is_isolated_case(CASE, TEST) {
+            let empty_config = sandbox.path("empty.gitconfig");
+            fs::write(&empty_config, "").expect("fixture Git config");
+            let safe_git_environment = sandbox.environment([
+                ("GIT_CONFIG_GLOBAL", empty_config.display().to_string()),
+                ("GIT_CONFIG_SYSTEM", empty_config.display().to_string()),
+                ("GIT_CONFIG_NOSYSTEM", "1".to_owned()),
+            ]);
+            let run_git = |args: &[&str]| {
+                let mut input = sandbox.process_input(&git, args.iter().copied());
+                input.env = Some(safe_git_environment.clone());
+                crate::process::ProcessRunner.run(input)
+            };
+            let initialized = run_git(&["init", "-b", "main"])
+                .await
+                .expect("initialize scratch Git");
+            assert_eq!(initialized.code, Some(0), "{initialized:?}");
+            let directory = run_git(&["rev-parse", "--absolute-git-dir"])
+                .await
+                .expect("resolve scratch Git directory");
+            assert_eq!(directory.code, Some(0), "{directory:?}");
+            assert_eq!(
+                fs::canonicalize(directory.stdout.trim()).expect("observed Git directory"),
+                fs::canonicalize(sandbox.path(".git")).expect("scratch Git directory"),
+                "ambient discovery must never select the protected bare repository"
+            );
+            assert!(
+                sandbox
+                    .environment(std::iter::empty::<(String, String)>())
+                    .keys()
+                    .all(|name| {
+                        !name
+                            .as_bytes()
+                            .get(..4)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"GIT_"))
+                    }),
+                "the base snapshot must exclude every inherited Git variable"
+            );
+            let ambient = run_git(&["config", "--get", "fixture.ambient"])
+                .await
+                .expect("read absent ambient fixture config");
+            assert_eq!(ambient.code, Some(1), "{ambient:?}");
+
+            let config = super::isolated_git_config::IsolatedGitConfig::new();
+            let mut command = Command::new(&git);
+            config.apply_to_command(&mut command);
+            let directory = command
+                .current_dir(sandbox.root())
+                .args(["rev-parse", "--absolute-git-dir"])
+                .output()
+                .expect("Git with command-owned configuration");
+            assert!(directory.status.success(), "{directory:?}");
+            assert_eq!(
+                fs::canonicalize(String::from_utf8(directory.stdout).unwrap().trim()).unwrap(),
+                fs::canonicalize(sandbox.path(".git")).unwrap(),
+                "the shared command helper must also remove ambient discovery"
+            );
+            for (key, expected_code, expected_value) in
+                [("fixture.ambient", 1, ""), ("commit.gpgSign", 0, "false")]
+            {
+                let mut command = Command::new(&git);
+                config.apply_to_command(&mut command);
+                let result = command
+                    .current_dir(sandbox.root())
+                    .args(["config", "--get", key])
+                    .output()
+                    .expect("read command-owned Git configuration");
+                assert_eq!(result.status.code(), Some(expected_code), "{result:?}");
+                assert_eq!(
+                    String::from_utf8(result.stdout).unwrap().trim(),
+                    expected_value
+                );
+            }
+
+            fs::write(
+                sandbox.path("fixture.txt"),
+                "owned by the scratch repository\n",
+            )
+            .expect("scratch file");
+            let mut environment = safe_git_environment;
+            environment.extend([
+                ("GIT_AUTHOR_NAME".to_owned(), "Fixture".to_owned()),
+                (
+                    "GIT_AUTHOR_EMAIL".to_owned(),
+                    "fixture@example.invalid".to_owned(),
+                ),
+                ("GIT_COMMITTER_NAME".to_owned(), "Fixture".to_owned()),
+                (
+                    "GIT_COMMITTER_EMAIL".to_owned(),
+                    "fixture@example.invalid".to_owned(),
+                ),
+                ("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()),
+                ("GIT_CONFIG_KEY_0".to_owned(), "fixture.explicit".to_owned()),
+                ("GIT_CONFIG_VALUE_0".to_owned(), "requested".to_owned()),
+            ]);
+            for args in [
+                vec!["add", "fixture.txt"],
+                vec![
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit",
+                    "-m",
+                    "scratch commit",
+                ],
+                vec!["config", "--get", "fixture.explicit"],
+            ] {
+                let mut input = sandbox.process_input(&git, args);
+                input.env = Some(environment.clone());
+                let result = crate::process::ProcessRunner
+                    .run(input)
+                    .await
+                    .expect("scratch Git operation");
+                assert_eq!(result.code, Some(0), "{result:?}");
+                if result.stdout.trim() == "requested" {
+                    return;
+                }
+            }
+            panic!("explicit Git fixture configuration was not preserved");
+        }
+
+        let bare = sandbox.path("protected.git");
+        let home = sandbox.path("home");
+        let work_tree = sandbox.path("protected-work-tree");
+        fs::create_dir(&home).expect("isolated home");
+        fs::create_dir(&work_tree).expect("protected work tree");
+        let config = sandbox.path("hostile.gitconfig");
+        fs::write(&config, "[fixture]\n\tambient = hostile\n").expect("hostile config");
+        let index = sandbox.path("protected.index");
+        fs::write(&index, "must not be overwritten\n").expect("protected index");
+        let initialized = Command::new(git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["init", "--bare", "-b", "protected"])
+            .arg(&bare)
+            .output()
+            .expect("initialize disposable bare repository");
+        assert!(initialized.status.success(), "{initialized:?}");
+        let before = snapshot(sandbox.root());
+        let objects = bare.join("objects");
+        let environment = [
+            ("HOME", home.as_os_str()),
+            ("USERPROFILE", home.as_os_str()),
+            ("GIT_DIR", bare.as_os_str()),
+            ("GIT_COMMON_DIR", bare.as_os_str()),
+            ("GIT_WORK_TREE", work_tree.as_os_str()),
+            ("GIT_INDEX_FILE", index.as_os_str()),
+            ("GIT_OBJECT_DIRECTORY", objects.as_os_str()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects.as_os_str()),
+            ("GIT_CEILING_DIRECTORIES", sandbox.root().as_os_str()),
+            ("GIT_CONFIG_GLOBAL", config.as_os_str()),
+            ("GIT_CONFIG_SYSTEM", config.as_os_str()),
+            ("GIT_CONFIG", config.as_os_str()),
+            ("GIT_CONFIG_NOSYSTEM", OsStr::new("0")),
+            ("GIT_CONFIG_COUNT", OsStr::new("1")),
+            ("GIT_CONFIG_KEY_0", OsStr::new("fixture.ambient")),
+            ("GIT_CONFIG_VALUE_0", OsStr::new("hostile")),
+            ("gIt_DISCOVERY_SENTINEL", OsStr::new("mixed-case prefix")),
+        ];
+        let result = sandbox.run_isolated_case(CASE, TEST, &environment);
+        assert!(
+            snapshot(sandbox.root()) == before,
+            "protected repository, config and index changed"
+        );
+        assert!(
+            result.status.success(),
+            "hostile Git environment child failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
         );
     }
 

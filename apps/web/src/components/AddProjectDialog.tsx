@@ -2,6 +2,7 @@
 
 import { ArrowLeftIcon } from "lucide-react";
 
+import { RemoteDirectoryBrowser } from "./RemoteDirectoryBrowser";
 import {
   AddProjectCloneStep,
   AddProjectCreateStep,
@@ -89,13 +90,33 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
               notice={workflow.notice}
               busy={workflow.busy}
               progress={workflow.cloneProgress}
-              canPickParent={workflow.canPickParent}
+              canPickParent
               onUrlChange={workflow.setCloneUrl}
               onParentDirChange={workflow.setCloneParent}
               onPickParent={() => void workflow.pickCloneParent()}
               onClone={() => void workflow.submitClone()}
               onCancel={workflow.cancelClone}
             />
+          ) : null}
+          {workflow.step === "clone-parent-browse" ? (
+            <div className="space-y-5">
+              <header className="space-y-1">
+                <h2 className="font-semibold text-2xl">
+                  Choose parent folder on {workflow.selectedHost.label}
+                </h2>
+                <p className="text-muted-foreground text-sm">
+                  The repository will be cloned inside this folder.
+                </p>
+              </header>
+              <RemoteDirectoryBrowser
+                environmentId={workflow.selectedHost.environmentId}
+                initialPath={workflow.cloneParent}
+                resetKey={workflow.selectedHost.environmentId}
+                onSelect={(path) => void workflow.selectBrowsedFolder(path)}
+                onCancel={workflow.back}
+                selectLabel="Choose parent folder"
+              />
+            </div>
           ) : null}
           {workflow.step === "create" ? (
             <AddProjectCreateStep

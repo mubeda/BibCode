@@ -333,19 +333,13 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
     path
 }
 
-fn isolated_claude_settings(instance: Value) -> Value {
-    json!({
-        "enableProviderUpdateChecks": false,
-        "providers": {
-            "codex": { "enabled": false },
-            "cursor": { "enabled": false },
-            "grok": { "enabled": false },
-            "opencode": { "enabled": false }
-        },
-        "providerInstances": {
-            "claudeAgent": instance
-        }
-    })
+fn isolated_claude_settings(sandbox: &Path, instance: Value) -> Value {
+    let mut settings = hermetic_providers::hermetic_provider_settings(sandbox);
+    for driver in ["codex", "cursor", "grok", "opencode"] {
+        settings["providers"][driver]["enabled"] = Value::Bool(false);
+    }
+    settings["providerInstances"] = json!({"claudeAgent": instance});
+    settings
 }
 
 async fn call(control: &NativeServerControl, method: &'static str, payload: Value) -> Value {
@@ -851,19 +845,22 @@ async fn provider_inventory_uses_provider_specific_status_and_configured_models(
 async fn claude_inventory_uses_authoritative_discovered_model_catalog() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let executable = write_discovering_claude_fixture(&directory).await;
-    let settings = isolated_claude_settings(json!({
-        "driver": "claudeAgent",
-        "enabled": true,
-        "environment": [{
-            "name": "BIBCODE_CLAUDE_FIXTURE_VERSION",
-            "value": "2.1.220",
-            "sensitive": false
-        }],
-        "config": {
-            "binaryPath": executable,
-            "customModels": ["claude-custom-test"]
-        }
-    }));
+    let settings = isolated_claude_settings(
+        directory.path(),
+        json!({
+            "driver": "claudeAgent",
+            "enabled": true,
+            "environment": [{
+                "name": "BIBCODE_CLAUDE_FIXTURE_VERSION",
+                "value": "2.1.220",
+                "sensitive": false
+            }],
+            "config": {
+                "binaryPath": executable,
+                "customModels": ["claude-custom-test"]
+            }
+        }),
+    );
     let settings_path = test_config(directory.path())
         .state_dir()
         .join("settings.json");
@@ -922,16 +919,19 @@ async fn claude_inventory_uses_authoritative_discovered_model_catalog() {
 async fn claude_inventory_keeps_discovered_models_when_skill_reload_is_invalid() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let executable = write_discovering_claude_fixture(&directory).await;
-    let settings = isolated_claude_settings(json!({
-        "driver": "claudeAgent",
-        "enabled": true,
-        "environment": [{
-            "name": "BIBCODE_CLAUDE_FIXTURE_VERSION",
-            "value": "2.1.220",
-            "sensitive": false
-        }],
-        "config": { "binaryPath": executable }
-    }));
+    let settings = isolated_claude_settings(
+        directory.path(),
+        json!({
+            "driver": "claudeAgent",
+            "enabled": true,
+            "environment": [{
+                "name": "BIBCODE_CLAUDE_FIXTURE_VERSION",
+                "value": "2.1.220",
+                "sensitive": false
+            }],
+            "config": { "binaryPath": executable }
+        }),
+    );
     let settings_path = test_config(directory.path())
         .state_dir()
         .join("settings.json");
@@ -977,11 +977,14 @@ async fn claude_inventory_keeps_discovered_models_when_skill_reload_is_invalid()
 async fn claude_inventory_hides_models_unsupported_by_the_installed_cli_version() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let executable = write_claude_fixture(&directory, "2.1.100").await;
-    let settings = isolated_claude_settings(json!({
-        "driver": "claudeAgent",
-        "enabled": true,
-        "config": { "binaryPath": executable }
-    }));
+    let settings = isolated_claude_settings(
+        directory.path(),
+        json!({
+            "driver": "claudeAgent",
+            "enabled": true,
+            "config": { "binaryPath": executable }
+        }),
+    );
     let settings_path = test_config(directory.path())
         .state_dir()
         .join("settings.json");
@@ -1154,6 +1157,7 @@ async fn refresh_providers_returns_version_advisories_without_registry_access() 
     )
     .await
     .expect("write settings fixture");
+    hermetic_providers::ensure_hermetic_settings(&test_config(directory.path()).state_dir());
     let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
 
     let refreshed = call(

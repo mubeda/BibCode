@@ -1331,3 +1331,11 @@ The Tauri/Rust migration retained the React frontend while removing the bundled
 Chromium/Electron shell and Node server process. Historical measurements and
 the repeatable capture commands are recorded in the
 [Desktop Performance Baseline](./desktop-performance-baseline.md).
+
+The native process sampler starts with an empty process table, so constructing
+the production runtime does not enumerate host processes. A requested diagnostics
+sample or non-empty process-ownership cleanup refreshes the host process table on
+the blocking pool. Full discovery remains necessary to identify previously unknown
+descendants for attribution and cleanup; direct PID identity checks use the native
+targeted lookup independently of that table. CPU observations establish their
+baseline on the first requested sample and retain it for subsequent samples.

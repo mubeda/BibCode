@@ -13,7 +13,13 @@ import {
 import { canUseNativeHostFolderPicker } from "../hostFolderPicker";
 export { getEnvironmentBrowsePlatform } from "../hostFolderPicker";
 
-export type AddProjectStep = "start" | "host-path" | "remote-browse" | "clone" | "create";
+export type AddProjectStep =
+  | "start"
+  | "host-path"
+  | "remote-browse"
+  | "clone"
+  | "clone-parent-browse"
+  | "create";
 
 /**
  * `cloning` and `reconnecting` can be cancelled; `cancelling` waits for the server to confirm;
