@@ -5,13 +5,25 @@
 #[path = "support/hermetic_providers.rs"]
 mod hermetic_providers;
 
+#[path = "support/child_command.rs"]
+mod child_command;
+use child_command::ChildCommandSpec;
+
+#[cfg(unix)]
+#[path = "support/child_watchdog.rs"]
+mod child_watchdog;
+
+#[cfg(unix)]
+#[path = "support/child_watchdog_tests.rs"]
+mod watchdog_tests;
+
 #[cfg(target_os = "linux")]
 #[path = "support/reexec.rs"]
 mod reexec;
 
 use std::{
     fs::OpenOptions,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
@@ -20,6 +32,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+#[cfg(not(unix))]
+use std::io::Read;
 
 use bibcode_server::{
     RpcExit, RpcRegistry, RpcResult, ServerConfig, ServerMessage, ServerRuntime,
@@ -83,7 +98,28 @@ fn child_process_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn run_child_with_deadline(command: &mut Command, context: &str, timeout: Duration) -> Output {
+fn run_child_with_deadline(
+    spec: &mut ChildCommandSpec,
+    context: &str,
+    timeout: Duration,
+) -> Output {
+    #[cfg(unix)]
+    {
+        child_watchdog::run(spec, context, timeout)
+    }
+    #[cfg(not(unix))]
+    {
+        run_direct_child_with_deadline(spec, context, timeout)
+    }
+}
+
+#[cfg(not(unix))]
+fn run_direct_child_with_deadline(
+    spec: &ChildCommandSpec,
+    context: &str,
+    timeout: Duration,
+) -> Output {
+    let mut command = spec.command();
     fn drain(pipe: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -94,12 +130,6 @@ fn run_child_with_deadline(command: &mut Command, context: &str, timeout: Durati
             let _ = sender.send(bytes);
         });
         receiver
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
     }
 
     let started = Instant::now();
@@ -119,21 +149,6 @@ fn run_child_with_deadline(command: &mut Command, context: &str, timeout: Durati
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            #[cfg(unix)]
-            {
-                let pgid = libc::pid_t::try_from(pid).expect("child PID fits pid_t");
-                // SAFETY: spawn gave this child its own process group. The child
-                // has not been reaped, so its PID cannot have been reused.
-                if unsafe { libc::kill(-pgid, libc::SIGKILL) } == -1 {
-                    let error = std::io::Error::last_os_error();
-                    assert_eq!(
-                        error.raw_os_error(),
-                        Some(libc::ESRCH),
-                        "kill timed-out child process group: {error}"
-                    );
-                }
-            }
-            #[cfg(not(unix))]
             child.kill().expect("kill timed-out child");
             break (child.wait().expect("reap timed-out child"), true);
         }
@@ -191,9 +206,9 @@ fn child_deadline_kills_and_reaps_a_stalled_child_and_reports_timeout() {
     let started = Instant::now();
     let result = std::panic::catch_unwind(|| {
         run_child_with_deadline(
-            Command::new("sh").args([
+            ChildCommandSpec::new("sh").args([
                 "-c",
-                "sleep 30 & printf 'descendant=%s\\n' \"$!\"; printf 'stalled child\\n' >&2; wait",
+                "sleep 30 & printf 'requested-child=%s\\ndescendant=%s\\n' \"$$\" \"$!\"; printf 'stalled child\\n' >&2; wait",
             ]),
             "sleep-timeout-fixture",
             Duration::from_millis(100),
@@ -216,30 +231,49 @@ fn child_deadline_kills_and_reaps_a_stalled_child_and_reports_timeout() {
         .expect("timeout includes descendant PID")
         .parse::<libc::pid_t>()
         .expect("numeric descendant PID");
+    let requested_child = report
+        .split_once("requested-child=")
+        .and_then(|(_, rest)| rest.lines().next())
+        .expect("timeout includes requested child PID")
+        .parse::<libc::pid_t>()
+        .expect("numeric requested child PID");
     loop {
         #[cfg(target_os = "linux")]
         {
             let mut status = 0;
             // SAFETY: only reap the fixture descendant adopted by this subreaper;
             // WNOHANG exposes a surviving descendant instead of waiting for it.
-            let waited = unsafe { libc::waitpid(descendant, &mut status, libc::WNOHANG) };
-            if waited == descendant {
-                assert!(libc::WIFSIGNALED(status));
-                assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
-            } else {
-                assert!(
-                    waited == 0
-                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
-                    "wait for the fixture descendant"
-                );
+            for owned in [requested_child, descendant] {
+                let waited = unsafe { libc::waitpid(owned, &mut status, libc::WNOHANG) };
+                if waited == owned {
+                    assert!(libc::WIFSIGNALED(status));
+                    assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+                } else {
+                    assert!(
+                        waited == 0
+                            || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+                        "wait for the owned fixture process"
+                    );
+                }
             }
         }
         // SAFETY: signal zero only checks the fixture descendant's existence.
-        if unsafe { libc::kill(descendant, 0) } == -1 {
+        let descendant_absent = unsafe { libc::kill(descendant, 0) } == -1;
+        if descendant_absent {
             assert_eq!(
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(libc::ESRCH)
             );
+        }
+        // SAFETY: the real child also belongs to this exact fixture.
+        let child_absent = unsafe { libc::kill(requested_child, 0) } == -1;
+        if child_absent {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+        if descendant_absent && child_absent {
             break;
         }
         assert!(
@@ -248,6 +282,12 @@ fn child_deadline_kills_and_reaps_a_stalled_child_and_reports_timeout() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    // SAFETY: only observe the real requested child published in its stdout.
+    assert_eq!(unsafe { libc::kill(requested_child, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
     let pid = report
         .split_once("(pid=")
         .and_then(|(_, rest)| rest.split_once(')'))
@@ -304,7 +344,7 @@ fn child_deadline_bounds_output_collection_when_a_descendant_escapes() {
     let started = Instant::now();
     let result = std::panic::catch_unwind(|| {
         run_child_with_deadline(
-            Command::new("sh")
+            ChildCommandSpec::new("sh")
                 .args([
                     "-c",
                     "\"$1\" --exact detached_pipe_holder_child --nocapture --test-threads=1 & wait",
@@ -341,13 +381,12 @@ fn child_deadline_bounds_output_collection_when_a_descendant_escapes() {
     assert!(report.contains("escaped-descendant-fixture"), "{report}");
     assert!(report.contains("timed out after"), "{report}");
     for stream in ["stdout", "stderr"] {
-        assert!(
-            report.contains(&format!(
-                "{stream}:\noutput unavailable: a descendant still holds the pipe"
-            )),
-            "{report}"
-        );
+        assert!(report.contains(&format!("{stream}:\n")), "{report}");
     }
+    assert!(
+        report.contains("output incomplete: monitor stopped at the absolute deadline"),
+        "{report}"
+    );
     phase.complete();
 }
 
@@ -356,7 +395,7 @@ fn child_deadline_bounds_output_collection_when_a_descendant_escapes() {
 fn child_deadline_returns_complete_output_on_normal_exit() {
     let _guard = child_process_guard();
     let output = run_child_with_deadline(
-        Command::new("sh").args([
+        ChildCommandSpec::new("sh").args([
             "-c",
             "i=0; while [ \"$i\" -lt 10000 ]; do printf 'stdout line\\n'; printf 'stderr line\\n' >&2; i=$((i + 1)); done; exit 7",
         ]),
@@ -592,7 +631,7 @@ async fn attachment_startup_recovery_removes_finals_left_by_an_aborted_process()
     let attachments_dir = config.state_dir().join("attachments");
     let ready = state.path().join("published");
     let output = run_child_with_deadline(
-        Command::new(std::env::current_exe().expect("test executable"))
+        ChildCommandSpec::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
                 "attachment_abort_child",
@@ -885,7 +924,7 @@ fn run_durable_boundary_child(state: &Path, provider: &str, mode: &str, sends: &
     let output = {
         let _guard = child_process_guard();
         run_child_with_deadline(
-            Command::new(std::env::current_exe().expect("test executable"))
+            ChildCommandSpec::new(std::env::current_exe().expect("test executable"))
                 .args([
                     "--exact",
                     "durable_boundary_crash_child",
@@ -1684,7 +1723,7 @@ fn missing_origin_keeps_durable_delivery_pending_without_provider_route() {
     let output = {
         let _guard = child_process_guard();
         run_child_with_deadline(
-            Command::new(std::env::current_exe().expect("test executable"))
+            ChildCommandSpec::new(std::env::current_exe().expect("test executable"))
                 .args([
                     "--exact",
                     "missing_origin_delivery_child",
