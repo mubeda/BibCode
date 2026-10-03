@@ -407,6 +407,8 @@ pub struct SupervisorOptions {
     pub session_idle_timeout: Duration,
     #[cfg(test)]
     idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
+    #[cfg(test)]
+    accepted_publication_test_hook: Option<AcceptedPublicationTestHook>,
 }
 
 impl Default for SupervisorOptions {
@@ -416,6 +418,8 @@ impl Default for SupervisorOptions {
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             #[cfg(test)]
             idle_deadline_test_observer: None,
+            #[cfg(test)]
+            accepted_publication_test_hook: None,
         }
     }
 }
@@ -557,6 +561,13 @@ enum SupervisorMessage {
     Shutdown {
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
+    PublishAcceptedDelivery {
+        identity: ProviderSessionIdentity,
+        generation: u64,
+        terminal_revision: u64,
+        turn_id: Option<String>,
+        response: oneshot::Sender<()>,
+    },
     DeliveryComplete {
         thread_id: String,
         generation: u64,
@@ -608,6 +619,30 @@ struct ActivityDispatchCompletionTestHook {
 }
 
 #[cfg(test)]
+#[derive(Debug, Default)]
+struct PublicationTestGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl PublicationTestGate {
+    async fn pause(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct AcceptedPublicationTestHook {
+    before_publication: Option<Arc<PublicationTestGate>>,
+    after_runtime: Option<Arc<PublicationTestGate>>,
+    publication_enqueued: Option<Arc<tokio::sync::Notify>>,
+    admission_waiting: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IdleDeadlineEvaluation {
     Stale,
@@ -628,6 +663,27 @@ enum IdleDeadlineTestEvent {
     },
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct StreamEndPublicationTestHook {
+    before_unlock: Arc<PublicationTestGate>,
+    after_unlock: Arc<PublicationTestGate>,
+}
+
+/// Shared only by the actor-owned start publisher and its existing per-session pump.
+/// Admitted core writers retain the lease through completion of submitted DB/engine work.
+#[derive(Default)]
+struct SessionPublicationState {
+    closed: bool,
+    terminal_revision: u64,
+    #[cfg(test)]
+    after_terminal_session: Option<Arc<PublicationTestGate>>,
+    #[cfg(test)]
+    stream_end_handoff: Option<StreamEndPublicationTestHook>,
+}
+
+type SessionPublicationFence = Arc<Mutex<SessionPublicationState>>;
+
 struct SessionEntry {
     launch: ProviderLaunchRequest,
     driver: Arc<dyn ProviderDriver>,
@@ -645,6 +701,9 @@ struct SessionEntry {
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
     activity_lifecycle: SharedActivityLifecycle,
     activity_compensation_key: String,
+    publication: SessionPublicationFence,
+    #[cfg(test)]
+    accepted_publication_test_hook: Option<AcceptedPublicationTestHook>,
     event_task: JoinHandle<()>,
     event_cancellation: CancellationToken,
     pending_stream_settlement: Option<oneshot::Receiver<()>>,
@@ -837,6 +896,8 @@ impl ProviderRuntimeSupervisor {
         let session_idle_timeout = options.session_idle_timeout;
         #[cfg(test)]
         let idle_deadline_test_observer = options.idle_deadline_test_observer.clone();
+        #[cfg(test)]
+        let accepted_publication_test_hook = options.accepted_publication_test_hook.clone();
         let (sender, receiver) = mpsc::channel(queue_capacity);
         let (terminal_sender, terminal_receiver) = mpsc::unbounded_channel();
         let (activity_dispatch_sender, activity_dispatch_receiver) = mpsc::channel(queue_capacity);
@@ -865,6 +926,8 @@ impl ProviderRuntimeSupervisor {
                 activity_dispatch_completion_hook,
                 #[cfg(test)]
                 idle_deadline_test_observer,
+                #[cfg(test)]
+                accepted_publication_test_hook,
             )
             .await;
         });
@@ -2171,11 +2234,25 @@ mod workspace_loss_tests {
     const BEFORE_LOSS: &str = "2026-01-01T00:00:00Z";
     const LOSS_ERROR: &str = "Provider session stopped because its workspace became unavailable. Review delivery status before continuing.";
 
+    type BoundedLossEvents = Arc<Mutex<mpsc::Receiver<ProviderEvent>>>;
+
     #[derive(Clone, Default)]
     struct LossDriver {
+        thread_id: String,
+        event_queue: Arc<std::sync::Mutex<HashMap<String, VecDeque<ProviderEvent>>>>,
+        native_returned: Arc<Notify>,
         shutdowns: Arc<AtomicUsize>,
+        sends: Arc<AtomicUsize>,
+        steers: Arc<AtomicUsize>,
+        shutdown_gate: Arc<std::sync::Mutex<Option<Arc<PublicationTestGate>>>>,
+        events_closed: Arc<AtomicBool>,
+        events_changed: Arc<Notify>,
         shutdown_fails: Arc<AtomicBool>,
         delay_acceptance: Arc<AtomicBool>,
+        unknown_turn_id: Arc<AtomicBool>,
+        event_taken: Arc<Notify>,
+        control_gate: Arc<std::sync::Mutex<Option<Arc<PublicationTestGate>>>>,
+        bounded_events: Arc<std::sync::Mutex<Option<BoundedLossEvents>>>,
         delivery_entered: Arc<Notify>,
         delivery_release: Arc<Notify>,
     }
@@ -2183,15 +2260,24 @@ mod workspace_loss_tests {
     impl ProviderDriverFactory for LossDriver {
         fn create(
             &self,
-            _: ProviderLaunchRequest,
+            request: ProviderLaunchRequest,
         ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
-            Box::pin(async { Ok(Arc::new(self.clone()) as Arc<dyn ProviderDriver>) })
+            Box::pin(async move {
+                let mut driver = self.clone();
+                driver.thread_id = request.thread_id;
+                Ok(Arc::new(driver) as Arc<dyn ProviderDriver>)
+            })
         }
     }
 
     impl ProviderDriver for LossDriver {
         fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
-            Box::pin(async { Ok(StartedSession::default()) })
+            Box::pin(async {
+                Ok(StartedSession {
+                    resume_cursor: Some(json!({"threadId":"loss-native-session"})),
+                    ..StartedSession::default()
+                })
+            })
         }
 
         fn send(
@@ -2201,11 +2287,32 @@ mod workspace_loss_tests {
             _: String,
         ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
             Box::pin(async {
+                self.sends.fetch_add(1, Ordering::SeqCst);
                 self.delivery_entered.notify_one();
                 if self.delay_acceptance.load(Ordering::SeqCst) {
                     self.delivery_release.notified().await;
                 }
-                Ok(Some("turn-1".to_owned()))
+                self.native_returned.notify_one();
+                Ok((!self.unknown_turn_id.load(Ordering::SeqCst)).then(|| "turn-1".to_owned()))
+            })
+        }
+
+        fn steer(
+            &self,
+            _: String,
+            _: Vec<Value>,
+            turn_id: String,
+            _: String,
+        ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+            Box::pin(async move {
+                self.steers.fetch_add(1, Ordering::SeqCst);
+                self.delivery_entered.notify_one();
+                if self.delay_acceptance.load(Ordering::SeqCst) {
+                    self.delivery_release.notified().await;
+                }
+                ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some(turn_id),
+                }
             })
         }
 
@@ -2221,7 +2328,13 @@ mod workspace_loss_tests {
             _: String,
             _: String,
         ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async {
+                let gate = self.control_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.pause().await;
+                }
+                Ok(())
+            })
         }
 
         fn answer(
@@ -2252,12 +2365,43 @@ mod workspace_loss_tests {
         }
 
         fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>> {
-            Box::pin(std::future::pending())
+            Box::pin(async {
+                let bounded = self.bounded_events.lock().unwrap().clone();
+                if let Some(receiver) = bounded {
+                    let event = receiver.lock().await.recv().await;
+                    self.event_taken.notify_one();
+                    return event;
+                }
+                loop {
+                    let changed = self.events_changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if self.events_closed.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    let event = self
+                        .event_queue
+                        .lock()
+                        .unwrap()
+                        .entry(self.thread_id.clone())
+                        .or_default()
+                        .pop_front();
+                    if let Some(event) = event {
+                        self.event_taken.notify_one();
+                        return Some(event);
+                    }
+                    changed.await;
+                }
+            })
         }
 
         fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
             Box::pin(async {
                 self.shutdowns.fetch_add(1, Ordering::SeqCst);
+                let gate = self.shutdown_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.pause().await;
+                }
                 if self.shutdown_fails.load(Ordering::SeqCst) {
                     Err(ProviderRuntimeError::Provider {
                         provider: "codex".to_owned(),
@@ -2280,6 +2424,10 @@ mod workspace_loss_tests {
 
     impl Fixture {
         async fn new(live: bool) -> Self {
+            Self::with_hook(live, AcceptedPublicationTestHook::default()).await
+        }
+
+        async fn with_hook(live: bool, hook: AcceptedPublicationTestHook) -> Self {
             let root = tempfile::tempdir().unwrap();
             let database = Database::open_in_memory().await.unwrap();
             database
@@ -2307,7 +2455,10 @@ mod workspace_loss_tests {
                 engine.clone(),
                 driver.clone(),
                 activity,
-                SupervisorOptions::default(),
+                SupervisorOptions {
+                    accepted_publication_test_hook: Some(hook),
+                    ..SupervisorOptions::default()
+                },
             );
             let launch = launch_request_for_command(
                 &engine,
@@ -2375,6 +2526,17 @@ mod workspace_loss_tests {
                     .unwrap()
                     .is_none()
             );
+        }
+
+        async fn runtime(&self) -> Value {
+            serde_json::to_value(
+                self.engine
+                    .repositories()
+                    .get_provider_session_runtime("t1".into())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
         }
 
         async fn shutdown(self) {
@@ -2642,6 +2804,1475 @@ mod workspace_loss_tests {
                 .is_none()
         );
         f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn settlement_after_acceptance_check_fences_late_publication() {
+        for status in ["ready", "running"] {
+            for shutdown_fails in [false, true] {
+                let gate = Arc::new(PublicationTestGate::default());
+                let f = Fixture::with_hook(
+                    true,
+                    AcceptedPublicationTestHook {
+                        before_publication: Some(gate.clone()),
+                        ..AcceptedPublicationTestHook::default()
+                    },
+                )
+                .await;
+                f.project(status).await;
+                f.driver
+                    .shutdown_fails
+                    .store(shutdown_fails, Ordering::SeqCst);
+                let delivery = f
+                    .supervisor
+                    .deliver_turn(turn("checked-before-loss", false), "checked-key".into())
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                    .await
+                    .unwrap();
+                let loss = f.loss().await;
+                let failed = loss.is_err();
+                let settled = serde_json::to_value(f.session().await).unwrap();
+                let events = f.engine.read_events(0).await.unwrap().len();
+                gate.release.notify_one();
+                let outcome = tokio::time::timeout(Duration::from_secs(5), delivery.completion())
+                    .await
+                    .unwrap();
+                let runtime = f
+                    .engine
+                    .repositories()
+                    .get_provider_session_runtime("t1".into())
+                    .await
+                    .unwrap();
+                let after = serde_json::to_value(f.session().await).unwrap();
+                let after_events = f.engine.read_events(0).await.unwrap().len();
+                f.shutdown().await;
+                assert_eq!(failed, shutdown_fails);
+                assert_eq!(
+                    outcome,
+                    ProviderDeliveryOutcome::Accepted {
+                        turn_id: Some("turn-1".into())
+                    }
+                );
+                assert!(
+                    runtime.is_none(),
+                    "settled driver publication resurrected runtime"
+                );
+                assert_eq!(after, settled);
+                assert_eq!(after_events, events);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_waits_for_admitted_accepted_publication() {
+        let gate = Arc::new(PublicationTestGate::default());
+        let f = Fixture::with_hook(
+            true,
+            AcceptedPublicationTestHook {
+                after_runtime: Some(gate.clone()),
+                ..AcceptedPublicationTestHook::default()
+            },
+        )
+        .await;
+        let identity = f.supervisor.capture_session_identity("t1").await.unwrap();
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn("publish-before-loss", false), "publish-key".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        let (response, mut settled) = oneshot::channel();
+        f.supervisor
+            .sender
+            .send(SupervisorMessage::SettleSessionAfterWorkspaceLoss {
+                thread_id: "t1".into(),
+                identity,
+                response,
+            })
+            .await
+            .unwrap();
+        // The gate holds the admitted writer before projection; settlement is queued next.
+        assert!(matches!(
+            settled.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        gate.release.notify_one();
+        settled.await.unwrap().unwrap();
+        assert_eq!(
+            delivery.completion().await,
+            ProviderDeliveryOutcome::Accepted {
+                turn_id: Some("turn-1".into())
+            }
+        );
+        f.assert_settled().await;
+        assert!(
+            f.engine
+                .repositories()
+                .get_provider_session_runtime("t1".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wrong_publication_generation_leaves_current_state_unchanged() {
+        let gate = Arc::new(PublicationTestGate::default());
+        let f = Fixture::with_hook(
+            true,
+            AcceptedPublicationTestHook {
+                before_publication: Some(gate.clone()),
+                ..AcceptedPublicationTestHook::default()
+            },
+        )
+        .await;
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn("current-generation", false), "current-key".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        let identity = f
+            .supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .unwrap();
+        let before = f.runtime().await;
+        let session = serde_json::to_value(f.session().await).unwrap();
+        let (response, suppressed) = oneshot::channel();
+        f.supervisor
+            .sender
+            .send(SupervisorMessage::PublishAcceptedDelivery {
+                identity,
+                generation: u64::MAX,
+                terminal_revision: 0,
+                turn_id: Some("wrong-generation".into()),
+                response,
+            })
+            .await
+            .unwrap();
+        suppressed.await.unwrap();
+        let after = f.runtime().await;
+        let after_session = serde_json::to_value(f.session().await).unwrap();
+        gate.release.notify_one();
+        let outcome = delivery.completion().await;
+        let sends = f.driver.sends.load(Ordering::SeqCst);
+        f.shutdown().await;
+        assert_eq!(after, before);
+        assert_eq!(after_session, session);
+        assert!(matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }));
+        assert_eq!(sends, 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_old_driver_publication_cannot_mutate_replacement() {
+        let gate = Arc::new(PublicationTestGate::default());
+        let f = Fixture::with_hook(
+            true,
+            AcceptedPublicationTestHook {
+                before_publication: Some(gate.clone()),
+                ..AcceptedPublicationTestHook::default()
+            },
+        )
+        .await;
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn("old-driver", false), "old-key".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        let old = f
+            .supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .unwrap();
+        f.supervisor
+            .stop_session_if_current(old.clone())
+            .await
+            .unwrap();
+        f.supervisor.launch(f.launch.clone()).await.unwrap();
+        let current = f
+            .supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&old.driver, &current.driver));
+        let before = f.runtime().await;
+        let session = serde_json::to_value(f.session().await).unwrap();
+        let (response, suppressed) = oneshot::channel();
+        // The old attempt still owns generation1; only the driver identity differs.
+        f.supervisor
+            .sender
+            .send(SupervisorMessage::PublishAcceptedDelivery {
+                identity: old,
+                generation: 1,
+                terminal_revision: 0,
+                turn_id: Some("old-turn".into()),
+                response,
+            })
+            .await
+            .unwrap();
+        suppressed.await.unwrap();
+        gate.release.notify_one();
+        let outcome = delivery.completion().await;
+        let after = f.runtime().await;
+        let after_session = serde_json::to_value(f.session().await).unwrap();
+        let still_current = f
+            .supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .unwrap();
+        let sends = f.driver.sends.load(Ordering::SeqCst);
+        f.shutdown().await;
+        assert_eq!(after, before);
+        assert_eq!(after_session, session);
+        assert!(Arc::ptr_eq(&current.driver, &still_current.driver));
+        assert!(matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }));
+        assert_eq!(sends, 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_queued_publication_ack_without_changing_accepted() {
+        let before_gate = Arc::new(PublicationTestGate::default());
+        let shutdown_gate = Arc::new(PublicationTestGate::default());
+        let enqueued = Arc::new(Notify::new());
+        let f = Fixture::with_hook(
+            true,
+            AcceptedPublicationTestHook {
+                before_publication: Some(before_gate.clone()),
+                publication_enqueued: Some(enqueued.clone()),
+                ..AcceptedPublicationTestHook::default()
+            },
+        )
+        .await;
+        *f.driver.shutdown_gate.lock().unwrap() = Some(shutdown_gate.clone());
+        let before = serde_json::to_value(f.session().await).unwrap();
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn("shutdown-accepted", false), "shutdown-key".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), before_gate.entered.notified())
+            .await
+            .unwrap();
+        let supervisor = f.supervisor.clone();
+        let shutdown = tokio::spawn(async move { supervisor.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(5), shutdown_gate.entered.notified())
+            .await
+            .unwrap();
+        before_gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), enqueued.notified())
+            .await
+            .unwrap();
+        // Actor is in shutdown, with a queued publication reply it cannot handle.
+        shutdown_gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), delivery.completion())
+            .await
+            .unwrap();
+        let after = serde_json::to_value(f.session().await).unwrap();
+        let runtime = f.runtime().await;
+        let sends = f.driver.sends.load(Ordering::SeqCst);
+        f.shutdown().await;
+        assert_eq!(
+            outcome,
+            ProviderDeliveryOutcome::Accepted {
+                turn_id: Some("turn-1".into())
+            }
+        );
+        assert_eq!(after, before);
+        assert!(runtime.is_null());
+        assert_eq!(sends, 1);
+    }
+
+    #[tokio::test]
+    async fn fast_stream_terminal_projection_is_not_overwritten_by_accepted_publication() {
+        let gate = Arc::new(PublicationTestGate::default());
+        let f = Fixture::with_hook(
+            true,
+            AcceptedPublicationTestHook {
+                before_publication: Some(gate.clone()),
+                ..AcceptedPublicationTestHook::default()
+            },
+        )
+        .await;
+        f.project("running").await;
+        f.engine.dispatch(serde_json::from_value(json!({"type":"thread.message.assistant.delta","commandId":"stream-partial","threadId":"t1","messageId":"stream-assistant","turnId":"turn-1","delta":"retained partial","createdAt":BEFORE_LOSS})).unwrap()).await.unwrap();
+        let mut events = f.engine.subscribe_events();
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn("stream-accepted", false), "stream-key".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        f.driver.events_closed.store(true, Ordering::SeqCst);
+        f.driver.events_changed.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.event.event_type == "thread.session-set"
+                    && event
+                        .event
+                        .payload
+                        .pointer("/session/status")
+                        .and_then(Value::as_str)
+                        == Some("error")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // Priority stream settlement must complete before this ordinary actor barrier.
+        f.supervisor.capture_session_identity("t1").await.unwrap();
+        let before = f.runtime().await;
+        let session = serde_json::to_value(f.session().await).unwrap();
+        gate.release.notify_one();
+        let outcome = delivery.completion().await;
+        let after = f.runtime().await;
+        let after_session = serde_json::to_value(f.session().await).unwrap();
+        let assistant = f
+            .engine
+            .repositories()
+            .get_message("stream-assistant".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let sends = f.driver.sends.load(Ordering::SeqCst);
+        f.shutdown().await;
+        assert!(matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }));
+        assert_eq!(after, before);
+        assert_eq!(after_session, session);
+        assert_eq!(assistant.text, "retained partial");
+        assert!(!assistant.is_streaming);
+        assert_eq!(sends, 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_steer_does_not_publish_running_after_a_concurrent_ready_settle() {
+        let f = Fixture::new(true).await;
+        f.project("running").await;
+        let command = turn("steer-queued", true);
+        let mut payload = serde_json::to_value(&command).unwrap();
+        payload[DELIVERY_ROUTE_FINGERPRINT_FIELD] =
+            Value::String(delivery_route_fingerprint(&f.launch).unwrap());
+        f.engine
+            .dispatch_with_admission(
+                command.clone(),
+                CommandAdmission {
+                    payload_digest: canonical_command_digest(&command).unwrap(),
+                    attachment_refs: Vec::new(),
+                    provider_turn: Some(NewProviderTurnDelivery {
+                        command_id: "steer-queued".into(),
+                        thread_id: "t1".into(),
+                        message_id: "steer-queued".into(),
+                        provider_instance_id: "codex".into(),
+                        provider_kind: "codex".into(),
+                        provider_session_id: None,
+                        delivery_key: "steer-key".into(),
+                        payload,
+                        state: TurnDeliveryState::Queued,
+                        mode: TurnDeliveryMode::Start,
+                        created_at: BEFORE_LOSS.into(),
+                    }),
+                },
+                || {},
+            )
+            .await
+            .unwrap();
+        f.engine.dispatch(serde_json::from_value(json!({"type":"thread.turn.steer","commandId":"steer-admit","threadId":"t1","messageId":"steer-queued","createdAt":BEFORE_LOSS})).unwrap()).await.unwrap();
+        let row = f
+            .engine
+            .repositories()
+            .claim_provider_turn("steer-queued".into(), BEFORE_LOSS.into())
+            .await
+            .unwrap()
+            .unwrap();
+        f.driver.delay_acceptance.store(true, Ordering::SeqCst);
+        let delivery = f
+            .supervisor
+            .deliver_frozen_turn(command, row)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), f.driver.delivery_entered.notified())
+            .await
+            .unwrap();
+        f.project("ready").await;
+        let before = f.runtime().await;
+        let session = serde_json::to_value(f.session().await).unwrap();
+        let events = f.engine.read_events(0).await.unwrap().len();
+        f.driver.delivery_release.notify_one();
+        let outcome = delivery.completion().await;
+        let after = f.runtime().await;
+        let after_session = serde_json::to_value(f.session().await).unwrap();
+        let after_events = f.engine.read_events(0).await.unwrap().len();
+        let sends = f.driver.sends.load(Ordering::SeqCst);
+        let steers = f.driver.steers.load(Ordering::SeqCst);
+        f.shutdown().await;
+        assert_eq!(
+            outcome,
+            ProviderDeliveryOutcome::Accepted {
+                turn_id: Some("turn-1".into())
+            }
+        );
+        assert_eq!(after, before);
+        assert_eq!(after_session, session);
+        assert_eq!(after_events, events);
+        assert_eq!((sends, steers), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn normal_completion_while_actor_is_busy_must_not_be_reopened_by_acceptance() {
+        let mut observations = Vec::new();
+        for (unknown_turn_id, completion_state) in
+            [(false, "completed"), (true, "completed"), (false, "failed")]
+        {
+            let enqueued = Arc::new(Notify::new());
+            let f = Fixture::with_hook(
+                true,
+                AcceptedPublicationTestHook {
+                    publication_enqueued: Some(enqueued),
+                    ..AcceptedPublicationTestHook::default()
+                },
+            )
+            .await;
+            f.driver
+                .unknown_turn_id
+                .store(unknown_turn_id, Ordering::SeqCst);
+            f.engine.dispatch(serde_json::from_value(json!({"type":"thread.create","commandId":"busy-thread","threadId":"busy-other","projectId":"p1","title":"Other","kind":"panel","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":BEFORE_LOSS})).unwrap()).await.unwrap();
+            let mut other_launch = f.launch.clone();
+            other_launch.thread_id = "busy-other".into();
+            f.supervisor.launch(other_launch).await.unwrap();
+            f.project("running").await;
+            let other = f
+                .supervisor
+                .capture_session_identity("busy-other")
+                .await
+                .unwrap()
+                .unwrap();
+            let gate = Arc::new(PublicationTestGate::default());
+            *f.driver.shutdown_gate.lock().unwrap() = Some(gate.clone());
+            f.driver.delay_acceptance.store(true, Ordering::SeqCst);
+            let delivery = f
+                .supervisor
+                .deliver_turn(
+                    turn("normal-fast-accepted", false),
+                    "normal-fast-key".into(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), f.driver.delivery_entered.notified())
+                .await
+                .unwrap();
+            let supervisor = f.supervisor.clone();
+            let stop = tokio::spawn(async move { supervisor.stop_session_if_current(other).await });
+            tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                .await
+                .unwrap();
+            let completion = tokio::spawn(delivery.completion());
+            f.driver.delivery_release.notify_one();
+            // Same external schedule for both: native-return notification, then native completion.
+            tokio::time::timeout(Duration::from_secs(5), f.driver.native_returned.notified())
+                .await
+                .unwrap();
+            let old_publication_done_before_event = completion.is_finished();
+            let mut events = f.engine.subscribe_events();
+            f.driver
+                .event_queue
+                .lock()
+                .unwrap()
+                .entry("t1".into())
+                .or_default()
+                .push_back(ProviderEvent {
+                    native_event_id: None,
+                    event_type: "turn.completed".into(),
+                    thread_id: "t1".into(),
+                    turn_id: Some("turn-1".into()),
+                    item_id: None,
+                    request_id: None,
+                    payload: json!({"state":completion_state}),
+                    activity: Vec::new(),
+                    activity_controls: ProviderActivityControls::default(),
+                });
+            f.driver.events_changed.notify_waiters();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if event.event.event_type == "thread.session-set"
+                        && event
+                            .event
+                            .payload
+                            .pointer("/session/status")
+                            .and_then(Value::as_str)
+                            == Some(if completion_state == "failed" {
+                                "error"
+                            } else {
+                                "ready"
+                            })
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let ready_before_release = f.session().await.status;
+            let publication_done_before_release = completion.is_finished();
+            // The same external actor hold ends only after Ready became visible.
+            *f.driver.shutdown_gate.lock().unwrap() = None;
+            gate.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), stop)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(5), completion)
+                .await
+                .unwrap()
+                .unwrap();
+            let after = f.session().await;
+            let runtime = f.runtime().await;
+            let turns = f
+                .engine
+                .repositories()
+                .list_turns_by_thread("t1".into())
+                .await
+                .unwrap();
+            let expected_state = if completion_state == "failed" {
+                "error"
+            } else {
+                "completed"
+            };
+            assert_eq!(after.active_turn_id, None);
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].state, expected_state);
+            assert_eq!(
+                outcome,
+                ProviderDeliveryOutcome::Accepted {
+                    turn_id: (!unknown_turn_id).then(|| "turn-1".into())
+                }
+            );
+            let sends = f.driver.sends.load(Ordering::SeqCst);
+            f.shutdown().await;
+            observations.push((
+                unknown_turn_id,
+                completion_state,
+                ready_before_release,
+                after.status,
+                runtime["status"].as_str().unwrap().to_owned(),
+                old_publication_done_before_event,
+                publication_done_before_release,
+            ));
+            assert!(matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }));
+            assert_eq!(sends, 1);
+        }
+        for observation in observations {
+            let expected = if observation.1 == "failed" {
+                "error"
+            } else {
+                "ready"
+            };
+            assert_eq!(observation.2, expected);
+            assert_eq!(
+                observation.3, expected,
+                "queued accepted publication reopened a native terminal"
+            );
+            assert_eq!(observation.4, expected);
+        }
+    }
+    #[tokio::test]
+    async fn caller_acknowledgement_closure_does_not_cancel_an_admitted_accepted_writer() {
+        let gate = Arc::new(PublicationTestGate::default());
+        let f = Fixture::with_hook(
+            true,
+            AcceptedPublicationTestHook {
+                after_runtime: Some(gate.clone()),
+                ..AcceptedPublicationTestHook::default()
+            },
+        )
+        .await;
+        let identity = f.supervisor.capture_session_identity("t1").await.unwrap();
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn("caller-closed", false), "caller-closed-key".into())
+            .await
+            .unwrap();
+        gate.entered.notified().await;
+        // The caller abandons its result after native Accepted; ownership stays on the actor.
+        drop(delivery);
+        let (response, mut settled) = oneshot::channel();
+        f.supervisor
+            .sender
+            .send(SupervisorMessage::SettleSessionAfterWorkspaceLoss {
+                thread_id: "t1".into(),
+                identity,
+                response,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            settled.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        gate.release.notify_one();
+        settled.await.unwrap().unwrap();
+        f.assert_settled().await;
+        assert!(f.runtime().await.is_null());
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 1);
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_acceptance_after_eof_without_an_active_turn_does_not_publish_running() {
+        let f = Fixture::new(false).await;
+        let (activity, mut sessions) = direct_session(&f).await;
+        let cancellation = sessions["t1"].event_cancellation.clone();
+        let before_runtime = f.runtime().await;
+        let before_session = serde_json::to_value(f.session().await).unwrap();
+        let before_events = f.engine.read_events(0).await.unwrap().len();
+        f.driver.delay_acceptance.store(true, Ordering::SeqCst);
+        let engine = f.engine.clone();
+        let factory = f.driver.clone() as Arc<dyn ProviderDriverFactory>;
+        let native = tokio::spawn(async move {
+            let result = handle_command(
+                &engine,
+                &factory,
+                &activity,
+                &mut sessions,
+                turn("legacy-eof", false),
+                None,
+            )
+            .await;
+            (activity, sessions, result)
+        });
+        f.driver.delivery_entered.notified().await;
+        f.driver.events_closed.store(true, Ordering::SeqCst);
+        f.driver.events_changed.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), cancellation.cancelled())
+            .await
+            .unwrap();
+        f.driver.delivery_release.notify_one();
+        let (activity, mut sessions, result) = native.await.unwrap();
+        let after_runtime = f.runtime().await;
+        let after_session = serde_json::to_value(f.session().await).unwrap();
+        let after_events = f.engine.read_events(0).await.unwrap().len();
+        let sends = f.driver.sends.load(Ordering::SeqCst);
+        detach_session(&activity, &mut sessions, "t1")
+            .await
+            .unwrap();
+        f.shutdown().await;
+        assert!(result.is_ok());
+        assert_eq!(sends, 1);
+        assert_eq!(after_runtime, before_runtime);
+        assert_eq!(after_session, before_session);
+        assert_eq!(after_events, before_events);
+    }
+
+    #[tokio::test]
+    async fn eof_handoff_closes_publication_before_a_waiting_legacy_publisher_can_write() {
+        let f = Fixture::new(false).await;
+        let (activity, mut sessions, mut terminal_events) =
+            direct_session_with_terminal_events(&f).await;
+        let publication = sessions["t1"].publication.clone();
+        let cancellation = sessions["t1"].event_cancellation.clone();
+        let before_unlock = Arc::new(PublicationTestGate::default());
+        let after_unlock = Arc::new(PublicationTestGate::default());
+        publication.lock().await.stream_end_handoff = Some(StreamEndPublicationTestHook {
+            before_unlock: before_unlock.clone(),
+            after_unlock: after_unlock.clone(),
+        });
+        let before_runtime = f.runtime().await;
+        let before_session = serde_json::to_value(f.session().await).unwrap();
+        let before_events = f.engine.read_events(0).await.unwrap().len();
+        f.driver.delay_acceptance.store(true, Ordering::SeqCst);
+        let engine = f.engine.clone();
+        let factory = f.driver.clone() as Arc<dyn ProviderDriverFactory>;
+        let native = tokio::spawn(async move {
+            let result = handle_command(
+                &engine,
+                &factory,
+                &activity,
+                &mut sessions,
+                turn("legacy-eof-handoff", false),
+                None,
+            )
+            .await;
+            (activity, sessions, result)
+        });
+        f.driver.delivery_entered.notified().await;
+        f.driver.events_closed.store(true, Ordering::SeqCst);
+        f.driver.events_changed.notify_one();
+        before_unlock.entered.notified().await;
+        let Some(SupervisorMessage::SessionStreamEnded { mut settled, .. }) =
+            terminal_events.recv().await
+        else {
+            panic!("EOF announces its existing settlement protocol");
+        };
+        assert!(
+            !cancellation.is_cancelled(),
+            "native acceptance is released before EOF cancellation"
+        );
+        assert!(
+            publication.try_lock().is_err(),
+            "EOF still owns its final core lease"
+        );
+        // On this current-thread runtime, native send returns and the real publisher
+        // queues for the held mutex before this notification resumes the test.
+        f.driver.delivery_release.notify_one();
+        f.driver.native_returned.notified().await;
+        assert!(
+            !native.is_finished(),
+            "the accepted legacy publisher waits behind EOF's lease"
+        );
+        before_unlock.release.notify_one();
+        after_unlock.entered.notified().await;
+        // The after-unlock gate forces the reviewed unlock-to-cancel interleaving on
+        // the old code. The repaired owner closes/cancels before releasing its lease.
+        let (activity, mut sessions, result) = tokio::time::timeout(Duration::from_secs(5), native)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(settled.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "settled acknowledgement remains after the final lease handoff"
+        );
+        let after_runtime = f.runtime().await;
+        let after_session = serde_json::to_value(f.session().await).unwrap();
+        let after_events = f.engine.read_events(0).await.unwrap().len();
+        let sends = f.driver.sends.load(Ordering::SeqCst);
+        let shutdowns_before_settled = f.driver.shutdowns.load(Ordering::SeqCst);
+        after_unlock.release.notify_one();
+        settled.await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            &mut sessions.get_mut("t1").unwrap().event_task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Remove a pump already joined above without polling its JoinHandle twice.
+        let entry = sessions.remove("t1").unwrap();
+        let closed = entry.publication.lock().await.closed;
+        let cancelled = entry.event_cancellation.is_cancelled();
+        let shutdowns = f.driver.shutdowns.load(Ordering::SeqCst);
+        drop(activity);
+        f.shutdown().await;
+        assert!(result.is_ok());
+        assert_eq!(sends, 1);
+        assert_eq!(
+            after_runtime, before_runtime,
+            "EOF handoff reopened runtime after an ended stream"
+        );
+        assert_eq!(after_session, before_session);
+        assert_eq!(after_events, before_events);
+        assert!(closed && cancelled);
+        assert_eq!(shutdowns_before_settled, 0);
+        assert_eq!(shutdowns, 1);
+    }
+
+    async fn direct_session(f: &Fixture) -> (ActivityProjection, HashMap<String, SessionEntry>) {
+        let (activity, sessions, _terminal_receiver) = direct_session_with_terminal_events(f).await;
+        (activity, sessions)
+    }
+
+    async fn direct_session_with_terminal_events(
+        f: &Fixture,
+    ) -> (
+        ActivityProjection,
+        HashMap<String, SessionEntry>,
+        mpsc::UnboundedReceiver<SupervisorMessage>,
+    ) {
+        let activity = ActivityProjection::with_controller(
+            ActivityRepository::new(f.engine.repositories().database().clone()),
+            AgentActivityController::new(false),
+        );
+        let (terminal_sender, terminal_receiver) = mpsc::unbounded_channel();
+        let (activity_sender, _activity_receiver) = mpsc::channel(256);
+        let mut sessions = HashMap::new();
+        launch_session(
+            &f.engine,
+            &(f.driver.clone() as Arc<dyn ProviderDriverFactory>),
+            &activity,
+            &mut sessions,
+            f.launch.clone(),
+            None,
+            None,
+            terminal_sender,
+            activity_sender,
+            256,
+            Duration::from_secs(3600),
+            Arc::new(RwLock::new(None)),
+            None,
+        )
+        .await
+        .unwrap();
+        (activity, sessions, terminal_receiver)
+    }
+
+    fn core_event(kind: &str, turn_id: &str, payload: Value) -> ProviderEvent {
+        ProviderEvent {
+            native_event_id: None,
+            event_type: kind.into(),
+            thread_id: "t1".into(),
+            turn_id: Some(turn_id.into()),
+            item_id: Some(format!("message-{turn_id}")),
+            request_id: None,
+            payload,
+            activity: Vec::new(),
+            activity_controls: ProviderActivityControls::default(),
+        }
+    }
+
+    fn enqueue(f: &Fixture, events: impl IntoIterator<Item = ProviderEvent>) {
+        f.driver
+            .event_queue
+            .lock()
+            .unwrap()
+            .entry("t1".into())
+            .or_default()
+            .extend(events);
+        f.driver.events_changed.notify_one();
+    }
+
+    async fn wait_for_terminal_activity(
+        engine: &OrchestrationEngine,
+        events: &mut tokio::sync::broadcast::Receiver<crate::persistence::OrchestrationEvent>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.event.event_type == "thread.activity-appended"
+                    && event
+                        .event
+                        .payload
+                        .pointer("/activity/kind")
+                        .and_then(Value::as_str)
+                        == Some("provider.turn")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // This read is behind the terminal engine command, after the complete core batch.
+        engine.read_events(0).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn detach_drains_a_submitted_terminal_command_before_aborting_the_pump() {
+        let f = Fixture::new(false).await;
+        let (activity, mut sessions) = direct_session(&f).await;
+        f.project("running").await;
+        f.engine.dispatch(serde_json::from_value(json!({"type":"thread.message.assistant.delta","commandId":"drain-text","threadId":"t1","messageId":"drain-assistant","turnId":"turn-1","delta":"keep submitted text","createdAt":BEFORE_LOSS})).unwrap()).await.unwrap();
+        let submitted = f
+            .engine
+            .test_hooks()
+            .pause_before_next_command_finalization();
+        enqueue(
+            &f,
+            [core_event(
+                "turn.completed",
+                "turn-1",
+                json!({"state":"completed"}),
+            )],
+        );
+        tokio::time::timeout(Duration::from_secs(5), submitted.wait_until_entered())
+            .await
+            .unwrap();
+        // The real SQLite Execute closure is running, while its engine caller awaits it.
+        let began = Arc::new(Notify::new());
+        let observed = began.clone();
+        let stop = tokio::spawn(async move {
+            observed.notify_one();
+            let entry = detach_session(&activity, &mut sessions, "t1")
+                .await
+                .unwrap();
+            entry.driver.shutdown().await.unwrap();
+        });
+        began.notified().await;
+        assert!(
+            !stop.is_finished(),
+            "detach cannot finish while a submitted core operation is held"
+        );
+        submitted.release();
+        tokio::time::timeout(Duration::from_secs(5), stop)
+            .await
+            .unwrap()
+            .unwrap();
+        let message = f
+            .engine
+            .repositories()
+            .get_message("drain-assistant".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let event_count = f.engine.read_events(0).await.unwrap().len();
+        f.engine
+            .repositories()
+            .delete_provider_session_runtime("t1".into())
+            .await
+            .unwrap();
+        assert!(f.runtime().await.is_null());
+        assert_eq!(f.engine.read_events(0).await.unwrap().len(), event_count);
+        f.shutdown().await;
+        assert!(
+            !message.is_streaming,
+            "detachment aborted the rest of an admitted terminal batch"
+        );
+        assert_eq!(message.text, "keep submitted text");
+    }
+
+    #[tokio::test]
+    async fn restart_drains_submitted_core_work_and_gives_the_replacement_a_fresh_fence() {
+        let f = Fixture::new(false).await;
+        let (activity, mut sessions) = direct_session(&f).await;
+        f.project("running").await;
+        f.engine.dispatch(serde_json::from_value(json!({"type":"thread.message.assistant.delta","commandId":"restart-text","threadId":"t1","messageId":"restart-assistant","turnId":"turn-1","delta":"restart keeps text","createdAt":BEFORE_LOSS})).unwrap()).await.unwrap();
+        let old_driver = sessions["t1"].driver.clone();
+        let old_fence = sessions["t1"].publication.clone();
+        let submitted = f
+            .engine
+            .test_hooks()
+            .pause_before_next_command_finalization();
+        enqueue(
+            &f,
+            [core_event(
+                "turn.completed",
+                "turn-1",
+                json!({"state":"completed"}),
+            )],
+        );
+        tokio::time::timeout(Duration::from_secs(5), submitted.wait_until_entered())
+            .await
+            .unwrap();
+        let engine = f.engine.clone();
+        let factory = f.driver.clone() as Arc<dyn ProviderDriverFactory>;
+        let launch = f.launch.clone();
+        let began = Arc::new(Notify::new());
+        let observed = began.clone();
+        let restart = tokio::spawn(async move {
+            observed.notify_one();
+            restart_session(
+                &engine,
+                &factory,
+                &activity,
+                &mut sessions,
+                "t1",
+                launch,
+                None,
+            )
+            .await
+            .unwrap();
+            (activity, sessions)
+        });
+        began.notified().await;
+        assert!(
+            !restart.is_finished(),
+            "restart cannot finish while a submitted core operation is held"
+        );
+        submitted.release();
+        let (activity, mut sessions) = tokio::time::timeout(Duration::from_secs(5), restart)
+            .await
+            .unwrap()
+            .unwrap();
+        let replaced = !Arc::ptr_eq(&old_driver, &sessions["t1"].driver);
+        let fresh = !Arc::ptr_eq(&old_fence, &sessions["t1"].publication);
+        let old_closed = old_fence.lock().await.closed;
+        let revision = capture_start_revision(&sessions["t1"]).await.unwrap();
+        let message = f
+            .engine
+            .repositories()
+            .get_message("restart-assistant".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let state = f.session().await.status;
+        let entry = detach_session(&activity, &mut sessions, "t1")
+            .await
+            .unwrap();
+        entry.driver.shutdown().await.unwrap();
+        f.shutdown().await;
+        assert!(replaced && fresh && old_closed);
+        assert_eq!(revision, 0);
+        assert_eq!(state, "ready");
+        assert!(!message.is_streaming);
+        assert_eq!(message.text, "restart keeps text");
+    }
+
+    #[tokio::test]
+    async fn failed_restart_keeps_the_old_publication_fence_and_session() {
+        let f = Fixture::new(false).await;
+        let (activity, mut sessions) = direct_session(&f).await;
+        let old_driver = sessions["t1"].driver.clone();
+        let old_fence = sessions["t1"].publication.clone();
+        let before = f.runtime().await;
+        f.driver.shutdown_fails.store(true, Ordering::SeqCst);
+        let result = restart_session(
+            &f.engine,
+            &(f.driver.clone() as Arc<dyn ProviderDriverFactory>),
+            &activity,
+            &mut sessions,
+            "t1",
+            f.launch.clone(),
+            None,
+        )
+        .await;
+        let same = Arc::ptr_eq(&old_driver, &sessions["t1"].driver)
+            && Arc::ptr_eq(&old_fence, &sessions["t1"].publication);
+        let open = !old_fence.lock().await.closed;
+        let after = f.runtime().await;
+        f.driver.shutdown_fails.store(false, Ordering::SeqCst);
+        let entry = detach_session(&activity, &mut sessions, "t1")
+            .await
+            .unwrap();
+        entry.driver.shutdown().await.unwrap();
+        f.shutdown().await;
+        assert!(result.is_err() && same && open);
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn legacy_start_does_not_reopen_a_terminal_and_a_fresh_admission_can_publish() {
+        for unknown_id in [false, true] {
+            let f = Fixture::new(false).await;
+            let (activity, mut sessions) = direct_session(&f).await;
+            f.project("running").await;
+            f.driver.delay_acceptance.store(true, Ordering::SeqCst);
+            f.driver.unknown_turn_id.store(unknown_id, Ordering::SeqCst);
+            let engine = f.engine.clone();
+            let factory = f.driver.clone() as Arc<dyn ProviderDriverFactory>;
+            let native = tokio::spawn(async move {
+                let result = handle_command(
+                    &engine,
+                    &factory,
+                    &activity,
+                    &mut sessions,
+                    turn("legacy-fast", false),
+                    None,
+                )
+                .await;
+                (activity, sessions, result)
+            });
+            f.driver.delivery_entered.notified().await;
+            let mut events = f.engine.subscribe_events();
+            // This also represents a late previous-turn terminal: no native ID guess is made.
+            enqueue(
+                &f,
+                [core_event(
+                    "turn.completed",
+                    "turn-1",
+                    json!({"state":"completed"}),
+                )],
+            );
+            wait_for_terminal_activity(&f.engine, &mut events).await;
+            f.driver.delivery_release.notify_one();
+            let (activity, mut sessions, result) =
+                tokio::time::timeout(Duration::from_secs(5), native)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let terminal = f.session().await.status;
+            f.driver.delay_acceptance.store(false, Ordering::SeqCst);
+            handle_command(
+                &f.engine,
+                &(f.driver.clone() as Arc<dyn ProviderDriverFactory>),
+                &activity,
+                &mut sessions,
+                turn("legacy-fresh", false),
+                None,
+            )
+            .await
+            .unwrap();
+            let fresh = f.session().await.status;
+            let sends = f.driver.sends.load(Ordering::SeqCst);
+            let entry = detach_session(&activity, &mut sessions, "t1")
+                .await
+                .unwrap();
+            entry.driver.shutdown().await.unwrap();
+            f.shutdown().await;
+            assert!(result.is_ok());
+            assert_eq!(terminal, "ready");
+            assert_eq!(fresh, "running");
+            assert_eq!(sends, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_first_orders_the_complete_terminal_batch_after_both_running_writes() {
+        let f = Fixture::new(false).await;
+        let (_activity, mut sessions) = direct_session(&f).await;
+        f.project("running").await;
+        f.engine.dispatch(serde_json::from_value(json!({"type":"thread.message.assistant.delta","commandId":"accepted-partial","threadId":"t1","messageId":"accepted-assistant","turnId":"turn-1","delta":"accepted keeps text","createdAt":BEFORE_LOSS})).unwrap()).await.unwrap();
+        let gate = Arc::new(PublicationTestGate::default());
+        sessions
+            .get_mut("t1")
+            .unwrap()
+            .accepted_publication_test_hook = Some(AcceptedPublicationTestHook {
+            after_runtime: Some(gate.clone()),
+            ..AcceptedPublicationTestHook::default()
+        });
+        let fence = sessions["t1"].publication.clone();
+        let writer_entry = sessions.remove("t1").unwrap();
+        let engine = f.engine.clone();
+        let accepted = tokio::spawn(async move {
+            publish_running_session(&engine, &writer_entry, 0, Some("turn-1".into()), true)
+                .await
+                .unwrap();
+            writer_entry
+        });
+        gate.entered.notified().await;
+        enqueue(
+            &f,
+            [core_event(
+                "turn.completed",
+                "turn-1",
+                json!({"state":"completed"}),
+            )],
+        );
+        f.driver.event_taken.notified().await;
+        assert!(
+            fence.try_lock().is_err(),
+            "accepted publication must retain its core lease"
+        );
+        let mut events = f.engine.subscribe_events();
+        gate.release.notify_one();
+        let mut entry = accepted.await.unwrap();
+        wait_for_terminal_activity(&f.engine, &mut events).await;
+        let message = f
+            .engine
+            .repositories()
+            .get_message("accepted-assistant".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let status = f.session().await.status;
+        let all_events = f.engine.read_events(0).await.unwrap();
+        let last_running = all_events
+            .iter()
+            .rposition(|event| {
+                event
+                    .event
+                    .payload
+                    .pointer("/session/status")
+                    .and_then(Value::as_str)
+                    == Some("running")
+            })
+            .unwrap();
+        let last_ready = all_events
+            .iter()
+            .rposition(|event| {
+                event
+                    .event
+                    .payload
+                    .pointer("/session/status")
+                    .and_then(Value::as_str)
+                    == Some("ready")
+            })
+            .unwrap();
+        close_publication_and_reap_event_task(&mut entry).await;
+        entry.driver.shutdown().await.unwrap();
+        f.shutdown().await;
+        assert_eq!(status, "ready");
+        assert!(last_running < last_ready);
+        assert!(!message.is_streaming);
+        assert_eq!(message.text, "accepted keeps text");
+    }
+
+    #[tokio::test]
+    async fn terminal_batch_blocks_next_admission_and_followup_messages_until_partial_settlement() {
+        let f = Fixture::new(false).await;
+        let (activity, mut sessions) = direct_session(&f).await;
+        f.project("running").await;
+        f.engine.dispatch(serde_json::from_value(json!({"type":"thread.message.assistant.delta","commandId":"terminal-partial","threadId":"t1","messageId":"terminal-assistant","turnId":"turn-1","delta":"terminal keeps text","createdAt":BEFORE_LOSS})).unwrap()).await.unwrap();
+        let gate = Arc::new(PublicationTestGate::default());
+        sessions["t1"]
+            .publication
+            .lock()
+            .await
+            .after_terminal_session = Some(gate.clone());
+        let admission = Arc::new(Notify::new());
+        sessions
+            .get_mut("t1")
+            .unwrap()
+            .accepted_publication_test_hook = Some(AcceptedPublicationTestHook {
+            admission_waiting: Some(admission.clone()),
+            ..AcceptedPublicationTestHook::default()
+        });
+        enqueue(
+            &f,
+            [
+                core_event("turn.completed", "turn-1", json!({"state":"completed"})),
+                core_event(
+                    "message.assistant.delta",
+                    "turn-2",
+                    json!({"delta":"followup"}),
+                ),
+                core_event("message.assistant.completed", "turn-2", json!({})),
+            ],
+        );
+        gate.entered.notified().await;
+        let engine = f.engine.clone();
+        let factory = f.driver.clone() as Arc<dyn ProviderDriverFactory>;
+        let followup = tokio::spawn(async move {
+            handle_command(
+                &engine,
+                &factory,
+                &activity,
+                &mut sessions,
+                turn("after-terminal", false),
+                None,
+            )
+            .await
+            .unwrap();
+            (activity, sessions)
+        });
+        admission.notified().await;
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 0);
+        assert!(
+            f.engine
+                .repositories()
+                .get_message("assistant:t1:item:message-turn-2".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let partial = f
+            .engine
+            .repositories()
+            .get_message("terminal-assistant".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(partial.is_streaming);
+        let mut events = f.engine.subscribe_events();
+        gate.release.notify_one();
+        let (activity, mut sessions) = followup.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.event.event_type == "thread.message-sent"
+                    && event.event.payload.get("turnId").and_then(Value::as_str) == Some("turn-2")
+                    && event
+                        .event
+                        .payload
+                        .get("streaming")
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let partial = f
+            .engine
+            .repositories()
+            .get_message("terminal-assistant".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let all_events = f.engine.read_events(0).await.unwrap();
+        let terminal = all_events
+            .iter()
+            .rposition(|event| {
+                event.event.event_type == "thread.activity-appended"
+                    && event
+                        .event
+                        .payload
+                        .pointer("/activity/turnId")
+                        .and_then(Value::as_str)
+                        == Some("turn-1")
+            })
+            .unwrap();
+        let delta = all_events
+            .iter()
+            .position(|event| {
+                event.event.event_type == "thread.message-sent"
+                    && event.event.payload.get("turnId").and_then(Value::as_str) == Some("turn-2")
+            })
+            .unwrap();
+        let followup_message = f
+            .engine
+            .repositories()
+            .get_message("assistant:t1:item:message-turn-2".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(followup_message.text, "followup");
+        assert!(!followup_message.is_streaming);
+        let status = f.session().await.status;
+        let sends = f.driver.sends.load(Ordering::SeqCst);
+        let entry = detach_session(&activity, &mut sessions, "t1")
+            .await
+            .unwrap();
+        entry.driver.shutdown().await.unwrap();
+        f.shutdown().await;
+        assert!(!partial.is_streaming);
+        assert_eq!(partial.text, "terminal keeps text");
+        assert!(terminal < delta);
+        assert_eq!(status, "running");
+        assert_eq!(sends, 1);
+    }
+
+    #[tokio::test]
+    async fn closed_fence_suppresses_a_waiting_pump_and_stale_start_writer() {
+        let f = Fixture::new(false).await;
+        let (activity, mut sessions) = direct_session(&f).await;
+        let mut entry = sessions.remove("t1").unwrap();
+        let publication = entry.publication.clone();
+        let mut lease = publication.lock().await;
+        lease.closed = true;
+        let runtime = f.runtime().await;
+        let session = serde_json::to_value(f.session().await).unwrap();
+        let count = f.engine.read_events(0).await.unwrap().len();
+        enqueue(
+            &f,
+            [core_event(
+                "message.assistant.delta",
+                "turn-1",
+                json!({"delta":"stale text"}),
+            )],
+        );
+        f.driver.event_taken.notified().await;
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(5), &mut entry.event_task)
+            .await
+            .unwrap()
+            .unwrap();
+        publish_running_session(&f.engine, &entry, 0, Some("stale".into()), true)
+            .await
+            .unwrap();
+        let admission = capture_start_revision(&entry).await;
+        let after_runtime = f.runtime().await;
+        let after_session = serde_json::to_value(f.session().await).unwrap();
+        let after_count = f.engine.read_events(0).await.unwrap().len();
+        entry.driver.shutdown().await.unwrap();
+        drop(activity);
+        f.shutdown().await;
+        assert!(admission.is_err());
+        assert_eq!(runtime, after_runtime);
+        assert_eq!(session, after_session);
+        assert_eq!(count, after_count);
+    }
+
+    #[tokio::test]
+    async fn exhausted_terminal_revision_never_reopens_running_publication() {
+        let f = Fixture::new(false).await;
+        let (activity, mut sessions) = direct_session(&f).await;
+        sessions["t1"].publication.lock().await.terminal_revision = u64::MAX - 1;
+        for _ in 0..2 {
+            let mut events = f.engine.subscribe_events();
+            enqueue(
+                &f,
+                [core_event(
+                    "turn.completed",
+                    "turn-1",
+                    json!({"state":"completed"}),
+                )],
+            );
+            wait_for_terminal_activity(&f.engine, &mut events).await;
+            handle_command(
+                &f.engine,
+                &(f.driver.clone() as Arc<dyn ProviderDriverFactory>),
+                &activity,
+                &mut sessions,
+                turn("exhausted", false),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(f.session().await.status, "ready");
+            assert_eq!(
+                sessions["t1"].publication.lock().await.terminal_revision,
+                u64::MAX
+            );
+        }
+        let entry = detach_session(&activity, &mut sessions, "t1")
+            .await
+            .unwrap();
+        entry.driver.shutdown().await.unwrap();
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pump_drains_bounded_native_output_while_the_actor_awaits_a_native_control() {
+        let f = Fixture::new(false).await;
+        let (native_output, receiver) = mpsc::channel(1);
+        *f.driver.bounded_events.lock().unwrap() = Some(Arc::new(Mutex::new(receiver)));
+        f.supervisor.launch(f.launch.clone()).await.unwrap();
+        f.project("running").await;
+        let gate = Arc::new(PublicationTestGate::default());
+        *f.driver.control_gate.lock().unwrap() = Some(gate.clone());
+        let supervisor = f.supervisor.clone();
+        let control = tokio::spawn(async move {
+            supervisor.handle_orchestration(serde_json::from_value(json!({"type":"thread.approval.respond","commandId":"native-control","threadId":"t1","requestId":"request","decision":"accept","createdAt":BEFORE_LOSS})).unwrap()).await
+        });
+        gate.entered.notified().await;
+        let mut events = f.engine.subscribe_events();
+        let output = tokio::spawn(async move {
+            for event in [
+                core_event("turn.completed", "turn-1", json!({"state":"completed"})),
+                core_event(
+                    "message.assistant.delta",
+                    "turn-2",
+                    json!({"delta":"bounded output"}),
+                ),
+                core_event("message.assistant.completed", "turn-2", json!({})),
+            ] {
+                native_output.send(event).await.unwrap();
+            }
+            native_output
+        });
+        let native_output = tokio::time::timeout(Duration::from_secs(5), output)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.event.event_type == "thread.message-sent"
+                    && event.event.payload.get("turnId").and_then(Value::as_str) == Some("turn-2")
+                    && event
+                        .event
+                        .payload
+                        .get("streaming")
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!control.is_finished());
+        gate.release.notify_one();
+        control.await.unwrap().unwrap();
+        *f.driver.control_gate.lock().unwrap() = None;
+        f.shutdown().await;
+        drop(native_output);
     }
 }
 
@@ -3169,6 +4800,7 @@ async fn run_supervisor(
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
     #[cfg(test)] activity_dispatch_completion_hook: Option<ActivityDispatchCompletionTestHook>,
     #[cfg(test)] idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
+    #[cfg(test)] accepted_publication_test_hook: Option<AcceptedPublicationTestHook>,
 ) {
     let mut sessions = HashMap::<String, SessionEntry>::new();
     let mut delivery_sequences = HashMap::<String, ThreadDeliverySequence>::new();
@@ -3499,6 +5131,10 @@ async fn run_supervisor(
                         },
                     )?;
                     let generation = next_delivery_generation;
+                    #[cfg(test)]
+                    if let Some(entry) = sessions.get_mut(&thread_id) {
+                        entry.accepted_publication_test_hook = accepted_publication_test_hook.clone();
+                    }
                     let result = spawn_delivery(
                         &engine,
                         &mut sessions,
@@ -3726,6 +5362,30 @@ async fn run_supervisor(
                     None
                 };
                 let _ = response.send(generation);
+            }
+            SupervisorMessage::PublishAcceptedDelivery {
+                identity,
+                generation,
+                terminal_revision,
+                turn_id,
+                response,
+            } => {
+                let generation_is_current = delivery_sequences
+                    .get(&identity.thread_id)
+                    .is_some_and(|sequence| sequence.active_generation == Some(generation));
+                if generation_is_current
+                    && let Some(entry) = sessions.get(&identity.thread_id)
+                    && Arc::ptr_eq(&entry.driver, &identity.driver)
+                    && !entry.event_cancellation.is_cancelled()
+                    && entry.pending_stream_settlement.is_none()
+                {
+                    // Actor identity ownership and the pump share one core write lease.
+                    let _ =
+                        publish_running_session(&engine, entry, terminal_revision, turn_id, true)
+                            .await;
+                }
+                // A stale local publication still belongs to a provider-accepted delivery.
+                let _ = response.send(());
             }
             SupervisorMessage::DeliveryComplete {
                 thread_id,
@@ -4081,15 +5741,19 @@ async fn spawn_delivery(
         .transpose()?;
     entry.idle_generation.fetch_add(1, Ordering::Relaxed);
     let driver = entry.driver.clone();
-    let launch = entry.launch.clone();
-    let resume_cursor = entry.resume_cursor.clone();
-    let runtime_payload = entry.runtime_payload.clone();
+    let identity = ProviderSessionIdentity {
+        thread_id: thread_id.clone(),
+        driver: entry.driver.clone(),
+    };
+    // Admission waits for the preceding core batch, then releases before native I/O.
+    let terminal_revision = capture_start_revision(entry).await?;
+    #[cfg(test)]
+    let accepted_publication_test_hook = entry.accepted_publication_test_hook.clone();
     let event_cancellation = entry.event_cancellation.clone();
     let repositories = engine.repositories();
-    let engine = engine.clone();
     let (completion_tx, completion) = oneshot::channel();
     let terminal = DeliveryTerminalGuard {
-        sender: terminal_sender,
+        sender: terminal_sender.clone(),
         thread_id,
         generation,
         completed: false,
@@ -4161,28 +5825,104 @@ async fn spawn_delivery(
             && steer_delivery.is_none()
             && !event_cancellation.is_cancelled()
         {
-            if let Err(error) = persist_runtime(
-                &repositories,
-                &launch,
-                "running",
-                resume_cursor,
-                runtime_payload,
-            )
-            .await
+            #[cfg(test)]
+            if let Some(gate) = accepted_publication_test_hook
+                .as_ref()
+                .and_then(|hook| hook.before_publication.as_ref())
             {
-                tracing::warn!(%error, "accepted provider delivery runtime state was not persisted");
+                gate.pause().await;
             }
-            if let Err(error) =
-                dispatch_session_state(&engine, &launch, "running", turn_id.clone(), None, None)
-                    .await
+            let (response, published) = oneshot::channel();
+            let enqueued = terminal_sender
+                .send(SupervisorMessage::PublishAcceptedDelivery {
+                    identity,
+                    generation,
+                    terminal_revision,
+                    turn_id: turn_id.clone(),
+                    response,
+                })
+                .is_ok();
+            #[cfg(test)]
+            if enqueued
+                && let Some(observed) = accepted_publication_test_hook
+                    .as_ref()
+                    .and_then(|hook| hook.publication_enqueued.as_ref())
             {
-                tracing::warn!(%error, "accepted provider delivery session state was not projected");
+                observed.notify_one();
+            }
+            if enqueued && published.await.is_err() {
+                tracing::debug!(
+                    thread_id = %terminal.thread_id,
+                    "accepted provider publication acknowledgement closed during supervisor shutdown"
+                );
             }
         }
         terminal.complete();
         let _ = completion_tx.send(outcome);
     });
     Ok(ProviderDeliveryHandle { completion })
+}
+
+async fn capture_start_revision(entry: &SessionEntry) -> Result<u64, ProviderRuntimeError> {
+    #[cfg(test)]
+    if let Some(observed) = entry
+        .accepted_publication_test_hook
+        .as_ref()
+        .and_then(|hook| hook.admission_waiting.as_ref())
+    {
+        observed.notify_one();
+    }
+    let publication = entry.publication.lock().await;
+    if publication.closed || entry.event_cancellation.is_cancelled() {
+        return Err(ProviderRuntimeError::SessionNotFound {
+            thread_id: entry.launch.thread_id.clone(),
+        });
+    }
+    Ok(publication.terminal_revision)
+}
+
+async fn publish_running_session(
+    engine: &OrchestrationEngine,
+    entry: &SessionEntry,
+    terminal_revision: u64,
+    turn_id: Option<String>,
+    best_effort: bool,
+) -> Result<(), ProviderRuntimeError> {
+    let publication = entry.publication.lock().await;
+    if publication.closed
+        || entry.event_cancellation.is_cancelled()
+        || publication.terminal_revision != terminal_revision
+        // Exhaustion is absorbing: a saturated witness can never reopen publication.
+        || publication.terminal_revision == u64::MAX
+    {
+        return Ok(());
+    }
+    let runtime = persist_entry(&engine.repositories(), entry, "running").await;
+    if best_effort {
+        if let Err(error) = runtime {
+            tracing::warn!(%error, "accepted provider delivery runtime state was not persisted");
+        }
+    } else {
+        runtime?;
+    }
+    #[cfg(test)]
+    if let Some(gate) = entry
+        .accepted_publication_test_hook
+        .as_ref()
+        .and_then(|hook| hook.after_runtime.as_ref())
+    {
+        gate.pause().await;
+    }
+    let session =
+        dispatch_session_state(engine, &entry.launch, "running", turn_id, None, None).await;
+    if best_effort {
+        if let Err(error) = session {
+            tracing::warn!(%error, "accepted provider delivery session state was not projected");
+        }
+        Ok(())
+    } else {
+        session
+    }
 }
 
 fn provider_supports_agent_activity(provider: &str) -> bool {
@@ -4612,6 +6352,7 @@ async fn launch_session(
     }
 
     let cancellation = CancellationToken::new();
+    let publication = Arc::new(Mutex::new(SessionPublicationState::default()));
     let activity_dispatch_cancellation = CancellationToken::new();
     let activity_late_dispatch_cancellation = CancellationToken::new();
     let idle_generation = Arc::new(AtomicU64::new(0));
@@ -4628,6 +6369,7 @@ async fn launch_session(
         activity_dispatch_sender.clone(),
         format!("supervisor:stream-ended:{activity_lifecycle_id}"),
         cancellation.clone(),
+        publication.clone(),
         operational_log.cloned(),
         idle_generation.clone(),
         terminal_sender.clone(),
@@ -4654,6 +6396,9 @@ async fn launch_session(
             activity_cancellation,
             activity_lifecycle,
             activity_compensation_key: format!("supervisor:cancelled-live:{activity_lifecycle_id}"),
+            publication,
+            #[cfg(test)]
+            accepted_publication_test_hook: None,
             event_task,
             event_cancellation: cancellation,
             pending_stream_settlement: None,
@@ -4725,12 +6470,12 @@ async fn handle_command(
             ..
         } => {
             entry.idle_generation.fetch_add(1, Ordering::Relaxed);
+            let terminal_revision = capture_start_revision(entry).await?;
             let turn_id = entry
                 .driver
                 .send(message.text, message.attachments, interaction_mode)
                 .await?;
-            persist_entry(&engine.repositories(), entry, "running").await?;
-            dispatch_session_state(engine, &entry.launch, "running", turn_id, None, None).await
+            publish_running_session(engine, entry, terminal_revision, turn_id, false).await
         }
         OrchestrationCommand::ThreadTurnInterrupt { turn_id, .. } => {
             entry.driver.interrupt(turn_id).await?;
@@ -5094,10 +6839,8 @@ async fn restart_session(
         cancel_and_reap_activity_tasks(entry).await;
         entry.driver.shutdown().await?;
     }
-    if let Some(entry) = sessions.remove(thread_id) {
-        entry.event_cancellation.cancel();
-        entry.event_task.abort();
-        let _ = entry.event_task.await;
+    if let Some(mut entry) = sessions.remove(thread_id) {
+        close_publication_and_reap_event_task(&mut entry).await;
         synchronize_activity_lifecycle(
             activity,
             &entry.launch.thread_id,
@@ -5297,6 +7040,7 @@ fn spawn_event_pump(
     activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
     stream_ended_event_key: String,
     cancellation: CancellationToken,
+    publication: SessionPublicationFence,
     operational_log: Option<ProviderOperationalLog>,
     idle_generation: Arc<AtomicU64>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
@@ -5496,13 +7240,24 @@ fn spawn_event_pump(
                         .then(|| idle_generation.fetch_add(1, Ordering::Relaxed) + 1);
                     let completed = event.event_type == "turn.completed"
                         && event.payload.get("state").and_then(Value::as_str) != Some("failed");
-                    if let Err(error) = project_provider_event(
+                    let mut core_publication = publication.lock().await;
+                    if core_publication.closed || cancellation.is_cancelled() {
+                        return;
+                    }
+                    if event.event_type == "turn.completed" {
+                        core_publication.terminal_revision = core_publication.terminal_revision.saturating_add(1);
+                    }
+                    let projection = project_provider_event(
                         &engine,
                         &launch,
                         resume_cursor.clone(),
                         runtime_payload.clone(),
                         event,
-                    ).await {
+                        #[cfg(test)]
+                        core_publication.after_terminal_session.as_ref(),
+                    ).await;
+                    drop(core_publication);
+                    if let Err(error) = projection {
                         if matches!(error, ProviderRuntimeError::Orchestration(_))
                             && provider_thread_was_deleted(&engine.repositories(), &launch.thread_id)
                                 .await
@@ -5561,7 +7316,8 @@ fn spawn_event_pump(
                 }
             }
         }
-        if !cancellation.is_cancelled() {
+        let mut core_publication = publication.lock().await;
+        if !core_publication.closed && !cancellation.is_cancelled() {
             const STREAM_END_ERROR: &str = "Provider event stream ended unexpectedly.";
             let stream_end_message = last_exit_reason.as_deref().map_or_else(
                 || STREAM_END_ERROR.to_owned(),
@@ -5604,12 +7360,16 @@ fn spawn_event_pump(
                     activity_controls: Default::default(),
                 };
                 idle_generation.fetch_add(1, Ordering::Relaxed);
+                core_publication.terminal_revision =
+                    core_publication.terminal_revision.saturating_add(1);
                 if let Err(error) = project_provider_event(
                     &engine,
                     &launch,
                     resume_cursor.clone(),
                     runtime_payload.clone(),
                     failure,
+                    #[cfg(test)]
+                    core_publication.after_terminal_session.as_ref(),
                 )
                 .await
                 {
@@ -5622,9 +7382,21 @@ fn spawn_event_pump(
                 }
             }
         }
-        // Projection has settled. Signal that this entry cannot accept delivery
-        // even while the driver's shutdown is still draining.
+        #[cfg(test)]
+        let stream_end_handoff = core_publication.stream_end_handoff.clone();
+        #[cfg(test)]
+        if let Some(handoff) = &stream_end_handoff {
+            handoff.before_unlock.pause().await;
+        }
+        // Close admission while the final lease still excludes waiting publishers.
+        // The settled acknowledgement and native shutdown remain outside that lease.
+        core_publication.closed = true;
         cancellation.cancel();
+        drop(core_publication);
+        #[cfg(test)]
+        if let Some(handoff) = &stream_end_handoff {
+            handoff.after_unlock.pause().await;
+        }
         let _ = settled_tx.send(());
         if let Err(error) = driver.shutdown().await {
             tracing::debug!(
@@ -5682,6 +7454,7 @@ async fn project_provider_event(
     resume_cursor: Option<Value>,
     runtime_payload: Option<Value>,
     event: ProviderEvent,
+    #[cfg(test)] after_terminal_session: Option<&Arc<PublicationTestGate>>,
 ) -> Result<(), ProviderRuntimeError> {
     let created_at = now();
     let command_id = format!("provider:{}", Uuid::new_v4());
@@ -5705,6 +7478,10 @@ async fn project_provider_event(
         )
         .await?;
         dispatch_session_state(engine, launch, status, None, last_error, last_error_class).await?;
+        #[cfg(test)]
+        if let Some(gate) = after_terminal_session {
+            gate.pause().await;
+        }
         if let Err(error) = settle_streaming_assistant_messages(
             engine,
             &event.thread_id,
@@ -6606,6 +8383,18 @@ mod removal_suspension_tests {
     }
 }
 
+/// Cancellation prevents new admission; closing waits for every admitted core batch.
+/// Never abort its owner while submitted DB/engine work can still complete.
+async fn close_publication_and_reap_event_task(entry: &mut SessionEntry) {
+    entry.event_cancellation.cancel();
+    {
+        let mut publication = entry.publication.lock().await;
+        publication.closed = true;
+    }
+    entry.event_task.abort();
+    let _ = (&mut entry.event_task).await;
+}
+
 async fn detach_session(
     activity: &ActivityProjection,
     sessions: &mut HashMap<String, SessionEntry>,
@@ -6624,9 +8413,7 @@ async fn detach_session(
     };
     entry.activity_control.write().await.take();
     cancel_and_reap_activity_tasks(&mut entry).await;
-    entry.event_cancellation.cancel();
-    entry.event_task.abort();
-    let _ = entry.event_task.await;
+    close_publication_and_reap_event_task(&mut entry).await;
     synchronize_activity_lifecycle(activity, &entry.launch.thread_id, &entry.activity_lifecycle)
         .await;
     compensate_cancelled_activity(
@@ -15303,6 +17090,9 @@ done
             activity_dispatch_sender,
             "claude-pump-stream-ended".to_owned(),
             pump_cancellation.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                super::SessionPublicationState::default(),
+            )),
             None,
             Arc::new(AtomicU64::new(0)),
             terminal_sender,
@@ -15557,6 +17347,9 @@ done
             activity_dispatch_sender,
             "claude-poison-stream-ended".to_owned(),
             pump_cancellation.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                super::SessionPublicationState::default(),
+            )),
             None,
             Arc::new(AtomicU64::new(0)),
             terminal_sender,
@@ -15749,6 +17542,9 @@ done
             activity_dispatch_sender,
             "claude-terminal-stream-ended".to_owned(),
             pump_cancellation.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                super::SessionPublicationState::default(),
+            )),
             None,
             Arc::new(AtomicU64::new(0)),
             terminal_sender,
@@ -18381,6 +20177,7 @@ done
                 queue_capacity: 2,
                 session_idle_timeout: IDLE_TIMEOUT,
                 idle_deadline_test_observer: Some(idle_deadline_tx),
+                accepted_publication_test_hook: None,
             },
         );
         let temp = TempDir::new().unwrap();
@@ -18582,6 +20379,7 @@ done
         events: mpsc::Sender<super::ProviderEvent>,
         deadlines: mpsc::UnboundedReceiver<super::IdleDeadlineTestEvent>,
         idle_timeout: Duration,
+        admission_waiting: Arc<tokio::sync::Notify>,
         _workspace: TempDir,
     }
 
@@ -18594,6 +20392,7 @@ done
             }));
             let (events, events_rx) = mpsc::channel(2);
             let (idle_deadline_tx, deadlines) = mpsc::unbounded_channel();
+            let admission_waiting = Arc::new(tokio::sync::Notify::new());
             let supervisor = super::ProviderRuntimeSupervisor::start(
                 engine.clone(),
                 Arc::new(SupervisorFactory {
@@ -18607,6 +20406,10 @@ done
                     queue_capacity: 2,
                     session_idle_timeout: idle_timeout,
                     idle_deadline_test_observer: Some(idle_deadline_tx),
+                    accepted_publication_test_hook: Some(super::AcceptedPublicationTestHook {
+                        admission_waiting: Some(admission_waiting.clone()),
+                        ..super::AcceptedPublicationTestHook::default()
+                    }),
                 },
             );
             let workspace = TempDir::new().unwrap();
@@ -18620,6 +20423,7 @@ done
                 events,
                 deadlines,
                 idle_timeout,
+                admission_waiting,
                 _workspace: workspace,
             }
         }
@@ -18637,10 +20441,33 @@ done
         }
 
         async fn admit(&self, id: &str) -> super::ProviderDeliveryHandle {
-            self.supervisor
+            let handle = self
+                .supervisor
                 .deliver_turn(Self::turn_command(id), id.to_owned())
                 .await
-                .expect("turn admitted")
+                .expect("turn admitted");
+            self.admission_waiting.notified().await;
+            handle
+        }
+
+        async fn queue_admission_behind_settlement(
+            &self,
+            id: &str,
+        ) -> tokio::task::JoinHandle<super::ProviderDeliveryHandle> {
+            let supervisor = self.supervisor.clone();
+            let command = Self::turn_command(id);
+            let key = id.to_owned();
+            let attempt = tokio::spawn(async move {
+                supervisor
+                    .deliver_turn(command, key)
+                    .await
+                    .expect("turn admitted after settlement")
+            });
+            self.admission_waiting.notified().await;
+            // The actor reserved the delivery/idle generation, but native admission must
+            // wait until the previous terminal batch completes. Release its test gate
+            // before awaiting the returned handle to avoid a fixture-only wait cycle.
+            attempt
         }
 
         async fn accepted(handle: super::ProviderDeliveryHandle, turn_id: &str) {
@@ -18843,8 +20670,9 @@ done
         let settlement = fixture
             .hold_completion_settlement("idle-turn-1", "assistant-first")
             .await;
-        let follow_up = fixture.admit("follow-up").await;
+        let follow_up = fixture.queue_admission_behind_settlement("follow-up").await;
         settlement.release();
+        let follow_up = follow_up.await.unwrap();
         IdleDeadlineFixture::accepted(follow_up, "idle-turn-2").await;
         fixture
             .assert_projection("running", Some("idle-turn-2"))
@@ -18889,8 +20717,9 @@ done
             state.send_gate = Some(gate.clone());
             state.send_entered = Some(entered.clone());
         }
-        let follow_up = fixture.admit("follow-up").await;
+        let follow_up = fixture.queue_admission_behind_settlement("follow-up").await;
         settlement.release();
+        let follow_up = follow_up.await.unwrap();
         entered.notified().await;
         let armed = fixture.next_deadline().await;
         fixture.assert_projection("ready", None).await;
@@ -18924,8 +20753,9 @@ done
         let first_settlement = fixture
             .hold_completion_settlement("idle-turn-1", "assistant-first")
             .await;
-        let follow_up = fixture.admit("follow-up").await;
+        let follow_up = fixture.queue_admission_behind_settlement("follow-up").await;
         first_settlement.release();
+        let follow_up = follow_up.await.unwrap();
         IdleDeadlineFixture::accepted(follow_up, "idle-turn-2").await;
         let first_armed = fixture.next_deadline().await;
         let settlement = fixture
@@ -20925,6 +22755,7 @@ done
                 activity: Vec::new(),
                 activity_controls: Default::default(),
             },
+            None,
         )
         .await
         .expect("work-log event projects");
@@ -21213,6 +23044,7 @@ done
                 activity: Vec::new(),
                 activity_controls: Default::default(),
             },
+            None,
         )
         .await
         .expect("context usage projects");
@@ -21262,6 +23094,7 @@ done
                 activity: Vec::new(),
                 activity_controls: Default::default(),
             },
+            None,
         )
         .await
         .expect("malformed context usage is ignored");
@@ -21300,6 +23133,7 @@ done
                 activity: Vec::new(),
                 activity_controls: Default::default(),
             },
+            None,
         )
         .await
         .expect("MCP status projects");
