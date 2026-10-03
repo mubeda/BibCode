@@ -38,6 +38,7 @@ export interface AddProjectStartStepProps {
 export interface AddProjectHostPathStepProps {
   readonly hostLabel: string;
   readonly path: string;
+  readonly platform: string | null;
   readonly error: string | null;
   readonly busy: boolean;
   readonly onPathChange: (path: string) => void;
@@ -392,12 +393,13 @@ function ParentDirectoryField({
 export function AddProjectHostPathStep({
   hostLabel,
   path,
+  platform,
   error,
   busy,
   onPathChange,
   onSubmit,
 }: AddProjectHostPathStepProps) {
-  const canSubmit = path.trim().length > 0 && !busy;
+  const canSubmit = path.trim().length > 0 && platform !== null && !busy;
 
   return (
     <form
@@ -432,6 +434,11 @@ export function AddProjectHostPathStep({
           value={path}
         />
       </div>
+      {platform === null && !busy ? (
+        <p className="text-muted-foreground text-sm" role="status">
+          Waiting for host information…
+        </p>
+      ) : null}
       {error ? <ErrorMessage>{error}</ErrorMessage> : null}
       <Button className="w-full" disabled={!canSubmit} size="lg" type="submit">
         {busy ? "Opening…" : "Open project"}
