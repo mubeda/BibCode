@@ -43,7 +43,11 @@ import {
 } from "./support/release-visual-fixture.ts";
 import { captureVisualScene, runVisualCore } from "./support/release-visual-core.ts";
 import { visualScenes } from "./support/release-visual-evidence.ts";
-import { readVisualViewport } from "./support/release-visual-observation.ts";
+import {
+  readVisualViewport,
+  readVisualWitness,
+  type VisualObservationInput,
+} from "./support/release-visual-observation.ts";
 import { correctDesktopUiOuterSize } from "./support/window-size.ts";
 
 const root = NodePath.resolve(import.meta.dirname, "../../..");
@@ -162,6 +166,44 @@ export function projectDeliveryStartupObservation(input: unknown) {
   };
 }
 
+/** Exact create-ref failure facts only; false is diagnostic, never capture approval. */
+export function projectVisualCreateRefObservation(input: unknown) {
+  try {
+    if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
+    const keys = [
+      "themeMatched",
+      "selectedMatched",
+      "expectedTextMatched",
+      "targetInView",
+      "credentialAbsent",
+      "bootShellAbsent",
+      "singleDialog",
+      "exactRef",
+      "derivedName",
+      "reuseBlocked",
+      "agentControl",
+      "advancedControl",
+    ];
+    const ownKeys = Reflect.ownKeys(input);
+    if (
+      ownKeys.length !== keys.length ||
+      !ownKeys.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const entries: Array<[string, boolean]> = [];
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      const value = descriptor.value;
+      if (typeof value !== "boolean") return null;
+      entries.push([key, value]);
+    }
+    return Object.fromEntries(entries);
+  } catch {
+    return null;
+  }
+}
+
 export async function runDeliveryRetryQualification() {
   const config = deliveryConfiguration(process.env);
   const owner = new QualificationOwner(root, config.fixture);
@@ -172,6 +214,7 @@ export async function runDeliveryRetryQualification() {
   const assertions: object[] = [];
   const captures: object[] = [];
   const capturedVisuals = new Set<string>();
+  let createRefObservationInput: VisualObservationInput | null = null;
   const networkProofs: object[] = [];
   const write = (name: string, value: unknown) =>
     NodeFS.writeFileSync(
@@ -275,6 +318,18 @@ export async function runDeliveryRetryQualification() {
       );
     } catch {
       // Unavailable diagnostics stay unknown; original failure and owned cleanup still run.
+      return null;
+    }
+  }
+
+  async function readCreateRefFailureObservation() {
+    if (createRefObservationInput === null) return null;
+    try {
+      return projectVisualCreateRefObservation(
+        await bounded(browser!.execute(readVisualWitness, createRefObservationInput), 2_000),
+      );
+    } catch {
+      // The bounded diagnostic never replaces the original failure.
       return null;
     }
   }
@@ -816,6 +871,14 @@ export async function runDeliveryRetryQualification() {
           },
           partialStageMatches: () => visualPartialStageMatches(visualInput),
           capture: async (scene) => {
+            if (scene === "worktree-create-ref")
+              createRefObservationInput = {
+                scene,
+                theme,
+                origin,
+                threadId: workspace.threadId,
+                branch: workspace.branch,
+              };
             captures.push(
               await captureVisualScene({
                 browser: b(),
@@ -1000,6 +1063,10 @@ export async function runDeliveryRetryQualification() {
     );
     success = true;
   } catch (error) {
+    const createRefObservation =
+      browser && phase === "visual-worktree-create-ref"
+        ? await readCreateRefFailureObservation()
+        : null;
     const startupObservation =
       browser && (phase.startsWith("pair-") || phase.startsWith("theme-"))
         ? await readStartupFailureObservation()
@@ -1022,6 +1089,7 @@ export async function runDeliveryRetryQualification() {
       failure: classifyQualificationFailure(error),
       startupObservation,
       worktreeObservation,
+      createRefObservation,
     });
   } finally {
     const processes = owner.processes.map(({ child, role, log, spawnFailure }) =>

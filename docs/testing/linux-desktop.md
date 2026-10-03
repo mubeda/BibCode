@@ -831,6 +831,13 @@ JSON receipt files enter the artifact allowlist. Inspect the originals
 independently before accepting visual quality. No private logs, provider inputs,
 credentials or profiles are retained.
 
+If the exact create-ref capture fails, `failure.json` additionally records
+`createRefObservation`: one read of the same twelve closed witness booleans,
+bounded to two seconds before cleanup. False facts identify unmet predicates;
+unavailable, malformed or extra fields remain unknown (`null`). This observation
+never approves a screenshot and retains no page text, input, path, URL or driver
+error. Other phases do not perform this read.
+
 As for delivery Retry, acceptance requires the outer input hashes unchanged,
 zero guard refusals, joined browser/server cleanup, no namespace survivors and
 the unchanged host network identity. The private fixture is deleted only after

@@ -5,13 +5,17 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeVM from "node:vm";
 import { describe, expect, it, vi } from "vite-plus/test";
-import { deliveryConfiguration } from "../qualify-delivery-retry.ts";
+import {
+  deliveryConfiguration,
+  projectVisualCreateRefObservation,
+} from "../qualify-delivery-retry.ts";
 import { deliveryScenes, deliveryThemes } from "./delivery-retry-evidence.ts";
 import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
 import { bounded } from "./qualification-owner.ts";
 import { resolveWorktreeCreateInput } from "../../../web/src/components/CreateWorktreeDialog.logic.ts";
 import { readSelectedDeliveryWorktree } from "./delivery-retry-workspace.ts";
 import { prepareDesktopUiTestContext } from "./test-project.ts";
+import { readVisualWitness } from "./release-visual-observation.ts";
 
 const environment = {
   CI: "true",
@@ -24,6 +28,285 @@ const environment = {
   BIBCODE_UPLOAD_CHROME: "/owned/chrome",
   BIBCODE_UPLOAD_DRIVER: "/owned/driver",
 };
+
+const createRefFacts = {
+  themeMatched: true,
+  selectedMatched: true,
+  expectedTextMatched: false,
+  targetInView: true,
+  credentialAbsent: true,
+  bootShellAbsent: true,
+  singleDialog: true,
+  exactRef: true,
+  derivedName: false,
+  reuseBlocked: true,
+  agentControl: true,
+  advancedControl: true,
+};
+
+function createRefFailureBoundary(
+  options: {
+    response?: unknown;
+    phase?: string;
+    noBrowser?: boolean;
+    noInput?: boolean;
+    pending?: boolean;
+    reject?: boolean;
+  } = {},
+) {
+  const writes: Array<Record<string, unknown>> = [];
+  let reads = 0;
+  let finishRead: (value: unknown) => void = () => {};
+  const observationInput = {
+    scene: "worktree-create-ref",
+    theme: "light",
+    origin: "http://127.0.0.1:4885",
+    threadId: "owned-thread",
+    branch: "codex/delivery-retry-light",
+  };
+  const projectorStart = controller.indexOf("export function projectVisualCreateRefObservation(");
+  const projectorEnd = controller.indexOf(
+    "export async function runDeliveryRetryQualification(",
+    projectorStart,
+  );
+  const helperStart = controller.indexOf("  async function readCreateRefFailureObservation()");
+  const helperEnd = controller.indexOf(
+    "  async function readWorktreeFailureObservation()",
+    helperStart,
+  );
+  const catchStart = controller.lastIndexOf("  } catch (error) {");
+  const catchEnd = controller.indexOf("  } finally {", catchStart);
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      (projectorStart < 0
+        ? ""
+        : controller.slice(projectorStart, projectorEnd).replace("export ", "")) +
+        (helperStart < 0 ? "" : controller.slice(helperStart, helperEnd)) +
+        "\nasync function fail() {" +
+        controller.slice(catchStart + "  } catch (error) {".length, catchEnd) +
+        "\n}\nfail",
+    ),
+    {
+      browser: options.noBrowser
+        ? undefined
+        : {
+            execute: async (reader: unknown, input: unknown) => {
+              reads++;
+              expect(reader).toBe(readVisualWitness);
+              expect(input).toEqual(observationInput);
+              if (options.reject) throw new Error("private-driver-value");
+              if (options.pending)
+                return new Promise((resolve) => {
+                  finishRead = resolve;
+                });
+              return Object.hasOwn(options, "response") ? options.response : createRefFacts;
+            },
+          },
+      phase: options.phase ?? "visual-worktree-create-ref",
+      theme: "light",
+      createRefObservationInput: options.noInput ? null : observationInput,
+      error: new Error("The required live observation did not arrive within its bound."),
+      bounded,
+      readVisualWitness,
+      classifyQualificationFailure,
+      readStartupFailureObservation: async () => null,
+      readWorktreeFailureObservation: async () => null,
+      write: (_name: string, value: Record<string, unknown>) => writes.push(value),
+    },
+  ) as () => Promise<void>;
+  return { run, writes, reads: () => reads, finishRead: (value: unknown) => finishRead(value) };
+}
+
+describe("closed create-ref failure facts", () => {
+  it("retains the failing exact scene facts without turning them into capture approval", async () => {
+    const f = createRefFailureBoundary();
+    await f.run();
+    expect(f.writes[0]?.createRefObservation).toEqual(createRefFacts);
+    expect(f.writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+    expect(f.reads()).toBe(1);
+    expect(JSON.stringify(f.writes)).not.toMatch(/4885|owned-thread|private-driver-value/);
+  });
+  it.each([
+    null,
+    [],
+    { ...createRefFacts, rawError: "private-driver-value" },
+    { ...createRefFacts, derivedName: "private-input" },
+    { ...createRefFacts, advancedControl: undefined },
+  ])("refuses missing, malformed or extra witness fields", async (response) => {
+    const f = createRefFailureBoundary({ response });
+    await f.run();
+    expect(f.writes[0]?.createRefObservation).toBeNull();
+    expect(f.writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+    expect(JSON.stringify(f.writes)).not.toMatch(/private/);
+  });
+  it.each([{ noBrowser: true }, { noInput: true }, { phase: "visual-git-changes-diff" }])(
+    "does not read outside the exact attempted create-ref capture",
+    async (options) => {
+      const f = createRefFailureBoundary(options);
+      await f.run();
+      expect(f.writes[0]?.createRefObservation).toBeNull();
+      expect(f.reads()).toBe(0);
+    },
+  );
+  it("keeps the original failure when the diagnostic read rejects", async () => {
+    const f = createRefFailureBoundary({ reject: true });
+    await f.run();
+    expect(f.writes[0]?.createRefObservation).toBeNull();
+    expect(f.writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+    expect(JSON.stringify(f.writes)).not.toMatch(/private-driver/);
+  });
+  it("bounds a pending diagnostic and ignores its late private result", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = createRefFailureBoundary({ pending: true });
+      const pending = f.run();
+      await vi.advanceTimersByTimeAsync(2_001);
+      await pending;
+      expect(f.writes[0]?.createRefObservation).toBeNull();
+      const receipt = JSON.stringify(f.writes);
+      f.finishRead({ rawError: "private-driver-value" });
+      await Promise.resolve();
+      expect(JSON.stringify(f.writes)).toBe(receipt);
+      expect(f.reads()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe.each(["projector", "failure-seam"])("create-ref descriptor admission: %s", (consumer) => {
+  async function project(input: unknown): Promise<unknown> {
+    if (consumer === "projector") {
+      let output: unknown;
+      let threw = false;
+      try {
+        output = projectVisualCreateRefObservation(input);
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(false);
+      return output;
+    }
+    const f = createRefFailureBoundary({ response: input });
+    await f.run();
+    expect(f.writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+    expect(f.reads()).toBe(1);
+    return f.writes[0]?.createRefObservation;
+  }
+
+  it.each(Object.keys(createRefFacts))(
+    "refuses the %s accessor without invoking it",
+    async (key) => {
+      let reads = 0;
+      const input = { ...createRefFacts };
+      Object.defineProperty(input, key, {
+        enumerable: true,
+        get: () => {
+          reads++;
+          return reads === 1 ? true : "inert-private-canary";
+        },
+      });
+      const output = await project(input);
+      expect(reads).toBe(0);
+      expect(output === null).toBe(true);
+    },
+  );
+
+  it.each(Object.keys(createRefFacts))(
+    "refuses inherited %s even with a replacement extra own key",
+    async (key) => {
+      const input = Object.assign(Object.create({ [key]: true }), createRefFacts) as Record<
+        string,
+        unknown
+      >;
+      delete input[key];
+      input.extra = false;
+      expect((await project(input)) === null).toBe(true);
+    },
+  );
+
+  it.each(Object.keys(createRefFacts))("requires %s to be enumerable own data", async (key) => {
+    const input = { ...createRefFacts };
+    Object.defineProperty(input, key, { enumerable: false });
+    expect((await project(input)) === null).toBe(true);
+  });
+
+  it.each([
+    "symbol",
+    "hidden-extra",
+    "extra",
+    "array",
+    "revoked",
+    "own-keys-throw",
+    "descriptor-throw",
+  ])("returns null locally for %s input", async (mode) => {
+    let input: object = { ...createRefFacts };
+    if (mode === "symbol") Object.defineProperty(input, Symbol("extra"), { value: true });
+    if (mode === "hidden-extra") Object.defineProperty(input, "extra", { value: true });
+    if (mode === "extra") Object.assign(input, { extra: true });
+    if (mode === "array") input = Object.assign([], createRefFacts);
+    if (mode === "revoked") {
+      const revocable = Proxy.revocable(input, {});
+      revocable.revoke();
+      input = revocable.proxy;
+    }
+    if (mode === "own-keys-throw")
+      input = new Proxy(input, {
+        ownKeys: () => {
+          throw new Error("Inert reflection refusal.");
+        },
+      });
+    if (mode === "descriptor-throw")
+      input = new Proxy(input, {
+        getOwnPropertyDescriptor: () => {
+          throw new Error("Inert reflection refusal.");
+        },
+      });
+    expect((await project(input)) === null).toBe(true);
+  });
+
+  it.each([true, false])(
+    "admits all %s enumerable data facts including a null prototype",
+    async (value) => {
+      const facts = Object.fromEntries(Object.keys(createRefFacts).map((key) => [key, value]));
+      expect(await project(facts)).toEqual(facts);
+      expect(await project(Object.assign(Object.create(null), facts))).toEqual(facts);
+    },
+  );
+
+  it("snapshots each own descriptor once without reading original values", async () => {
+    let ownKeyReads = 0;
+    let propertyReads = 0;
+    const descriptorReads = new Map<PropertyKey, number>();
+    const input = new Proxy(
+      { ...createRefFacts },
+      {
+        ownKeys: (target) => {
+          ownKeyReads++;
+          return Reflect.ownKeys(target);
+        },
+        getOwnPropertyDescriptor: (target, key) => {
+          descriptorReads.set(key, (descriptorReads.get(key) ?? 0) + 1);
+          if (descriptorReads.get(key) !== 1)
+            throw new Error("Inert duplicate descriptor refusal.");
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+        get: (_target, key) => {
+          // Promise resolution probes then before the projector sees the input.
+          if (key === "then") return undefined;
+          propertyReads++;
+          throw new Error("Inert original value refusal.");
+        },
+      },
+    );
+    const output = await project(input);
+    expect(propertyReads).toBe(0);
+    expect(ownKeyReads).toBe(1);
+    expect([...descriptorReads.keys()].sort()).toEqual(Object.keys(createRefFacts).sort());
+    expect([...descriptorReads.values()]).toEqual(Array.from({ length: 12 }, () => 1));
+    expect(output).toEqual(createRefFacts);
+  });
+});
 
 describe("delivery controller admission", () => {
   it("consumes only explicit owned inputs and has a finite six-image manifest", () => {
@@ -967,9 +1250,12 @@ function startupFailureBoundary(
   const start = controller.lastIndexOf("  } catch (error) {");
   const end = controller.indexOf("  } finally {", start);
   const helperStart = controller.indexOf("  async function readStartupFailureObservation()");
-  const helperEnd = controller.indexOf("  async function setTheme()", helperStart);
+  const helperEnd = controller.indexOf(
+    "  async function readCreateRefFailureObservation()",
+    helperStart,
+  );
   const projectorStart = controller.indexOf("export function projectDeliveryStartupObservation(");
-  const projectorEnd = controller.indexOf("export async function runDeliveryRetryQualification()");
+  const projectorEnd = controller.indexOf("export function projectVisualCreateRefObservation(");
   if (start < 0 || end < start) throw new Error("Missing controller failure boundary.");
   const projector =
     projectorStart < 0 ? "" : controller.slice(projectorStart, projectorEnd).replace("export ", "");

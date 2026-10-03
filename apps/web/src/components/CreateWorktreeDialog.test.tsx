@@ -1474,6 +1474,56 @@ if (browserRuntime) {
       container.remove();
     });
 
+    it("reopens the visual fixture and derives the exact occupied ref after clearing its prior name", async () => {
+      testState.refs = [
+        { name: "main", current: true, worktreePath: "/repo" },
+        { name: "visual-free", isRemote: false, worktreePath: null },
+        { name: "visual-held", isRemote: false, worktreePath: "/owned/held" },
+      ];
+      const { container, root } = await mountDialog();
+      try {
+        await setInputValue(
+          requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']"),
+          "codex/delivery retry light",
+        );
+        await renderDialog(root, false);
+        await renderDialog(root, true);
+        const name = requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Worktree name']",
+        );
+        expect(name.value).toBe("codex/delivery retry light");
+
+        await React.act(async () => requiredButton(container, "Branch").click());
+        await setInputValue(name, "");
+        const source = requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Search branches']",
+        );
+        await setInputValue(source, "visual-held");
+
+        expect(name.value).toBe("visual-held");
+        expect(source.value).toBe("visual-held");
+        expect(
+          Array.from(container.querySelectorAll("button")).filter(
+            (candidate) => candidate.textContent?.trim() === "visual-held",
+          ),
+        ).toHaveLength(0);
+        expect(container.querySelector('p[role="status"]')?.textContent).toBe(
+          '"visual-held" is already checked out. A new branch ("visual-held-2" or the next available name) will be created from it.',
+        );
+        const reuse = Array.from(container.querySelectorAll("label"))
+          .find((label) => label.textContent?.includes("Reuse branch"))
+          ?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+        expect(reuse?.disabled).toBe(true);
+        expect(reuse?.checked).toBe(false);
+        expect(testState.createWorktree).not.toHaveBeenCalled();
+      } finally {
+        await React.act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
     it("preserves a manually edited name and leaves branch reuse off", async () => {
       testState.refs = [{ name: "feature/login", isRemote: false }];
       const { container, root } = await mountDialog();
