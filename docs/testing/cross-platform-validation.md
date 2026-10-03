@@ -1269,6 +1269,15 @@ server connection; confirm **Refresh** can retry and returning to the form keeps
 its input. Capture the flow in light and dark. Local/WSL native picking must still
 work, and manual parent entry must remain available.
 
+For manual **Add Project → Type a path instead** during host initialization,
+verify that the path stays editable, **Open project** is disabled with a waiting
+status, and pointer, Enter and form submission do not create a project while host
+platform information is unknown. When it arrives, the same dialog must enable
+submission without clearing the path or changing the selected host; nothing is
+submitted automatically. A selected host that disconnects retains the existing
+fallback behavior. Run `AddProjectReadiness.test.tsx` through the web package's
+compiled happy-dom lane alongside the Add Project component/workflow tests.
+
 Create a disposable bare repository large enough that a clone at about
 600 KB/s takes well over 30 seconds (for example 20 MB or more of
 incompressible files). Serve it over smart HTTP (`git http-backend` behind a
