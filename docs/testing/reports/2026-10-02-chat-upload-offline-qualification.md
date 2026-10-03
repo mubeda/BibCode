@@ -151,3 +151,25 @@ vp test run apps/desktop/e2e/support/browser-startup.test.ts
 These observations are prepared for independent review; no new native result or
 startup cause is claimed. The next ordinary smoke must still reach an actual
 successful upload before the slow-link matrix is expanded.
+
+Run `37080390542` at `913b` reached genuine pairing, project import, real file
+selection/preview and provider delivery. The owned provider received exactly
+one attachment with matching bytes and digest. Its final staged-path assertion
+failed: the 1 KiB fixture has only 1,390 encoded data-URL characters and therefore
+stays inline under the product's at-most-256-KiB policy, even on a capable host.
+This delivery is not staged-upload qualification, and the absence of a startup
+failure in this run does not establish the earlier splash cause.
+
+The plain smoke now generates a real 512 KiB one-pixel PNG (699,074 encoded
+characters), named `plain-staged-image-512kib` in its result. It still requires
+exact provider bytes/digest and an observed outbound `uploads.begin`; product
+thresholds, capability policy, timeout, pairing and cleanup are unchanged. The
+fixture test derives actual encoded length and calls the real staging policy,
+with a 1 KiB inline control. No new native result is claimed before activation.
+
+The current outbound plain serializer sends one JSON Request string, which the
+observer recognizes. Incoming negotiated plain records are binary, which this
+observer does not decode; its capability matcher also does not follow the config
+snapshot's nested `config.environment` shape. Capability and outstanding-append
+observations remain unqualified and cannot prove native concurrency or
+backpressure. A separate reviewed decoder slice is needed for that matrix.

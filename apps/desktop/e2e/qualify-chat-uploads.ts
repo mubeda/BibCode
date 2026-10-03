@@ -21,7 +21,11 @@ import {
   browserStartupObservationScript,
   projectBrowserStartupObservation,
 } from "./support/browser-startup.ts";
-import { createSizedPng, instrumentCodexAttachmentLog } from "./support/chat-upload-fixture.ts";
+import {
+  createSizedPng,
+  instrumentCodexAttachmentLog,
+  STAGED_SMOKE_IMAGE_BYTES,
+} from "./support/chat-upload-fixture.ts";
 import { startThrottleProxy } from "../../../scripts/throttle-proxy.ts";
 import {
   classifyQualificationFailure,
@@ -508,7 +512,7 @@ try {
   plain.route = await b.getUrl();
 
   const pngPath = NodePath.join(fixtureRoot, "upload-smoke.png");
-  const png = createSizedPng(1024, "smoke");
+  const png = createSizedPng(STAGED_SMOKE_IMAGE_BYTES, "smoke");
   NodeFS.writeFileSync(pngPath, png);
   const digest = NodeCrypto.createHash("sha256").update(png).digest("hex");
   phase("wait-composer-file-enabled");
@@ -562,7 +566,7 @@ try {
   }
   await b.saveScreenshot(NodePath.join(evidenceRoot, "plain-smoke.png"));
   results.push({
-    scenario: "plain-small-image",
+    scenario: "plain-staged-image-512kib",
     providerBytes: png.length,
     providerDigest: digest,
     observations,

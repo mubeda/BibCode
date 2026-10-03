@@ -6,7 +6,15 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeZlib from "node:zlib";
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { createSizedPng, instrumentCodexAttachmentLog } from "./chat-upload-fixture.ts";
+import {
+  createSizedPng,
+  instrumentCodexAttachmentLog,
+  STAGED_SMOKE_IMAGE_BYTES,
+} from "./chat-upload-fixture.ts";
+import {
+  encodedAttachmentCharacters,
+  shouldStageAttachments,
+} from "../../../../packages/client-runtime/src/operations/attachmentStaging.ts";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -14,6 +22,32 @@ afterEach(() => {
 });
 
 describe("owned live upload fixtures", () => {
+  it("makes the actual smoke image cross the real staging policy, with a small inline control", () => {
+    const attachment = (size: number) => {
+      const bytes = createSizedPng(size, "smoke");
+      const file = new File([Uint8Array.from(bytes)], "upload-smoke.png", { type: "image/png" });
+      return {
+        bytes,
+        source: {
+          type: "image" as const,
+          id: "owned-smoke",
+          name: file.name,
+          mimeType: file.type,
+          sizeBytes: file.size,
+          file,
+        },
+      };
+    };
+    const smoke = attachment(STAGED_SMOKE_IMAGE_BYTES);
+    const actualEncoded = "data:image/png;base64," + smoke.bytes.toString("base64");
+    expect(encodedAttachmentCharacters(smoke.source)).toBe(actualEncoded.length);
+    expect(shouldStageAttachments(true, [smoke.source])).toBe(true);
+    expect(shouldStageAttachments(false, [smoke.source])).toBe(false);
+    const small = attachment(1024);
+    expect(encodedAttachmentCharacters(small.source)).toBe(1390);
+    expect(shouldStageAttachments(true, [small.source])).toBe(false);
+  });
+
   it("makes an exact 10 MiB PNG with valid chunk checksums and a real pixel", () => {
     const bytes = createSizedPng(10 * 1024 ** 2, "slow-link");
     expect(bytes.length).toBe(10 * 1024 ** 2);

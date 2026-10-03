@@ -4,6 +4,8 @@ import * as NodePath from "node:path";
 import * as NodeZlib from "node:zlib";
 
 const MAX_IMAGE_BYTES = 10 * 1024 ** 2;
+/** Clearly exceeds the product's 256 KiB aggregate encoded inline limit. */
+export const STAGED_SMOKE_IMAGE_BYTES = 512 * 1024;
 
 function chunk(name: string, data: Buffer): Buffer {
   const bytes = Buffer.alloc(12 + data.length);
