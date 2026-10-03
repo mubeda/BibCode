@@ -137,6 +137,11 @@ directories; **Type a path instead** switches to manual entry of an absolute
 or home-relative path. Selecting a folder adds that folder as one project and
 does not scan for nested repositories.
 
+While host information is loading, manual entry keeps the path editable and
+explains why **Open project** is unavailable. The button becomes available when
+the information arrives, keeping the entered path and selected host. Nothing is
+submitted automatically.
+
 In **Clone from URL**, **Browse…** beside **Parent folder** opens the native
 picker for local and mapped WSL locations, or a directory browser on the selected
 server for remote hosts and browser clients. The browser names the server and
