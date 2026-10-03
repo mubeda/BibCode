@@ -593,6 +593,11 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   target or change the fixture's status to preserve the pre-restart dialog title.
   Separate Retry, reconfirmation, Cancel, request-count and removal phases locate
   failures without retaining page text or weakening the existing action bounds.
+  Reload diagnostics similarly identify workspace/primary selection, composer
+  readiness, the same-version connection transition, changed-version offer and
+  actual replacement document. They add only fixed phase markers: preserve all
+  public actions, clock/boot checks, negative observation windows, draft checks
+  and existing bounds. An incomplete phase is not proof of a reload defect.
   Only a push to `codex/qualify-release-ui` or a manual dispatch starts it; a push
   selects core, and manual dispatch offers core/full. There is no main-branch trigger.
   Neither selection installs software, supplies native host-toast evidence, or

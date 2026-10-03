@@ -965,6 +965,43 @@ it.each([
   expect(observed.at(-1)).toBe(expected);
 });
 
+it.each([
+  ["workspace", "reload-open-workspace"],
+  ["select-primary", "reload-select-primary"],
+  ["composer", "reload-composer-ready"],
+  ["draft", "reload-fill-draft"],
+  ["document", "reload-document-before"],
+])("identifies the actual reload setup failure at %s", async (failed, expectedPhase) => {
+  const start = controller.indexOf("async function reloadFlow(");
+  const end = controller.indexOf('\ntry {\n  phase("prepare-contained-network");', start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const phases: string[] = [];
+  const failure = new Error("inert reload boundary");
+  const boundary = (name: string) => {
+    if (name === failed) throw failure;
+  };
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(controller.slice(start, end) + "\nreloadFlow"),
+    {
+      phase: (value: string) => phases.push(value),
+      currentTheme: "light",
+      composer: "owned-composer",
+      workspace: async () => boundary("workspace"),
+      click: async () => boundary("select-primary"),
+      required: () => ({
+        $: () => ({
+          waitForDisplayed: async () => boundary("composer"),
+          setValue: async () => boundary("draft"),
+        }),
+        execute: async () => boundary("document"),
+      }),
+    },
+  );
+  await expect(run({})).rejects.toBe(failure);
+  expect(phases.at(-1)).toBe(expectedPhase);
+});
+
 it.each(["stale-connected", "stays-disconnected", "unknown", "reconnected"])(
   "same-version negative control requires this restart's browser transition: %s",
   async (outcome) => {
@@ -982,6 +1019,7 @@ it.each(["stale-connected", "stays-disconnected", "unknown", "reconnected"])(
       newBootRead = false,
       negativeChecks = 0;
     const statuses: string[] = [];
+    const phases: string[] = [];
     const readStatus = () => {
       const status =
         !requested || outcome === "stale-connected"
@@ -1017,6 +1055,7 @@ it.each(["stale-connected", "stays-disconnected", "unknown", "reconnected"])(
       ),
       {
         required: () => browser,
+        phase: (value: string) => phases.push(value),
         primary: { port: 4887, child: {} },
         bundleVersion: "0.7.2",
         restart: async () => {
@@ -1050,9 +1089,17 @@ it.each(["stale-connected", "stays-disconnected", "unknown", "reconnected"])(
       expect(statuses).toContain("disconnected");
       expect(statuses.at(-1)).toBe("connected");
       expect(negativeChecks).toBeGreaterThan(0);
+      expect(phases).toContain("reload-same-version-new-boot");
+      expect(phases).toContain("reload-same-version-negative-control");
+      expect(phases.at(-1)).toBe("reload-changed-version-restart");
     } else {
       await expect(run()).rejects.toThrow();
       expect(negativeChecks).toBe(0);
+      expect(phases.at(-1)).toBe(
+        outcome === "stays-disconnected"
+          ? "reload-same-version-connected"
+          : "reload-same-version-disconnected",
+      );
     }
   },
 );

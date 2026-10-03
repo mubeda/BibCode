@@ -1139,18 +1139,22 @@ async function restartPrimaryWithBrowserTransition(primary: Host, version: strin
         ?.getAttribute("data-status");
       return status === "connected" || status === "disconnected" ? status : null;
     });
+  phase("reload-same-version-before-connected");
   await required().waitUntil(async () => (await read()) === "connected", {
     timeout: 30_000,
     interval: 250,
   });
+  phase("reload-same-version-old-boot");
   const before = await descriptor(primary.port);
   check(typeof before.bootId === "string", "primary-before-restart-identity");
   const startedAt = performance.now(),
     deadline = startedAt + 30_000;
   const remaining = () => Math.max(1, deadline - performance.now());
+  phase("reload-same-version-command");
   await owner.command(primary.child, { restart: { serverVersion: version, afterMs: 2_000 } });
   // Observe loss of the old connection before accepting the replacement's connected state.
   // Connecting/reconnecting show disconnected; missing/error/unknown is not proof.
+  phase("reload-same-version-disconnected");
   await bounded(
     required().waitUntil(async () => (await read()) === "disconnected", {
       timeout: remaining(),
@@ -1158,6 +1162,7 @@ async function restartPrimaryWithBrowserTransition(primary: Host, version: strin
     }),
     remaining(),
   );
+  phase("reload-same-version-new-boot");
   await owner.until(async () => {
     try {
       const after = await descriptor(primary.port);
@@ -1170,6 +1175,7 @@ async function restartPrimaryWithBrowserTransition(primary: Host, version: strin
       return false;
     }
   }, remaining());
+  phase("reload-same-version-connected");
   await bounded(
     required().waitUntil(async () => (await read()) === "connected", {
       timeout: remaining(),
@@ -1189,13 +1195,19 @@ async function restartPrimaryWithBrowserTransition(primary: Host, version: strin
 
 async function reloadFlow(primary: Host) {
   phase("browser-reload");
+  phase("reload-open-workspace");
   await workspace();
+  phase("reload-select-primary");
   await click('[data-testid="environment-rail-local"]');
+  phase("reload-composer-ready");
   await required().$(composer).waitForDisplayed();
   const draft = `unsent reload draft ${currentTheme}`;
+  phase("reload-fill-draft");
   await required().$(composer).setValue(draft);
+  phase("reload-document-before");
   const documentBefore = await required().execute(() => performance.timeOrigin);
   const sameVersionTransition = await restartPrimaryWithBrowserTransition(primary, bundleVersion);
+  phase("reload-same-version-negative-control");
   const controlStart = performance.now();
   while (performance.now() - controlStart < 10_000) {
     check(
@@ -1212,8 +1224,11 @@ async function reloadFlow(primary: Host) {
     await delay(250);
   }
   const controlElapsedMs = Math.round(performance.now() - controlStart);
+  phase("reload-changed-version-restart");
   await restart(primary, "9.9.1");
+  phase("reload-offer-ready");
   await text("body", "BiBCode on this server was updated to v9.9.1. Reload to use it.");
+  phase("reload-offer-preserves-document");
   const offerStart = performance.now();
   while (performance.now() - offerStart < 10_000) {
     check(
@@ -1225,8 +1240,11 @@ async function reloadFlow(primary: Host) {
   }
   const reloadBanner =
     '//*[@role="status" and contains(.,"BiBCode on this server was updated to v9.9.1.")]';
+  phase("reload-offer-capture");
   await capture("reload-offer", primary, reloadBanner, "Reload to use it.");
+  phase("reload-activate");
   await click(`${reloadBanner}//button[normalize-space()="Reload"]`);
+  phase("reload-replacement-document");
   await required().waitUntil(
     async () => {
       try {
@@ -1237,6 +1255,7 @@ async function reloadFlow(primary: Host) {
     },
     { timeout: 30_000 },
   );
+  phase("reload-restored-composer");
   await required().$(composer).waitForDisplayed();
   check((await required().$(composer).getText()).includes(draft), "actual-reload-keeps-draft");
   check(
@@ -1246,6 +1265,7 @@ async function reloadFlow(primary: Host) {
       .catch(() => false)),
     "replacement-document-clears-offer",
   );
+  phase("reload-result-capture");
   await capture(
     "reload-complete",
     primary,
