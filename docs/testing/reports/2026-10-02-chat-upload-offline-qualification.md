@@ -280,3 +280,28 @@ introduced. Inert actual-controller tests establish failure attribution and the
 unchanged successful action trace. Another reviewed native run must supply the
 actual failing boundary; a missing dialog-readiness wait remains an unproven
 timing hypothesis, not a product or fixture fix.
+
+Run `37123144294` at `a807db33` retained an unsuccessful Noise 64 KiB/s dark
+case at `matrix-noise-connect`, before a Noise socket or upload. This narrows the
+earlier setup checkpoint to the public submit lookup/click. The safe failure
+classification remains unclassified with a null error class; the completed job
+log does not expose the private controller exception.
+
+Read-only diagnosis found a deterministic controller defect: the compound
+`[role="dialog"] button=Add Server` selector is forwarded unchanged as CSS by
+the installed WebdriverIO parser. CSS cannot combine that ancestor with
+WebdriverIO's text-selector shorthand. The controller now uses one exact
+dialog-scoped XPath for the same public Add Server submit. Other selectors,
+actions, order, acknowledgement, payload/host pinning, original budgets,
+ownership, capture fences and cleanup remain unchanged.
+
+The regression runs the actual controller setup fragment and installed
+WebdriverIO selector parser against the actual ConnectTab pairing-body rendering
+with its real Button/Checkbox primitives and inert surrounding ports. It failed
+with the former CSS selector and passes with the scoped XPath, one enabled
+submit and one activation. Separate rendered controls retain the disabled
+pre-acknowledgement and busy states. This is inert compatibility evidence; it
+does not execute a native pointer action, XPath engine, handshake or upload.
+Native causality remains consistent with the observed boundary, and a reviewed
+new native run must establish the repaired Noise outcome before a Noise pass is
+claimed. The living test runbooks were reviewed and remain accurate.

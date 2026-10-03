@@ -334,7 +334,7 @@ async function runMatrix(
       await acknowledgement.click();
     }
     phase("matrix-noise-connect");
-    await b.$(`${dialog} button=Add Server`).click();
+    await b.$('//*[@role="dialog"]//button[normalize-space()="Add Server"]').click();
     phase("matrix-noise-dialog-closed");
     await b.$(dialog).waitForDisplayed({ reverse: true });
     phase("matrix-noise-environment");

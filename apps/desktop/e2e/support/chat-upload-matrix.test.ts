@@ -25,7 +25,11 @@ const noiseActions = [
   "environment-selected",
 ] as const;
 
-async function runActualNoiseSetup(failure?: (typeof noiseActions)[number], visible = true) {
+async function runActualNoiseSetup(
+  failure?: (typeof noiseActions)[number],
+  visible = true,
+  activateSubmit?: (selector: string) => Promise<void>,
+) {
   const source = NodeFS.readFileSync(
     new URL("../qualify-chat-uploads.ts", import.meta.url),
     "utf8",
@@ -57,7 +61,7 @@ async function runActualNoiseSetup(failure?: (typeof noiseActions)[number], visi
     '[role="dialog"] input[placeholder="e.g. Linux workstation"]',
     '[role="dialog"] textarea[placeholder="bibcode://pair?code=…"]',
     '[role="dialog"] [role="checkbox"]',
-    '[role="dialog"] button=Add Server',
+    '//*[@role="dialog"]//button[normalize-space()="Add Server"]',
     '[role="dialog"]',
     '[role="radio"][aria-label="QA Upload Noise"]',
   ];
@@ -124,6 +128,7 @@ async function runActualNoiseSetup(failure?: (typeof noiseActions)[number], visi
                       : selector === selectors[5]
                         ? "connect"
                         : "environment";
+              if (name === "connect") await activateSubmit?.(selector);
               action(name);
             },
             waitForDisplayed: async (options?: unknown) => {
@@ -165,6 +170,151 @@ async function runActualNoiseSetup(failure?: (typeof noiseActions)[number], visi
   }
   return { failed, trace, phases, triggerClicks };
 }
+
+function installedWebdriverLocator(selector: string): { using: string; value: string } {
+  const source = NodeFS.readFileSync(new URL(import.meta.resolve("webdriverio")), "utf8");
+  const start = source.indexOf("var DEFAULT_STRATEGY =");
+  const end = source.indexOf("\n// src/commands/element/shadow$$.ts", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const findStrategy = NodeVM.runInNewContext(`${source.slice(start, end)}\nfindStrategy`, {
+    DEEP_SELECTOR: ">>>",
+    ARIA_SELECTOR: "aria/",
+    roleElements: new Map(),
+  }) as (selector: string, isW3C: boolean, isMobile: boolean) => { using: string; value: string };
+  return findStrategy(selector, true, false);
+}
+
+async function renderActualPairingSubmit(acknowledged: boolean, adding = false) {
+  const webRequire = NodeModule.createRequire(
+    new URL("../../../web/package.json", import.meta.url),
+  );
+  const { transformSync } = NodeModule.createRequire(webRequire.resolve("vite-plus"))(
+    "esbuild",
+  ) as {
+    transformSync: (source: string, options: Record<string, string>) => { code: string };
+  };
+  const React = webRequire("react") as {
+    createElement: (...args: unknown[]) => unknown;
+  };
+  const { renderToStaticMarkup } = webRequire("react-dom/server") as {
+    renderToStaticMarkup: (element: unknown) => string;
+  };
+  const { Window } = webRequire("happy-dom") as {
+    Window: new () => { document: Document; happyDOM: { close: () => Promise<void> } };
+  };
+  const compile = (source: string) =>
+    transformSync(source, { loader: "tsx", format: "cjs", jsx: "transform" }).code;
+  const uiComponent = (name: string): Record<string, unknown> => {
+    const source = NodeFS.readFileSync(
+      new URL(`../../../web/src/components/ui/${name}.tsx`, import.meta.url),
+      "utf8",
+    );
+    const module = { exports: {} };
+    NodeVM.runInNewContext(compile(source), {
+      module,
+      exports: module.exports,
+      React,
+      require: (id: string) =>
+        id === "~/lib/utils"
+          ? { cn: (...values: unknown[]) => values.filter(Boolean).join(" ") }
+          : webRequire(id),
+    });
+    return module.exports;
+  };
+  const source = NodeFS.readFileSync(
+    new URL("../../../web/src/components/settings/remote-servers/ConnectTab.tsx", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf("  const renderPairingCodeModeBody =");
+  const end = source.indexOf("  const renderSshFields =", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const wrapper = (props: { children?: unknown }) =>
+    React.createElement("div", null, props.children);
+  const renderBody = NodeVM.runInNewContext(
+    compile(`${source.slice(start, end)}\nrenderPairingCodeModeBody;`),
+    {
+      React,
+      Input: "input",
+      Textarea: "textarea",
+      Button: uiComponent("button").Button,
+      Checkbox: uiComponent("checkbox").Checkbox,
+      PlusIcon: () => null,
+      Collapsible: wrapper,
+      CollapsibleTrigger: wrapper,
+      CollapsibleContent: wrapper,
+      serverAlias: "Inert QA",
+      pairingCodeInput: "inert-code",
+      tunnelAcknowledged: acknowledged,
+      requiresTunnelAcknowledgement: true,
+      isAddingSavedBackend: adding,
+      savedBackendError: null,
+      addServerFailure: null,
+      ADD_SERVER_FAILURE_REASONS: [],
+      renderRemoteModeBody: () => null,
+      describeAddServerFailure: () => null,
+      handleAddServer: () => {},
+      setServerAlias: () => {},
+      setPairingCodeInput: () => {},
+      setTunnelAcknowledged: () => {},
+      setFlowDemandsAcknowledgement: () => {},
+      setAddServerFailure: () => {},
+      setSavedBackendError: () => {},
+    },
+  ) as () => unknown;
+  const window = new Window();
+  window.document.body.innerHTML = renderToStaticMarkup(
+    React.createElement("div", { role: "dialog" }, renderBody()),
+  );
+  return window;
+}
+
+it("actual Noise setup resolves the rendered acknowledged submit through WebdriverIO", async () => {
+  const window = await renderActualPairingSubmit(true);
+  let activations = 0;
+  let locator: ReturnType<typeof installedWebdriverLocator> | null = null;
+  const expectedLocator = {
+    using: "xpath",
+    value: '//*[@role="dialog"]//button[normalize-space()="Add Server"]',
+  };
+  try {
+    const result = await runActualNoiseSetup(undefined, true, async (selector) => {
+      locator = installedWebdriverLocator(selector);
+      expect(locator).toEqual(expectedLocator);
+      const matching = [
+        ...window.document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button'),
+      ].filter((button) => button.textContent?.trim() === "Add Server");
+      expect(matching).toHaveLength(1);
+      expect(matching[0]!.disabled).toBe(false);
+      activations++;
+    });
+    expect(locator).toEqual(expectedLocator);
+    expect(result.failed).toBe(false);
+    expect(result.phases.at(-1)).toBe("matrix-noise-environment-selected");
+    expect(activations).toBe(1);
+    expect(result.triggerClicks).toBe(1);
+  } finally {
+    await window.happyDOM.close();
+  }
+});
+
+it.each([
+  [false, false],
+  [true, true],
+])(
+  "actual Noise submit remains disabled with acknowledged=%s and adding=%s",
+  async (acknowledged, adding) => {
+    const window = await renderActualPairingSubmit(acknowledged, adding);
+    try {
+      const submit = window.document.querySelector<HTMLButtonElement>('button[data-slot="button"]');
+      expect(submit).not.toBeNull();
+      expect(submit!.disabled).toBe(true);
+    } finally {
+      await window.happyDOM.close();
+    }
+  },
+);
 
 it.each(noiseActions.filter((name) => name !== "acknowledgement"))(
   "actual Noise setup records the last attempted fixed boundary: %s",
