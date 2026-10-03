@@ -901,3 +901,76 @@ describe("deferDesktopUiTestContextCleanupUntilExit", () => {
     expect(cleanedContext).toBe(context);
   });
 });
+
+describe("bounded opt-in chat matrix drip", () => {
+  it.each(["interrupt", "shutdown", "stdin-close"] as const)(
+    "drips actual fixture events and joins timers after %s",
+    async (settle) => {
+      const environment: NodeJS.ProcessEnv = {
+        PATH: process.env.PATH,
+        BIBCODE_E2E_PLATFORM: "mac",
+        BIBCODE_E2E_SLOW_TURN_MS: "10000",
+        BIBCODE_E2E_DRIP_MODE: "chat-matrix",
+      };
+      const context = prepareDesktopUiTestContext(environment);
+      contexts.push(context);
+      const protocol = startCodexFixture(
+        NodePath.join(context.shimDirectory, "codex-fixture.mjs"),
+        environment,
+      );
+      try {
+        const started = (await protocol.request("turn/start", {
+          input: [{ type: "text", text: "upload-stream [[slow]] [[drip]]" }],
+        })) as { turn: { id: string } };
+        await expect
+          .poll(
+            () =>
+              protocol.notifications.filter((event) => event.method === "item/agentMessage/delta")
+                .length,
+            { timeout: 2500 },
+          )
+          .toBeGreaterThanOrEqual(2);
+        if (settle === "stdin-close") await protocol.close();
+        else
+          await protocol.request(settle === "interrupt" ? "turn/interrupt" : "shutdown", {
+            turnId: started.turn.id,
+          });
+        const count = protocol.notifications.filter(
+          (event) => event.method === "item/agentMessage/delta",
+        ).length;
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+        expect(
+          protocol.notifications.filter((event) => event.method === "item/agentMessage/delta"),
+        ).toHaveLength(count);
+      } finally {
+        await protocol.close();
+      }
+    },
+    10_000,
+  );
+
+  it("does not enable drip without the explicit environment opt-in", async () => {
+    const environment: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH,
+      BIBCODE_E2E_PLATFORM: "mac",
+      BIBCODE_E2E_SLOW_TURN_MS: "1500",
+    };
+    const context = prepareDesktopUiTestContext(environment);
+    contexts.push(context);
+    const protocol = startCodexFixture(
+      NodePath.join(context.shimDirectory, "codex-fixture.mjs"),
+      environment,
+    );
+    try {
+      await protocol.request("turn/start", {
+        input: [{ type: "text", text: "upload-stream [[slow]] [[drip]]" }],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      expect(
+        protocol.notifications.filter((event) => event.method === "item/agentMessage/delta"),
+      ).toHaveLength(1);
+    } finally {
+      await protocol.close();
+    }
+  }, 10_000);
+});

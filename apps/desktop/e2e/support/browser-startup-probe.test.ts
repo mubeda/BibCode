@@ -282,6 +282,7 @@ describe("credential-free startup probe", () => {
     let receipt: Record<string, unknown> = {};
     NodeVM.runInNewContext(source.slice(start, end), {
       success,
+      selectedMatrixCase: null,
       qualificationMode: "startup-only",
       currentPhase: "pair-wait-token",
       process: { env: {} },
@@ -306,4 +307,10 @@ describe("credential-free startup probe", () => {
     });
     expect(receipt.scope).toContain("startup-only");
   });
+});
+
+it("accepts only the new explicit matrix mode alongside unchanged smoke/startup defaults", () => {
+  expect(parseQualificationMode("upload-matrix")).toBe("upload-matrix");
+  expect(parseQualificationMode(undefined)).toBe("upload-smoke");
+  expect(parseQualificationMode("startup-only")).toBe("startup-only");
 });

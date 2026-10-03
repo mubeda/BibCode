@@ -1426,6 +1426,29 @@ plain RPC and a pinned E2EE profile. Verify that the carrying session advertises
    behavior after `close()` separately from upload success. Report unavailable
    native WebKitGTK measurements explicitly as **not measured**.
 
+The disposable Linux first-matrix workflow selects one fixed case from
+`apps/desktop/e2e/support/chat-upload-matrix-cases.json` with explicit
+`BIBCODE_UPLOAD_MODE=upload-matrix` and `BIBCODE_UPLOAD_CASE`. It covers four
+transport/rate delivery pairs and, for each transport, freeze/resume, three
+Cancel gestures and concurrent stream/Stop; light/dark are distributed across
+that covering set. Each selected case uses1800/1860second child/outer budgets,
+while smoke/startup retain600/660. Python and the actual browser driver share
+that manifest. The private root uses an exclusive0700UUID allocation without
+putting the run ID in Chromium's TMPDIR socket path.
+
+Pair/pin Noise through the public Add Server offer and verified owned forwarder,
+never by editing app state. Use real file input, theme controls and pointer/Tab
+keys. Require advancing rounded UI progress plus target-provider bytes/digest;
+rounded display units do not replace raw acknowledgement counters. Noise records
+remain opaque; transport-only close-call4408/timing/buffer metadata does not
+claim receipt of a close frame across a frozen link. Require the actual client
+close within33seconds, visible Reconnecting, thaw and monotonic progress. Cancel
+must preserve both captured and newer drafts/previews without errors. The
+explicit generated Codex drip opt-in is bounded and joins on all exits; default
+fixture behavior stays unchanged. Scope result/screenshot receipts to the
+selected case and keep `fullMatrixComplete:false` while later retention,
+fallback, max-batch, admission/remount, heartbeat and WebKitGTK cases are pending.
+
 Record these results in the report template's staged upload subsection. This
 scenario does not validate Phase B file-panel uploads/downloads or asset routing.
 

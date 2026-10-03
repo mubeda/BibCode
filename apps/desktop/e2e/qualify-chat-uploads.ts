@@ -36,6 +36,16 @@ import {
   chatUploadObservationScript,
   projectChatUploadObservation,
 } from "./support/chat-upload-observer.ts";
+import {
+  parseChatMatrixCase,
+  runChatMatrixCase,
+  activateMatrixCancel,
+  readChatMatrixDom,
+  matrixEditor,
+  qualificationScreenSafe,
+  type ChatMatrixCase,
+  type MatrixBrowser,
+} from "./support/chat-upload-matrix.ts";
 import { startThrottleProxy } from "../../../scripts/throttle-proxy.ts";
 import {
   classifyQualificationFailure,
@@ -45,6 +55,12 @@ import {
 } from "./support/chat-upload-evidence.ts";
 
 const qualificationMode = parseQualificationMode(process.env.BIBCODE_UPLOAD_MODE);
+const selectedMatrixCase =
+  qualificationMode === "upload-matrix"
+    ? parseChatMatrixCase(process.env.BIBCODE_UPLOAD_CASE)
+    : null;
+if (qualificationMode !== "upload-matrix" && process.env.BIBCODE_UPLOAD_CASE)
+  throw new Error("The upload matrix case is invalid.");
 
 const root = NodePath.resolve(import.meta.dirname, "../../..");
 const fixture = process.env.BIBCODE_UPLOAD_FIXTURE;
@@ -155,6 +171,7 @@ function prepareEnvironments() {
     childEnv.BIBCODE_UPLOAD_RECEIPTS = NodePath.join(context.runRoot, "upload-receipts.jsonl");
     childEnv.PATH = context.shimDirectory + NodePath.delimiter + NodePath.join(fixtureRoot, "bin");
     childEnv.BIBCODE_E2E_SLOW_TURN_MS = "3600000";
+    if (selectedMatrixCase?.action === "stop") childEnv.BIBCODE_E2E_DRIP_MODE = "chat-matrix";
     childEnv.CLAUDE_CONFIG_DIR = NodePath.join(context.fixtureUserHomePath, ".claude");
     childEnv.CODEX_HOME = NodePath.join(context.fixtureUserHomePath, ".codex");
     for (const [key, relative] of [
@@ -208,6 +225,275 @@ function prepareEnvironments() {
     };
   });
 }
+async function matrixImportProject(b: MatrixBrowser, projectPath: string): Promise<void> {
+  await b.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
+  await b.$('[data-testid="sidebar-add-project-trigger"]').click();
+  await b
+    .$("//button[@data-add-project-action='true'][.//span[normalize-space()='Browse folder']]")
+    .click();
+  await until(
+    async () =>
+      (await b.$("#add-project-host-path").isDisplayed()) ||
+      (await b.$("button=Type a path instead").isDisplayed()),
+  );
+  if (!(await b.$("#add-project-host-path").isExisting()))
+    await b.$("button=Type a path instead").click();
+  await b.$("#add-project-host-path").setValue(projectPath);
+  await b.$("button=Open project").click();
+  await b.$(matrixEditor).waitForDisplayed();
+}
+
+async function runMatrix(
+  b: MatrixBrowser,
+  selection: ChatMatrixCase,
+  environments: ReturnType<typeof prepareEnvironments>,
+): Promise<void> {
+  const targetIndex = selection.transport === "plain" ? 0 : 1;
+  const target = environments[targetIndex]!;
+  const proxy = proxies[targetIndex]!;
+  phase("matrix-public-settings");
+  await b.$('[data-testid="environment-rail-manage"]').click();
+  await b.$("button=General").waitForDisplayed();
+  await b.$("button=General").click();
+  await b.$('[aria-label="Theme preference"]').click();
+  await b
+    .$(
+      `//*[@role="option" and normalize-space()="${selection.theme === "light" ? "Light" : "Dark"}"]`,
+    )
+    .click();
+  await until(async () =>
+    b.execute(
+      (dark) => document.documentElement.classList.contains("dark") === dark,
+      selection.theme === "dark",
+    ),
+  );
+  let pinnedNoisePathObserved = false;
+  if (selection.transport === "noise") {
+    phase("matrix-noise-offer");
+    const issued = JSON.parse(
+      NodeChildProcess.execFileSync(
+        serverBinary,
+        [
+          "pairing",
+          "offer",
+          "--base-dir",
+          target.context.stateRoot,
+          "--dev-url",
+          webOrigin,
+          "--endpoint",
+          "http://127.0.0.1:4911",
+          "--reach",
+          "this-computer",
+          "--name",
+          "QA Upload Noise",
+          "--json",
+        ],
+        { env: target.env, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] },
+      ),
+    ) as { link?: unknown };
+    if (typeof issued.link !== "string" || !issued.link.startsWith("bibcode://pair?"))
+      throw new Error("Matrix evidence assertion failed.");
+    const code = new URL(issued.link).searchParams.get("code");
+    const payload = code
+      ? (JSON.parse(Buffer.from(code, "base64url").toString("utf8")) as {
+          hostKey?: unknown;
+          endpoint?: unknown;
+        })
+      : null;
+    const offeredEndpoint =
+      typeof payload?.endpoint === "string" ? new URL(payload.endpoint) : null;
+    if (
+      typeof payload?.hostKey !== "string" ||
+      payload.hostKey.length !== 43 ||
+      offeredEndpoint?.origin !== "http://127.0.0.1:4911" ||
+      offeredEndpoint.pathname !== "/" ||
+      offeredEndpoint.search !== "" ||
+      offeredEndpoint.hash !== ""
+    )
+      throw new Error("Matrix evidence assertion failed.");
+    await b.$("button=Remote Servers").click();
+    await b.$('button[aria-label="Add Server"]').waitForDisplayed();
+    await b.$('button[aria-label="Add Server"]').click();
+    const dialog = '[role="dialog"]';
+    await b.$(`${dialog} input[placeholder="e.g. Linux workstation"]`).setValue("QA Upload Noise");
+    await b.$(`${dialog} textarea[placeholder="bibcode://pair?code=…"]`).setValue(issued.link);
+    const acknowledgement = b.$(`${dialog} [role="checkbox"]`);
+    if (await acknowledgement.isDisplayed().catch(() => false)) {
+      // This fixture owns the actual bidirectional TCP forwarder into this same private namespace.
+      if (proxy.port !== 4911) throw new Error("Matrix evidence assertion failed.");
+      await acknowledgement.click();
+    }
+    await b.$(`${dialog} button=Add Server`).click();
+    await b.$(dialog).waitForDisplayed({ reverse: true });
+    await b.$('[role="radio"][aria-label="QA Upload Noise"]').click();
+    await until(
+      async () =>
+        (await b.$('[role="radio"][aria-label="QA Upload Noise"]').getAttribute("aria-checked")) ===
+        "true",
+    );
+  }
+  if (
+    await b
+      .$("button=Back")
+      .isDisplayed()
+      .catch(() => false)
+  )
+    await b.$("button=Back").click();
+  if (selection.transport === "noise") await matrixImportProject(b, target.projectPath);
+  await b.$(matrixEditor).waitForDisplayed();
+  const observe = async () => {
+    const observed = projectChatUploadObservation(
+      await bounded(
+        b.execute(() => {
+          const observer = Reflect.get(window, "__uploadObservations") as
+            | { read?: () => unknown }
+            | undefined;
+          return observer?.read?.() ?? null;
+        }),
+        5000,
+      ),
+    );
+    if (observed === null) throw new Error("Matrix evidence assertion failed.");
+    return observed;
+  };
+  if (selection.transport === "noise") {
+    await until(async () => (await observe()).noise.opened > 0);
+    pinnedNoisePathObserved = true;
+  }
+  proxy.update({ up: selection.upBytesPerSecond, down: 0, frozen: false });
+  const beforeMatrixObservation = await observe();
+  const beforeMatrixWireBytes = proxy.measurements().up.receivedBytes;
+  const pngPath = NodePath.join(fixtureRoot, "upload-matrix.png");
+  const png = createSizedPng(10 * 1024 ** 2, "matrix");
+  NodeFS.writeFileSync(pngPath, png);
+  const digest = NodeCrypto.createHash("sha256").update(png).digest("hex");
+  const readUi = () =>
+    bounded(
+      b.execute(readChatMatrixDom, { outgoing: "upload-matrix", newer: "upload-newer-draft" }),
+      5000,
+    );
+  const send = async (prompt: string) => {
+    await b.$(matrixEditor).click();
+    await b.$(matrixEditor).addValue(prompt);
+    await b.keys("Enter");
+  };
+  const receipt = async () => {
+    if (!NodeFS.existsSync(target.receipts)) return { count: 0, matched: false };
+    if (NodeFS.statSync(target.receipts).size > 65536)
+      throw new Error("Matrix evidence assertion failed.");
+    const matches = NodeFS.readFileSync(target.receipts, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.prompt === "upload-matrix");
+    const item = matches[0];
+    return {
+      count: matches.length,
+      matched:
+        matches.length === 1 &&
+        item.attachments.length === 1 &&
+        item.attachments[0].bytes === png.length &&
+        item.attachments[0].sha256 === digest,
+    };
+  };
+  const result = await runChatMatrixCase(selection, {
+    phase,
+    until,
+    observe,
+    measurements: () => proxy.measurements(),
+    clock: () =>
+      bounded(
+        b.execute(() => performance.now()),
+        5000,
+      ),
+    freeze: (value) => {
+      proxy.update({ frozen: value });
+    },
+    readUi,
+    receipt,
+    stageAndSend: async () => {
+      const input = await b.$('[data-center-surface-host][data-visible="true"] input[type="file"]');
+      await input.waitForEnabled();
+      await b.elementSendKeys(await input.elementId, pngPath);
+      await until(async () => (await readUi()).validPreview);
+      await send("upload-matrix");
+    },
+    editNewer: async () => {
+      await b.$(matrixEditor).click();
+      await b.$(matrixEditor).addValue("upload-newer-draft");
+    },
+    startStream: () => send("upload-stream [[slow]] [[drip]]"),
+    stopGeneration: async () => {
+      await b.$('button[aria-label="Stop generation"]').click();
+    },
+    activateCancel: () =>
+      activateMatrixCancel(
+        b,
+        selection.action as "cancel-pointer" | "cancel-enter" | "cancel-space",
+      ),
+    capture: async (name) => {
+      const current = await readUi();
+      if (
+        name === "matrix-cancel-restored.png" &&
+        !(
+          current.validPreview &&
+          current.restoredOutgoing &&
+          current.newerPreserved &&
+          !current.error
+        )
+      )
+        throw new Error("Matrix evidence assertion failed.");
+      if (
+        name === "matrix-result.png" &&
+        !(
+          current.deliveredImage &&
+          current.progressUnits === null &&
+          !current.reconnecting &&
+          !current.error &&
+          !current.stopAvailable
+        )
+      )
+        throw new Error("Matrix evidence assertion failed.");
+      if (
+        name === "matrix-progress.png" ||
+        name === "matrix-reconnecting.png" ||
+        name === "matrix-stream-stop.png"
+      ) {
+        await b.$('//button[normalize-space()="Cancel" and ../p[@role="status"]]').scrollIntoView();
+      } else if (name === "matrix-result.png") {
+        const images = await b
+          .$$('[data-center-surface-host][data-visible="true"] [data-message-role="user"] img')
+          .getElements();
+        if (images.length === 0) throw new Error("Matrix evidence assertion failed.");
+        await images.at(-1)!.scrollIntoView();
+      }
+      const safe = await bounded(
+        b.execute(qualificationScreenSafe, { origin: webOrigin, dark: selection.theme === "dark" }),
+        5000,
+      );
+      if (!safe) throw new Error("Matrix evidence assertion failed.");
+      await b.saveScreenshot(NodePath.join(evidenceRoot, name));
+    },
+  });
+  if (selection.transport === "noise") {
+    const afterMatrixObservation = await observe();
+    if (
+      afterMatrixObservation.plain.requests.begin !==
+        beforeMatrixObservation.plain.requests.begin ||
+      proxy.measurements().up.receivedBytes <= beforeMatrixWireBytes
+    )
+      throw new Error("Matrix evidence assertion failed.");
+  }
+  results.push({
+    ...result,
+    pinnedNoisePathObserved,
+    providerBytes: selection.action.startsWith("cancel") ? null : png.length,
+    providerDigest: selection.action.startsWith("cancel") ? null : digest,
+  });
+  phase("matrix-case-complete");
+}
+
 const webEnv = {
   ...process.env,
   PORT: "4901",
@@ -531,73 +817,78 @@ try {
     await b.$(editorSelector).waitForDisplayed();
     plain.route = await b.getUrl();
 
-    const pngPath = NodePath.join(fixtureRoot, "upload-smoke.png");
-    const png = createSizedPng(STAGED_SMOKE_IMAGE_BYTES, "smoke");
-    NodeFS.writeFileSync(pngPath, png);
-    const digest = NodeCrypto.createHash("sha256").update(png).digest("hex");
-    phase("wait-composer-file-enabled");
-    const input = await b.$('[data-center-surface-host][data-visible="true"] input[type="file"]');
-    await input.waitForEnabled();
-    phase("select-composer-file");
-    // The real input is hidden. Send the file through WebDriver's native upload command;
-    // setValue first sends Element Clear, which requires an interactable control.
-    await b.elementSendKeys(await input.elementId, pngPath);
-    phase("wait-composer-image-preview");
-    await until(async () =>
-      b.execute(() =>
-        Array.from(document.querySelectorAll('[data-chat-composer-form="true"] img')).some(
-          (element) =>
-            element instanceof HTMLImageElement &&
-            element.complete &&
-            element.naturalWidth === 1 &&
-            element.naturalHeight === 1,
+    if (selectedMatrixCase) {
+      await runMatrix(b, selectedMatrixCase, environments);
+      success = true;
+    } else {
+      const pngPath = NodePath.join(fixtureRoot, "upload-smoke.png");
+      const png = createSizedPng(STAGED_SMOKE_IMAGE_BYTES, "smoke");
+      NodeFS.writeFileSync(pngPath, png);
+      const digest = NodeCrypto.createHash("sha256").update(png).digest("hex");
+      phase("wait-composer-file-enabled");
+      const input = await b.$('[data-center-surface-host][data-visible="true"] input[type="file"]');
+      await input.waitForEnabled();
+      phase("select-composer-file");
+      // The real input is hidden. Send the file through WebDriver's native upload command;
+      // setValue first sends Element Clear, which requires an interactable control.
+      await b.elementSendKeys(await input.elementId, pngPath);
+      phase("wait-composer-image-preview");
+      await until(async () =>
+        b.execute(() =>
+          Array.from(document.querySelectorAll('[data-chat-composer-form="true"] img')).some(
+            (element) =>
+              element instanceof HTMLImageElement &&
+              element.complete &&
+              element.naturalWidth === 1 &&
+              element.naturalHeight === 1,
+          ),
         ),
-      ),
-    );
-    phase("enter-composer-message");
-    await b.$(editorSelector).click();
-    await b.$(editorSelector).addValue("upload-smoke");
-    phase("send-composer-message");
-    await b.keys("Enter");
-    phase("wait-provider-attachment");
-    await until(
-      async () =>
-        NodeFS.existsSync(plain.receipts) &&
-        NodeFS.readFileSync(plain.receipts, "utf8").includes('"prompt":"upload-smoke"'),
-    );
-    phase("verify-provider-attachment");
-    const receipts = NodeFS.readFileSync(plain.receipts, "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-    const received = receipts.find((entry) => entry.prompt === "upload-smoke");
-    if (
-      received.attachments.length !== 1 ||
-      received.attachments[0].bytes !== png.length ||
-      received.attachments[0].sha256 !== digest
-    ) {
-      throw new Error("The provider did not receive the exact composer attachment.");
+      );
+      phase("enter-composer-message");
+      await b.$(editorSelector).click();
+      await b.$(editorSelector).addValue("upload-smoke");
+      phase("send-composer-message");
+      await b.keys("Enter");
+      phase("wait-provider-attachment");
+      await until(
+        async () =>
+          NodeFS.existsSync(plain.receipts) &&
+          NodeFS.readFileSync(plain.receipts, "utf8").includes('"prompt":"upload-smoke"'),
+      );
+      phase("verify-provider-attachment");
+      const receipts = NodeFS.readFileSync(plain.receipts, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      const received = receipts.find((entry) => entry.prompt === "upload-smoke");
+      if (
+        received.attachments.length !== 1 ||
+        received.attachments[0].bytes !== png.length ||
+        received.attachments[0].sha256 !== digest
+      ) {
+        throw new Error("The provider did not receive the exact composer attachment.");
+      }
+      const observations = projectChatUploadObservation(
+        await b.execute(() => {
+          const observer = Reflect.get(window, "__uploadObservations") as
+            | { read?: () => unknown }
+            | undefined;
+          return observer?.read?.() ?? null;
+        }),
+      );
+      if (observations === null || observations.plain.requests.begin === 0) {
+        throw new Error("The actual browser did not exercise staged uploads.");
+      }
+      await b.saveScreenshot(NodePath.join(evidenceRoot, "plain-smoke.png"));
+      results.push({
+        scenario: "plain-staged-image-512kib",
+        providerBytes: png.length,
+        providerDigest: digest,
+        observations,
+      });
+      phase("smoke-complete");
+      success = true;
     }
-    const observations = projectChatUploadObservation(
-      await b.execute(() => {
-        const observer = Reflect.get(window, "__uploadObservations") as
-          | { read?: () => unknown }
-          | undefined;
-        return observer?.read?.() ?? null;
-      }),
-    );
-    if (observations === null || observations.plain.requests.begin === 0) {
-      throw new Error("The actual browser did not exercise staged uploads.");
-    }
-    await b.saveScreenshot(NodePath.join(evidenceRoot, "plain-smoke.png"));
-    results.push({
-      scenario: "plain-staged-image-512kib",
-      providerBytes: png.length,
-      providerDigest: digest,
-      observations,
-    });
-    phase("smoke-complete");
-    success = true;
   }
 } catch (error) {
   if (error instanceof BrowserConnectivityFailure) networkProof = error.proof;
@@ -741,16 +1032,7 @@ try {
   ) {
     try {
       const safe = await bounded(
-        browser.execute(
-          (ownedOrigin: string) =>
-            location.origin === ownedOrigin &&
-            location.search === "" &&
-            location.hash === "" &&
-            document.querySelector(
-              '#pairing-token,input[type="password"],input[autocomplete="one-time-code"]',
-            ) === null,
-          webOrigin,
-        ),
+        browser.execute(qualificationScreenSafe, { origin: webOrigin, dark: null }),
         5_000,
       );
       if (
@@ -810,7 +1092,9 @@ try {
     });
   }
   write("result", {
-    success: success && qualificationMode === "upload-smoke",
+    success: success && qualificationMode !== "startup-only",
+    matrixCase: selectedMatrixCase?.case ?? null,
+    fullMatrixComplete: false,
     qualificationMode,
     startupProbePassed: qualificationMode === "startup-only" ? success : null,
     phase: currentPhase,
@@ -826,7 +1110,9 @@ try {
     scope:
       qualificationMode === "startup-only"
         ? "Credential-free startup-only observation; no pairing grant, project import or upload qualification."
-        : "Chromium staged-upload smoke only; full slow-link matrix and WebKitGTK remain unmeasured.",
+        : qualificationMode === "upload-matrix"
+          ? "One selected Chromium upload matrix case; retention, fallback, max batch, admission/remount, heartbeat and WebKitGTK remain unmeasured."
+          : "Chromium staged-upload smoke only; full slow-link matrix and WebKitGTK remain unmeasured.",
     childProcessesClosed: processes.every(
       ({ child }) => child.exitCode !== null || child.signalCode !== null,
     ),

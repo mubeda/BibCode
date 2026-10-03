@@ -1,8 +1,8 @@
-export type QualificationMode = "upload-smoke" | "startup-only";
+export type QualificationMode = "upload-smoke" | "startup-only" | "upload-matrix";
 
 export function parseQualificationMode(value: unknown): QualificationMode {
   if (value === undefined || value === "upload-smoke") return "upload-smoke";
-  if (value === "startup-only") return value;
+  if (value === "startup-only" || value === "upload-matrix") return value;
   throw new Error("The qualification mode is invalid.");
 }
 

@@ -168,13 +168,29 @@ def network():
 def qualification_mode(value):
     if value is None or value == 'upload-smoke':
         return 'upload-smoke'
-    if value == 'startup-only':
+    if value in ['startup-only', 'upload-matrix']:
         return value
     raise RuntimeError('The qualification mode is invalid')
 
 
+
+def case_settings(mode, selected):
+    if mode != 'upload-matrix':
+        if selected not in [None, '']:
+            raise RuntimeError('The upload matrix case is invalid')
+        return {'case': None, 'inner_timeout': 600, 'outer_timeout': 660}
+    manifest = json.loads((Path(__file__).resolve().parent.parent / 'apps/desktop/e2e/support/chat-upload-matrix-cases.json').read_text())
+    match = next((entry for entry in manifest if entry['case'] == selected), None)
+    if (match is None or match.get('innerTimeoutSeconds') != 1800 or match.get('outerTimeoutSeconds') != 1860
+            or match.get('upBytesPerSecond') not in [16384, 65536]
+            or match.get('transport') not in ['plain', 'noise'] or match.get('theme') not in ['light', 'dark']):
+        raise RuntimeError('The upload matrix case is invalid')
+    return {'case': match['case'], 'inner_timeout': 1800, 'outer_timeout': 1860}
+
+
 def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_namespace, source, ip):
     mode = qualification_mode(os.environ.get('BIBCODE_UPLOAD_MODE'))
+    selection = case_settings(mode, os.environ.get('BIBCODE_UPLOAD_CASE'))
     private_namespace = os.readlink('/proc/self/ns/net')
     if os.getpid() != 1 or private_namespace == host_namespace:
         raise RuntimeError('Refusing to run outside the owned PID/network namespaces')
@@ -201,15 +217,15 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
             'BIBCODE_UPLOAD_CHROME': chrome, 'BIBCODE_UPLOAD_DRIVER': driver,
             'BIBCODE_UPLOAD_SOURCE': source,
             'BIBCODE_UPLOAD_MODE': mode,
+            **({'BIBCODE_UPLOAD_CASE': selection['case']} if selection['case'] is not None else {}),
             **trusted_network,
         }
         with (fixture / 'private-controller.log').open('xb') as output:
             process = subprocess.Popen([node, 'apps/desktop/e2e/qualify-chat-uploads.ts'],
                                        env=environment, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
-            # This branch runs only the small-image smoke. Slow-link matrix
-            # runs need their own explicit budget after this short loop works.
-            status = process.wait(timeout=600)
+            # Only a fixed selected matrix case has the reviewed long budget.
+            status = process.wait(timeout=selection['inner_timeout'])
     finally:
         observed = namespace_children()
         for number in [signal.SIGTERM, signal.SIGKILL]:
@@ -302,25 +318,27 @@ print(json.dumps(result)); sys.exit(0 if result['noDefaultRoute'] else 1)
 
 def outer():
     mode = qualification_mode(os.environ.get('BIBCODE_UPLOAD_MODE'))
+    selection = case_settings(mode, os.environ.get('BIBCODE_UPLOAD_CASE'))
     programs = host_programs()
     run_id = os.environ['GITHUB_RUN_ID']
     node = resolve_node_runtime()
     server = str(Path(os.environ['BIBCODE_UPLOAD_SERVER']).resolve(strict=True))
     evidence = Path(os.environ['RUNNER_TEMP']) / ('issue17-browser-' + run_id)
-    fixture = Path('/tmp') / ('bibcode-upload-' + run_id + '-' + uuid.uuid4().hex)
+    # Evidence carries the run ID; keep owned TMPDIR short for native Unix sockets.
+    fixture = Path('/tmp') / ('bibcode-upload-' + uuid.uuid4().hex)
     evidence.mkdir(mode=0o700, exist_ok=False)
     fixture.mkdir(mode=0o700, exist_ok=False)
     namespace = os.readlink('/proc/self/ns/net')
     versions = {name: subprocess.check_output([path, '--version'], text=True, timeout=10).splitlines()[0]
                 for name, path in programs.items() if name in ['google-chrome', 'chromedriver']}
     write_json(evidence / 'provenance.json', {'source': os.environ['GITHUB_SHA'], 'versions': versions,
-                                             'qualificationMode': mode,
+                                             'qualificationMode': mode, 'matrixCase': selection['case'],
                                              'fixtureRoot': str(fixture), 'guardMode': 'default Abort'})
     command = [programs['unshare'], '--user', '--map-current-user', '--keep-caps', '--net', '--pid', '--mount-proc',
                '--fork', '--kill-child', sys.executable, __file__, 'inner', str(evidence), str(fixture),
                node, server, programs['google-chrome'], programs['chromedriver'], programs['git'], programs['dirname'],
                namespace, os.environ['GITHUB_SHA'], str(Path(programs['ip']).resolve(strict=True))]
-    result, _ = run_owned_command(command, timeout=660, grace=15)
+    result, _ = run_owned_command(command, timeout=selection['outer_timeout'], grace=15)
     result['hostNetworkNamespaceUnchanged'] = os.readlink('/proc/self/ns/net') == namespace
     write_json(evidence / 'supervisor.json', result)
     print(json.dumps({'exitCode': result['exitCode'], 'evidence': str(evidence),

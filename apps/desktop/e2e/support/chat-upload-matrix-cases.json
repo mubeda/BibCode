@@ -1,0 +1,128 @@
+[
+  {
+    "case": "plain-64-light-delivery",
+    "transport": "plain",
+    "upBytesPerSecond": 65536,
+    "theme": "light",
+    "action": "delivery",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "plain-16-dark-delivery",
+    "transport": "plain",
+    "upBytesPerSecond": 16384,
+    "theme": "dark",
+    "action": "delivery",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "noise-64-dark-delivery",
+    "transport": "noise",
+    "upBytesPerSecond": 65536,
+    "theme": "dark",
+    "action": "delivery",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "noise-16-light-delivery",
+    "transport": "noise",
+    "upBytesPerSecond": 16384,
+    "theme": "light",
+    "action": "delivery",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "plain-64-dark-freeze",
+    "transport": "plain",
+    "upBytesPerSecond": 65536,
+    "theme": "dark",
+    "action": "freeze",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "noise-64-light-freeze",
+    "transport": "noise",
+    "upBytesPerSecond": 65536,
+    "theme": "light",
+    "action": "freeze",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "plain-16-light-cancel-pointer",
+    "transport": "plain",
+    "upBytesPerSecond": 16384,
+    "theme": "light",
+    "action": "cancel-pointer",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "plain-16-dark-cancel-enter",
+    "transport": "plain",
+    "upBytesPerSecond": 16384,
+    "theme": "dark",
+    "action": "cancel-enter",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "plain-64-light-cancel-space",
+    "transport": "plain",
+    "upBytesPerSecond": 65536,
+    "theme": "light",
+    "action": "cancel-space",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "noise-16-dark-cancel-pointer",
+    "transport": "noise",
+    "upBytesPerSecond": 16384,
+    "theme": "dark",
+    "action": "cancel-pointer",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "noise-16-light-cancel-enter",
+    "transport": "noise",
+    "upBytesPerSecond": 16384,
+    "theme": "light",
+    "action": "cancel-enter",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "noise-64-dark-cancel-space",
+    "transport": "noise",
+    "upBytesPerSecond": 65536,
+    "theme": "dark",
+    "action": "cancel-space",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "plain-64-dark-stop",
+    "transport": "plain",
+    "upBytesPerSecond": 65536,
+    "theme": "dark",
+    "action": "stop",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  },
+  {
+    "case": "noise-64-light-stop",
+    "transport": "noise",
+    "upBytesPerSecond": 65536,
+    "theme": "light",
+    "action": "stop",
+    "innerTimeoutSeconds": 1800,
+    "outerTimeoutSeconds": 1860
+  }
+]

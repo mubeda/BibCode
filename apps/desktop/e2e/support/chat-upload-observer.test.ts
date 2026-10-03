@@ -619,3 +619,110 @@ it.each([
   expect(f.read().plain.maxBufferedBytesAtClose).toBe(13);
   expect(JSON.stringify(f.read())).not.toMatch(/private-reason|extra-identity/);
 });
+
+it("observes only transport close metadata for Noise without examining application bytes", () => {
+  const f = fixture();
+  const noise = new f.page.WebSocket("ws://localhost:4911/ws-e2ee");
+  noise.emit("open");
+  noise.send("opaque-private-frame");
+  noise.emit("message", { data: Uint8Array.of(2, 123).buffer });
+  f.advance(20);
+  expect(noise.close(4408, "private-reason")).toBe(9);
+  expect(f.read().noise).toMatchObject({
+    applicationMetricsAvailable: false,
+    closeCalls: 1,
+    lastCloseCode: 4408,
+    lastCloseAtMs: 20,
+    maxBufferedBytesAtClose: 13,
+    closeMetricsComplete: true,
+  });
+  expect(f.read().plain.requests.append).toBe(0);
+  expect(JSON.stringify(f.read())).not.toContain("private");
+});
+
+it("timestamps plain close metadata in the document clock used by the passive freeze probe", () => {
+  const f = fixture();
+  f.advance(25);
+  f.socket.close(4408);
+  expect(f.read().plain.lastCloseAtMs).toBe(25);
+});
+
+it.each([
+  { args: [] },
+  { args: [undefined] },
+  { args: [4408, undefined, { secret: "extra-reference" }] },
+])("preserves complete native Noise close arguments and receiver: %j", ({ args }) => {
+  const f = fixture();
+  const original = Object.getPrototypeOf(Object.getPrototypeOf(f.socket));
+  const result = {};
+  const captured: Array<{ receiver: unknown; values: unknown[] }> = [];
+  original.close = function (this: unknown, ...values: unknown[]) {
+    captured.push({ receiver: this, values });
+    return result;
+  };
+  const noise = new f.page.WebSocket("ws://localhost:4911/ws-e2ee");
+  noise.emit("open");
+  expect(Reflect.apply(noise.close, noise, args)).toBe(result);
+  expect(captured[0]!.receiver).toBe(noise);
+  expect(captured[0]!.values).toHaveLength(args.length);
+  args.forEach((value, index) => expect(captured[0]!.values[index]).toBe(value));
+  expect(f.read().noise.closeCalls).toBe(1);
+  expect(JSON.stringify(f.read())).not.toContain("extra-reference");
+});
+
+it("does not publish Noise close on native failure and keeps unavailable metadata separate from plaintext", () => {
+  const f = fixture();
+  const original = Object.getPrototypeOf(Object.getPrototypeOf(f.socket));
+  const failure = new Error("private-native-failure");
+  original.close = function () {
+    throw failure;
+  };
+  const failed = new f.page.WebSocket("ws://localhost:4911/ws-e2ee");
+  failed.emit("open");
+  expect(() => failed.close(4408)).toThrow(failure);
+  expect(f.read().noise.closeCalls).toBe(0);
+  original.close = function () {
+    return 9;
+  };
+  const unknown = new f.page.WebSocket("ws://localhost:4911/ws-e2ee");
+  unknown.emit("open");
+  Object.defineProperty(unknown, "bufferedAmount", {
+    get: () => {
+      throw new Error("private-metadata");
+    },
+  });
+  expect(unknown.close(4408)).toBe(9);
+  expect(f.read().noise.closeMetricsComplete).toBe(false);
+  expect(f.read().plain.complete).toBe(true);
+  expect(JSON.stringify(f.read())).not.toContain("private");
+});
+
+it.each([{ args: [] }, { args: [undefined] }, { args: ["4408"] }])(
+  "the latest normally returning close code/time stays one tuple: %j",
+  ({ args }) => {
+    const f = fixture();
+    const noise = new f.page.WebSocket("ws://localhost:4911/ws-e2ee");
+    noise.emit("open");
+    f.advance(10);
+    noise.close(4408);
+    f.advance(10);
+    Reflect.apply(noise.close, noise, args);
+    expect(f.read().noise).toMatchObject({ closeCalls: 2, lastCloseCode: null, lastCloseAtMs: 20 });
+  },
+);
+
+it("an unknown latest close time cannot reuse an older timestamp", () => {
+  const f = fixture();
+  const noise = new f.page.WebSocket("ws://localhost:4911/ws-e2ee");
+  noise.emit("open");
+  f.advance(10);
+  noise.close(4408);
+  f.advance(NaN);
+  noise.close(4408);
+  expect(f.read().noise).toMatchObject({
+    closeCalls: 2,
+    lastCloseCode: 4408,
+    lastCloseAtMs: null,
+    closeMetricsComplete: false,
+  });
+});

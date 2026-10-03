@@ -30,8 +30,19 @@ export interface ChatUploadObservation {
     maxBufferedBytesAtClose: number | null;
     closeCalls: number;
     lastCloseCode: number | null;
+    lastCloseAtMs: number | null;
   };
-  noise: { created: number; opened: number; closed: number; applicationMetricsAvailable: false };
+  noise: {
+    created: number;
+    opened: number;
+    closed: number;
+    applicationMetricsAvailable: false;
+    closeCalls: number;
+    lastCloseCode: number | null;
+    lastCloseAtMs: number | null;
+    maxBufferedBytesAtClose: number | null;
+    closeMetricsComplete: boolean;
+  };
   other: { created: number };
 }
 
@@ -72,8 +83,19 @@ function installChatUploadObserver() {
     maxBufferedBytesAtClose: null as number | null,
     closeCalls: 0,
     lastCloseCode: null as number | null,
+    lastCloseAtMs: null as number | null,
   };
-  const noise = { created: 0, opened: 0, closed: 0, applicationMetricsAvailable: false as const };
+  const noise = {
+    created: 0,
+    opened: 0,
+    closed: 0,
+    applicationMetricsAvailable: false as const,
+    closeCalls: 0,
+    lastCloseCode: null as number | null,
+    lastCloseAtMs: null as number | null,
+    maxBufferedBytesAtClose: null as number | null,
+    closeMetricsComplete: true,
+  };
   const other = { created: 0 };
   let socketOverflow = false;
   type Pending = {
@@ -379,6 +401,7 @@ function installChatUploadObserver() {
       maxBufferedBytesAtClose: plain.maxBufferedBytesAtClose,
       closeCalls: plain.closeCalls,
       lastCloseCode: plain.lastCloseCode,
+      lastCloseAtMs: plain.lastCloseAtMs,
     },
     noise: { ...noise },
     other: { ...other },
@@ -427,6 +450,47 @@ function installChatUploadObserver() {
         state.pending.clear();
         reset(state);
       });
+      const ownsReceiver = (candidate: WebSocket) => candidate === this;
+      const closeOwner = endpoint === "plain" ? plain : noise;
+      const closeUnknown = () => {
+        if (endpoint === "plain") issue("unknown");
+        else noise.closeMetricsComplete = false;
+      };
+      const close = this.close;
+      this.close = function (this: WebSocket, ...args: Parameters<WebSocket["close"]>) {
+        let buffered: number | null = null;
+        try {
+          const observed = this.bufferedAmount;
+          if (integer(observed, 2 ** 31 - 1)) buffered = observed;
+        } catch {
+          /* Metadata cannot prevent native close. */
+        }
+        const result = Reflect.apply(close, this, args);
+        try {
+          if (!ownsReceiver(this)) {
+            closeUnknown();
+            return result;
+          }
+          bump(closeOwner, "closeCalls");
+          closeOwner.lastCloseCode = null;
+          closeOwner.lastCloseAtMs = null;
+          const code = args[0];
+          if (integer(code, 4999) && code >= 1000) closeOwner.lastCloseCode = code;
+          const closedAt = performance.now();
+          if (Number.isFinite(closedAt) && closedAt >= 0 && closedAt <= 3_600_000)
+            closeOwner.lastCloseAtMs = closedAt;
+          else closeUnknown();
+          if (buffered !== null)
+            closeOwner.maxBufferedBytesAtClose = Math.max(
+              closeOwner.maxBufferedBytesAtClose ?? 0,
+              buffered,
+            );
+          else closeUnknown();
+        } catch {
+          closeUnknown();
+        }
+        return result;
+      };
       if (endpoint !== "plain") return;
       this.addEventListener("message", (event) => {
         try {
@@ -436,7 +500,6 @@ function installChatUploadObserver() {
         }
       });
       const send = this.send;
-      const ownsReceiver = (candidate: WebSocket) => candidate === this;
       this.send = function (this: WebSocket, ...args: Parameters<WebSocket["send"]>) {
         const result = Reflect.apply(send, this, args);
         try {
@@ -446,32 +509,6 @@ function installChatUploadObserver() {
           else issue("unsupported");
         } catch {
           issue("malformed");
-        }
-        return result;
-      };
-      const close = this.close;
-      this.close = function (this: WebSocket, ...args: Parameters<WebSocket["close"]>) {
-        let buffered: number | null = null;
-        try {
-          const observed = this.bufferedAmount;
-          if (integer(observed, 2 ** 31 - 1)) buffered = observed;
-        } catch {
-          /* Metadata cannot prevent the original close. */
-        }
-        const result = Reflect.apply(close, this, args);
-        try {
-          if (!ownsReceiver(this)) {
-            issue("unknown");
-            return result;
-          }
-          bump(plain, "closeCalls");
-          const code = args[0];
-          if (integer(code, 4999) && code >= 1000) plain.lastCloseCode = code;
-          if (buffered !== null)
-            plain.maxBufferedBytesAtClose = Math.max(plain.maxBufferedBytesAtClose ?? 0, buffered);
-          else issue("unknown");
-        } catch {
-          issue("unknown");
         }
         return result;
       };
@@ -527,6 +564,7 @@ export function projectChatUploadObservation(input: unknown): ChatUploadObservat
       "maxBufferedBytesAtClose",
       "closeCalls",
       "lastCloseCode",
+      "lastCloseAtMs",
     ]) ||
     !keys(append, [
       "outstanding",
@@ -544,7 +582,17 @@ export function projectChatUploadObservation(input: unknown): ChatUploadObservat
     !keys(requests, ["begin", "append", "get", "cancel"]) ||
     !keys(control, ["ping", "pong", "ack", "interrupt"]) ||
     !keys(issues, ["malformed", "unsupported", "overflow", "unknown"]) ||
-    !keys(noise, ["created", "opened", "closed", "applicationMetricsAvailable"]) ||
+    !keys(noise, [
+      "created",
+      "opened",
+      "closed",
+      "applicationMetricsAvailable",
+      "closeCalls",
+      "lastCloseCode",
+      "lastCloseAtMs",
+      "maxBufferedBytesAtClose",
+      "closeMetricsComplete",
+    ]) ||
     !keys(other, ["created"]) ||
     noise!.applicationMetricsAvailable !== false
   )
@@ -625,6 +673,22 @@ export function projectChatUploadObservation(input: unknown): ChatUploadObservat
       Object.values(issues!).some((value) => value !== 0))
   )
     return null;
+  for (const value of [plain!.lastCloseAtMs, noise!.lastCloseAtMs])
+    if (
+      !(
+        value === null ||
+        (typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 3_600_000)
+      )
+    )
+      return null;
+  if (
+    !count(noise!.closeCalls) ||
+    !nullable(noise!.maxBufferedBytesAtClose, 2 ** 31 - 1) ||
+    !nullable(noise!.lastCloseCode, 4999) ||
+    typeof noise!.closeMetricsComplete !== "boolean"
+  )
+    return null;
+  if (noise!.lastCloseCode !== null && (noise!.lastCloseCode as number) < 1000) return null;
   // Every accepted field is a fixed primitive; rebuilding through JSON returns no
   // input object identity/accessors/foreign fields to the artifact caller.
   return JSON.parse(

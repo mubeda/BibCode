@@ -329,12 +329,19 @@ const slowTurnTimeoutMs = Number(process.env.BIBCODE_E2E_SLOW_TURN_MS ?? 60000);
 if (!Number.isSafeInteger(slowTurnTimeoutMs) || slowTurnTimeoutMs <= 0) {
   throw new Error("BIBCODE_E2E_SLOW_TURN_MS must be a positive integer.");
 }
+const dripMode = process.env.BIBCODE_E2E_DRIP_MODE;
+if (dripMode !== undefined && dripMode !== "chat-matrix") {
+  throw new Error("BIBCODE_E2E_DRIP_MODE must be absent or chat-matrix.");
+}
 let activeTurnId = null;
 let slowTurnTimer;
 let slowTurnPoll;
+let dripTimer;
+let dripTicks = 0;
 const clearSlowTurn = () => {
   clearTimeout(slowTurnTimer);
   clearInterval(slowTurnPoll);
+  clearInterval(dripTimer);
 };
 const completeTurn = (status = "completed") => {
   clearSlowTurn();
@@ -461,6 +468,18 @@ reader.on("line", (line) => {
         delta: streamResponse
       } });
       if (prompt.includes("[[slow]]")) {
+        if (dripMode === "chat-matrix" && prompt.includes("[[drip]]")) {
+          dripTicks = 0;
+          dripTimer = setInterval(() => {
+            if (activeTurnId !== turnId) { clearInterval(dripTimer); return; }
+            dripTicks++;
+            send({ method: "item/agentMessage/delta", params: {
+              threadId: "bibcode-ui-provider-thread", turnId,
+              itemId: "bibcode-ui-message-" + turnId, delta: " drip" + dripTicks + "."
+            } });
+            if (dripTicks >= 900) completeTurn();
+          }, 1000);
+        }
         slowTurnTimer = setTimeout(completeTurn, slowTurnTimeoutMs);
         slowTurnPoll = setInterval(() => {
           try {

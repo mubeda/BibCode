@@ -1,0 +1,86 @@
+name: Issue 17 first browser upload matrix
+
+on:
+  push:
+    branches: [codex/qualify-chat-matrix]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser_uploads:
+    name: Linux Chromium ${{ matrix.case }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        case:
+          - plain-64-light-delivery
+          - plain-16-dark-delivery
+          - noise-64-dark-delivery
+          - noise-16-light-delivery
+          - plain-64-dark-freeze
+          - noise-64-light-freeze
+          - plain-16-light-cancel-pointer
+          - plain-16-dark-cancel-enter
+          - plain-64-light-cancel-space
+          - noise-16-dark-cancel-pointer
+          - noise-16-light-cancel-enter
+          - noise-64-dark-cancel-space
+          - plain-64-dark-stop
+          - noise-64-light-stop
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+      - name: Install frozen dependencies
+        run: vp install --frozen-lockfile
+      - name: Check owned fixture and process helpers
+        run: |
+          python3 -B scripts/qualify-chat-uploads.test.py
+          python3 -B scripts/qualify-chat-network.test.py
+          python3 -B scripts/qualify-chat-uploads.py preflight
+          vp test run apps/desktop/e2e/support/chat-upload-matrix.test.ts apps/desktop/e2e/support/chat-upload-observer.test.ts apps/desktop/e2e/support/test-project.test.ts apps/desktop/e2e/support/chat-upload-fixture.test.ts apps/desktop/e2e/support/chat-upload-evidence.test.ts apps/desktop/e2e/support/browser-network.test.ts apps/desktop/e2e/support/browser-startup.test.ts
+      - name: Build guarded fixture server
+        run: cargo build -p bibcode-server --bin bibcode --features hermetic-test-guard -j 2
+      - name: Run one fixed first-matrix case
+        env:
+          BIBCODE_UPLOAD_SERVER: ${{ github.workspace }}/target/debug/bibcode
+          BIBCODE_UPLOAD_MODE: upload-matrix
+          BIBCODE_UPLOAD_CASE: ${{ matrix.case }}
+        run: python3 -B scripts/qualify-chat-uploads.py
+      - name: Retain explicit safe evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue17-matrix-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/matrix-progress.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/matrix-result.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/matrix-reconnecting.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/matrix-cancel-restored.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/matrix-stream-stop.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure-after-pair.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure-before-credential.png
+          if-no-files-found: warn

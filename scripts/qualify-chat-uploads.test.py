@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -22,6 +23,66 @@ spec.loader.exec_module(qualification)
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_actual_budget_and_private_environment_producers_use_selected_case(self):
+        module = ast.parse(SOURCE.read_text())
+        inner = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'inner')
+        outer = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'outer')
+        wait = next(node for node in ast.walk(inner) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'wait')
+        run = next(node for node in ast.walk(outer) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'run_owned_command')
+        for mode, selected, expected in [('upload-smoke', None, (600, 660)), ('startup-only', None, (600, 660)), ('upload-matrix', 'noise-16-light-delivery', (1800, 1860))]:
+            selection = qualification.case_settings(mode, selected)
+            observed = []
+            process = SimpleNamespace(wait=lambda **kwargs: observed.append(kwargs['timeout']))
+            eval(compile(ast.Expression(wait), 'actual-inner-budget', 'eval'), {'process': process, 'selection': selection})
+            eval(compile(ast.Expression(run), 'actual-outer-budget', 'eval'), {'command': ['owned'], 'selection': selection, 'run_owned_command': lambda *args, **kwargs: observed.append(kwargs['timeout'])})
+            self.assertEqual(tuple(observed), expected)
+        environment = next(node for node in ast.walk(inner) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'environment' for target in node.targets))
+        scope = {'mode': 'upload-matrix', 'selection': qualification.case_settings('upload-matrix', 'noise-16-light-delivery'), 'Path': Path, 'fixture': Path('/owned/fixture'), 'evidence': Path('/owned/evidence'), 'node': '/owned/node', 'os': os, 'private_namespace': 'owned', 'server': '/owned/server', 'chrome': '/owned/chrome', 'driver': '/owned/driver', 'source': 'a' * 40, 'trusted_network': {}}
+        exec(compile(ast.Module(body=[environment], type_ignores=[]), 'actual-matrix-environment', 'exec'), scope)
+        self.assertEqual(scope['environment']['BIBCODE_UPLOAD_CASE'], 'noise-16-light-delivery')
+        self.assertEqual(scope['environment']['BIBCODE_UPLOAD_MODE'], 'upload-matrix')
+
+    def test_actual_root_admission_remains_exclusive_private_and_evidence_run_id_is_separate(self):
+        source = SOURCE.read_text()
+        module = ast.parse(source)
+        outer = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'outer')
+        admissions = [node for node in ast.walk(outer) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'mkdir']
+        self.assertEqual(len(admissions), 2)
+        for call in admissions:
+            self.assertEqual({entry.arg: ast.literal_eval(entry.value) for entry in call.keywords}, {'mode': 0o700, 'exist_ok': False})
+        evidence = next(node for node in ast.walk(outer) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'evidence' for target in node.targets))
+        scope = {'Path': Path, 'os': SimpleNamespace(environ={'RUNNER_TEMP': '/owned/evidence'}), 'run_id': '1234567890'}
+        exec(compile(ast.Module(body=[evidence], type_ignores=[]), 'actual-evidence-producer', 'exec'), scope)
+        self.assertEqual(scope['evidence'], Path('/owned/evidence/issue17-browser-1234567890'))
+        self.assertIn("'--fork', '--kill-child', sys.executable, __file__, 'inner'", source)
+
+    def test_matrix_cases_use_fixed_long_budgets_while_defaults_stay_unchanged(self):
+        self.assertEqual(qualification.qualification_mode('upload-matrix'), 'upload-matrix')
+        self.assertEqual(qualification.case_settings('upload-smoke', None), {'case': None, 'inner_timeout': 600, 'outer_timeout': 660})
+        self.assertEqual(qualification.case_settings('startup-only', None), {'case': None, 'inner_timeout': 600, 'outer_timeout': 660})
+        manifest = json.loads((SOURCE.parent.parent / 'apps/desktop/e2e/support/chat-upload-matrix-cases.json').read_text())
+        self.assertEqual(len(manifest), 14)
+        for selected in manifest:
+            self.assertEqual(qualification.case_settings('upload-matrix', selected['case']), {'case': selected['case'], 'inner_timeout': 1800, 'outer_timeout': 1860})
+        with self.assertRaisesRegex(RuntimeError, 'matrix case'):
+            qualification.case_settings('upload-matrix', 'private-invalid')
+        with self.assertRaisesRegex(RuntimeError, 'matrix case'):
+            qualification.case_settings('upload-smoke', manifest[0]['case'])
+
+    def test_invalid_matrix_case_refuses_before_any_program_or_namespace_admission(self):
+        with mock.patch.dict(os.environ, {'BIBCODE_UPLOAD_MODE': 'upload-matrix', 'BIBCODE_UPLOAD_CASE': 'private-invalid'}), mock.patch.object(qualification, 'host_programs') as programs:
+            with self.assertRaisesRegex(RuntimeError, 'matrix case'):
+                qualification.outer()
+            programs.assert_not_called()
+
+    def test_actual_fixture_root_assignment_uses_uuid_without_long_run_id(self):
+        module = ast.parse(SOURCE.read_text())
+        outer = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'outer')
+        assignment = next(node for node in ast.walk(outer) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'fixture' for target in node.targets))
+        scope = {'Path': Path, 'run_id': '12345678901234567890', 'uuid': SimpleNamespace(uuid4=lambda: SimpleNamespace(hex='a' * 32))}
+        exec(compile(ast.Module(body=[assignment], type_ignores=[]), 'actual-root-producer', 'exec'), scope)
+        self.assertEqual(scope['fixture'], Path('/tmp') / ('bibcode-upload-' + 'a' * 32))
+
     def test_mode_defaults_to_upload_and_startup_is_explicit(self):
         self.assertEqual(qualification.qualification_mode(None), 'upload-smoke')
         self.assertEqual(qualification.qualification_mode('startup-only'), 'startup-only')
@@ -41,7 +102,7 @@ class SupervisorTests(unittest.TestCase):
         assignment = next(node for node in ast.walk(inner) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'environment' for target in node.targets))
         scope = {'mode': 'startup-only', 'Path': Path, 'fixture': Path('/owned/fixture'), 'evidence': Path('/owned/evidence'),
                  'node': '/owned/node', 'os': os, 'private_namespace': 'owned', 'server': '/owned/server',
-                 'chrome': '/owned/chrome', 'driver': '/owned/driver', 'source': 'a' * 40, 'trusted_network': {}}
+                 'chrome': '/owned/chrome', 'driver': '/owned/driver', 'source': 'a' * 40, 'trusted_network': {}, 'selection': {'case': None}}
         exec(compile(ast.Module(body=[assignment], type_ignores=[]), 'owned-environment', 'exec'), scope)
         self.assertEqual(scope['environment']['BIBCODE_UPLOAD_MODE'], 'startup-only')
 
