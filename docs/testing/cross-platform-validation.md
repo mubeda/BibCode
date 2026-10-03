@@ -1447,9 +1447,39 @@ use actual UI progress, verified pinned routing and provider bytes/digest as
 separate behavior evidence. No private-state/key injection or guessed ciphertext
 counter substitutes are permitted. Browser bufferedAmount sampled at an explicit
 close call describes queued browser data at that instant, not proxy/server memory
-or confirmed delivery. Native Ping/Pong, queued-byte drain and selective-reply
-fault measurements require their own reviewed fixture support; the current
-smoke does not establish them.
+or confirmed delivery. Native Ping/Pong and selective-reply fault measurements
+require their own reviewed fixture support; the current smoke does not establish
+them.
+
+The TCP throttle proxy exposes `measurements()` and read-only `GET /measurements`
+separately from the unchanged `/state` and `/set` settings responses. Its fixed
+snapshot records each direction and simultaneous totals: received wire bytes,
+bytes admitted by a normally returning `destination.write` (including `false`),
+currently owned queued bytes, peak queued bytes, write attempts, backpressure,
+completed versus abandoned drain waits, discarded queue bytes and direction
+lifetimes. Connection closure counts join both native sockets; `close()` stops
+both paced queues and waits for their sockets and listener server. Shutdown
+clears data/end/drain/close callbacks and fences already retained callbacks, so
+neither drained events nor late data can revive a stopped direction.
+
+These are proxy/socket-admission measurements, not acknowledgement or delivery.
+Queue bytes include an attempted write until its normal return classifies the
+piece; a throwing write leaves measurement partial and releases owned buffers.
+Discard means the proxy drops its references, not that bytes already handed to
+Node or the peer vanished. Source callbacks can exceed the 64 KiB pause threshold,
+and subarrays can retain larger backing buffers; queued bytes are not a RAM or
+kernel-buffer estimate. Aggregate peak is the maximum simultaneous queued total,
+not the sum of lifetime directional peaks. Completed totals consume constant
+space; the proxy retains only the native connections it still owns.
+
+All counters remain finite. Overflow or invalid numeric observations mark the
+snapshot partial and unknown queue accounting remains null; do not interpret
+partial values as complete-zero. New metadata retains no address, path, connection
+identifier, payload, header, error or credential. Raw TCP callbacks/writes do not
+define WebSocket frames or validate an HTTP Upgrade, so `controls.nativeWebSocket`
+and `controls.rpc` remain the fixed `not-observed` value. Neither Ping/Pong counts
+nor Noise/RPC controls may be inferred from byte sizes. A separately reviewed,
+bounded header-only attribution seam is still required for native heartbeat proof.
 
 ## Slow-link liveness scenario
 

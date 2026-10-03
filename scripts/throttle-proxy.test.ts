@@ -9,7 +9,13 @@ import * as NodeURL from "node:url";
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { startThrottleProxy, startControlServer, runThrottleProxyMain } from "./throttle-proxy.ts";
+import {
+  startThrottleProxy,
+  startControlServer,
+  runThrottleProxyMain,
+  pace,
+  createProxyMeasurements,
+} from "./throttle-proxy.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -178,4 +184,393 @@ describe("startThrottleProxy", () => {
   it("does not start a CLI server when imported", async () => {
     expect(await runThrottleProxyMain(false, [])).toBe(false);
   });
+});
+
+it("counts actual forwarded duplex bytes without changing their contents or control settings", async () => {
+  const upstreamBytes = Buffer.from("owned-upstream-sentinel");
+  const downstreamBytes = Buffer.from("owned-downstream-sentinel");
+  const received: Buffer[] = [];
+  const server = NodeNet.createServer((socket) => {
+    socket.on("data", (chunk: Buffer) => {
+      received.push(chunk);
+      if (Buffer.concat(received).length === upstreamBytes.length) socket.end(downstreamBytes);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const proxy = await startThrottleProxy({
+    listenHost: "127.0.0.1",
+    listenPort: 0,
+    targetHost: "127.0.0.1",
+    targetPort: (server.address() as NodeNet.AddressInfo).port,
+  });
+  cleanups.push(proxy.close);
+  const response = await new Promise<Buffer>((resolve, reject) => {
+    const parts: Buffer[] = [];
+    const client = NodeNet.connect(proxy.port, "127.0.0.1", () => client.write(upstreamBytes));
+    client.on("data", (piece: Buffer) => parts.push(piece));
+    client.on("end", () => resolve(Buffer.concat(parts)));
+    client.on("error", reject);
+  });
+  expect(response).toEqual(downstreamBytes);
+  expect(Buffer.concat(received)).toEqual(upstreamBytes);
+  await proxy.close();
+  const measured = proxy.measurements();
+  expect(measured.up).toMatchObject({
+    receivedBytes: upstreamBytes.length,
+    destinationAcceptedBytes: upstreamBytes.length,
+    queuedBytes: 0,
+    discardedBytes: 0,
+    complete: true,
+  });
+  expect(measured.down).toMatchObject({
+    receivedBytes: downstreamBytes.length,
+    destinationAcceptedBytes: downstreamBytes.length,
+    queuedBytes: 0,
+    discardedBytes: 0,
+    complete: true,
+  });
+  expect(measured.connections).toEqual({ created: 1, active: 0, closed: 1 });
+  expect(measured.controls).toEqual({ nativeWebSocket: "not-observed", rpc: "not-observed" });
+  expect(JSON.stringify(measured)).not.toMatch(/sentinel|127\.0\.0\.1|port|path|payload/);
+});
+
+it("reports frozen queued/discarded bytes and joins closure without later counter movement", async () => {
+  const target = await servePayload(Buffer.alloc(16 * 1024, 120));
+  const proxy = await startThrottleProxy({
+    listenHost: "127.0.0.1",
+    listenPort: 0,
+    targetHost: "127.0.0.1",
+    targetPort: target,
+    initial: { frozen: true },
+  });
+  cleanups.push(proxy.close);
+  const client = NodeNet.connect(proxy.port, "127.0.0.1");
+  client.on("error", () => {});
+  cleanups.push(async () => {
+    client.destroy();
+  });
+  await vi.waitFor(() => expect(proxy.measurements().down.queuedBytes).toBe(16 * 1024));
+  expect(proxy.measurements().down).toMatchObject({
+    destinationAcceptedBytes: 0,
+    peakQueuedBytes: 16 * 1024,
+  });
+  await proxy.close();
+  const terminal = proxy.measurements();
+  expect(terminal.down).toMatchObject({
+    receivedBytes: 16 * 1024,
+    queuedBytes: 0,
+    discardedBytes: 16 * 1024,
+  });
+  expect(terminal.connections.active).toBe(0);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  expect(proxy.measurements()).toEqual(terminal);
+});
+
+it("fences stopped direction data/drain callbacks and discards only its unaccepted queue", () => {
+  vi.useFakeTimers();
+  const source = new NodeNet.Socket();
+  const destination = new NodeNet.Socket();
+  const measurements = createProxyMeasurements();
+  const write = vi.spyOn(destination, "write").mockReturnValue(false);
+  try {
+    const stop = pace(
+      source,
+      destination,
+      () => 0,
+      () => false,
+      (event) => measurements.observe("up", event),
+    );
+    source.emit("data", Buffer.alloc(8192));
+    vi.advanceTimersByTime(0);
+    expect(write).toHaveBeenCalledTimes(1);
+    const lateData = source.listeners("data").at(-1)!;
+    const lateDrain = destination.listeners("drain").at(-1)!;
+    stop();
+    const terminal = measurements.snapshot();
+    expect(terminal.up).toMatchObject({
+      receivedBytes: 8192,
+      destinationAcceptedBytes: 4096,
+      discardedBytes: 4096,
+      queuedBytes: 0,
+      backpressureEvents: 1,
+      drainEvents: 0,
+      abandonedDrainWaits: 1,
+    });
+    lateData(Buffer.alloc(4096));
+    lateDrain();
+    destination.emit("drain");
+    vi.advanceTimersByTime(1000);
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(measurements.snapshot()).toEqual(terminal);
+    expect(source.listenerCount("data")).toBe(0);
+    expect(destination.listenerCount("drain")).toBe(0);
+  } finally {
+    source.destroy();
+    destination.destroy();
+    vi.useRealTimers();
+  }
+});
+
+it("observes backpressure drain and exact writes before normal end without changing the byte sequence", () => {
+  vi.useFakeTimers();
+  const source = new NodeNet.Socket();
+  const destination = new NodeNet.Socket();
+  const measurements = createProxyMeasurements();
+  const writes: Buffer[] = [];
+  vi.spyOn(destination, "write").mockImplementation((piece) => {
+    writes.push(Buffer.from(piece as Buffer));
+    return writes.length !== 1;
+  });
+  const end = vi.spyOn(destination, "end").mockReturnValue(destination);
+  try {
+    const stop = pace(
+      source,
+      destination,
+      () => 0,
+      () => false,
+      (event) => measurements.observe("down", event),
+    );
+    const bytes = Buffer.alloc(8192, 121);
+    source.emit("data", bytes);
+    source.emit("end");
+    vi.advanceTimersByTime(0);
+    expect(measurements.snapshot().down).toMatchObject({
+      queuedBytes: 4096,
+      destinationAcceptedBytes: 4096,
+      backpressureEvents: 1,
+      drainEvents: 0,
+    });
+    destination.emit("drain");
+    vi.advanceTimersByTime(1);
+    expect(Buffer.concat(writes)).toEqual(bytes);
+    expect(end).toHaveBeenCalledOnce();
+    expect(measurements.snapshot().down).toMatchObject({
+      queuedBytes: 0,
+      destinationAcceptedBytes: 8192,
+      writeCalls: 2,
+      drainEvents: 1,
+      discardedBytes: 0,
+    });
+    stop();
+  } finally {
+    source.destroy();
+    destination.destroy();
+    vi.useRealTimers();
+  }
+});
+
+it("keeps counter overflow or malformed numbers explicit without retaining foreign metadata", () => {
+  const measurements = createProxyMeasurements();
+  measurements.observe("up", { _tag: "received", bytes: Number.MAX_SAFE_INTEGER });
+  measurements.observe("up", { _tag: "received", bytes: 1 });
+  expect(measurements.snapshot().up).toMatchObject({ complete: false, overflow: true });
+  expect(measurements.snapshot().up.queuedBytes).toBeNull();
+  const malformed = createProxyMeasurements();
+  malformed.observe("down", { _tag: "received", bytes: NaN, secret: "do-not-retain" } as never);
+  expect(malformed.snapshot().down.complete).toBe(false);
+  expect(JSON.stringify(malformed.snapshot())).not.toContain("do-not-retain");
+});
+
+it("reports the actual overshoot callback and simultaneous aggregate queue peak", () => {
+  vi.useFakeTimers();
+  const source = new NodeNet.Socket();
+  const destination = new NodeNet.Socket();
+  const measurements = createProxyMeasurements();
+  try {
+    const stop = pace(
+      source,
+      destination,
+      () => 0,
+      () => true,
+      (event) => measurements.observe("up", event),
+    );
+    source.emit("data", Buffer.alloc(128 * 1024));
+    measurements.observe("down", { _tag: "received", bytes: 4096 });
+    expect(source.isPaused()).toBe(true);
+    expect(measurements.snapshot().up.peakQueuedBytes).toBe(128 * 1024);
+    expect(measurements.snapshot().total.peakQueuedBytes).toBe(128 * 1024 + 4096);
+    stop();
+    measurements.observe("down", { _tag: "discarded", bytes: 4096 });
+    expect(measurements.snapshot().total.queuedBytes).toBe(0);
+  } finally {
+    source.destroy();
+    destination.destroy();
+    vi.useRealTimers();
+  }
+});
+
+it("stops a direction whose destination closes and cannot restart a queued freeze timer", () => {
+  vi.useFakeTimers();
+  const source = new NodeNet.Socket();
+  const destination = new NodeNet.Socket();
+  const measurements = createProxyMeasurements();
+  const write = vi.spyOn(destination, "write").mockReturnValue(true);
+  try {
+    const stop = pace(
+      source,
+      destination,
+      () => 0,
+      () => true,
+      (event) => measurements.observe("down", event),
+    );
+    source.emit("data", Buffer.alloc(4096));
+    vi.advanceTimersByTime(0);
+    destination.emit("close");
+    const terminal = measurements.snapshot();
+    expect(terminal.down).toMatchObject({
+      queuedBytes: 0,
+      discardedBytes: 4096,
+      stoppedDirections: 1,
+    });
+    vi.advanceTimersByTime(1000);
+    expect(write).not.toHaveBeenCalled();
+    expect(measurements.snapshot()).toEqual(terminal);
+    stop();
+  } finally {
+    source.destroy();
+    destination.destroy();
+    vi.useRealTimers();
+  }
+});
+
+it("preserves a native write throw while reporting unknown admission and cleaning the owned queue", () => {
+  vi.useFakeTimers();
+  const source = new NodeNet.Socket();
+  const destination = new NodeNet.Socket();
+  const measurements = createProxyMeasurements();
+  const failure = new Error("private-native-write");
+  vi.spyOn(destination, "write").mockImplementation(() => {
+    throw failure;
+  });
+  try {
+    pace(
+      source,
+      destination,
+      () => 0,
+      () => false,
+      (event) => measurements.observe("up", event),
+    );
+    source.emit("data", Buffer.alloc(8192));
+    expect(() => vi.advanceTimersByTime(0)).toThrow(failure);
+    expect(measurements.snapshot().up).toMatchObject({
+      complete: false,
+      receivedBytes: 8192,
+      destinationAcceptedBytes: 0,
+      discardedBytes: 8192,
+      queuedBytes: 0,
+      writeCalls: 1,
+      stoppedDirections: 1,
+    });
+    expect(JSON.stringify(measurements.snapshot())).not.toContain("private");
+  } finally {
+    source.destroy();
+    destination.destroy();
+    vi.useRealTimers();
+  }
+});
+
+it("exposes only metadata on the new read-only route and keeps existing state/set responses exact", async () => {
+  const target = await servePayload(Buffer.alloc(0));
+  const proxy = await startThrottleProxy({
+    listenHost: "127.0.0.1",
+    listenPort: 0,
+    targetHost: "127.0.0.1",
+    targetPort: target,
+  });
+  cleanups.push(proxy.close);
+  const server = await startControlServer(proxy, "127.0.0.1", 0);
+  cleanups.push(
+    () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  );
+  const port = (server.address() as NodeNet.AddressInfo).port;
+  const before = proxy.settings();
+  const measured = await (
+    await fetch(`http://127.0.0.1:${port}/measurements?up=1&freeze=1`)
+  ).json();
+  expect(measured).toEqual(proxy.measurements());
+  expect(proxy.settings()).toEqual(before);
+  expect(await (await fetch(`http://127.0.0.1:${port}/state`)).json()).toEqual({
+    down: 0,
+    up: 0,
+    frozen: false,
+  });
+  expect(await (await fetch(`http://127.0.0.1:${port}/set?up=65536`)).json()).toEqual({
+    down: 0,
+    up: 65536,
+    frozen: false,
+  });
+  const snapshot = proxy.measurements();
+  (snapshot.up as { receivedBytes: number }).receivedBytes = 99;
+  expect(proxy.measurements().up.receivedBytes).toBe(0);
+});
+
+it("releases the paced source pause on early upstream EOF so the native pair can close", async () => {
+  let respond: (() => void) | undefined;
+  const target = NodeNet.createServer((socket) => {
+    respond = () => socket.end(Buffer.from("owned-response"));
+    socket.on("data", () => {});
+  });
+  await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise<void>((resolve) => target.close(() => resolve())));
+  const proxy = await startThrottleProxy({
+    listenHost: "127.0.0.1",
+    listenPort: 0,
+    targetHost: "127.0.0.1",
+    targetPort: (target.address() as NodeNet.AddressInfo).port,
+    initial: { up: 1 },
+  });
+  cleanups.push(proxy.close);
+  const response = new Promise<Buffer>((resolve, reject) => {
+    const pieces: Buffer[] = [];
+    const client = NodeNet.connect(proxy.port, "127.0.0.1", () =>
+      client.write(Buffer.alloc(128 * 1024)),
+    );
+    client.on("data", (piece: Buffer) => pieces.push(piece));
+    client.on("end", () => resolve(Buffer.concat(pieces)));
+    client.on("error", reject);
+    cleanups.push(async () => {
+      client.destroy();
+    });
+  });
+  await vi.waitFor(() =>
+    expect(proxy.measurements().up.queuedBytes).toBeGreaterThanOrEqual(64 * 1024),
+  );
+  respond!();
+  expect(await response).toEqual(Buffer.from("owned-response"));
+  await vi.waitFor(() => expect(proxy.measurements().connections.active).toBe(0));
+  expect(proxy.measurements().up.discardedBytes).toBeGreaterThan(0);
+});
+
+it.each(["received", "accepted", "discarded"] as const)(
+  "makes malformed %s byte deltas leave a sticky unknown queue for direction and aggregate",
+  (tag) => {
+    for (const invalid of [NaN, Infinity, -1, 0.5]) {
+      const measurements = createProxyMeasurements();
+      measurements.observe("up", { _tag: "received", bytes: 8 });
+      measurements.observe("up", { _tag: tag, bytes: invalid });
+      expect(measurements.snapshot().up).toMatchObject({ complete: false, queuedBytes: null });
+      expect(measurements.snapshot().total).toMatchObject({ complete: false, queuedBytes: null });
+      expect(measurements.snapshot().down).toMatchObject({ complete: true, queuedBytes: 0 });
+      measurements.observe("up", { _tag: "accepted", bytes: 8 });
+      measurements.observe("down", { _tag: "received", bytes: 4 });
+      expect(measurements.snapshot().up.queuedBytes).toBeNull();
+      expect(measurements.snapshot().total.queuedBytes).toBeNull();
+      expect(measurements.snapshot().down.queuedBytes).toBe(4);
+    }
+  },
+);
+
+it("does not report a measured zero queue when the first receipt is invalid", () => {
+  const measurements = createProxyMeasurements();
+  measurements.observe("down", { _tag: "received", bytes: NaN });
+  expect(measurements.snapshot().down.queuedBytes).toBeNull();
+  expect(measurements.snapshot().total.queuedBytes).toBeNull();
+  measurements.observe("down", { _tag: "received", bytes: 8 });
+  expect(measurements.snapshot().down.queuedBytes).toBeNull();
+  expect(measurements.snapshot().total.queuedBytes).toBeNull();
 });

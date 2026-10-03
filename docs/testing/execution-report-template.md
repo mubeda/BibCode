@@ -262,6 +262,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Upstream rate/latency and duration at 64 KiB/s and 16 KiB/s; acknowledged progress samples and maximum outstanding appends:
 - Plain observer availability/completeness, malformed/unsupported/overflow/unknown counts, partial messages, aggregate versus per-socket outstanding high-water, successful/failed/abandoned appends and reply timing; Noise application metrics unavailable unless separately measured:
 - Actual carrying configuration capability observation; browser bufferedAmount at close versus separately measured proxy/receiver data; native heartbeat Ping/Pong distinguished from RPC controls:
+- Proxy measurements completeness/overflow; per-direction and simultaneous total received/socket-admitted/queued/peak/discarded bytes, write/backpressure/completed-or-abandoned drain events, joined connection counts; native WS/RPC controls explicitly not observed unless independently attributed:
 - Concurrent stream and Stop latency; upload completion without 4408; provider fixture received-byte/digest comparison:
 - Multi-file duration over ten minutes, completed-stage get activity touches, non-overlapping keeper requests and joined cleanup on all exits:
 - Freeze timestamp, 4408 timestamp (within 33 seconds), resume checkpoint after thaw, earlier-file restart/expiry outcome and once-per-file budget:
