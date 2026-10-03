@@ -1,9 +1,12 @@
 """Contained-network guard tests use only fake namespace/ip observations."""
 import copy
+import ast
 import importlib.util
 import json
 from pathlib import Path
 import sys
+import os
+from types import SimpleNamespace
 import unittest
 
 spec = importlib.util.spec_from_file_location('network', Path(__file__).with_name('qualify-chat-network.py'))
@@ -16,6 +19,23 @@ ENV = {'CI': 'true', 'BIBCODE_UPLOAD_HOST_NETNS': 'net:[1]', 'BIBCODE_UPLOAD_NET
        'BIBCODE_UPLOAD_PYTHON': str(Path(sys.executable).resolve()),
        'BIBCODE_UPLOAD_NETWORK_HELPER': str(Path(__file__).with_name('qualify-chat-uploads.py').resolve())}
 OWNER = [sys.executable, ENV['BIBCODE_UPLOAD_NETWORK_HELPER'], 'inner', 'evidence', 'fixture', 'node', 'server', 'chrome', 'driver', 'git', 'dirname', 'net:[1]', 'source', ENV['BIBCODE_UPLOAD_IP']]
+OLD_RECEIPT = {'source': 'cd66fda5700294a320fe76256c486bd7a7a0b3a5', 'serverVersion': '0.7.2', 'binarySha256': 'a' * 64, 'build': 'immutable-source', 'hermeticGuard': 'unavailable-in-old-source', 'contractProof': {'serveFlags': True, 'pairingIssue': True, 'inlineDataUrl': True, 'capabilityAbsent': True, 'operateScope': True}}
+
+def actual_handoff(mode, receipt=None):
+    """Execute the actual launch/vector and child environment expressions, never unshare/IP."""
+    module = ast.parse(Path(ENV['BIBCODE_UPLOAD_NETWORK_HELPER']).read_text())
+    outer = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'outer')
+    inner = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'inner')
+    start = next(index for index, node in enumerate(outer.body) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'command' for target in node.targets))
+    end = next(index for index, node in enumerate(outer.body[start:], start) if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == 'run_owned_command')
+    scope = {'mode': mode, 'old_receipt': receipt, 'programs': {'unshare': 'unshare', 'google-chrome': 'chrome', 'chromedriver': 'driver', 'git': 'git', 'dirname': 'dirname', 'ip': ENV['BIBCODE_UPLOAD_IP']}, 'sys': sys, '__file__': ENV['BIBCODE_UPLOAD_NETWORK_HELPER'], 'evidence': Path('evidence'), 'fixture': Path('fixture'), 'node': 'node', 'server': 'server', 'namespace': ENV['BIBCODE_UPLOAD_HOST_NETNS'], 'Path': Path, 'os': SimpleNamespace(environ={'GITHUB_SHA': 'source'}, pathsep=os.pathsep), 'json': json}
+    exec(compile(ast.Module(body=outer.body[start:end], type_ignores=[]), 'actual-owner-launcher', 'exec'), scope)
+    command = scope['command']
+    owner = command[command.index('inner') - 2:]
+    environment = next(node for node in ast.walk(inner) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'environment' for target in node.targets))
+    scope.update({'chrome': 'chrome', 'driver': 'driver', 'source': 'source', 'private_namespace': ENV['BIBCODE_UPLOAD_NETNS'], 'selection': {'case': None}, 'trusted_network': ENV, 'os': SimpleNamespace(environ={'PATH': 'owned-tools'}, pathsep=os.pathsep)})
+    exec(compile(ast.Module(body=[environment], type_ignores=[]), 'actual-owner-environment', 'exec'), scope)
+    return owner, scope['environment']
 NAMESPACES = {f'/proc/{owner}/ns/{kind}': value for owner in ['self', '1']
               for kind, value in [('net', 'net:[2]'), ('pid', 'pid:[3]'), ('user', 'user:[4]')]}
 LO = {'ifindex': 1, 'ifname': 'lo'}
@@ -62,9 +82,77 @@ class FakeIp:
         return result, json.dumps(value).encode()
 
 class NetworkTests(unittest.TestCase):
-    def setup_network(self, fake, env=None, namespaces=None, **kwargs):
+    def setup_network(self, fake, env=None, namespaces=None, owner=None, **kwargs):
         return network.setup(env or ENV, fake, readlink=(namespaces or NAMESPACES).__getitem__,
-                             platform='linux', read_owner=lambda: '\0'.join(OWNER).encode(), read_capabilities=kwargs.pop('read_capabilities', lambda: b'CapEff:\t0000000000001000\n'), **kwargs)
+                             platform='linux', read_owner=lambda: ('\0'.join(owner or OWNER) + '\0').encode(), read_capabilities=kwargs.pop('read_capabilities', lambda: b'CapEff:\t0000000000001000\n'), **kwargs)
+    def test_actual_default_launcher_and_network_admission_preserve_fourteen_owner_values(self):
+        for mode in ['upload-smoke', 'startup-only', 'upload-matrix']:
+            with self.subTest(mode=mode):
+                owner, environment = actual_handoff(mode)
+                self.assertEqual(len(owner), 14)
+                self.assertNotIn('BIBCODE_UPLOAD_OLD_INPUT', environment)
+                fake = FakeIp()
+                proof = self.setup_network(fake, env=environment, owner=owner)
+                self.assertTrue(proof['privateNet'])
+                self.assertEqual(fake.mutations, MUTATIONS)
+
+    def test_actual_remaining_launcher_and_network_admission_bind_the_fifteenth_receipt(self):
+        owner, environment = actual_handoff('remaining-qualification', OLD_RECEIPT)
+        self.assertEqual(len(owner), 15)
+        self.assertEqual(owner[14], environment['BIBCODE_UPLOAD_OLD_INPUT'])
+        fake = FakeIp()
+        try:
+            proof = self.setup_network(fake, env=environment, owner=owner)
+        except network.NetworkRefused:
+            self.fail('Actual remaining launcher was refused before its owned network admission')
+        self.assertTrue(proof['privateNet'])
+        self.assertEqual(fake.mutations, MUTATIONS)
+
+    def test_missing_extra_changed_malformed_and_contradictory_receipts_refuse_before_ip(self):
+        encoded = json.dumps(OLD_RECEIPT)
+        base = {**ENV, 'BIBCODE_UPLOAD_MODE': 'remaining-qualification', 'BIBCODE_UPLOAD_OLD_INPUT': encoded}
+        controls = [
+            (OWNER, base), (OWNER + [encoded, encoded], base),
+            (OWNER + [encoded], {key: value for key, value in base.items() if key != 'BIBCODE_UPLOAD_OLD_INPUT'}),
+            (OWNER + [encoded], {**base, 'BIBCODE_UPLOAD_OLD_INPUT': json.dumps({**OLD_RECEIPT, 'binarySha256': 'b' * 64})}),
+            (OWNER + ['null'], {**base, 'BIBCODE_UPLOAD_OLD_INPUT': 'null'}),
+            (OWNER + ['{}'], {**base, 'BIBCODE_UPLOAD_OLD_INPUT': '{}'}),
+            (OWNER + ['malformed'], {**base, 'BIBCODE_UPLOAD_OLD_INPUT': 'malformed'}),
+            (OWNER + [''], {**base, 'BIBCODE_UPLOAD_OLD_INPUT': ''}),
+            (OWNER + [encoded, ''], base),
+            (OWNER + [''], {**ENV, 'BIBCODE_UPLOAD_MODE': 'upload-smoke'}),
+            (OWNER + [encoded], {**base, 'BIBCODE_UPLOAD_MODE': 'upload-smoke'}),
+            (OWNER, {**ENV, 'BIBCODE_UPLOAD_OLD_INPUT': encoded}),
+            (OWNER, {**ENV, 'BIBCODE_UPLOAD_MODE': 'unknown'}),
+            (OWNER + [encoded], {**base, 'BIBCODE_UPLOAD_CASE': 'plain-64-light-delivery'}),
+        ]
+        for key, value in [('source', 'b' * 40), ('serverVersion', '0.7.3'), ('binarySha256', 'G' * 64), ('hermeticGuard', 'default Abort'), ('contractProof', {**OLD_RECEIPT['contractProof'], 'operateScope': 1})]:
+            malformed = json.dumps({**OLD_RECEIPT, key: value})
+            controls.append((OWNER + [malformed], {**base, 'BIBCODE_UPLOAD_OLD_INPUT': malformed}))
+        for malformed in [json.dumps({**OLD_RECEIPT, 'unknown': 'private'}), json.dumps({key: value for key, value in OLD_RECEIPT.items() if key != 'build'}), encoded[:-1] + ', "source": "cd66fda5700294a320fe76256c486bd7a7a0b3a5"}', encoded + ' ' * 4096]:
+            controls.append((OWNER + [malformed], {**base, 'BIBCODE_UPLOAD_OLD_INPUT': malformed}))
+        for owner, environment in controls:
+            with self.subTest(length=len(owner)):
+                fake = FakeIp()
+                with self.assertRaises(network.NetworkRefused) as failure:
+                    self.setup_network(fake, env=environment, owner=owner)
+                self.assertEqual(fake.calls, [])
+                self.assertEqual(failure.exception.proof['attemptedMutations'], 0)
+                self.assertEqual(failure.exception.proof['completedMutations'], 0)
+
+    def test_remaining_admission_preserves_python_helper_host_ip_and_each_namespace_guard(self):
+        encoded = json.dumps(OLD_RECEIPT)
+        environment = {**ENV, 'BIBCODE_UPLOAD_MODE': 'remaining-qualification', 'BIBCODE_UPLOAD_OLD_INPUT': encoded}
+        for index, replacement in [(0, ENV['BIBCODE_UPLOAD_NETWORK_HELPER']), (1, ENV['BIBCODE_UPLOAD_PYTHON']), (11, 'net:[9]'), (13, ENV['BIBCODE_UPLOAD_NETWORK_HELPER'])]:
+            owner = OWNER + [encoded]; owner[index] = replacement
+            fake = FakeIp()
+            with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=environment, owner=owner)
+            self.assertEqual(fake.calls, [])
+        for kind in ['net', 'pid', 'user']:
+            for peer in ['self', '1']:
+                fake = FakeIp(); namespaces = {**NAMESPACES, '/proc/' + peer + '/ns/' + kind: kind + ':[99]'}
+                with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=environment, namespaces=namespaces, owner=OWNER + [encoded])
+                self.assertEqual(fake.calls, [])
     def test_wrong_namespace_refuses_before_ip_mutations(self):
         for path, wrong in [('/proc/self/ns/net', 'net:[1]'), ('/proc/1/ns/net', 'net:[8]'),
                             ('/proc/self/ns/pid', 'pid:[8]'), ('/proc/1/ns/user', 'user:[8]')]:

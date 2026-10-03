@@ -1482,6 +1482,15 @@ guard is reported as unavailable in that old source; owned HOME, fake-provider
 paths, settings, process supervision and the private no-external-route namespace
 remain required. A receipt is preparation evidence, not an old-server pass.
 
+The PID1 handoff remains exactly fourteen argument values for every ordinary
+profile. Only explicit remaining qualification adds a fifteenth value: its
+bounded closed immutable receipt must match the child environment handoff
+exactly. Missing, extra, changed, malformed, unknown or contradictory profile
+inputs are refused before IP reads or mutations. Empty extra arguments remain
+visible when decoding the kernel command-line terminator. The existing native
+Python/helper/IP identities and net/PID/user namespace checks remain mandatory
+for both shapes; no general argument-count fallback is permitted.
+
 Require the actual carrying config to lack staging, a real public file-input
 send of a 10 MiB PNG, complete valid inline request/image metadata, zero
 `uploads.*` requests or staged references, exact provider bytes/digest, usable

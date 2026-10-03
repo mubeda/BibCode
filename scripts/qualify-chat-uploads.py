@@ -149,11 +149,16 @@ def network_environment(host_namespace, ip):
             'BIBCODE_UPLOAD_NETWORK_HELPER': str(Path(__file__).resolve(strict=True))}
 
 
-def network():
+def network_module():
     import importlib.util
     spec = importlib.util.spec_from_file_location('contained_network', Path(__file__).with_name('qualify-chat-network.py'))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def network():
+    module = network_module()
     try:
         proof = module.setup(os.environ, run_owned_command)
     except module.NetworkRefused as failure:
@@ -199,19 +204,7 @@ def verify_old_inline_input(server, receipt_path):
             raw = receipt_file.read(4097)
         if len(raw) > 4096:
             raise ValueError()
-        receipt = json.loads(raw)
-        keys = {'source', 'serverVersion', 'binarySha256', 'build', 'hermeticGuard', 'contractProof'}
-        proof_keys = {'serveFlags', 'pairingIssue', 'inlineDataUrl', 'capabilityAbsent', 'operateScope'}
-        if (not isinstance(receipt, dict) or set(receipt) != keys
-                or receipt['source'] != 'cd66fda5700294a320fe76256c486bd7a7a0b3a5'
-                or receipt['serverVersion'] != '0.7.2' or receipt['build'] != 'immutable-source'
-                or receipt['hermeticGuard'] != 'unavailable-in-old-source'
-                or not isinstance(receipt['binarySha256'], str) or len(receipt['binarySha256']) != 64
-                or any(char not in '0123456789abcdef' for char in receipt['binarySha256'])
-                or not isinstance(receipt['contractProof'], dict)
-                or set(receipt['contractProof']) != proof_keys
-                or any(value is not True for value in receipt['contractProof'].values())):
-            raise ValueError()
+        receipt = network_module().decode_old_inline_receipt(raw)
         hasher = hashlib.sha256()
         with os.fdopen(os.open(server, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as binary:
             before = os.fstat(binary.fileno())
@@ -326,7 +319,12 @@ def prepare_old_inline_input():
 def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_namespace, source, ip, old_receipt_json=None):
     mode = qualification_mode(os.environ.get('BIBCODE_UPLOAD_MODE'))
     selection = case_settings(mode, os.environ.get('BIBCODE_UPLOAD_CASE'))
-    old_receipt = json.loads(old_receipt_json) if old_receipt_json is not None else None
+    if mode == 'remaining-qualification':
+        old_receipt = network_module().decode_old_inline_receipt(old_receipt_json)
+    else:
+        if old_receipt_json is not None:
+            raise RuntimeError('Old inline input refused')
+        old_receipt = None
     private_namespace = os.readlink('/proc/self/ns/net')
     if os.getpid() != 1 or private_namespace == host_namespace:
         raise RuntimeError('Refusing to run outside the owned PID/network namespaces')
@@ -490,8 +488,9 @@ def outer():
     command = [programs['unshare'], '--user', '--map-current-user', '--keep-caps', '--net', '--pid', '--mount-proc',
                '--fork', '--kill-child', sys.executable, __file__, 'inner', str(evidence), str(fixture),
                node, server, programs['google-chrome'], programs['chromedriver'], programs['git'], programs['dirname'],
-               namespace, os.environ['GITHUB_SHA'], str(Path(programs['ip']).resolve(strict=True)),
-               json.dumps(old_receipt)]
+               namespace, os.environ['GITHUB_SHA'], str(Path(programs['ip']).resolve(strict=True))]
+    if mode == 'remaining-qualification':
+        command.append(json.dumps(old_receipt))
     result, _ = run_owned_command(command, timeout=selection['outer_timeout'], grace=15)
     result['hostNetworkNamespaceUnchanged'] = os.readlink('/proc/self/ns/net') == namespace
     write_json(evidence / 'supervisor.json', result)

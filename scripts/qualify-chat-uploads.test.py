@@ -24,6 +24,14 @@ spec.loader.exec_module(qualification)
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_inner_rejects_missing_malformed_or_contradictory_extra_before_namespace_reads(self):
+        arguments = [Path('evidence'), Path('fixture'), 'node', 'server', 'chrome', 'driver', 'git', 'dirname', 'host', 'source', 'ip']
+        for mode, extra in [('upload-smoke', 'null'), ('startup-only', '{}'), ('upload-matrix', 'null'), ('remaining-qualification', None), ('remaining-qualification', '{}')]:
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, {'BIBCODE_UPLOAD_MODE': mode}), mock.patch.object(qualification.os, 'readlink', wraps=os.readlink) as readlink:
+                with self.assertRaises((RuntimeError, ValueError)):
+                    qualification.inner(*arguments, old_receipt_json=extra)
+                self.assertFalse(any(call.args and call.args[0] == '/proc/self/ns/net' for call in readlink.call_args_list))
+
     def test_old_contract_proof_distinguishes_source_cli_and_scope_from_native_success(self):
         files = {'manifest': 'version = "0.7.2"', 'lifecycle': 'capabilities', 'control': 'capabilities', 'environment': 'capabilities', 'orchestration': 'dataUrl', 'scope': '"orchestration.dispatchCommand" => Some(SCOPE_ORCHESTRATION_OPERATE),', 'model': '"orchestration:operate"', 'library': 'issue_administrative_pairing_link'}
         serve = '--mode --host --port --base-dir --dev-url --no-browser --no-startup-pairing-offer'

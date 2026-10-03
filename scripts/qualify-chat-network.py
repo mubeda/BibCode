@@ -18,6 +18,39 @@ MUTATIONS = [
     ['route', 'add', 'default', 'via', ADDRESSES[PEER], 'dev', IN],
 ]
 
+def decode_old_inline_receipt(raw):
+    """Closed bounded preparation record, shared by file and PID1 handoff validation."""
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode('utf8')
+        except UnicodeError:
+            raise ValueError('Old inline input refused') from None
+    if not isinstance(raw, str) or len(raw) > 4096 or len(raw.encode('utf8')) > 4096:
+        raise ValueError('Old inline input refused')
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('Old inline input refused')
+            result[key] = value
+        return result
+    try:
+        receipt = json.loads(raw, object_pairs_hook=unique_object)
+    except (ValueError, TypeError):
+        raise ValueError('Old inline input refused') from None
+    keys = {'source', 'serverVersion', 'binarySha256', 'build', 'hermeticGuard', 'contractProof'}
+    proof_keys = {'serveFlags', 'pairingIssue', 'inlineDataUrl', 'capabilityAbsent', 'operateScope'}
+    if (not isinstance(receipt, dict) or set(receipt) != keys
+            or receipt['source'] != 'cd66fda5700294a320fe76256c486bd7a7a0b3a5'
+            or receipt['serverVersion'] != '0.7.2' or receipt['build'] != 'immutable-source'
+            or receipt['hermeticGuard'] != 'unavailable-in-old-source'
+            or not isinstance(receipt['binarySha256'], str)
+            or re.fullmatch(r'[a-f0-9]{64}', receipt['binarySha256']) is None
+            or not isinstance(receipt['contractProof'], dict) or set(receipt['contractProof']) != proof_keys
+            or any(value is not True for value in receipt['contractProof'].values())):
+        raise ValueError('Old inline input refused')
+    return receipt
+
 class NetworkRefused(Exception):
     def __init__(self, proof=None):
         super().__init__('Contained qualification network setup refused.')
@@ -80,8 +113,21 @@ def _setup(environment, run_owned, context, readlink, platform, clock, read_owne
     context.stage = 'owner-shape'
     # Anchor the environment handoff to the visible, checked inner PID1 owner.
     try:
-        owner = read_owner().decode('utf8').rstrip('\0').split('\0')
-        require(len(owner) == 14 and owner[2] == 'inner')
+        raw_owner = read_owner().decode('utf8')
+        owner = raw_owner.split('\0')
+        if raw_owner.endswith('\0'):
+            owner.pop()  # Only the kernel terminator; extra empty arguments remain visible.
+        mode = environment.get('BIBCODE_UPLOAD_MODE')
+        remaining = mode == 'remaining-qualification'
+        require(mode in [None, 'upload-smoke', 'startup-only', 'upload-matrix', 'remaining-qualification'])
+        require(len(owner) == (15 if remaining else 14) and owner[2] == 'inner')
+        if remaining:
+            extra = environment.get('BIBCODE_UPLOAD_OLD_INPUT')
+            require(owner[14] == extra)
+            decode_old_inline_receipt(extra)
+            require(environment.get('BIBCODE_UPLOAD_CASE') in [None, ''])
+        else:
+            require('BIBCODE_UPLOAD_OLD_INPUT' not in environment)
         context.stage = 'owner-python'
         require(str(Path(owner[0]).resolve(strict=True)) == environment.get('BIBCODE_UPLOAD_PYTHON'))
         context.stage = 'owner-helper'
