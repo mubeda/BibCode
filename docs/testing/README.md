@@ -32,6 +32,43 @@ Native release reports also separate desktop-installer evidence from standalone-
 archive/package evidence. Each architecture requires its own native result; one
 architecture never proves another.
 
+### Temporary Windows legacy RPC qualification
+
+The optional `--previous-stable-trigger remote-rpc` seeded-upgrade selection is
+restricted to native Windows CI. The default remains `local-bridge`. The
+[temporary qualification workflow](../../.github/workflows/qualify-windows-legacy-rpc.yml)
+pins the previous host to the original `v0.7.2` source and runs three separate
+lanes on Windows x64 and ARM64: previous host through authenticated RPC,
+current-source protected host through the local bridge, and current-source host
+through RPC. The ordinary desktop-upgrade matrix is unchanged.
+
+The old source is not patched or instrumented. All tracked files must match the
+selected commit except the seven declared version files: only their package
+version values may differ, with every other manifest/lock value and file mode
+checked. This includes native build scripts, client runtime and root profiles.
+The actual bridge/update/auth/maintenance hashes, build versions and trigger are recorded
+before any lane starts; these records say `selected-not-yet-verified`. Only a
+completed lane result says `verified`. Both RPC lanes retain the real held-upload
+admission, protection progress, identity, backup, requester and process checks.
+In this selection the starting app must also match the planned baseline version
+after the existing observation/seeding step and before update-path credential,
+grant or installer-driver commands. The controller checks it again at completion.
+Their private receipts and joined cleanup belong to separate lane roots. A
+missing required or malformed receipt prevents public evidence retention.
+RPC residue removal requires two consecutive successful observations that the
+desktop process name targeted by the existing CI cleanup plan is absent. Kill
+results alone cannot authorize removal. Each read-only observation must finish
+with closed, untruncated output streams; a signal, stderr or missing stream close
+cannot stand in for absence. Unknown observations or exhausted stop attempts
+fail qualification and preserve that owner's residue and receipts.
+
+A pass qualifies this tag-source rebuild's authenticated migration route. It
+does not fix or qualify the old local-bridge path, whose prior stack overflow
+remains unresolved, or establish byte identity with a published installer.
+Require all three results on both architectures before calling the temporary
+trial complete. Native execution and any later version-scoped default-matrix
+exception need separate review; do not run the packaged harness on a user's host.
+
 ## Living documentation and execution reports
 
 The runbooks define current procedure and supported behavior. Branch names,

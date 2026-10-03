@@ -8,6 +8,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 import * as NodeURL from "node:url";
+import * as NodeCrypto from "node:crypto";
 import { parse as parseToml, type TomlTable } from "smol-toml";
 import {
   REMOTE_UPDATE_DOWNLOAD_BUDGET_MS,
@@ -21,11 +22,13 @@ import {
   releaseCargoLockFile,
   releasePackageFiles,
   releaseRustPackageFiles,
+  releaseVersionFiles,
 } from "./update-release-package-versions.ts";
 
 export type SeededUpgradePlatform = "linux" | "mac" | "win";
 export type SeededUpgradeArch = "arm64" | "x64";
 export type SeededUpgradeLane = "previous-stable" | "protected-baseline" | "remote-install";
+export type SeededUpgradeTrigger = "local-bridge" | "remote-rpc";
 
 const MOCK_UPDATE_READY_TIMEOUT_MS = 60_000;
 
@@ -37,6 +40,7 @@ export interface SeededDesktopUpgradeSmokeInput {
   readonly platform: SeededUpgradePlatform;
   readonly previousTag: string;
   readonly previousVersion: string;
+  readonly previousStableTrigger?: SeededUpgradeTrigger;
   readonly publicKeyFile: string;
   readonly repositoryRoot: string;
   readonly restartTimeoutMs: number;
@@ -86,6 +90,156 @@ export class SeededDesktopUpgradeSmokeError extends Error {
   override readonly name = "SeededDesktopUpgradeSmokeError";
 }
 
+const previousStableTrigger = (
+  value: unknown,
+  platform: SeededUpgradePlatform,
+  wsl: boolean,
+): SeededUpgradeTrigger => {
+  const trigger = value === undefined ? "local-bridge" : value;
+  if (trigger !== "local-bridge" && trigger !== "remote-rpc") {
+    throw new SeededDesktopUpgradeSmokeError(
+      "--previous-stable-trigger must be local-bridge or remote-rpc.",
+    );
+  }
+  if (trigger === "remote-rpc" && (platform !== "win" || wsl)) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "The previous-stable RPC trigger requires native Windows.",
+    );
+  }
+  return trigger;
+};
+
+const UPGRADE_SOURCE_PATHS = [
+  "apps/desktop/src-tauri/src/bridge.rs",
+  "apps/desktop/src-tauri/src/firewall.rs",
+  "apps/desktop/src-tauri/src/updates.rs",
+  "apps/desktop/src-tauri/src/remote_update_delegate.rs",
+  "apps/server/src/remote_update.rs",
+  "apps/server/src/production/remote_update_rpc.rs",
+  "apps/server/src/auth/http.rs",
+  "apps/server/src/maintenance.rs",
+] as const;
+const MAX_VERSION_SOURCE_BYTES = 262_144;
+
+/** The canonical transaction may change version fields and serialization, never other values. */
+export function assertSeededVersionOverlay(
+  path: string,
+  originalText: string,
+  currentText: string,
+  version: string,
+): void {
+  try {
+    let expected: unknown;
+    let current: unknown;
+    if (releasePackageFiles.some((entry) => entry === path)) {
+      const original: unknown = JSON.parse(originalText);
+      if (
+        typeof original !== "object" ||
+        original === null ||
+        Array.isArray(original) ||
+        !("version" in original) ||
+        typeof original.version !== "string"
+      )
+        throw new Error("Invalid package manifest");
+      expected = { ...original, version };
+      current = JSON.parse(currentText);
+    } else if (releaseRustPackageFiles.some((entry) => entry === path)) {
+      const original = parseToml(originalText);
+      const pkg = original.package;
+      if (
+        typeof pkg !== "object" ||
+        pkg === null ||
+        Array.isArray(pkg) ||
+        !("version" in pkg) ||
+        typeof pkg.version !== "string"
+      )
+        throw new Error("Invalid Cargo manifest");
+      expected = { ...original, package: { ...pkg, version } };
+      current = parseToml(currentText);
+    } else if (path === releaseCargoLockFile) {
+      const original = parseToml(originalText);
+      if (!Array.isArray(original.package)) throw new Error("Invalid Cargo lock");
+      const seen = new Set<string>();
+      const packages = original.package.map((pkg) => {
+        if (
+          typeof pkg !== "object" ||
+          pkg === null ||
+          Array.isArray(pkg) ||
+          !("name" in pkg) ||
+          typeof pkg.name !== "string"
+        )
+          throw new Error("Invalid locked package");
+        if (pkg.name !== "bibcode-server" && pkg.name !== "bibcode-desktop") return pkg;
+        if (seen.has(pkg.name) || !("version" in pkg) || typeof pkg.version !== "string")
+          throw new Error("Invalid release package");
+        seen.add(pkg.name);
+        return { ...pkg, version };
+      });
+      if (seen.size !== 2) throw new Error("Missing release packages");
+      expected = { ...original, package: packages };
+      current = parseToml(currentText);
+    } else throw new Error("Not a declared version file");
+    if (!NodeUtil.isDeepStrictEqual(current, expected))
+      throw new Error("Non-version values changed");
+  } catch {
+    throw new SeededDesktopUpgradeSmokeError(
+      "The declared version overlay did not match the source.",
+    );
+  }
+}
+
+/** Bounded source facts are planned coverage; ordinary lane verifiers alone publish success. */
+export function createSeededUpgradeProvenance(input: {
+  readonly lane: SeededUpgradeLane;
+  readonly trigger: SeededUpgradeTrigger;
+  readonly sourceRef: string;
+  readonly sourceCommit: string;
+  readonly baselineVersion: string;
+  readonly candidateVersion: string;
+  readonly sourceHashes: Readonly<Record<string, string>>;
+}) {
+  try {
+    if (
+      !["previous-stable", "protected-baseline", "remote-install"].includes(input.lane) ||
+      !["local-bridge", "remote-rpc"].includes(input.trigger) ||
+      !/^[a-f0-9]{40}$/.test(input.sourceCommit) ||
+      input.baselineVersion.length > 128 ||
+      input.candidateVersion.length > 128 ||
+      input.sourceRef !==
+        (input.lane === "previous-stable" ? `v${input.baselineVersion}` : input.sourceCommit) ||
+      Object.keys(input.sourceHashes).length !== UPGRADE_SOURCE_PATHS.length ||
+      !UPGRADE_SOURCE_PATHS.every((path) => /^[a-f0-9]{64}$/.test(input.sourceHashes[path] ?? ""))
+    )
+      throw new Error("Invalid source facts");
+    assertBaselineVersionIsOlder(input.baselineVersion, input.candidateVersion);
+  } catch {
+    throw new SeededDesktopUpgradeSmokeError("The upgrade source provenance is invalid.");
+  }
+  const excludesOldLocal = input.lane === "previous-stable" && input.trigger === "remote-rpc";
+  return {
+    schemaVersion: 1,
+    lane: input.lane,
+    trigger: input.trigger,
+    sourceKind: input.lane === "previous-stable" ? "tag-source-rebuild" : "current-source-rebuild",
+    sourceRef: input.sourceRef,
+    sourceCommit: input.sourceCommit,
+    sourceFiles: UPGRADE_SOURCE_PATHS.map((path) => ({ path, sha256: input.sourceHashes[path]! })),
+    baselineVersion: input.baselineVersion,
+    candidateVersion: input.candidateVersion,
+    instrumentationApplied: false,
+    trackedSourcePolicy: "all-tracked-with-validated-version-fields",
+    permittedVersionOverlayFiles: [...releaseVersionFiles],
+    packaging: { profile: "release", desktopE2e: true, ephemeralUpdaterOverlay: true },
+    protectionRequired: input.lane !== "previous-stable" || input.trigger === "remote-rpc",
+    coverageStatus: "selected-not-yet-verified",
+    excludedEntryPoints: excludesOldLocal ? ["previous-stable-local-bridge"] : [],
+    knownPriorFailure:
+      excludesOldLocal && input.sourceRef === "v0.7.2"
+        ? "previous-stable-local-bridge-stack-overflow"
+        : null,
+  };
+}
+
 export const REMOTE_INSTALL_FORBIDDEN_PORTS: ReadonlySet<number> = new Set([
   3773, 5733, 13773, 18431, 18432,
 ]);
@@ -107,6 +261,15 @@ export function countAppImageMounts(procMounts: string, prefix: string): number 
     .split("\n")
     .filter((line) => NodePath.posix.basename(line.split(" ")[1] ?? "").startsWith(prefix)).length;
 }
+export interface RemoteHeldUploadEvidence {
+  readonly admitted: boolean;
+  readonly releasedOnWaitingStage: boolean;
+  readonly completed: boolean;
+  readonly bytesMatch: boolean;
+  readonly noPartials: boolean;
+  readonly requestClosed: boolean;
+  readonly holdLimitMs: number;
+}
 export interface RemoteInstallEvidence {
   readonly before: {
     readonly bootId: string;
@@ -121,6 +284,7 @@ export interface RemoteInstallEvidence {
   readonly phases: ReadonlyArray<string>;
   readonly sawPercent: boolean;
   readonly sawStage: boolean;
+  readonly heldUpload: RemoteHeldUploadEvidence;
   readonly preUpdateBackups: number;
   readonly requesterLogLines: number;
   readonly appImageMounts: number | null;
@@ -149,6 +313,18 @@ export function verifyRemoteInstallOutcome(
   if (!evidence.phases.includes("succeeded")) fail("the coordinator did not succeed.");
   if (!evidence.sawPercent || !evidence.sawStage)
     fail("download and protection progress was not observed.");
+  const held = evidence.heldUpload;
+  if (
+    !held ||
+    held.admitted !== true ||
+    held.releasedOnWaitingStage !== true ||
+    held.completed !== true ||
+    held.bytesMatch !== true ||
+    held.noPartials !== true ||
+    held.requestClosed !== true ||
+    held.holdLimitMs !== 20_000
+  )
+    fail("the owned held upload witness was not completed.");
   if (evidence.preUpdateBackups < 1) fail("no pre-update backup was observed.");
   if (evidence.requesterLogLines !== 1) fail("expected exactly one requester log entry.");
   if (evidence.appImageMounts !== null && evidence.appImageMounts !== 1)
@@ -210,6 +386,7 @@ export function parseSeededDesktopUpgradeSmokeArgs(
         platform: { type: "string" },
         "previous-tag": { type: "string" },
         "previous-version": { type: "string" },
+        "previous-stable-trigger": { type: "string" },
         "public-key-file": { type: "string" },
         "restart-timeout-ms": { type: "string" },
         "run-id": { type: "string" },
@@ -258,6 +435,11 @@ export function parseSeededDesktopUpgradeSmokeArgs(
     platform,
     previousTag: requireString(values, "previous-tag"),
     previousVersion: requireString(values, "previous-version"),
+    previousStableTrigger: previousStableTrigger(
+      values["previous-stable-trigger"],
+      platform,
+      values.wsl === true,
+    ),
     publicKeyFile: requireAbsolute(requireString(values, "public-key-file"), "public-key-file"),
     repositoryRoot: NodePath.resolve(repositoryRoot),
     restartTimeoutMs: parsePositiveInteger(
@@ -389,8 +571,10 @@ export function buildLocalUpdaterManifest(input: {
 
 export function createSeededUpgradeDriverSpec(input: {
   readonly candidateVersion: string;
+  readonly baselineVersion?: string | undefined;
   readonly expectedDataRoot: string;
   readonly lane: SeededUpgradeLane;
+  readonly trigger?: SeededUpgradeTrigger;
   readonly phase: "seed-and-install" | "verify";
   readonly projectId: string;
   readonly resultPath: string;
@@ -399,16 +583,29 @@ export function createSeededUpgradeDriverSpec(input: {
   readonly remoteInstallDriverPath?: string;
   readonly remoteHarnessPath?: string;
   readonly remoteSecretPath?: string;
+  readonly remoteUploadSecretPath?: string;
   readonly remoteEvidencePath?: string;
   readonly appBinaryPath?: string;
   readonly platform?: SeededUpgradePlatform;
 }): string {
+  const trigger =
+    input.trigger ?? (input.lane === "remote-install" ? "remote-rpc" : "local-bridge");
   if (
-    input.lane === "remote-install" &&
+    input.lane === "previous-stable" &&
+    trigger === "remote-rpc" &&
+    input.baselineVersion === undefined
+  ) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "The previous RPC phase requires a planned baseline version.",
+    );
+  }
+  if (
+    trigger === "remote-rpc" &&
     input.phase === "seed-and-install" &&
     (!input.remoteInstallDriverPath ||
       !input.remoteHarnessPath ||
       !input.remoteSecretPath ||
+      !input.remoteUploadSecretPath ||
       !input.remoteEvidencePath ||
       !input.appBinaryPath ||
       !input.platform)
@@ -579,9 +776,17 @@ async function observe(seed) {
 describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
   it("uses public desktop and authenticated RPC boundaries", async () => {
     const observation = await observe(${input.phase === "seed-and-install" ? "true" : "false"});
+    ${
+      input.phase === "seed-and-install" && input.baselineVersion !== undefined
+        ? `
+    if (observation.appVersion !== input.baselineVersion) {
+      throw new Error("The starting app version did not match the planned baseline.");
+    }`
+        : ""
+    }
     NodeFS.writeFileSync(input.resultPath, JSON.stringify(observation));
     ${
-      input.phase === "seed-and-install" && input.lane === "remote-install"
+      input.phase === "seed-and-install" && trigger === "remote-rpc"
         ? `
     await browser.execute(() => { window.location.hash = "/settings/remote-servers?tab=share"; });
     let widened = false;
@@ -640,6 +845,8 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
     const evidence = await runRemoteInstallDriver({
       ...credentials,
       candidateVersion: input.candidateVersion,
+      workspaceRoot: input.workspaceRoot,
+      uploadReceiptPath: input.remoteUploadSecretPath,
       requireWide: widened,
       onInstallDispatched: () => {
         NodeFS.writeFileSync(input.resultPath, JSON.stringify({ ...observation, installAttempted: true }));
@@ -808,6 +1015,7 @@ export function verifySeededUpgradeOutcome(
   before: SeededUpgradeObservationBefore,
   after: SeededUpgradeObservationAfter,
   candidateVersion: string,
+  trigger: SeededUpgradeTrigger = "local-bridge",
 ): void {
   if (after.appVersion !== candidateVersion) {
     throw new SeededDesktopUpgradeSmokeError(
@@ -825,7 +1033,7 @@ export function verifySeededUpgradeOutcome(
   if (after.storageInstanceId === null) {
     throw new SeededDesktopUpgradeSmokeError("The candidate did not publish a storage identity.");
   }
-  if (lane === "previous-stable") return;
+  if (lane === "previous-stable" && trigger === "local-bridge") return;
   if (before.storageInstanceId === null) {
     throw new SeededDesktopUpgradeSmokeError(
       "The protected baseline storage identity must not be null.",
@@ -1004,8 +1212,207 @@ export class ManagedProcessRegistry {
   }
 }
 
+export interface RemoteUploadCapabilityReceipt {
+  readonly version: 1;
+  readonly relativeDirectory: string;
+  readonly relativeUrl: string;
+}
+const uploadDirectoryPattern =
+  /^bibcode-update-witness-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const privateUploadError = () =>
+  new SeededDesktopUpgradeSmokeError("The private upload receipt is invalid or unavailable.");
+function decodeRemoteUploadReceipt(value: unknown): RemoteUploadCapabilityReceipt {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Object.keys(value).sort().join(",") !== "relativeDirectory,relativeUrl,version" ||
+    !("version" in value) ||
+    value.version !== 1 ||
+    !("relativeDirectory" in value) ||
+    typeof value.relativeDirectory !== "string" ||
+    !uploadDirectoryPattern.test(value.relativeDirectory) ||
+    !("relativeUrl" in value) ||
+    typeof value.relativeUrl !== "string" ||
+    value.relativeUrl.length > 4096 ||
+    !/^\/api\/transfers\/[A-Za-z0-9._~-]+$/.test(value.relativeUrl) ||
+    new URL(value.relativeUrl, "http://127.0.0.1").pathname !== value.relativeUrl
+  ) {
+    throw privateUploadError();
+  }
+  return { version: 1, relativeDirectory: value.relativeDirectory, relativeUrl: value.relativeUrl };
+}
+
+async function readBoundedPrivateReceipt(path: string): Promise<unknown | null> {
+  try {
+    const metadata = await NodeFS.promises.lstat(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw privateUploadError();
+    });
+    if (metadata === null) return null;
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw privateUploadError();
+    const file = await NodeFS.promises.open(path, "r");
+    try {
+      const bytes = Buffer.alloc(8193);
+      let total = 0;
+      while (total < bytes.length) {
+        const { bytesRead } = await file.read(bytes, total, bytes.length - total, total);
+        if (bytesRead === 0) break;
+        total += bytesRead;
+      }
+      if (total > 8192) throw privateUploadError();
+      const value: unknown = JSON.parse(bytes.subarray(0, total).toString("utf8"));
+      // Only ENOENT is absence. A present JSON null must never permit unredacted retention.
+      if (value === null) throw privateUploadError();
+      return value;
+    } finally {
+      await file.close();
+    }
+  } catch {
+    throw privateUploadError();
+  }
+}
+
+/** Exclusive and flushed before HTTP dispatch; this private record is never an artifact. */
+export async function writeRemoteUploadCapabilityReceipt(
+  path: string,
+  receipt: RemoteUploadCapabilityReceipt,
+): Promise<void> {
+  try {
+    const value = decodeRemoteUploadReceipt(receipt);
+    const file = await NodeFS.promises.open(path, "wx", 0o600);
+    try {
+      await file.writeFile(JSON.stringify(value) + "\n");
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+  } catch {
+    throw privateUploadError();
+  }
+}
+
+/** A malformed private receipt must prevent log retention, not become a raw JSON error. */
+export async function readRemoteFixtureSecrets(input: {
+  readonly credentialReceiptPath: string;
+  readonly uploadReceiptPath: string;
+  readonly requireCredentialReceipt?: boolean;
+  readonly requireUploadReceipt?: boolean;
+}): Promise<string[]> {
+  const credentials = await readBoundedPrivateReceipt(input.credentialReceiptPath);
+  const upload = await readBoundedPrivateReceipt(input.uploadReceiptPath);
+  const secrets: string[] = [];
+  if (credentials !== null) {
+    if (
+      typeof credentials !== "object" ||
+      Object.keys(credentials).some((key) => key !== "bootstrapToken" && key !== "endpoint") ||
+      !("bootstrapToken" in credentials) ||
+      typeof credentials.bootstrapToken !== "string" ||
+      credentials.bootstrapToken.length === 0 ||
+      credentials.bootstrapToken.length > 6144 ||
+      ("endpoint" in credentials && typeof credentials.endpoint !== "string")
+    ) {
+      throw new SeededDesktopUpgradeSmokeError("The private remote credential receipt is invalid.");
+    }
+    secrets.push(credentials.bootstrapToken);
+  } else if (input.requireCredentialReceipt) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "The private remote credential receipt is unavailable.",
+    );
+  }
+  if (upload !== null) {
+    if (credentials === null) throw privateUploadError();
+    const receipt = decodeRemoteUploadReceipt(upload);
+    secrets.push(receipt.relativeUrl, receipt.relativeUrl.slice("/api/transfers/".length));
+  } else if (input.requireUploadReceipt) throw privateUploadError();
+  return secrets;
+}
+
+/** Run only inside the existing lane process owner, so failed stop cannot unlink a live writer. */
+export async function stopRemoteUploadFixture(input: {
+  readonly workspaceRoot: string;
+  readonly uploadReceiptPath: string;
+  readonly stop: () => Promise<void>;
+}): Promise<void> {
+  await input.stop();
+  const value = await readBoundedPrivateReceipt(input.uploadReceiptPath);
+  if (value === null) return;
+  const receipt = decodeRemoteUploadReceipt(value);
+  const directory = NodePath.join(input.workspaceRoot, receipt.relativeDirectory);
+  try {
+    const metadata = await NodeFS.promises
+      .lstat(directory)
+      .catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw privateUploadError();
+      });
+    if (metadata === null) return;
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw privateUploadError();
+    const names = await NodeFS.promises.readdir(directory);
+    if (
+      !names.every(
+        (name) =>
+          name === "protection-witness.txt" ||
+          (name.startsWith(".protection-witness.txt.") && name.endsWith(".bibcode-upload.part")),
+      )
+    ) {
+      throw privateUploadError();
+    }
+    await NodeFS.promises.rm(directory, { recursive: true });
+  } catch {
+    throw new SeededDesktopUpgradeSmokeError(
+      "The stopped upload fixture could not be safely removed.",
+    );
+  }
+}
+
+/** One owned RPC lane; paths and the launch witness cannot be rebound by a later lane. */
+export function createRpcUpgradeFixture(input: {
+  readonly runRoot: string;
+  readonly workspaceRoot: string;
+}) {
+  const credentialReceiptPath = NodePath.join(input.runRoot, "remote-bootstrap.secret.json");
+  const uploadReceiptPath = NodePath.join(input.runRoot, "remote-upload.secret.json");
+  const markerPath = NodePath.join(input.runRoot, "before.json");
+  const workspaceRoot = input.workspaceRoot;
+  let phaseStarted = false;
+  return Object.freeze({
+    credentialReceiptPath,
+    uploadReceiptPath,
+    markPhaseStarted: () => {
+      phaseStarted = true;
+    },
+    readSecrets: async () => {
+      let installAttempted = false;
+      try {
+        const marker = await readObservation<{ readonly installAttempted?: unknown }>(markerPath);
+        installAttempted = marker.installAttempted === true;
+      } catch {
+        /* The phase may not have reached its install marker. */
+      }
+      return readRemoteFixtureSecrets({
+        credentialReceiptPath,
+        uploadReceiptPath,
+        requireCredentialReceipt: phaseStarted,
+        requireUploadReceipt: installAttempted,
+      });
+    },
+    stop: async (stop: () => Promise<void>) => {
+      await stopRemoteUploadFixture({ workspaceRoot, uploadReceiptPath, stop });
+      await NodeFS.promises.rm(uploadReceiptPath, { force: true });
+      await NodeFS.promises.rm(credentialReceiptPath, { force: true });
+    },
+  });
+}
+
+type RpcUpgradeFixture = ReturnType<typeof createRpcUpgradeFixture>;
+
 const redactLiteral = (text: string, value: string): string =>
   value.length === 0 ? text : text.split(value).join("[REDACTED]");
+
+// Maintenance labels truncate at160 characters. Exact full-token replacement alone cannot
+// protect those prefixes, including their JSON/URI-escaped diagnostic representations.
+const signedTransferLabelPattern =
+  /(?:\/|\\+\/|\\+u002f|%(?:25)*2f)api(?:\/|\\+\/|\\+u002f|%(?:25)*2f)transfers(?:\/|\\+\/|\\+u002f|%(?:25)*2f)(?:[A-Za-z0-9._~-]|\\+u[0-9a-f]{4}|%[0-9a-f]{2})+(?:…)?/gi;
 
 export function redactAndBoundUpgradeEvidence(
   text: string,
@@ -1018,7 +1425,7 @@ export function redactAndBoundUpgradeEvidence(
   let redacted = [...input.secrets, ...input.roots]
     .filter((value) => value.length > 0)
     .sort((left, right) => right.length - left.length)
-    .reduce(redactLiteral, text);
+    .reduce(redactLiteral, text.replace(signedTransferLabelPattern, "/api/transfers/[REDACTED]"));
   const encoded = Buffer.from(redacted);
   if (encoded.byteLength <= input.maxBytes) return redacted;
   const suffix = "\n[TRUNCATED]";
@@ -1060,6 +1467,7 @@ export const runBoundedCommand = async (input: {
   readonly env?: NodeJS.ProcessEnv | undefined;
   readonly inherit?: boolean | undefined;
   readonly timeoutMs?: number | undefined;
+  readonly waitForStdioClose?: boolean | undefined;
 }): Promise<CommandResult> =>
   new Promise((resolve, reject) => {
     const child = NodeChildProcess.spawn(input.command, input.args, {
@@ -1072,18 +1480,29 @@ export const runBoundedCommand = async (input: {
     let settled = false;
     let stdout = "";
     let stderr = "";
+    let outputTruncated = false;
     child.stdout?.on("data", (chunk: Buffer) => {
-      stdout = `${stdout}${chunk.toString("utf8")}`.slice(-262_144);
+      const next = `${stdout}${chunk.toString("utf8")}`;
+      outputTruncated ||= next.length > 262_144;
+      stdout = next.slice(-262_144);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = `${stderr}${chunk.toString("utf8")}`.slice(-262_144);
+      const next = `${stderr}${chunk.toString("utf8")}`;
+      outputTruncated ||= next.length > 262_144;
+      stderr = next.slice(-262_144);
     });
+    const releaseObservationPipes = () => {
+      if (!input.waitForStdioClose) return;
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    };
     const timeout =
       input.timeoutMs === undefined
         ? undefined
         : setTimeout(() => {
             if (settled) return;
             settled = true;
+            releaseObservationPipes();
             void terminateChild(child).then(
               () =>
                 reject(
@@ -1098,13 +1517,22 @@ export const runBoundedCommand = async (input: {
       if (settled) return;
       settled = true;
       if (timeout !== undefined) clearTimeout(timeout);
+      releaseObservationPipes();
       reject(error);
     });
-    child.once("exit", (code) => {
+    // Observers need complete evidence; launchers retain their existing exit-based completion.
+    child.once(input.waitForStdioClose ? "close" : "exit", (code: number | null) => {
       if (settled) return;
       settled = true;
       if (timeout !== undefined) clearTimeout(timeout);
-      resolve({ exitCode: code ?? 1, stderr, stdout });
+      if (input.waitForStdioClose && outputTruncated) {
+        reject(
+          new SeededDesktopUpgradeSmokeError("Process observation output exceeded its bound."),
+        );
+        return;
+      }
+      // Signal-only termination has no ordinary exit status, including pgrep's no-match code 1.
+      resolve({ exitCode: code ?? -1, stderr, stdout });
     });
   });
 
@@ -1126,28 +1554,111 @@ export function restartedApplicationCleanupPlan(
   };
 }
 
+// Read-only projection of the same process name targeted by the existing CI cleanup plan.
+// Names arrive through the environment; no process paths, arguments or error text are returned.
+export const windowsApplicationAbsenceScript = `
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+try {
+  if ($env:CI -ne 'true') { throw 'not-ci' }
+  $targetName = $env:BIBCODE_SEEDED_APPLICATION_NAME
+  if ([string]::IsNullOrWhiteSpace($targetName)) { throw 'missing-target' }
+  $records = @(Get-CimInstance -ClassName Win32_Process -Property Name,ProcessId -ErrorAction Stop)
+  $matching = 0
+  $observedSelf = $false
+  foreach ($record in $records) {
+    $observedName = [string]$record.Name
+    if ([string]::IsNullOrWhiteSpace($observedName)) { throw 'unknown-process' }
+    if ($record.ProcessId -eq $PID) { $observedSelf = $true }
+    if ([string]::Equals($observedName, $targetName, [System.StringComparison]::OrdinalIgnoreCase)) { $matching += 1 }
+  }
+  if (-not $observedSelf) { throw 'incomplete-observation' }
+  [ordered]@{ observed = $true; matchingProcesses = $matching } | ConvertTo-Json -Compress
+} catch {
+  '{"observed":false,"matchingProcesses":null}'
+  exit 1
+}
+`;
+
+const restartedApplicationIsAbsent = async (
+  appBinaryPath: string,
+  platform: SeededUpgradePlatform,
+): Promise<boolean> => {
+  if (platform === "win") {
+    const result = await runCommand({
+      command: "powershell.exe",
+      args: ["-NoProfile", "-NonInteractive", "-Command", windowsApplicationAbsenceScript],
+      cwd: NodePath.dirname(appBinaryPath),
+      env: {
+        ...process.env,
+        BIBCODE_SEEDED_APPLICATION_NAME: NodePath.win32.basename(appBinaryPath),
+      },
+      timeoutMs: 10_000,
+      waitForStdioClose: true,
+    });
+    if (result.exitCode !== 0 || result.stderr.trim() !== "" || result.stdout.length > 1024)
+      throw new Error("Process observation unavailable");
+    const value: unknown = JSON.parse(result.stdout.trim().replace(/^\uFEFF/, ""));
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      Object.keys(value).sort().join(",") !== "matchingProcesses,observed" ||
+      !("observed" in value) ||
+      value.observed !== true ||
+      !("matchingProcesses" in value) ||
+      typeof value.matchingProcesses !== "number" ||
+      !Number.isSafeInteger(value.matchingProcesses) ||
+      value.matchingProcesses < 0 ||
+      value.matchingProcesses > 1_000_000
+    )
+      throw new Error("Process observation invalid");
+    return value.matchingProcesses === 0;
+  }
+  const result = await runCommand({
+    command: "pgrep",
+    args: ["-x", "bibcode-desktop"],
+    cwd: NodePath.dirname(appBinaryPath),
+    timeoutMs: 10_000,
+    waitForStdioClose: true,
+  });
+  if (result.stderr.trim() !== "") throw new Error("Process observation reported an error");
+  const pids = result.stdout.trim();
+  if (result.exitCode === 1 && pids === "") return true;
+  if (result.exitCode === 0 && /^[1-9][0-9]*(?:\r?\n[1-9][0-9]*)*$/.test(pids)) return false;
+  throw new Error("Process observation unavailable");
+};
+
 const stopRestartedApplication = async (
   appBinaryPath: string,
   platform: SeededUpgradePlatform,
 ): Promise<void> => {
-  const plan = restartedApplicationCleanupPlan(appBinaryPath, platform);
-  let killed = false;
-  let missesAfterKill = 0;
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const result = await runCommand({
-      ...plan,
-      cwd: NodePath.dirname(appBinaryPath),
-      timeoutMs: 10_000,
-    });
-    if (result.exitCode === 0) {
-      killed = true;
-      missesAfterKill = 0;
-    } else if (killed) {
-      missesAfterKill += 1;
-      if (missesAfterKill >= 2) return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+  if (process.env.CI !== "true") {
+    throw new SeededDesktopUpgradeSmokeError(
+      "Application cleanup is restricted to the owned CI fixture.",
+    );
   }
+  const plan = restartedApplicationCleanupPlan(appBinaryPath, platform);
+  let confirmedAbsent = 0;
+  try {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (await restartedApplicationIsAbsent(appBinaryPath, platform)) {
+        confirmedAbsent += 1;
+        if (confirmedAbsent >= 2) return;
+      } else {
+        confirmedAbsent = 0;
+        // A kill result is never evidence of absence, including a nonzero "not found" exit.
+        await runCommand({ ...plan, cwd: NodePath.dirname(appBinaryPath), timeoutMs: 10_000 });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  } catch {
+    throw new SeededDesktopUpgradeSmokeError(
+      "Application shutdown could not be verified; fixture files were preserved.",
+    );
+  }
+  throw new SeededDesktopUpgradeSmokeError(
+    "Application shutdown was not confirmed within its bound; fixture files were preserved.",
+  );
 };
 
 export async function removeSeededUpgradeDependencyTree(checkout: string): Promise<void> {
@@ -1177,6 +1688,128 @@ const requireCommandSuccess = async (input: Parameters<typeof runCommand>[0]): P
 
 const writePrivateJson = async (path: string, value: unknown): Promise<void> => {
   await NodeFS.promises.writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+};
+
+const recordUpgradeSourceProvenance = async (input: {
+  readonly lane: SeededUpgradeLane;
+  readonly trigger: SeededUpgradeTrigger;
+  readonly checkout: string;
+  readonly sourceRef: string;
+  readonly baselineVersion: string;
+  readonly candidateVersion: string;
+  readonly evidenceDirectory: string;
+}): Promise<void> => {
+  try {
+    const head = await runCommand({
+      command: "git",
+      args: ["rev-parse", "HEAD"],
+      cwd: input.checkout,
+      timeoutMs: 10000,
+    });
+    const ref = await runCommand({
+      command: "git",
+      args: ["rev-parse", `${input.sourceRef}^{commit}`],
+      cwd: input.checkout,
+      timeoutMs: 10000,
+    });
+    const sourceCommit = head.stdout.trim();
+    if (
+      head.exitCode !== 0 ||
+      ref.exitCode !== 0 ||
+      sourceCommit !== ref.stdout.trim() ||
+      !/^[a-f0-9]{40}$/.test(sourceCommit)
+    )
+      throw new Error("Source identity mismatch");
+    const unchanged = await runCommand({
+      command: "git",
+      args: [
+        "diff",
+        "--quiet",
+        sourceCommit,
+        "--",
+        ".",
+        ...releaseVersionFiles.map((path) => `:(top,exclude,literal)${path}`),
+      ],
+      cwd: input.checkout,
+      timeoutMs: 10000,
+    });
+    if (unchanged.exitCode !== 0) throw new Error("Baseline source was modified");
+    for (const path of releaseVersionFiles) {
+      const metadata = await runCommand({
+        command: "git",
+        args: [
+          "diff",
+          "--raw",
+          "--no-abbrev",
+          "--no-renames",
+          "-z",
+          sourceCommit,
+          "--",
+          `:(top,literal)${path}`,
+        ],
+        cwd: input.checkout,
+        timeoutMs: 10000,
+      });
+      if (metadata.exitCode !== 0) throw new Error("Version metadata unavailable");
+      if (metadata.stdout !== "") {
+        const fields = metadata.stdout.split("\0");
+        if (
+          fields.length !== 3 ||
+          fields[1] !== path ||
+          fields[2] !== "" ||
+          !/^:100644 100644 [a-f0-9]{40} [a-f0-9]{40} M$/.test(fields[0]!)
+        )
+          throw new Error("Version file mode or identity changed");
+      }
+      const object = `${sourceCommit}:${path}`;
+      const sizeResult = await runCommand({
+        command: "git",
+        args: ["cat-file", "-s", object],
+        cwd: input.checkout,
+        timeoutMs: 10000,
+      });
+      const size = Number(sizeResult.stdout.trim());
+      if (
+        sizeResult.exitCode !== 0 ||
+        !Number.isSafeInteger(size) ||
+        size <= 0 ||
+        size > MAX_VERSION_SOURCE_BYTES
+      )
+        throw new Error("Version source exceeds its bound");
+      const original = await runCommand({
+        command: "git",
+        args: ["show", object],
+        cwd: input.checkout,
+        timeoutMs: 10000,
+      });
+      if (original.exitCode !== 0 || Buffer.byteLength(original.stdout) !== size)
+        throw new Error("Version source was incomplete");
+      const file = NodePath.join(input.checkout, path);
+      const stat = await NodeFS.promises.lstat(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_VERSION_SOURCE_BYTES)
+        throw new Error("Invalid version file");
+      assertSeededVersionOverlay(
+        path,
+        original.stdout,
+        await NodeFS.promises.readFile(file, "utf8"),
+        input.baselineVersion,
+      );
+    }
+    const sourceHashes: Record<string, string> = {};
+    for (const path of UPGRADE_SOURCE_PATHS) {
+      sourceHashes[path] = NodeCrypto.createHash("sha256")
+        .update(await NodeFS.promises.readFile(NodePath.join(input.checkout, path)))
+        .digest("hex");
+    }
+    const provenance = createSeededUpgradeProvenance({ ...input, sourceCommit, sourceHashes });
+    await NodeFS.promises.mkdir(input.evidenceDirectory, { recursive: true, mode: 0o700 });
+    await writePrivateJson(
+      NodePath.join(input.evidenceDirectory, "source-provenance.json"),
+      provenance,
+    );
+  } catch {
+    throw new SeededDesktopUpgradeSmokeError("The unchanged upgrade source could not be verified.");
+  }
 };
 
 const walkFiles = async (root: string): Promise<ReadonlyArray<string>> => {
@@ -1517,10 +2150,13 @@ const runWebDriverPhase = async (input: {
   readonly appBinaryPath: string;
   readonly backendPort: number;
   readonly candidateVersion: string;
+  readonly baselineVersion?: string | undefined;
   readonly dataRoot: string;
   readonly evidenceDirectory: string;
   readonly expectedDataRoot: string;
   readonly lane: SeededUpgradeLane;
+  readonly trigger: SeededUpgradeTrigger;
+  readonly rpcFixture?: RpcUpgradeFixture | undefined;
   readonly phase: "seed-and-install" | "verify";
   readonly platform: SeededUpgradePlatform;
   readonly projectId: string;
@@ -1532,13 +2168,16 @@ const runWebDriverPhase = async (input: {
   readonly webdriverPort: number;
   readonly wsl: boolean;
 }): Promise<void> => {
+  const { rpcFixture, ...driverInput } = input;
+  if ((input.trigger === "remote-rpc") !== (rpcFixture !== undefined)) {
+    throw new SeededDesktopUpgradeSmokeError("The RPC phase requires its own fixture owner.");
+  }
   const phaseRoot = NodePath.join(input.runRoot, `${input.phase}-driver`);
   await NodeFS.promises.mkdir(phaseRoot, { recursive: true });
   const specPath = NodePath.join(phaseRoot, "seeded-upgrade.e2e.ts");
   const configPath = NodePath.join(phaseRoot, "wdio.conf.mjs");
-  const remoteSecretPath = NodePath.join(input.runRoot, "remote-bootstrap.secret.json");
   const phaseTimeoutMs =
-    input.lane === "remote-install" && input.phase === "seed-and-install"
+    input.trigger === "remote-rpc" && input.phase === "seed-and-install"
       ? input.restartTimeoutMs +
         REMOTE_UPDATE_DOWNLOAD_BUDGET_MS +
         REMOTE_UPDATE_INSTALL_BUDGET_MS +
@@ -1548,8 +2187,8 @@ const runWebDriverPhase = async (input: {
   await NodeFS.promises.writeFile(
     specPath,
     createSeededUpgradeDriverSpec({
-      ...input,
-      ...(input.lane === "remote-install"
+      ...driverInput,
+      ...(rpcFixture !== undefined
         ? {
             remoteInstallDriverPath: NodeURL.pathToFileURL(
               NodePath.join(input.repositoryRoot, "scripts/lib/remote-install-driver.ts"),
@@ -1557,7 +2196,8 @@ const runWebDriverPhase = async (input: {
             remoteHarnessPath: NodeURL.pathToFileURL(
               NodePath.join(input.repositoryRoot, "scripts/seeded-desktop-upgrade-smoke.ts"),
             ).href,
-            remoteSecretPath,
+            remoteSecretPath: rpcFixture.credentialReceiptPath,
+            remoteUploadSecretPath: rpcFixture.uploadReceiptPath,
             remoteEvidencePath: NodePath.join(input.evidenceDirectory, "remote-rpc.json"),
           }
         : {}),
@@ -1576,6 +2216,9 @@ const runWebDriverPhase = async (input: {
     }),
     { mode: 0o600 },
   );
+  // Once launch is attempted, even a failed phase may have returned a grant to WDIO output.
+  // Notify before dispatch; local spec/config preparation failures require no credential receipt.
+  rpcFixture?.markPhaseStarted();
   const result = await runCommand({
     command: seededUpgradeVitePlusExecutable,
     args: ["exec", "wdio", "run", configPath],
@@ -1595,22 +2238,6 @@ const runWebDriverPhase = async (input: {
     timeoutMs: phaseTimeoutMs,
   });
   const resultExists = NodeFS.existsSync(input.resultPath);
-  await NodeFS.promises.writeFile(
-    NodePath.join(input.evidenceDirectory, `${input.phase}.log`),
-    redactAndBoundUpgradeEvidence(`${result.stdout}\n${result.stderr}`, {
-      maxBytes: 64 * 1024,
-      roots: [input.dataRoot, input.runRoot],
-      secrets:
-        input.lane === "remote-install" && NodeFS.existsSync(remoteSecretPath)
-          ? [
-              String(
-                (await readObservation<{ bootstrapToken: string }>(remoteSecretPath))
-                  .bootstrapToken,
-              ),
-            ]
-          : [],
-    }),
-  );
   let installAttempted = false;
   if (input.phase === "seed-and-install" && resultExists) {
     try {
@@ -1622,6 +2249,15 @@ const runWebDriverPhase = async (input: {
       installAttempted = false;
     }
   }
+  const privateSecrets = rpcFixture !== undefined ? await rpcFixture.readSecrets() : [];
+  await NodeFS.promises.writeFile(
+    NodePath.join(input.evidenceDirectory, `${input.phase}.log`),
+    redactAndBoundUpgradeEvidence(`${result.stdout}\n${result.stderr}`, {
+      maxBytes: 64 * 1024,
+      roots: [input.dataRoot, input.runRoot],
+      secrets: privateSecrets,
+    }),
+  );
   assertWebDriverPhaseExit({
     exitCode: result.exitCode,
     installAttempted,
@@ -1760,8 +2396,11 @@ const runUpgradeLane = async (input: {
   readonly appBinaryPath: string;
   readonly backendPort: number;
   readonly candidateVersion: string;
+  readonly baselineVersion?: string | undefined;
   readonly layout: SeededUpgradeLaneLayout;
   readonly lane: SeededUpgradeLane;
+  readonly trigger: SeededUpgradeTrigger;
+  readonly rpcFixture?: RpcUpgradeFixture | undefined;
   readonly platform: SeededUpgradePlatform;
   readonly projectId: string;
   readonly repositoryRoot: string;
@@ -1778,10 +2417,13 @@ const runUpgradeLane = async (input: {
     appBinaryPath: input.appBinaryPath,
     backendPort: input.backendPort,
     candidateVersion: input.candidateVersion,
+    baselineVersion: input.baselineVersion,
     dataRoot: input.layout.dataRoot,
     evidenceDirectory: input.layout.evidenceDirectory,
     expectedDataRoot: input.layout.dataRoot,
     lane: input.lane,
+    trigger: input.trigger,
+    rpcFixture: input.rpcFixture,
     platform: input.platform,
     projectId: input.projectId,
     repositoryRoot: input.repositoryRoot,
@@ -1802,7 +2444,7 @@ const runUpgradeLane = async (input: {
       timeoutMs: input.restartTimeoutMs,
     });
   }
-  if (input.lane === "remote-install") {
+  if (input.trigger === "remote-rpc") {
     const remote = await readObservation<
       Omit<RemoteInstallEvidence, "preUpdateBackups"> & { widened: boolean }
     >(NodePath.join(input.layout.evidenceDirectory, "remote-rpc.json"));
@@ -1815,8 +2457,13 @@ const runUpgradeLane = async (input: {
   await runWebDriverPhase({ ...shared, phase: "verify", resultPath: afterPath });
   const before = await readObservation<SeededUpgradeObservationBefore>(beforePath);
   const after = await readObservation<SeededUpgradeObservationAfter>(afterPath);
-  verifySeededUpgradeOutcome(input.lane, before, after, input.candidateVersion);
-  if (input.lane === "remote-install") {
+  if (input.baselineVersion !== undefined && before.appVersion !== input.baselineVersion) {
+    throw new SeededDesktopUpgradeSmokeError(
+      "The starting app version did not match the planned baseline.",
+    );
+  }
+  verifySeededUpgradeOutcome(input.lane, before, after, input.candidateVersion, input.trigger);
+  if (input.trigger === "remote-rpc") {
     const remote = await readObservation<Omit<RemoteInstallEvidence, "preUpdateBackups">>(
       NodePath.join(input.layout.evidenceDirectory, "remote-host.json"),
     );
@@ -1828,6 +2475,15 @@ const runUpgradeLane = async (input: {
       ).length,
     };
     verifyRemoteInstallOutcome(evidence, input.candidateVersion);
+    if (
+      evidence.before.storageInstanceId !== before.storageInstanceId ||
+      evidence.after.storageInstanceId !== after.storageInstanceId ||
+      evidence.before.serverVersion !== before.appVersion
+    ) {
+      throw new SeededDesktopUpgradeSmokeError(
+        "The RPC update observations did not match the seeded host identity.",
+      );
+    }
     await writePrivateJson(
       NodePath.join(input.layout.evidenceDirectory, "remote-install-result.json"),
       evidence,
@@ -1837,13 +2493,26 @@ const runUpgradeLane = async (input: {
     NodePath.join(input.layout.evidenceDirectory, "result.json"),
     `${JSON.stringify({
       lane: input.lane,
+      trigger: input.trigger,
+      coverageStatus: "verified",
+      ...(input.baselineVersion !== undefined
+        ? {
+            plannedBaselineVersion: input.baselineVersion,
+            observedBaselineVersion: before.appVersion,
+          }
+        : {}),
       candidateVersion: input.candidateVersion,
       observedAppVersion: after.appVersion,
       projectRetained: true,
       storageIdentityRetained:
         before.storageInstanceId === null || before.storageInstanceId === after.storageInstanceId,
       preUpdateBackupObserved:
-        input.lane === "previous-stable" || after.preUpdateBackups.length > 0,
+        (input.lane === "previous-stable" && input.trigger === "local-bridge") ||
+        after.preUpdateBackups.some(
+          (backup) =>
+            backup.trigger === "pre-update" &&
+            backup.storageInstanceId === before.storageInstanceId,
+        ),
     })}\n`,
   );
 };
@@ -1911,6 +2580,12 @@ export async function runSeededDesktopUpgradeSmoke(
     throw new SeededDesktopUpgradeSmokeError(
       "This packaged-upgrade harness is CI-only; it can terminate desktop applications.",
     );
+  const previousTrigger = previousStableTrigger(
+    input.previousStableTrigger,
+    input.platform,
+    input.wsl,
+  );
+  const baselineVersion = previousTrigger === "remote-rpc" ? input.previousVersion : undefined;
   assertBaselineVersionIsOlder(input.previousVersion, input.candidateVersion);
   const runId = input.runId;
   const workRoot = await canonicalizeSeededUpgradeWorkRoot(input.workRoot);
@@ -1983,13 +2658,7 @@ export async function runSeededDesktopUpgradeSmoke(
   });
 
   const cleanup = new ManagedProcessRegistry();
-  const remoteSecretPath = NodePath.join(
-    NodePath.dirname(layout.remoteInstall.dataRoot),
-    "remote-bootstrap.secret.json",
-  );
-  cleanup.add("private remote credentials", () =>
-    NodeFS.promises.rm(remoteSecretPath, { force: true }),
-  );
+  const rpcFixtures: RpcUpgradeFixture[] = [];
   const signingEnvironment = {
     ...process.env,
     TAURI_SIGNING_PRIVATE_KEY: signingKey,
@@ -2093,6 +2762,41 @@ export async function runSeededDesktopUpgradeSmoke(
       targetDirectory: layout.protectedBaseline.buildRoot,
       version: input.previousVersion,
     });
+    if (previousTrigger === "remote-rpc") {
+      for (const [lane, trigger, sourceRef, sourceLayout, resultLayout] of [
+        [
+          "previous-stable",
+          "remote-rpc",
+          input.previousTag,
+          layout.previousStable,
+          layout.previousStable,
+        ],
+        [
+          "protected-baseline",
+          "local-bridge",
+          currentCommit,
+          layout.protectedBaseline,
+          layout.protectedBaseline,
+        ],
+        [
+          "remote-install",
+          "remote-rpc",
+          currentCommit,
+          layout.protectedBaseline,
+          layout.remoteInstall,
+        ],
+      ] as const) {
+        await recordUpgradeSourceProvenance({
+          lane,
+          trigger,
+          sourceRef,
+          checkout: sourceLayout.checkout,
+          baselineVersion: input.previousVersion,
+          candidateVersion: input.candidateVersion,
+          evidenceDirectory: resultLayout.evidenceDirectory,
+        });
+      }
+    }
     await publishCandidateUpdater({
       arch: input.arch,
       candidateBuildRoot: layout.candidateBuildRoot,
@@ -2121,11 +2825,29 @@ export async function runSeededDesktopUpgradeSmoke(
         packagePath: previousPackage,
         platform: input.platform,
       });
+      const previousRpc =
+        previousTrigger === "remote-rpc"
+          ? createRpcUpgradeFixture({
+              runRoot: NodePath.dirname(layout.previousStable.dataRoot),
+              workspaceRoot: layout.previousStable.workspaceRoot,
+            })
+          : undefined;
+      if (previousRpc !== undefined) {
+        rpcFixtures.push(previousRpc);
+        cleanup.add("previous RPC application", () =>
+          previousRpc.stop(() =>
+            stopRemoteLaneApplication(previousApp, input.platform, layout.previousStable.dataRoot),
+          ),
+        );
+      }
       await runUpgradeLane({
         appBinaryPath: previousApp,
         backendPort: input.updaterPort + 1,
         candidateVersion: input.candidateVersion,
         lane: "previous-stable",
+        baselineVersion,
+        trigger: previousTrigger,
+        rpcFixture: previousRpc,
         layout: layout.previousStable,
         platform: input.platform,
         projectId: `seed-${runId}-previous`,
@@ -2151,6 +2873,8 @@ export async function runSeededDesktopUpgradeSmoke(
       backendPort: input.updaterPort + 2,
       candidateVersion: input.candidateVersion,
       lane: "protected-baseline",
+      baselineVersion,
+      trigger: "local-bridge",
       layout: layout.protectedBaseline,
       platform: input.platform,
       projectId: `seed-${runId}-protected`,
@@ -2170,14 +2894,24 @@ export async function runSeededDesktopUpgradeSmoke(
         await NodeFS.promises.rename(remoteApp, isolatedAppImage);
         remoteApp = isolatedAppImage;
       }
+      const remoteRpc = createRpcUpgradeFixture({
+        runRoot: NodePath.dirname(layout.remoteInstall.dataRoot),
+        workspaceRoot: layout.remoteInstall.workspaceRoot,
+      });
+      rpcFixtures.push(remoteRpc);
       cleanup.add("isolated remote application", () =>
-        stopRemoteLaneApplication(remoteApp, input.platform, layout.remoteInstall.dataRoot),
+        remoteRpc.stop(() =>
+          stopRemoteLaneApplication(remoteApp, input.platform, layout.remoteInstall.dataRoot),
+        ),
       );
       await runUpgradeLane({
         appBinaryPath: remoteApp,
         backendPort: assertRemoteInstallPort(input.updaterPort + 3),
         candidateVersion: input.candidateVersion,
         lane: "remote-install",
+        baselineVersion,
+        trigger: "remote-rpc",
+        rpcFixture: remoteRpc,
         layout: layout.remoteInstall,
         platform: input.platform,
         projectId: `seed-${runId}-remote`,
@@ -2192,23 +2926,13 @@ export async function runSeededDesktopUpgradeSmoke(
   } finally {
     const secrets = [signingKey, signingPassword];
     let safeToRetainEvidence = true;
-    const privateReceipt = NodePath.join(
-      NodePath.dirname(layout.remoteInstall.dataRoot),
-      "remote-bootstrap.secret.json",
-    );
-    if (NodeFS.existsSync(privateReceipt)) {
-      try {
-        const receipt = await readObservation<{ bootstrapToken: unknown }>(privateReceipt);
-        if (typeof receipt.bootstrapToken !== "string" || receipt.bootstrapToken.length === 0) {
-          failure ??= new SeededDesktopUpgradeSmokeError(
-            "The private remote credential receipt is invalid.",
-          );
-          safeToRetainEvidence = false;
-        } else secrets.push(receipt.bootstrapToken);
-      } catch (error) {
-        failure ??= error;
-        safeToRetainEvidence = false;
-      }
+    try {
+      for (const fixture of rpcFixtures) secrets.push(...(await fixture.readSecrets()));
+    } catch {
+      failure ??= new SeededDesktopUpgradeSmokeError(
+        "Private remote fixture receipts were invalid; evidence was not retained.",
+      );
+      safeToRetainEvidence = false;
     }
     if (safeToRetainEvidence)
       await copyBoundedEvidence({

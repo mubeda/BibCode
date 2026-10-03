@@ -5,11 +5,19 @@ import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeVM from "node:vm";
 import * as NodeURL from "node:url";
+import * as NodeModule from "node:module";
+import * as NodeCrypto from "node:crypto";
+import * as NodeEvents from "node:events";
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import * as Schema from "effect/Schema";
+import * as Effect from "effect/Effect";
+import { it as effectIt } from "@effect/vitest";
+import { HostProcessPlatform } from "@bibcode/shared/hostProcess";
 import { AuthPairingLink } from "@bibcode/contracts";
 import { parse as parseToml, type TomlTable } from "smol-toml";
+import * as YAML from "yaml";
+import * as SeededUpgradeHarness from "./seeded-desktop-upgrade-smoke.ts";
 import {
   releasePackageFiles,
   releaseRustPackageFiles,
@@ -31,6 +39,9 @@ import {
   parseSeededDesktopUpgradeSmokeArgs,
   prepareSeededUpgradeBuild,
   redactAndBoundUpgradeEvidence,
+  writeRemoteUploadCapabilityReceipt,
+  readRemoteFixtureSecrets,
+  stopRemoteUploadFixture,
   removeSeededUpgradeDependencyTree,
   runBoundedCommand,
   seededUpgradeVitePlusExecutable,
@@ -55,6 +66,1704 @@ const absolute = (...parts: ReadonlyArray<string>): string =>
 
 const decodePairingLink = Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingLink));
 const repositoryRoot = NodeURL.fileURLToPath(new URL("..", import.meta.url));
+
+interface ObservedUpgradeLane {
+  readonly lane: SeededUpgradeHarness.SeededUpgradeLane;
+  readonly trigger?: SeededUpgradeHarness.SeededUpgradeTrigger;
+  readonly layout: ReturnType<typeof createSeededUpgradeRunLayout>["previousStable"];
+  readonly appBinaryPath: string;
+  readonly rpcFixture?: ReturnType<typeof SeededUpgradeHarness.createRpcUpgradeFixture>;
+  readonly backendPort: number;
+  readonly webdriverPort: number;
+}
+
+/** Execute the actual owner with only build/application/command boundaries made inert. */
+const legacyOrchestrationFixture = async (
+  options: {
+    previousTrigger?: SeededUpgradeHarness.SeededUpgradeTrigger;
+    wsl?: boolean;
+    onLane?: (lane: ObservedUpgradeLane) => Promise<void>;
+  } = {},
+) => {
+  const root = await NodeFS.promises.realpath(
+    await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "legacy-rpc-owner-")),
+  );
+  const publicKeyFile = NodePath.join(root, "public.key");
+  await NodeFS.promises.writeFile(publicKeyFile, "public-fixture-key");
+  const input: SeededDesktopUpgradeSmokeInput = {
+    arch: "x64",
+    artifactDirectory: NodePath.join(root, "artifacts"),
+    bundle: "nsis",
+    candidateVersion: "0.7.3-upgrade.1",
+    platform: "win",
+    previousTag: "v0.7.2",
+    previousVersion: "0.7.2",
+    previousStableTrigger: options.previousTrigger ?? "remote-rpc",
+    publicKeyFile,
+    repositoryRoot: NodePath.join(root, "repository"),
+    restartTimeoutMs: 180000,
+    runId: "fixture",
+    updaterPort: 43120,
+    wsl: options.wsl ?? false,
+    workRoot: NodePath.join(root, "work"),
+  };
+  const layout = createSeededUpgradeRunLayout(input.workRoot, input.runId);
+  const commands: ReadonlyArray<string>[] = [];
+  const builds: { checkout: string; version: string }[] = [];
+  const installs: { laneRoot: string; packagePath: string }[] = [];
+  const lanes: ObservedUpgradeLane[] = [];
+  const stopped: string[] = [];
+  const retainedSecrets: string[][] = [];
+  const provenanceInputs: { lane: string; trigger: string; checkout: string; sourceRef: string }[] =
+    [];
+  const source = await NodeFS.promises.readFile(
+    new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+    "utf8",
+  );
+  const selectorStart = source.indexOf("const previousStableTrigger =");
+  const selectorEnd = source.indexOf("\nconst UPGRADE_SOURCE_PATHS", selectorStart);
+  const start = source.indexOf("export async function runSeededDesktopUpgradeSmoke(");
+  const end = source.indexOf("\nasync function main()", start);
+  if ([selectorStart, selectorEnd, start, end].some((index) => index < 0))
+    throw new Error("Orchestration source missing");
+  const body = NodeModule.stripTypeScriptTypes(
+    source.slice(selectorStart, selectorEnd) +
+      "\n" +
+      source.slice(start, end).replace("export ", ""),
+  );
+  const context = {
+    NodePath,
+    NodeFS,
+    NodeCrypto,
+    SeededDesktopUpgradeSmokeError,
+    ManagedProcessRegistry,
+    assertBaselineVersionIsOlder,
+    assertRemoteInstallPort,
+    createSeededUpgradeRunLayout,
+    canonicalizeSeededUpgradeWorkRoot,
+    readRemoteFixtureSecrets,
+    stopRemoteUploadFixture,
+    createRpcUpgradeFixture: SeededUpgradeHarness.createRpcUpgradeFixture,
+    MOCK_UPDATE_LOOPBACK_HOST: "127.0.0.1",
+    process: {
+      env: {
+        CI: "true",
+        TAURI_SIGNING_PRIVATE_KEY: "private-key-sentinel",
+        TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "private-password-sentinel",
+      },
+    },
+    writeBuildOverlay: async () => {},
+    writePrivateJson: async () => {},
+    readObservation: async (path: string) =>
+      JSON.parse(await NodeFS.promises.readFile(path, "utf8")),
+    runCommand: async () => ({ stdout: "a".repeat(40), stderr: "", exitCode: 0 }),
+    requireCommandSuccess: async ({ args }: { args: string[] }) => {
+      commands.push(args);
+    },
+    removeSeededUpgradeDependencyTree: async () => {},
+    buildPackagedApplication: async (value: { checkout: string; version: string }) => {
+      builds.push(value);
+    },
+    publishCandidateUpdater: async () => {},
+    startMockUpdateServer: async () => ({}),
+    terminateChild: async () => {
+      stopped.push("updater");
+    },
+    baselinePackage: async (buildRoot: string) => NodePath.join(buildRoot, "installer.exe"),
+    installBaselinePackage: async (value: { laneRoot: string; packagePath: string }) => {
+      installs.push(value);
+      await NodeFS.promises.mkdir(value.laneRoot, { recursive: true });
+      return NodePath.join(value.laneRoot, "app.exe");
+    },
+    runUpgradeLane: async (value: ObservedUpgradeLane) => {
+      lanes.push(value);
+      await NodeFS.promises.mkdir(value.layout.workspaceRoot, { recursive: true });
+      await options.onLane?.(value);
+    },
+    stopRemoteLaneApplication: async (app: string) => {
+      stopped.push(app);
+    },
+    copyBoundedEvidence: async ({ secrets }: { secrets: string[] }) => {
+      retainedSecrets.push(secrets);
+    },
+    recordUpgradeSourceProvenance: async (value: {
+      lane: string;
+      trigger: string;
+      checkout: string;
+      sourceRef: string;
+    }) => {
+      provenanceInputs.push(value);
+    },
+  };
+  const run = NodeVM.runInNewContext(`${body}\nrunSeededDesktopUpgradeSmoke`, context, {
+    timeout: 1000,
+  }) as (input: SeededDesktopUpgradeSmokeInput) => Promise<void>;
+  return {
+    input,
+    layout,
+    commands,
+    builds,
+    installs,
+    lanes,
+    stopped,
+    retainedSecrets,
+    provenanceInputs,
+    run: () => run(input),
+    dispose: () => NodeFS.promises.rm(root, { recursive: true, force: true }),
+  };
+};
+
+describe("previous/current RPC orchestration", () => {
+  it("keeps three source/layout identities while selecting only the previous trigger", async () => {
+    const fixture = await legacyOrchestrationFixture();
+    try {
+      await fixture.run();
+      expect(fixture.lanes.map(({ lane, trigger }) => ({ lane, trigger }))).toEqual([
+        { lane: "previous-stable", trigger: "remote-rpc" },
+        { lane: "protected-baseline", trigger: "local-bridge" },
+        { lane: "remote-install", trigger: "remote-rpc" },
+      ]);
+      expect(fixture.lanes.map((value) => value.layout.dataRoot)).toEqual([
+        fixture.layout.previousStable.dataRoot,
+        fixture.layout.protectedBaseline.dataRoot,
+        fixture.layout.remoteInstall.dataRoot,
+      ]);
+      expect(fixture.installs.map((value) => value.packagePath)).toEqual([
+        NodePath.join(fixture.layout.previousStable.buildRoot, "installer.exe"),
+        NodePath.join(fixture.layout.protectedBaseline.buildRoot, "installer.exe"),
+        NodePath.join(fixture.layout.protectedBaseline.buildRoot, "installer.exe"),
+      ]);
+      expect(fixture.lanes[0]?.rpcFixture?.credentialReceiptPath).toBe(
+        NodePath.join(
+          NodePath.dirname(fixture.layout.previousStable.dataRoot),
+          "remote-bootstrap.secret.json",
+        ),
+      );
+      expect(fixture.lanes[2]?.rpcFixture?.credentialReceiptPath).toBe(
+        NodePath.join(
+          NodePath.dirname(fixture.layout.remoteInstall.dataRoot),
+          "remote-bootstrap.secret.json",
+        ),
+      );
+      expect(fixture.stopped).toContain(fixture.lanes[0]?.appBinaryPath);
+      expect(fixture.stopped).toContain(fixture.lanes[2]?.appBinaryPath);
+      expect(fixture.commands.some((args) => args.includes("apply"))).toBe(false);
+      expect(
+        fixture.provenanceInputs.map(({ lane, trigger, checkout, sourceRef }) => ({
+          lane,
+          trigger,
+          checkout,
+          sourceRef,
+        })),
+      ).toEqual([
+        {
+          lane: "previous-stable",
+          trigger: "remote-rpc",
+          checkout: fixture.layout.previousStable.checkout,
+          sourceRef: "v0.7.2",
+        },
+        {
+          lane: "protected-baseline",
+          trigger: "local-bridge",
+          checkout: fixture.layout.protectedBaseline.checkout,
+          sourceRef: "a".repeat(40),
+        },
+        {
+          lane: "remote-install",
+          trigger: "remote-rpc",
+          checkout: fixture.layout.protectedBaseline.checkout,
+          sourceRef: "a".repeat(40),
+        },
+      ]);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+  it("refuses all evidence when the previous RPC lane has a malformed receipt", async () => {
+    const fixture = await legacyOrchestrationFixture({
+      onLane: async (lane) => {
+        if (lane.lane === "previous-stable")
+          await NodeFS.promises.writeFile(
+            NodePath.join(NodePath.dirname(lane.layout.dataRoot), "remote-bootstrap.secret.json"),
+            "null",
+          );
+      },
+    });
+    try {
+      await expect(fixture.run()).rejects.toThrow(/receipts were invalid/);
+      expect(fixture.retainedSecrets).toEqual([]);
+      expect(fixture.stopped).toContain(fixture.lanes[0]?.appBinaryPath);
+      expect(fixture.stopped).toContain("updater");
+    } finally {
+      await fixture.dispose();
+    }
+  });
+  it("collects both lanes' private secrets before either owner's joined cleanup", async () => {
+    const fixture = await legacyOrchestrationFixture({
+      onLane: async (lane) => {
+        if (lane.rpcFixture === undefined) return;
+        lane.rpcFixture.markPhaseStarted();
+        await NodeFS.promises.writeFile(
+          lane.rpcFixture.credentialReceiptPath,
+          JSON.stringify({ bootstrapToken: `${lane.lane}-private-grant` }),
+        );
+      },
+    });
+    try {
+      await fixture.run();
+      expect(fixture.retainedSecrets).toHaveLength(1);
+      expect(fixture.retainedSecrets[0]).toEqual(
+        expect.arrayContaining(["previous-stable-private-grant", "remote-install-private-grant"]),
+      );
+      for (const lane of fixture.lanes)
+        if (lane.rpcFixture !== undefined)
+          expect(NodeFS.existsSync(lane.rpcFixture.credentialReceiptPath)).toBe(false);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+  it.each([false, true])("preserves default local behavior with WSL=%s", async (wsl) => {
+    const fixture = await legacyOrchestrationFixture({ previousTrigger: "local-bridge", wsl });
+    try {
+      await fixture.run();
+      expect(fixture.lanes.map(({ lane, trigger }) => ({ lane, trigger }))).toEqual(
+        wsl
+          ? [{ lane: "protected-baseline", trigger: "local-bridge" }]
+          : [
+              { lane: "previous-stable", trigger: "local-bridge" },
+              { lane: "protected-baseline", trigger: "local-bridge" },
+              { lane: "remote-install", trigger: "remote-rpc" },
+            ],
+      );
+      expect(fixture.lanes.filter((lane) => lane.rpcFixture !== undefined)).toHaveLength(
+        wsl ? 0 : 1,
+      );
+    } finally {
+      await fixture.dispose();
+    }
+  });
+});
+
+describe("previous RPC lane result verification", () => {
+  it.each([
+    "other-store",
+    "other-start-version",
+    "matching-wrong-baseline",
+    "old-boot",
+    "no-stage",
+    "no-percent",
+    "unfinished-held",
+    "two-requesters",
+    "no-backup",
+    "valid",
+  ])("verifies the actual lane result for %s", async (kind) => {
+    const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "rpc-lane-result-"));
+    try {
+      const layout = createSeededUpgradeRunLayout(root, "result").previousStable;
+      const candidate = "0.7.3-upgrade.1";
+      const before = {
+        appVersion: kind === "matching-wrong-baseline" ? "0.7.1" : "0.7.2",
+        effectiveRoot: layout.dataRoot,
+        projectId: "p1",
+        projectIds: ["p1"],
+        storageInstanceId: "s1",
+      };
+      const after = {
+        appVersion: candidate,
+        effectiveRoot: layout.dataRoot,
+        projectIds: ["p1"],
+        storageInstanceId: "s1",
+        preUpdateBackups:
+          kind === "no-backup" ? [] : [{ storageInstanceId: "s1", trigger: "pre-update" }],
+      };
+      const remote = {
+        before: {
+          bootId: "b1",
+          serverVersion:
+            kind === "other-start-version" || kind === "matching-wrong-baseline"
+              ? "0.7.1"
+              : "0.7.2",
+          storageInstanceId: kind === "other-store" ? "s2" : "s1",
+        },
+        after: {
+          bootId: kind === "old-boot" ? "b1" : "b2",
+          serverVersion: candidate,
+          storageInstanceId: kind === "other-store" ? "s2" : "s1",
+        },
+        phases: ["downloading", "installing", "succeeded"],
+        sawPercent: kind !== "no-percent",
+        sawStage: kind !== "no-stage",
+        heldUpload: {
+          admitted: true,
+          releasedOnWaitingStage: true,
+          completed: kind !== "unfinished-held",
+          bytesMatch: true,
+          noPartials: true,
+          requestClosed: true,
+          holdLimitMs: 20000,
+        },
+        requesterLogLines: kind === "two-requesters" ? 2 : 1,
+        appImageMounts: null,
+        runtimeProcesses: null,
+      };
+      const source = await NodeFS.promises.readFile(
+        new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+        "utf8",
+      );
+      const start = source.indexOf("const runUpgradeLane = async");
+      const end = source.indexOf("\nconst copyBoundedEvidence", start);
+      if (start < 0 || end < 0) throw new Error("Lane verifier source missing");
+      const writePrivateJson = async (path: string, value: unknown) =>
+        NodeFS.promises.writeFile(path, JSON.stringify(value));
+      const input = {
+        lane: "previous-stable",
+        trigger: "remote-rpc",
+        layout,
+        candidateVersion: candidate,
+        baselineVersion: "0.7.2",
+        appBinaryPath: NodePath.join(root, "owned.exe"),
+        backendPort: 43121,
+        platform: "win",
+        projectId: "p1",
+        repositoryRoot,
+        restartTimeoutMs: 180000,
+        webdriverPort: 43221,
+        wsl: false,
+        rpcFixture: SeededUpgradeHarness.createRpcUpgradeFixture({
+          runRoot: NodePath.dirname(layout.dataRoot),
+          workspaceRoot: layout.workspaceRoot,
+        }),
+      };
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(source.slice(start, end)) + "\nrunUpgradeLane",
+        {
+          NodeFS,
+          NodePath,
+          SeededDesktopUpgradeSmokeError,
+          verifySeededUpgradeOutcome,
+          verifyRemoteInstallOutcome,
+          writePrivateJson,
+          readObservation: async (path: string) =>
+            JSON.parse(await NodeFS.promises.readFile(path, "utf8")),
+          runWebDriverPhase: async (phase: { phase: string; resultPath: string }) => {
+            await writePrivateJson(
+              phase.resultPath,
+              phase.phase === "seed-and-install" ? before : after,
+            );
+            if (phase.phase === "seed-and-install")
+              await writePrivateJson(
+                NodePath.join(layout.evidenceDirectory, "remote-rpc.json"),
+                remote,
+              );
+          },
+          waitForWindowsInstalledCandidate: async () => {},
+          stopRemoteLaneApplication: async () => {},
+        },
+        { timeout: 1000 },
+      ) as (input: unknown) => Promise<void>;
+      if (kind === "valid") {
+        await run(input);
+        expect(
+          JSON.parse(
+            await NodeFS.promises.readFile(
+              NodePath.join(layout.evidenceDirectory, "result.json"),
+              "utf8",
+            ),
+          ),
+        ).toMatchObject({
+          lane: "previous-stable",
+          trigger: "remote-rpc",
+          storageIdentityRetained: true,
+          preUpdateBackupObserved: true,
+          coverageStatus: "verified",
+        });
+      } else {
+        await expect(run(input)).rejects.toThrow(SeededDesktopUpgradeSmokeError);
+        expect(NodeFS.existsSync(NodePath.join(layout.evidenceDirectory, "result.json"))).toBe(
+          false,
+        );
+      }
+    } finally {
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("explicit previous-stable RPC selection", () => {
+  const args = [
+    "--platform",
+    "win",
+    "--arch",
+    "x64",
+    "--bundle",
+    "nsis",
+    "--candidate-version",
+    "0.7.3-upgrade.1",
+    "--previous-tag",
+    "v0.7.2",
+    "--previous-version",
+    "0.7.2",
+    "--public-key-file",
+    absolute("keys", "updater.pub"),
+    "--run-id",
+    "legacy-rpc",
+    "--work-root",
+    absolute("work"),
+    "--artifact-dir",
+    absolute("evidence"),
+  ];
+  it("keeps local-bridge as the default and accepts an explicit native Windows RPC trigger", () => {
+    expect(parseSeededDesktopUpgradeSmokeArgs(args).previousStableTrigger).toBe("local-bridge");
+    expect(
+      parseSeededDesktopUpgradeSmokeArgs([...args, "--previous-stable-trigger", "remote-rpc"])
+        .previousStableTrigger,
+    ).toBe("remote-rpc");
+  });
+  it.each([
+    ["linux", "appimage", false],
+    ["mac", "dmg", false],
+    ["win", "nsis", true],
+  ] as const)("refuses RPC selection for %s with WSL=%s before launch", (platform, bundle, wsl) => {
+    expect(() =>
+      parseSeededDesktopUpgradeSmokeArgs([
+        ...args.with(1, platform).with(5, bundle),
+        "--previous-stable-trigger",
+        "remote-rpc",
+        ...(wsl ? ["--wsl"] : []),
+      ]),
+    ).toThrow(/native Windows/);
+  });
+  it("rejects an unknown trigger instead of silently selecting another update path", () => {
+    expect(() =>
+      parseSeededDesktopUpgradeSmokeArgs([
+        ...args,
+        "--previous-stable-trigger",
+        "automatic-fallback",
+      ]),
+    ).toThrow(/trigger/);
+  });
+  it("rejects invalid direct RPC selection before preparing any files", async () => {
+    const input = {
+      ...parseSeededDesktopUpgradeSmokeArgs(args),
+      platform: "linux" as const,
+      previousStableTrigger: "remote-rpc" as const,
+    };
+    vi.stubEnv("CI", "true");
+    const mkdir = vi
+      .spyOn(NodeFS.promises, "mkdir")
+      .mockRejectedValue(new Error("unexpected preparation"));
+    try {
+      await expect(runSeededDesktopUpgradeSmoke(input)).rejects.toThrow(/native Windows/);
+      expect(mkdir).not.toHaveBeenCalled();
+    } finally {
+      mkdir.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+  it.each(["null-before", "changed-store", "missing-backup"])(
+    "requires actual protection for previous RPC: %s",
+    (failure) => {
+      const before = {
+        appVersion: "0.7.2",
+        effectiveRoot: absolute("data"),
+        projectId: "p1",
+        projectIds: ["p1"],
+        storageInstanceId: failure === "null-before" ? null : "s1",
+      };
+      const after = {
+        appVersion: "0.7.3-upgrade.1",
+        effectiveRoot: absolute("data"),
+        projectIds: ["p1"],
+        storageInstanceId: failure === "changed-store" ? "s2" : "s1",
+        preUpdateBackups:
+          failure === "missing-backup" ? [] : [{ storageInstanceId: "s1", trigger: "pre-update" }],
+      };
+      expect(() =>
+        verifySeededUpgradeOutcome(
+          "previous-stable",
+          before,
+          after,
+          "0.7.3-upgrade.1",
+          "remote-rpc",
+        ),
+      ).toThrow(SeededDesktopUpgradeSmokeError);
+      // The previous local route's existing legacy observation policy remains unchanged.
+      expect(() =>
+        verifySeededUpgradeOutcome("previous-stable", before, after, "0.7.3-upgrade.1"),
+      ).not.toThrow();
+    },
+  );
+});
+
+describe("closed Windows compatibility provenance", () => {
+  const sourcePaths = [
+    "apps/desktop/src-tauri/src/bridge.rs",
+    "apps/desktop/src-tauri/src/firewall.rs",
+    "apps/desktop/src-tauri/src/updates.rs",
+    "apps/desktop/src-tauri/src/remote_update_delegate.rs",
+    "apps/server/src/remote_update.rs",
+    "apps/server/src/production/remote_update_rpc.rs",
+    "apps/server/src/auth/http.rs",
+    "apps/server/src/maintenance.rs",
+  ];
+  const input = {
+    lane: "previous-stable" as const,
+    trigger: "remote-rpc" as const,
+    sourceRef: "v0.7.2",
+    sourceCommit: "b".repeat(40),
+    baselineVersion: "0.7.2",
+    candidateVersion: "0.7.3-upgrade.1",
+    sourceHashes: Object.fromEntries(sourcePaths.map((path) => [path, "c".repeat(64)])),
+  };
+  it("records source rebuild and the unexercised old local failure without claiming a native pass", () => {
+    const provenance = SeededUpgradeHarness.createSeededUpgradeProvenance(input);
+    expect(provenance).toMatchObject({
+      schemaVersion: 1,
+      lane: "previous-stable",
+      trigger: "remote-rpc",
+      sourceKind: "tag-source-rebuild",
+      sourceCommit: "b".repeat(40),
+      sourceRef: "v0.7.2",
+      baselineVersion: "0.7.2",
+      candidateVersion: "0.7.3-upgrade.1",
+      instrumentationApplied: false,
+      coverageStatus: "selected-not-yet-verified",
+      excludedEntryPoints: ["previous-stable-local-bridge"],
+      knownPriorFailure: "previous-stable-local-bridge-stack-overflow",
+    });
+    expect(provenance.sourceFiles.map((entry) => entry.path)).toEqual(sourcePaths);
+    expect(provenance.sourceFiles.every((entry) => entry.sha256 === "c".repeat(64))).toBe(true);
+  });
+  it.each(["sourceRef", "sourceCommit", "baselineVersion", "candidateVersion", "sourceHashes"])(
+    "rejects private/unbounded %s before creating public provenance",
+    (field) => {
+      const value = {
+        ...input,
+        [field]: field === "sourceHashes" ? { private: "do-not-retain" } : "private-do-not-retain",
+      };
+      let error: unknown;
+      try {
+        SeededUpgradeHarness.createSeededUpgradeProvenance(value as typeof input);
+      } catch (cause) {
+        error = cause;
+      }
+      expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+      expect(String(error)).not.toContain("private-do-not-retain");
+    },
+  );
+  it.each([
+    null,
+    "apps/desktop/src-tauri/src/bridge.rs",
+    "apps/desktop/src-tauri/build.rs",
+    "packages/client-runtime/src/state/remoteUpdates.ts",
+    "Cargo.toml",
+    "apps/desktop/src-tauri/Cargo.toml",
+    "apps/desktop/package.json",
+    "Cargo.lock",
+    "apps/desktop/package.json:mode",
+    "Cargo.lock:truncated",
+  ])("checks all tracked source before retaining provenance; changed=%s", async (changedPath) => {
+    const actualChangedPath = changedPath?.split(":")[0] ?? null;
+    const root = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "legacy-source-facts-"),
+    );
+    try {
+      for (const path of sourcePaths) {
+        const target = NodePath.join(root, "checkout", path);
+        await NodeFS.promises.mkdir(NodePath.dirname(target), { recursive: true });
+        await NodeFS.promises.writeFile(target, "test-owned source bytes\n");
+      }
+      const originalVersions = new Map<string, string>();
+      for (const path of releaseVersionFiles) {
+        const original = await NodeFS.promises.readFile(
+          NodePath.join(repositoryRoot, path),
+          "utf8",
+        );
+        originalVersions.set(path, original);
+        let current = original;
+        if (changedPath === path) {
+          if (path.endsWith("package.json")) {
+            const value = JSON.parse(original);
+            value.scripts = { ...value.scripts, build: "private-source-detail" };
+            current = JSON.stringify(value);
+          } else if (path === "Cargo.lock") {
+            current = original.replace(/\nversion = "[^"]+"/, '\nversion = "999.0.0"');
+          } else current = original + "\n[profile.release]\nopt-level = 0\n";
+        }
+        const target = NodePath.join(root, "checkout", path);
+        await NodeFS.promises.mkdir(NodePath.dirname(target), { recursive: true });
+        await NodeFS.promises.writeFile(target, current);
+      }
+      const source = await NodeFS.promises.readFile(
+        new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+        "utf8",
+      );
+      const start = source.indexOf("const recordUpgradeSourceProvenance = async");
+      const end = source.indexOf("\nconst walkFiles", start);
+      if (start < 0 || end < 0) throw new Error("Source provenance recorder is missing");
+      const commands: ReadonlyArray<string>[] = [];
+      const record = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(source.slice(start, end)) +
+          "\nrecordUpgradeSourceProvenance",
+        {
+          NodeFS,
+          NodePath,
+          NodeCrypto,
+          Buffer,
+          releaseVersionFiles,
+          MAX_VERSION_SOURCE_BYTES: 262144,
+          assertSeededVersionOverlay: SeededUpgradeHarness.assertSeededVersionOverlay,
+          UPGRADE_SOURCE_PATHS: sourcePaths,
+          SeededDesktopUpgradeSmokeError,
+          createSeededUpgradeProvenance: SeededUpgradeHarness.createSeededUpgradeProvenance,
+          runCommand: async ({ args }: { args: string[] }) => {
+            commands.push(args);
+            if (args[0] === "rev-parse") return { stdout: "b".repeat(40), exitCode: 0 };
+            if (args[0] === "diff" && args[1] === "--quiet") {
+              const scope = args.slice(args.indexOf("--") + 1);
+              const included =
+                actualChangedPath !== null &&
+                scope.some(
+                  (path) =>
+                    path === "." ||
+                    actualChangedPath === path ||
+                    actualChangedPath.startsWith(path + "/"),
+                );
+              const excluded = scope.includes(`:(top,exclude,literal)${actualChangedPath}`);
+              return { stdout: "", exitCode: included && !excluded ? 1 : 0 };
+            }
+            if (args[0] === "diff" && args[1] === "--raw")
+              return {
+                stdout:
+                  changedPath?.endsWith(":mode") &&
+                  args.at(-1) === `:(top,literal)${actualChangedPath}`
+                    ? `:100644 100755 ${"b".repeat(40)} ${"0".repeat(40)} M\0${actualChangedPath}\0`
+                    : "",
+                exitCode: 0,
+              };
+            if (args[0] === "cat-file") {
+              const path = args[2]!.slice(41);
+              return {
+                stdout: String(Buffer.byteLength(originalVersions.get(path)!)),
+                exitCode: 0,
+              };
+            }
+            if (args[0] === "show") {
+              const path = args[1]!.slice(41);
+              const value = originalVersions.get(path)!;
+              return {
+                stdout:
+                  changedPath?.endsWith(":truncated") && path === actualChangedPath
+                    ? value.slice(1)
+                    : value,
+                exitCode: 0,
+              };
+            }
+            return {
+              stdout: "private-source-detail",
+              exitCode: 1,
+            };
+          },
+          writePrivateJson: async (path: string, value: unknown) =>
+            NodeFS.promises.writeFile(path, JSON.stringify(value)),
+        },
+        { timeout: 1000 },
+      ) as (input: unknown) => Promise<void>;
+      const evidenceDirectory = NodePath.join(root, "evidence");
+      const run = record({
+        ...input,
+        checkout: NodePath.join(root, "checkout"),
+        evidenceDirectory,
+      });
+      if (changedPath !== null) {
+        const error = await run.catch((cause: unknown) => cause);
+        expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        expect(String(error)).not.toContain("private-source-detail");
+        expect(NodeFS.existsSync(NodePath.join(evidenceDirectory, "source-provenance.json"))).toBe(
+          false,
+        );
+      } else {
+        await run;
+        const result = JSON.parse(
+          await NodeFS.promises.readFile(
+            NodePath.join(evidenceDirectory, "source-provenance.json"),
+            "utf8",
+          ),
+        );
+        expect(result).toMatchObject({
+          sourceCommit: "b".repeat(40),
+          instrumentationApplied: false,
+          coverageStatus: "selected-not-yet-verified",
+        });
+        expect(result.sourceFiles).toEqual(
+          sourcePaths.map((path) => ({
+            path,
+            sha256: NodeCrypto.createHash("sha256")
+              .update("test-owned source bytes\n")
+              .digest("hex"),
+          })),
+        );
+        expect(commands).toContainEqual([
+          "diff",
+          "--quiet",
+          "b".repeat(40),
+          "--",
+          ".",
+          ...releaseVersionFiles.map((path) => `:(top,exclude,literal)${path}`),
+        ]);
+      }
+    } finally {
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("declared version overlays", () => {
+  const jsonBefore =
+    '{"name":"owned","version":"0.7.1","scripts":{"build":"safe"},"dependencies":{"x":"1"}}';
+  const jsonAfter =
+    '{"name":"owned","version":"0.7.2","scripts":{"build":"safe"},"dependencies":{"x":"1"}}';
+  const cargoBefore = '[package]\nname="bibcode-server"\nversion="0.7.1"\n[dependencies]\nx="1"\n';
+  const cargoAfter = '[package]\nname="bibcode-server"\nversion="0.7.2"\n[dependencies]\nx="1"\n';
+  const lockBefore =
+    'version=4\n[[package]]\nname="bibcode-server"\nversion="0.7.1"\n[[package]]\nname="bibcode-desktop"\nversion="0.7.1"\n[[package]]\nname="dependency"\nversion="1.0.0"\n';
+  const lockAfter =
+    'version=4\n[[package]]\nname="bibcode-server"\nversion="0.7.2"\n[[package]]\nname="bibcode-desktop"\nversion="0.7.2"\n[[package]]\nname="dependency"\nversion="1.0.0"\n';
+  it.each([
+    ["apps/server/package.json", jsonBefore, jsonAfter],
+    ["apps/server/Cargo.toml", cargoBefore, cargoAfter],
+    ["Cargo.lock", lockBefore, lockAfter],
+  ])("allows only the maintained version fields in %s", (path, before, after) => {
+    expect(() =>
+      SeededUpgradeHarness.assertSeededVersionOverlay(path!, before!, after!, "0.7.2"),
+    ).not.toThrow();
+  });
+  it.each([
+    ["apps/server/package.json", jsonBefore, jsonAfter.replace("safe", "private-source-detail")],
+    ["apps/server/package.json", jsonBefore, jsonAfter.replace('"x":"1"', '"x":"2"')],
+    ["apps/server/Cargo.toml", cargoBefore, cargoAfter + '[profile.release]\nlto="fat"\n'],
+    ["apps/server/Cargo.toml", cargoBefore, cargoAfter.replace('x="1"', 'x="2"')],
+    ["Cargo.lock", lockBefore, lockAfter.replace('version="1.0.0"', 'version="9.9.9"')],
+    ["apps/desktop/src-tauri/build.rs", "before", "after"],
+  ])("refuses non-version changes in %s with closed errors", (path, before, after) => {
+    let error: unknown;
+    try {
+      SeededUpgradeHarness.assertSeededVersionOverlay(path!, before!, after!, "0.7.2");
+    } catch (cause) {
+      error = cause;
+    }
+    expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+    expect(String(error)).not.toContain("private-source-detail");
+  });
+});
+
+describe("temporary Windows legacy RPC workflow", () => {
+  it("selects both native architectures, preserves three lanes, and gates the explicit trigger", async () => {
+    const workflow = YAML.parse(
+      await NodeFS.promises.readFile(
+        NodePath.join(repositoryRoot, ".github/workflows/qualify-windows-legacy-rpc.yml"),
+        "utf8",
+      ),
+    );
+    expect(Object.keys(workflow.on).sort()).toEqual(["push", "workflow_dispatch"]);
+    expect(workflow.on.push.branches).toEqual(["codex/qualify-windows-legacy-rpc"]);
+    expect(workflow.permissions).toEqual({ contents: "read" });
+    const jobs = Object.values(workflow.jobs) as Array<{
+      "runs-on": string;
+      "timeout-minutes": number;
+      env: Record<string, string>;
+      strategy: { matrix: { include: unknown[] } };
+      steps: Array<{
+        name: string;
+        run?: string;
+        if?: string;
+        with?: Record<string, unknown>;
+        "continue-on-error"?: boolean;
+      }>;
+    }>;
+    expect(jobs).toHaveLength(1);
+    const job = jobs[0]!;
+    expect(job.strategy.matrix.include).toEqual([
+      { label: "Windows x64 old RPC and current bridge/RPC", runner: "windows-2025", arch: "x64" },
+      {
+        label: "Windows ARM64 old RPC and current bridge/RPC",
+        runner: "windows-11-vs2026-arm",
+        arch: "arm64",
+      },
+    ]);
+    expect(job["timeout-minutes"]).toBe(240);
+    expect(job.env.CARGO_BUILD_JOBS).toBe("2");
+    const trial = job.steps.findIndex(
+      (step) => step.name === "Run unchanged-old RPC, current local bridge, and current RPC",
+    );
+    expect(trial).toBeGreaterThan(0);
+    const gates = [
+      "Install frozen dependencies",
+      "Check source formatting and lint",
+      "Test held-upload and lane ownership",
+      "Build web assets",
+      "Typecheck full workspace",
+      "Check Rust formatting",
+      "Test native bridge contract",
+      "Test update coordinator",
+      "Test Windows firewall arguments",
+      "Test real HTTP maintenance admission",
+      "Recompute affected Clippy diagnostics",
+    ];
+    for (const name of gates) {
+      const at = job.steps.findIndex((step) => step.name === name);
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect(at).toBeLessThan(trial);
+      expect(job.steps[at]?.if).toBeUndefined();
+    }
+    expect(job.steps.every((step) => step["continue-on-error"] === undefined)).toBe(true);
+    expect(job.steps.findIndex((step) => step.name === "Build web assets")).toBeLessThan(
+      job.steps.findIndex((step) => step.name === "Typecheck full workspace"),
+    );
+    const command = job.steps[trial]!.run!;
+    expect(command).toContain("--previous-stable-trigger remote-rpc");
+    expect(command).toContain("--restart-timeout-ms 180000");
+    expect(command).not.toMatch(/--windows-diagnostics|--windows-protected-current|--wsl/);
+    expect(
+      job.steps.find(
+        (step) => step.name === "Pin unchanged previous release and candidate versions",
+      )?.run,
+    ).toContain('previous_tag="v0.7.2"');
+    expect(
+      job.steps.find(
+        (step) => step.name === "Pin unchanged previous release and candidate versions",
+      )?.run,
+    ).toContain("cd66fda5700294a320fe76256c486bd7a7a0b3a5");
+    expect(
+      job.steps.find((step) => step.name === "Generate ephemeral updater signing key")?.run,
+    ).toContain('echo "::add-mask::$key_password"');
+    expect(
+      job.steps.find((step) => step.name === "Upload bounded compatibility evidence")?.with?.path,
+    ).toBe("${{ runner.temp }}/bibcode-windows-legacy-rpc/evidence/*");
+    expect(
+      job.steps.find((step) => step.name === "Recompute affected Clippy diagnostics")?.run,
+    ).toContain("-- -D warnings");
+  });
+});
+
+describe("private held upload receipt and cleanup", () => {
+  const directory = "bibcode-update-witness-00000000-0000-4000-8000-000000000001";
+  const receipt = {
+    version: 1 as const,
+    relativeDirectory: directory,
+    relativeUrl: "/api/transfers/private-capability",
+  };
+  async function owned(
+    run: (root: string, workspace: string, upload: string, credentials: string) => Promise<void>,
+  ) {
+    const root = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "held-upload-receipt-"),
+    );
+    const workspace = NodePath.join(root, "workspace");
+    await NodeFS.promises.mkdir(workspace);
+    const credentials = NodePath.join(root, "credentials.json");
+    await NodeFS.promises.writeFile(
+      credentials,
+      JSON.stringify({ bootstrapToken: "private-grant" }),
+      { mode: 0o600 },
+    );
+    try {
+      await run(root, workspace, NodePath.join(root, "upload.json"), credentials);
+    } finally {
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  }
+  effectIt.effect(
+    "persists an immutable private capability receipt and reads all literal secrets",
+    () =>
+      Effect.gen(function* () {
+        const platform = yield* HostProcessPlatform;
+        yield* Effect.promise(() =>
+          owned(async (_root, _workspace, path, credentials) => {
+            await writeRemoteUploadCapabilityReceipt(path, receipt);
+            const bytes = await NodeFS.promises.readFile(path, "utf8");
+            expect(JSON.parse(bytes)).toEqual(receipt);
+            if (platform !== "win32")
+              expect((await NodeFS.promises.stat(path)).mode & 0o777).toBe(0o600);
+            await expect(
+              writeRemoteUploadCapabilityReceipt(path, {
+                ...receipt,
+                relativeUrl: "/api/transfers/replacement",
+              }),
+            ).rejects.toThrow("private upload receipt");
+            expect(await NodeFS.promises.readFile(path, "utf8")).toBe(bytes);
+            expect(
+              await readRemoteFixtureSecrets({
+                credentialReceiptPath: credentials,
+                uploadReceiptPath: path,
+                requireUploadReceipt: true,
+              }),
+            ).toEqual(
+              expect.arrayContaining(["private-grant", receipt.relativeUrl, "private-capability"]),
+            );
+          }),
+        );
+      }),
+  );
+  it.each(["malformed", "unexpected-fields", "traversal", "missing", "oversized"])(
+    "refuses %s receipts with closed errors",
+    async (kind) => {
+      await owned(async (_root, _workspace, path, credentials) => {
+        const text =
+          kind === "malformed"
+            ? '{"private-capability":'
+            : kind === "unexpected-fields"
+              ? JSON.stringify({ ...receipt, privateUnknown: "private-capability" })
+              : kind === "traversal"
+                ? JSON.stringify({ ...receipt, relativeDirectory: "../outside" })
+                : kind === "oversized"
+                  ? "private-capability".repeat(1000)
+                  : null;
+        if (text !== null) await NodeFS.promises.writeFile(path, text);
+        const error = await readRemoteFixtureSecrets({
+          credentialReceiptPath: credentials,
+          uploadReceiptPath: path,
+          requireUploadReceipt: true,
+        }).catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        expect(String(error)).not.toContain("private-capability");
+      });
+    },
+  );
+  it.each([
+    ["credentials", false],
+    ["credentials", true],
+    ["upload", false],
+    ["upload", true],
+  ] as const)(
+    "rejects present null %s even when required upload is %s",
+    async (kind, requireUploadReceipt) => {
+      await owned(async (_root, _workspace, path, credentials) => {
+        await NodeFS.promises.writeFile(kind === "credentials" ? credentials : path, "null");
+        const error = await readRemoteFixtureSecrets({
+          credentialReceiptPath: credentials,
+          uploadReceiptPath: path,
+          requireUploadReceipt,
+        }).catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        expect(String(error)).not.toContain("private-grant");
+      });
+    },
+  );
+  it("requires bootstrap receipt once the remote phase could have returned credentials", async () => {
+    await owned(async (_root, _workspace, path, credentials) => {
+      await NodeFS.promises.rm(credentials);
+      const input = {
+        credentialReceiptPath: credentials,
+        uploadReceiptPath: path,
+        requireUploadReceipt: false,
+        requireCredentialReceipt: true,
+      };
+      await expect(readRemoteFixtureSecrets(input)).rejects.toThrow(
+        "private remote credential receipt",
+      );
+    });
+  });
+  it("allows absent receipts before any remote phase could start", async () => {
+    await owned(async (_root, _workspace, path, credentials) => {
+      await NodeFS.promises.rm(credentials);
+      expect(
+        await readRemoteFixtureSecrets({
+          credentialReceiptPath: credentials,
+          uploadReceiptPath: path,
+          requireUploadReceipt: false,
+        }),
+      ).toEqual([]);
+    });
+  });
+  it("waits for actual process-stop settlement before removing only owned upload residue", async () => {
+    await owned(async (_root, workspace, path) => {
+      await writeRemoteUploadCapabilityReceipt(path, receipt);
+      const target = NodePath.join(workspace, directory);
+      await NodeFS.promises.mkdir(target);
+      await NodeFS.promises.writeFile(NodePath.join(target, "protection-witness.txt"), "o");
+      await NodeFS.promises.writeFile(
+        NodePath.join(target, ".protection-witness.txt.1-2-3.bibcode-upload.part"),
+        "o",
+      );
+      const gate = Promise.withResolvers<void>();
+      const stopping = stopRemoteUploadFixture({
+        workspaceRoot: workspace,
+        uploadReceiptPath: path,
+        stop: () => gate.promise,
+      });
+      expect(NodeFS.existsSync(target)).toBe(true);
+      gate.resolve();
+      await stopping;
+      expect(NodeFS.existsSync(target)).toBe(false);
+      expect(NodeFS.existsSync(workspace)).toBe(true);
+    });
+  });
+  it("refuses malformed bootstrap JSON without exposing the parse input", async () => {
+    await owned(async (_root, _workspace, path, credentials) => {
+      await writeRemoteUploadCapabilityReceipt(path, receipt);
+      await NodeFS.promises.writeFile(credentials, '{"private-grant":');
+      const error = await readRemoteFixtureSecrets({
+        credentialReceiptPath: credentials,
+        uploadReceiptPath: path,
+      }).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+      expect(String(error)).not.toContain("private-grant");
+    });
+  });
+  it("preserves residue when process cleanup fails or the directory contains unknown work", async () => {
+    await owned(async (_root, workspace, path) => {
+      await writeRemoteUploadCapabilityReceipt(path, receipt);
+      const target = NodePath.join(workspace, directory);
+      await NodeFS.promises.mkdir(target);
+      await NodeFS.promises.writeFile(NodePath.join(target, "unexpected.txt"), "preserve");
+      await expect(
+        stopRemoteUploadFixture({
+          workspaceRoot: workspace,
+          uploadReceiptPath: path,
+          stop: async () => {
+            throw new Error("stop refused");
+          },
+        }),
+      ).rejects.toThrow();
+      expect(NodeFS.existsSync(target)).toBe(true);
+      await expect(
+        stopRemoteUploadFixture({
+          workspaceRoot: workspace,
+          uploadReceiptPath: path,
+          stop: async () => {},
+        }),
+      ).rejects.toThrow();
+      expect(await NodeFS.promises.readFile(NodePath.join(target, "unexpected.txt"), "utf8")).toBe(
+        "preserve",
+      );
+    });
+  });
+});
+
+describe("RPC lane fixture ownership", () => {
+  const receipt = {
+    version: 1 as const,
+    relativeDirectory: "bibcode-update-witness-00000000-0000-4000-8000-000000000002",
+    relativeUrl: "/api/transfers/previous-private-capability",
+  };
+  const owned = async (run: (root: string) => Promise<void>) => {
+    const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "rpc-lane-owners-"));
+    try {
+      await run(root);
+    } finally {
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  };
+  const fixtureAt = async (root: string, lane: string) => {
+    const runRoot = NodePath.join(root, lane);
+    const workspaceRoot = NodePath.join(runRoot, "workspace");
+    await NodeFS.promises.mkdir(workspaceRoot, { recursive: true });
+    return {
+      input: { runRoot, workspaceRoot },
+      owner: SeededUpgradeHarness.createRpcUpgradeFixture({ runRoot, workspaceRoot }),
+    };
+  };
+  it("requires receipts independently for started and unstarted RPC lanes", async () => {
+    await owned(async (root) => {
+      const previous = await fixtureAt(root, "previous");
+      const current = await fixtureAt(root, "remote");
+      previous.owner.markPhaseStarted();
+      await expect(previous.owner.readSecrets()).rejects.toThrow(/credential receipt/);
+      expect(await current.owner.readSecrets()).toEqual([]);
+      await NodeFS.promises.writeFile(
+        previous.owner.credentialReceiptPath,
+        JSON.stringify({ bootstrapToken: "previous-private-grant" }),
+      );
+      await writeRemoteUploadCapabilityReceipt(previous.owner.uploadReceiptPath, receipt);
+      await NodeFS.promises.writeFile(
+        NodePath.join(previous.input.runRoot, "before.json"),
+        JSON.stringify({ installAttempted: true }),
+      );
+      expect(await previous.owner.readSecrets()).toEqual(
+        expect.arrayContaining(["previous-private-grant", receipt.relativeUrl]),
+      );
+      current.owner.markPhaseStarted();
+      await expect(current.owner.readSecrets()).rejects.toThrow(/credential receipt/);
+      expect(await previous.owner.readSecrets()).toContain("previous-private-grant");
+      await NodeFS.promises.writeFile(current.owner.credentialReceiptPath, "null");
+      await expect(current.owner.readSecrets()).rejects.toThrow(SeededDesktopUpgradeSmokeError);
+    });
+  });
+  it("joins each captured application stop before removing only that lane's residue and receipts", async () => {
+    await owned(async (root) => {
+      const previous = await fixtureAt(root, "previous");
+      const current = await fixtureAt(root, "remote");
+      for (const { input, owner } of [previous, current]) {
+        await NodeFS.promises.writeFile(
+          owner.credentialReceiptPath,
+          JSON.stringify({ bootstrapToken: "private-grant" }),
+        );
+        await writeRemoteUploadCapabilityReceipt(owner.uploadReceiptPath, receipt);
+        await NodeFS.promises.mkdir(NodePath.join(input.workspaceRoot, receipt.relativeDirectory));
+        await NodeFS.promises.writeFile(
+          NodePath.join(input.workspaceRoot, receipt.relativeDirectory, "protection-witness.txt"),
+          "o",
+        );
+      }
+      const previousPath = NodePath.join(previous.input.workspaceRoot, receipt.relativeDirectory);
+      const currentPath = NodePath.join(current.input.workspaceRoot, receipt.relativeDirectory);
+      const gate = Promise.withResolvers<void>();
+      const stopping = previous.owner.stop(() => gate.promise);
+      expect(NodeFS.existsSync(previousPath)).toBe(true);
+      expect(NodeFS.existsSync(currentPath)).toBe(true);
+      gate.resolve();
+      await stopping;
+      expect(NodeFS.existsSync(previousPath)).toBe(false);
+      expect(NodeFS.existsSync(previous.owner.credentialReceiptPath)).toBe(false);
+      expect(NodeFS.existsSync(previous.owner.uploadReceiptPath)).toBe(false);
+      expect(NodeFS.existsSync(currentPath)).toBe(true);
+      await expect(
+        current.owner.stop(async () => {
+          throw new Error("owned stop failed");
+        }),
+      ).rejects.toThrow(/stop failed/);
+      expect(NodeFS.existsSync(currentPath)).toBe(true);
+      expect(NodeFS.existsSync(current.owner.credentialReceiptPath)).toBe(true);
+      expect(NodeFS.existsSync(current.owner.uploadReceiptPath)).toBe(true);
+      await current.owner.stop(async () => {});
+      expect(NodeFS.existsSync(currentPath)).toBe(false);
+    });
+  });
+});
+
+/** Compile the actual runner with inert child and timer ports; no process is spawned or signalled. */
+const inertCommandRunner = async () => {
+  const source = await NodeFS.promises.readFile(
+    new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf("const terminateChild = async");
+  const end = source.indexOf("const runCommand = runBoundedCommand;", start);
+  if (start < 0 || end < 0) throw new Error("Command runner source missing");
+  const stdout = Object.assign(new NodeEvents.EventEmitter(), { destroy: vi.fn() });
+  const stderr = Object.assign(new NodeEvents.EventEmitter(), { destroy: vi.fn() });
+  const child = Object.assign(new NodeEvents.EventEmitter(), {
+    exitCode: null as number | null,
+    signalCode: null as NodeJS.Signals | null,
+    stdout,
+    stderr,
+    kill: vi.fn(),
+  });
+  const timers = new Set<() => void>();
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(source.slice(start, end).replaceAll(/^export /gm, "")) +
+      "\nrunBoundedCommand",
+    {
+      NodeChildProcess: { spawn: () => child },
+      NodePath,
+      SeededDesktopUpgradeSmokeError,
+      process: { env: {} },
+      setTimeout: (callback: () => void) => {
+        timers.add(callback);
+        return callback;
+      },
+      clearTimeout: (callback: () => void) => timers.delete(callback),
+    },
+    { timeout: 1000 },
+  ) as (
+    input: Parameters<typeof runBoundedCommand>[0] & { waitForStdioClose?: boolean },
+  ) => ReturnType<typeof runBoundedCommand>;
+  return {
+    child,
+    timers,
+    run,
+    exit: (code: number | null, signal: NodeJS.Signals | null = null) => {
+      child.exitCode = code;
+      child.signalCode = signal;
+      child.emit("exit", code, signal);
+    },
+    close: (code: number | null, signal: NodeJS.Signals | null = null) => {
+      child.emit("close", code, signal);
+    },
+    expire: () => {
+      const expiring = Array.from(timers);
+      timers.clear();
+      for (const timer of expiring) timer();
+    },
+  };
+};
+
+describe("bounded process observation completion", () => {
+  const observation = {
+    command: "inert-observer",
+    args: [],
+    cwd: "/inert-owned-fixture",
+    timeoutMs: 10_000,
+    waitForStdioClose: true,
+  };
+
+  it("does not convert a signal-only termination into an ordinary no-match exit", async () => {
+    const runner = await inertCommandRunner();
+    const result = runner.run(observation);
+    runner.exit(null, "SIGTERM");
+    runner.close(null, "SIGTERM");
+    expect((await result).exitCode).toBe(-1);
+    expect(runner.timers.size).toBe(0);
+  });
+
+  it("includes pending stderr before an observation can settle", async () => {
+    const runner = await inertCommandRunner();
+    let settled = false;
+    const result = runner.run(observation).then((value) => {
+      settled = true;
+      return value;
+    });
+    runner.exit(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    runner.child.stderr.emit("data", Buffer.from("private-stop-sentinel"));
+    runner.close(1);
+    expect(await result).toEqual({
+      exitCode: 1,
+      stdout: "",
+      stderr: "private-stop-sentinel",
+    });
+    expect(runner.timers.size).toBe(0);
+  });
+
+  it("bounds a missing stdio close and releases the observer's local pipes", async () => {
+    const runner = await inertCommandRunner();
+    const result = runner.run(observation);
+    runner.exit(1);
+    runner.expire();
+    await expect(result).rejects.toThrow(/timed out/);
+    expect(runner.child.stdout.destroy).toHaveBeenCalledOnce();
+    expect(runner.child.stderr.destroy).toHaveBeenCalledOnce();
+    expect(runner.child.kill).not.toHaveBeenCalled();
+    expect(runner.timers.size).toBe(0);
+  });
+
+  it("refuses a truncated observation even when its retained tail looks empty", async () => {
+    const runner = await inertCommandRunner();
+    const result = runner.run(observation);
+    runner.child.stderr.emit("data", Buffer.from("private-stop-sentinel" + " ".repeat(262_144)));
+    runner.exit(1);
+    runner.close(1);
+    const failure = await result.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(failure instanceof SeededDesktopUpgradeSmokeError).toBe(true);
+    expect(String(failure)).toContain("output exceeded its bound");
+    expect(runner.timers.size).toBe(0);
+  });
+
+  it("keeps launcher completion on exit when completed stdio was not requested", async () => {
+    const runner = await inertCommandRunner();
+    const result = runner.run({ ...observation, waitForStdioClose: false });
+    runner.exit(0);
+    expect(await result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+    expect(runner.timers.size).toBe(0);
+  });
+});
+
+describe("confirmed restarted application shutdown", () => {
+  const scenarios = [
+    "kill-errors",
+    "kill-success-still-live",
+    "kill-then-errors",
+    "observation-error",
+    "observation-unknown",
+    "observation-malformed",
+    "observation-stderr",
+    "kill-throws",
+    "not-ci",
+    "already-absent",
+    "kill-then-absent",
+    "transient-absence",
+    "error-then-confirmed-absent",
+    "mac-absent",
+    "mac-observation-error",
+    "mac-observation-stderr",
+    "mac-observation-signal",
+    "mac-observation-late-stderr",
+    "mac-observation-missing-close",
+    "mac-malformed",
+  ] as const;
+  it.each(scenarios)(
+    "joins the actual stop chain and preserves uncertain owners: %s",
+    async (scenario) => {
+      const root = await NodeFS.promises.mkdtemp(
+        NodePath.join(NodeOS.tmpdir(), "confirmed-app-stop-"),
+      );
+      try {
+        const workspaceRoot = NodePath.join(root, "workspace");
+        await NodeFS.promises.mkdir(workspaceRoot);
+        const fixture = SeededUpgradeHarness.createRpcUpgradeFixture({
+          runRoot: root,
+          workspaceRoot,
+        });
+        const receipt = {
+          version: 1 as const,
+          relativeDirectory: "bibcode-update-witness-00000000-0000-4000-8000-000000000099",
+          relativeUrl: "/api/transfers/private-stop-sentinel",
+        };
+        const residue = NodePath.join(workspaceRoot, receipt.relativeDirectory);
+        await NodeFS.promises.mkdir(residue);
+        await NodeFS.promises.writeFile(NodePath.join(residue, "protection-witness.txt"), "o");
+        await NodeFS.promises.writeFile(
+          fixture.credentialReceiptPath,
+          JSON.stringify({ bootstrapToken: "private-stop-sentinel" }),
+        );
+        await writeRemoteUploadCapabilityReceipt(fixture.uploadReceiptPath, receipt);
+        const source = await NodeFS.promises.readFile(
+          new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+          "utf8",
+        );
+        const observeStart = source.indexOf("export const windowsApplicationAbsenceScript =");
+        const start =
+          observeStart >= 0
+            ? observeStart
+            : source.indexOf("const stopRestartedApplication = async");
+        const end = source.indexOf(
+          "export async function removeSeededUpgradeDependencyTree",
+          start,
+        );
+        const remoteStart = source.indexOf("const stopRemoteLaneApplication = async");
+        const remoteEnd = source.indexOf("const runUpgradeLane = async", remoteStart);
+        if ([start, end, remoteStart, remoteEnd].some((index) => index < 0))
+          throw new Error("Stop chain source missing");
+        const helperSource = NodeModule.stripTypeScriptTypes(
+          (source.slice(start, end) + "\n" + source.slice(remoteStart, remoteEnd)).replaceAll(
+            /^export /gm,
+            "",
+          ),
+        );
+        const calls: { command: string; args: ReadonlyArray<string> }[] = [];
+        let kills = 0;
+        let observations = 0;
+        const stop = NodeVM.runInNewContext(
+          helperSource + "\nstopRemoteLaneApplication",
+          {
+            NodePath,
+            SeededDesktopUpgradeSmokeError,
+            restartedApplicationCleanupPlan,
+            process: { env: { CI: scenario === "not-ci" ? "false" : "true" } },
+            setTimeout: (callback: () => void) => {
+              queueMicrotask(callback);
+              return 0;
+            },
+            runCommand: async (input: {
+              command: string;
+              args: ReadonlyArray<string>;
+              env?: Record<string, string>;
+              timeoutMs: number;
+              waitForStdioClose?: boolean;
+            }) => {
+              calls.push(input);
+              expect(input.timeoutMs).toBeLessThanOrEqual(10000);
+              if (input.command === "taskkill.exe" || input.command === "pkill") {
+                kills += 1;
+                if (scenario === "kill-throws") throw new Error("private-stop-sentinel");
+                const exitCode =
+                  scenario === "kill-errors" ||
+                  scenario === "error-then-confirmed-absent" ||
+                  (scenario === "kill-then-errors" && kills > 1)
+                    ? 5
+                    : 0;
+                return { stdout: "", stderr: exitCode ? "private-stop-sentinel" : "", exitCode };
+              }
+              observations += 1;
+              if (input.command === "pgrep") {
+                expect(input.args).toEqual(["-x", "bibcode-desktop"]);
+                if (
+                  scenario === "mac-observation-signal" ||
+                  scenario === "mac-observation-late-stderr" ||
+                  scenario === "mac-observation-missing-close"
+                ) {
+                  const runner = await inertCommandRunner();
+                  const result = runner.run({ ...input, cwd: root });
+                  if (scenario === "mac-observation-signal") {
+                    runner.exit(null, "SIGTERM");
+                    runner.close(null, "SIGTERM");
+                  } else {
+                    runner.exit(1);
+                    await Promise.resolve();
+                    if (scenario === "mac-observation-late-stderr") {
+                      runner.child.stderr.emit("data", Buffer.from("private-stop-sentinel"));
+                      runner.close(1);
+                    } else runner.expire();
+                  }
+                  return result;
+                }
+                if (scenario === "mac-observation-error")
+                  return { stdout: "", stderr: "private-stop-sentinel", exitCode: 2 };
+                if (scenario === "mac-observation-stderr")
+                  return { stdout: "", stderr: "private-stop-sentinel", exitCode: 1 };
+                if (scenario === "mac-malformed")
+                  return { stdout: "private-stop-sentinel", stderr: "", exitCode: 0 };
+                return { stdout: "", stderr: "", exitCode: 1 };
+              }
+              expect(input.command).toBe("powershell.exe");
+              expect(input.env?.BIBCODE_SEEDED_APPLICATION_NAME).toBe("bibcode-desktop.exe");
+              if (scenario === "observation-error")
+                return { stdout: "", stderr: "private-stop-sentinel", exitCode: 5 };
+              if (scenario === "observation-unknown")
+                return {
+                  stdout: '{"observed":false,"matchingProcesses":null}',
+                  stderr: "",
+                  exitCode: 0,
+                };
+              if (scenario === "observation-malformed")
+                return { stdout: "private-stop-sentinel", stderr: "", exitCode: 0 };
+              if (scenario === "observation-stderr")
+                return {
+                  stdout: '{"observed":true,"matchingProcesses":0}',
+                  stderr: "private-stop-sentinel",
+                  exitCode: 0,
+                };
+              const absent =
+                scenario === "already-absent" ||
+                ((scenario === "kill-then-absent" || scenario === "error-then-confirmed-absent") &&
+                  observations > 1) ||
+                (scenario === "transient-absence" && observations !== 2);
+              return {
+                stdout: JSON.stringify({ observed: true, matchingProcesses: absent ? 0 : 1 }),
+                stderr: "",
+                exitCode: 0,
+              };
+            },
+          },
+          { timeout: 1000 },
+        ) as (app: string, platform: "win" | "mac", dataRoot: string) => Promise<void>;
+        const succeeds = [
+          "already-absent",
+          "kill-then-absent",
+          "transient-absence",
+          "error-then-confirmed-absent",
+          "mac-absent",
+        ].includes(scenario);
+        const outcome = fixture.stop(() =>
+          stop(
+            NodePath.join(root, "bibcode-desktop.exe"),
+            scenario.startsWith("mac-") ? "mac" : "win",
+            NodePath.join(root, "data"),
+          ),
+        );
+        if (succeeds) {
+          await outcome;
+          expect(observations).toBeGreaterThanOrEqual(2);
+          expect(NodeFS.existsSync(residue)).toBe(false);
+          expect(NodeFS.existsSync(fixture.uploadReceiptPath)).toBe(false);
+          expect(NodeFS.existsSync(fixture.credentialReceiptPath)).toBe(false);
+          if (scenario === "already-absent" || scenario === "mac-absent") expect(kills).toBe(0);
+          if (scenario === "transient-absence") {
+            expect(observations).toBe(4);
+            expect(kills).toBe(1);
+          }
+        } else {
+          const error = await outcome.catch((cause: unknown) => cause);
+          expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+          expect(String(error)).not.toContain("private-stop-sentinel");
+          expect(NodeFS.existsSync(residue)).toBe(true);
+          expect(NodeFS.existsSync(fixture.uploadReceiptPath)).toBe(true);
+          expect(NodeFS.existsSync(fixture.credentialReceiptPath)).toBe(true);
+          if (scenario === "not-ci") expect(calls).toEqual([]);
+        }
+        expect(kills).toBeLessThanOrEqual(20);
+        expect(observations).toBeLessThanOrEqual(20);
+      } finally {
+        await NodeFS.promises.rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+/** Execute the real retention/dispatch bodies with inert native ports and owned temporary files. */
+const remoteRetentionFixture = async () => {
+  const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "remote-retention-"));
+  const runRoot = NodePath.join(root, "remote");
+  const evidenceDirectory = NodePath.join(runRoot, "evidence");
+  await NodeFS.promises.mkdir(evidenceDirectory, { recursive: true });
+  const source = await NodeFS.promises.readFile(
+    new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+    "utf8",
+  );
+  const phaseStart = source.indexOf("const runWebDriverPhase = async");
+  const phaseEnd = source.indexOf("\nconst startMockUpdateServer", phaseStart);
+  const laneStart = source.indexOf("const runUpgradeLane = async");
+  const laneEnd = source.indexOf("\nconst copyBoundedEvidence", laneStart);
+  const ownerStart = source.indexOf(
+    "      await runUpgradeLane({\n        appBinaryPath: remoteApp,",
+  );
+  const ownerEnd = source.indexOf("\n      });", ownerStart) + "\n      });".length;
+  const finallyStart = source.indexOf("    const secrets = [signingKey, signingPassword];");
+  const finallyEnd = source.indexOf("\n  }\n  if (failure !== undefined)", finallyStart);
+  if (
+    [phaseStart, phaseEnd, laneStart, laneEnd, ownerStart, finallyStart, finallyEnd].some(
+      (index) => index < 0,
+    )
+  )
+    throw new Error("Remote evidence owner source is unavailable.");
+  const phaseInput = {
+    appBinaryPath: NodePath.join(root, "owned-app"),
+    backendPort: 14953,
+    candidateVersion: "0.7.3",
+    dataRoot: NodePath.join(runRoot, "data"),
+    evidenceDirectory,
+    expectedDataRoot: NodePath.join(runRoot, "data"),
+    lane: "remote-install",
+    phase: "seed-and-install",
+    platform: "linux",
+    projectId: "remote-fixture",
+    repositoryRoot,
+    restartTimeoutMs: 30_000,
+    resultPath: NodePath.join(runRoot, "before.json"),
+    runRoot,
+    workspaceRoot: NodePath.join(runRoot, "workspace"),
+    webdriverPort: 15053,
+    wsl: false,
+  };
+  const runCommand = vi.fn(async () => ({
+    exitCode: 1,
+    stdout: "fixture-private-returned-token",
+    stderr: "private receipt write failed",
+  }));
+  const copyBoundedEvidence = vi.fn(async () => {});
+  const cleanup = vi.fn(async () => {});
+  const remoteRpc = SeededUpgradeHarness.createRpcUpgradeFixture({
+    runRoot,
+    workspaceRoot: phaseInput.workspaceRoot,
+  });
+  const context = NodeVM.createContext({
+    NodeFS,
+    NodePath,
+    NodeURL,
+    process: { env: {} },
+    REMOTE_UPDATE_DOWNLOAD_BUDGET_MS: 1,
+    REMOTE_UPDATE_INSTALL_BUDGET_MS: 1,
+    REMOTE_UPDATE_RESTART_BUDGET_MS: 1,
+    seededUpgradeVitePlusExecutable,
+    createSeededUpgradeDriverSpec,
+    createSeededUpgradeWdioConfig,
+    readRemoteFixtureSecrets,
+    redactAndBoundUpgradeEvidence,
+    assertWebDriverPhaseExit,
+    assertRemoteInstallPort,
+    SeededDesktopUpgradeSmokeError,
+    runCommand,
+    remoteRpc,
+    rpcFixtures: [remoteRpc],
+    baselineVersion: undefined,
+    signingKey: "private-signing-key",
+    signingPassword: "private-signing-password",
+    failure: undefined,
+    remoteApp: phaseInput.appBinaryPath,
+    runId: "fixture",
+    input: {
+      ...phaseInput,
+      updaterPort: 14950,
+      artifactDirectory: NodePath.join(root, "retained"),
+    },
+    layout: { remoteInstall: phaseInput },
+    requestLogPath: NodePath.join(root, "requests.jsonl"),
+    readObservation: async (path: string) =>
+      JSON.parse(await NodeFS.promises.readFile(path, "utf8")),
+    copyBoundedEvidence,
+    cleanup: { cleanup },
+  });
+  const evaluate = (body: string): Promise<unknown> =>
+    NodeVM.runInContext(NodeModule.stripTypeScriptTypes(`(async () => { ${body} })()`), context, {
+      timeout: 1_000,
+    }) as Promise<unknown>;
+  const runPhase = async (prepareFailure = false) => {
+    if (prepareFailure) {
+      await NodeFS.promises.writeFile(NodePath.join(runRoot, "seed-and-install-driver"), "owned");
+    }
+    return evaluate(
+      source.slice(phaseStart, phaseEnd) +
+        "\n" +
+        source.slice(laneStart, laneEnd) +
+        "\n" +
+        source.slice(ownerStart, ownerEnd),
+    );
+  };
+  return {
+    root,
+    runRoot,
+    evidenceDirectory,
+    runCommand,
+    copyBoundedEvidence,
+    cleanup,
+    runPhase,
+    finalize: () => evaluate(source.slice(finallyStart, finallyEnd) + "\n return failure;"),
+    dispose: () => NodeFS.promises.rm(root, { recursive: true, force: true }),
+  };
+};
+
+describe("remote phase receipt retention boundaries", () => {
+  it("refuses phase logs after credentials return but receipt publication fails", async () => {
+    const fixture = await remoteRetentionFixture();
+    try {
+      const error = await fixture.runPhase().catch((error: unknown) => error);
+      expect(
+        NodeFS.existsSync(NodePath.join(fixture.evidenceDirectory, "seed-and-install.log")),
+      ).toBe(false);
+      expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+      expect(String(error)).not.toContain("fixture-private-returned-token");
+    } finally {
+      await fixture.dispose();
+    }
+  });
+  it.each(["returned", "thrown"])(
+    "refuses final copies after a %s remote phase failure without a bootstrap receipt",
+    async (kind) => {
+      const fixture = await remoteRetentionFixture();
+      try {
+        if (kind === "thrown")
+          fixture.runCommand.mockRejectedValue(new Error("fixture launch failure"));
+        await fixture.runPhase().catch(() => undefined);
+        const finalError = await fixture.finalize();
+        expect(fixture.copyBoundedEvidence).not.toHaveBeenCalled();
+        expect(finalError).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        expect(fixture.cleanup).toHaveBeenCalledOnce();
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+  it("keeps earlier evidence when local phase preparation fails before any launch attempt", async () => {
+    const fixture = await remoteRetentionFixture();
+    try {
+      await expect(fixture.runPhase(true)).rejects.toThrow();
+      expect(fixture.runCommand).not.toHaveBeenCalled();
+      expect(await fixture.finalize()).toBeUndefined();
+      expect(fixture.copyBoundedEvidence).toHaveBeenCalledOnce();
+      expect(fixture.cleanup).toHaveBeenCalledOnce();
+    } finally {
+      await fixture.dispose();
+    }
+  });
+  it("retains redacted failure evidence with a valid bootstrap receipt before install dispatch", async () => {
+    const fixture = await remoteRetentionFixture();
+    try {
+      await NodeFS.promises.writeFile(
+        NodePath.join(fixture.runRoot, "remote-bootstrap.secret.json"),
+        JSON.stringify({ bootstrapToken: "fixture-private-returned-token" }),
+      );
+      await expect(fixture.runPhase()).rejects.toThrow();
+      const log = await NodeFS.promises.readFile(
+        NodePath.join(fixture.evidenceDirectory, "seed-and-install.log"),
+        "utf8",
+      );
+      expect(log).toContain("[REDACTED]");
+      expect(log).not.toContain("fixture-private-returned-token");
+      expect(await fixture.finalize()).toBeUndefined();
+      expect(fixture.copyBoundedEvidence).toHaveBeenCalledOnce();
+      expect(fixture.cleanup).toHaveBeenCalledOnce();
+    } finally {
+      await fixture.dispose();
+    }
+  });
+});
+
 const versionFixture = async () => {
   const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "seeded-versions-"));
   const originals = new Map(
@@ -98,20 +1807,26 @@ const publicPairingGrant = {
 };
 
 /** Executes the generated credential callback and its receipt/driver handoff without a desktop. */
-const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
+const remoteGrantFixture = (
+  responses: ReadonlyArray<unknown>,
+  selection?: { lane: "previous-stable"; trigger: "remote-rpc" },
+) => {
+  const lane: SeededUpgradeHarness.SeededUpgradeLane = selection?.lane ?? "remote-install";
   const input = {
     candidateVersion: "0.7.3",
     expectedDataRoot: absolute("remote", "data"),
-    lane: "remote-install" as const,
+    lane,
+    ...(selection ? { trigger: selection.trigger, baselineVersion: "0.7.2" } : {}),
     phase: "seed-and-install" as const,
     projectId: "remote-project",
     resultPath: absolute("remote", "before.json"),
     workspaceRoot: absolute("remote", "workspace"),
-    platform: "linux" as const,
+    platform: selection ? ("win" as const) : ("linux" as const),
     appBinaryPath: absolute("RemoteLane.AppImage"),
     remoteInstallDriverPath: "fixture:driver",
     remoteHarnessPath: "fixture:host",
     remoteSecretPath: absolute("remote", "private.json"),
+    remoteUploadSecretPath: absolute("remote", "upload-private.json"),
     remoteEvidencePath: absolute("remote", "evidence", "remote-rpc.json"),
   };
   const spec = createSeededUpgradeDriverSpec(input);
@@ -179,6 +1894,44 @@ const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
 describe("generated remote sharing grant handoff", () => {
   afterEach(() => vi.useRealTimers());
 
+  it("refuses an unexpected starting version before update-path credential and installer commands", async () => {
+    const input = {
+      candidateVersion: "0.7.3-upgrade.1",
+      baselineVersion: "0.7.2",
+      expectedDataRoot: absolute("previous", "data"),
+      lane: "previous-stable" as const,
+      trigger: "remote-rpc" as const,
+      phase: "seed-and-install" as const,
+      projectId: "p1",
+      resultPath: absolute("previous", "before.json"),
+      workspaceRoot: absolute("previous", "workspace"),
+      platform: "win" as const,
+      appBinaryPath: absolute("previous", "app.exe"),
+      remoteInstallDriverPath: "fixture:driver",
+      remoteHarnessPath: "fixture:host",
+      remoteSecretPath: absolute("previous", "credentials.json"),
+      remoteUploadSecretPath: absolute("previous", "upload.json"),
+      remoteEvidencePath: absolute("previous", "remote.json"),
+    };
+    const spec = createSeededUpgradeDriverSpec(input);
+    const start = spec.indexOf("    const observation = await observe(true);");
+    const end = spec.indexOf("    const credentials = await browser.execute(", start);
+    if (start < 0 || end < 0) throw new Error("Remote seed admission block missing");
+    const execute = vi.fn(async () => false);
+    const run = NodeVM.runInNewContext(
+      `(async () => { ${spec.slice(start, end)} })()`,
+      {
+        input,
+        observe: async () => ({ appVersion: "0.7.1" }),
+        NodeFS: { writeFileSync: () => {} },
+        browser: { execute, waitUntil: async () => {} },
+      },
+      { timeout: 1000 },
+    ) as Promise<void>;
+    await expect(run).rejects.toThrow(/starting app version.*planned baseline/);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it("redeems the published grant shape and retains credentials only in the private receipt", async () => {
     decodePairingLink(publicPairingGrant);
     const fixture = remoteGrantFixture([[publicPairingGrant]]);
@@ -187,6 +1940,8 @@ describe("generated remote sharing grant handoff", () => {
       endpoint: "http://127.0.0.1:43123",
       bootstrapToken: "fixture-distinct-grant",
       candidateVersion: "0.7.3",
+      workspaceRoot: fixture.input.workspaceRoot,
+      uploadReceiptPath: fixture.input.remoteUploadSecretPath,
       requireWide: true,
       onInstallDispatched: expect.any(Function),
     });
@@ -203,6 +1958,24 @@ describe("generated remote sharing grant handoff", () => {
       if (path !== fixture.input.remoteSecretPath)
         expect(file.contents).not.toContain("fixture-distinct-grant");
     }
+  });
+
+  it("uses the same authenticated RPC handoff for an explicitly selected previous baseline", async () => {
+    const fixture = remoteGrantFixture([[publicPairingGrant]], {
+      lane: "previous-stable",
+      trigger: "remote-rpc",
+    });
+    await fixture.run();
+    expect(fixture.driver).toHaveBeenCalledOnce();
+    expect(fixture.driver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        bootstrapToken: "fixture-distinct-grant",
+        uploadReceiptPath: fixture.input.remoteUploadSecretPath,
+        workspaceRoot: fixture.input.workspaceRoot,
+        onInstallDispatched: expect.any(Function),
+      }),
+    );
+    expect(fixture.files.get(fixture.input.remoteSecretPath)?.mode).toBe(0o600);
   });
 
   it("waits for minting after native exposure has already widened", async () => {
@@ -355,6 +2128,7 @@ describe("seeded packaged desktop upgrade harness", () => {
         remoteInstallDriverPath: "file:///isolated/remote-install-driver.ts",
         remoteHarnessPath: "file:///isolated/seeded-desktop-upgrade-smoke.ts",
         remoteSecretPath: NodePath.join(directory, "private.json"),
+        remoteUploadSecretPath: NodePath.join(directory, "upload-private.json"),
         remoteEvidencePath: NodePath.join(directory, "evidence.json"),
       });
       const path = NodePath.join(directory, "remote.e2e.mjs");
@@ -415,6 +2189,15 @@ describe("seeded packaged desktop upgrade harness", () => {
       phases: ["downloading", "installing", "succeeded"],
       sawPercent: true,
       sawStage: true,
+      heldUpload: {
+        admitted: true,
+        releasedOnWaitingStage: true,
+        completed: true,
+        bytesMatch: true,
+        noPartials: true,
+        requestClosed: true,
+        holdLimitMs: 20_000,
+      },
       preUpdateBackups: 1,
       requesterLogLines: 1,
       appImageMounts: 1,
@@ -428,6 +2211,10 @@ describe("seeded packaged desktop upgrade harness", () => {
       { ...good, phases: [] },
       { ...good, sawPercent: false },
       { ...good, sawStage: false },
+      { ...good, heldUpload: { ...good.heldUpload, releasedOnWaitingStage: false } },
+      { ...good, heldUpload: { ...good.heldUpload, requestClosed: false } },
+      { ...good, heldUpload: { ...good.heldUpload, bytesMatch: false } },
+      { ...good, heldUpload: { ...good.heldUpload, noPartials: false } },
       { ...good, preUpdateBackups: 0 },
       { ...good, requesterLogLines: 2 },
       { ...good, appImageMounts: 2 },
@@ -462,7 +2249,7 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(seededUpgradeVitePlusExecutable).toBe("vp");
   });
 
-  it("targets only the exact updater-restarted application on every host", () => {
+  it("retains the maintained desktop process names in cleanup plans", () => {
     expect(
       restartedApplicationCleanupPlan(
         String.raw`C:\Program Files\BiBCode\bibcode-desktop.exe`,
@@ -572,6 +2359,7 @@ describe("seeded packaged desktop upgrade harness", () => {
       platform: "mac",
       previousTag: "v0.3.10",
       previousVersion: "0.3.10",
+      previousStableTrigger: "local-bridge",
       publicKeyFile: absolute("keys", "updater.key.pub"),
       repositoryRoot,
       restartTimeoutMs: 90_000,
@@ -1038,6 +2826,35 @@ describe("seeded packaged desktop upgrade harness", () => {
       await NodeFS.promises.rm(root, { recursive: true, force: true });
     }
   });
+
+  it.each(["raw", "truncated", "json", "slash-escaped", "unicode-slash", "encoded-token"] as const)(
+    "redacts %s signed transfer labels before evidence bounds",
+    (kind) => {
+      const capability = "capability-prefix-" + "private".repeat(60);
+      const full = "HTTP POST /api/transfers/" + capability;
+      const truncated = full.slice(0, 159) + "…";
+      const label =
+        kind === "raw"
+          ? full
+          : kind === "json"
+            ? JSON.stringify({ operation: truncated })
+            : kind === "slash-escaped"
+              ? truncated.replaceAll("/", "\\/")
+              : kind === "unicode-slash"
+                ? truncated.replaceAll("/", "\\u002f")
+                : kind === "encoded-token"
+                  ? truncated.replace("capability", "\\u0063apability")
+                  : truncated;
+      const evidence = redactAndBoundUpgradeEvidence(label, {
+        maxBytes: 512,
+        roots: [],
+        secrets: [capability],
+      });
+      expect(evidence).not.toContain("capability-prefix");
+      expect(evidence).not.toContain("privateprivate");
+      expect(evidence).toContain("[REDACTED]");
+    },
+  );
 
   it("redacts secrets and roots before bounding retained failure evidence", () => {
     const privateKey = "PRIVATE-TEST-KEY-MATERIAL";
