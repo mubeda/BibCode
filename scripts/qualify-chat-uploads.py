@@ -358,7 +358,8 @@ def outer(scenario='chat-upload', ui_matrix='core'):
     node = resolve_node_runtime()
     server = str(Path(os.environ['BIBCODE_UPLOAD_SERVER']).resolve(strict=True))
     evidence = Path(os.environ['RUNNER_TEMP']) / (selection['evidence_prefix'] + run_id)
-    fixture = Path('/tmp') / (selection['fixture_prefix'] + run_id + '-' + uuid.uuid4().hex)
+    # Evidence carries the run ID; keep this owned TMPDIR short for Chromium's Unix socket.
+    fixture = Path('/tmp') / (selection['fixture_prefix'] + uuid.uuid4().hex)
     evidence.mkdir(mode=0o700, exist_ok=False)
     fixture.mkdir(mode=0o700, exist_ok=False)
     namespace = os.readlink('/proc/self/ns/net')

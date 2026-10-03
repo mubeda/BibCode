@@ -68,3 +68,25 @@ The actual outer producer and inner environment now feed the helper's regression
 tests. This fixes the reproduced handoff mismatch; the next reviewed native run
 must still establish actual UI behavior. No product, deadline or topology change
 is part of this repair.
+
+Both `8c1a10e4` attempts of run `37096649000` passed ownership/network preparation
+but failed to create a browser session. Chrome and ChromeDriver were both
+`154.0.8037.57`; cleanup remained complete. The precise original Chrome failure
+text was not retained, so the original native cause remains an inference.
+
+[Chromium branch 8037](https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/8037/chrome/browser/process_singleton_posix.cc)
+and its [temporary directory allocator](https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/8037/base/files/file_util_posix.cc)
+provide a deterministic pathname defect: the current UI TMPDIR was 67 bytes,
+and its branded singleton socket suffix adds 41 bytes. The portable setup rejects
+lengths at or above the [Linux 108-byte buffer](https://raw.githubusercontent.com/torvalds/linux/v6.8/include/uapi/linux/un.h),
+so 108 fails; the unbranded suffix adds 45 bytes. Removing the redundant workflow
+run ID from the private root keeps its scenario prefix and random UUID, giving
+96/100-byte UI socket paths and 93/97-byte chat socket paths. Exclusive `0700`
+creation, owned TMPDIR,
+namespace checks and joined cleanup stay intact. Evidence/artifact run IDs and
+browser/sandbox flags are unchanged. Actual-producer byte-budget tests cover both
+brands and current/longer run IDs; a native rerun must still confirm the effect.
+
+Separately, the two temporary QA workflow artifact actions now match the existing
+audited repository v7.0.1 pin. The dependency ledger and other actions are
+unchanged; this corrects a static gate mismatch and is not a browser-cause claim.

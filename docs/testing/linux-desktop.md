@@ -596,7 +596,11 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   server/example outside Cargo output and records source/build hashes; it serves
   those web assets with the existing preview configuration. Its shared Python
   owner admits only a disposable CI PID/network namespace, and its shared browser
-  owner enables no performance logging. Prepare the reviewed contained topology
+  owner enables no performance logging. Keep its private TMPDIR short: Chromium
+  adds a branded temporary subdirectory and Unix socket filename within the
+  platform pathname limit. The allocated scenario prefix plus random UUID stays
+  exclusive and `0700`; workflow run IDs belong in evidence/artifact names, not this
+  private root. Prepare the reviewed contained topology
   before any fixture, service or browser admission. Browser state before setup is
   unobserved (`before:null`); each created browser must pass one bounded actual
   online read. No post-launch network mutation, repair, sleep or retry is allowed.
