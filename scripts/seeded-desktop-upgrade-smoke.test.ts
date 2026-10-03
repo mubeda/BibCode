@@ -3764,7 +3764,7 @@ describe("grant deadline attribution", () => {
       fixture.context.browser.execute.mockResolvedValue({
         _tag: "seeded-credential-failure",
         milestone: "credential-wide-grant-deadline",
-        grantDeadline: { offerState: "unknown", ...counts },
+        grantDeadline: { offerState: "unknown", offerFailureBanner: "unknown", ...counts },
       });
       await expect(fixture.run()).rejects.toThrow("credential response invalid");
       expect(snapshot(fixture).milestone).toBe("credential-wide-result-invalid");
@@ -3772,7 +3772,9 @@ describe("grant deadline attribution", () => {
     },
   );
   it.each(contradictory)("rejects contradictory retained deadline evidence: %j", async (counts) => {
-    expect(await retainedFacts({ offerState: "unknown", ...counts })).toEqual({
+    expect(
+      await retainedFacts({ offerState: "unknown", offerFailureBanner: "unknown", ...counts }),
+    ).toEqual({
       availability: "invalid",
       milestone: null,
     });
@@ -3785,7 +3787,7 @@ describe("grant deadline attribution", () => {
   ])(
     "preserves truthful zero/overflow/late/earlier-match forms at both consumers: %j",
     async (counts) => {
-      const facts = { offerState: "unknown", ...counts };
+      const facts = { offerState: "unknown", offerFailureBanner: "unknown", ...counts };
       const fixture = owned();
       fixture.context.browser.execute.mockResolvedValue({
         _tag: "seeded-credential-failure",
@@ -3821,6 +3823,210 @@ describe("grant deadline attribution", () => {
       });
     return document;
   };
+
+  const bannerDocument = (contents: string) => {
+    const document = dom("known-failure");
+    document.body.innerHTML = `<section><h2>Offer generator</h2><div><button>Generate pairing offer</button>${contents}</div></section>`;
+    return document;
+  };
+  it.each([
+    ["local-confirmed", "The offer was not created. Remote access is confirmed local-only."],
+    [
+      "active-reason",
+      "The offer was not created. Remote access remains enabled because another live access reason still requires it.",
+    ],
+    [
+      "cancellation-unconfirmed",
+      "The offer result could not be canceled or confirmed. Remote access was deliberately left unchanged because a live credential may exist.",
+    ],
+    [
+      "cleanup-failed",
+      "The offer was canceled, but remote-access cleanup could not be verified. Review Exposure and retry cleanup.",
+    ],
+    ["unclassified", "private-error-canary"],
+    ["unclassified", "x".repeat(512)],
+    [
+      "unclassified",
+      "The offer was not created. Remote access is confirmed local-only. private-error-canary",
+    ],
+  ])("classifies only the existing finite failure banner locally: %s", async (want, text) => {
+    vi.useFakeTimers();
+    const fixture = owned();
+    fixture.context.document = bannerDocument(`<p class="text-destructive">${text}</p>`);
+    const outcome = fixture.run().catch(() => null);
+    await vi.runAllTimersAsync();
+    await outcome;
+    const facts = snapshot(fixture).grantDeadline;
+    expect(facts).toEqual({
+      offerState: "known-failure",
+      offerFailureBanner: want,
+      pollAttempts: 80,
+      listResponses: 80,
+      lastListCount: 0,
+      eligibleShapeSeen: false,
+    });
+    expect(await retainedFacts(facts)).toEqual({
+      availability: "valid",
+      milestone: "credential-wide-grant-deadline",
+      grantDeadline: facts,
+    });
+    expect(JSON.stringify([...fixture.files.values()])).not.toContain(text);
+    expect(fixture.driver).not.toHaveBeenCalled();
+    expect(fixture.context.browser.execute).toHaveBeenCalledOnce();
+    expect(fixture.fetch).toHaveBeenCalledTimes(80);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it.each([
+    [
+      "oversized-text",
+      `<p class="text-destructive">${"x".repeat(513)}</p>`,
+      "known-failure",
+      "unknown",
+    ],
+    [
+      "nested-text",
+      '<p class="text-destructive"><span>private-error-canary</span></p>',
+      "known-failure",
+      "unknown",
+    ],
+    ["empty-text", '<p class="text-destructive"></p>', "known-failure", "unknown"],
+    [
+      "multiple-banners",
+      '<p class="text-destructive">private-first-canary</p><p class="text-destructive">private-second-canary</p>',
+      "known-failure",
+      "unknown",
+    ],
+    ["no-banner", "", "unknown", "not-observed"],
+    [
+      "conflicting-state",
+      '<button disabled>Generating…</button><p class="text-destructive">private-error-canary</p>',
+      "unknown",
+      "unknown",
+    ],
+  ])(
+    "keeps unavailable or conflicting banner observations honest: %s",
+    async (_kind, html, state, want) => {
+      vi.useFakeTimers();
+      const fixture = owned();
+      fixture.context.document = bannerDocument(html);
+      const outcome = fixture.run().catch(() => null);
+      await vi.runAllTimersAsync();
+      await outcome;
+      expect(snapshot(fixture).grantDeadline).toMatchObject({
+        offerState: state,
+        offerFailureBanner: want,
+      });
+      expect(JSON.stringify([...fixture.files.values()])).not.toContain("canary");
+      expect(fixture.driver).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+  it("does not retain failing banner accessors or read unrelated private controls", async () => {
+    vi.useFakeTimers();
+    const fixture = owned();
+    const document = bannerDocument(
+      '<p class="text-destructive">private-error-canary</p><input value="private-input-canary"><code>private-code-canary</code>',
+    );
+    for (const node of document.querySelectorAll("p"))
+      Object.defineProperty(node, "childNodes", {
+        get() {
+          throw new Error("private-accessor-canary");
+        },
+      });
+    for (const node of document.querySelectorAll("input, code"))
+      Object.defineProperty(node, "textContent", {
+        get() {
+          throw new Error("unrelated-private-read-canary");
+        },
+      });
+    fixture.context.document = document;
+    const outcome = fixture.run().catch(() => null);
+    await vi.runAllTimersAsync();
+    await outcome;
+    expect(snapshot(fixture).grantDeadline).toMatchObject({
+      offerState: "known-failure",
+      offerFailureBanner: "unknown",
+    });
+    expect(JSON.stringify([...fixture.files.values()])).not.toContain("canary");
+    expect(fixture.driver).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it.each([
+    ["missing", "unknown", undefined],
+    ["foreign", "unknown", "private-category-canary"],
+    ["null", "unknown", null],
+    ["number", "unknown", 0],
+    ["generating-conflict", "generating", "local-confirmed"],
+    ["generated-conflict", "generated", "unknown"],
+    ["failure-conflict", "known-failure", "not-observed"],
+    ["unknown-conflict", "unknown", "cleanup-failed"],
+  ])(
+    "refuses malformed or contradictory banner categories at both consumers: %s",
+    async (kind, state, category) => {
+      const facts = {
+        offerState: state,
+        ...(kind === "missing" ? {} : { offerFailureBanner: category }),
+        pollAttempts: 0,
+        listResponses: 0,
+        lastListCount: null,
+        eligibleShapeSeen: null,
+      };
+      const fixture = owned();
+      fixture.context.browser.execute.mockResolvedValue({
+        _tag: "seeded-credential-failure",
+        milestone: "credential-wide-grant-deadline",
+        grantDeadline: facts,
+      });
+      await expect(fixture.run()).rejects.toThrow("credential response invalid");
+      expect(snapshot(fixture).milestone).toBe("credential-wide-result-invalid");
+      expect(await retainedFacts(facts)).toEqual({ availability: "invalid", milestone: null });
+      expect(fixture.driver).not.toHaveBeenCalled();
+      expect(JSON.stringify([...fixture.files.values()])).not.toContain("canary");
+    },
+  );
+  it.each(["accessor", "nonenumerable", "symbol", "extra"])(
+    "refuses foreign banner descriptors without reading them: %s",
+    async (kind) => {
+      const facts = {
+        offerState: "unknown",
+        offerFailureBanner: "unknown",
+        pollAttempts: 0,
+        listResponses: 0,
+        lastListCount: null,
+        eligibleShapeSeen: null,
+      };
+      let reads = 0;
+      if (kind === "accessor")
+        Object.defineProperty(facts, "offerFailureBanner", {
+          enumerable: true,
+          get() {
+            reads++;
+            throw new Error("private-category-canary");
+          },
+        });
+      if (kind === "nonenumerable")
+        Object.defineProperty(facts, "offerFailureBanner", { value: "unknown", enumerable: false });
+      if (kind === "symbol")
+        Object.defineProperty(facts, Symbol("private-category-canary"), { value: true });
+      if (kind === "extra")
+        Object.defineProperty(facts, "private", {
+          value: "private-category-canary",
+          enumerable: true,
+        });
+      const fixture = owned();
+      fixture.context.browser.execute.mockResolvedValue({
+        _tag: "seeded-credential-failure",
+        milestone: "credential-wide-grant-deadline",
+        grantDeadline: facts,
+      });
+      await expect(fixture.run()).rejects.toThrow("credential response invalid");
+      expect(reads).toBe(0);
+      expect(snapshot(fixture).milestone).toBe("credential-wide-result-invalid");
+      expect(fixture.driver).not.toHaveBeenCalled();
+      expect(JSON.stringify([...fixture.files.values()])).not.toContain("canary");
+    },
+  );
+
   it.each(["generating", "generated", "known-failure", "unknown"])(
     "records finite offer state without reading private DOM: %s",
     async (state) => {
@@ -3834,6 +4040,12 @@ describe("grant deadline attribution", () => {
         milestone: "credential-wide-grant-deadline",
         grantDeadline: {
           offerState: state,
+          offerFailureBanner:
+            state === "unknown"
+              ? "unknown"
+              : state === "known-failure"
+                ? "unclassified"
+                : "not-observed",
           pollAttempts: 80,
           listResponses: 80,
           lastListCount: 0,
@@ -3853,6 +4065,7 @@ describe("grant deadline attribution", () => {
     await expect(fixture.run()).rejects.toThrow("no live native sharing grant");
     expect(snapshot(fixture).grantDeadline).toEqual({
       offerState: "unknown",
+      offerFailureBanner: "unknown",
       pollAttempts: 0,
       listResponses: 0,
       lastListCount: null,
@@ -3883,6 +4096,7 @@ describe("grant deadline attribution", () => {
       milestone: "credential-wide-grant-deadline",
       grantDeadline: {
         offerState: "unknown",
+        offerFailureBanner: "unknown",
         pollAttempts: 0,
         listResponses: 0,
         lastListCount: null,
@@ -3935,6 +4149,7 @@ describe("grant deadline attribution", () => {
       });
       expect(snapshot(fixture).grantDeadline).toEqual({
         offerState: "unknown",
+        offerFailureBanner: "unknown",
         pollAttempts: 1,
         listResponses: 1,
         lastListCount: kind === "oversized" ? null : list.length,
@@ -3964,6 +4179,7 @@ describe("grant deadline attribution", () => {
     let reads = 0;
     const details: Record<string, unknown> = {
       offerState: "unknown",
+      offerFailureBanner: "unknown",
       pollAttempts: 0,
       listResponses: 0,
       lastListCount: null,
@@ -4022,6 +4238,7 @@ describe("grant deadline attribution", () => {
     });
     expect(snapshot(fixture).grantDeadline).toEqual({
       offerState: "unknown",
+      offerFailureBanner: "unknown",
       pollAttempts: null,
       listResponses: null,
       lastListCount: 0,
@@ -4042,6 +4259,7 @@ describe("grant deadline attribution", () => {
         fixture.runCommand.mockImplementation(async () => {
           const details: Record<string, unknown> = {
             offerState: "generating",
+            offerFailureBanner: "not-observed",
             pollAttempts: 2,
             listResponses: 2,
             lastListCount: 0,
@@ -4072,6 +4290,7 @@ describe("grant deadline attribution", () => {
                 milestone: "credential-wide-grant-deadline",
                 grantDeadline: {
                   offerState: "generating",
+                  offerFailureBanner: "not-observed",
                   pollAttempts: 2,
                   listResponses: 2,
                   lastListCount: 0,

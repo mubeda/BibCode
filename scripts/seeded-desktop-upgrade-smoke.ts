@@ -73,6 +73,7 @@ function decodeSeededGrantDeadline(value: unknown) {
     if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
     const keys = [
       "offerState",
+      "offerFailureBanner",
       "pollAttempts",
       "listResponses",
       "lastListCount",
@@ -87,6 +88,7 @@ function decodeSeededGrantDeadline(value: unknown) {
         : undefined;
     };
     const offerState = field("offerState");
+    const offerFailureBanner = field("offerFailureBanner");
     const pollAttempts = field("pollAttempts");
     const listResponses = field("listResponses");
     const lastListCount = field("lastListCount");
@@ -97,6 +99,19 @@ function decodeSeededGrantDeadline(value: unknown) {
     if (
       typeof offerState !== "string" ||
       !["generating", "generated", "known-failure", "unknown"].includes(offerState) ||
+      typeof offerFailureBanner !== "string" ||
+      ![
+        "local-confirmed",
+        "active-reason",
+        "cancellation-unconfirmed",
+        "cleanup-failed",
+        "unclassified",
+        "not-observed",
+        "unknown",
+      ].includes(offerFailureBanner) ||
+      (offerState === "known-failure" && offerFailureBanner === "not-observed") ||
+      (["generating", "generated"].includes(offerState) && offerFailureBanner !== "not-observed") ||
+      (offerState === "unknown" && !["unknown", "not-observed"].includes(offerFailureBanner)) ||
       !bounded(pollAttempts, 80) ||
       !bounded(listResponses, 80) ||
       !bounded(lastListCount, 1024) ||
@@ -107,7 +122,14 @@ function decodeSeededGrantDeadline(value: unknown) {
       (listResponses !== 0 && eligibleShapeSeen === null)
     )
       return null;
-    return { offerState, pollAttempts, listResponses, lastListCount, eligibleShapeSeen };
+    return {
+      offerState,
+      offerFailureBanner,
+      pollAttempts,
+      listResponses,
+      lastListCount,
+      eligibleShapeSeen,
+    };
   } catch {
     return null;
   }
@@ -969,6 +991,7 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
           await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(250, deadline - Date.now()))));
         }
         let offerState = "unknown";
+        let offerFailureBanner = "unknown";
         try {
           const candidates = document.querySelectorAll("section");
           const sections = candidates.length > 32 ? [] : [...candidates].filter((section) =>
@@ -980,13 +1003,34 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
             const generating = [...buttons].some((button) =>
               button.disabled && button.textContent?.trim() === "Generating…");
             const generated = Boolean(section.querySelector('svg[role="img"][aria-label="Pairing code — scan with a BiBCode client"]'));
-            const failed = Boolean(section.querySelector(":scope > div > p.text-destructive"));
-            if (Number(generating) + Number(generated) + Number(failed) === 1)
+            const failureBanners = section.querySelectorAll(":scope > div > p.text-destructive");
+            const failed = failureBanners.length > 0;
+            const states = Number(generating) + Number(generated) + Number(failed);
+            if (states === 1) {
               offerState = generating ? "generating" : generated ? "generated" : "known-failure";
+              offerFailureBanner = failed ? "unknown" : "not-observed";
+              if (failed && failureBanners.length === 1) {
+                // Only the source-defined banner's one bounded text node is inspected locally.
+                // This is a banner witness, never a typed cause or raw-text receipt.
+                const nodes = failureBanners[0].childNodes;
+                if (nodes.length === 1 && nodes[0].nodeType === 3) {
+                  const text = nodes[0].data;
+                  if (typeof text === "string" && text.length > 0 && text.length <= 512) {
+                    const banners = [
+                      ["The offer was not created. Remote access is confirmed local-only.", "local-confirmed"],
+                      ["The offer was not created. Remote access remains enabled because another live access reason still requires it.", "active-reason"],
+                      ["The offer result could not be canceled or confirmed. Remote access was deliberately left unchanged because a live credential may exist.", "cancellation-unconfirmed"],
+                      ["The offer was canceled, but remote-access cleanup could not be verified. Review Exposure and retry cleanup.", "cleanup-failed"],
+                    ];
+                    offerFailureBanner = banners.find((entry) => entry[0] === text)?.[1] ?? "unclassified";
+                  }
+                }
+              }
+            } else if (states === 0) offerFailureBanner = "not-observed";
           }
-        } catch { /* Unavailable or changed DOM stays unknown; no error text is inspected. */ }
+        } catch { /* Unavailable or changed DOM stays unknown; no text leaves this callback. */ }
         return { ...refuse("grant-deadline"), grantDeadline: {
-          offerState, pollAttempts, listResponses, lastListCount, eligibleShapeSeen,
+          offerState, offerFailureBanner, pollAttempts, listResponses, lastListCount, eligibleShapeSeen,
         } };
       }
       return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: bootstrap.bootstrapToken };

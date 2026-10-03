@@ -77,8 +77,18 @@ change, retry or deadline extension.
 Only the existing wide grant-deadline refusal may add `grantDeadline` facts.
 `offerState` is generating, generated, known-failure or unknown, derived from
 the current Offer generator's fixed control/QR/error-banner markup without
-reading offer values or error content. Missing, ambiguous, changed or oversized
-DOM stays unknown. Poll attempts and valid list responses are bounded to 80;
+reading offer values. `offerFailureBanner` observes only the four exact
+source-defined mint-cleanup banners: local-confirmed, active-reason,
+cancellation-unconfirmed or cleanup-failed. It is a local banner witness, not
+an authoritative failure kind, HTTP status or cleanup result. One direct text
+node of 1–512 characters is compared locally; no text, input, offer value or
+error detail leaves the callback. A different bounded banner is unclassified;
+no banner in an unambiguous section is not-observed. Unavailable, conflicting,
+nested, multiple or oversized banner observations stay unknown. Generating or
+generated state requires not-observed; known-failure cannot be not-observed;
+unknown state admits only unknown or not-observed. Missing, ambiguous, changed
+or oversized section/control DOM stays unknown. Poll attempts and valid list
+responses are bounded to 80;
 the last list length is bounded to 1,024. Exceeded counts become null. The
 eligible-shape flag comes from the existing grant match, including a match that
 arrived after the deadline; with no list response it stays null rather than
