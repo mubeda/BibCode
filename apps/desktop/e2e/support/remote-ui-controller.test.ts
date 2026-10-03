@@ -14,6 +14,7 @@ import {
   remoteUiThemes,
   screenshotName,
   projectRemoteUiSetupObservation,
+  projectRemoteUiCheckAgainObservation,
 } from "./remote-ui-evidence.ts";
 
 const controller = NodeFS.readFileSync(
@@ -655,15 +656,7 @@ it.each([
 ])(
   "keeps setup error data inside the page and returns only a closed category %#",
   (message, category) => {
-    const start = controller.indexOf(
-      "browser.execute(() => {",
-      controller.indexOf("} catch (error) {", controller.indexOf('phase("complete")')),
-    );
-    const tail = controller.slice(start);
-    const end = tail.search(/\n\s*\}\),\n\s*2_000,/);
-    expect(start).toBeGreaterThan(0);
-    expect(end).toBeGreaterThan(0);
-    const callback = tail.slice("browser.execute(".length, end) + "\n}";
+    const callback = failureObservationCallbackSource();
     class Button {
       disabled = false;
     }
@@ -721,15 +714,7 @@ it.each([
   ["private-path https://private-host private-credential", "unknown"],
   ["x".repeat(300), "unknown"],
 ])("observes only a finite import error and busy flag %#", (message, category) => {
-  const start = controller.indexOf(
-    "browser.execute(() => {",
-    controller.indexOf("} catch (error) {", controller.indexOf('phase("complete")')),
-  );
-  const tail = controller.slice(start);
-  const end = tail.search(/\n\s*\}\),\n\s*2_000,/);
-  expect(start).toBeGreaterThan(0);
-  expect(end).toBeGreaterThan(0);
-  const callback = tail.slice("browser.execute(".length, end) + "\n}";
+  const callback = failureObservationCallbackSource();
   let present = true;
   let busy = false;
   const input = {
@@ -830,6 +815,7 @@ it.each(["unavailable", "no-browser", "write-failure", "manual-assertion"])(
           throw new Error("Unavailable must not be projected.");
         },
         projectRemoteUiSetupObservation,
+        projectRemoteUiCheckAgainObservation,
         classifyQualificationFailure: () => ({ kind: "timeout" }),
         owner: {
           processes: [],
@@ -1266,3 +1252,349 @@ it("executes the actual read-only capture callback with real modal/toast distinc
   boot = true;
   expect(read(input).bootShellAbsent).toBe(false);
 });
+
+it.each(["displayed", "clickable", "click", "row"])(
+  "identifies the exact Check again failed operation without another action: %s",
+  async (failed) => {
+    const start = controller.indexOf('  phase("failure-check-again");');
+    const end = controller.indexOf('  await capture("dismissed"', start);
+    const helperStart = controller.indexOf("const click = async");
+    const helperEnd = controller.indexOf("const text = async", helperStart);
+    const calls: string[] = [],
+      phases: string[] = [];
+    const failure = new Error("inert private selector/error/interceptor");
+    const operation = async (name: string, args: unknown[]) => {
+      expect(args).toEqual([]);
+      calls.push(name);
+      if (name === failed) throw failure;
+    };
+    const target = {
+      waitForDisplayed: (...args: unknown[]) => operation("displayed", args),
+      waitForClickable: (...args: unknown[]) => operation("clickable", args),
+      click: (...args: unknown[]) => operation("click", args),
+    };
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        controller.slice(helperStart, helperEnd) +
+          "async function run() {" +
+          controller.slice(start, end) +
+          "}\nrun",
+      ),
+      {
+        phase: (value: string) => phases.push(value),
+        host: { label: "QA Failure light" },
+        row: () => "owned-row",
+        element: (selector: string) => {
+          expect(selector).toBe(
+            'owned-row//button[normalize-space()="Check again" or normalize-space()="Check"]',
+          );
+          return target;
+        },
+        text: async (selector: string, expected: string, ...args: unknown[]) => {
+          expect(selector).toBe("owned-row");
+          expect(expected).toBe("Update to v9.9.1…");
+          await operation("row", args);
+        },
+      },
+    );
+    await expect(run()).rejects.toBe(failure);
+    expect(phases.at(-1)).toBe(`failure-check-again-${failed}`);
+    expect(calls).toEqual(
+      ["displayed", "clickable", "click", "row"].slice(
+        0,
+        ["displayed", "clickable", "click", "row"].indexOf(failed) + 1,
+      ),
+    );
+  },
+);
+
+function failureObservationCallbackSource() {
+  const start = controller.indexOf(
+    "browser.execute(",
+    controller.indexOf("} catch (error) {", controller.indexOf('phase("complete")')),
+  );
+  const tail = controller.slice(start);
+  const end = tail.search(/\n\s*\},\n\s*\{\n\s*checkAgain:/);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(0);
+  return tail.slice("browser.execute(".length, end) + "\n}";
+}
+
+it.each(["light", "dark"])(
+  "keeps the actual %s failure-row producer closed and scoped",
+  (theme) => {
+    for (const mode of [
+      "ready",
+      "toast",
+      "dialog",
+      "other",
+      "none",
+      "offscreen",
+      "hidden",
+      "disabled",
+      "checking",
+      "missing-control",
+      "multiple-controls",
+      "unknown-badge",
+      "private-label",
+      "missing-row",
+      "multiple-rows",
+      "wrong-origin",
+      "wrong-route",
+      "search",
+      "hash",
+      "wrong-theme",
+      "inactive",
+    ]) {
+      class Button {
+        readonly textContent: string;
+        constructor(textContent: string) {
+          this.textContent = textContent;
+        }
+        disabled = mode === "disabled";
+        get value() {
+          throw new Error("Input values must not be read.");
+        }
+        getClientRects() {
+          return mode === "hidden" ? [] : [{}];
+        }
+        getBoundingClientRect() {
+          return { left: mode === "offscreen" ? -100 : 10, top: 10, width: 20, height: 20 };
+        }
+        contains(node: unknown) {
+          return node === this;
+        }
+      }
+      const control = new Button(
+        mode === "checking"
+          ? "Checking…"
+          : mode === "private-label"
+            ? "private-credential".repeat(8)
+            : "Check",
+      );
+      const update = new Button("Update to v9.9.1…");
+      const buttons =
+        mode === "missing-control"
+          ? [update]
+          : mode === "multiple-controls"
+            ? [control, new Button("Check again"), update]
+            : [control, update];
+      const row = {
+        querySelectorAll: () => buttons,
+        querySelector: () => ({
+          getAttribute: () =>
+            mode === "unknown-badge" ? "private-credential /private/path" : "update-available",
+        }),
+      };
+      const heading = {
+        textContent: `QA Failure ${theme}`,
+        parentElement: { parentElement: { parentElement: row } },
+      };
+      let rowReads = 0;
+      const read = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes("(" + failureObservationCallbackSource() + ")"),
+        {
+          window: { innerWidth: 1280, innerHeight: 960 },
+          HTMLButtonElement: Button,
+          getComputedStyle: () => ({ visibility: "visible", display: "block" }),
+          location: {
+            origin: mode === "wrong-origin" ? "http://private-host" : "http://localhost:4901",
+            pathname: mode === "wrong-route" ? "/private-path" : "/settings/remote-servers",
+            search: mode === "search" ? "?private-credential" : "",
+            hash: mode === "hash" ? "#private-credential" : "",
+            get href() {
+              throw new Error("No arbitrary URL reads.");
+            },
+          },
+          document: {
+            readyState: "complete",
+            getElementById: () => null,
+            querySelector: () => null,
+            querySelectorAll: () => {
+              rowReads++;
+              return mode === "missing-row"
+                ? []
+                : mode === "multiple-rows"
+                  ? [heading, heading]
+                  : [heading];
+            },
+            elementFromPoint: () =>
+              ["ready", "disabled", "checking", "unknown-badge"].includes(mode)
+                ? control
+                : mode === "none"
+                  ? null
+                  : {
+                      get textContent() {
+                        throw new Error("No interceptor text reads.");
+                      },
+                      closest: (selector: string) =>
+                        (mode === "toast" && selector.includes("toast")) ||
+                        (mode === "dialog" && selector.includes("dialog"))
+                          ? {}
+                          : null,
+                    },
+          },
+        },
+      );
+      const result = read({
+        checkAgain: mode !== "inactive",
+        theme: mode === "wrong-theme" ? "private-credential" : theme,
+      });
+      const projected = projectRemoteUiCheckAgainObservation(result.checkAgain);
+      if (mode === "inactive") {
+        expect(projected).toBeNull();
+        expect(rowReads).toBe(0);
+      } else if (["wrong-origin", "wrong-route", "search", "hash", "wrong-theme"].includes(mode)) {
+        expect(projected?.safeLocation).toBe(false);
+        expect(rowReads).toBe(0);
+        expect(Object.values(projected!).slice(1)).toEqual(Array(9).fill(null));
+      } else {
+        expect(projected?.safeLocation).toBe(true);
+        expect(rowReads).toBe(1);
+        expect(projected?.rowCount).toBe(
+          mode === "missing-row" ? "none" : mode === "multiple-rows" ? "multiple" : "one",
+        );
+        if (["ready", "toast", "dialog", "other", "none", "offscreen"].includes(mode)) {
+          expect(projected?.hitTarget).toBe(
+            mode === "ready" ? "target" : mode === "offscreen" ? "outside-viewport" : mode,
+          );
+          expect(projected?.controlLabel).toBe("check");
+          expect(projected?.updateActionPresent).toBe(true);
+        }
+        if (mode === "hidden")
+          expect(projected).toMatchObject({ controlVisible: false, hitTarget: null });
+        if (mode === "disabled") expect(projected?.controlDisabled).toBe(true);
+        if (mode === "checking") expect(projected?.controlLabel).toBe("checking");
+        if (mode === "unknown-badge") expect(result.checkAgain.badgeVariant).toBeNull();
+        if (mode === "private-label" || mode === "missing-control")
+          expect(projected).toMatchObject({ controlCount: "none", controlLabel: null });
+        if (mode === "multiple-controls")
+          expect(projected).toMatchObject({
+            controlCount: "multiple",
+            controlLabel: null,
+            controlVisible: null,
+            controlDisabled: null,
+            hitTarget: null,
+          });
+      }
+      expect(JSON.stringify(result.checkAgain)).not.toMatch(
+        /private-|https?:|selector|interceptor/,
+      );
+      expect(JSON.stringify(projected)).not.toMatch(/private-|https?:|selector|interceptor/);
+    }
+  },
+);
+
+it.each([
+  "own",
+  "inherited",
+  "accessor",
+  "throwing-accessor",
+  "nonenumerable",
+  "throwing-descriptor",
+])(
+  "keeps refused descriptor evidence local at the actual failure/cleanup seam: %s",
+  async (kind) => {
+    const known = {
+      safeLocation: true,
+      rowCount: "one",
+      controlCount: "one",
+      controlLabel: "check",
+      controlVisible: true,
+      controlDisabled: false,
+      hitTarget: "target",
+      updateActionPresent: true,
+      badgeVariant: "update-available",
+      dismissPresent: false,
+    };
+    let reads = 0,
+      samples = 0,
+      joined = false;
+    let payload: object = kind === "inherited" ? Object.create(known) : { ...known };
+    if (kind === "accessor" || kind === "throwing-accessor")
+      Object.defineProperty(payload, "controlLabel", {
+        enumerable: true,
+        get() {
+          reads++;
+          if (kind === "throwing-accessor") throw new Error("private accessor/error");
+          return "check";
+        },
+      });
+    if (kind === "nonenumerable")
+      Object.defineProperty(payload, "controlLabel", { enumerable: false, value: "check" });
+    if (kind === "throwing-descriptor")
+      payload = new Proxy(payload, {
+        getOwnPropertyDescriptor() {
+          throw new Error("private descriptor/error");
+        },
+      });
+    const start = controller.indexOf("} catch (error) {", controller.indexOf('phase("complete")'));
+    const end = controller.indexOf("\nprocess.exitCode", start);
+    const failure = new Error("private intercepted selector/error");
+    const writes = new Map<string, Record<string, unknown>>();
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function fail(){ try { throw original; " + controller.slice(start, end) + "}\nfail",
+      ),
+      {
+        original: failure,
+        BrowserConnectivityFailure: class extends Error {},
+        networkProofs: [],
+        currentPhase: "failure-check-again-click",
+        currentTheme: "light",
+        success: false,
+        browser: {
+          execute: async (_read: unknown, input: unknown) => {
+            samples++;
+            expect(input).toEqual({ checkAgain: true, theme: "light" });
+            return { startup: {}, setup: null, checkAgain: payload };
+          },
+          deleteSession: async () => {
+            joined = true;
+          },
+        },
+        bounded: (promise: Promise<unknown>, timeout: number) => {
+          expect(timeout).toBe(2_000);
+          return promise;
+        },
+        projectBrowserStartupObservation: () => ({ errors: 0 }),
+        projectRemoteUiSetupObservation,
+        projectRemoteUiCheckAgainObservation,
+        classifyQualificationFailure: (error: unknown) => {
+          expect(error).toBe(failure);
+          return { kind: "click-intercepted" };
+        },
+        readManualAssertionCode: () => null,
+        owner: {
+          processes: [],
+          failures: [],
+          childrenClosed: () => joined,
+          close: async (resources: { browser?: () => Promise<void> }) => {
+            await resources.browser?.();
+          },
+        },
+        tunnels: [],
+        plan: remoteUiPlan("core"),
+        captures: [],
+        assertions: [],
+        bundleVersion: "0.7.2",
+        process: { env: {} },
+        write: (name: string, value: Record<string, unknown>) => writes.set(name, value),
+      },
+    );
+    await run();
+    expect(samples).toBe(1);
+    expect(reads).toBe(0);
+    expect(joined).toBe(true);
+    const observed = writes.get("failure")!;
+    expect(observed.phase).toBe("failure-check-again-click");
+    expect(observed.failure).toEqual({ kind: "click-intercepted" });
+    expect(observed.startup).toEqual({ errors: 0 });
+    if (kind === "own") expect(observed.checkAgain).toEqual(known);
+    else if (kind === "inherited")
+      expect(Object.values(observed.checkAgain as object)).toEqual(Array(10).fill(null));
+    else expect(observed.checkAgain).toBeNull();
+    expect(JSON.stringify(Array.from(writes.values()))).not.toContain("private");
+    expect(writes.get("result")?.childProcessesClosed).toBe(true);
+  },
+);

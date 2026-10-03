@@ -593,6 +593,20 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   target or change the fixture's status to preserve the pre-restart dialog title.
   Separate Retry, reconfirmation, Cancel, request-count and removal phases locate
   failures without retaining page text or weakening the existing action bounds.
+  The final failure-flow Check/Check again boundary separately records its
+  displayed wait, clickability wait, click and row-state wait. A failure there
+  adds one guarded row sample to the existing two-second failure observation:
+  fixed row/control count and label categories, visibility/disabled flags,
+  known update badge, expected version-action and Dismiss presence, and a finite
+  center-point hit category. It requires the fixed QA origin, exact Remote
+  Servers route, empty query/fragment and a light/dark fixture name before row
+  inspection. Unknown, unsafe, missing or ambiguous scope remains unavailable.
+  Decode only own enumerable data facts; refuse recognized accessors/nonenumerable
+  descriptors or reflection failures locally, and leave inherited facts unknown.
+  No text, input, path, URL, credential, selector, coordinate or raw interceptor
+  leaves the page. These are current post-failure facts, not proof of the earlier
+  native click's blocker. Preserve the one public action, owner and every
+  existing wait, request-count, version and draft assertion.
   Reload diagnostics similarly identify workspace/primary selection, composer
   readiness, the same-version connection transition, changed-version offer and
   actual replacement document. They add only fixed phase markers: preserve all

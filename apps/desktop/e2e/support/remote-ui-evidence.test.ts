@@ -9,6 +9,7 @@ import {
   inspectScreenshot,
   remoteUiPlan,
   projectRemoteUiSetupObservation,
+  projectRemoteUiCheckAgainObservation,
 } from "./remote-ui-evidence.ts";
 
 it("projects only closed setup facts and preserves unknown versus absent observations", () => {
@@ -192,3 +193,137 @@ it.each([1, 2, 3, 4])(
     }
   },
 );
+
+it("decodes only closed Check again row fields and quarantines unsafe or ambiguous scope", () => {
+  for (const input of [undefined, null, [], "private-credential"])
+    expect(projectRemoteUiCheckAgainObservation(input)).toBeNull();
+  const known = {
+    safeLocation: true,
+    rowCount: "one",
+    controlCount: "one",
+    controlLabel: "check-again",
+    controlVisible: true,
+    controlDisabled: false,
+    hitTarget: "toast",
+    updateActionPresent: false,
+    badgeVariant: "error",
+    dismissPresent: false,
+  };
+  expect(projectRemoteUiCheckAgainObservation(known)).toEqual(known);
+  expect(
+    projectRemoteUiCheckAgainObservation({
+      ...known,
+      safeLocation: false,
+      extra: "private-credential",
+    }),
+  ).toEqual({
+    ...Object.fromEntries(Object.keys(known).map((key) => [key, null])),
+    safeLocation: false,
+  });
+  for (const field of Object.keys(known)) {
+    const output = projectRemoteUiCheckAgainObservation({
+      ...known,
+      [field]: "private-credential /private/path http://private-host",
+      rawText: "private-credential",
+      input: "private-credential",
+    });
+    expect(JSON.stringify(output)).not.toContain("private-");
+    expect(Object.keys(output!)).toEqual(Object.keys(known));
+    expect(output![field as keyof typeof output]).toBeNull();
+  }
+  for (const value of ["none", "multiple", null, "private-credential"]) {
+    const output = projectRemoteUiCheckAgainObservation({ ...known, rowCount: value });
+    expect(Object.values(output!).slice(2)).toEqual(Array(8).fill(null));
+  }
+});
+
+it.each(["accessor", "throwing-accessor", "nonenumerable", "inherited"])(
+  "admits only own enumerable data facts in the actual projection: %s",
+  (kind) => {
+    const known = {
+      safeLocation: true,
+      rowCount: "one",
+      controlCount: "one",
+      controlLabel: "check-again",
+      controlVisible: true,
+      controlDisabled: false,
+      hitTarget: "toast",
+      updateActionPresent: false,
+      badgeVariant: "error",
+      dismissPresent: false,
+    };
+    for (const field of Object.keys(known) as Array<keyof typeof known>) {
+      let reads = 0;
+      const input = Object.assign(
+        kind === "inherited" ? Object.create({ [field]: known[field] }) : {},
+        known,
+      );
+      delete input[field];
+      if (kind !== "inherited")
+        Object.defineProperty(
+          input,
+          field,
+          kind === "nonenumerable"
+            ? {
+                enumerable: false,
+                value: known[field],
+              }
+            : {
+                enumerable: true,
+                get() {
+                  reads++;
+                  if (kind === "throwing-accessor") throw new Error("private getter/error");
+                  return known[field];
+                },
+              },
+        );
+      let output: ReturnType<typeof projectRemoteUiCheckAgainObservation>;
+      expect(() => {
+        output = projectRemoteUiCheckAgainObservation(input);
+      }).not.toThrow();
+      if (kind === "inherited") expect(output![field]).toBeNull();
+      else expect(output!).toBeNull();
+      expect(reads).toBe(0);
+    }
+  },
+);
+
+it("locally refuses descriptor inspection failures and keeps unknown accessors unread", () => {
+  const known = {
+    safeLocation: true,
+    rowCount: "one",
+    controlCount: "one",
+    controlLabel: "check",
+    controlVisible: true,
+    controlDisabled: false,
+    hitTarget: "target",
+    updateActionPresent: true,
+    badgeVariant: "update-available",
+    dismissPresent: false,
+  };
+  const revoked = Proxy.revocable(known, {});
+  revoked.revoke();
+  const throwing = new Proxy(known, {
+    getOwnPropertyDescriptor() {
+      throw new Error("private descriptor/error");
+    },
+  });
+  for (const input of [throwing, revoked.proxy]) {
+    let output: ReturnType<typeof projectRemoteUiCheckAgainObservation>;
+    expect(() => {
+      output = projectRemoteUiCheckAgainObservation(input);
+    }).not.toThrow();
+    expect(output!).toBeNull();
+  }
+  const allowed = Object.assign(Object.create(null), known);
+  Object.defineProperty(allowed, "privateRawText", {
+    enumerable: true,
+    get() {
+      throw new Error("Unknown keys must not be read.");
+    },
+  });
+  expect(projectRemoteUiCheckAgainObservation(allowed)).toEqual(known);
+  expect(Object.values(projectRemoteUiCheckAgainObservation(Object.create(known))!)).toEqual(
+    Array(10).fill(null),
+  );
+});

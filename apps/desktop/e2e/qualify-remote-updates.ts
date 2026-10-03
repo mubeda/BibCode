@@ -36,6 +36,7 @@ import {
   inspectScreenshot,
   countInstallRequests,
   projectRemoteUiSetupObservation,
+  projectRemoteUiCheckAgainObservation,
   type RemoteUiTheme,
   type RemoteUiScene,
 } from "./support/remote-ui-evidence.ts";
@@ -128,10 +129,16 @@ const element = (selector: string) => {
   const scopedText = /^(.*) (button=[^\n]+)$/.exec(selector);
   return scopedText ? required().$(scopedText[1]!).$(scopedText[2]!) : required().$(selector);
 };
-const click = async (selector: string) => {
+const click = async (
+  selector: string,
+  observe?: (operation: "displayed" | "clickable" | "click") => void,
+) => {
   const target = element(selector);
+  observe?.("displayed");
   await target.waitForDisplayed();
+  observe?.("clickable");
   await target.waitForClickable();
+  observe?.("click");
   await target.click();
 };
 const text = async (selector: string, expected: string, timeout = 30_000) => {
@@ -817,7 +824,13 @@ async function failureFlow() {
   phase("failure-check-again");
   await click(
     `${row(host.label)}//button[normalize-space()="Check again" or normalize-space()="Check"]`,
+    (operation) => {
+      if (operation === "displayed") phase("failure-check-again-displayed");
+      else if (operation === "clickable") phase("failure-check-again-clickable");
+      else phase("failure-check-again-click");
+    },
   );
+  phase("failure-check-again-row");
   await text(row(host.label), "Update to v9.9.1…");
   await capture("dismissed", host, row(host.label), "Update to v9.9.1…");
   await workspace();
@@ -1388,85 +1401,198 @@ try {
   if (error instanceof BrowserConnectivityFailure) networkProofs.push(error.proof);
   let startup: unknown = null;
   let setup: ReturnType<typeof projectRemoteUiSetupObservation> = null;
+  let checkAgain: ReturnType<typeof projectRemoteUiCheckAgainObservation> = null;
   if (browser) {
     try {
       const observed = await bounded(
-        browser.execute(() => {
-          const observer = Reflect.get(window, "__browserStartupObservation") as
-            | { read?: () => unknown }
-            | undefined;
-          const token = document.getElementById("pairing-token");
-          const form = token?.closest("form");
-          const submit = form?.querySelector('button[type="submit"]');
-          const error = form?.querySelector(".text-destructive");
-          // Compare one bounded error surface locally; no text or input value leaves the page.
-          const content = error?.textContent ?? "";
-          const message = content.length <= 256 ? content.trim() : null;
-          const pairingError = !form
-            ? null
-            : !error
-              ? "none"
-              : message === "Enter a pairing token to continue."
-                ? "credential-required"
-                : message === "Invalid pairing token. Check the token and try again."
-                  ? "credential-rejected"
-                  : message === "Timed out waiting for authenticated session after bootstrap."
-                    ? "session-timeout"
-                    : message !== null &&
-                        /^Primary environment request failed during (exchange-bootstrap-credential|fetch-session-state|fetch-environment-descriptor) \(HTTP [1-5]\d{2}\)\.$/.test(
-                          message,
-                        )
-                      ? "request-failed"
-                      : "unknown";
-          const importPath = document.getElementById("add-project-host-path");
-          const importForm = importPath?.closest("form");
-          const importAlert = importForm?.querySelector('[role="alert"]');
-          const importContent = importAlert?.textContent ?? "";
-          const importMessage = importContent.length <= 256 ? importContent.trim() : null;
-          const importError = !importForm
-            ? null
-            : !importAlert
-              ? "none"
-              : importMessage === "Enter a project path."
-                ? "path-required"
-                : importMessage === "Host platform information is still loading."
-                  ? "host-loading"
-                  : importMessage === "Windows-style paths are only supported on Windows."
-                    ? "unsupported-windows"
-                    : importMessage === "Enter an absolute or home-relative path."
-                      ? "path-relative"
-                      : "unknown";
-          return {
-            startup: observer?.read?.() ?? null,
-            setup: {
-              route:
-                location.pathname === "/pair"
-                  ? "pair"
-                  : location.pathname === "/settings" || location.pathname.startsWith("/settings/")
-                    ? "settings"
-                    : "other",
-              readyState: document.readyState,
-              tokenPresent: token !== null,
-              submitPresent: submit != null,
-              submitDisabled: submit instanceof HTMLButtonElement ? submit.disabled : null,
-              sidebarPresent:
-                document.querySelector('[data-testid="sidebar-add-project-trigger"]') !== null,
-              importPathPresent: importPath !== null,
-              importBusy: importPath?.hasAttribute("disabled") ?? null,
-              importError,
-              themeControlPresent:
-                document.querySelector('[aria-label="Theme preference"]') !== null,
-              pairingPendingPresent:
-                document.querySelector("h1")?.textContent?.trim() ===
-                "Pairing with this environment",
-              pairingError,
-            },
-          };
-        }),
+        browser.execute(
+          (input?: { checkAgain: boolean; theme: string }) => {
+            const observer = Reflect.get(window, "__browserStartupObservation") as
+              | { read?: () => unknown }
+              | undefined;
+            const token = document.getElementById("pairing-token");
+            const form = token?.closest("form");
+            const submit = form?.querySelector('button[type="submit"]');
+            const error = form?.querySelector(".text-destructive");
+            // Compare one bounded error surface locally; no text or input value leaves the page.
+            const content = error?.textContent ?? "";
+            const message = content.length <= 256 ? content.trim() : null;
+            const pairingError = !form
+              ? null
+              : !error
+                ? "none"
+                : message === "Enter a pairing token to continue."
+                  ? "credential-required"
+                  : message === "Invalid pairing token. Check the token and try again."
+                    ? "credential-rejected"
+                    : message === "Timed out waiting for authenticated session after bootstrap."
+                      ? "session-timeout"
+                      : message !== null &&
+                          /^Primary environment request failed during (exchange-bootstrap-credential|fetch-session-state|fetch-environment-descriptor) \(HTTP [1-5]\d{2}\)\.$/.test(
+                            message,
+                          )
+                        ? "request-failed"
+                        : "unknown";
+            const importPath = document.getElementById("add-project-host-path");
+            const importForm = importPath?.closest("form");
+            const importAlert = importForm?.querySelector('[role="alert"]');
+            const importContent = importAlert?.textContent ?? "";
+            const importMessage = importContent.length <= 256 ? importContent.trim() : null;
+            const importError = !importForm
+              ? null
+              : !importAlert
+                ? "none"
+                : importMessage === "Enter a project path."
+                  ? "path-required"
+                  : importMessage === "Host platform information is still loading."
+                    ? "host-loading"
+                    : importMessage === "Windows-style paths are only supported on Windows."
+                      ? "unsupported-windows"
+                      : importMessage === "Enter an absolute or home-relative path."
+                        ? "path-relative"
+                        : "unknown";
+            // One failure-only sample. No page values, selectors or hit-test details leave it.
+            const readCheckAgain = () => {
+              if (input?.checkAgain !== true) return null;
+              const safeLocation =
+                (input.theme === "light" || input.theme === "dark") &&
+                location.origin === "http://localhost:4901" &&
+                location.pathname === "/settings/remote-servers" &&
+                location.search === "" &&
+                location.hash === "";
+              if (!safeLocation) return { safeLocation: false };
+              const count = (size: number) =>
+                size === 0 ? "none" : size === 1 ? "one" : "multiple";
+              const headings = Array.from(document.querySelectorAll("h3")).filter((heading) => {
+                const content = heading.textContent ?? "";
+                return content.length <= 64 && content.trim() === `QA Failure ${input.theme}`;
+              });
+              const rowCount = count(headings.length);
+              if (headings.length !== 1) return { safeLocation, rowCount };
+              const targetRow = headings[0]?.parentElement?.parentElement?.parentElement;
+              if (!targetRow) return { safeLocation, rowCount: "none" };
+              const buttons = Array.from(targetRow.querySelectorAll("button"));
+              const label = (button: Element) => {
+                const content = button.textContent ?? "";
+                return content.length <= 32 ? content.trim() : null;
+              };
+              const controls = buttons.filter((button) =>
+                ["Check", "Check again", "Checking…"].includes(label(button) ?? ""),
+              );
+              const control = controls.length === 1 ? controls[0]! : null;
+              const visible =
+                control === null
+                  ? null
+                  : control.getClientRects().length > 0 &&
+                    getComputedStyle(control).visibility !== "hidden" &&
+                    getComputedStyle(control).display !== "none";
+              let hitTarget: string | null = null;
+              if (control !== null && visible && typeof document.elementFromPoint === "function") {
+                const rect = control.getBoundingClientRect();
+                const x = rect.left + rect.width / 2,
+                  y = rect.top + rect.height / 2;
+                if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) {
+                  hitTarget = "outside-viewport";
+                } else {
+                  const hit = document.elementFromPoint(x, y);
+                  hitTarget =
+                    hit === null
+                      ? "none"
+                      : control === hit || control.contains(hit)
+                        ? "target"
+                        : hit.closest('[data-slot="toast-viewport"]')
+                          ? "toast"
+                          : hit.closest(
+                                '[data-slot="dialog-popup"], [data-slot="dialog-backdrop"], [data-slot="alert-dialog-popup"], [data-slot="alert-dialog-backdrop"]',
+                              )
+                            ? "dialog"
+                            : "other";
+                }
+              }
+              const controlLabel = control === null ? null : label(control);
+              const badge =
+                targetRow.querySelector("[data-variant]")?.getAttribute("data-variant") ?? null;
+              return {
+                safeLocation,
+                rowCount,
+                controlCount: count(controls.length),
+                controlLabel:
+                  controlLabel === "Check"
+                    ? "check"
+                    : controlLabel === "Check again"
+                      ? "check-again"
+                      : controlLabel === "Checking…"
+                        ? "checking"
+                        : null,
+                controlVisible: visible,
+                controlDisabled: control instanceof HTMLButtonElement ? control.disabled : null,
+                hitTarget,
+                updateActionPresent: buttons.some(
+                  (button) => label(button) === "Update to v9.9.1…",
+                ),
+                badgeVariant:
+                  badge !== null &&
+                  [
+                    "checking",
+                    "not-checked",
+                    "unreachable",
+                    "check-failed",
+                    "up-to-date",
+                    "update-available",
+                    "busy",
+                    "manual",
+                    "error",
+                  ].includes(badge)
+                    ? badge
+                    : null,
+                dismissPresent: buttons.some((button) => label(button) === "Dismiss"),
+              };
+            };
+            return {
+              startup: observer?.read?.() ?? null,
+              checkAgain: readCheckAgain(),
+              setup: {
+                route:
+                  location.pathname === "/pair"
+                    ? "pair"
+                    : location.pathname === "/settings" ||
+                        location.pathname.startsWith("/settings/")
+                      ? "settings"
+                      : "other",
+                readyState: document.readyState,
+                tokenPresent: token !== null,
+                submitPresent: submit != null,
+                submitDisabled: submit instanceof HTMLButtonElement ? submit.disabled : null,
+                sidebarPresent:
+                  document.querySelector('[data-testid="sidebar-add-project-trigger"]') !== null,
+                importPathPresent: importPath !== null,
+                importBusy: importPath?.hasAttribute("disabled") ?? null,
+                importError,
+                themeControlPresent:
+                  document.querySelector('[aria-label="Theme preference"]') !== null,
+                pairingPendingPresent:
+                  document.querySelector("h1")?.textContent?.trim() ===
+                  "Pairing with this environment",
+                pairingError,
+              },
+            };
+          },
+          {
+            checkAgain: [
+              "failure-check-again",
+              "failure-check-again-displayed",
+              "failure-check-again-clickable",
+              "failure-check-again-click",
+              "failure-check-again-row",
+            ].includes(currentPhase),
+            theme: currentTheme,
+          },
+        ),
         2_000,
       );
       startup = projectBrowserStartupObservation(observed.startup);
       setup = projectRemoteUiSetupObservation(observed.setup);
+      checkAgain = projectRemoteUiCheckAgainObservation(observed.checkAgain);
     } catch {
       /* Closed unavailable evidence; no fallback app state. */
     }
@@ -1478,6 +1604,7 @@ try {
     manualAssertionCode: readManualAssertionCode(error),
     startup,
     setup,
+    checkAgain,
   });
 } finally {
   const beforeCleanup = owner.processes.map(({ child, role, log, spawnFailure }) =>

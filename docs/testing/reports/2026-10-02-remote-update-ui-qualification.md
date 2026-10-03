@@ -210,3 +210,39 @@ become a single unknown category. No input value, error text, URL or credential
 leaves the browser. Actual callback and projection tests include private strings,
 oversized messages, busy/idle and missing forms. This is diagnosis only: startup
 ordering, importer actions, deadlines, permissions and cleanup remain unchanged.
+
+Full trial `37125389515`, attempt 2, at `b6ddf8b9` retained fourteen original
+light PNGs and failed at `failure-check-again`. The downloaded closed failure
+receipt says **click-intercepted**; the initial dispatch's observation-timeout
+label was incorrect and is superseded by that receipt. Setup is a completed
+Settings route with no import/pairing fields, and startup records zero JavaScript,
+rejection and resource errors. Joined cleanup records no failure and closed
+children. These facts do not identify the exact click-helper operation or blocker.
+
+The actual controller/pinned clickability replay and mounted Settings row tests
+pass their existing readiness, failed-run Dismiss, Check-again and check/status
+callbacks. They do not reproduce native interception. Source-only hypotheses
+about transient overlap, control replacement or status ordering therefore remain
+unproved; no UI remedy, click resend, timeout expansion or new scenario is added.
+
+Four literal operation markers now separate the final displayed wait,
+clickability wait, click command and expected row-state wait. A location-guarded
+sample of that fixed fixture row shares the existing two-second failure observation
+and exports only strict enums/booleans. Count/label, enabled/visible, known badge,
+expected version-action/Dismiss and center-hit categories distinguish the current
+public row after failure without returning selectors, raw text, coordinates,
+inputs, URLs or interceptor details. Unsafe/missing/ambiguous facts stay unknown.
+A current sample cannot prove the state of an earlier click. Original actions,
+request counts, draft/version/ownership checks, owner and all twenty Reload phase
+markers remain unchanged. Root owns independent review and any contained native
+rerun; full matrix acceptance remains pending.
+
+Independent review identified a descriptor-admission P2 in the new Check again
+projection: direct property reads could admit inherited/accessor facts and let a
+throwing getter escape. Actual projection regressions first reproduced those
+cases. The repair snapshots only recognized own enumerable data descriptors,
+never invokes accessors, ignores unknown keys and locally refuses reflection
+failures. Missing/inherited facts retain the existing unknown quarantine. Actual
+failure/cleanup replay preserves the original click-intercepted receipt, one
+sample and joined cleanup when descriptor evidence is refused. No UI action,
+wait, timer, owner, acceptance assertion or native causal conclusion changes.

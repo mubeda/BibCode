@@ -31,6 +31,72 @@ export const remoteUiScenes = [
 ] as const;
 export type RemoteUiScene = (typeof remoteUiScenes)[number];
 
+/** Closed facts from one current row after failure; never proof of the earlier click. */
+export function projectRemoteUiCheckAgainObservation(input: unknown) {
+  if (input === null || typeof input !== "object") return null;
+  const row: Record<string, unknown> = {};
+  try {
+    if (Array.isArray(input)) return null;
+    for (const key of [
+      "safeLocation",
+      "rowCount",
+      "controlCount",
+      "controlLabel",
+      "controlVisible",
+      "controlDisabled",
+      "hitTarget",
+      "updateActionPresent",
+      "badgeVariant",
+      "dismissPresent",
+    ]) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (descriptor === undefined) continue;
+      if (!descriptor.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      row[key] = descriptor.value;
+    }
+  } catch {
+    return null;
+  }
+  const safeLocation = typeof row.safeLocation === "boolean" ? row.safeLocation : null;
+  const source: Record<string, unknown> = safeLocation === true ? row : {};
+  const choice = (key: string, values: readonly string[]) =>
+    typeof source[key] === "string" && values.includes(source[key]) ? source[key] : null;
+  const rowCount = choice("rowCount", ["none", "one", "multiple"]);
+  const fields: Record<string, unknown> = rowCount === "one" ? source : {};
+  const flag = (key: string) => (typeof fields[key] === "boolean" ? fields[key] : null);
+  const enumField = (key: string, values: readonly string[]) =>
+    typeof fields[key] === "string" && values.includes(fields[key]) ? fields[key] : null;
+  const controlCount = enumField("controlCount", ["none", "one", "multiple"]);
+  return {
+    safeLocation,
+    rowCount,
+    controlCount,
+    controlLabel:
+      controlCount === "one"
+        ? enumField("controlLabel", ["check", "check-again", "checking"])
+        : null,
+    controlVisible: controlCount === "one" ? flag("controlVisible") : null,
+    controlDisabled: controlCount === "one" ? flag("controlDisabled") : null,
+    hitTarget:
+      controlCount === "one"
+        ? enumField("hitTarget", ["target", "toast", "dialog", "other", "none", "outside-viewport"])
+        : null,
+    updateActionPresent: flag("updateActionPresent"),
+    badgeVariant: enumField("badgeVariant", [
+      "checking",
+      "not-checked",
+      "unreachable",
+      "check-failed",
+      "up-to-date",
+      "update-available",
+      "busy",
+      "manual",
+      "error",
+    ]),
+    dismissPresent: flag("dismissPresent"),
+  };
+}
+
 /** Closed, presence-only failure facts. Missing/invalid observations stay unavailable. */
 export function projectRemoteUiSetupObservation(input: unknown) {
   if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
