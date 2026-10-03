@@ -74,6 +74,20 @@ Malformed callback results are refused before private credential publication. A
 rejected WebDriver call retains its started checkpoint: its internal stage and
 cause remain unknown. These diagnostics add no authentication attempt, exposure
 change, retry or deadline extension.
+Only the existing wide grant-deadline refusal may add `grantDeadline` facts.
+`offerState` is generating, generated, known-failure or unknown, derived from
+the current Offer generator's fixed control/QR/error-banner markup without
+reading offer values or error content. Missing, ambiguous, changed or oversized
+DOM stays unknown. Poll attempts and valid list responses are bounded to 80;
+the last list length is bounded to 1,024. Exceeded counts become null. The
+eligible-shape flag comes from the existing grant match, including a match that
+arrived after the deadline; with no list response it stays null rather than
+false. These are observations, not an extended acceptance window or mint proof.
+Both the returned callback and private snapshot require exact own data fields,
+known enums and bounded/internally consistent numbers before reconstruction in
+the retained diagnostic. Malformed details produce unknown/invalid step
+evidence and never authorize raw WebDriver/log retention. Success credentials,
+other refusals, requests, polling deadlines and cleanup remain unchanged.
 RPC residue removal requires two consecutive successful observations that the
 desktop process name targeted by the existing CI cleanup plan is absent. Kill
 results alone cannot authorize removal. Each read-only observation must finish

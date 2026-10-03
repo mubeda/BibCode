@@ -67,6 +67,52 @@ const seededStepMilestones = [
 
 const MOCK_UPDATE_READY_TIMEOUT_MS = 60_000;
 
+/** Closed deadline facts only; accessors and foreign fields never become evidence. */
+function decodeSeededGrantDeadline(value: unknown) {
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+    const keys = [
+      "offerState",
+      "pollAttempts",
+      "listResponses",
+      "lastListCount",
+      "eligibleShapeSeen",
+    ];
+    if (Reflect.ownKeys(value).length !== keys.length) return null;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const field = (key: string): unknown => {
+      const descriptor = descriptors[key];
+      return descriptor?.enumerable && Object.hasOwn(descriptor, "value")
+        ? descriptor.value
+        : undefined;
+    };
+    const offerState = field("offerState");
+    const pollAttempts = field("pollAttempts");
+    const listResponses = field("listResponses");
+    const lastListCount = field("lastListCount");
+    const eligibleShapeSeen = field("eligibleShapeSeen");
+    const bounded = (count: unknown, maximum: number): count is number | null =>
+      count === null ||
+      (typeof count === "number" && Number.isSafeInteger(count) && count >= 0 && count <= maximum);
+    if (
+      typeof offerState !== "string" ||
+      !["generating", "generated", "known-failure", "unknown"].includes(offerState) ||
+      !bounded(pollAttempts, 80) ||
+      !bounded(listResponses, 80) ||
+      !bounded(lastListCount, 1024) ||
+      (eligibleShapeSeen !== null && typeof eligibleShapeSeen !== "boolean") ||
+      pollAttempts !== listResponses ||
+      (listResponses === 1 && lastListCount === 0 && eligibleShapeSeen === true) ||
+      (listResponses === 0 && (lastListCount !== null || eligibleShapeSeen !== null)) ||
+      (listResponses !== 0 && eligibleShapeSeen === null)
+    )
+      return null;
+    return { offerState, pollAttempts, listResponses, lastListCount, eligibleShapeSeen };
+  } catch {
+    return null;
+  }
+}
+
 export interface SeededDesktopUpgradeSmokeInput {
   readonly arch: SeededUpgradeArch;
   readonly artifactDirectory: string;
@@ -658,7 +704,7 @@ import * as NodeFS from "node:fs";
 const input = ${serializedInput};
 
 // Private, best-effort checkpoint only. It never authorizes raw evidence retention.
-function publishStep(milestone) {
+function publishStep(milestone, grantDeadline = null) {
   if (typeof input.stepStatusPath !== "string" ||
       !${JSON.stringify(seededStepMilestones)}.includes(milestone)) return;
   const temporary = input.stepStatusPath + ".tmp";
@@ -670,6 +716,7 @@ function publishStep(milestone) {
       NodeFS.writeFileSync(fd, JSON.stringify({
         version: 1, lane: input.lane, phase: input.phase,
         trigger: ${JSON.stringify(trigger)}, milestone,
+        ...(grantDeadline === null ? {} : { grantDeadline }),
       }) + "\\n");
     } finally { NodeFS.closeSync(fd); }
     NodeFS.renameSync(temporary, input.stepStatusPath);
@@ -679,6 +726,7 @@ function publishStep(milestone) {
     if (owned) try { NodeFS.unlinkSync(temporary); } catch {}
   }
 }
+const decodeSeededGrantDeadline = ${decodeSeededGrantDeadline.toString()};
 publishStep("spec-loaded");
 
 async function waitForDesktopBridge() {
@@ -885,7 +933,10 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
         catch { return refuse("bearer-failed"); }
         // Exposure precedes minting. Stay below the embedded driver's 30-second command bound.
         const deadline = Date.now() + 20000;
+        let pollAttempts = 0, listResponses = 0, lastListCount = null, eligibleShapeSeen = null;
+        const increment = (count) => count !== null && count < 80 ? count + 1 : null;
         while (Date.now() < deadline) {
+          pollAttempts = increment(pollAttempts);
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), Math.min(5000, deadline - Date.now()));
           let links;
@@ -904,29 +955,56 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
             clearTimeout(timeout);
           }
           if (!Array.isArray(links)) return refuse("list-invalid");
+          listResponses = increment(listResponses);
+          lastListCount = links.length <= 1024 ? links.length : null;
           // AuthPairingLink publishes reach and credential; offHost is server-private metadata.
           const grant = links.find((link) => link !== null && typeof link === "object" &&
             link.reach === "another-device" && typeof link.id === "string" && link.id.trim().length > 0 &&
             typeof link.credential === "string" && link.credential.trim().length > 0);
+          eligibleShapeSeen = eligibleShapeSeen === true || Boolean(grant);
           if (grant && Date.now() < deadline) {
             // Redeeming the offered grant keeps the wide listener alive across the update.
             return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: grant.credential };
           }
           await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(250, deadline - Date.now()))));
         }
-        return refuse("grant-deadline");
+        let offerState = "unknown";
+        try {
+          const candidates = document.querySelectorAll("section");
+          const sections = candidates.length > 32 ? [] : [...candidates].filter((section) =>
+            section.querySelector("h2")?.textContent?.trim() === "Offer generator");
+          if (sections.length === 1) {
+            const section = sections[0];
+            const buttons = section.querySelectorAll("button");
+            if (buttons.length > 32) throw new Error();
+            const generating = [...buttons].some((button) =>
+              button.disabled && button.textContent?.trim() === "Generating…");
+            const generated = Boolean(section.querySelector('svg[role="img"][aria-label="Pairing code — scan with a BiBCode client"]'));
+            const failed = Boolean(section.querySelector(":scope > div > p.text-destructive"));
+            if (Number(generating) + Number(generated) + Number(failed) === 1)
+              offerState = generating ? "generating" : generated ? "generated" : "known-failure";
+          }
+        } catch { /* Unavailable or changed DOM stays unknown; no error text is inspected. */ }
+        return { ...refuse("grant-deadline"), grantDeadline: {
+          offerState, pollAttempts, listResponses, lastListCount, eligibleShapeSeen,
+        } };
       }
       return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: bootstrap.bootstrapToken };
     }, widened);
     // Reconstruct only finite callback facts; arbitrary WebDriver results are never receipts.
     const resultIsRecord = credentialResult !== null && typeof credentialResult === "object" && !Array.isArray(credentialResult);
-    const resultKeys = resultIsRecord ? Object.keys(credentialResult) : [];
-    const field = (name) => resultIsRecord ? Object.getOwnPropertyDescriptor(credentialResult, name)?.value : undefined;
+    const resultKeys = resultIsRecord ? Reflect.ownKeys(credentialResult) : [];
+    const field = (name) => {
+      const descriptor = resultIsRecord ? Object.getOwnPropertyDescriptor(credentialResult, name) : undefined;
+      return descriptor?.enumerable && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
+    };
     const failureMilestone = field("milestone");
-    if (resultKeys.length === 2 && field("_tag") === "seeded-credential-failure" &&
+    const isDeadline = widened && failureMilestone === "credential-wide-grant-deadline";
+    const grantDeadline = isDeadline ? decodeSeededGrantDeadline(field("grantDeadline")) : null;
+    if (resultKeys.length === (isDeadline ? 3 : 2) && (!isDeadline || grantDeadline !== null) && field("_tag") === "seeded-credential-failure" &&
         ${JSON.stringify(credentialFailureMilestones)}.includes(failureMilestone) &&
         failureMilestone.startsWith(widened ? "credential-wide-" : "credential-loopback-")) {
-      publishStep(failureMilestone);
+      publishStep(failureMilestone, grantDeadline);
       const message = failureMilestone.endsWith("bootstrap-unavailable") ? "Remote verification bootstrap unavailable."
         : failureMilestone.endsWith("bootstrap-read-failed") ? "Remote verification bootstrap read failed."
         : failureMilestone.endsWith("bearer-failed") ? "Remote verification bearer acquisition failed."
@@ -1445,7 +1523,16 @@ const readSeededStepStatus = async (path: string, owner: SeededPhaseIdentity) =>
     if (value === null) return { availability: "missing", milestone: null } as const;
     if (typeof value === "object" && !Array.isArray(value)) {
       const row = value as Record<string, unknown>;
-      const keys = ["version", "lane", "phase", "trigger", "milestone"];
+      const isDeadline = row.milestone === "credential-wide-grant-deadline";
+      const grantDeadline = isDeadline ? decodeSeededGrantDeadline(row.grantDeadline) : null;
+      const keys = [
+        "version",
+        "lane",
+        "phase",
+        "trigger",
+        "milestone",
+        ...(isDeadline ? ["grantDeadline"] : []),
+      ];
       if (
         Object.keys(row).length === keys.length &&
         keys.every((key) => Object.hasOwn(row, key)) &&
@@ -1453,11 +1540,13 @@ const readSeededStepStatus = async (path: string, owner: SeededPhaseIdentity) =>
         row.lane === owner.lane &&
         row.phase === owner.phase &&
         row.trigger === owner.trigger &&
-        seededStepMilestones.some((milestone) => milestone === row.milestone)
+        seededStepMilestones.some((milestone) => milestone === row.milestone) &&
+        (!isDeadline || grantDeadline !== null)
       )
         return {
           availability: "valid",
           milestone: row.milestone as (typeof seededStepMilestones)[number],
+          ...(isDeadline ? { grantDeadline } : {}),
         } as const;
     }
   } catch {

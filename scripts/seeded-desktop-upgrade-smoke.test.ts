@@ -2282,6 +2282,11 @@ const versionFixture = async () => {
   };
   return { root, originals, checkout };
 };
+type DeadlineDocument = {
+  body: { innerHTML: string };
+  querySelectorAll(selector: string): Iterable<object>;
+};
+
 const publicPairingGrant = {
   id: "fixture-grant",
   credential: "fixture-distinct-grant",
@@ -2348,6 +2353,7 @@ const remoteGrantFixture = (
     widened: true,
     observation: { projectId: "remote-project" },
     browser: { execute },
+    document: undefined as DeadlineDocument | undefined,
     window: {
       desktopBridge: {
         getLocalEnvironmentBootstraps: () => [
@@ -2391,7 +2397,7 @@ const remoteGrantFixture = (
     },
     fetch,
     URL,
-    Date,
+    Date: { now: Date.now },
     AbortController,
     setTimeout,
     clearTimeout,
@@ -3707,4 +3713,378 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(config).toContain('headers.delete("content-length")');
     expect(config).toContain("captureBackendLogs: true");
   });
+});
+
+describe("grant deadline attribution", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+  const owned = () =>
+    remoteGrantFixture([[]], { lane: "previous-stable", trigger: "remote-rpc" }, true);
+  const snapshot = (fixture: ReturnType<typeof owned>) =>
+    JSON.parse(fixture.files.get(fixture.input.stepStatusPath!)!.contents);
+  const contradictory = [
+    { pollAttempts: 0, listResponses: null, lastListCount: 0, eligibleShapeSeen: false },
+    { pollAttempts: null, listResponses: 0, lastListCount: null, eligibleShapeSeen: null },
+    { pollAttempts: 2, listResponses: 1, lastListCount: 0, eligibleShapeSeen: false },
+    { pollAttempts: 1, listResponses: 1, lastListCount: 0, eligibleShapeSeen: true },
+  ];
+  const retainedFacts = async (facts: unknown) => {
+    const fixture = await remoteRetentionFixture();
+    const lines: unknown[] = [];
+    const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => lines.push(line));
+    try {
+      fixture.runCommand.mockImplementation(async () => {
+        await NodeFS.promises.writeFile(
+          NodePath.join(fixture.runRoot, "seed-and-install-driver", "step-status.private.json"),
+          JSON.stringify({
+            version: 1,
+            lane: "remote-install",
+            phase: "seed-and-install",
+            trigger: "remote-rpc",
+            milestone: "credential-wide-grant-deadline",
+            grantDeadline: facts,
+          }),
+        );
+        return { exitCode: 1, stdout: "private-output-canary", stderr: "" };
+      });
+      await expect(fixture.runDirectPhase()).rejects.toThrow("credential receipt is unavailable");
+      expect(JSON.stringify(lines)).not.toContain("canary");
+      return JSON.parse(String(lines[0])).generatedStep;
+    } finally {
+      output.mockRestore();
+      await fixture.dispose();
+    }
+  };
+  it.each(contradictory)(
+    "rejects contradictory generated deadline evidence: %j",
+    async (counts) => {
+      const fixture = owned();
+      fixture.context.browser.execute.mockResolvedValue({
+        _tag: "seeded-credential-failure",
+        milestone: "credential-wide-grant-deadline",
+        grantDeadline: { offerState: "unknown", ...counts },
+      });
+      await expect(fixture.run()).rejects.toThrow("credential response invalid");
+      expect(snapshot(fixture).milestone).toBe("credential-wide-result-invalid");
+      expect(fixture.driver).not.toHaveBeenCalled();
+    },
+  );
+  it.each(contradictory)("rejects contradictory retained deadline evidence: %j", async (counts) => {
+    expect(await retainedFacts({ offerState: "unknown", ...counts })).toEqual({
+      availability: "invalid",
+      milestone: null,
+    });
+  });
+  it.each([
+    { pollAttempts: 0, listResponses: 0, lastListCount: null, eligibleShapeSeen: null },
+    { pollAttempts: null, listResponses: null, lastListCount: 0, eligibleShapeSeen: false },
+    { pollAttempts: 1, listResponses: 1, lastListCount: 1, eligibleShapeSeen: true },
+    { pollAttempts: 2, listResponses: 2, lastListCount: 0, eligibleShapeSeen: true },
+  ])(
+    "preserves truthful zero/overflow/late/earlier-match forms at both consumers: %j",
+    async (counts) => {
+      const facts = { offerState: "unknown", ...counts };
+      const fixture = owned();
+      fixture.context.browser.execute.mockResolvedValue({
+        _tag: "seeded-credential-failure",
+        milestone: "credential-wide-grant-deadline",
+        grantDeadline: facts,
+      });
+      await expect(fixture.run()).rejects.toThrow("no live native sharing grant");
+      expect(snapshot(fixture).grantDeadline).toEqual(facts);
+      expect(await retainedFacts(facts)).toEqual({
+        availability: "valid",
+        milestone: "credential-wide-grant-deadline",
+        grantDeadline: facts,
+      });
+    },
+  );
+  const dom = (state: string) => {
+    const { Window } = NodeModule.createRequire(
+      new URL("../apps/web/package.json", import.meta.url),
+    )("happy-dom") as { Window: new () => { document: DeadlineDocument } };
+    const document = new Window().document;
+    document.body.innerHTML = `<section><h2>Offer generator</h2><div>${
+      state === "generating"
+        ? "<button disabled>Generating…</button>"
+        : "<button>Generate pairing offer</button>"
+    }${state === "generated" ? '<svg role="img" aria-label="Pairing code — scan with a BiBCode client"><path /></svg><code>private-code-canary</code>' : ""}${
+      state === "known-failure" ? '<p class="text-destructive">private-error-canary</p>' : ""
+    }</div></section>`;
+    for (const node of document.querySelectorAll("code, p, svg, path"))
+      Object.defineProperty(node, "textContent", {
+        get: () => {
+          throw new Error("private-text-read-canary");
+        },
+      });
+    return document;
+  };
+  it.each(["generating", "generated", "known-failure", "unknown"])(
+    "records finite offer state without reading private DOM: %s",
+    async (state) => {
+      vi.useFakeTimers();
+      const fixture = owned();
+      fixture.context.document = state === "unknown" ? undefined : dom(state);
+      const outcome = fixture.run().catch(() => null);
+      await vi.runAllTimersAsync();
+      await outcome;
+      expect(snapshot(fixture)).toMatchObject({
+        milestone: "credential-wide-grant-deadline",
+        grantDeadline: {
+          offerState: state,
+          pollAttempts: 80,
+          listResponses: 80,
+          lastListCount: 0,
+          eligibleShapeSeen: false,
+        },
+      });
+      expect(fixture.fetch).toHaveBeenCalledTimes(80);
+      expect(fixture.context.browser.execute).toHaveBeenCalledOnce();
+      expect(fixture.driver).not.toHaveBeenCalled();
+      expect(JSON.stringify([...fixture.files.values()])).not.toContain("canary");
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+  it("keeps zero polling attempts distinct from an empty observed list", async () => {
+    const fixture = owned();
+    fixture.context.Date = { now: vi.fn().mockReturnValueOnce(0).mockReturnValue(20001) };
+    await expect(fixture.run()).rejects.toThrow("no live native sharing grant");
+    expect(snapshot(fixture).grantDeadline).toEqual({
+      offerState: "unknown",
+      pollAttempts: 0,
+      listResponses: 0,
+      lastListCount: null,
+      eligibleShapeSeen: null,
+    });
+    expect(fixture.fetch).not.toHaveBeenCalled();
+  });
+  it.each(["ambiguous", "oversized"])("keeps unsafe offer DOM unknown: %s", async (kind) => {
+    vi.useFakeTimers();
+    const fixture = owned();
+    const document = dom("generated");
+    document.body.innerHTML =
+      kind === "oversized"
+        ? Array.from({ length: 33 }, () => "<section><h2>Offer generator</h2></section>").join("")
+        : '<section><h2>Offer generator</h2><div><button disabled>Generating…</button><svg role="img" aria-label="Pairing code — scan with a BiBCode client"></svg></div></section>';
+    fixture.context.document = document;
+    const outcome = fixture.run().catch(() => null);
+    await vi.runAllTimersAsync();
+    await outcome;
+    expect(snapshot(fixture).grantDeadline.offerState).toBe("unknown");
+    expect(fixture.context.browser.execute).toHaveBeenCalledOnce();
+  });
+  it.each(["symbol", "accessor"])("refuses untrusted outer deadline fields: %s", async (kind) => {
+    const fixture = owned();
+    let reads = 0;
+    const result = {
+      _tag: "seeded-credential-failure",
+      milestone: "credential-wide-grant-deadline",
+      grantDeadline: {
+        offerState: "unknown",
+        pollAttempts: 0,
+        listResponses: 0,
+        lastListCount: null,
+        eligibleShapeSeen: null,
+      },
+    };
+    if (kind === "symbol")
+      Object.defineProperty(result, Symbol("private-outer-canary"), { value: true });
+    else
+      Object.defineProperty(result, "grantDeadline", {
+        enumerable: true,
+        get() {
+          reads++;
+          throw new Error("private-outer-canary");
+        },
+      });
+    fixture.context.browser.execute.mockResolvedValue(result);
+    await expect(fixture.run()).rejects.toThrow("credential response invalid");
+    expect(reads).toBe(0);
+    expect(snapshot(fixture).milestone).toBe("credential-wide-result-invalid");
+    expect(JSON.stringify([...fixture.files.values()])).not.toContain("canary");
+  });
+  it.each(["empty", "nonmatching", "matching-afterdeadline", "oversized"])(
+    "records only bounded existing list facts: %s",
+    async (kind) => {
+      vi.useFakeTimers();
+      const fixture = owned();
+      const list =
+        kind === "empty"
+          ? []
+          : kind === "oversized"
+            ? Array.from({ length: 1025 }, () => ({ reach: "this-computer" }))
+            : [
+                {
+                  ...publicPairingGrant,
+                  ...(kind === "nonmatching" ? { reach: "this-computer" } : {}),
+                },
+              ];
+      fixture.fetch.mockResolvedValue({
+        ok: true,
+        json: async () => {
+          vi.setSystemTime(vi.getMockedSystemTime()!.getTime() + 20001);
+          return list;
+        },
+      });
+      const outcome = fixture.run().catch((error: Error) => error);
+      await vi.runAllTimersAsync();
+      expect(await outcome).toMatchObject({
+        message: "Remote verification has no live native sharing grant.",
+      });
+      expect(snapshot(fixture).grantDeadline).toEqual({
+        offerState: "unknown",
+        pollAttempts: 1,
+        listResponses: 1,
+        lastListCount: kind === "oversized" ? null : list.length,
+        eligibleShapeSeen: kind === "matching-afterdeadline",
+      });
+      expect(fixture.fetch).toHaveBeenCalledOnce();
+      expect(fixture.driver).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+  it.each([
+    "missing",
+    "extra",
+    "unknown-state",
+    "overflow",
+    "negative",
+    "fraction",
+    "accessor",
+    "array",
+    "wrong-refusal",
+    "symbol",
+    "nonenumerable",
+    "impossible-counts",
+    "unknown-observed-shape",
+  ])("rejects untrusted deadline callback details: %s", async (kind) => {
+    const fixture = owned();
+    let reads = 0;
+    const details: Record<string, unknown> = {
+      offerState: "unknown",
+      pollAttempts: 0,
+      listResponses: 0,
+      lastListCount: null,
+      eligibleShapeSeen: null,
+    };
+    if (kind === "extra") details.private = "private-detail-canary";
+    if (kind === "unknown-state") details.offerState = "private-detail-canary";
+    if (kind === "overflow") details.pollAttempts = 81;
+    if (kind === "negative") details.listResponses = -1;
+    if (kind === "fraction") details.lastListCount = 0.5;
+    if (kind === "symbol")
+      Object.defineProperty(details, Symbol("private-detail-canary"), { value: true });
+    if (kind === "nonenumerable")
+      Object.defineProperty(details, "offerState", { value: "unknown", enumerable: false });
+    if (kind === "impossible-counts") details.listResponses = 1;
+    if (kind === "unknown-observed-shape") {
+      details.pollAttempts = 1;
+      details.listResponses = 1;
+    }
+    if (kind === "accessor")
+      Object.defineProperty(details, "offerState", {
+        enumerable: true,
+        get() {
+          reads++;
+          throw new Error("private-detail-canary");
+        },
+      });
+    fixture.context.browser.execute.mockResolvedValue({
+      _tag: "seeded-credential-failure",
+      milestone:
+        kind === "wrong-refusal" ? "credential-wide-http-401" : "credential-wide-grant-deadline",
+      ...(kind === "missing" ? {} : { grantDeadline: kind === "array" ? [] : details }),
+    });
+    await expect(fixture.run()).rejects.toThrow("credential response invalid");
+    expect(snapshot(fixture).milestone).toBe("credential-wide-result-invalid");
+    expect(reads).toBe(0);
+    expect(fixture.driver).not.toHaveBeenCalled();
+    expect(JSON.stringify([...fixture.files.values()])).not.toContain("canary");
+  });
+  it("keeps excess poll counts unknown without changing the existing requests", async () => {
+    vi.useFakeTimers();
+    const fixture = owned();
+    let responses = 0;
+    fixture.context.Date = { now: () => (responses > 80 ? 20001 : 0) };
+    fixture.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => {
+        responses++;
+        return [];
+      },
+    });
+    const outcome = fixture.run().catch((error: Error) => error);
+    await vi.runAllTimersAsync();
+    expect(await outcome).toMatchObject({
+      message: "Remote verification has no live native sharing grant.",
+    });
+    expect(snapshot(fixture).grantDeadline).toEqual({
+      offerState: "unknown",
+      pollAttempts: null,
+      listResponses: null,
+      lastListCount: 0,
+      eligibleShapeSeen: false,
+    });
+    expect(fixture.fetch).toHaveBeenCalledTimes(81);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it.each(["valid", "extra", "overflow", "wrong-step", "oversized"])(
+    "retains only validated deadline snapshot details: %s",
+    async (kind) => {
+      const fixture = await remoteRetentionFixture();
+      const lines: unknown[] = [];
+      const output = vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+        lines.push(line);
+      });
+      try {
+        fixture.runCommand.mockImplementation(async () => {
+          const details: Record<string, unknown> = {
+            offerState: "generating",
+            pollAttempts: 2,
+            listResponses: 2,
+            lastListCount: 0,
+            eligibleShapeSeen: false,
+          };
+          if (kind === "extra") details.private = "private-detail-canary";
+          if (kind === "overflow") details.lastListCount = 1025;
+          const status = {
+            version: 1,
+            lane: "remote-install",
+            phase: "seed-and-install",
+            trigger: "remote-rpc",
+            milestone:
+              kind === "wrong-step" ? "credential-wide-http-401" : "credential-wide-grant-deadline",
+            grantDeadline: details,
+          };
+          await NodeFS.promises.writeFile(
+            NodePath.join(fixture.runRoot, "seed-and-install-driver", "step-status.private.json"),
+            (kind === "oversized" ? " ".repeat(8193) : "") + JSON.stringify(status),
+          );
+          return { exitCode: 1, stdout: "private-output-canary", stderr: "" };
+        });
+        await expect(fixture.runDirectPhase()).rejects.toThrow("credential receipt is unavailable");
+        expect(JSON.parse(String(lines[0])).generatedStep).toEqual(
+          kind === "valid"
+            ? {
+                availability: "valid",
+                milestone: "credential-wide-grant-deadline",
+                grantDeadline: {
+                  offerState: "generating",
+                  pollAttempts: 2,
+                  listResponses: 2,
+                  lastListCount: 0,
+                  eligibleShapeSeen: false,
+                },
+              }
+            : { availability: "invalid", milestone: null },
+        );
+        expect(JSON.stringify(lines)).not.toContain("canary");
+      } finally {
+        output.mockRestore();
+        await fixture.dispose();
+      }
+    },
+  );
 });
