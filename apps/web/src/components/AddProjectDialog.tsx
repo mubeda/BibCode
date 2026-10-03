@@ -64,6 +64,7 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
             <AddProjectHostPathStep
               hostLabel={workflow.selectedHost.label}
               path={workflow.hostPath}
+              platform={workflow.selectedHost.platform}
               error={workflow.error}
               busy={workflow.busy}
               onPathChange={workflow.setHostPath}
