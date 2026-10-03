@@ -80,8 +80,21 @@ def _setup(environment, run_owned, context, readlink, platform, clock, read_owne
     context.stage = 'owner-shape'
     # Anchor the environment handoff to the visible, checked inner PID1 owner.
     try:
-        owner = read_owner().decode('utf8').rstrip('\0').split('\0')
-        require(len(owner) == 14 and owner[2] == 'inner')
+        # /proc terminates argv once; stripping all NULs would hide an extra empty argument.
+        owner = read_owner().decode('utf8').removesuffix('\0').split('\0')
+        require(len(owner) in [14, 18] and owner[2] == 'inner')
+        ui_keys = ['BIBCODE_RELEASE_UI_FAKE_HOST', 'BIBCODE_RELEASE_UI_WEB', 'BIBCODE_RELEASE_UI_MATRIX']
+        if len(owner) == 14:
+            require(not any(key in environment for key in ui_keys))
+        else:
+            require(owner[14] == 'remote-updates-ui')
+            require(owner[17] in ['core', 'full'] and owner[17] == environment.get(ui_keys[2]))
+            for index, key, directory in [(15, ui_keys[0], False), (16, ui_keys[1], True)]:
+                path = Path(owner[index])
+                require(path.is_absolute())
+                canonical = path.resolve(strict=True)
+                require(str(canonical) == owner[index] == environment.get(key))
+                require(canonical.is_dir() if directory else canonical.is_file())
         context.stage = 'owner-python'
         require(str(Path(owner[0]).resolve(strict=True)) == environment.get('BIBCODE_UPLOAD_PYTHON'))
         context.stage = 'owner-helper'

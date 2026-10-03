@@ -47,3 +47,24 @@ the independent review packet. No local browser, native app/server, network
 namespace, installer or CI activation is part of those checks. Required full
 workspace types include Cargo checks and must be recorded separately from the
 server-only CI job's focused types/build. UI/React product source is unchanged.
+
+The first core trial, `37094352184` at `8b7d710b`, stopped before any fixture or
+browser admission. Its closed network receipt reported `owner-shape`, zero
+attempted/completed mutations and effective network capability. No children or
+namespace survivors remained; controller/supervisor were reaped, the private
+fixture was deleted, and host network identity/build hashes were unchanged.
+It supplies no UI acceptance evidence. No private job or controller log was
+needed to attribute this failure.
+
+The actual UI producer appends four declared inputs to the ordinary fourteen
+PID1 arguments; the unchanged network guard accepted only the fourteen-argument
+form. An inert replay of the actual producer and real guard reproduced the UI
+refusal before all IP calls while the ordinary chat control passed. The repair
+validates the two exact forms separately: UI selector, canonical fake-host file
+and web directory, and matching core/full selection. It preserves every original
+owner/namespace anchor and every topology predicate/command. Extra, truncated,
+empty-tail, cross-scenario or mismatched declarations fail before any IP read.
+The actual outer producer and inner environment now feed the helper's regression
+tests. This fixes the reproduced handoff mismatch; the next reviewed native run
+must still establish actual UI behavior. No product, deadline or topology change
+is part of this repair.

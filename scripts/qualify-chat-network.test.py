@@ -1,9 +1,13 @@
 """Contained-network guard tests use only fake namespace/ip observations."""
 import copy
+import ast
 import importlib.util
 import json
 from pathlib import Path
+import inspect
 import sys
+import tempfile
+import types
 import unittest
 
 spec = importlib.util.spec_from_file_location('network', Path(__file__).with_name('qualify-chat-network.py'))
@@ -34,6 +38,37 @@ MUTATIONS = [['link', 'add', 'bcup-in', 'type', 'veth', 'peer', 'name', 'bcup-pe
              ['link', 'set', 'dev', 'bcup-in', 'up'], ['link', 'set', 'dev', 'bcup-peer', 'up'],
              ['route', 'add', 'default', 'via', '10.254.231.2', 'dev', 'bcup-in']]
 
+def actual_owner_handoff(root, scenario, matrix='core'):
+    """Use actual producer/environment expressions without admitting a real process."""
+    source = Path(__file__).with_name('qualify-chat-uploads.py')
+    spec = importlib.util.spec_from_file_location('owner_qualification', source)
+    qualifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qualifier)
+    module = ast.parse(source.read_text())
+    outer = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'outer')
+    command = next(node for node in outer.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'command' for target in node.targets))
+    selection = next(node for node in outer.body if isinstance(node, ast.If) and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) and call.func.value.id == 'command' and call.func.attr == 'extend' for call in ast.walk(node)))
+    fake = root / 'fake-host'; fake.write_bytes(b'owned inert file')
+    web = root / 'web'; web.mkdir(); (web / 'index.html').write_text('owned inert web')
+    scope = {**qualifier.__dict__, 'scenario': scenario, 'ui_matrix': matrix,
+             'programs': {key: sys.executable for key in ['google-chrome', 'chromedriver', 'git', 'dirname', 'ip']} | {'unshare': '/owned/unshare'},
+             'evidence': root / 'evidence', 'fixture': root, 'node': sys.executable, 'server': sys.executable,
+             'namespace': 'net:[1]', 'provenance': {},
+             'os': types.SimpleNamespace(environ={'GITHUB_SHA': 'a' * 40,
+                 'BIBCODE_RELEASE_UI_FAKE_HOST': str(fake), 'BIBCODE_RELEASE_UI_WEB': str(web)})}
+    exec(compile(ast.Module(body=[command, selection], type_ignores=[]), 'actual-owner-command', 'exec'), scope)
+    command = scope['command']
+    owner = command[command.index('inner') - 2:]
+    arguments = inspect.signature(qualifier.inner).bind(Path(owner[3]), Path(owner[4]), *owner[5:])
+    arguments.apply_defaults()
+    inner = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'inner')
+    environment = next(node for node in ast.walk(inner) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'environment' for target in node.targets))
+    selected_environment = next(node for node in ast.walk(inner) if isinstance(node, ast.If) and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) and call.func.value.id == 'environment' and call.func.attr == 'update' for call in ast.walk(node)))
+    scope = {**qualifier.__dict__, **arguments.arguments, 'private_namespace': 'net:[2]',
+             'trusted_network': ENV, 'os': types.SimpleNamespace(environ={'PATH': '/owned/tools'}, pathsep=':')}
+    exec(compile(ast.Module(body=[environment, selected_environment], type_ignores=[]), 'actual-owner-environment', 'exec'), scope)
+    return owner, scope['environment']
+
 class FakeIp:
     def __init__(self):
         self.calls = []
@@ -62,9 +97,59 @@ class FakeIp:
         return result, json.dumps(value).encode()
 
 class NetworkTests(unittest.TestCase):
-    def setup_network(self, fake, env=None, namespaces=None, **kwargs):
+    def setup_network(self, fake, env=None, namespaces=None, owner=None, **kwargs):
         return network.setup(env or ENV, fake, readlink=(namespaces or NAMESPACES).__getitem__,
-                             platform='linux', read_owner=lambda: '\0'.join(OWNER).encode(), read_capabilities=kwargs.pop('read_capabilities', lambda: b'CapEff:\t0000000000001000\n'), **kwargs)
+                             platform='linux', read_owner=lambda: ('\0'.join(OWNER if owner is None else owner) + '\0').encode(), read_capabilities=kwargs.pop('read_capabilities', lambda: b'CapEff:\t0000000000001000\n'), **kwargs)
+
+    def test_actual_chat_and_both_ui_producers_satisfy_the_existing_containment_contract(self):
+        for scenario, matrix, length in [('chat-upload', 'core', 14), ('remote-updates-ui', 'core', 18), ('remote-updates-ui', 'full', 18)]:
+            with self.subTest(scenario=scenario, matrix=matrix), tempfile.TemporaryDirectory(prefix='bibcode-owner-contract-') as directory:
+                owner, env = actual_owner_handoff(Path(directory), scenario, matrix)
+                self.assertEqual(len(owner), length)
+                fake = FakeIp(); proof = self.setup_network(fake, env=env, owner=owner)
+                self.assertEqual(fake.mutations, MUTATIONS)
+                self.assertTrue(proof['linksContained'])
+
+    def test_owner_argument_forms_refuse_extra_empty_and_truncated_arguments(self):
+        for scenario in ['chat-upload', 'remote-updates-ui']:
+            with tempfile.TemporaryDirectory(prefix='bibcode-owner-arity-') as directory:
+                owner, env = actual_owner_handoff(Path(directory), scenario)
+                for invalid in [owner + [''], owner + ['unexpected'], owner[:-1]]:
+                    fake = FakeIp()
+                    with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=env, owner=invalid)
+                    self.assertEqual(fake.calls, [])
+
+    def test_ui_selector_and_every_declared_input_identity_refuse_before_ip_reads(self):
+        with tempfile.TemporaryDirectory(prefix='bibcode-owner-identity-') as directory:
+            owner, env = actual_owner_handoff(Path(directory), 'remote-updates-ui')
+            other_file = Path(directory) / 'other-host'; other_file.write_bytes(b'owned')
+            other_web = Path(directory) / 'other-web'; other_web.mkdir()
+            cases = []
+            for index, value in [(14, 'chat-upload'), (14, '../arbitrary'), (15, str(other_file.resolve())), (16, str(other_web.resolve())), (17, 'full'), (17, 'unknown')]:
+                changed = list(owner); changed[index] = value; cases.append((changed, env))
+            for key in ['BIBCODE_RELEASE_UI_FAKE_HOST', 'BIBCODE_RELEASE_UI_WEB', 'BIBCODE_RELEASE_UI_MATRIX']:
+                changed = dict(env); changed.pop(key); cases.append((owner, changed))
+            # A matched declaration still must have the exact canonical path and kind.
+            alias = Path(directory) / 'alias-host'; alias.symlink_to(Path(owner[15]))
+            for index, key, value in [(15, 'BIBCODE_RELEASE_UI_FAKE_HOST', owner[16]),
+                                      (16, 'BIBCODE_RELEASE_UI_WEB', owner[15]),
+                                      (15, 'BIBCODE_RELEASE_UI_FAKE_HOST', str(alias))]:
+                changed = list(owner); changed[index] = value
+                cases.append((changed, {**env, key: value}))
+            cases.append((owner[:14], env))
+            for invalid, environment in cases:
+                fake = FakeIp()
+                with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=environment, owner=invalid)
+                self.assertEqual(fake.calls, [])
+
+    def test_original_owner_anchors_remain_required_for_both_forms(self):
+        for scenario in ['chat-upload', 'remote-updates-ui']:
+            with tempfile.TemporaryDirectory(prefix='bibcode-owner-anchor-') as directory:
+                owner, env = actual_owner_handoff(Path(directory), scenario)
+                for index, value in [(0, '/missing-python'), (1, '/missing-helper'), (2, 'outer'), (11, 'net:[99]'), (13, '/missing-ip')]:
+                    invalid = list(owner); invalid[index] = value; fake = FakeIp()
+                    with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=env, owner=invalid)
+                    self.assertEqual(fake.calls, [])
     def test_wrong_namespace_refuses_before_ip_mutations(self):
         for path, wrong in [('/proc/self/ns/net', 'net:[1]'), ('/proc/1/ns/net', 'net:[8]'),
                             ('/proc/self/ns/pid', 'pid:[8]'), ('/proc/1/ns/user', 'user:[8]')]:

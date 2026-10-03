@@ -600,6 +600,11 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   before any fixture, service or browser admission. Browser state before setup is
   unobserved (`before:null`); each created browser must pass one bounded actual
   online read. No post-launch network mutation, repair, sleep or retry is allowed.
+  The network helper validates the exact PID1 argument form for the selected
+  qualifier: the ordinary chat form or the UI form with its fixed selector,
+  canonical input identities and matching core/full selection. An owner-shape
+  refusal precedes all network reads/mutations; preserve that receipt and repair
+  the handoff instead of bypassing its ownership checks.
   Remote pairing uses the real Add Server
   flow through an owned loopback tunnel. The fresh-terminal setup uses genuine
   authenticated public RPC and a pinned owned executable; dialog counts and all
