@@ -78,26 +78,67 @@ const exactModel =
   '[data-model-picker-content="true"] [data-model-picker-instance-id="claudeAgent"][data-model-picker-model-slug="opus"]';
 const project = "/private-owned-workspace";
 
-function worktreeOpeningBoundary(fail?: string) {
+function worktreeOpeningBoundary(
+  options: {
+    fail?: string;
+    focusAfterTabs?: number;
+    initiallyFocused?: boolean;
+    loseFocusAfterEnabled?: boolean;
+    finalCount?: number;
+  } = {},
+) {
   const calls: string[] = [];
   const phases: string[] = [];
+  const keys: string[] = [];
+  let tabs = 0;
+  let countReads = 0;
+  let focused = options.initiallyFocused ?? false;
+  let displayed = false;
+  let enabled = false;
   const failure = new Error("private-target?token=private-token timed out");
   const hit = async (name: string, args: unknown[] = []) => {
     expect(args).toEqual([]);
     calls.push(name);
-    if (name === fail) throw failure;
+    if (name === options.fail) throw failure;
   };
   const browser = {
-    $$: () => ({ length: hit("count").then(() => 1) }),
-    $: (selector: string) => ({
-      moveTo: (...args: unknown[]) => {
-        expect(selector).toContain("ancestor::div");
-        return hit("hover", args);
-      },
-      waitForDisplayed: (...args: unknown[]) => hit("displayed", args),
-      waitForEnabled: (...args: unknown[]) => hit("enabled", args),
-      click: (...args: unknown[]) => hit("click", args),
-    }),
+    $$: (selector: string) => {
+      expect(selector).toBe('button[aria-label^="New worktree in "]');
+      return {
+        length: hit("count").then(() => (++countReads === 1 ? 1 : (options.finalCount ?? 1))),
+      };
+    },
+    $: (selector: string) => {
+      expect(selector).toBe('button[aria-label^="New worktree in "]');
+      return {
+        isFocused: async () => {
+          await hit("focused");
+          return focused;
+        },
+        waitForDisplayed: async (...args: unknown[]) => {
+          await hit("displayed", args);
+          // Actual compiled CSS requires focus-within when hover does not expose this strip.
+          if (!focused) throw failure;
+          displayed = true;
+        },
+        waitForEnabled: async (...args: unknown[]) => {
+          await hit("enabled", args);
+          enabled = true;
+          if (options.loseFocusAfterEnabled) focused = false;
+        },
+      };
+    },
+    keys: async (key: string) => {
+      keys.push(key);
+      if (key === "Tab") {
+        await hit("tab");
+        focused = ++tabs === (options.focusAfterTabs ?? 2);
+      } else {
+        expect(key).toBe("Enter");
+        expect(focused && displayed && enabled).toBe(true);
+        await hit("enter");
+      }
+    },
   };
   const helpersStart = controller.indexOf("  const step =");
   const helpersEnd = controller.indexOf("  const row =", helpersStart);
@@ -119,36 +160,92 @@ function worktreeOpeningBoundary(fail?: string) {
     {
       browser,
       write: (_name: string, value: { phase: string }) => phases.push(value.phase),
+      owner: {
+        until: async (read: () => Promise<boolean>, ...options: unknown[]) => {
+          expect(options).toEqual([]);
+          for (let attempt = 0; attempt < 3; attempt++) if (await read()) return;
+          throw failure;
+        },
+      },
     },
   ) as () => Promise<void>;
-  return { run, calls, phases, failure };
+  return { run, calls, phases, keys, failure };
 }
 
 describe("exact worktree opening attribution", () => {
+  it("uses public keyboard focus and Enter when hover does not expose the action", async () => {
+    const f = worktreeOpeningBoundary();
+    await f.run();
+    expect(f.keys).toEqual(["Tab", "Tab", "Enter"]);
+    expect(f.calls).toEqual([
+      "count",
+      "focused",
+      "tab",
+      "focused",
+      "focused",
+      "tab",
+      "focused",
+      "displayed",
+      "enabled",
+      "count",
+      "focused",
+      "enter",
+    ]);
+  });
+
   it.each([
     ["count", "worktree-open-count"],
-    ["hover", "worktree-open-hover"],
+    ["focused", "worktree-open-focus"],
+    ["tab", "worktree-open-focus"],
     ["displayed", "worktree-open-displayed"],
     ["enabled", "worktree-open-enabled"],
-    ["click", "worktree-open-click"],
+    ["enter", "worktree-open-enter"],
   ])(
     "retains the failing public %s await without retry or private data",
     async (fail, expected) => {
-      const f = worktreeOpeningBoundary(fail);
+      const f = worktreeOpeningBoundary({ fail });
       await expect(f.run()).rejects.toBe(f.failure);
       expect(f.calls.at(-1)).toBe(fail);
       expect(f.phases.at(-1)).toBe(expected);
       const retained = { phase: f.phases.at(-1), failure: classifyQualificationFailure(f.failure) };
       expect(retained.failure.kind).toBe("timeout");
       expect(JSON.stringify(retained)).not.toMatch(/private|token=/);
+      expect(f.keys.filter((key) => key === "Enter")).toHaveLength(fail === "enter" ? 1 : 0);
     },
   );
 
-  it("preserves the original public opening command order and inherited options", async () => {
-    const f = worktreeOpeningBoundary();
+  it("keeps an already focused action and sends only Enter after readiness", async () => {
+    const f = worktreeOpeningBoundary({ initiallyFocused: true });
     await f.run();
-    expect(f.calls).toEqual(["count", "hover", "displayed", "enabled", "click"]);
+    expect(f.keys).toEqual(["Enter"]);
+    expect(f.calls).toEqual([
+      "count",
+      "focused",
+      "displayed",
+      "enabled",
+      "count",
+      "focused",
+      "enter",
+    ]);
   });
+
+  it("stops at the existing focus-search bound without activation", async () => {
+    const f = worktreeOpeningBoundary({ focusAfterTabs: 99 });
+    await expect(f.run()).rejects.toBe(f.failure);
+    expect(f.phases.at(-1)).toBe("worktree-open-focus");
+    expect(f.keys).toEqual(["Tab", "Tab", "Tab"]);
+    expect(f.calls).not.toContain("displayed");
+  });
+
+  it.each([{ loseFocusAfterEnabled: true }, { finalCount: 0 }, { finalCount: 2 }])(
+    "refuses stale focus or changed control ownership before Enter: %j",
+    async (options) => {
+      const f = worktreeOpeningBoundary(options);
+      await expect(f.run()).rejects.toThrow("Owned delivery qualification assertion failed.");
+      expect(f.phases.at(-1)).toBe("worktree-open-focus-confirm");
+      expect(f.keys).toEqual(["Tab", "Tab"]);
+    },
+  );
 });
 
 it("targets the selected managed worktree, preserving the primary Git anchor during loss", async () => {
@@ -219,7 +316,8 @@ it.each([
 ])("creates and binds a real managed-worktree UI flow before delivery: %s", async (mode) => {
   const phases: string[] = [],
     clicks: string[] = [];
-  let headerHovered = false,
+  let createFocused = false,
+    dialogOpened = false,
     branchHovered = false,
     modelSelected = false,
     created = false,
@@ -231,7 +329,7 @@ it.each([
   };
   const selectedReader = () => null;
   const click = async (selector: string) => {
-    expect(headerHovered).toBe(true);
+    expect(dialogOpened).toBe(true);
     clicks.push(selector);
     if (selector.includes("starts-with")) {
       expect(named).toBe(true);
@@ -244,19 +342,28 @@ it.each([
     }),
     $: (selector: string) => ({
       moveTo: async () => {
-        if (selector.includes("group/project-header")) headerHovered = true;
-        else branchHovered = true;
+        branchHovered = true;
       },
+      isFocused: async () => createFocused,
       waitForDisplayed: async (options?: { reverse?: boolean }) => {
         if (options?.reverse) expect(created).toBe(true);
       },
       waitForEnabled: async () => {},
       click: () => click(selector),
       setValue: async (value: string) => {
+        expect(dialogOpened).toBe(true);
         expect(value).toBe(identity.branch);
         named = true;
       },
     }),
+    keys: async (key: string) => {
+      if (key === "Tab") createFocused = true;
+      else {
+        expect(key).toBe("Enter");
+        expect(createFocused).toBe(true);
+        dialogOpened = true;
+      }
+    },
     execute: async (read: unknown, input: unknown) => {
       if (read === selectedReader) {
         expect(created).toBe(true);
@@ -317,7 +424,7 @@ it.each([
     expect(await execute()).toEqual({ ...identity, threadId: "owned-thread" });
     expect(phases.at(-1)).toBe("worktree-ready");
     expect(modelSelected).toBe(true);
-    expect(clicks).toHaveLength(2);
+    expect(clicks).toHaveLength(1);
   } else {
     await expect(execute()).rejects.toThrow("Owned refusal.");
     if (mode === "no-project" || mode === "ambiguous-project") expect(clicks).toEqual([]);
@@ -981,8 +1088,14 @@ function worktreeFailureBoundary(
 }
 
 describe("closed worktree-opening failure facts", () => {
-  it("samples public DOM facts once without values, text, identifiers or URLs", async () => {
+  it.each([
+    "worktree-open-focus",
+    "worktree-open-focus-confirm",
+    "worktree-open-enter",
+    "worktree-open-displayed",
+  ])("samples closed DOM facts once after %s", async (phase) => {
     const f = worktreeFailureBoundary({
+      phase,
       hidden: true,
       disabled: true,
       covered: true,

@@ -725,16 +725,24 @@ DOM inspection. Missing, malformed or late observations remain unknown and
 cannot replace the original failure or skip joined cleanup. These facts are
 failure diagnostics, not authentication or screenshot acceptance evidence.
 
-Worktree opening records separate control-count, header-hover, displayed,
-enabled and public-click phases. A failure in those phases may take one
+Worktree opening follows the existing public keyboard route: send real Tab
+keys within the normal action bound until the unique **New worktree** button
+reports focus, wait for it to be displayed and enabled, recheck uniqueness and
+focus, then send Enter once. The header's focus-within action strip is independent
+of hover capability. Do not assign DOM focus, synthesize a click, force visibility
+or infer a runner's hover capability from a hovered header. Project/dialog/name,
+selected-card and Git identity assertions remain mandatory.
+
+Separate control-count, focus-search, displayed, enabled, focus-confirmation
+and Enter phases identify opening failures. A failure in those phases may take one
 two-second, location-guarded read-only sample: a finite control-count category
 and boolean-or-unknown header/button visibility, hover, enabled and hit-target
 facts, plus dialog/model-picker visibility. These are current DOM samples,
 not the result of an earlier WebDriver command. Missing controls or unsupported
 visibility observations remain unknown. No paths, IDs, coordinates, text,
 input values, URLs or screenshots are retained; late samples cannot republish
-after failure or alter cleanup. Hover/click behavior and readiness bounds stay
-unchanged.
+after failure or alter cleanup. The normal action and outer qualification bounds
+remain unchanged.
 
 The Retry button must open the real browser confirmation. Read its exact copy
 through WebDriver's alert API, dismiss once and prove no new input/launch, then

@@ -405,19 +405,22 @@ export async function runDeliveryRetryQualification() {
     const popup = '[data-slot="dialog-popup"][role="dialog"]';
     step("worktree-open-count");
     check((await b().$$(create).length) === 1);
-    step("worktree-open-hover");
-    await b()
-      .$(
-        '//*[@data-testid="new-worktree-button"]/ancestor::div[contains(concat(" ", normalize-space(@class), " "), " group/project-header ")][1]',
-      )
-      .moveTo();
     const createButton = b().$(create);
+    step("worktree-open-focus");
+    // The existing focus-within action strip does not depend on hover capability.
+    await owner.until(async () => {
+      if (await createButton.isFocused()) return true;
+      await b().keys("Tab");
+      return createButton.isFocused();
+    });
     step("worktree-open-displayed");
     await createButton.waitForDisplayed();
     step("worktree-open-enabled");
     await createButton.waitForEnabled();
-    step("worktree-open-click");
-    await createButton.click();
+    step("worktree-open-focus-confirm");
+    check((await b().$$(create).length) === 1 && (await createButton.isFocused()));
+    step("worktree-open-enter");
+    await b().keys("Enter");
     step("worktree-name");
     const name = b().$(`${popup} input[placeholder="Worktree name"]`);
     await name.waitForDisplayed();
@@ -883,10 +886,11 @@ export async function runDeliveryRetryQualification() {
       browser &&
       [
         "worktree-open-count",
-        "worktree-open-hover",
+        "worktree-open-focus",
         "worktree-open-displayed",
         "worktree-open-enabled",
-        "worktree-open-click",
+        "worktree-open-focus-confirm",
+        "worktree-open-enter",
       ].includes(phase)
         ? await readWorktreeFailureObservation()
         : null;
