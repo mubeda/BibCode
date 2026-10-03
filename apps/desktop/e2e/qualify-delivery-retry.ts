@@ -73,6 +73,49 @@ export function deliveryConfiguration(
   };
 }
 
+/** Failure attribution only: closed facts, never page values or driver payloads. */
+export function projectDeliveryStartupObservation(input: unknown) {
+  const value =
+    typeof input === "object" && input !== null && !Array.isArray(input)
+      ? (input as Record<string, unknown>)
+      : {};
+  const safeLocation = typeof value.safeLocation === "boolean" ? value.safeLocation : null;
+  const source = safeLocation === true ? value : {};
+  const boolean = (key: string): boolean | null =>
+    typeof source[key] === "boolean" ? source[key] : null;
+  return {
+    safeLocation,
+    route:
+      typeof source.route === "string" &&
+      [
+        "pair",
+        "root",
+        "workspace",
+        "settings-general",
+        "settings-remote-servers",
+        "other",
+      ].includes(source.route)
+        ? source.route
+        : null,
+    readyState:
+      typeof source.readyState === "string" &&
+      ["loading", "interactive", "complete"].includes(source.readyState)
+        ? source.readyState
+        : null,
+    online: boolean("online"),
+    tokenInputPresent: boolean("tokenInputPresent"),
+    tokenInputDisabled: boolean("tokenInputDisabled"),
+    submitPresent: boolean("submitPresent"),
+    submitDisabled: boolean("submitDisabled"),
+    pairingErrorPresent: boolean("pairingErrorPresent"),
+    pendingHeadingPresent: boolean("pendingHeadingPresent"),
+    sidebarPresent: boolean("sidebarPresent"),
+    primaryConnected: boolean("primaryConnected"),
+    themeControlPresent: boolean("themeControlPresent"),
+    darkTheme: boolean("darkTheme"),
+  };
+}
+
 export async function runDeliveryRetryQualification() {
   const config = deliveryConfiguration(process.env);
   const owner = new QualificationOwner(root, config.fixture);
@@ -131,20 +174,85 @@ export async function runDeliveryRetryQualification() {
   const unchanged = (before: DeliveryReceipts, after: DeliveryReceipts) =>
     check(after.complete && JSON.stringify(after.entries) === JSON.stringify(before.entries));
 
+  async function readStartupFailureObservation() {
+    try {
+      return projectDeliveryStartupObservation(
+        await bounded(
+          browser!.execute((expectedOrigin) => {
+            if (
+              location.origin !== expectedOrigin ||
+              location.search !== "" ||
+              location.hash !== ""
+            )
+              return { safeLocation: false };
+            const token = document.querySelector("#pairing-token");
+            const pairingForm = token instanceof HTMLInputElement ? token.form : null;
+            const submit = pairingForm?.querySelector('button[type="submit"]');
+            return {
+              safeLocation: true,
+              route:
+                location.pathname === "/pair"
+                  ? "pair"
+                  : location.pathname === "/"
+                    ? "root"
+                    : location.pathname === "/settings/general"
+                      ? "settings-general"
+                      : location.pathname === "/settings/remote-servers"
+                        ? "settings-remote-servers"
+                        : location.pathname.startsWith("/local/")
+                          ? "workspace"
+                          : "other",
+              readyState: document.readyState,
+              online: navigator.onLine,
+              tokenInputPresent: token instanceof HTMLInputElement,
+              tokenInputDisabled: token instanceof HTMLInputElement ? token.disabled : null,
+              submitPresent: submit instanceof HTMLButtonElement,
+              submitDisabled: submit instanceof HTMLButtonElement ? submit.disabled : null,
+              pairingErrorPresent: pairingForm?.querySelector(".text-destructive") != null,
+              pendingHeadingPresent:
+                document.querySelector("h1")?.textContent?.trim() ===
+                "Pairing with this environment",
+              sidebarPresent:
+                document.querySelector('[data-testid="sidebar-add-project-trigger"]') !== null,
+              primaryConnected:
+                document.querySelector(
+                  '[data-testid="environment-rail-local"] [data-status="connected"]',
+                ) !== null,
+              themeControlPresent:
+                document.querySelector('[aria-label="Theme preference"]') !== null,
+              darkTheme: document.documentElement.classList.contains("dark"),
+            };
+          }, origin),
+          2000,
+        ),
+      );
+    } catch {
+      // Unavailable diagnostics stay unknown; original failure and owned cleanup still run.
+      return null;
+    }
+  }
+
   async function setTheme() {
+    step("theme-open-settings");
     await click('[data-testid="environment-rail-manage"]');
+    step("theme-open-general");
     await click("button=General");
+    step("theme-open-preference");
     await click('[aria-label="Theme preference"]');
+    step("theme-select");
     await click(
       `//*[@role="option" and normalize-space()="${theme === "light" ? "Light" : "Dark"}"]`,
     );
+    step("theme-wait-applied");
     await owner.until(async () =>
       b().execute(
         (dark) => document.documentElement.classList.contains("dark") === dark,
         theme === "dark",
       ),
     );
+    step("theme-open-remote-servers");
     await click("button=Remote Servers");
+    step("theme-back");
     await click("button=Back");
   }
 
@@ -399,23 +507,30 @@ export async function runDeliveryRetryQualification() {
       );
       browser = opened.browser;
       networkProofs.push(await verifyOwnedBrowserOnline(browser, network));
-      step("pair");
+      step("pair-issue-credential");
       const grant = await owner.json(
         config.binary,
         ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
         childEnv,
       );
+      step("pair-check-credential");
       const credential =
         typeof grant === "object" && grant !== null && "credential" in grant
           ? grant.credential
           : null;
       if (typeof credential !== "string" || credential.length < 8)
         throw new Error("Owned pairing credential unavailable.");
+      step("pair-navigate");
       await browser.url(origin + "/pair");
+      step("pair-wait-token");
       await browser.$("#pairing-token").waitForDisplayed();
+      step("pair-fill-token");
       await browser.$("#pairing-token").setValue(credential);
+      step("pair-submit");
       await click("button=Continue");
+      step("pair-wait-sidebar");
       await browser.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
+      step("pair-wait-connected");
       await browser
         .$('[data-testid="environment-rail-local"] [data-status="connected"]')
         .waitForDisplayed();
@@ -528,7 +643,16 @@ export async function runDeliveryRetryQualification() {
     );
     success = true;
   } catch (error) {
-    write("failure", { phase, theme, failure: classifyQualificationFailure(error) });
+    const startupObservation =
+      browser && (phase.startsWith("pair-") || phase.startsWith("theme-"))
+        ? await readStartupFailureObservation()
+        : null;
+    write("failure", {
+      phase,
+      theme,
+      failure: classifyQualificationFailure(error),
+      startupObservation,
+    });
   } finally {
     const processes = owner.processes.map(({ child, role, log, spawnFailure }) =>
       projectQualificationProcess({

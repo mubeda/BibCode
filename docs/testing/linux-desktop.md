@@ -697,6 +697,14 @@ model name alone does not identify the provider. Closed `import-*` phase codes
 identify the last attempted UI boundary without retaining workspace paths,
 page text, credentials or raw errors; provider receipt assertions still apply.
 
+Pairing and theme changes also record literal subphases before each action or
+read. If either fails, one read-only observation may take up to two seconds;
+it records only known route/readiness enums and booleans for the form,
+connection and theme controls. An unexpected origin, query or fragment stops
+DOM inspection. Missing, malformed or late observations remain unknown and
+cannot replace the original failure or skip joined cleanup. These facts are
+failure diagnostics, not authentication or screenshot acceptance evidence.
+
 The Retry button must open the real browser confirmation. Read its exact copy
 through WebDriver's alert API, dismiss once and prove no new input/launch, then
 click again and accept. Do not replace `window.confirm`, call a private handler
