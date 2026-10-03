@@ -171,3 +171,26 @@ reproduced harness readiness gap; it does not prove the original native failure
 was caused by animation, clipboard, route selection or a command mismatch.
 Production rendering, metadata, permissions, configurations and deadlines remain
 unchanged. Root owns another native activation after review.
+
+Trial `37107060494` at `b2e73be0` passed all light core cases, including archive,
+package and unknown manual instructions, row/card agreement and actual clipboard
+contents. Eighteen original light PNGs were retained. It failed at `start-theme`
+for dark, before any second-theme child was registered. Final cleanup again
+confirmed no survivors, unchanged namespace/build inputs and deleted private root.
+No dark or full-matrix acceptance is established.
+
+The controller stopped the preview launcher after light and attempted to rebind
+its port before dark. The actual `runLocalVp` launcher synchronously waits for a
+child; killing that launcher does not forward its signal to the child. A disposable
+inert listener through the actual launcher and `QualificationOwner` reproduced a
+listener surviving launcher termination. An actual-controller two-theme replay
+then failed at the same port boundary. These establish a harness lifetime defect;
+the old broad native phase alone does not identify which port was occupied.
+
+The immutable preview now remains owned for the whole run. Both themes still use
+fresh primary backends, browser profiles, drivers and actual theme selection.
+Its arguments, web origin, copied assets, readiness bound and final namespace
+cleanup are unchanged. Literal preview/driver-port/primary/browser phases improve
+attribution without collecting raw output. The controller replay covers completion
+and second-theme startup failure, including final cleanup. Native dark acceptance
+still requires the reviewed rerun.

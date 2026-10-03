@@ -18,6 +18,143 @@ const controller = NodeFS.readFileSync(
   "utf8",
 );
 
+it.each([false, true])(
+  "keeps one immutable asset server across fresh theme fixtures and final cleanup (dark failure: %s)",
+  async (failDark) => {
+    let assetListener = false;
+    let webStarts = 0;
+    let browserStarts = 0;
+    let finalCleanup = false;
+    const portChecks: number[] = [];
+    const stopped: string[] = [];
+    const writes = new Map<string, Record<string, unknown>>();
+    const contexts: string[] = [];
+    const scope: Record<string, any> = {
+      root: "/owned-source",
+      fixture: "/owned-fixture",
+      assets: "/owned-assets",
+      chrome: "/owned-chrome",
+      driver: "/owned-driver",
+      webOrigin: "http://localhost:4901",
+      bundleVersion: "0.7.2",
+      NodePath,
+      process: { execPath: "/owned-node", env: {}, exitCode: undefined },
+      currentTheme: "light",
+      currentPhase: "prepare",
+      success: false,
+      browser: undefined,
+      captures: [],
+      assertions: [],
+      networkProofs: [],
+      tunnels: [],
+      plan: { flows: ["success"], scenes: ["success"], selection: "core", pendingCases: [] },
+      remoteUiThemes,
+      browserStartupObservationScript: "",
+      prepareOwnedNetwork: async () => ({ proof: {} }),
+      terminalExecutable: () => {},
+      phase: (name: string) => {
+        scope.currentPhase = name;
+      },
+      unusedPort: async (port: number) => {
+        portChecks.push(port);
+        // run-local-vp waits synchronously for its preview child. Stopping that
+        // launcher does not close the child's listener; PID1 owns final cleanup.
+        if (port === 4901 && assetListener) throw new Error("Owned fixture port is occupied.");
+      },
+      fakeHost: async () => {
+        contexts.push(scope.currentTheme);
+        return { child: { role: `primary-${scope.currentTheme}` } };
+      },
+      fetch: async () => ({ ok: true }),
+      AbortSignal,
+      openOwnedBrowser: async () => {
+        browserStarts++;
+        if (failDark && scope.currentTheme === "dark") throw new Error("inert dark startup");
+        return {
+          driver: { role: `driver-${scope.currentTheme}` },
+          browser: {
+            sendCommandAndGetResult: async () => {},
+            url: async () => {},
+            $: () => ({ waitForDisplayed: async () => {}, setValue: async () => {} }),
+            deleteSession: async () => {},
+            execute: async () => {
+              throw new Error("inert unavailable observation");
+            },
+          },
+        };
+      },
+      verifyOwnedBrowserOnline: async () => ({}),
+      grant: async () => "inert-credential",
+      click: async () => {},
+      importProject: async () => {},
+      setTheme: async () => {},
+      workspace: async () => {},
+      successFlow: async () => {
+        scope.captures.push({ theme: scope.currentTheme });
+      },
+      failureFlow: async () => {},
+      restartFailures: async () => {},
+      queuedFlow: async () => {},
+      manualFlow: async () => {},
+      reloadFlow: async () => {},
+      check: (ok: boolean) => {
+        if (!ok) throw new Error("inert acceptance failure");
+      },
+      bounded: async (promise: Promise<unknown>) => promise,
+      BrowserConnectivityFailure: class extends Error {},
+      classifyQualificationFailure: () => ({ kind: "inert" }),
+      readManualAssertionCode: () => null,
+      write: (name: string, value: Record<string, unknown>) => writes.set(name, value),
+      owner: {
+        processes: [],
+        failures: [],
+        spawn: (_command: string, _args: string[], _env: unknown, role: string) => {
+          expect(role).toBe("web");
+          expect(assetListener).toBe(false);
+          webStarts++;
+          assetListener = true;
+          return { role };
+        },
+        until: async (check: () => Promise<boolean>) => {
+          expect(await check()).toBe(true);
+        },
+        stop: async (entry: { role: string }) => {
+          stopped.push(entry.role);
+        },
+        close: async () => {
+          finalCleanup = true;
+          assetListener = false;
+        },
+        childrenClosed: () => finalCleanup,
+      },
+    };
+    const start = controller.indexOf('try {\n  phase("prepare-contained-network");');
+    expect(start).toBeGreaterThan(0);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run() {" + controller.slice(start) + "}\nrun",
+      ),
+      scope,
+    );
+    await run();
+    expect(webStarts).toBe(1);
+    expect(browserStarts).toBe(2);
+    expect(contexts).toEqual(["light", "dark"]);
+    expect(portChecks.filter((port) => port === 4901)).toHaveLength(1);
+    expect(portChecks.filter((port) => port === 4915)).toHaveLength(2);
+    expect(stopped).toEqual(
+      failDark
+        ? ["driver-light", "primary-light"]
+        : ["driver-light", "primary-light", "driver-dark", "primary-dark"],
+    );
+    expect(finalCleanup).toBe(true);
+    expect(assetListener).toBe(false);
+    expect(writes.get("result")?.success).toBe(!failDark);
+    expect(writes.get("result")?.childProcessesClosed).toBe(true);
+    expect(scope.process.exitCode).toBe(failDark ? 1 : 0);
+  },
+);
+
 it("projects only allowlisted manual checks raised by this controller, without reading error text", () => {
   const start = controller.indexOf("const manualAssertionCodes =");
   const end = controller.indexOf("const required =", start);

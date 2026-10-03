@@ -1261,43 +1261,48 @@ try {
   const preparedNetwork = await prepareOwnedNetwork(root);
   networkProofs.push(preparedNetwork.proof);
   terminalExecutable();
+  // The immutable preview belongs to the whole run. Its launcher may exit
+  // before a preview descendant, so do not stop and rebind it between themes.
+  phase("start-web");
+  await unusedPort(4901);
+  owner.spawn(
+    process.execPath,
+    [
+      NodePath.join(root, "scripts/run-local-vp.mjs"),
+      "preview",
+      "--config",
+      "apps/web/vite.config.app.mjs",
+      "apps/web",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "4901",
+      "--strictPort",
+      "--outDir",
+      assets,
+    ],
+    {
+      ...process.env,
+      VITE_WS_URL: "ws://localhost:4887",
+      VITE_HTTP_URL: "http://localhost:4887",
+      VITE_DEV_SERVER_URL: webOrigin,
+    },
+    "web",
+  );
+  await owner.until(async () => {
+    try {
+      return (await fetch(webOrigin, { signal: AbortSignal.timeout(1_000) })).ok;
+    } catch {
+      return false;
+    }
+  });
   for (const theme of remoteUiThemes) {
     currentTheme = theme;
-    phase("start-theme");
-    await unusedPort(4901);
+    phase("theme-driver-port");
     await unusedPort(4915);
+    phase("theme-primary-start");
     const primary = await fakeHost("primary", 4887, `QA Primary ${theme}`, bundleVersion);
-    const web = owner.spawn(
-      process.execPath,
-      [
-        NodePath.join(root, "scripts/run-local-vp.mjs"),
-        "preview",
-        "--config",
-        "apps/web/vite.config.app.mjs",
-        "apps/web",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "4901",
-        "--strictPort",
-        "--outDir",
-        assets,
-      ],
-      {
-        ...process.env,
-        VITE_WS_URL: "ws://localhost:4887",
-        VITE_HTTP_URL: "http://localhost:4887",
-        VITE_DEV_SERVER_URL: webOrigin,
-      },
-      "web",
-    );
-    await owner.until(async () => {
-      try {
-        return (await fetch(webOrigin, { signal: AbortSignal.timeout(1_000) })).ok;
-      } catch {
-        return false;
-      }
-    });
+    phase("theme-browser-start");
     const startedBrowser = await openOwnedBrowser(
       owner,
       chrome,
@@ -1347,7 +1352,6 @@ try {
     );
     browser = undefined;
     await owner.stop(startedBrowser.driver);
-    await owner.stop(web);
     await owner.stop(primary.child);
   }
   success = true;

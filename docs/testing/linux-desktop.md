@@ -594,7 +594,12 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Run this workflow only after independent harness review and the separate
   browser-startup prerequisite. It builds the web source once, copies the guarded
   server/example outside Cargo output and records source/build hashes; it serves
-  those web assets with the existing preview configuration. Its shared Python
+  those web assets with the existing preview configuration. One immutable
+  preview server spans both themes; each theme still starts a fresh primary
+  backend, browser profile and driver. Do not stop and rebind the preview between
+  themes: terminating its launcher need not terminate its listening descendant.
+  Final owner and PID1 cleanup still join and verify the whole private scope.
+  Its shared Python
   owner admits only a disposable CI PID/network namespace, and its shared browser
   owner enables no performance logging. Keep its private TMPDIR short: Chromium
   adds a branded temporary subdirectory and Unix socket filename within the
