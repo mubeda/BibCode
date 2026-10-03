@@ -1,4 +1,11 @@
 /** Closed QA metadata only. Wire identifiers never leave the installer's transient maps. */
+/** Explicit numeric 4408 calls; ordinary cleanup never erases the latest matching witness. */
+export interface Close4408Observation {
+  readonly count: number;
+  readonly lastAtMs: number | null;
+  readonly complete: boolean;
+}
+
 export interface ChatUploadObservation {
   version: 1;
   available: true;
@@ -31,6 +38,7 @@ export interface ChatUploadObservation {
     closeCalls: number;
     lastCloseCode: number | null;
     lastCloseAtMs: number | null;
+    close4408: Close4408Observation;
   };
   noise: {
     created: number;
@@ -42,6 +50,7 @@ export interface ChatUploadObservation {
     lastCloseAtMs: number | null;
     maxBufferedBytesAtClose: number | null;
     closeMetricsComplete: boolean;
+    close4408: Close4408Observation;
   };
   other: { created: number };
 }
@@ -84,6 +93,7 @@ function installChatUploadObserver() {
     closeCalls: 0,
     lastCloseCode: null as number | null,
     lastCloseAtMs: null as number | null,
+    close4408: { count: 0, lastAtMs: null as number | null, complete: true },
   };
   const noise = {
     created: 0,
@@ -95,6 +105,7 @@ function installChatUploadObserver() {
     lastCloseAtMs: null as number | null,
     maxBufferedBytesAtClose: null as number | null,
     closeMetricsComplete: true,
+    close4408: { count: 0, lastAtMs: null as number | null, complete: true },
   };
   const other = { created: 0 };
   let socketOverflow = false;
@@ -129,6 +140,20 @@ function installChatUploadObserver() {
     const value: unknown = Reflect.get(group, key);
     if (typeof value === "number" && value < countLimit) Reflect.set(group, key, value + 1);
     else socketOverflow = true;
+  };
+  const recordClose4408 = (witness: typeof plain.close4408, atMs: number | null) => {
+    const previousAtMs = witness.lastAtMs;
+    witness.lastAtMs = null;
+    if (witness.count >= countLimit) {
+      witness.complete = false;
+      return;
+    }
+    witness.count += 1;
+    if (!witness.complete || atMs === null || (previousAtMs !== null && atMs < previousAtMs)) {
+      witness.complete = false;
+      return;
+    }
+    witness.lastAtMs = atMs;
   };
   const outstanding = () =>
     states.reduce(
@@ -366,6 +391,10 @@ function installChatUploadObserver() {
     }
     reset(state);
   };
+  const snapshotClose4408 = (witness: typeof plain.close4408): Close4408Observation => {
+    const complete = witness.complete && !socketOverflow;
+    return { count: witness.count, lastAtMs: complete ? witness.lastAtMs : null, complete };
+  };
   const read = (): ChatUploadObservation => ({
     version: 1,
     available: true,
@@ -402,8 +431,9 @@ function installChatUploadObserver() {
       closeCalls: plain.closeCalls,
       lastCloseCode: plain.lastCloseCode,
       lastCloseAtMs: plain.lastCloseAtMs,
+      close4408: snapshotClose4408(plain.close4408),
     },
-    noise: { ...noise },
+    noise: { ...noise, close4408: snapshotClose4408(noise.close4408) },
     other: { ...other },
   });
   Reflect.set(window, "__uploadObservations", { read });
@@ -476,10 +506,16 @@ function installChatUploadObserver() {
           closeOwner.lastCloseAtMs = null;
           const code = args[0];
           if (integer(code, 4999) && code >= 1000) closeOwner.lastCloseCode = code;
-          const closedAt = performance.now();
-          if (Number.isFinite(closedAt) && closedAt >= 0 && closedAt <= 3_600_000)
-            closeOwner.lastCloseAtMs = closedAt;
-          else closeUnknown();
+          let closedAt: number | null = null;
+          try {
+            const now = performance.now();
+            if (Number.isFinite(now) && now >= 0 && now <= 3_600_000) closedAt = now;
+          } catch {
+            // A failed clock read cannot erase an observed native call or reuse an older time.
+          }
+          closeOwner.lastCloseAtMs = closedAt;
+          if (closedAt === null) closeUnknown();
+          if (code === 4408) recordClose4408(closeOwner.close4408, closedAt);
           if (buffered !== null)
             closeOwner.maxBufferedBytesAtClose = Math.max(
               closeOwner.maxBufferedBytesAtClose ?? 0,
@@ -565,6 +601,7 @@ export function projectChatUploadObservation(input: unknown): ChatUploadObservat
       "closeCalls",
       "lastCloseCode",
       "lastCloseAtMs",
+      "close4408",
     ]) ||
     !keys(append, [
       "outstanding",
@@ -592,6 +629,7 @@ export function projectChatUploadObservation(input: unknown): ChatUploadObservat
       "lastCloseAtMs",
       "maxBufferedBytesAtClose",
       "closeMetricsComplete",
+      "close4408",
     ]) ||
     !keys(other, ["created"]) ||
     noise!.applicationMetricsAvailable !== false
@@ -689,6 +727,33 @@ export function projectChatUploadObservation(input: unknown): ChatUploadObservat
   )
     return null;
   if (noise!.lastCloseCode !== null && (noise!.lastCloseCode as number) < 1000) return null;
+  const closeWitness = (input: unknown, closeCalls: unknown): Close4408Observation | null => {
+    const value = record(input);
+    if (!keys(value, ["count", "lastAtMs", "complete"])) return null;
+    const { count: calls, lastAtMs, complete } = value!;
+    if (
+      !count(calls) ||
+      !count(closeCalls) ||
+      (calls as number) > (closeCalls as number) ||
+      typeof complete !== "boolean" ||
+      (top!.socketOverflow === true && complete) ||
+      !(
+        lastAtMs === null ||
+        (typeof lastAtMs === "number" &&
+          Number.isFinite(lastAtMs) &&
+          lastAtMs >= 0 &&
+          lastAtMs <= 3_600_000)
+      ) ||
+      (calls === 0 && lastAtMs !== null) ||
+      (complete && (calls as number) > 0 && lastAtMs === null) ||
+      (!complete && lastAtMs !== null)
+    )
+      return null;
+    return { count: calls as number, lastAtMs: lastAtMs as number | null, complete };
+  };
+  const plainClose4408 = closeWitness(plain!.close4408, plain!.closeCalls);
+  const noiseClose4408 = closeWitness(noise!.close4408, noise!.closeCalls);
+  if (plainClose4408 === null || noiseClose4408 === null) return null;
   // Every accepted field is a fixed primitive; rebuilding through JSON returns no
   // input object identity/accessors/foreign fields to the artifact caller.
   return JSON.parse(
@@ -702,8 +767,9 @@ export function projectChatUploadObservation(input: unknown): ChatUploadObservat
         append: { ...append },
         control: { ...control },
         issues: { ...issues },
+        close4408: plainClose4408,
       },
-      noise: { ...noise },
+      noise: { ...noise, close4408: noiseClose4408 },
       other: { ...other },
     }),
   ) as ChatUploadObservation;

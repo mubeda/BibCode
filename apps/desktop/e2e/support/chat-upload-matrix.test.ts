@@ -526,9 +526,12 @@ it("never passes a late 4408 as within the deadline and always thaws after faile
     measurements: () => ({}),
     observe: async () => ({
       plain: {
+        available: true,
+        complete: true,
         closeCalls: frozen ? 1 : 0,
         lastCloseCode: 4408,
         lastCloseAtMs: frozen ? 34000 : null,
+        close4408: { count: frozen ? 1 : 0, lastAtMs: frozen ? 34000 : null, complete: true },
       },
     }),
     freeze: (value: boolean) => {
@@ -637,6 +640,11 @@ it("rejects incomplete Noise close evidence instead of qualifying a successful f
         lastCloseCode: 4408,
         lastCloseAtMs: 1000,
         closeMetricsComplete: false,
+        close4408: {
+          count: frozen || delivered ? 1 : 0,
+          lastAtMs: frozen || delivered ? 1000 : null,
+          complete: true,
+        },
         applicationMetricsAvailable: false,
       },
     }),
@@ -780,6 +788,11 @@ it("complete Noise close proof still qualifies and remains an application close-
         lastCloseCode: 4408,
         lastCloseAtMs: 1000,
         closeMetricsComplete: true,
+        close4408: {
+          count: frozen || delivered ? 1 : 0,
+          lastAtMs: frozen || delivered ? 1000 : null,
+          complete: true,
+        },
         applicationMetricsAvailable: false,
       },
     }),

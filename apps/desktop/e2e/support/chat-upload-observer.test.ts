@@ -13,7 +13,7 @@ import {
 
 const codec = json.makeUnsafe();
 const encode = (value: unknown) => codec.encode(value) as string;
-function fixture(script = chatUploadObservationScript) {
+function fixture(script = chatUploadObservationScript, clock?: () => number) {
   let time = 0;
   const calls: unknown[] = [];
   class Original {
@@ -51,7 +51,7 @@ function fixture(script = chatUploadObservationScript) {
     TextEncoder,
     ArrayBuffer,
     Uint8Array,
-    performance: { now: () => time },
+    performance: { now: clock ?? (() => time) },
   });
   const socket = new page.WebSocket("ws://localhost:4903/ws?ticket=do-not-retain");
   socket.emit("open");
@@ -725,4 +725,115 @@ it("an unknown latest close time cannot reuse an older timestamp", () => {
     lastCloseAtMs: null,
     closeMetricsComplete: false,
   });
+});
+
+it.each(["plain", "noise"] as const)(
+  "retains the numeric 4408 witness through ordinary %s cleanup without changing the latest tuple",
+  (transport) => {
+    const f = fixture();
+    const socket =
+      transport === "plain" ? f.socket : new f.page.WebSocket("ws://localhost:4911/ws-e2ee");
+    f.advance(10);
+    expect(socket.close(4408, "private-reason")).toBe(9);
+    f.advance(5);
+    socket.close(1000);
+    socket.close();
+    expect(f.read()[transport]).toMatchObject({
+      closeCalls: 3,
+      lastCloseCode: null,
+      lastCloseAtMs: 15,
+      close4408: { count: 1, lastAtMs: 10, complete: true },
+    });
+    const snapshot = f.read();
+    (snapshot[transport].close4408 as { count: number }).count = 99;
+    expect(f.read()[transport].close4408.count).toBe(1);
+    expect(JSON.stringify(f.read())).not.toContain("private");
+  },
+);
+
+it.each([NaN, -1, -5])(
+  "unknown or reset 4408 clock stays incomplete after later valid calls: %s",
+  (delta) => {
+    const f = fixture();
+    f.advance(10);
+    f.socket.close(4408);
+    f.advance(delta);
+    f.socket.close(4408);
+    expect(f.read().plain.close4408).toEqual({ count: 2, lastAtMs: null, complete: false });
+    f.advance(20);
+    f.socket.close(4408);
+    expect(f.read().plain.close4408).toEqual({ count: 3, lastAtMs: null, complete: false });
+  },
+);
+
+it("does not count an uncalled, unclassifiable or throwing native close as a numeric 4408 witness", () => {
+  const f = fixture();
+  expect(f.read().plain.close4408).toEqual({ count: 0, lastAtMs: null, complete: true });
+  Reflect.apply(f.socket.close, f.socket, ["4408"]);
+  expect(f.read().plain.close4408).toEqual({ count: 0, lastAtMs: null, complete: true });
+  const original = Object.getPrototypeOf(Object.getPrototypeOf(f.socket));
+  const failure = new Error("private-native-close");
+  original.close = function () {
+    throw failure;
+  };
+  const socket = new f.page.WebSocket("ws://localhost:4911/ws-e2ee");
+  try {
+    socket.close(4408);
+    expect.unreachable();
+  } catch (error) {
+    expect(error === failure).toBe(true);
+  }
+  expect(f.read().noise.close4408).toEqual({ count: 0, lastAtMs: null, complete: true });
+});
+
+it("bounds the 4408 count and refuses proof after overflow", () => {
+  const f = fixture();
+  const original = Object.getPrototypeOf(Object.getPrototypeOf(f.socket));
+  original.close = () => 9;
+  const socket = new f.page.WebSocket("ws://localhost:4911/ws-e2ee");
+  for (let count = 0; count <= 1_000_000; count++) socket.close(4408);
+  expect(f.read().noise.close4408).toEqual({ count: 1_000_000, lastAtMs: null, complete: false });
+});
+
+it("cannot claim a complete 4408 witness after the socket observation bound is exceeded", () => {
+  const f = fixture();
+  f.socket.close(4408);
+  for (let index = 0; index < 16; index++) {
+    const socket = new f.page.WebSocket("ws://localhost:4911/ws-e2ee");
+    socket.emit("open");
+  }
+  expect(f.read().socketOverflow).toBe(true);
+  expect(f.read().plain.close4408).toEqual({ count: 1, lastAtMs: null, complete: false });
+  expect(f.read().noise.close4408).toEqual({ count: 0, lastAtMs: null, complete: false });
+  const invalid = f.read();
+  Reflect.set(invalid.plain, "close4408", { count: 1, lastAtMs: 0, complete: true });
+  expect(projectChatUploadObservation(invalid)).toBeNull();
+});
+
+it("counts a successful native 4408 even when the clock throws, without retaining its cause", () => {
+  const f = fixture(undefined, () => {
+    throw new Error("private-clock-cause");
+  });
+  expect(f.socket.close(4408)).toBe(9);
+  expect(f.read().plain.close4408).toEqual({ count: 1, lastAtMs: null, complete: false });
+  expect(JSON.stringify(f.read())).not.toContain("private");
+});
+
+it("strictly projects the closed 4408 witness instead of retaining foreign metadata or invented proof", () => {
+  const f = fixture();
+  f.advance(10);
+  f.socket.close(4408);
+  expect(f.read().plain.close4408).toEqual({ count: 1, lastAtMs: 10, complete: true });
+  for (const witness of [
+    { count: 1, lastAtMs: 10, complete: true, reason: "private-reason" },
+    { count: 0, lastAtMs: 10, complete: true },
+    { count: 1, lastAtMs: null, complete: true },
+    { count: 1, lastAtMs: 10, complete: false },
+    { count: 2, lastAtMs: 10, complete: true },
+    { count: Infinity, lastAtMs: null, complete: false },
+  ]) {
+    const value = f.read();
+    Reflect.set(value.plain, "close4408", witness);
+    expect(projectChatUploadObservation(value)).toBeNull();
+  }
 });

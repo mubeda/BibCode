@@ -1458,6 +1458,18 @@ fixture behavior stays unchanged. Scope result/screenshot receipts to the
 selected case and keep `fullMatrixComplete:false` while later retention,
 fallback, max-batch, admission/remount, heartbeat and WebKitGTK cases are pending.
 
+The passive observer keeps the latest close code/time truthful and separately
+records a constant-space `close4408` witness for each transport: a bounded count
+of normally returning owned calls with explicit numeric code 4408, the latest
+matching document-clock time, and completeness. Ordinary cleanup calls such as
+`close(1000)` do not erase that witness. Freeze proof requires a new matching
+count after its baseline and a matching time within the existing 33-second
+window; an older pre-freeze event cannot qualify. Reject a freeze clock earlier
+than a known baseline witness time before freezing. Unknown or regressed matching
+times and counter or socket-observation overflow leave the witness incomplete with a null time, even
+after later valid calls. These metadata contain no socket identity or close
+reason and do not establish a received frame, completed handshake, or cause.
+
 Record these results in the report template's staged upload subsection. This
 scenario does not validate Phase B file-panel uploads/downloads or asset routing.
 

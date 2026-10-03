@@ -231,10 +231,13 @@ export async function runChatMatrixCase(selection: ChatMatrixCase, port: MatrixP
     await port.capture("matrix-cancel-restored.png");
   } else {
     if (selection.action === "freeze") {
-      const baseline = (await port.observe())[selection.transport].closeCalls;
+      const beforeFreeze = (await port.observe())[selection.transport].close4408;
+      matrixCheck(beforeFreeze.complete);
+      const baseline = beforeFreeze.count;
       const started = await port.clock();
       const checkpoint = samples.at(-1)!;
       matrixCheck(Number.isFinite(started) && started >= 0);
+      matrixCheck(beforeFreeze.lastAtMs === null || beforeFreeze.lastAtMs <= started);
       port.phase("matrix-freeze");
       port.freeze(true);
       try {
@@ -246,13 +249,10 @@ export async function runChatMatrixCase(selection: ChatMatrixCase, port: MatrixP
               ? snapshot.noise.closeMetricsComplete
               : snapshot.plain.available && snapshot.plain.complete,
           );
-          if (
-            observed.closeCalls <= baseline ||
-            observed.lastCloseCode !== 4408 ||
-            observed.lastCloseAtMs === null
-          )
-            return false;
-          clientCloseElapsedMs = observed.lastCloseAtMs - started;
+          const witness = observed.close4408;
+          matrixCheck(witness.complete);
+          if (witness.count <= baseline || witness.lastAtMs === null) return false;
+          clientCloseElapsedMs = witness.lastAtMs - started;
           matrixCheck(clientCloseElapsedMs >= 0 && clientCloseElapsedMs <= 33_000);
           return true;
         }, 35_000);
@@ -318,6 +318,7 @@ export async function runChatMatrixCase(selection: ChatMatrixCase, port: MatrixP
     }
   }
   if (selection.action === "freeze") {
+    matrixCheck(observed[selection.transport].close4408.complete);
     matrixCheck(
       selection.transport === "noise"
         ? observed.noise.closeMetricsComplete
