@@ -373,6 +373,18 @@ as a successful crash probe. Run the recovery suite in the foreground with
 Cargo jobs bounded by `-j 2`; retain child diagnostics and report pipe/resource
 failures without weakening delivery assertions or production deadlines.
 
+On Unix, recovery-test children have a private re-executed monitor group and a
+parent-owned lifetime lease. Follow [the watchdog procedure](./flaky-tests.md#unix-recovery-test-watchdog)
+for `turn_delivery_recovery` on native Linux and native macOS: parent SIGKILL
+and SIGINT must remove handshake-proven child/grandchild/group identities while
+an owned peer survives. Verify raw child status, streamed binary diagnostics,
+normal root exit with descendant-held pipes, startup/protocol failure, original
+absolute deadlines, and monitor reaping. This is test-fixture ownership;
+production `ProcessRunner` behavior and Windows's direct helper are separate.
+Descendants that leave the group are excluded and retain an explicit fixture
+cleanup owner. Record paired base/change latency and reliability evidence;
+existing macOS desktop CI alone does not run this server integration target.
+
 For web queue behavior, run the focused renderer seams and then the web gates:
 
 ```sh
