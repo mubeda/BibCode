@@ -330,6 +330,39 @@ recovery must preserve queued state, payload, mode, and existing holds without
 launching a provider. A starting/connecting/running projection without a live
 runtime, including after graceful shutdown, must become an error with no active
 turn, settle its partial assistant messages, and hold every queued message.
+For accepted-start publication, use deterministic supervisor and native-driver
+gates to cover both workspace-loss orderings: settle after native acceptance
+before publication, then hold an actor-owned publication and queue settlement
+behind it. Repeat ready/running projection, shutdown failure, retained partial
+text and queue holds, old-driver identity and wrong generation. Accepted and
+one native send must survive suppression, caller/actor acknowledgement closure
+and public shutdown; steers must retain their no-running-publication policy.
+
+Also cover normal terminal completion before queued Accepted publication with
+known and unknown native turn IDs and failed completion. In the opposite order,
+hold Accepted between its durable running writes and require the entire terminal
+batch to follow. Gate a terminal after status projection but before partial text
+completion; next native admission and later deltas/completions must wait until
+partial settlement and terminal activity finish. A late previous-turn terminal
+conservatively suppresses running publication; a fresh admission can publish.
+Exercise revision exhaustion without wraparound or reopening publication.
+
+Use the existing SQLite/engine persistence gate to pause a real submitted core
+command, then cancel/stop or restart. Drain must retain the writer through the
+complete core batch before pump abort, runtime deletion or replacement. Verify
+closed-fence stale writers make no runtime/session/message writes, successful
+restart uses a fresh fence, and failed native shutdown leaves the old session
+installed. Preserve EOF/fatal-exit partial settlement and idle-rearm controls.
+A bounded native output fixture must keep draining while the actor awaits a
+native control. Keep fake drivers, queued writes and tasks scoped and joined;
+no actual provider, account or host credential is needed. Run the closest owner
+group and adjacent provider supervisor tests before integrations:
+
+```sh
+cargo test -p bibcode-server --lib production::provider_runtime::workspace_loss_tests:: -j 2
+cargo test -p bibcode-server --test production_provider_runtime --test turn_delivery_recovery -j 2
+```
+
 In light and dark themes, both restart reconciliation and workspace-loss
 settlement must show "BiBCode stopped this session" above their existing
 actionable explanation. A genuine provider disconnect must retain the
