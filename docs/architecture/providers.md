@@ -217,6 +217,44 @@ failure projects as
 `provider_error`, since anything reaching that projection came off a provider's
 wire.
 
+Accepted start delivery keeps native provider I/O outside the supervisor actor.
+Its compact accepted-publication message carries the exact driver identity,
+current delivery generation, native turn ID, captured terminal revision and
+acknowledgement through the existing internal terminal lane. The actor checks
+that identity and generation are current, with no cancellation or pending
+stream-end settlement. Each session shares one private async publication fence
+with its existing pump. Start admission captures the revision under that fence,
+then releases it before native I/O; both optimistic running writes retain one
+lease and are suppressed if the fence closed or a terminal was observed since
+admission. Revision exhaustion permanently suppresses optimistic publication.
+Any intervening terminal suppresses the writes even for an unknown native turn
+ID or a late previous-turn completion; a fresh later admission can publish at
+the newer revision. The legacy direct start path uses the same publisher.
+
+The pump advances the revision before projecting a native terminal and retains
+the fence through its complete core batch: runtime and session state, retained
+partial-message settlement and terminal activity. Other core events use the same
+lease and pump order. Admission waits for that batch before starting follow-up
+native work. EOF's active-turn lookup and synthetic failure use the same fence
+while preserving the existing stream-end acknowledgement protocol. Activity
+projection, activity controls, native reads and writes, actor acknowledgements,
+and driver shutdown remain outside the fence. The pump keeps consuming native
+output while the actor awaits controls; it never awaits a new actor publication
+acknowledgement.
+
+Detach cancels event admission and permanently closes the fence only after
+admitted core writers finish their submitted DB/engine work. It then aborts and
+joins the old pump before runtime deletion or settlement. Successful restart
+uses the same drain and gives the replacement a fresh fence; native shutdown
+still runs first, and a shutdown failure leaves the old session installed.
+There is no timeout that releases an admitted writer before completion.
+Suppression, write failure or actor shutdown does not reinterpret provider
+`Accepted` as not sent and never redelivers the input. Publication acknowledgement
+precedes `DeliveryComplete`, so deferred configuration and explicit stop cannot
+overtake it. Steer acceptance never publishes running state. Actor persistence
+awaits and core drain can delay lifecycle controls; unrelated pumps retain
+independent fences.
+
 When a provider reports a fatal `session.exited` or its event stream ends, the
 supervisor preserves that event and any already-projected turn failure, and
 settles an abandoned active turn only if one remains. Native runtimes can keep

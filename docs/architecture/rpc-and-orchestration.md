@@ -1549,9 +1549,16 @@ the turn ends as error, and the session reports `session_stopped` with
 delivery status before continuing." A shutdown error does not skip settlement
 after detach. Cleanup also requests settlement without a captured identity, so
 a later attempt can retry a failed settlement. Ready projections are left alone;
-removal cleanup retains its existing stop-only behavior. A delivery accepted
-after its session's cancellation skips publishing running runtime and session
-state while retaining the accepted delivery outcome. Retry resolution repeats
+removal cleanup retains its existing stop-only behavior. Accepted start publication remains owned by the supervisor's current driver
+identity and delivery generation. A per-session publication fence captures the
+terminal revision before native delivery and serializes both running writes
+with the pump's complete core batches. Cancellation, closure or any terminal
+observed since admission suppresses optimistic running publication without
+changing Accepted or resending input, including unknown native turn IDs. A fresh
+later admission uses the newer revision. Detach closes and drains admitted
+submitted core writers before pump abort and runtime deletion; successful
+restart uses the same drain and a fresh replacement fence after native shutdown.
+Shutdown failure preserves the existing old-session behavior. Retry resolution repeats
 capture only while its transition ownership is current, and recovery/newer-loss
 cancellation still short-circuits the whole
 attempt. Terminal cleanup applies the same transition-scoped pattern to every
