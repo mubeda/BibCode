@@ -173,3 +173,30 @@ observer does not decode; its capability matcher also does not follow the config
 snapshot's nested `config.environment` shape. Capability and outstanding-append
 observations remain unqualified and cannot prove native concurrency or
 backpressure. A separate reviewed decoder slice is needed for that matrix.
+
+Run `37082615063` at `94b9` again stopped at the static splash before credential
+entry. It observed one combined script/link resource error, successful entry
+transfer, no completed bootstrap/bridge/router/AppRoot resources, and no recorded
+JavaScript/rejection/HTTP error. That does not identify the resource or dependency
+that failed, establish pending graph work, or diagnose a network transition.
+
+The passive DOM snapshot now associates a failed element with closed resource
+kind/type and reads actual `onLine` at capture. A separate explicitly selected
+`startup-only` mode uses the pinned classic ChromeDriver performance-log command
+to classify bounded `Network.loadingFailed` type/error counts. Raw records,
+messages, URLs, headers, IDs and payloads are transient and never artifacts;
+unknown/missing/oversized/partial capture remains explicit. The collected network
+categories do not identify a dependency by URL or prove that unobserved requests
+are pending. No fetch, retry, warmup, timeout or product policy changes are made.
+
+The startup-only workflow is restricted to its separate QA branch/manual trigger.
+Its controller never issues a pairing grant, enters a credential, imports a
+project or uploads. Both successful and failed probe paths join the same owned
+cleanup. Its result says `startup-only`, records separate startup readiness, and
+keeps upload `success` false. The existing upload workflow/default capabilities
+do not enable performance logging, and its required upload assertions remain.
+Classic log retrieval resets the buffer before navigation; this mode ends after
+the unauthenticated page observation, so there is no capture-to-login boundary.
+
+Prepared inert validation does not qualify startup or upload natively. Parent
+review/activation and the next actual closed evidence are still required.

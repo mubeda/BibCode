@@ -165,7 +165,16 @@ def network():
     return 0
 
 
+def qualification_mode(value):
+    if value is None or value == 'upload-smoke':
+        return 'upload-smoke'
+    if value == 'startup-only':
+        return value
+    raise RuntimeError('The qualification mode is invalid')
+
+
 def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_namespace, source, ip):
+    mode = qualification_mode(os.environ.get('BIBCODE_UPLOAD_MODE'))
     private_namespace = os.readlink('/proc/self/ns/net')
     if os.getpid() != 1 or private_namespace == host_namespace:
         raise RuntimeError('Refusing to run outside the owned PID/network namespaces')
@@ -191,6 +200,7 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
             'BIBCODE_UPLOAD_NETNS': private_namespace, 'BIBCODE_UPLOAD_SERVER': server,
             'BIBCODE_UPLOAD_CHROME': chrome, 'BIBCODE_UPLOAD_DRIVER': driver,
             'BIBCODE_UPLOAD_SOURCE': source,
+            'BIBCODE_UPLOAD_MODE': mode,
             **trusted_network,
         }
         with (fixture / 'private-controller.log').open('xb') as output:
@@ -291,6 +301,7 @@ print(json.dumps(result)); sys.exit(0 if result['noDefaultRoute'] else 1)
 
 
 def outer():
+    mode = qualification_mode(os.environ.get('BIBCODE_UPLOAD_MODE'))
     programs = host_programs()
     run_id = os.environ['GITHUB_RUN_ID']
     node = resolve_node_runtime()
@@ -303,6 +314,7 @@ def outer():
     versions = {name: subprocess.check_output([path, '--version'], text=True, timeout=10).splitlines()[0]
                 for name, path in programs.items() if name in ['google-chrome', 'chromedriver']}
     write_json(evidence / 'provenance.json', {'source': os.environ['GITHUB_SHA'], 'versions': versions,
+                                             'qualificationMode': mode,
                                              'fixtureRoot': str(fixture), 'guardMode': 'default Abort'})
     command = [programs['unshare'], '--user', '--map-current-user', '--keep-caps', '--net', '--pid', '--mount-proc',
                '--fork', '--kill-child', sys.executable, __file__, 'inner', str(evidence), str(fixture),

@@ -1,5 +1,6 @@
 """Real-process supervisor tests; no namespace, installer, or UI execution."""
 import importlib.util
+import ast
 import contextlib
 import io
 import json
@@ -21,6 +22,29 @@ spec.loader.exec_module(qualification)
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_mode_defaults_to_upload_and_startup_is_explicit(self):
+        self.assertEqual(qualification.qualification_mode(None), 'upload-smoke')
+        self.assertEqual(qualification.qualification_mode('startup-only'), 'startup-only')
+        with self.assertRaisesRegex(RuntimeError, 'qualification mode'):
+            qualification.qualification_mode('private-invalid')
+
+    def test_invalid_mode_refuses_before_program_or_namespace_admission(self):
+        with mock.patch.dict(os.environ, {'BIBCODE_UPLOAD_MODE': 'private-invalid'}), \
+             mock.patch.object(qualification, 'host_programs') as programs:
+            with self.assertRaisesRegex(RuntimeError, 'qualification mode'):
+                qualification.outer()
+            programs.assert_not_called()
+
+    def test_actual_inner_environment_forwards_only_the_selected_mode(self):
+        module = ast.parse(SOURCE.read_text())
+        inner = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'inner')
+        assignment = next(node for node in ast.walk(inner) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'environment' for target in node.targets))
+        scope = {'mode': 'startup-only', 'Path': Path, 'fixture': Path('/owned/fixture'), 'evidence': Path('/owned/evidence'),
+                 'node': '/owned/node', 'os': os, 'private_namespace': 'owned', 'server': '/owned/server',
+                 'chrome': '/owned/chrome', 'driver': '/owned/driver', 'source': 'a' * 40, 'trusted_network': {}}
+        exec(compile(ast.Module(body=[assignment], type_ignores=[]), 'owned-environment', 'exec'), scope)
+        self.assertEqual(scope['environment']['BIBCODE_UPLOAD_MODE'], 'startup-only')
+
     def test_preflight_cancellation_does_not_start_another_owned_probe(self):
         cancelled = {'exitCode': 143, 'timedOut': False, 'cancelledSignal': signal.SIGTERM, 'supervisorReaped': True}
         succeeded = {'exitCode': 0, 'timedOut': False, 'cancelledSignal': None, 'supervisorReaped': True}

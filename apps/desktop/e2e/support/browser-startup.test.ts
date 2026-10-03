@@ -11,6 +11,7 @@ function install(resourceObserverAvailable = true) {
   let resources!: (list: { getEntries: () => unknown[] }) => void;
   const elements = new Set(["boot-shell"]);
   const page: Record<string, unknown> = {};
+  const navigator = { onLine: true };
   const document = {
     readyState: "loading",
     getElementById: (id: string) => (elements.has(id) ? {} : null),
@@ -21,6 +22,7 @@ function install(resourceObserverAvailable = true) {
     window: page,
     document,
     location: { origin: "http://localhost:4901" },
+    navigator,
     URL,
     addEventListener: (name: string, handler: (event: unknown) => void) =>
       handlers.set(name, handler),
@@ -37,6 +39,7 @@ function install(resourceObserverAvailable = true) {
     handlers,
     elements,
     document,
+    navigator,
     resource: (entries: unknown[]) => resources({ getEntries: () => entries }),
     failedResourceRead: () =>
       resources({
@@ -49,6 +52,73 @@ function install(resourceObserverAvailable = true) {
 }
 
 describe("passive browser startup evidence", () => {
+  it("attributes failed element resources to closed kinds without keeping their URLs", () => {
+    const fixture = install();
+    for (const [target, expected] of [
+      [
+        {
+          tagName: "SCRIPT",
+          type: "module",
+          src: "http://localhost:4901/src/main.tsx?credential-private",
+        },
+        { element: "script", kind: "entry", type: "module" },
+      ],
+      [
+        { tagName: "SCRIPT", type: "", src: "http://localhost:4901/theme-bootstrap.js" },
+        { element: "script", kind: "theme-bootstrap", type: "classic" },
+      ],
+      [
+        { tagName: "SCRIPT", type: "module", src: "http://localhost:4901/@vite/client" },
+        { element: "script", kind: "vite-client", type: "module" },
+      ],
+      [
+        { tagName: "LINK", rel: "icon", href: "http://localhost:4901/favicon.ico?private" },
+        { element: "link", kind: "icon", type: "icon" },
+      ],
+      [
+        { tagName: "LINK", rel: "stylesheet", href: "http://localhost:4901/src/index.css" },
+        { element: "link", kind: "source", type: "stylesheet" },
+      ],
+      [
+        { tagName: "SCRIPT", type: "module", src: "https://foreign.invalid/private" },
+        { element: "script", kind: "cross-origin", type: "module" },
+      ],
+    ]) {
+      fixture.handlers.get("error")?.({ target });
+      const observed = projectBrowserStartupObservation(fixture.read());
+      expect(observed).toMatchObject({ lastResourceFailure: expected });
+      expect(JSON.stringify(fixture.read())).not.toMatch(/credential|private|https?:\/\//);
+    }
+  });
+
+  it("preserves a resource error with unknown association when its target getter throws", () => {
+    const fixture = install();
+    fixture.handlers.get("error")?.({
+      target: {
+        tagName: "SCRIPT",
+        get src() {
+          throw new Error("private");
+        },
+      },
+    });
+    const observed = projectBrowserStartupObservation(fixture.read());
+    expect(observed).toMatchObject({
+      resourceErrors: 1,
+      lastResourceFailure: { element: "script", kind: "unknown", type: "unknown" },
+    });
+    fixture.navigator.onLine = false;
+    expect(projectBrowserStartupObservation(fixture.read())).toMatchObject({ onlineAtRead: false });
+    expect(
+      projectBrowserStartupObservation({
+        lastResourceFailure: { element: "secret", kind: "private", type: "raw" },
+        onlineAtRead: "true",
+      }),
+    ).toMatchObject({
+      lastResourceFailure: { element: null, kind: null, type: null },
+      onlineAtRead: null,
+    });
+  });
+
   it("observes boot and load independently without forcing readiness", () => {
     const fixture = install();
     expect(fixture.read()).toMatchObject({

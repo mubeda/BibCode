@@ -22,6 +22,11 @@ import {
   projectBrowserStartupObservation,
 } from "./support/browser-startup.ts";
 import {
+  parseQualificationMode,
+  projectStartupNetworkLogs,
+  runCredentialFreeStartupProbe,
+} from "./support/browser-startup-probe.ts";
+import {
   createSizedPng,
   instrumentCodexAttachmentLog,
   STAGED_SMOKE_IMAGE_BYTES,
@@ -33,6 +38,8 @@ import {
   projectPairingObservation,
   projectQualificationProcess,
 } from "./support/chat-upload-evidence.ts";
+
+const qualificationMode = parseQualificationMode(process.env.BIBCODE_UPLOAD_MODE);
 
 const root = NodePath.resolve(import.meta.dirname, "../../..");
 const fixture = process.env.BIBCODE_UPLOAD_FIXTURE;
@@ -263,6 +270,7 @@ let pairingCompleted = false;
 let credentialEntryAttempted = false;
 let pairingObservation: ReturnType<typeof projectPairingObservation> | null = null;
 let startupObservation: ReturnType<typeof projectBrowserStartupObservation> | null = null;
+let startupNetworkObservation: ReturnType<typeof projectStartupNetworkLogs> | null = null;
 let success = false;
 const cleanupFailures: Array<{
   role: string;
@@ -385,8 +393,14 @@ try {
         browserName: "chrome",
         webSocketUrl: false,
         "wdio:enforceWebDriverClassic": true,
+        ...(qualificationMode === "startup-only"
+          ? { "goog:loggingPrefs": { performance: "ALL" } }
+          : {}),
         "goog:chromeOptions": {
           binary: chrome,
+          ...(qualificationMode === "startup-only"
+            ? { perfLoggingPrefs: { enableNetwork: true, enablePage: false } }
+            : {}),
           args: [
             "--headless=new",
             "--disable-dev-shm-usage",
@@ -458,121 +472,168 @@ try {
       }),
   });
   const plain = environments[0]!;
-  phase("pair-issue-token");
-  const credential = JSON.parse(
-    NodeChildProcess.execFileSync(
-      serverBinary,
-      ["pairing", "issue", "--base-dir", plain.context.stateRoot, "--dev-url", webOrigin, "--json"],
-      { env: plain.env, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] },
-    ),
-  ).credential;
-  if (typeof credential !== "string" || credential.length < 8)
-    throw new Error("Owned pairing command returned no credential.");
-  phase("pair-navigate");
-  await b.url(webOrigin + "/pair");
-  phase("pair-wait-token");
-  await b.$("#pairing-token").waitForDisplayed();
-  phase("pair-fill-token");
-  credentialEntryAttempted = true;
-  await b.$("#pairing-token").setValue(credential);
-  phase("pair-submit");
-  await b.$("button=Continue").click();
-  phase("pair-wait-sidebar");
-  await b.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
-  pairingCompleted = true;
-
-  phase("wait-primary-connected");
-  await b.$('[data-testid="environment-rail-local"] [data-status="connected"]').waitForDisplayed();
-  phase("open-project-menu");
-  await b.$('[data-testid="sidebar-add-project-trigger"]').click();
-  phase("choose-project-browse");
-  const browseFolder = b.$(
-    "//button[@data-add-project-action='true'][.//span[normalize-space()='Browse folder']]",
-  );
-  await browseFolder.waitForDisplayed();
-  await browseFolder.click();
-  phase("choose-project-path-entry");
-  await until(
-    async () =>
-      (await b.$("#add-project-host-path").isDisplayed()) ||
-      (await b.$("button=Type a path instead").isDisplayed()),
-  );
-  if (!(await b.$("#add-project-host-path").isExisting())) {
-    await b.$("button=Type a path instead").waitForDisplayed();
-    await b.$("button=Type a path instead").click();
-  }
-  phase("submit-project-path");
-  await b.$("#add-project-host-path").waitForDisplayed();
-  await b.$("#add-project-host-path").setValue(plain.projectPath);
-  await b.$("button=Open project").click();
-  phase("wait-project-composer");
-  const editorSelector =
-    '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]';
-  await b.$(editorSelector).waitForDisplayed();
-  plain.route = await b.getUrl();
-
-  const pngPath = NodePath.join(fixtureRoot, "upload-smoke.png");
-  const png = createSizedPng(STAGED_SMOKE_IMAGE_BYTES, "smoke");
-  NodeFS.writeFileSync(pngPath, png);
-  const digest = NodeCrypto.createHash("sha256").update(png).digest("hex");
-  phase("wait-composer-file-enabled");
-  const input = await b.$('[data-center-surface-host][data-visible="true"] input[type="file"]');
-  await input.waitForEnabled();
-  phase("select-composer-file");
-  // The real input is hidden. Send the file through WebDriver's native upload command;
-  // setValue first sends Element Clear, which requires an interactable control.
-  await b.elementSendKeys(await input.elementId, pngPath);
-  phase("wait-composer-image-preview");
-  await until(async () =>
-    b.execute(() =>
-      Array.from(document.querySelectorAll('[data-chat-composer-form="true"] img')).some(
-        (element) =>
-          element instanceof HTMLImageElement &&
-          element.complete &&
-          element.naturalWidth === 1 &&
-          element.naturalHeight === 1,
+  if (qualificationMode === "startup-only") {
+    phase("startup-only-probe");
+    const probe = await runCredentialFreeStartupProbe({
+      readPerformanceLogs: () => bounded(b.getLogs("performance"), 2_000),
+      navigate: async () => {
+        phase("pair-navigate");
+        await b.url(webOrigin + "/pair");
+      },
+      waitForPairingControl: async () => {
+        phase("pair-wait-token");
+        await b.$("#pairing-token").waitForDisplayed();
+      },
+    });
+    startupNetworkObservation = probe.network;
+    try {
+      startupObservation = projectBrowserStartupObservation(
+        await bounded(
+          b.execute(() => {
+            const observer = Reflect.get(window, "__browserStartupObservation") as
+              | { read?: () => unknown }
+              | undefined;
+            return observer?.read?.() ?? null;
+          }),
+          2_000,
+        ),
+      );
+    } catch {
+      /* Unknown observation cannot lead to credential entry. */
+    }
+    if (!probe.reachedPairingControl || !probe.network.available)
+      throw new Error("The credential-free startup probe did not reach observable readiness.");
+    phase("startup-only-complete");
+    success = true;
+  } else {
+    phase("pair-issue-token");
+    const credential = JSON.parse(
+      NodeChildProcess.execFileSync(
+        serverBinary,
+        [
+          "pairing",
+          "issue",
+          "--base-dir",
+          plain.context.stateRoot,
+          "--dev-url",
+          webOrigin,
+          "--json",
+        ],
+        { env: plain.env, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] },
       ),
-    ),
-  );
-  phase("enter-composer-message");
-  await b.$(editorSelector).click();
-  await b.$(editorSelector).addValue("upload-smoke");
-  phase("send-composer-message");
-  await b.keys("Enter");
-  phase("wait-provider-attachment");
-  await until(
-    async () =>
-      NodeFS.existsSync(plain.receipts) &&
-      NodeFS.readFileSync(plain.receipts, "utf8").includes('"prompt":"upload-smoke"'),
-  );
-  phase("verify-provider-attachment");
-  const receipts = NodeFS.readFileSync(plain.receipts, "utf8")
-    .trim()
-    .split("\n")
-    .map((line) => JSON.parse(line));
-  const received = receipts.find((entry) => entry.prompt === "upload-smoke");
-  if (
-    received.attachments.length !== 1 ||
-    received.attachments[0].bytes !== png.length ||
-    received.attachments[0].sha256 !== digest
-  ) {
-    throw new Error("The provider did not receive the exact composer attachment.");
+    ).credential;
+    if (typeof credential !== "string" || credential.length < 8)
+      throw new Error("Owned pairing command returned no credential.");
+    phase("pair-navigate");
+    await b.url(webOrigin + "/pair");
+    phase("pair-wait-token");
+    await b.$("#pairing-token").waitForDisplayed();
+    phase("pair-fill-token");
+    credentialEntryAttempted = true;
+    await b.$("#pairing-token").setValue(credential);
+    phase("pair-submit");
+    await b.$("button=Continue").click();
+    phase("pair-wait-sidebar");
+    await b.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
+    pairingCompleted = true;
+
+    phase("wait-primary-connected");
+    await b
+      .$('[data-testid="environment-rail-local"] [data-status="connected"]')
+      .waitForDisplayed();
+    phase("open-project-menu");
+    await b.$('[data-testid="sidebar-add-project-trigger"]').click();
+    phase("choose-project-browse");
+    const browseFolder = b.$(
+      "//button[@data-add-project-action='true'][.//span[normalize-space()='Browse folder']]",
+    );
+    await browseFolder.waitForDisplayed();
+    await browseFolder.click();
+    phase("choose-project-path-entry");
+    await until(
+      async () =>
+        (await b.$("#add-project-host-path").isDisplayed()) ||
+        (await b.$("button=Type a path instead").isDisplayed()),
+    );
+    if (!(await b.$("#add-project-host-path").isExisting())) {
+      await b.$("button=Type a path instead").waitForDisplayed();
+      await b.$("button=Type a path instead").click();
+    }
+    phase("submit-project-path");
+    await b.$("#add-project-host-path").waitForDisplayed();
+    await b.$("#add-project-host-path").setValue(plain.projectPath);
+    await b.$("button=Open project").click();
+    phase("wait-project-composer");
+    const editorSelector =
+      '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]';
+    await b.$(editorSelector).waitForDisplayed();
+    plain.route = await b.getUrl();
+
+    const pngPath = NodePath.join(fixtureRoot, "upload-smoke.png");
+    const png = createSizedPng(STAGED_SMOKE_IMAGE_BYTES, "smoke");
+    NodeFS.writeFileSync(pngPath, png);
+    const digest = NodeCrypto.createHash("sha256").update(png).digest("hex");
+    phase("wait-composer-file-enabled");
+    const input = await b.$('[data-center-surface-host][data-visible="true"] input[type="file"]');
+    await input.waitForEnabled();
+    phase("select-composer-file");
+    // The real input is hidden. Send the file through WebDriver's native upload command;
+    // setValue first sends Element Clear, which requires an interactable control.
+    await b.elementSendKeys(await input.elementId, pngPath);
+    phase("wait-composer-image-preview");
+    await until(async () =>
+      b.execute(() =>
+        Array.from(document.querySelectorAll('[data-chat-composer-form="true"] img')).some(
+          (element) =>
+            element instanceof HTMLImageElement &&
+            element.complete &&
+            element.naturalWidth === 1 &&
+            element.naturalHeight === 1,
+        ),
+      ),
+    );
+    phase("enter-composer-message");
+    await b.$(editorSelector).click();
+    await b.$(editorSelector).addValue("upload-smoke");
+    phase("send-composer-message");
+    await b.keys("Enter");
+    phase("wait-provider-attachment");
+    await until(
+      async () =>
+        NodeFS.existsSync(plain.receipts) &&
+        NodeFS.readFileSync(plain.receipts, "utf8").includes('"prompt":"upload-smoke"'),
+    );
+    phase("verify-provider-attachment");
+    const receipts = NodeFS.readFileSync(plain.receipts, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const received = receipts.find((entry) => entry.prompt === "upload-smoke");
+    if (
+      received.attachments.length !== 1 ||
+      received.attachments[0].bytes !== png.length ||
+      received.attachments[0].sha256 !== digest
+    ) {
+      throw new Error("The provider did not receive the exact composer attachment.");
+    }
+    const observations = await b.execute(() =>
+      JSON.parse(JSON.stringify(Reflect.get(window, "__uploadObservations"))),
+    );
+    if (
+      !observations.events.some((entry: { method?: string }) => entry.method === "uploads.begin")
+    ) {
+      throw new Error("The actual browser did not exercise staged uploads.");
+    }
+    await b.saveScreenshot(NodePath.join(evidenceRoot, "plain-smoke.png"));
+    results.push({
+      scenario: "plain-staged-image-512kib",
+      providerBytes: png.length,
+      providerDigest: digest,
+      observations,
+    });
+    phase("smoke-complete");
+    success = true;
   }
-  const observations = await b.execute(() =>
-    JSON.parse(JSON.stringify(Reflect.get(window, "__uploadObservations"))),
-  );
-  if (!observations.events.some((entry: { method?: string }) => entry.method === "uploads.begin")) {
-    throw new Error("The actual browser did not exercise staged uploads.");
-  }
-  await b.saveScreenshot(NodePath.join(evidenceRoot, "plain-smoke.png"));
-  results.push({
-    scenario: "plain-staged-image-512kib",
-    providerBytes: png.length,
-    providerDigest: digest,
-    observations,
-  });
-  phase("smoke-complete");
-  success = true;
 } catch (error) {
   if (error instanceof BrowserConnectivityFailure) networkProof = error.proof;
   if (browser && currentPhase.startsWith("pair-")) {
@@ -665,6 +726,8 @@ try {
     onlineAfterPairFailure,
     pairingObservation,
     startupObservation,
+    startupNetworkObservation,
+    qualificationMode,
   });
   // Retain passive transport observations after a completed pairing.
   if (browser && pairingCompleted) {
@@ -683,6 +746,8 @@ try {
         onlineAfterPairFailure,
         pairingObservation,
         startupObservation,
+        startupNetworkObservation,
+        qualificationMode,
       });
     } catch {
       // Diagnostic capture cannot skip the owned process cleanup below.
@@ -770,7 +835,9 @@ try {
     });
   }
   write("result", {
-    success,
+    success: success && qualificationMode === "upload-smoke",
+    qualificationMode,
+    startupProbePassed: qualificationMode === "startup-only" ? success : null,
     phase: currentPhase,
     source: process.env.BIBCODE_UPLOAD_SOURCE,
     results,
@@ -778,10 +845,13 @@ try {
     onlineAfterPairFailure,
     pairingObservation,
     startupObservation,
+    startupNetworkObservation,
     beforeCleanup,
     cleanupFailures,
     scope:
-      "Chromium staged-upload smoke only; full slow-link matrix and WebKitGTK remain unmeasured.",
+      qualificationMode === "startup-only"
+        ? "Credential-free startup-only observation; no pairing grant, project import or upload qualification."
+        : "Chromium staged-upload smoke only; full slow-link matrix and WebKitGTK remain unmeasured.",
     childProcessesClosed: processes.every(
       ({ child }) => child.exitCode !== null || child.signalCode !== null,
     ),

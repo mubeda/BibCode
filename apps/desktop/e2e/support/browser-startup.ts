@@ -19,6 +19,24 @@ const errorClasses = new Set([
   "DOMException",
 ]);
 const statuses = new Set(["ok", "client-error", "server-error", "other", "unknown"]);
+const failedKinds = new Set([
+  ...resourceKinds,
+  "theme-bootstrap",
+  "vite-client",
+  "icon",
+  "other",
+  "cross-origin",
+  "unknown",
+]);
+const failedTypes = new Set([
+  "module",
+  "classic",
+  "stylesheet",
+  "modulepreload",
+  "icon",
+  "other",
+  "unknown",
+]);
 const maximumCount = 20_000;
 
 function record(value: unknown): Record<string, unknown> {
@@ -36,6 +54,7 @@ export function projectBrowserStartupObservation(input: unknown) {
       ? value
       : null;
   const resources = record(source.resources);
+  const failure = record(source.lastResourceFailure);
   return {
     installed: boolean("installed"),
     bootShellPresent: boolean("bootShellPresent"),
@@ -48,6 +67,22 @@ export function projectBrowserStartupObservation(input: unknown) {
     errors: count(source.errors),
     rejections: count(source.rejections),
     resourceErrors: count(source.resourceErrors),
+    onlineAtRead: boolean("onlineAtRead"),
+    lastResourceFailure:
+      source.lastResourceFailure == null
+        ? null
+        : {
+            element:
+              failure.element === "script" || failure.element === "link" ? failure.element : null,
+            kind:
+              typeof failure.kind === "string" && failedKinds.has(failure.kind)
+                ? failure.kind
+                : null,
+            type:
+              typeof failure.type === "string" && failedTypes.has(failure.type)
+                ? failure.type
+                : null,
+          },
     lastErrorClass:
       typeof source.lastErrorClass === "string" && errorClasses.has(source.lastErrorClass)
         ? source.lastErrorClass
@@ -93,7 +128,7 @@ export const browserStartupObservationScript = String.raw`(() => {
     domContentLoaded: document.readyState === 'interactive' || document.readyState === 'complete',
     windowLoaded: document.readyState === 'complete', errors: 0, rejections: 0, resourceErrors: 0,
     lastErrorClass: null, dynamicImportFailure: false, resourceObserverAvailable: false,
-    resourceEntriesTruncated: false, counterSaturated: false,
+    resourceEntriesTruncated: false, counterSaturated: false, lastResourceFailure: null,
   };
   const resources = Object.fromEntries(kinds.map((kind) => [kind, { completed: 0, httpErrors: 0, lastStatus: 'unknown', lastDurationMs: null }]));
   const increment = (object, key) => {
@@ -113,6 +148,29 @@ export const browserStartupObservationScript = String.raw`(() => {
     try {
       if (event && (event.target?.tagName === 'SCRIPT' || event.target?.tagName === 'LINK') && !('error' in event)) {
         increment(state, 'resourceErrors');
+        const element = event.target.tagName === 'SCRIPT' ? 'script' : 'link';
+        state.lastResourceFailure = { element, kind: 'unknown', type: 'unknown' };
+        try {
+          const target = event.target;
+          const name = element === 'script' ? target.src : target.href;
+          let kind = 'unknown';
+          if (typeof name === 'string' && name.length > 0 && name.length <= 8192) {
+            const url = new URL(name, location.origin);
+            kind = url.origin !== location.origin ? 'cross-origin' :
+              url.pathname === '/theme-bootstrap.js' ? 'theme-bootstrap' :
+              url.pathname === '/@vite/client' ? 'vite-client' :
+              ['/favicon.ico', '/apple-touch-icon.png'].includes(url.pathname) ? 'icon' : kindFor(name) ?? 'other';
+          }
+          let type = 'unknown';
+          if (element === 'script' && typeof target.type === 'string' && target.type.length <= 64) {
+            const value = target.type.trim().toLowerCase();
+            type = value === 'module' ? 'module' : ['', 'text/javascript', 'application/javascript', 'text/ecmascript', 'application/ecmascript'].includes(value) ? 'classic' : 'other';
+          } else if (element === 'link' && typeof target.rel === 'string' && target.rel.length <= 128) {
+            const values = target.rel.toLowerCase().split(/\s+/);
+            type = values.includes('stylesheet') ? 'stylesheet' : values.includes('modulepreload') ? 'modulepreload' : values.includes('icon') ? 'icon' : 'other';
+          }
+          state.lastResourceFailure = { element, kind, type };
+        } catch { /* A failed target read stays unknown; no raw string is retained. */ }
       } else { increment(state, 'errors'); inspectError(event?.error); }
     } catch { /* Observation never alters the page's error handling. */ }
   }, true);
@@ -162,6 +220,8 @@ export const browserStartupObservationScript = String.raw`(() => {
     desktopBridgePresent: window.desktopBridge !== undefined,
     tauriMarkerPresent: window.__TAURI__ !== undefined || window.__TAURI_INTERNALS__ !== undefined,
     errors: state.errors, rejections: state.rejections, resourceErrors: state.resourceErrors,
+    onlineAtRead: (() => { try { const value = navigator.onLine; return typeof value === 'boolean' ? value : null; } catch { return null; } })(),
+    lastResourceFailure: state.lastResourceFailure === null ? null : { ...state.lastResourceFailure },
     lastErrorClass: state.lastErrorClass, dynamicImportFailure: state.dynamicImportFailure,
     resourceObserverAvailable: state.resourceObserverAvailable,
     resourceEntriesTruncated: state.resourceEntriesTruncated, counterSaturated: state.counterSaturated,
