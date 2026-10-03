@@ -67,6 +67,613 @@ const absolute = (...parts: ReadonlyArray<string>): string =>
 const decodePairingLink = Schema.decodeUnknownSync(Schema.toCodecJson(AuthPairingLink));
 const repositoryRoot = NodeURL.fileURLToPath(new URL("..", import.meta.url));
 
+/** Execute the generated browser callback with inert transport and native bridge ports. */
+const generatedObserverFixture = async (
+  options: {
+    executeFailure?: boolean;
+    seed?: boolean;
+    openEvent?: "close" | "error" | "timeout";
+    sendFailure?: "Request" | "Interrupt" | "ShellRequest";
+    runIt?: boolean;
+  } = {},
+) => {
+  const input = {
+    candidateVersion: "0.7.3-upgrade.1",
+    expectedDataRoot: "/owned/data",
+    lane: "remote-install" as const,
+    phase: "verify" as const,
+    projectId: "private-project-sentinel",
+    resultPath: "/owned/after.json",
+    observerDiagnosticPath: "/owned/verify-observer.json",
+    workspaceRoot: "/owned/workspace",
+  };
+  const spec = createSeededUpgradeDriverSpec(input);
+  const end = spec.indexOf('describe("seeded packaged upgrade');
+  if (end < 0) throw new Error("Generated observer source missing");
+  const writes = new Map<string, unknown>();
+  const timers = new Map<() => void, number>();
+  const timerBudgets: number[] = [];
+  let now = 0;
+  const status = vi.fn(async () => []);
+  type Callback = (event: Record<string, unknown>) => void;
+  class Socket {
+    static OPEN = 1;
+    readyState = 0;
+    protocol = "";
+    listeners = new Map<string, Map<Callback, boolean>>();
+    retired: Callback[] = [];
+    sent: Record<string, unknown>[] = [];
+    closes = 0;
+    handlerErrors = 0;
+    constructor() {
+      sockets.push(this);
+      queueMicrotask(() => {
+        if (options.openEvent === "timeout") return;
+        if (options.openEvent) {
+          this.emit(options.openEvent, {
+            code: 1006,
+            wasClean: false,
+            reason: "private-open-sentinel",
+          });
+          return;
+        }
+        this.readyState = 1;
+        this.emit("open", {});
+      });
+    }
+    addEventListener(type: string, callback: Callback, options?: { once?: boolean }) {
+      const listeners = this.listeners.get(type) ?? new Map<Callback, boolean>();
+      listeners.set(callback, options?.once === true);
+      this.listeners.set(type, listeners);
+    }
+    removeEventListener(type: string, callback: Callback) {
+      if (this.listeners.get(type)?.delete(callback)) this.retired.push(callback);
+    }
+    emit(type: string, event: Record<string, unknown>) {
+      for (const [callback, once] of Array.from(this.listeners.get(type) ?? [])) {
+        if (once) this.removeEventListener(type, callback);
+        try {
+          callback(event);
+        } catch {
+          this.handlerErrors += 1;
+        }
+      }
+    }
+    send(data: string) {
+      const frame = JSON.parse(data) as Record<string, unknown>;
+      if (
+        frame._tag === options.sendFailure ||
+        (options.sendFailure === "ShellRequest" && frame.tag === "orchestration.subscribeShell")
+      )
+        throw new Error("private-send-sentinel");
+      this.sent.push(frame);
+    }
+    close() {
+      this.closes += 1;
+      this.readyState = 3;
+      this.emit("close", { code: 1000, wasClean: true, reason: "private-close-sentinel" });
+    }
+  }
+  const sockets: Socket[] = [];
+  let runRegistered: (() => Promise<unknown>) | undefined;
+  const run = NodeVM.runInNewContext(
+    spec.replace('import * as NodeFS from "node:fs";', "") + "\nobserve",
+    {
+      describe: (_name: string, body: () => void) => body(),
+      it: (_name: string, body: () => Promise<unknown>) => {
+        runRegistered = body;
+      },
+      NodeFS: {
+        writeFileSync: (path: string, value: string) => writes.set(path, JSON.parse(value)),
+      },
+      window: {
+        desktopBridge: {
+          getLocalEnvironmentBootstraps: () => [
+            {
+              id: "primary",
+              httpBaseUrl: "http://private.invalid",
+              wsBaseUrl: "ws://private.invalid",
+            },
+          ],
+          getLocalEnvironmentBearerToken: async () => "private-bearer-sentinel",
+          getProjectDataStatuses: status,
+          getUpdateState: async () => ({ currentVersion: input.candidateVersion }),
+        },
+      },
+      browser: {
+        waitUntil: async (probe: () => Promise<boolean>) => expect(await probe()).toBe(true),
+        execute: async (callback: (...args: unknown[]) => unknown, ...args: unknown[]) => {
+          if (options.executeFailure) throw new Error("private-execute-sentinel");
+          return callback(...args);
+        },
+      },
+      fetch: async (url: URL) => ({
+        ok: true,
+        json: async () =>
+          url.pathname.endsWith("environment")
+            ? { storageInstanceId: "private-store-sentinel", serverVersion: input.candidateVersion }
+            : { ticket: "private-ticket-sentinel" },
+      }),
+      URL,
+      WebSocket: Socket,
+      performance: { now: () => now },
+      Date,
+      setTimeout: (callback: () => void, milliseconds: number) => {
+        timers.set(callback, now + milliseconds);
+        timerBudgets.push(milliseconds);
+        return callback;
+      },
+      clearTimeout: (callback: () => void) => timers.delete(callback),
+    },
+    { timeout: 1000 },
+  ) as (seed: boolean) => Promise<unknown>;
+  let settled = false;
+  const execution = options.runIt ? runRegistered?.() : run(options.seed === true);
+  if (!execution) throw new Error("Generated verification body missing");
+  const outcome = execution.then(
+    (value) => {
+      settled = true;
+      return { success: true, value };
+    },
+    (error: unknown) => {
+      settled = true;
+      return { success: false, value: String(error) };
+    },
+  );
+  const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+  await flush();
+  return {
+    input,
+    writes,
+    timers,
+    timerBudgets,
+    sockets,
+    status,
+    outcome,
+    flush,
+    isSettled: () => settled,
+    expire: async () => {
+      now += 15_000;
+      for (const [callback, at] of Array.from(timers)) {
+        if (at <= now) {
+          timers.delete(callback);
+          callback();
+        }
+      }
+      await flush();
+    },
+  };
+};
+
+describe("generated observer terminal diagnostics", () => {
+  it("keeps the temporary Mac ARM trial on all three ordinary lanes and mandatory gates", async () => {
+    const workflow = YAML.parse(
+      await NodeFS.promises.readFile(
+        new URL("../.github/workflows/qualify-mac-upgrade.yml", import.meta.url),
+        "utf8",
+      ),
+    );
+    expect(workflow.on).toEqual({
+      push: { branches: ["codex/qualify-mac-upgrade"] },
+      workflow_dispatch: null,
+    });
+    expect(Object.keys(workflow.jobs)).toEqual(["mac_upgrade_observer"]);
+    const job = workflow.jobs.mac_upgrade_observer;
+    expect(job["runs-on"]).toBe("macos-26");
+    expect(job["timeout-minutes"]).toBe(240);
+    const steps = job.steps as {
+      name: string;
+      run?: string;
+      if?: string;
+      with?: Record<string, unknown>;
+    }[];
+    const trial = steps.findIndex(
+      (step) =>
+        step.name === "Run previous-stable, protected-baseline, and remote-install upgrades",
+    );
+    expect(trial).toBeGreaterThan(0);
+    for (const name of [
+      "Install frozen dependencies",
+      "Check source formatting and lint",
+      "Test observer, held-upload and lane ownership",
+      "Build web assets",
+      "Typecheck full workspace",
+      "Check Rust formatting",
+      "Test native bridge contract",
+      "Test update coordinator",
+      "Test real HTTP maintenance admission",
+      "Recompute affected Clippy diagnostics",
+    ]) {
+      const index = steps.findIndex((step) => step.name === name);
+      expect(index, name).toBeGreaterThanOrEqual(0);
+      expect(index, name).toBeLessThan(trial);
+    }
+    expect(steps[trial]!.run).toContain("--platform mac");
+    expect(steps[trial]!.run).toContain("--arch arm64");
+    expect(steps[trial]!.run).toContain("--bundle dmg");
+    expect(steps[trial]!.run).toContain("--restart-timeout-ms 180000");
+    expect(steps[trial]!.run).not.toMatch(/--previous-stable-trigger|--wsl/);
+    expect(steps.at(-1)).toMatchObject({
+      if: "always()",
+      with: {
+        path: "${{ runner.temp }}/bibcode-mac-upgrade-observer/evidence/*",
+        "if-no-files-found": "error",
+        "retention-days": 7,
+      },
+    });
+  });
+
+  it.each([
+    "stream-failure",
+    "stream-eof",
+    "defect",
+    "protocol-error",
+    "socket-close",
+    "socket-error",
+    "malformed-text",
+    "binary-frame",
+    "unknown-frame",
+  ] as const)("settles %s immediately with closed evidence and cleanup", async (scenario) => {
+    const fixture = await generatedObserverFixture();
+    const socket = fixture.sockets[0]!;
+    const id = socket.sent.find((frame) => frame._tag === "Request")?.id;
+    const frames = {
+      "stream-failure": {
+        _tag: "Exit",
+        requestId: id,
+        exit: {
+          _tag: "Failure",
+          cause: [
+            {
+              _tag: "Fail",
+              error: {
+                _tag: "OrchestrationGetSnapshotError",
+                message: "private-payload-sentinel",
+                cause: "private-cause-sentinel",
+              },
+            },
+          ],
+        },
+      },
+      "stream-eof": { _tag: "Exit", requestId: id, exit: { _tag: "Success" } },
+      defect: { _tag: "Defect", defect: "private-cause-sentinel" },
+      "protocol-error": { _tag: "ClientProtocolError", error: "private-payload-sentinel" },
+      "unknown-frame": { _tag: "private-tag-sentinel", requestId: id },
+    };
+    if (scenario === "socket-close")
+      socket.emit("close", { code: 1006, wasClean: false, reason: "private-close-sentinel" });
+    else if (scenario === "socket-error")
+      socket.emit("error", { message: "private-error-sentinel" });
+    else if (scenario === "malformed-text")
+      socket.emit("message", { data: "private-invalid-json" });
+    else if (scenario === "binary-frame") socket.emit("message", { data: new Uint8Array([1, 2]) });
+    else socket.emit("message", { data: JSON.stringify(frames[scenario]) });
+    await fixture.flush();
+    const immediate = fixture.isSettled();
+    if (!immediate) await fixture.expire();
+    const result = await fixture.outcome;
+    expect(immediate).toBe(true);
+    expect(result.success).toBe(false);
+    const diagnostic = fixture.writes.get(fixture.input.observerDiagnosticPath);
+    expect(diagnostic).toMatchObject({ version: 1, available: true, outcome: scenario });
+    expect(JSON.stringify(diagnostic)).not.toContain("private-");
+    expect(String(result.value)).not.toContain("private-");
+    expect(fixture.writes.has(fixture.input.resultPath)).toBe(false);
+    expect(fixture.status).not.toHaveBeenCalled();
+    expect(fixture.timers.size).toBe(0);
+    expect(socket.closes).toBe(1);
+    expect(socket.handlerErrors).toBe(0);
+    expect([...socket.listeners.values()].every((listeners) => listeners.size === 0)).toBe(true);
+    const saved = JSON.stringify(diagnostic);
+    for (const callback of socket.retired) callback({ data: "private-late-sentinel", code: 4001 });
+    expect(JSON.stringify(fixture.writes.get(fixture.input.observerDiagnosticPath))).toBe(saved);
+    expect(socket.sent.filter((frame) => frame._tag === "Request")).toHaveLength(1);
+  });
+
+  it("keeps the real first snapshot, sends one Interrupt and closes", async () => {
+    const fixture = await generatedObserverFixture();
+    const socket = fixture.sockets[0]!;
+    const id = socket.sent[0]!.id;
+    socket.emit("message", {
+      data: JSON.stringify({
+        _tag: "Chunk",
+        requestId: id,
+        values: [{ kind: "snapshot", snapshot: { projects: [{ id: fixture.input.projectId }] } }],
+      }),
+    });
+    const result = await fixture.outcome;
+    expect(result.success).toBe(true);
+    expect(result.value).toMatchObject({
+      appVersion: fixture.input.candidateVersion,
+      projectIds: [fixture.input.projectId],
+      storageInstanceId: "private-store-sentinel",
+    });
+    expect(socket.sent.filter((frame) => frame._tag === "Interrupt")).toHaveLength(1);
+    expect(socket.closes).toBe(1);
+    expect(fixture.timers.size).toBe(0);
+    expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+      outcome: "success",
+      available: true,
+    });
+  });
+
+  it("keeps the real 15s timeout and counts unmatched frames without retaining their IDs", async () => {
+    const fixture = await generatedObserverFixture();
+    const socket = fixture.sockets[0]!;
+    socket.emit("message", {
+      data: JSON.stringify({
+        _tag: "Exit",
+        requestId: "private-other-id",
+        exit: { _tag: "Success" },
+      }),
+    });
+    await fixture.flush();
+    expect(fixture.isSettled()).toBe(false);
+    await fixture.expire();
+    expect((await fixture.outcome).success).toBe(false);
+    expect(fixture.timerBudgets).toEqual([15000, 15000]);
+    expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+      outcome: "request-timeout",
+      frames: { unmatched: 1 },
+      elapsedMs: 15000,
+    });
+    expect(fixture.timers.size).toBe(0);
+    expect(socket.closes).toBe(1);
+  });
+
+  it("marks missing execute evidence unavailable instead of publishing an observation", async () => {
+    const fixture = await generatedObserverFixture({ executeFailure: true });
+    expect((await fixture.outcome).success).toBe(false);
+    const diagnostic = fixture.writes.get(fixture.input.observerDiagnosticPath);
+    expect(diagnostic).toMatchObject({
+      available: false,
+      outcome: "execute-unavailable",
+      elapsedMs: null,
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("private-");
+    expect(fixture.writes.has(fixture.input.resultPath)).toBe(false);
+  });
+
+  it("closes the snapshot socket before the unchanged native status observations", async () => {
+    const fixture = await generatedObserverFixture();
+    const socket = fixture.sockets[0]!;
+    const closeCounts: number[] = [];
+    fixture.status.mockImplementation(async () => {
+      closeCounts.push(socket.closes);
+      return [];
+    });
+    socket.emit("message", {
+      data: JSON.stringify({
+        _tag: "Chunk",
+        requestId: socket.sent[0]!.id,
+        values: [{ kind: "snapshot", snapshot: { projects: [] } }],
+      }),
+    });
+    expect((await fixture.outcome).success).toBe(true);
+    expect(closeCounts).toEqual([1]);
+    expect(socket.closes).toBe(1);
+  });
+
+  it.each(["close", "error", "timeout"] as const)(
+    "closes opening failure: %s",
+    async (openEvent) => {
+      const fixture = await generatedObserverFixture({ openEvent });
+      if (openEvent === "timeout") await fixture.expire();
+      expect((await fixture.outcome).success).toBe(false);
+      expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+        outcome: openEvent === "timeout" ? "open-timeout" : "socket-" + openEvent,
+        socketOpened: false,
+      });
+      expect(fixture.sockets[0]!.sent).toEqual([]);
+      expect(fixture.sockets[0]!.closes).toBe(1);
+      expect(fixture.timers.size).toBe(0);
+    },
+  );
+
+  it.each(["Request", "Interrupt"] as const)(
+    "does not replay after a %s send failure",
+    async (sendFailure) => {
+      const fixture = await generatedObserverFixture({ sendFailure });
+      const socket = fixture.sockets[0]!;
+      if (sendFailure === "Interrupt")
+        socket.emit("message", {
+          data: JSON.stringify({
+            _tag: "Chunk",
+            requestId: socket.sent[0]!.id,
+            values: [{ kind: "snapshot", snapshot: { projects: [] } }],
+          }),
+        });
+      expect((await fixture.outcome).success).toBe(false);
+      expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+        outcome: "send-error",
+      });
+      expect(socket.sent.filter((frame) => frame._tag === "Request")).toHaveLength(
+        sendFailure === "Request" ? 0 : 1,
+      );
+      expect(fixture.timers.size).toBe(0);
+      expect(socket.closes).toBe(1);
+    },
+  );
+
+  it("retains seed acceptance then reads one real shell snapshot", async () => {
+    const fixture = await generatedObserverFixture({ seed: true });
+    const socket = fixture.sockets[0]!;
+    expect(socket.sent[0]!.tag).toBe("orchestration.dispatchCommand");
+    socket.emit("message", {
+      data: JSON.stringify({
+        _tag: "Exit",
+        requestId: socket.sent[0]!.id,
+        exit: { _tag: "Success", value: null },
+      }),
+    });
+    await fixture.flush();
+    expect(socket.sent[1]!.tag).toBe("orchestration.subscribeShell");
+    socket.emit("message", {
+      data: JSON.stringify({
+        _tag: "Chunk",
+        requestId: socket.sent[1]!.id,
+        values: [{ kind: "snapshot", snapshot: { projects: [{ id: fixture.input.projectId }] } }],
+      }),
+    });
+    expect((await fixture.outcome).success).toBe(true);
+    expect(socket.sent.map((frame) => frame._tag)).toEqual(["Request", "Request", "Interrupt"]);
+  });
+
+  it("does not attribute the seed request's sent or terminal facts to a refused shell send", async () => {
+    const fixture = await generatedObserverFixture({ seed: true, sendFailure: "ShellRequest" });
+    const socket = fixture.sockets[0]!;
+    socket.emit("message", {
+      data: JSON.stringify({
+        _tag: "Exit",
+        requestId: socket.sent[0]!.id,
+        exit: { _tag: "Success" },
+      }),
+    });
+    expect((await fixture.outcome).success).toBe(false);
+    expect(socket.sent).toHaveLength(1);
+    expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+      request: "shell",
+      outcome: "send-error",
+      requestSent: false,
+      terminal: "none",
+      interruptSent: false,
+    });
+  });
+
+  it.each(["Die", "Interrupt", "private-unknown-cause"])(
+    "projects only the closed failure category: %s",
+    async (causeKind) => {
+      const fixture = await generatedObserverFixture();
+      const socket = fixture.sockets[0]!;
+      socket.emit("message", {
+        data: JSON.stringify({
+          _tag: "Exit",
+          requestId: socket.sent[0]!.id,
+          exit: {
+            _tag: "Failure",
+            cause: [
+              {
+                _tag: causeKind,
+                defect: "private-defect",
+                fiberId: "private-fiber-id",
+                error: { _tag: "private-error-tag", message: "private-message" },
+              },
+            ],
+          },
+        }),
+      });
+      expect((await fixture.outcome).success).toBe(false);
+      const diagnostic = fixture.writes.get(fixture.input.observerDiagnosticPath);
+      expect(diagnostic).toMatchObject({
+        outcome: "stream-failure",
+        causeKind: causeKind.startsWith("private-") ? "unknown" : causeKind,
+        failureTag: "unknown",
+      });
+      expect(JSON.stringify(diagnostic)).not.toContain("private-");
+    },
+  );
+
+  it("bounds diagnostic frame counts without changing the request deadline", async () => {
+    const fixture = await generatedObserverFixture();
+    const socket = fixture.sockets[0]!;
+    for (let index = 0; index < 1010; index += 1)
+      socket.emit("message", {
+        data: JSON.stringify({ _tag: "Pong", private: "private-payload" }),
+      });
+    await fixture.expire();
+    expect((await fixture.outcome).success).toBe(false);
+    const diagnostic = fixture.writes.get(fixture.input.observerDiagnosticPath);
+    expect(diagnostic).toMatchObject({ frames: { text: 1000, pong: 1000 }, elapsedMs: 15000 });
+    expect(JSON.stringify(diagnostic).length).toBeLessThan(2000);
+    expect(JSON.stringify(diagnostic)).not.toContain("private-");
+  });
+
+  it("closes unknown diagnostic fields and refuses an impossible close code", () => {
+    const diagnostic = SeededUpgradeHarness.sanitizeSeededUpgradeObserverDiagnostic({
+      available: true,
+      outcome: "private-outcome",
+      milestone: "private-milestone",
+      request: "private-request",
+      terminal: "private-terminal",
+      causeKind: "private-cause",
+      failureTag: "private-tag",
+      elapsedMs: Number.POSITIVE_INFINITY,
+      closeCode: 999999,
+      wasClean: "private-reason",
+      frames: { text: 999999, binary: -1, extra: "private-payload" },
+      url: "private-url",
+      token: "private-token",
+      id: "private-id",
+      cause: "private-raw-cause",
+    });
+    expect(diagnostic).toMatchObject({
+      outcome: "unknown",
+      milestone: "unknown",
+      elapsedMs: null,
+      closeCode: null,
+      wasClean: null,
+      frames: { text: 1000, binary: null },
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("private-");
+    expect(JSON.stringify(diagnostic).length).toBeLessThan(2000);
+  });
+
+  it.each([
+    "null",
+    "array",
+    "empty-chunk",
+    "numeric-id",
+    "invalid-exit",
+    "invalid-snapshot",
+  ] as const)("refuses malformed decoded protocol data: %s", async (scenario) => {
+    const fixture = await generatedObserverFixture();
+    const socket = fixture.sockets[0]!;
+    const id = socket.sent[0]!.id;
+    const values = {
+      null: null,
+      array: [],
+      "empty-chunk": { _tag: "Chunk", requestId: id, values: [] },
+      "numeric-id": { _tag: "Exit", requestId: 0, exit: { _tag: "Success" } },
+      "invalid-exit": { _tag: "Exit", requestId: id, exit: { _tag: "private-terminal" } },
+      "invalid-snapshot": { _tag: "Chunk", requestId: id, values: [{ kind: "private-kind" }] },
+    };
+    socket.emit("message", { data: JSON.stringify(values[scenario]) });
+    expect((await fixture.outcome).success).toBe(false);
+    expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+      outcome: scenario === "invalid-snapshot" ? "invalid-snapshot" : "decode-error",
+    });
+    expect(socket.handlerErrors).toBe(0);
+    expect(fixture.timers.size).toBe(0);
+  });
+
+  it.each([true, false])(
+    "the actual generated test persists success only after observation: %s",
+    async (success) => {
+      const fixture = await generatedObserverFixture({ runIt: true });
+      const socket = fixture.sockets[0]!;
+      const id = socket.sent[0]!.id;
+      socket.emit("message", {
+        data: JSON.stringify(
+          success
+            ? {
+                _tag: "Chunk",
+                requestId: id,
+                values: [
+                  { kind: "snapshot", snapshot: { projects: [{ id: fixture.input.projectId }] } },
+                ],
+              }
+            : { _tag: "Exit", requestId: id, exit: { _tag: "Success" } },
+        ),
+      });
+      expect((await fixture.outcome).success).toBe(success);
+      expect(fixture.writes.has(fixture.input.resultPath)).toBe(success);
+      expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+        outcome: success ? "success" : "stream-eof",
+      });
+    },
+  );
+});
+
 interface ObservedUpgradeLane {
   readonly lane: SeededUpgradeHarness.SeededUpgradeLane;
   readonly trigger?: SeededUpgradeHarness.SeededUpgradeTrigger;

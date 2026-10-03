@@ -69,6 +69,28 @@ Require all three results on both architectures before calling the temporary
 trial complete. Native execution and any later version-scoped default-matrix
 exception need separate review; do not run the packaged harness on a user's host.
 
+### Seeded observer diagnostics
+
+The seeded harness records a separate `seed-and-install-observer.json` or
+`verify-observer.json` beside each lane's bounded evidence. These describe the
+existing one-shot authenticated observer, not update success. They contain only
+closed milestones/outcomes, capped frame counts, known failure categories,
+bounded elapsed time and socket-state facts. They never retain raw RPC payloads,
+causes, close reasons, request or storage IDs, endpoints, or authentication data.
+Frame counts cover the observer; request and terminal facts describe its current
+request, without carrying prior request success into a later failed send.
+An embedded execute failure without a returned envelope is explicitly
+unavailable; missing observations are not zero-valued evidence.
+
+A streamed terminal, protocol/decode failure, or socket close/error settles the
+pending observation immediately. A valid first shell snapshot still sends one
+Interrupt and closes before native project-data reads. Unmatched responses do
+not reset the original 15-second deadline, and no observation is retried. On a
+failed lane, inspect the closed observer record first; only completed normal
+lane results establish project, root, storage, backup and version verification.
+The temporary Mac ARM workflow retains all three ordinary lanes and adds no
+success exception. Its workflow and any native activation require review.
+
 ## Living documentation and execution reports
 
 The runbooks define current procedure and supported behavior. Branch names,

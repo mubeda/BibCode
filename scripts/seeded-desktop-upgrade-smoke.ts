@@ -569,6 +569,128 @@ export function buildLocalUpdaterManifest(input: {
   };
 }
 
+/** Self-contained so the generated spec uses this same closed evidence projection. */
+export function sanitizeSeededUpgradeObserverDiagnostic(value: unknown) {
+  const object = (entry: unknown): Record<string, unknown> =>
+    typeof entry === "object" && entry !== null && !Array.isArray(entry)
+      ? (entry as Record<string, unknown>)
+      : {};
+  const input = object(value);
+  const available = input.available === true;
+  const choice = (entry: unknown, choices: ReadonlyArray<string>) =>
+    typeof entry === "string" && choices.includes(entry) ? entry : "unknown";
+  const number = (entry: unknown, maximum: number) =>
+    typeof entry === "number" && Number.isFinite(entry) && entry >= 0
+      ? Math.min(maximum, Math.floor(entry))
+      : null;
+  const boolean = (entry: unknown) => (typeof entry === "boolean" ? entry : null);
+  const frames = object(input.frames);
+  return {
+    version: 1,
+    available,
+    milestone: choice(input.milestone, [
+      "bridge",
+      "bootstrap",
+      "bearer",
+      "descriptor",
+      "ticket",
+      "opening",
+      "open",
+      "project-create",
+      "shell",
+      "snapshot",
+      "native-status",
+      "complete",
+    ]),
+    outcome: choice(input.outcome, [
+      "success",
+      "stream-failure",
+      "request-failure",
+      "stream-eof",
+      "defect",
+      "protocol-error",
+      "socket-close",
+      "socket-error",
+      "malformed-text",
+      "binary-frame",
+      "other-frame",
+      "unknown-frame",
+      "decode-error",
+      "invalid-snapshot",
+      "open-timeout",
+      "request-timeout",
+      "send-error",
+      "setup-failure",
+      "native-status-failure",
+      "cleanup-failure",
+      "execute-unavailable",
+    ]),
+    request: choice(input.request, ["none", "project-create", "shell"]),
+    elapsedMs: available ? number(input.elapsedMs, 300_000) : null,
+    terminal: choice(input.terminal, [
+      "none",
+      "snapshot",
+      "Success",
+      "Failure",
+      "Defect",
+      "ClientProtocolError",
+      "close",
+      "error",
+      "timeout",
+      "decode",
+    ]),
+    causeKind:
+      input.causeKind === null
+        ? null
+        : choice(input.causeKind, ["Fail", "Die", "Interrupt", "mixed"]),
+    failureTag:
+      input.failureTag === null
+        ? null
+        : choice(input.failureTag, [
+            "OrchestrationGetSnapshotError",
+            "OrchestrationDispatchCommandError",
+            "EnvironmentAuthorizationError",
+            "UpdateMaintenanceActiveError",
+            "RpcResponseTooLargeError",
+            "RpcOutboundAdmissionError",
+          ]),
+    frames: available
+      ? Object.fromEntries(
+          [
+            "text",
+            "binary",
+            "other",
+            "parseErrors",
+            "chunk",
+            "exit",
+            "defect",
+            "protocol",
+            "pong",
+            "unknown",
+            "matched",
+            "unmatched",
+          ].map((key) => [key, number(frames[key], 1_000)]),
+        )
+      : null,
+    socketOpened: available ? boolean(input.socketOpened) : null,
+    socketError: available ? boolean(input.socketError) : null,
+    requestSent: available ? boolean(input.requestSent) : null,
+    interruptSent: available ? boolean(input.interruptSent) : null,
+    closeRequested: available ? boolean(input.closeRequested) : null,
+    wholeTextProtocol: available ? boolean(input.wholeTextProtocol) : null,
+    descriptorIdentityPresent: available ? boolean(input.descriptorIdentityPresent) : null,
+    closeCode:
+      available &&
+      typeof input.closeCode === "number" &&
+      Number.isInteger(input.closeCode) &&
+      input.closeCode >= 0 &&
+      input.closeCode <= 4_999
+        ? input.closeCode
+        : null,
+    wasClean: available ? boolean(input.wasClean) : null,
+  };
+}
+
 export function createSeededUpgradeDriverSpec(input: {
   readonly candidateVersion: string;
   readonly baselineVersion?: string | undefined;
@@ -578,6 +700,7 @@ export function createSeededUpgradeDriverSpec(input: {
   readonly phase: "seed-and-install" | "verify";
   readonly projectId: string;
   readonly resultPath: string;
+  readonly observerDiagnosticPath?: string | undefined;
   readonly workspaceRoot: string;
   readonly wsl?: boolean | undefined;
   readonly remoteInstallDriverPath?: string;
@@ -620,6 +743,7 @@ export function createSeededUpgradeDriverSpec(input: {
 import * as NodeFS from "node:fs";
 
 const input = ${serializedInput};
+const closeObserverDiagnostic = (${sanitizeSeededUpgradeObserverDiagnostic.toString()});
 
 async function waitForDesktopBridge() {
   await browser.waitUntil(
@@ -633,144 +757,279 @@ async function waitForDesktopBridge() {
 }
 
 async function observe(seed) {
-  await waitForDesktopBridge();
-  return browser.execute(async (parameters, seed) => {
-    const bridge = window.desktopBridge;
-    if (!bridge) throw new Error("The packaged desktop bridge is unavailable.");
-    if (parameters.wsl && seed) {
-      if (
-        typeof bridge.setWslOnly !== "function" ||
-        typeof bridge.setWslBackendEnabled !== "function"
-      ) {
-        throw new Error("The packaged desktop bridge cannot configure WSL.");
-      }
-      await bridge.setWslOnly(true);
-      await bridge.setWslBackendEnabled(true);
-    }
-    const bootstrap = await new Promise((resolve, reject) => {
-      const startedAt = Date.now();
-      const poll = () => {
-        const candidate = bridge
-          .getLocalEnvironmentBootstraps()
-          .find((entry) => entry.id === "primary");
-        const isReady =
-          candidate?.httpBaseUrl &&
-          candidate?.wsBaseUrl &&
-          (!parameters.wsl || typeof candidate.runningDistro === "string");
-        if (isReady) return resolve(candidate);
-        if (Date.now() - startedAt >= 60000) {
-          return reject(new Error("The packaged primary bootstrap did not become ready."));
-        }
-        setTimeout(poll, 100);
+  let envelope;
+  try {
+    await waitForDesktopBridge();
+    envelope = await browser.execute(async (parameters, seed) => {
+      const startedAt = performance.now();
+      const diagnostic = {
+        available: true, milestone: "bridge", outcome: "setup-failure", request: "none",
+        elapsedMs: 0, terminal: "none", causeKind: null, failureTag: null,
+        frames: { text: 0, binary: 0, other: 0, parseErrors: 0, chunk: 0, exit: 0, defect: 0, protocol: 0, pong: 0, unknown: 0, matched: 0, unmatched: 0 },
+        socketOpened: false, socketError: false, requestSent: false, interruptSent: false,
+        closeRequested: false, wholeTextProtocol: null, descriptorIdentityPresent: null,
+        closeCode: null, wasClean: null,
       };
-      poll();
-    });
-    if (!bootstrap || !bootstrap.httpBaseUrl || !bootstrap.wsBaseUrl) {
-      throw new Error("The packaged primary bootstrap is unavailable.");
-    }
-    const bearer = await bridge.getLocalEnvironmentBearerToken();
-    const descriptorResponse = await fetch(
-      new URL("/.well-known/bibcode/environment", bootstrap.httpBaseUrl),
-    );
-    if (!descriptorResponse.ok) {
-      throw new Error("The environment descriptor request failed.");
-    }
-    const descriptor = await descriptorResponse.json();
-    const ticketResponse = await fetch(
-      new URL("/api/auth/websocket-ticket", bootstrap.httpBaseUrl),
-      { method: "POST", headers: { authorization: "Bearer " + bearer } },
-    );
-    if (!ticketResponse.ok) throw new Error("The WebSocket ticket request failed.");
-    const ticket = (await ticketResponse.json()).ticket;
-    if (typeof ticket !== "string" || ticket.length === 0) {
-      throw new Error("The WebSocket ticket response was invalid.");
-    }
-    const socketUrl = new URL(bootstrap.wsBaseUrl);
-    if (socketUrl.pathname === "" || socketUrl.pathname === "/") socketUrl.pathname = "/ws";
-    socketUrl.searchParams.set("wsTicket", ticket);
-    const socket = new WebSocket(socketUrl);
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("Timed out opening RPC.")), 15000);
-      socket.addEventListener("open", () => { clearTimeout(timeout); resolve(); }, { once: true });
-      socket.addEventListener("error", () => { clearTimeout(timeout); reject(new Error("RPC failed.")); }, { once: true });
-    });
-    let sequence = 0;
-    const request = (tag, payload, stream = false) => new Promise((resolve, reject) => {
-      const requestId = String(sequence++);
-      const timeout = setTimeout(() => reject(new Error("Timed out waiting for " + tag + ".")), 15000);
-      const onMessage = (event) => {
-        if (typeof event.data !== "string") return;
-        const message = JSON.parse(event.data);
-        if (message.requestId !== requestId) return;
-        if (stream && message._tag === "Chunk") {
-          clearTimeout(timeout);
-          socket.removeEventListener("message", onMessage);
-          socket.send(JSON.stringify({ _tag: "Interrupt", requestId }));
-          resolve(message.values?.[0] ?? null);
-          return;
-        }
-        if (!stream && message._tag === "Exit") {
-          clearTimeout(timeout);
-          socket.removeEventListener("message", onMessage);
-          if (message.exit?._tag !== "Success") reject(new Error("RPC " + tag + " failed."));
-          else resolve(message.exit.value ?? null);
-        }
+      let socket;
+      let socketCloseAttempted = false;
+      let retired = false;
+      let observation;
+      let ok = false;
+      const count = (name) => { diagnostic.frames[name] = Math.min(1000, diagnostic.frames[name] + 1); };
+      const fail = (outcome, terminal) => {
+        diagnostic.outcome = outcome;
+        if (terminal) diagnostic.terminal = terminal;
+        return new Error("Packaged observer failed.");
       };
-      socket.addEventListener("message", onMessage);
-      socket.send(JSON.stringify({ _tag: "Request", id: requestId, tag, payload, headers: [] }));
-    });
-    if (seed) {
-      await request("orchestration.dispatchCommand", {
-        type: "project.create",
-        commandId: "seed-" + parameters.projectId,
-        projectId: parameters.projectId,
-        title: "Seeded upgrade project",
-        workspaceRoot: parameters.workspaceRoot,
-        createWorkspaceRootIfMissing: true,
-        initializeGit: false,
-        defaultModelSelection: null,
-        createdAt: "2026-01-01T00:00:00.000Z",
-      });
-    }
-    const shellEnvelope = await request("orchestration.subscribeShell", {}, true);
-    const shell = shellEnvelope?.kind === "snapshot" ? shellEnvelope.snapshot : null;
-    const projectIds = Array.isArray(shell?.projects)
-      ? shell.projects.map((project) => project?.id).filter((id) => typeof id === "string")
-      : [];
-    socket.close();
-    let effectiveRoot = parameters.expectedDataRoot;
-    let preUpdateBackups = [];
-    if (typeof bridge.getProjectDataStatuses === "function") {
-      const statuses = await bridge.getProjectDataStatuses();
-      const primary = statuses.find((status) => status.environmentId === "primary");
-      if (primary) {
-        if (typeof primary.effectiveRoot === "string") effectiveRoot = primary.effectiveRoot;
-        if (Array.isArray(primary.backups)) {
-          preUpdateBackups = primary.backups.map((backup) => ({
-            ...backup,
-            storageInstanceId: primary.storageInstanceId,
-          }));
+      const recordClose = (event) => {
+        diagnostic.closeCode = Number.isInteger(event.code) && event.code >= 0 && event.code <= 4999 ? event.code : null;
+        diagnostic.wasClean = typeof event.wasClean === "boolean" ? event.wasClean : null;
+      };
+      const closeSocket = () => {
+        if (!socket || socketCloseAttempted) return;
+        socketCloseAttempted = true;
+        try { socket.close(); diagnostic.closeRequested = true; }
+        catch { throw fail("cleanup-failure"); }
+      };
+      try {
+        const bridge = window.desktopBridge;
+        if (!bridge) throw fail("setup-failure");
+        if (parameters.wsl && seed) {
+          if (typeof bridge.setWslOnly !== "function" || typeof bridge.setWslBackendEnabled !== "function") throw fail("setup-failure");
+          await bridge.setWslOnly(true);
+          await bridge.setWslBackendEnabled(true);
         }
+        diagnostic.milestone = "bootstrap";
+        const bootstrap = await new Promise((resolve, reject) => {
+          const startedAt = Date.now();
+          const poll = () => {
+            const candidate = bridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary");
+            const isReady = candidate?.httpBaseUrl && candidate?.wsBaseUrl && (!parameters.wsl || typeof candidate.runningDistro === "string");
+            if (isReady) return resolve(candidate);
+            if (Date.now() - startedAt >= 60000) return reject(fail("setup-failure"));
+            setTimeout(poll, 100);
+          };
+          poll();
+        });
+        if (!bootstrap?.httpBaseUrl || !bootstrap?.wsBaseUrl) throw fail("setup-failure");
+        diagnostic.milestone = "bearer";
+        const bearer = await bridge.getLocalEnvironmentBearerToken();
+        diagnostic.milestone = "descriptor";
+        const descriptorResponse = await fetch(new URL("/.well-known/bibcode/environment", bootstrap.httpBaseUrl));
+        if (!descriptorResponse.ok) throw fail("setup-failure");
+        const descriptor = await descriptorResponse.json();
+        diagnostic.descriptorIdentityPresent = typeof descriptor?.storageInstanceId === "string" && descriptor.storageInstanceId.length > 0;
+        diagnostic.milestone = "ticket";
+        const ticketResponse = await fetch(new URL("/api/auth/websocket-ticket", bootstrap.httpBaseUrl), {
+          method: "POST", headers: { authorization: "Bearer " + bearer },
+        });
+        if (!ticketResponse.ok) throw fail("setup-failure");
+        const ticket = (await ticketResponse.json()).ticket;
+        if (typeof ticket !== "string" || ticket.length === 0) throw fail("setup-failure");
+        const socketUrl = new URL(bootstrap.wsBaseUrl);
+        if (socketUrl.pathname === "" || socketUrl.pathname === "/") socketUrl.pathname = "/ws";
+        socketUrl.searchParams.set("wsTicket", ticket);
+        diagnostic.milestone = "opening";
+        socket = new WebSocket(socketUrl);
+        await new Promise((resolve, reject) => {
+          let settled = false;
+          const cleanup = () => {
+            clearTimeout(timeout);
+            socket.removeEventListener("open", onOpen);
+            socket.removeEventListener("close", onClose);
+            socket.removeEventListener("error", onError);
+          };
+          const finish = (error) => {
+            if (settled || retired) return;
+            settled = true;
+            cleanup();
+            if (error) reject(error); else resolve();
+          };
+          const onOpen = () => {
+            if (settled || retired) return;
+            diagnostic.socketOpened = true;
+            diagnostic.wholeTextProtocol = socket.protocol === "";
+            finish();
+          };
+          const onClose = (event) => {
+            if (settled || retired) return;
+            recordClose(event);
+            finish(fail("socket-close", "close"));
+          };
+          const onError = () => {
+            if (settled || retired) return;
+            diagnostic.socketError = true;
+            finish(fail("socket-error", "error"));
+          };
+          const timeout = setTimeout(() => {
+            if (!settled && !retired) finish(fail("open-timeout", "timeout"));
+          }, 15000);
+          socket.addEventListener("open", onOpen);
+          socket.addEventListener("close", onClose);
+          socket.addEventListener("error", onError);
+        });
+        diagnostic.milestone = "open";
+        let sequence = 0;
+        const request = (tag, payload, stream = false) => new Promise((resolve, reject) => {
+          const requestId = String(sequence++);
+          diagnostic.request = stream ? "shell" : "project-create";
+          diagnostic.milestone = diagnostic.request;
+          diagnostic.requestSent = false;
+          diagnostic.interruptSent = false;
+          diagnostic.terminal = "none";
+          diagnostic.causeKind = null;
+          diagnostic.failureTag = null;
+          let settled = false;
+          const cleanup = () => {
+            clearTimeout(timeout);
+            socket.removeEventListener("message", onMessage);
+            socket.removeEventListener("close", onClose);
+            socket.removeEventListener("error", onError);
+          };
+          const finish = (error, value, interrupt = false) => {
+            if (settled || retired) return;
+            settled = true;
+            cleanup();
+            if (!error && interrupt) {
+              try {
+                socket.send(JSON.stringify({ _tag: "Interrupt", requestId }));
+                diagnostic.interruptSent = true;
+              } catch { error = fail("send-error"); }
+            }
+            if (error) reject(error); else resolve(value);
+          };
+          const onClose = (event) => {
+            if (settled || retired) return;
+            recordClose(event);
+            finish(fail("socket-close", "close"));
+          };
+          const onError = () => {
+            if (settled || retired) return;
+            diagnostic.socketError = true;
+            finish(fail("socket-error", "error"));
+          };
+          const onMessage = (event) => {
+            if (settled || retired) return;
+            if (typeof event.data !== "string") {
+              const binary = event.data instanceof ArrayBuffer || ArrayBuffer.isView(event.data) || (typeof Blob !== "undefined" && event.data instanceof Blob);
+              count(binary ? "binary" : "other");
+              finish(fail(binary ? "binary-frame" : "other-frame", "decode"));
+              return;
+            }
+            count("text");
+            let message;
+            try { message = JSON.parse(event.data); }
+            catch { count("parseErrors"); finish(fail("malformed-text", "decode")); return; }
+            if (!message || typeof message !== "object" || Array.isArray(message)) {
+              finish(fail("decode-error", "decode")); return;
+            }
+            if (message._tag === "Defect" || message._tag === "ClientProtocolError") {
+              count(message._tag === "Defect" ? "defect" : "protocol");
+              finish(fail(message._tag === "Defect" ? "defect" : "protocol-error", message._tag)); return;
+            }
+            if (message._tag === "Pong") { count("pong"); return; }
+            if (message._tag !== "Chunk" && message._tag !== "Exit") {
+              count("unknown"); finish(fail("unknown-frame", "decode")); return;
+            }
+            count(message._tag === "Chunk" ? "chunk" : "exit");
+            if (typeof message.requestId !== "string") { finish(fail("decode-error", "decode")); return; }
+            if (message.requestId !== requestId) { count("unmatched"); return; }
+            count("matched");
+            if (message._tag === "Chunk") {
+              if (!stream || !Array.isArray(message.values) || message.values.length === 0) { finish(fail("decode-error", "decode")); return; }
+              const value = message.values[0];
+              if (value?.kind !== "snapshot" || !Array.isArray(value.snapshot?.projects)) { finish(fail("invalid-snapshot", "decode")); return; }
+              diagnostic.milestone = "snapshot";
+              diagnostic.terminal = "snapshot";
+              finish(null, value, true); return;
+            }
+            if (message.exit?._tag === "Failure") {
+              diagnostic.causeKind = "unknown";
+              diagnostic.failureTag = "unknown";
+              if (Array.isArray(message.exit.cause) && message.exit.cause.length > 0 && message.exit.cause.length <= 16) {
+                const kinds = [...new Set(message.exit.cause.map((cause) => ["Fail", "Die", "Interrupt"].includes(cause?._tag) ? cause._tag : "unknown"))];
+                diagnostic.causeKind = kinds.length === 1 ? kinds[0] : "mixed";
+                const known = ["OrchestrationGetSnapshotError", "OrchestrationDispatchCommandError", "EnvironmentAuthorizationError", "UpdateMaintenanceActiveError", "RpcResponseTooLargeError", "RpcOutboundAdmissionError"];
+                const cause = message.exit.cause.find((cause) => cause?._tag === "Fail" && known.includes(cause.error?._tag));
+                if (cause) diagnostic.failureTag = cause.error._tag;
+              }
+              finish(fail(stream ? "stream-failure" : "request-failure", "Failure")); return;
+            }
+            if (message.exit?._tag !== "Success") { finish(fail("decode-error", "decode")); return; }
+            diagnostic.terminal = "Success";
+            if (stream) finish(fail("stream-eof", "Success"));
+            else finish(null, message.exit.value ?? null);
+          };
+          const timeout = setTimeout(() => {
+            if (!settled && !retired) finish(fail("request-timeout", "timeout"));
+          }, 15000);
+          socket.addEventListener("message", onMessage);
+          socket.addEventListener("close", onClose);
+          socket.addEventListener("error", onError);
+          try {
+            if (socket.readyState !== WebSocket.OPEN) { finish(fail("socket-close", "close")); return; }
+            socket.send(JSON.stringify({ _tag: "Request", id: requestId, tag, payload, headers: [] }));
+            diagnostic.requestSent = true;
+          } catch { finish(fail("send-error")); }
+        });
+        if (seed) {
+          await request("orchestration.dispatchCommand", {
+            type: "project.create", commandId: "seed-" + parameters.projectId,
+            projectId: parameters.projectId, title: "Seeded upgrade project",
+            workspaceRoot: parameters.workspaceRoot, createWorkspaceRootIfMissing: true,
+            initializeGit: false, defaultModelSelection: null, createdAt: "2026-01-01T00:00:00.000Z",
+          });
+        }
+        const shellEnvelope = await request("orchestration.subscribeShell", {}, true);
+        closeSocket();
+        const shell = shellEnvelope.snapshot;
+        const projectIds = shell.projects.map((project) => project?.id).filter((id) => typeof id === "string");
+        diagnostic.milestone = "native-status";
+        diagnostic.outcome = "native-status-failure";
+        let effectiveRoot = parameters.expectedDataRoot;
+        let preUpdateBackups = [];
+        if (typeof bridge.getProjectDataStatuses === "function") {
+          const statuses = await bridge.getProjectDataStatuses();
+          const primary = statuses.find((status) => status.environmentId === "primary");
+          if (primary) {
+            if (typeof primary.effectiveRoot === "string") effectiveRoot = primary.effectiveRoot;
+            if (Array.isArray(primary.backups)) preUpdateBackups = primary.backups.map((backup) => ({ ...backup, storageInstanceId: primary.storageInstanceId }));
+          }
+        }
+        const updateState = typeof bridge.getUpdateState === "function" ? await bridge.getUpdateState() : null;
+        observation = {
+          appVersion: typeof updateState?.currentVersion === "string" ? updateState.currentVersion : null,
+          effectiveRoot, projectId: parameters.projectId, projectIds,
+          storageInstanceId: typeof descriptor?.storageInstanceId === "string" ? descriptor.storageInstanceId : null,
+          preUpdateBackups,
+        };
+        diagnostic.milestone = "complete";
+        diagnostic.outcome = "success";
+        ok = true;
+      } catch {
+        // The diagnostic vocabulary is the only failure detail returned to the driver.
+      } finally {
+        retired = true;
+        try { closeSocket(); }
+        catch { diagnostic.outcome = "cleanup-failure"; ok = false; }
+        diagnostic.elapsedMs = Math.max(0, Math.min(300000, Math.floor(performance.now() - startedAt)));
       }
-    }
-    const updateState =
-      typeof bridge.getUpdateState === "function" ? await bridge.getUpdateState() : null;
-    return {
-      appVersion:
-        typeof updateState?.currentVersion === "string" ? updateState.currentVersion : null,
-      effectiveRoot,
-      projectId: parameters.projectId,
-      projectIds,
-      storageInstanceId:
-        typeof descriptor?.storageInstanceId === "string" ? descriptor.storageInstanceId : null,
-      preUpdateBackups,
-    };
-  }, {
-    expectedDataRoot: input.expectedDataRoot,
-    projectId: input.projectId,
-    workspaceRoot: input.workspaceRoot,
-    wsl: input.wsl === true,
-  }, seed);
+      return ok ? { ok: true, observation, diagnostic } : { ok: false, diagnostic };
+    }, {
+      expectedDataRoot: input.expectedDataRoot, projectId: input.projectId,
+      workspaceRoot: input.workspaceRoot, wsl: input.wsl === true,
+    }, seed);
+  } catch {
+    envelope = { ok: false, diagnostic: { available: false, outcome: "execute-unavailable" } };
+  }
+  const diagnostic = closeObserverDiagnostic(envelope?.diagnostic);
+  try {
+    NodeFS.writeFileSync(input.observerDiagnosticPath ?? input.resultPath + ".observer.json", JSON.stringify(diagnostic), { mode: 0o600 });
+  } catch { throw new Error("Packaged observer evidence could not be retained."); }
+  if (envelope?.ok !== true || diagnostic.available !== true || diagnostic.outcome !== "success") {
+    throw new Error("The packaged observer failed (" + diagnostic.outcome + ").");
+  }
+  return envelope.observation;
 }
 
 describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
@@ -2188,6 +2447,10 @@ const runWebDriverPhase = async (input: {
     specPath,
     createSeededUpgradeDriverSpec({
       ...driverInput,
+      observerDiagnosticPath: NodePath.join(
+        input.evidenceDirectory,
+        `${input.phase}-observer.json`,
+      ),
       ...(rpcFixture !== undefined
         ? {
             remoteInstallDriverPath: NodeURL.pathToFileURL(

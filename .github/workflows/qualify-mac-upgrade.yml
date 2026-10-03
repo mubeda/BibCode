@@ -1,0 +1,149 @@
+name: Qualify Mac ARM seeded observer
+
+on:
+  push:
+    branches: [codex/qualify-mac-upgrade]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mac_upgrade_observer:
+    name: Mac ARM ordinary three-lane upgrade
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Checkout complete release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Install frozen dependencies
+        run: vp install --frozen-lockfile
+
+      - name: Check source formatting and lint
+        run: vp check
+
+      - name: Test observer, held-upload and lane ownership
+        run: >
+          vp test run
+          scripts/lib/held-workspace-upload.test.ts
+          scripts/lib/remote-install-driver.test.ts
+          scripts/seeded-desktop-upgrade-smoke.test.ts
+
+      - name: Build web assets
+        run: vp run --filter @bibcode/web build
+
+      - name: Typecheck full workspace
+        run: vp run typecheck
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Test native bridge contract
+        run: >
+          node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib
+          bridge::tests::tauri_ipc_handlers_preserve_runtime_agnostic_bridge_contracts -- --exact
+
+      - name: Test update coordinator
+        run: node scripts/run-msvc.mjs cargo test -p bibcode-desktop -j 2 --lib updates::tests
+
+      - name: Test real HTTP maintenance admission
+        run: node scripts/run-msvc.mjs cargo test -p bibcode-server --test production_maintenance -j 2
+
+      - name: Recompute affected Clippy diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/run-msvc.mjs cargo clean -p bibcode-desktop -p bibcode-server
+          node scripts/run-msvc.mjs cargo clippy -p bibcode-desktop --all-targets -j 2 -- -D warnings
+          node scripts/run-msvc.mjs cargo clippy -p bibcode-server --test production_maintenance -j 2 -- -D warnings
+
+      - id: versions
+        name: Pin unchanged previous release and candidate versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_tag="v0.7.2"
+          previous_commit="$(git rev-parse "${previous_tag}^{commit}")"
+          test "$previous_commit" = "cd66fda5700294a320fe76256c486bd7a7a0b3a5"
+          previous_version="${previous_tag#v}"
+          previous_core="${previous_version%%[-+]*}"
+          IFS=. read -r major minor patch <<< "$previous_core"
+          candidate_version="$major.$minor.$((patch + 1))-upgrade.${GITHUB_RUN_NUMBER}"
+          {
+            echo "candidate_version=$candidate_version"
+            echo "previous_tag=$previous_tag"
+            echo "previous_version=$previous_version"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo '## Mac ARM update coverage'
+            echo 'This trial retains previous-stable local, current protected local, and current remote RPC lanes.'
+            echo 'Closed observer diagnostics attribute verification failures; only completed lane results qualify an upgrade.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate ephemeral updater signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/bibcode-mac-upgrade-observer.key"
+          key_password="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"
+          echo "::add-mask::$key_password"
+          (cd apps/desktop && vp exec tauri signer generate \
+            --ci --password "$key_password" --write-keys "$key_path" >/dev/null)
+          test -s "$key_path"
+          test -s "$key_path.pub"
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$key_path"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$key_password"
+            echo "BIBCODE_UPGRADE_PUBLIC_KEY_FILE=$key_path.pub"
+          } >> "$GITHUB_ENV"
+
+      - name: Run previous-stable, protected-baseline, and remote-install upgrades
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/seeded-desktop-upgrade-smoke.ts \
+            --platform mac \
+            --arch arm64 \
+            --bundle dmg \
+            --candidate-version "${{ steps.versions.outputs.candidate_version }}" \
+            --previous-tag "${{ steps.versions.outputs.previous_tag }}" \
+            --previous-version "${{ steps.versions.outputs.previous_version }}" \
+            --public-key-file "$BIBCODE_UPGRADE_PUBLIC_KEY_FILE" \
+            --run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-mac-arm64-observer" \
+            --work-root "$RUNNER_TEMP/bibcode-mac-upgrade-observer/work" \
+            --artifact-dir "$RUNNER_TEMP/bibcode-mac-upgrade-observer/evidence" \
+            --updater-port 43120 \
+            --restart-timeout-ms 180000
+
+      - name: Upload bounded observer and upgrade evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mac-arm64-upgrade-observer
+          path: ${{ runner.temp }}/bibcode-mac-upgrade-observer/evidence/*
+          if-no-files-found: error
+          retention-days: 7
