@@ -97,8 +97,28 @@ const phase = (name: string) => {
   currentPhase = name;
   write("phase", { phase: name, theme: currentTheme });
 };
+const manualAssertionCodes = new Set([
+  "manual-observed-platform",
+  "manual-observed-install-kind",
+  "manual-has-no-install-control",
+  "manual-restart-command",
+  "manual-archive-platform",
+  "manual-package-platform",
+  "manual-unknown-platform",
+  "manual-row-clipboard",
+  "manual-row-card-agree",
+  "manual-card-clipboard",
+]);
+const manualAssertionFailures = new WeakMap<Error, string>();
 function check(value: unknown, code: string): asserts value {
-  if (value !== true) throw new Error(`UI qualification assertion failed: ${code}.`);
+  if (value !== true) {
+    const error = new Error(`UI qualification assertion failed: ${code}.`);
+    if (manualAssertionCodes.has(code)) manualAssertionFailures.set(error, code);
+    throw error;
+  }
+}
+function readManualAssertionCode(error: unknown): string | null {
+  return error instanceof Error ? (manualAssertionFailures.get(error) ?? null) : null;
 }
 const required = () => {
   if (!browser) throw new Error("Owned browser is unavailable.");
@@ -998,7 +1018,9 @@ async function manualFlow() {
     permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"],
   });
   for (const kind of ["archive", "package", "unknown"] as const) {
+    phase(`manual-${kind}-start-host`);
     const host = await manualHost(kind);
+    phase(`manual-${kind}-descriptor`);
     const actual = await descriptor(host.port);
     check(
       actual.platform?.os === "linux" && actual.platform.arch === "x64",
@@ -1008,17 +1030,23 @@ async function manualFlow() {
       actual.remoteUpdateSupport?.installKind === (kind === "package" ? "system-package" : kind),
       "manual-observed-install-kind",
     );
+    phase(`manual-${kind}-add-host`);
     await addHost(host, false);
+    phase(`manual-${kind}-no-install-control`);
     check(
       !(await required()
         .$(`${row(host.label)}//button[starts-with(normalize-space(),"Update to v")]`)
         .isExisting()),
       "manual-has-no-install-control",
     );
+    phase(`manual-${kind}-show-row-steps`);
     await click(`${row(host.label)}//button[normalize-space()="Show update steps"]`);
+    phase(`manual-${kind}-read-row-steps`);
+    await text(`${row(host.label)}//pre`, "# Currently running:");
     const rowSteps = await required()
       .$(`${row(host.label)}//pre`)
       .getText();
+    phase(`manual-${kind}-validate-row-steps`);
     check(
       rowSteps.includes("bibcode serve") ||
         (kind === "package" && rowSteps.includes("sudo apt install")),
@@ -1039,8 +1067,10 @@ async function manualFlow() {
         rowSteps.includes("Install the new bibcode distribution for this host."),
         "manual-unknown-platform",
       );
+    phase(`manual-${kind}-copy-row`);
     await click(`${row(host.label)}//button[normalize-space()="Copy"]`);
     await text("body", "Update instructions copied");
+    phase(`manual-${kind}-row-clipboard`);
     check(
       await required().executeAsync((expected, done) => {
         navigator.clipboard.readText().then(
@@ -1050,14 +1080,20 @@ async function manualFlow() {
       }, rowSteps),
       "manual-row-clipboard",
     );
+    phase(`manual-${kind}-open-card`);
     await workspace();
     await click('[data-testid="environment-context-card-menu"]');
     await click('//*[@role="menuitem" and normalize-space()="Show update steps"]');
     await text(dialog, `Update ${host.label} manually`);
+    phase(`manual-${kind}-read-card-steps`);
+    await text(`${dialog} pre`, "# Currently running:");
     const dialogSteps = await required().$(`${dialog} pre`).getText();
+    phase(`manual-${kind}-compare-row-card`);
     check(dialogSteps === rowSteps, "manual-row-card-agree");
+    phase(`manual-${kind}-copy-card`);
     await click(`${dialog} button=Copy`);
     await text(dialog, "Copied");
+    phase(`manual-${kind}-card-clipboard`);
     check(
       await required().executeAsync((expected, done) => {
         navigator.clipboard.readText().then(
@@ -1067,7 +1103,9 @@ async function manualFlow() {
       }, dialogSteps),
       "manual-card-clipboard",
     );
+    phase(`manual-${kind}-capture`);
     await capture(`manual-${kind}`, host, dialog, `Update ${host.label} manually`);
+    phase(`manual-${kind}-close-card`);
     await click(`${dialog} button=Close`);
     assertions.push({
       theme: currentTheme,
@@ -1080,6 +1118,7 @@ async function manualFlow() {
       interactiveInstallControlAbsent: true,
       instructionsExecuted: false,
     });
+    phase(`manual-${kind}-remove-host`);
     await removeHost(host);
   }
 }
@@ -1384,6 +1423,7 @@ try {
     phase: currentPhase,
     theme: currentTheme,
     failure: classifyQualificationFailure(error),
+    manualAssertionCode: readManualAssertionCode(error),
     startup,
     setup,
   });

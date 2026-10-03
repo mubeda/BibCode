@@ -639,6 +639,14 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   creation. Manual CLI layouts qualify descriptor kind, visible instructions and
   actual clipboard contents; their install dispatch remains unobserved, and their
   instructions are never executed.
+  Manual cases wait for the visible instruction block's running-version marker
+  under the existing text-readiness bound before reading and validating its full
+  text. Keep all platform/command, row-versus-card, clipboard and absent-install
+  assertions. Record fixed per-kind setup/read/copy/capture phases so failures
+  do not collapse into one manual stage. A failure receipt may contain only an
+  allowlisted manual assertion code registered by that controller's own check;
+  errors from the browser, arbitrary check strings, exception text and copied
+  commands must never supply that field. Missing ownership remains null.
 
   For the full Reload negative control, observe the primary rail connected,
   then disconnected and connected again around the same-version restart, with a

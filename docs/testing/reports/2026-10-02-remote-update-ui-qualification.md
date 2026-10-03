@@ -142,3 +142,32 @@ not establish one wire-level attempt inside that dependency.
 Dismiss and Check have literal subphases. No new sleep, click retry, toast dismissal,
 product change or native activation is part of this repair. The fourteen original
 images remain unchanged and do not establish completion of either UI matrix.
+
+Trial `37105416473` at `9aed182a` passed the light success and complete
+failure/Retry/Dismiss flows and retained fifteen original PNGs, including the
+dismissed state. It then failed in the broad `manual-instructions` phase before
+the first manual capture. The archive host was alive and its real pairing-offer
+CLI exited zero; source order therefore places the failure after the initial
+platform/install-kind checks. No retained fact identifies the precise remaining
+UI or assertion boundary. Cleanup, host namespace, build hashes and private-fixture
+deletion passed. These are partial light results; manual, dark and full-only
+acceptance remain unqualified.
+
+The product's Linux/x64 archive instruction generator matches the existing
+archive/checksum/restart expectations. Source also shows a height-animated
+collapsible, while the qualifier immediately read its text after opening it.
+An inert replay of the actual manual flow with the real instruction generator
+reproduced a premature restart-command assertion while the text was not visible.
+The repaired qualifier waits for the actual visible instruction block's running
+marker within the existing thirty-second bound, then preserves every original
+content, copy/clipboard, no-install and row/card comparison. An empty block still
+times out, and wrong instructions or clipboard values still fail.
+
+Per-kind manual substeps and an identity-bound, ten-code manual assertion
+allowlist now make a later failure attributable without retaining raw exceptions,
+page text, commands, credentials or URLs. Unregistered errors retain a null code,
+even if their message or properties imitate a local assertion. This fixes the
+reproduced harness readiness gap; it does not prove the original native failure
+was caused by animation, clipboard, route selection or a command mismatch.
+Production rendering, metadata, permissions, configurations and deadlines remain
+unchanged. Root owns another native activation after review.

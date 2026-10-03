@@ -4,6 +4,7 @@ import * as NodeVM from "node:vm";
 import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
+import { manualUpdateSteps } from "../../../web/src/components/settings/remoteUpdatePresentation.ts";
 import {
   remoteUiPlan,
   remoteUiScenes,
@@ -16,6 +17,201 @@ const controller = NodeFS.readFileSync(
   new URL("../qualify-remote-updates.ts", import.meta.url),
   "utf8",
 );
+
+it("projects only allowlisted manual checks raised by this controller, without reading error text", () => {
+  const start = controller.indexOf("const manualAssertionCodes =");
+  const end = controller.indexOf("const required =", start);
+  expect(start).toBeGreaterThan(0);
+  const own = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      controller.slice(start, end) +
+        "\n({ check, readManualAssertionCode, codes: Array.from(manualAssertionCodes) })",
+    ),
+  );
+  expect(own.codes).toHaveLength(10);
+  for (const code of own.codes) {
+    let caught: unknown;
+    try {
+      own.check(false, code);
+    } catch (error) {
+      caught = error;
+    }
+    expect(own.readManualAssertionCode(caught)).toBe(code);
+    const forged = Object.create(Object.getPrototypeOf(caught)) as object;
+    Object.defineProperty(forged, "message", {
+      get: () => {
+        throw new Error("No error-text reads.");
+      },
+    });
+    Object.defineProperty(forged, "code", {
+      get: () => {
+        throw new Error("No code-property reads.");
+      },
+    });
+    expect(own.readManualAssertionCode(forged)).toBeNull();
+    expect(
+      own.readManualAssertionCode(new Error(`UI qualification assertion failed: ${code}.`)),
+    ).toBeNull();
+  }
+  for (const code of [
+    "manual-private-token",
+    "manual-row-clipboard private-value",
+    "manual-row-clipboard\n",
+    "row-cancel-keeps-draft",
+  ]) {
+    let caught: unknown;
+    try {
+      own.check(false, code);
+    } catch (error) {
+      caught = error;
+    }
+    expect(own.readManualAssertionCode(caught)).toBeNull();
+  }
+  for (const value of [null, "manual-row-clipboard", { code: "manual-row-clipboard" }])
+    expect(own.readManualAssertionCode(value)).toBeNull();
+});
+
+it.each([
+  "reveals",
+  "never-reveals",
+  "wrong-archive",
+  "row-clipboard-mismatch",
+  "card-clipboard-mismatch",
+])("uses real rendered instructions and actual manual flow with %s", async (mode) => {
+  let kind: "archive" | "package" | "unknown" = "archive",
+    elapsed = 0,
+    revealAt = Infinity,
+    clipboard = "",
+    copies = 0;
+  const phases: string[] = [],
+    captured: string[] = [],
+    receipts: unknown[] = [];
+  const declaredChecks = new Set<string>();
+  const steps = () =>
+    manualUpdateSteps({
+      installKind: kind === "package" ? "system-package" : kind,
+      os: "linux",
+      arch: "x64",
+      sshLaunched: false,
+      serverVersion: "0.7.2",
+    });
+  const renderedSteps = () =>
+    mode === "wrong-archive" ? "bibcode serve\n# Currently running: v0.7.2" : steps();
+  const browser = {
+    sendCommandAndGetResult: async () => {},
+    $: (selector: string) => ({
+      isExisting: async () => false,
+      getText: async () =>
+        selector === "owned-row//pre"
+          ? elapsed >= revealAt
+            ? renderedSteps()
+            : ""
+          : selector === "dialog pre"
+            ? renderedSteps()
+            : selector === "dialog"
+              ? "Update QA manually\nCopied"
+              : "Update instructions copied",
+    }),
+    waitUntil: async (
+      read: () => Promise<boolean>,
+      options: { timeout: number; interval: number },
+    ) => {
+      expect(options.timeout).toBe(30_000);
+      const deadline = elapsed + options.timeout;
+      while (elapsed < deadline) {
+        if (await read()) return;
+        elapsed += options.interval;
+      }
+      throw new Error("inert text readiness deadline");
+    },
+    executeAsync: (
+      read: (expected: string, done: (value: boolean) => void) => void,
+      expected: string,
+    ) => new Promise((resolve) => read(expected, resolve)),
+  };
+  const start = controller.indexOf("async function manualFlow()");
+  const end = controller.indexOf("async function restartPrimaryWithBrowserTransition(", start);
+  const textStart = controller.indexOf("const text = async");
+  const textEnd = controller.indexOf("const dialog =", textStart);
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      controller.slice(textStart, textEnd) + controller.slice(start, end) + "\nmanualFlow",
+    ),
+    {
+      phase: (name: string) => phases.push(name),
+      currentTheme: "light",
+      webOrigin: "http://localhost:4901",
+      dialog: "dialog",
+      required: () => browser,
+      manualHost: async (next: typeof kind) => {
+        kind = next;
+        return { label: "QA", port: 4886 };
+      },
+      descriptor: async () => ({
+        platform: { os: "linux", arch: "x64" },
+        remoteUpdateSupport: { installKind: kind === "package" ? "system-package" : kind },
+      }),
+      addHost: async () => {},
+      row: () => "owned-row",
+      workspace: async () => {},
+      removeHost: async () => {},
+      click: async (selector: string) => {
+        if (selector.includes('="Show update steps"'))
+          revealAt = mode === "never-reveals" ? Infinity : elapsed + 200;
+        if (selector.includes('="Copy"') || selector === "dialog button=Copy") {
+          copies++;
+          clipboard = renderedSteps();
+        }
+      },
+      check: (value: unknown, code: string) => {
+        declaredChecks.add(code);
+        if (value !== true) throw new Error(code);
+      },
+      navigator: {
+        clipboard: {
+          readText: async () =>
+            (mode === "row-clipboard-mismatch" && copies === 1) ||
+            (mode === "card-clipboard-mismatch" && copies === 2)
+              ? "inert clipboard mismatch"
+              : clipboard,
+        },
+      },
+      capture: async (scene: string) => captured.push(scene),
+      assertions: receipts,
+    },
+  );
+  if (mode === "reveals") {
+    await run();
+    expect(captured).toEqual(["manual-archive", "manual-package", "manual-unknown"]);
+    expect(copies).toBe(6);
+    expect(receipts).toHaveLength(3);
+    expect(phases).toContain("manual-archive-read-row-steps");
+    expect(phases).toContain("manual-package-card-clipboard");
+    expect(phases).toContain("manual-unknown-capture");
+    const checkStart = controller.indexOf("const manualAssertionCodes =");
+    const checkEnd = controller.indexOf("const required =", checkStart);
+    const codes = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        controller.slice(checkStart, checkEnd) + "\nArray.from(manualAssertionCodes)",
+      ),
+    ) as string[];
+    expect(codes.toSorted()).toEqual([...declaredChecks].toSorted());
+  } else {
+    const code =
+      mode === "never-reveals"
+        ? "inert text readiness deadline"
+        : mode === "wrong-archive"
+          ? "manual-archive-platform"
+          : mode === "row-clipboard-mismatch"
+            ? "manual-row-clipboard"
+            : "manual-card-clipboard";
+    await expect(run()).rejects.toThrow(code);
+    expect(captured).toEqual([]);
+    expect(copies).toBe(
+      mode === "row-clipboard-mismatch" ? 1 : mode === "card-clipboard-mismatch" ? 2 : 0,
+    );
+  }
+});
 
 it.each(["ready", "toast-clears", "backdrop-clears", "covered", "disabled", "click-rejects"])(
   "uses actual pinned clickability readiness before one native click: %s",
@@ -308,16 +504,22 @@ it.each([
   },
 );
 
-it.each(["unavailable", "no-browser", "write-failure"])(
+it.each(["unavailable", "no-browser", "write-failure", "manual-assertion"])(
   "retains unavailable setup honestly and still runs joined cleanup on %s",
   async (mode) => {
     const start = controller.indexOf("} catch (error) {", controller.indexOf('phase("complete")'));
     const end = controller.indexOf("\nprocess.exitCode", start);
     const writes: Array<{ name: string; value: Record<string, unknown> }> = [];
     let closed = false;
+    const checkStart = controller.indexOf("const manualAssertionCodes =");
+    const checkEnd = controller.indexOf("const required =", checkStart);
     const run = NodeVM.runInNewContext(
       NodeModule.stripTypeScriptTypes(
-        'async function fail() { try { throw new Error("inert failure"); ' +
+        controller.slice(checkStart, checkEnd) +
+          "async function fail() { try { " +
+          (mode === "manual-assertion"
+            ? 'check(false, "manual-row-clipboard"); '
+            : 'throw new Error("inert failure"); ') +
           controller.slice(start, end) +
           "}\nfail",
       ),
@@ -372,6 +574,7 @@ it.each(["unavailable", "no-browser", "write-failure"])(
     expect(writes.find(({ name }) => name === "failure")?.value).toMatchObject({
       startup: null,
       setup: null,
+      manualAssertionCode: mode === "manual-assertion" ? "manual-row-clipboard" : null,
     });
     expect(writes.find(({ name }) => name === "result")?.value).toMatchObject({
       success: false,
