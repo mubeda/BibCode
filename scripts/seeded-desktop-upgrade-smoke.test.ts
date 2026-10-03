@@ -75,13 +75,17 @@ const generatedObserverFixture = async (
     openEvent?: "close" | "error" | "timeout";
     sendFailure?: "Request" | "Interrupt" | "ShellRequest";
     runIt?: boolean;
+    descriptor?: unknown;
+    phase?: "seed-and-install" | "verify";
+    exposureMissing?: boolean;
   } = {},
 ) => {
   const input = {
     candidateVersion: "0.7.3-upgrade.1",
     expectedDataRoot: "/owned/data",
     lane: "remote-install" as const,
-    phase: "verify" as const,
+    phase: options.phase ?? ("verify" as const),
+    ...(options.phase === "seed-and-install" ? { trigger: "local-bridge" as const } : {}),
     projectId: "private-project-sentinel",
     resultPath: "/owned/after.json",
     observerDiagnosticPath: "/owned/verify-observer.json",
@@ -91,10 +95,45 @@ const generatedObserverFixture = async (
   const end = spec.indexOf('describe("seeded packaged upgrade');
   if (end < 0) throw new Error("Generated observer source missing");
   const writes = new Map<string, unknown>();
+  const executeEnvelopes: unknown[] = [];
   const timers = new Map<() => void, number>();
   const timerBudgets: number[] = [];
   let now = 0;
   const status = vi.fn(async () => []);
+  const bearer = vi.fn(async () => "private-bearer-sentinel");
+  const exposure = vi.fn(async (): Promise<unknown> => ({
+    mode: "local-only",
+    configuredMode: "network-accessible",
+    management: "native",
+    endpointUrl: "http://private.invalid",
+  }));
+  const fetch = vi.fn(
+    async (
+      url: URL,
+      _init?: RequestInit,
+    ): Promise<{ ok: boolean; json: () => Promise<unknown> }> => ({
+      ok: true,
+      json: async () =>
+        url.pathname.endsWith("environment")
+          ? (options.descriptor ?? {
+              bootId: "private-boot-sentinel",
+              storageInstanceId: "private-store-sentinel",
+              serverVersion: input.candidateVersion,
+            })
+          : url.pathname.endsWith("session")
+            ? { authenticated: true }
+            : { ticket: "private-ticket-sentinel" },
+    }),
+  );
+  const bridge = {
+    getLocalEnvironmentBootstraps: vi.fn(() => [
+      { id: "primary", httpBaseUrl: "http://private.invalid", wsBaseUrl: "ws://private.invalid" },
+    ]),
+    getLocalEnvironmentBearerToken: bearer,
+    ...(options.exposureMissing ? {} : { getServerExposureState: exposure }),
+    getProjectDataStatuses: status,
+    getUpdateState: async () => ({ currentVersion: input.candidateVersion }),
+  };
   type Callback = (event: Record<string, unknown>) => void;
   class Socket {
     static OPEN = 1;
@@ -167,33 +206,19 @@ const generatedObserverFixture = async (
         writeFileSync: (path: string, value: string) => writes.set(path, JSON.parse(value)),
       },
       window: {
-        desktopBridge: {
-          getLocalEnvironmentBootstraps: () => [
-            {
-              id: "primary",
-              httpBaseUrl: "http://private.invalid",
-              wsBaseUrl: "ws://private.invalid",
-            },
-          ],
-          getLocalEnvironmentBearerToken: async () => "private-bearer-sentinel",
-          getProjectDataStatuses: status,
-          getUpdateState: async () => ({ currentVersion: input.candidateVersion }),
-        },
+        desktopBridge: bridge,
       },
       browser: {
         waitUntil: async (probe: () => Promise<boolean>) => expect(await probe()).toBe(true),
         execute: async (callback: (...args: unknown[]) => unknown, ...args: unknown[]) => {
           if (options.executeFailure) throw new Error("private-execute-sentinel");
-          return callback(...args);
+          const result = await callback(...args);
+          executeEnvelopes.push(result);
+          return result;
         },
       },
-      fetch: async (url: URL) => ({
-        ok: true,
-        json: async () =>
-          url.pathname.endsWith("environment")
-            ? { storageInstanceId: "private-store-sentinel", serverVersion: input.candidateVersion }
-            : { ticket: "private-ticket-sentinel" },
-      }),
+      fetch,
+      AbortController,
       URL,
       WebSocket: Socket,
       performance: { now: () => now },
@@ -221,27 +246,34 @@ const generatedObserverFixture = async (
     },
   );
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const advance = async (milliseconds: number) => {
+    now += milliseconds;
+    for (const [callback, at] of Array.from(timers)) {
+      if (at <= now) {
+        timers.delete(callback);
+        callback();
+      }
+    }
+    await flush();
+  };
   await flush();
   return {
     input,
     writes,
+    executeEnvelopes,
     timers,
     timerBudgets,
     sockets,
     status,
+    bridge,
+    bearer,
+    exposure,
+    fetch,
     outcome,
     flush,
+    advance,
     isSettled: () => settled,
-    expire: async () => {
-      now += 15_000;
-      for (const [callback, at] of Array.from(timers)) {
-        if (at <= now) {
-          timers.delete(callback);
-          callback();
-        }
-      }
-      await flush();
-    },
+    expire: () => advance(15_000),
   };
 };
 
@@ -355,7 +387,7 @@ describe("generated observer terminal diagnostics", () => {
     expect(immediate).toBe(true);
     expect(result.success).toBe(false);
     const diagnostic = fixture.writes.get(fixture.input.observerDiagnosticPath);
-    expect(diagnostic).toMatchObject({ version: 1, available: true, outcome: scenario });
+    expect(diagnostic).toMatchObject({ version: 2, available: true, outcome: scenario });
     expect(JSON.stringify(diagnostic)).not.toContain("private-");
     expect(String(result.value)).not.toContain("private-");
     expect(fixture.writes.has(fixture.input.resultPath)).toBe(false);
@@ -365,8 +397,10 @@ describe("generated observer terminal diagnostics", () => {
     expect(socket.handlerErrors).toBe(0);
     expect([...socket.listeners.values()].every((listeners) => listeners.size === 0)).toBe(true);
     const saved = JSON.stringify(diagnostic);
+    const returned = JSON.stringify(fixture.executeEnvelopes);
     for (const callback of socket.retired) callback({ data: "private-late-sentinel", code: 4001 });
     expect(JSON.stringify(fixture.writes.get(fixture.input.observerDiagnosticPath))).toBe(saved);
+    expect(JSON.stringify(fixture.executeEnvelopes)).toBe(returned);
     expect(socket.sent.filter((frame) => frame._tag === "Request")).toHaveLength(1);
   });
 
@@ -395,6 +429,336 @@ describe("generated observer terminal diagnostics", () => {
       outcome: "success",
       available: true,
     });
+  });
+
+  it("adds closed post-failure comparisons without changing the original socket failure", async () => {
+    const fixture = await generatedObserverFixture({ runIt: true });
+    fixture.bridge.getLocalEnvironmentBootstraps.mockReturnValue([
+      {
+        id: "primary",
+        httpBaseUrl: "http://private-new.invalid",
+        wsBaseUrl: "ws://private-new.invalid",
+      },
+    ]);
+    fixture.bearer.mockResolvedValue("private-new-bearer");
+    fixture.fetch.mockImplementation(async (url) => ({
+      ok: true,
+      json: async () =>
+        url.pathname.endsWith("environment")
+          ? {
+              bootId: "private-new-boot",
+              storageInstanceId: "private-store-sentinel",
+              serverVersion: fixture.input.candidateVersion,
+              endpoint: "private-endpoint",
+            }
+          : { authenticated: false, token: "private-token", sessionId: "private-session" },
+    }));
+    fixture.exposure.mockResolvedValue({
+      mode: "network-accessible",
+      configuredMode: "network-accessible",
+      management: "native",
+      endpointUrl: "http://private-new-endpoint.invalid",
+      reason: "private-exposure-reason",
+    });
+    await fixture.advance(237);
+    fixture.sockets[0]!.emit("close", { code: 1005, wasClean: true });
+    expect((await fixture.outcome).success).toBe(false);
+    const diagnostic = fixture.writes.get(fixture.input.observerDiagnosticPath);
+    expect(diagnostic).toMatchObject({
+      outcome: "socket-close",
+      milestone: "shell",
+      terminal: "close",
+      elapsedMs: 237,
+      closeCode: 1005,
+      postFailure: {
+        descriptor: {
+          available: true,
+          bootChanged: true,
+          sameStore: true,
+          expectedVersionMatches: true,
+        },
+        auth: { available: true, authenticated: false },
+        exposure: {
+          available: true,
+          mode: "network-accessible",
+          configuredMode: "network-accessible",
+          management: "native",
+          runtimeEndpointPresent: true,
+        },
+      },
+    });
+    expect(fixture.writes.has(fixture.input.resultPath)).toBe(false);
+    expect(JSON.stringify(diagnostic)).not.toContain("private-");
+    expect(JSON.stringify(fixture.executeEnvelopes)).not.toContain("private-");
+    expect(fixture.fetch.mock.calls.map(([url]) => url.pathname)).toEqual([
+      "/.well-known/bibcode/environment",
+      "/api/auth/websocket-ticket",
+      "/.well-known/bibcode/environment",
+      "/api/auth/session",
+    ]);
+    const [descriptorRead, authRead] = fixture.fetch.mock.calls.slice(2);
+    expect(descriptorRead![0].origin).toBe("http://private.invalid");
+    expect(authRead![0].origin).toBe("http://private.invalid");
+    expect(authRead![1]).toMatchObject({
+      credentials: "omit",
+      redirect: "error",
+      headers: { authorization: "Bearer private-bearer-sentinel" },
+    });
+    expect(descriptorRead![1]?.signal).toBe(authRead![1]?.signal);
+    expect(fixture.bearer).toHaveBeenCalledTimes(1);
+    expect(fixture.bridge.getLocalEnvironmentBootstraps).toHaveBeenCalledTimes(1);
+    expect(fixture.sockets).toHaveLength(1);
+    expect(fixture.sockets[0]!.sent).toHaveLength(1);
+    expect(fixture.sockets[0]!.closes).toBe(1);
+    expect(fixture.status).not.toHaveBeenCalled();
+    expect(fixture.exposure).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false, "true", null, undefined])(
+    "requires a strict auth boolean after HTTP 200: %s",
+    async (authenticated) => {
+      const fixture = await generatedObserverFixture();
+      fixture.fetch.mockResolvedValue({ ok: true, json: async () => ({ authenticated }) });
+      fixture.sockets[0]!.emit("error", {});
+      await fixture.outcome;
+      expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+        outcome: "socket-error",
+        postFailure: {
+          auth: {
+            available: typeof authenticated === "boolean",
+            authenticated: typeof authenticated === "boolean" ? authenticated : null,
+          },
+        },
+      });
+    },
+  );
+
+  it.each([
+    { descriptor: {}, want: { bootChanged: null, sameStore: null, expectedVersionMatches: null } },
+    {
+      descriptor: {
+        bootId: "private-boot-sentinel",
+        storageInstanceId: "private-other-store",
+        serverVersion: "0.0.0",
+      },
+      want: { bootChanged: false, sameStore: false, expectedVersionMatches: false },
+    },
+  ])("keeps descriptor comparisons null-aware: $want", async ({ descriptor, want }) => {
+    const fixture = await generatedObserverFixture();
+    fixture.fetch.mockResolvedValue({ ok: true, json: async () => descriptor });
+    fixture.sockets[0]!.emit("close", { code: 1005, wasClean: true });
+    await fixture.outcome;
+    expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+      postFailure: { descriptor: { available: true, ...want } },
+    });
+  });
+
+  it("does not infer descriptor identity or an unknown seed-phase expected version", async () => {
+    const fixture = await generatedObserverFixture({ descriptor: {}, phase: "seed-and-install" });
+    fixture.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        bootId: "private-boot",
+        storageInstanceId: "private-store",
+        serverVersion: fixture.input.candidateVersion,
+      }),
+    });
+    fixture.sockets[0]!.emit("close", {});
+    await fixture.outcome;
+    expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+      postFailure: {
+        descriptor: {
+          available: true,
+          bootChanged: null,
+          sameStore: null,
+          expectedVersionMatches: null,
+        },
+      },
+    });
+  });
+
+  it.each([
+    { endpointUrl: null, want: false },
+    { endpointUrl: undefined, want: null },
+    { endpointUrl: "", want: null },
+  ])(
+    "does not treat a persisted exposure fallback as a live endpoint: $endpointUrl",
+    async ({ endpointUrl, want }) => {
+      const fixture = await generatedObserverFixture();
+      fixture.exposure.mockResolvedValue({
+        mode: "network-accessible",
+        configuredMode: "network-accessible",
+        management: "native",
+        endpointUrl,
+      });
+      fixture.sockets[0]!.emit("close", {});
+      await fixture.outcome;
+      expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+        postFailure: {
+          exposure: { available: true, mode: "network-accessible", runtimeEndpointPresent: want },
+        },
+      });
+    },
+  );
+
+  it("bounds all post-failure reads together and ignores unavailable and late results", async () => {
+    const fixture = await generatedObserverFixture();
+    let finishDescriptor:
+      | ((value: { ok: boolean; json: () => Promise<unknown> }) => void)
+      | undefined;
+    let finishExposure: ((value: unknown) => void) | undefined;
+    fixture.fetch.mockImplementation((url) =>
+      url.pathname.endsWith("environment")
+        ? new Promise((resolve) => {
+            finishDescriptor = resolve;
+          })
+        : Promise.resolve({ ok: true, json: async () => ({ authenticated: false }) }),
+    );
+    fixture.exposure.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishExposure = resolve;
+        }),
+    );
+    await fixture.advance(237);
+    fixture.sockets[0]!.emit("close", { code: 1005, wasClean: true });
+    await fixture.flush();
+    await fixture.advance(1499);
+    expect(fixture.isSettled()).toBe(false);
+    await fixture.advance(1);
+    expect((await fixture.outcome).success).toBe(false);
+    const diagnostic = fixture.writes.get(fixture.input.observerDiagnosticPath);
+    expect(diagnostic).toMatchObject({
+      outcome: "socket-close",
+      elapsedMs: 237,
+      postFailure: {
+        descriptor: {
+          available: false,
+          bootChanged: null,
+          sameStore: null,
+          expectedVersionMatches: null,
+        },
+        auth: { available: true, authenticated: false },
+        exposure: {
+          available: false,
+          mode: null,
+          configuredMode: null,
+          management: null,
+          runtimeEndpointPresent: null,
+        },
+      },
+    });
+    expect(fixture.fetch.mock.calls[2]![1]?.signal?.aborted).toBe(true);
+    expect(fixture.timers.size).toBe(0);
+    expect(fixture.sockets[0]!.closes).toBe(1);
+    const saved = JSON.stringify(diagnostic);
+    const returned = JSON.stringify(fixture.executeEnvelopes);
+    finishDescriptor?.({ ok: true, json: async () => ({ bootId: "private-late-boot" }) });
+    finishExposure?.({ mode: "private-late-mode", endpointUrl: "private-late-endpoint" });
+    await fixture.flush();
+    expect(JSON.stringify(fixture.writes.get(fixture.input.observerDiagnosticPath))).toBe(saved);
+    expect(JSON.stringify(fixture.executeEnvelopes)).toBe(returned);
+    expect(saved).not.toContain("private-");
+  });
+
+  it.each(["http-error", "json-error", "invalid-body"] as const)(
+    "preserves socket failure when diagnostic reads are unavailable: %s",
+    async (scenario) => {
+      const fixture = await generatedObserverFixture();
+      fixture.fetch.mockResolvedValue({
+        ok: scenario !== "http-error",
+        json: async () => {
+          if (scenario === "json-error") throw new Error("private-response-cause");
+          return scenario === "invalid-body" ? ["private-body"] : { authenticated: true };
+        },
+      });
+      fixture.exposure.mockRejectedValue(new Error("private-native-cause"));
+      fixture.sockets[0]!.emit("close", { code: 1005, wasClean: true });
+      expect((await fixture.outcome).success).toBe(false);
+      const diagnostic = fixture.writes.get(fixture.input.observerDiagnosticPath);
+      expect(diagnostic).toMatchObject({
+        outcome: "socket-close",
+        postFailure: {
+          descriptor: { available: false },
+          auth: { available: false },
+          exposure: { available: false },
+        },
+      });
+      expect(JSON.stringify(diagnostic)).not.toContain("private-");
+      expect(fixture.timers.size).toBe(0);
+    },
+  );
+
+  it("retains unavailable exposure when the public method is absent", async () => {
+    const fixture = await generatedObserverFixture({ exposureMissing: true });
+    fixture.sockets[0]!.emit("close", {});
+    await fixture.outcome;
+    expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+      outcome: "socket-close",
+      postFailure: { exposure: { available: false, runtimeEndpointPresent: null } },
+    });
+    expect(fixture.exposure).not.toHaveBeenCalled();
+  });
+
+  it("closes exposure enums before the browser callback returns", async () => {
+    const fixture = await generatedObserverFixture();
+    fixture.exposure.mockResolvedValue({
+      mode: "private-mode",
+      configuredMode: "private-configured-mode",
+      management: "private-management",
+      endpointUrl: "http://private-endpoint.invalid",
+    });
+    fixture.sockets[0]!.emit("close", {});
+    await fixture.outcome;
+    expect(fixture.executeEnvelopes.at(-1)).toMatchObject({
+      ok: false,
+      diagnostic: {
+        postFailure: {
+          exposure: {
+            available: true,
+            mode: null,
+            configuredMode: null,
+            management: null,
+            runtimeEndpointPresent: true,
+          },
+        },
+      },
+    });
+    expect(JSON.stringify(fixture.executeEnvelopes)).not.toContain("private-");
+  });
+
+  it("includes stalled response bodies in the one post-failure deadline", async () => {
+    const fixture = await generatedObserverFixture();
+    let finishBody: ((value: unknown) => void) | undefined;
+    fixture.fetch.mockImplementation(async (url) => {
+      if (url.pathname.endsWith("session")) throw new Error("private-transport-cause");
+      return {
+        ok: true,
+        json: () =>
+          new Promise((resolve) => {
+            finishBody = resolve;
+          }),
+      };
+    });
+    fixture.sockets[0]!.emit("close", {});
+    await fixture.flush();
+    await fixture.advance(1500);
+    expect((await fixture.outcome).success).toBe(false);
+    expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+      outcome: "socket-close",
+      elapsedMs: 0,
+      postFailure: {
+        descriptor: { available: false },
+        auth: { available: false },
+        exposure: { available: true },
+      },
+    });
+    const returned = JSON.stringify(fixture.executeEnvelopes);
+    finishBody?.({ bootId: "private-late-body", serverVersion: "private-version" });
+    await fixture.flush();
+    expect(JSON.stringify(fixture.executeEnvelopes)).toBe(returned);
+    expect(returned).not.toContain("private-");
+    expect(fixture.fetch).toHaveBeenCalledTimes(4);
   });
 
   it("keeps the real 15s timeout and counts unmatched frames without retaining their IDs", async () => {
@@ -617,6 +981,78 @@ describe("generated observer terminal diagnostics", () => {
     expect(JSON.stringify(diagnostic)).not.toContain("private-");
     expect(JSON.stringify(diagnostic).length).toBeLessThan(2000);
   });
+
+  it("closes post-failure evidence fields and refuses invented exposure enums", () => {
+    const diagnostic = SeededUpgradeHarness.sanitizeSeededUpgradeObserverDiagnostic({
+      available: true,
+      outcome: "socket-close",
+      postFailure: {
+        descriptor: {
+          available: true,
+          bootChanged: "private-boot",
+          sameStore: true,
+          expectedVersionMatches: false,
+          bootId: "private-id",
+        },
+        auth: { available: false, authenticated: true, token: "private-bearer" },
+        exposure: {
+          available: true,
+          mode: "private-mode",
+          configuredMode: "local-only",
+          management: "private-management",
+          runtimeEndpointPresent: "private-endpoint",
+          endpointUrl: "private-url",
+        },
+        reason: "private-reason",
+      },
+    });
+    expect(diagnostic).toMatchObject({
+      postFailure: {
+        descriptor: {
+          available: true,
+          bootChanged: null,
+          sameStore: true,
+          expectedVersionMatches: false,
+        },
+        auth: { available: false, authenticated: null },
+        exposure: {
+          available: true,
+          mode: null,
+          configuredMode: "local-only",
+          management: null,
+          runtimeEndpointPresent: null,
+        },
+      },
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("private-");
+    expect(JSON.stringify(diagnostic).length).toBeLessThan(2000);
+  });
+
+  it.each(["snapshot", "decode", "timeout"] as const)(
+    "does not probe after a non-socket terminal: %s",
+    async (terminal) => {
+      const fixture = await generatedObserverFixture();
+      if (terminal === "timeout") await fixture.expire();
+      else {
+        fixture.sockets[0]!.emit("message", {
+          data:
+            terminal === "decode"
+              ? "not-json"
+              : JSON.stringify({
+                  _tag: "Chunk",
+                  requestId: fixture.sockets[0]!.sent[0]!.id,
+                  values: [{ kind: "snapshot", snapshot: { projects: [] } }],
+                }),
+        });
+      }
+      await fixture.outcome;
+      expect(fixture.writes.get(fixture.input.observerDiagnosticPath)).toMatchObject({
+        postFailure: null,
+      });
+      expect(fixture.fetch).toHaveBeenCalledTimes(2);
+      expect(fixture.exposure).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     "null",

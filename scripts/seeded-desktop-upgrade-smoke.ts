@@ -569,6 +569,119 @@ export function buildLocalUpdaterManifest(input: {
   };
 }
 
+/** Self-contained for the generated callback; never returns the read responses or credentials. */
+async function readSeededUpgradeObserverPostFailure(input: {
+  readonly httpBaseUrl: string;
+  readonly bearer: string;
+  readonly descriptor: unknown;
+  readonly expectedVersion: string | null;
+  readonly readExposure: (() => Promise<unknown>) | undefined;
+}) {
+  const result = {
+    descriptor: {
+      available: false,
+      bootChanged: null as boolean | null,
+      sameStore: null as boolean | null,
+      expectedVersionMatches: null as boolean | null,
+    },
+    auth: { available: false, authenticated: null as boolean | null },
+    exposure: {
+      available: false,
+      mode: null as string | null,
+      configuredMode: null as string | null,
+      management: null as string | null,
+      runtimeEndpointPresent: null as boolean | null,
+    },
+  };
+  const record = (value: unknown): Record<string, unknown> | null =>
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  const present = (value: unknown): value is string =>
+    typeof value === "string" && value.trim().length > 0;
+  const choice = (value: unknown, choices: readonly string[]) =>
+    typeof value === "string" && choices.includes(value) ? value : null;
+  let accepting = true;
+  let controller: AbortController | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    controller = new AbortController();
+    const request = {
+      credentials: "omit",
+      redirect: "error",
+      cache: "no-store",
+      signal: controller.signal,
+    } as const;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        accepting = false;
+        controller?.abort();
+        resolve();
+      }, 1_500);
+    });
+    const reads = [
+      (async () => {
+        const response = await fetch(
+          new URL("/.well-known/bibcode/environment", input.httpBaseUrl),
+          request,
+        );
+        if (!response.ok) return;
+        const after = record(await response.json());
+        if (!accepting || after === null) return;
+        const before = record(input.descriptor);
+        result.descriptor = {
+          available: true,
+          bootChanged:
+            present(before?.bootId) && present(after.bootId)
+              ? before.bootId !== after.bootId
+              : null,
+          sameStore:
+            present(before?.storageInstanceId) && present(after.storageInstanceId)
+              ? before.storageInstanceId === after.storageInstanceId
+              : null,
+          expectedVersionMatches:
+            present(input.expectedVersion) && present(after.serverVersion)
+              ? input.expectedVersion === after.serverVersion
+              : null,
+        };
+      })(),
+      (async () => {
+        const response = await fetch(new URL("/api/auth/session", input.httpBaseUrl), {
+          ...request,
+          headers: { authorization: "Bearer " + input.bearer },
+        });
+        if (!response.ok) return;
+        const state = record(await response.json());
+        if (!accepting || typeof state?.authenticated !== "boolean") return;
+        result.auth = { available: true, authenticated: state.authenticated };
+      })(),
+      (async () => {
+        const state = record(await input.readExposure?.());
+        if (!accepting || state === null) return;
+        result.exposure = {
+          available: true,
+          mode: choice(state.mode, ["local-only", "network-accessible"]),
+          configuredMode: choice(state.configuredMode, ["local-only", "network-accessible"]),
+          management: choice(state.management, ["native", "external"]),
+          runtimeEndpointPresent: present(state.endpointUrl)
+            ? true
+            : state.endpointUrl === null
+              ? false
+              : null,
+        };
+      })(),
+    ];
+    await Promise.race([Promise.allSettled(reads), deadline]);
+  } catch {
+    // Diagnostics cannot replace the recorded observer failure or retain private causes.
+  } finally {
+    accepting = false;
+    if (timer !== undefined) clearTimeout(timer);
+    controller?.abort();
+  }
+  return result;
+}
+
 /** Self-contained so the generated spec uses this same closed evidence projection. */
 export function sanitizeSeededUpgradeObserverDiagnostic(value: unknown) {
   const object = (entry: unknown): Record<string, unknown> =>
@@ -584,9 +697,15 @@ export function sanitizeSeededUpgradeObserverDiagnostic(value: unknown) {
       ? Math.min(maximum, Math.floor(entry))
       : null;
   const boolean = (entry: unknown) => (typeof entry === "boolean" ? entry : null);
+  const nullableChoice = (entry: unknown, choices: readonly string[]) =>
+    typeof entry === "string" && choices.includes(entry) ? entry : null;
   const frames = object(input.frames);
+  const postFailure = object(input.postFailure);
+  const descriptor = object(postFailure.descriptor);
+  const auth = object(postFailure.auth);
+  const exposure = object(postFailure.exposure);
   return {
-    version: 1,
+    version: 2,
     available,
     milestone: choice(input.milestone, [
       "bridge",
@@ -688,6 +807,43 @@ export function sanitizeSeededUpgradeObserverDiagnostic(value: unknown) {
         ? input.closeCode
         : null,
     wasClean: available ? boolean(input.wasClean) : null,
+    postFailure:
+      available &&
+      (input.outcome === "socket-close" || input.outcome === "socket-error") &&
+      input.postFailure !== null &&
+      typeof input.postFailure === "object" &&
+      !Array.isArray(input.postFailure)
+        ? {
+            descriptor: {
+              available: descriptor.available === true,
+              bootChanged: descriptor.available === true ? boolean(descriptor.bootChanged) : null,
+              sameStore: descriptor.available === true ? boolean(descriptor.sameStore) : null,
+              expectedVersionMatches:
+                descriptor.available === true ? boolean(descriptor.expectedVersionMatches) : null,
+            },
+            auth: {
+              available: auth.available === true && typeof auth.authenticated === "boolean",
+              authenticated: auth.available === true ? boolean(auth.authenticated) : null,
+            },
+            exposure: {
+              available: exposure.available === true,
+              mode:
+                exposure.available === true
+                  ? nullableChoice(exposure.mode, ["local-only", "network-accessible"])
+                  : null,
+              configuredMode:
+                exposure.available === true
+                  ? nullableChoice(exposure.configuredMode, ["local-only", "network-accessible"])
+                  : null,
+              management:
+                exposure.available === true
+                  ? nullableChoice(exposure.management, ["native", "external"])
+                  : null,
+              runtimeEndpointPresent:
+                exposure.available === true ? boolean(exposure.runtimeEndpointPresent) : null,
+            },
+          }
+        : null,
   };
 }
 
@@ -768,8 +924,10 @@ async function observe(seed) {
         frames: { text: 0, binary: 0, other: 0, parseErrors: 0, chunk: 0, exit: 0, defect: 0, protocol: 0, pong: 0, unknown: 0, matched: 0, unmatched: 0 },
         socketOpened: false, socketError: false, requestSent: false, interruptSent: false,
         closeRequested: false, wholeTextProtocol: null, descriptorIdentityPresent: null,
-        closeCode: null, wasClean: null,
+        closeCode: null, wasClean: null, postFailure: null,
       };
+      const readPostFailure = (${readSeededUpgradeObserverPostFailure.toString()});
+      let postFailureInput;
       let socket;
       let socketCloseAttempted = false;
       let retired = false;
@@ -818,6 +976,11 @@ async function observe(seed) {
         const descriptorResponse = await fetch(new URL("/.well-known/bibcode/environment", bootstrap.httpBaseUrl));
         if (!descriptorResponse.ok) throw fail("setup-failure");
         const descriptor = await descriptorResponse.json();
+        postFailureInput = {
+          httpBaseUrl: bootstrap.httpBaseUrl, bearer, descriptor,
+          expectedVersion: parameters.expectedVersion,
+          readExposure: typeof bridge.getServerExposureState === "function" ? () => bridge.getServerExposureState() : undefined,
+        };
         diagnostic.descriptorIdentityPresent = typeof descriptor?.storageInstanceId === "string" && descriptor.storageInstanceId.length > 0;
         diagnostic.milestone = "ticket";
         const ticketResponse = await fetch(new URL("/api/auth/websocket-ticket", bootstrap.httpBaseUrl), {
@@ -1014,9 +1177,14 @@ async function observe(seed) {
         catch { diagnostic.outcome = "cleanup-failure"; ok = false; }
         diagnostic.elapsedMs = Math.max(0, Math.min(300000, Math.floor(performance.now() - startedAt)));
       }
+      // The original failure and elapsed time are fixed before this one read-only round.
+      if (!ok && postFailureInput && (diagnostic.outcome === "socket-close" || diagnostic.outcome === "socket-error")) {
+        diagnostic.postFailure = await readPostFailure(postFailureInput);
+      }
       return ok ? { ok: true, observation, diagnostic } : { ok: false, diagnostic };
     }, {
       expectedDataRoot: input.expectedDataRoot, projectId: input.projectId,
+      expectedVersion: input.phase === "verify" ? input.candidateVersion : input.baselineVersion ?? null,
       workspaceRoot: input.workspaceRoot, wsl: input.wsl === true,
     }, seed);
   } catch {

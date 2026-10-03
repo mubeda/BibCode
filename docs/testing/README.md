@@ -88,6 +88,20 @@ Interrupt and closes before native project-data reads. Unmatched responses do
 not reset the original 15-second deadline, and no observation is retried. On a
 failed lane, inspect the closed observer record first; only completed normal
 lane results establish project, root, storage, backup and version verification.
+Version 2 records may include `postFailure` after a premature socket close or
+error. The original failure and elapsed time are fixed first. One read-only
+round then has a shared 1.5-second bound to compare the original descriptor with
+the same endpoint, check the original bearer at `/api/auth/session` with cookies
+omitted, and read the public desktop exposure state. It mints no credential or
+ticket, opens no second socket, and does not retry observation. HTTP 200 is not
+authentication evidence without a strict `authenticated` boolean.
+The record retains only availability, nullable boot/store/expected-version
+comparison booleans, and allowed exposure enums plus whether a runtime endpoint
+was present. A persisted wide setting without an endpoint is not a live wide
+runtime. Missing or malformed comparison fields remain null; failed, timed-out,
+or late reads remain unavailable. They cannot change the original failure. The
+additional reads cannot qualify an upgrade or establish a close cause on their
+own.
 The temporary Mac ARM workflow retains all three ordinary lanes and adds no
 success exception. Its workflow and any native activation require review.
 
