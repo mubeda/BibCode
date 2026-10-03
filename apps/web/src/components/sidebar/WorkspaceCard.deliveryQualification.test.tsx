@@ -4,8 +4,10 @@ import * as NodeVM from "node:vm";
 import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 import { resolveWorktreeCreateInput } from "../CreateWorktreeDialog.logic.ts";
 import { shouldShowWorkspaceBranchText, WORKSPACE_CARD_STATUS } from "../Sidebar.logic.ts";
 import {
@@ -14,6 +16,7 @@ import {
   WorkspaceCardTitleLine,
   workspaceCardIds,
 } from "./WorkspaceCard.tsx";
+import { resolveWorkspaceCardBranchTooltip } from "./workspaceCard.logic";
 
 // Execute only the actual self-contained browser reader. Importing the desktop
 // module would pull its unrelated Git owner into the web TypeScript project.
@@ -238,3 +241,159 @@ it.each(["light", "dark"])(
     }
   },
 );
+
+// Mount the real card and pinned BaseUI. Static markup and mocked tooltips cannot
+// exercise the controller's actual popup selector, text or hover lifecycle.
+const controllerSource = NodeFS.readFileSync(
+  NodePath.resolve(import.meta.dirname, "../../../../desktop/e2e/qualify-delivery-retry.ts"),
+  "utf8",
+);
+const tooltipStart = controllerSource.indexOf('    step("worktree-visible-path");');
+const tooltipEnd = controllerSource.indexOf(
+  '    await selectClaudeModel("worktree");',
+  tooltipStart,
+);
+if (tooltipStart < 0 || tooltipEnd <= tooltipStart)
+  throw new Error("The qualification tooltip seam is missing.");
+const tooltipSource = NodeModule.stripTypeScriptTypes(
+  "async function replay() {\n" + controllerSource.slice(tooltipStart, tooltipEnd) + "\n}\nreplay",
+);
+
+describe.each(["light", "dark"])("actual mounted %s card tooltip qualification", (theme) => {
+  it.each([
+    "visible",
+    "wrong-path",
+    "wrong-branch",
+    "hidden",
+    "move-only",
+    "enter-only",
+    "touch",
+    "foreign-text-node",
+  ])("keeps visible exact path and branch proof mandatory: %s", async (scenario) => {
+    vi.useFakeTimers();
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    // happy-dom has no layout. Control only the existing visibility predicate;
+    // card markup, hover state, portal and popup content are actual source.
+    vi.spyOn(HTMLElement.prototype, "getClientRects").mockImplementation(
+      function (this: HTMLElement) {
+        return (scenario === "hidden" && this.matches('[data-slot="tooltip-popup"]')
+          ? []
+          : [{ width: 120, height: 24 }]) as unknown as DOMRectList;
+      },
+    );
+    const branch = `codex/delivery-retry-${theme}`;
+    const path = "/owned/run/worktrees/selected";
+    const threadId = "owned-thread";
+    const ids = workspaceCardIds("owned-card");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const noop = () => {};
+    try {
+      await act(async () =>
+        root.render(
+          <WorkspaceCardShell
+            testId={`thread-row-${threadId}`}
+            buttonTestId={`thread-card-button-${threadId}`}
+            className=""
+            idBase="owned-card"
+            isActive
+            hasFlags={false}
+            hasBranchLine
+            hasSessionLine={false}
+            status={WORKSPACE_CARD_STATUS.idle}
+            onClick={noop}
+            onContextMenu={noop}
+            onButtonKeyDown={noop}
+          >
+            <WorkspaceCardTitleLine
+              id={ids.title}
+              flagsId={ids.flags}
+              title={branch.replaceAll("-", " ")}
+              titleTestId={`thread-title-${threadId}`}
+              unread={false}
+              pinned={false}
+            />
+            <WorkspaceCardBranchLine
+              id={ids.branch}
+              branch={branch}
+              branchTooltip={resolveWorkspaceCardBranchTooltip({
+                branch: scenario === "wrong-branch" ? "codex/other" : branch,
+                worktreePath: scenario === "wrong-path" ? "/owned/other" : path,
+                checkoutPath: null,
+              })}
+            />
+          </WorkspaceCardShell>,
+        ),
+      );
+      if (scenario === "foreign-text-node") {
+        const foreign = document.createElement("span");
+        foreign.textContent = `Worktree: selected (${branch})`;
+        container.append(foreign);
+      }
+      const browser = {
+        $: (selector: string) => ({
+          moveTo: async () => {
+            expect(selector).toBe(
+              `[data-testid="thread-row-${threadId}"] [id$="-branch"] [data-slot="tooltip-trigger"]`,
+            );
+            const target = document.querySelector(selector)!;
+            expect(target).not.toBeNull();
+            await act(async () => {
+              if (scenario !== "move-only" && scenario !== "foreign-text-node") {
+                target.dispatchEvent(
+                  new PointerEvent("pointerover", {
+                    bubbles: true,
+                    pointerType: scenario === "touch" ? "touch" : "mouse",
+                  }),
+                );
+                target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+                target.dispatchEvent(new MouseEvent("mouseenter"));
+              }
+              if (scenario !== "enter-only")
+                target.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
+              await vi.advanceTimersByTimeAsync(700);
+            });
+          },
+        }),
+        execute: async (reader: (value: string) => boolean, value: string) => reader(value),
+      };
+      const replay = NodeVM.runInNewContext(tooltipSource, {
+        b: () => browser,
+        step: () => {},
+        branch,
+        threadId,
+        identity: { path },
+        NodePath,
+        document,
+        owner: {
+          until: async (read: () => Promise<boolean>) => {
+            if (!(await read())) throw new Error("Tooltip observation refused.");
+          },
+        },
+      }) as () => Promise<void>;
+      if (scenario === "visible") {
+        await expect(replay()).resolves.toBeUndefined();
+      } else {
+        await expect(replay()).rejects.toThrow("Tooltip observation refused.");
+      }
+      const popup = document.querySelector('[data-slot="tooltip-popup"]');
+      if (["visible", "wrong-path", "wrong-branch", "hidden"].includes(scenario)) {
+        expect(popup).not.toBeNull();
+        expect(popup?.textContent?.trim()).toBe(
+          scenario === "wrong-branch"
+            ? "Worktree: selected (codex/other)"
+            : `Worktree: ${scenario === "wrong-path" ? "other" : "selected"} (${branch})`,
+        );
+      } else {
+        expect(popup).toBeNull();
+      }
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+});

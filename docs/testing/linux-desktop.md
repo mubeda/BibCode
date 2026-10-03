@@ -703,6 +703,15 @@ IDs refuse verification rather than falling back to initial title matching.
 The compiled web gate renders the actual card primitives with this visibility
 policy and exercises the browser reader before and after the real first-send
 title transition.
+The mounted gate also opens the real card tooltip through the pinned BaseUI
+mouse lifecycle and executes the controller's actual hover/read seam in both
+themes. The popup is selected by the existing `data-slot="tooltip-popup"`
+surface: pinned BaseUI 1.7.0 renders that slot without a `role="tooltip"`
+attribute. Keep the nonempty client-rect and exact `Worktree: <basename>
+(<branch>)` checks; a hidden popup, wrong path/branch or unrelated text cannot
+substitute. The inert replay controls layout and time only, so it does not prove
+native pointer delivery or geometry; the contained CI interaction must still
+observe the real visible popup.
 The workflow's explicit helper gate includes `delivery-retry-workspace.test.ts`
 for real disposable Git identity/refusal and restoration controls.
 

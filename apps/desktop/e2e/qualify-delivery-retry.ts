@@ -458,7 +458,7 @@ export async function runDeliveryRetryQualification() {
     await owner.until(async () =>
       b().execute(
         (expected) =>
-          Array.from(document.querySelectorAll('[role="tooltip"]')).some(
+          Array.from(document.querySelectorAll('[data-slot="tooltip-popup"]')).some(
             (element) =>
               element.getClientRects().length > 0 && element.textContent?.trim() === expected,
           ),
