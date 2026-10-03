@@ -653,6 +653,11 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Missing observations stay null; presence is not proof of authentication or
   visibility. No input values, URLs, page/error text, credentials or network logs
   are retained, and unavailable diagnostics cannot skip joined cleanup.
+  Success preparation also records fixed host-start, Add Server action/read,
+  project-import, draft, Settings and first-row-capture phases. These observers
+  add no UI action or wait and do not identify a native cause by themselves.
+  Isolate optional preparation-observer exceptions so the original actions
+  continue; keep ordinary phase, UI/read and capture failures fail-closed.
   Import diagnostics also retain the path control's disabled/busy flag and a
   finite category for the form's existing validation messages. Missing forms are
   unknown; other errors are unclassified. The path value and error text never

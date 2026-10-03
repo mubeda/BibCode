@@ -385,25 +385,77 @@ async function selectHost(host: Host) {
   );
 }
 
-async function addHost(host: Host, interactive = true) {
+const SUCCESS_ADD_HOST_PHASES = {
+  settings: "success-add-host-settings",
+  open: "success-add-host-open",
+  dialog: "success-add-host-dialog",
+  alias: "success-add-host-alias",
+  code: "success-add-host-code",
+  "ack-visible": "success-add-host-ack-visible",
+  "ack-proof": "success-add-host-ack-proof",
+  ack: "success-add-host-ack",
+  submit: "success-add-host-submit",
+  closed: "success-add-host-closed",
+  row: "success-add-host-row",
+  select: "success-add-host-select",
+  "return-settings": "success-add-host-return-settings",
+  check: "success-add-host-check",
+  status: "success-add-host-status",
+} as const;
+const SUCCESS_IMPORT_PHASES = {
+  "primary-import-workspace": "success-import-workspace",
+  "primary-import-menu": "success-import-menu",
+  "primary-import-path-mode": "success-import-path-mode",
+  "primary-import-path-input": "success-import-path-input",
+  "primary-import-submit": "success-import-submit",
+  "primary-import-composer": "success-import-composer",
+} as const;
+
+async function addHost(
+  host: Host,
+  interactive = true,
+  observe?: (operation: keyof typeof SUCCESS_ADD_HOST_PHASES) => void,
+) {
+  const observeStep = (operation: keyof typeof SUCCESS_ADD_HOST_PHASES) => {
+    try {
+      observe?.(operation);
+    } catch {
+      // Optional attribution cannot skip the original UI actions.
+    }
+  };
+  observeStep("settings");
   await settings();
+  observeStep("open");
   await click('button[aria-label="Add Server"]');
+  observeStep("dialog");
   await required().$(dialog).waitForDisplayed();
+  observeStep("alias");
   await required().$(`${dialog} input[placeholder="e.g. Linux workstation"]`).setValue(host.label);
+  observeStep("code");
   await required()
     .$(`${dialog} textarea[placeholder="bibcode://pair?code=…"]`)
     .setValue(await offer(host));
   const acknowledgement = required().$(`${dialog} [role="checkbox"]`);
+  observeStep("ack-visible");
   if (await acknowledgement.isDisplayed().catch(() => false)) {
+    observeStep("ack-proof");
     check(host.closeTunnel !== undefined, "actual-tunnel-before-acknowledgement");
+    observeStep("ack");
     await acknowledgement.click();
   }
+  observeStep("submit");
   await click(`${dialog} button=Add Server`);
+  observeStep("closed");
   await required().$(dialog).waitForDisplayed({ reverse: true });
+  observeStep("row");
   await text(row(host.label), host.label);
+  observeStep("select");
   await selectHost(host);
+  observeStep("return-settings");
   await settings();
+  observeStep("check");
   await click(`${row(host.label)}//button[normalize-space()="Check"]`);
+  observeStep("status");
   await text(row(host.label), interactive ? "Update to v9.9.1…" : "Manual updates");
 }
 
@@ -421,9 +473,17 @@ async function removeHost(host: Host) {
   }
 }
 
-async function importProject(host: Host) {
-  const primaryPhase = (name: string) => {
+async function importProject(
+  host: Host,
+  observe?: (operation: keyof typeof SUCCESS_IMPORT_PHASES) => void,
+) {
+  const primaryPhase = (name: keyof typeof SUCCESS_IMPORT_PHASES) => {
     if (host.devUrl) phase(name);
+    try {
+      observe?.(name);
+    } catch {
+      // Optional attribution cannot skip the original UI actions.
+    }
   };
   primaryPhase("primary-import-workspace");
   await workspace();
@@ -710,12 +770,16 @@ async function freshTerminalCounts(host: Host) {
 
 async function successFlow() {
   phase("success-flow");
+  phase("success-host-start");
   const host = await fakeHost("update-a", 4888, `QA Success ${currentTheme}`);
-  await addHost(host);
-  await importProject(host);
+  await addHost(host, true, (operation) => phase(SUCCESS_ADD_HOST_PHASES[operation]));
+  await importProject(host, (operation) => phase(SUCCESS_IMPORT_PHASES[operation]));
+  phase("success-draft");
   const draft = `retained update draft ${currentTheme}`;
   await required().$(composer).setValue(draft);
+  phase("success-settings");
   await settings();
+  phase("success-initial-row");
   await capture("initial-row", host, row(host.label), "Update to v9.9.1…");
   await workspace();
   await capture("initial-card", host, card, host.label);

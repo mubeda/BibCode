@@ -1598,3 +1598,403 @@ it.each([
     expect(writes.get("result")?.childProcessesClosed).toBe(true);
   },
 );
+
+it.each([
+  "settings",
+  "open",
+  "dialog",
+  "alias",
+  "code",
+  "ack-visible",
+  "ack-proof",
+  "ack",
+  "submit",
+  "closed",
+  "row",
+  "select",
+  "return-settings",
+  "check",
+  "status",
+])("identifies the actual success Add Server preparation operation: %s", async (failed) => {
+  const start = controller.indexOf("async function addHost(");
+  const end = controller.indexOf("async function removeHost(", start);
+  const operations: string[] = [],
+    calls: string[] = [];
+  const stopped = new Error("inert preparation failure");
+  let settingsCalls = 0;
+  const boundary = async (operation: string) => {
+    calls.push(operation);
+    if (operation === failed) throw stopped;
+  };
+  const host = {
+    label: "QA Success light",
+    closeTunnel: failed === "ack-proof" ? undefined : () => {},
+  };
+  const dialog = '[data-slot="dialog-popup"][role="dialog"]';
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(controller.slice(start, end) + "\naddHost"),
+    {
+      settings: () => boundary(++settingsCalls === 1 ? "settings" : "return-settings"),
+      click: (selector: string) =>
+        boundary(
+          selector.includes('aria-label="Add Server"')
+            ? "open"
+            : selector.includes("button=Add Server")
+              ? "submit"
+              : "check",
+        ),
+      required: () => ({
+        $: (selector: string) => ({
+          waitForDisplayed: (options?: { reverse?: boolean }) =>
+            boundary(options?.reverse ? "closed" : "dialog"),
+          setValue: (value: string) => {
+            expect(value).toBe(selector.includes("input[") ? host.label : "inert-offer");
+            return boundary(selector.includes("input[") ? "alias" : "code");
+          },
+          isDisplayed: async () => {
+            await boundary("ack-visible");
+            return true;
+          },
+          click: () => boundary("ack"),
+        }),
+      }),
+      dialog,
+      offer: async () => "inert-offer",
+      check: (value: unknown, code: string) => {
+        expect(code).toBe("actual-tunnel-before-acknowledgement");
+        calls.push("ack-proof");
+        if (!value) throw stopped;
+      },
+      text: (selector: string, expected: string) => {
+        expect(selector).toBe("owned-row");
+        return boundary(expected === host.label ? "row" : "status");
+      },
+      row: () => "owned-row",
+      selectHost: () => boundary("select"),
+    },
+  );
+  if (failed === "ack-visible") {
+    // Existing catch deliberately treats this read as false.
+    await expect(
+      run(host, true, (operation: string) => operations.push(operation)),
+    ).resolves.toBeUndefined();
+    expect(operations).toContain("ack-visible");
+    expect(calls).not.toContain("ack");
+  } else {
+    await expect(run(host, true, (operation: string) => operations.push(operation))).rejects.toBe(
+      stopped,
+    );
+    expect(operations.at(-1)).toBe(failed);
+  }
+});
+
+it.each([
+  "primary-import-workspace",
+  "primary-import-menu",
+  "primary-import-path-mode",
+  "primary-import-path-input",
+  "primary-import-submit",
+  "primary-import-composer",
+])(
+  "identifies the actual success project-import operation while preserving primary phases: %s",
+  async (failed) => {
+    const start = controller.indexOf("async function importProject(");
+    const end = controller.indexOf("async function setTheme(", start);
+    const observed: string[] = [];
+    const stopped = new Error("inert import failure");
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(controller.slice(start, end) + "\nimportProject"),
+      {
+        phase: () => {
+          throw new Error("Remote success import must not become a primary phase.");
+        },
+        workspace: async () => {
+          if (failed === "primary-import-workspace") throw stopped;
+        },
+        click: async (selector: string) => {
+          if (failed === "primary-import-menu" && selector.includes("sidebar-add-project"))
+            throw stopped;
+          if (failed === "primary-import-submit" && selector === "button=Open project")
+            throw stopped;
+        },
+        owner: {
+          until: async (read: () => Promise<boolean>) => {
+            if (failed === "primary-import-path-mode") throw stopped;
+            expect(await read()).toBe(true);
+          },
+        },
+        required: () => ({
+          $: (selector: string) => ({
+            isDisplayed: async () => true,
+            isExisting: async () => true,
+            waitForDisplayed: async () => {
+              if (failed === "primary-import-path-input" && selector === "#add-project-host-path")
+                throw stopped;
+              if (failed === "primary-import-composer" && selector === "owned-composer")
+                throw stopped;
+            },
+            setValue: async (value: string) => expect(value).toBe("/owned/project"),
+          }),
+        }),
+        composer: "owned-composer",
+      },
+    );
+    await expect(
+      run({ project: "/owned/project" }, (operation: string) => observed.push(operation)),
+    ).rejects.toBe(stopped);
+    expect(observed.at(-1)).toBe(failed);
+  },
+);
+
+it.each(["host", "add-host", "import", "draft", "settings", "initial-row"])(
+  "wires only literal success preparation phases before the first capture: %s",
+  async (failed) => {
+    const start = controller.indexOf("async function successFlow()");
+    const end = controller.indexOf(
+      "  await workspace();",
+      controller.indexOf('  await capture("initial-row"', start),
+    );
+    const mapsStart = controller.indexOf("const SUCCESS_ADD_HOST_PHASES");
+    const mapsEnd = controller.indexOf("async function addHost(", mapsStart);
+    const phases: string[] = [];
+    const calls: string[] = [];
+    const stopped = new Error("inert success preparation failure");
+    const boundary = async (name: string) => {
+      calls.push(name);
+      if (name === failed) throw stopped;
+    };
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        controller.slice(mapsStart, mapsEnd) +
+          "async function prep(){" +
+          controller.slice(controller.indexOf("{", start) + 1, end) +
+          "}\nprep",
+      ),
+      {
+        phase: (name: string) => phases.push(name),
+        currentTheme: "light",
+        composer: "owned-composer",
+        fakeHost: async (role: string, port: number, label: string) => {
+          expect([role, port, label]).toEqual(["update-a", 4888, "QA Success light"]);
+          await boundary("host");
+          return { label };
+        },
+        addHost: async (
+          _host: unknown,
+          interactive: boolean,
+          observe: (operation: string) => void,
+        ) => {
+          expect(interactive).toBe(true);
+          observe("submit");
+          await boundary("add-host");
+        },
+        importProject: async (_host: unknown, observe: (operation: string) => void) => {
+          observe("primary-import-submit");
+          await boundary("import");
+        },
+        required: () => ({
+          $: (selector: string) => {
+            expect(selector).toBe("owned-composer");
+            return {
+              setValue: async (value: string) => {
+                expect(value).toBe("retained update draft light");
+                await boundary("draft");
+              },
+            };
+          },
+        }),
+        settings: () => boundary("settings"),
+        row: () => "owned-row",
+        capture: async (scene: string, _host: unknown, target: string, expected: string) => {
+          expect([scene, target, expected]).toEqual([
+            "initial-row",
+            "owned-row",
+            "Update to v9.9.1…",
+          ]);
+          await boundary("initial-row");
+        },
+      },
+    );
+    await expect(run()).rejects.toBe(stopped);
+    const expected: Record<string, string> = {
+      host: "success-host-start",
+      "add-host": "success-add-host-submit",
+      import: "success-import-submit",
+      draft: "success-draft",
+      settings: "success-settings",
+      "initial-row": "success-initial-row",
+    };
+    expect(phases.at(-1)).toBe(expected[failed]);
+    expect(phases[0]).toBe("success-flow");
+    expect(phases.every((value) => /^(success-flow|success-[a-z-]+)$/.test(value))).toBe(true);
+    expect(calls).toEqual(
+      ["host", "add-host", "import", "draft", "settings", "initial-row"].slice(
+        0,
+        ["host", "add-host", "import", "draft", "settings", "initial-row"].indexOf(failed) + 1,
+      ),
+    );
+  },
+);
+
+function preparationObserverReplay(
+  throwPhase: string | null = null,
+  failOperation: string | null = null,
+) {
+  const mapsStart = controller.indexOf("const SUCCESS_ADD_HOST_PHASES");
+  const addStart = controller.indexOf("async function addHost(");
+  const addEnd = controller.indexOf("async function removeHost(", addStart);
+  const importStart = controller.indexOf("async function importProject(");
+  const importEnd = controller.indexOf("async function setTheme(", importStart);
+  const successStart = controller.indexOf("async function successFlow()");
+  const successEnd = controller.indexOf(
+    "  await workspace();",
+    controller.indexOf('  await capture("initial-row"', successStart),
+  );
+  const calls: unknown[][] = [],
+    phases: string[] = [];
+  const failure = new Error("inert observer/operation failure");
+  const record = async (name: string, ...args: unknown[]) => {
+    calls.push([name, ...args]);
+    if (name === failOperation) throw failure;
+  };
+  const host = { label: "QA Success light", project: "/owned/project", closeTunnel: () => {} };
+  const code =
+    controller.slice(mapsStart, addStart) +
+    controller.slice(addStart, addEnd) +
+    controller.slice(importStart, importEnd) +
+    "async function prep(){" +
+    controller.slice(controller.indexOf("{", successStart) + 1, successEnd) +
+    "}\n({addHost,importProject,prep,hostKeys:Object.keys(SUCCESS_ADD_HOST_PHASES),importKeys:Object.keys(SUCCESS_IMPORT_PHASES),hostPhases:Object.values(SUCCESS_ADD_HOST_PHASES),importPhases:Object.values(SUCCESS_IMPORT_PHASES)})";
+  const run = NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes(code), {
+    phase: (name: string) => {
+      phases.push(name);
+      if (name === throwPhase) throw failure;
+    },
+    currentTheme: "light",
+    dialog: '[data-slot="dialog-popup"][role="dialog"]',
+    composer: "owned-composer",
+    settings: () => record("settings"),
+    workspace: () => record("workspace"),
+    click: (selector: string) => record("click", selector),
+    offer: async (value: unknown) => {
+      expect(value).toBe(host);
+      await record("offer");
+      return "inert-offer";
+    },
+    row: () => "owned-row",
+    selectHost: () => record("select"),
+    check: (value: unknown, code: string) => {
+      calls.push(["check", code]);
+      if (!value) throw failure;
+    },
+    text: (selector: string, expected: string, ...rest: unknown[]) =>
+      record("text", selector, expected, ...rest),
+    owner: {
+      until: async (read: () => Promise<boolean>, ...args: unknown[]) => {
+        await record("until", ...args);
+        expect(await read()).toBe(true);
+      },
+    },
+    required: () => ({
+      $: (selector: string) => ({
+        waitForDisplayed: (...args: unknown[]) => record("displayed", selector, ...args),
+        setValue: (value: string) => record("input", selector, value),
+        isDisplayed: async (...args: unknown[]) => {
+          await record("visible", selector, ...args);
+          return true;
+        },
+        isExisting: async (...args: unknown[]) => {
+          await record("existing", selector, ...args);
+          return true;
+        },
+        click: (...args: unknown[]) => record("ack-click", selector, ...args),
+      }),
+    }),
+    fakeHost: async (role: string, port: number, label: string) => {
+      await record("host", role, port, label);
+      return host;
+    },
+    capture: (scene: string, _host: unknown, target: string, expected: string) =>
+      record("capture", scene, target, expected),
+  });
+  return { ...run, host, calls, phases, failure };
+}
+
+it("preserves the actual Add Server baseline actions with successful or throwing observers at every position", async () => {
+  const baseline = preparationObserverReplay();
+  await baseline.addHost(baseline.host);
+  const normal = preparationObserverReplay();
+  const seen: string[] = [];
+  await normal.addHost(normal.host, true, (operation: string) => seen.push(operation));
+  expect(normal.calls).toEqual(baseline.calls);
+  expect(seen).toEqual(normal.hostKeys);
+  for (const failed of normal.hostKeys) {
+    const probe = preparationObserverReplay();
+    const observed: string[] = [];
+    await expect(
+      probe.addHost(probe.host, true, (operation: string) => {
+        observed.push(operation);
+        if (operation === failed) throw probe.failure;
+      }),
+    ).resolves.toBeUndefined();
+    expect(probe.calls).toEqual(baseline.calls);
+    expect(observed).toEqual(normal.hostKeys);
+  }
+});
+
+it("preserves the actual import baseline and primary phases with observers throwing at every position", async () => {
+  for (const primary of [false, true]) {
+    const baseline = preparationObserverReplay();
+    const baselineHost = { ...baseline.host, ...(primary ? { devUrl: "owned" } : {}) };
+    await baseline.importProject(baselineHost);
+    for (const failed of baseline.importKeys) {
+      const probe = preparationObserverReplay();
+      const observed: string[] = [];
+      const host = { ...probe.host, ...(primary ? { devUrl: "owned" } : {}) };
+      await expect(
+        probe.importProject(host, (operation: string) => {
+          observed.push(operation);
+          if (operation === failed) throw probe.failure;
+        }),
+      ).resolves.toBeUndefined();
+      expect(probe.calls).toEqual(baseline.calls);
+      expect(probe.phases).toEqual(baseline.phases);
+      expect(observed).toEqual(baseline.importKeys);
+    }
+  }
+});
+
+it("keeps real success wiring running when any optional mapped phase callback throws", async () => {
+  const baseline = preparationObserverReplay();
+  await baseline.prep();
+  for (const failed of [...baseline.hostPhases, ...baseline.importPhases]) {
+    const probe = preparationObserverReplay(failed);
+    await expect(probe.prep()).resolves.toBeUndefined();
+    expect(probe.calls).toEqual(baseline.calls);
+    expect(probe.phases).toEqual(baseline.phases);
+  }
+});
+
+it("keeps broad phases, original operations and capture failures fail-closed", async () => {
+  for (const failed of [
+    "success-flow",
+    "success-host-start",
+    "success-draft",
+    "success-settings",
+    "success-initial-row",
+  ]) {
+    const probe = preparationObserverReplay(failed);
+    await expect(probe.prep()).rejects.toBe(probe.failure);
+    expect(probe.calls.some((call: readonly unknown[]) => call[0] === "capture")).toBe(false);
+  }
+  for (const failed of ["settings", "click", "input", "capture"]) {
+    const probe = preparationObserverReplay(null, failed);
+    await expect(probe.prep()).rejects.toBe(probe.failure);
+    expect(probe.calls.at(-1)?.[0]).toBe(failed);
+  }
+  const primary = preparationObserverReplay("primary-import-workspace");
+  await expect(primary.importProject({ ...primary.host, devUrl: "owned" }, () => {})).rejects.toBe(
+    primary.failure,
+  );
+  expect(primary.calls).toEqual([]);
+});

@@ -246,3 +246,35 @@ failures. Missing/inherited facts retain the existing unknown quarantine. Actual
 failure/cleanup replay preserves the original click-intercepted receipt, one
 sample and joined cleanup when descriptor evidence is refused. No UI action,
 wait, timer, owner, acceptance assertion or native causal conclusion changes.
+
+Full trial `37140073951` on `b407a606` failed in light `success-flow` before any
+capture, with closed kind unclassified and no Check again/manual assertion fact.
+Its post-failure setup has the sidebar and import path control, idle import and
+no known import error; startup has no JavaScript/rejection/resource error and
+cleanup passed. The same-source core trial `37139721783` passed thirty-six
+captures before the cancellation request. Neither record identifies the failing
+operation or establishes a product defect.
+
+The exact installed WebDriverIO 9.29.1 parser/controller probe falsifies a proposed
+Add Server compound-selector blocker at this source: its existing element helper
+already splits the actual dialog CSS prefix from chained button-text XPath. The
+real rendered pairing body/Button/Checkbox resolves one acknowledged submit and
+refuses unacknowledged/adding controls. The prior #17 direct-compound defect is
+not reproduced by this helper. No selector or click-policy remedy was applied.
+
+Success-only closed observers now distinguish host startup, existing Add Server
+actions/reads, project import, retained draft entry, Settings and first-row capture.
+Actual helper/controller replays fail before the added observation points and
+pass with them while retaining original operation order and inputs. Existing
+primary import markers, non-success helper calls, selectors, UI actions, waits,
+request/version/draft checks, owner and all twenty Reload markers remain intact.
+These are attribution diagnostics only. Native cause and full acceptance remain
+pending under root ownership; no blind full rerun was performed here.
+
+Independent review found that a throwing optional preparation observer could
+abort before the original helper action. Actual no-observer versus throwing
+callback replays reproduced this P2. The repair isolates only the new optional
+callback invocation; baseline action journals, arguments and default budgets
+remain equal at every observer position and through the actual success wiring.
+Original primary/broad-phase writes, UI/read failures and capture/privacy gates
+remain fail-closed. No telemetry subsystem or product/native remedy is added.
