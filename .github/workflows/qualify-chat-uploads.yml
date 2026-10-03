@@ -1,0 +1,61 @@
+name: Issue 17 browser upload qualification
+
+on:
+  push:
+    branches: [codex/qualify-chat-uploads]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser_uploads:
+    name: Linux Chromium upload smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+      - name: Install frozen dependencies
+        run: vp install --frozen-lockfile
+      - name: Check owned fixture and process helpers
+        run: |
+          python3 -B scripts/qualify-chat-uploads.test.py
+          python3 -B scripts/qualify-chat-network.test.py
+          python3 -B scripts/qualify-chat-uploads.py preflight
+          vp test run apps/desktop/e2e/support/chat-upload-fixture.test.ts apps/desktop/e2e/support/chat-upload-evidence.test.ts apps/desktop/e2e/support/browser-network.test.ts apps/desktop/e2e/support/browser-startup.test.ts
+      - name: Build guarded fixture server
+        run: cargo build -p bibcode-server --bin bibcode --features hermetic-test-guard -j 2
+      - name: Run isolated real browser upload smoke
+        env:
+          BIBCODE_UPLOAD_SERVER: ${{ github.workspace }}/target/debug/bibcode
+        run: python3 -B scripts/qualify-chat-uploads.py
+      - name: Retain explicit safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: issue17-browser-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/plain-smoke.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure-after-pair.png
+            ${{ runner.temp }}/issue17-browser-${{ github.run_id }}/failure-before-credential.png
+          if-no-files-found: warn

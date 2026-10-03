@@ -578,6 +578,53 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   restart, and the recorded runtime process count must be one. Count and stop
   only processes whose current environment has that lane's exact `BIBCODE_HOME`.
 
+  The temporary `qualify-release-ui.yml` QA CI workflow qualifies the browser
+  controls against the maintained `remote_update_fake_host` example and real
+  headless CLI layouts. Its default **core** selection covers both themes for
+  confirmation/cancel, fresh active-work counts, progress across remount, success,
+  failure/retry/dismiss and manual instructions. **Full** additionally selects
+  wrong-version restart, the actual three-minute no-return deadline, two active
+  updates plus one queued update, and the real browser Reload button. A core
+  result explicitly lists those pending cases and is not full UI qualification.
+  Only a push to `codex/qualify-release-ui` or a manual dispatch starts it; a push
+  selects core, and manual dispatch offers core/full. There is no main-branch trigger.
+  Neither selection installs software, supplies native host-toast evidence, or
+  replaces the final integrated screenshot sweep.
+
+  Run this workflow only after independent harness review and the separate
+  browser-startup prerequisite. It builds the web source once, copies the guarded
+  server/example outside Cargo output and records source/build hashes; it serves
+  those web assets with the existing preview configuration. Its shared Python
+  owner admits only a disposable CI PID/network namespace, and its shared browser
+  owner enables no performance logging. Prepare the reviewed contained topology
+  before any fixture, service or browser admission. Browser state before setup is
+  unobserved (`before:null`); each created browser must pass one bounded actual
+  online read. No post-launch network mutation, repair, sleep or retry is allowed.
+  Remote pairing uses the real Add Server
+  flow through an owned loopback tunnel. The fresh-terminal setup uses genuine
+  authenticated public RPC and a pinned owned executable; dialog counts and all
+  update actions use the real UI. Reports distinguish that setup from UI terminal
+  creation. Manual CLI layouts qualify descriptor kind, visible instructions and
+  actual clipboard contents; their install dispatch remains unobserved, and their
+  instructions are never executed.
+
+  For the full Reload negative control, observe the primary rail connected,
+  then disconnected and connected again around the same-version restart, with a
+  new server boot, before starting the unchanged ten-second no-prompt window.
+  Missing/stale browser state or Node-only reachability cannot satisfy it. Keep
+  that transition within the existing thirty-second bound, and record its closed
+  transition receipt separately from the duration of the negative window.
+
+  Retain only the workflow's finite screenshot names and closed JSON evidence.
+  Each original image requires actual theme, selected environment, expected text,
+  unobstructed visible target, nonblank PNG and no credential control or URL.
+  Inspect the original images before accepting visual quality. Shared cleanup
+  joins the browser, proxies and children; PID1 then reaps descendants. The
+  private fixture is deleted only after both owners report joined cleanup. Require
+  unchanged build inputs, zero guard refusals, no namespace survivors and unchanged
+  host network identity. Keep partial/failure evidence honest; no retained raw logs,
+  profiles, tokens, requester identities or fabricated zero install counts.
+
 - seed an incompatible newer connection IndexedDB version and confirm the
   boot-level recovery dialog lists the deleted data classes, keeps **Reload** as
   a non-destructive exit, requires a separately acknowledged confirmation that a

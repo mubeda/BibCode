@@ -1,0 +1,139 @@
+name: Issue 16 controlled remote update UI
+
+on:
+  push:
+    branches: [codex/qualify-release-ui]
+  workflow_dispatch:
+    inputs:
+      matrix:
+        description: Core feedback or the complete browser matrix
+        type: choice
+        required: true
+        default: core
+        options: [core, full]
+
+permissions:
+  contents: read
+
+jobs:
+  remote_ui:
+    name: Linux Chromium remote update UI (${{ inputs.matrix || 'core' }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      BIBCODE_RELEASE_UI_MATRIX: ${{ inputs.matrix || 'core' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+      - name: Install frozen dependencies
+        run: vp install --frozen-lockfile
+      - name: Check owned helpers and namespace admission
+        run: |
+          python3 -B scripts/qualify-chat-uploads.test.py
+          python3 -B scripts/qualify-chat-network.test.py
+          python3 -B scripts/qualify-chat-uploads.py preflight
+          vp test run apps/desktop/e2e/support/qualification-owner.test.ts apps/desktop/e2e/support/remote-ui-evidence.test.ts apps/desktop/e2e/support/remote-ui-rpc.test.ts apps/desktop/e2e/support/remote-ui-controller.test.ts apps/desktop/e2e/support/chat-upload-fixture.test.ts apps/desktop/e2e/support/chat-upload-evidence.test.ts apps/desktop/e2e/support/browser-network.test.ts apps/desktop/e2e/support/browser-startup.test.ts
+      - name: Build the source UI once with owned loopback targets
+        env:
+          VITE_WS_URL: ws://127.0.0.1:4887
+          VITE_HTTP_URL: http://127.0.0.1:4887
+          VITE_DEV_SERVER_URL: http://localhost:4901
+        run: vp run --filter @bibcode/web build
+      - name: Required static gates
+        run: |
+          vp check
+          vp exec tsc --noEmit -p apps/desktop/e2e/tsconfig.json
+          vp exec tsc --noEmit -p scripts/tsconfig.json
+      - name: Build guarded server and maintained interactive fake host
+        run: cargo build -p bibcode-server --bin bibcode --example remote_update_fake_host --features hermetic-test-guard -j 2
+      - name: Copy immutable inputs outside Cargo output
+        run: |
+          python3 - <<'PYTHON'
+          import os, shutil
+          from pathlib import Path
+          target = Path(os.environ['RUNNER_TEMP']) / 'issue16-ui-build'
+          target.mkdir(mode=0o700)
+          shutil.copy2('target/debug/bibcode', target / 'bibcode')
+          shutil.copy2('target/debug/examples/remote_update_fake_host', target / 'remote-update-fake-host')
+          shutil.copytree('apps/web/dist', target / 'web')
+          for path in [target / 'bibcode', target / 'remote-update-fake-host']:
+              path.chmod(0o500)
+          PYTHON
+      - name: Run contained remote update UI selection
+        env:
+          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue16-ui-build/bibcode
+          BIBCODE_RELEASE_UI_FAKE_HOST: ${{ runner.temp }}/issue16-ui-build/remote-update-fake-host
+          BIBCODE_RELEASE_UI_WEB: ${{ runner.temp }}/issue16-ui-build/web
+        run: python3 -B scripts/qualify-chat-uploads.py --scenario remote-updates-ui --matrix "$BIBCODE_RELEASE_UI_MATRIX"
+      - name: Retain explicit safe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: issue16-ui-${{ inputs.matrix || 'core' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/assertions.json
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/initial-row-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/initial-row-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/initial-card-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/initial-card-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/confirm-row-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/confirm-row-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/confirm-card-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/confirm-card-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/terminal-warning-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/terminal-warning-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/downloading-row-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/downloading-row-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/downloading-card-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/downloading-card-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/downloading-remounted-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/downloading-remounted-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/backup-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/backup-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/restarting-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/restarting-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/success-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/success-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/failure-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/failure-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/row-retry-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/row-retry-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/toast-retry-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/toast-retry-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/dismissed-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/dismissed-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/wrong-version-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/wrong-version-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/not-back-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/not-back-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/queued-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/queued-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/manual-archive-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/manual-archive-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/manual-package-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/manual-package-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/manual-unknown-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/manual-unknown-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/reload-offer-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/reload-offer-dark.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/reload-complete-light.png
+            ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/reload-complete-dark.png
+          if-no-files-found: warn
