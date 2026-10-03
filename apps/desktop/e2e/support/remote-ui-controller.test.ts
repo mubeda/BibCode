@@ -4,7 +4,10 @@ import * as NodeVM from "node:vm";
 import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
-import { manualUpdateSteps } from "../../../web/src/components/settings/remoteUpdatePresentation.ts";
+import {
+  manualUpdateSteps,
+  remoteUpdateConfirmation,
+} from "../../../web/src/components/settings/remoteUpdatePresentation.ts";
 import {
   remoteUiPlan,
   remoteUiScenes,
@@ -447,6 +450,74 @@ it.each(["ready", "toast-clears", "backdrop-clears", "covered", "disabled", "cli
     if (mode === "backdrop-clears") expect(elapsed).toBe(1000);
   },
 );
+
+it("reconfirms a wrong-version retry with the restarted host's unknown target and fresh counts", async () => {
+  const start = controller.indexOf("async function restartFailures()");
+  const end = controller.indexOf("async function queuedFlow()", start);
+  const nextCase = new Error("next inert case");
+  const host = { label: "QA Wrong Version light" };
+  const actions: string[] = [];
+  let dialogText: string | null = null;
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(controller.slice(start, end) + "\nrestartFailures"),
+    {
+      currentTheme: "light",
+      dialog: "dialog",
+      phase: (value: string) => {
+        if (value === "real-no-return-deadline") throw nextCase;
+      },
+      fakeHost: async () => host,
+      addHost: async () => {},
+      openConfirmation: async () => {},
+      confirm: async () => actions.push("initial-confirm"),
+      exactRequests: async (_host: unknown, count: number) => actions.push(`requests:${count}`),
+      status: async () => {},
+      row: () => "owned-row",
+      restart: async () => {
+        // The maintained host resets ScriptedStatus to default on restart. A
+        // Settings row therefore requests a fresh confirmation with null target.
+        const presentation = remoteUpdateConfirmation({
+          name: host.label,
+          targetVersion: null,
+          appVersion: "0.7.2",
+          activeWork: { runningTurns: 0, liveTerminals: 0, queuedMessages: 0 },
+          counting: false,
+        });
+        dialogText = [presentation.title, ...presentation.lines].join("\n");
+      },
+      text: async (selector: string, expected: string) => {
+        if (selector === "dialog") {
+          if (!dialogText?.includes(expected))
+            throw new Error("Expected controlled UI state did not arrive.");
+          actions.push(`dialog:${expected}`);
+        }
+      },
+      capture: async (scene: string, _host: unknown, _row: string, expected: string) => {
+        expect(scene).toBe("wrong-version");
+        expect(expected).toBe("QA Wrong Version light restarted on v9.9.0 instead of v9.9.1.");
+        actions.push("wrong-version-capture");
+      },
+      click: async (selector: string) => {
+        expect(selector).toBe('owned-row//button[normalize-space()="Retry"]');
+        actions.push("retry");
+      },
+      cancel: async () => actions.push("cancel"),
+      removeHost: async () => actions.push("remove"),
+    },
+  );
+  await expect(run()).rejects.toBe(nextCase);
+  expect(actions).toEqual([
+    "initial-confirm",
+    "requests:1",
+    "wrong-version-capture",
+    "retry",
+    "dialog:Update QA Wrong Version light?",
+    "dialog:Nothing is running on it now.",
+    "cancel",
+    "requests:1",
+    "remove",
+  ]);
+});
 
 it.each(["Dismiss", "Check"])("identifies the final failure-flow %s boundary", async (action) => {
   const start = controller.indexOf("async function failureFlow()");

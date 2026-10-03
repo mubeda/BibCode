@@ -854,10 +854,18 @@ async function restartFailures() {
     row(wrong.label),
     `${wrong.label} restarted on v9.9.0 instead of v9.9.1.`,
   );
+  phase("wrong-version-retry");
   await click(`${row(wrong.label)}//button[normalize-space()="Retry"]`);
-  await text(dialog, `Update ${wrong.label} to v9.9.1?`);
+  phase("wrong-version-reconfirmation");
+  // Restart resets the scripted updater's latest version. Settings requests a
+  // fresh confirmation, so its target is unknown until another check succeeds.
+  await text(dialog, `Update ${wrong.label}?`);
+  await text(dialog, "Nothing is running on it now.");
+  phase("wrong-version-cancel");
   await cancel();
+  phase("wrong-version-request-count");
   await exactRequests(wrong, 1);
+  phase("wrong-version-remove");
   await removeHost(wrong);
   phase("real-no-return-deadline");
   const absent = await fakeHost("update-a", 4888, `QA No Return ${currentTheme}`);

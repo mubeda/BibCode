@@ -586,6 +586,13 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   wrong-version restart, the actual three-minute no-return deadline, two active
   updates plus one queued update, and the real browser Reload button. A core
   result explicitly lists those pending cases and is not full UI qualification.
+  After the scripted wrong-version restart, its updater status has no latest
+  version. Verify the exact wrong-version error first, then use Settings Retry
+  and require the named confirmation without a version plus fresh work counts.
+  Cancel must retain exactly the original one install request. Do not invent a
+  target or change the fixture's status to preserve the pre-restart dialog title.
+  Separate Retry, reconfirmation, Cancel, request-count and removal phases locate
+  failures without retaining page text or weakening the existing action bounds.
   Only a push to `codex/qualify-release-ui` or a manual dispatch starts it; a push
   selects core, and manual dispatch offers core/full. There is no main-branch trigger.
   Neither selection installs software, supplies native host-toast evidence, or
