@@ -725,6 +725,17 @@ DOM inspection. Missing, malformed or late observations remain unknown and
 cannot replace the original failure or skip joined cleanup. These facts are
 failure diagnostics, not authentication or screenshot acceptance evidence.
 
+Worktree opening records separate control-count, header-hover, displayed,
+enabled and public-click phases. A failure in those phases may take one
+two-second, location-guarded read-only sample: a finite control-count category
+and boolean-or-unknown header/button visibility, hover, enabled and hit-target
+facts, plus dialog/model-picker visibility. These are current DOM samples,
+not the result of an earlier WebDriver command. Missing controls or unsupported
+visibility observations remain unknown. No paths, IDs, coordinates, text,
+input values, URLs or screenshots are retained; late samples cannot republish
+after failure or alter cleanup. Hover/click behavior and readiness bounds stay
+unchanged.
+
 The Retry button must open the real browser confirmation. Read its exact copy
 through WebDriver's alert API, dismiss once and prove no new input/launch, then
 click again and accept. Do not replace `window.confirm`, call a private handler

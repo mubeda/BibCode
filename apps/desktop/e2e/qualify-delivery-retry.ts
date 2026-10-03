@@ -77,6 +77,35 @@ export function deliveryConfiguration(
   };
 }
 
+/** Sampled DOM facts only; never a substitute for a completed WebDriver command. */
+export function projectDeliveryWorktreeObservation(input: unknown) {
+  const value =
+    typeof input === "object" && input !== null && !Array.isArray(input)
+      ? (input as Record<string, unknown>)
+      : {};
+  const rawSafeLocation = value.safeLocation;
+  const safeLocation = typeof rawSafeLocation === "boolean" ? rawSafeLocation : null;
+  const source = safeLocation === true ? value : {};
+  const boolean = (key: string): boolean | null => {
+    const field = source[key];
+    return typeof field === "boolean" ? field : null;
+  };
+  const count = source.createCount;
+  return {
+    safeLocation,
+    createCount:
+      typeof count === "string" && ["none", "one", "multiple"].includes(count) ? count : null,
+    headerHovered: boolean("headerHovered"),
+    headerVisible: boolean("headerVisible"),
+    headerHitTarget: boolean("headerHitTarget"),
+    createVisible: boolean("createVisible"),
+    createEnabled: boolean("createEnabled"),
+    createHitTarget: boolean("createHitTarget"),
+    dialogVisible: boolean("dialogVisible"),
+    modelPickerVisible: boolean("modelPickerVisible"),
+  };
+}
+
 /** Failure attribution only: closed facts, never page values or driver payloads. */
 export function projectDeliveryStartupObservation(input: unknown) {
   const value =
@@ -236,6 +265,67 @@ export async function runDeliveryRetryQualification() {
     }
   }
 
+  async function readWorktreeFailureObservation() {
+    try {
+      return projectDeliveryWorktreeObservation(
+        await bounded(
+          browser!.execute((expectedOrigin) => {
+            if (
+              location.origin !== expectedOrigin ||
+              location.search !== "" ||
+              location.hash !== ""
+            )
+              return { safeLocation: false };
+            const controls = document.querySelectorAll('button[aria-label^="New worktree in "]');
+            const create = controls.length === 1 ? controls[0]! : null;
+            const header = create?.closest('div[class~="group/project-header"]') ?? null;
+            const visible = (element: Element | null): boolean | null =>
+              element && typeof element.checkVisibility === "function"
+                ? element.checkVisibility({
+                    contentVisibilityAuto: true,
+                    opacityProperty: true,
+                    visibilityProperty: true,
+                  })
+                : null;
+            const hitTarget = (element: Element | null): boolean | null => {
+              if (!element) return null;
+              const rect = element.getBoundingClientRect();
+              if (rect.width <= 0 || rect.height <= 0) return false;
+              const hit = document.elementFromPoint(
+                rect.left + rect.width / 2,
+                rect.top + rect.height / 2,
+              );
+              return hit !== null && (hit === element || element.contains(hit));
+            };
+            const anyVisible = (selector: string): boolean | null => {
+              const observations = new Set(
+                Array.from(document.querySelectorAll(selector), visible),
+              );
+              return observations.has(true) ? true : observations.has(null) ? null : false;
+            };
+            return {
+              safeLocation: true,
+              createCount:
+                controls.length === 0 ? "none" : controls.length === 1 ? "one" : "multiple",
+              headerHovered: header?.matches(":hover") ?? null,
+              headerVisible: visible(header),
+              headerHitTarget: hitTarget(header),
+              createVisible: visible(create),
+              createEnabled: create instanceof HTMLButtonElement ? !create.disabled : null,
+              createHitTarget: hitTarget(create),
+              dialogVisible: anyVisible('[data-slot="dialog-popup"][role="dialog"]'),
+              modelPickerVisible: anyVisible('[data-model-picker-content="true"]'),
+            };
+          }, origin),
+          2000,
+        ),
+      );
+    } catch {
+      // The original failure survives unavailable/late diagnostics and owns cleanup.
+      return null;
+    }
+  }
+
   async function setTheme() {
     step("theme-open-settings");
     await click('[data-testid="environment-rail-manage"]');
@@ -313,14 +403,21 @@ export async function runDeliveryRetryQualification() {
     const branch = `codex/delivery-retry-${theme}`;
     const create = 'button[aria-label^="New worktree in "]';
     const popup = '[data-slot="dialog-popup"][role="dialog"]';
-    step("worktree-open-dialog");
+    step("worktree-open-count");
     check((await b().$$(create).length) === 1);
+    step("worktree-open-hover");
     await b()
       .$(
         '//*[@data-testid="new-worktree-button"]/ancestor::div[contains(concat(" ", normalize-space(@class), " "), " group/project-header ")][1]',
       )
       .moveTo();
-    await click(create);
+    const createButton = b().$(create);
+    step("worktree-open-displayed");
+    await createButton.waitForDisplayed();
+    step("worktree-open-enabled");
+    await createButton.waitForEnabled();
+    step("worktree-open-click");
+    await createButton.click();
     step("worktree-name");
     const name = b().$(`${popup} input[placeholder="Worktree name"]`);
     await name.waitForDisplayed();
@@ -782,11 +879,23 @@ export async function runDeliveryRetryQualification() {
       browser && (phase.startsWith("pair-") || phase.startsWith("theme-"))
         ? await readStartupFailureObservation()
         : null;
+    const worktreeObservation =
+      browser &&
+      [
+        "worktree-open-count",
+        "worktree-open-hover",
+        "worktree-open-displayed",
+        "worktree-open-enabled",
+        "worktree-open-click",
+      ].includes(phase)
+        ? await readWorktreeFailureObservation()
+        : null;
     write("failure", {
       phase,
       theme,
       failure: classifyQualificationFailure(error),
       startupObservation,
+      worktreeObservation,
     });
   } finally {
     const processes = owner.processes.map(({ child, role, log, spawnFailure }) =>

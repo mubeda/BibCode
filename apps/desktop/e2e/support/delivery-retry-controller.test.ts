@@ -78,6 +78,79 @@ const exactModel =
   '[data-model-picker-content="true"] [data-model-picker-instance-id="claudeAgent"][data-model-picker-model-slug="opus"]';
 const project = "/private-owned-workspace";
 
+function worktreeOpeningBoundary(fail?: string) {
+  const calls: string[] = [];
+  const phases: string[] = [];
+  const failure = new Error("private-target?token=private-token timed out");
+  const hit = async (name: string, args: unknown[] = []) => {
+    expect(args).toEqual([]);
+    calls.push(name);
+    if (name === fail) throw failure;
+  };
+  const browser = {
+    $$: () => ({ length: hit("count").then(() => 1) }),
+    $: (selector: string) => ({
+      moveTo: (...args: unknown[]) => {
+        expect(selector).toContain("ancestor::div");
+        return hit("hover", args);
+      },
+      waitForDisplayed: (...args: unknown[]) => hit("displayed", args),
+      waitForEnabled: (...args: unknown[]) => hit("enabled", args),
+      click: (...args: unknown[]) => hit("click", args),
+    }),
+  };
+  const helpersStart = controller.indexOf("  const step =");
+  const helpersEnd = controller.indexOf("  const row =", helpersStart);
+  const openingStart = controller.indexOf(
+    "    const create =",
+    controller.indexOf("  async function createOwnedWorkspace("),
+  );
+  const openingEnd = controller.indexOf('    step("worktree-name");', openingStart);
+  expect(openingStart).toBeGreaterThan(0);
+  expect(openingEnd).toBeGreaterThan(openingStart);
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      'let phase = "setup"; const theme = "light";\n' +
+        controller.slice(helpersStart, helpersEnd) +
+        "\nasync function open() {\n" +
+        controller.slice(openingStart, openingEnd) +
+        "\n}\nopen",
+    ),
+    {
+      browser,
+      write: (_name: string, value: { phase: string }) => phases.push(value.phase),
+    },
+  ) as () => Promise<void>;
+  return { run, calls, phases, failure };
+}
+
+describe("exact worktree opening attribution", () => {
+  it.each([
+    ["count", "worktree-open-count"],
+    ["hover", "worktree-open-hover"],
+    ["displayed", "worktree-open-displayed"],
+    ["enabled", "worktree-open-enabled"],
+    ["click", "worktree-open-click"],
+  ])(
+    "retains the failing public %s await without retry or private data",
+    async (fail, expected) => {
+      const f = worktreeOpeningBoundary(fail);
+      await expect(f.run()).rejects.toBe(f.failure);
+      expect(f.calls.at(-1)).toBe(fail);
+      expect(f.phases.at(-1)).toBe(expected);
+      const retained = { phase: f.phases.at(-1), failure: classifyQualificationFailure(f.failure) };
+      expect(retained.failure.kind).toBe("timeout");
+      expect(JSON.stringify(retained)).not.toMatch(/private|token=/);
+    },
+  );
+
+  it("preserves the original public opening command order and inherited options", async () => {
+    const f = worktreeOpeningBoundary();
+    await f.run();
+    expect(f.calls).toEqual(["count", "hover", "displayed", "enabled", "click"]);
+  });
+});
+
 it("targets the selected managed worktree, preserving the primary Git anchor during loss", async () => {
   const start = controller.indexOf('      step("workspace-loss");');
   const end = controller.indexOf('      step("uncertain");', start);
@@ -157,6 +230,14 @@ it.each([
     commonDirectory: "/owned/run/project/.git",
   };
   const selectedReader = () => null;
+  const click = async (selector: string) => {
+    expect(headerHovered).toBe(true);
+    clicks.push(selector);
+    if (selector.includes("starts-with")) {
+      expect(named).toBe(true);
+      created = true;
+    }
+  };
   const browser = {
     $$: () => ({
       length: Promise.resolve(mode === "no-project" ? 0 : mode === "ambiguous-project" ? 2 : 1),
@@ -169,6 +250,8 @@ it.each([
       waitForDisplayed: async (options?: { reverse?: boolean }) => {
         if (options?.reverse) expect(created).toBe(true);
       },
+      waitForEnabled: async () => {},
+      click: () => click(selector),
       setValue: async (value: string) => {
         expect(value).toBe(identity.branch);
         named = true;
@@ -201,14 +284,7 @@ it.each([
       check: (value: unknown) => {
         if (!value) throw new Error("Owned refusal.");
       },
-      click: async (selector: string) => {
-        expect(headerHovered).toBe(true);
-        clicks.push(selector);
-        if (selector.includes("starts-with")) {
-          expect(named).toBe(true);
-          created = true;
-        }
-      },
+      click,
       owner: {
         until: async (read: () => Promise<boolean>) => {
           if (!(await read())) throw new Error("Owned refusal.");
@@ -746,6 +822,306 @@ describe("closed failure-only startup observation", () => {
       await running;
       expect(f.writes[0]?.startupObservation).toBeNull();
       f.finishRead({ raw: "private-late-body" });
+      await Promise.resolve();
+      expect(f.writes).toHaveLength(1);
+      expect(JSON.stringify(f.writes)).not.toContain("private");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+function worktreeFailureBoundary(
+  options: {
+    count?: number;
+    noHeader?: boolean;
+    hidden?: boolean;
+    disabled?: boolean;
+    covered?: boolean;
+    notHovered?: boolean;
+    dialog?: boolean;
+    picker?: boolean;
+    visibilityUnavailable?: boolean;
+    location?: { origin?: string; search?: string; hash?: string };
+    phase?: string;
+    noBrowser?: boolean;
+    response?: unknown;
+    read?: "reject" | "pending";
+  } = {},
+) {
+  const writes: Array<{ worktreeObservation?: unknown; failure?: { kind: string } }> = [];
+  let reads = 0,
+    queries = 0;
+  let finishRead: (value: unknown) => void = () => {
+    throw new Error("No pending read.");
+  };
+  class Element {
+    readonly kind: string;
+    constructor(kind: string) {
+      this.kind = kind;
+    }
+    get textContent(): never {
+      throw new Error("No page text reads.");
+    }
+    checkVisibility(input: unknown) {
+      expect(input).toEqual({
+        contentVisibilityAuto: true,
+        opacityProperty: true,
+        visibilityProperty: true,
+      });
+      return !options.hidden;
+    }
+    getBoundingClientRect() {
+      return { left: this.kind === "header" ? 0 : 100, top: 0, width: 20, height: 20 };
+    }
+    contains(value: unknown) {
+      return value === this;
+    }
+    matches(selector: string) {
+      expect(selector).toBe(":hover");
+      return !options.notHovered;
+    }
+  }
+  const header = new Element("header");
+  class Button extends Element {
+    disabled = options.disabled === true;
+    get value(): never {
+      throw new Error("No input value reads.");
+    }
+    closest(selector: string) {
+      expect(selector).toBe('div[class~="group/project-header"]');
+      return options.noHeader ? null : header;
+    }
+  }
+  const button = new Button("create");
+  const dialog = new Element("dialog"),
+    picker = new Element("picker");
+  if (options.visibilityUnavailable)
+    for (const node of [header, button, dialog, picker])
+      Object.defineProperty(node, "checkVisibility", { value: undefined });
+  const browser = {
+    execute: async (callback: (origin: string) => unknown, expectedOrigin: string) => {
+      reads++;
+      if (options.read === "reject") throw new Error("private-driver-error");
+      if (options.read === "pending")
+        return new Promise((resolve) => {
+          finishRead = resolve;
+        });
+      if (Object.hasOwn(options, "response")) return options.response;
+      return callback(expectedOrigin);
+    },
+  };
+  const projectorStart = controller.indexOf("export function projectDeliveryWorktreeObservation(");
+  const projectorEnd = controller.indexOf("export function projectDeliveryStartupObservation(");
+  const helperStart = controller.indexOf("  async function readWorktreeFailureObservation()");
+  const helperEnd = controller.indexOf("  async function setTheme()", helperStart);
+  const catchStart = controller.lastIndexOf("  } catch (error) {");
+  const catchEnd = controller.indexOf("  } finally {", catchStart);
+  const projector =
+    projectorStart < 0 ? "" : controller.slice(projectorStart, projectorEnd).replace("export ", "");
+  const helper = helperStart < 0 ? "" : controller.slice(helperStart, helperEnd);
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      projector +
+        helper +
+        "\nasync function fail() {" +
+        controller.slice(catchStart + "  } catch (error) {".length, catchEnd) +
+        "\n}\nfail",
+    ),
+    {
+      browser: options.noBrowser ? undefined : browser,
+      phase: options.phase ?? "worktree-open-displayed",
+      theme: "light",
+      origin: "http://127.0.0.1:4885",
+      error: new Error("private-original-error timed out"),
+      bounded,
+      classifyQualificationFailure,
+      write: (_name: string, value: { worktreeObservation?: unknown }) => writes.push(value),
+      HTMLButtonElement: Button,
+      location: {
+        origin: "http://127.0.0.1:4885",
+        search: "",
+        hash: "",
+        ...options.location,
+        get href(): never {
+          throw new Error("No URL reads.");
+        },
+        get pathname(): never {
+          throw new Error("No route reads.");
+        },
+      },
+      document: {
+        get body(): never {
+          throw new Error("No body reads.");
+        },
+        querySelectorAll: (selector: string) => {
+          queries++;
+          if (selector === 'button[aria-label^="New worktree in "]')
+            return Array.from({ length: options.count ?? 1 }, () => button);
+          if (selector === '[data-slot="dialog-popup"][role="dialog"]')
+            return options.dialog ? [dialog] : [];
+          if (selector === '[data-model-picker-content="true"]')
+            return options.picker ? [picker] : [];
+          throw new Error("Unexpected DOM query.");
+        },
+        elementFromPoint: (x: number) => {
+          queries++;
+          return options.covered ? {} : x < 50 ? header : button;
+        },
+      },
+    },
+  ) as () => Promise<void>;
+  return {
+    run,
+    writes,
+    reads: () => reads,
+    queries: () => queries,
+    finishRead: (value: unknown) => finishRead(value),
+  };
+}
+
+describe("closed worktree-opening failure facts", () => {
+  it("samples public DOM facts once without values, text, identifiers or URLs", async () => {
+    const f = worktreeFailureBoundary({
+      hidden: true,
+      disabled: true,
+      covered: true,
+      notHovered: true,
+      dialog: true,
+      picker: true,
+    });
+    await f.run();
+    expect(f.writes[0]?.worktreeObservation).toEqual({
+      safeLocation: true,
+      createCount: "one",
+      headerHovered: false,
+      headerVisible: false,
+      headerHitTarget: false,
+      createVisible: false,
+      createEnabled: false,
+      createHitTarget: false,
+      dialogVisible: false,
+      modelPickerVisible: false,
+    });
+    expect(f.reads()).toBe(1);
+    expect(f.writes[0]?.failure?.kind).toBe("timeout");
+    expect(JSON.stringify(f.writes)).not.toMatch(/private|http|token=|new-worktree/);
+  });
+
+  it("distinguishes a visible public dialog and picker from absent controls", async () => {
+    const f = worktreeFailureBoundary({ dialog: true, picker: true, noHeader: true });
+    await f.run();
+    expect(f.writes[0]?.worktreeObservation).toMatchObject({
+      createCount: "one",
+      headerHovered: null,
+      headerVisible: null,
+      headerHitTarget: null,
+      createVisible: true,
+      createEnabled: true,
+      createHitTarget: true,
+      dialogVisible: true,
+      modelPickerVisible: true,
+    });
+  });
+
+  it.each([
+    [0, "none"],
+    [2, "multiple"],
+  ] as const)("does not choose an arbitrary button from count %s", async (count, category) => {
+    const f = worktreeFailureBoundary({ count });
+    await f.run();
+    expect(f.writes[0]?.worktreeObservation).toEqual({
+      safeLocation: true,
+      createCount: category,
+      headerHovered: null,
+      headerVisible: null,
+      headerHitTarget: null,
+      createVisible: null,
+      createEnabled: null,
+      createHitTarget: null,
+      dialogVisible: false,
+      modelPickerVisible: false,
+    });
+  });
+
+  it("keeps unavailable visibility unknown instead of substituting WebDriver state", async () => {
+    const f = worktreeFailureBoundary({ visibilityUnavailable: true, dialog: true, picker: true });
+    await f.run();
+    expect(f.writes[0]?.worktreeObservation).toMatchObject({
+      headerVisible: null,
+      createVisible: null,
+      dialogVisible: null,
+      modelPickerVisible: null,
+    });
+  });
+
+  it.each([{ origin: "https://private" }, { search: "?private" }, { hash: "#private" }])(
+    "refuses foreign or credential-bearing locations before DOM reads: %j",
+    async (location) => {
+      const f = worktreeFailureBoundary({ location });
+      await f.run();
+      expect(f.queries()).toBe(0);
+      const value = f.writes[0]?.worktreeObservation as Record<string, unknown>;
+      expect(value?.safeLocation).toBe(false);
+      expect(
+        Object.entries(value)
+          .filter(([key]) => key !== "safeLocation")
+          .every(([, value]) => value === null),
+      ).toBe(true);
+      expect(JSON.stringify(f.writes)).not.toContain("private");
+    },
+  );
+
+  it.each([true, false, "private"] as const)(
+    "projects only finite types for safe location %s",
+    async (safeLocation) => {
+      const f = worktreeFailureBoundary({
+        response: {
+          safeLocation,
+          createCount: "private",
+          headerHovered: "private",
+          createEnabled: "private",
+          extra: "private",
+        },
+      });
+      await f.run();
+      const value = f.writes[0]?.worktreeObservation as Record<string, unknown>;
+      expect(value?.safeLocation).toBe(typeof safeLocation === "boolean" ? safeLocation : null);
+      expect(
+        Object.entries(value)
+          .filter(([key]) => key !== "safeLocation")
+          .every(([, value]) => value === null),
+      ).toBe(true);
+      expect(JSON.stringify(f.writes)).not.toContain("private");
+    },
+  );
+
+  it.each([
+    { noBrowser: true },
+    { phase: "worktree-git-identity" },
+    { phase: "worktree-open-model-picker" },
+    { read: "reject" as const },
+  ])("preserves failure without missing/non-opening/failed observations: %j", async (options) => {
+    const f = worktreeFailureBoundary(options);
+    await f.run();
+    expect(f.writes).toHaveLength(1);
+    expect(f.writes[0]?.worktreeObservation).toBeNull();
+    expect(f.writes[0]?.failure?.kind).toBe("timeout");
+    expect(f.reads()).toBe(options.read ? 1 : 0);
+  });
+
+  it("uses the existing two-second bound and never republishes a late observation", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = worktreeFailureBoundary({ read: "pending" });
+      const running = f.run();
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(f.writes).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      await running;
+      expect(f.writes[0]?.worktreeObservation).toBeNull();
+      expect(f.writes[0]?.failure?.kind).toBe("timeout");
+      f.finishRead({ raw: "private-late-data" });
       await Promise.resolve();
       expect(f.writes).toHaveLength(1);
       expect(JSON.stringify(f.writes)).not.toContain("private");
