@@ -130,32 +130,30 @@ describe.skipIf(!NodeFS.existsSync(git))("owned delivery Git identity (Linux qua
   });
 });
 
-it.each([
-  "selected",
-  "primary",
-  "wrong-route",
-  "wrong-title",
-  "wrong-branch",
-  "multiple",
-  "unsafe-location",
-])("reads only the public selected managed card: %s", (mode) => {
+function publicSelectedCard(mode = "selected", title = "codex/delivery retry light") {
   const card = {
     getAttribute: (name: string) =>
       name === "data-testid"
         ? "thread-card-button-owned-thread"
         : name === "aria-describedby"
-          ? "owned-branch"
+          ? mode === "hidden-branch"
+            ? ""
+            : mode === "ambiguous-branch-description"
+              ? "owned-branch other-branch"
+              : "owned-branch"
           : null,
   };
   const row = {
-    querySelector: () => ({ textContent: mode === "wrong-title" ? "private-text" : branch }),
+    querySelector: () => ({
+      textContent: mode === "wrong-title" ? "private-text" : title,
+    }),
   };
   const read = NodeVM.runInNewContext("(" + readSelectedDeliveryWorktree.toString() + ")", {
     location: {
-      origin: "http://127.0.0.1:4885",
+      origin: mode === "wrong-origin" ? "http://localhost:4885" : "http://127.0.0.1:4885",
       pathname: mode === "wrong-route" ? "/local/other" : "/local/owned-thread",
       search: mode === "unsafe-location" ? "?token=private" : "",
-      hash: "",
+      hash: mode === "unsafe-hash" ? "#private" : "",
     },
     document: {
       querySelectorAll: () =>
@@ -166,7 +164,79 @@ it.each([
       }),
     },
   });
-  expect(read({ origin: "http://127.0.0.1:4885", branch })).toEqual(
-    mode === "selected" ? { threadId: "owned-thread" } : null,
-  );
+  return read;
+}
+
+describe.each([
+  { phase: "initial", boundThreadId: null, title: "codex/delivery retry light" },
+  {
+    phase: "bound after auto-title",
+    boundThreadId: "owned-thread",
+    title: "delivery baseline light",
+  },
+])("public selected managed card: $phase", ({ boundThreadId, title }) => {
+  it.each([
+    "selected",
+    "primary",
+    "wrong-route",
+    "wrong-branch",
+    "hidden-branch",
+    "ambiguous-branch-description",
+    "multiple",
+    "wrong-origin",
+    "unsafe-location",
+    "unsafe-hash",
+  ])("retains selection, route, branch and location ownership: %s", (mode) => {
+    expect(
+      publicSelectedCard(mode, title)({ origin: "http://127.0.0.1:4885", branch, boundThreadId }),
+    ).toEqual(mode === "selected" ? { threadId: "owned-thread" } : null);
+  });
+});
+
+it.each(["codex/delivery-retry-light", "foreign title", "delivery baseline light"])(
+  "refuses initial binding to a duplicate or foreign title: %s",
+  (title) => {
+    expect(
+      publicSelectedCard(
+        "selected",
+        title,
+      )({ origin: "http://127.0.0.1:4885", branch, boundThreadId: null }),
+    ).toBeNull();
+  },
+);
+
+it.each(
+  [
+    undefined,
+    "",
+    "other-thread",
+    "owned thread",
+    "x".repeat(129),
+    42,
+    false,
+    {},
+    [],
+    ["owned-thread"],
+  ].map((boundThreadId) => ({ boundThreadId })),
+)(
+  "refuses an absent, malformed or foreign bound ID without initial fallback: $boundThreadId",
+  ({ boundThreadId }) => {
+    expect(
+      publicSelectedCard()({ origin: "http://127.0.0.1:4885", branch, boundThreadId }),
+    ).toBeNull();
+  },
+);
+
+it("requires an explicit binding phase even when the initial title matches", () => {
+  expect(publicSelectedCard()({ origin: "http://127.0.0.1:4885", branch })).toBeNull();
+});
+
+it("refuses a foreign requested origin even when the public location matches", () => {
+  expect(
+    publicSelectedCard("wrong-origin")({
+      origin: "http://localhost:4885",
+      branch,
+      boundThreadId: null,
+    }),
+  ).toBeNull();
 });

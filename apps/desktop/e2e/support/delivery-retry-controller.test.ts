@@ -7,6 +7,8 @@ import { deliveryConfiguration } from "../qualify-delivery-retry.ts";
 import { deliveryScenes, deliveryThemes } from "./delivery-retry-evidence.ts";
 import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
 import { bounded } from "./qualification-owner.ts";
+import { resolveWorktreeCreateInput } from "../../../web/src/components/CreateWorktreeDialog.logic.ts";
+import { readSelectedDeliveryWorktree } from "./delivery-retry-workspace.ts";
 
 const environment = {
   CI: "true",
@@ -352,7 +354,16 @@ it.each([
       click: () => click(selector),
       setValue: async (value: string) => {
         expect(dialogOpened).toBe(true);
-        expect(value).toBe(identity.branch);
+        const resolved = resolveWorktreeCreateInput({
+          mode: "smart",
+          nameText: value,
+          selectedBranchRefName: null,
+          githubItem: null,
+          advancedBaseBranchOverride: null,
+          defaultBaseBranch: "main",
+        });
+        expect(resolved?.branchName).toBe(identity.branch);
+        expect(resolved?.title).toBe("codex/delivery retry light");
         named = true;
       },
     }),
@@ -367,6 +378,11 @@ it.each([
     execute: async (read: unknown, input: unknown) => {
       if (read === selectedReader) {
         expect(created).toBe(true);
+        expect(input).toEqual({
+          origin: "http://127.0.0.1:4885",
+          branch: identity.branch,
+          boundThreadId: modelSelected ? "owned-thread" : null,
+        });
         return mode === "no-selected-card"
           ? null
           : { threadId: modelSelected && mode === "selection-changed" ? "other" : "owned-thread" };
@@ -430,6 +446,81 @@ it.each([
     if (mode === "no-project" || mode === "ambiguous-project") expect(clicks).toEqual([]);
   }
   expect(phases.every((phase) => /^worktree-[a-z-]+$/.test(phase))).toBe(true);
+});
+
+describe.each(["pre-loss", "recovery"])("bound workspace controller read: %s", (phase) => {
+  it.each(["owned-thread", "replaced-thread"])(
+    "accepts the auto-titled card only while its captured ID remains selected: %s",
+    async (selectedId) => {
+      const workspace = { branch: "codex/delivery-retry-light", threadId: "owned-thread" };
+      const start = controller.indexOf(
+        phase === "pre-loss"
+          ? '      step("workspace-verify-identity");'
+          : '      step("workspace-wait-recovered");',
+      );
+      const end = controller.indexOf(
+        phase === "pre-loss"
+          ? "      check(\n        JSON.stringify("
+          : "      check(\n        readOwnedDeliveryWorktree(",
+        start,
+      );
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      const read = NodeVM.runInNewContext("(" + readSelectedDeliveryWorktree.toString() + ")", {
+        location: {
+          origin: "http://127.0.0.1:4885",
+          pathname: "/local/" + selectedId,
+          search: "",
+          hash: "",
+        },
+        document: {
+          querySelectorAll: () => [
+            {
+              getAttribute: (name: string) =>
+                name === "data-testid" ? "thread-card-button-" + selectedId : "owned-branch",
+            },
+          ],
+          querySelector: () => ({
+            querySelector: () => ({ textContent: "delivery baseline light" }),
+          }),
+          getElementById: () => ({ querySelector: () => ({ textContent: workspace.branch }) }),
+        },
+      });
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          "async function verify() {" + controller.slice(start, end) + "}\nverify",
+        ),
+        {
+          origin: "http://127.0.0.1:4885",
+          workspace,
+          readSelectedDeliveryWorktree,
+          step: () => {},
+          check: (value: unknown) => {
+            if (!value) throw new Error("Owned refusal.");
+          },
+          owner: {
+            until: async (observe: () => Promise<boolean>) => {
+              if (!(await observe())) throw new Error("Owned refusal.");
+            },
+          },
+          browser: {
+            execute: async (reader: unknown, input: unknown) => {
+              expect(reader).toBe(readSelectedDeliveryWorktree);
+              expect(input).toEqual({
+                origin: "http://127.0.0.1:4885",
+                branch: workspace.branch,
+                boundThreadId: workspace.threadId,
+              });
+              return read(input);
+            },
+            $: () => ({ isExisting: async () => false }),
+          },
+        },
+      ) as () => Promise<void>;
+      if (selectedId === "owned-thread") await expect(run()).resolves.toBeUndefined();
+      else await expect(run()).rejects.toThrow("Owned refusal.");
+    },
+  );
 });
 
 function importBoundary(

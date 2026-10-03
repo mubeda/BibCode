@@ -691,6 +691,18 @@ thread/branch/title and worktree tooltip to one registered, non-primary Git
 worktree with the same reachable common directory. Read Git with the pinned
 fixture executable, private HOME, disabled system/global settings, bounded output
 and joined synchronous commands; never retain paths, IDs or Git output.
+Use a fixture title that differs from its sanitized Git branch. The actual
+sidebar intentionally omits duplicate branch text, so a title equal to its branch
+cannot supply the required branch/path tooltip. Keep both identity checks; do not
+accept a missing description as proof. Initial binding requires the exact distinct
+fixture title and captures the immutable thread ID. Every later ready, pre-loss
+and recovery read requires that captured ID plus the same selected card, route
+and branch description. The first message auto-titles the conversation, so its
+mutable title is not later identity proof. Missing, malformed or different bound
+IDs refuse verification rather than falling back to initial title matching.
+The compiled web gate renders the actual card primitives with this visibility
+policy and exercises the browser reader before and after the real first-send
+title transition.
 The workflow's explicit helper gate includes `delivery-retry-workspace.test.ts`
 for real disposable Git identity/refusal and restoration controls.
 

@@ -424,7 +424,8 @@ export async function runDeliveryRetryQualification() {
     step("worktree-name");
     const name = b().$(`${popup} input[placeholder="Worktree name"]`);
     await name.waitForDisplayed();
-    await name.setValue(branch);
+    // Keep the title distinct so the actual card retains its branch/path hint.
+    await name.setValue(branch.replaceAll("-", " "));
     step("worktree-create");
     await click(
       '//*[@data-slot="dialog-popup"]//button[starts-with(normalize-space(.),"Create worktree")]',
@@ -433,7 +434,11 @@ export async function runDeliveryRetryQualification() {
     step("worktree-select-identity");
     let selected: { threadId: string } | null = null;
     await owner.until(async () => {
-      selected = await b().execute(readSelectedDeliveryWorktree, { origin, branch });
+      selected = await b().execute(readSelectedDeliveryWorktree, {
+        origin,
+        branch,
+        boundThreadId: null,
+      });
       return selected !== null;
     });
     check(selected !== null);
@@ -463,7 +468,8 @@ export async function runDeliveryRetryQualification() {
     await selectClaudeModel("worktree");
     step("worktree-ready");
     check(
-      (await b().execute(readSelectedDeliveryWorktree, { origin, branch }))?.threadId === threadId,
+      (await b().execute(readSelectedDeliveryWorktree, { origin, branch, boundThreadId: threadId }))
+        ?.threadId === threadId,
     );
     return { ...identity, threadId };
   }
@@ -746,8 +752,13 @@ export async function runDeliveryRetryQualification() {
       await type(draft);
       step("workspace-verify-identity");
       check(
-        (await browser.execute(readSelectedDeliveryWorktree, { origin, branch: workspace.branch }))
-          ?.threadId === workspace.threadId,
+        (
+          await browser.execute(readSelectedDeliveryWorktree, {
+            origin,
+            branch: workspace.branch,
+            boundThreadId: workspace.threadId,
+          })
+        )?.threadId === workspace.threadId,
       );
       check(
         JSON.stringify(
@@ -800,6 +811,7 @@ export async function runDeliveryRetryQualification() {
             await browser!.execute(readSelectedDeliveryWorktree, {
               origin,
               branch: workspace.branch,
+              boundThreadId: workspace.threadId,
             })
           )?.threadId === workspace.threadId &&
           !(await browser!

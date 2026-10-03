@@ -19,11 +19,16 @@ describe("delivery Retry workflow", () => {
       name?: string;
       run?: string;
       uses?: string;
+      "working-directory"?: string;
       with?: { path?: string };
     }>;
     expect(
       steps.find((entry) => entry.name === "Run contained actual Retry interaction")?.run,
     ).toBe("python3 -B scripts/qualify-chat-uploads.py --scenario delivery-retry-ui");
+    expect(steps.find((entry) => entry.name === "Verify real card identity markup")).toMatchObject({
+      "working-directory": "apps/web",
+      run: "vp test run --project unit src/components/sidebar/WorkspaceCard.deliveryQualification.test.tsx",
+    });
     const artifacts = steps.find((entry) => entry.name === "Retain explicit safe evidence");
     expect(artifacts?.uses).toBe(
       "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
