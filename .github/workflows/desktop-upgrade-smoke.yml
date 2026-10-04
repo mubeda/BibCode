@@ -1,14 +1,25 @@
+# TEMPORARY QA alias: restore/exclude before final issue integration.
+# Registered default-branch workflow path; canonical core default is preserved.
 name: First release visual batch (manual preparation lane)
 
 on:
   workflow_dispatch:
+    inputs:
+      scene_selection:
+        description: Fixed visual preparation selection
+        type: choice
+        required: true
+        default: release-visual-core
+        options:
+          - release-visual-core
+          - release-visual-settings
 
 permissions:
   contents: read
 
 jobs:
   visual_core:
-    name: Linux Chromium eight scene pairs in both themes
+    name: ${{ inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -35,6 +46,7 @@ jobs:
           python3 -B scripts/qualify-chat-network.test.py
           python3 -B scripts/qualify-chat-uploads.py preflight
           vp test run scripts/qualify-release-visuals-workflow.test.ts apps/desktop/e2e/support/release-visual-fixture.test.ts apps/desktop/e2e/support/release-visual-core.test.ts apps/desktop/e2e/support/release-visual-evidence.test.ts apps/desktop/e2e/support/release-visual-observation.test.ts apps/desktop/e2e/support/release-visual-boundaries.test.ts apps/desktop/e2e/support/provider-shims.test.ts apps/desktop/e2e/support/qualification-owner.test.ts apps/desktop/e2e/support/remote-ui-evidence.test.ts apps/desktop/e2e/support/delivery-retry-evidence.test.ts apps/desktop/e2e/support/delivery-retry-flow.test.ts apps/desktop/e2e/support/delivery-retry-controller.test.ts apps/desktop/e2e/support/delivery-import-observation.test.ts apps/desktop/e2e/support/delivery-retry-workspace.test.ts apps/desktop/e2e/support/browser-network.test.ts
+          vp test run apps/desktop/e2e/support/release-visual-settings.test.ts apps/desktop/e2e/support/release-visual-settings-fixture.test.ts apps/desktop/e2e/support/release-visual-settings-preflight.test.ts apps/desktop/e2e/support/release-visual-settings-wiring.test.ts
       - name: Build the source UI once with owned loopback targets
         env:
           VITE_WS_URL: ws://127.0.0.1:4885
@@ -60,12 +72,19 @@ jobs:
           (target / 'bibcode').chmod(0o500)
           PYTHON
       - name: Run contained first visual batch
+        if: ${{ inputs.scene_selection == 'release-visual-core' || inputs.scene_selection == '' }}
         env:
           BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-visual-build/bibcode
           BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue29-visual-build/web
         run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-core
+      - name: Run contained settings visual batch
+        if: ${{ inputs.scene_selection == 'release-visual-settings' }}
+        env:
+          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-visual-build/bibcode
+          BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue29-visual-build/web
+        run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-settings
       - name: Retain explicit safe evidence
-        if: always()
+        if: ${{ always() && (inputs.scene_selection == 'release-visual-core' || inputs.scene_selection == '') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: issue29-core-${{ github.run_id }}-${{ github.run_attempt }}
@@ -95,3 +114,26 @@ jobs:
             ${{ runner.temp }}/issue29-core-${{ github.run_id }}/files-editor-comment-dark.png
             ${{ runner.temp }}/issue29-core-${{ github.run_id }}/command-palette-light.png
             ${{ runner.temp }}/issue29-core-${{ github.run_id }}/command-palette-dark.png
+      - name: Retain explicit settings evidence
+        if: ${{ always() && inputs.scene_selection == 'release-visual-settings' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue29-settings-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/assertions.json
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-provider-form-light.png
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-provider-form-dark.png
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/model-picker-light.png
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/model-picker-dark.png
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-keybindings-light.png
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-keybindings-dark.png
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-source-control-light.png
+            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-source-control-dark.png
