@@ -138,7 +138,18 @@ foreach ($state in $expectedStates) {
           shell: false,
         },
       );
-      expect(result.status).toBe(0);
+      const spawnErrorCode = result.error
+        ? (["ETIMEDOUT", "ENOENT", "ENOBUFS", "EACCES"] as ReadonlyArray<string>).includes(
+            (result.error as NodeJS.ErrnoException).code ?? "",
+          )
+          ? (result.error as NodeJS.ErrnoException).code
+          : "other"
+        : null;
+      expect({
+        status: result.status,
+        spawnErrorCode,
+        signaled: result.signal !== null,
+      }).toEqual({ status: 0, spawnErrorCode: null, signaled: false });
       expect(JSON.parse(result.stdout.trim())).toEqual({
         parsed: true,
         triStateCases: 3,

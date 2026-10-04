@@ -2867,7 +2867,7 @@ const refusedInstallObservation = {
 };
 
 describe("private install observation artifact retention", () => {
-  it.each([
+  effectIt.effect.each([
     { category: "returned refusal", observation: refusedInstallObservation, attempted: false },
     {
       category: "unavailable disconnect",
@@ -2876,42 +2876,54 @@ describe("private install observation artifact retention", () => {
     },
   ])(
     "retains $category through the actual phase and failure copier",
-    async ({ observation, attempted }) => {
-      const fixture = await installObservationRetentionFixture({
-        effectiveRoot: "private-userdata-canary",
-        projectId: "private-userdata-canary",
-        installAttempted: attempted,
-        installResultObservation: observation,
-        phases: ["checking", "available"],
-      });
-      try {
-        if (attempted) await expect(fixture.run()).resolves.toBeUndefined();
-        else await expect(fixture.run()).rejects.toBeInstanceOf(SeededDesktopUpgradeSmokeError);
-        const artifact = await fixture.copy();
-        const retainedPath = NodePath.join(
-          artifact,
-          "previous-stable-install-result-observation.json",
+    ({ observation, attempted }) =>
+      Effect.gen(function* () {
+        const platform = yield* HostProcessPlatform;
+        const fixture = yield* Effect.promise(() =>
+          installObservationRetentionFixture({
+            effectiveRoot: "private-userdata-canary",
+            projectId: "private-userdata-canary",
+            installAttempted: attempted,
+            installResultObservation: observation,
+            phases: ["checking", "available"],
+          }),
         );
-        expect(NodeFS.existsSync(retainedPath)).toBe(true);
-        const retained = await NodeFS.promises.readFile(retainedPath, "utf8");
-        expect(JSON.parse(retained)).toEqual({
-          installResultObservation: observation,
-          phases: ["checking", "available"],
-        });
-        expect(retained).not.toContain("private-userdata-canary");
-        expect(await NodeFS.promises.readFile(fixture.resultPath, "utf8")).toContain(
-          "private-userdata-canary",
-        );
-        expect((await NodeFS.promises.stat(fixture.observationPath)).mode & 0o777).toBe(0o600);
-        expect(fixture.markerReads()).toBe(1);
-        expect(fixture.runCommand).toHaveBeenCalledOnce();
-        expect(fixture.runCommand.mock.calls[0]?.[0]).toMatchObject({
-          timeoutMs: seededUpgradePhaseTimeoutMs(fixture.input),
-        });
-      } finally {
-        await fixture.dispose();
-      }
-    },
+        yield* Effect.gen(function* () {
+          const retained = yield* Effect.promise(async () => {
+            if (attempted) await expect(fixture.run()).resolves.toBeUndefined();
+            else await expect(fixture.run()).rejects.toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+            const artifact = await fixture.copy();
+            const retainedPath = NodePath.join(
+              artifact,
+              "previous-stable-install-result-observation.json",
+            );
+            expect(NodeFS.existsSync(retainedPath)).toBe(true);
+            const retained = await NodeFS.promises.readFile(retainedPath, "utf8");
+            expect(retained).not.toContain("private-userdata-canary");
+            expect(await NodeFS.promises.readFile(fixture.resultPath, "utf8")).toContain(
+              "private-userdata-canary",
+            );
+            expect(fixture.writes).toContainEqual({ path: fixture.observationPath, mode: 0o600 });
+            if (platform !== "win32")
+              expect((await NodeFS.promises.stat(fixture.observationPath)).mode & 0o777).toBe(
+                0o600,
+              );
+            expect(fixture.markerReads()).toBe(1);
+            expect(fixture.runCommand).toHaveBeenCalledOnce();
+            expect(fixture.runCommand.mock.calls[0]?.[0]).toMatchObject({
+              timeoutMs: seededUpgradePhaseTimeoutMs(fixture.input),
+            });
+            return retained;
+          });
+          const decoded = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(
+            retained,
+          );
+          expect(decoded).toEqual({
+            installResultObservation: observation,
+            phases: ["checking", "available"],
+          });
+        }).pipe(Effect.ensuring(Effect.promise(() => fixture.dispose())));
+      }),
   );
 
   it.each([
