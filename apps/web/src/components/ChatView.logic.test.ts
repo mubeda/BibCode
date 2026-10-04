@@ -65,7 +65,145 @@ import {
   threadHasStarted,
   waitForStartedServerThread,
   threadErrorAttribution,
+  prepareTurnAttachments,
+  mergeInterruptedComposerContent,
+  reusableStagedAttachmentAttempt,
 } from "./ChatView.logic";
+import { AsyncResult } from "effect/unstable/reactivity";
+import * as Cause from "effect/Cause";
+import type { AttachmentStagingResult } from "@bibcode/client-runtime/operations";
+
+describe("staged attachment send seams", () => {
+  const attachment = {
+    type: "file" as const,
+    id: "file-1",
+    name: "a.txt",
+    mimeType: "text/plain",
+    sizeBytes: 3,
+    file: new Blob(["abc"]),
+  };
+  const staged = {
+    _tag: "staged" as const,
+    attachments: [
+      {
+        type: "file" as const,
+        id: "file-1",
+        name: "a.txt",
+        mimeType: "text/plain",
+        sizeBytes: 3,
+        uploadId: "stage-1",
+      },
+    ],
+  };
+  it("staged send does not read data URLs, while inline fallback does", async () => {
+    const read = vi.fn().mockResolvedValue("data:text/plain;base64,YWJj");
+    const result = await prepareTurnAttachments({
+      sources: [attachment],
+      stage: async () => AsyncResult.success(staged),
+      readInline: read,
+    });
+    expect(result).toMatchObject({ _tag: "Success", value: staged.attachments });
+    expect(read).not.toHaveBeenCalled();
+    const inline = await prepareTurnAttachments({
+      sources: [attachment],
+      stage: async () => AsyncResult.success({ _tag: "inline" }),
+      readInline: read,
+    });
+    expect(inline).toMatchObject({
+      _tag: "Success",
+      value: [
+        {
+          type: "file",
+          id: "file-1",
+          name: "a.txt",
+          mimeType: "text/plain",
+          sizeBytes: 3,
+          dataUrl: "data:text/plain;base64,YWJj",
+        },
+      ],
+    });
+    if (inline._tag === "Success") expect(inline.value[0]).not.toHaveProperty("uploadId");
+    expect(read).toHaveBeenCalledExactlyOnceWith(attachment.file);
+  });
+  it("preserves interruption without constructing bytes or a replacement error", async () => {
+    const interrupted = AsyncResult.failure<AttachmentStagingResult>(Cause.interrupt());
+    const read = vi.fn();
+    const result = await prepareTurnAttachments({
+      sources: [attachment],
+      stage: async () => interrupted,
+      readInline: read,
+    });
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") expect(result.cause).toBe(interrupted.cause);
+    expect(read).not.toHaveBeenCalled();
+  });
+  it("restores outgoing content alongside fresh edits and deduplicates context ids", () => {
+    const current = {
+      prompt: "new work",
+      attachments: [{ id: "new" }],
+      terminalContexts: [{ id: "same", text: "new terminal" }],
+      elementContexts: [{ id: "new element" }],
+      previewAnnotations: [{ id: "new preview" }],
+      reviewComments: [{ id: "new review" }],
+    };
+    const outgoing = {
+      prompt: "sent work",
+      attachments: [{ id: "sent" }],
+      terminalContexts: [{ id: "same", text: "old terminal" }, { id: "old" }],
+      elementContexts: [{ id: "sent element" }],
+      previewAnnotations: [{ id: "sent preview" }],
+      reviewComments: [{ id: "sent review" }],
+    };
+    const merged = mergeInterruptedComposerContent(current, outgoing);
+    expect(merged.prompt).toBe("new work\n\nsent work");
+    expect(merged.attachments.map((value) => value.id)).toEqual(["new", "sent"]);
+    expect(merged.terminalContexts).toEqual([
+      current.terminalContexts[0],
+      outgoing.terminalContexts[1],
+    ]);
+    expect(merged.elementContexts.map((value) => value.id)).toEqual([
+      "new element",
+      "sent element",
+    ]);
+    expect(merged.previewAnnotations.map((value) => value.id)).toEqual([
+      "new preview",
+      "sent preview",
+    ]);
+    expect(merged.reviewComments.map((value) => value.id)).toEqual(["new review", "sent review"]);
+    expect(current.prompt).toBe("new work");
+  });
+  it("reuses completed bytes only for unchanged files in the same thread before expiry", () => {
+    const attempt = {
+      threadKey: "host:thread",
+      createdAt: 1000,
+      sources: [attachment],
+      attachments: staged.attachments,
+    };
+    expect(reusableStagedAttachmentAttempt(attempt, "host:thread", [attachment], 2000)).toBe(
+      staged.attachments,
+    );
+    expect(reusableStagedAttachmentAttempt(attempt, "other:thread", [attachment], 2000)).toBeNull();
+    expect(
+      reusableStagedAttachmentAttempt(
+        attempt,
+        "host:thread",
+        [{ ...attachment, file: new Blob(["xyz"]) }],
+        2000,
+      ),
+    ).toBeNull();
+    expect(
+      reusableStagedAttachmentAttempt(
+        attempt,
+        "host:thread",
+        [{ ...attachment, name: "renamed.txt" }],
+        2000,
+      ),
+    ).toBeNull();
+    expect(
+      reusableStagedAttachmentAttempt(attempt, "host:thread", [attachment], 601000),
+    ).toBeNull();
+  });
+});
 
 const environmentId = EnvironmentId.make("environment-local");
 const projectId = ProjectId.make("project-1");

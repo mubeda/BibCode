@@ -220,6 +220,8 @@ function buildProps() {
     onCancelQueuedMessage: () => {},
     resolvingQueuedMessageId: null,
     queuedMessageErrors: {},
+    attachmentUploads: {},
+    onCancelAttachmentUpload: () => {},
     isRevertingCheckpoint: false,
     onImageExpand: () => {},
     activeThreadEnvironmentId: ACTIVE_THREAD_ENVIRONMENT_ID,
@@ -1409,6 +1411,32 @@ describe("MessagesTimeline work entry rows", () => {
 });
 
 describe("MessagesTimeline user message affordances", () => {
+  it("shows a local pending upload on its message with a focusable Cancel action", async () => {
+    const entry = buildUserTimelineEntry("Outgoing files");
+    const cancel = vi.fn();
+    const container = await mountTimeline({
+      timelineEntries: [entry],
+      attachmentUploads: {
+        [entry.message.id]: {
+          attachmentCount: 2,
+          fileName: "a.png",
+          sentBytes: 3.1 * 1024 ** 2,
+          totalBytes: 20 * 1024 ** 2,
+          phase: "uploading",
+        },
+      },
+      onCancelAttachmentUpload: cancel,
+    });
+    expect(container.textContent).toContain("Uploading 2 attachments — 3.1 of 20 MiB");
+    const button = [...container.querySelectorAll("button")].find(
+      (value) => value.textContent === "Cancel",
+    )!;
+    button.focus();
+    expect(document.activeElement).toBe(button);
+    await click(button);
+    expect(cancel).toHaveBeenCalledExactlyOnceWith(entry.message.id);
+    expect(container.textContent).not.toContain("Queued");
+  });
   it("renders the revert button when the message has revertable turns", async () => {
     const entry = buildUserTimelineEntry("Revert me.");
     const markup = await renderTimeline({

@@ -332,6 +332,47 @@ idle center terminal when possible and otherwise open a new center terminal.
 The retired bottom terminal drawer and its bottom-toolbar toggle no longer
 exist.
 
+### Uploading chat attachments
+
+When the server supports staged attachments and a message's total encoded
+attachments exceed 256 KiB, its local pending row shows **Uploading 2 attachments
+— 3.1 of 20 MiB** and **Cancel**. Progress counts bytes acknowledged by the
+server. Attachments upload one after another; a dropped connection shows
+**Reconnecting…**, then resumes the acknowledged bytes when the host returns.
+An expired upload can restart once per file. Completed files are kept alive
+while later attachments upload and verified before the message is sent. A
+server without this capability keeps the
+inline attachment path.
+
+**Cancel** stops the upload and immediately restores its prompt, attachments,
+terminal and element context, preview annotations and review comments to the
+composer. Newer composer edits are kept alongside that snapshot. An upload
+failure restores the same work and explains which file failed and how to retry.
+Cancel remains available while reconnecting; once turn admission starts, the
+upload action disappears and the normal message delivery controls apply.
+
+A send made while an agent is running shows the same local pending upload row
+before the server accepts its queue entry. It does not claim to be queued or
+start another agent. The running agent's **Stop** remains available. The local
+row disappears once queue admission completes. Completed uploads may be reused
+by an unchanged send attempt after a failed admission; upload ids are never
+saved in composer drafts, and abandoned attempts release their uploads or let
+them expire while disconnected.
+
+Switching threads or closing and reopening a view after the upload enters
+normal message admission does not cancel or forget that send. Other views wait
+for its outcome rather than sending a second copy. If its reply is lost, the next **Send** first checks the
+original send without uploading a second copy. An unchanged restored draft
+clears once that send is confirmed. New edits remain in the composer with an
+**Earlier send confirmed** notice, so you can review them before sending another
+message. If the original was not accepted and its upload expired, the error
+asks you to send again; that explicit send uploads a fresh copy.
+
+If the environment changes host or data store while a send is unresolved,
+BiBCode keeps the draft and original intent and asks you to reconnect to the
+original environment before sending another copy. A reconnect or credential
+renewal on the same store checks the original send under your current permissions.
+
 ### Queued messages
 
 While a turn runs or the provider is still accepting your previous message,

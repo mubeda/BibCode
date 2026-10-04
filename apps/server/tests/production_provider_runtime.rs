@@ -1069,6 +1069,7 @@ async fn admit_and_freeze_sending_delivery(
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let runtime = ServerRuntime::start_with_registry(test_config(settings), registry)
         .await
@@ -3752,6 +3753,7 @@ async fn admitted_turn_freezes_native_session_before_provider_delivery_begins() 
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -3894,6 +3896,7 @@ async fn registered_dispatch_rpc_prepares_attachments_before_persistence_and_pro
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -4106,6 +4109,7 @@ async fn registered_durable_rpc_wakes_delivery_before_a_cancelled_response_retur
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -4331,6 +4335,7 @@ async fn delivery_service_orders_each_thread_without_blocking_another_thread() {
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let runtime = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -4591,6 +4596,7 @@ async fn delivery_service_never_exceeds_its_configured_four_thread_semaphore() {
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let runtime = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -4780,6 +4786,7 @@ async fn registered_dispatch_rpc_proves_one_mixed_attachment_delivery_for_every_
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let runtime = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -4976,6 +4983,7 @@ async fn registered_dispatch_rpc_refuses_an_attachment_id_from_another_thread() 
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -8838,6 +8846,7 @@ async fn rejected_metadata_rpc_keeps_selection_and_leaves_exact_receipt_resumabl
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -10467,6 +10476,7 @@ async fn checkpoint_rpc_rolls_back_once_after_restore_with_the_computed_delta() 
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -10583,6 +10593,7 @@ async fn checkpoint_rpc_reports_effect_failure_without_a_direct_or_second_rollba
         supervisor.clone(),
         settings.path().to_path_buf(),
         delivery.clone(),
+        attachment_upload_registry(),
     );
     let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -16316,4 +16327,12 @@ done
         requests[1],
         json!({"type":"user","session_id":"claude-session","message":{"role":"user","content":[{"type":"text","text":"follow up"}]},"parent_tool_use_id":null})
     );
+}
+
+fn attachment_upload_registry() -> bibcode_server::transfer::staging::UploadRegistry {
+    bibcode_server::transfer::staging::UploadRegistry::new(
+        std::env::temp_dir().join(format!("bibcode-test-uploads-{}", uuid::Uuid::new_v4())),
+        bibcode_server::transfer::staging::UploadLimits::default(),
+        std::sync::Arc::new(tokio::time::Instant::now),
+    )
 }

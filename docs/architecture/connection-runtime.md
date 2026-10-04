@@ -382,6 +382,73 @@ observable platform scenarios and supported recovery actions.
 
 ## State and retry policy
 
+Chat attachment staging is owned by `operations/uploadStager.ts` and
+`operations/attachmentStaging.ts`. The decision reads `attachmentStaging` from
+the actual carrying session's initial config. A turn stays inline when the
+capability is absent or all data-URL characters total at most 256 KiB; otherwise
+all its attachments stage sequentially over typed `uploads.*` RPCs. No method
+probe is sent to an old server.
+
+The stager starts with 64 KiB raw chunks, permits at most two outstanding
+appends and adapts measured acknowledgement time toward one second per chunk,
+between 16 KiB and 1 MiB. Progress counts acknowledged raw bytes. Incremental
+SHA-256 uses bounded clones at outstanding chunk boundaries; it is available
+on plain HTTP origins without WebCrypto and supplies its digest on the final
+append. After a transport cut, outstanding calls are joined before following
+the registry's next session. Capability is checked again, `uploads.get` selects
+the retained hash checkpoint, and an unknown or expired upload can begin again
+once per file. An impossible checkpoint fails rather than guessing.
+
+Completed-but-unbound files stay alive during long multi-file sends through
+one operation-owned, sequential `uploads.get` sweep per minute, bounded to five
+seconds. The task is cancelled and joined on every operation exit. Final
+validation, including reused send attempts, restages a disappeared file under
+the same once-per-file budget already used by active resume; the validation
+passes remain bounded by file count. No keepalive task owns reconnect retries.
+
+A separate client command retains completed stages during queued/outstanding
+turn admission, before the per-thread dispatch scheduler starts. It shares the
+bounded keeper and follows the registry's current session without taking over
+reconnect policy. Route disposal does not abort or release an admitting send;
+its outcome stops and joins the keeper. Success forgets the consumed stages;
+definite failure after navigation restores the captured old draft and releases
+unbound IDs, while an in-view failure may retain them for retry.
+
+Transient staged/pending/replay ownership lives in the client-runtime admission
+owner instantiated once by application thread state, keyed by environment and
+thread. Views only subscribe to its busy state and acquire an atomic send
+lease. Route and component disposal do not retire unresolved admission identity,
+and a result arriving after unmount updates the same application record a newly
+mounted view reads. Multiple views cannot issue independent sends or replays
+for a leased thread. No upload, replay or authority state is persisted in drafts.
+
+A captured authority binds the store ID and host identity. The serial command
+checks both against the actual carrying session after its lane opens, then
+uses that exact session for dispatch; client-only authority never enters the
+wire command. Blocked/removed environments and changed host/store identities
+leave unresolved intent intact and refuse a fresh send. Authenticated session
+or cookie rotation alone does not change the durable/global command receipt:
+current orchestration:operate permissions still apply, accepted exact replays
+skip binding, and an unaccepted foreign-owner source returns typed not_found.
+Fresh legacy inline sends remain usable without staging/store-identity support.
+
+A lost staged-admission reply retains its immutable original command, including
+command/message IDs, timestamp and upload references. An explicit Send replays
+that exact receipt input before any upload get/restaging. Accepted replays do
+not need already consumed stages. Typed not_found proves non-acceptance and
+permits fresh IDs on a subsequent send; further ambiguous failures retain the
+original replay. Composer edits made meanwhile are kept for review, without
+silently being sent as part of that reconciliation. No replay IDs are persisted.
+
+An invocation's AbortSignal remains an interruption, with bounded best-effort
+cancellation of its unbound stages. The UI restores work immediately. Completed
+stages belong to an in-memory send attempt until durable turn admission, retry,
+expiry or abandonment; staged ids never enter persisted composer drafts. This
+operation has no whole-upload deadline and does not change supervisor retry
+policy or liveness evidence. Legacy inline sends, large editor writes and large
+prompts remain subject to the existing whole-request/transport size and silence
+limits; this feature makes only capable chat attachment sends resumable.
+
 The supervisor publishes these phases:
 
 - `available`: disconnected and not requested;
@@ -632,6 +699,8 @@ without `vcsCloneReattach`, it is today's single `vcs.clone` call, and **Cancel
 clone**, or the dialog unmounting, aborts it, so the interrupt stops the clone.
 
 With the capability, the command (`state/vcsClone.ts`) owns the re-attach loop;
+its next-session wait and transport-loss classification live in
+`connection/nextSession.ts`, shared with staged attachment uploads.
 React owns no retry loop. It sends `detach: true`. On `RpcClientError`,
 `EnvironmentRpcUnavailableError`, or an interrupt it did not request (the RPC
 client resumes pending calls with an interrupt when the socket closes), it

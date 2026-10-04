@@ -1,4 +1,5 @@
 import * as Crypto from "effect/Crypto";
+import type * as Effect from "effect/Effect";
 import { Atom } from "effect/unstable/reactivity";
 
 import { createAtomCommandScheduler, createEnvironmentCommand } from "./runtime.ts";
@@ -37,6 +38,17 @@ import {
   updateThreadMetadata,
 } from "../operations/commands.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
+import {
+  admitStagedThreadTurn,
+  readAttachmentAdmissionAuthority,
+} from "../operations/attachmentAdmissionAuthority.ts";
+import type { AttachmentAdmissionAuthority } from "../operations/attachmentAdmissionOwner.ts";
+import {
+  stageAttachments,
+  releaseStagedAttachments,
+  keepStagedAttachmentsAlive,
+  type AttachmentStagingInput,
+} from "../operations/attachmentStaging.ts";
 
 export type {
   ArchiveThreadInput,
@@ -67,6 +79,47 @@ export function createThreadEnvironmentAtoms<R, E>(
       JSON.stringify([environmentId, input.threadId]),
   };
   return {
+    attachmentAdmissionAuthority: createEnvironmentCommand<
+      EnvironmentRegistry | Crypto.Crypto | R,
+      E,
+      void,
+      Effect.Success<ReturnType<typeof readAttachmentAdmissionAuthority>>,
+      Effect.Error<ReturnType<typeof readAttachmentAdmissionAuthority>>
+    >(runtime, {
+      label: "environment-data:commands:thread:attachment-admission-authority",
+      execute: () => readAttachmentAdmissionAuthority(),
+    }),
+    stageAttachments: createEnvironmentCommand<
+      EnvironmentRegistry | Crypto.Crypto | R,
+      E,
+      AttachmentStagingInput,
+      Effect.Success<ReturnType<typeof stageAttachments>>,
+      Effect.Error<ReturnType<typeof stageAttachments>>
+    >(runtime, {
+      label: "environment-data:commands:thread:stage-attachments",
+      execute: (input: AttachmentStagingInput) => stageAttachments(input),
+    }),
+    releaseStagedAttachments: createEnvironmentCommand<
+      EnvironmentRegistry | Crypto.Crypto | R,
+      E,
+      Parameters<typeof releaseStagedAttachments>[0],
+      Effect.Success<ReturnType<typeof releaseStagedAttachments>>,
+      Effect.Error<ReturnType<typeof releaseStagedAttachments>>
+    >(runtime, {
+      label: "environment-data:commands:thread:release-staged-attachments",
+      execute: (input: Parameters<typeof releaseStagedAttachments>[0]) =>
+        releaseStagedAttachments(input),
+    }),
+    keepStagedAttachmentsAlive: createEnvironmentCommand<
+      EnvironmentRegistry | Crypto.Crypto | R,
+      E,
+      Parameters<typeof keepStagedAttachmentsAlive>[0],
+      Effect.Success<ReturnType<typeof keepStagedAttachmentsAlive>>,
+      Effect.Error<ReturnType<typeof keepStagedAttachmentsAlive>>
+    >(runtime, {
+      label: "environment-data:commands:thread:keep-staged-attachments-alive",
+      execute: (input) => keepStagedAttachmentsAlive(input),
+    }),
     create: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:create",
       execute: (input: CreateThreadInput) => createThread(input),
@@ -109,9 +162,25 @@ export function createThreadEnvironmentAtoms<R, E>(
       scheduler,
       concurrency,
     }),
-    startTurn: createEnvironmentCommand(runtime, {
+    startTurn: createEnvironmentCommand<
+      EnvironmentRegistry | Crypto.Crypto | R,
+      E,
+      StartThreadTurnInput & { readonly attachmentAuthority?: AttachmentAdmissionAuthority },
+      Effect.Success<ReturnType<typeof startThreadTurn>>,
+      | Effect.Error<ReturnType<typeof startThreadTurn>>
+      | Effect.Error<ReturnType<typeof admitStagedThreadTurn>>
+    >(runtime, {
       label: "environment-data:commands:thread:start-turn",
-      execute: (input: StartThreadTurnInput) => startThreadTurn(input),
+      execute: (
+        input: StartThreadTurnInput & {
+          readonly attachmentAuthority?: AttachmentAdmissionAuthority;
+        },
+      ) => {
+        const { attachmentAuthority, ...command } = input;
+        return attachmentAuthority === undefined
+          ? startThreadTurn(input)
+          : admitStagedThreadTurn(command, attachmentAuthority);
+      },
       scheduler,
       concurrency,
     }),

@@ -1,3 +1,4 @@
+import { UploadId } from "./uploads.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
@@ -197,6 +198,7 @@ export const ChatFileAttachment = Schema.Struct({
 export type ChatFileAttachment = typeof ChatFileAttachment.Type;
 
 export const UploadChatImageAttachment = Schema.Struct({
+  uploadId: Schema.optional(Schema.Never),
   type: Schema.Literal("image"),
   id: ChatAttachmentId,
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
@@ -211,6 +213,7 @@ export const UploadChatImageAttachment = Schema.Struct({
 export type UploadChatImageAttachment = typeof UploadChatImageAttachment.Type;
 
 export const UploadChatFileAttachment = Schema.Struct({
+  uploadId: Schema.optional(Schema.Never),
   type: Schema.Literal("file"),
   id: ChatAttachmentId,
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
@@ -226,9 +229,31 @@ export type UploadChatFileAttachment = typeof UploadChatFileAttachment.Type;
 
 export const ChatAttachment = Schema.Union([ChatImageAttachment, ChatFileAttachment]);
 export type ChatAttachment = typeof ChatAttachment.Type;
-export const UploadChatAttachment = Schema.Union([
+export const InlineUploadChatAttachment = Schema.Union([
   UploadChatImageAttachment,
   UploadChatFileAttachment,
+]);
+export type InlineUploadChatAttachment = typeof InlineUploadChatAttachment.Type;
+export const StagedUploadChatImageAttachment = Schema.Struct({
+  ...ChatImageAttachment.fields,
+  uploadId: UploadId,
+  dataUrl: Schema.optional(Schema.Never),
+});
+export type StagedUploadChatImageAttachment = typeof StagedUploadChatImageAttachment.Type;
+export const StagedUploadChatFileAttachment = Schema.Struct({
+  ...ChatFileAttachment.fields,
+  uploadId: UploadId,
+  dataUrl: Schema.optional(Schema.Never),
+});
+export type StagedUploadChatFileAttachment = typeof StagedUploadChatFileAttachment.Type;
+export const StagedUploadChatAttachment = Schema.Union([
+  StagedUploadChatImageAttachment,
+  StagedUploadChatFileAttachment,
+]);
+export type StagedUploadChatAttachment = typeof StagedUploadChatAttachment.Type;
+export const UploadChatAttachment = Schema.Union([
+  InlineUploadChatAttachment,
+  StagedUploadChatAttachment,
 ]);
 export type UploadChatAttachment = typeof UploadChatAttachment.Type;
 

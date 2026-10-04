@@ -1,3 +1,4 @@
+import type { StagedAttachmentAttempt } from "../state/attachmentAdmissions";
 import {
   ACTIVITY_PAGE_MAX_LENGTH,
   type ActivityScopeRef,
@@ -33,6 +34,10 @@ import {
   connectionStatusText,
   type EnvironmentConnectionPresentation,
 } from "@bibcode/client-runtime/connection";
+import type { AttachmentSource, AttachmentStagingResult } from "@bibcode/client-runtime/operations";
+import { settlePromise, type AtomCommandResult } from "@bibcode/client-runtime/state/runtime";
+import { AsyncResult } from "effect/unstable/reactivity";
+import type { StagedUploadChatAttachment, UploadChatAttachment } from "@bibcode/contracts";
 
 export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "bibcode:last-invoked-script-by-project";
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
@@ -294,7 +299,7 @@ export interface PullRequestDialogState {
   key: number;
 }
 
-export function readFileAsDataUrl(file: File): Promise<string> {
+export function readFileAsDataUrl(file: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.addEventListener("load", () => {
@@ -825,4 +830,106 @@ export function describeUnavailableEnvironment(input: {
       input.connection.error ??
       "Reconnect this environment before sending messages or running actions.",
   };
+}
+
+/** Staging selects the wire path before any whole-file encoding starts. */
+export async function prepareTurnAttachments(input: {
+  readonly sources: ReadonlyArray<AttachmentSource>;
+  readonly stage: () => Promise<AtomCommandResult<AttachmentStagingResult, unknown>>;
+  readonly readInline?: (file: Blob) => Promise<string>;
+}): Promise<AtomCommandResult<ReadonlyArray<UploadChatAttachment>, unknown>> {
+  const result = await input.stage();
+  if (result._tag === "Failure") return AsyncResult.failure(result.cause);
+  if (result.value._tag === "staged") return AsyncResult.success(result.value.attachments);
+  const read = input.readInline ?? readFileAsDataUrl;
+  return settlePromise(() =>
+    Promise.all(
+      input.sources.map(async (source) => ({
+        type: source.type,
+        id: source.id,
+        name: source.name,
+        mimeType: source.mimeType,
+        sizeBytes: source.sizeBytes,
+        dataUrl: await read(source.file),
+      })),
+    ),
+  );
+}
+
+interface ComposerContentLike {
+  readonly prompt: string;
+  readonly attachments: ReadonlyArray<{ readonly id: string }>;
+  readonly terminalContexts: ReadonlyArray<{ readonly id: string }>;
+  readonly elementContexts: ReadonlyArray<{ readonly id: string }>;
+  readonly previewAnnotations: ReadonlyArray<{ readonly id: string }>;
+  readonly reviewComments: ReadonlyArray<{ readonly id: string }>;
+}
+
+function mergeContentById<
+  Current extends { readonly id: string },
+  Outgoing extends { readonly id: string },
+>(current: ReadonlyArray<Current>, outgoing: ReadonlyArray<Outgoing>): Array<Current | Outgoing> {
+  const ids = new Set(current.map((item) => item.id));
+  return [...current, ...outgoing.filter((item) => !ids.has(item.id))];
+}
+
+/** A failed or cancelled send must restore the snapshot without replacing newer work. */
+export function mergeInterruptedComposerContent<
+  Current extends ComposerContentLike,
+  Outgoing extends ComposerContentLike,
+>(current: Current, outgoing: Outgoing) {
+  return {
+    prompt:
+      current.prompt === outgoing.prompt
+        ? current.prompt
+        : [current.prompt, outgoing.prompt].filter(Boolean).join("\n\n"),
+    attachments: mergeContentById<Current["attachments"][number], Outgoing["attachments"][number]>(
+      current.attachments,
+      outgoing.attachments,
+    ),
+    terminalContexts: mergeContentById<
+      Current["terminalContexts"][number],
+      Outgoing["terminalContexts"][number]
+    >(current.terminalContexts, outgoing.terminalContexts),
+    elementContexts: mergeContentById<
+      Current["elementContexts"][number],
+      Outgoing["elementContexts"][number]
+    >(current.elementContexts, outgoing.elementContexts),
+    previewAnnotations: mergeContentById<
+      Current["previewAnnotations"][number],
+      Outgoing["previewAnnotations"][number]
+    >(current.previewAnnotations, outgoing.previewAnnotations),
+    reviewComments: mergeContentById<
+      Current["reviewComments"][number],
+      Outgoing["reviewComments"][number]
+    >(current.reviewComments, outgoing.reviewComments),
+  };
+}
+
+/** Upload ids belong only to this in-memory send attempt, never a persisted draft. */
+export function reusableStagedAttachmentAttempt(
+  attempt: StagedAttachmentAttempt | undefined,
+  threadKey: string,
+  sources: ReadonlyArray<AttachmentSource>,
+  now: number,
+): ReadonlyArray<StagedUploadChatAttachment> | null {
+  if (
+    !attempt ||
+    attempt.threadKey !== threadKey ||
+    now - attempt.createdAt >= 10 * 60_000 ||
+    sources.length !== attempt.sources.length
+  )
+    return null;
+  const unchanged = sources.every((source, index) => {
+    const old = attempt.sources[index]!;
+    return (
+      source.file === old.file &&
+      source.id === old.id &&
+      source.type === old.type &&
+      source.name === old.name &&
+      source.mimeType === old.mimeType &&
+      source.sizeBytes === old.sizeBytes
+    );
+  });
+  return unchanged ? attempt.attachments : null;
 }
