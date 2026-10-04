@@ -1387,6 +1387,58 @@ it.each(["displayed", "clickable", "click", "row"])(
   },
 );
 
+it.each(["displayed", "clickable", "click", "toast"])(
+  "attributes the existing manual row-copy failure without another action: %s",
+  async (failed) => {
+    const start = controller.indexOf("    phase(`manual-${kind}-copy-row`);");
+    const end = controller.indexOf("    phase(`manual-${kind}-row-clipboard`);", start);
+    const helperStart = controller.indexOf("const click = async");
+    const helperEnd = controller.indexOf("const text = async", helperStart);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const failure = new Error("inert private copy failure");
+    const calls: string[] = [],
+      phases: string[] = [];
+    const operation = async (name: string, args: unknown[]) => {
+      expect(args).toEqual([]);
+      calls.push(name);
+      if (name === failed) throw failure;
+    };
+    const target = {
+      waitForDisplayed: (...args: unknown[]) => operation("displayed", args),
+      waitForClickable: (...args: unknown[]) => operation("clickable", args),
+      click: (...args: unknown[]) => operation("click", args),
+    };
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        controller.slice(helperStart, helperEnd) +
+          "async function run() {" +
+          controller.slice(start, end) +
+          "}\nrun",
+      ),
+      {
+        kind: "archive",
+        host: { label: "owned synthetic host" },
+        row: () => "owned-row",
+        phase: (value: string) => phases.push(value),
+        element: (selector: string) => {
+          expect(selector).toBe('owned-row//button[normalize-space()="Copy"]');
+          return target;
+        },
+        text: async (selector: string, expected: string, ...args: unknown[]) => {
+          expect(selector).toBe("body");
+          expect(expected).toBe("Update instructions copied");
+          await operation("toast", args);
+        },
+      },
+    );
+    await expect(run()).rejects.toBe(failure);
+    expect(phases.at(-1)).toBe(`manual-archive-copy-row-${failed}`);
+    const order = ["displayed", "clickable", "click", "toast"];
+    expect(calls).toEqual(order.slice(0, order.indexOf(failed) + 1));
+  },
+);
+
 function failureObservationCallbackSource() {
   const start = controller.indexOf(
     "browser.execute(",

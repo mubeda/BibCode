@@ -1312,7 +1312,10 @@ async function manualFlow() {
         "manual-unknown-platform",
       );
     phase(`manual-${kind}-copy-row`);
-    await click(`${row(host.label)}//button[normalize-space()="Copy"]`);
+    await click(`${row(host.label)}//button[normalize-space()="Copy"]`, (operation) =>
+      phase(`manual-${kind}-copy-row-${operation}`),
+    );
+    phase(`manual-${kind}-copy-row-toast`);
     await text("body", "Update instructions copied");
     phase(`manual-${kind}-row-clipboard`);
     check(
