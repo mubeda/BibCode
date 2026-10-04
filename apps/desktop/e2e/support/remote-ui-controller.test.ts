@@ -2779,7 +2779,10 @@ function sdkClickResponseError(
 }
 
 // Execute the actual Classic click recovery, without importing a session or HTTP runtime.
-function sdkInternalScrollClick(sourceSelector = 'button[data-slot="toast-close"]') {
+function sdkInternalMissingClick(
+  sourceSelector = 'button[data-slot="toast-close"]',
+  mode: "scroll" | "html" = "scroll",
+) {
   const packagePath = NodeFS.realpathSync(
     new URL("../../node_modules/webdriverio/package.json", import.meta.url),
   );
@@ -2807,14 +2810,26 @@ function sdkInternalScrollClick(sourceSelector = 'button[data-slot="toast-close"
     cut("function verifyArgsAndStripIfElement(args)", "async function getElementRect(scope)"),
     cut("function isStaleElementError(err)", "function transformClassicToBidiSelector"),
     cut("var IMPLICIT_WAIT_EXCLUSION_LIST =", "var multiremoteHandler ="),
+    cut("async function getHTML(options", "function populateHTML("),
+    cut("async function waitForClickable({", "// src/commands/element/waitForDisplayed.ts"),
+    cut("async function waitForExist({", "// src/commands/element/waitForStable.ts"),
+    cut("function waitUntil(condition,", "// src/commands/mobile/swipe.ts"),
+    cut("var TIMEOUT_ERROR =", "// src/utils/interception/utils.ts"),
+    cut("async function isClickable()", "// src/commands/element/isDisplayed.ts"),
+    cut("async function isDisplayed(commandParams", "// src/commands/element/isEnabled.ts"),
+    cut("async function isExisting()", "// src/commands/element/isFocused.ts"),
   ].join("\n");
   const calls: string[] = [];
+  const bodies: Record<string, number> = {};
   let failure: unknown;
   class Element {
     elementId: string | undefined;
     selector = sourceSelector;
     index = 0;
     parent: object;
+    options = { waitforTimeout: 0, waitforInterval: 1 };
+    isBidi = false;
+    isMobile = false;
     declare click: () => Promise<unknown>;
     declare scrollIntoView: (options: unknown) => Promise<unknown>;
     constructor(id: string | undefined) {
@@ -2823,7 +2838,9 @@ function sdkInternalScrollClick(sourceSelector = 'button[data-slot="toast-close"
     }
     async elementClick() {
       calls.push("click-transport");
-      throw sdkClickResponseError("element click intercepted");
+      throw sdkClickResponseError(
+        mode === "html" ? "element not interactable" : "element click intercepted",
+      );
     }
     async waitForExist() {
       calls.push("existence-wait");
@@ -2834,6 +2851,12 @@ function sdkInternalScrollClick(sourceSelector = 'button[data-slot="toast-close"
     isMobile: false,
     isBidi: false,
     capabilities: { browserName: "chrome" },
+    on: () => {
+      calls.push("wait-listener-add");
+    },
+    off: () => {
+      calls.push("wait-listener-remove");
+    },
     getElementRect: async () => {
       calls.push("scroll-rect");
       throw sdkClickResponseError("stale element reference", {
@@ -2845,8 +2868,20 @@ function sdkInternalScrollClick(sourceSelector = 'button[data-slot="toast-close"
     execute: async function (script: unknown, ...args: unknown[]): Promise<unknown> {
       return commands.execute.call(this, script, ...args);
     },
-    executeScript: async (_script: unknown, args: unknown[]) => {
-      calls.push("scroll-web-execute");
+    executeScript: async (script: unknown, args: unknown[]) => {
+      expect(typeof script).toBe("string");
+      if (mode === "html" && typeof script === "string") {
+        if (script.includes("function checkVisibility")) {
+          calls.push("visibility-transport");
+          return false;
+        }
+        if (script.includes("window.getComputedStyle")) {
+          calls.push("style-transport");
+          return { value: "none" };
+        }
+        expect(script).toContain("outerHTML");
+      }
+      calls.push(mode === "html" ? "html-transport" : "scroll-web-execute");
       expect(args[0]).not.toBeInstanceOf(Element);
       throw sdkClickResponseError("stale element reference", { command: "execute/sync" });
     },
@@ -2856,31 +2891,102 @@ function sdkInternalScrollClick(sourceSelector = 'button[data-slot="toast-close"
     $: (selector: string) => {
       expect(selector).toBe(sourceSelector);
       calls.push("same-selector-refetch");
-      return { getElement: async () => new Element(undefined) };
+      return { getElement: async () => wire(new Element(undefined)) };
+    },
+    $$: (selector: string) => {
+      expect(selector).toBe(sourceSelector);
+      calls.push("existence-lookup");
+      return { getElements: async () => [] };
     },
   };
+  const htmlScriptSource = NodeFS.readFileSync(
+    NodePath.join(NodePath.dirname(packagePath), "build/scripts/getHTML.js"),
+    "utf8",
+  );
   const commands = NodeVM.runInNewContext(
-    code + "\n({click, scrollIntoView, execute, elementErrorHandler})",
+    code +
+      "\n({click, scrollIntoView, execute, elementErrorHandler, getHTML, waitForClickable, waitForExist, waitUntil, isClickable, isDisplayed, isExisting})",
     {
       getBrowserObject2: () => browser,
+      getBrowserObject11: () => browser,
+      getBrowserObject21: () => browser,
+      getBrowserObject22: () => browser,
+      getBrowserObject23: () => browser,
       getBrowserObject30: () => browser,
+      getBrowserObject33: () => browser,
       getBrowserObject39: () => browser,
+      hasElementId: async (element: { elementId?: string }) => Boolean(element.elementId),
       log4: { debug() {} },
       log27: { warn() {} },
       ELEMENT_KEY17: "element-6066-11e4-a52e-4f735466cecf",
+      ELEMENT_KEY12: "element-6066-11e4-a52e-4f735466cecf",
+      ELEMENT_KEY19: "element-6066-11e4-a52e-4f735466cecf",
       ELEMENT_KEY20: "element-6066-11e4-a52e-4f735466cecf",
       ELEMENT_KEY21: "element-6066-11e4-a52e-4f735466cecf",
       polyfillFn: "function webdriverioPolyfill() {}",
+      getHTMLScript: NodeVM.runInNewContext(
+        htmlScriptSource.slice(0, htmlScriptSource.indexOf("export {")) + "\ngetHTML",
+      ),
+      sanitizeHTML: () => {
+        throw new Error("No HTML is returned by this SDK fixture.");
+      },
+      isElementClickableScript: () => {
+        throw new Error("Hidden control must short-circuit.");
+      },
+      isElementDisplayedLegacyScript: () => {
+        throw new Error("No legacy visibility port.");
+      },
+      isElementInViewportScript: () => {
+        throw new Error("No viewport port.");
+      },
+      AbortController,
+      Date: { now: () => 1 },
+      setTimeout: (callback: () => void) => {
+        const token = { cancelled: false };
+        queueMicrotask(() => {
+          if (!token.cancelled) callback();
+        });
+        return token;
+      },
+      clearTimeout: (token: { cancelled: boolean }) => {
+        token.cancelled = true;
+      },
     },
   );
-  const wrap = (_name: string, operation: unknown) => operation;
-  const element = new Element("owned-node");
-  element.click = commands.elementErrorHandler(wrap)("click", commands.click).bind(element);
-  element.scrollIntoView = commands
-    .elementErrorHandler(wrap)("scrollIntoView", commands.scrollIntoView)
-    .bind(element);
+  const wrap = (name: string, operation: (...args: unknown[]) => unknown) =>
+    function (this: unknown, ...args: unknown[]) {
+      if (operation === commands[name]) bodies[name] = (bodies[name] ?? 0) + 1;
+      return operation.apply(this, args);
+    };
+  const wire = (element: Element) => {
+    const names =
+      mode === "html"
+        ? [
+            "click",
+            "getHTML",
+            "waitForClickable",
+            "waitForExist",
+            "waitUntil",
+            "isClickable",
+            "isDisplayed",
+            "isExisting",
+          ]
+        : ["click", "scrollIntoView"];
+    Object.assign(
+      element,
+      Object.fromEntries(
+        names.map((name) => [
+          name,
+          commands.elementErrorHandler(wrap)(name, commands[name]).bind(element),
+        ]),
+      ),
+    );
+    return element;
+  };
+  const element = wire(new Element("owned-node"));
   return {
     calls,
+    bodies,
     failure: () => failure,
     click: async () => {
       try {
@@ -2894,7 +3000,7 @@ function sdkInternalScrollClick(sourceSelector = 'button[data-slot="toast-close"
 }
 
 it("accepts the actual Classic SDK internal scroll missing error only after fresh toast absence", async () => {
-  const sdk = sdkInternalScrollClick();
+  const sdk = sdkInternalMissingClick();
   const probe = removalReplay(null, { sdkClick: sdk.click, disappears: true });
   const stages: string[] = [];
   await expect(
@@ -2915,16 +3021,51 @@ it("accepts the actual Classic SDK internal scroll missing error only after fres
   expect(probe.signatures.has(sdk.failure() as object)).toBe(false);
 });
 
+it("accepts the actual SDK getHTML fallback missing error only after fresh toast absence", async () => {
+  const sdk = sdkInternalMissingClick(undefined, "html");
+  const probe = removalReplay(null, { sdkClick: sdk.click, disappears: true });
+  const stages: string[] = [];
+  await expect(
+    probe.remove(probe.host, (stage: string) => stages.push(stage)),
+  ).resolves.toBeUndefined();
+  expect(sdk.calls.filter((call) => call === "click-transport")).toHaveLength(1);
+  expect(sdk.calls.filter((call) => call === "html-transport")).toHaveLength(1);
+  expect(sdk.calls.filter((call) => call === "same-selector-refetch")).toHaveLength(1);
+  expect(sdk.calls.filter((call) => call === "existence-lookup")).toHaveLength(1);
+  expect(sdk.calls.filter((call) => call === "wait-listener-add")).toHaveLength(2);
+  expect(sdk.calls.filter((call) => call === "wait-listener-remove")).toHaveLength(2);
+  expect(sdk.bodies).toEqual({
+    click: 1,
+    waitForClickable: 1,
+    waitUntil: 2,
+    isClickable: 1,
+    isDisplayed: 1,
+    getHTML: 1,
+    waitForExist: 1,
+    isExisting: 1,
+  });
+  expect(stages.at(-1)).toBe("toast-recheck-empty");
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+  expect(probe.calls.filter((call) => call[0] === "until")).toEqual([["until"]]);
+  expect(probe.signatures.has(sdk.failure() as object)).toBe(false);
+});
+
 it.each([
-  { refusal: "visible replacement", phase: "toast-recheck-visible" },
-  { refusal: "lookup failure", phase: "toast-recheck-list" },
-  { refusal: "display failure", phase: "toast-recheck-displayed" },
-  { refusal: "other selector", phase: "toast-click-unrecognized" },
+  { mode: "scroll" as const, refusal: "visible replacement", phase: "toast-recheck-visible" },
+  { mode: "scroll" as const, refusal: "lookup failure", phase: "toast-recheck-list" },
+  { mode: "scroll" as const, refusal: "display failure", phase: "toast-recheck-displayed" },
+  { mode: "scroll" as const, refusal: "other selector", phase: "toast-click-unrecognized" },
+  { mode: "html" as const, refusal: "visible replacement", phase: "toast-recheck-visible" },
+  { mode: "html" as const, refusal: "lookup failure", phase: "toast-recheck-list" },
+  { mode: "html" as const, refusal: "display failure", phase: "toast-recheck-displayed" },
+  { mode: "html" as const, refusal: "other selector", phase: "toast-click-unrecognized" },
 ])(
-  "preserves the actual internal scroll error after $refusal without clicking a replacement",
+  "preserves the actual internal $mode error after $refusal without clicking a replacement",
   async (testCase) => {
-    const sdk = sdkInternalScrollClick(
+    const sdk = sdkInternalMissingClick(
       testCase.refusal === "other selector" ? 'button[data-slot="other-close"]' : undefined,
+      testCase.mode,
     );
     const readFailure = new Error("Inert absence read failed.");
     const probe = removalReplay(null, {
@@ -2954,11 +3095,32 @@ it.each([
 );
 
 it.each([
+  { shape: "generic getHTML", message: "getHTML failed" },
+  {
+    shape: "wrapped getHTML",
+    message:
+      'WebDriverError: Can\'t call getHTML on element with selector "button[data-slot="toast-close"]" because element wasn\'t found',
+  },
+  {
+    shape: "prefixed getHTML",
+    message:
+      'prefix Can\'t call getHTML on element with selector "button[data-slot="toast-close"]" because element wasn\'t found',
+  },
+  {
+    shape: "trailing getHTML",
+    message:
+      'Can\'t call getHTML on element with selector "button[data-slot="toast-close"]" because element wasn\'t found extra',
+  },
+  {
+    shape: "newline getHTML",
+    message:
+      'Can\'t call getHTML on element with selector "button[data-slot="toast-close"]" because element wasn\'t found\n',
+  },
   { shape: "generic scroll", message: "scrollIntoView failed" },
   {
     shape: "other operation",
     message:
-      'Can\'t call getHTML on element with selector "button[data-slot="toast-close"]" because element wasn\'t found',
+      'Can\'t call getText on element with selector "button[data-slot="toast-close"]" because element wasn\'t found',
   },
   {
     shape: "execute argument",

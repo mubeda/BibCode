@@ -33,6 +33,12 @@ it.each([
     null,
   ],
   [
+    "Can't call getHTML on element with selector \"private\" because element wasn't found",
+    "implicit",
+    "getHTML",
+    null,
+  ],
+  [
     "Can't call $ on element with selector \"private\" because element wasn't found",
     "implicit",
     "$",

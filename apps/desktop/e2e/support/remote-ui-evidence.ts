@@ -56,6 +56,7 @@ export interface RemoteUiToastErrorSignature {
     | "waitForDisplayed"
     | "waitForClickable"
     | "getElement"
+    | "getHTML"
     | "isDisplayed"
     | "isClickable"
     | "$"
@@ -127,6 +128,7 @@ export function projectRemoteUiToastErrorSignature(
             "waitForDisplayed",
             "waitForClickable",
             "getElement",
+            "getHTML",
             "isDisplayed",
             "isClickable",
             "$",

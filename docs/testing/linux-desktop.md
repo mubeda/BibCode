@@ -603,8 +603,8 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   absence reads preserve the original failure and click phase. This conservative
   recognition reads only an own data message. It admits the canonical missing/stale
   prefixes, the exact public implicit-missing click message, the pinned SDK's exact
-  internal scroll-missing message for that same toast-close selector during its
-  Classic click fallback, and the pinned SDK's
+  internal scroll-missing or getHTML-missing message for that same toast-close
+  selector during its Classic click fallbacks, and the pinned SDK's
   `WebDriverError` wrapper only for a bounded element-ID click command with `POST`
   and no argument suffix. Wrapped detail can contain the SDK's preserved line breaks
   within its 1024-character bound; element IDs remain bounded. Other error
