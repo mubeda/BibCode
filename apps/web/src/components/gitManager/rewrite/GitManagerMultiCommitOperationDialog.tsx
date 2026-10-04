@@ -87,9 +87,7 @@ const BranchChoiceGroup = memo(function BranchChoiceGroup({
   if (branches.length === 0) return null;
   return (
     <section aria-label={`${label} branches`}>
-      <h3 className="px-2 py-1 text-[10px] font-semibold text-muted-foreground uppercase">
-        {label}
-      </h3>
+      <h3 className="px-2 py-1 text-xs font-semibold text-muted-foreground uppercase">{label}</h3>
       {branches.map((branch) => (
         <BranchChoice
           branch={branch}
@@ -289,7 +287,7 @@ export const GitManagerMultiCommitOperationDialog = memo(
                 {mergeSummary === null ? null : (
                   <div aria-live="polite" className="rounded-md bg-muted/35 p-3 text-xs">
                     <p>{mergeSummary.message}</p>
-                    <p className="mt-1 text-[10px] text-muted-foreground tabular-nums">
+                    <p className="mt-1 text-xs text-muted-foreground tabular-nums">
                       Ahead {mergeSummary.ahead} · Behind {mergeSummary.behind}
                     </p>
                   </div>

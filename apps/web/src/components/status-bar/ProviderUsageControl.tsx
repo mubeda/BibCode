@@ -85,7 +85,7 @@ export function ProviderUsageControl({
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
         aria-label={label}
-        className="inline-flex h-5 shrink-0 items-center rounded border-0 bg-transparent px-1 text-[11px] outline-none hover:bg-accent/70 focus-visible:ring-2 focus-visible:ring-ring"
+        className="inline-flex h-5 shrink-0 items-center rounded border-0 bg-transparent px-1 text-xs outline-none hover:bg-accent/70 focus-visible:ring-2 focus-visible:ring-ring"
         title={label}
       >
         {iconOnly ? (

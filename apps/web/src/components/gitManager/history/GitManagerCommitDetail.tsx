@@ -71,20 +71,20 @@ const IdentityBadge = memo(function IdentityBadge({
     <div className="flex min-w-0 items-center gap-2">
       <span
         aria-hidden="true"
-        className="flex size-7 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white"
+        className="flex size-7 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white"
         style={{ backgroundColor: `hsl(${identity.hue} 55% 42%)` }}
       >
         {identity.initials}
       </span>
       <span className="min-w-0">
-        <span className="block text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+        <span className="block text-xs font-medium tracking-wide text-muted-foreground uppercase">
           {label}
         </span>
         <span className="block truncate text-xs" title={identity.title}>
           {identity.title}
         </span>
         <time
-          className="block text-[10px] text-muted-foreground"
+          className="block text-xs text-muted-foreground"
           dateTime={new Date(timestampMs).toISOString()}
         >
           {identityDateFormatter.format(timestampMs)}
@@ -121,7 +121,7 @@ const ChangedFileRow = memo(function ChangedFileRow({
       type="button"
       aria-selected={selected}
       className={cn(
-        "flex h-[29px] w-full min-w-0 items-center gap-1.5 px-2 text-left text-[11px] focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
+        "flex h-[29px] w-full min-w-0 items-center gap-1.5 px-2 text-left text-xs focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring",
         selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/45",
       )}
       data-changed-file-path={path}
@@ -320,7 +320,7 @@ export const GitManagerCommitDetail = memo(function GitManagerCommitDetail({
           <button
             type="button"
             aria-label={`Copy commit SHA ${commit.shortSha}`}
-            className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-1 font-mono text-[10px] text-muted-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
+            className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-1 font-mono text-xs text-muted-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
             translate="no"
             onClick={copySha}
           >
@@ -337,7 +337,7 @@ export const GitManagerCommitDetail = memo(function GitManagerCommitDetail({
             {commit.decorations.map((decoration) => (
               <span
                 key={decoration}
-                className="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground"
+                className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
                 translate="no"
               >
                 {decoration}
@@ -427,8 +427,8 @@ export const GitManagerCommitDetail = memo(function GitManagerCommitDetail({
             </Suspense>
           ) : renderablePatch?.kind === "raw" ? (
             <div className="space-y-2">
-              <p className="text-[11px] text-muted-foreground">{renderablePatch.reason}</p>
-              <pre className="overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/25 p-3 font-mono text-[11px]">
+              <p className="text-xs text-muted-foreground">{renderablePatch.reason}</p>
+              <pre className="overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/25 p-3 font-mono text-xs">
                 {renderablePatch.text}
               </pre>
             </div>

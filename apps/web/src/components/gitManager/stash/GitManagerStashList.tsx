@@ -137,9 +137,9 @@ const GitManagerStashRowView = memo(function GitManagerStashRowView({
         variant="ghost"
         onClick={select}
       >
-        <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{selector}</span>
+        <span className="shrink-0 font-mono text-xs text-muted-foreground">{selector}</span>
         <span className="min-w-0 flex-1 truncate text-xs">{row.message}</span>
-        <span className="shrink-0 text-[10px] text-muted-foreground">
+        <span className="shrink-0 text-xs text-muted-foreground">
           {row.files.length} {row.files.length === 1 ? "file" : "files"}
         </span>
       </Button>
