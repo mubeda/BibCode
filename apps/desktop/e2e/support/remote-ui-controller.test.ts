@@ -236,6 +236,10 @@ it.each([
   "wrong-archive",
   "row-clipboard-mismatch",
   "card-clipboard-mismatch",
+  "archive-removal-failure",
+  "package-removal-failure",
+  "unknown-removal-failure",
+  "removal-observer-fault",
 ])("uses real rendered instructions and actual manual flow with %s", async (mode) => {
   let kind: "archive" | "package" | "unknown" = "archive",
     elapsed = 0,
@@ -246,6 +250,10 @@ it.each([
     captured: string[] = [],
     receipts: unknown[] = [];
   const declaredChecks = new Set<string>();
+  const removals: ReturnType<typeof removalReplay>[] = [];
+  const removalError = sdkClickResponseError("no such element", {
+    message: 'Unable to find button[data-slot="toast-close"] private-native-detail',
+  });
   const steps = () =>
     manualUpdateSteps({
       installKind: kind === "package" ? "system-package" : kind,
@@ -297,7 +305,15 @@ it.each([
       controller.slice(textStart, textEnd) + controller.slice(start, end) + "\nmanualFlow",
     ),
     {
-      phase: (name: string) => phases.push(name),
+      phase: (name: string) => {
+        phases.push(name);
+        if (
+          mode === "removal-observer-fault" &&
+          name.includes("-remove-") &&
+          !name.endsWith("-remove-host")
+        )
+          throw new Error("inert optional removal observer fault");
+      },
       currentTheme: "light",
       webOrigin: "http://localhost:4901",
       dialog: "dialog",
@@ -313,7 +329,15 @@ it.each([
       addHost: async () => {},
       row: () => "owned-row",
       workspace: async () => {},
-      removeHost: async () => {},
+      removeHost: async (host: unknown, observe?: (operation: string) => void) => {
+        expect(host).toEqual({ label: "QA", port: 4886 });
+        const probe = removalReplay(
+          null,
+          mode === `${kind}-removal-failure` ? { clickFailure: removalError } : {},
+        );
+        removals.push(probe);
+        await probe.remove(probe.host, observe);
+      },
       click: async (selector: string) => {
         if (selector.includes('="Show update steps"'))
           revealAt = mode === "never-reveals" ? Infinity : elapsed + 200;
@@ -339,7 +363,7 @@ it.each([
       assertions: receipts,
     },
   );
-  if (mode === "reveals") {
+  if (mode === "reveals" || mode === "removal-observer-fault") {
     await run();
     expect(captured).toEqual(["manual-archive", "manual-package", "manual-unknown"]);
     expect(copies).toBe(6);
@@ -347,6 +371,22 @@ it.each([
     expect(phases).toContain("manual-archive-read-row-steps");
     expect(phases).toContain("manual-package-card-clipboard");
     expect(phases).toContain("manual-unknown-capture");
+    for (const installKind of ["archive", "package", "unknown"]) {
+      expect(phases.indexOf(`manual-${installKind}-remove-host`)).toBeLessThan(
+        phases.indexOf(`manual-${installKind}-remove-settings`),
+      );
+      expect(phases).toContain(`manual-${installKind}-remove-confirm-click`);
+      expect(phases).toContain(`manual-${installKind}-remove-row-removed`);
+      expect(phases).toContain(`manual-${installKind}-remove-child-stop`);
+      expect(phases).toContain(`manual-${installKind}-remove-tunnel-close`);
+      expect(phases).toContain(`manual-${installKind}-remove-toast-click`);
+    }
+    expect(removals).toHaveLength(3);
+    for (const probe of removals) {
+      expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+      expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+      expect(probe.calls.filter((call) => call[0] === "bound")).toEqual([["bound", 5_000]]);
+    }
     const checkStart = controller.indexOf("const manualAssertionCodes =");
     const checkEnd = controller.indexOf("const required =", checkStart);
     const codes = NodeVM.runInNewContext(
@@ -355,6 +395,18 @@ it.each([
       ),
     ) as string[];
     expect(codes.toSorted()).toEqual([...declaredChecks].toSorted());
+  } else if (mode.endsWith("-removal-failure")) {
+    await expect(run()).rejects.toBe(removalError);
+    const completed = ["archive", "package", "unknown"].indexOf(kind) + 1;
+    expect(captured).toHaveLength(completed);
+    expect(receipts).toHaveLength(completed);
+    expect(copies).toBe(completed * 2);
+    expect(phases).toContain(`manual-${kind}-remove-host`);
+    expect(phases.at(-1)).toBe(`manual-${kind}-remove-toast-click-unrecognized`);
+    const probe = removals.at(-1)!;
+    expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+    expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(1);
+    expect(probe.signatures.has(removalError)).toBe(true);
   } else {
     const code =
       mode === "never-reveals"
@@ -2612,6 +2664,45 @@ function toastFailureReceipt(
   expect(records).toHaveLength(1);
   return records[0]!;
 }
+
+it.each(["archive", "package", "unknown"])(
+  "retains the owned SDK signature only at the exact manual %s unrecognized-toast phase",
+  async (kind) => {
+    const error = sdkClickResponseError("no such element", {
+      message: 'Unable to find button[data-slot="toast-close"] private-native-detail',
+    });
+    const probe = removalReplay(null, { clickFailure: error });
+    await expect(probe.remove(probe.host)).rejects.toBe(error);
+    const phase = `manual-${kind}-remove-toast-click-unrecognized`;
+    const receipt = toastFailureReceipt(error, probe.signatures, phase);
+    expect(receipt.toastErrorSignature).toMatchObject({
+      wrapperPrefix: true,
+      messageFamily: "other",
+      exactToastSelectorPresent: true,
+      sdkTemplate: "protocol",
+    });
+    expect(Object.isFrozen(receipt.toastErrorSignature)).toBe(true);
+    expect(
+      toastFailureReceipt(new Error(error.message), probe.signatures, phase).toastErrorSignature,
+    ).toBeNull();
+    expect(toastFailureReceipt(undefined, probe.signatures, phase).toastErrorSignature).toBeNull();
+    for (const unrelated of [
+      `manual-${kind}-remove-host`,
+      `manual-${kind}-remove-toast-click`,
+      phase + "-extra",
+      "manual-other-remove-toast-click-unrecognized",
+      "queued-remove-a-toast-click-unrecognized",
+    ])
+      expect(
+        toastFailureReceipt(error, probe.signatures, unrelated).toastErrorSignature,
+      ).toBeNull();
+    expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+    expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(1);
+    expect(JSON.stringify(receipt)).not.toMatch(
+      /private-|button\[|no such element|WebDriverError:/,
+    );
+  },
+);
 
 it("retains only a closed signature for the actual unrecognized SDK error in the existing failure receipt", async () => {
   const error = sdkClickResponseError("no such element", {

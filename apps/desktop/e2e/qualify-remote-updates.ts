@@ -1366,7 +1366,7 @@ async function manualFlow() {
       instructionsExecuted: false,
     });
     phase(`manual-${kind}-remove-host`);
-    await removeHost(host);
+    await removeHost(host, (operation) => phase(`manual-${kind}-remove-${operation}`));
   }
 }
 
@@ -1948,7 +1948,12 @@ try {
     checkAgain,
     successRemoval,
     toastErrorSignature:
-      currentPhase === "success-remove-toast-click-unrecognized" &&
+      [
+        "success-remove-toast-click-unrecognized",
+        "manual-archive-remove-toast-click-unrecognized",
+        "manual-package-remove-toast-click-unrecognized",
+        "manual-unknown-remove-toast-click-unrecognized",
+      ].includes(currentPhase) &&
       error !== null &&
       typeof error === "object"
         ? (toastErrorSignatureFailures.get(error) ?? null)

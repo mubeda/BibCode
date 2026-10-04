@@ -761,6 +761,10 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Manual row copying records displayed, clickable, click, and success-toast
   phases immediately before those existing awaits, without another browser
   read or action. Clipboard comparison remains a separate required step.
+  Manual removal keeps its per-kind `remove-host` entry phase and forwards the
+  existing removal observer as `manual-archive/package/unknown-remove-<operation>`.
+  Those fixed phases identify the existing Settings/menu/confirmation, row-absence,
+  child/tunnel joins and toast boundaries without another read, action or budget.
   A failure receipt may contain only an
   allowlisted manual assertion code registered by that controller's own check;
   errors from the browser, arbitrary check strings, exception text and copied
@@ -772,6 +776,11 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   prove the earlier recheck succeeded; preserve the original click error on refusal.
   At exactly `success-remove-toast-click-unrecognized`, the existing failure receipt
   may include `toastErrorSignature` associated with that same thrown error object.
+  The same owned signature is admitted at exactly
+  `manual-archive-remove-toast-click-unrecognized`,
+  `manual-package-remove-toast-click-unrecognized`, or
+  `manual-unknown-remove-toast-click-unrecognized`. Retrieval uses the existing
+  error-keyed WeakMap; it adds no message inspection or browser observation.
   It contains only wrapper/canonical-message family, exact click-POST suffix,
   argument-suffix shape, a coarse length bucket, exact toast-selector presence and
   an own-data name family. Three additional closed fields identify a fixed SDK
