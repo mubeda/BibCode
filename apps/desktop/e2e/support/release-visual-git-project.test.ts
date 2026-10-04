@@ -664,9 +664,14 @@ function actualOwnerAdapters(options: { kind?: string; fault?: string } = {}) {
   const input = {
     origin: "http://127.0.0.1:4885",
     fixture,
-    importProject: async (cwd: string) => {
+    importProject: async (
+      cwd: string,
+      bindSource?: () => Promise<GitProject.GitProjectVisualSelection>,
+    ) => {
       expect(cwd).toBe(fixture[kind]);
       calls.push("import");
+      if (bindSource) await bindSource();
+      calls.push("model");
     },
     readSnapshot: async () => {
       calls.push("snapshot");
@@ -744,6 +749,31 @@ function actualOwnerAdapters(options: { kind?: string; fault?: string } = {}) {
     snapshot: () => snapshot,
   };
 }
+it("binds and verifies the imported source before model selection without duplicating the snapshot loop", async () => {
+  const f = actualOwnerAdapters();
+  await f.adapter.selectProject("rich", f.fixture.rich);
+  expect(f.calls.indexOf("snapshot")).toBeLessThan(f.calls.indexOf("model"));
+  expect(f.calls.indexOf("source")).toBeLessThan(f.calls.indexOf("model"));
+  expect(f.calls.indexOf('click:[data-testid="primary-card-button-owned-project"]')).toBeLessThan(
+    f.calls.indexOf("model"),
+  );
+  expect(f.calls.indexOf("public")).toBeLessThan(f.calls.indexOf("model"));
+  expect(f.calls.filter((call) => call === "snapshot")).toHaveLength(2);
+});
+it.each(["duplicate-project", "duplicate-thread", "wrong-default", "source"])(
+  "refuses ambiguous imported identity before model selection: %s",
+  async (fault) => {
+    const f = actualOwnerAdapters({ fault });
+    await expect(f.adapter.selectProject("rich", f.fixture.rich)).rejects.toThrow();
+    expect(f.calls).not.toContain("model");
+  },
+);
+it("refuses stale other-primary selection before any model action", async () => {
+  const f = actualOwnerAdapters({ fault: "selected" });
+  await expect(f.adapter.selectProject("rich", f.fixture.rich)).rejects.toThrow();
+  expect(f.calls).toContain("public");
+  expect(f.calls).not.toContain("model");
+});
 it.each(["rich", "merge", "unborn", "ordinary", "broken"])(
   "binds real typed default-thread identity after async public mounting: %s",
   async (kind) => {

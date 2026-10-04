@@ -31,6 +31,14 @@ import {
   readVisualTextRowFailure,
   projectVisualTextRowFailure,
 } from "./release-visual-observation.ts";
+import { resolveSettingsVisualFailureScene } from "./release-visual-settings.ts";
+
+/** Execute controller regions with their actual shared closed-scene dependency. */
+const runControllerSource = (
+  code: string,
+  context: NodeVM.Context,
+  options?: Parameters<typeof NodeVM.runInNewContext>[2],
+) => NodeVM.runInNewContext(code, { resolveSettingsVisualFailureScene, ...context }, options);
 
 const environment = {
   CI: "true",
@@ -277,7 +285,7 @@ it("executes the original failure writer and entire joined cleanup with same-err
   expect(end).toBeGreaterThan(start);
   const events: string[] = [],
     writes: Array<Record<string, unknown>> = [];
-  const run = NodeVM.runInNewContext(
+  const run = runControllerSource(
     NodeModule.stripTypeScriptTypes(
       "async function fail() { try { throw original;" + controller.slice(start, end) + "}\nfail",
     ),
@@ -345,7 +353,7 @@ describe("closed text-row failure boundary", () => {
         commonDirectory: "/owned/common",
       };
       const calls: string[] = [];
-      const invoke = NodeVM.runInNewContext(
+      const invoke = runControllerSource(
         NodeModule.stripTypeScriptTypes(
           "let textRowObservationInput = { old: true }; const verify = ({" +
             controller.slice(start, end) +
@@ -449,7 +457,7 @@ describe("closed text-row failure boundary", () => {
       const catchStart = controller.lastIndexOf("  } catch (error) {");
       const finallyEnd = controller.indexOf("  return success ? 0 : 1;", catchStart);
       expect(helperStart).toBeGreaterThan(0);
-      const run = NodeVM.runInNewContext(
+      const run = runControllerSource(
         NodeModule.stripTypeScriptTypes(
           controller.slice(helperStart, helperEnd) +
             "\nasync function fail() { try { throw error;" +
@@ -581,7 +589,7 @@ function createRefFailureBoundary(
   );
   const catchStart = controller.lastIndexOf("  } catch (error) {");
   const catchEnd = controller.indexOf("  } finally {", catchStart);
-  const run = NodeVM.runInNewContext(
+  const run = runControllerSource(
     NodeModule.stripTypeScriptTypes(
       (projectorStart < 0
         ? ""
@@ -633,7 +641,7 @@ describe("closed create-ref failure facts", () => {
     const end = controller.indexOf("          capture: async (scene) => {", start);
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
-    const record = NodeVM.runInNewContext(
+    const record = runControllerSource(
       NodeModule.stripTypeScriptTypes(
         "let createRefClearObservation = null; const record = ({" +
           controller.slice(start, end) +
@@ -808,7 +816,7 @@ describe("import failure receipt boundary", () => {
         expect(error).toBe(originalError);
         return classifyQualificationFailure(error);
       });
-      const run = NodeVM.runInNewContext(
+      const run = runControllerSource(
         NodeModule.stripTypeScriptTypes(
           controller.slice(helperStart, helperEnd) +
             "\nasync function failure(){" +
@@ -874,7 +882,7 @@ describe("import failure receipt boundary", () => {
             finish = resolve;
           }),
       );
-      const run = NodeVM.runInNewContext(
+      const run = runControllerSource(
         NodeModule.stripTypeScriptTypes(
           controller.slice(start, end) +
             "\nasync function failure(){" +
@@ -909,6 +917,89 @@ describe("import failure receipt boundary", () => {
     }
   });
 });
+
+it.each([
+  null,
+  { environmentId: "local", projectId: "private-project", threadId: "private-thread" },
+])(
+  "joins the existing failed model read with its private binding and original verdict: %s",
+  async (binding) => {
+    const observations: Record<string, unknown>[] = [];
+    const original = new Error("The required live observation did not arrive within its bound.");
+    const facts = {
+      safeLocation: true,
+      route: "workspace",
+      modalPresent: false,
+      modalDisplayed: null,
+      pathPresent: false,
+      pathDisabled: null,
+      submitPresent: false,
+      submitDisabled: null,
+      composerPresent: true,
+      composerDisplayed: true,
+      primaryCardCount: "one",
+      primaryCardSelected: true,
+      errorCategory: null,
+      modelFacts: binding
+        ? {
+            expectedTriggerLabel: false,
+            triggerDisabled: false,
+            desiredOptionSelected: null,
+            desiredOptionDisabled: null,
+          }
+        : null,
+    };
+    let reads = 0;
+    const bounds: number[] = [];
+    const helperStart = controller.indexOf("  async function readImportFailureObservation()");
+    const helperEnd = controller.indexOf(
+      "  async function readWorktreeFailureObservation()",
+      helperStart,
+    );
+    const catchStart = controller.lastIndexOf("  } catch (error) {");
+    const catchEnd = controller.indexOf("  } finally {", catchStart);
+    const run = runControllerSource(
+      NodeModule.stripTypeScriptTypes(
+        controller.slice(helperStart, helperEnd) +
+          "\nasync function failure(){" +
+          controller.slice(catchStart + "  } catch (error) {".length, catchEnd) +
+          "}\nfailure",
+      ),
+      {
+        browser: {
+          execute: async (reader: unknown, ...args: unknown[]) => {
+            reads++;
+            expect(reader).toBe(readDeliveryImportObservation);
+            expect(args).toEqual([{ origin: "http://127.0.0.1:4885", binding }]);
+            return facts;
+          },
+        },
+        phase: "import-verify-claude-opus",
+        theme: "light",
+        origin: "http://127.0.0.1:4885",
+        importModelBinding: binding,
+        readDeliveryImportObservation,
+        projectDeliveryImportObservation,
+        bounded: (promise: Promise<unknown>, ms: number) => {
+          bounds.push(ms);
+          return bounded(promise, ms);
+        },
+        error: original,
+        classifyQualificationFailure: (error: unknown) => {
+          expect(error).toBe(original);
+          return classifyQualificationFailure(error);
+        },
+        write: (_name: string, value: Record<string, unknown>) => observations.push(value),
+      },
+    ) as () => Promise<void>;
+    await run();
+    expect(reads).toBe(1);
+    expect(bounds).toEqual([2_000]);
+    expect(observations[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+    expect(observations[0]?.importObservation).toEqual(facts);
+    expect(JSON.stringify(observations)).not.toMatch(/private|http/);
+  },
+);
 
 describe("closed browser startup failure facts", () => {
   const ready = {
@@ -983,7 +1074,7 @@ describe("closed browser startup failure facts", () => {
         network = {},
         proofs: unknown[] = [];
       const originalFailure = new Error("Inert original startup failure.");
-      const run = NodeVM.runInNewContext(
+      const run = runControllerSource(
         NodeModule.stripTypeScriptTypes(
           "async function run() { let browserDriverReadiness = null, browserReadinessStage = null, browser; try {" +
             controller.slice(start, end) +
@@ -1335,7 +1426,7 @@ function worktreeOpeningBoundary(
   const openingEnd = controller.indexOf("\n  }", openingStart);
   expect(openingStart).toBeGreaterThan(0);
   expect(openingEnd).toBeGreaterThan(openingStart);
-  const run = NodeVM.runInNewContext(
+  const run = runControllerSource(
     NodeModule.stripTypeScriptTypes(
       'let phase = "setup"; const theme = "light";\n' +
         controller.slice(helpersStart, helpersEnd) +
@@ -1445,7 +1536,7 @@ it("targets the selected managed worktree, preserving the primary Git anchor dur
     branch: "codex/delivery-retry-light",
     commonDirectory: "/private-owned-root/project/.git",
   };
-  const run = NodeVM.runInNewContext(
+  const run = runControllerSource(
     NodeModule.stripTypeScriptTypes(
       "async function loss() {" + controller.slice(start, end) + "}\nloss",
     ),
@@ -1573,7 +1664,7 @@ it.each([
       }
       expect(branchHovered).toBe(true);
       expect(input).toBe("Worktree: selected (codex/delivery-retry-light)");
-      const observe = NodeVM.runInNewContext(
+      const observe = runControllerSource(
         "(" + (read as (input: unknown) => boolean).toString() + ")",
         {
           document: {
@@ -1595,7 +1686,7 @@ it.each([
   const start = controller.indexOf("  async function openWorktreeDialog(");
   const end = controller.indexOf("  async function type(", start);
   expect(start).toBeGreaterThan(0);
-  const run = NodeVM.runInNewContext(
+  const run = runControllerSource(
     NodeModule.stripTypeScriptTypes(controller.slice(start, end) + "\ncreateOwnedWorkspace"),
     {
       theme: "light",
@@ -1673,7 +1764,7 @@ describe.each(["visual", "pre-loss", "recovery"])(
         );
         expect(opening).toBeGreaterThan(0);
         expect(end).toBeGreaterThan(start);
-        const read = NodeVM.runInNewContext("(" + readSelectedDeliveryWorktree.toString() + ")", {
+        const read = runControllerSource("(" + readSelectedDeliveryWorktree.toString() + ")", {
           location: {
             origin: "http://127.0.0.1:4885",
             pathname: "/local/" + selectedId,
@@ -1705,7 +1796,7 @@ describe.each(["visual", "pre-loss", "recovery"])(
           },
           $: () => ({ isExisting: async () => false }),
         };
-        const run = NodeVM.runInNewContext(
+        const run = runControllerSource(
           NodeModule.stripTypeScriptTypes(
             "async function verify() {" + controller.slice(start, end) + "}\nverify",
           ),
@@ -1766,7 +1857,7 @@ describe.each(["delivery-retry-ui", "release-visual-core"])(
         const end = controller.indexOf("      delete childEnv.BIBCODE_HERMETIC_GUARD;", start);
         expect(start).toBeGreaterThan(0);
         expect(end).toBeGreaterThan(start);
-        const construct = NodeVM.runInNewContext(
+        const construct = runControllerSource(
           NodeModule.stripTypeScriptTypes(
             "function prepare() {" + controller.slice(start, end) + "\nreturn childEnv; }\nprepare",
           ),
@@ -1809,6 +1900,11 @@ function importBoundary(
     delayedLabel?: boolean;
     typePath?: boolean;
     fail?: string;
+    bindSource?: () => Promise<{
+      environmentId: string;
+      projectId: string;
+      threadId: string;
+    }>;
   } = {},
 ) {
   const phases: string[] = [];
@@ -1843,7 +1939,12 @@ function importBoundary(
       getText: async () => "Opus 5",
       getAttribute: async (name: string) => {
         invoke(`attribute:${selector}:${name}`);
-        if (selector !== trigger || name !== "aria-label" || !selected) return null;
+        if (
+          !selector.endsWith('[data-chat-provider-model-picker="true"]') ||
+          name !== "aria-label" ||
+          !selected
+        )
+          return null;
         if (options.delayedLabel && labelReads++ === 0) return "Codex · GPT-5";
         return options.selectedLabel === undefined ? "Claude · Opus 5" : options.selectedLabel;
       },
@@ -1855,9 +1956,9 @@ function importBoundary(
   const helpersEnd = controller.indexOf("  const row =", helpersStart);
   if (start < 0 || end < start || helpersStart < 0 || helpersEnd < helpersStart)
     throw new Error("Missing controller import boundary.");
-  const run = NodeVM.runInNewContext(
+  const run = runControllerSource(
     NodeModule.stripTypeScriptTypes(
-      'let phase = "import"; const theme = "light";\n' +
+      'let phase = "import"; let importModelBinding; const theme = "light";\n' +
         controller.slice(helpersStart, helpersEnd) +
         controller.slice(start, end) +
         "\nimportProject",
@@ -1875,11 +1976,72 @@ function importBoundary(
         },
       },
     },
-  ) as (project: string) => Promise<void>;
-  return { run: () => run(project), phases, calls };
+  ) as (project: string, bindSource?: typeof options.bindSource) => Promise<void>;
+  return {
+    run: (useBinding = true) => run(project, useBinding ? options.bindSource : undefined),
+    phases,
+    calls,
+  };
 }
 
 describe("delivery import through public controls", () => {
+  it("joins a Git/project import after composer admission and scopes model selection to that source", async () => {
+    let f: ReturnType<typeof importBoundary>;
+    f = importBoundary({
+      bindSource: async () => {
+        expect(f.calls.at(-1)).toBe(`display:${composer}`);
+        f.calls.push("bind-source");
+        return { environmentId: "local", projectId: "owned-project", threadId: "owned-thread" };
+      },
+    });
+    await f.run();
+    const ownedTrigger =
+      '[data-center-surface-host="chat:host"][data-visible="true"] [data-chat-composer-form="true"] [data-chat-provider-model-picker="true"]';
+    expect(f.calls.indexOf("bind-source")).toBeLessThan(f.calls.indexOf(`click:${ownedTrigger}`));
+    expect(f.calls).toContain(`attribute:${ownedTrigger}:aria-label`);
+    expect(f.calls).not.toContain(`click:${trigger}`);
+  });
+
+  it("preserves a source-binding failure before model actions", async () => {
+    const original = new Error("Owned import identity refused.");
+    const f = importBoundary({
+      bindSource: async () => {
+        throw original;
+      },
+    });
+    await expect(f.run()).rejects.toBe(original);
+    expect(f.calls.some((call) => call.includes("model-picker"))).toBe(false);
+  });
+
+  it("clears the previous private binding when the next ordinary import has no continuation", async () => {
+    const f = importBoundary({
+      bindSource: async () => ({
+        environmentId: "local",
+        projectId: "owned-project",
+        threadId: "owned-thread",
+      }),
+    });
+    await f.run();
+    const prior = f.calls.length;
+    await f.run(false);
+    expect(f.calls.slice(prior)).toContain(`click:${trigger}`);
+    expect(
+      f.calls.slice(prior).some((call) => call.includes('data-center-surface-host="chat:host"')),
+    ).toBe(false);
+  });
+
+  it.each([
+    { environmentId: "remote", projectId: "owned-project", threadId: "owned-thread" },
+    { environmentId: "local", projectId: "owned-project", threadId: 'unsafe"thread' },
+  ])(
+    "refuses an invalid continuation identity before constructing model selectors: %s",
+    async (selection) => {
+      const f = importBoundary({ bindSource: async () => selection });
+      await expect(f.run()).rejects.toThrow();
+      expect(f.calls.some((call) => call.includes("model-picker"))).toBe(false);
+    },
+  );
+
   it("accepts the selected Claude model when its visible text is only the model name", async () => {
     const f = importBoundary();
     await f.run();
@@ -1985,7 +2147,7 @@ function pairingBoundary(
   const helpersEnd = controller.indexOf("  const row =", helpersStart);
   if ([grantStart, start, end, themeStart, themeEnd, helpersStart, helpersEnd].some((n) => n < 0))
     throw new Error("Missing controller pairing boundary.");
-  const run = NodeVM.runInNewContext(
+  const run = runControllerSource(
     NodeModule.stripTypeScriptTypes(
       'let phase = "pair";\n' +
         controller.slice(helpersStart, helpersEnd) +
@@ -2142,7 +2304,7 @@ function startupFailureBoundary(
   const projector =
     projectorStart < 0 ? "" : controller.slice(projectorStart, projectorEnd).replace("export ", "");
   const helper = helperStart < 0 ? "" : controller.slice(helperStart, helperEnd);
-  const run = NodeVM.runInNewContext(
+  const run = runControllerSource(
     NodeModule.stripTypeScriptTypes(
       projector +
         helper +
@@ -2404,7 +2566,7 @@ function worktreeFailureBoundary(
   const projector =
     projectorStart < 0 ? "" : controller.slice(projectorStart, projectorEnd).replace("export ", "");
   const helper = helperStart < 0 ? "" : controller.slice(helperStart, helperEnd);
-  const run = NodeVM.runInNewContext(
+  const run = runControllerSource(
     NodeModule.stripTypeScriptTypes(
       projector +
         helper +

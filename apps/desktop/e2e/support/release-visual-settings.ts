@@ -66,6 +66,15 @@ const sceneFacts: Record<SettingsVisualScene, readonly string[]> = {
   ],
 };
 
+/** Failure attribution joins only these exact phases to their existing capture scenes. */
+export function resolveSettingsVisualFailureScene(
+  phase: string,
+): "settings-source-control" | "settings-provider-form" | null {
+  if (phase === "visual-settings-source-control") return "settings-source-control";
+  if (phase === "visual-settings-provider-form") return "settings-provider-form";
+  return null;
+}
+
 /** Closed already-read failure facts; unsafe context is unavailable, never capture approval. */
 export function projectSettingsVisualFailureWitness(
   scene: SettingsVisualScene,

@@ -120,7 +120,10 @@ export interface GitProjectOwnerAdapterInput {
   owner: Pick<QualificationOwner, "until">;
   origin: string;
   fixture: GitProjectVisualFixture;
-  importProject: (cwd: string) => Promise<void>;
+  importProject: (
+    cwd: string,
+    bindSource?: () => Promise<GitProjectVisualSelection>,
+  ) => Promise<void>;
   readSnapshot: () => Promise<OrchestrationReadModel>;
   verifyServer: () => Promise<void>;
   readBranch: (cwd: string) => string | null;
@@ -172,42 +175,48 @@ export function createGitProjectOwnerAdapters(input: GitProjectOwnerAdapterInput
     ) => {
       if (cwd !== input.fixture[kind]) throw refused();
       await input.verifyServer();
-      await input.importProject(cwd);
       const binding: { selection: GitProjectVisualSelection | null } = { selection: null };
-      await input.owner.until(async () => {
-        const snapshot = await input.readSnapshot();
-        const projects = snapshot.projects.filter(
-          (project) => project.workspaceRoot === cwd && project.deletedAt === null,
-        );
-        if (projects.length === 0) return false;
-        if (projects.length !== 1 || projects[0]!.title !== NodePath.basename(cwd)) throw refused();
-        const project = projects[0]!;
-        const threads = snapshot.threads.filter(
-          (thread) =>
-            thread.projectId === project.id &&
-            thread.kind === "default" &&
-            thread.deletedAt === null,
-        );
-        if (threads.length === 0) return false;
-        if (threads.length !== 1 || threads[0]!.worktreePath !== null) throw refused();
-        if (![project.id, threads[0]!.id].every((value) => /^[A-Za-z0-9._:-]{1,128}$/.test(value)))
-          throw refused();
-        binding.selection = {
-          projectId: project.id,
-          threadId: threads[0]!.id,
-          environmentId: "local",
-          cwd,
-          branch: input.readBranch(cwd),
-          title: project.title,
-        };
-        return true;
+      await input.importProject(cwd, async () => {
+        await input.owner.until(async () => {
+          const snapshot = await input.readSnapshot();
+          const projects = snapshot.projects.filter(
+            (project) => project.workspaceRoot === cwd && project.deletedAt === null,
+          );
+          if (projects.length === 0) return false;
+          if (projects.length !== 1 || projects[0]!.title !== NodePath.basename(cwd))
+            throw refused();
+          const project = projects[0]!;
+          const threads = snapshot.threads.filter(
+            (thread) =>
+              thread.projectId === project.id &&
+              thread.kind === "default" &&
+              thread.deletedAt === null,
+          );
+          if (threads.length === 0) return false;
+          if (threads.length !== 1 || threads[0]!.worktreePath !== null) throw refused();
+          if (
+            ![project.id, threads[0]!.id].every((value) => /^[A-Za-z0-9._:-]{1,128}$/.test(value))
+          )
+            throw refused();
+          binding.selection = {
+            projectId: project.id,
+            threadId: threads[0]!.id,
+            environmentId: "local",
+            cwd,
+            branch: input.readBranch(cwd),
+            title: project.title,
+          };
+          return true;
+        });
+        if (binding.selection === null) throw refused();
+        const selected = binding.selection;
+        bound.set(selected.projectId, selected);
+        await click(`[data-testid="primary-card-button-${selected.projectId}"]`);
+        await verifyOwnedIdentity(selected);
+        return selected;
       });
       if (binding.selection === null) throw refused();
-      const selected = binding.selection;
-      bound.set(selected.projectId, selected);
-      await click(`[data-testid="primary-card-button-${selected.projectId}"]`);
-      await verifyOwnedIdentity(selected);
-      return selected;
+      return binding.selection;
     },
     verifyOwnedIdentity,
     openHiddenWorktrees: async (selection: GitProjectVisualSelection) => {

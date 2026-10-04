@@ -2,6 +2,13 @@
 import * as NodeFS from "node:fs";
 import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
+import { projectCoreBranchCaptureFailureWitness } from "./release-visual-core-capture-facts.ts";
+export {
+  projectCoreBranchCaptureFailureWitness,
+  createCoreBranchCaptureFailureObserver,
+  readCoreBranchCaptureFailureFacts,
+  type CoreBranchCaptureFailureRecord,
+} from "./release-visual-core-capture-facts.ts";
 import {
   bounded,
   type QualificationBrowser,
@@ -27,38 +34,54 @@ export interface VisualCaptureInput extends VisualObservationInput {
   owner: QualificationOwner;
   evidence: string;
   captured: Set<string>;
+  observeFailure?: (error: unknown, witness: Readonly<Record<string, boolean>> | null) => void;
 }
 export async function captureVisualScene(input: VisualCaptureInput): Promise<object> {
-  const file = visualScreenshotName(input.scene, input.theme);
-  if (input.captured.has(file) || (await input.browser.isAlertOpen()))
-    throw new Error("Visual capture refused.");
-  const observation: VisualObservationInput = {
-    scene: input.scene,
-    theme: input.theme,
-    origin: input.origin,
-    threadId: input.threadId,
-    branch: input.branch,
-  };
-  let witness: Record<string, true> | undefined;
-  await input.owner.until(async () => {
-    const value = await bounded(input.browser.execute(readVisualWitness, observation), 2_000);
+  let latestFailureFacts: Readonly<Record<string, boolean>> | null = null;
+  try {
+    const file = visualScreenshotName(input.scene, input.theme);
+    if (input.captured.has(file) || (await input.browser.isAlertOpen()))
+      throw new Error("Visual capture refused.");
+    const observation: VisualObservationInput = {
+      scene: input.scene,
+      theme: input.theme,
+      origin: input.origin,
+      threadId: input.threadId,
+      branch: input.branch,
+    };
+    let witness: Record<string, true> | undefined;
+    await input.owner.until(async () => {
+      const value = await bounded(input.browser.execute(readVisualWitness, observation), 2_000);
+      if (input.scene === "git-branch-menu")
+        latestFailureFacts = projectCoreBranchCaptureFailureWitness(value);
+      try {
+        witness = validateVisualWitness(input.scene, value);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    const bytes = Buffer.from(await bounded(input.browser.takeScreenshot(), 5_000), "base64");
+    const finalWitness = await bounded(
+      input.browser.execute(readVisualWitness, observation),
+      2_000,
+    );
+    if (input.scene === "git-branch-menu")
+      latestFailureFacts = projectCoreBranchCaptureFailureWitness(finalWitness);
+    validateVisualWitness(input.scene, finalWitness);
+    const image = inspectScreenshot(bytes);
+    if (image.width !== 1280 || image.height !== 960) throw new Error("Visual viewport refused.");
+    NodeFS.writeFileSync(NodePath.join(input.evidence, file), bytes, { mode: 0o600, flag: "wx" });
+    input.captured.add(file);
+    return { scene: input.scene, theme: input.theme, file, witness, ...image };
+  } catch (error) {
     try {
-      witness = validateVisualWitness(input.scene, value);
-      return true;
+      input.observeFailure?.(error, latestFailureFacts);
     } catch {
-      return false;
+      /* Optional facts cannot replace the original capture failure. */
     }
-  });
-  const bytes = Buffer.from(await bounded(input.browser.takeScreenshot(), 5_000), "base64");
-  validateVisualWitness(
-    input.scene,
-    await bounded(input.browser.execute(readVisualWitness, observation), 2_000),
-  );
-  const image = inspectScreenshot(bytes);
-  if (image.width !== 1280 || image.height !== 960) throw new Error("Visual viewport refused.");
-  NodeFS.writeFileSync(NodePath.join(input.evidence, file), bytes, { mode: 0o600, flag: "wx" });
-  input.captured.add(file);
-  return { scene: input.scene, theme: input.theme, file, witness, ...image };
+    throw error;
+  }
 }
 export interface VisualCoreInput {
   browser: QualificationBrowser;

@@ -376,11 +376,78 @@ const sourceControlFailureFacts = {
   scanSettled: true,
 };
 
+const providerFormFailureFacts = {
+  themeMatched: true,
+  selectedMatched: true,
+  expectedTextMatched: false,
+  targetInView: false,
+  credentialAbsent: true,
+  bootShellAbsent: true,
+  nonSecretFieldsVisible: false,
+  ownedConfigOnly: true,
+  modelsVisible: false,
+  modelControlsVisible: false,
+  accountsRedacted: true,
+};
+
+it.each([
+  ["visual-settings-source-control", "settings-source-control"],
+  ["visual-settings-provider-form", "settings-provider-form"],
+  ["visual-settings-provider-form-open", null],
+  ["visual-settings-provider-details", null],
+  ["visual-settings-provider-form-extra", null],
+  ["visual-settings-keybindings", null],
+  ["visual-model-picker", null],
+  ["constructor", null],
+])("joins only the exact failure phase %s to its observed scene", (phase, expected) => {
+  const resolve = Reflect.get(SettingsEvidence, "resolveSettingsVisualFailureScene") as
+    | ((phase: string) => string | null)
+    | undefined;
+  expect(resolve?.(phase!)).toBe(expected);
+});
+
+it.each(["false", "missing", "extra", "unsafe", "getter", "proxy", "non-boolean", "null"])(
+  "retains only complete safe provider-form own boolean failure facts: %s",
+  (mode) => {
+    let reads = 0;
+    let value: unknown = { ...providerFormFailureFacts };
+    if (mode === "missing") delete (value as Record<string, unknown>).modelsVisible;
+    if (mode === "extra") Object.assign(value as object, { raw: "private" });
+    if (mode === "unsafe") Object.assign(value as object, { credentialAbsent: false });
+    if (mode === "non-boolean") Object.assign(value as object, { accountsRedacted: "private" });
+    if (mode === "getter")
+      Object.defineProperty(value, "modelControlsVisible", {
+        enumerable: true,
+        get() {
+          reads++;
+          throw new Error("private getter");
+        },
+      });
+    if (mode === "proxy")
+      value = new Proxy(value as object, {
+        ownKeys() {
+          reads++;
+          throw new Error("private proxy");
+        },
+      });
+    if (mode === "null") value = null;
+    const result = SettingsEvidence.projectSettingsVisualFailureWitness(
+      "settings-provider-form",
+      value,
+    );
+    expect(result).toEqual(mode === "false" ? providerFormFailureFacts : null);
+    expect(reads).toBe(0);
+    expect(JSON.stringify(result)).not.toContain("private");
+    expect(() => validateSettingsVisualWitness("settings-provider-form", result)).toThrow();
+  },
+);
+
 it("observes only the existing false capture facts while preserving the original capture error", async () => {
   const evidence = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "settings-failure-facts-"));
   const original = new Error("Original capture observation timeout.");
   const calls: string[] = [];
   const observed: Array<{ error: unknown; witness: unknown }> = [];
+  let actualFacts: Record<string, boolean> = sourceControlFailureFacts;
   const input = {
     ...observation,
     scene: "settings-source-control",
@@ -397,7 +464,7 @@ it("observes only the existing false capture facts while preserving the original
       execute: async (reader: unknown) => {
         expect(reader).toBe(readSettingsVisualWitness);
         calls.push("read");
-        return sourceControlFailureFacts;
+        return actualFacts;
       },
       takeScreenshot: async () => {
         throw new Error("No screenshot on failed witness.");
@@ -417,6 +484,21 @@ it("observes only the existing false capture facts while preserving the original
     await expect(captureSettingsVisualScene(input)).rejects.toBe(original);
     expect(observed).toEqual([{ error: original, witness: sourceControlFailureFacts }]);
     expect(calls).toEqual(["alert", "identity", "read"]);
+    expect(NodeFS.readdirSync(evidence)).toEqual([]);
+    input.scene = "settings-provider-form";
+    actualFacts = providerFormFailureFacts;
+    const latest = { ...providerFormFailureFacts, modelControlsVisible: true };
+    calls.length = 0;
+    observed.length = 0;
+    input.owner.until = async (read) => {
+      expect(await read()).toBe(false);
+      actualFacts = latest;
+      expect(await read()).toBe(false);
+      throw original;
+    };
+    await expect(captureSettingsVisualScene(input)).rejects.toBe(original);
+    expect(observed).toEqual([{ error: original, witness: latest }]);
+    expect(calls).toEqual(["alert", "identity", "read", "read"]);
     expect(NodeFS.readdirSync(evidence)).toEqual([]);
   } finally {
     NodeFS.rmSync(evidence, { recursive: true, force: true });
@@ -460,6 +542,12 @@ it.each(["themeMatched", "selectedMatched", "credentialAbsent", "bootShellAbsent
     expect(
       SettingsEvidence.projectSettingsVisualFailureWitness("settings-source-control", {
         ...sourceControlFailureFacts,
+        [guard]: false,
+      }),
+    ).toBeNull();
+    expect(
+      SettingsEvidence.projectSettingsVisualFailureWitness("settings-provider-form", {
+        ...providerFormFailureFacts,
         [guard]: false,
       }),
     ).toBeNull();

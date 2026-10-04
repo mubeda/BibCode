@@ -39,6 +39,217 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
+const modelBinding = {
+  environmentId: "local",
+  projectId: "owned-project",
+  threadId: "owned-thread",
+};
+const modelOwner =
+  '<div data-testid="environment-rail-local" aria-checked="true"><span data-status="connected"></span></div><button data-testid="primary-card-button-owned-project" aria-current="page"></button><div data-center-surface-host="chat:host" data-visible="true"><form data-chat-composer-form="true"><div data-testid="composer-editor">private draft</div><button data-chat-provider-model-picker="true" aria-label="Claude · Opus 5" aria-expanded="true" aria-controls="owned-picker"></button></form></div>';
+const modelPopup =
+  '<div data-slot="popover-popup" id="owned-picker"><div data-model-picker-content="true"><div role="option" data-model-picker-instance-id="claudeAgent" data-model-picker-model-slug="opus" aria-selected="true" aria-disabled="false">private model description</div></div></div>';
+
+describe("closed model facts after trusted import binding", () => {
+  it.each([
+    ["pairing-token", '<input id="pairing-token">'],
+    ["password", '<input type="password">'],
+    ["one-time-code", '<input autocomplete="one-time-code">'],
+    ["pairing-uri", '<textarea placeholder="bibcode://pair…"></textarea>'],
+  ])("nulls serialized bound model facts when a pairing control exists: %s", (_kind, markup) => {
+    page(modelOwner + modelPopup + markup, "/local/owned-thread");
+    const observed = NodeVM.runInNewContext(
+      "(" + readDeliveryImportObservation.toString() + ")({ origin, binding })",
+      {
+        origin,
+        binding: modelBinding,
+        location,
+        document,
+        HTMLInputElement,
+        HTMLButtonElement,
+        innerWidth,
+        innerHeight,
+      },
+    );
+    expect(observed.modelFacts).toBeNull();
+    const { modelFacts: _modelFacts, ...legacy } = observed;
+    expect(legacy).toEqual({
+      safeLocation: true,
+      route: "workspace",
+      modalPresent: false,
+      modalDisplayed: null,
+      pathPresent: false,
+      pathDisabled: null,
+      submitPresent: false,
+      submitDisabled: null,
+      composerPresent: true,
+      composerDisplayed: true,
+      primaryCardCount: "one",
+      primaryCardSelected: true,
+      errorCategory: null,
+    });
+    expect(readDeliveryImportObservation(origin)).toEqual(legacy);
+  });
+
+  it("keeps an explicitly unbound model attempt null and legacy calls unchanged", () => {
+    page(modelOwner + modelPopup, "/local/owned-thread");
+    expect(readDeliveryImportObservation({ origin, binding: null })?.modelFacts).toBeNull();
+    expect(Object.hasOwn(readDeliveryImportObservation(origin)!, "modelFacts")).toBe(false);
+  });
+
+  it("joins the actual public trigger and controlled selected option without retaining labels or descriptions", () => {
+    page(modelOwner + modelPopup, "/local/owned-thread");
+    const facts = readDeliveryImportObservation({ origin, binding: modelBinding })?.modelFacts;
+    expect(facts).toEqual({
+      expectedTriggerLabel: true,
+      triggerDisabled: false,
+      desiredOptionSelected: true,
+      desiredOptionDisabled: false,
+    });
+    expect(
+      JSON.stringify(readDeliveryImportObservation({ origin, binding: modelBinding })),
+    ).not.toMatch(/private|Claude|Opus|owned-|http/);
+  });
+
+  it("keeps selection unavailable when the owned picker is closed even if the displayed label matches", () => {
+    page(modelOwner + modelPopup, "/local/owned-thread");
+    document
+      .querySelector("[data-chat-provider-model-picker]")!
+      .setAttribute("aria-expanded", "false");
+    expect(readDeliveryImportObservation({ origin, binding: modelBinding })?.modelFacts).toEqual({
+      expectedTriggerLabel: true,
+      triggerDisabled: false,
+      desiredOptionSelected: null,
+      desiredOptionDisabled: null,
+    });
+  });
+
+  it("distinguishes an unmatched selection and disabled option from the displayed trigger label", () => {
+    page(modelOwner + modelPopup, "/local/owned-thread");
+    const option = document.querySelector('[role="option"]')!;
+    option.setAttribute("aria-selected", "false");
+    option.setAttribute("aria-disabled", "true");
+    expect(readDeliveryImportObservation({ origin, binding: modelBinding })?.modelFacts).toEqual({
+      expectedTriggerLabel: true,
+      triggerDisabled: false,
+      desiredOptionSelected: false,
+      desiredOptionDisabled: true,
+    });
+  });
+
+  it.each(["route", "surface", "card", "duplicate-trigger", "duplicate-selected-card", "rail"])(
+    "refuses model facts for unjoined public ownership: %s",
+    (fault) => {
+      page(
+        modelOwner + modelPopup,
+        fault === "route" ? "/local/other-thread" : "/local/owned-thread",
+      );
+      if (fault === "surface")
+        document
+          .querySelector("[data-center-surface-host]")!
+          .setAttribute("data-center-surface-host", "chat:other-thread");
+      if (fault === "card")
+        document
+          .querySelector('[data-testid="primary-card-button-owned-project"]')!
+          .setAttribute("aria-current", "false");
+      if (fault === "duplicate-trigger")
+        document
+          .querySelector("form")!
+          .append(document.querySelector("[data-chat-provider-model-picker]")!.cloneNode(true));
+      if (fault === "duplicate-selected-card")
+        document.body.insertAdjacentHTML(
+          "beforeend",
+          '<button data-testid="primary-card-button-other" aria-current="page"></button>',
+        );
+      if (fault === "rail") document.querySelector('[data-status="connected"]')!.remove();
+      expect(
+        readDeliveryImportObservation({ origin, binding: modelBinding })?.modelFacts,
+      ).toBeNull();
+    },
+  );
+
+  it("allows other unselected projects while refusing unrelated popup selection", () => {
+    page(
+      modelOwner + modelPopup + '<button data-testid="primary-card-button-other"></button>',
+      "/local/owned-thread",
+    );
+    document.querySelector('[data-slot="popover-popup"]')!.id = "other-picker";
+    expect(readDeliveryImportObservation({ origin, binding: modelBinding })?.modelFacts).toEqual({
+      expectedTriggerLabel: true,
+      triggerDisabled: false,
+      desiredOptionSelected: null,
+      desiredOptionDisabled: null,
+    });
+  });
+
+  it("leaves absent selected/disabled metadata unknown and samples actual native trigger disablement", () => {
+    page(modelOwner + modelPopup, "/local/owned-thread");
+    const trigger = document.querySelector<HTMLButtonElement>("[data-chat-provider-model-picker]")!;
+    trigger.disabled = true;
+    trigger.setAttribute("aria-label", "private-unexpected-label");
+    const option = document.querySelector('[role="option"]')!;
+    option.removeAttribute("aria-selected");
+    option.removeAttribute("aria-disabled");
+    expect(readDeliveryImportObservation({ origin, binding: modelBinding })?.modelFacts).toEqual({
+      expectedTriggerLabel: false,
+      triggerDisabled: true,
+      desiredOptionSelected: null,
+      desiredOptionDisabled: null,
+    });
+  });
+
+  it.each(["missing", "duplicate"])(
+    "keeps ambiguous desired option metadata unknown: %s",
+    (fault) => {
+      page(modelOwner + modelPopup, "/local/owned-thread");
+      const option = document.querySelector('[role="option"]')!;
+      if (fault === "missing") option.remove();
+      else option.parentElement!.append(option.cloneNode(true));
+      expect(readDeliveryImportObservation({ origin, binding: modelBinding })?.modelFacts).toEqual({
+        expectedTriggerLabel: true,
+        triggerDisabled: false,
+        desiredOptionSelected: null,
+        desiredOptionDisabled: null,
+      });
+    },
+  );
+
+  it("serializes the bound reader and projects only its fixed nullable model facts", () => {
+    page(modelOwner + modelPopup, "/local/owned-thread");
+    const observed = NodeVM.runInNewContext(
+      "(" + readDeliveryImportObservation.toString() + ")({ origin, binding })",
+      {
+        origin,
+        binding: modelBinding,
+        location,
+        document,
+        HTMLInputElement,
+        HTMLButtonElement,
+        innerWidth,
+        innerHeight,
+      },
+    );
+    expect(projectDeliveryImportObservation(observed)?.modelFacts).toEqual({
+      expectedTriggerLabel: true,
+      triggerDisabled: false,
+      desiredOptionSelected: true,
+      desiredOptionDisabled: false,
+    });
+    expect(
+      projectDeliveryImportObservation({
+        ...observed,
+        modelFacts: { ...observed.modelFacts, raw: "private-reason" },
+      }),
+    ).toBeNull();
+    const getter = vi.fn(() => {
+      throw new Error("private getter");
+    });
+    const poisoned = { ...observed.modelFacts };
+    Object.defineProperty(poisoned, "expectedTriggerLabel", { enumerable: true, get: getter });
+    expect(projectDeliveryImportObservation({ ...observed, modelFacts: poisoned })).toBeNull();
+    expect(getter).not.toHaveBeenCalled();
+  });
+});
+
 describe("failure-only owned import DOM sample", () => {
   it("observes the actual public form/card/composer shape without values, text or actions", () => {
     page(modal + card + composer, "/local/private-id");

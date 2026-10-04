@@ -881,6 +881,23 @@ JSON receipt files enter the artifact allowlist. Inspect the originals
 independently before accepting visual quality. No private logs, provider inputs,
 credentials or profiles are retained.
 
+At exactly `visual-git-branch-menu`, the existing failure receipt may retain
+`coreBranchCaptureFailureFacts` from the last witness already returned by the
+capture's existing polling or post-screenshot read. It adds no browser/RPC read,
+action, timer, deadline, retry or capture fallback. The fixed ten booleans retain
+false scene/text/geometry facts only when theme, selected context, credential
+absence and boot absence remain safe. Before reflection, native Node proxy
+checks reject live or revoked witnesses, ownership and association inputs;
+accessors, inherited/missing/extra keys, malformed data and reflection faults
+remain unavailable (`null`). Bind the observer to the current source and the
+existing verified managed thread/branch/theme; rejoin those private facts before
+retaining only fixed scene/theme and witness booleans. Only that actual capture
+failure's original error object owns its snapshot. Before any returned witness,
+after unsafe latest facts or without matching identity, facts remain null.
+Observer faults preserve the original exception and joined cleanup. These facts
+describe the last returned sample, do not approve a screenshot, and do not prove
+which native event or layout caused an earlier wait to fail.
+
 If the exact create-ref capture fails, `failure.json` additionally records
 `createRefObservation`: one read of the same twelve closed witness booleans,
 bounded to two seconds before cleanup. False facts identify unmet predicates;
@@ -989,8 +1006,12 @@ Readonly availability requires native `disabled` or exact public
 `aria-disabled="true"`. Base UI switch roots use the latter; a data marker,
 muted style or disabled-looking text alone is not readonly evidence. Preserve
 the exact checked states and existing full geometry/identity/credential fences.
-At only `visual-settings-source-control`, the existing failure receipt may include
+At only `visual-settings-source-control` or `visual-settings-provider-form`, the
+existing failure receipt may include
 `settingsCaptureFailureFacts` for that same thrown error and current scene/theme.
+The provider form retains only its existing `nonSecretFieldsVisible`,
+`ownedConfigOnly`, `modelsVisible`, `modelControlsVisible` and `accountsRedacted`
+booleans alongside the unchanged common facts.
 It reuses the latest actual witness from existing capture reads; it adds no DOM
 execution or retry. Exact known own-data booleans may retain false scene/text or
 geometry facts. Unsafe theme, selection, credential or boot context, malformed or
@@ -1077,6 +1098,26 @@ with one newly admitted fixture recipe before the server starts. Local tests
 use inert Git/browser/owner/HTTP ports; they do not run this recipe or launch the
 qualification runtime. Run the Git/project helper and fixture tests alongside
 the shared controller/owner and wrapper admission tests before a native trial.
+
+For this selection only, public import waits for the composer, then runs the
+caller's existing typed snapshot/default-thread binding before selecting Claude
+Opus. Reuse the exact primary-card click and server/snapshot/source/public-route
+admission at that boundary; do not duplicate their RPCs or actions after model
+selection. The source-derived primary composer surface is `chat:host`;
+`chat:<thread-id>` is a sibling surface and cannot stand in for the default
+thread. Other core/settings/delivery import actions retain their existing order.
+
+At `import-verify-claude-opus`, the existing single bounded `importObservation`
+read may also retain `modelFacts` from that private binding. Exact route,
+selected project card, local rail, primary host/form and trigger must join;
+pairing-token/password/one-time-code/pairing-URI controls refuse these new facts.
+They contain only nullable `expectedTriggerLabel`, `triggerDisabled`,
+`desiredOptionSelected` and `desiredOptionDisabled` booleans. Option facts require
+the trigger's unique currently visible controlled popup; closed, missing or
+ambiguous selection/disabled metadata remains null. A displayed label never
+proves the selected model or provider readiness. IDs, labels, reasons, HTML,
+credentials and private snapshot/source payloads stay out of receipts. These
+facts cannot replace the original failure or joined cleanup, or approve pixels.
 
 The exact owned private Git executable runs with a non-shell five-second bound,
 64 KiB output cap, isolated HOME/PATH/global/system configuration, noninteractive

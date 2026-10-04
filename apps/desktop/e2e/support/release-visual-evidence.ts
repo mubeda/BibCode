@@ -39,6 +39,18 @@ const facts: Record<VisualScene, readonly string[]> = {
   "files-editor-comment": ["nestedTree", "fileText", "comment", "toolbar"],
   "command-palette": ["singlePalette", "filteredAction", "singleActiveRow", "inputFocused"],
 };
+const common = [
+  "themeMatched",
+  "selectedMatched",
+  "expectedTextMatched",
+  "targetInView",
+  "credentialAbsent",
+  "bootShellAbsent",
+] as const;
+/** The same closed keys serve capture admission and failure-only projection. */
+export function visualWitnessKeys(scene: VisualScene): readonly string[] {
+  return [...common, ...facts[scene]];
+}
 export function visualScreenshotName(scene: string, theme: string): string {
   if (!visualScenes.some((allowed) => scene === allowed) || !["light", "dark"].includes(theme))
     throw new Error("Unknown visual capture.");
@@ -49,15 +61,7 @@ export function validateVisualWitness(scene: VisualScene, input: unknown): Recor
   if (!visualScenes.includes(scene) || !input || typeof input !== "object" || Array.isArray(input))
     throw new Error("Visual precondition failed.");
   const value = input as Record<string, unknown>;
-  const common = [
-    "themeMatched",
-    "selectedMatched",
-    "expectedTextMatched",
-    "targetInView",
-    "credentialAbsent",
-    "bootShellAbsent",
-  ];
-  const keys = [...common, ...facts[scene]];
+  const keys = visualWitnessKeys(scene);
   if (Object.keys(value).length !== keys.length || !keys.every((key) => value[key] === true))
     throw new Error("Visual precondition failed.");
   validateCaptureWitness(Object.fromEntries(common.map((key) => [key, value[key]])));

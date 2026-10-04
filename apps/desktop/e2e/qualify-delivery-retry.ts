@@ -58,6 +58,7 @@ import { resolveActualRetryPrompt } from "./support/delivery-retry-flow.ts";
 import {
   readDeliveryImportObservation,
   projectDeliveryImportObservation,
+  type DeliveryImportModelBinding,
 } from "./support/delivery-import-observation.ts";
 import {
   readOwnedDeliveryWorktree,
@@ -69,7 +70,13 @@ import {
   prepareVisualWorktree,
   visualPartialStageMatches,
 } from "./support/release-visual-fixture.ts";
-import { captureVisualScene, runVisualCore } from "./support/release-visual-core.ts";
+import {
+  captureVisualScene,
+  runVisualCore,
+  createCoreBranchCaptureFailureObserver,
+  readCoreBranchCaptureFailureFacts,
+  type CoreBranchCaptureFailureRecord,
+} from "./support/release-visual-core.ts";
 import { visualScenes } from "./support/release-visual-evidence.ts";
 import {
   runVisualSettings,
@@ -79,6 +86,7 @@ import {
   projectSettingsVisualAssertion,
   validateSettingsVisualJoins,
   projectSettingsVisualFailureWitness,
+  resolveSettingsVisualFailureScene,
   type SettingsVisualObservationInput,
 } from "./support/release-visual-settings.ts";
 import { readSettingsVisualProviderConfiguration } from "./support/release-visual-settings-preflight.ts";
@@ -141,11 +149,10 @@ export function readSettingsCaptureFailureFacts(
   phase: string,
   theme: DeliveryTheme,
 ) {
-  if (phase !== "visual-settings-source-control" || error === null || typeof error !== "object")
-    return null;
+  const scene = resolveSettingsVisualFailureScene(phase);
+  if (scene === null || error === null || typeof error !== "object") return null;
   const record = records.get(error);
-  if (record?.ownership.scene !== "settings-source-control" || record.ownership.theme !== theme)
-    return null;
+  if (record?.ownership.scene !== scene || record.ownership.theme !== theme) return null;
   return { scene: record.ownership.scene, theme, witness: record.witness };
 }
 
@@ -311,7 +318,10 @@ export async function runOwnedGitProjectSelection(input: {
   captured: Set<string>;
   captures: object[];
   assertions: object[];
-  importProject: (cwd: string) => Promise<void>;
+  importProject: (
+    cwd: string,
+    bindSource?: () => Promise<GitProjectVisualSelection>,
+  ) => Promise<void>;
   step: (phase: string) => void;
   write: (name: string, value: unknown) => void;
   readBranch: (cwd: string) => string | null;
@@ -540,9 +550,11 @@ export async function runDeliveryRetryQualification() {
   const assertions: object[] = [];
   const captures: object[] = [];
   const capturedVisuals = new Set<string>();
+  const coreBranchCaptureFailures = new WeakMap<object, CoreBranchCaptureFailureRecord>();
   const settingsCaptureFailures = new WeakMap<object, SettingsCaptureFailureRecord>();
   let createRefObservationInput: VisualObservationInput | null = null;
   let textRowObservationInput: VisualTextRowObservationInput | null = null;
+  let importModelBinding: DeliveryImportModelBinding | null | undefined;
   let createRefClearObservation: ReturnType<typeof projectVisualNameClearObservation> = null;
   let browserDriverReadiness: OwnedDriverReadiness | null = null;
   let browserReadinessStage: "driver-readiness" | "session-create" | "online-proof" | null = null;
@@ -680,7 +692,15 @@ export async function runDeliveryRetryQualification() {
   async function readImportFailureObservation() {
     try {
       return projectDeliveryImportObservation(
-        await bounded(browser!.execute(readDeliveryImportObservation, origin), 2_000),
+        await bounded(
+          phase === "import-verify-claude-opus" && importModelBinding !== undefined
+            ? browser!.execute(readDeliveryImportObservation, {
+                origin,
+                binding: importModelBinding,
+              })
+            : browser!.execute(readDeliveryImportObservation, origin),
+          2_000,
+        ),
       );
     } catch {
       // Failure-only observation cannot replace the import error or owned cleanup.
@@ -773,7 +793,11 @@ export async function runDeliveryRetryQualification() {
     await click("button=Back");
   }
 
-  async function importProject(project: string) {
+  async function importProject(
+    project: string,
+    bindSource?: () => Promise<GitProjectVisualSelection>,
+  ) {
+    importModelBinding = bindSource ? null : undefined;
     step("import-open-project-menu");
     await click('[data-testid="sidebar-add-project-trigger"]');
     step("import-browse-folder");
@@ -798,12 +822,33 @@ export async function runDeliveryRetryQualification() {
     await click("button=Open project");
     step("import-wait-composer");
     await b().$(composer).waitForDisplayed();
-    await selectClaudeModel("import");
+    if (bindSource) {
+      step("import-bind-source");
+      const selected = await bindSource();
+      check(
+        selected.environmentId === "local" &&
+          [selected.projectId, selected.threadId].every((value) =>
+            /^[A-Za-z0-9._:-]{1,128}$/.test(value),
+          ),
+      );
+      importModelBinding = {
+        environmentId: selected.environmentId,
+        projectId: selected.projectId,
+        threadId: selected.threadId,
+      };
+    }
+    await selectClaudeModel("import", importModelBinding ?? undefined);
   }
 
-  async function selectClaudeModel(scope: "import" | "worktree") {
+  async function selectClaudeModel(
+    scope: "import" | "worktree",
+    binding?: DeliveryImportModelBinding,
+  ) {
+    const modelForm = binding
+      ? '[data-center-surface-host="chat:host"][data-visible="true"] [data-chat-composer-form="true"]'
+      : form;
     step(`${scope}-open-model-picker`);
-    await click(`${form} [data-chat-provider-model-picker="true"]`);
+    await click(`${modelForm} [data-chat-provider-model-picker="true"]`);
     const model =
       '[data-model-picker-content="true"] [data-model-picker-instance-id="claudeAgent"][data-model-picker-model-slug="opus"]';
     step(`${scope}-select-claude-opus`);
@@ -814,7 +859,7 @@ export async function runDeliveryRetryQualification() {
     await owner.until(
       async () =>
         (await b()
-          .$(`${form} [data-chat-provider-model-picker="true"]`)
+          .$(`${modelForm} [data-chat-provider-model-picker="true"]`)
           .getAttribute("aria-label")) === "Claude · Opus 5",
     );
   }
@@ -1364,6 +1409,22 @@ export async function runDeliveryRetryQualification() {
                 origin,
                 threadId: workspace.threadId,
                 branch: workspace.branch,
+                ...(scene === "git-branch-menu"
+                  ? {
+                      observeFailure: createCoreBranchCaptureFailureObserver(
+                        coreBranchCaptureFailures,
+                        {
+                          source: config.source,
+                          scene,
+                          theme,
+                          origin,
+                          threadId: workspace.threadId,
+                          branch: workspace.branch,
+                        },
+                        textRowObservationInput,
+                      ),
+                    }
+                  : {}),
               }),
             );
             write("assertions", { captures, assertions });
@@ -1641,8 +1702,22 @@ export async function runDeliveryRetryQualification() {
       worktreeObservation,
       createRefObservation,
       textRowObservation,
+      coreBranchCaptureFailureFacts:
+        phase === "visual-git-branch-menu"
+          ? readCoreBranchCaptureFailureFacts(coreBranchCaptureFailures, error, {
+              source: config.source,
+              scene: "git-branch-menu",
+              phase,
+              theme,
+              origin,
+              threadId:
+                (textRowObservationInput as VisualTextRowObservationInput | null)?.threadId ?? "",
+              branch:
+                (textRowObservationInput as VisualTextRowObservationInput | null)?.branch ?? "",
+            })
+          : null,
       settingsCaptureFailureFacts:
-        phase === "visual-settings-source-control"
+        resolveSettingsVisualFailureScene(phase) !== null
           ? readSettingsCaptureFailureFacts(settingsCaptureFailures, error, phase, theme)
           : null,
       createRefClearObservation:
