@@ -236,7 +236,9 @@ describe("cross-platform CI contract", () => {
     );
 
     expect(windowsE2eStep?.if).toBe("matrix.platform == 'win'");
-    expect(windowsE2eStep?.run).toBe("vp test run apps/desktop/e2e/support/test-project.test.ts");
+    expect(windowsE2eStep?.run).toBe(
+      "vp test run apps/desktop/e2e/support/test-project.test.ts apps/web/src/components/gitManager/gitManagerRepositoryAvailability.test.ts",
+    );
   });
 
   it("compiles every bibcode-server test target on the Windows native rows", () => {

@@ -197,8 +197,9 @@ rejection cannot auto-start the interrupted input.
 
 A failed turn carries both a message and a class. `turn.completed` uses the
 contract-canonical `errorMessage`, and `errorClass` — a `RuntimeErrorClass` of
-`provider_error`, `transport_error`, `permission_error`, `validation_error` or
-`unknown` — records **who reported** the failure. Both are projected onto the
+`provider_error`, `transport_error`, `session_stopped`, `permission_error`,
+`validation_error` or `unknown` — records **who reported** the failure or that
+BiBCode deliberately stopped the session. Both are projected onto the
 thread session as `lastError` and `lastErrorClass`.
 
 Decoders accept a newer, unrecognized provider class as `unknown` so a newer
@@ -206,11 +207,53 @@ server cannot make an older client reject the entire live event or persisted
 session. Encoders remain strict and emit only the canonical values above.
 
 The class is required because `lastError` is mixed-provenance: it carries a
-provider's own failure and also BiBCode's restart notice, which is classified
-`transport_error`. Without it a surface cannot tell an upstream outage from a
-BiBCode defect. A driver that does not classify its failure projects as
+provider's own failure and also BiBCode's restart or workspace-loss notice.
+Those intentional stops use `session_stopped` and the title "BiBCode stopped
+this session"; an unexpected provider disconnect retains `transport_error`
+and its lost-connection title. The body retains its actionable explanation.
+No title is inferred from message text. Older clients decode the new class as
+`unknown` and retain their generic banner. A driver that does not classify its
+failure projects as
 `provider_error`, since anything reaching that projection came off a provider's
 wire.
+
+Accepted start delivery keeps native provider I/O outside the supervisor actor.
+Its compact accepted-publication message carries the exact driver identity,
+current delivery generation, native turn ID, captured terminal revision and
+acknowledgement through the existing internal terminal lane. The actor checks
+that identity and generation are current, with no cancellation or pending
+stream-end settlement. Each session shares one private async publication fence
+with its existing pump. Start admission captures the revision under that fence,
+then releases it before native I/O; both optimistic running writes retain one
+lease and are suppressed if the fence closed or a terminal was observed since
+admission. Revision exhaustion permanently suppresses optimistic publication.
+Any intervening terminal suppresses the writes even for an unknown native turn
+ID or a late previous-turn completion; a fresh later admission can publish at
+the newer revision. The legacy direct start path uses the same publisher.
+
+The pump advances the revision before projecting a native terminal and retains
+the fence through its complete core batch: runtime and session state, retained
+partial-message settlement and terminal activity. Other core events use the same
+lease and pump order. Admission waits for that batch before starting follow-up
+native work. EOF's active-turn lookup and synthetic failure use the same fence
+while preserving the existing stream-end acknowledgement protocol. Activity
+projection, activity controls, native reads and writes, actor acknowledgements,
+and driver shutdown remain outside the fence. The pump keeps consuming native
+output while the actor awaits controls; it never awaits a new actor publication
+acknowledgement.
+
+Detach cancels event admission and permanently closes the fence only after
+admitted core writers finish their submitted DB/engine work. It then aborts and
+joins the old pump before runtime deletion or settlement. Successful restart
+uses the same drain and gives the replacement a fresh fence; native shutdown
+still runs first, and a shutdown failure leaves the old session installed.
+There is no timeout that releases an admitted writer before completion.
+Suppression, write failure or actor shutdown does not reinterpret provider
+`Accepted` as not sent and never redelivers the input. Publication acknowledgement
+precedes `DeliveryComplete`, so deferred configuration and explicit stop cannot
+overtake it. Steer acceptance never publishes running state. Actor persistence
+awaits and core drain can delay lifecycle controls; unrelated pumps retain
+independent fences.
 
 When a provider reports a fatal `session.exited` or its event stream ends, the
 supervisor preserves that event and any already-projected turn failure, and
@@ -223,7 +266,21 @@ an idle deadline generation before `ready` is published; successful projection o
 non-failed completion arms it. When a current deadline finds a busy session (an
 admitted delivery, a `running` or `starting` projection, or an active turn), it
 immediately re-arms for one idle timeout, and the next completion supersedes that
-re-arm. The next start delivery,
+re-arm.
+
+Idle retention is deliberately conservative in three cases: a send that ends
+without a turn after invalidating an earlier deadline; a launched or restored
+session that has never run a turn; and a failed turn. None arms a new idle
+deadline. Idle policy retains the session until a later successfully projected,
+non-failed completion arms one, or an explicit stop/lifecycle cleanup removes
+it. This retains resources longer but avoids treating those events as proof
+that the provider is idle. The existing admission/projection check cannot see
+all unprojected provider work, including a provider-initiated turn or a failed
+running-state write; that limitation remains explicit. Expiring these cases
+would first require an authoritative busy/idle signal and defined failure
+ordering. The current decision is to preserve this retention policy.
+
+The next start delivery,
 including **Send now** on a held queued message, detaches the dead session and
 releases its activity and process ownership through normal session cleanup.
 It retains the persisted resume cursor and follows the existing missing-session

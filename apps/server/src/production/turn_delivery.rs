@@ -355,9 +355,12 @@ fn guard_delivery_router(
             let loss = workspace_admission.loss_cancellation();
             let route = router(command, delivery_key);
             tokio::pin!(route);
+            // Once routing can run, it may already have written to the provider.
+            // Cancelling its future cannot prove that the message was not sent;
+            // preserve the uncertain-delivery confirmation before any retry.
             tokio::select! {
                 biased;
-                () = loss.cancelled() => ProviderDeliveryOutcome::DefinitelyNotSent {
+                () = loss.cancelled() => ProviderDeliveryOutcome::Ambiguous {
                     detail: loss
                         .unavailable()
                         .map_or_else(|| "workspace became unavailable".to_owned(), |error| error.message),
@@ -1307,6 +1310,12 @@ fn provider_delivery_outcome(
             None,
             DeliveryTaskOutcome::Finished,
         ),
+        ProviderDeliveryOutcome::AcceptedInNewConversation { .. } => (
+            TurnDeliveryState::Delivered,
+            None,
+            Some(TurnDeliveryFailureReason::StartedNewConversation),
+            DeliveryTaskOutcome::Finished,
+        ),
         ProviderDeliveryOutcome::DefinitelyNotSent { detail } => (
             TurnDeliveryState::Pending,
             Some(detail),
@@ -1476,8 +1485,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_loss_cancels_an_inflight_provider_route_before_publication() {
+    async fn workspace_loss_preserves_ambiguity_after_provider_routing() {
         struct PendingRoute {
+            started: Arc<Semaphore>,
+            written: Arc<AtomicBool>,
             drops: Arc<AtomicUsize>,
         }
 
@@ -1488,6 +1499,11 @@ mod tests {
                 self: Pin<&mut Self>,
                 _context: &mut std::task::Context<'_>,
             ) -> std::task::Poll<Self::Output> {
+                if !self.written.swap(true, Ordering::SeqCst) {
+                    // Routing may write to the provider before waiting for its
+                    // acknowledgement. Dropping the future cannot undo that.
+                    self.started.add_permits(1);
+                }
                 std::task::Poll::Pending
             }
         }
@@ -1501,14 +1517,17 @@ mod tests {
         let registry = WorkspaceAvailabilityRegistry::new();
         let started = Arc::new(Semaphore::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
+        let written = Arc::new(AtomicBool::new(false));
         let router = guard_delivery_router(
             WorkspaceAdmissionController::registry_only(registry.clone()),
             Arc::new({
                 let started = started.clone();
                 let drops = drops.clone();
+                let written = written.clone();
                 move |_command, _delivery_key| {
-                    started.add_permits(1);
                     Box::pin(PendingRoute {
+                        started: started.clone(),
+                        written: written.clone(),
                         drops: drops.clone(),
                     })
                 }
@@ -1523,6 +1542,7 @@ mod tests {
             .expect("provider route starts")
             .forget();
 
+        assert!(written.load(Ordering::SeqCst));
         assert!(
             registry
                 .mark_unavailable(WorkspaceLossTransition {
@@ -1546,7 +1566,7 @@ mod tests {
         );
         assert!(matches!(
             route.await.expect("guarded route task"),
-            ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+            ProviderDeliveryOutcome::Ambiguous { .. }
         ));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
@@ -1692,6 +1712,17 @@ mod tests {
     #[test]
     fn provider_delivery_outcomes_have_explicit_durable_transitions() {
         assert_eq!(
+            provider_delivery_outcome(ProviderDeliveryOutcome::AcceptedInNewConversation {
+                turn_id: Some("fresh".to_owned())
+            }),
+            (
+                TurnDeliveryState::Delivered,
+                None,
+                Some(TurnDeliveryFailureReason::StartedNewConversation),
+                DeliveryTaskOutcome::Finished
+            ),
+        );
+        assert_eq!(
             provider_delivery_outcome(ProviderDeliveryOutcome::Accepted { turn_id: None }),
             (
                 TurnDeliveryState::Delivered,
@@ -1743,102 +1774,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refused_delivery_persists_reason_through_transition_retries() {
-        let database = Database::open_in_memory().await.expect("database");
-        database
-            .call(|connection| Ok(run_migrations(connection, None)?))
-            .await
-            .expect("migrations");
-        seed_pending(&database, "refused", "thread", 1).await;
-        database.call(|connection| {
+    async fn delivery_reason_persists_through_transition_retries_without_resending() {
+        for (outcome, expected_state, expected_reason, expected_detail, state_label) in [
+            (
+                ProviderDeliveryOutcome::Refused {
+                    detail: "model refused".to_owned(),
+                },
+                TurnDeliveryState::Failed,
+                "modelSelectionRefused",
+                Some("model refused"),
+                "failed",
+            ),
+            (
+                ProviderDeliveryOutcome::AcceptedInNewConversation {
+                    turn_id: Some("fresh".to_owned()),
+                },
+                TurnDeliveryState::Delivered,
+                "startedNewConversation",
+                None,
+                "delivered",
+            ),
+        ] {
+            let database = Database::open_in_memory().await.expect("database");
+            database
+                .call(|connection| Ok(run_migrations(connection, None)?))
+                .await
+                .expect("migrations");
+            seed_pending(&database, "refused", "thread", 1).await;
+            database.call(|connection| {
             connection.execute(
                 "INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES ('message-1', 'thread', 'user', 'refused', 0, 'created', 'created')", [],
             )?;
             Ok(())
         }).await.expect("message projection");
-        let hooks = TestHooks::default();
-        hooks.fail_next_delivery_transitions(2);
-        let engine = OrchestrationEngine::start(
-            database.clone(),
-            EngineOptions {
-                test_hooks: hooks.clone(),
-                ..EngineOptions::default()
-            },
-        )
-        .await
-        .expect("engine");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let router: ProviderDeliveryRouter = Arc::new({
-            let calls = calls.clone();
-            move |_, _| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Box::pin(ready(ProviderDeliveryOutcome::Refused {
-                    detail: "model refused".to_owned(),
-                }))
-            }
-        });
-        let service = TurnDeliveryService::start_with_delivery_router(
-            engine.clone(),
-            1,
-            router,
-            Arc::new(|_| Box::pin(ready(ProviderReconciliationOutcome::Absent))),
-        );
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let row = engine
-                    .repositories()
-                    .get_provider_turn_delivery("refused".to_owned())
-                    .await
-                    .expect("outbox")
-                    .expect("delivery");
-                if row.state == TurnDeliveryState::Failed {
-                    assert_eq!(row.attempts, 1);
-                    assert_eq!(row.last_error.as_deref(), Some("model refused"));
-                    break;
+            let hooks = TestHooks::default();
+            hooks.fail_next_delivery_transitions(2);
+            let engine = OrchestrationEngine::start(
+                database.clone(),
+                EngineOptions {
+                    test_hooks: hooks.clone(),
+                    ..EngineOptions::default()
+                },
+            )
+            .await
+            .expect("engine");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let router: ProviderDeliveryRouter = Arc::new({
+                let calls = calls.clone();
+                move |_, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(ready(outcome.clone()))
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("refusal persisted");
-        let reason = database
-            .call(|connection| {
-                Ok(connection.query_row(
+            });
+            let service = TurnDeliveryService::start_with_delivery_router(
+                engine.clone(),
+                1,
+                router,
+                Arc::new(|_| Box::pin(ready(ProviderReconciliationOutcome::Absent))),
+            );
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let row = engine
+                        .repositories()
+                        .get_provider_turn_delivery("refused".to_owned())
+                        .await
+                        .expect("outbox")
+                        .expect("delivery");
+                    if row.state == expected_state {
+                        assert_eq!(row.attempts, 1);
+                        assert_eq!(row.last_error.as_deref(), expected_detail);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("refusal persisted");
+            let reason = database
+                .call(|connection| {
+                    Ok(connection.query_row(
                     "SELECT failure_reason FROM provider_turn_outbox WHERE command_id = 'refused'",
                     [],
                     |row| row.get::<_, Option<String>>(0),
                 )?)
-            })
-            .await
-            .expect("outbox reason");
-        assert_eq!(reason.as_deref(), Some("modelSelectionRefused"));
-        let events = engine.read_events(0).await.expect("events");
-        let refused = events
-            .iter()
-            .filter(|event| {
-                event.event.event_type == "thread.turn-delivery-updated"
-                    && event.event.payload["state"] == "failed"
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(refused.len(), 1);
-        assert_eq!(
-            refused[0].event.payload["delivery"]["reason"],
-            "modelSelectionRefused"
-        );
-        let message = engine
-            .repositories()
-            .get_message("message-1".to_owned())
-            .await
-            .expect("message lookup")
-            .expect("message");
-        assert_eq!(
-            message.delivery_reason.as_deref(),
-            Some("modelSelectionRefused")
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(hooks.delivery_transition_attempts(), 3);
-        service.shutdown().await;
-        engine.shutdown().await;
+                })
+                .await
+                .expect("outbox reason");
+            assert_eq!(reason.as_deref(), Some(expected_reason));
+            let events = engine.read_events(0).await.expect("events");
+            let refused = events
+                .iter()
+                .filter(|event| {
+                    event.event.event_type == "thread.turn-delivery-updated"
+                        && event.event.payload["state"] == state_label
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(refused.len(), 1);
+            assert_eq!(
+                refused[0].event.payload["delivery"]["reason"],
+                expected_reason
+            );
+            let message = engine
+                .repositories()
+                .get_message("message-1".to_owned())
+                .await
+                .expect("message lookup")
+                .expect("message");
+            assert_eq!(message.delivery_reason.as_deref(), Some(expected_reason));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(hooks.delivery_transition_attempts(), 3);
+            service.shutdown().await;
+            engine.shutdown().await;
+        }
     }
 
     #[tokio::test]

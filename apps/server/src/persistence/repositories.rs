@@ -918,6 +918,33 @@ impl Repositories {
             .await
     }
 
+    /// Clears only a claimed start's lost native identity, preserving its payload and FIFO receipt.
+    pub(crate) async fn unfreeze_provider_turn_session(
+        &self,
+        command_id: String,
+        expected_attempt: i64,
+        provider_instance_id: String,
+        provider_kind: String,
+        provider_session_id: String,
+        updated_at: String,
+    ) -> Result<Option<ProviderTurnDelivery>> {
+        self.database.call(move |connection| {
+            connection.query_row(
+                "UPDATE provider_turn_outbox SET provider_session_id = NULL, updated_at = ? \
+                 WHERE command_id = ? AND state = 'sending' AND mode = 'start' AND attempts = ? \
+                   AND provider_instance_id = ? AND provider_kind = ? AND provider_session_id = ? \
+                   AND NOT EXISTS (SELECT 1 FROM provider_session_runtime AS runtime \
+                     WHERE runtime.thread_id = provider_turn_outbox.thread_id \
+                       AND (runtime.provider_name <> provider_turn_outbox.provider_kind \
+                         OR runtime.provider_instance_id IS NOT provider_turn_outbox.provider_instance_id \
+                         OR runtime.resume_cursor_json IS NOT NULL)) \
+                 RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
+                params![updated_at, command_id, expected_attempt, provider_instance_id, provider_kind, provider_session_id],
+                decode_provider_turn_delivery,
+            ).optional().map_err(Into::into)
+        }).await
+    }
+
     pub async fn replace_pending_provider_turn_payload(
         &self,
         command_id: String,
@@ -2914,4 +2941,263 @@ fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
         off_host: row.get(15)?,
         delivery_state: row.get(16)?,
     })
+}
+
+#[cfg(test)]
+mod frozen_session_unfreeze_tests {
+    use super::*;
+    use crate::persistence::{ProviderSessionRuntime, run_migrations};
+    use serde_json::json;
+
+    async fn fixture() -> Repositories {
+        let database = Database::open_in_memory().await.unwrap();
+        database.call(|connection| {
+            run_migrations(connection, None)?;
+            connection.execute(
+                "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, payload_digest) VALUES ('frozen', 'thread', 't1', 'created', 123, 'accepted', 'digest')", [],
+            )?;
+            connection.execute(
+                "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('frozen', 't1', 'm1', 'cursor-instance', 'cursor', 'old-session', 'same-key', '{\"text\":\"preserve\"}', 'sending', 3, 'previous error', 'created', 'before')", [],
+            )?;
+            Ok(())
+        }).await.unwrap();
+        Repositories::new(database)
+    }
+
+    async fn unfreeze(repositories: &Repositories) -> Option<ProviderTurnDelivery> {
+        repositories
+            .unfreeze_provider_turn_session(
+                "frozen".to_owned(),
+                3,
+                "cursor-instance".to_owned(),
+                "cursor".to_owned(),
+                "old-session".to_owned(),
+                "after".to_owned(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn runtime(
+        repositories: &Repositories,
+        provider: &str,
+        instance: Option<&str>,
+        cursor: Option<Value>,
+    ) {
+        repositories
+            .upsert_provider_session_runtime(ProviderSessionRuntime {
+                thread_id: "t1".to_owned(),
+                provider_name: provider.to_owned(),
+                provider_instance_id: instance.map(str::to_owned),
+                adapter_key: "cursor-acp".to_owned(),
+                runtime_mode: "full-access".to_owned(),
+                status: "suspended".to_owned(),
+                last_seen_at: "seen".to_owned(),
+                resume_cursor: cursor,
+                runtime_payload: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unfreeze_preserves_payload_fifo_receipt_and_attempt_for_missing_or_cursorless_runtime()
+    {
+        for cursorless_row in [false, true] {
+            let repositories = fixture().await;
+            if cursorless_row {
+                runtime(&repositories, "cursor", Some("cursor-instance"), None).await;
+            }
+            let row = unfreeze(&repositories)
+                .await
+                .expect("expected identity unfreezes");
+            assert_eq!(row.provider_session_id, None);
+            assert_eq!(row.state, TurnDeliveryState::Sending);
+            assert_eq!(row.attempts, 3);
+            assert_eq!(row.payload, json!({"text":"preserve"}));
+            assert_eq!(row.delivery_key, "same-key");
+            assert_eq!(row.last_error.as_deref(), Some("previous error"));
+            assert_eq!(row.created_at, "created");
+            let sequence: i64 = repositories.database.call(|connection| {
+                Ok(connection.query_row("SELECT result_sequence FROM orchestration_command_receipts WHERE command_id = 'frozen'", [], |row| row.get(0))?)
+            }).await.unwrap();
+            assert_eq!(sequence, 123);
+            assert!(
+                unfreeze(&repositories).await.is_none(),
+                "the old freeze cannot clear twice"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unfreeze_rejects_wrong_command_attempt_instance_provider_native_session_state_or_mode()
+    {
+        for (command, attempt, instance, provider, session, state, mode) in [
+            (
+                "other",
+                3,
+                "cursor-instance",
+                "cursor",
+                "old-session",
+                "sending",
+                "start",
+            ),
+            (
+                "frozen",
+                2,
+                "cursor-instance",
+                "cursor",
+                "old-session",
+                "sending",
+                "start",
+            ),
+            (
+                "frozen",
+                3,
+                "other",
+                "cursor",
+                "old-session",
+                "sending",
+                "start",
+            ),
+            (
+                "frozen",
+                3,
+                "cursor-instance",
+                "claudeAgent",
+                "old-session",
+                "sending",
+                "start",
+            ),
+            (
+                "frozen",
+                3,
+                "cursor-instance",
+                "cursor",
+                "other",
+                "sending",
+                "start",
+            ),
+            (
+                "frozen",
+                3,
+                "cursor-instance",
+                "cursor",
+                "old-session",
+                "pending",
+                "start",
+            ),
+            (
+                "frozen",
+                3,
+                "cursor-instance",
+                "cursor",
+                "old-session",
+                "delivered",
+                "start",
+            ),
+            (
+                "frozen",
+                3,
+                "cursor-instance",
+                "cursor",
+                "old-session",
+                "uncertain",
+                "start",
+            ),
+            (
+                "frozen",
+                3,
+                "cursor-instance",
+                "cursor",
+                "old-session",
+                "dismissed",
+                "start",
+            ),
+            (
+                "frozen",
+                3,
+                "cursor-instance",
+                "cursor",
+                "old-session",
+                "sending",
+                "steer",
+            ),
+        ] {
+            let repositories = fixture().await;
+            repositories
+                .database
+                .call(move |connection| {
+                    connection.execute(
+                        "UPDATE provider_turn_outbox SET state = ?, mode = ?",
+                        params![state, mode],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert!(
+                repositories
+                    .unfreeze_provider_turn_session(
+                        command.to_owned(),
+                        attempt,
+                        instance.to_owned(),
+                        provider.to_owned(),
+                        session.to_owned(),
+                        "after".to_owned(),
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let row = repositories
+                .get_provider_turn_delivery("frozen".to_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.provider_session_id.as_deref(), Some("old-session"));
+            assert_eq!(row.updated_at, "before");
+        }
+    }
+
+    #[tokio::test]
+    async fn unfreeze_cas_refuses_runtime_resume_or_identity_restored_after_loss_was_observed() {
+        for (provider, instance, cursor) in [
+            (
+                "cursor",
+                Some("cursor-instance"),
+                Some(json!({"sessionId":"old-session"})),
+            ),
+            (
+                "cursor",
+                Some("cursor-instance"),
+                Some(json!({"sessionId":"replacement"})),
+            ),
+            ("cursor", Some("other"), None),
+            ("codex", Some("cursor-instance"), None),
+            ("cursor", None, None),
+        ] {
+            let repositories = fixture().await;
+            runtime(&repositories, provider, instance, cursor.clone()).await;
+            assert!(unfreeze(&repositories).await.is_none());
+            assert_eq!(
+                repositories
+                    .get_provider_turn_delivery("frozen".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .provider_session_id
+                    .as_deref(),
+                Some("old-session")
+            );
+            let retained = repositories
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.resume_cursor, cursor);
+            assert_eq!(retained.provider_name, provider);
+            assert_eq!(retained.provider_instance_id.as_deref(), instance);
+        }
+    }
 }
