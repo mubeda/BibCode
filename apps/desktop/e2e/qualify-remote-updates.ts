@@ -40,6 +40,7 @@ import {
   countInstallRequests,
   projectRemoteUiSetupObservation,
   projectRemoteUiCheckAgainObservation,
+  projectRemoteUiSuccessRemovalObservation,
   type RemoteUiTheme,
   type RemoteUiScene,
 } from "./support/remote-ui-evidence.ts";
@@ -485,6 +486,28 @@ type RemoveHostOperation =
   | "toast-displayed"
   | "toast-click";
 
+const SUCCESS_REMOVE_PHASES = {
+  settings: "success-remove-settings",
+  more: "success-remove-more",
+  remove: "success-remove-remove",
+  confirm: "success-remove-confirm",
+  "more-displayed": "success-remove-more-displayed",
+  "more-clickable": "success-remove-more-clickable",
+  "more-click": "success-remove-more-click",
+  "remove-displayed": "success-remove-remove-displayed",
+  "remove-clickable": "success-remove-remove-clickable",
+  "remove-click": "success-remove-remove-click",
+  "confirm-displayed": "success-remove-confirm-displayed",
+  "confirm-clickable": "success-remove-confirm-clickable",
+  "confirm-click": "success-remove-confirm-click",
+  "row-removed": "success-remove-row-removed",
+  "child-stop": "success-remove-child-stop",
+  "tunnel-close": "success-remove-tunnel-close",
+  "toast-list": "success-remove-toast-list",
+  "toast-displayed": "success-remove-toast-displayed",
+  "toast-click": "success-remove-toast-click",
+} as const satisfies Record<RemoveHostOperation, string>;
+
 async function removeHost(host: Host, observe?: (operation: RemoveHostOperation) => void) {
   const observeStep = (operation: RemoveHostOperation) => {
     try {
@@ -917,7 +940,7 @@ async function successFlow() {
     draftRetained: true,
     newVersionObserved: "9.9.1",
   });
-  await removeHost(host);
+  await removeHost(host, (operation) => phase(SUCCESS_REMOVE_PHASES[operation]));
 }
 
 async function failureFlow() {
@@ -1617,11 +1640,12 @@ try {
   let startup: unknown = null;
   let setup: ReturnType<typeof projectRemoteUiSetupObservation> = null;
   let checkAgain: ReturnType<typeof projectRemoteUiCheckAgainObservation> = null;
+  let successRemoval: ReturnType<typeof projectRemoteUiSuccessRemovalObservation> = null;
   if (browser) {
     try {
       const observed = await bounded(
         browser.execute(
-          (input?: { checkAgain: boolean; theme: string }) => {
+          (input?: { checkAgain: boolean; successRemoval: boolean; theme: string }) => {
             const observer = Reflect.get(window, "__browserStartupObservation") as
               | { read?: () => unknown }
               | undefined;
@@ -1763,9 +1787,54 @@ try {
                 dismissPresent: buttons.some((button) => label(button) === "Dismiss"),
               };
             };
+            const readSuccessRemoval = () => {
+              if (input?.successRemoval !== true) return null;
+              const safeLocation =
+                (input.theme === "light" || input.theme === "dark") &&
+                location.origin === "http://localhost:4901" &&
+                location.pathname === "/settings/remote-servers" &&
+                location.search === "" &&
+                location.hash === "" &&
+                document.documentElement.classList.contains("dark") === (input.theme === "dark") &&
+                document.querySelector(
+                  '#pairing-token,input[type="password"],input[autocomplete="one-time-code"],textarea[placeholder^="bibcode://pair"]',
+                ) === null;
+              if (!safeLocation) return { safeLocation: false };
+              const count = (size: number) =>
+                size === 0 ? "none" : size === 1 ? "one" : "multiple";
+              const rows = Array.from(document.querySelectorAll("h3")).filter((heading) => {
+                const content = heading.textContent ?? "";
+                return content.length <= 64 && content.trim() === `QA Success ${input.theme}`;
+              });
+              const closes = Array.from(
+                document.querySelectorAll('button[data-slot="toast-close"]'),
+              );
+              const visibleCloses = closes.filter((close) => {
+                const style = getComputedStyle(close);
+                return (
+                  close.getClientRects().length > 0 &&
+                  style.visibility !== "hidden" &&
+                  style.display !== "none"
+                );
+              });
+              const endingToasts = new Set(
+                closes
+                  .map((close) => close.closest("[data-ending-style]"))
+                  .filter((toast) => toast !== null),
+              );
+              return {
+                safeLocation,
+                rowCount: count(rows.length),
+                toastCloseCount: count(closes.length),
+                visibleToastCloseCount: count(visibleCloses.length),
+                endingToastCount: count(endingToasts.size),
+                removalDialogPresent: document.querySelector('[role="alertdialog"]') !== null,
+              };
+            };
             return {
               startup: observer?.read?.() ?? null,
               checkAgain: readCheckAgain(),
+              successRemoval: readSuccessRemoval(),
               setup: {
                 route:
                   location.pathname === "/pair"
@@ -1800,6 +1869,9 @@ try {
               "failure-check-again-click",
               "failure-check-again-row",
             ].includes(currentPhase),
+            successRemoval: Object.values(SUCCESS_REMOVE_PHASES).some(
+              (value) => value === currentPhase,
+            ),
             theme: currentTheme,
           },
         ),
@@ -1808,6 +1880,7 @@ try {
       startup = projectBrowserStartupObservation(observed.startup);
       setup = projectRemoteUiSetupObservation(observed.setup);
       checkAgain = projectRemoteUiCheckAgainObservation(observed.checkAgain);
+      successRemoval = projectRemoteUiSuccessRemovalObservation(observed.successRemoval);
     } catch {
       /* Closed unavailable evidence; no fallback app state. */
     }
@@ -1820,6 +1893,7 @@ try {
     startup,
     setup,
     checkAgain,
+    successRemoval,
     reloadPrimaryThreadProof:
       currentPhase === "reload-primary-thread-proof"
         ? projectReloadPrimaryThreadWitness(reloadPrimaryThreadWitness)

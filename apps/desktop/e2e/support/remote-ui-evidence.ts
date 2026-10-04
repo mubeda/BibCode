@@ -31,6 +31,45 @@ export const remoteUiScenes = [
 ] as const;
 export type RemoteUiScene = (typeof remoteUiScenes)[number];
 
+/** One current removal snapshot after failure; never proof of an earlier control's absence. */
+export function projectRemoteUiSuccessRemovalObservation(input: unknown) {
+  if (input === null || typeof input !== "object") return null;
+  const row: Record<string, unknown> = {};
+  try {
+    if (Array.isArray(input)) return null;
+    for (const key of [
+      "safeLocation",
+      "rowCount",
+      "toastCloseCount",
+      "visibleToastCloseCount",
+      "endingToastCount",
+      "removalDialogPresent",
+    ]) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (descriptor === undefined) continue;
+      if (!descriptor.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      row[key] = descriptor.value;
+    }
+  } catch {
+    return null;
+  }
+  const safeLocation = typeof row.safeLocation === "boolean" ? row.safeLocation : null;
+  const source: Record<string, unknown> = safeLocation === true ? row : {};
+  const count = (key: string) =>
+    typeof source[key] === "string" && ["none", "one", "multiple"].includes(source[key])
+      ? source[key]
+      : null;
+  return {
+    safeLocation,
+    rowCount: count("rowCount"),
+    toastCloseCount: count("toastCloseCount"),
+    visibleToastCloseCount: count("visibleToastCloseCount"),
+    endingToastCount: count("endingToastCount"),
+    removalDialogPresent:
+      typeof source.removalDialogPresent === "boolean" ? source.removalDialogPresent : null,
+  };
+}
+
 /** Closed facts from one current row after failure; never proof of the earlier click. */
 export function projectRemoteUiCheckAgainObservation(input: unknown) {
   if (input === null || typeof input !== "object") return null;

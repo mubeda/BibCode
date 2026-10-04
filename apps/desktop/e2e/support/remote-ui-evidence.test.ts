@@ -10,6 +10,7 @@ import {
   remoteUiPlan,
   projectRemoteUiSetupObservation,
   projectRemoteUiCheckAgainObservation,
+  projectRemoteUiSuccessRemovalObservation,
 } from "./remote-ui-evidence.ts";
 
 it("projects only closed setup facts and preserves unknown versus absent observations", () => {
@@ -326,4 +327,120 @@ it("locally refuses descriptor inspection failures and keeps unknown accessors u
   expect(Object.values(projectRemoteUiCheckAgainObservation(Object.create(known))!)).toEqual(
     Array(10).fill(null),
   );
+});
+
+const successRemovalFacts = {
+  safeLocation: true,
+  rowCount: "none",
+  toastCloseCount: "one",
+  visibleToastCloseCount: "none",
+  endingToastCount: "one",
+  removalDialogPresent: false,
+};
+
+it("keeps success-removal snapshots closed without treating absent controls as prior click proof", () => {
+  for (const input of [undefined, null, [], "private-credential"])
+    expect(projectRemoteUiSuccessRemovalObservation(input)).toBeNull();
+  expect(projectRemoteUiSuccessRemovalObservation(successRemovalFacts)).toEqual(
+    successRemovalFacts,
+  );
+  for (const field of Object.keys(successRemovalFacts)) {
+    const output = projectRemoteUiSuccessRemovalObservation({
+      ...successRemovalFacts,
+      [field]: "private-credential /private/path http://private-host",
+      privateText: "private-credential",
+    });
+    expect(output![field as keyof typeof output]).toBeNull();
+    expect(Object.keys(output!)).toEqual(Object.keys(successRemovalFacts));
+    expect(JSON.stringify(output)).not.toContain("private-");
+  }
+  for (const safeLocation of [false, undefined, "true"]) {
+    expect(
+      projectRemoteUiSuccessRemovalObservation({ ...successRemovalFacts, safeLocation }),
+    ).toEqual({
+      safeLocation: safeLocation === false ? false : null,
+      rowCount: null,
+      toastCloseCount: null,
+      visibleToastCloseCount: null,
+      endingToastCount: null,
+      removalDialogPresent: null,
+    });
+  }
+  for (const value of ["none", "one", "multiple"]) {
+    expect(
+      projectRemoteUiSuccessRemovalObservation({
+        ...successRemovalFacts,
+        rowCount: value,
+        toastCloseCount: value,
+        visibleToastCloseCount: value,
+        endingToastCount: value,
+      }),
+    ).toEqual({
+      ...successRemovalFacts,
+      rowCount: value,
+      toastCloseCount: value,
+      visibleToastCloseCount: value,
+      endingToastCount: value,
+    });
+  }
+});
+
+it.each(["accessor", "throwing-accessor", "nonenumerable", "inherited"])(
+  "does not execute untrusted success-removal fact readers: %s",
+  (kind) => {
+    for (const field of Object.keys(successRemovalFacts)) {
+      let reads = 0;
+      const input: Record<string, unknown> = { ...successRemovalFacts };
+      delete input[field];
+      if (kind === "inherited")
+        Object.setPrototypeOf(input, { [field]: Reflect.get(successRemovalFacts, field) });
+      else
+        Object.defineProperty(
+          input,
+          field,
+          kind === "nonenumerable"
+            ? { enumerable: false, value: Reflect.get(successRemovalFacts, field) }
+            : {
+                enumerable: true,
+                get() {
+                  reads++;
+                  if (kind === "throwing-accessor") throw new Error("private getter/error");
+                  return Reflect.get(successRemovalFacts, field);
+                },
+              },
+        );
+      let output: ReturnType<typeof projectRemoteUiSuccessRemovalObservation>;
+      expect(() => {
+        output = projectRemoteUiSuccessRemovalObservation(input);
+      }).not.toThrow();
+      if (kind === "inherited") expect(output![field as keyof typeof output]).toBeNull();
+      else expect(output!).toBeNull();
+      expect(reads).toBe(0);
+    }
+  },
+);
+
+it("quarantines unreadable success-removal proxies and leaves unrelated private fields unread", () => {
+  const revoked = Proxy.revocable(successRemovalFacts, {});
+  revoked.revoke();
+  const throwing = new Proxy(successRemovalFacts, {
+    getOwnPropertyDescriptor() {
+      throw new Error("private descriptor/error");
+    },
+  });
+  for (const input of [throwing, revoked.proxy]) {
+    expect(() => projectRemoteUiSuccessRemovalObservation(input)).not.toThrow();
+    expect(projectRemoteUiSuccessRemovalObservation(input)).toBeNull();
+  }
+  const input = Object.assign(Object.create(null), successRemovalFacts);
+  Object.defineProperty(input, "privateRawText", {
+    enumerable: true,
+    get() {
+      throw new Error("Unknown fields must remain unread.");
+    },
+  });
+  expect(projectRemoteUiSuccessRemovalObservation(input)).toEqual(successRemovalFacts);
+  expect(
+    Object.values(projectRemoteUiSuccessRemovalObservation(Object.create(successRemovalFacts))!),
+  ).toEqual(Array(6).fill(null));
 });

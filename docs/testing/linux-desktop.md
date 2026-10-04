@@ -711,6 +711,17 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   add no UI action or wait and do not identify a native cause by themselves.
   Isolate optional preparation-observer exceptions so the original actions
   continue; keep ordinary phase, UI/read and capture failures fail-closed.
+  Success-case removal records fixed Settings/menu/confirmation, row-absence,
+  child/tunnel cleanup and notification-list/visibility/click phases through the
+  existing observer. One existing bounded failure sample may retain a closed
+  `successRemoval` snapshot only for those phases on the exact owned origin and
+  Remote Servers route, with no query/hash or credential controls and the admitted
+  theme. It contains row/notification-close/visible-close/ending-toast count
+  categories and removal-dialog presence; missing or unsafe observations remain
+  unavailable. Ending-toast counts use distinct ending ancestors of the current
+  close controls. These current facts do not prove an earlier target disappeared
+  or identify the failed click. Keep the original failure and joined cleanup;
+  add no actions, waits, retries, forced clicks or changed notification lifetime.
   Import diagnostics also retain the path control's disabled/busy flag and a
   finite category for the form's existing validation messages. Missing forms are
   unknown; other errors are unclassified. The path value and error text never

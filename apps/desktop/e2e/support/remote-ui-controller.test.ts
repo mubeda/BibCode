@@ -22,11 +22,21 @@ import {
   screenshotName,
   projectRemoteUiSetupObservation,
   projectRemoteUiCheckAgainObservation,
+  projectRemoteUiSuccessRemovalObservation,
 } from "./remote-ui-evidence.ts";
 
 const controller = NodeFS.readFileSync(
   new URL("../qualify-remote-updates.ts", import.meta.url),
   "utf8",
+);
+
+const successRemovalPhases: Record<string, string> = NodeVM.runInNewContext(
+  NodeModule.stripTypeScriptTypes(
+    controller.slice(
+      controller.indexOf("const SUCCESS_REMOVE_PHASES"),
+      controller.indexOf("async function removeHost("),
+    ) + "\nSUCCESS_REMOVE_PHASES",
+  ),
 );
 
 it.each([false, true])(
@@ -823,6 +833,8 @@ it.each(["unavailable", "no-browser", "write-failure", "manual-assertion"])(
         },
         projectRemoteUiSetupObservation,
         projectRemoteUiCheckAgainObservation,
+        projectRemoteUiSuccessRemovalObservation,
+        SUCCESS_REMOVE_PHASES: successRemovalPhases,
         classifyQualificationFailure: () => ({ kind: "timeout" }),
         owner: {
           processes: [],
@@ -1612,7 +1624,7 @@ it.each([
         browser: {
           execute: async (_read: unknown, input: unknown) => {
             samples++;
-            expect(input).toEqual({ checkAgain: true, theme: "light" });
+            expect(input).toEqual({ checkAgain: true, successRemoval: false, theme: "light" });
             return { startup: {}, setup: null, checkAgain: payload };
           },
           deleteSession: async () => {
@@ -1626,6 +1638,8 @@ it.each([
         projectBrowserStartupObservation: () => ({ errors: 0 }),
         projectRemoteUiSetupObservation,
         projectRemoteUiCheckAgainObservation,
+        projectRemoteUiSuccessRemovalObservation,
+        SUCCESS_REMOVE_PHASES: successRemovalPhases,
         classifyQualificationFailure: (error: unknown) => {
           expect(error).toBe(failure);
           return { kind: "click-intercepted" };
@@ -2361,6 +2375,7 @@ it("retains only the same-read closed primary witness at the exact failed proof 
       startup: null,
       setup: null,
       checkAgain: null,
+      successRemoval: null,
       reloadPrimaryThreadWitness: {
         requestAdmitted: true,
         httpStatus: "forbidden",
@@ -2741,3 +2756,178 @@ it("binds only fixed queue removal slot/stage markers after the unchanged core a
   ]);
   expect(JSON.stringify(phases)).not.toMatch(/private|label|http/);
 });
+
+it.each([
+  "settings",
+  "more-displayed",
+  "more-clickable",
+  "more-click",
+  "remove-displayed",
+  "remove-clickable",
+  "remove-click",
+  "confirm-displayed",
+  "confirm-clickable",
+  "confirm-click",
+  "row-removed",
+  "child-stop",
+  "tunnel-close",
+  "toast-list",
+  "toast-displayed",
+  "toast-click",
+])(
+  "attributes the actual success removal failure without changing actions or error identity: %s",
+  async (failed) => {
+    const successStart = controller.indexOf("async function successFlow()");
+    const successEnd = controller.indexOf("\nasync function failureFlow()", successStart);
+    const flow = controller.slice(successStart, successEnd);
+    const tailStart = flow.indexOf("  assertions.push({", flow.indexOf('"success-keeps-draft"'));
+    const tail = flow.slice(tailStart, flow.lastIndexOf("\n}"));
+    const mapStart = controller.indexOf("const SUCCESS_REMOVE_PHASES");
+    const mapEnd = controller.indexOf("async function removeHost(", mapStart);
+    const map = mapStart < 0 ? "" : controller.slice(mapStart, mapEnd);
+    const baseline = removalReplay(failed);
+    await expect(baseline.remove(baseline.host)).rejects.toBe(baseline.failure);
+    for (const throwingObserver of [false, true]) {
+      const probe = removalReplay(failed);
+      const phases: string[] = [];
+      const assertions: Array<Record<string, unknown>> = [];
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(map + "async function tail(){" + tail + "\n}\ntail"),
+        {
+          currentTheme: "light",
+          host: probe.host,
+          assertions,
+          removeHost: probe.remove,
+          phase: (value: string) => {
+            phases.push(value);
+            expect(assertions).toHaveLength(1);
+            if (throwingObserver) throw new Error("inert observer failure");
+          },
+        },
+      );
+      await expect(run()).rejects.toBe(probe.failure);
+      expect(probe.calls).toEqual(baseline.calls);
+      expect(phases.at(-1)).toBe(`success-remove-${failed}`);
+      expect(phases[0]).toBe("success-remove-settings");
+      expect(assertions).toEqual([
+        {
+          theme: "light",
+          kind: "confirmation-and-progress",
+          rowCancel: true,
+          cardCancel: true,
+          remountPreservedRun: true,
+          exactInstallRequests: 1,
+          draftRetained: true,
+          newVersionObserved: "9.9.1",
+        },
+      ]);
+      expect(JSON.stringify(phases)).not.toMatch(/inert|private|label|http/);
+    }
+  },
+);
+
+it.each([
+  "success-remove-toast-displayed",
+  "success-remove-toast-click",
+  "success-initial-row",
+  "success-remove-unknown",
+])(
+  "samples success-removal evidence once at the original failure/cleanup seam: %s",
+  async (currentPhase) => {
+    const facts = {
+      safeLocation: true,
+      rowCount: "none",
+      toastCloseCount: "one",
+      visibleToastCloseCount: "none",
+      endingToastCount: "one",
+      removalDialogPresent: false,
+    };
+    for (const unavailable of [false, true]) {
+      const start = controller.indexOf(
+        "} catch (error) {",
+        controller.indexOf('phase("complete")'),
+      );
+      const end = controller.indexOf("\nprocess.exitCode", start);
+      const original = new Error("inert original failure");
+      let samples = 0,
+        joined = false;
+      const writes = new Map<string, Record<string, unknown>>();
+      const admitted = ["success-remove-toast-displayed", "success-remove-toast-click"].includes(
+        currentPhase,
+      );
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          "async function fail(){ try { throw original; " +
+            controller.slice(start, end) +
+            "}\nfail",
+        ),
+        {
+          original,
+          currentPhase,
+          currentTheme: "light",
+          success: false,
+          BrowserConnectivityFailure: class extends Error {},
+          networkProofs: [],
+          SUCCESS_REMOVE_PHASES: successRemovalPhases,
+          browser: {
+            execute: async (_read: unknown, input: unknown) => {
+              samples++;
+              expect(input).toEqual({
+                checkAgain: false,
+                successRemoval: admitted,
+                theme: "light",
+              });
+              if (unavailable) throw new Error("inert observation failure");
+              return {
+                startup: null,
+                setup: null,
+                checkAgain: null,
+                successRemoval: admitted ? facts : null,
+              };
+            },
+            deleteSession: async () => {
+              joined = true;
+            },
+          },
+          bounded: (promise: Promise<unknown>, timeout: number) => {
+            expect(timeout).toBe(2_000);
+            return promise;
+          },
+          projectBrowserStartupObservation: () => null,
+          projectRemoteUiSetupObservation,
+          projectRemoteUiCheckAgainObservation,
+          projectRemoteUiSuccessRemovalObservation,
+          classifyQualificationFailure: (error: unknown) => {
+            expect(error).toBe(original);
+            return { kind: "missing-element" };
+          },
+          readManualAssertionCode: () => null,
+          owner: {
+            processes: [],
+            failures: [],
+            childrenClosed: () => joined,
+            close: async (resources: { browser?: () => Promise<void> }) => {
+              await resources.browser?.();
+            },
+          },
+          tunnels: [],
+          plan: remoteUiPlan("core"),
+          captures: [],
+          assertions: [],
+          bundleVersion: "0.7.2",
+          process: { env: {} },
+          write: (name: string, value: Record<string, unknown>) => writes.set(name, value),
+        },
+      );
+      await run();
+      expect(samples).toBe(1);
+      expect(joined).toBe(true);
+      expect(writes.get("failure")).toMatchObject({
+        phase: currentPhase,
+        failure: { kind: "missing-element" },
+        successRemoval: admitted && !unavailable ? facts : null,
+      });
+      expect(writes.get("result")).toMatchObject({ success: false, childProcessesClosed: true });
+    }
+  },
+);
