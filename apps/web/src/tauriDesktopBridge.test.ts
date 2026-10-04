@@ -6,10 +6,12 @@ import {
   verifyPreparedStorageIdentity,
 } from "@bibcode/client-runtime/connection";
 import { AcceptedStorageIdentityStore } from "@bibcode/client-runtime/platform";
+import { makeEnvironmentHttpApiClient, remoteHttpClientLayer } from "@bibcode/client-runtime/rpc";
 import { DEFAULT_CLIENT_SETTINGS, type DesktopBridge, EnvironmentId } from "@bibcode/contracts";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
 import { it as effectIt } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -1278,6 +1280,190 @@ describe("tauriDesktopBridge", () => {
 
     expect(harness.unlisteners.get("desktop:menu-action")).toHaveBeenCalledTimes(1);
     expect(harness.unlisteners.get("desktop:update-state")).toHaveBeenCalledTimes(1);
+  });
+
+  effectIt.effect(
+    "keeps typed pairing requests authorized when another consumer refreshes the bridge after backend-ready",
+    () =>
+      Effect.gen(function* () {
+        let bootstraps = [{ ...defaultLocalEnvironmentBootstrap, bootstrapToken: "bootstrap-1" }];
+        const harness = installTauriHarness({ localEnvironmentBootstraps: () => bootstraps });
+        Object.defineProperty(window, "location", {
+          configurable: true,
+          value: { origin: "tauri://localhost", href: "tauri://localhost/settings" },
+        });
+        let exchanges = 0;
+        let currentBearer: string | null = null;
+        // The native issuer keeps only its latest desktop bearer session. This inert
+        // transport enforces that contract; the bridge, event and HTTP client are real.
+        const fetchFixture = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const request = new Request(input, init);
+          const pathname = new URL(request.url).pathname;
+          if (pathname === "/oauth/token") {
+            const form = new URLSearchParams(await request.text());
+            expect(form.get("subject_token")).toBe(bootstraps[0]?.bootstrapToken);
+            currentBearer = `issued-bearer-${++exchanges}`;
+            return Response.json({ access_token: currentBearer });
+          }
+          if (request.headers.get("authorization") !== `Bearer ${currentBearer}`) {
+            return Response.json(
+              {
+                _tag: "EnvironmentAuthInvalidError",
+                code: "auth_invalid",
+                reason: "invalid_credential",
+                traceId: "superseded-session",
+              },
+              { status: 401 },
+            );
+          }
+          if (pathname === "/api/auth/pairing-offer/cancel") {
+            return Response.json({ cancelled: true });
+          }
+          if (pathname === "/api/auth/pairing-offer") {
+            return Response.json({
+              id: "offer-1",
+              code: "pairing-offer",
+              reach: "another-device",
+              endpoint: defaultLocalEnvironmentBootstrap.httpBaseUrl,
+              name: "Shared host",
+              expiresAt: "2099-01-01T00:00:00Z",
+            });
+          }
+          throw new Error("Unexpected inert auth request.");
+        });
+        vi.stubGlobal("fetch", fetchFixture);
+        const bridge = yield* Effect.promise(installBridge);
+        const { readDesktopPrimaryBearerToken } = yield* Effect.promise(
+          () => import("./environments/primary/desktopAuth"),
+        );
+        const client = yield* Effect.promise(() => import("./environments/primary/httpClient"));
+        const { makePrimaryEnvironmentHttpLayer } = yield* Effect.promise(
+          () => import("./environments/primary/httpLayer"),
+        );
+        return yield* Effect.gen(function* () {
+          const api = yield* client.PrimaryEnvironmentHttpClient;
+          const offerInput = {
+            name: "Shared host",
+            endpoint: defaultLocalEnvironmentBootstrap.httpBaseUrl,
+            reach: "another-device" as const,
+          };
+          const [first, directBefore] = yield* Effect.promise(() =>
+            Promise.all([readDesktopPrimaryBearerToken(), bridge.getLocalEnvironmentBearerToken()]),
+          );
+          expect(directBefore).toBe(first);
+          expect(exchanges).toBe(1);
+          const before = yield* api.auth.pairingOffer({
+            headers: { "idempotency-key": "before-ready" },
+            payload: offerInput,
+          });
+          expect(before.id).toBe("offer-1");
+          expect(
+            yield* api.auth.cancelPairingOffer({
+              headers: {},
+              payload: { idempotencyKey: "before-ready" },
+            }),
+          ).toEqual({ cancelled: true });
+
+          bootstraps = [{ ...defaultLocalEnvironmentBootstrap, bootstrapToken: "bootstrap-2" }];
+          const backendReady = harness.listeners.get("desktop:backend-ready");
+          expect(backendReady).toBeTypeOf("function");
+          backendReady!({ payload: { reason: "restarted", bootstraps } });
+          const refreshed = yield* Effect.promise(() => bridge.getLocalEnvironmentBearerToken());
+          expect(refreshed).not.toBe(first);
+          // The revoked-token control uses the same real typed response decoder.
+          const stale = yield* makeEnvironmentHttpApiClient(
+            defaultLocalEnvironmentBootstrap.httpBaseUrl,
+          ).pipe(
+            Effect.flatMap((raw) =>
+              raw.auth.cancelPairingOffer({
+                headers: { authorization: `Bearer ${first}` },
+                payload: { idempotencyKey: "stale-control" },
+              }),
+            ),
+            Effect.provide(remoteHttpClientLayer(fetchFixture)),
+            Effect.result,
+          );
+          expect(stale).toMatchObject({
+            _tag: "Failure",
+            failure: { _tag: "EnvironmentAuthInvalidError", reason: "invalid_credential" },
+          });
+
+          const after = yield* api.auth.pairingOffer({
+            headers: { "idempotency-key": "after-ready" },
+            payload: offerInput,
+          });
+          expect(after.id).toBe("offer-1");
+          expect(
+            yield* api.auth.cancelPairingOffer({
+              headers: {},
+              payload: { idempotencyKey: "after-ready" },
+            }),
+          ).toEqual({ cancelled: true });
+          const [primary, direct] = yield* Effect.promise(() =>
+            Promise.all([readDesktopPrimaryBearerToken(), bridge.getLocalEnvironmentBearerToken()]),
+          );
+          expect(primary).toBe(refreshed);
+          expect(direct).toBe(refreshed);
+          expect(exchanges).toBe(2);
+          expect(window.desktopBridge).toBe(bridge);
+        }).pipe(
+          Effect.provide(client.layer.pipe(Layer.provide(makePrimaryEnvironmentHttpLayer()))),
+        );
+      }),
+  );
+
+  it("retains the current bearer when an older exchange rejects after backend-ready", async () => {
+    let bootstraps = [{ ...defaultLocalEnvironmentBootstrap, bootstrapToken: "first-bootstrap" }];
+    const harness = installTauriHarness({ localEnvironmentBootstraps: () => bootstraps });
+    let rejectFirst: ((error: Error) => void) | undefined;
+    let exchanges = 0;
+    vi.stubGlobal("fetch", async () => {
+      exchanges++;
+      if (exchanges === 1)
+        return new Promise<Response>((_resolve, reject) => {
+          rejectFirst = reject;
+        });
+      return Response.json({ access_token: `current-${exchanges}` });
+    });
+    const bridge = await installBridge();
+    const first = bridge.getLocalEnvironmentBearerToken().catch((error: unknown) => error);
+    await vi.waitFor(() => expect(rejectFirst).toBeTypeOf("function"));
+    bootstraps = [{ ...defaultLocalEnvironmentBootstrap, bootstrapToken: "second-bootstrap" }];
+    harness.listeners.get("desktop:backend-ready")!({
+      payload: { reason: "restarted", bootstraps },
+    });
+    const replacement = await bridge.getLocalEnvironmentBearerToken();
+    rejectFirst!(new Error("Old exchange rejected."));
+    await first;
+    const current = await bridge.getLocalEnvironmentBearerToken();
+    expect(current).toBe(replacement);
+    expect(exchanges).toBe(2);
+  });
+
+  it("shares a current exchange failure and coalesces its next retry across consumers", async () => {
+    installTauriHarness();
+    const failure = new Error("Current exchange failed.");
+    let exchanges = 0;
+    vi.stubGlobal("fetch", async () => {
+      exchanges++;
+      if (exchanges === 1) throw failure;
+      return Response.json({ access_token: "recovered-bearer" });
+    });
+    const bridge = await installBridge();
+    const { readDesktopPrimaryBearerToken } = await import("./environments/primary/desktopAuth");
+    const rejected = await Promise.allSettled([
+      readDesktopPrimaryBearerToken(),
+      bridge.getLocalEnvironmentBearerToken(),
+    ]);
+    expect(rejected).toEqual([
+      { status: "rejected", reason: failure },
+      { status: "rejected", reason: failure },
+    ]);
+    expect(exchanges).toBe(1);
+    await expect(
+      Promise.all([readDesktopPrimaryBearerToken(), bridge.getLocalEnvironmentBearerToken()]),
+    ).resolves.toEqual(["recovered-bearer", "recovered-bearer"]);
+    expect(exchanges).toBe(2);
   });
 
   it("refreshes cached local bootstraps and bearer tokens from backend-ready events without reinstalling the bridge", async () => {
