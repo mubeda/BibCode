@@ -589,7 +589,9 @@ async function removeHost(host: Host, observe?: (operation: RemoveHostOperation)
               message,
             ) &&
             message !==
-              `Can't call click on element with selector "${toastClose}" because element wasn't found`
+              `Can't call click on element with selector "${toastClose}" because element wasn't found` &&
+            message !==
+              `Can't call scrollIntoView on element with selector "${toastClose}" because element wasn't found`
           ) {
             observeStep("toast-click-unrecognized");
             try {

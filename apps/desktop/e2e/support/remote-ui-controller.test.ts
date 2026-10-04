@@ -2412,6 +2412,7 @@ function removalReplay(
     toastCount?: number;
     signatures?: WeakMap<object, unknown>;
     signatureFault?: boolean;
+    sdkClick?: () => Promise<unknown>;
   } = {},
 ) {
   const start = controller.indexOf("async function removeHost(");
@@ -2467,6 +2468,7 @@ function removalReplay(
         },
         click: async () => {
           await action("toast-click");
+          if (toastCase.sdkClick) return toastCase.sdkClick();
           if (toastCase.clickFailure !== undefined) throw toastCase.clickFailure;
           if (generation !== toastGeneration)
             throw new Error("stale element reference: a later close was re-rendered");
@@ -2769,6 +2771,222 @@ function sdkClickResponseError(
     { method: input.method ?? "POST", body: input.body },
   );
 }
+
+// Execute the actual Classic click recovery, without importing a session or HTTP runtime.
+function sdkInternalScrollClick(sourceSelector = 'button[data-slot="toast-close"]') {
+  const packagePath = NodeFS.realpathSync(
+    new URL("../../node_modules/webdriverio/package.json", import.meta.url),
+  );
+  const source = NodeFS.readFileSync(
+    NodePath.join(NodePath.dirname(packagePath), "build/node.js"),
+    "utf8",
+  );
+  const cut = (start: string, end: string) => {
+    const first = source.indexOf(start),
+      last = source.indexOf(end, first);
+    expect(first).toBeGreaterThan(0);
+    expect(last).toBeGreaterThan(first);
+    return source.slice(first, last);
+  };
+  const code = [
+    cut(
+      "async function implicitWait(currentElement, commandName)",
+      "// src/utils/refetchElement.ts",
+    ),
+    cut("async function refetchElement(currentElement, commandName)", "// src/utils/index.ts"),
+    cut("function click(options)", "async function actionClick(element, options)"),
+    cut("async function scrollIntoView(options", "async function mobileScrollUntilVisible"),
+    cut("function scrollIntoViewWeb(options", "// src/commands/element/selectByAttribute.ts"),
+    cut("async function execute(script, ...args)", "// src/commands/browser/executeAsync.ts"),
+    cut("function verifyArgsAndStripIfElement(args)", "async function getElementRect(scope)"),
+    cut("function isStaleElementError(err)", "function transformClassicToBidiSelector"),
+    cut("var IMPLICIT_WAIT_EXCLUSION_LIST =", "var multiremoteHandler ="),
+  ].join("\n");
+  const calls: string[] = [];
+  let failure: unknown;
+  class Element {
+    elementId: string | undefined;
+    selector = sourceSelector;
+    index = 0;
+    parent: object;
+    declare click: () => Promise<unknown>;
+    declare scrollIntoView: (options: unknown) => Promise<unknown>;
+    constructor(id: string | undefined) {
+      this.elementId = id;
+      this.parent = browser;
+    }
+    async elementClick() {
+      calls.push("click-transport");
+      throw sdkClickResponseError("element click intercepted");
+    }
+    async waitForExist() {
+      calls.push("existence-wait");
+      throw new Error("Inert same-selector absence.");
+    }
+  }
+  const browser = {
+    isMobile: false,
+    isBidi: false,
+    capabilities: { browserName: "chrome" },
+    getElementRect: async () => {
+      calls.push("scroll-rect");
+      throw sdkClickResponseError("stale element reference", {
+        command: "element/owned-node/rect",
+        method: "GET",
+      });
+    },
+    getWindowSize: async () => ({ width: 1280, height: 960 }),
+    execute: async function (script: unknown, ...args: unknown[]): Promise<unknown> {
+      return commands.execute.call(this, script, ...args);
+    },
+    executeScript: async (_script: unknown, args: unknown[]) => {
+      calls.push("scroll-web-execute");
+      expect(args[0]).not.toBeInstanceOf(Element);
+      throw sdkClickResponseError("stale element reference", { command: "execute/sync" });
+    },
+    action: () => {
+      throw new Error("No action port is available in this SDK fixture.");
+    },
+    $: (selector: string) => {
+      expect(selector).toBe(sourceSelector);
+      calls.push("same-selector-refetch");
+      return { getElement: async () => new Element(undefined) };
+    },
+  };
+  const commands = NodeVM.runInNewContext(
+    code + "\n({click, scrollIntoView, execute, elementErrorHandler})",
+    {
+      getBrowserObject2: () => browser,
+      getBrowserObject30: () => browser,
+      getBrowserObject39: () => browser,
+      log4: { debug() {} },
+      log27: { warn() {} },
+      ELEMENT_KEY17: "element-6066-11e4-a52e-4f735466cecf",
+      ELEMENT_KEY20: "element-6066-11e4-a52e-4f735466cecf",
+      ELEMENT_KEY21: "element-6066-11e4-a52e-4f735466cecf",
+      polyfillFn: "function webdriverioPolyfill() {}",
+    },
+  );
+  const wrap = (_name: string, operation: unknown) => operation;
+  const element = new Element("owned-node");
+  element.click = commands.elementErrorHandler(wrap)("click", commands.click).bind(element);
+  element.scrollIntoView = commands
+    .elementErrorHandler(wrap)("scrollIntoView", commands.scrollIntoView)
+    .bind(element);
+  return {
+    calls,
+    failure: () => failure,
+    click: async () => {
+      try {
+        return await element.click();
+      } catch (error) {
+        failure = error;
+        throw error;
+      }
+    },
+  };
+}
+
+it("accepts the actual Classic SDK internal scroll missing error only after fresh toast absence", async () => {
+  const sdk = sdkInternalScrollClick();
+  const probe = removalReplay(null, { sdkClick: sdk.click, disappears: true });
+  const stages: string[] = [];
+  await expect(
+    probe.remove(probe.host, (stage: string) => stages.push(stage)),
+  ).resolves.toBeUndefined();
+  expect(sdk.calls).toEqual([
+    "click-transport",
+    "scroll-rect",
+    "scroll-web-execute",
+    "same-selector-refetch",
+    "existence-wait",
+  ]);
+  expect(stages.at(-1)).toBe("toast-recheck-empty");
+  expect(probe.toastVisible()).toBe(false);
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+  expect(probe.calls.filter((call) => call[0] === "until")).toEqual([["until"]]);
+  expect(probe.signatures.has(sdk.failure() as object)).toBe(false);
+});
+
+it.each([
+  { refusal: "visible replacement", phase: "toast-recheck-visible" },
+  { refusal: "lookup failure", phase: "toast-recheck-list" },
+  { refusal: "display failure", phase: "toast-recheck-displayed" },
+  { refusal: "other selector", phase: "toast-click-unrecognized" },
+])(
+  "preserves the actual internal scroll error after $refusal without clicking a replacement",
+  async (testCase) => {
+    const sdk = sdkInternalScrollClick(
+      testCase.refusal === "other selector" ? 'button[data-slot="other-close"]' : undefined,
+    );
+    const readFailure = new Error("Inert absence read failed.");
+    const probe = removalReplay(null, {
+      sdkClick: sdk.click,
+      disappears: true,
+      replacement: ["visible replacement", "display failure"].includes(testCase.refusal),
+      reobserveFailure: testCase.refusal === "lookup failure" ? readFailure : undefined,
+      reobserveDisplayFailure: testCase.refusal === "display failure" ? readFailure : undefined,
+    });
+    const stages: string[] = [];
+    const outcome = await probe
+      .remove(probe.host, (stage: string) => stages.push(stage))
+      .then(
+        () => ({ error: undefined }),
+        (error: unknown) => ({ error }),
+      );
+    expect(outcome.error).toBe(sdk.failure());
+    expect(outcome.error).not.toBeUndefined();
+    expect(stages.at(-1)).toBe(testCase.phase);
+    expect(sdk.calls.filter((call) => call === "click-transport")).toHaveLength(1);
+    expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+    expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(
+      testCase.refusal === "other selector" ? 1 : 2,
+    );
+    expect(probe.calls.filter((call) => call[0] === "until")).toEqual([["until"]]);
+  },
+);
+
+it.each([
+  { shape: "generic scroll", message: "scrollIntoView failed" },
+  {
+    shape: "other operation",
+    message:
+      'Can\'t call getHTML on element with selector "button[data-slot="toast-close"]" because element wasn\'t found',
+  },
+  {
+    shape: "execute argument",
+    message:
+      'The element with selector "button[data-slot="toast-close"]" you are trying to pass into the execute method wasn\'t found',
+  },
+  {
+    shape: "BiDi find",
+    message: 'Couldn\'t find element with selector "button[data-slot="toast-close"]"',
+  },
+  {
+    shape: "wrapped scroll",
+    message:
+      'WebDriverError: Can\'t call scrollIntoView on element with selector "button[data-slot="toast-close"]" because element wasn\'t found',
+  },
+  {
+    shape: "trailing text",
+    message:
+      'Can\'t call scrollIntoView on element with selector "button[data-slot="toast-close"]" because element wasn\'t found extra',
+  },
+  {
+    shape: "trailing newline",
+    message:
+      'Can\'t call scrollIntoView on element with selector "button[data-slot="toast-close"]" because element wasn\'t found\n',
+  },
+])("refuses $shape errors even when no toast remains", async (testCase) => {
+  const error = new Error(testCase.message);
+  const probe = removalReplay(null, { clickFailure: error, disappears: true });
+  const stages: string[] = [];
+  await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(error);
+  expect(stages.at(-1)).toBe("toast-click-unrecognized");
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(1);
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+});
 
 it.each(["no such element", "stale element reference"])(
   "accepts the pinned SDK wrapped $0 click failure only after fresh toast absence",
