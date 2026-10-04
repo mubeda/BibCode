@@ -30,6 +30,15 @@ public package has no root export; callers use focused subpaths such as
 - `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It
   reconciles platform-provided registrations and exposes environment-scoped
   execution to domain state.
+- The web Tauri bridge owns the primary bearer exchange promise. It shares one
+  exchange across concurrent consumers, clears a failed exchange for retry,
+  and invalidates the promise when `desktop:backend-ready` publishes a new
+  bootstrap. A rejected exchange clears only its own cached promise; a late
+  rejection from before backend-ready cannot discard a replacement exchange.
+  Primary HTTP requests read through that same owner; they do not
+  retain a separate bearer promise across a backend restart. This matters
+  because a new desktop-bootstrap exchange supersedes earlier sessions of the
+  same method. Browser primary requests continue using their session cookie.
 - Domain modules under `state/*` consume the registry and expose focused Atom
   constructors. React presentation does not own sockets or retry loops.
 
