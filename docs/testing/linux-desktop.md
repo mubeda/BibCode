@@ -818,6 +818,15 @@ ID even after the provider changes its title. The real `tooltip-popup` must show
 the verified worktree path hint. Never replace these checks with renderer stores,
 a synthetic click, or a primary-checkout substitute.
 
+Before branch-menu capture, type the fixed branch filter and require the real
+remote-checkout row. Clear the unique displayed/enabled Filter branches input
+through the same focused-control keyboard clear as Worktree name: prove active
+focus and stable identity, select with Control+A, recheck uniqueness, focus and
+identity, then press Backspace. The unchanged witness must observe the current
+local branch, remote checkout row, occupied worktree action, and hovered
+rename/delete controls before capture. Inert endpoint regressions cover the
+controlled-state seam; native CI must prove the browser gesture and pixels.
+
 The card-menu scene requires a genuine no-editor fixture before server
 admission. Only this selector removes the ordinary fixture's exact generated
 `cursor` editor launcher; the default fixture retains it, and `cursor-agent`,

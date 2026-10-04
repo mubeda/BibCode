@@ -119,6 +119,19 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
       throw new Error("Visual public control refused.");
     return element;
   };
+  const clearOwnedInput = async (selector: string) => {
+    const field = await focus(selector);
+    const fieldId = field.elementId;
+    if (!fieldId) throw new Error("Visual public control refused.");
+    await browser.keys(["Control", "a"]);
+    if (
+      (await browser.$$(selector).length) !== 1 ||
+      !(await field.isFocused()) ||
+      field.elementId !== fieldId
+    )
+      throw new Error("Visual public control refused.");
+    await browser.keys("Backspace");
+  };
   const composer =
     '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]';
   const card = `[data-testid="thread-card-button-${input.threadId}"]`;
@@ -156,18 +169,7 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
     }
   }
   try {
-    const selector = `${popup} input[placeholder="Worktree name"]`;
-    const name = await focus(selector);
-    const nameId = name.elementId;
-    if (!nameId) throw new Error("Visual public control refused.");
-    await browser.keys(["Control", "a"]);
-    if (
-      (await browser.$$(selector).length) !== 1 ||
-      !(await name.isFocused()) ||
-      name.elementId !== nameId
-    )
-      throw new Error("Visual public control refused.");
-    await browser.keys("Backspace");
+    await clearOwnedInput(`${popup} input[placeholder="Worktree name"]`);
   } finally {
     if (input.recordClearObservation) {
       let observation = null;
@@ -261,7 +263,7 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
   await browser
     .$('button[aria-label="Check out remote branch origin/visual-held"]')
     .waitForDisplayed();
-  await branchFilter.setValue("");
+  await clearOwnedInput('input[aria-label="Filter branches"]');
   await browser
     .$('//*[@aria-label="Branches"]//button[.//span[normalize-space()="visual-held"]]')
     .moveTo();

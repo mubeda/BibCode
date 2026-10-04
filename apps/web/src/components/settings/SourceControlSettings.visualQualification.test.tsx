@@ -10,7 +10,6 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
-  Outlet,
   RouterProvider,
   useLocation,
 } from "@tanstack/react-router";
@@ -20,6 +19,7 @@ import * as Option from "effect/Option";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
+import { compile } from "tailwindcss";
 import { expect, it, vi } from "vite-plus/test";
 
 const ports = vi.hoisted(() => ({
@@ -62,7 +62,9 @@ import {
   __resetClientSettingsPersistenceForTests,
   __setClientSettingsForTests,
 } from "../../hooks/useSettings";
-import { Sidebar, SidebarInset, SidebarProvider } from "../ui/sidebar";
+import { Route as SettingsRoute } from "../../routes/settings";
+import { AppStatusBarView } from "../status-bar/AppStatusBar";
+import { Sidebar, SidebarProvider } from "../ui/sidebar";
 import { SettingsSidebarNav } from "./SettingsSidebarNav";
 import { SourceControlSettingsPanel } from "./SourceControlSettings";
 
@@ -142,14 +144,26 @@ const discovery: SourceControlDiscoveryResult = {
 
 function MountedSettings() {
   const location = useLocation();
+  const SettingsLayout = SettingsRoute.options.component!;
   return (
-    <SidebarProvider>
+    <SidebarProvider className="h-dvh! min-h-0! border-t border-panel-separator">
       <Sidebar>
         <SettingsSidebarNav pathname={location.pathname} />
       </Sidebar>
-      <SidebarInset>
-        <Outlet />
-      </SidebarInset>
+      {/* Match __root's flex column, block Outlet host and status-bar sibling. */}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div className="min-h-0 min-w-0 flex-1">
+          <SettingsLayout />
+        </div>
+        <AppStatusBarView
+          usage={null}
+          diagnostics={{ diagnostics: null, queryError: null }}
+          localDiagnostics={null}
+          terminalCount={0}
+          showResourceUsage={false}
+          onRefresh={() => {}}
+        />
+      </div>
     </SidebarProvider>
   );
 }
@@ -182,6 +196,14 @@ it("uses the existing displayed wait before counting the cold mounted Git detail
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
+  const styles = document.createElement("style");
+  // HappyDOM rejects dvh and the layer-order statement. Normalize those only
+  // for CSS-intent inspection; this test does not simulate browser layout.
+  styles.textContent = (await compile("@tailwind utilities;"))
+    .build(["h-dvh", "h-dvh!", "h-full", "border-t", "flex", "flex-col", "shrink-0"])
+    .replaceAll("@layer properties;", "")
+    .replaceAll("100dvh", "100vh");
+  document.head.append(styles);
   const network = vi.fn(() => {
     throw new Error("No network in mounted Source Control seam.");
   });
@@ -354,10 +376,37 @@ it("uses the existing displayed wait before counting the cold mounted Git detail
             const { validateSettingsVisualWitness } = actual;
             const read = () => actual.readSettingsVisualWitness(observation);
             const witness = read();
-            expect(witness).toMatchObject({ gitAvailable: true, hostingUnavailable: true });
+            expect(witness).toMatchObject({
+              expectedTextMatched: true,
+              gitAvailable: true,
+              hostingUnavailable: true,
+              targetInView: true,
+            });
             expect(validateSettingsVisualWitness("settings-source-control", witness)).toEqual(
               witness,
             );
+            const shell = document.querySelector<HTMLElement>('[data-slot="sidebar-wrapper"]')!;
+            const inset = document.querySelector<HTMLElement>('[data-slot="sidebar-inset"]')!;
+            const declaredHeight = (element: HTMLElement) =>
+              Array.from(styles.sheet!.cssRules).find(
+                (rule) =>
+                  rule instanceof CSSStyleRule &&
+                  rule.style.height !== "" &&
+                  element.matches(rule.selectorText),
+              ) as CSSStyleRule | undefined;
+            const outletHost = inset.parentElement!;
+            const column = outletHost.parentElement!;
+            const statusBar = document.querySelector<HTMLElement>("[data-status-bar]")!;
+            expect(getComputedStyle(column).display).toBe("flex");
+            expect(getComputedStyle(column).flexDirection).toBe("column");
+            expect(getComputedStyle(outletHost).display).toBe("block");
+            expect(statusBar.parentElement).toBe(column);
+            expect(getComputedStyle(statusBar).flexShrink).toBe("0");
+            expect(declaredHeight(shell)?.style.height).toBe("100vh");
+            expect(Number.parseFloat(getComputedStyle(shell).borderTopWidth)).toBe(1);
+            // The block Outlet host cannot stretch an auto-height child. Fill
+            // its allotted height, which excludes the status bar and shell border.
+            expect(declaredHeight(inset)?.style.height).toBe("100%");
             for (const label of ["Git", "GitHub", "GitLab"]) {
               const original = document.querySelector<HTMLElement>(
                 `[role="switch"][aria-label="${label} availability"]`,
@@ -452,6 +501,7 @@ it("uses the existing displayed wait before counting the cold mounted Git detail
   } finally {
     await act(async () => root.unmount());
     container.remove();
+    styles.remove();
     registry.dispose();
     __resetClientSettingsPersistenceForTests();
     vi.restoreAllMocks();
