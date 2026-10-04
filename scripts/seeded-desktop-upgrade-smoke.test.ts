@@ -696,6 +696,145 @@ describe("generated remote sharing grant handoff", () => {
   });
 });
 
+describe("seeded packaging build budgets", () => {
+  // Exercise the actual command and its three call sites without launching a
+  // native build, updater, or application. Keep the existing command checks.
+  const source = NodeFS.readFileSync(
+    new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+    "utf8",
+  );
+  const commandStart = source.indexOf("const requireCommandSuccess = async");
+  const commandEnd = source.indexOf("\nconst writePrivateJson", commandStart);
+  const buildStart = source.indexOf("const buildPackagedApplication = async");
+  const buildEnd = source.indexOf("\nexport const seededUpgradeBundleRoot", buildStart);
+  const callsStart = source.indexOf("    await buildPackagedApplication({", buildEnd);
+  const callsEnd = source.indexOf("    await publishCandidateUpdater({", callsStart);
+  if ([commandStart, commandEnd, buildStart, buildEnd, callsStart, callsEnd].some((i) => i < 0))
+    throw new Error("Seeded packaging command source is unavailable.");
+
+  const fixture = (platform: SeededDesktopUpgradeSmokeInput["platform"], arch: "arm64" | "x64") => {
+    const layout = createSeededUpgradeRunLayout(absolute("work"), "budget-fixture");
+    const runCommand = vi.fn(async (_input: Parameters<typeof runBoundedCommand>[0]) => ({
+      exitCode: 0,
+      stderr: "",
+      stdout: "",
+    }));
+    const prepareSeededUpgradeBuild = vi.fn(async () => {});
+    const signingEnvironment = { TAURI_SIGNING_PRIVATE_KEY: "fixture-private-key" };
+    const context = {
+      NodePath,
+      runCommand,
+      prepareSeededUpgradeBuild,
+      seededUpgradeVitePlusExecutable,
+      seededUpgradeRustTarget,
+      SeededDesktopUpgradeSmokeError,
+      layout,
+      candidateOverlay: absolute("candidate-overlay.json"),
+      previousOverlay: absolute("previous-overlay.json"),
+      protectedOverlay: absolute("protected-overlay.json"),
+      signingEnvironment,
+      input: {
+        arch,
+        platform,
+        bundle: platform === "mac" ? "dmg" : platform === "win" ? "nsis" : "appimage",
+        repositoryRoot,
+        candidateVersion: "9.9.9-upgrade.1",
+        previousVersion: "1.2.3",
+        wsl: false,
+      },
+    };
+    return {
+      ...context,
+      run: () =>
+        NodeVM.runInNewContext(
+          NodeModule.stripTypeScriptTypes(
+            `(async () => { ${source.slice(commandStart, commandEnd)}\n${source.slice(buildStart, buildEnd)}\n${source.slice(callsStart, callsEnd)} })()`,
+          ),
+          context,
+          { timeout: 1_000 },
+        ) as Promise<void>,
+    };
+  };
+
+  it.each([
+    ["mac", "x64", 90],
+    ["mac", "arm64", 45],
+    ["linux", "x64", 45],
+    ["linux", "arm64", 45],
+    ["win", "x64", 45],
+    ["win", "arm64", 45],
+  ] as const)(
+    "bounds all three %s/%s packaging commands at %i minutes",
+    async (platform, arch, minutes) => {
+      const owned = fixture(platform, arch);
+      await owned.run();
+      expect(owned.prepareSeededUpgradeBuild).toHaveBeenCalledTimes(3);
+      expect(owned.runCommand).toHaveBeenCalledTimes(6);
+      const builds = [
+        [owned.layout.candidateCheckout, owned.layout.candidateBuildRoot, owned.candidateOverlay],
+        [
+          owned.layout.previousStable.checkout,
+          owned.layout.previousStable.buildRoot,
+          owned.previousOverlay,
+        ],
+        [
+          owned.layout.protectedBaseline.checkout,
+          owned.layout.protectedBaseline.buildRoot,
+          owned.protectedOverlay,
+        ],
+      ];
+      expect(new Set(builds.map(([, target]) => target)).size).toBe(3);
+      for (const [index, [checkout, target, overlay]] of builds.entries()) {
+        expect(owned.runCommand).toHaveBeenNthCalledWith(index * 2 + 1, {
+          command: seededUpgradeVitePlusExecutable,
+          args: ["install", "--frozen-lockfile"],
+          cwd: checkout,
+          inherit: true,
+          timeoutMs: 10 * 60_000,
+        });
+        expect(owned.runCommand).toHaveBeenNthCalledWith(index * 2 + 2, {
+          command: seededUpgradeVitePlusExecutable,
+          args: [
+            "run",
+            "--filter",
+            "@bibcode/desktop",
+            "build",
+            "--features",
+            "desktop-e2e",
+            "--config",
+            NodePath.join(checkout!, "apps/desktop/src-tauri/tauri.release.conf.json"),
+            "--config",
+            NodePath.join(checkout!, "apps/desktop/src-tauri/tauri.e2e.conf.json"),
+            "--config",
+            overlay,
+            "--bundles",
+            platform === "mac" ? "app,dmg" : owned.input.bundle,
+            "--target",
+            seededUpgradeRustTarget(platform, arch),
+          ],
+          cwd: checkout,
+          env: { ...owned.signingEnvironment, CARGO_TARGET_DIR: target },
+          inherit: true,
+          timeoutMs: minutes * 60_000,
+        });
+      }
+    },
+  );
+
+  it.each([1, 2])(
+    "still stops on failed command %i before later packages",
+    async (failedCommand) => {
+      const owned = fixture("mac", "x64");
+      if (failedCommand === 2)
+        owned.runCommand.mockResolvedValueOnce({ exitCode: 0, stderr: "", stdout: "" });
+      owned.runCommand.mockResolvedValueOnce({ exitCode: 7, stderr: "", stdout: "" });
+      await expect(owned.run()).rejects.toThrow("exited with code 7");
+      expect(owned.runCommand).toHaveBeenCalledTimes(failedCommand);
+      expect(owned.prepareSeededUpgradeBuild).toHaveBeenCalledTimes(1);
+    },
+  );
+});
+
 describe("seeded packaged desktop upgrade harness", () => {
   it("waits for the exact Windows candidate and installer exit before cleanup", () => {
     const candidate = "0.7.3-upgrade.46";

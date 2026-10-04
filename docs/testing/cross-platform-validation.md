@@ -1319,6 +1319,19 @@ live pass. Host notice can remain tests-only under the approved validation
 contract. Never execute the seeded harness locally, even with an isolated data
 root; legacy cleanup can terminate another desktop app.
 
+For seeded CI qualification, distinguish a packaging-child timeout from a
+runtime-upgrade failure. The candidate, previous stable, and protected baseline
+are three sequential builds with separate cold Cargo outputs outside the
+workflow's cached repository `target`; `remote-install` reuses the protected
+package. Only macOS x64 gives each packaging child 90 minutes and the complete
+job 360 minutes. Other targets keep 45-minute packaging children and 240-minute
+jobs; the separate WSL job also keeps 240 minutes. Frozen installs remain
+10 minutes per checkout. Intel's job reserves 60 additional minutes after the
+three packaging and install bounds for setup, all lanes, evidence, and cleanup.
+Product, WebDriver, and restart deadlines remain unchanged. Record a command
+timeout and the last completed phase as unavailable native evidence; passing
+tooling tests cannot substitute for completed upgrade observations.
+
 ## Clone from URL network scenario
 
 Before the network-transfer checks, select a remote server and enter a Git URL

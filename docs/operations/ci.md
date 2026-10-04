@@ -90,6 +90,14 @@ its immutable SHA.
   the product coordinator, verifies boot/version/storage/protection evidence,
   and scopes Linux process cleanup to its exact data root. The harness rejects
   local invocation; unit/syntax checks do not constitute real upgrade evidence.
+  The seeded macOS Intel row has a 360-minute complete-job allowance for three
+  cold, isolated 90-minute packaging children, three 10-minute frozen installs,
+  and 60 minutes for setup, runtime verification, evidence, and cleanup.
+  The other five rows and the separate WSL job keep 240 minutes; their packaging
+  children keep 45 minutes. `remote-install` reuses the protected package.
+  Repository `target` caching cannot warm the run root's three Cargo outputs.
+  These packaging allowances are separate from the native desktop CI job above
+  and preserve all existing product, WebDriver, and restart deadlines.
   Windows lanes wait for the exact candidate's installed PE version before
   stopping and relaunching the host, retaining bounded handoff observations.
   Its WSL-specific lane remains Windows x64.
