@@ -346,6 +346,31 @@ whole-workspace `vp check`,
 `vp run typecheck` and a fresh full browser qualification remain with the root
 agent; these focused checks do not establish native success.
 
+Fresh full native trial `37159666596` at `a0d51aad` failed at light
+`reload-primary-thread-proof` after twenty-one light originals and thirty
+assertions. Joined cleanup reports no failures, closed children and no namespace
+survivors. Actual Reload and the extended dark lane did not run. The receipt
+contains only generic Error and setup/startup observations; it cannot identify
+HTTP status, body/list admission, matching rows or the rejected predicate.
+The native cause therefore remains unknown.
+
+The diagnostic-only follow-up captures a closed witness from the same existing
+read and retains it only in that exact failed phase. It records HTTP category,
+parse/list admission, finite matching counts and nullable predicate flags.
+Raw response/input/IDs/errors/URLs/tokens remain local. Optional observer and
+descriptor failures cannot replace the original verdict, assertion failure or
+joined cleanup. No request, grant, socket, store/API access, card action, timer
+increase or acceptance relaxation is added.
+
+Project creation/backfill supplies null branch/worktree metadata. The public
+metadata command permits branch changes, while worktree-path changes require
+dedicated authority; the engine's generic metadata update has no default-kind
+branch guard. This is an admission possibility, not evidence that the native
+trial changed branch. All existing branch/worktree checks remain in place.
+The diagnostic follow-up passed 217 focused tests across nine files, desktop
+e2e TypeScript checking and the seven-file formatting/lint gate. A fresh native
+witness is still required; none was produced by these source/fixture checks.
+
 Root's focused visual inspection also found the Retry action visibly clipped at
 the right edge of the authoritative 1280x817 `not-back-light.png` original. This
 is a #16/UI.md follow-up for a later focused toast source check. It is not an

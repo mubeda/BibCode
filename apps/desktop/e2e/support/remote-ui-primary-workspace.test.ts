@@ -5,6 +5,8 @@ import * as NodeVM from "node:vm";
 import { expect, it } from "vite-plus/test";
 import {
   decodeReloadPrimaryWorkspace,
+  decodeReloadPrimaryThreadProof,
+  projectReloadPrimaryThreadWitness,
   readReloadPrimaryThread,
   readReloadPrimaryWorkspace,
 } from "./remote-ui-primary-workspace.ts";
@@ -315,18 +317,23 @@ function fixture(active = true, existing = true, empty = false) {
   };
 }
 
-function publicThreadRead(f: ReturnType<typeof fixture>, snapshot: unknown = f.snapshot) {
+function publicThreadRead(
+  f: ReturnType<typeof fixture>,
+  snapshot: unknown = f.snapshot,
+  decorate?: (response: { ok: boolean; status: number; text: () => Promise<string> }) => unknown,
+) {
   const requests: Array<{ url: string; credentials: string; timeout: number }> = [];
-  const read = NodeVM.runInNewContext("(" + readReloadPrimaryThread.toString() + ")", {
+  const rawRead = NodeVM.runInNewContext("(" + readReloadPrimaryThread.toString() + ")", {
     document: f.window.document,
     location: f.location,
     AbortSignal: { timeout: (timeout: number) => ({ timeout }) },
     fetch: async (url: string, options: { credentials: string; signal: { timeout: number } }) => {
       requests.push({ url, credentials: options.credentials, timeout: options.signal.timeout });
-      return { ok: true, text: async () => JSON.stringify(snapshot) };
+      const response = { ok: true, status: 200, text: async () => JSON.stringify(snapshot) };
+      return decorate ? decorate(response) : response;
     },
   });
-  return { read, requests };
+  return { read: async (input: unknown) => (await rawRead(input)).matched, rawRead, requests };
 }
 
 it("captures the actual empty primary card without starting or fabricating a provider session", async () => {
@@ -356,6 +363,170 @@ it("captures the actual empty primary card without starting or fabricating a pro
   } finally {
     await f.window.happyDOM.close();
   }
+});
+
+it("adds closed witness to the same read without accepting a refused branch or retaining private values", async () => {
+  const f = fixture(false, true, true);
+  try {
+    const snapshot = {
+      ...f.snapshot,
+      threads: [{ ...f.snapshot.threads[0], branch: "private-branch" }],
+    };
+    const probe = publicThreadRead(f, snapshot);
+    const proof = await probe.rawRead({ ...binding, snapshotPath: "/api/orchestration/snapshot" });
+    expect(proof.matched).toBe(false);
+    expect(probe.requests).toHaveLength(1);
+    expect(proof.witness).toEqual({
+      requestAdmitted: true,
+      httpStatus: "success",
+      body: "parsed",
+      listsAdmitted: true,
+      projectMatches: "one",
+      threadMatches: "one",
+      projectLive: true,
+      threadProjectMatched: true,
+      threadDefault: true,
+      threadUnarchived: true,
+      threadUndeleted: true,
+      branchNull: false,
+      worktreeNull: true,
+    });
+    expect(decodeReloadPrimaryThreadProof(proof)?.matched).toBe(false);
+    expect(JSON.stringify(proof)).not.toMatch(/private|owned-project|owned-thread|localhost|http:/);
+  } finally {
+    await f.window.happyDOM.close();
+  }
+});
+
+it("distinguishes HTTP refusal without reading its body and contains a throwing status observer", async () => {
+  const f = fixture(false, true, true);
+  const input = { ...binding, snapshotPath: "/api/orchestration/snapshot" };
+  try {
+    for (const [status, category] of [
+      [401, "unauthorized"],
+      [403, "forbidden"],
+      [404, "not-found"],
+      [409, "client-error"],
+      [500, "server-error"],
+      [302, "redirect"],
+    ] as const) {
+      const probe = publicThreadRead(f, f.snapshot, () => ({
+        ok: false,
+        status,
+        text: () => {
+          throw new Error("Refused body must not be read.");
+        },
+      }));
+      const proof = await probe.rawRead(input);
+      expect(proof.matched).toBe(false);
+      expect(proof.witness.httpStatus).toBe(category);
+      expect(proof.witness.body).toBeNull();
+      expect(proof.witness.projectMatches).toBeNull();
+      expect(probe.requests).toHaveLength(1);
+    }
+    const probe = publicThreadRead(f, f.snapshot, (response) => {
+      Object.defineProperty(response, "status", {
+        get() {
+          throw new Error("private-status-error");
+        },
+      });
+      return response;
+    });
+    const proof = await probe.rawRead(input);
+    expect(proof.matched).toBe(true);
+    expect(proof.witness.httpStatus).toBeNull();
+    expect(proof.witness.body).toBe("parsed");
+    expect(probe.requests).toHaveLength(1);
+  } finally {
+    await f.window.happyDOM.close();
+  }
+});
+
+it("keeps unavailable parse/list/count/predicate observations unknown rather than inventing proof", async () => {
+  const f = fixture(false, true, true);
+  const input = { ...binding, snapshotPath: "/api/orchestration/snapshot" };
+  try {
+    const lists = await publicThreadRead(f, { projects: null, threads: [] }).rawRead(input);
+    expect(lists.matched).toBe(false);
+    expect(lists.witness.listsAdmitted).toBe(false);
+    expect(lists.witness.projectMatches).toBeNull();
+    const missing = await publicThreadRead(f, { projects: [], threads: [] }).rawRead(input);
+    expect(missing.matched).toBe(false);
+    expect(missing.witness.projectMatches).toBe("none");
+    expect(missing.witness.threadMatches).toBe("none");
+    expect(missing.witness.threadDefault).toBeNull();
+    const duplicate = await publicThreadRead(f, {
+      ...f.snapshot,
+      threads: [f.snapshot.threads[0], f.snapshot.threads[0]],
+    }).rawRead(input);
+    expect(duplicate.matched).toBe(false);
+    expect(duplicate.witness.threadMatches).toBe("multiple");
+    expect(duplicate.witness.branchNull).toBeNull();
+    const thread = { ...f.snapshot.threads[0] };
+    delete thread.branch;
+    const absent = await publicThreadRead(f, { ...f.snapshot, threads: [thread] }).rawRead(input);
+    expect(absent.matched).toBe(false);
+    expect(absent.witness.branchNull).toBeNull();
+  } finally {
+    await f.window.happyDOM.close();
+  }
+});
+
+it("projects only finite own witness data and contains malformed/accessor/reflection facts", () => {
+  const raw = {
+    requestAdmitted: true,
+    httpStatus: "success",
+    branchNull: false,
+    private: "private-secret",
+  };
+  const projected = projectReloadPrimaryThreadWitness(raw)!;
+  expect(projected.requestAdmitted).toBe(true);
+  expect(projected.branchNull).toBe(false);
+  expect(projected.projectMatches).toBeNull();
+  expect(JSON.stringify(projected)).not.toMatch(/private|secret/);
+  expect(projectReloadPrimaryThreadWitness(Object.create(raw))?.requestAdmitted).toBeNull();
+  for (const key of Object.keys(projected)) {
+    let reads = 0;
+    const input = { ...raw };
+    Object.defineProperty(input, key, {
+      enumerable: true,
+      get() {
+        reads++;
+        throw new Error("private-getter");
+      },
+    });
+    expect(projectReloadPrimaryThreadWitness(input)).toBeNull();
+    expect(reads).toBe(0);
+  }
+  for (const key of ["matched", "witness"]) {
+    let reads = 0;
+    const input = { matched: true, witness: raw };
+    Object.defineProperty(input, key, {
+      enumerable: true,
+      get() {
+        reads++;
+        throw new Error("private-getter");
+      },
+    });
+    expect(decodeReloadPrimaryThreadProof(input)).toEqual(
+      key === "matched" ? null : { matched: true, witness: null },
+    );
+    expect(reads).toBe(0);
+  }
+  const revoked = Proxy.revocable(raw, {});
+  revoked.revoke();
+  expect(projectReloadPrimaryThreadWitness(revoked.proxy)).toBeNull();
+  expect(decodeReloadPrimaryThreadProof(revoked.proxy)).toBeNull();
+  const brokenWitness = new Proxy(
+    { matched: false, witness: raw },
+    {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === "witness") throw new Error("private-reflection-error");
+        return Object.getOwnPropertyDescriptor(target, key);
+      },
+    },
+  );
+  expect(decodeReloadPrimaryThreadProof(brokenWitness)).toEqual({ matched: false, witness: null });
 });
 
 it("never binds an unbackfilled primary card that the production projection cannot select", async () => {
@@ -513,7 +684,7 @@ it("refuses unsafe scope and failed/unbounded public reads without exposing resp
           };
         },
       });
-      expect(await read(proofInput)).toBe(false);
+      expect((await read(proofInput)).matched).toBe(false);
     }
     for (const field of Object.keys(binding)) {
       const probe = publicThreadRead(f);

@@ -46,9 +46,12 @@ import {
 import { callFixtureRpc } from "./support/remote-ui-rpc.ts";
 import {
   decodeReloadPrimaryWorkspace,
+  decodeReloadPrimaryThreadProof,
+  projectReloadPrimaryThreadWitness,
   readReloadPrimaryThread,
   readReloadPrimaryWorkspace,
   type ReloadPrimaryWorkspace,
+  type ReloadPrimaryThreadWitness,
 } from "./support/remote-ui-primary-workspace.ts";
 
 const root = NodePath.resolve(import.meta.dirname, "../../..");
@@ -96,6 +99,7 @@ let success = false;
 const captures: Array<Record<string, unknown>> = [];
 const assertions: Array<Record<string, unknown>> = [];
 const networkProofs: unknown[] = [];
+let reloadPrimaryThreadWitness: ReloadPrimaryThreadWitness | null = null;
 const tunnels: Array<() => Promise<void>> = [];
 const write = (name: "phase" | "result" | "failure" | "assertions", value: unknown) =>
   NodeFS.writeFileSync(
@@ -1280,6 +1284,7 @@ async function restartPrimaryWithBrowserTransition(primary: Host, version: strin
 }
 
 async function reloadFlow(primary: Host, primaryWorkspace: ReloadPrimaryWorkspace | null) {
+  reloadPrimaryThreadWitness = null;
   check(primaryWorkspace !== null, "owned-primary-workspace-bound");
   const primaryRead = {
     projectName: NodePath.basename(primary.project),
@@ -1305,13 +1310,14 @@ async function reloadFlow(primary: Host, primaryWorkspace: ReloadPrimaryWorkspac
         })) === true,
     );
     phase("reload-primary-thread-proof");
-    check(
+    const proof = decodeReloadPrimaryThreadProof(
       await required().execute(readReloadPrimaryThread, {
         ...primaryWorkspace,
         snapshotPath: EnvironmentOrchestrationHttpApi.endpoints.snapshot.path,
       }),
-      "owned-primary-thread-exists",
     );
+    reloadPrimaryThreadWitness = proof?.witness ?? null;
+    check(proof?.matched === true, "owned-primary-thread-exists");
     phase("reload-primary-card-select");
     await click(`[data-testid="primary-card-button-${primaryWorkspace.projectId}"]`);
   }
@@ -1741,6 +1747,10 @@ try {
     startup,
     setup,
     checkAgain,
+    reloadPrimaryThreadProof:
+      currentPhase === "reload-primary-thread-proof"
+        ? projectReloadPrimaryThreadWitness(reloadPrimaryThreadWitness)
+        : null,
   });
 } finally {
   const beforeCleanup = owner.processes.map(({ child, role, log, spawnFailure }) =>

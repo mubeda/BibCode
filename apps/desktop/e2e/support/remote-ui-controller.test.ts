@@ -6,6 +6,8 @@ import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
 import {
   decodeReloadPrimaryWorkspace,
+  decodeReloadPrimaryThreadProof,
+  projectReloadPrimaryThreadWitness,
   readReloadPrimaryThread,
   readReloadPrimaryWorkspace,
 } from "./remote-ui-primary-workspace.ts";
@@ -986,6 +988,7 @@ it.each([
       decodeReloadPrimaryWorkspace,
       readReloadPrimaryWorkspace,
       readReloadPrimaryThread,
+      decodeReloadPrimaryThreadProof,
       EnvironmentOrchestrationHttpApi: {
         endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
       },
@@ -2070,6 +2073,7 @@ it.each(["empty-index", "removed-thread", "already-primary"])(
       controller.indexOf("async function reloadFlow("),
     );
     const end = controller.indexOf("  const draft =", start);
+    let proofReads = 0;
     const phases: string[] = [],
       actions: string[] = [];
     const binding = {
@@ -2091,7 +2095,11 @@ it.each(["empty-index", "removed-thread", "already-primary"])(
         },
       }),
       execute: async (read: unknown, input: Record<string, unknown>) => {
-        if (read === readReloadPrimaryThread || input.requireSelected === false) return true;
+        if (read === readReloadPrimaryThread) {
+          proofReads++;
+          return { matched: true, witness: null };
+        }
+        if (input.requireSelected === false) return true;
         return route === "/primary/owned-thread" ? binding : null;
       },
     };
@@ -2114,6 +2122,7 @@ it.each(["empty-index", "removed-thread", "already-primary"])(
         primaryWorkspace: binding,
         readReloadPrimaryWorkspace,
         readReloadPrimaryThread,
+        decodeReloadPrimaryThreadProof,
         EnvironmentOrchestrationHttpApi: {
           endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
         },
@@ -2138,6 +2147,7 @@ it.each(["empty-index", "removed-thread", "already-primary"])(
           ],
     );
     expect(phases.at(-1)).toBe("reload-composer-ready");
+    expect(proofReads).toBe(initial === "already-primary" ? 0 : 1);
   },
 );
 
@@ -2161,6 +2171,7 @@ it.each(["core", "full", "malformed"])(
         decodeReloadPrimaryWorkspace,
         readReloadPrimaryWorkspace,
         readReloadPrimaryThread,
+        decodeReloadPrimaryThreadProof,
         EnvironmentOrchestrationHttpApi: {
           endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
         },
@@ -2238,6 +2249,7 @@ it.each(["missing-card", "foreign-thread", "missing-primary-thread"])(
         decodeReloadPrimaryWorkspace,
         readReloadPrimaryWorkspace,
         readReloadPrimaryThread,
+        decodeReloadPrimaryThreadProof,
         EnvironmentOrchestrationHttpApi: {
           endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
         },
@@ -2249,7 +2261,7 @@ it.each(["missing-card", "foreign-thread", "missing-primary-thread"])(
         required: () => ({
           execute: async (_read: unknown, input: { requireSelected: boolean }) =>
             _read === readReloadPrimaryThread
-              ? mode !== "missing-primary-thread"
+              ? { matched: mode !== "missing-primary-thread", witness: null }
               : input.requireSelected
                 ? { ...binding, threadId: "foreign-thread" }
                 : mode === "missing-card"
@@ -2309,6 +2321,7 @@ it("checks the same captured identity again after real replacement document/comp
         decodeReloadPrimaryWorkspace,
         readReloadPrimaryWorkspace,
         readReloadPrimaryThread,
+        decodeReloadPrimaryThreadProof,
         EnvironmentOrchestrationHttpApi: {
           endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
         },
@@ -2324,5 +2337,49 @@ it("checks the same captured identity again after real replacement document/comp
     );
     if (threadId === "owned-thread") await expect(run()).resolves.toBeUndefined();
     else await expect(run()).rejects.toThrow("Restored identity refused.");
+  }
+});
+
+it("retains only the same-read closed primary witness at the exact failed proof phase", () => {
+  const start = controller.indexOf('  write("failure", {');
+  const end = controller.indexOf("\n} finally {", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  for (const currentPhase of [
+    "reload-primary-thread-proof",
+    "reload-primary-card-ready",
+    "reload-primary-card-select",
+    "primary-import",
+  ]) {
+    const records: Array<{ name: string; value: Record<string, unknown> }> = [];
+    NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes(controller.slice(start, end)), {
+      currentPhase,
+      currentTheme: "light",
+      error: new Error("private-error"),
+      classifyQualificationFailure: () => ({ kind: "unclassified", errorClass: "Error" }),
+      readManualAssertionCode: () => null,
+      startup: null,
+      setup: null,
+      checkAgain: null,
+      reloadPrimaryThreadWitness: {
+        requestAdmitted: true,
+        httpStatus: "forbidden",
+        private: "private-snapshot",
+      },
+      projectReloadPrimaryThreadWitness,
+      write: (name: string, value: Record<string, unknown>) => records.push({ name, value }),
+      fetch: () => {
+        throw new Error("No additional request is authorized.");
+      },
+    });
+    expect(records).toHaveLength(1);
+    expect(records[0]?.name).toBe("failure");
+    expect(records[0]?.value.failure).toEqual({ kind: "unclassified", errorClass: "Error" });
+    expect(records[0]?.value.reloadPrimaryThreadProof).toEqual(
+      currentPhase === "reload-primary-thread-proof"
+        ? projectReloadPrimaryThreadWitness({ requestAdmitted: true, httpStatus: "forbidden" })
+        : null,
+    );
+    expect(JSON.stringify(records)).not.toMatch(/private|snapshot|http:\/\/|credential/);
   }
 });

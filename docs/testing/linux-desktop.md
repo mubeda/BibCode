@@ -622,8 +622,15 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   `worktree_path` fields; do not treat the contract's camelCase DTO as an alias.
   Report the existing endpoint/contract disagreement without changing product
   protocols as part of qualification.
-  Keep the read in the page and return only a boolean; missing, duplicated,
-  foreign, deleted, archived or failed proof prevents the click. Refuse
+  Keep raw read values in the page. Its unchanged boolean verdict may carry
+  one closed witness from that same request: request/parse/list admission,
+  finite HTTP status and matching-row counts, and nullable live/default/
+  branch/worktree predicate flags. Retain that witness only in `failure.json`
+  at the exact `reload-primary-thread-proof` phase, and leave unavailable facts
+  null. Reproject own enumerable data and contain optional observation errors;
+  never retain response/input/identity/error/URL/token values or add a request.
+  This witness does not establish a past native cause. Missing, duplicated,
+  foreign, deleted, archived or failed proof still prevents the click. Refuse
   missing/ambiguous/unbackfilled cards and changed identities; never create a
   thread, fabricate a session, pick another card or mutate renderer stores.
   Binding and snapshot values never enter retained evidence.
