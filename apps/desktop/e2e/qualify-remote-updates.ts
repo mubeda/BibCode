@@ -970,6 +970,29 @@ async function freshTerminalCounts(host: Host) {
 }
 
 async function successFlow() {
+  const observeConfirmation = (
+    stage:
+      | "initial-card-workspace"
+      | "initial-card"
+      | "row-confirmation"
+      | "row-idle-proof"
+      | "confirm-row"
+      | "row-cancel"
+      | "row-requests"
+      | "row-workspace"
+      | "row-draft"
+      | "card-confirmation"
+      | "confirm-card"
+      | "card-cancel"
+      | "card-requests"
+      | "card-draft",
+  ) => {
+    try {
+      phase(`success-${stage}`);
+    } catch {
+      // Optional attribution cannot skip an action or replace its original failure.
+    }
+  };
   phase("success-flow");
   phase("success-host-start");
   const host = await fakeHost("update-a", 4888, `QA Success ${currentTheme}`);
@@ -982,19 +1005,33 @@ async function successFlow() {
   await settings();
   phase("success-initial-row");
   await capture("initial-row", host, row(host.label), "Update to v9.9.1…");
+  observeConfirmation("initial-card-workspace");
   await workspace();
+  observeConfirmation("initial-card");
   await capture("initial-card", host, card, host.label);
+  observeConfirmation("row-confirmation");
   await openConfirmation(host, "row");
+  observeConfirmation("row-idle-proof");
   await text(dialog, "Nothing is running on it now.");
+  observeConfirmation("confirm-row");
   await capture("confirm-row", host, dialog, `Update ${host.label} to v9.9.1?`);
+  observeConfirmation("row-cancel");
   await cancel();
+  observeConfirmation("row-requests");
   await exactRequests(host, 0);
+  observeConfirmation("row-workspace");
   await workspace();
+  observeConfirmation("row-draft");
   check((await required().$(composer).getText()).includes(draft), "row-cancel-keeps-draft");
+  observeConfirmation("card-confirmation");
   await openConfirmation(host, "card");
+  observeConfirmation("confirm-card");
   await capture("confirm-card", host, dialog, `Update ${host.label} to v9.9.1?`);
+  observeConfirmation("card-cancel");
   await cancel();
+  observeConfirmation("card-requests");
   await exactRequests(host, 0);
+  observeConfirmation("card-draft");
   check((await required().$(composer).getText()).includes(draft), "card-cancel-keeps-draft");
   await freshTerminalCounts(host);
   await openConfirmation(host, "row");

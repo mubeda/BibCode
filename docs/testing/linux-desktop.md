@@ -733,6 +733,13 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Success preparation also records fixed host-start, Add Server action/read,
   project-import, draft, Settings and first-row-capture phases. These observers
   add no UI action or wait and do not identify a native cause by themselves.
+  After that capture, fixed success markers distinguish the first card's
+  workspace/capture, row confirmation/idle proof/capture, each row or card
+  cancellation/request-count/draft proof, the row's return to the workspace,
+  and card confirmation/capture. A retained capture can prove an earlier
+  predicate passed even when an older failure phase remains. These markers
+  change attribution only; preserve actions, read order, budgets, capture
+  guards, original errors and the success/failure verdict.
   Isolate optional preparation-observer exceptions so the original actions
   continue; keep ordinary phase, UI/read and capture failures fail-closed.
   Success-case removal records fixed Settings/menu/confirmation, row-absence,

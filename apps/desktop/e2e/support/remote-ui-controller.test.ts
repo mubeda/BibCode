@@ -2021,6 +2021,122 @@ it.each(["host", "add-host", "import", "draft", "settings", "initial-row"])(
   },
 );
 
+it.each([
+  ["initial-card-workspace", "workspace-1"],
+  ["initial-card", "capture-initial-card"],
+  ["row-confirmation", "confirmation-row"],
+  ["row-idle-proof", "idle-proof"],
+  ["confirm-row", "capture-confirm-row"],
+  ["row-cancel", "cancel-1"],
+  ["row-requests", "requests-1"],
+  ["row-workspace", "workspace-2"],
+  ["row-draft", "draft-1"],
+  ["card-confirmation", "confirmation-card"],
+  ["confirm-card", "capture-confirm-card"],
+  ["card-cancel", "cancel-2"],
+  ["card-requests", "requests-2"],
+  ["card-draft", "draft-2"],
+])(
+  "attributes the actual success action after the first row capture: %s",
+  async (stage, failed) => {
+    const start = controller.indexOf("async function successFlow()");
+    const end = controller.indexOf("  await freshTerminalCounts(host);", start);
+    const mapsStart = controller.indexOf("const SUCCESS_ADD_HOST_PHASES");
+    const mapsEnd = controller.indexOf("async function addHost(", mapsStart);
+    const actions = [
+      "capture-initial-row",
+      "workspace-1",
+      "capture-initial-card",
+      "confirmation-row",
+      "idle-proof",
+      "capture-confirm-row",
+      "cancel-1",
+      "requests-1",
+      "workspace-2",
+      "draft-1",
+      "check-row-cancel-keeps-draft",
+      "confirmation-card",
+      "capture-confirm-card",
+      "cancel-2",
+      "requests-2",
+      "draft-2",
+      "check-card-cancel-keeps-draft",
+    ];
+    for (const theme of remoteUiThemes) {
+      for (const observerThrows of [false, true]) {
+        const original = new Error("Inert original success action failure.");
+        const calls: string[] = [];
+        const phases: string[] = [];
+        const completed: string[] = [];
+        let workspaces = 0,
+          cancels = 0,
+          requests = 0,
+          drafts = 0;
+        const boundary = (name: string) => {
+          calls.push(name);
+          if (name === failed) throw original;
+        };
+        const run = NodeVM.runInNewContext(
+          NodeModule.stripTypeScriptTypes(
+            controller.slice(mapsStart, mapsEnd) +
+              "async function probe(){" +
+              controller.slice(controller.indexOf("{", start) + 1, end) +
+              "}\nprobe",
+          ),
+          {
+            currentTheme: theme,
+            phase: (name: string) => {
+              phases.push(name);
+              if (observerThrows && name === `success-${stage}`) throw new Error("Inert observer.");
+            },
+            fakeHost: async () => ({ label: "owned" }),
+            addHost: async () => {},
+            importProject: async () => {},
+            composer: "owned-composer",
+            required: () => ({
+              $: () => ({
+                setValue: async () => {},
+                getText: async () => {
+                  boundary(`draft-${++drafts}`);
+                  return `retained update draft ${theme}`;
+                },
+              }),
+            }),
+            settings: async () => {},
+            row: () => "owned-row",
+            card: "owned-card",
+            dialog: "owned-dialog",
+            workspace: async () => boundary(`workspace-${++workspaces}`),
+            capture: async (scene: string) => {
+              boundary(`capture-${scene}`);
+              completed.push(scene);
+            },
+            openConfirmation: async (_host: unknown, location: string) =>
+              boundary(`confirmation-${location}`),
+            text: async () => boundary("idle-proof"),
+            cancel: async () => boundary(`cancel-${++cancels}`),
+            exactRequests: async (_host: unknown, count: number) => {
+              expect(count).toBe(0);
+              boundary(`requests-${++requests}`);
+            },
+            check: (value: boolean, code: string) => {
+              expect(value).toBe(true);
+              boundary(`check-${code}`);
+            },
+          },
+        );
+        await expect(run()).rejects.toBe(original);
+        expect(calls).toEqual(actions.slice(0, actions.indexOf(failed) + 1));
+        expect(phases.at(-1)).toBe(`success-${stage}`);
+        if (actions.indexOf(failed) > actions.indexOf("capture-confirm-row")) {
+          expect(completed.slice(0, 3)).toEqual(["initial-row", "initial-card", "confirm-row"]);
+        }
+        expect(phases.join(" ")).not.toMatch(/owned|retained|http/);
+      }
+    }
+  },
+);
+
 function preparationObserverReplay(
   throwPhase: string | null = null,
   failOperation: string | null = null,
