@@ -624,6 +624,53 @@ export async function captureSettingsVisualScene(
   }
 }
 
+/** Native public scrolling for the two owned fields; the pinned SDK's wheel path has zero deltas. */
+export function scrollSettingsVisualField(
+  input: SettingsVisualObservationInput & { selector: string; block: "start" | "end" },
+): void {
+  const fields = {
+    "#provider-instance-claudeAgent-binaryPath": "start",
+    "#provider-instance-claudeAgent-custom-model": "end",
+  };
+  if (
+    input.scene !== "settings-provider-form" ||
+    input.origin !== "http://127.0.0.1:4885" ||
+    location.origin !== input.origin ||
+    location.pathname !== "/settings/providers" ||
+    location.search !== "" ||
+    location.hash !== "" ||
+    !["light", "dark"].includes(input.theme) ||
+    document.documentElement.classList.contains("dark") !== (input.theme === "dark") ||
+    !/^[A-Za-z0-9._:-]{1,128}$/.test(input.threadId) ||
+    input.branch !== `codex/delivery-retry-${input.theme}` ||
+    !Object.hasOwn(fields, input.selector) ||
+    fields[input.selector as keyof typeof fields] !== input.block ||
+    document.getElementById("boot-shell") !== null ||
+    document.querySelector("vite-error-overlay") !== null ||
+    document.querySelector(
+      '#pairing-token,input[type="password"],input[autocomplete="one-time-code"],textarea[placeholder^="bibcode://pair"]',
+    ) !== null
+  )
+    throw new Error("Owned settings scroll context refused.");
+  const selected = document.querySelectorAll(
+    '[data-slot="sidebar-menu-button"][data-active="true"]',
+  );
+  const local = document.querySelectorAll('[data-testid="environment-rail-local"]');
+  if (
+    selected.length !== 1 ||
+    selected[0]?.textContent?.trim() !== "Providers" ||
+    local.length !== 1 ||
+    local[0]?.getAttribute("aria-checked") !== "true" ||
+    local[0]?.querySelector('[data-status="connected"]') === null
+  )
+    throw new Error("Owned settings scroll context refused.");
+  const targets = document.querySelectorAll(input.selector);
+  if (targets.length !== 1 || !(targets[0] instanceof HTMLInputElement))
+    throw new Error("Owned settings scroll field refused.");
+  // The same browser-native API used by the SDK's desktop fallback, with ordinary alignment.
+  targets[0].scrollIntoView({ block: input.block, inline: "nearest" });
+}
+
 export interface SettingsVisualInput extends Omit<SettingsVisualObservationInput, "scene"> {
   browser: QualificationBrowser;
   owner: Pick<QualificationOwner, "until">;
@@ -682,7 +729,15 @@ export async function runVisualSettings(input: SettingsVisualInput): Promise<obj
   };
   const scroll = async (selector: string, block: "start" | "end") => {
     const before = await bounded(browser.execute(readVisualPageScroll), 2_000);
-    await browser.$(selector).scrollIntoView({ block });
+    await browser.execute(scrollSettingsVisualField, {
+      scene: "settings-provider-form" as const,
+      theme: input.theme,
+      origin: input.origin,
+      threadId: input.threadId,
+      branch: input.branch,
+      selector,
+      block,
+    });
     const after = await bounded(browser.execute(readVisualPageScroll), 2_000);
     if (before.x !== after.x || before.y !== after.y)
       throw new Error("Visual settings scroll escaped.");

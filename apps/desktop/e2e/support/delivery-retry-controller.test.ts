@@ -3183,6 +3183,59 @@ it.each(["issue", "exchange"])(
   },
 );
 
+it("decodes the public HTTP full-read-model parity fixture through the actual owned reader", async () => {
+  const payload: unknown = JSON.parse(
+    NodeFS.readFileSync(
+      new URL(
+        "../../../../packages/contracts/fixtures/http-orchestration/full-read-model.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const fetcher = vi.fn(async (url: string, options: RequestInit) => {
+    expect(url).toBe("http://127.0.0.1:4885/api/orchestration/snapshot");
+    expect(new Headers(options.headers).get("authorization")).toBe("Bearer owned-private-session");
+    expect(options.signal).toBeInstanceOf(AbortSignal);
+    return new Response(JSON.stringify(payload));
+  });
+  vi.stubGlobal("fetch", fetcher);
+  try {
+    const model = await readOwnedGitProjectSnapshot("owned-private-session");
+    expect(model.snapshotSequence).toBe(42);
+    expect(model.projects.map((project) => [project.id, project.deletedAt !== null])).toEqual([
+      ["project-live", false],
+      ["project-deleted", true],
+    ]);
+    expect(
+      model.threads.map((thread) => [
+        thread.id,
+        thread.archivedAt !== null,
+        thread.deletedAt !== null,
+      ]),
+    ).toEqual([
+      ["thread-live", false, false],
+      ["thread-archived", true, false],
+      ["thread-deleted", false, true],
+    ]);
+    const live = model.threads[0]!;
+    expect(live.kind).toBe("default");
+    expect(live.latestTurn?.sourceProposedPlan).toBeUndefined();
+    expect(live.session?.providerInstanceId).toBeUndefined();
+    expect(live.messages.map((message) => message.id)).toEqual(["message-live"]);
+    expect(live.activities[0]?.tone).toBe("warning");
+    expect(live.proposedPlans[0]?.id).toBe("plan-live");
+    expect(live.checkpoints[0]?.checkpointRef).toBe("refs/checkpoints/owned");
+    expect(model.threads[1]!.messages).toEqual([]);
+    expect(model.threads[2]!.messages.map((message) => message.id)).toEqual(["message-deleted"]);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(Object.hasOwn(model, "states")).toBe(false);
+    expect(JSON.stringify(model)).not.toContain("owned-private-session");
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
 it("reads only the current typed owned snapshot endpoint with a session bearer and keeps credentials off results", async () => {
   const fetcher = vi.fn(
     async (url: string, options: { headers: { authorization: string }; signal: AbortSignal }) => {

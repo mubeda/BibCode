@@ -835,6 +835,21 @@ installed Tailwind compilation verifies the actual CSS rule. HappyDOM does not
 implement focus-within visibility, so native CI must prove the gesture and
 pixels. No capture predicate or request bound is relaxed.
 
+After the branch-menu original, send Escape and require the public branch
+popup to become undisplayed before selecting the managed card or opening Files.
+Identify its fixed Branches content and exclude hidden ancestors so an unrelated
+keep-mounted hidden popup cannot satisfy the proof. Use the existing reverse-
+display wait with its existing SDK wait bound. Escape completion alone does not
+admit the next interaction. The real BaseUI popup may remain mounted through
+close settlement; its ending positioner is inert, so that lifecycle observation
+alone does not prove an intercepted native click. Keep fixed phase attribution
+for the existing Files control waits/clicks, owned identity, panel visibility,
+tree entries, line and comment draft. Phase labels export no selector, path,
+text or identity and add no action, browser read, retry or time budget. A failed
+close proof stops before Files, while existing click/read exceptions propagate
+unchanged. Native CI still must establish the specific failure control and
+subsequent capture success.
+
 The card-menu scene requires a genuine no-editor fixture before server
 admission. Only this selector removes the ordinary fixture's exact generated
 `cursor` editor launcher; the default fixture retains it, and `cursor-agent`,
@@ -1033,6 +1048,16 @@ unavailable data and failed owned-identity checks remain null. No text, values,
 IDs, styles, HTML, URLs or credentials are retained. Observer faults preserve the
 original capture exception and joined cleanup; facts never approve a capture or
 identify its cause, and an earlier valid sample cannot prove the later state.
+The two owned provider fields scroll through the pinned SDK fallback's supported
+browser execution path, using native `Element.scrollIntoView` with binary-start
+and custom-model-end alignment and nearest inline alignment. The pinned desktop
+SDK wheel path serializes zero scroll deltas on success and need not perform this
+scroll; do not require an action failure to obtain its native fallback. Refuse
+foreign route/theme/selection, credential or boot context and ambiguous or missing
+owned inputs. Keep the existing before/after outer-page scroll guard and all
+one-scene visibility, clipping, identity, nonsecret-config and PNG admission
+predicates. Source/SDK tests do not prove native layout or an attainable field span.
+
 The qualifier does not authenticate, forge, toggle availability or save settings. Providers
 is the current `/settings/providers` route, separate from Agents. Expand the
 existing Claude card to show actual non-secret fields and model controls.
@@ -1177,6 +1202,16 @@ and existing request bounds remain unchanged. The added CLI issue and OAuth
 exchange each use their existing ten-second owner/request bound. No grant,
 access token, header, cookie or private snapshot payload enters retained
 evidence.
+
+Snapshot admission must decode the endpoint's public `OrchestrationReadModel`,
+not raw persistence rows. The server uses its shared project/thread projection
+from one repository load, preserves archived/deleted markers, and emits the
+existing public camel-case identities. A populated public fixture is checked
+against the Rust projection and decoded through the actual QA reader; empty
+mock bodies alone cannot prove this boundary. No raw snapshot, path, message,
+model selection or credential becomes retained native evidence. Source parity
+can establish a contract defect and repair, while the native failed substep
+and final captures still require the controlled CI run.
 
 The finite lane retains eleven named originals per theme: `worktree-discovery`,
 `project-open-directory`, `project-clone-chooser`, `project-clone-incomplete`,

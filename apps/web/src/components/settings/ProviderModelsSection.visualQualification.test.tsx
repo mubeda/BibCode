@@ -22,6 +22,49 @@ import { SettingsPageContainer } from "./settingsLayout";
 import { ProviderInstanceCard } from "./ProviderInstanceCard";
 import { DRIVER_OPTION_BY_VALUE } from "./providerDriverMeta";
 
+function installedSdkScroll(browser: unknown) {
+  const require = NodeModule.createRequire(
+    new NodeURL.URL("../../../../desktop/package.json", import.meta.url),
+  );
+  const source = NodeFS.readFileSync(
+    new NodeURL.URL("node.js", NodeURL.pathToFileURL(require.resolve("webdriverio"))),
+    "utf8",
+  );
+  const between = (start: string, end: string) => {
+    const first = source.indexOf(start);
+    const last = source.indexOf(end, first + start.length);
+    expect(first).toBeGreaterThan(0);
+    expect(last).toBeGreaterThan(first);
+    return source.slice(first, last);
+  };
+  const sdk = NodeVM.runInNewContext(
+    between("var BaseAction = class", "\n//") +
+      between("var DEFAULT_SCROLL_PARAMS", "// src/commands/browser/action.ts") +
+      between("async function scrollIntoView(", "async function mobileScrollUntilVisible(") +
+      between("function scrollIntoViewWeb(", "\n//") +
+      "\n({ WheelAction, scrollIntoView })",
+    {
+      window,
+      getBrowserObject30: (element: { parent: unknown }) => element.parent,
+      ELEMENT_KEY3: "element-6066-11e4-a52e-4f735466cecf",
+      ELEMENT_KEY17: "element-6066-11e4-a52e-4f735466cecf",
+      keyActionIds: 0,
+      pointerActionIds: 0,
+      wheelActionIds: 0,
+      log27: {
+        warn: () => {
+          throw new Error("Unexpected SDK scroll fallback.");
+        },
+      },
+    },
+  );
+  return {
+    scroll: (element: unknown, options: ScrollIntoViewOptions) =>
+      sdk.scrollIntoView.call(element, options),
+    action: () => new sdk.WheelAction(browser),
+  };
+}
+
 it.each([false, true])(
   "reads the actual mounted Opus models card with favorite=%s",
   async (favorite) => {
@@ -165,6 +208,151 @@ it.each([false, true])(
         ownedConfigOnly: true,
         targetInView: true,
       });
+      const page = custom.closest<HTMLElement>(".scrollbar-gutter-both")!;
+      const panel = custom.closest<HTMLElement>('[data-slot="collapsible-panel"]')!;
+      const list = favoriteButton.closest<HTMLElement>(".overflow-y-auto")!;
+      const order = container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Move Opus 5 up"]',
+      )!;
+      const binary = container.querySelector<HTMLInputElement>(
+        "#provider-instance-claudeAgent-binaryPath",
+      )!;
+      const home = container.querySelector<HTMLInputElement>(
+        "#provider-instance-claudeAgent-homePath",
+      )!;
+      const args = container.querySelector<HTMLInputElement>(
+        "#provider-instance-claudeAgent-launchArgs",
+      )!;
+      expect(panel.classList.contains("overflow-hidden")).toBe(true);
+      expect(list.classList.contains("max-h-40")).toBe(true);
+      page.style.overflowY = "auto";
+      panel.style.overflowY = "hidden";
+      list.style.overflowY = "auto";
+      const positions = new Map<HTMLElement, number>([
+        [binary, 680],
+        [home, 744],
+        [args, 808],
+        [favoriteButton, 936],
+        [order, 936],
+        [custom, 1064],
+      ]);
+      // A constructed 416px field span fits this 820px scrollport; this is not browser layout evidence.
+      geometry.mockImplementation(function (this: HTMLElement) {
+        if (this === page) return new DOMRect(10, 80, 900, 820);
+        if (this === panel) return new DOMRect(10, 200 - page.scrollTop, 900, 1800);
+        if (this === list) return new DOMRect(10, 920 - page.scrollTop, 900, 160);
+        const top = positions.get(this);
+        return top === undefined
+          ? new DOMRect(10, 10, 300, 200)
+          : new DOMRect(10, top - page.scrollTop, 300, 32);
+      });
+      const nativeScrolls: ScrollIntoViewOptions[] = [];
+      vi.spyOn(HTMLElement.prototype, "scrollIntoView").mockImplementation(
+        function (this: HTMLElement, options) {
+          const value = options as ScrollIntoViewOptions;
+          expect([binary, custom]).toContain(this);
+          nativeScrolls.push(value);
+          const target = positions.get(this)!;
+          page.scrollTop = Math.max(0, value.block === "start" ? target - 80 : target + 32 - 900);
+        },
+      );
+      const actions: Array<{ deltaX: number; deltaY: number }> = [];
+      const nodes = new Map<string, HTMLElement>();
+      let ordinal = 0;
+      let sdk: ReturnType<typeof installedSdkScroll>;
+      const browser = {
+        isMobile: false,
+        getElementRect: async (id: string) => nodes.get(id)!.getBoundingClientRect(),
+        getWindowSize: async () => ({ width: innerWidth, height: innerHeight }),
+        execute: async (callback: (...values: unknown[]) => unknown, ...values: unknown[]) =>
+          callback(...values),
+        action: () => sdk.action(),
+        performActions: async (
+          payloads: Array<{ actions: Array<{ deltaX: number; deltaY: number }> }>,
+        ) => {
+          // Inert successful wheel transport: zero deltas cannot establish a scrolling action.
+          for (const payload of payloads)
+            for (const action of payload.actions) actions.push(action);
+        },
+        releaseActions: async () => {},
+        $: (selector: string) => {
+          const node = container.querySelector<HTMLElement>(selector)!;
+          const id = `owned-field-${++ordinal}`;
+          nodes.set(id, node);
+          const element: Record<string, unknown> = {
+            parent: browser,
+            elementId: id,
+            "element-6066-11e4-a52e-4f735466cecf": id,
+          };
+          return {
+            ...element,
+            scrollIntoView: (options: ScrollIntoViewOptions) => sdk.scroll(element, options),
+          };
+        },
+      };
+      sdk = installedSdkScroll(browser);
+      await browser
+        .$("#provider-instance-claudeAgent-custom-model")
+        .scrollIntoView({ block: "end" });
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toMatchObject({ deltaX: 0, deltaY: 0 });
+      expect(nativeScrolls).toHaveLength(0);
+      expect(observe()).toMatchObject({
+        nonSecretFieldsVisible: true,
+        modelsCustomFieldInView: false,
+        modelControlsVisible: false,
+      });
+      const scrollStart = source.indexOf(
+        "  const scroll = async",
+        source.indexOf("export async function runVisualSettings("),
+      );
+      const scrollEnd = source.indexOf("  const closeOverlay", scrollStart);
+      const nativeStart = source.indexOf("export function scrollSettingsVisualField(");
+      const nativeEnd = source.indexOf("export interface SettingsVisualInput", nativeStart);
+      const nativeSource = nativeStart === -1 ? "" : source.slice(nativeStart, nativeEnd);
+      const actualScroll = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          nativeSource + source.slice(scrollStart, scrollEnd) + "\nscroll",
+        ).replace(/^export /gm, ""),
+        {
+          browser,
+          bounded: async (value: Promise<unknown>) => value,
+          readVisualPageScroll: () => ({ x: 0, y: 0 }),
+          input: {
+            scene: "settings-provider-form",
+            theme: "light",
+            origin: location.origin,
+            threadId: "owned",
+            branch: "codex/delivery-retry-light",
+          },
+          document,
+          location,
+          HTMLElement,
+          HTMLInputElement,
+        },
+      );
+      await actualScroll("#provider-instance-claudeAgent-binaryPath", "start");
+      await actualScroll("#provider-instance-claudeAgent-custom-model", "end");
+      expect(nativeScrolls).toEqual([
+        { block: "start", inline: "nearest" },
+        { block: "end", inline: "nearest" },
+      ]);
+      expect(observe()).toMatchObject({
+        nonSecretFieldsVisible: true,
+        modelsCustomFieldInView: true,
+        modelsCustomFieldReady: true,
+        modelsVisible: true,
+        modelControlsVisible: true,
+      });
+      positions.set(custom, 1700);
+      await actualScroll("#provider-instance-claudeAgent-custom-model", "end");
+      expect(observe()).toMatchObject({
+        nonSecretFieldsVisible: false,
+        modelsCustomFieldInView: true,
+      });
+      page.scrollTop = 0;
+      page.style.overflowY = panel.style.overflowY = list.style.overflowY = "";
+      geometry.mockReturnValue(new DOMRect(10, 10, 300, 200));
       custom.value = "Retained custom draft";
       expect(observe()).toMatchObject({
         modelsVisible: false,

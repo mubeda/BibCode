@@ -118,12 +118,19 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
       // Optional attribution cannot replace an existing action or outcome.
     }
   };
-  const click = async (selector: string, control?: PartialStageControl) => {
+  const click = async (
+    selector: string,
+    control?: PartialStageControl,
+    filesControl?: "card" | "right-panel" | "open" | "collapse" | "comment",
+  ) => {
     const element = browser.$(selector);
+    if (filesControl) step(`visual-files-${filesControl}-displayed`);
     if (control) observePartialAwait(control, "displayed");
     await element.waitForDisplayed();
+    if (filesControl) step(`visual-files-${filesControl}-enabled`);
     if (control) observePartialAwait(control, "enabled");
     await element.waitForEnabled();
+    if (filesControl) step(`visual-files-${filesControl}-click`);
     if (control) observePartialAwait(control, "click");
     await element.click();
   };
@@ -301,30 +308,53 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
     .$('//*[@aria-label="Branches"]//button[.//span[normalize-space()="visual-held"]]')
     .moveTo();
   await capture("git-branch-menu");
+  step("visual-branches-close-escape");
   await browser.keys("Escape");
+  step("visual-branches-close-hidden");
+  await browser
+    .$(
+      '//*[@data-slot="popover-popup" and .//*[@aria-label="Branches"] and not(ancestor::*[@hidden])]',
+    )
+    .waitForDisplayed({ reverse: true });
 
   step("visual-files-open");
-  await click(card);
+  await click(card, undefined, "card");
+  step("visual-files-managed-identity");
   await input.verifyManaged();
+  step("visual-files-panel-visible");
   if (!(await browser.$("[data-right-panel-tabbar]").isDisplayed()))
-    await click('button[aria-label^="Toggle right panel"]');
+    await click('button[aria-label^="Toggle right panel"]', undefined, "right-panel");
   // The fresh owned thread has no right-panel surfaces. Missing empty-state controls refuse.
-  await click('//button[.//span[normalize-space()="Files"] and not(@aria-disabled="true")]');
-  await click('[aria-label="Collapse all folders"]');
+  await click(
+    '//button[.//span[normalize-space()="Files"] and not(@aria-disabled="true")]',
+    undefined,
+    "open",
+  );
+  await click('[aria-label="Collapse all folders"]', undefined, "collapse");
   const tree = browser.$("[data-preview-panel-mode] file-tree-container");
-  for (const path of ["src/", "src/nested/", "src/nested/visual-note.ts"]) {
+  for (const [path, control] of [
+    ["src/", "tree-src"],
+    ["src/nested/", "tree-nested"],
+    ["src/nested/visual-note.ts", "tree-file"],
+  ] as const) {
     const entry = tree.shadow$(`[role="treeitem"][data-item-path="${path}"]`);
+    step(`visual-files-${control}-displayed`);
     await entry.waitForDisplayed();
+    step(`visual-files-${control}-click`);
     await entry.click();
   }
   const file = browser.$("[data-preview-panel-mode] diffs-container");
   const line = file.shadow$('[data-gutter] [data-column-number="1"]');
+  step("visual-files-line-displayed");
   await line.waitForDisplayed();
+  step("visual-files-line-click");
   await line.click();
   const comment = browser.$('textarea[aria-label="Comment on lines 1"]');
+  step("visual-files-comment-input-displayed");
   await comment.waitForDisplayed();
+  step("visual-files-comment-draft");
   await comment.setValue("Review this owned line");
-  await click('//button[normalize-space()="Comment"]');
+  await click('//button[normalize-space()="Comment"]', undefined, "comment");
   await capture("files-editor-comment");
 
   step("visual-palette-open");

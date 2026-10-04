@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 // @effect-diagnostics nodeBuiltinImport:off - Synthetic PNG and inert WebDriver boundary only; no browser or server starts.
 import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
@@ -13,6 +14,288 @@ import {
 } from "./release-visual-core.ts";
 import * as CoreCapture from "./release-visual-core.ts";
 import { readVisualWitness, observeVisualNameClear } from "./release-visual-observation.ts";
+
+it("awaits the actual keep-mounted BaseUI popup close before the next Files card interaction", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("BASE_UI_ANIMATIONS_DISABLED", false);
+  const frames = new Map<number, FrameRequestCallback>();
+  let ordinal = 0;
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    frames.set(++ordinal, callback);
+    return ordinal;
+  });
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => frames.delete(id));
+  const flushFrames = () => {
+    const queued = [...frames.values()];
+    frames.clear();
+    for (const callback of queued) callback(0);
+  };
+  let finish: () => void = () => {};
+  const finished = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const animationDescriptor = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "getAnimations",
+  );
+  Object.defineProperty(HTMLElement.prototype, "getAnimations", {
+    configurable: true,
+    value(this: HTMLElement) {
+      return this.matches('[data-slot="popover-popup"][data-ending-style]') ? [{ finished }] : [];
+    },
+  });
+  const webRequire = NodeModule.createRequire(NodePath.resolve("apps/web/package.json"));
+  const { act, createElement } = webRequire("react") as {
+    act: (run: () => void | Promise<void>) => Promise<void>;
+    createElement: (type: unknown, props: unknown, ...children: unknown[]) => unknown;
+  };
+  const { createRoot } = webRequire("react-dom/client") as {
+    createRoot: (container: Element) => { render: (node: unknown) => void; unmount: () => void };
+  };
+  const popoverModule = "../../../web/src/components/ui/popover.tsx";
+  const { Popover, PopoverTrigger, PopoverPopup } = await import(popoverModule);
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const calls: string[] = [];
+  let closeCompleted = false;
+  try {
+    await act(async () =>
+      root.render(
+        createElement(
+          Popover,
+          {
+            defaultOpen: true,
+            onOpenChangeComplete: (open: boolean) => {
+              if (!open) closeCompleted = true;
+            },
+          },
+          createElement(PopoverTrigger, null, "Choose branch"),
+          createElement(
+            PopoverPopup,
+            null,
+            createElement(
+              "div",
+              { "aria-label": "Branches" },
+              createElement("button", null, "visual-held"),
+            ),
+          ),
+        ),
+      ),
+    );
+    await act(async () => {
+      for (let pass = 0; pass < 4; pass++) {
+        flushFrames();
+        await Promise.resolve();
+      }
+    });
+    const popup = document.querySelector<HTMLElement>('[data-slot="popover-popup"]')!;
+    const positioner = popup.closest<HTMLElement>('[data-slot="popover-positioner"]')!;
+    expect(positioner.hidden).toBe(false);
+    const source = NodeFS.readFileSync(
+      NodePath.join(import.meta.dirname, "release-visual-core.ts"),
+      "utf8",
+    );
+    const start = source.indexOf('  await capture("git-branch-menu");');
+    const end = source.indexOf("  await input.verifyManaged();", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" + source.slice(start, end) + "}\nrun",
+      ),
+      {
+        card: "owned-card",
+        capture: async () => {
+          calls.push("capture");
+          expect(positioner.hidden).toBe(false);
+        },
+        step: () => {},
+        click: async (selector: string) => {
+          expect(selector).toBe("owned-card");
+          expect(closeCompleted).toBe(true);
+          expect(positioner.hidden).toBe(true);
+          calls.push("card");
+        },
+        browser: {
+          keys: async (key: string) => {
+            expect(key).toBe("Escape");
+            calls.push("Escape");
+            await act(async () => {
+              popup.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+              flushFrames();
+              await Promise.resolve();
+            });
+            expect(popup.hasAttribute("data-ending-style")).toBe(true);
+            expect(positioner.hidden).toBe(false);
+            // BaseUI makes the ending positioner inert; this seam proves missing
+            // completion admission, not that animation alone intercepted native clicks.
+            expect(positioner.style.pointerEvents).toBe("none");
+            expect(closeCompleted).toBe(false);
+          },
+          $: (selector: string) => ({
+            waitForDisplayed: async (options: { reverse?: boolean }) => {
+              expect(selector).toBe(
+                '//*[@data-slot="popover-popup" and .//*[@aria-label="Branches"] and not(ancestor::*[@hidden])]',
+              );
+              expect(options).toEqual({ reverse: true });
+              calls.push("close-proof");
+              await act(async () => {
+                flushFrames();
+                await Promise.resolve();
+                finish();
+                await finished;
+                await Promise.resolve();
+              });
+              expect(positioner.hidden).toBe(true);
+              expect(closeCompleted).toBe(true);
+            },
+          }),
+        },
+      },
+    ) as () => Promise<void>;
+    await run();
+    expect(calls).toEqual(["capture", "Escape", "close-proof", "card"]);
+  } finally {
+    finish();
+    await act(async () => root.unmount());
+    container.remove();
+    if (animationDescriptor)
+      Object.defineProperty(HTMLElement.prototype, "getAnimations", animationDescriptor);
+    else Reflect.deleteProperty(HTMLElement.prototype, "getAnimations");
+    vi.unstubAllGlobals();
+  }
+});
+
+it.each(["escape", "hidden"])(
+  "propagates the original branch-close %s failure before Files interaction",
+  async (stage) => {
+    const source = NodeFS.readFileSync(
+      NodePath.join(import.meta.dirname, "release-visual-core.ts"),
+      "utf8",
+    );
+    const start = source.indexOf('  await capture("git-branch-menu");');
+    const end = source.indexOf("  await input.verifyManaged();", start);
+    const calls: string[] = [];
+    const phases: string[] = [];
+    const original = new Error("Inert original branch-close failure.");
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" + source.slice(start, end) + "}\nrun",
+      ),
+      {
+        card: "owned-card",
+        capture: async () => calls.push("capture"),
+        click: async () => calls.push("card"),
+        step: (phase: string) => phases.push(phase),
+        browser: {
+          keys: async () => {
+            calls.push("Escape");
+            if (stage === "escape") throw original;
+          },
+          $: () => ({
+            waitForDisplayed: async (options: { reverse?: boolean }) => {
+              expect(options).toEqual({ reverse: true });
+              calls.push("close-proof");
+              throw original;
+            },
+          }),
+        },
+      },
+    ) as () => Promise<void>;
+    await expect(run()).rejects.toBe(original);
+    expect(calls).toEqual(
+      stage === "escape" ? ["capture", "Escape"] : ["capture", "Escape", "close-proof"],
+    );
+    expect(phases.at(-1)).toBe(`visual-branches-close-${stage}`);
+  },
+);
+
+it.each([
+  "card",
+  "right-panel",
+  "open",
+  "collapse",
+  "tree-src",
+  "tree-nested",
+  "tree-file",
+  "line",
+  "comment",
+])(
+  "attributes only the existing Files click await and preserves its original error: %s",
+  async (target) => {
+    const source = NodeFS.readFileSync(
+      NodePath.join(import.meta.dirname, "release-visual-core.ts"),
+      "utf8",
+    );
+    const clickStart = source.indexOf("  const click = async");
+    const clickEnd = source.indexOf("  const focus = async", clickStart);
+    const start = source.indexOf('  step("visual-files-open");');
+    const end = source.indexOf('  await capture("files-editor-comment");', start);
+    expect(clickStart).toBeGreaterThan(0);
+    expect(clickEnd).toBeGreaterThan(clickStart);
+    expect(end).toBeGreaterThan(start);
+    const phases: string[] = [];
+    const actions: string[] = [];
+    const original = new Error("Inert original Files click failure.");
+    const element = (control: string) => ({
+      waitForDisplayed: async () => actions.push("display:" + control),
+      waitForEnabled: async () => actions.push("enabled:" + control),
+      isDisplayed: async () => target !== "right-panel",
+      setValue: async () => actions.push("draft"),
+      click: async () => {
+        actions.push("click:" + control);
+        if (control === target) throw original;
+      },
+      shadow$: (selector: string) =>
+        element(
+          selector.includes("data-gutter")
+            ? "line"
+            : selector.includes('"src/"')
+              ? "tree-src"
+              : selector.includes('"src/nested/"')
+                ? "tree-nested"
+                : "tree-file",
+        ),
+    });
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" +
+          source.slice(clickStart, clickEnd) +
+          source.slice(start, end) +
+          "}\nrun",
+      ),
+      {
+        card: "owned-card",
+        step: (phase: string) => phases.push(phase),
+        input: { verifyManaged: async () => actions.push("identity") },
+        observePartialAwait: () => {
+          throw new Error("Unexpected partial-stage observer.");
+        },
+        browser: {
+          $: (selector: string) =>
+            element(
+              selector === "owned-card"
+                ? "card"
+                : selector.includes("Toggle right panel")
+                  ? "right-panel"
+                  : selector.includes('normalize-space()="Files"')
+                    ? "open"
+                    : selector.includes("Collapse all folders")
+                      ? "collapse"
+                      : selector.includes('normalize-space()="Comment"')
+                        ? "comment"
+                        : "tree",
+            ),
+        },
+      },
+    ) as () => Promise<void>;
+    await expect(run()).rejects.toBe(original);
+    expect(phases.at(-1)).toBe(`visual-files-${target}-click`);
+    expect(actions.at(-1)).toBe("click:" + target);
+    expect(JSON.stringify(phases)).not.toMatch(/owned-card|data-|aria-|src\/|private/);
+  },
+);
 
 function png() {
   const chunk = (type: string, data: Buffer) => {
@@ -677,7 +960,7 @@ it.each([
   "admits occupied branch focus only after public current-ref readiness and preserves identity: %s",
   async (mode) => {
     const source = NodeFS.readFileSync(
-      new URL("./release-visual-core.ts", import.meta.url),
+      NodePath.join(import.meta.dirname, "release-visual-core.ts"),
       "utf8",
     );
     const begin = source.indexOf("  const focus = async");

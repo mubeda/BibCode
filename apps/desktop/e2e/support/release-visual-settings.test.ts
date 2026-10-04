@@ -4,6 +4,7 @@ import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 import * as NodeVM from "node:vm";
 import * as NodeZlib from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
@@ -13,6 +14,7 @@ import {
   readSettingsVisualWitness,
   readSettingsAddProviderVisibility,
   runVisualSettings,
+  scrollSettingsVisualField,
   validateSettingsVisualWitness,
   settingsVisualScreenshotName,
   projectSettingsVisualCapture,
@@ -86,6 +88,149 @@ afterEach(() => {
   vi.unstubAllGlobals();
   document.body.innerHTML = "";
 });
+
+it.each(["light", "dark"] as const)("scrolls only the two owned fields natively in %s", (theme) => {
+  page("settings-provider-form");
+  document.documentElement.classList.toggle("dark", theme === "dark");
+  const scroll = vi.spyOn(HTMLElement.prototype, "scrollIntoView").mockImplementation(() => {});
+  const value = vi.spyOn(HTMLInputElement.prototype, "value", "get");
+  for (const [selector, block] of [
+    ["#provider-instance-claudeAgent-binaryPath", "start"],
+    ["#provider-instance-claudeAgent-custom-model", "end"],
+  ] as const) {
+    scrollSettingsVisualField({
+      ...observation,
+      scene: "settings-provider-form",
+      theme,
+      branch: `codex/delivery-retry-${theme}`,
+      selector,
+      block,
+    });
+    expect(scroll.mock.instances.at(-1)).toBe(document.querySelector(selector));
+    expect(scroll.mock.calls.at(-1)).toEqual([{ block, inline: "nearest" }]);
+  }
+  expect(scroll).toHaveBeenCalledTimes(2);
+  expect(value).not.toHaveBeenCalled();
+});
+
+it.each([
+  "missing",
+  "duplicate",
+  "wrong-node",
+  "route",
+  "origin",
+  "query",
+  "hash",
+  "theme",
+  "branch",
+  "nav",
+  "rail",
+  "credential",
+  "boot",
+  "selector",
+  "block",
+])("refuses unsafe native scroll %s without calling the action or reading field values", (mode) => {
+  page("settings-provider-form");
+  const selector = "#provider-instance-claudeAgent-custom-model";
+  const target = document.querySelector(selector)!;
+  const input = {
+    ...observation,
+    scene: "settings-provider-form" as const,
+    selector,
+    block: "end" as "start" | "end",
+  };
+  if (mode === "missing") target.remove();
+  if (mode === "duplicate") target.parentElement!.append(target.cloneNode(true));
+  if (mode === "wrong-node")
+    target.outerHTML = '<div id="provider-instance-claudeAgent-custom-model"></div>';
+  if (mode === "route") locationAt("/local/owned");
+  if (mode === "origin") input.origin = "http://outside.invalid";
+  if (mode === "query") vi.stubGlobal("location", { ...location, search: "?owned" });
+  if (mode === "hash") vi.stubGlobal("location", { ...location, hash: "#owned" });
+  if (mode === "theme") document.documentElement.classList.add("dark");
+  if (mode === "branch") input.branch = "other";
+  if (mode === "nav")
+    document.querySelector('[data-slot="sidebar-menu-button"]')!.textContent = "General";
+  if (mode === "rail")
+    document
+      .querySelector('[data-testid="environment-rail-local"]')!
+      .setAttribute("aria-checked", "false");
+  if (mode === "credential")
+    document.body.insertAdjacentHTML("beforeend", '<input type="password">');
+  if (mode === "boot") document.body.insertAdjacentHTML("beforeend", '<div id="boot-shell"></div>');
+  if (mode === "selector") input.selector = "constructor";
+  if (mode === "block") input.block = "start";
+  const scroll = vi.spyOn(HTMLElement.prototype, "scrollIntoView").mockImplementation(() => {});
+  const value = vi.spyOn(HTMLInputElement.prototype, "value", "get");
+  expect(() => scrollSettingsVisualField(input)).toThrow();
+  expect(scroll).not.toHaveBeenCalled();
+  expect(value).not.toHaveBeenCalled();
+});
+
+it("preserves the original native action failure", () => {
+  page("settings-provider-form");
+  const original = new Error("Inert original native scroll failure.");
+  vi.spyOn(HTMLElement.prototype, "scrollIntoView").mockImplementation(() => {
+    throw original;
+  });
+  try {
+    scrollSettingsVisualField({
+      ...observation,
+      scene: "settings-provider-form",
+      selector: "#provider-instance-claudeAgent-custom-model",
+      block: "end",
+    });
+  } catch (error) {
+    expect(error).toBe(original);
+    return;
+  }
+  throw new Error("Expected the original failure.");
+});
+
+it.each(["before", "native", "after", "escape"])(
+  "keeps the actual scrolling error and outer-page guard at %s",
+  async (mode) => {
+    const source = NodeFS.readFileSync(
+      new NodeURL.URL("./release-visual-settings.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf(
+      "  const scroll = async",
+      source.indexOf("export async function runVisualSettings("),
+    );
+    const end = source.indexOf("  const closeOverlay", start);
+    const original = new Error("Inert original scrolling transport failure.");
+    const calls: string[] = [];
+    let pages = 0;
+    const browser = {
+      execute: async (read: unknown) => {
+        const operation =
+          read === scrollSettingsVisualField ? "native" : ++pages === 1 ? "before" : "after";
+        calls.push(operation);
+        if (mode === operation) throw original;
+        return { x: 0, y: mode === "escape" && operation === "after" ? 1 : 0 };
+      },
+    };
+    const scroll = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(source.slice(start, end) + "\nscroll"),
+      {
+        browser,
+        input: observation,
+        scrollSettingsVisualField,
+        readVisualPageScroll: () => {},
+        bounded: async (value: Promise<unknown>) => value,
+      },
+    );
+    const operation = scroll("#provider-instance-claudeAgent-custom-model", "end");
+    if (mode === "escape")
+      await expect(operation).rejects.toThrow("Visual settings scroll escaped.");
+    else await expect(operation).rejects.toBe(original);
+    const expected = ["before", "native", "after"];
+    expect(calls).toEqual(
+      mode === "escape" ? expected : expected.slice(0, expected.indexOf(mode) + 1),
+    );
+  },
+);
 
 describe("closed settings DOM witnesses", () => {
   it.each([
@@ -826,9 +971,6 @@ function controller(failure?: string) {
     setValue: async (value: string) => {
       actions.push(selector + ":" + value);
     },
-    scrollIntoView: async () => {
-      actions.push("scroll:" + selector);
-    },
     getText: async () =>
       failure === "draft" && route === "chat" && actions.includes("button=Back")
         ? "changed"
@@ -843,7 +985,14 @@ function controller(failure?: string) {
         actions.push("key:" + key);
         if (key === "Escape") popup = "";
       },
-      execute: async (read: unknown) => {
+      execute: async (read: unknown, options?: { selector: string; block: string }) => {
+        if (read === scrollSettingsVisualField) {
+          expect(route).toBe("providers");
+          expect(details).toBe(true);
+          expect(options?.block).toBe(options?.selector.endsWith("binaryPath") ? "start" : "end");
+          actions.push("scroll:" + options?.selector);
+          return;
+        }
         if (read === readSettingsAddProviderVisibility)
           return { oneControl: true, visible: false, hidden: true, enabled: true };
         return { x: 0, y: 0 };
