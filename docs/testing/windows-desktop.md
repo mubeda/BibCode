@@ -447,6 +447,18 @@ records path/version/hash and installer PID/path observations without command
 lines or credentials. Inspect that artifact on timeout; the later public
 runtime-version and retained-data checks remain required.
 
+The seed driver's existing private result receipt also retains `installResultObservation`
+from the already-returned public `installUpdate` result: returned/unavailable category,
+accepted/completed booleans or null, and only current-contract status, phase and
+error-context enums or null. The existing pre-install write initializes unavailable;
+a disconnect, never-return, or protected-lane finish at `protecting` before the result
+arrives cannot prove that result. A later return does not revise an already-delivered
+unavailable record. Existing phase listeners retain only first-seen contract phases.
+Unknown, inherited, accessor or unreadable facts stay null; raw errors, messages,
+IDs, paths, URLs and arguments are not added. These facts add no bridge call,
+listener, retry, poll, deadline or file write and do not replace the original
+completion verdict or establish a native failure cause.
+
 The CI harness also starts a bounded read-only process-event witness before the
 seed driver's installation dispatch and joins that exact observer after the
 handoff wait, including failures. `windows-installer-events.json` contains only

@@ -2227,3 +2227,472 @@ it("retains the closed stream console record through the generated native fronte
   onLine!("[WDIO-FRONTEND][INFO] " + message);
   expect(retained).toEqual([]);
 });
+
+/** Execute the actual generated install segment through inert bridge/file/timer ports. */
+function installResultFixture(
+  options: {
+    lane?: "previous-stable" | "protected-baseline";
+    result?: unknown;
+    mode?: "returned" | "never" | "protecting" | "disconnect" | "reject";
+    error?: Error;
+    preparationStates?: unknown[];
+    installStates?: unknown[];
+  } = {},
+) {
+  const input = {
+    candidateVersion: "0.7.3",
+    expectedDataRoot: absolute("install-result", "data"),
+    lane: options.lane ?? "previous-stable",
+    phase: "seed-and-install" as const,
+    projectId: "install-result-project",
+    resultPath: absolute("install-result", "before.json"),
+    workspaceRoot: absolute("install-result", "workspace"),
+    platform: "win" as const,
+  };
+  const spec = createSeededUpgradeDriverSpec(input);
+  const start = spec.indexOf("    const preparation = await browser.executeAsync");
+  const end = spec.indexOf("\n  });\n});", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const files = new Map([[input.resultPath, JSON.stringify({ baseline: true })]]);
+  const writes: Array<Record<string, unknown>> = [];
+  const calls: string[] = [];
+  const timers: number[] = [];
+  const listeners: Array<(state: unknown) => void> = [];
+  const emit = (state: unknown) => listeners.forEach((listener) => listener(state));
+  let returnInstall!: (value: unknown) => void;
+  const deferred = new Promise((resolve) => {
+    returnInstall = resolve;
+  });
+  let executions = 0;
+  const failure = options.error ?? new Error("inert existing bridge failure");
+  const run = NodeVM.runInNewContext(
+    "async function run(){\n" + spec.slice(start, end) + "\n}\nrun",
+    {
+      input,
+      Date,
+      setTimeout: (callback: () => void, delay: number) => {
+        timers.push(delay);
+        // @effect-diagnostics-next-line globalTimers:off - Generated callbacks use the controlled Vitest clock.
+        return setTimeout(callback, delay);
+      },
+      NodeFS: {
+        readFileSync: (path: string) => files.get(path),
+        writeFileSync: (path: string, contents: string) => {
+          expect(path).toBe(input.resultPath);
+          files.set(path, contents);
+          writes.push(JSON.parse(contents));
+        },
+      },
+      window: {
+        desktopBridge: {
+          onUpdateState: (listener: (state: unknown) => void) => {
+            calls.push("listener");
+            listeners.push(listener);
+            return () => {};
+          },
+          checkForUpdate: async () => {
+            calls.push("check");
+            for (const state of options.preparationStates ?? [
+              { phase: "checking" },
+              { phase: "available" },
+            ])
+              emit(state);
+            return { state: { status: "available", availableVersion: input.candidateVersion } };
+          },
+          downloadUpdate: async () => {
+            calls.push("download");
+            return { completed: true, state: { downloadedVersion: input.candidateVersion } };
+          },
+          installUpdate: async () => {
+            calls.push("install");
+            for (const state of options.installStates ?? []) emit(state);
+            if (options.mode === "protecting") {
+              emit({ phase: "protecting" });
+              return deferred;
+            }
+            if (options.mode === "never" || options.mode === "disconnect") return deferred;
+            if (options.mode === "reject") throw failure;
+            return (
+              options.result ?? {
+                accepted: true,
+                completed: true,
+                state: { status: "downloaded", phase: "installing", errorContext: null },
+              }
+            );
+          },
+        },
+      },
+      browser: {
+        executeAsync: (
+          callback: (argument: string, done: (value: unknown) => void) => void,
+          argument: string,
+        ) => {
+          const execution = ++executions;
+          return new Promise((resolve, reject) => {
+            try {
+              callback(argument, (value) => resolve(JSON.parse(JSON.stringify(value))));
+            } catch (error) {
+              reject(error);
+            }
+            if (execution === 2 && options.mode === "disconnect")
+              queueMicrotask(() => reject(failure));
+          });
+        },
+      },
+    },
+  ) as () => Promise<void>;
+  const result = run();
+  void result.catch(() => {});
+  return {
+    run: result,
+    calls,
+    writes,
+    timers,
+    returnInstall,
+    read: () => JSON.parse(files.get(input.resultPath)!) as Record<string, unknown>,
+  };
+}
+
+describe("generated public install-result observation", () => {
+  afterEach(() => vi.useRealTimers());
+  it("retains the already-returned refused public install result without changing its verdict", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({
+      result: {
+        accepted: false,
+        completed: false,
+        state: {
+          status: "error",
+          phase: "failed",
+          errorContext: "install",
+          message: "private-native-message",
+          environmentId: "private-id",
+        },
+      },
+      installStates: [{ phase: "protecting" }, { phase: "failed" }],
+    });
+    await expect(fixture.run).rejects.toThrow("install did not complete");
+    expect(fixture.read().installResultObservation).toEqual({
+      kind: "returned",
+      accepted: false,
+      completed: false,
+      status: "error",
+      phase: "failed",
+      errorContext: "install",
+    });
+    expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
+    expect(fixture.read().installAttempted).toBe(false);
+    expect(fixture.read().phases).toEqual(["checking", "available", "protecting", "failed"]);
+    expect(JSON.stringify(fixture.writes)).not.toContain("private-");
+  });
+
+  it("records accepted completed=false separately from the unchanged install failure", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({
+      result: {
+        accepted: true,
+        completed: false,
+        state: { status: "downloaded", phase: "protecting", errorContext: null },
+      },
+    });
+    await expect(fixture.run).rejects.toThrow("install did not complete");
+    expect(fixture.read().installResultObservation).toEqual({
+      kind: "returned",
+      accepted: true,
+      completed: false,
+      status: "downloaded",
+      phase: "protecting",
+      errorContext: null,
+    });
+    expect(fixture.timers).toEqual([30000]);
+    expect(fixture.writes).toHaveLength(2);
+  });
+
+  it.each([false, true])(
+    "does not turn the observed accepted=%s flag into a new completion predicate",
+    async (accepted) => {
+      vi.useFakeTimers();
+      const fixture = installResultFixture({
+        result: {
+          accepted,
+          completed: true,
+          state: { status: "downloaded", phase: "installing", errorContext: null },
+        },
+      });
+      await vi.advanceTimersByTimeAsync(30750);
+      await fixture.run;
+      expect(fixture.read().installAttempted).toBe(true);
+      expect(fixture.read().installResultObservation).toEqual({
+        kind: "returned",
+        accepted,
+        completed: true,
+        status: "downloaded",
+        phase: "installing",
+        errorContext: null,
+      });
+      expect(fixture.timers).toEqual([30000, 750, 30000]);
+      expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
+      expect(fixture.writes).toHaveLength(2);
+    },
+  );
+
+  it("keeps an early protecting finish unavailable even if the result arrives afterward", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({ lane: "protected-baseline", mode: "protecting" });
+    await vi.advanceTimersByTimeAsync(0);
+    const expected = {
+      kind: "unavailable",
+      accepted: null,
+      completed: null,
+      status: null,
+      phase: null,
+      errorContext: null,
+    };
+    expect(fixture.read().installResultObservation).toEqual(expected);
+    expect(fixture.read().phases).toEqual(["checking", "available", "protecting"]);
+    fixture.returnInstall({
+      accepted: true,
+      completed: true,
+      state: { status: "downloaded", phase: "installing", errorContext: null },
+    });
+    await vi.advanceTimersByTimeAsync(30000);
+    await fixture.run;
+    expect(fixture.read().installResultObservation).toEqual(expected);
+    expect(fixture.read().installAttempted).toBe(true);
+    expect(fixture.writes).toHaveLength(2);
+    expect(fixture.timers).toEqual([30000, 30000]);
+    expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
+  });
+
+  it("persists unavailable before a never-returning install reaches the original timeout", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({
+      mode: "never",
+      installStates: [{ phase: "installing" }],
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fixture.writes).toHaveLength(1);
+    expect(fixture.read().installResultObservation).toEqual({
+      kind: "unavailable",
+      accepted: null,
+      completed: null,
+      status: null,
+      phase: null,
+      errorContext: null,
+    });
+    const rejected = expect(fixture.run).rejects.toThrow(
+      "timed out observing updater installation",
+    );
+    await vi.advanceTimersByTimeAsync(30000);
+    await rejected;
+    expect(fixture.read().installAttempted).toBe(false);
+    expect(fixture.read().installResultObservation).toMatchObject({
+      kind: "unavailable",
+      accepted: null,
+      completed: null,
+    });
+    expect(fixture.read().phases).toEqual(["checking", "available", "installing"]);
+    expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
+    expect(fixture.timers).toEqual([30000]);
+  });
+
+  it("preserves a disconnect object and the pre-execution unavailable receipt", async () => {
+    vi.useFakeTimers();
+    const original = new Error("inert original driver disconnect");
+    const fixture = installResultFixture({ mode: "disconnect", error: original });
+    await expect(fixture.run).rejects.toBe(original);
+    expect(fixture.writes).toHaveLength(1);
+    expect(fixture.read().installResultObservation).toEqual({
+      kind: "unavailable",
+      accepted: null,
+      completed: null,
+      status: null,
+      phase: null,
+      errorContext: null,
+    });
+    expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
+    expect(JSON.stringify(fixture.writes)).not.toContain("driver disconnect");
+  });
+
+  it("keeps the existing rejection-to-error outcome without serializing it into result facts", async () => {
+    vi.useFakeTimers();
+    const original = new Error("inert original bridge rejection");
+    const fixture = installResultFixture({ mode: "reject", error: original });
+    await expect(fixture.run).rejects.toThrow(String(original));
+    expect(fixture.read().installResultObservation).toEqual({
+      kind: "unavailable",
+      accepted: null,
+      completed: null,
+      status: null,
+      phase: null,
+      errorContext: null,
+    });
+    expect(JSON.stringify(fixture.writes)).not.toContain("bridge rejection");
+    expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
+  });
+
+  it("does not add completed-getter reads or change the existing completion exception outcome", async () => {
+    vi.useFakeTimers();
+    let reads = 0;
+    const original = new Error("private completion error");
+    const result = {
+      accepted: true,
+      state: { status: "downloaded", phase: "failed", errorContext: "install" },
+    };
+    Object.defineProperty(result, "completed", {
+      get() {
+        reads++;
+        throw original;
+      },
+    });
+    const fixture = installResultFixture({ result });
+    await expect(fixture.run).rejects.toThrow(String(original));
+    expect(reads).toBe(1);
+    expect(fixture.read().installResultObservation).toEqual({
+      kind: "returned",
+      accepted: true,
+      completed: null,
+      status: "downloaded",
+      phase: "failed",
+      errorContext: "install",
+    });
+    expect(JSON.stringify(fixture.writes)).not.toContain("private completion");
+  });
+
+  it("quarantines unknown enums, non-boolean flags and raw returned metadata", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({
+      result: {
+        accepted: "private-accepted",
+        completed: "private-completed",
+        state: {
+          status: "private-status",
+          phase: "private-phase",
+          errorContext: "private-context",
+          message: "private-message",
+          environmentId: "private-id",
+          path: "/private/path",
+          url: "http://private-host",
+          arguments: ["private-argument"],
+        },
+      },
+    });
+    await expect(fixture.run).rejects.toThrow("install did not complete");
+    expect(fixture.read().installResultObservation).toEqual({
+      kind: "returned",
+      accepted: null,
+      completed: null,
+      status: null,
+      phase: null,
+      errorContext: null,
+    });
+    expect(JSON.stringify(fixture.writes)).not.toMatch(/private|http:\/\/|arguments|environmentId/);
+  });
+
+  it.each([
+    "accepted accessor",
+    "state accessor",
+    "state field accessors",
+    "inherited",
+    "reflection",
+  ])("leaves %s facts unknown and does not execute diagnostic getters", async (mode) => {
+    vi.useFakeTimers();
+    let reads = 0;
+    const getter = () => {
+      reads++;
+      throw new Error("private diagnostic getter");
+    };
+    let result: object = {
+      accepted: true,
+      completed: false,
+      state: { status: "downloaded", phase: "failed", errorContext: "install" },
+    };
+    if (mode === "accepted accessor") Object.defineProperty(result, "accepted", { get: getter });
+    else if (mode === "state accessor") Object.defineProperty(result, "state", { get: getter });
+    else if (mode === "state field accessors") {
+      const state = {};
+      for (const key of ["status", "phase", "errorContext"])
+        Object.defineProperty(state, key, { get: getter });
+      Object.assign(result, { state });
+    } else if (mode === "inherited")
+      result = Object.assign(
+        Object.create({
+          accepted: true,
+          state: { status: "downloaded", phase: "failed", errorContext: "install" },
+        }),
+        { completed: false },
+      );
+    else
+      result = new Proxy(result, {
+        getOwnPropertyDescriptor() {
+          throw new Error("private reflection fault");
+        },
+      });
+    const fixture = installResultFixture({ result });
+    await expect(fixture.run).rejects.toThrow("install did not complete");
+    const receipt = fixture.read().installResultObservation;
+    expect(receipt).toEqual({
+      kind: "returned",
+      accepted: ["accepted accessor", "inherited", "reflection"].includes(mode) ? null : true,
+      completed: mode === "reflection" ? null : false,
+      status: mode === "accepted accessor" ? "downloaded" : null,
+      phase: mode === "accepted accessor" ? "failed" : null,
+      errorContext: mode === "accepted accessor" ? "install" : null,
+    });
+    expect(reads).toBe(0);
+    expect(JSON.stringify(fixture.writes)).not.toContain("private");
+  });
+
+  it("collects only first-seen contract phases from the two existing listeners", async () => {
+    vi.useFakeTimers();
+    let reads = 0;
+    const accessor = Object.defineProperty({}, "phase", {
+      get() {
+        reads++;
+        throw new Error("private phase getter");
+      },
+    });
+    const reflection = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error("private phase reflection");
+        },
+      },
+    );
+    const fixture = installResultFixture({
+      result: { accepted: true, completed: false, state: {} },
+      preparationStates: [
+        { phase: "idle" },
+        { phase: "checking" },
+        { phase: "private-phase" },
+        accessor,
+        reflection,
+        { phase: "checking" },
+        { phase: "available" },
+      ],
+      installStates: [
+        { phase: "protecting" },
+        { phase: "installing" },
+        { phase: "failed" },
+        { phase: "failed" },
+        { phase: "private-late" },
+        accessor,
+        reflection,
+      ],
+    });
+    await expect(fixture.run).rejects.toThrow("install did not complete");
+    expect(fixture.read().phases).toEqual([
+      "idle",
+      "checking",
+      "available",
+      "protecting",
+      "installing",
+      "failed",
+    ]);
+    expect(reads).toBe(0);
+    expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
+    expect(JSON.stringify(fixture.writes)).not.toContain("private");
+  });
+});
