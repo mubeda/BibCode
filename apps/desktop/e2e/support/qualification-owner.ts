@@ -226,10 +226,111 @@ export function ownedBrowserOptions(chrome: string, profile: string, _webOrigin:
   };
 }
 
+export interface OwnedDriverReadiness {
+  attempts: number;
+  attemptsCapped: boolean;
+  lastHttpStatus: "success" | "client-error" | "server-error" | "redirect" | "other" | null;
+  ready: boolean | null;
+  body: "not-read" | "decoded" | "malformed" | "invalid-json" | "unreadable";
+  failure: "fetch" | "response" | "body" | "predicate" | null;
+  errorClass:
+    | "Error"
+    | "TypeError"
+    | "SyntaxError"
+    | "RangeError"
+    | "DOMException"
+    | "other"
+    | null;
+  driverExited: boolean | null;
+  driverSpawn: "none" | "failed" | null;
+}
+
+/** Exact closed readiness metadata only; never request/response or exception values. */
+export function projectOwnedDriverReadiness(input: unknown): OwnedDriverReadiness | null {
+  try {
+    if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+    const keys = [
+      "attempts",
+      "attemptsCapped",
+      "lastHttpStatus",
+      "ready",
+      "body",
+      "failure",
+      "errorClass",
+      "driverExited",
+      "driverSpawn",
+    ];
+    const ownKeys = Reflect.ownKeys(input);
+    if (
+      ownKeys.length !== keys.length ||
+      !ownKeys.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const values: Record<string, unknown> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      values[key] = descriptor.value;
+    }
+    const choices = (key: string, allowed: string[], nullable = true) =>
+      (nullable && values[key] === null) ||
+      (typeof values[key] === "string" && allowed.includes(values[key]));
+    if (
+      typeof values.attempts !== "number" ||
+      !Number.isInteger(values.attempts) ||
+      values.attempts < 0 ||
+      values.attempts > 1024 ||
+      typeof values.attemptsCapped !== "boolean" ||
+      !choices("lastHttpStatus", [
+        "success",
+        "client-error",
+        "server-error",
+        "redirect",
+        "other",
+      ]) ||
+      !(values.ready === null || typeof values.ready === "boolean") ||
+      !choices("body", ["not-read", "decoded", "malformed", "invalid-json", "unreadable"], false) ||
+      !choices("failure", ["fetch", "response", "body", "predicate"]) ||
+      !choices("errorClass", [
+        "Error",
+        "TypeError",
+        "SyntaxError",
+        "RangeError",
+        "DOMException",
+        "other",
+      ]) ||
+      !(values.driverExited === null || typeof values.driverExited === "boolean") ||
+      !choices("driverSpawn", ["none", "failed"])
+    )
+      return null;
+    return values as unknown as OwnedDriverReadiness;
+  } catch {
+    return null;
+  }
+}
+
+function readinessErrorClass(error: unknown): OwnedDriverReadiness["errorClass"] {
+  try {
+    if (typeof DOMException !== "undefined" && error instanceof DOMException) return "DOMException";
+    if (error === null || typeof error !== "object") return "other";
+    const descriptor =
+      Object.getOwnPropertyDescriptor(error, "name") ??
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(error), "name");
+    return descriptor &&
+      Object.hasOwn(descriptor, "value") &&
+      ["Error", "TypeError", "SyntaxError", "RangeError"].includes(descriptor.value)
+      ? descriptor.value
+      : "other";
+  } catch {
+    return "other";
+  }
+}
+
 export async function startOwnedBrowserDriver(
   owner: QualificationOwner,
   driver: string,
   webOrigin: string,
+  observeReadiness?: (value: OwnedDriverReadiness | null) => void,
 ) {
   const child = owner.spawn(
     driver,
@@ -237,17 +338,107 @@ export async function startOwnedBrowserDriver(
     process.env,
     "driver",
   );
-  await owner.until(async () => {
+  const observation: OwnedDriverReadiness = {
+    attempts: 0,
+    attemptsCapped: false,
+    lastHttpStatus: null,
+    ready: null,
+    body: "not-read",
+    failure: null,
+    errorClass: null,
+    driverExited: null,
+    driverSpawn: null,
+  };
+  const observe = () => {
+    if (!observeReadiness) return;
     try {
-      const response = await fetch("http://127.0.0.1:4915/status", {
-        signal: AbortSignal.timeout(1_000),
-      });
-      if (!response.ok) return false;
-      return ((await response.json()) as { value?: { ready?: boolean } }).value?.ready === true;
+      const own = (object: object, key: string) => {
+        const descriptor = Object.getOwnPropertyDescriptor(object, key);
+        return descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
+      };
+      const driverProcess = own(child, "child");
+      const exit =
+        driverProcess !== null && typeof driverProcess === "object"
+          ? own(driverProcess, "exitCode")
+          : undefined;
+      const signal =
+        driverProcess !== null && typeof driverProcess === "object"
+          ? own(driverProcess, "signalCode")
+          : undefined;
+      const spawn = own(child, "spawnFailure");
+      observation.driverExited =
+        (exit === null ||
+          (typeof exit === "number" && Number.isInteger(exit) && exit >= 0 && exit <= 255)) &&
+        (signal === null || typeof signal === "string")
+          ? exit !== null || signal !== null
+          : null;
+      observation.driverSpawn =
+        spawn === null
+          ? "none"
+          : spawn !== undefined && typeof spawn === "object"
+            ? "failed"
+            : null;
+      observeReadiness(projectOwnedDriverReadiness(observation));
     } catch {
-      return false;
+      /* Optional observation never controls readiness or original failure. */
     }
-  });
+  };
+  try {
+    await owner.until(async () => {
+      if (observation.attempts === 1024) observation.attemptsCapped = true;
+      observation.attempts = Math.min(1024, observation.attempts + 1);
+      observation.ready = null;
+      observation.body = "not-read";
+      observation.failure = null;
+      observation.errorClass = null;
+      let stage: OwnedDriverReadiness["failure"] = "fetch";
+      try {
+        const response = await fetch("http://127.0.0.1:4915/status", {
+          signal: AbortSignal.timeout(1_000),
+        });
+        stage = "response";
+        const ok = response.ok;
+        if (observeReadiness) {
+          try {
+            const status = response.status;
+            if (Number.isInteger(status) && status >= 100 && status <= 599)
+              observation.lastHttpStatus =
+                status >= 200 && status < 300
+                  ? "success"
+                  : status >= 400 && status < 500
+                    ? "client-error"
+                    : status >= 500
+                      ? "server-error"
+                      : status >= 300
+                        ? "redirect"
+                        : "other";
+          } catch {
+            /* Status metadata cannot replace the original ok/body predicate. */
+          }
+        }
+        if (!ok) return false;
+        stage = "body";
+        observation.body = "unreadable";
+        const body = (await response.json()) as { value?: { ready?: boolean } };
+        stage = "predicate";
+        const ready = body.value?.ready;
+        observation.ready = typeof ready === "boolean" ? ready : null;
+        observation.body = typeof ready === "boolean" ? "decoded" : "malformed";
+        return ready === true;
+      } catch (error) {
+        observation.failure = stage;
+        if (observeReadiness) observation.errorClass = readinessErrorClass(error);
+        if (stage === "body" && observation.errorClass === "SyntaxError")
+          observation.body = "invalid-json";
+        else if (stage === "predicate") observation.body = "malformed";
+        return false;
+      } finally {
+        observe();
+      }
+    });
+  } finally {
+    observe();
+  }
   return child;
 }
 
@@ -257,8 +448,20 @@ export async function openOwnedBrowser(
   driver: string,
   webOrigin: string,
   profile: string,
+  observeReadiness?: (value: OwnedDriverReadiness | null) => void,
+  observeStage?: (value: "driver-readiness" | "session-create") => void,
 ) {
-  const child = await startOwnedBrowserDriver(owner, driver, webOrigin);
+  try {
+    observeStage?.("driver-readiness");
+  } catch {
+    /* Optional stage sinks never control browser startup. */
+  }
+  const child = await startOwnedBrowserDriver(owner, driver, webOrigin, observeReadiness);
+  try {
+    observeStage?.("session-create");
+  } catch {
+    /* Preserve the original session result or failure. */
+  }
   const browser = await bounded(remote(ownedBrowserOptions(chrome, profile, webOrigin)), 45_000);
   return { browser, driver: child };
 }

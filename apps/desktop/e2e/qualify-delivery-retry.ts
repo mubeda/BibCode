@@ -12,6 +12,8 @@ import {
   prepareOwnedNetwork,
   verifyOwnedBrowserOnline,
   type QualificationBrowser,
+  projectOwnedDriverReadiness,
+  type OwnedDriverReadiness,
 } from "./support/qualification-owner.ts";
 import { prepareDesktopUiTestContext } from "./support/test-project.ts";
 import {
@@ -217,6 +219,8 @@ export async function runDeliveryRetryQualification() {
   const capturedVisuals = new Set<string>();
   let createRefObservationInput: VisualObservationInput | null = null;
   let createRefClearObservation: ReturnType<typeof projectVisualNameClearObservation> = null;
+  let browserDriverReadiness: OwnedDriverReadiness | null = null;
+  let browserReadinessStage: "driver-readiness" | "session-create" | "online-proof" | null = null;
   const networkProofs: object[] = [];
   const write = (name: string, value: unknown) =>
     NodeFS.writeFileSync(
@@ -762,14 +766,24 @@ export async function runDeliveryRetryQualification() {
         }
       });
       step("browser");
+      browserDriverReadiness = null;
+      browserReadinessStage = null;
       const opened = await openOwnedBrowser(
         owner,
         config.chrome,
         config.driver,
         origin,
         NodePath.join(runRoot, "profile"),
+        (value) => {
+          browserDriverReadiness = projectOwnedDriverReadiness(value);
+        },
+        (value) => {
+          browserReadinessStage =
+            value === "driver-readiness" || value === "session-create" ? value : null;
+        },
       );
       browser = opened.browser;
+      browserReadinessStage = "online-proof";
       networkProofs.push(await verifyOwnedBrowserOnline(browser, network));
       step("pair-issue-credential");
       const grant = await owner.json(
@@ -1097,6 +1111,13 @@ export async function runDeliveryRetryQualification() {
       createRefObservation,
       createRefClearObservation:
         phase === "visual-worktree-create-ref" ? createRefClearObservation : null,
+      browserDriverReadiness:
+        phase === "browser" ? projectOwnedDriverReadiness(browserDriverReadiness) : null,
+      browserReadinessStage:
+        phase === "browser" &&
+        ["driver-readiness", "session-create", "online-proof"].includes(browserReadinessStage ?? "")
+          ? browserReadinessStage
+          : null,
     });
   } finally {
     const processes = owner.processes.map(({ child, role, log, spawnFailure }) =>

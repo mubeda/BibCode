@@ -684,6 +684,22 @@ use a short case prefix plus the complete UUID, with exclusive `0700` creation;
 run IDs remain in evidence paths, keeping Chromium's branded and unbranded
 Unix socket names within their limit.
 
+For delivery Retry and the first release visual batch, a failure in the existing
+`browser` phase records `browserReadinessStage`: `driver-readiness`,
+`session-create`, or `online-proof`. These are the existing await boundaries;
+the phase alone cannot identify which one failed. `browserDriverReadiness`
+contains only closed facts from the existing driver `/status` polls: attempt
+count capped at 1024 plus a cap flag, the last observed HTTP status category,
+boolean-or-unknown parsed readiness, body-decode category, failure stage and
+finite error class, and existing driver exit/spawn flags. Missing or malformed
+metadata stays unknown. The last HTTP category may precede a later fetch failure,
+and a successful status receipt can accompany a session or online-proof failure.
+Optional observation errors cannot change the readiness predicate, original
+failure, launch options, request count, waits or cleanup. No response body,
+request URL, error text or driver log enters these receipts; preserve an unknown
+cause until the closed evidence identifies a boundary. Other failure phases
+retain null for both fields.
+
 In each theme, the driver pairs and imports through the public UI, then creates
 and selects a genuine managed worktree through **New worktree**. Its configured
 worktree base stays inside the private fixture. Bind the selected card's public

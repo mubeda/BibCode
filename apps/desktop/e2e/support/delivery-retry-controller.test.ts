@@ -11,7 +11,7 @@ import {
 } from "../qualify-delivery-retry.ts";
 import { deliveryScenes, deliveryThemes } from "./delivery-retry-evidence.ts";
 import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
-import { bounded } from "./qualification-owner.ts";
+import { bounded, projectOwnedDriverReadiness } from "./qualification-owner.ts";
 import { resolveWorktreeCreateInput } from "../../../web/src/components/CreateWorktreeDialog.logic.ts";
 import { readSelectedDeliveryWorktree } from "./delivery-retry-workspace.ts";
 import { prepareDesktopUiTestContext } from "./test-project.ts";
@@ -56,6 +56,8 @@ function createRefFailureBoundary(
     pending?: boolean;
     reject?: boolean;
     clearObservation?: unknown;
+    readiness?: unknown;
+    readinessStage?: unknown;
   } = {},
 ) {
   const writes: Array<Record<string, unknown>> = [];
@@ -110,8 +112,11 @@ function createRefFailureBoundary(
       theme: "light",
       createRefObservationInput: options.noInput ? null : observationInput,
       createRefClearObservation: options.clearObservation ?? null,
+      browserDriverReadiness: options.readiness ?? null,
+      browserReadinessStage: options.readinessStage ?? null,
       error: new Error("The required live observation did not arrive within its bound."),
       bounded,
+      projectOwnedDriverReadiness,
       readVisualWitness,
       classifyQualificationFailure,
       readStartupFailureObservation: async () => null,
@@ -232,6 +237,135 @@ describe("closed create-ref failure facts", () => {
       vi.useRealTimers();
     }
   });
+});
+
+describe("closed browser startup failure facts", () => {
+  const ready = {
+    attempts: 2,
+    attemptsCapped: false,
+    lastHttpStatus: "success",
+    ready: true,
+    body: "decoded",
+    failure: null,
+    errorClass: null,
+    driverExited: false,
+    driverSpawn: "none",
+  };
+  it.each(["driver-readiness", "session-create", "online-proof"])(
+    "retains closed existing status facts only in browser phase, stage=%s",
+    async (stage) => {
+      const f = createRefFailureBoundary({
+        phase: "browser",
+        readiness: ready,
+        readinessStage: stage,
+      });
+      await f.run();
+      expect(f.writes[0]?.browserDriverReadiness).toEqual(ready);
+      expect(f.writes[0]?.browserReadinessStage).toBe(stage);
+      expect(f.writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+      expect(f.reads()).toBe(0);
+      const other = createRefFailureBoundary({
+        phase: "pair-issue-credential",
+        readiness: ready,
+        readinessStage: stage,
+      });
+      await other.run();
+      expect(other.writes[0]?.browserDriverReadiness).toBeNull();
+      expect(other.writes[0]?.browserReadinessStage).toBeNull();
+      expect(other.reads()).toBe(0);
+    },
+  );
+  it("quarantines malformed/accessor/proxy metadata and keeps the original failure", async () => {
+    const read = vi.fn(() => "private receipt");
+    const accessor = { ...ready };
+    Object.defineProperty(accessor, "ready", { enumerable: true, get: read });
+    const revoked = Proxy.revocable(ready, {});
+    revoked.revoke();
+    for (const readiness of [
+      null,
+      { ...ready, rawBody: "private receipt" },
+      accessor,
+      revoked.proxy,
+    ]) {
+      const f = createRefFailureBoundary({
+        phase: "browser",
+        readiness,
+        readinessStage: "private-stage",
+      });
+      await f.run();
+      expect(f.writes[0]?.browserDriverReadiness).toBeNull();
+      expect(f.writes[0]?.browserReadinessStage).toBeNull();
+      expect(f.writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+      expect(f.reads()).toBe(0);
+      expect(JSON.stringify(f.writes)).not.toMatch(/private|http|owned-thread/);
+    }
+    expect(read).not.toHaveBeenCalled();
+  });
+  it.each(["ready", "session-failure", "online-failure"])(
+    "uses only the existing open/online calls and marks online proof for %s",
+    async (outcome) => {
+      const start = controller.indexOf('      step("browser");');
+      const end = controller.indexOf('      step("pair-issue-credential");', start);
+      const calls: string[] = [],
+        child = {},
+        browser = {},
+        network = {},
+        proofs: unknown[] = [];
+      const originalFailure = new Error("Inert original startup failure.");
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          "async function run() { let browserDriverReadiness = null, browserReadinessStage = null, browser; try {" +
+            controller.slice(start, end) +
+            "return {browserDriverReadiness, browserReadinessStage}; } catch (error) { return {browserDriverReadiness, browserReadinessStage, error}; }}\nrun",
+        ),
+        {
+          owner: {},
+          config: { chrome: "/owned/chrome", driver: "/owned/driver" },
+          origin: "http://127.0.0.1:4885",
+          runRoot: "/owned",
+          NodePath,
+          network,
+          networkProofs: proofs,
+          step: (phase: string) => calls.push(phase),
+          projectOwnedDriverReadiness,
+          openOwnedBrowser: async (...args: unknown[]) => {
+            calls.push("open");
+            expect(args.slice(1, 5)).toEqual([
+              "/owned/chrome",
+              "/owned/driver",
+              "http://127.0.0.1:4885",
+              "/owned/profile",
+            ]);
+            (args[6] as (value: unknown) => void)("driver-readiness");
+            (args[5] as (value: unknown) => void)(ready);
+            (args[6] as (value: unknown) => void)("session-create");
+            if (outcome === "session-failure") throw originalFailure;
+            return { browser, driver: child };
+          },
+          verifyOwnedBrowserOnline: async (...args: unknown[]) => {
+            calls.push("online");
+            expect(args).toEqual([browser, network]);
+            if (outcome === "online-failure") throw originalFailure;
+            return { after: true };
+          },
+        },
+      ) as () => Promise<{
+        browserDriverReadiness: unknown;
+        browserReadinessStage: unknown;
+        error?: unknown;
+      }>;
+      const result = await run();
+      expect(result.browserDriverReadiness).toEqual(ready);
+      expect(result.browserReadinessStage).toBe(
+        outcome === "session-failure" ? "session-create" : "online-proof",
+      );
+      expect(result.error).toBe(outcome === "ready" ? undefined : originalFailure);
+      expect(calls).toEqual(
+        outcome === "session-failure" ? ["browser", "open"] : ["browser", "open", "online"],
+      );
+      expect(proofs).toHaveLength(outcome === "ready" ? 1 : 0);
+    },
+  );
 });
 
 describe.each(["projector", "failure-seam"])("create-ref descriptor admission: %s", (consumer) => {
