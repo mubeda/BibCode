@@ -581,7 +581,46 @@ async function removeHost(host: Host, observe?: (operation: RemoveHostOperation)
             observeStep("toast-click-unavailable");
             throw error;
           }
+          // The pinned middleware can return owned-close HTML after its wait
+          // fails. Recognize only that bounded SDK frame and own data name.
+          let sdkInteractableClose = false;
+          const frame =
+            message.length <= 1024 && message.endsWith("</button> did not become interactable")
+              ? /^Element <button\b([^<>]*)>(?:(?!<\/?[bB][uU][tT][tT][oO][nN]\b)[\s\S])*<\/button> did not become interactable$/.exec(
+                  message,
+                )
+              : null;
+          if (frame) {
+            const header = frame[1]!;
+            const attribute =
+              /\s+([A-Za-z_:][A-Za-z0-9_.:-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?/y;
+            let offset = 0,
+              slots = 0,
+              ownedSlot = false,
+              valid = true;
+            while (header.slice(offset).trim() !== "") {
+              attribute.lastIndex = offset;
+              const token = attribute.exec(header);
+              if (!token) {
+                valid = false;
+                break;
+              }
+              offset = attribute.lastIndex;
+              if (token[1]!.toLowerCase() === "data-slot") {
+                slots++;
+                ownedSlot = token[1] === "data-slot" && token[2] === '"toast-close"';
+              }
+            }
+            if (valid && slots === 1 && ownedSlot) {
+              const name = Object.getOwnPropertyDescriptor(error, "name");
+              sdkInteractableClose =
+                name !== undefined &&
+                Object.hasOwn(name, "value") &&
+                name.value === "webdriverio(middleware): element did not become interactable";
+            }
+          }
           if (
+            !sdkInteractableClose &&
             !/^(?:no such element|stale element reference)(?::|$)/.test(message) &&
             // The pinned SDK wraps response errors with this command/method suffix.
             // Bound verbatim details (including line breaks) and ID; refuse args/other operations.

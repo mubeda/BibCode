@@ -601,7 +601,7 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   count as already gone only when a second fresh enumeration proves that same
   zero-visible end state. Unknown click errors, visible replacements and failed
   absence reads preserve the original failure and click phase. This conservative
-  recognition reads only an own data message. It admits the canonical missing/stale
+  recognition reads an own data message. It admits the canonical missing/stale
   prefixes, the exact public implicit-missing click message, the pinned SDK's exact
   internal scroll-missing or getHTML-missing message for that same toast-close
   selector during its Classic click fallbacks, and the pinned SDK's
@@ -609,7 +609,15 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   and no argument suffix. Wrapped detail can contain the SDK's preserved line breaks
   within its 1024-character bound; element IDs remain bounded. Other error
   families, commands or methods, malformed wrappers and unavailable message data
-  preserve the original error. Keep raw messages, IDs, URLs and arguments private;
+  preserve the original error. The successful-HTML SDK middleware variant additionally
+  requires its exact own data middleware name, at most 1024 message units, exact
+  `Element … did not become interactable` framing and a single outer button with
+  exactly one real `data-slot="toast-close"` attribute. The bounded opening-tag
+  attribute check treats quoted values as opaque, rejects duplicate/spoofed markers,
+  and never parses the inner markup. It still requires the unchanged fresh zero-visible
+  close proof; visible/replacement controls and failed reads preserve the same error.
+  Native closed shape alone does not identify this as the native cause. Keep raw
+  HTML, messages, IDs, URLs and arguments private;
   recognition adds no evidence beyond the existing fixed phase markers. This
   proof needs no fabricated toast identity or changes to toast lifetimes, Retry
   behavior or functional assertions. A missing element alone does not establish

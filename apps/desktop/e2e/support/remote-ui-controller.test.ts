@@ -2925,6 +2925,7 @@ function sdkClickResponseError(
 function sdkInternalMissingClick(
   sourceSelector = 'button[data-slot="toast-close"]',
   mode: "scroll" | "html" = "scroll",
+  syntheticHtml?: string,
 ) {
   const packagePath = NodeFS.realpathSync(
     new URL("../../node_modules/webdriverio/package.json", import.meta.url),
@@ -2954,6 +2955,7 @@ function sdkInternalMissingClick(
     cut("function isStaleElementError(err)", "function transformClassicToBidiSelector"),
     cut("var IMPLICIT_WAIT_EXCLUSION_LIST =", "var multiremoteHandler ="),
     cut("async function getHTML(options", "function populateHTML("),
+    cut("function sanitizeHTML(", "// src/commands/element/getLocation.ts"),
     cut("async function waitForClickable({", "// src/commands/element/waitForDisplayed.ts"),
     cut("async function waitForExist({", "// src/commands/element/waitForStable.ts"),
     cut("function waitUntil(condition,", "// src/commands/mobile/swipe.ts"),
@@ -3026,6 +3028,7 @@ function sdkInternalMissingClick(
       }
       calls.push(mode === "html" ? "html-transport" : "scroll-web-execute");
       expect(args[0]).not.toBeInstanceOf(Element);
+      if (mode === "html" && syntheticHtml !== undefined) return syntheticHtml;
       throw sdkClickResponseError("stale element reference", { command: "execute/sync" });
     },
     action: () => {
@@ -3070,9 +3073,7 @@ function sdkInternalMissingClick(
       getHTMLScript: NodeVM.runInNewContext(
         htmlScriptSource.slice(0, htmlScriptSource.indexOf("export {")) + "\ngetHTML",
       ),
-      sanitizeHTML: () => {
-        throw new Error("No HTML is returned by this SDK fixture.");
-      },
+      prettifyFn: NodeModule.createRequire(packagePath)("htmlfy").prettify,
       isElementClickableScript: () => {
         throw new Error("Hidden control must short-circuit.");
       },
@@ -3142,6 +3143,40 @@ function sdkInternalMissingClick(
   };
 }
 
+it("proves the installed SDK successful-HTML interactability variant without retaining native HTML", async () => {
+  const sdk = sdkInternalMissingClick(
+    undefined,
+    "html",
+    '<button data-slot="toast-close"><!--synthetic-comment--><svg><path d="M0 0"></path></svg></button>',
+  );
+  const error = await sdk.click().catch((failure: unknown) => failure);
+  expect(error).toBe(sdk.failure());
+  expect(Object.getOwnPropertyDescriptor(error, "name")?.value).toBe(
+    "webdriverio(middleware): element did not become interactable",
+  );
+  const message = Object.getOwnPropertyDescriptor(error, "message")!.value as string;
+  expect(message.startsWith('Element <button data-slot="toast-close">')).toBe(true);
+  expect(message.endsWith("</button> did not become interactable")).toBe(true);
+  expect(message).not.toContain("synthetic-comment");
+  expect(message).toContain("\n");
+  expect(projectRemoteUiToastErrorSignature(message, error)).toMatchObject({
+    sdkTemplate: "interactable",
+    nameFamily: "other",
+    exactToastSelectorPresent: false,
+    lengthBucket: "0-1024",
+  });
+  expect(sdk.calls.filter((call) => call === "click-transport")).toHaveLength(1);
+  expect(sdk.calls.filter((call) => call === "html-transport")).toHaveLength(1);
+  expect(sdk.bodies).toEqual({
+    click: 1,
+    waitForClickable: 1,
+    waitUntil: 1,
+    isClickable: 1,
+    isDisplayed: 1,
+    getHTML: 1,
+  });
+});
+
 it("accepts the actual Classic SDK internal scroll missing error only after fresh toast absence", async () => {
   const sdk = sdkInternalMissingClick();
   const probe = removalReplay(null, { sdkClick: sdk.click, disappears: true });
@@ -3194,6 +3229,142 @@ it("accepts the actual SDK getHTML fallback missing error only after fresh toast
   expect(probe.signatures.has(sdk.failure() as object)).toBe(false);
 });
 
+it("accepts the actual SDK owned-close interactability error only after fresh toast absence", async () => {
+  const sdk = sdkInternalMissingClick(
+    undefined,
+    "html",
+    '<button data-slot="toast-close"><svg><path d="M0 0"></path></svg></button>',
+  );
+  const probe = removalReplay(null, { sdkClick: sdk.click, disappears: true });
+  const stages: string[] = [];
+  await expect(
+    probe.remove(probe.host, (stage: string) => stages.push(stage)),
+  ).resolves.toBeUndefined();
+  expect(stages.at(-1)).toBe("toast-recheck-empty");
+  expect(sdk.calls.filter((call) => call === "click-transport")).toHaveLength(1);
+  expect(sdk.calls.filter((call) => call === "html-transport")).toHaveLength(1);
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+  expect(probe.calls.filter((call) => call[0] === "until")).toEqual([["until"]]);
+  expect(probe.signatures.has(sdk.failure() as object)).toBe(false);
+});
+
+it.each([
+  "wrong name",
+  "missing name",
+  "inherited name",
+  "name accessor",
+  "name reflection",
+  "message accessor",
+  "wrong marker",
+  "quoted marker",
+  "duplicate marker",
+  "duplicate framed marker",
+  "duplicate case-folded marker",
+  "slot in body",
+  "adjacent button",
+  "nested mixed-case button",
+  "oversize",
+  "wrong suffix",
+  "trailing newline",
+  "wrong prefix",
+])("refuses a lookalike SDK interactability error after %s", async (shape) => {
+  let reads = 0;
+  let emitted: unknown;
+  const html =
+    shape === "wrong marker"
+      ? '<button data-slot="other-close">Synthetic</button>'
+      : shape === "quoted marker"
+        ? `<button title=' data-slot="toast-close" '>Synthetic</button>`
+        : shape === "duplicate marker"
+          ? '<button data-slot="toast-close" data-slot="other-close">Synthetic</button>'
+          : shape === "slot in body"
+            ? '<button><span data-slot="toast-close">Synthetic</span></button>'
+            : shape === "nested mixed-case button"
+              ? '<button data-slot="toast-close"><BuTtOn>Nested</BuTtOn></button>'
+              : shape === "adjacent button"
+                ? '<button data-slot="toast-close"></button><button></button>'
+                : `<button data-slot="toast-close">${shape === "oversize" ? "x".repeat(1100) : "Synthetic"}</button>`;
+  const sdk = sdkInternalMissingClick(undefined, "html", html);
+  const probe = removalReplay(null, {
+    disappears: true,
+    sdkClick: async () => {
+      try {
+        return await sdk.click();
+      } catch (error) {
+        emitted = error;
+        if (shape === "wrong name")
+          Object.defineProperty(error, "name", { value: "element not interactable" });
+        if (shape === "missing name") Reflect.deleteProperty(error as object, "name");
+        if (shape === "inherited name") {
+          Reflect.deleteProperty(error as object, "name");
+          Object.setPrototypeOf(
+            error,
+            Object.create(Object.getPrototypeOf(error), {
+              name: { value: "webdriverio(middleware): element did not become interactable" },
+            }),
+          );
+        }
+        if (shape === "name accessor")
+          Object.defineProperty(error, "name", {
+            get() {
+              reads++;
+              throw new Error("inert accessor fault");
+            },
+          });
+        if (shape === "name reflection")
+          emitted = new Proxy(error as object, {
+            getOwnPropertyDescriptor(target, key) {
+              if (key === "name") throw new Error("inert reflection fault");
+              return Reflect.getOwnPropertyDescriptor(target, key);
+            },
+          });
+        if (shape === "message accessor")
+          Object.defineProperty(error, "message", {
+            get() {
+              reads++;
+              throw new Error("inert accessor fault");
+            },
+          });
+        if (
+          [
+            "wrong suffix",
+            "trailing newline",
+            "wrong prefix",
+            "duplicate framed marker",
+            "duplicate case-folded marker",
+          ].includes(shape)
+        ) {
+          const message = Object.getOwnPropertyDescriptor(error, "message")!.value;
+          Object.defineProperty(error, "message", {
+            value:
+              shape === "wrong prefix"
+                ? "Wrapped: " + message
+                : shape === "duplicate framed marker"
+                  ? message.replace(
+                      'data-slot="toast-close"',
+                      'data-slot="toast-close" data-slot="toast-close"',
+                    )
+                  : shape === "duplicate case-folded marker"
+                    ? message.replace(
+                        'data-slot="toast-close"',
+                        'data-slot="toast-close" DATA-SLOT="other-close"',
+                      )
+                    : message + (shape === "trailing newline" ? "\n" : "."),
+          });
+        }
+        throw emitted;
+      }
+    },
+  });
+  const outcome = await probe.remove(probe.host).catch((error: unknown) => error);
+  expect(outcome).toBe(emitted);
+  expect(reads).toBe(0);
+  expect(sdk.calls.filter((call) => call === "click-transport")).toHaveLength(1);
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(1);
+});
+
 it.each([
   { mode: "scroll" as const, refusal: "visible replacement", phase: "toast-recheck-visible" },
   { mode: "scroll" as const, refusal: "lookup failure", phase: "toast-recheck-list" },
@@ -3203,17 +3374,45 @@ it.each([
   { mode: "html" as const, refusal: "lookup failure", phase: "toast-recheck-list" },
   { mode: "html" as const, refusal: "display failure", phase: "toast-recheck-displayed" },
   { mode: "html" as const, refusal: "other selector", phase: "toast-click-unrecognized" },
+  {
+    mode: "html" as const,
+    html: true,
+    refusal: "visible replacement",
+    phase: "toast-recheck-visible",
+  },
+  {
+    mode: "html" as const,
+    html: true,
+    refusal: "visible original",
+    phase: "toast-recheck-visible",
+  },
+  { mode: "html" as const, html: true, refusal: "lookup failure", phase: "toast-recheck-list" },
+  {
+    mode: "html" as const,
+    html: true,
+    refusal: "display failure",
+    phase: "toast-recheck-displayed",
+  },
+  {
+    mode: "html" as const,
+    html: true,
+    refusal: "other selector",
+    phase: "toast-click-unrecognized",
+  },
 ])(
   "preserves the actual internal $mode error after $refusal without clicking a replacement",
   async (testCase) => {
     const sdk = sdkInternalMissingClick(
       testCase.refusal === "other selector" ? 'button[data-slot="other-close"]' : undefined,
       testCase.mode,
+      "html" in testCase && testCase.html
+        ? `<button data-slot="${testCase.refusal === "other selector" ? "other-close" : "toast-close"}">Synthetic</button>`
+        : undefined,
     );
     const readFailure = new Error("Inert absence read failed.");
     const probe = removalReplay(null, {
       sdkClick: sdk.click,
-      disappears: true,
+      disappears: testCase.refusal !== "visible original",
       replacement: ["visible replacement", "display failure"].includes(testCase.refusal),
       reobserveFailure: testCase.refusal === "lookup failure" ? readFailure : undefined,
       reobserveDisplayFailure: testCase.refusal === "display failure" ? readFailure : undefined,
