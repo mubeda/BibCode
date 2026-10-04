@@ -1,3 +1,14 @@
+import {
+  UploadBeginInput,
+  UploadBeginResult,
+  UploadAppendInput,
+  UploadAppendResult,
+  UploadGetInput,
+  UploadGetResult,
+  UploadCancelInput,
+  UploadCancelResult,
+  UploadError,
+} from "./uploads.ts";
 import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
@@ -378,6 +389,10 @@ export const WorktreeRemoveInput = Schema.Struct({
 export type WorktreeRemoveInput = typeof WorktreeRemoveInput.Type;
 
 export const WS_METHODS = {
+  uploadsBegin: "uploads.begin",
+  uploadsAppend: "uploads.append",
+  uploadsGet: "uploads.get",
+  uploadsCancel: "uploads.cancel",
   // Authentication methods
   authConfirmPairing: "auth.confirmPairing",
 
@@ -1494,6 +1509,7 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
     success: OrchestrationRpcSchemas.dispatchCommand.output,
     error: Schema.Union([
       OrchestrationDispatchCommandError,
+      UploadError,
       WorkspaceUnavailableError,
       WorkspaceIdentityError,
       EnvironmentRpcError,
@@ -1623,7 +1639,32 @@ export const WsSubscribeActivityRpc = Rpc.make(WS_METHODS.subscribeActivity, {
   stream: true,
 });
 
+export const WsUploadsBeginRpc = Rpc.make(WS_METHODS.uploadsBegin, {
+  payload: UploadBeginInput,
+  success: UploadBeginResult,
+  error: Schema.Union([UploadError, EnvironmentRpcError]),
+});
+export const WsUploadsAppendRpc = Rpc.make(WS_METHODS.uploadsAppend, {
+  payload: UploadAppendInput,
+  success: UploadAppendResult,
+  error: Schema.Union([UploadError, EnvironmentRpcError]),
+});
+export const WsUploadsGetRpc = Rpc.make(WS_METHODS.uploadsGet, {
+  payload: UploadGetInput,
+  success: UploadGetResult,
+  error: Schema.Union([UploadError, EnvironmentRpcError]),
+});
+export const WsUploadsCancelRpc = Rpc.make(WS_METHODS.uploadsCancel, {
+  payload: UploadCancelInput,
+  success: UploadCancelResult,
+  error: Schema.Union([UploadError, EnvironmentRpcError]),
+});
+
 export const WsRpcGroup = RpcGroup.make(
+  WsUploadsBeginRpc,
+  WsUploadsAppendRpc,
+  WsUploadsGetRpc,
+  WsUploadsCancelRpc,
   WsAuthConfirmPairingRpc,
   WsServerGetConfigRpc,
   WsServerGetProviderCapabilitiesRpc,

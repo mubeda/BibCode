@@ -95,7 +95,7 @@ KiB leaves as binary frames, one record per frame, in the E2EE record format:
 `0x00` for the final record, `0x01` for a continuation, and `0x02` for a
 stand-alone control message sent between the records of another message, which
 the client returns without touching the partial message. Smaller messages stay
-whole text frames, requests are never split, and the limits are 64 MiB and
+whole text frames, individual requests are never split, and the limits are 64 MiB and
 2,048 records per message. Without the echoed subprotocol the server keeps
 today's whole text frames. E2EE sockets always use records; `0x02` control
 records are used there only when the client lists `interleave-v1` in
@@ -1281,6 +1281,43 @@ so it cannot delete a replacement, accepted, or rejected receipt. Attachment
 publication remains rollback-owned until the command, references, and provider
 outbox commit atomically; startup scavenges a final file left by a process crash
 after reservation and publication but before that transaction.
+
+### Attachment staging
+
+Servers with `capabilities.attachmentStaging` accept chat attachments through
+`uploads.begin`, `uploads.append`, `uploads.get`, and `uploads.cancel`. These
+unary RPCs use the existing WebSocket framing and authorization;
+all four require `orchestration:operate`. Attachments travel as several
+acknowledged requests, each carrying at most 1 MiB of canonical base64-decoded
+bytes. The client normally keeps at most two smaller chunks outstanding.
+Each append acknowledges only bytes written and flushed to disk. A completing
+append requires a verified SHA-256 supplied either at begin or completion.
+Zero-byte uploads finalize with a digest at begin or an empty append.
+
+The Rust server owns one registry shared by upload handlers and durable turn
+admission. Ownership follows the authenticated session across reconnects.
+Unknown, expired, and foreign upload IDs return the same `UploadError` with
+`reason: "not_found"`; cancellation of inaccessible IDs returns an empty success.
+There are at most 16 open stages per owner, 10 MiB per stage, and 256 MiB of
+declared staging bytes across the server. Partial and complete unbound stages
+expire after ten idle minutes; begin, acknowledged append, and get refresh
+activity. An operation may keep completed stages alive with get while uploading
+other attachments. A minute sweeper and admission-time expiry release quotas.
+Server startup removes only owned UUID upload leaves in `attachment-uploads/`;
+durable attachments remain in `attachments/`. Shutdown closes staging admission,
+joins admitted writers and the sweeper, and removes remaining stages.
+
+A turn names `uploadId` instead of `dataUrl`. The staged branch runs before
+attachment-by-ID reuse, rejects both byte sources and duplicate upload IDs, and
+checks owner, completion, name, type, MIME, size, and verified content digest.
+It holds the upload's write guard while publishing a final attachment through a
+hard link or bounded copy. Only finals created by that batch are rollback-owned;
+identical existing files are adopted. Failed durable admission removes owned
+finals and retains completed stages for retry. The durable commit consumes the
+bound stages and quotas, leaving only attachment metadata in events and the
+provider delivery outbox. Direct and queued turns share this transaction.
+Accepted command replays skip staging preparation. Legacy clients and servers
+continue using inline data URLs when the capability is absent.
 
 Canonical workspace ownership is protected by a server-owned global fence keyed
 by physical host identity. Present paths canonicalize through the filesystem;
