@@ -484,6 +484,430 @@ const publicPairingGrant = {
   reach: "another-device",
 };
 
+/** Runs the generated verifier, including its real browser callback and RPC request. */
+const shellObservationFixture = (options: { loggerThrows?: boolean } = {}) => {
+  const spec = createSeededUpgradeDriverSpec({
+    candidateVersion: "0.7.3",
+    expectedDataRoot: absolute("fixture", "data"),
+    lane: "remote-install",
+    phase: "verify",
+    projectId: "fixture-project",
+    resultPath: absolute("fixture", "after.json"),
+    workspaceRoot: absolute("fixture", "workspace"),
+  });
+  const requests: Array<Record<string, unknown>> = [];
+  const logs: Array<string> = [];
+  const files = new Map<string, string>();
+  let decodedMessage: unknown;
+  const sockets: Array<FixtureSocket> = [];
+  let run: Promise<void> = Promise.resolve();
+  let settled = false;
+  class FixtureSocket {
+    readonly listeners = new Map<string, Set<(event: unknown) => void>>();
+    constructor(_url: URL) {
+      sockets.push(this);
+      queueMicrotask(() => this.emit("open", {}));
+    }
+    addEventListener(type: string, listener: (event: unknown) => void) {
+      const listeners = this.listeners.get(type) ?? new Set();
+      listeners.add(listener);
+      this.listeners.set(type, listeners);
+    }
+    removeEventListener(type: string, listener: (event: unknown) => void) {
+      this.listeners.get(type)?.delete(listener);
+    }
+    send(text: string) {
+      requests.push(JSON.parse(text) as Record<string, unknown>);
+    }
+    close() {
+      this.emit("close", { code: 1000, wasClean: true });
+    }
+    emit(type: string, event: unknown) {
+      for (const listener of this.listeners.get(type) ?? []) listener(event);
+    }
+  }
+  const context = {
+    NodeFS: { writeFileSync: (path: string, contents: string) => files.set(path, contents) },
+    browser: {
+      waitUntil: async (condition: () => Promise<boolean>) => {
+        if (!(await condition())) throw new Error("Fixture bridge unavailable.");
+      },
+      execute: async (callback: (...args: unknown[]) => unknown, ...args: unknown[]) =>
+        callback(...args),
+    },
+    window: {
+      desktopBridge: {
+        getLocalEnvironmentBootstraps: () => [
+          {
+            id: "primary",
+            httpBaseUrl: "http://127.0.0.1:43123",
+            wsBaseUrl: "ws://127.0.0.1:43123/ws",
+          },
+        ],
+        getLocalEnvironmentBearerToken: async () => "fixture-private-bearer",
+        getProjectDataStatuses: async () => [
+          {
+            environmentId: "primary",
+            effectiveRoot: absolute("fixture", "data"),
+            storageInstanceId: "fixture-private-storage",
+            backups: [{ trigger: "pre-update" }],
+          },
+        ],
+        getUpdateState: async () => ({ currentVersion: "0.7.3" }),
+      },
+    },
+    fetch: async (url: URL) => ({
+      ok: true,
+      json: async () =>
+        url.pathname === "/api/auth/websocket-ticket"
+          ? { ticket: "fixture-private-ticket" }
+          : { storageInstanceId: "fixture-private-storage" },
+    }),
+    WebSocket: FixtureSocket,
+    JSON: {
+      stringify: JSON.stringify,
+      parse: (text: string) => {
+        if (decodedMessage !== undefined) {
+          const message = decodedMessage;
+          decodedMessage = undefined;
+          return message;
+        }
+        return JSON.parse(text) as unknown;
+      },
+    },
+    console: {
+      info: (text: string) => {
+        if (options.loggerThrows) throw new Error("fixture-private-logger-fault");
+        logs.push(text);
+      },
+    },
+    URL,
+    Date,
+    setTimeout,
+    clearTimeout,
+    describe: (_name: string, callback: () => void) => callback(),
+    it: (_name: string, callback: () => Promise<void>) => {
+      run = callback();
+      void run.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+    },
+  };
+  NodeVM.runInNewContext(spec.slice(spec.indexOf("const input =")), context, { timeout: 1_000 });
+  return {
+    run: () => run,
+    settled: () => settled,
+    requests,
+    files,
+    logs,
+    message: (message: unknown) => {
+      decodedMessage = message;
+      sockets[0]!.emit("message", { data: "fixture-decoded-message" });
+    },
+    event: (type: string, event: unknown) => sockets[0]!.emit(type, event),
+    requestId: () => requests.find((request) => request._tag === "Request")!.id,
+    listenerCount: (type: string) => sockets[0]!.listeners.get(type)?.size ?? 0,
+    facts: () =>
+      logs[0] === undefined
+        ? {}
+        : (JSON.parse(logs[0].replace("seeded-upgrade-stream-observation ", "")) as Record<
+            string,
+            unknown
+          >),
+  };
+};
+
+describe("generated shell stream observations", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("records a first Chunk without changing the verifier receipt or interrupt", async () => {
+    vi.useFakeTimers();
+    const fixture = shellObservationFixture();
+    await vi.advanceTimersByTimeAsync(0);
+    fixture.message({
+      _tag: "Chunk",
+      requestId: fixture.requestId(),
+      values: [{ kind: "snapshot", snapshot: { projects: [{ id: "fixture-project" }] } }],
+    });
+    await fixture.run();
+    expect([...fixture.files.values()].map((text) => JSON.parse(text))).toEqual([
+      {
+        appVersion: "0.7.3",
+        effectiveRoot: absolute("fixture", "data"),
+        projectId: "fixture-project",
+        projectIds: ["fixture-project"],
+        storageInstanceId: "fixture-private-storage",
+        preUpdateBackups: [{ trigger: "pre-update", storageInstanceId: "fixture-private-storage" }],
+      },
+    ]);
+    expect(fixture.requests.map((request) => request._tag)).toEqual(["Request", "Interrupt"]);
+    expect(fixture.facts()).toMatchObject({
+      method: "orchestration.subscribeShell",
+      requestCount: 1,
+      chunkCount: 1,
+      exitSuccessCount: 0,
+      exitFailureCount: 0,
+      timeout: false,
+    });
+    expect(fixture.listenerCount("close")).toBe(0);
+    // Preserve the original socket-open error listener; remove only the QA listener.
+    expect(fixture.listenerCount("error")).toBe(1);
+    expect(fixture.logs.join("\n")).not.toContain("fixture-private");
+  });
+
+  it.each([
+    [
+      "ExitSuccess",
+      { _tag: "Exit", exit: { _tag: "Success", value: null } },
+      { exitSuccessCount: 1, exitFailureCount: 0, defectCount: 0, rpcErrorTag: "unobserved" },
+    ],
+    [
+      "ExitFailure",
+      {
+        _tag: "Exit",
+        exit: {
+          _tag: "Failure",
+          cause: [
+            {
+              _tag: "Fail",
+              error: { _tag: "OrchestrationGetSnapshotError", message: "fixture-private-cause" },
+            },
+          ],
+        },
+      },
+      {
+        exitSuccessCount: 0,
+        exitFailureCount: 1,
+        defectCount: 0,
+        rpcErrorTag: "OrchestrationGetSnapshotError",
+      },
+    ],
+    [
+      "Defect",
+      { _tag: "Defect", defect: { message: "fixture-private-defect" } },
+      { exitSuccessCount: 0, exitFailureCount: 0, defectCount: 1, rpcErrorTag: "unobserved" },
+    ],
+    [
+      "Die",
+      {
+        _tag: "Exit",
+        exit: {
+          _tag: "Failure",
+          cause: [{ _tag: "Die", defect: { message: "fixture-private-defect" } }],
+        },
+      },
+      { exitFailureCount: 1, dieCauseCount: 1, rpcErrorTag: "unobserved" },
+    ],
+    [
+      "Interrupt",
+      { _tag: "Exit", exit: { _tag: "Failure", cause: [{ _tag: "Interrupt", fiberId: 1 }] } },
+      { exitFailureCount: 1, interruptCauseCount: 1, rpcErrorTag: "unobserved" },
+    ],
+    [
+      "ClientProtocolError",
+      { _tag: "ClientProtocolError", error: { message: "fixture-private-protocol-error" } },
+      { protocolErrorCount: 1, rpcErrorTag: "unobserved" },
+    ],
+  ] as const)(
+    "observes %s while preserving the original first-Chunk deadline",
+    async (_name, message, facts) => {
+      vi.useFakeTimers();
+      const fixture = shellObservationFixture();
+      await vi.advanceTimersByTimeAsync(0);
+      fixture.message(
+        message._tag === "Exit" ? { ...message, requestId: fixture.requestId() } : message,
+      );
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(fixture.settled()).toBe(false);
+      const result = expect(fixture.run()).rejects.toThrow(
+        "Timed out waiting for orchestration.subscribeShell.",
+      );
+      await vi.advanceTimersByTimeAsync(1);
+      await result;
+      expect(fixture.facts()).toMatchObject({
+        ...facts,
+        method: "orchestration.subscribeShell",
+        requestCount: 1,
+        chunkCount: 0,
+        timeout: true,
+      });
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.files.size).toBe(0);
+      expect(fixture.logs.join("\n")).not.toContain("fixture-private");
+      expect(fixture.listenerCount("close")).toBe(0);
+      expect(fixture.listenerCount("error")).toBe(1);
+    },
+  );
+
+  it("records socket close and error facts without inventing an authorization cause", async () => {
+    vi.useFakeTimers();
+    const fixture = shellObservationFixture();
+    await vi.advanceTimersByTimeAsync(0);
+    fixture.event("error", { message: "fixture-private-error" });
+    fixture.event("close", { code: 1006, wasClean: false, reason: "fixture-private-reason" });
+    const result = expect(fixture.run()).rejects.toThrow(
+      "Timed out waiting for orchestration.subscribeShell.",
+    );
+    await vi.advanceTimersByTimeAsync(15_000);
+    await result;
+    expect(fixture.facts()).toMatchObject({
+      closeCount: 1,
+      closeCode: 1006,
+      closeWasClean: false,
+      socketErrorCount: 1,
+      rpcErrorTag: "unobserved",
+      timeout: true,
+    });
+    expect(fixture.logs.join("\n")).not.toContain("fixture-private");
+  });
+
+  it("bounds counters and ignores mismatched IDs and private unknown error tags", async () => {
+    vi.useFakeTimers();
+    const fixture = shellObservationFixture();
+    await vi.advanceTimersByTimeAsync(0);
+    for (let index = 0; index < 300; index += 1) {
+      fixture.message({
+        _tag: "Chunk",
+        requestId: "fixture-private-other-id",
+        values: [{ kind: "snapshot", snapshot: { projects: [] } }],
+      });
+      fixture.event("error", { message: "fixture-private-error" });
+    }
+    fixture.message({
+      _tag: "Exit",
+      requestId: fixture.requestId(),
+      exit: {
+        _tag: "Failure",
+        cause: [
+          {
+            _tag: "Fail",
+            error: {
+              _tag: "fixture-private-error-tag",
+              message: "fixture-private-message",
+              url: "http://fixture-private.invalid",
+              headers: { authorization: "fixture-private-grant" },
+            },
+          },
+        ],
+      },
+    });
+    const result = expect(fixture.run()).rejects.toThrow(
+      "Timed out waiting for orchestration.subscribeShell.",
+    );
+    await vi.advanceTimersByTimeAsync(15_000);
+    await result;
+    expect(fixture.facts()).toMatchObject({
+      chunkCount: 0,
+      mismatchedCount: 255,
+      socketErrorCount: 255,
+      rpcErrorTag: "unknown",
+      requestCount: 1,
+      timeout: true,
+    });
+    expect(fixture.logs).toHaveLength(1);
+    expect(fixture.logs[0]!.length).toBeLessThan(2048);
+    expect(fixture.logs[0]).not.toContain("fixture-private");
+    expect(fixture.requests).toHaveLength(1);
+    expect(fixture.files.size).toBe(0);
+  });
+
+  it("does not invoke an error-tag accessor while projecting a Failure", async () => {
+    vi.useFakeTimers();
+    const fixture = shellObservationFixture();
+    await vi.advanceTimersByTimeAsync(0);
+    const error = Object.defineProperty({ message: "fixture-private-message" }, "_tag", {
+      get() {
+        throw new Error("fixture-private-accessor");
+      },
+    });
+    fixture.message({
+      _tag: "Exit",
+      requestId: fixture.requestId(),
+      exit: { _tag: "Failure", cause: [{ _tag: "Fail", error }] },
+    });
+    const result = expect(fixture.run()).rejects.toThrow(
+      "Timed out waiting for orchestration.subscribeShell.",
+    );
+    await vi.advanceTimersByTimeAsync(15_000);
+    await result;
+    expect(fixture.facts()).toMatchObject({
+      rpcErrorTag: "unknown",
+      observerErrorCount: 0,
+      timeout: true,
+    });
+  });
+
+  it.each(["getter", "reflection"] as const)(
+    "contains observer-only %s errors and retains the original timeout",
+    async (kind) => {
+      vi.useFakeTimers();
+      const fixture = shellObservationFixture();
+      await vi.advanceTimersByTimeAsync(0);
+      const exit =
+        kind === "getter"
+          ? Object.defineProperty({ _tag: "Failure" }, "cause", {
+              get() {
+                throw new Error("fixture-private-getter");
+              },
+            })
+          : {
+              _tag: "Failure",
+              cause: [
+                {
+                  _tag: "Fail",
+                  error: new Proxy(
+                    {},
+                    {
+                      getOwnPropertyDescriptor() {
+                        throw new Error("fixture-private-reflection");
+                      },
+                    },
+                  ),
+                },
+              ],
+            };
+      fixture.message({ _tag: "Exit", requestId: fixture.requestId(), exit });
+      const result = expect(fixture.run()).rejects.toThrow(
+        "Timed out waiting for orchestration.subscribeShell.",
+      );
+      await vi.advanceTimersByTimeAsync(15_000);
+      await result;
+      expect(fixture.facts()).toMatchObject({ observerErrorCount: 1, timeout: true });
+      expect(fixture.logs.join("\n")).not.toContain("fixture-private");
+    },
+  );
+
+  it.each([false, true])(
+    "contains logger faults without changing first-Chunk success=%s",
+    async (chunk) => {
+      vi.useFakeTimers();
+      const fixture = shellObservationFixture({ loggerThrows: true });
+      await vi.advanceTimersByTimeAsync(0);
+      if (chunk) {
+        fixture.message({
+          _tag: "Chunk",
+          requestId: fixture.requestId(),
+          values: [{ kind: "snapshot", snapshot: { projects: [] } }],
+        });
+        await fixture.run();
+        expect(fixture.files.size).toBe(1);
+      } else {
+        const result = expect(fixture.run()).rejects.toThrow(
+          "Timed out waiting for orchestration.subscribeShell.",
+        );
+        await vi.advanceTimersByTimeAsync(15_000);
+        await result;
+      }
+      expect(fixture.logs).toEqual([]);
+    },
+  );
+});
+
 /** Executes the generated credential callback and its receipt/driver handoff without a desktop. */
 const remoteGrantFixture = (responses: ReadonlyArray<unknown>) => {
   const input = {

@@ -155,6 +155,14 @@ leave product, WebDriver, and restart deadlines intact; record a packaging
 timeout separately from native upgrade results, and never run this CI harness
 locally. See the [seeded matrix procedure](../operations/release.md#seeded-packaged-upgrade-matrix).
 
+The generated shell verifier emits one bounded `seeded-upgrade-stream-observation`
+JSON record on its first Chunk or before its existing 15-second timeout. It contains
+only fixed RPC categories, capped frame/terminal counters, an allowlisted error
+tag, and socket close/error facts. Unobserved facts remain explicit; no frame,
+cause, identity, endpoint or credential is retained. Observer failures do not
+change the original verdict or deadline. Treat these facts as diagnostics, never
+as substitute version, project, storage or backup proof, or as an inferred cause.
+
 Build the host-native artifact:
 
 ```sh

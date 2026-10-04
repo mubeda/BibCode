@@ -529,16 +529,86 @@ async function observe(seed) {
     let sequence = 0;
     const request = (tag, payload, stream = false) => new Promise((resolve, reject) => {
       const requestId = String(sequence++);
-      const timeout = setTimeout(() => reject(new Error("Timed out waiting for " + tag + ".")), 15000);
+      const timeout = setTimeout(() => {
+        observeStream(() => { facts.timeout = true; });
+        publishStreamObservation();
+        reject(new Error("Timed out waiting for " + tag + "."));
+      }, 15000);
+      // QA projection only: Rust rpc/message.rs and Effect RpcMessage.ExitEncoded agree
+      // on Chunk, Exit Success/Failure and connection-level Defect/ClientProtocolError.
+      const facts = stream && tag === "orchestration.subscribeShell" ? {
+        method: "orchestration.subscribeShell", requestCount: 0, chunkCount: 0,
+        exitSuccessCount: 0, exitFailureCount: 0, defectCount: 0, protocolErrorCount: 0,
+        mismatchedCount: 0, failCauseCount: 0, dieCauseCount: 0, interruptCauseCount: 0,
+        rpcErrorTag: "unobserved", closeCount: 0, closeCode: null, closeWasClean: null,
+        socketErrorCount: 0, observerErrorCount: 0, timeout: false,
+      } : null;
+      const observeStream = (observe) => {
+        if (facts === null) return;
+        try { observe(); }
+        catch { if (facts.observerErrorCount < 255) facts.observerErrorCount += 1; }
+      };
+      const increment = (key) => { if (facts[key] < 255) facts[key] += 1; };
+      const onStreamClose = (event) => observeStream(() => {
+        increment("closeCount");
+        facts.closeCode = Number.isInteger(event.code) && event.code >= 0 && event.code <= 65535 ? event.code : null;
+        facts.closeWasClean = typeof event.wasClean === "boolean" ? event.wasClean : null;
+      });
+      const onStreamError = () => observeStream(() => increment("socketErrorCount"));
+      let observationPublished = false;
+      const publishStreamObservation = () => {
+        if (facts === null || observationPublished) return;
+        observationPublished = true;
+        observeStream(() => socket.removeEventListener("close", onStreamClose));
+        observeStream(() => socket.removeEventListener("error", onStreamError));
+        observeStream(() => {
+          const json = JSON.stringify(facts);
+          if (typeof json === "string" && json.length <= 2048)
+            console.info("seeded-upgrade-stream-observation " + json);
+        });
+      };
+      observeStream(() => socket.addEventListener("close", onStreamClose));
+      observeStream(() => socket.addEventListener("error", onStreamError));
       const onMessage = (event) => {
         if (typeof event.data !== "string") return;
         const message = JSON.parse(event.data);
+        observeStream(() => {
+          if (message._tag === "Defect") { increment("defectCount"); return; }
+          if (message._tag === "ClientProtocolError") { increment("protocolErrorCount"); return; }
+          if (message.requestId !== requestId) {
+            if (message._tag === "Chunk" || message._tag === "Exit") increment("mismatchedCount");
+            return;
+          }
+          if (message._tag === "Chunk") { increment("chunkCount"); return; }
+          if (message._tag !== "Exit") return;
+          if (message.exit?._tag === "Success") { increment("exitSuccessCount"); return; }
+          if (message.exit?._tag !== "Failure") return;
+          increment("exitFailureCount");
+          const cause = message.exit.cause;
+          if (!Array.isArray(cause)) return;
+          // Bound inspection, and read only cause constructors plus an own data _tag.
+          // Payloads, accessor values, unknown tags and cause/defect messages never leave here.
+          for (const item of cause.slice(0, 16)) {
+            if (item?._tag === "Die") { increment("dieCauseCount"); continue; }
+            if (item?._tag === "Interrupt") { increment("interruptCauseCount"); continue; }
+            if (item?._tag !== "Fail") continue;
+            increment("failCauseCount");
+            const error = item.error;
+            const errorTag = error !== null && typeof error === "object"
+              ? Object.getOwnPropertyDescriptor(error, "_tag")?.value : undefined;
+            if (["OrchestrationGetSnapshotError", "EnvironmentAuthorizationError",
+              "UpdateMaintenanceActiveError", "RpcResponseTooLargeError", "RpcOutboundAdmissionError"].includes(errorTag))
+              facts.rpcErrorTag = errorTag;
+            else if (facts.rpcErrorTag === "unobserved") facts.rpcErrorTag = "unknown";
+          }
+        });
         if (message.requestId !== requestId) return;
         if (stream && message._tag === "Chunk") {
           clearTimeout(timeout);
           socket.removeEventListener("message", onMessage);
           socket.send(JSON.stringify({ _tag: "Interrupt", requestId }));
           resolve(message.values?.[0] ?? null);
+          publishStreamObservation();
           return;
         }
         if (!stream && message._tag === "Exit") {
@@ -550,6 +620,7 @@ async function observe(seed) {
       };
       socket.addEventListener("message", onMessage);
       socket.send(JSON.stringify({ _tag: "Request", id: requestId, tag, payload, headers: [] }));
+      observeStream(() => increment("requestCount"));
     });
     if (seed) {
       await request("orchestration.dispatchCommand", {
