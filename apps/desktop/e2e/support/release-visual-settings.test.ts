@@ -575,28 +575,28 @@ describe("fixed public settings controller", () => {
 });
 
 const keybindingsAwaitCalls = [
-  "nav-lookup",
   "nav-displayed",
+  "nav-lookup",
   "nav-enabled",
   "nav-click",
-  "search-lookup",
   "search-displayed",
+  "search-lookup",
   "search-enabled",
   "search-click",
   "search-input-fill",
-  "add-lookup",
   "add-displayed",
+  "add-lookup",
   "add-enabled",
   "add-click",
-  "when-lookup",
   "when-displayed",
+  "when-lookup",
   "when-enabled",
   "when-click",
   "when-input-displayed",
   "when-input-fill",
 ];
 
-function keybindingsAwaitReplay(failed?: string, observerThrows = false) {
+function keybindingsAwaitReplay(failed?: string, observerThrows = false, matchCount = 1) {
   const source = NodeFS.readFileSync(
     NodePath.join(import.meta.dirname, "release-visual-settings.ts"),
     "utf8",
@@ -650,7 +650,7 @@ function keybindingsAwaitReplay(failed?: string, observerThrows = false) {
         browser: {
           $$: async (selector: string) => {
             action(controlFor(selector) + "-lookup");
-            return [{}];
+            return Array.from({ length: matchCount }, () => ({}));
           },
           $: (selector: string) => {
             const control = controlFor(selector);
@@ -675,6 +675,13 @@ function keybindingsAwaitReplay(failed?: string, observerThrows = false) {
 }
 
 describe("keybindings last-await attribution", () => {
+  it.each([0, 2])("still refuses %s controls after the existing displayed wait", async (count) => {
+    const replay = keybindingsAwaitReplay(undefined, true, count);
+    await expect(replay.run()).rejects.toThrow("Visual settings public control refused.");
+    expect(replay.calls).toEqual(["nav-displayed", "nav-lookup"]);
+    expect(replay.phases.at(-1)).toBe("visual-settings-keybindings-open-nav-lookup");
+    expect(replay.values).toEqual([]);
+  });
   it.each(keybindingsAwaitCalls)(
     "preserves the original %s failure at its exact existing boundary",
     async (failed) => {

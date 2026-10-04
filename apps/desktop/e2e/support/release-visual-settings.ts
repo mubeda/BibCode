@@ -573,12 +573,12 @@ export async function runVisualSettings(input: SettingsVisualInput): Promise<obj
     }
   };
   const click = async (selector: string, control?: KeybindingsControl) => {
-    if (control) observeKeybindingsAwait(control, "lookup");
-    if ((await (await browser.$$(selector)).length) !== 1)
-      throw new Error("Visual settings public control refused.");
     const element = browser.$(selector);
     if (control) observeKeybindingsAwait(control, "displayed");
     await element.waitForDisplayed();
+    if (control) observeKeybindingsAwait(control, "lookup");
+    if ((await (await browser.$$(selector)).length) !== 1)
+      throw new Error("Visual settings public control refused.");
     if (control) observeKeybindingsAwait(control, "enabled");
     await element.waitForEnabled();
     if (control) observeKeybindingsAwait(control, "click");
