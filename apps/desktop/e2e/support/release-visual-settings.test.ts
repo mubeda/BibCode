@@ -385,6 +385,8 @@ const providerFormFailureFacts = {
   bootShellAbsent: true,
   nonSecretFieldsVisible: false,
   ownedConfigOnly: true,
+  modelsCustomFieldInView: false,
+  modelsCustomFieldReady: false,
   modelsVisible: false,
   modelControlsVisible: false,
   accountsRedacted: true,

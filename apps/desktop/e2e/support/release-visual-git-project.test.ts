@@ -376,7 +376,7 @@ it("projects only owned original capture facts and refuses invented full coverag
   expect(() => projectGitProjectVisualCapture(getter)).toThrow();
 });
 
-it("runs only the finite public sequence and keeps the partial/unbound rows unqualified", async () => {
+it("runs only the finite public sequence, cancels rewrite preview and keeps tags partial", async () => {
   const captures: Array<[string, string]> = [];
   const actions: string[] = [];
   const values = new Map<string, string>();
@@ -398,6 +398,12 @@ it("runs only the finite public sequence and keeps the partial/unbound rows unqu
     },
     verifyDirtyRetained: async () => {
       actions.push("verify-dirty");
+    },
+    beginRewritePreview: async () => {
+      actions.push("rewrite-baseline");
+    },
+    verifyRewriteRetained: async () => {
+      actions.push("verify-rewrite-retained");
     },
     verifyMergeAborted: async () => {
       actions.push("verify-aborted");
@@ -430,13 +436,15 @@ it("runs only the finite public sequence and keeps the partial/unbound rows unqu
     },
     getValue: async () => values.get(selector),
     getText: async () =>
-      selector === "[data-worktree-candidate-row]"
-        ? "visual-discovered"
-        : selector === '[role="tab"][aria-selected="true"]'
-          ? tab
-          : selector === '[role="tabpanel"]' && broken
-            ? "Git can't read this repository."
-            : "An incomplete clone exists at",
+      selector.includes('data-slot="dialog-title"')
+        ? "Rewrite Rebase History?"
+        : selector === "[data-worktree-candidate-row]"
+          ? "visual-discovered"
+          : selector === '[role="tab"][aria-selected="true"]'
+            ? tab
+            : selector === '[role="tabpanel"]' && broken
+              ? "Git can't read this repository."
+              : "An incomplete clone exists at",
     isDisplayed: async () => true,
   });
   const result = await runGitProjectVisual({
@@ -476,6 +484,7 @@ it("runs only the finite public sequence and keeps the partial/unbound rows unqu
     ["project-clone-chooser", "complete"],
     ["project-clone-incomplete", "complete"],
     ["git-tags", "groups-and-names-only"],
+    ["git-rewrite-preview", "complete"],
     ["git-switch-with-changes", "complete"],
     ["git-merge-conflict", "complete"],
     ["git-unborn", "complete"],
@@ -493,6 +502,8 @@ it("runs only the finite public sequence and keeps the partial/unbound rows unqu
     noEditableCloneName: true,
     chooserRetained: true,
     dirtyWorkRetained: true,
+    rewritePreviewCancelled: true,
+    rewriteStateRetained: true,
     mergeAborted: true,
     brokenMetadataRestored: true,
     selectedTabRetained: true,
@@ -500,6 +511,9 @@ it("runs only the finite public sequence and keeps the partial/unbound rows unqu
   expect(actions.filter((value) => value.startsWith("click:"))).not.toContain(
     "click:button=Refresh",
   );
+  expect(actions).toContain("rewrite-baseline");
+  expect(actions).toContain("verify-rewrite-retained");
+  expect(actions.some((value) => value.includes("Rewrite History"))).toBe(false);
   expect(actions).toContain("verify-private-alias");
   expect(actions).toContain("restore-private-config");
   expect(actions.filter((value) => value === "verify-no-clone-import")).toHaveLength(2);
@@ -905,9 +919,8 @@ function actualRestorationBoundary(mode: "success" | "restore-fails" | "both-fai
         if (mode === "both-fail") throw captureFailure;
       },
       gitProjectVisualScenes,
-      completed: gitProjectVisualScenes.filter(
-        (scene) => scene !== "git-tags" && scene !== "git-rewrite-preview",
-      ),
+      rewrite: { rewritePreviewCancelled: true, rewriteStateRetained: true },
+      completed: gitProjectVisualScenes.filter((scene) => scene !== "git-tags"),
       refused: () => new Error("Visual Git/project precondition failed."),
     },
   );
@@ -939,4 +952,208 @@ it("credits restoration only after the real cleanup callback successfully acknow
   expect(f.restoreAttempts()).toBe(1);
   expect(f.owner.failures).toEqual([]);
   expect(f.downstream).toEqual(["retry-display", "tags-display", "identity"]);
+});
+
+async function mountedRewritePreview(theme: "light" | "dark") {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const webRequire = NodeModule.createRequire(NodePath.resolve("apps/web/package.json"));
+  const { act, createElement } = webRequire("react") as {
+    act: (run: () => void | Promise<void>) => Promise<void>;
+    createElement: (type: unknown, props: unknown, ...children: unknown[]) => unknown;
+  };
+  const { createRoot } = webRequire("react-dom/client") as {
+    createRoot: (container: Element) => { render: (node: unknown) => void; unmount: () => void };
+  };
+  const dialogModule =
+    "../../../web/src/components/gitManager/rewrite/GitManagerMultiCommitOperationDialog.tsx";
+  const logicModule =
+    "../../../web/src/components/gitManager/rewrite/gitManagerMultiCommitOperation.logic.ts";
+  const { GitManagerMultiCommitOperationDialog } = await import(dialogModule);
+  const { advanceMultiCommitOperation } = await import(logicModule);
+  const input = {
+    scene: "git-rewrite-preview" as const,
+    coverage: "complete" as const,
+    theme,
+    origin: "http://127.0.0.1:4885",
+    selection: {
+      projectId: "owned-rich",
+      threadId: "owned-default",
+      environmentId: "local",
+      cwd: "/owned/visual-git-project/rich",
+      branch: "main",
+      title: "rich",
+    },
+    directory: "/owned/visual-git-project/ordinary/nested",
+    cloneUrl: "https://visual.invalid/visual-origin.git",
+    cloneParent: "/owned/visual-git-project/clone-parent",
+  };
+  let state = {
+    step: "choose-branch",
+    kind: "rebase",
+    selectedShas: [],
+    selectedBranch: null,
+    conflicts: [],
+    continueBlocked: null,
+    originalBranchTip: null,
+    operationEvent: null,
+    operationStartedExternally: false,
+    abortRequested: false,
+    commitsArePushed: true,
+    refs: [
+      {
+        name: "visual-switch",
+        tipSha: "a".repeat(40),
+        upstream: null,
+        ahead: 0,
+        behind: 0,
+        current: false,
+        isDefault: false,
+        worktreePath: null,
+        blocked: [],
+      },
+    ],
+  };
+  const events: string[] = [];
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const render = () =>
+    root.render(
+      createElement(
+        "div",
+        null,
+        createElement(
+          "div",
+          { "data-testid": "environment-rail-local", "aria-checked": "true" },
+          createElement("i", { "data-status": "connected" }),
+        ),
+        createElement("button", { "data-testid": "primary-card-button-owned-rich" }, "rich"),
+        createElement(
+          "div",
+          { "data-testid": "git-manager-environment" },
+          createElement("span", {
+            "data-testid": "git-manager-project",
+            title: input.selection.cwd,
+          }),
+          createElement("button", { "aria-label": "Choose branch" }, "main"),
+        ),
+        createElement(GitManagerMultiCommitOperationDialog, {
+          state,
+          onAdvance: (event: { _tag: string }) => {
+            events.push(event._tag);
+            state = advanceMultiCommitOperation(state, event);
+            render();
+          },
+          onCancel: () => {
+            events.push("cancelled");
+            state = advanceMultiCommitOperation(state, { _tag: "cancelled" });
+            render();
+          },
+          onConfirmAbort: () => {
+            throw new Error("Unexpected abort.");
+          },
+        }),
+      ),
+    );
+  try {
+    await act(async () => render());
+    const choice = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Choose branch visual-switch"]',
+    );
+    expect(choice?.disabled).toBe(false);
+    await act(async () => choice?.click());
+    expect(state.step).toBe("warn-force-push");
+    expect(state.selectedBranch).toBe("visual-switch");
+    vi.stubGlobal("location", {
+      origin: input.origin,
+      pathname: "/project/local/owned-rich/git",
+      search: "",
+      hash: "",
+    });
+    vi.stubGlobal("innerWidth", 1280);
+    vi.stubGlobal("innerHeight", 960);
+    document.documentElement.classList.toggle("dark", theme === "dark");
+    // Ideal layout/hit testing only: this proves real content and reducer ownership,
+    // while native pixel geometry and animation remain CI-only evidence.
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(10, 10, 500, 300),
+    );
+    vi.spyOn(document, "elementFromPoint").mockImplementation(() =>
+      document.querySelector('[data-slot="dialog-popup"][role="dialog"]'),
+    );
+    const reader = NodeVM.runInNewContext("(" + readGitProjectVisualWitness.toString() + ")", {
+      document,
+      location,
+      getComputedStyle,
+      HTMLElement,
+      HTMLInputElement,
+      innerWidth,
+      innerHeight,
+    }) as typeof readGitProjectVisualWitness;
+    return {
+      input,
+      events,
+      reader,
+      act,
+      state: () => state,
+      close: async () => {
+        await act(async () => root.unmount());
+        container.remove();
+      },
+    };
+  } catch (error) {
+    await act(async () => root.unmount());
+    container.remove();
+    throw error;
+  }
+}
+
+it.each(["light", "dark"] as const)(
+  "binds the real pushed rebase warning to the %s serialized witness and cancels without advancing",
+  async (theme) => {
+    const f = await mountedRewritePreview(theme);
+    try {
+      const witness = f.reader(f.input);
+      expect(validateGitProjectVisualWitness("git-rewrite-preview", "complete", witness)).toEqual({
+        ...common,
+        targetBranch: true,
+        operationDescription: true,
+        safeWarning: true,
+      });
+      const cancel = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+        (button) => button.textContent === "Cancel",
+      );
+      await f.act(async () => cancel?.click());
+      expect(f.state().step).toBeNull();
+      expect(f.events).toEqual(["branch-chosen", "cancelled"]);
+      expect(f.reader(f.input)?.targetInView).toBe(false);
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+it("refuses missing rewrite target/warning/content and private credential controls in the actual dialog seam", async () => {
+  const f = await mountedRewritePreview("light");
+  try {
+    const branch = document.querySelector<HTMLButtonElement>('button[aria-label="Choose branch"]')!;
+    branch.textContent = "other";
+    expect(f.reader(f.input)?.targetBranch).toBe(false);
+    branch.textContent = "main";
+    const title = document.querySelector('[data-slot="dialog-title"]')!;
+    title.textContent = "Rebase in Progress";
+    expect(f.reader(f.input)?.operationDescription).toBe(false);
+    title.textContent = "Rewrite Rebase History?";
+    const warning = Array.from(document.querySelectorAll("p")).find((element) =>
+      element.textContent?.includes("Rewriting pushed commits"),
+    )!;
+    warning.textContent = "A generic warning.";
+    expect(f.reader(f.input)?.safeWarning).toBe(false);
+    const privateControl = document.createElement("input");
+    privateControl.type = "password";
+    document.body.append(privateControl);
+    expect(f.reader(f.input)?.credentialAbsent).toBe(false);
+  } finally {
+    await f.close();
+  }
 });

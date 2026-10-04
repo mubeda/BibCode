@@ -45,6 +45,8 @@ const sceneFacts: Record<SettingsVisualScene, readonly string[]> = {
   "settings-provider-form": [
     "nonSecretFieldsVisible",
     "ownedConfigOnly",
+    "modelsCustomFieldInView",
+    "modelsCustomFieldReady",
     "modelsVisible",
     "modelControlsVisible",
     "accountsRedacted",
@@ -406,21 +408,28 @@ export function readSettingsVisualWitness(
         home = field("#provider-instance-claudeAgent-homePath"),
         args = field("#provider-instance-claudeAgent-launchArgs");
       const custom = field("#provider-instance-claudeAgent-custom-model");
-      facts = {
-        nonSecretFieldsVisible: [binary, home, args].every(inView),
-        ownedConfigOnly:
-          binary?.value === "claude" &&
-          home?.value === "" &&
-          args?.value === "" &&
-          document.querySelector('input[aria-label^="Environment variable value"]') === null,
-        modelsVisible:
-          inView(custom) &&
-          custom?.value === "" &&
-          inView(
-            one(
-              'button[aria-label="Add Opus 5 to favorites"],button[aria-label="Remove Opus 5 from favorites"]',
-            ),
+      const nonSecretFieldsVisible = [binary, home, args].every(inView);
+      const ownedConfigOnly =
+        binary?.value === "claude" &&
+        home?.value === "" &&
+        args?.value === "" &&
+        document.querySelector('input[aria-label^="Environment variable value"]') === null;
+      // Retain the evaluated prefixes; later reads keep the original short-circuit behavior.
+      const modelsCustomFieldInView = inView(custom);
+      const modelsCustomFieldReady = modelsCustomFieldInView && custom?.value === "";
+      const modelsVisible =
+        modelsCustomFieldReady &&
+        inView(
+          one(
+            'button[aria-label="Add Opus 5 to favorites"],button[aria-label="Remove Opus 5 from favorites"]',
           ),
+        );
+      facts = {
+        nonSecretFieldsVisible,
+        ownedConfigOnly,
+        modelsCustomFieldInView,
+        modelsCustomFieldReady,
+        modelsVisible,
         modelControlsVisible: inView(one('button[aria-label="Move Opus 5 up"]')),
         accountsRedacted: Array.from(
           document.querySelectorAll('button[aria-label="Toggle account email visibility"]'),

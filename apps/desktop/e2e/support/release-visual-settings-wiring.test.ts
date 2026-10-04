@@ -25,6 +25,8 @@ const facts = {
   "settings-provider-form": [
     "nonSecretFieldsVisible",
     "ownedConfigOnly",
+    "modelsCustomFieldInView",
+    "modelsCustomFieldReady",
     "modelsVisible",
     "modelControlsVisible",
     "accountsRedacted",

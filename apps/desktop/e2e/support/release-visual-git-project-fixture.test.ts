@@ -1,9 +1,12 @@
-// @effect-diagnostics nodeBuiltinImport:off - Private filesystem and inert Git ports only; never starts Git.
+// @effect-diagnostics nodeBuiltinImport:off - Inert ports and bounded Git commands use only isolated temporary fixtures.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
 import { expect, it } from "vite-plus/test";
 import { prepareGitProjectVisualFixture } from "./release-visual-git-project-fixture.ts";
+import { runGitRewritePreview } from "./release-visual-git-project.ts";
+import { QualificationOwner } from "./qualification-owner.ts";
 
 it("refuses an unadmitted owner before creating fixture files or invoking Git", async () => {
   const root = NodeFS.realpathSync(
@@ -34,6 +37,222 @@ it("refuses an unadmitted owner before creating fixture files or invoking Git", 
     NodeFS.rmSync(root, { recursive: true, force: true });
   }
 });
+
+async function temporaryRewriteFixture() {
+  const root = NodeFS.realpathSync(
+    NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "visual-rewrite-")),
+  );
+  NodeFS.chmodSync(root, 0o700);
+  const home = NodePath.join(root, "home");
+  NodeFS.mkdirSync(home, { mode: 0o700 });
+  const calls: string[][] = [];
+  const git = async (cwd: string, args: readonly string[]) => {
+    calls.push([...args]);
+    const result = NodeChildProcess.spawnSync("git", [...args], {
+      cwd,
+      env: {
+        PATH: process.env.PATH,
+        HOME: home,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: NodePath.join(home, "gitconfig"),
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "user.name",
+        GIT_CONFIG_VALUE_0: "Owned fixture",
+        GIT_CONFIG_KEY_1: "user.email",
+        GIT_CONFIG_VALUE_1: "owned@localhost",
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_ASKPASS: "false",
+        LANG: "C",
+        LC_ALL: "C",
+      },
+      encoding: "utf8",
+      timeout: 5000,
+      maxBuffer: 65536,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (result.error || result.status === null) throw new Error("Owned temporary Git refused.");
+    return { status: result.status, stdout: result.stdout };
+  };
+  try {
+    const fixture = await prepareGitProjectVisualFixture({
+      root,
+      home,
+      theme: "light",
+      admitOwner: async () => {},
+      git,
+    });
+    return {
+      root,
+      fixture,
+      git,
+      calls,
+      close: () => NodeFS.rmSync(root, { recursive: true, force: true }),
+    };
+  } catch (error) {
+    NodeFS.rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+it.each(["cancel", "capture-failure", "chooser-failure", "cancel-failure"])(
+  "retains exact real temporary refs/index/dirty work when rewrite preview ends at %s",
+  async (mode) => {
+    const f = await temporaryRewriteFixture();
+    const owner = new QualificationOwner(f.root, f.root);
+    const original = new Error("Inert original capture failure.");
+    const cleanupError = new Error("Inert cancel failure.");
+    const actions: string[] = [];
+    let title = "",
+      displayed = false;
+    const popup = '[data-slot="dialog-popup"][role="dialog"]';
+    const element = (selector: string) => ({
+      waitForDisplayed: async (options?: { reverse?: boolean }) => {
+        if (options?.reverse) expect(displayed).toBe(false);
+      },
+      waitForEnabled: async () => {},
+      isDisplayed: async () => displayed,
+      getText: async () => title,
+      click: async () => {
+        actions.push(selector);
+        if (selector.includes("Rebase…")) {
+          displayed = true;
+          title = "Choose a Branch to Rebase";
+        } else if (selector.includes("visual-switch")) {
+          if (mode === "chooser-failure") throw original;
+          title = "Rewrite Rebase History?";
+        } else if (selector === `${popup} button=Cancel`) {
+          if (mode === "cancel-failure") throw cleanupError;
+          displayed = false;
+        } else throw new Error("Unexpected UI action.");
+      },
+    });
+    try {
+      const result = runGitRewritePreview({
+        browser: {
+          $: element,
+          $$: () => ({ length: Promise.resolve(1) }),
+          keys: async (key: string) => {
+            expect(key).toBe("Escape");
+            actions.push("Escape");
+            displayed = false;
+          },
+        },
+        owner,
+        fixture: f.fixture,
+        selection: {
+          environmentId: "local",
+          projectId: "owned-rich",
+          threadId: "owned-thread",
+          cwd: f.fixture.rich,
+          title: "rich",
+          branch: "main",
+        },
+        verifyOwnedIdentity: async () => {},
+        step: () => {},
+        capture: async () => {
+          expect(title).toBe("Rewrite Rebase History?");
+          if (mode === "capture-failure" || mode === "cancel-failure") throw original;
+        },
+      } as never);
+      if (mode === "cancel")
+        await expect(result).resolves.toEqual({
+          rewritePreviewCancelled: true,
+          rewriteStateRetained: true,
+        });
+      else await expect(result).rejects.toBe(original);
+      await f.fixture.verifyRewriteRetained();
+      expect(owner.failures).toHaveLength(mode === "cancel-failure" ? 1 : 0);
+      expect(actions).not.toContain(`${popup} button=Rewrite History`);
+      expect(actions.at(-1)).toBe(mode === "chooser-failure" ? "Escape" : `${popup} button=Cancel`);
+      expect(f.calls.some((args) => args.includes("rebase") || args.includes("reset"))).toBe(false);
+      expect(NodeFS.readFileSync(NodePath.join(f.fixture.rich, "visual-note.txt"), "utf8")).toBe(
+        "Owned dirty work must remain.\n",
+      );
+      const retentionCalls = f.calls.filter((args) => args[0] === "--no-optional-locks");
+      expect(retentionCalls.length).toBeGreaterThan(0);
+      expect(
+        retentionCalls.every((args) =>
+          ["rev-parse", "show-ref", "diff", "status"].includes(args[1]!),
+        ),
+      ).toBe(true);
+    } finally {
+      f.close();
+    }
+  },
+);
+
+it.each([
+  "refs",
+  "index",
+  "dirty",
+  "untracked",
+  "rebase-marker",
+  "index-symlink",
+  "index-overflow",
+])("refuses altered real temporary rewrite state: %s", async (mode) => {
+  const f = await temporaryRewriteFixture();
+  try {
+    await f.fixture.beginRewritePreview();
+    const admin = NodePath.join(f.fixture.rich, ".git"),
+      index = NodePath.join(admin, "index");
+    if (mode === "refs") await f.git(f.fixture.rich, ["tag", "owned-unexpected"]);
+    if (mode === "index") NodeFS.appendFileSync(index, "changed");
+    if (mode === "dirty")
+      NodeFS.writeFileSync(
+        NodePath.join(f.fixture.rich, "visual-note.txt"),
+        "changed dirty work\n",
+      );
+    if (mode === "untracked")
+      NodeFS.writeFileSync(NodePath.join(f.fixture.rich, "owned-extra.txt"), "untracked\n");
+    if (mode === "rebase-marker") NodeFS.mkdirSync(NodePath.join(admin, "rebase-merge"));
+    if (mode === "index-symlink") {
+      NodeFS.renameSync(index, index + "-saved");
+      NodeFS.symlinkSync(index + "-saved", index);
+    }
+    if (mode === "index-overflow") NodeFS.writeFileSync(index, Buffer.alloc(65537));
+    await expect(f.fixture.verifyRewriteRetained()).rejects.toThrow(
+      "Owned Git/project fixture refused.",
+    );
+  } finally {
+    f.close();
+  }
+});
+
+it("admits only one pushed, unstaged rewrite baseline and refuses premature verification", async () => {
+  const f = await temporaryRewriteFixture();
+  try {
+    await expect(f.fixture.verifyRewriteRetained()).rejects.toThrow(
+      "Owned Git/project fixture refused.",
+    );
+    await f.fixture.beginRewritePreview();
+    await expect(f.fixture.beginRewritePreview()).rejects.toThrow(
+      "Owned Git/project fixture refused.",
+    );
+    await f.fixture.verifyRewriteRetained();
+  } finally {
+    f.close();
+  }
+});
+
+it.each(["upstream", "staged"])(
+  "refuses a rewrite baseline without its fixed %s precondition",
+  async (mode) => {
+    const f = await temporaryRewriteFixture();
+    try {
+      await f.git(
+        f.fixture.rich,
+        mode === "upstream"
+          ? ["branch", "--unset-upstream", "main"]
+          : ["add", "--", "visual-note.txt"],
+      );
+      await expect(f.fixture.beginRewritePreview()).rejects.toThrow(
+        "Owned Git/project fixture refused.",
+      );
+    } finally {
+      f.close();
+    }
+  },
+);
 
 it.each(["symlink-root", "outside-home", "preexisting-group"])(
   "refuses unsafe private fixture layout without running Git: %s",

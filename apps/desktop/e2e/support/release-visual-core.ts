@@ -127,18 +127,25 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
     if (control) observePartialAwait(control, "click");
     await element.click();
   };
-  const focus = async (selector: string) => {
+  const focus = async (selector: string, ready?: () => Promise<boolean>) => {
     if ((await browser.$$(selector).length) !== 1)
       throw new Error("Visual public control refused.");
     const element = browser.$(selector);
+    const elementId = ready ? await element.elementId : undefined;
+    if (ready && !elementId) throw new Error("Visual public control refused.");
     await owner.until(async () => {
+      if (ready && !(await ready())) return false;
       if (await element.isFocused()) return true;
       await browser.keys("Tab");
       return element.isFocused();
     });
     await element.waitForDisplayed();
     await element.waitForEnabled();
-    if ((await browser.$$(selector).length) !== 1 || !(await element.isFocused()))
+    if (
+      (await browser.$$(selector).length) !== 1 ||
+      !(await element.isFocused()) ||
+      (ready && ((await element.elementId) !== elementId || !(await ready())))
+    )
       throw new Error("Visual public control refused.");
     return element;
   };
@@ -287,6 +294,9 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
     .$('button[aria-label="Check out remote branch origin/visual-held"]')
     .waitForDisplayed();
   await clearOwnedInput('input[aria-label="Filter branches"]');
+  await focus('//*[@aria-label="Branches"]//button[.//span[normalize-space()="visual-held"]]', () =>
+    browser.$('[aria-label="Branches"] [aria-label="Current branch"]').isDisplayed(),
+  );
   await browser
     .$('//*[@aria-label="Branches"]//button[.//span[normalize-space()="visual-held"]]')
     .moveTo();

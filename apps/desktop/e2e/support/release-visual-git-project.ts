@@ -267,23 +267,18 @@ export function createGitProjectOwnerAdapters(input: GitProjectOwnerAdapterInput
 export function projectGitProjectVisualAssertion(theme: "light" | "dark", input: unknown) {
   const expected = {
     inventory: [...gitProjectVisualScenes],
-    completedScenes: gitProjectVisualScenes.filter(
-      (scene) => scene !== "git-tags" && scene !== "git-rewrite-preview",
-    ),
+    completedScenes: gitProjectVisualScenes.filter((scene) => scene !== "git-tags"),
     partialScenes: ["git-tags"],
     blockedScenes: [
       { scene: "git-tags", check: "disabled-actions", reason: "no-owned-stable-disabled-binding" },
-      {
-        scene: "git-rewrite-preview",
-        check: "target-operation-warning",
-        reason: "multi-commit-substates-unbound",
-      },
     ],
     completeGroup: false,
     cloneExecuted: false,
     noEditableCloneName: true,
     chooserRetained: true,
     dirtyWorkRetained: true,
+    rewritePreviewCancelled: true,
+    rewriteStateRetained: true,
     mergeAborted: true,
     brokenMetadataRestored: true,
     selectedTabRetained: true,
@@ -556,6 +551,27 @@ export function readGitProjectVisualWitness(
         (value) => inView(value) && text(value).length > 0,
       ),
     };
+  } else if (input.scene === "git-rewrite-preview") {
+    target = popup;
+    const branch = one('button[aria-label="Choose branch"]');
+    const cancel = button(popup, "Cancel"),
+      confirm = button(popup, "Rewrite History");
+    facts = {
+      targetBranch: input.selection.branch === "main" && inView(branch) && text(branch) === "main",
+      operationDescription:
+        text(popup?.querySelector('[data-slot="dialog-title"]') ?? null) ===
+          "Rewrite Rebase History?" &&
+        text(popup).includes("History will be rewritten") &&
+        inView(cancel) &&
+        inView(confirm) &&
+        !(cancel as HTMLButtonElement | null)?.disabled &&
+        !(confirm as HTMLButtonElement | null)?.disabled,
+      safeWarning:
+        text(popup).includes("force push will be needed") &&
+        text(popup).includes("force-with-lease") &&
+        text(popup).includes("Rewriting pushed commits changes their identifiers.") &&
+        text(popup).includes("Confirm only if replacing the remote branch history is intended."),
+    };
   } else if (input.scene === "git-unborn") {
     target = pane;
     const branch = one('button[aria-label="Choose branch"]');
@@ -605,7 +621,7 @@ export function readGitProjectVisualWitness(
         all('[role="tab"][aria-selected="true"]').length === 1 &&
         text(one('[role="tab"][aria-selected="true"]')) === "Tags",
     };
-  } else return null; // No complete public multi-commit target/warning binding is invented.
+  } else return null;
   const rect = target?.getBoundingClientRect();
   const unobstructed =
     !!target &&
@@ -726,7 +742,58 @@ export interface GitProjectVisualInput {
     coverage: GitProjectVisualCoverage,
   ) => Promise<void>;
 }
-/** One finite group. Partial tags and the unbound rewrite scene remain explicitly unqualified. */
+/** A pushed rebase warning is cancelled through public UI; no rewrite is performed. */
+export async function runGitRewritePreview(
+  input: Pick<
+    GitProjectVisualInput,
+    "browser" | "owner" | "fixture" | "verifyOwnedIdentity" | "step"
+  > & { selection: GitProjectVisualSelection; capture: () => Promise<void> },
+) {
+  const popup = '[data-slot="dialog-popup"][role="dialog"]';
+  const click = async (selector: string) => {
+    const element = input.browser.$(selector);
+    await element.waitForDisplayed();
+    if ((await input.browser.$$(selector).length) !== 1) throw refused();
+    await element.waitForEnabled();
+    await element.click();
+  };
+  await input.verifyOwnedIdentity(input.selection);
+  await input.fixture.beginRewritePreview();
+  let cancelled = false;
+  try {
+    input.step("visual-git-project-rewrite-preview-open");
+    await click('//button[normalize-space()="Rebase…"]');
+    await input.browser.$(`${popup} [data-slot="dialog-title"]`).waitForDisplayed();
+    input.step("visual-git-project-rewrite-preview-base");
+    await click(`${popup} button[aria-label="Choose branch visual-switch"]`);
+    await input.browser
+      .$('//*[@data-slot="dialog-title" and normalize-space()="Rewrite Rebase History?"]')
+      .waitForDisplayed();
+    await input.capture();
+  } finally {
+    await input.owner.cleanup("visual-owned-rewrite-preview", async () => {
+      try {
+        await input.verifyOwnedIdentity(input.selection);
+        if (await input.browser.$(popup).isDisplayed()) {
+          const title = await input.browser.$(`${popup} [data-slot="dialog-title"]`).getText();
+          if (!["Choose a Branch to Rebase", "Rewrite Rebase History?"].includes(title))
+            throw refused();
+          input.step("visual-git-project-rewrite-preview-cancel");
+          if (title === "Choose a Branch to Rebase") await input.browser.keys("Escape");
+          else await click(`${popup} button=Cancel`);
+          await input.browser.$(popup).waitForDisplayed({ reverse: true });
+        }
+      } finally {
+        await input.fixture.verifyRewriteRetained();
+      }
+      cancelled = true;
+    });
+  }
+  if (!cancelled) throw refused();
+  return { rewritePreviewCancelled: true, rewriteStateRetained: true } as const;
+}
+
+/** One finite group. Tags disabled-actions coverage remains explicitly partial. */
 export async function runGitProjectVisual(input: GitProjectVisualInput): Promise<object> {
   const { browser, fixture } = input;
   const completed: GitProjectVisualScene[] = [];
@@ -841,6 +908,11 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
   await tab("Tags");
   await capture("git-tags", rich, "groups-and-names-only");
   await tab("History");
+  const rewrite = await runGitRewritePreview({
+    ...input,
+    selection: rich,
+    capture: () => capture("git-rewrite-preview", rich),
+  });
   await click('[aria-label="Choose branch"]');
   await click('//*[@aria-label="Branches"]//button[.//span[normalize-space()="visual-switch"]]');
   await capture("git-switch-with-changes", rich);
@@ -902,21 +974,17 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
   await input.verifyOwnedIdentity(broken);
   return {
     inventory: [...gitProjectVisualScenes],
-    completedScenes: completed,
+    completedScenes: gitProjectVisualScenes.filter((scene) => completed.includes(scene)),
     partialScenes: ["git-tags"],
     blockedScenes: [
       { scene: "git-tags", check: "disabled-actions", reason: "no-owned-stable-disabled-binding" },
-      {
-        scene: "git-rewrite-preview",
-        check: "target-operation-warning",
-        reason: "multi-commit-substates-unbound",
-      },
     ],
     completeGroup: false,
     cloneExecuted: false,
     noEditableCloneName: true,
     chooserRetained: true,
     dirtyWorkRetained: true,
+    ...rewrite,
     mergeAborted: true,
     brokenMetadataRestored: metadataRestored,
     selectedTabRetained: true,

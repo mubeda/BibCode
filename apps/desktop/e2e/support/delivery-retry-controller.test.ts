@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeVM from "node:vm";
 import { describe, expect, it, vi } from "vite-plus/test";
+import * as DeliveryController from "../qualify-delivery-retry.ts";
 import {
   deliveryConfiguration,
   projectVisualCreateRefObservation,
@@ -2135,8 +2136,8 @@ function pairingBoundary(
       return callback(value);
     },
   };
-  const grantStart = controller.indexOf("      const grant =");
-  const start = controller.lastIndexOf("      step(", grantStart);
+  const start = controller.indexOf('      step("pair-issue-credential");');
+  const grantStart = controller.indexOf("      const grant =", start);
   const end = controller.indexOf(
     '      if (config.selection === "release-visual-git-project") {',
     start,
@@ -2893,11 +2894,300 @@ it.each(["main", "wrong-ref", "symlink", "ordinary", "ordinary-git"])(
     }
   },
 );
-it("reads only the current typed owned snapshot endpoint and keeps the pairing credential off results", async () => {
+it("uses a distinct once-issued Node grant after the browser has consumed its pairing grant", async () => {
+  const browserGrant = "owned-private-browser-grant";
+  const bootstrap = "owned-private-node-grant";
+  const session = "owned-private-session-access-token";
+  const seen: string[] = [];
+  const consumed = new Set<string>();
+  const issueGrant = vi.fn(async () => ({ credential: bootstrap }));
+  const snapshot = {
+    snapshotSequence: 0,
+    projects: [],
+    threads: [],
+    updatedAt: "2026-10-04T00:00:00.000Z",
+  };
+  const fetcher = vi.fn(async (url: string | URL, options?: RequestInit) => {
+    const path = new URL(String(url)).pathname;
+    seen.push(path);
+    expect(options?.signal).toBeInstanceOf(AbortSignal);
+    if (path === "/api/auth/browser-session") {
+      const credential = JSON.parse(String(options?.body)).credential;
+      expect(credential).toBe(browserGrant);
+      consumed.add(credential);
+      return new Response(null, { status: 204 });
+    }
+    if (path === "/oauth/token") {
+      expect(options?.method).toBe("POST");
+      const credential = new URLSearchParams(String(options?.body)).get("subject_token");
+      if (credential !== bootstrap || consumed.has(credential))
+        return new Response(null, { status: 401 });
+      consumed.add(credential);
+      return new Response(JSON.stringify({ access_token: session }));
+    }
+    expect(path).toBe("/api/orchestration/snapshot");
+    const bearer = new Headers(options?.headers).get("authorization");
+    return bearer === "Bearer " + session
+      ? new Response(JSON.stringify(snapshot))
+      : new Response(null, { status: 401 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  try {
+    await fetcher("http://127.0.0.1:4885/api/auth/browser-session", {
+      method: "POST",
+      signal: AbortSignal.timeout(1000),
+      body: JSON.stringify({ credential: browserGrant }),
+    });
+    await expect(readOwnedGitProjectSnapshot(bootstrap)).rejects.toThrow(
+      "Owned Git/project snapshot refused.",
+    );
+    seen.length = 0;
+    const factory = Reflect.get(DeliveryController, "createOwnedGitProjectSnapshotReader");
+    const read = factory(issueGrant);
+    await expect(read()).resolves.toEqual(snapshot);
+    await expect(read()).resolves.toEqual(snapshot);
+    expect(seen).toEqual([
+      "/oauth/token",
+      "/api/orchestration/snapshot",
+      "/api/orchestration/snapshot",
+    ]);
+    expect(issueGrant).toHaveBeenCalledTimes(1);
+    expect(consumed).toEqual(new Set([browserGrant, bootstrap]));
+    expect(JSON.stringify(snapshot)).not.toContain("owned-private");
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it("wires the real producer's existing snapshot port to the single exchanged Node session", async () => {
+  const bootstrap = "owned-private-bootstrap";
+  const token = "owned-private-session-access-token";
+  const paths: string[] = [];
+  let snapshotReads: Promise<unknown[]> | undefined;
+  vi.stubGlobal("fetch", async (url: string | URL, options?: RequestInit) => {
+    const path = new URL(String(url)).pathname;
+    paths.push(path);
+    if (path === "/oauth/token") return new Response(JSON.stringify({ access_token: token }));
+    expect(new Headers(options?.headers).get("authorization")).toBe("Bearer " + token);
+    return new Response(
+      JSON.stringify({
+        snapshotSequence: 0,
+        projects: [],
+        threads: [],
+        updatedAt: "2026-10-04T00:00:00.000Z",
+      }),
+    );
+  });
+  const begin = controller.indexOf("  const adapters = createGitProjectOwnerAdapters(");
+  const end = controller.indexOf("  const proof = await runGitProjectVisual(", begin);
+  expect(begin).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(begin);
+  const run = runControllerSource(
+    NodeModule.stripTypeScriptTypes(
+      "async function bind(){" + controller.slice(begin, end) + "}\nbind",
+    ),
+    {
+      input: {
+        fixture: { root: "owned-root" },
+        issueSnapshotGrant: async () => ({ credential: bootstrap }),
+      },
+      origin: "http://127.0.0.1:4885",
+      initial: {},
+      readOwnedGitProjectDescriptor: async () => ({}),
+      verifyOwnedGitProjectSource: () => {},
+      createOwnedGitProjectSnapshotReader: Reflect.get(
+        DeliveryController,
+        "createOwnedGitProjectSnapshotReader",
+      ),
+      createGitProjectOwnerAdapters: (options: { readSnapshot: () => Promise<unknown> }) => {
+        snapshotReads = Promise.all([options.readSnapshot(), options.readSnapshot()]);
+        return {};
+      },
+    },
+  ) as () => Promise<void>;
+  try {
+    await run();
+    await snapshotReads;
+    expect(paths).toEqual([
+      "/oauth/token",
+      "/api/orchestration/snapshot",
+      "/api/orchestration/snapshot",
+    ]);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it("the actual caller consumes the browser grant before issuing its distinct Node snapshot grant", async () => {
+  const consumed = new Set<string>();
+  let filled = "";
+  const grants = ["owned-browser-once", "owned-node-once"] as const;
+  let issued = 0;
+  const issue = vi.fn(async (binary: string, args: string[], env: NodeJS.ProcessEnv) => {
+    expect(binary).toBe("owned-binary");
+    expect(args).toEqual(["pairing", "issue", "--base-dir", "owned-state", "--json"]);
+    expect(env).toEqual({ OWNED: "fixture" });
+    const credential = grants[issued++];
+    if (credential === undefined) throw new Error("Unexpected extra grant.");
+    return { credential };
+  });
+  const paths: string[] = [];
+  vi.stubGlobal("fetch", async (url: string | URL, options?: RequestInit) => {
+    const path = new URL(String(url)).pathname;
+    paths.push(path);
+    if (path === "/oauth/token") {
+      const credential = new URLSearchParams(String(options?.body)).get("subject_token");
+      if (credential !== grants[1] || consumed.has(credential))
+        return new Response(null, { status: 401 });
+      consumed.add(credential);
+      return new Response(JSON.stringify({ access_token: "owned-session" }));
+    }
+    expect(path).toBe("/api/orchestration/snapshot");
+    expect(new Headers(options?.headers).get("authorization")).toBe("Bearer owned-session");
+    return new Response(
+      JSON.stringify({
+        snapshotSequence: 0,
+        projects: [],
+        threads: [],
+        updatedAt: "2026-10-04T00:00:00.000Z",
+      }),
+    );
+  });
+  const begin = controller.indexOf('      step("pair-issue-credential");');
+  const end = controller.indexOf('        step("theme-cleanup");', begin);
+  expect(begin).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(begin);
+  const factory = Reflect.get(DeliveryController, "createOwnedGitProjectSnapshotReader");
+  const run = runControllerSource(
+    NodeModule.stripTypeScriptTypes(
+      "async function run(){" + controller.slice(begin, end) + "}}\nrun",
+    ),
+    {
+      browser: {
+        url: async () => {},
+        $: () => ({
+          waitForDisplayed: async () => {},
+          setValue: async (v: string) => (filled = v),
+        }),
+      },
+      owner: { json: issue },
+      config: { binary: "owned-binary", selection: "release-visual-git-project" },
+      context: { stateRoot: "owned-state" },
+      childEnv: { OWNED: "fixture" },
+      theme: "light",
+      gitProjectFixture: { ordinary: "owned-ordinary" },
+      capturedVisuals: new Set(),
+      captures: [],
+      assertions: [],
+      step: () => {},
+      write: () => {},
+      check: (value: boolean) => expect(value).toBe(true),
+      importProject: async () => {},
+      setTheme: async () => {},
+      origin: "http://127.0.0.1:4885",
+      click: async (selector: string) => {
+        expect(selector).toBe("button=Continue");
+        expect(filled).toBe(grants[0]);
+        consumed.add(filled);
+      },
+      runOwnedGitProjectSelection: async (input: {
+        issueSnapshotGrant: () => Promise<unknown>;
+      }) => {
+        expect(consumed.has(grants[0])).toBe(true);
+        const read = factory(input.issueSnapshotGrant);
+        await read();
+        await read();
+      },
+    },
+  ) as () => Promise<void>;
+  try {
+    await run();
+    expect(issue).toHaveBeenCalledTimes(2);
+    expect(consumed).toEqual(new Set(grants));
+    expect(paths).toEqual([
+      "/oauth/token",
+      "/api/orchestration/snapshot",
+      "/api/orchestration/snapshot",
+    ]);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it("refuses an already-consumed grant once without reminting or reading a snapshot", async () => {
+  const issue = vi.fn(async () => ({ credential: "owned-consumed-browser-grant" }));
+  const fetcher = vi.fn(
+    async (_url: string | URL, _options?: RequestInit) => new Response(null, { status: 401 }),
+  );
+  vi.stubGlobal("fetch", fetcher);
+  const factory = Reflect.get(DeliveryController, "createOwnedGitProjectSnapshotReader");
+  const read = factory(issue);
+  try {
+    let original: unknown;
+    try {
+      await read();
+    } catch (error) {
+      original = error;
+    }
+    expect(original).toBeInstanceOf(Error);
+    await expect(read()).rejects.toBe(original);
+    expect(issue).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).pathname).toBe("/oauth/token");
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it.each([null, {}, { credential: "short" }, { credential: "x".repeat(16385) }])(
+  "refuses malformed Node grants before exchange and caches that refusal",
+  async (grant) => {
+    const issue = vi.fn(async () => grant);
+    const fetcher = vi.fn(async () => new Response(null, { status: 401 }));
+    vi.stubGlobal("fetch", fetcher);
+    const factory = Reflect.get(DeliveryController, "createOwnedGitProjectSnapshotReader");
+    const read = factory(issue);
+    try {
+      await expect(read()).rejects.toThrow("Owned snapshot credential unavailable.");
+      await expect(read()).rejects.toThrow("Owned snapshot credential unavailable.");
+      expect(issue).toHaveBeenCalledTimes(1);
+      expect(fetcher).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  },
+);
+
+it.each(["issue", "exchange"])(
+  "keeps a failed auth %s bounded and preserves its original failure without reminting",
+  async (stage) => {
+    const original = new Error("Inert original auth transport failure.");
+    const fetcher = vi.fn(async () => {
+      throw original;
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const factory = Reflect.get(DeliveryController, "createOwnedGitProjectSnapshotReader");
+    const issueGrant = vi.fn(async () => {
+      if (stage === "issue") throw original;
+      return { credential: "owned-private-bootstrap" };
+    });
+    const read = factory(issueGrant);
+    try {
+      await expect(read()).rejects.toBe(original);
+      await expect(read()).rejects.toBe(original);
+      expect(fetcher).toHaveBeenCalledTimes(stage === "issue" ? 0 : 1);
+      expect(issueGrant).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  },
+);
+
+it("reads only the current typed owned snapshot endpoint with a session bearer and keeps credentials off results", async () => {
   const fetcher = vi.fn(
     async (url: string, options: { headers: { authorization: string }; signal: AbortSignal }) => {
       expect(url).toBe("http://127.0.0.1:4885/api/orchestration/snapshot");
-      expect(options.headers).toEqual({ authorization: "Bearer owned-private-test-credential" });
+      expect(options.headers).toEqual({ authorization: "Bearer owned-private-session-token" });
       expect(options.signal).toBeInstanceOf(AbortSignal);
       return {
         ok: true,
@@ -2912,7 +3202,7 @@ it("reads only the current typed owned snapshot endpoint and keeps the pairing c
   );
   vi.stubGlobal("fetch", fetcher);
   try {
-    expect(await readOwnedGitProjectSnapshot("owned-private-test-credential")).toEqual({
+    expect(await readOwnedGitProjectSnapshot("owned-private-session-token")).toEqual({
       snapshotSequence: 0,
       projects: [],
       threads: [],
@@ -2922,4 +3212,42 @@ it("reads only the current typed owned snapshot endpoint and keeps the pairing c
   } finally {
     vi.unstubAllGlobals();
   }
+});
+
+it("retains the provider custom-model prefix booleans through the exact existing failure join", () => {
+  const records = new WeakMap<object, SettingsCaptureFailureRecord>();
+  const error = new Error("Owned provider model predicate failure.");
+  const witness = {
+    themeMatched: true,
+    selectedMatched: true,
+    expectedTextMatched: false,
+    targetInView: true,
+    credentialAbsent: true,
+    bootShellAbsent: true,
+    nonSecretFieldsVisible: true,
+    ownedConfigOnly: true,
+    modelsCustomFieldInView: true,
+    modelsCustomFieldReady: false,
+    modelsVisible: false,
+    modelControlsVisible: true,
+    accountsRedacted: true,
+  };
+  createSettingsCaptureFailureObserver(records, {
+    scene: "settings-provider-form",
+    theme: "light",
+    origin: "http://127.0.0.1:4885",
+    threadId: "owned",
+    branch: "codex/delivery-retry-light",
+  })(error, witness);
+  expect(
+    readSettingsCaptureFailureFacts(records, error, "visual-settings-provider-form", "light"),
+  ).toEqual({ scene: "settings-provider-form", theme: "light", witness });
+  expect(
+    readSettingsCaptureFailureFacts(
+      records,
+      new Error(error.message),
+      "visual-settings-provider-form",
+      "light",
+    ),
+  ).toBeNull();
 });

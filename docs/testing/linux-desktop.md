@@ -822,10 +822,18 @@ Before branch-menu capture, type the fixed branch filter and require the real
 remote-checkout row. Clear the unique displayed/enabled Filter branches input
 through the same focused-control keyboard clear as Worktree name: prove active
 focus and stable identity, select with Control+A, recheck uniqueness, focus and
-identity, then press Backspace. The unchanged witness must observe the current
-local branch, remote checkout row, occupied worktree action, and hovered
-rename/delete controls before capture. Inert endpoint regressions cover the
-controlled-state seam; native CI must prove the browser gesture and pixels.
+identity, then press Backspace. Before advancing Tab focus, require the public
+current-branch indicator to reappear within the existing owner focus bound.
+Focus the unique displayed/enabled occupied branch row's main button by Tab,
+then recheck its identity, focus and current-branch readiness. Do not activate
+Switch to worktree. Keep the existing row hover and unchanged capture witness:
+current local branch, remote checkout row, occupied worktree action, and visible
+rename/delete controls are all required. The component's existing focus-within
+rule exposes those controls even when their mutation actions are disabled.
+Inert endpoint regressions cover actual controlled state and keyboard focus;
+installed Tailwind compilation verifies the actual CSS rule. HappyDOM does not
+implement focus-within visibility, so native CI must prove the gesture and
+pixels. No capture predicate or request bound is relaxed.
 
 The card-menu scene requires a genuine no-editor fixture before server
 admission. Only this selector removes the ordinary fixture's exact generated
@@ -1011,7 +1019,13 @@ existing failure receipt may include
 `settingsCaptureFailureFacts` for that same thrown error and current scene/theme.
 The provider form retains only its existing `nonSecretFieldsVisible`,
 `ownedConfigOnly`, `modelsVisible`, `modelControlsVisible` and `accountsRedacted`
-booleans alongside the unchanged common facts.
+booleans alongside the unchanged common facts. Two model prefixes additionally
+retain `modelsCustomFieldInView` and `modelsCustomFieldReady` (in-view and empty).
+A false first prefix identifies input visibility; true first/false ready identifies
+a non-empty input; both true with false `modelsVisible` identifies the existing
+favorite-control predicate. Later reads preserve the original short circuit: an
+unready input adds no favorite query, and no raw value or geometry is retained.
+Capture admission remains equivalent on the actual reader, not relaxed.
 It reuses the latest actual witness from existing capture reads; it adds no DOM
 execution or retry. Exact known own-data booleans may retain false scene/text or
 geometry facts. Unsafe theme, selection, credential or boot context, malformed or
@@ -1149,9 +1163,25 @@ credential, theme, 1280 by 960 geometry, unobstructed target, original nonblank
 PNG and post-screenshot witness checks. Missing, zero-size or stale controls
 refuse capture; do not force clicks, widen budgets or fabricate a busy state.
 
-The finite lane retains ten named originals per theme: `worktree-discovery`,
+Git/project snapshot admission issues one separate, unconsumed Node pairing
+grant through the existing bounded private CLI owner for each producer. The
+browser keeps its original grant; Continue consumes that grant before this
+snapshot reader starts. Exchange the distinct Node grant once through the
+existing owned OAuth bootstrap helper, then cache that private plain-session
+access token across the existing typed snapshot reads. Cache issue/exchange
+failure too: fail without retrying or reminting a consumed grant. A pairing
+grant is a bootstrap subject, never a snapshot bearer; that endpoint requires
+a session with `orchestration:read`. Public descriptor reads remain
+unauthenticated, and the snapshot decoder, source/default-thread/card proof
+and existing request bounds remain unchanged. The added CLI issue and OAuth
+exchange each use their existing ten-second owner/request bound. No grant,
+access token, header, cookie or private snapshot payload enters retained
+evidence.
+
+The finite lane retains eleven named originals per theme: `worktree-discovery`,
 `project-open-directory`, `project-clone-chooser`, `project-clone-incomplete`,
-`git-tags`, `git-switch-with-changes`, `git-merge-conflict`, `git-unborn`,
+`git-tags`, `git-switch-with-changes`, `git-merge-conflict`,
+`git-rewrite-preview`, `git-unborn`,
 `git-no-repository`, and `git-broken-recovery`. Only their explicit light/dark
 filenames and the same seven closed phase/failure/provenance/result/assertions/
 namespace-cleanup/supervisor JSON receipts enter the artifact allowlist. No
@@ -1160,8 +1190,18 @@ retained. The actual owner still joins browser/server/process cleanup and the
 Python namespace owner before deleting its private fixture.
 
 All eleven approved group IDs remain in the closed assertion. Tags pictures
-only groups/names: its disabled-actions check is unqualified. Rewrite preview
-remains unbound and has no retained PNG. `completeGroup` is always false; the
+only groups/names: its disabled-actions check is unqualified. The pushed rebase
+preview opens from History through Rebase and the fixed base branch choice.
+Its named original joins the visible owned current branch, exact operation
+warning and enabled Cancel/Rewrite History controls. Use Cancel after capture;
+never confirm Rewrite History. Failed chooser admission uses the dialog's
+ordinary Escape cancellation. The existing source/default-thread/server joins
+remain required. Before opening the preview, admit the fixed upstream and
+record private refs, index bytes, dirty diff and porcelain status. The cleanup
+callback always checks them unchanged, including when capture or cancellation
+fails; its read-only Git observations use --no-optional-locks. Never retain
+those private snapshots. A cleanup failure remains failed and cannot replace
+an original capture exception. `completeGroup` is always false; the
 complete approved 82-scene/164-original obligation remains unchanged. The
 initial discovery Add/Keep-hidden state is pictured, while the later real
 Show Hidden Worktrees state has no extra original. The clone chooser is opened

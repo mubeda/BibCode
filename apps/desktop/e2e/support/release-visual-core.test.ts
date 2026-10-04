@@ -663,6 +663,119 @@ it.each(["missing", "duplicate", "focus-lost", "replacement"])(
     expect(captures).toEqual(["workspace-composite", "workspace-card-menu"]);
   },
 );
+it.each([
+  "ready",
+  "stale",
+  "stale-after-focus",
+  "missing",
+  "duplicate",
+  "missing-id",
+  "replacement",
+  "focus-lost",
+  "read-failed",
+])(
+  "admits occupied branch focus only after public current-ref readiness and preserves identity: %s",
+  async (mode) => {
+    const source = NodeFS.readFileSync(
+      new URL("./release-visual-core.ts", import.meta.url),
+      "utf8",
+    );
+    const begin = source.indexOf("  const focus = async");
+    const end = source.indexOf("\n  const composer =", begin);
+    const branchBegin = source.indexOf(
+      "  await clearOwnedInput('input[aria-label=\"Filter branches\"]');",
+    );
+    const branchEnd = source.indexOf('  await capture("git-branch-menu");', branchBegin);
+    expect(begin).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(begin);
+    expect(branchBegin).toBeGreaterThan(end);
+    expect(branchEnd).toBeGreaterThan(branchBegin);
+    const held = '//*[@aria-label="Branches"]//button[.//span[normalize-space()="visual-held"]]';
+    const calls: string[] = [];
+    let focused = 'input[aria-label="Filter branches"]';
+    let readyReads = 0;
+    let ownedId = mode === "missing-id" ? undefined : "owned-held";
+    const original = new Error("Inert original current-ref read failure.");
+    const element = {
+      get elementId() {
+        return Promise.resolve(ownedId);
+      },
+      isFocused: async () => focused === held,
+      waitForDisplayed: async () => {
+        if (mode === "replacement") ownedId = "replacement";
+        if (mode === "focus-lost") focused = "other";
+      },
+      waitForEnabled: async () => {},
+      moveTo: async () => calls.push("hover"),
+    };
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" +
+          source.slice(begin, end) +
+          source.slice(branchBegin, branchEnd + '  await capture("git-branch-menu");'.length) +
+          "}\nrun",
+      ),
+      {
+        Error,
+        browser: {
+          $$: (selector: string) => ({
+            length: Promise.resolve(
+              selector === held ? (mode === "missing" ? 0 : mode === "duplicate" ? 2 : 1) : 1,
+            ),
+          }),
+          $: (selector: string) =>
+            selector === held
+              ? element
+              : selector.includes("Current branch")
+                ? {
+                    isDisplayed: async () => {
+                      readyReads++;
+                      if (mode === "read-failed") throw original;
+                      return (
+                        mode !== "stale" &&
+                        readyReads >= 2 &&
+                        (mode !== "stale-after-focus" || readyReads === 2)
+                      );
+                    },
+                  }
+                : {
+                    elementId: "owned-filter",
+                    isFocused: async () => focused === selector,
+                    waitForDisplayed: async () => {},
+                    waitForEnabled: async () => {},
+                  },
+          keys: async (keys: string | string[]) => {
+            if (keys === "Tab") {
+              expect(readyReads).toBeGreaterThanOrEqual(2);
+              calls.push("Tab");
+              focused = held;
+            } else calls.push(JSON.stringify(keys));
+          },
+        },
+        owner: {
+          until: async (proof: () => Promise<boolean>) => {
+            for (let pass = 0; pass < 4; pass++) if (await proof()) return;
+            throw new Error("Inert public readiness timed out.");
+          },
+        },
+        capture: async () => calls.push("capture"),
+      },
+    ) as () => Promise<void>;
+    if (mode === "ready") {
+      await run();
+      expect(readyReads).toBe(3);
+      expect(calls).toEqual(['["Control","a"]', '"Backspace"', "Tab", "hover", "capture"]);
+    } else {
+      const failure = await run().catch((error: unknown) => error);
+      if (mode === "read-failed") expect(failure).toBe(original);
+      else expect(failure).toBeInstanceOf(Error);
+      expect(calls).not.toContain("hover");
+      expect(calls).not.toContain("capture");
+      if (["missing", "duplicate", "missing-id", "stale", "read-failed"].includes(mode))
+        expect(calls).not.toContain("Tab");
+    }
+  },
+);
 it("checks the shared managed-worktree identity before the first exact scene and propagates capture failure", async () => {
   const order: string[] = [];
   const stopped = new Error("fixture capture stopped");

@@ -148,6 +148,7 @@ it("retains the fixed partial Git/project lane identically in canonical and TEMP
     "git-tags",
     "git-switch-with-changes",
     "git-merge-conflict",
+    "git-rewrite-preview",
     "git-unborn",
     "git-no-repository",
     "git-broken-recovery",
@@ -194,5 +195,5 @@ it("retains the fixed partial Git/project lane identically in canonical and TEMP
     "supervisor.json",
     ...scenes.flatMap((scene) => [scene + "-light.png", scene + "-dark.png"]),
   ]);
-  expect(evidence.with.path).not.toMatch(/\*|git-rewrite-preview/);
+  expect(evidence.with.path).not.toMatch(/\*/);
 });

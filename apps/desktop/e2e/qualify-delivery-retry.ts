@@ -100,6 +100,7 @@ import {
   type VisualTextRowObservationInput,
 } from "./support/release-visual-observation.ts";
 import { correctDesktopUiOuterSize } from "./support/window-size.ts";
+import { fixtureAccessToken } from "./support/remote-ui-rpc.ts";
 
 const root = NodePath.resolve(import.meta.dirname, "../../..");
 const contractsRequire = NodeModule.createRequire(
@@ -254,13 +255,30 @@ export function runOwnedGitProjectCommand(
 }
 
 /** HTTP bodies are decoded by the current public contracts and remain private. */
-export async function readOwnedGitProjectSnapshot(credential: string) {
+export async function readOwnedGitProjectSnapshot(accessToken: string) {
   const response = await fetch(origin + EnvironmentOrchestrationHttpApi.endpoints.snapshot.path, {
-    headers: { authorization: `Bearer ${credential}` },
+    headers: { authorization: `Bearer ${accessToken}` },
     signal: AbortSignal.timeout(1000),
   });
   if (!response.ok) throw new Error("Owned Git/project snapshot refused.");
   return Schema.decodeUnknownSync(OrchestrationReadModel)(await response.json());
+}
+/** A separate one-time Node grant mints one session for this producer's snapshot loop. */
+export function createOwnedGitProjectSnapshotReader(issueGrant: () => Promise<unknown>) {
+  let accessToken: Promise<string> | undefined;
+  return async () => {
+    accessToken ??= (async () => {
+      const grant = await issueGrant();
+      const credential =
+        typeof grant === "object" && grant !== null && "credential" in grant
+          ? grant.credential
+          : null;
+      if (typeof credential !== "string" || credential.length < 8 || credential.length > 16384)
+        throw new Error("Owned snapshot credential unavailable.");
+      return fixtureAccessToken(origin, credential);
+    })();
+    return readOwnedGitProjectSnapshot(await accessToken);
+  };
 }
 export async function readOwnedGitProjectDescriptor() {
   const response = await fetch(origin + EnvironmentMetadataHttpApi.endpoints.descriptor.path, {
@@ -313,7 +331,7 @@ export async function runOwnedGitProjectSelection(input: {
   owner: QualificationOwner;
   theme: "light" | "dark";
   fixture: GitProjectVisualFixture;
-  credential: string;
+  issueSnapshotGrant: () => Promise<unknown>;
   evidence: string;
   captured: Set<string>;
   captures: object[];
@@ -335,7 +353,7 @@ export async function runOwnedGitProjectSelection(input: {
     origin,
     fixture: input.fixture,
     importProject: input.importProject,
-    readSnapshot: () => readOwnedGitProjectSnapshot(input.credential),
+    readSnapshot: createOwnedGitProjectSnapshotReader(input.issueSnapshotGrant),
     verifyServer: async () => {
       const current = await readOwnedGitProjectDescriptor();
       if (
@@ -1263,7 +1281,12 @@ export async function runDeliveryRetryQualification() {
           owner,
           theme,
           fixture: gitProjectFixture,
-          credential,
+          issueSnapshotGrant: () =>
+            owner.json(
+              config.binary,
+              ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
+              childEnv,
+            ),
           evidence: config.evidence,
           captured: capturedVisuals,
           captures,

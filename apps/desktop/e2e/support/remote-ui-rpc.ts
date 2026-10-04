@@ -2,7 +2,8 @@
 // @effect-diagnostics globalTimers:off - The browser-owned fixture socket has bounded request/close waits.
 import type { QualificationBrowser } from "./qualification-owner.ts";
 
-export async function fixtureRpcTicket(
+/** One bounded owned bootstrap exchange; the private bearer is never retained as evidence. */
+export async function fixtureAccessToken(
   endpoint: string,
   credential: string,
   fetcher: typeof fetch = fetch,
@@ -41,9 +42,19 @@ export async function fixtureRpcTicket(
     payload.access_token.length > 16384
   )
     throw new Error("Fixture authentication shape refused.");
+  return payload.access_token;
+}
+
+export async function fixtureRpcTicket(
+  endpoint: string,
+  credential: string,
+  fetcher: typeof fetch = fetch,
+): Promise<string> {
+  const base = new URL(endpoint);
+  const accessToken = await fixtureAccessToken(endpoint, credential, fetcher);
   const response = await fetcher(new URL("/api/auth/websocket-ticket", base), {
     method: "POST",
-    headers: { authorization: `Bearer ${payload.access_token}` },
+    headers: { authorization: `Bearer ${accessToken}` },
     signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) throw new Error("Fixture socket authorization refused.");

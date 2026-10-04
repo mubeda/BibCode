@@ -28,6 +28,8 @@ export interface GitProjectVisualFixture {
   breakMetadata: () => Promise<void>;
   restoreMetadata: () => Promise<void>;
   verifyDirtyRetained: () => Promise<void>;
+  beginRewritePreview: () => Promise<void>;
+  verifyRewriteRetained: () => Promise<void>;
   verifyMergeAborted: () => Promise<void>;
   verifyIncompleteRetained: () => void;
   verifyCloneAlias: () => Promise<void>;
@@ -210,6 +212,41 @@ export async function prepareGitProjectVisualFixture(
     regularConfig();
     const originalConfig = NodeFS.readFileSync(configPath);
     let damaged = false;
+    let rewriteBaseline: { refs: string; index: Buffer; diff: string; status: string } | null =
+      null;
+    const readRewriteIndex = () => {
+      const directory = NodePath.join(rich, ".git");
+      canonicalDirectory(directory);
+      const index = NodePath.join(directory, "index");
+      const stat = NodeFS.lstatSync(index);
+      if (
+        !stat.isFile() ||
+        stat.isSymbolicLink() ||
+        stat.nlink !== 1 ||
+        stat.uid !== NodeFS.lstatSync(root).uid ||
+        stat.size > 65536 ||
+        NodeFS.realpathSync(index) !== index
+      )
+        throw refused();
+      return NodeFS.readFileSync(index);
+    };
+    const readRewriteGit = (args: readonly string[]) => git(rich, ["--no-optional-locks", ...args]);
+    const rewriteState = async () => ({
+      refs: await readRewriteGit(["show-ref", "--head", "--dereference"]),
+      index: readRewriteIndex(),
+      diff: await readRewriteGit(["diff", "--binary", "--no-ext-diff", "--"]),
+      status: await readRewriteGit(["status", "--porcelain=v1", "--untracked-files=all"]),
+    });
+    const noRewriteOperation = () => {
+      for (const marker of [
+        "REBASE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+      ])
+        if (NodeFS.existsSync(NodePath.join(rich, ".git", marker))) throw refused();
+    };
     const fixture: GitProjectVisualFixture = {
       root,
       rich,
@@ -247,6 +284,33 @@ export async function prepareGitProjectVisualFixture(
           NodeFS.readFileSync(NodePath.join(rich, "visual-note.txt"), "utf8") !==
             "Owned dirty work must remain.\n" ||
           (await git(rich, ["status", "--porcelain"])).trim() !== "M visual-note.txt"
+        )
+          throw refused();
+      },
+      beginRewritePreview: async () => {
+        await input.admitOwner();
+        if (rewriteBaseline !== null) throw refused();
+        await fixture.verifyDirtyRetained();
+        noRewriteOperation();
+        if (
+          (await readRewriteGit(["rev-parse", "--symbolic-full-name", "@{upstream}"])).trim() !==
+            "refs/remotes/origin/main" ||
+          (await readRewriteGit(["rev-parse", "origin/main"])).trim() !== richHead
+        )
+          throw refused();
+        await readRewriteGit(["diff", "--cached", "--quiet"]);
+        rewriteBaseline = await rewriteState();
+      },
+      verifyRewriteRetained: async () => {
+        await input.admitOwner();
+        if (rewriteBaseline === null) throw refused();
+        noRewriteOperation();
+        const current = await rewriteState();
+        if (
+          current.refs !== rewriteBaseline.refs ||
+          !current.index.equals(rewriteBaseline.index) ||
+          current.diff !== rewriteBaseline.diff ||
+          current.status !== rewriteBaseline.status
         )
           throw refused();
       },
