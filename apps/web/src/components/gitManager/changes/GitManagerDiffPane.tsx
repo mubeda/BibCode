@@ -331,7 +331,7 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
         {availableAreas.includes("unstaged") ? (
           <button
             aria-pressed={activeArea === "unstaged"}
-            className="rounded px-2 py-0.5 text-[10px] aria-pressed:bg-accent"
+            className="rounded px-2 py-0.5 text-xs aria-pressed:bg-accent"
             type="button"
             onClick={selectUnstaged}
           >
@@ -341,7 +341,7 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
         {availableAreas.includes("staged") ? (
           <button
             aria-pressed={activeArea === "staged"}
-            className="rounded px-2 py-0.5 text-[10px] aria-pressed:bg-accent"
+            className="rounded px-2 py-0.5 text-xs aria-pressed:bg-accent"
             type="button"
             onClick={selectStaged}
           >
@@ -413,8 +413,8 @@ export const GitManagerDiffPane = memo(function GitManagerDiffPane({
           </>
         ) : renderablePatch?.kind === "raw" ? (
           <div className="min-w-0 flex-1 space-y-2 overflow-auto p-2">
-            <p className="text-[11px] text-muted-foreground">{renderablePatch.reason}</p>
-            <pre className="whitespace-pre-wrap rounded border border-border bg-muted/25 p-2 font-mono text-[11px]">
+            <p className="text-xs text-muted-foreground">{renderablePatch.reason}</p>
+            <pre className="whitespace-pre-wrap rounded border border-border bg-muted/25 p-2 font-mono text-xs">
               {renderablePatch.text}
             </pre>
           </div>

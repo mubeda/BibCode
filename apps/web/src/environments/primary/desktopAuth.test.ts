@@ -1,7 +1,7 @@
 import type { DesktopBridge } from "@bibcode/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "@effect/vitest";
 
-import { __resetDesktopPrimaryAuthForTests, readDesktopPrimaryBearerToken } from "./desktopAuth";
+import { readDesktopPrimaryBearerToken } from "./desktopAuth";
 
 describe("desktop primary auth", () => {
   beforeEach(() => {
@@ -12,22 +12,29 @@ describe("desktop primary auth", () => {
   });
 
   afterEach(() => {
-    __resetDesktopPrimaryAuthForTests();
     Reflect.deleteProperty(globalThis, "window");
   });
 
-  it("reuses the main-process bearer token across renderer requests", async () => {
-    const getLocalEnvironmentBearerToken = vi.fn().mockResolvedValue("desktop-bearer-token");
+  it("preserves bridge failures and permits the bridge's next successful read", async () => {
+    const failure = new Error("Bearer exchange failed.");
+    const getLocalEnvironmentBearerToken = vi
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue("recovered-bearer-token");
     window.desktopBridge = {
       getLocalEnvironmentBearerToken,
     } as unknown as DesktopBridge;
 
-    await expect(readDesktopPrimaryBearerToken()).resolves.toBe("desktop-bearer-token");
-    await expect(readDesktopPrimaryBearerToken()).resolves.toBe("desktop-bearer-token");
-    expect(getLocalEnvironmentBearerToken).toHaveBeenCalledTimes(1);
+    await expect(readDesktopPrimaryBearerToken()).rejects.toBe(failure);
+    await expect(readDesktopPrimaryBearerToken()).resolves.toBe("recovered-bearer-token");
   });
 
   it("does not require desktop auth in a browser", async () => {
+    await expect(readDesktopPrimaryBearerToken()).resolves.toBeNull();
+  });
+
+  it("does not require a browser global", async () => {
+    Reflect.deleteProperty(globalThis, "window");
     await expect(readDesktopPrimaryBearerToken()).resolves.toBeNull();
   });
 });

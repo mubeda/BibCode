@@ -90,6 +90,8 @@ use crate::{
 
 pub struct ProductionRuntime {
     pub registry: RpcRegistry,
+    attachment_uploads: crate::transfer::staging::UploadRegistry,
+    upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
     pub activity_projections: ActivityProjections,
     pub preview_automation: PreviewAutomationBroker,
@@ -248,6 +250,15 @@ impl ProductionRuntime {
             .reconcile_startup(&referenced_attachment_ids)
             .await
             .map_err(|error| error.to_string())?;
+        crate::transfer::staging::wipe_chat_partials(&state_paths.attachment_uploads_dir)
+            .await
+            .map_err(|error| error.to_string())?;
+        let attachment_uploads = crate::transfer::staging::UploadRegistry::new(
+            state_paths.attachment_uploads_dir.clone(),
+            crate::transfer::staging::UploadLimits::default(),
+            Arc::new(tokio::time::Instant::now),
+        );
+        let upload_sweeper = attachment_uploads.start_sweeper();
         let process_attribution = ProcessAttributionRegistry::new();
         let managed_endpoint =
             ManagedEndpointRuntime::with_process_attribution(process_attribution.clone());
@@ -444,6 +455,11 @@ impl ProductionRuntime {
             config.state_dir(),
             turn_delivery.clone(),
             workspace_availability.clone(),
+            attachment_uploads.clone(),
+        );
+        crate::production::uploads_rpc::register_uploads_rpc(
+            &mut registry,
+            attachment_uploads.clone(),
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         let git_manager = GitManagerRpcServices::with_dependencies(
@@ -483,6 +499,8 @@ impl ProductionRuntime {
 
         Ok(Self {
             registry,
+            attachment_uploads,
+            upload_sweeper,
             orchestration,
             activity_projections,
             preview_automation,
@@ -643,6 +661,8 @@ impl ProductionRuntime {
         self.clone_operations.close_and_drain().await;
         self.provider_update_checks.shutdown().await;
         self.turn_delivery.shutdown().await;
+        self.upload_sweeper.shutdown().await;
+        self.attachment_uploads.shutdown().await;
         self.orchestration_effects.shutdown().await;
         if let Err(error) = self.provider_runtime.shutdown().await {
             let error = bound_diagnostic_string(&error.to_string(), 160);

@@ -254,10 +254,15 @@ async function exchangeLocalEnvironmentBearerToken(): Promise<string> {
 }
 
 function getLocalEnvironmentBearerToken(): Promise<string> {
-  localEnvironmentBearerToken ??= exchangeLocalEnvironmentBearerToken().catch((error) => {
-    localEnvironmentBearerToken = null;
-    throw error;
-  });
+  if (localEnvironmentBearerToken === null) {
+    const exchange: Promise<string> = exchangeLocalEnvironmentBearerToken().catch((error) => {
+      if (localEnvironmentBearerToken === exchange) {
+        localEnvironmentBearerToken = null;
+      }
+      throw error;
+    });
+    localEnvironmentBearerToken = exchange;
+  }
   return localEnvironmentBearerToken;
 }
 

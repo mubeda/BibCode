@@ -214,6 +214,20 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Hide/remove non-destructive result:
 - Final on-disk verification:
 
+## Remote-server updates
+
+- Settings/card confirmation, fresh counts, Cancel, and Retry reconfirmation:
+- Progress/queued/restart/version checking, closing the view, and row Dismiss:
+- Manual archive/package/OS/architecture/SSH steps and Copy:
+- Browser explicit Reload and composer input retained:
+- Host request notice and Manage devices (native | tests-only | unavailable):
+- Fake-host UI/session evidence and light/dark screenshots:
+- Real seeded CI run link, target, lane and `widened` result:
+- Before/after boot, version, storage identity and project retention:
+- Observed percentages/stages, verified backup and requester log counts:
+- Linux scoped AppImage mount/runtime counts and cleanup evidence:
+- Exact commands, unavailable checks and residual risk:
+
 ## Clone from URL network scenario
 
 - Throttled remote size, rate, and clone duration (> 30 s) with dialog close after registration:
@@ -241,6 +255,24 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Frozen link: seconds until the 4408 close, exact status text, reconnect after thawing; the next attempt's failure time (at most 15 seconds after it starts) and text:
 - Idle freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 50), observed before thaw:
 - Transfer freeze: freeze-start and server teardown timestamps; elapsed seconds (at most 33), observed before thaw; subscription cleanup evidence:
+
+### Staged chat attachment upload evidence
+
+- Carrying-session `attachmentStaging`, plain/pinned E2EE transport, source byte count and digest:
+- Upstream rate/latency and duration at 64 KiB/s and 16 KiB/s; acknowledged progress samples and maximum outstanding appends:
+- Concurrent stream and Stop latency; upload completion without 4408; provider fixture received-byte/digest comparison:
+- Multi-file duration over ten minutes, completed-stage get activity touches, non-overlapping keeper requests and joined cleanup on all exits:
+- Freeze timestamp, 4408 timestamp (within 33 seconds), resume checkpoint after thaw, earlier-file restart/expiry outcome and once-per-file budget:
+- Cancel using pointer, Tab/Enter and Tab/Space on separate uploads; abort count, error-banner absence and usable restored previews:
+- New composer edits plus restored outgoing prompt, attachments, terminal/element context, annotations and review comments:
+- Queued upload local row before admission, queue acceptance and exactly-once local-row removal:
+- Route/unmount during pending admission: no premature cancel, keeper join at outcome, old-draft restoration/new-draft preservation:
+- Real unmount/remount before/after ambiguity settlement; unchanged replay, zero restaging, fresh-edit retention and concurrent-view fence:
+- Current permission/session rotation on same store; blocked/removal and host/store replacement fences with unresolved intent retained:
+- Lost accepted reply: exact command/message/timestamp/upload-ID replay, zero reupload, changed-composer retention; typed not_found and subsequent fresh send:
+- Old-server inline fallback, no `uploads.*` probes, failed-admission reuse, and abandoned-stage cleanup:
+- Light/dark upload and reconnect/Cancel screenshots:
+- Browser queued-data-after-close/Ping-Pong probe; WebKitGTK measured or explicitly not measured:
 
 ## SSH environment evidence
 

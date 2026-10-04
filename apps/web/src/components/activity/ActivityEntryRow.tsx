@@ -83,7 +83,7 @@ export function ActivityEntryRow({ entry, timestampFormat }: ActivityEntryRowPro
         </span>
         <span className="min-w-16 flex-1 truncate text-sm">{entry.title}</span>
         <time
-          className="ml-auto shrink-0 text-[11px] text-muted-foreground"
+          className="ml-auto shrink-0 text-xs text-muted-foreground"
           dateTime={entry.createdAt}
           title={entry.createdAt}
         >

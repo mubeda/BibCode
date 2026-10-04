@@ -76,6 +76,27 @@ proxy the chosen HTTPS address to the local BiBCode backend, then let the deskto
 app rescan it. The native `bibcode` CLI does not currently provide Tailscale
 Serve setup flags.
 
+## Update a remote server
+
+For a desktop-hosted release, choose **Update to v…** on its sidebar card or in
+**Settings → Remote Servers**. The confirmation names the host and explains
+that its running agents and terminals stop; conversations and queued messages
+are kept. Counts may still be loading, and an unavailable count does not block
+your choice.
+
+The card and row show download progress, backup, restart, and version checking.
+Closing Settings keeps the update running. On failure, **Retry** asks again;
+Settings also offers **Dismiss**. If the host has not come back, inspect BiBCode
+there and re-pair if its port changed. A restart on the old version is reported
+explicitly. The host displays who requested the update; **Manage devices** opens
+its sharing controls.
+
+Headless and externally managed hosts use **Show update steps** and **Copy**.
+Steps match their archive/package, OS, architecture, or SSH launch. Run them on
+that host; verify an SSH pid still belongs to that server before stopping it.
+The browser page offers **Reload** when its own server was updated by another
+client. It preserves your unsent text until you choose Reload.
+
 ## Headless server
 
 `bibcode start` and `bibcode serve` run the same native server. `start` opens the

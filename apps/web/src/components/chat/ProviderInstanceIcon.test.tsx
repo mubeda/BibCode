@@ -36,6 +36,24 @@ describe("providerInstanceInitials", () => {
 });
 
 describe("ProviderInstanceIcon", () => {
+  it("keeps readable initials in flow beside the compact provider logo", () => {
+    const markup = renderToStaticMarkup(
+      <ProviderInstanceIcon
+        driverKind={ProviderDriverKind.make("codex")}
+        displayName="Codex Agent"
+        showBadge
+        className="h-5"
+        iconClassName="size-4"
+      />,
+    );
+    expect(markup).toContain("data-codex-icon");
+    const badge = markup.match(/<span class="([^"]+)"[^>]*>CA<\/span>/)?.[1];
+    expect(badge).toBeDefined();
+    expect(badge?.split(" ")).not.toContain("absolute");
+    expect(badge?.split(" ")).toContain("shrink-0");
+    expect(badge?.split(" ")).toContain("text-xs");
+  });
+
   it("renders a known provider icon without indicators", () => {
     const markup = renderToStaticMarkup(
       <ProviderInstanceIcon

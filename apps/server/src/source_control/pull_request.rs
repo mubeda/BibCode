@@ -5,7 +5,7 @@ use reqwest::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
 
-use crate::git::{OutputPolicy, ProcessRequest, ProcessRunner};
+use crate::git::{OutputPolicy, ProcessFailureFacts, ProcessRequest, ProcessRunner};
 
 use super::ProviderKind;
 
@@ -119,6 +119,25 @@ pub struct SourceControlProviderError {
 pub(crate) struct ProviderCommandFailure {
     pub code: &'static str,
     pub host_detail: Option<String>,
+    pub process_failure: Option<ProcessFailureFacts>,
+}
+
+impl SourceControlProviderError {
+    pub(crate) fn safe_failure_message(&self) -> Option<String> {
+        self.command_failure
+            .as_ref()?
+            .process_failure
+            .map(|facts| facts.message(provider_program(self.provider)))
+    }
+}
+
+fn provider_program(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Github => "gh",
+        ProviderKind::Gitlab => "glab",
+        ProviderKind::AzureDevops => "az",
+        ProviderKind::Bitbucket | ProviderKind::Unknown => "provider CLI",
+    }
 }
 
 impl std::fmt::Display for SourceControlProviderError {
@@ -1079,25 +1098,23 @@ impl PullRequestService {
             )
             .await
             .map_err(|error| {
-                operation_error(
+                process_error(
                     provider,
                     cwd,
                     operation,
-                    Some(command.label()),
-                    None,
-                    &error.to_string(),
+                    command.label(),
+                    error.safe_facts(),
                 )
             })?;
         if output.exit_code == 0 || allowed_non_zero_exit_codes.contains(&output.exit_code) {
             Ok(output)
         } else {
-            Err(operation_error(
+            Err(process_error(
                 provider,
                 cwd,
                 operation,
-                Some(command.label()),
-                None,
-                "Provider CLI returned a non-success exit status.",
+                command.label(),
+                ProcessFailureFacts::exited(output.exit_code),
             ))
         }
     }
@@ -1459,6 +1476,29 @@ fn provider_error(
     }
 }
 
+fn process_error(
+    provider: ProviderKind,
+    cwd: &std::path::Path,
+    operation: &str,
+    command: &str,
+    facts: ProcessFailureFacts,
+) -> SourceControlProviderError {
+    let mut error = operation_error(
+        provider,
+        cwd,
+        operation,
+        Some(command),
+        None,
+        &facts.message(provider_program(provider)),
+    );
+    error.command_failure = Some(Box::new(ProviderCommandFailure {
+        code: "host_rejected",
+        host_detail: None,
+        process_failure: Some(facts),
+    }));
+    error
+}
+
 fn operation_error(
     provider: ProviderKind,
     cwd: &std::path::Path,
@@ -1529,6 +1569,137 @@ mod tests {
     use crate::test_support::TestSandbox;
 
     use super::*;
+
+    #[tokio::test]
+    async fn creation_launch_failures_do_not_confuse_missing_executable_and_missing_cwd() {
+        let sandbox = TestSandbox::new("creation-launch-failure");
+        let executable =
+            sandbox.executable_script("fixture-host-cli", "exit 0", "@echo off\r\nexit /b 0");
+        for (command, cwd) in [
+            (
+                sandbox.root().join("absent-cli"),
+                sandbox.root().to_path_buf(),
+            ),
+            (executable, sandbox.root().join("absent-workspace")),
+        ] {
+            let command = command.to_string_lossy().into_owned();
+            let service = PullRequestService::with_provider_commands(
+                command.clone(),
+                command.clone(),
+                command,
+            );
+            let error = service
+                .create(
+                    CreatePullRequestInput {
+                        cwd,
+                        provider: ProviderKind::Gitlab,
+                        base_branch: "main".into(),
+                        head_branch: "private-branch-sentinel".into(),
+                        title: "private-title-sentinel".into(),
+                        body: "Bearer private-body-sentinel".into(),
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect_err("owned launch must fail");
+            assert!(
+                error.detail.contains("required file or directory")
+                    || error.detail.contains("required path is not a directory"),
+                "{}",
+                error.detail
+            );
+            assert!(error.detail.contains("repository folder"));
+            assert!(!error.detail.contains("not installed"));
+            assert!(!error.detail.contains("sentinel"));
+            assert!(
+                !error
+                    .detail
+                    .contains(sandbox.root().to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                error.safe_failure_message().as_deref(),
+                Some(error.detail.as_ref())
+            );
+            let wire = serde_json::to_value(&error).unwrap();
+            assert!(wire.get("commandFailure").is_none());
+            assert!(wire.get("processFailure").is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn creation_launch_denial_retains_safe_permission_guidance() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sandbox = TestSandbox::new("creation-launch-denied");
+        let executable = sandbox.executable_script("denied-host-cli", "exit 0", "");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let command = executable.to_string_lossy().into_owned();
+        let service =
+            PullRequestService::with_provider_commands(command.clone(), command.clone(), command);
+        let error = service
+            .create(
+                CreatePullRequestInput {
+                    cwd: sandbox.root().to_path_buf(),
+                    provider: ProviderKind::Gitlab,
+                    base_branch: "main".into(),
+                    head_branch: "feature".into(),
+                    title: "private-title-sentinel".into(),
+                    body: "private-body-sentinel".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("owned executable is not executable");
+        assert!(
+            error.detail.contains("permission was denied"),
+            "{}",
+            error.detail
+        );
+        assert!(error.detail.contains("executable permissions"));
+        assert!(!error.detail.contains("sentinel"));
+        assert!(
+            !error
+                .detail
+                .contains(sandbox.root().to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_exit_status_keeps_private_output_out_of_messages_and_facts() {
+        let sandbox = TestSandbox::new("creation-exit-failure");
+        let executable = sandbox.executable_script(
+            "fixture-host-cli", "printf 'stdout-credential-sentinel\\n'\nprintf 'stderr-credential-sentinel\\n' >&2\nexit 23",
+            "@echo off\r\necho stdout-credential-sentinel\r\necho stderr-credential-sentinel 1>&2\r\nexit /b 23",
+        );
+        let command = executable.to_string_lossy().into_owned();
+        let service =
+            PullRequestService::with_provider_commands(command.clone(), command.clone(), command);
+        let error = service
+            .create(
+                CreatePullRequestInput {
+                    cwd: sandbox.root().to_path_buf(),
+                    provider: ProviderKind::Gitlab,
+                    base_branch: "main".into(),
+                    head_branch: "feature".into(),
+                    title: "private-title-sentinel".into(),
+                    body: "private-body-sentinel".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("owned provider fixture exits unsuccessfully");
+        assert!(
+            error.detail.contains("glab exited with status 23"),
+            "{}",
+            error.detail
+        );
+        assert_eq!(
+            error.safe_failure_message().as_deref(),
+            Some(error.detail.as_ref())
+        );
+        assert!(!error.detail.contains("sentinel"));
+        assert!(!format!("{:?}", error.command_failure).contains("sentinel"));
+    }
 
     struct FakeHttpServer {
         base_url: String,

@@ -43,6 +43,7 @@ export interface EnvironmentContextCardView {
   readonly versionLine: string | null;
   readonly compatBadge: EnvironmentCompatBadge | null;
   readonly showUpdateActions: boolean;
+  readonly manualUpdates: boolean;
 }
 
 export function buildEnvironmentContextCardView(input: {
@@ -74,5 +75,6 @@ export function buildEnvironmentContextCardView(input: {
     versionLine: serverVersion === null ? null : `BiBCode v${serverVersion}`,
     compatBadge: resolveCompatBadge(compat),
     showUpdateActions: selectRemoteUpdateControlCapability(input.serverConfig),
+    manualUpdates: input.serverConfig?.environment.remoteUpdateSupport?.installMode === "manual",
   };
 }

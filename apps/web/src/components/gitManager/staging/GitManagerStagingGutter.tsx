@@ -101,7 +101,7 @@ const GutterLineControl = memo(function GutterLineControl({
       aria-checked={selected}
       aria-describedby={disabledReason === null ? undefined : DISABLED_REASON_ID}
       aria-label={`Toggle line ${line.lineNumber}, ${line.side}`}
-      className="flex h-5 min-w-0 items-center gap-1 rounded-sm px-1 font-mono text-[10px] outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+      className="flex h-5 min-w-0 items-center gap-1 rounded-sm px-1 font-mono text-xs outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
       data-line-index={line.index}
       disabled={disabledReason !== null}
       role="checkbox"
@@ -168,7 +168,7 @@ const GutterRunControl = memo(function GutterRunControl({
         aria-checked={state === "partial" ? "mixed" : state === "all"}
         aria-describedby={disabledReason === null ? undefined : DISABLED_REASON_ID}
         aria-label={`Toggle changed-line run starting at line ${firstLine?.lineNumber ?? 0}`}
-        className="flex h-5 w-full items-center gap-1 rounded-sm px-1 text-[10px] text-muted-foreground outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+        className="flex h-5 w-full items-center gap-1 rounded-sm px-1 text-xs text-muted-foreground outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
         disabled={disabledReason !== null}
         role="checkbox"
         title={disabledReason ?? undefined}
@@ -285,7 +285,7 @@ const GitManagerTextStagingGutter = memo(function GitManagerTextStagingGutter({
         {onApplySelection === undefined ? null : (
           <button
             aria-describedby={disabledReason === null ? undefined : DISABLED_REASON_ID}
-            className="h-6 w-full rounded border border-input px-1 text-[10px] font-medium outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            className="h-6 w-full rounded border border-input px-1 text-xs font-medium outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
             disabled={selectionDisabled}
             title={disabledReason ?? undefined}
             type="button"
@@ -297,7 +297,7 @@ const GitManagerTextStagingGutter = memo(function GitManagerTextStagingGutter({
         {area === "staged" || onRequestDiscard === undefined ? null : (
           <button
             aria-describedby={disabledReason === null ? undefined : DISABLED_REASON_ID}
-            className="h-6 w-full rounded border border-destructive/50 px-1 text-[10px] font-medium text-destructive outline-none hover:bg-destructive/10 focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            className="h-6 w-full rounded border border-destructive/50 px-1 text-xs font-medium text-destructive outline-none hover:bg-destructive/10 focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
             disabled={selectionDisabled}
             type="button"
             onClick={onRequestDiscard}
@@ -306,7 +306,7 @@ const GitManagerTextStagingGutter = memo(function GitManagerTextStagingGutter({
           </button>
         )}
         {disabledReason === null ? null : (
-          <p className="text-[10px] text-muted-foreground" id={DISABLED_REASON_ID} role="status">
+          <p className="text-xs text-muted-foreground" id={DISABLED_REASON_ID} role="status">
             {disabledReason}
           </p>
         )}

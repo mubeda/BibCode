@@ -627,6 +627,27 @@ Plain authenticated WebSockets enter the live-client
 registry only after the HTTP upgrade completes, and unregister from the same
 upgrade-owned lifecycle.
 
+Settings rows and the sidebar card start updates through the web runtime's one
+confirmation-request Atom. `AppRoot` hosts `UpdateServerDialog`; counts are read
+only while it is open and `remoteUpdateProgress` is advertised. Counts are
+advice, so a failed or pending read never prevents confirmation. **Retry** from
+a row, card, or outcome toast asks again with fresh counts. The shared run
+survives closing either view. Rows and cards stop observing their status query
+while a run is active; the rail's existing status observation remains bounded.
+Progress replaces the action, a failed row offers **Retry** and **Dismiss**, and
+a failed card retains **Retry** beside its explained badge.
+
+Manual hosts expose **Show update steps**, using install kind, host OS and
+architecture, and SSH launch state. Windows archive checks use PowerShell;
+SSH steps require verifying the current server before stopping it. There is no
+invented latest version for a manual host.
+
+The host renderer announces `requestedBy` once per install with **Manage
+devices**, which opens **Share this host**. Missing device addresses are omitted
+from user copy. Browser mode records its primary server's first boot and offers
+**Reload** after a changed boot/version; it never reloads automatically, so
+unsent input stays intact until the user chooses.
+
 ### Share ceremony and exposure
 
 The Share tab mints the complete pairing payload on the server through
@@ -802,6 +823,13 @@ Plain `/ws` explicitly caps a WebSocket frame at 16 MiB and a reassembled
 WebSocket message at 64 MiB. Its authenticated session enters connected
 bookkeeping only inside the successful upgrade-owned task; a failed upgrade
 cannot leak a live connection count or revocation token.
+
+Chat attachment staging (`uploads.begin`, `uploads.append`, `uploads.get`, and
+`uploads.cancel`) uses the authenticated RPC channel. On host-key pairings its
+metadata, chunks, digests, acknowledgements, and staged turn admission stay
+inside Noise. Session ownership survives reconnect with the same credential;
+a different session cannot read, append, or bind another session's stage.
+Staging introduces no HTTP route or exception to this audit.
 
 #### Host-key HTTP audit
 

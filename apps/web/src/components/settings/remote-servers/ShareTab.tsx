@@ -269,9 +269,7 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
         <span className="min-w-0 flex-1">
           <span className="block truncate">{option.label}</span>
           {renderDetail ? (
-            <span className="block truncate text-[11px] text-muted-foreground">
-              {option.detail}
-            </span>
+            <span className="block truncate text-xs text-muted-foreground">{option.detail}</span>
           ) : null}
         </span>
       </MenuItem>
@@ -281,7 +279,7 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
       <span className="min-w-0 flex-1">
         <span className="block truncate">Copy code</span>
         {renderDetail ? (
-          <span className="block truncate text-[11px] text-muted-foreground">Token only</span>
+          <span className="block truncate text-xs text-muted-foreground">Token only</span>
         ) : null}
       </span>
     </MenuItem>
@@ -379,7 +377,7 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
             <AccessScopeSummary scopes={pairingLink.scopes} label="Pairing link scopes" />
           </p>
           {shareablePairingUrl === null ? (
-            <p className="text-[11px] text-muted-foreground/70">
+            <p className="text-xs text-muted-foreground/70">
               Copy the token and pair from another client using this backend&apos;s reachable host.
             </p>
           ) : null}
@@ -542,7 +540,7 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
             />
             <h3 className="text-sm font-medium text-foreground">{primaryLabel}</h3>
             {clientSession.current ? (
-              <span className="text-[10px] text-muted-foreground/80 rounded-md border border-border/50 bg-muted/50 px-1 py-0.5">
+              <span className="text-xs text-muted-foreground/80 rounded-md border border-border/50 bg-muted/50 px-1 py-0.5">
                 This device
               </span>
             ) : null}
@@ -704,14 +702,14 @@ const AdvertisedEndpointListRow = memo(function AdvertisedEndpointListRow({
             </p>
           ) : null}
           {!isAvailable ? (
-            <span className="shrink-0 rounded-md border border-border/70 px-1 py-0.5 text-[10px] text-muted-foreground">
+            <span className="shrink-0 rounded-md border border-border/70 px-1 py-0.5 text-xs text-muted-foreground">
               Setup required
             </span>
           ) : null}
         </div>
         <div className="ml-auto flex min-h-6 shrink-0 items-center justify-end gap-2">
           {isDefault ? (
-            <span className="rounded-md border border-primary/30 bg-primary/10 px-1 py-0.5 text-[10px] text-primary">
+            <span className="rounded-md border border-primary/30 bg-primary/10 px-1 py-0.5 text-xs text-primary">
               Default
             </span>
           ) : null}

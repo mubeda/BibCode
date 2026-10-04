@@ -49,7 +49,7 @@ export interface ResourceDiagnosticsSectionsProps {
 function SummaryMetric({ label, value }: { readonly label: string; readonly value: string }) {
   return (
     <div className="min-w-0">
-      <div className="text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground/70">
+      <div className="text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground/70">
         {label}
       </div>
       <div className="mt-0.5 truncate font-mono text-sm font-semibold tabular-nums text-foreground">
@@ -166,7 +166,7 @@ function SortHeader({
         type="button"
         variant="ghost"
         size="xs"
-        className="-mx-2 h-6 px-2 text-[11px] font-semibold uppercase tracking-[0.08em]"
+        className="-mx-2 h-6 px-2 text-xs font-semibold uppercase tracking-[0.08em]"
         aria-label={`Sort by ${sortLabel}`}
         onClick={() => onSort(sortKey)}
       >
@@ -200,7 +200,7 @@ function HistorySortHeader({
         type="button"
         variant="ghost"
         size="xs"
-        className="-mx-2 h-6 px-2 text-[11px] font-semibold uppercase tracking-[0.08em]"
+        className="-mx-2 h-6 px-2 text-xs font-semibold uppercase tracking-[0.08em]"
         aria-label={`Sort history by ${label}`}
         onClick={() => onSort(sortKey)}
       >
@@ -244,7 +244,7 @@ function LiveProcessTable({
           <col className="w-[7%]" />
           <col className="w-[8%]" />
         </colgroup>
-        <thead className="sticky top-0 z-10 border-b border-border/60 bg-card text-[11px] uppercase tracking-[0.08em] text-muted-foreground/70">
+        <thead className="sticky top-0 z-10 border-b border-border/60 bg-card text-xs uppercase tracking-[0.08em] text-muted-foreground/70">
           <tr>
             <SortHeader
               label={LIVE_PROCESS_COLUMNS[0]}
@@ -296,7 +296,7 @@ function LiveProcessTable({
               <td className="px-3 py-2">
                 <span
                   className={cn(
-                    "rounded-sm px-1.5 py-0.5 text-[10px] font-semibold uppercase",
+                    "rounded-sm px-1.5 py-0.5 text-xs font-semibold uppercase",
                     row.scope === "core"
                       ? "bg-blue-500/10 text-blue-700 dark:text-blue-300"
                       : "bg-violet-500/10 text-violet-700 dark:text-violet-300",
@@ -314,7 +314,7 @@ function LiveProcessTable({
                   <TooltipTrigger render={<span className="block truncate">{row.command}</span>} />
                   <TooltipPopup
                     side="top"
-                    className="max-w-[min(440px,calc(100vw-2rem))] break-words font-mono text-[11px]"
+                    className="max-w-[min(440px,calc(100vw-2rem))] break-words font-mono text-xs"
                   >
                     {row.command}
                   </TooltipPopup>
@@ -385,7 +385,7 @@ function ResourceHistoryWindowSelector({
           variant="ghost"
           size="xs"
           className={cn(
-            "h-6 rounded-sm px-2 text-[11px] font-medium text-muted-foreground",
+            "h-6 rounded-sm px-2 text-xs font-medium text-muted-foreground",
             selectedWindowMs === option.windowMs && "bg-muted text-foreground",
           )}
           aria-label={`Show ${option.label} resource history`}
@@ -417,7 +417,7 @@ function HistoryMetricToggle({
             variant="ghost"
             size="xs"
             className={cn(
-              "h-6 rounded-sm px-2 text-[11px] font-medium text-muted-foreground",
+              "h-6 rounded-sm px-2 text-xs font-medium text-muted-foreground",
               metric === option && "bg-muted text-foreground",
             )}
             aria-label={`${label} history`}
@@ -478,14 +478,14 @@ function ResourceHistoryChart({
                   </div>
                 }
               />
-              <TooltipPopup side="top" className="max-w-xs text-left text-[11px]">
+              <TooltipPopup side="top" className="max-w-xs text-left text-xs">
                 {bar.tooltip}
               </TooltipPopup>
             </Tooltip>
           );
         })}
       </div>
-      <div className="mt-2 flex items-center gap-4 text-[10px] text-muted-foreground">
+      <div className="mt-2 flex items-center gap-4 text-xs text-muted-foreground">
         <span className="inline-flex items-center gap-1">
           <span className="size-2 rounded-sm bg-blue-500/70" aria-hidden />
           BiBCode Core average
@@ -516,7 +516,7 @@ function HistoryProcessTable({
       className="max-h-[min(64vh,44rem)] w-full max-w-full border-t border-border/60"
     >
       <table className="w-full min-w-[1480px] table-fixed text-left text-xs">
-        <thead className="sticky top-0 z-10 border-b border-border/60 bg-card text-[11px] uppercase tracking-[0.08em] text-muted-foreground/70">
+        <thead className="sticky top-0 z-10 border-b border-border/60 bg-card text-xs uppercase tracking-[0.08em] text-muted-foreground/70">
           <tr>
             <HistorySortHeader
               label={HISTORY_PROCESS_COLUMNS[0]}
@@ -599,7 +599,7 @@ function HistoryProcessTable({
               <td className="px-3 py-2">
                 <span
                   className={cn(
-                    "rounded-sm px-1.5 py-0.5 text-[10px] font-semibold uppercase",
+                    "rounded-sm px-1.5 py-0.5 text-xs font-semibold uppercase",
                     row.scope === "core"
                       ? "bg-blue-500/10 text-blue-700 dark:text-blue-300"
                       : "bg-violet-500/10 text-violet-700 dark:text-violet-300",
@@ -631,7 +631,7 @@ function HistoryProcessTable({
                   <TooltipTrigger render={<span className="block truncate">{row.command}</span>} />
                   <TooltipPopup
                     side="top"
-                    className="max-w-[min(440px,calc(100vw-2rem))] break-words font-mono text-[11px]"
+                    className="max-w-[min(440px,calc(100vw-2rem))] break-words font-mono text-xs"
                   >
                     {row.command}
                   </TooltipPopup>
@@ -704,7 +704,7 @@ export function ResourceDiagnosticsSections({
               <LiveSummaryCard scope="core" summary={live.summary.core} />
               <LiveSummaryCard scope="external" summary={live.summary.external} />
             </ResourceSummaryPair>
-            <div className="border-t border-border/60 px-4 py-2 text-[11px] text-muted-foreground sm:px-5">
+            <div className="border-t border-border/60 px-4 py-2 text-xs text-muted-foreground sm:px-5">
               Server PID <span className="font-mono tabular-nums">{processData?.serverPid}</span>
             </div>
           </>
@@ -737,7 +737,7 @@ export function ResourceDiagnosticsSections({
         }
       >
         <div className="flex items-center justify-between gap-3 px-4 py-2 sm:px-5">
-          <div className="text-[11px] text-muted-foreground">
+          <div className="text-xs text-muted-foreground">
             {history.sampleCountLabel} samples · {history.sampleIntervalLabel} interval ·{" "}
             {history.processCountLabel} processes
           </div>

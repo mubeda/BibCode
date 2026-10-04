@@ -95,7 +95,7 @@ KiB leaves as binary frames, one record per frame, in the E2EE record format:
 `0x00` for the final record, `0x01` for a continuation, and `0x02` for a
 stand-alone control message sent between the records of another message, which
 the client returns without touching the partial message. Smaller messages stay
-whole text frames, requests are never split, and the limits are 64 MiB and
+whole text frames, individual requests are never split, and the limits are 64 MiB and
 2,048 records per message. Without the echoed subprotocol the server keeps
 today's whole text frames. E2EE sockets always use records; `0x02` control
 records are used there only when the client lists `interleave-v1` in
@@ -1282,6 +1282,43 @@ publication remains rollback-owned until the command, references, and provider
 outbox commit atomically; startup scavenges a final file left by a process crash
 after reservation and publication but before that transaction.
 
+### Attachment staging
+
+Servers with `capabilities.attachmentStaging` accept chat attachments through
+`uploads.begin`, `uploads.append`, `uploads.get`, and `uploads.cancel`. These
+unary RPCs use the existing WebSocket framing and authorization;
+all four require `orchestration:operate`. Attachments travel as several
+acknowledged requests, each carrying at most 1 MiB of canonical base64-decoded
+bytes. The client normally keeps at most two smaller chunks outstanding.
+Each append acknowledges only bytes written and flushed to disk. A completing
+append requires a verified SHA-256 supplied either at begin or completion.
+Zero-byte uploads finalize with a digest at begin or an empty append.
+
+The Rust server owns one registry shared by upload handlers and durable turn
+admission. Ownership follows the authenticated session across reconnects.
+Unknown, expired, and foreign upload IDs return the same `UploadError` with
+`reason: "not_found"`; cancellation of inaccessible IDs returns an empty success.
+There are at most 16 open stages per owner, 10 MiB per stage, and 256 MiB of
+declared staging bytes across the server. Partial and complete unbound stages
+expire after ten idle minutes; begin, acknowledged append, and get refresh
+activity. An operation may keep completed stages alive with get while uploading
+other attachments. A minute sweeper and admission-time expiry release quotas.
+Server startup removes only owned UUID upload leaves in `attachment-uploads/`;
+durable attachments remain in `attachments/`. Shutdown closes staging admission,
+joins admitted writers and the sweeper, and removes remaining stages.
+
+A turn names `uploadId` instead of `dataUrl`. The staged branch runs before
+attachment-by-ID reuse, rejects both byte sources and duplicate upload IDs, and
+checks owner, completion, name, type, MIME, size, and verified content digest.
+It holds the upload's write guard while publishing a final attachment through a
+hard link or bounded copy. Only finals created by that batch are rollback-owned;
+identical existing files are adopted. Failed durable admission removes owned
+finals and retains completed stages for retry. The durable commit consumes the
+bound stages and quotas, leaving only attachment metadata in events and the
+provider delivery outbox. Direct and queued turns share this transaction.
+Accepted command replays skip staging preparation. Legacy clients and servers
+continue using inline data URLs when the capability is absent.
+
 Canonical workspace ownership is protected by a server-owned global fence keyed
 by physical host identity. Present paths canonicalize through the filesystem;
 missing leaves resolve the nearest existing ancestor and append their normalized
@@ -2259,6 +2296,31 @@ success. The browser still performs thread deletion after the VCS result. After
 cleanup succeeds, the receipt moves to `removed`; a later retry after a
 thread-deletion failure returns success without inspecting or deleting a
 replacement that now occupies the old path.
+
+## Failure diagnostics and elapsed timing
+
+The configured local `TraceDiagnosticsStore` records failed unary handlers and
+terminal domain failures from stacked Git actions. Unary registration owns its
+handler timer. The stacked-action owner records the failure before converting
+it to an `action_failed` progress chunk; generic stream transport does not infer
+domain errors from arbitrary message bodies. Both owners reuse the registry's
+configured recorder and preserve the original result if diagnostic writing fails.
+
+Process errors provide private closed failure facts to source-control and Git
+Manager error mapping. User-facing launch messages may contain a known tool
+label and numeric OS error, but never raw error sources, command arguments or
+process output. A not-found launch category does not assert that the executable
+is absent rather than a required directory or interpreter.
+
+Native trace records and responses add optional `durationMeasured` on occurrences
+and recent failures, and `measuredCount` on span summaries. Existing finite numeric
+duration fields remain compatible with older clients. New failures measure
+server-handler/action elapsed time with the monotonic clock before logging;
+untimed events are explicitly unmeasured. Unmarked legacy zero durations are
+unavailable, while positive legacy durations remain measured. Unknown samples
+retain their failure/count evidence but do not contribute to latency statistics
+or slow rankings. An older server's summary lacks a known measured denominator,
+so current clients display its summary timing as unavailable.
 
 ## Invariants
 

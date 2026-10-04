@@ -402,3 +402,13 @@ describe("remote update descriptor surface", () => {
     });
   });
 });
+
+it("defaults attachment staging to false for legacy descriptors", () => {
+  expect(Schema.decodeUnknownSync(ExecutionEnvironmentCapabilities)({}).attachmentStaging).toBe(
+    false,
+  );
+  expect(
+    Schema.decodeUnknownSync(ExecutionEnvironmentCapabilities)({ attachmentStaging: true })
+      .attachmentStaging,
+  ).toBe(true);
+});

@@ -104,10 +104,130 @@ pub enum ProcessError {
     },
 }
 
+/// Safe facts for user-facing errors; never contains command paths, arguments or output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessFailureFacts {
+    kind: ProcessFailureKind,
+    os_error: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessFailureKind {
+    LaunchNotFound,
+    LaunchDenied,
+    LaunchNotDirectory,
+    LaunchInvalidInput,
+    LaunchRejected,
+    TimedOut(u128),
+    Cancelled,
+    OutputLimit,
+    Exited(i32),
+    Pipe,
+    Read,
+    Stdin,
+    Wait,
+    MissingExitCode,
+}
+
+impl ProcessFailureFacts {
+    pub(crate) fn exited(code: i32) -> Self {
+        Self {
+            kind: ProcessFailureKind::Exited(code),
+            os_error: None,
+        }
+    }
+
+    pub(crate) fn message(self, program: &'static str) -> String {
+        let (reason, guidance) = match self.kind {
+            ProcessFailureKind::LaunchNotFound => (
+                "a required file or directory was not found",
+                "Check that the executable is available to this environment and that the repository folder is accessible.",
+            ),
+            ProcessFailureKind::LaunchDenied => (
+                "permission was denied",
+                "Check executable permissions and access to the repository folder.",
+            ),
+            ProcessFailureKind::LaunchNotDirectory => (
+                "a required path is not a directory",
+                "Check that the repository folder and executable location are accessible directories.",
+            ),
+            ProcessFailureKind::LaunchInvalidInput => (
+                "the launch input was invalid",
+                "Check the executable configuration and the requested input.",
+            ),
+            ProcessFailureKind::LaunchRejected => (
+                "the operating system rejected the launch",
+                "Check the executable and access to the repository folder.",
+            ),
+            ProcessFailureKind::TimedOut(milliseconds) => {
+                return format!(
+                    "{program} timed out after {milliseconds} ms. Check the operation before retrying."
+                );
+            }
+            ProcessFailureKind::Cancelled => return format!("{program} was cancelled."),
+            ProcessFailureKind::OutputLimit => {
+                return format!("{program} output exceeded its limit.");
+            }
+            ProcessFailureKind::Exited(code) => {
+                return format!(
+                    "{program} exited with status {code}. Check the repository and provider state before retrying."
+                );
+            }
+            ProcessFailureKind::Pipe => {
+                return format!("Could not access {program} process input or output.");
+            }
+            ProcessFailureKind::Read => {
+                return format!("{program} process output could not be read.");
+            }
+            ProcessFailureKind::Stdin => return format!("Could not send input to {program}."),
+            ProcessFailureKind::Wait => {
+                return format!("Could not observe {program} process completion.");
+            }
+            ProcessFailureKind::MissingExitCode => {
+                return format!("{program} completed without an exit status.");
+            }
+        };
+        let os_error = self
+            .os_error
+            .map_or_else(String::new, |code| format!(" (OS error {code})"));
+        format!("Could not start {program}: {reason}{os_error}. {guidance}")
+    }
+}
+
 impl ProcessError {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled { .. })
+    }
+
+    pub(crate) fn safe_facts(&self) -> ProcessFailureFacts {
+        match self {
+            Self::Spawn { source, .. } => ProcessFailureFacts {
+                kind: match source.kind() {
+                    std::io::ErrorKind::NotFound => ProcessFailureKind::LaunchNotFound,
+                    std::io::ErrorKind::PermissionDenied => ProcessFailureKind::LaunchDenied,
+                    std::io::ErrorKind::NotADirectory => ProcessFailureKind::LaunchNotDirectory,
+                    std::io::ErrorKind::InvalidInput => ProcessFailureKind::LaunchInvalidInput,
+                    _ => ProcessFailureKind::LaunchRejected,
+                },
+                os_error: source.raw_os_error(),
+            },
+            error => ProcessFailureFacts {
+                kind: match error {
+                    Self::Timeout { timeout_ms, .. } => ProcessFailureKind::TimedOut(*timeout_ms),
+                    Self::Cancelled { .. } => ProcessFailureKind::Cancelled,
+                    Self::OutputLimit { .. } => ProcessFailureKind::OutputLimit,
+                    Self::NonZeroExit { exit_code, .. } => ProcessFailureKind::Exited(*exit_code),
+                    Self::Pipe { .. } => ProcessFailureKind::Pipe,
+                    Self::Read { .. } => ProcessFailureKind::Read,
+                    Self::Stdin { .. } => ProcessFailureKind::Stdin,
+                    Self::Wait { .. } => ProcessFailureKind::Wait,
+                    Self::MissingExitCode { .. } => ProcessFailureKind::MissingExitCode,
+                    Self::Spawn { .. } => unreachable!("spawn handled above"),
+                },
+                os_error: None,
+            },
+        }
     }
 }
 
@@ -373,6 +493,128 @@ fn render_bytes(output: SupervisedStreamOutput, append_marker: bool) -> Vec<u8> 
 mod tests {
     use super::*;
     use crate::test_support::TestSandbox;
+
+    #[test]
+    fn safe_spawn_failure_preserves_category_without_private_launch_data() {
+        for (kind, expected) in [
+            (
+                std::io::ErrorKind::NotFound,
+                "required file or directory was not found",
+            ),
+            (
+                std::io::ErrorKind::PermissionDenied,
+                "permission was denied",
+            ),
+            (
+                std::io::ErrorKind::NotADirectory,
+                "a required path is not a directory",
+            ),
+            (
+                std::io::ErrorKind::InvalidInput,
+                "the launch input was invalid",
+            ),
+            (
+                std::io::ErrorKind::Other,
+                "the operating system rejected the launch",
+            ),
+        ] {
+            let error = ProcessError::Spawn {
+                operation: "private-operation-sentinel".to_owned(),
+                command: "/private/executable-sentinel".to_owned(),
+                source: std::io::Error::new(kind, "Bearer credential-sentinel stdout-sentinel"),
+            };
+            let message = error.safe_facts().message("glab");
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("glab"));
+            assert!(!message.contains("sentinel"));
+            assert!(!message.contains("/private"));
+            assert!(!message.contains("not installed"));
+        }
+        let error = ProcessError::Spawn {
+            operation: "fixture".into(),
+            command: "private".into(),
+            source: std::io::Error::from_raw_os_error(2),
+        };
+        assert!(error.safe_facts().message("glab").contains("OS error 2"));
+    }
+
+    #[test]
+    fn safe_process_failure_distinguishes_completion_without_forwarding_output() {
+        for (error, expected) in [
+            (
+                ProcessError::NonZeroExit {
+                    operation: "private-operation-sentinel".into(),
+                    exit_code: 23,
+                    stdout_length: 1,
+                    stderr_length: 1,
+                    stdout: "stdout-credential-sentinel".into(),
+                    stderr: "stderr-credential-sentinel".into(),
+                },
+                "status 23",
+            ),
+            (
+                ProcessError::Timeout {
+                    operation: "private-operation-sentinel".into(),
+                    timeout_ms: 60000,
+                },
+                "timed out after 60000 ms",
+            ),
+            (
+                ProcessError::Cancelled {
+                    operation: "private-operation-sentinel".into(),
+                },
+                "was cancelled",
+            ),
+            (
+                ProcessError::OutputLimit {
+                    operation: "private-operation-sentinel".into(),
+                    stream: "stdout",
+                    max_bytes: 10,
+                    observed_bytes: 20,
+                },
+                "output exceeded its limit",
+            ),
+            (
+                ProcessError::Read {
+                    operation: "private-operation-sentinel".into(),
+                    stream: "stdout",
+                    source: std::io::Error::other("credential-sentinel"),
+                },
+                "output could not be read",
+            ),
+            (
+                ProcessError::Wait {
+                    operation: "private-operation-sentinel".into(),
+                    source: std::io::Error::other("credential-sentinel"),
+                },
+                "process completion",
+            ),
+            (
+                ProcessError::Pipe {
+                    operation: "private-operation-sentinel".into(),
+                    stream: "stdout",
+                },
+                "process input or output",
+            ),
+            (
+                ProcessError::Stdin {
+                    operation: "private-operation-sentinel".into(),
+                    source: std::io::Error::other("credential-sentinel"),
+                },
+                "send input",
+            ),
+            (
+                ProcessError::MissingExitCode {
+                    operation: "private-operation-sentinel".into(),
+                },
+                "without an exit status",
+            ),
+        ] {
+            let message = error.safe_facts().message("git");
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("sentinel"));
+        }
+    }
 
     fn fixture_request(sandbox: &TestSandbox, operation: &str, command: PathBuf) -> ProcessRequest {
         ProcessRequest {

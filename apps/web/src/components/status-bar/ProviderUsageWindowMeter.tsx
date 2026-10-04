@@ -110,7 +110,7 @@ export function ProviderUsageWindowMeter({
           style={{ width: `${fillPercent}%` }}
         />
       </div>
-      <div className="flex min-w-0 items-center justify-between gap-2 text-[11px]">
+      <div className="flex min-w-0 items-center justify-between gap-2 text-xs">
         <span className="truncate text-muted-foreground">
           {window.resetLabel ?? "Reset time unavailable"}
         </span>

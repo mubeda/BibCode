@@ -4,7 +4,7 @@ import {
   defaultInstanceIdForDriver,
   type EnvironmentId,
   type ChatFileAttachment,
-  UploadChatAttachment,
+  InlineUploadChatAttachment,
   ModelSelection,
   ProjectId,
   ProviderInstanceId,
@@ -80,7 +80,7 @@ if (typeof window !== "undefined" && typeof window.addEventListener === "functio
   });
 }
 
-export const PersistedComposerAttachment = UploadChatAttachment;
+export const PersistedComposerAttachment = InlineUploadChatAttachment;
 export type PersistedComposerAttachment = typeof PersistedComposerAttachment.Type;
 const decodePersistedComposerAttachment = Schema.decodeUnknownSync(PersistedComposerAttachment);
 

@@ -86,7 +86,21 @@ its immutable SHA.
 - `.github/workflows/desktop-ui-smoke.yml` is a manual or reusable packaged-app
   UI smoke matrix for all six supported native targets.
 - `.github/workflows/desktop-upgrade-smoke.yml` runs real seeded updater flows on
-  all six targets; its WSL-specific lane remains Windows x64.
+  all six targets, including the isolated `remote-install` lane. That lane uses
+  the product coordinator, verifies boot/version/storage/protection evidence,
+  and scopes Linux process cleanup to its exact data root. The harness rejects
+  local invocation; unit/syntax checks do not constitute real upgrade evidence.
+  The seeded macOS Intel row has a 360-minute complete-job allowance for three
+  cold, isolated 90-minute packaging children, three 10-minute frozen installs,
+  and 60 minutes for setup, runtime verification, evidence, and cleanup.
+  The other five rows and the separate WSL job keep 240 minutes; their packaging
+  children keep 45 minutes. `remote-install` reuses the protected package.
+  Repository `target` caching cannot warm the run root's three Cargo outputs.
+  These packaging allowances are separate from the native desktop CI job above
+  and preserve all existing product, WebDriver, and restart deadlines.
+  Windows lanes wait for the exact candidate's installed PE version before
+  stopping and relaunching the host, retaining bounded handoff observations.
+  Its WSL-specific lane remains Windows x64.
 - `.github/workflows/release.yml` runs the stable/nightly release pipeline. See
   the [Release Checklist](./release.md). Its separate server matrix builds six
   archives, four Linux packages, and native distribution evidence before release

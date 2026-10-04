@@ -33,7 +33,7 @@ export function SettingsSection({
   return (
     <section {...sectionProps} className={cn("space-y-2.5", className)}>
       <div className="flex items-center justify-between px-1">
-        <h2 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-foreground/50">
+        <h2 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.08em] text-foreground/50">
           <span className="inline-block h-px w-3 bg-border" aria-hidden />
           {icon}
           {title}
@@ -91,7 +91,7 @@ export function SettingsRow({
             </span>
           </div>
           <p className="text-xs text-muted-foreground/80">{description}</p>
-          {status ? <div className="pt-0.5 text-[11px] text-muted-foreground">{status}</div> : null}
+          {status ? <div className="pt-0.5 text-xs text-muted-foreground">{status}</div> : null}
         </div>
         {control ? (
           <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
