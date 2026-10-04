@@ -38,7 +38,6 @@ import { EnvironmentRegistry } from "@bibcode/client-runtime/connection";
 import { ManagedRelay } from "@bibcode/client-runtime/relay";
 import { remoteHttpClientLayer } from "@bibcode/client-runtime/rpc";
 import { makeTestExecutionEnvironmentCapabilities } from "@bibcode/shared/testSupport";
-import { __resetDesktopPrimaryAuthForTests } from "../environments/primary/desktopAuth";
 import {
   resetPrimaryEnvironmentDescriptorForTests,
   writePrimaryEnvironmentDescriptor,
@@ -226,7 +225,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  __resetDesktopPrimaryAuthForTests();
   resetPrimaryEnvironmentDescriptorForTests();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();

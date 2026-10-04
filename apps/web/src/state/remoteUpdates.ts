@@ -97,6 +97,15 @@ export function useStartRemoteUpdate(): (request: RemoteUpdateConfirmationReques
   );
 }
 
+/** Clears settled feedback in the existing runtime owner; never cancels an active install. */
+export function useDismissRemoteUpdate(): (environmentId: EnvironmentId) => void {
+  const registry = useContext(RegistryContext);
+  return useCallback(
+    (environmentId: EnvironmentId) => remoteUpdateEnvironment.dismiss(registry, environmentId),
+    [registry],
+  );
+}
+
 const IDLE_CHECK_STATE_ATOM = Atom.make(IDLE_REMOTE_UPDATE_CHECK_STATE).pipe(
   Atom.withLabel("web-remote-update-check:idle"),
 );

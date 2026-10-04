@@ -59,6 +59,12 @@ prefix, and server and target versions. An `error` snapshot adds a `warn` line,
 Both use the `bibcode_server::remote_update` target and contain no credentials
 or full session IDs. Manual install refusals emit neither line.
 
+The desktop notice uses the same requester metadata once per install and
+omits unavailable addresses from its copy. Its **Manage devices** action opens
+the host's sharing controls. The CI remote-install lane requires exactly one
+requester info line for its single install request and retains bounded,
+redacted evidence; it never retains bootstrap or pairing credentials.
+
 In headless mode, run the native server from a terminal, or install the
 per-user service (`bibcode service install`) whose stdout and stderr go to the
 service manager's log (the journal on Linux, `~/Library/Logs/bibcode-server.log`

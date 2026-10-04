@@ -174,6 +174,8 @@ export interface ServerUpdateBadgeProps extends ServerUpdateStatus {
    * where the view already shows its own Check action.
    */
   readonly onCheckAgain?: (() => void) | undefined;
+  /** Reopens confirmation with fresh counts after a failed run. */
+  readonly onRetryRun?: (() => void) | undefined;
 }
 
 export function ServerUpdateBadge({
@@ -182,6 +184,7 @@ export function ServerUpdateBadge({
   onUpdate,
   onRetry,
   onCheckAgain,
+  onRetryRun,
   ...status
 }: ServerUpdateBadgeProps) {
   const variant =
@@ -223,7 +226,7 @@ export function ServerUpdateBadge({
     <span
       data-variant={variant}
       className={cn(
-        "inline-flex shrink-0 items-center rounded border px-1.5 py-0.5 text-xs",
+        "inline-flex min-w-0 max-w-full items-center rounded border px-1.5 py-0.5 text-xs whitespace-normal break-words",
         BADGE_CLASSES[variant],
       )}
     >
@@ -243,7 +246,11 @@ export function ServerUpdateBadge({
       </Tooltip>
     );
   const action =
-    run !== null ? null : variant === "unreachable" && onRetry !== undefined ? (
+    run?.phase === "failed" && onRetryRun !== undefined ? (
+      <Button size="xs" variant="outline" onClick={onRetryRun}>
+        Retry
+      </Button>
+    ) : run !== null ? null : variant === "unreachable" && onRetry !== undefined ? (
       <Button size="xs" variant="outline" aria-label="Retry update status" onClick={onRetry}>
         Retry
       </Button>
@@ -254,25 +261,9 @@ export function ServerUpdateBadge({
     ) : null;
   if (action === null) return explained;
   return (
-    <span className="inline-flex shrink-0 items-center gap-1">
+    <span className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1">
       {explained}
       {action}
     </span>
   );
-}
-
-/**
- * Headless servers cannot install remotely and have no update feed: show honest
- * operator steps, never a fabricated "latest version".
- */
-export function manualUpdateInstructions(serverVersion: string): string {
-  return [
-    "# Update this BiBCode server manually on its host:",
-    "# 1. Stop the running server (Ctrl+C or your service manager).",
-    "# 2. Install the latest bibcode build (replace the binary on PATH).",
-    "# 3. Restart it:",
-    "bibcode serve",
-    "",
-    `# Currently running: v${serverVersion}`,
-  ].join("\n");
 }

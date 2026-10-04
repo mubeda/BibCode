@@ -61,6 +61,11 @@ Archives contain one versioned directory with `bibcode` or `bibcode.exe`, `web/`
 user, firewall rule, or machine-wide configuration; the optional service is per user
 and created by `bibcode service install`.
 
+The client shows these operator instructions under **Show update steps** in
+Remote Servers and the host's sidebar card. It uses the server's install kind,
+OS, architecture, and SSH launch state, with **Copy** for the displayed steps.
+Standalone servers remain manually updated.
+
 ## Run as a per-user service
 
 The server spawns provider CLIs and reads their credentials from your home

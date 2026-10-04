@@ -144,6 +144,17 @@ the user's running instance for this check.
 
 ## Application and DMG build inspection
 
+The CI-only seeded-upgrade matrix gives Intel x64 packaging children 90 minutes
+and its complete job 360 minutes. ARM64 keeps 45-minute packaging children and
+a 240-minute job. There are three sequential cold packages with separate Cargo
+outputs (candidate, previous stable, protected baseline), each with a separate
+10-minute frozen install; the cached repository `target` does not warm these
+outputs. Intel's remaining 60 minutes cover setup, all upgrade lanes, evidence,
+and cleanup. `remote-install` reuses the protected package. These allowances
+leave product, WebDriver, and restart deadlines intact; record a packaging
+timeout separately from native upgrade results, and never run this CI harness
+locally. See the [seeded matrix procedure](../operations/release.md#seeded-packaged-upgrade-matrix).
+
 Build the host-native artifact:
 
 ```sh
@@ -361,6 +372,20 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   restart it and confirm its sidebar card reads **Not checked yet**, then changes
   to **Up to date** or **Update to v…** within about a minute without **Check
   for updates**;
+  Use a desktop-hosted release shared through **Another device** as the second
+  host. From both Settings and its card, **Update to v…** must open a named
+  confirmation; with one terminal open there, counts must say it will stop.
+  Cancel starts nothing. Confirm, observe downloading/backup/restart/version
+  checking and success; closing Settings must not cancel the run. A failed
+  restart beyond the three-minute budget shows actionable failure; **Retry**
+  reconfirms with fresh counts, and row **Dismiss** clears settled feedback.
+  A manual host offers **Show update steps** and **Copy** matching its platform
+  and install kind. The host notice names the requester and **Manage devices**
+  opens sharing controls. Update a browser page's own host from another client;
+  verify its explicit Reload prompt preserves typed composer input. Capture
+  both themes. The notice may be classified as tests-only when no controlled
+  release host is available; do not run the CI seeded harness locally.
+
 - seed an incompatible newer connection IndexedDB version and confirm the
   boot-level recovery dialog lists the deleted data classes, keeps **Reload** as
   a non-destructive exit, requires a separately acknowledged confirmation that a

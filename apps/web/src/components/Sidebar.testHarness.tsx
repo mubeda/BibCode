@@ -43,6 +43,10 @@ const h = vi.hoisted(() => {
     primaryEnvironmentId: null,
     activeEnvironmentId: null,
     serverConfigs: new Map(),
+    remoteUpdateRuns: new Map<string, unknown>(),
+    remoteUpdateSnapshots: new Map<string, unknown>(),
+    remoteUpdateSnapshotQueries: [] as string[],
+    requestRemoteUpdate: vi.fn(),
     clientSettings: null,
     atomValues: {},
     vcsStatusByCwd: {},
@@ -378,20 +382,36 @@ vi.mock("../state/query", () => ({
     if (atom?.__q?.startsWith("vcs.")) {
       h.state.vcsQueries.push(atom);
     }
+    if (atom?.__q === "remoteUpdate.snapshot")
+      h.state.remoteUpdateSnapshotQueries.push(atom.args?.environmentId);
     return {
       data:
-        atom?.__q === "worktree.catalog"
-          ? (h.state.worktreeCatalogs.get(
-              `${atom.args?.environmentId}:${atom.args?.input?.projectId}`,
-            ) ?? null)
-          : atom
-            ? (h.state.vcsStatusByCwd[atom.args?.input?.cwd ?? ""] ?? null)
-            : null,
+        atom?.__q === "remoteUpdate.snapshot"
+          ? (h.state.remoteUpdateSnapshots.get(atom.args?.environmentId) ?? null)
+          : atom?.__q === "worktree.catalog"
+            ? (h.state.worktreeCatalogs.get(
+                `${atom.args?.environmentId}:${atom.args?.input?.projectId}`,
+              ) ?? null)
+            : atom
+              ? (h.state.vcsStatusByCwd[atom.args?.input?.cwd ?? ""] ?? null)
+              : null,
       error: null,
+      emission: { _tag: "Success" },
       isPending: false,
       refresh: () => {},
     };
   },
+}));
+
+vi.mock("../state/remoteUpdates", () => ({
+  remoteUpdateEnvironment: {
+    snapshot: (args: unknown) => ({ __q: "remoteUpdate.snapshot", args }),
+    check: { label: "remote-update.check" },
+  },
+  useRemoteUpdateRun: (id: string | null) =>
+    id === null ? null : (h.state.remoteUpdateRuns.get(id) ?? null),
+  useRemoteUpdateCheckState: () => ({ inFlight: false, failure: null }),
+  useRequestRemoteUpdateConfirmation: () => h.state.requestRemoteUpdate,
 }));
 
 vi.mock("../state/terminalSessions", () => ({
@@ -642,6 +662,9 @@ vi.mock("./settings/SettingsSidebarNav", () => ({
 vi.mock("./sidebar/EnvironmentContextCard", () => ({
   EnvironmentContextCard: h.mk("EnvironmentContextCard"),
 }));
+vi.mock("./settings/ManualUpdateStepsDialog", () => ({
+  ManualUpdateStepsDialog: h.mk("ManualUpdateStepsDialog"),
+}));
 vi.mock("./sidebar/SidebarUpdatePill", () => ({
   SidebarUpdatePill: h.mk("SidebarUpdatePill", "span"),
 }));
@@ -795,6 +818,7 @@ function environmentFixture(overrides: {
   displayUrl?: string | null;
   phase?: string;
   error?: string | null;
+  serverConfig?: unknown;
 }) {
   return {
     environmentId: overrides.environmentId,
@@ -809,6 +833,7 @@ function environmentFixture(overrides: {
     },
     displayUrl: overrides.displayUrl ?? null,
     connection: { phase: overrides.phase ?? "connected", error: overrides.error ?? null },
+    serverConfig: overrides.serverConfig ?? null,
   };
 }
 
@@ -1103,6 +1128,10 @@ beforeEach(() => {
   h.state.projects = [];
   h.state.threads = [];
   h.state.environments = [];
+  h.state.remoteUpdateRuns.clear();
+  h.state.remoteUpdateSnapshots.clear();
+  h.state.remoteUpdateSnapshotQueries = [];
+  h.state.requestRemoteUpdate.mockReset();
   h.state.primaryEnvironmentId = ENV_MAIN;
   h.state.activeEnvironmentId = null;
   h.state.serverConfigs = new Map();

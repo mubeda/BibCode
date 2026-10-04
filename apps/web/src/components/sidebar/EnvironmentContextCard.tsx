@@ -25,6 +25,8 @@ const CARD_STATUS_DOT_CLASS: Record<EnvironmentRailStatus, string> = {
 export interface EnvironmentContextCardProps {
   readonly updateBadge?: React.ReactNode;
   readonly onCheckForUpdates?: (environmentId: EnvironmentId) => void;
+  readonly onShowUpdateSteps?: (environmentId: EnvironmentId) => void;
+  readonly updateInProgress?: boolean;
 }
 
 /** Remote-environment context and actions; hidden for this machine. */
@@ -145,8 +147,16 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
           <MenuItem onClick={() => void disconnectEnvironment(activeEnvironmentId)}>
             Disconnect
           </MenuItem>
-          {view.showUpdateActions && props.onCheckForUpdates !== undefined ? (
-            <MenuItem onClick={() => props.onCheckForUpdates?.(activeEnvironmentId)}>
+          {view.manualUpdates && props.onShowUpdateSteps !== undefined ? (
+            <MenuItem onClick={() => props.onShowUpdateSteps?.(activeEnvironmentId)}>
+              Show update steps
+            </MenuItem>
+          ) : view.showUpdateActions && props.onCheckForUpdates !== undefined ? (
+            <MenuItem
+              disabled={props.updateInProgress}
+              title={props.updateInProgress ? "An update is already queued or running." : undefined}
+              onClick={() => props.onCheckForUpdates?.(activeEnvironmentId)}
+            >
               Check for updates
             </MenuItem>
           ) : null}

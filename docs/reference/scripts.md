@@ -175,6 +175,28 @@ The builder stages the native `bibcode` executable, production web client,
 uses `scripts/test-linux-server-package.ts` to install, start, remove, and verify data
 preservation in the documented native-architecture containers.
 
+## Remote update verification tooling
+
+`vp run test:desktop:upgrade` invokes the CI-only seeded packaged-upgrade
+harness. Ordinary native matrix jobs include `remote-install` after the existing
+previous-stable/protected lanes; it reuses the current-source baseline in its
+own root. Never run this command locally. For code changes, run only:
+
+```sh
+vp test run scripts/seeded-desktop-upgrade-smoke.test.ts scripts/lib/remote-install-driver.test.ts
+node --check scripts/seeded-desktop-upgrade-smoke.ts
+node --check scripts/lib/remote-install-driver.ts
+vp run --filter @bibcode/scripts typecheck
+```
+
+The Node driver imports the product coordinator through the client-runtime's
+public subpath; scripts declares that workspace dependency only for tooling.
+It exchanges a private test grant/bootstrap for its own bearer/tickets, records
+boot/version/storage and progress, and never prints credentials. Syntax and
+unit checks qualify the tooling, not actual install or native UI behavior.
+The loopback fake host below qualifies scripted UI/reconnect states without
+performing a production install.
+
 ## Repository Maintenance
 
 - `cargo run -p bibcode-server --example remote_update_fake_host -- <base-dir> <port 4800-4899> <server-version> [label]`:
