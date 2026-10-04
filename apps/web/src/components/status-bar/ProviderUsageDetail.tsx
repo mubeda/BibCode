@@ -168,7 +168,7 @@ export function ProviderUsageDetail({
             <p className="mt-0.5 text-muted-foreground">{viewModel.plan.label} plan</p>
           ) : null}
         </div>
-        <p className="shrink-0 text-muted-foreground text-[11px]">
+        <p className="shrink-0 text-muted-foreground text-xs">
           Updated{" "}
           <time dateTime={updatedAt} title={updatedAt}>
             {formatRelativeTimeLabel(updatedAt)}
