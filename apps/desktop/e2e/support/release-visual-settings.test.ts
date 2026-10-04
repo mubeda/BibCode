@@ -543,7 +543,9 @@ describe("fixed public settings controller", () => {
       addProviderDialog: "unsupported-hidden-control",
     });
     expect(
-      c.actions.indexOf('input[aria-label="When expression"]:terminalFocus && !terminalOpen'),
+      c.actions.indexOf(
+        '[data-slot="popover-popup"][data-open] input[aria-label="When expression"]:terminalFocus && !terminalOpen',
+      ),
     ).toBeLessThan(c.actions.indexOf('button[aria-label="Cancel new keybinding"]'));
     expect(c.actions).not.toContain('button[aria-label="Add provider instance"]');
     expect(
@@ -631,7 +633,7 @@ function keybindingsAwaitReplay(failed?: string, observerThrows = false) {
     'input[aria-label="Search keybindings"]': "search-input",
     'button[aria-label="Add keybinding"]': "add",
     'button[aria-label="Edit when clause for new keybinding"]': "when",
-    'input[aria-label="When expression"]': "when-input",
+    '[data-slot="popover-popup"][data-open] input[aria-label="When expression"]': "when-input",
   };
   const controlFor = (selector: string) => {
     const control = controls[selector];

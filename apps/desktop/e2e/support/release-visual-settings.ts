@@ -633,10 +633,12 @@ export async function runVisualSettings(input: SettingsVisualInput): Promise<obj
     await click('button[aria-label="Edit when clause for new keybinding"]', "when");
     overlay = true;
     observeKeybindingsAwait("when-input", "displayed");
-    await browser.$('input[aria-label="When expression"]').waitForDisplayed();
+    await browser
+      .$('[data-slot="popover-popup"][data-open] input[aria-label="When expression"]')
+      .waitForDisplayed();
     observeKeybindingsAwait("when-input", "fill");
     await browser
-      .$('input[aria-label="When expression"]')
+      .$('[data-slot="popover-popup"][data-open] input[aria-label="When expression"]')
       .setValue("terminalFocus && !terminalOpen");
     await capture("settings-keybindings");
     await closeOverlay();
