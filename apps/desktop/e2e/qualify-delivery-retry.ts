@@ -34,6 +34,10 @@ import {
 } from "./support/delivery-retry-evidence.ts";
 import { resolveActualRetryPrompt } from "./support/delivery-retry-flow.ts";
 import {
+  readDeliveryImportObservation,
+  projectDeliveryImportObservation,
+} from "./support/delivery-import-observation.ts";
+import {
   readOwnedDeliveryWorktree,
   readSelectedDeliveryWorktree,
 } from "./support/delivery-retry-workspace.ts";
@@ -336,6 +340,17 @@ export async function runDeliveryRetryQualification() {
       );
     } catch {
       // The bounded diagnostic never replaces the original failure.
+      return null;
+    }
+  }
+
+  async function readImportFailureObservation() {
+    try {
+      return projectDeliveryImportObservation(
+        await bounded(browser!.execute(readDeliveryImportObservation, origin), 2_000),
+      );
+    } catch {
+      // Failure-only observation cannot replace the import error or owned cleanup.
       return null;
     }
   }
@@ -1090,6 +1105,8 @@ export async function runDeliveryRetryQualification() {
       browser && (phase.startsWith("pair-") || phase.startsWith("theme-"))
         ? await readStartupFailureObservation()
         : null;
+    const importObservation =
+      browser && phase.startsWith("import-") ? await readImportFailureObservation() : null;
     const worktreeObservation =
       browser &&
       [
@@ -1107,6 +1124,7 @@ export async function runDeliveryRetryQualification() {
       theme,
       failure: classifyQualificationFailure(error),
       startupObservation,
+      importObservation,
       worktreeObservation,
       createRefObservation,
       createRefClearObservation:

@@ -12,6 +12,10 @@ import {
 import { deliveryScenes, deliveryThemes } from "./delivery-retry-evidence.ts";
 import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
 import { bounded, projectOwnedDriverReadiness } from "./qualification-owner.ts";
+import {
+  readDeliveryImportObservation,
+  projectDeliveryImportObservation,
+} from "./delivery-import-observation.ts";
 import { resolveWorktreeCreateInput } from "../../../web/src/components/CreateWorktreeDialog.logic.ts";
 import { readSelectedDeliveryWorktree } from "./delivery-retry-workspace.ts";
 import { prepareDesktopUiTestContext } from "./test-project.ts";
@@ -58,6 +62,7 @@ function createRefFailureBoundary(
     clearObservation?: unknown;
     readiness?: unknown;
     readinessStage?: unknown;
+    importObservation?: unknown;
   } = {},
 ) {
   const writes: Array<Record<string, unknown>> = [];
@@ -77,7 +82,7 @@ function createRefFailureBoundary(
   );
   const helperStart = controller.indexOf("  async function readCreateRefFailureObservation()");
   const helperEnd = controller.indexOf(
-    "  async function readWorktreeFailureObservation()",
+    "  async function readImportFailureObservation()",
     helperStart,
   );
   const catchStart = controller.lastIndexOf("  } catch (error) {");
@@ -120,6 +125,7 @@ function createRefFailureBoundary(
       readVisualWitness,
       classifyQualificationFailure,
       readStartupFailureObservation: async () => null,
+      readImportFailureObservation: async () => options.importObservation ?? null,
       readWorktreeFailureObservation: async () => null,
       write: (_name: string, value: Record<string, unknown>) => writes.push(value),
     },
@@ -233,6 +239,177 @@ describe("closed create-ref failure facts", () => {
       await Promise.resolve();
       expect(JSON.stringify(f.writes)).toBe(receipt);
       expect(f.reads()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("import failure receipt boundary", () => {
+  it("retains import-only facts without changing the original failure or adding another read", async () => {
+    const facts = {
+      safeLocation: true,
+      route: "root",
+      modalPresent: false,
+      modalDisplayed: null,
+      pathPresent: false,
+      pathDisabled: null,
+      submitPresent: false,
+      submitDisabled: null,
+      composerPresent: false,
+      composerDisplayed: null,
+      primaryCardCount: "one",
+      primaryCardSelected: false,
+      errorCategory: null,
+    };
+    const f = createRefFailureBoundary({ phase: "import-wait-composer", importObservation: facts });
+    await f.run();
+    expect(f.writes[0]?.importObservation).toEqual(facts);
+    expect(f.writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+    expect(f.reads()).toBe(0);
+    const other = createRefFailureBoundary({ phase: "baseline", importObservation: facts });
+    await other.run();
+    expect(other.writes[0]?.importObservation).toBeNull();
+    expect(other.reads()).toBe(0);
+  });
+  it.each(["record", "reject", "malformed", "accessor", "proxy", "absent"])(
+    "contains the actual optional read at import failure: %s",
+    async (mode) => {
+      const facts = {
+        safeLocation: true,
+        route: "root",
+        modalPresent: false,
+        modalDisplayed: null,
+        pathPresent: false,
+        pathDisabled: null,
+        submitPresent: false,
+        submitDisabled: null,
+        composerPresent: false,
+        composerDisplayed: null,
+        primaryCardCount: "one",
+        primaryCardSelected: false,
+        errorCategory: null,
+      };
+      let reads = 0;
+      const bounds: number[] = [],
+        writes: Record<string, unknown>[] = [];
+      const getter = vi.fn(() => {
+        throw new Error("private field getter");
+      });
+      const accessor = { ...facts };
+      Object.defineProperty(accessor, "route", { enumerable: true, get: getter });
+      const revoked = Proxy.revocable(facts, {});
+      revoked.revoke();
+      const helperStart = controller.indexOf("  async function readImportFailureObservation()");
+      const helperEnd = controller.indexOf(
+        "  async function readWorktreeFailureObservation()",
+        helperStart,
+      );
+      const catchStart = controller.lastIndexOf("  } catch (error) {");
+      const catchEnd = controller.indexOf("  } finally {", catchStart);
+      const originalError = new Error(
+        "The required live observation did not arrive within its bound.",
+      );
+      const classify = vi.fn((error: unknown) => {
+        expect(error).toBe(originalError);
+        return classifyQualificationFailure(error);
+      });
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          controller.slice(helperStart, helperEnd) +
+            "\nasync function failure(){" +
+            controller.slice(catchStart + "  } catch (error) {".length, catchEnd) +
+            "}\nfailure",
+        ),
+        {
+          browser:
+            mode === "absent"
+              ? undefined
+              : {
+                  execute: async (reader: unknown, input: unknown) => {
+                    reads++;
+                    expect(reader).toBe(readDeliveryImportObservation);
+                    expect(input).toBe("http://127.0.0.1:4885");
+                    if (mode === "reject") throw new Error("private driver error");
+                    return mode === "malformed"
+                      ? { ...facts, raw: "private payload" }
+                      : mode === "accessor"
+                        ? accessor
+                        : mode === "proxy"
+                          ? revoked.proxy
+                          : facts;
+                  },
+                },
+          bounded: (promise: Promise<unknown>, ms: number) => {
+            bounds.push(ms);
+            return bounded(promise, ms);
+          },
+          readDeliveryImportObservation,
+          projectDeliveryImportObservation,
+          phase: "import-wait-composer",
+          theme: "light",
+          origin: "http://127.0.0.1:4885",
+          error: originalError,
+          classifyQualificationFailure: classify,
+          write: (_name: string, value: Record<string, unknown>) => writes.push(value),
+        },
+      ) as () => Promise<void>;
+      await run();
+      expect(writes).toHaveLength(1);
+      expect(writes[0]?.importObservation).toEqual(mode === "record" ? facts : null);
+      expect(writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+      expect(classify).toHaveBeenCalledTimes(1);
+      expect(getter).not.toHaveBeenCalled();
+      expect(reads).toBe(mode === "absent" ? 0 : 1);
+      expect(bounds).toEqual(mode === "absent" ? [] : [2_000]);
+      expect(JSON.stringify(writes)).not.toMatch(/private|http/);
+    },
+  );
+  it("joins original failure reporting after the two-second read bound and ignores a late result", async () => {
+    vi.useFakeTimers();
+    try {
+      let finish: (value: unknown) => void = () => {};
+      const writes: Record<string, unknown>[] = [];
+      const start = controller.indexOf("  async function readImportFailureObservation()");
+      const end = controller.indexOf("  async function readWorktreeFailureObservation()", start);
+      const catchStart = controller.lastIndexOf("  } catch (error) {");
+      const catchEnd = controller.indexOf("  } finally {", catchStart);
+      const execute = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          controller.slice(start, end) +
+            "\nasync function failure(){" +
+            controller.slice(catchStart + "  } catch (error) {".length, catchEnd) +
+            "}\nfailure",
+        ),
+        {
+          browser: { execute },
+          bounded,
+          readDeliveryImportObservation,
+          projectDeliveryImportObservation,
+          phase: "import-wait-composer",
+          theme: "light",
+          origin: "http://127.0.0.1:4885",
+          error: new Error("The required live observation did not arrive within its bound."),
+          classifyQualificationFailure,
+          write: (_name: string, value: Record<string, unknown>) => writes.push(value),
+        },
+      ) as () => Promise<void>;
+      const pending = run();
+      await vi.advanceTimersByTimeAsync(2_001);
+      await pending;
+      expect(writes[0]?.importObservation).toBeNull();
+      expect(writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+      const receipt = JSON.stringify(writes);
+      finish({ private: "late payload" });
+      await Promise.resolve();
+      expect(JSON.stringify(writes)).toBe(receipt);
+      expect(execute).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }

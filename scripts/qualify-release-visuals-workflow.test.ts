@@ -56,6 +56,7 @@ describe("first visual batch workflow boundary", () => {
       "release-visual-boundaries",
       "delivery-retry-workspace",
       "delivery-retry-controller",
+      "delivery-import-observation",
     ])
       expect(gate).toContain(`support/${name}.test.ts`);
   });

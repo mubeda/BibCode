@@ -741,6 +741,19 @@ DOM inspection. Missing, malformed or late observations remain unknown and
 cannot replace the original failure or skip joined cleanup. These facts are
 failure diagnostics, not authentication or screenshot acceptance evidence.
 
+An `import-*` failure may take one similarly bounded two-second read-only sample
+in `importObservation`. It checks the fixed owned origin before DOM inspection
+and retains only a route category, Add Project modal/path/submit presence and
+disabled flags, modal/composer visibility with finite viewport geometry, primary
+card count category and selected boolean, and a closed error category. Only exact
+known Add Project validation/status copy, workspace alert titles and add/open
+failure toast titles are classified; toast/workspace descriptions, input values
+and card text stay unread. Error categories are `host-loading`, `path-invalid`,
+`workspace-unavailable`, `other` or unknown. This is a current failure sample,
+not proof that the earlier submit was disabled or that a project/card was opened.
+Other phases retain null; unknown/malformed/throwing or late diagnostics cannot
+replace the original error, change the normal UI sequence, or skip joined cleanup.
+
 Worktree opening follows the existing public keyboard route: send real Tab
 keys within the normal action bound until the unique **New worktree** button
 reports focus, wait for it to be displayed and enabled, recheck uniqueness and
