@@ -495,6 +495,10 @@ the profile verdict. A failed previous-stable lane still stops later lanes and
 fails the complete job.
 
 The pre-packaging helper gate exercises the real evidence copier and requests
+one test worker so the native parser does not race another test-file worker.
+It runs every helper case and preserves the parser's five-second limit. This
+controls fixture concurrency; native startup performance remains qualified by CI.
+The evidence copier requests
 0600 for each closed install observation. On Windows it verifies that requested
 mode instead of interpreting POSIX permission bits as an ACL; Unix hosts also
 verify the resulting 0600 bits. The inert native PowerShell parser check retains

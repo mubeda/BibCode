@@ -60,7 +60,7 @@ jobs:
         run: vp install --frozen-lockfile
       - name: Validate Windows installer witness tooling before packaging
         run: vp test scripts/lib/windows-installer-witness.test.ts
-          scripts/seeded-desktop-upgrade-smoke.test.ts
+          scripts/seeded-desktop-upgrade-smoke.test.ts --maxWorkers 1
 
       - id: versions
         name: Resolve previous stable and isolated candidate versions
