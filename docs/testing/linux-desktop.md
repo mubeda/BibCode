@@ -595,8 +595,14 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   marker failures cannot skip an action, replace its original failure or alter
   a budget; these markers add no UI read, request or interaction. After row
   removal and owned child/tunnel joins, toast cleanup reads current visible close
-  controls one at a time within the existing thirty-second owner observation
-  bound. Re-fetch after each dismissal and require a fresh read with zero visible
+  controls and their pinned SDK public clickability before dispatch. Skip
+  displayed but ineligible controls during the current enumeration; click one
+  eligible close at a time within the existing thirty-second owner observation
+  bound. Keep cleanup incomplete while any visible close remains, even when none
+  is currently clickable. Fixed `toast-clickable` phases attribute that read.
+  Ending/reflowing roots can remain displayed while outside the viewport or
+  covered; display alone does not establish interaction eligibility. Re-fetch
+  after each dismissal and require a fresh read with zero visible
   close controls before completing cleanup. A recognized missing/stale click may
   count as already gone only when a second fresh enumeration proves that same
   zero-visible end state. Unknown click errors, visible replacements and failed

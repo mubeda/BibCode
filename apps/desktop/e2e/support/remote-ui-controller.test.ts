@@ -2517,6 +2517,8 @@ function removalReplay(
     signatures?: WeakMap<object, unknown>;
     signatureFault?: boolean;
     sdkClick?: () => Promise<unknown>;
+    firstCovered?: boolean;
+    neverClickable?: boolean;
   } = {},
 ) {
   const start = controller.indexOf("async function removeHost(");
@@ -2535,6 +2537,7 @@ function removalReplay(
   let toastGeneration = 0;
   let toastLists = 0;
   let visibleReads = 0;
+  const clickedIndices: number[] = [];
   const action = async (operation: string, args: unknown[] = []) => {
     calls.push([operation, ...args]);
     if (operation === failed) throw failure;
@@ -2561,7 +2564,7 @@ function removalReplay(
       if (toastLists > 1 && toastCase.reobserveFailure !== undefined)
         throw toastCase.reobserveFailure;
       const generation = toastGeneration;
-      return Array.from({ length: toastCount }, () => ({
+      return Array.from({ length: toastCount }, (_unused, index) => ({
         isDisplayed: async () => {
           await action("toast-displayed");
           if (toastLists > 1 && toastCase.reobserveDisplayFailure !== undefined)
@@ -2570,8 +2573,16 @@ function removalReplay(
           if (visibleReads === 1 && toastCase.disappears && !toastCase.replacement) toastCount = 0;
           return true;
         },
+        isClickable: async () => {
+          await action("toast-clickable");
+          return (
+            !toastCase.neverClickable &&
+            !(toastCase.firstCovered && toastLists === 1 && index === 0)
+          );
+        },
         click: async () => {
           await action("toast-click");
+          clickedIndices.push(index);
           if (toastCase.sdkClick) return toastCase.sdkClick();
           if (toastCase.clickFailure !== undefined) throw toastCase.clickFailure;
           if (generation !== toastGeneration)
@@ -2633,6 +2644,7 @@ function removalReplay(
     failure,
     deadlineFailure,
     signatures,
+    clickedIndices,
     toastVisible: () => toastCount > 0,
   };
 }
@@ -3809,6 +3821,7 @@ it.each([
     "tunnel-close",
     "toast-list",
     "toast-displayed",
+    "toast-clickable",
     "toast-click",
     "toast-click-inspect",
     "toast-click-matched",
@@ -3860,6 +3873,29 @@ it("preserves the original missing click error when the absence read fails", asy
   expect(stages.at(-1)).toBe("toast-recheck-list");
 });
 
+it("selects the eligible displayed toast before a covered control and refetches between actions", async () => {
+  const probe = removalReplay(null, { toastCount: 2, firstCovered: true });
+  await expect(probe.remove(probe.host)).resolves.toBeUndefined();
+  expect(probe.clickedIndices).toEqual([1, 0]);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(3);
+  expect(probe.toastVisible()).toBe(false);
+});
+
+it("keeps cleanup incomplete while displayed closes remain ineligible within the existing owner bound", async () => {
+  const probe = removalReplay(null, { neverClickable: true });
+  await expect(probe.remove(probe.host)).rejects.toBe(probe.deadlineFailure);
+  expect(probe.clickedIndices).toEqual([]);
+  expect(probe.toastVisible()).toBe(true);
+  expect(probe.calls.filter((call) => call[0] === "until")).toEqual([["until"]]);
+});
+
+it("preserves the original eligibility-read failure before any toast click", async () => {
+  const probe = removalReplay("toast-clickable");
+  await expect(probe.remove(probe.host)).rejects.toBe(probe.failure);
+  expect(probe.clickedIndices).toEqual([]);
+  expect(probe.toastVisible()).toBe(true);
+});
+
 it("requires a fresh toast-free end state after successful cleanup clicks", async () => {
   const probe = removalReplay(null, { remainsAfterClick: true });
   await expect(probe.remove(probe.host)).rejects.toBe(probe.deadlineFailure);
@@ -3882,7 +3918,7 @@ it("keeps the original visibility-read failure without clicking or claiming abse
   expect(probe.toastVisible()).toBe(true);
 });
 
-it("adds removal markers without changing existing control selectors, argument defaults or joins", async () => {
+it("preserves control selectors/defaults/joins while checking toast eligibility before dispatch", async () => {
   const baseline = removalReplay();
   await baseline.remove(baseline.host);
   expect(baseline.calls).toEqual([
@@ -3906,6 +3942,7 @@ it("adds removal markers without changing existing control selectors, argument d
     ["until"],
     ["toast-list", 'button[data-slot="toast-close"]'],
     ["toast-displayed"],
+    ["toast-clickable"],
     ["toast-click"],
     ["toast-list", 'button[data-slot="toast-close"]'],
   ]);
@@ -3932,6 +3969,7 @@ it("adds removal markers without changing existing control selectors, argument d
     "tunnel-close",
     "toast-list",
     "toast-displayed",
+    "toast-clickable",
     "toast-click",
     "toast-list",
   ]);
@@ -3959,6 +3997,7 @@ it.each([
   "child-stop",
   "tunnel-close",
   "toast-list",
+  "toast-clickable",
   "toast-click",
 ])(
   "keeps the original removal failure and identifies its existing boundary: %s",
@@ -4037,6 +4076,7 @@ it.each([
   "tunnel-close",
   "toast-list",
   "toast-displayed",
+  "toast-clickable",
   "toast-click",
 ])(
   "attributes the actual success removal failure without changing actions or error identity: %s",

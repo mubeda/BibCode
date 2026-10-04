@@ -488,6 +488,7 @@ type RemoveHostOperation =
   | "tunnel-close"
   | "toast-list"
   | "toast-displayed"
+  | "toast-clickable"
   | "toast-click"
   | "toast-click-inspect"
   | "toast-click-unavailable"
@@ -517,6 +518,7 @@ const SUCCESS_REMOVE_PHASES = {
   "tunnel-close": "success-remove-tunnel-close",
   "toast-list": "success-remove-toast-list",
   "toast-displayed": "success-remove-toast-displayed",
+  "toast-clickable": "success-remove-toast-clickable",
   "toast-click": "success-remove-toast-click",
   "toast-click-inspect": "success-remove-toast-click-inspect",
   "toast-click-unavailable": "success-remove-toast-click-unavailable",
@@ -562,9 +564,13 @@ async function removeHost(host: Host, observe?: (operation: RemoveHostOperation)
   const toastClose = 'button[data-slot="toast-close"]';
   await owner.until(async () => {
     observeStep("toast-list");
+    let visibleCloseRemains = false;
     for (const close of await required().$$(toastClose)) {
       observeStep("toast-displayed");
       if (!(await close.isDisplayed())) continue;
+      visibleCloseRemains = true;
+      observeStep("toast-clickable");
+      if (!(await close.isClickable())) continue;
       observeStep("toast-click");
       try {
         await close.click();
@@ -664,7 +670,7 @@ async function removeHost(host: Host, observe?: (operation: RemoveHostOperation)
       // Re-fetch after each dismissal; later controls may have re-rendered.
       return false;
     }
-    return true;
+    return !visibleCloseRemains;
   });
 }
 
