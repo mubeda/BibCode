@@ -467,6 +467,17 @@ IDs, paths, URLs and arguments are not added. The observation adds no bridge cal
 listener, retry, poll or deadline and does not replace the original
 completion verdict or establish a native failure cause.
 
+The generated local driver also emits at most three closed
+`seeded-upgrade-install-observation` console records through the configured
+private frontend-log collector: `listener-settled`, `install-dispatched`, and
+`returned`. The first means the existing optional registration continuation
+settled; the second means the existing install call returned an awaitable value.
+Neither proves that Rust received the command or an installer launched. The
+returned record includes only the existing closed install-result projection.
+These records survive independently of the WebDriver async result where the
+collector retains them. Missing records remain unobserved; logger faults cannot
+replace the original outcome. Calls, timers, verdicts and cleanup are unchanged.
+
 The CI harness also starts a bounded read-only process-event witness before the
 seed driver's installation dispatch and joins that exact observer after the
 handoff wait, including failures. `windows-installer-events.json` contains only

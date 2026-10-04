@@ -2237,6 +2237,7 @@ function installResultFixture(
     error?: Error;
     preparationStates?: unknown[];
     installStates?: unknown[];
+    logFault?: boolean;
   } = {},
 ) {
   const input = {
@@ -2259,6 +2260,7 @@ function installResultFixture(
   const calls: string[] = [];
   const timers: number[] = [];
   const listeners: Array<(state: unknown) => void> = [];
+  const stageObservations: Array<Record<string, unknown>> = [];
   const emit = (state: unknown) => listeners.forEach((listener) => listener(state));
   let returnInstall!: (value: unknown) => void;
   const deferred = new Promise((resolve) => {
@@ -2271,6 +2273,14 @@ function installResultFixture(
     {
       input,
       Date,
+      console: {
+        info: (line: string) => {
+          if (options.logFault) throw new Error("inert optional logger fault");
+          const prefix = "seeded-upgrade-install-observation ";
+          expect(line.startsWith(prefix)).toBe(true);
+          stageObservations.push(JSON.parse(line.slice(prefix.length)));
+        },
+      },
       setTimeout: (callback: () => void, delay: number) => {
         timers.push(delay);
         // @effect-diagnostics-next-line globalTimers:off - Generated callbacks use the controlled Vitest clock.
@@ -2350,12 +2360,73 @@ function installResultFixture(
     writes,
     timers,
     returnInstall,
+    stageObservations,
     read: () => JSON.parse(files.get(input.resultPath)!) as Record<string, unknown>,
   };
 }
 
 describe("generated public install-result observation", () => {
   afterEach(() => vi.useRealTimers());
+  it("retains closed install dispatch stages before a never-returning native command", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({ mode: "never" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fixture.stageObservations).toEqual([
+      { stage: "listener-settled" },
+      { stage: "install-dispatched" },
+    ]);
+    expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
+    expect(fixture.timers).toEqual([30000]);
+    await vi.advanceTimersByTimeAsync(30000);
+    await expect(fixture.run).rejects.toThrow("timed out observing updater installation");
+    expect(fixture.stageObservations).toHaveLength(2);
+  });
+
+  it.each([false, true])(
+    "preserves returned refusal and privacy when logger fault=%s",
+    async (logFault) => {
+      vi.useFakeTimers();
+      const fixture = installResultFixture({
+        logFault,
+        result: {
+          accepted: false,
+          completed: false,
+          state: {
+            status: "error",
+            phase: "failed",
+            errorContext: "install",
+            message: "private-native-value",
+            environmentId: "private-id",
+          },
+        },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(fixture.run).rejects.toThrow("install did not complete");
+      expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
+      expect(fixture.timers).toEqual([30000]);
+      expect(fixture.stageObservations).toEqual(
+        logFault
+          ? []
+          : [
+              { stage: "listener-settled" },
+              { stage: "install-dispatched" },
+              {
+                stage: "returned",
+                installResultObservation: {
+                  kind: "returned",
+                  accepted: false,
+                  completed: false,
+                  status: "error",
+                  phase: "failed",
+                  errorContext: "install",
+                },
+              },
+            ],
+      );
+      expect(JSON.stringify(fixture.stageObservations)).not.toContain("private-");
+    },
+  );
+
   it("retains the already-returned refused public install result without changing its verdict", async () => {
     vi.useFakeTimers();
     const fixture = installResultFixture({

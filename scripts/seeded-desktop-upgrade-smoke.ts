@@ -934,6 +934,12 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
       const allowedStatuses = ${JSON.stringify(Object.keys(updateStatuses))};
       const allowedErrorContexts = ${JSON.stringify(Object.keys(updateErrorContexts))};
       let installResultObservation = { kind: "unavailable", accepted: null, completed: null, status: null, phase: null, errorContext: null };
+      const publishInstallObservation = (stage) => {
+        try {
+          const observation = stage === "returned" ? { stage, installResultObservation } : { stage };
+          console.info("seeded-upgrade-install-observation " + JSON.stringify(observation));
+        } catch { /* Optional closed logging never replaces the install outcome. */ }
+      };
       const ownData = (value, key) => {
         try {
           const descriptor = value !== null && typeof value === "object" ? Object.getOwnPropertyDescriptor(value, key) : undefined;
@@ -958,9 +964,13 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
         if (allowedPhases.includes(phase) && !observed.includes(phase)) observed.push(phase);
         if (lane === "protected-baseline" && state?.phase === "protecting") finish(null);
       })).then(async () => {
-        const install = await bridge.installUpdate();
+        publishInstallObservation("listener-settled");
+        const pendingInstall = bridge.installUpdate();
+        publishInstallObservation("install-dispatched");
+        const install = await pendingInstall;
         // Observation cannot replace the original completion verdict or mutate an earlier done payload.
         installResultObservation = observeResult(install);
+        publishInstallObservation("returned");
         if (install?.completed !== true) return finish("install did not complete");
         if (lane === "previous-stable") setTimeout(() => finish(null), 750);
         else finish(null);
