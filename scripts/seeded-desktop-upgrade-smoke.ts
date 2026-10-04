@@ -8,6 +8,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 import * as NodeURL from "node:url";
+import * as NodeCrypto from "node:crypto";
 import { parse as parseToml, type TomlTable } from "smol-toml";
 import {
   REMOTE_UPDATE_DOWNLOAD_BUDGET_MS,
@@ -17,6 +18,10 @@ import {
 
 import { MOCK_UPDATE_LOOPBACK_HOST, MOCK_UPDATE_READY_PATH } from "./mock-update-server.ts";
 import { requireReleaseTarget, type TauriUpdaterTarget } from "./lib/release-targets.ts";
+import {
+  openWindowsInstallerWitness,
+  runWithWindowsInstallerWitness,
+} from "./lib/windows-installer-witness.ts";
 import {
   releaseCargoLockFile,
   releasePackageFiles,
@@ -1698,6 +1703,20 @@ export const config = {
 };
 `;
 
+export function seededUpgradePhaseTimeoutMs(input: {
+  readonly lane: SeededUpgradeLane;
+  readonly phase: "seed-and-install" | "verify";
+  readonly restartTimeoutMs: number;
+}): number {
+  return input.lane === "remote-install" && input.phase === "seed-and-install"
+    ? input.restartTimeoutMs +
+        REMOTE_UPDATE_DOWNLOAD_BUDGET_MS +
+        REMOTE_UPDATE_INSTALL_BUDGET_MS +
+        REMOTE_UPDATE_RESTART_BUDGET_MS +
+        90_000
+    : input.restartTimeoutMs + (input.phase === "seed-and-install" ? 90_000 : 30_000);
+}
+
 const runWebDriverPhase = async (input: {
   readonly appBinaryPath: string;
   readonly backendPort: number;
@@ -1724,14 +1743,7 @@ const runWebDriverPhase = async (input: {
   const configPath = NodePath.join(phaseRoot, "wdio.conf.mjs");
   const remoteSecretPath = NodePath.join(input.runRoot, "remote-bootstrap.secret.json");
   const remoteUploadSecretPath = NodePath.join(input.runRoot, "remote-upload.secret.json");
-  const phaseTimeoutMs =
-    input.lane === "remote-install" && input.phase === "seed-and-install"
-      ? input.restartTimeoutMs +
-        REMOTE_UPDATE_DOWNLOAD_BUDGET_MS +
-        REMOTE_UPDATE_INSTALL_BUDGET_MS +
-        REMOTE_UPDATE_RESTART_BUDGET_MS +
-        90_000
-      : input.restartTimeoutMs + (input.phase === "seed-and-install" ? 90_000 : 30_000);
+  const phaseTimeoutMs = seededUpgradePhaseTimeoutMs(input);
   await NodeFS.promises.writeFile(
     specPath,
     createSeededUpgradeDriverSpec({
@@ -1960,6 +1972,7 @@ const runUpgradeLane = async (input: {
   readonly restartTimeoutMs: number;
   readonly webdriverPort: number;
   readonly wsl: boolean;
+  readonly windowsCandidateRoot?: string;
   readonly onRemotePhaseStarted?: (() => void) | undefined;
 }): Promise<void> => {
   await NodeFS.promises.mkdir(input.layout.dataRoot, { recursive: true, mode: 0o700 });
@@ -1987,15 +2000,60 @@ const runUpgradeLane = async (input: {
     wsl: input.wsl,
     onRemotePhaseStarted: input.onRemotePhaseStarted,
   } as const;
-  await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
+  const seedAndHandoff = async () => {
+    await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
+    if (input.platform === "win") {
+      await waitForWindowsInstalledCandidate({
+        appBinaryPath: input.appBinaryPath,
+        candidateVersion: input.candidateVersion,
+        evidenceDirectory: input.layout.evidenceDirectory,
+        timeoutMs: input.restartTimeoutMs,
+      });
+    }
+  };
   if (input.platform === "win") {
-    await waitForWindowsInstalledCandidate({
-      appBinaryPath: input.appBinaryPath,
-      candidateVersion: input.candidateVersion,
-      evidenceDirectory: input.layout.evidenceDirectory,
-      timeoutMs: input.restartTimeoutMs,
-    });
-  }
+    await runWithWindowsInstallerWitness(
+      {
+        open: async () => {
+          if (input.windowsCandidateRoot === undefined)
+            throw new Error("Windows witness payload is unavailable.");
+          const payloadPath = await findExactlyOne(
+            input.windowsCandidateRoot,
+            (path) => path.endsWith(".exe"),
+            "candidate installer witness payload",
+          );
+          const digest = NodeCrypto.createHash("sha256");
+          for await (const bytes of NodeFS.createReadStream(payloadPath)) digest.update(bytes);
+          const configuration = JSON.parse(
+            await NodeFS.promises.readFile(
+              NodePath.join(input.repositoryRoot, "apps/desktop/src-tauri/tauri.conf.json"),
+              "utf8",
+            ),
+          ) as { readonly productName?: unknown };
+          if (typeof configuration.productName !== "string")
+            throw new Error("Windows witness product is unavailable.");
+          return openWindowsInstallerWitness({
+            appBinaryPath: input.appBinaryPath,
+            candidateVersion: input.candidateVersion,
+            candidateSha256: digest.digest("hex"),
+            productName: configuration.productName,
+            controlRoot: shared.runRoot,
+            lifetimeMs:
+              seededUpgradePhaseTimeoutMs({ ...input, phase: "seed-and-install" }) +
+              input.restartTimeoutMs +
+              10_000,
+          });
+        },
+        retain: async (evidence) => {
+          await writePrivateJson(
+            NodePath.join(input.layout.evidenceDirectory, "windows-installer-events.json"),
+            evidence,
+          );
+        },
+      },
+      seedAndHandoff,
+    );
+  } else await seedAndHandoff();
   if (input.lane === "remote-install") {
     const remote = await readObservation<
       Omit<RemoteInstallEvidence, "preUpdateBackups"> & { widened: boolean }
@@ -2328,6 +2386,7 @@ export async function runSeededDesktopUpgradeSmoke(
         restartTimeoutMs: input.restartTimeoutMs,
         webdriverPort: input.updaterPort + 101,
         wsl: false,
+        ...(input.platform === "win" ? { windowsCandidateRoot: layout.updaterRoot } : {}),
       });
     }
 
@@ -2353,6 +2412,7 @@ export async function runSeededDesktopUpgradeSmoke(
       restartTimeoutMs: input.restartTimeoutMs,
       webdriverPort: input.updaterPort + 102,
       wsl: input.wsl,
+      ...(input.platform === "win" ? { windowsCandidateRoot: layout.updaterRoot } : {}),
     });
     if (!input.wsl) {
       let remoteApp = await installBaselinePackage({
@@ -2390,6 +2450,7 @@ export async function runSeededDesktopUpgradeSmoke(
         restartTimeoutMs: input.restartTimeoutMs,
         webdriverPort: assertRemoteInstallPort(input.updaterPort + 103),
         wsl: false,
+        ...(input.platform === "win" ? { windowsCandidateRoot: layout.updaterRoot } : {}),
         onRemotePhaseStarted: () => {
           remotePhaseStarted = true;
         },

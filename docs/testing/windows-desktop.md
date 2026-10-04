@@ -447,6 +447,22 @@ records path/version/hash and installer PID/path observations without command
 lines or credentials. Inspect that artifact on timeout; the later public
 runtime-version and retained-data checks remain required.
 
+The CI harness also starts a bounded read-only process-event witness before the
+seed driver's installation dispatch and joins that exact observer after the
+handoff wait, including failures. `windows-installer-events.json` contains only
+closed event kinds, elapsed times, attribution booleans, and exit codes. Local
+start/stop subscriptions filter the exact application and candidate installer
+image names and automatically unregister at finite trigger limits. Application
+attribution checks its exact private executable path; installer attribution
+records parent identity, updater temporary layout, and payload-hash matches when
+those facts remain readable. A short-lived event can retain unknown path/hash
+facts. Missing events, unavailable permissions, an exhausted trigger limit, or
+an incomplete trace never prove that installation was not launched. Observer
+cleanup must be joined; it never terminates the application or installer. The
+existing candidate, data-retention, protection, and timeout assertions remain
+the profile verdict. A failed previous-stable lane still stops later lanes and
+fails the complete job.
+
 Build and run packaged E2E with the supported platform value
 `BIBCODE_E2E_PLATFORM=win`:
 

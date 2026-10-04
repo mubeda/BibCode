@@ -276,6 +276,16 @@ starting an application. Never run it on a machine with a user's BiBCode app:
 legacy lane cleanup can select the process name. Use the workflow's disposable
 native runners and ephemeral signing keys, not production signing credentials.
 
+Windows additionally retains a bounded process-event witness that starts before
+installation dispatch and is joined after the existing installed-candidate
+wait. Its closed metadata can capture an installer that exits between ordinary
+polls; private image names, paths, process identities, and command lines are not
+retained. Unknown attribution or absent events remain unavailable evidence.
+This diagnostic does not change installation policy, deadlines, assertions, or
+the first-failure lane scheduling. See the
+[Windows runbook](../testing/windows-desktop.md#nsis-package-build-and-inspection)
+for its interpretation and cleanup contract.
+
 The ordinary native matrix also runs `remote-install`, reusing the current-source
 protected baseline in a separate data/workspace root. It generates an **Another
 device** grant through the packaged UI and redeems it for a distinct test client.
