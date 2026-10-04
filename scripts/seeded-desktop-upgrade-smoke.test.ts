@@ -2147,3 +2147,83 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(config).toContain("captureBackendLogs: true");
   });
 });
+
+it("retains the closed stream console record through the generated native frontend collector", () => {
+  const generated = createSeededUpgradeWdioConfig({
+    appBinaryPath: absolute("installed", "bibcode-desktop"),
+    artifactDirectory: absolute("evidence"),
+    restartTimeoutMs: 120_000,
+    specPath: absolute("driver", "seeded-upgrade.e2e.ts"),
+    webdriverPort: 44_450,
+  });
+  const config = NodeVM.runInNewContext(
+    generated.replace("export const config =", "const config =") + "\nconfig",
+    { Headers },
+  );
+  const resolve = NodeModule.createRequire(
+    new URL("../apps/desktop/package.json", import.meta.url),
+  );
+  const source = NodeFS.readFileSync(
+    NodePath.join(NodePath.dirname(resolve.resolve("@wdio/tauri-service")), "../esm/index.js"),
+    "utf8",
+  );
+  const realFunction = (name: string) => {
+    const start = source.indexOf("function " + name + "(");
+    const end = source.indexOf("\n}", start) + 2;
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    return source.slice(start, end);
+  };
+  const parserStart = source.indexOf("const FRONTEND_MARKER =");
+  const parserEnd = source.indexOf("\n}", source.indexOf("function parseLogLine(")) + 2;
+  const captureStart = source.indexOf("const TAURI_STARTUP_MARKERS$1 =");
+  const captureEnd = source.indexOf("\n}", source.indexOf("function createLogCapture(")) + 2;
+  const helpers =
+    source.slice(parserStart, parserEnd) +
+    "\n" +
+    ["formatLogMessage", "transformPrefixedMessage", "forwardLog", "mergeOptions"]
+      .map(realFunction)
+      .join("\n") +
+    "\n" +
+    source.slice(captureStart, captureEnd) +
+    "\n({mergeOptions,createLogCapture})";
+  const retained: string[] = [];
+  let onLine: ((line: string, instance?: string) => void) | undefined;
+  const collector = NodeVM.runInNewContext(helpers, {
+    createLogger: () => ({}),
+    normaliseDriverProvider: (value: string) => value,
+    shouldLog: (level: string, minimum: string) => level === "info" && minimum === "info",
+    isLogWriterInitialized: () => true,
+    getLogWriter: () => ({ write: (message: string) => retained.push(message) }),
+    createLogCapture$1: (options: { onLine: (line: string, instance?: string) => void }) => {
+      onLine = options.onLine;
+      return { close() {} };
+    },
+  });
+  const options = collector.mergeOptions(config.services[0][1], undefined);
+  const facts = {
+    method: "orchestration.subscribeShell",
+    requestCount: 1,
+    chunkCount: 0,
+    timeout: true,
+  };
+  const message = "seeded-upgrade-stream-observation " + JSON.stringify(facts);
+  collector.createLogCapture({ stream: {}, identifier: "inert", options });
+  onLine!("[WDIO-FRONTEND][INFO] " + message);
+  expect(retained).toEqual(["[Tauri:Frontend] " + message]);
+  expect(JSON.parse(retained[0]!.slice(retained[0]!.indexOf("{")))).toEqual(facts);
+  expect(options.captureBackendLogs).toBe(true);
+  expect(options.captureFrontendLogs).toBe(true);
+  expect(config.outputDir).toBe(absolute("evidence"));
+  expect(options.logDir).toBe(config.outputDir);
+  expect(config.connectionRetryCount).toBe(0);
+  expect(options.commandTimeout).toBe(30_000);
+  retained.length = 0;
+  collector.createLogCapture({
+    stream: {},
+    identifier: "inert",
+    options: { ...options, captureFrontendLogs: false },
+  });
+  onLine!("[WDIO-FRONTEND][INFO] " + message);
+  expect(retained).toEqual([]);
+});

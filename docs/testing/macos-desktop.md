@@ -163,6 +163,20 @@ cause, identity, endpoint or credential is retained. Observer failures do not
 change the original verdict or deadline. Treat these facts as diagnostics, never
 as substitute version, project, storage or backup proof, or as an inferred cause.
 
+The generated native WDIO configuration retains both backend and frontend logs;
+backend capture alone discards the browser console observer's frontend channel.
+The existing service writes frontend-prefixed messages into timestamped `wdio*.log`
+files in the phase evidence directory. The harness copies those logs privately
+through its existing root/known-secret redaction and 64 KiB per-file bound.
+Export only closed decoded observer facts, never raw native log contents. An
+observer prefix inside echoed generated script is not an emitted JSON record.
+The embedded service already owns stdout/stderr readers and their joined teardown;
+this setting changes their retention filter. Existing console forwarding can use
+test-service native logging IPC, so record logging traffic accurately rather than
+claiming zero traffic. Application RPC actions and the 15-second shell deadline
+remain unchanged; native console delivery and the shell failure still require
+observed evidence.
+
 Build the host-native artifact:
 
 ```sh

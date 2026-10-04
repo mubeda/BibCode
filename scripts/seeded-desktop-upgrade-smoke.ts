@@ -1754,6 +1754,7 @@ export const config = {
     statusPollTimeout: 10000,
     commandTimeout: 30000,
     captureBackendLogs: true,
+    captureFrontendLogs: true,
     logDir: ${JSON.stringify(input.artifactDirectory)},
   }]],
   capabilities: [{ browserName: "tauri", "tauri:options": { application: ${JSON.stringify(input.appBinaryPath)} } }],
