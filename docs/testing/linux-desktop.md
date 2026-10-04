@@ -770,8 +770,11 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   may include `toastErrorSignature` associated with that same thrown error object.
   It contains only wrapper/canonical-message family, exact click-POST suffix,
   argument-suffix shape, a coarse length bucket, exact toast-selector presence and
-  an own-data name family. Inspect at most 4096 message units; longer suffix/selector
-  facts remain null. Missing/accessor/proxy metadata stays unavailable, and no raw
+  an own-data name family. Three additional closed fields identify a fixed SDK
+  template prefix, an allowlisted implicit command, and a recognized wait condition.
+  These categories describe the message shape; they do not identify its native cause
+  or admit recovery. Inspect at most 4096 message units; longer suffix/selector and
+  SDK-category facts remain null. Missing/accessor/proxy metadata stays unavailable, and no raw
   message, name, selector, ID, URL or arguments leave the qualifier. Matched errors
   and unrelated phases/errors supply no signature. This failure-only classification
   adds no UI read, request, write, action, timer or recovery; it qualifies string

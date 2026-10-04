@@ -1,5 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off - Test-owned PNG fixtures and private receipt data.
 import * as NodeZlib from "node:zlib";
+import * as NodeFS from "node:fs";
+import * as NodeVM from "node:vm";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 import { expect, it } from "vite-plus/test";
 import {
   remoteUiScenes,
@@ -14,6 +18,113 @@ import {
   projectRemoteUiToastErrorSignature,
 } from "./remote-ui-evidence.ts";
 
+it.each([
+  ["WebDriverError: private", "protocol", null, null],
+  [
+    "Can't call click on element with selector \"private\" because element wasn't found",
+    "implicit",
+    "click",
+    null,
+  ],
+  [
+    "Can't call scrollIntoView on element with selector \"private\" because element wasn't found",
+    "implicit",
+    "scrollIntoView",
+    null,
+  ],
+  [
+    "Can't call $ on element with selector \"private\" because element wasn't found",
+    "implicit",
+    "$",
+    null,
+  ],
+  [
+    "Can't call $$ on element with selector \"private\" because element wasn't found",
+    "implicit",
+    "$$",
+    null,
+  ],
+  [
+    "Can't call privateCommand on element with selector \"private\" because element wasn't found",
+    "implicit",
+    "other",
+    null,
+  ],
+  ['element ("private") still not existing after 10000ms', "wait", null, "existing"],
+  [
+    'element ("private") still not displayed within viewport after 10000ms',
+    "wait",
+    null,
+    "displayed",
+  ],
+  ['element ("private") still clickable after 10000ms', "wait", null, "clickable"],
+  ['element ("private") still not enabled after 10000ms', "wait", null, "enabled"],
+  ['element ("private") malformed private condition', "wait", null, null],
+  ["waitUntil condition failed with the following reason: private", "wait-wrapper", null, null],
+  [
+    'The element with selector "private" you are trying to pass into the execute method wasn\'t found',
+    "execute",
+    null,
+    null,
+  ],
+  ['Couldn\'t find element with selector "private"', "lookup", null, null],
+  ["Element private did not become interactable", "interactable", null, null],
+  ["private arbitrary body", "other", null, null],
+])(
+  "retains fixed SDK categories without retaining source strings: %s",
+  (message, sdkTemplate, sdkCommand, sdkCondition) => {
+    const signature = projectRemoteUiToastErrorSignature(message);
+    expect(signature).toMatchObject({ sdkTemplate, sdkCommand, sdkCondition });
+    expect(JSON.stringify(signature)).not.toContain("private");
+    expect(Object.isFrozen(signature)).toBe(true);
+    expect(projectRemoteUiToastErrorSignature(message + "x".repeat(4097))).toMatchObject({
+      sdkTemplate: null,
+      sdkCommand: null,
+      sdkCondition: null,
+    });
+  },
+);
+
+it.each(["Existing", "Displayed", "Clickable", "Enabled"])(
+  "classifies the installed SDK's actual default wait template: %s",
+  async (condition) => {
+    const manifest = NodeFS.realpathSync(
+      new NodeURL.URL("../../node_modules/webdriverio/package.json", import.meta.url),
+    );
+    const sdk = NodeFS.readFileSync(
+      NodePath.join(NodePath.dirname(manifest), "build", "node.js"),
+      "utf8",
+    );
+    const method = condition === "Existing" ? "Exist" : condition;
+    const marker =
+      (condition === "Displayed" ? "function " : "async function ") + "waitFor" + method + "(";
+    const begin = sdk.indexOf(marker);
+    const end = sdk.indexOf("\n}\n", begin) + 2;
+    expect(begin).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(begin);
+    const actual = NodeVM.runInNewContext("(" + sdk.slice(begin, end) + ")", {
+      getBrowserObject33: () => ({ isMobile: false }),
+    });
+    const original = new Error("inert wait");
+    const port = {
+      selector: 'button[data-slot="toast-close"]',
+      elementId: "inert",
+      options: { waitforTimeout: 10000, waitforInterval: 10 },
+      waitUntil: async (_predicate: unknown, options: { timeoutMsg: string }) => {
+        original.message = options.timeoutMsg;
+        throw original;
+      },
+    };
+    await expect(actual.call(port)).rejects.toBe(original);
+    expect(projectRemoteUiToastErrorSignature(original.message, original)).toMatchObject({
+      sdkTemplate: "wait",
+      sdkCommand: null,
+      sdkCondition: condition.toLowerCase(),
+      exactToastSelectorPresent: true,
+    });
+  },
+);
+
 it("keeps toast string-shape facts finite and separate from any recovery verdict", () => {
   const message =
     'WebDriverError: no such element: private detail button[data-slot="toast-close"] when running "element/private-id/click" with method "POST"';
@@ -27,6 +138,9 @@ it("keeps toast string-shape facts finite and separate from any recovery verdict
     lengthBucket: "0-1024",
     exactToastSelectorPresent: true,
     nameFamily: "missing",
+    sdkTemplate: "protocol",
+    sdkCommand: null,
+    sdkCondition: null,
   });
   expect(Object.isFrozen(signature)).toBe(true);
   expect(JSON.stringify(signature)).not.toMatch(
@@ -61,6 +175,9 @@ it.each([
       lengthBucket: input.bucket,
       exactToastSelectorPresent: input.size > 4096 ? null : false,
       nameFamily: "unavailable",
+      sdkTemplate: input.size > 4096 ? null : "other",
+      sdkCommand: null,
+      sdkCondition: null,
     });
   },
 );

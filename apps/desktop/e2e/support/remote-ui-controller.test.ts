@@ -2581,6 +2581,9 @@ it("retains only a closed signature for the actual unrecognized SDK error in the
     lengthBucket: "0-1024",
     exactToastSelectorPresent: true,
     nameFamily: "missing",
+    sdkTemplate: "protocol",
+    sdkCommand: null,
+    sdkCondition: null,
   });
   expect(stages.at(-1)).toBe("toast-click-unrecognized");
   expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
@@ -2629,6 +2632,9 @@ it.each([
     lengthBucket: "0-1024",
     exactToastSelectorPresent: false,
     nameFamily: input.category === "invalid session id" ? "other" : input.family,
+    sdkTemplate: "protocol",
+    sdkCommand: null,
+    sdkCondition: null,
   });
   expect(JSON.stringify(signature)).not.toMatch(
     /private|owned-node|inert.invalid|when running|no such element|stale element reference/,

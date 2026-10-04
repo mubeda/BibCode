@@ -39,6 +39,30 @@ export interface RemoteUiToastErrorSignature {
   readonly lengthBucket: "0-1024" | "1025-2048" | "2049-4096" | "over-4096";
   readonly exactToastSelectorPresent: boolean | null;
   readonly nameFamily: "missing" | "stale" | "other" | "unavailable";
+  readonly sdkTemplate:
+    | "protocol"
+    | "implicit"
+    | "wait"
+    | "wait-wrapper"
+    | "execute"
+    | "lookup"
+    | "interactable"
+    | "other"
+    | null;
+  readonly sdkCommand:
+    | "click"
+    | "scrollIntoView"
+    | "waitForExist"
+    | "waitForDisplayed"
+    | "waitForClickable"
+    | "getElement"
+    | "isDisplayed"
+    | "isClickable"
+    | "$"
+    | "$$"
+    | "other"
+    | null;
+  readonly sdkCondition: "existing" | "displayed" | "clickable" | "enabled" | null;
 }
 
 /** Finite string-shape facts from an already-read own message; never a recovery verdict. */
@@ -73,6 +97,56 @@ export function projectRemoteUiToastErrorSignature(
     // Unreadable optional metadata cannot replace the original failure.
   }
   const bounded = message.length <= 4096;
+  // Fixed SDK prefixes describe string shape only. They never admit a failed click.
+  const sdkTemplate: RemoteUiToastErrorSignature["sdkTemplate"] = !bounded
+    ? null
+    : wrapperPrefix
+      ? "protocol"
+      : message.startsWith("Can't call ")
+        ? "implicit"
+        : message.startsWith('element ("')
+          ? "wait"
+          : message.startsWith("waitUntil condition ")
+            ? "wait-wrapper"
+            : message.startsWith('The element with selector "')
+              ? "execute"
+              : message.startsWith("Couldn't find element with selector \"")
+                ? "lookup"
+                : message.startsWith("Element ")
+                  ? "interactable"
+                  : "other";
+  const command =
+    sdkTemplate === "implicit" ? /^Can't call ([A-Za-z$]{1,32}) on /.exec(message)?.[1] : null;
+  const sdkCommand: RemoteUiToastErrorSignature["sdkCommand"] =
+    sdkTemplate !== "implicit"
+      ? null
+      : [
+            "click",
+            "scrollIntoView",
+            "waitForExist",
+            "waitForDisplayed",
+            "waitForClickable",
+            "getElement",
+            "isDisplayed",
+            "isClickable",
+            "$",
+            "$$",
+          ].includes(command ?? "")
+        ? (command as Exclude<RemoteUiToastErrorSignature["sdkCommand"], "other" | null>)
+        : "other";
+  const condition =
+    sdkTemplate === "wait"
+      ? /^element \("[\s\S]*"\) still (?:not )?(existing|displayed|clickable|enabled)(?: within viewport)? after \d{1,9}ms$/.exec(
+          message,
+        )?.[1]
+      : null;
+  const sdkCondition: RemoteUiToastErrorSignature["sdkCondition"] =
+    condition === "existing" ||
+    condition === "displayed" ||
+    condition === "clickable" ||
+    condition === "enabled"
+      ? condition
+      : null;
   return Object.freeze({
     wrapperPrefix,
     messageFamily,
@@ -92,6 +166,9 @@ export function projectRemoteUiToastErrorSignature(
             : "over-4096",
     exactToastSelectorPresent: bounded ? message.includes('button[data-slot="toast-close"]') : null,
     nameFamily,
+    sdkTemplate,
+    sdkCommand,
+    sdkCondition,
   });
 }
 
