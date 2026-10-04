@@ -1,7 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off - Synthetic PNG and inert WebDriver boundary only; no browser or server starts.
 import * as NodeFS from "node:fs";
+import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeVM from "node:vm";
 import * as NodeZlib from "node:zlib";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { captureVisualScene, type VisualCaptureInput } from "./release-visual-core.ts";
@@ -464,3 +466,125 @@ it.each([true, false])(
     });
   },
 );
+
+const partialAwaitCalls = [
+  "changes-tab-displayed",
+  "changes-tab-enabled",
+  "changes-tab-click",
+  "text-row-displayed",
+  "text-row-enabled",
+  "text-row-click",
+  "first-run-displayed",
+  "first-run-enabled",
+  "first-run-click",
+  "stage-submit-displayed",
+  "stage-submit-enabled",
+  "stage-submit-click",
+  "index-proof",
+  "index-read",
+  "staged-area-displayed",
+  "staged-area-enabled",
+  "staged-area-click",
+];
+
+function partialAwaitReplay(failed?: string, observerThrows = false) {
+  const source = NodeFS.readFileSync(
+    NodePath.join(import.meta.dirname, "release-visual-core.ts"),
+    "utf8",
+  );
+  const start = source.indexOf(
+    "  const { browser, owner, step } = input;",
+    source.indexOf("export async function runVisualCore"),
+  );
+  const end = source.indexOf("  const focus = async", start);
+  const bodyStart = source.indexOf('  step("visual-partial-stage");', end);
+  const bodyEnd = source.indexOf('  await capture("git-changes-diff");', bodyStart);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  expect(bodyEnd).toBeGreaterThan(bodyStart);
+  const replay = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      "async function replay(input) {\n" +
+        source.slice(start, end) +
+        source.slice(bodyStart, bodyEnd) +
+        "\n}\nreplay",
+    ),
+  ) as (input: unknown) => Promise<void>;
+  const calls: string[] = [],
+    phases: string[] = [];
+  const error = new Error("Inert original partial-stage await failure.");
+  const action = (operation: string) => {
+    calls.push(operation);
+    if (operation === failed) throw error;
+  };
+  const controls: Record<string, string> = {
+    '//button[@role="tab" and normalize-space()="Changes"]': "changes-tab",
+    '[role="option"][data-path="pierre-step5.ts"]': "text-row",
+    'aside[aria-label="Partial staging selection gutter"] button[aria-label="Toggle changed-line run starting at line 1"]':
+      "first-run",
+    '//aside[@aria-label="Partial staging selection gutter"]//button[normalize-space()="Stage selected lines"]':
+      "stage-submit",
+    '//section[@aria-label="Diff for pierre-step5.ts"]//button[normalize-space()="Staged"]':
+      "staged-area",
+  };
+  return {
+    calls,
+    phases,
+    error,
+    run: () =>
+      replay({
+        browser: {
+          $: (selector: string) => {
+            const control = controls[selector];
+            expect(control).toBeDefined();
+            return {
+              waitForDisplayed: async () => action(control + "-displayed"),
+              waitForEnabled: async () => action(control + "-enabled"),
+              click: async () => action(control + "-click"),
+            };
+          },
+        },
+        owner: {
+          until: async (read: () => Promise<boolean>) => {
+            action("index-proof");
+            expect(await read()).toBe(true);
+          },
+        },
+        partialStageMatches: () => {
+          action("index-read");
+          return true;
+        },
+        step: (phase: string) => {
+          phases.push(phase);
+          if (observerThrows && phase.startsWith("visual-partial-stage-"))
+            throw new Error("Inert optional attribution failure.");
+        },
+      }),
+  };
+}
+
+describe("partial-stage last-await attribution", () => {
+  it.each(partialAwaitCalls)(
+    "preserves the original %s failure at its exact existing boundary",
+    async (failed) => {
+      const replay = partialAwaitReplay(failed, true);
+      await expect(replay.run()).rejects.toBe(replay.error);
+      expect(replay.calls).toEqual(
+        partialAwaitCalls.slice(0, partialAwaitCalls.indexOf(failed) + 1),
+      );
+      expect(replay.phases.at(-1)).toBe(
+        "visual-partial-stage-" + (failed === "index-read" ? "index-proof" : failed),
+      );
+    },
+  );
+  it.each([false, true])(
+    "keeps original action order and success with throwing attribution=%s",
+    async (throws) => {
+      const replay = partialAwaitReplay(undefined, throws);
+      await expect(replay.run()).resolves.toBeUndefined();
+      expect(replay.calls).toEqual(partialAwaitCalls);
+      expect(replay.phases[0]).toBe("visual-partial-stage");
+      expect(replay.phases.at(-1)).toBe("visual-partial-stage-staged-area-click");
+    },
+  );
+});

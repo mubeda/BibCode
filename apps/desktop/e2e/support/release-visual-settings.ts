@@ -561,12 +561,27 @@ export async function runVisualSettings(input: SettingsVisualInput): Promise<obj
     newBinding = false,
     expandedClaude = false;
   let addProviderDialog: "unsupported-hidden-control" | "unpictured-public-dialog";
-  const click = async (selector: string) => {
+  type KeybindingsControl = "nav" | "search" | "add" | "when";
+  const observeKeybindingsAwait = (
+    control: KeybindingsControl | "search-input" | "when-input",
+    operation: "lookup" | "displayed" | "enabled" | "click" | "fill",
+  ) => {
+    try {
+      step("visual-settings-keybindings-open-" + control + "-" + operation);
+    } catch {
+      // Optional attribution cannot replace an existing action or outcome.
+    }
+  };
+  const click = async (selector: string, control?: KeybindingsControl) => {
+    if (control) observeKeybindingsAwait(control, "lookup");
     if ((await (await browser.$$(selector)).length) !== 1)
       throw new Error("Visual settings public control refused.");
     const element = browser.$(selector);
+    if (control) observeKeybindingsAwait(control, "displayed");
     await element.waitForDisplayed();
+    if (control) observeKeybindingsAwait(control, "enabled");
     await element.waitForEnabled();
+    if (control) observeKeybindingsAwait(control, "click");
     await element.click();
   };
   const unchanged = async () => {
@@ -609,14 +624,17 @@ export async function runVisualSettings(input: SettingsVisualInput): Promise<obj
     inSettings = true;
     await click('[data-testid="environment-rail-manage"]');
     step("visual-settings-keybindings-open");
-    await click("button=Keybindings");
-    await click('button[aria-label="Search keybindings"]');
+    await click("button=Keybindings", "nav");
+    await click('button[aria-label="Search keybindings"]', "search");
+    observeKeybindingsAwait("search-input", "fill");
     await browser.$('input[aria-label="Search keybindings"]').setValue("sidebar");
-    await click('button[aria-label="Add keybinding"]');
+    await click('button[aria-label="Add keybinding"]', "add");
     newBinding = true;
-    await click('button[aria-label="Edit when clause for new keybinding"]');
+    await click('button[aria-label="Edit when clause for new keybinding"]', "when");
     overlay = true;
+    observeKeybindingsAwait("when-input", "displayed");
     await browser.$('input[aria-label="When expression"]').waitForDisplayed();
+    observeKeybindingsAwait("when-input", "fill");
     await browser
       .$('input[aria-label="When expression"]')
       .setValue("terminalFocus && !terminalOpen");

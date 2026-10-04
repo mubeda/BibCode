@@ -79,10 +79,29 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
     step(`visual-${scene}`);
     await input.capture(scene);
   };
-  const click = async (selector: string) => {
+  type PartialStageControl =
+    | "changes-tab"
+    | "text-row"
+    | "first-run"
+    | "stage-submit"
+    | "staged-area";
+  const observePartialAwait = (
+    control: PartialStageControl | "index",
+    operation: "displayed" | "enabled" | "click" | "proof",
+  ) => {
+    try {
+      step("visual-partial-stage-" + control + "-" + operation);
+    } catch {
+      // Optional attribution cannot replace an existing action or outcome.
+    }
+  };
+  const click = async (selector: string, control?: PartialStageControl) => {
     const element = browser.$(selector);
+    if (control) observePartialAwait(control, "displayed");
     await element.waitForDisplayed();
+    if (control) observePartialAwait(control, "enabled");
     await element.waitForEnabled();
+    if (control) observePartialAwait(control, "click");
     await element.click();
   };
   const focus = async (selector: string) => {
@@ -203,17 +222,21 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
   );
   await owner.until(async () => bounded(browser.execute(readVisualImageLoaded), 2_000));
   step("visual-partial-stage");
-  await click('//button[@role="tab" and normalize-space()="Changes"]');
-  await click('[role="option"][data-path="pierre-step5.ts"]');
+  await click('//button[@role="tab" and normalize-space()="Changes"]', "changes-tab");
+  await click('[role="option"][data-path="pierre-step5.ts"]', "text-row");
   await click(
     'aside[aria-label="Partial staging selection gutter"] button[aria-label="Toggle changed-line run starting at line 1"]',
+    "first-run",
   );
   await click(
     '//aside[@aria-label="Partial staging selection gutter"]//button[normalize-space()="Stage selected lines"]',
+    "stage-submit",
   );
+  observePartialAwait("index", "proof");
   await owner.until(async () => input.partialStageMatches());
   await click(
     '//section[@aria-label="Diff for pierre-step5.ts"]//button[normalize-space()="Staged"]',
+    "staged-area",
   );
   await capture("git-changes-diff");
 

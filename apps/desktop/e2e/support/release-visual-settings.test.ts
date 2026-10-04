@@ -1,8 +1,10 @@
 // @vitest-environment happy-dom
 // @effect-diagnostics nodeBuiltinImport:off - Inert DOM/driver ports and original synthetic PNGs only.
 import * as NodeFS from "node:fs";
+import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeVM from "node:vm";
 import * as NodeZlib from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import {
@@ -568,4 +570,129 @@ describe("fixed public settings controller", () => {
     const c = controller("draft");
     await expect(runVisualSettings(c.input)).rejects.toThrow("Visual settings draft changed.");
   });
+});
+
+const keybindingsAwaitCalls = [
+  "nav-lookup",
+  "nav-displayed",
+  "nav-enabled",
+  "nav-click",
+  "search-lookup",
+  "search-displayed",
+  "search-enabled",
+  "search-click",
+  "search-input-fill",
+  "add-lookup",
+  "add-displayed",
+  "add-enabled",
+  "add-click",
+  "when-lookup",
+  "when-displayed",
+  "when-enabled",
+  "when-click",
+  "when-input-displayed",
+  "when-input-fill",
+];
+
+function keybindingsAwaitReplay(failed?: string, observerThrows = false) {
+  const source = NodeFS.readFileSync(
+    NodePath.join(import.meta.dirname, "release-visual-settings.ts"),
+    "utf8",
+  );
+  const start = source.indexOf(
+    "  const { browser, step } = input;",
+    source.indexOf("export async function runVisualSettings"),
+  );
+  const end = source.indexOf("  const unchanged = async", start);
+  const bodyStart = source.indexOf('    step("visual-settings-keybindings-open");', end);
+  const bodyEnd = source.indexOf('    await capture("settings-keybindings");', bodyStart);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  expect(bodyEnd).toBeGreaterThan(bodyStart);
+  const replay = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      "async function replay(input) {\n" +
+        source.slice(start, end) +
+        source.slice(bodyStart, bodyEnd) +
+        "\n}\nreplay",
+    ),
+  ) as (input: unknown) => Promise<void>;
+  const calls: string[] = [],
+    phases: string[] = [],
+    values: string[] = [];
+  const error = new Error("Inert original keybindings await failure.");
+  const action = (operation: string) => {
+    calls.push(operation);
+    if (operation === failed) throw error;
+  };
+  const controls: Record<string, string> = {
+    "button=Keybindings": "nav",
+    'button[aria-label="Search keybindings"]': "search",
+    'input[aria-label="Search keybindings"]': "search-input",
+    'button[aria-label="Add keybinding"]': "add",
+    'button[aria-label="Edit when clause for new keybinding"]': "when",
+    'input[aria-label="When expression"]': "when-input",
+  };
+  const controlFor = (selector: string) => {
+    const control = controls[selector];
+    expect(control).toBeDefined();
+    return control;
+  };
+  return {
+    calls,
+    phases,
+    values,
+    error,
+    run: () =>
+      replay({
+        browser: {
+          $$: async (selector: string) => {
+            action(controlFor(selector) + "-lookup");
+            return [{}];
+          },
+          $: (selector: string) => {
+            const control = controlFor(selector);
+            return {
+              waitForDisplayed: async () => action(control + "-displayed"),
+              waitForEnabled: async () => action(control + "-enabled"),
+              click: async () => action(control + "-click"),
+              setValue: async (value: string) => {
+                action(control + "-fill");
+                values.push(value);
+              },
+            };
+          },
+        },
+        step: (phase: string) => {
+          phases.push(phase);
+          if (observerThrows && phase.startsWith("visual-settings-keybindings-open-"))
+            throw new Error("Inert optional attribution failure.");
+        },
+      }),
+  };
+}
+
+describe("keybindings last-await attribution", () => {
+  it.each(keybindingsAwaitCalls)(
+    "preserves the original %s failure at its exact existing boundary",
+    async (failed) => {
+      const replay = keybindingsAwaitReplay(failed, true);
+      await expect(replay.run()).rejects.toBe(replay.error);
+      expect(replay.calls).toEqual(
+        keybindingsAwaitCalls.slice(0, keybindingsAwaitCalls.indexOf(failed) + 1),
+      );
+      expect(replay.phases.at(-1)).toBe("visual-settings-keybindings-open-" + failed);
+    },
+  );
+  it.each([false, true])(
+    "keeps original actions, input arguments and success with throwing attribution=%s",
+    async (throws) => {
+      const replay = keybindingsAwaitReplay(undefined, throws);
+      await expect(replay.run()).resolves.toBeUndefined();
+      expect(replay.calls).toEqual(keybindingsAwaitCalls);
+      expect(replay.values).toEqual(["sidebar", "terminalFocus && !terminalOpen"]);
+      expect(replay.phases[0]).toBe("visual-settings-keybindings-open");
+      expect(replay.phases.at(-1)).toBe("visual-settings-keybindings-open-when-input-fill");
+    },
+  );
 });
