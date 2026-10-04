@@ -30,6 +30,15 @@ public package has no root export; callers use focused subpaths such as
 - `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It
   reconciles platform-provided registrations and exposes environment-scoped
   execution to domain state.
+- The web Tauri bridge owns the primary bearer exchange promise. It shares one
+  exchange across concurrent consumers, clears a failed exchange for retry,
+  and invalidates the promise when `desktop:backend-ready` publishes a new
+  bootstrap. A rejected exchange clears only its own cached promise; a late
+  rejection from before backend-ready cannot discard a replacement exchange.
+  Primary HTTP requests read through that same owner; they do not
+  retain a separate bearer promise across a backend restart. This matters
+  because a new desktop-bootstrap exchange supersedes earlier sessions of the
+  same method. Browser primary requests continue using their session cookie.
 - Domain modules under `state/*` consume the registry and expose focused Atom
   constructors. React presentation does not own sockets or retry loops.
 
@@ -62,6 +71,18 @@ for the wire methods, limits, and failure rules.
 
 The composition root is
 [`connection/layer.ts`](../../packages/client-runtime/src/connection/layer.ts).
+
+## Remote-update presentation lifetime
+
+The client-runtime update coordinator retains the per-environment run; React
+views do not own its cancellation or restart loop. The web confirmation-request
+Atom is separate transient intent, shared by Settings, sidebar, and Retry
+toasts. Its root-mounted dialog observes `activeWork` only while open; that
+query's zero idle retention gives every confirmation fresh counts. Row/card
+status observation pauses during a run, while the rail retains its existing
+bounded observation. A restart follows current connection generations without
+changing desired intent; explicit user disconnection is respected. Per-boot
+identity is never persisted or substituted for storage identity.
 
 ## Targets
 

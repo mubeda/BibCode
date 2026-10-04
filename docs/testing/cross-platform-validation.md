@@ -1301,6 +1301,37 @@ packaged application:
 
 Do not run destructive worktree scenarios against a user repository.
 
+## Remote-server update scenario
+
+Exercise the controlled second host from both Settings and the sidebar in both
+themes: named confirmation with fresh counts and Cancel; progress replacing the
+action; view-close persistence; failure with Retry reconfirmation and row
+Dismiss; manual platform/install/SSH instructions with Copy. For browser mode,
+restart its primary host on another version and verify an explicit Reload
+prompt with composer input retained. Host notice links to sharing management.
+Record fake-host UI/session evidence separately from real installation evidence.
+
+The seeded `remote-install` lane runs only on disposable native CI runners. It
+checks candidate boot/version, retained storage/project/backup, observed
+percent/stage, requester log count, and Linux mount/runtime ownership. Record
+whether a live native grant actually widened; `widened: false` is not a wide
+live pass. Host notice can remain tests-only under the approved validation
+contract. Never execute the seeded harness locally, even with an isolated data
+root; legacy cleanup can terminate another desktop app.
+
+For seeded CI qualification, distinguish a packaging-child timeout from a
+runtime-upgrade failure. The candidate, previous stable, and protected baseline
+are three sequential builds with separate cold Cargo outputs outside the
+workflow's cached repository `target`; `remote-install` reuses the protected
+package. Only macOS x64 gives each packaging child 90 minutes and the complete
+job 360 minutes. Other targets keep 45-minute packaging children and 240-minute
+jobs; the separate WSL job also keeps 240 minutes. Frozen installs remain
+10 minutes per checkout. Intel's job reserves 60 additional minutes after the
+three packaging and install bounds for setup, all lanes, evidence, and cleanup.
+Product, WebDriver, and restart deadlines remain unchanged. Record a command
+timeout and the last completed phase as unavailable native evidence; passing
+tooling tests cannot substitute for completed upgrade observations.
+
 ## Clone from URL network scenario
 
 Before the network-transfer checks, select a remote server and enter a Git URL

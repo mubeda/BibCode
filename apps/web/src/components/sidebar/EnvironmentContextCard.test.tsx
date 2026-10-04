@@ -130,6 +130,37 @@ function accessibleText(element: Element): string {
 }
 
 describe("EnvironmentContextCard", () => {
+  it("disables checking while the shared update is already queued or running", () => {
+    h.reset();
+    h.activeEnvironmentId = ENV_REMOTE;
+    h.environment = remoteEnvironment({
+      environment: { serverVersion: "0.7.2", capabilities: {} },
+    });
+    renderToStaticMarkup(<EnvironmentContextCard onCheckForUpdates={vi.fn()} updateInProgress />);
+    expect(h.menuItems.find((entry) => entry.children === "Check for updates")?.disabled).toBe(
+      true,
+    );
+  });
+  it("offers manual update steps instead of a check that cannot update this host", () => {
+    h.reset();
+    h.activeEnvironmentId = ENV_REMOTE;
+    h.environment = remoteEnvironment({
+      environment: {
+        serverVersion: "0.7.2",
+        remoteUpdateSupport: { installMode: "manual" },
+        capabilities: {},
+      },
+    });
+    const show = vi.fn();
+    renderToStaticMarkup(
+      <EnvironmentContextCard onCheckForUpdates={vi.fn()} onShowUpdateSteps={show} />,
+    );
+    const item = h.menuItems.find((entry) => entry.children === "Show update steps");
+    expect(item).toBeDefined();
+    expect(h.menuItems.some((entry) => entry.children === "Check for updates")).toBe(false);
+    (item!.onClick as () => void)();
+    expect(show).toHaveBeenCalledExactlyOnceWith(ENV_REMOTE);
+  });
   it("renders nothing for Local", () => {
     h.reset();
     h.activeEnvironmentId = ENV_REMOTE;

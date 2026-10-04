@@ -13,6 +13,8 @@ use bibcode_server::{
 use futures_util::SinkExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -36,6 +38,239 @@ fn disable_provider_processes(root: &std::path::Path) {
     hermetic_providers::write_hermetic_settings(
         &ServerConfig::new(root).state_dir(),
         json!({"providers": providers}),
+    );
+}
+
+// These fixture errors are deliberately closed strings: HTTP/RPC errors can contain a signed
+// transfer URL. Keep every connection and the temporary root owned until runtime cleanup joins.
+async fn held_upload_head(stream: &mut TcpStream) -> Result<Vec<u8>, &'static str> {
+    timeout(Duration::from_secs(3), async {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            if head.len() == 4096 {
+                return Err("held upload HTTP header exceeded its bound");
+            }
+            head.push(
+                stream
+                    .read_u8()
+                    .await
+                    .map_err(|_| "held upload HTTP header ended")?,
+            );
+        }
+        Ok(head)
+    })
+    .await
+    .map_err(|_| "held upload HTTP header timed out")?
+}
+
+async fn held_upload_drain(stream: &mut TcpStream) -> Result<(), &'static str> {
+    let mut remainder = Vec::new();
+    timeout(
+        Duration::from_secs(3),
+        stream.take(8193).read_to_end(&mut remainder),
+    )
+    .await
+    .map_err(|_| "held upload HTTP close timed out")?
+    .map_err(|_| "held upload HTTP close failed")?;
+    if remainder.len() > 8192 {
+        return Err("held upload HTTP response exceeded its bound");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn expect_continue_upload_holds_real_update_admission_until_body_completion() {
+    let root = tempfile::tempdir().expect("owned held upload root");
+    disable_provider_processes(root.path());
+    let workspace = root.path().join("held-upload-workspace");
+    std::fs::create_dir(&workspace).expect("owned held upload workspace");
+    let bootstrap = "held-upload-maintenance-bootstrap";
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("owned HTTP client");
+    let server = ServerRuntime::start(desktop_config(root.path(), bootstrap))
+        .await
+        .expect("owned held upload runtime");
+    let address = server.local_addr();
+    let base = format!("http://{address}");
+    let mut socket = None;
+    let mut upload: Option<TcpStream> = None;
+    let mut sent_bytes = 0;
+    let mut preparation = None;
+
+    let observation: Result<(bool, bool, bool), &'static str> = timeout(Duration::from_secs(20), async {
+        let mut refused = TcpStream::connect(address)
+            .await
+            .map_err(|_| "refusal connection failed")?;
+        refused.write_all(b"POST /api/transfers/invalid-fixture-signature HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+            .await.map_err(|_| "refusal request failed")?;
+        let first = held_upload_head(&mut refused).await?;
+        let invalid_refused = first.starts_with(b"HTTP/1.1 404 ");
+        if !invalid_refused {
+            return Err("invalid signed upload did not receive a final refusal before 100");
+        }
+        held_upload_drain(&mut refused).await?;
+        drop(refused);
+
+        let credentials = client.post(format!("{base}/oauth/token"))
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
+                ("subject_token", bootstrap),
+                ("subject_token_type", "urn:bibcode:params:oauth:token-type:environment-bootstrap"),
+                ("requested_token_type", "urn:ietf:params:oauth:token-type:access_token"),
+            ])
+            .send().await.map_err(|_| "fixture authentication failed")?
+            .json::<Value>().await.map_err(|_| "fixture authentication response invalid")?;
+        let token = credentials["access_token"].as_str().ok_or("fixture access token missing")?;
+        let authorization = client.post(format!("{base}/api/auth/websocket-ticket"))
+            .bearer_auth(token).send().await.map_err(|_| "fixture ticket request failed")?
+            .json::<Value>().await.map_err(|_| "fixture ticket response invalid")?;
+        let ticket = authorization["ticket"].as_str().ok_or("fixture ticket missing")?;
+        let (connected, _) = timeout(Duration::from_secs(3), connect_async(format!("ws://{address}/ws?wsTicket={ticket}")))
+            .await.map_err(|_| "fixture RPC connect timed out")?
+            .map_err(|_| "fixture RPC connect failed")?;
+        socket = Some(connected);
+        let rpc = socket.as_mut().ok_or("fixture RPC missing")?;
+        rpc.send(Message::Text(json!({
+            "_tag":"Request", "id":"901", "tag":"projects.createUploadUrl",
+            "payload":{"cwd":workspace.to_string_lossy(),"relativeDirectory":"","fileName":"protection-witness.txt"},
+            "headers":[]
+        }).to_string().into())).await.map_err(|_| "fixture upload mint send failed")?;
+        let minted = timeout(Duration::from_secs(3), async {
+            loop {
+                let message = next_frame_past_heartbeat(rpc).await
+                    .ok_or("fixture upload mint socket closed")?
+                    .map_err(|_| "fixture upload mint transport failed")?;
+                let message: Value = serde_json::from_str(message.to_text().map_err(|_| "fixture upload mint was not text")?)
+                    .map_err(|_| "fixture upload mint response invalid")?;
+                if message["requestId"] != "901" { continue; }
+                if message["exit"]["_tag"] != "Success" { return Err("fixture upload mint refused"); }
+                return message["exit"]["value"]["relativeUrl"].as_str()
+                    .map(str::to_owned).ok_or("fixture upload capability missing");
+            }
+        }).await.map_err(|_| "fixture upload mint timed out")??;
+        if !minted.starts_with("/api/transfers/") || minted.contains(['\r', '\n', '?', '#']) {
+            return Err("fixture upload capability has unexpected route shape");
+        }
+        upload = Some(TcpStream::connect(address).await.map_err(|_| "held upload connect failed")?);
+        let stream = upload.as_mut().ok_or("held upload socket missing")?;
+        let request = format!("POST {minted} HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Type: application/octet-stream\r\nContent-Length: 2\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.map_err(|_| "held upload headers failed")?;
+        let head = held_upload_head(stream).await?;
+        if head != b"HTTP/1.1 100 Continue\r\n\r\n" {
+            return Err("held upload did not receive actual 100 Continue");
+        }
+        // Hyper's 100 follows the production writer's first body poll: reservation and partial
+        // creation have already completed, not merely a successful TCP connection.
+        let admitted_files = std::fs::read_dir(&workspace)
+            .map_err(|_| "admitted upload directory unreadable")?
+            .collect::<Result<Vec<_>, _>>().map_err(|_| "admitted upload directory unreadable")?;
+        let partial_created = admitted_files.iter().any(|entry| entry.file_name().to_string_lossy().ends_with(".bibcode-upload.part"));
+        let reservation_created = workspace.join("protection-witness.txt").is_file();
+        stream.write_all(b"o").await.map_err(|_| "held upload prefix failed")?;
+        sent_bytes = 1;
+
+        let prepare_client = client.clone();
+        let prepare_url = format!("{base}{MAINTENANCE_UPDATE_PREPARE_PATH}");
+        preparation = Some(tokio::spawn(async move {
+            prepare_client.post(prepare_url).header(DESKTOP_MAINTENANCE_TOKEN_HEADER, bootstrap)
+                .send().await.map_err(|_| "held preparation request failed")?
+                .json::<Value>().await.map_err(|_| "held preparation response invalid")
+        }));
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let status = client.get(format!("{base}{MAINTENANCE_UPDATE_STATUS_PATH}"))
+                    .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, bootstrap)
+                    .send().await.map_err(|_| "held preparation status failed")?
+                    .json::<Value>().await.map_err(|_| "held preparation status invalid")?;
+                if status["phase"] == "preparing" && status["stage"] == "waiting-for-mutations" && status["inFlightMutations"] == 1 {
+                    return Ok::<(), &'static str>(());
+                }
+                if preparation.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
+                    return Err("maintenance did not wait for the held upload");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.map_err(|_| "held mutation stage was not observed")??;
+        let was_waiting = preparation.as_ref().is_some_and(|task| !task.is_finished());
+        stream.write_all(b"k").await.map_err(|_| "held upload final byte failed")?;
+        sent_bytes = 2;
+        let final_head = held_upload_head(stream).await?;
+        let created = final_head.starts_with(b"HTTP/1.1 201 ");
+        held_upload_drain(stream).await?;
+        drop(upload.take());
+        Ok((invalid_refused, partial_created && reservation_created && was_waiting, created))
+    }).await.unwrap_or(Err("held upload observation exceeded its deadline"));
+
+    // Always retire the body before joining preparation. No assertion or temp-root removal can
+    // interrupt this cleanup, including on header/auth/status failure.
+    if let Some(mut stream) = upload.take() {
+        if sent_bytes < 2 {
+            let _ = timeout(
+                Duration::from_secs(1),
+                stream.write_all(&b"ok"[sent_bytes..]),
+            )
+            .await;
+        }
+        let _ = timeout(Duration::from_secs(1), stream.shutdown()).await;
+        let _ = held_upload_drain(&mut stream).await;
+    }
+    if let Some(mut rpc) = socket.take() {
+        let _ = timeout(Duration::from_secs(1), rpc.close(None)).await;
+        let _ = timeout(Duration::from_secs(1), next_frame_past_heartbeat(&mut rpc)).await;
+    }
+    let prepared = if let Some(mut task) = preparation.take() {
+        match timeout(Duration::from_secs(6), &mut task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("held preparation task failed"),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err("held preparation join timed out")
+            }
+        }
+    } else {
+        Err("held preparation was never started")
+    };
+    let mut cancelled = false;
+    if let Ok(value) = &prepared
+        && let Some(operation_id) = value["operationId"].as_str()
+        && let Ok(response) = client
+            .post(format!("{base}{MAINTENANCE_UPDATE_CANCEL_PATH}"))
+            .header(DESKTOP_MAINTENANCE_TOKEN_HEADER, bootstrap)
+            .json(&json!({"operationId":operation_id}))
+            .send()
+            .await
+        && let Ok(result) = response.json::<Value>().await
+    {
+        cancelled = result["cancelled"] == true;
+    }
+    drop(client);
+    server.shutdown();
+    let joined = server.join().await.is_ok();
+    // The real runtime and its HTTP handlers have joined before reading/removing any residue.
+    let contents = std::fs::read(workspace.join("protection-witness.txt"));
+    let entries =
+        std::fs::read_dir(&workspace).and_then(|entries| entries.collect::<Result<Vec<_>, _>>());
+    assert!(joined, "held upload runtime failed to join");
+    assert_eq!(observation, Ok((true, true, true)));
+    assert!(
+        cancelled,
+        "prepared maintenance was not cancelled through its public boundary"
+    );
+    assert_eq!(
+        prepared
+            .ok()
+            .and_then(|value| value["drainedOperations"].as_u64()),
+        Some(1)
+    );
+    assert_eq!(contents.expect("joined upload file"), b"ok");
+    assert_eq!(
+        entries.expect("joined upload directory").len(),
+        1,
+        "owned upload left a partial or reservation"
     );
 }
 
