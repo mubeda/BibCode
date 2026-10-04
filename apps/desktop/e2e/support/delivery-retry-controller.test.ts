@@ -680,6 +680,20 @@ describe.each(["projector", "failure-seam"])("create-ref descriptor admission: %
 });
 
 describe("delivery controller admission", () => {
+  it("admits only the fixed settings selector through the same namespace fence", () => {
+    expect(
+      deliveryConfiguration(
+        { ...environment, BIBCODE_DELIVERY_UI_SELECTION: "release-visual-settings" },
+        () => "net:[owned]",
+      ).selection,
+    ).toBe("release-visual-settings");
+    expect(() =>
+      deliveryConfiguration(
+        { ...environment, BIBCODE_DELIVERY_UI_SELECTION: "release-visual-settings" },
+        () => "net:[other]",
+      ),
+    ).toThrow("Owned delivery qualification namespace refused.");
+  });
   it("consumes only explicit owned inputs and has a finite six-image manifest", () => {
     expect(deliveryConfiguration(environment, () => "net:[owned]")).toEqual({
       source: "a".repeat(40),

@@ -35,7 +35,7 @@ describe("visual preparation source boundaries", () => {
         "Visual reader mutation refused.",
       );
   });
-  it.each(["delivery-retry-ui", "release-visual-core"])(
+  it.each(["delivery-retry-ui", "release-visual-core", "release-visual-settings"])(
     "executes the shared finally owner and closed failure result for %s",
     async (selection) => {
       let cleanup = 0;

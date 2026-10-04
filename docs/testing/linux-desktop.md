@@ -915,6 +915,69 @@ both owners prove joined cleanup. A partial or failed run records only the
 captures it actually completed and keeps its failure classification; it cannot
 claim all eight pairs from the manifest alone.
 
+### Settings release visual batch
+
+The same manual-only `qualify-release-visuals.yml` offers the fixed
+`release-visual-settings` choice separately from its default
+`release-visual-core`. It uses the same real-server controller, Python namespace
+owner, browser profile, pairing, public theme/import/Claude model selection and
+one managed-worktree creator per theme. The original core selection, sixteen
+PNG filenames and 600/660-second bounds remain unchanged. Settings uses those
+same bounds for exactly four pairs: `model-picker`, `settings-keybindings`,
+`settings-source-control`, and `settings-provider-form`. Never append these
+scenes to the eight-scene core sequence or widen its deadline.
+
+Compile the guarded CLI and UI before admission. The settings preflight joins
+the existing owner's `provenance.json` source/default-Abort/server hash to the
+actual canonical, regular, executable immutable binary. It also verifies the
+private fixture directories and generated Claude launcher/marker files, exact
+owned PATH/private HOME and known disabled/missing configuration before writing
+only the returned private settings. Positive filesystem/guard facts must come
+from this preflight; do not manufacture flags or use host providers. Its Claude
+form uses literal `claude`, empty home/launch fields and no environment values;
+the owned missing Cursor path supports an unavailable instance. Default fixture
+modes and provider resolver/guard behavior are unchanged.
+
+The shared creator proves the real selected card, branch/path tooltip and Git
+identity once before the ordinary baseline. Require exact 1280x960 and retain
+`Owned visual review draft` and Claude/Opus selection. The model picker shows
+the current ready-model list/search/favorite controls. Keybindings opens the
+public filtered condition editor and cancels its unsaved new row. Source
+Control observes real Git version/availability, explained unavailable
+GitHub/GitLab indicators and an expanded fetch interval after discovery settles;
+it does not authenticate, forge, toggle availability or save settings. Providers
+is the current `/settings/providers` route, separate from Agents. Expand the
+existing Claude card to show actual non-secret fields and model controls.
+
+Keep the hidden Add instance opener hidden. Its computed visibility determines
+the closed unsupported diagnostic; a source inventory does not establish Add
+wizard pixels. Provider account/status overviews, the Add wizard, Effort/Fast
+Mode and Azure/Bitbucket rows stay explicitly unpictured. A blank or hidden
+password input still refuses the unchanged credential fence. A clipped,
+obstructed, stale or secret form leaves that pair unqualified; there is no
+closed-card substitute, gallery or screenshot fallback. Provider form runs
+after the other three scenes and any refusal remains fatal.
+
+Every retained PNG passes the full scene witness, immutable private Git identity
+on both sides of capture, the existing six common facts and unchanged original
+PNG parser. Before writing assertions, project only the fixed boolean/enum
+receipts; successful completion requires all eight unique scene/theme files and
+both theme assertions. Settings evidence uses the separate
+`issue29-settings-<run-id>` producer directory and only its eight named originals
+plus the same seven closed JSON receipts. No logs, profiles, credentials,
+provider/session IDs or private fixture inputs enter that artifact allowlist.
+The outer owner also requires unchanged input hashes, zero guard refusals and
+joined namespace/browser/server cleanup before deleting its private fixture.
+
+Inspect all original light/dark images independently and preserve incomplete
+substates in the report. A passed preparation lane does not qualify the full
+release matrix or native/Tauri behavior. Root must nominate the immutable final
+product source separately from the reviewed harness overlay; neither static
+tests nor provisional source captures establish final-product pixels. If the
+canonical workflow is not registered on the default branch, report that
+registration limitation; do not repurpose another live manual workflow without
+root approval.
+
 ## Process-group cleanup
 
 Capture PID, PPID, process group, start time, executable, and command line for

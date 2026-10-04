@@ -50,6 +50,15 @@ import {
 import { captureVisualScene, runVisualCore } from "./support/release-visual-core.ts";
 import { visualScenes } from "./support/release-visual-evidence.ts";
 import {
+  runVisualSettings,
+  captureSettingsVisualScene,
+  settingsVisualScenes,
+  projectSettingsVisualCapture,
+  projectSettingsVisualAssertion,
+  validateSettingsVisualJoins,
+} from "./support/release-visual-settings.ts";
+import { readSettingsVisualProviderConfiguration } from "./support/release-visual-settings-preflight.ts";
+import {
   readVisualViewport,
   readVisualWitness,
   projectVisualNameClearObservation,
@@ -77,7 +86,7 @@ export function deliveryConfiguration(
     driver: environment.BIBCODE_UPLOAD_DRIVER,
   };
   if (
-    !["delivery-retry-ui", "release-visual-core"].includes(selection) ||
+    !["delivery-retry-ui", "release-visual-core", "release-visual-settings"].includes(selection) ||
     environment.CI !== "true" ||
     !/^[0-9a-f]{40}$/.test(environment.BIBCODE_UPLOAD_SOURCE ?? "") ||
     Object.values(values).some((value) => !value || !NodePath.isAbsolute(value)) ||
@@ -90,7 +99,7 @@ export function deliveryConfiguration(
     throw new Error("Owned delivery qualification namespace refused.");
   }
   return { ...values, selection, source: environment.BIBCODE_UPLOAD_SOURCE! } as {
-    selection: "delivery-retry-ui" | "release-visual-core";
+    selection: "delivery-retry-ui" | "release-visual-core" | "release-visual-settings";
     fixture: string;
     evidence: string;
     binary: string;
@@ -741,7 +750,24 @@ export async function runDeliveryRetryQualification() {
       configured.enableProviderUpdateChecks = false;
       configured.worktreeBaseDirectory = NodePath.join(runRoot, "managed-worktrees");
       NodeFS.mkdirSync(configured.worktreeBaseDirectory, { mode: 0o700 });
-      NodeFS.writeFileSync(settingsPath, JSON.stringify(configured), { mode: 0o600 });
+      let settingsForWrite = configured;
+      if (config.selection === "release-visual-settings") {
+        step("visual-settings-provider-fixture");
+        settingsForWrite = readSettingsVisualProviderConfiguration({
+          fixtureRoot: config.fixture,
+          runRoot,
+          theme,
+          shimDirectory: context.shimDirectory,
+          home: context.fixtureUserHomePath,
+          binDirectory: NodePath.join(config.fixture, "bin"),
+          childEnv,
+          binary: config.binary,
+          source: config.source,
+          evidence: config.evidence,
+          configured,
+        });
+      }
+      NodeFS.writeFileSync(settingsPath, JSON.stringify(settingsForWrite), { mode: 0o600 });
       await new Promise<void>((resolve, reject) => {
         const probe = NodeNet.createServer();
         probe.once("error", () => reject(new Error("Owned delivery port unavailable.")));
@@ -855,6 +881,21 @@ export async function runDeliveryRetryQualification() {
           const viewport = await bounded(browser!.execute(readVisualViewport), 2_000);
           return viewport.width === 1280 && viewport.height === 960;
         });
+      } else if (config.selection === "release-visual-settings") {
+        step("visual-settings-viewport");
+        const observed = await bounded(browser.execute(readVisualViewport), 2_000);
+        const outer = await browser.getWindowSize();
+        const corrected = correctDesktopUiOuterSize(
+          outer,
+          { width: 1280, height: 960 },
+          observed,
+          observed.devicePixelRatio,
+        );
+        await browser.setWindowSize(corrected.width, corrected.height);
+        await owner.until(async () => {
+          const viewport = await bounded(browser!.execute(readVisualViewport), 2_000);
+          return viewport.width === 1280 && viewport.height === 960;
+        });
       }
       const baseline = `delivery baseline ${theme}`;
       const prompt = `delivery held message ${theme}`;
@@ -930,6 +971,62 @@ export async function runDeliveryRetryQualification() {
           },
         });
         assertions.push({ theme, ...proof });
+      } else if (config.selection === "release-visual-settings") {
+        await type("Owned visual review draft");
+        const verifyOwnedIdentity = async () => {
+          check(
+            JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
+              JSON.stringify({
+                path: workspace.path,
+                branch: workspace.branch,
+                commonDirectory: workspace.commonDirectory,
+              }),
+          );
+        };
+        const proof = await runVisualSettings({
+          browser,
+          owner,
+          origin,
+          theme,
+          threadId: workspace.threadId,
+          branch: workspace.branch,
+          step,
+          verifyOwnedIdentity,
+          verifyManaged: async () => {
+            await owner.until(
+              async () =>
+                (
+                  await b().execute(readSelectedDeliveryWorktree, {
+                    origin,
+                    branch: workspace.branch,
+                    boundThreadId: workspace.threadId,
+                  })
+                )?.threadId === workspace.threadId,
+            );
+            await verifyOwnedIdentity();
+          },
+          capture: async (scene) => {
+            captures.push(
+              projectSettingsVisualCapture(
+                await captureSettingsVisualScene({
+                  browser: b(),
+                  owner,
+                  evidence: config.evidence,
+                  captured: capturedVisuals,
+                  scene,
+                  theme,
+                  origin,
+                  threadId: workspace.threadId,
+                  branch: workspace.branch,
+                  verifyOwnedIdentity,
+                }),
+              ),
+            );
+            write("assertions", { captures, assertions });
+          },
+        });
+        assertions.push(projectSettingsVisualAssertion(theme, proof));
+        write("assertions", { captures, assertions });
       } else {
         step("hold-input");
         NodeFS.writeFileSync(NodePath.join(control, "withhold-next"), "hold", {
@@ -1088,12 +1185,16 @@ export async function runDeliveryRetryQualification() {
       await owner.stop(server);
       check(owner.failures.length === 0);
     }
+    if (config.selection === "release-visual-settings")
+      validateSettingsVisualJoins(captures, assertions);
     check(
       captures.length ===
         deliveryThemes.length *
           (config.selection === "release-visual-core"
             ? visualScenes.length
-            : deliveryScenes.length) && assertions.length === 2,
+            : config.selection === "release-visual-settings"
+              ? settingsVisualScenes.length
+              : deliveryScenes.length) && assertions.length === 2,
     );
     success = true;
   } catch (error) {
@@ -1172,7 +1273,9 @@ export async function runDeliveryRetryQualification() {
       scope:
         config.selection === "release-visual-core"
           ? "First eight Linux Chromium scene pairs only. Original PNGs require independent review; unpictured surfaces and the remaining issue29 matrix are unqualified. No Playwright, Tauri or final-release acceptance claim."
-          : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
+          : config.selection === "release-visual-settings"
+            ? "Four Linux Chromium settings scene pairs only. Add instance wizard and declared unpictured substates remain unqualified. Original light/dark PNGs require independent review; no native or full-matrix qualification claim."
+            : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
     });
   }
   return success ? 0 : 1;
