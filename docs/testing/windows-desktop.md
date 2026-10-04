@@ -454,9 +454,17 @@ error-context enums or null. The existing pre-install write initializes unavaila
 a disconnect, never-return, or protected-lane finish at `protecting` before the result
 arrives cannot prove that result. A later return does not revise an already-delivered
 unavailable record. Existing phase listeners retain only first-seen contract phases.
+After the Windows local seed phase, the harness reuses its existing parsed marker
+and writes only the closed observation and unique contract phases to the explicit
+0600 `install-result-observation.json` in the lane evidence directory. The bounded
+evidence copier includes it on failure. This file excludes the raw user-data receipt;
+missing, malformed or unreadable observation facts become unavailable, oversized
+phase lists are discarded, and an optional retention fault preserves the original
+phase verdict. Verification does not overwrite the install receipt. The remote lane
+keeps its separate coordinator evidence contract.
 Unknown, inherited, accessor or unreadable facts stay null; raw errors, messages,
-IDs, paths, URLs and arguments are not added. These facts add no bridge call,
-listener, retry, poll, deadline or file write and do not replace the original
+IDs, paths, URLs and arguments are not added. The observation adds no bridge call,
+listener, retry, poll or deadline and does not replace the original
 completion verdict or establish a native failure cause.
 
 The CI harness also starts a bounded read-only process-event witness before the

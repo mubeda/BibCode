@@ -2696,3 +2696,494 @@ describe("generated public install-result observation", () => {
     expect(JSON.stringify(fixture.writes)).not.toContain("private");
   });
 });
+
+/** Actual phase and copier; only native command and optional receipt fault ports are inert. */
+async function installObservationRetentionFixture(
+  marker: unknown,
+  options: {
+    parsedMarker?: unknown;
+    markerText?: string;
+    markerMissing?: boolean;
+    markerReadFault?: boolean;
+    observationWriteFault?: boolean;
+    commandError?: Error;
+    exitCode?: number;
+    platform?: "win" | "linux";
+    phase?: "seed-and-install" | "verify";
+    lane?: "previous-stable" | "protected-baseline";
+  } = {},
+) {
+  const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "install-retention-"));
+  const layout = createSeededUpgradeRunLayout(root, "owned");
+  const lane =
+    options.lane === "protected-baseline" ? layout.protectedBaseline : layout.previousStable;
+  const runRoot = NodePath.dirname(lane.dataRoot);
+  const resultPath = NodePath.join(runRoot, "before.json");
+  const observationPath = NodePath.join(lane.evidenceDirectory, "install-result-observation.json");
+  await NodeFS.promises.mkdir(lane.evidenceDirectory, { recursive: true, mode: 0o700 });
+  if (!options.markerMissing)
+    await NodeFS.promises.writeFile(resultPath, options.markerText ?? JSON.stringify(marker), {
+      mode: 0o600,
+    });
+  const source = await NodeFS.promises.readFile(
+    new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+    "utf8",
+  );
+  const slice = (start: string, end: string) => {
+    const a = source.indexOf(start);
+    const b = source.indexOf(end, a);
+    expect(a).toBeGreaterThanOrEqual(0);
+    expect(b).toBeGreaterThan(a);
+    return source.slice(a, b);
+  };
+  const projectionStart = source.indexOf("const projectInstallResultObservation =");
+  const projection =
+    projectionStart < 0
+      ? ""
+      : slice("const updatePhases:", "export function createSeededUpgradeDriverSpec");
+  const writes: Array<{ path: string; mode: number | undefined }> = [];
+  let markerReads = 0;
+  const runCommand = vi.fn(async (_command: Record<string, unknown>) => {
+    if (options.commandError) throw options.commandError;
+    return { exitCode: options.exitCode ?? 1, stdout: "fixed stdout", stderr: "fixed stderr" };
+  });
+  let verdictError: unknown;
+  const verdict = vi.fn((input: Parameters<typeof assertWebDriverPhaseExit>[0]) => {
+    try {
+      assertWebDriverPhaseExit(input);
+    } catch (error) {
+      verdictError = error;
+      throw error;
+    }
+  });
+  const context = {
+    NodeFS: {
+      ...NodeFS,
+      promises: {
+        ...NodeFS.promises,
+        readFile: async (path: string, encoding: "utf8") => {
+          if (path === resultPath) {
+            markerReads++;
+            if (options.markerReadFault) throw new Error("private optional marker read fault");
+          }
+          return NodeFS.promises.readFile(path, encoding);
+        },
+        writeFile: async (path: string, body: string, configuration?: { mode?: number }) => {
+          writes.push({ path, mode: configuration?.mode });
+          if (path === observationPath && options.observationWriteFault)
+            throw new Error("private optional observation write fault");
+          return NodeFS.promises.writeFile(path, body, configuration);
+        },
+      },
+    },
+    NodePath,
+    NodeURL,
+    process: { env: {} },
+    JSON: {
+      stringify: JSON.stringify,
+      parse: (text: string) =>
+        Object.hasOwn(options, "parsedMarker") ? options.parsedMarker : JSON.parse(text),
+    },
+    Buffer,
+    seededUpgradeVitePlusExecutable,
+    seededUpgradePhaseTimeoutMs,
+    createSeededUpgradeDriverSpec,
+    createSeededUpgradeWdioConfig,
+    readRemoteFixtureSecrets,
+    redactAndBoundUpgradeEvidence,
+    assertWebDriverPhaseExit: verdict,
+    runCommand,
+  };
+  const code =
+    projection +
+    slice("const writePrivateJson =", "const findExactlyOne =") +
+    slice("const runWebDriverPhase =", "const startMockUpdateServer =") +
+    slice("const copyBoundedEvidence =", "export async function runSeededDesktopUpgradeSmoke") +
+    "\n({runWebDriverPhase,copyBoundedEvidence})";
+  const actual = NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes(code), context, {
+    timeout: 1_000,
+  }) as {
+    runWebDriverPhase: (input: Record<string, unknown>) => Promise<void>;
+    copyBoundedEvidence: (input: Record<string, unknown>) => Promise<void>;
+  };
+  const input = {
+    appBinaryPath: NodePath.join(root, "inert-app"),
+    backendPort: 14953,
+    candidateVersion: "0.7.3",
+    dataRoot: lane.dataRoot,
+    evidenceDirectory: lane.evidenceDirectory,
+    expectedDataRoot: lane.dataRoot,
+    lane: options.lane ?? "previous-stable",
+    phase: options.phase ?? "seed-and-install",
+    platform: options.platform ?? "win",
+    projectId: "private-userdata-canary",
+    repositoryRoot,
+    restartTimeoutMs: 30_000,
+    resultPath,
+    runRoot,
+    workspaceRoot: lane.workspaceRoot,
+    webdriverPort: 15053,
+    wsl: false,
+  } as const;
+  return {
+    observationPath,
+    resultPath,
+    input,
+    writes,
+    markerReads: () => markerReads,
+    runCommand,
+    verdict,
+    verdictError: () => verdictError,
+    run: () => actual.runWebDriverPhase(input),
+    copy: async () => {
+      const artifactDirectory = NodePath.join(root, "retained");
+      await actual.copyBoundedEvidence({
+        artifactDirectory,
+        layout,
+        requestLogPath: NodePath.join(root, "absent-requests.jsonl"),
+        secrets: [],
+      });
+      return artifactDirectory;
+    },
+    dispose: () => NodeFS.promises.rm(root, { recursive: true, force: true }),
+  };
+}
+
+const unavailableInstallObservation = {
+  kind: "unavailable",
+  accepted: null,
+  completed: null,
+  status: null,
+  phase: null,
+  errorContext: null,
+};
+const refusedInstallObservation = {
+  kind: "returned",
+  accepted: false,
+  completed: false,
+  status: "error",
+  phase: "failed",
+  errorContext: "install",
+};
+
+describe("private install observation artifact retention", () => {
+  it.each([
+    { category: "returned refusal", observation: refusedInstallObservation, attempted: false },
+    {
+      category: "unavailable disconnect",
+      observation: unavailableInstallObservation,
+      attempted: true,
+    },
+  ])(
+    "retains $category through the actual phase and failure copier",
+    async ({ observation, attempted }) => {
+      const fixture = await installObservationRetentionFixture({
+        effectiveRoot: "private-userdata-canary",
+        projectId: "private-userdata-canary",
+        installAttempted: attempted,
+        installResultObservation: observation,
+        phases: ["checking", "available"],
+      });
+      try {
+        if (attempted) await expect(fixture.run()).resolves.toBeUndefined();
+        else await expect(fixture.run()).rejects.toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        const artifact = await fixture.copy();
+        const retainedPath = NodePath.join(
+          artifact,
+          "previous-stable-install-result-observation.json",
+        );
+        expect(NodeFS.existsSync(retainedPath)).toBe(true);
+        const retained = await NodeFS.promises.readFile(retainedPath, "utf8");
+        expect(JSON.parse(retained)).toEqual({
+          installResultObservation: observation,
+          phases: ["checking", "available"],
+        });
+        expect(retained).not.toContain("private-userdata-canary");
+        expect(await NodeFS.promises.readFile(fixture.resultPath, "utf8")).toContain(
+          "private-userdata-canary",
+        );
+        expect((await NodeFS.promises.stat(fixture.observationPath)).mode & 0o777).toBe(0o600);
+        expect(fixture.markerReads()).toBe(1);
+        expect(fixture.runCommand).toHaveBeenCalledOnce();
+        expect(fixture.runCommand.mock.calls[0]?.[0]).toMatchObject({
+          timeoutMs: seededUpgradePhaseTimeoutMs(fixture.input),
+        });
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  it.each([
+    {
+      category: "accepted incomplete",
+      observation: { ...refusedInstallObservation, accepted: true },
+    },
+    {
+      category: "returned null facts",
+      observation: { ...unavailableInstallObservation, kind: "returned" },
+    },
+  ])("retains $category without interpreting it as success", async ({ observation }) => {
+    const fixture = await installObservationRetentionFixture({
+      installAttempted: false,
+      installResultObservation: observation,
+    });
+    try {
+      const error = await fixture.run().catch((error: unknown) => error);
+      expect(error).toBe(fixture.verdictError());
+      expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+      expect(JSON.parse(await NodeFS.promises.readFile(fixture.observationPath, "utf8"))).toEqual({
+        installResultObservation: observation,
+        phases: [],
+      });
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it.each([
+    { category: "missing", observation: undefined },
+    { category: "partial", observation: { kind: "returned", accepted: false } },
+    {
+      category: "unknown enum",
+      observation: { ...refusedInstallObservation, status: "private-userdata-canary" },
+    },
+    {
+      category: "nonboolean",
+      observation: { ...refusedInstallObservation, accepted: "private-userdata-canary" },
+    },
+    {
+      category: "unknown kind",
+      observation: { ...refusedInstallObservation, kind: "private-userdata-canary" },
+    },
+    {
+      category: "private extra field",
+      observation: { ...refusedInstallObservation, message: "private-userdata-canary" },
+    },
+    {
+      category: "oversized value",
+      observation: { ...refusedInstallObservation, status: "private-userdata-canary".repeat(4096) },
+    },
+    {
+      category: "unavailable with claims",
+      observation: { ...refusedInstallObservation, kind: "unavailable" },
+    },
+  ])("quarantines $category facts", async ({ observation }) => {
+    const fixture = await installObservationRetentionFixture({
+      installAttempted: false,
+      installResultObservation: observation,
+      phases: ["checking", "private-userdata-canary", "checking", "available"],
+    });
+    try {
+      const error = await fixture.run().catch((error: unknown) => error);
+      expect(error).toBe(fixture.verdictError());
+      const text = await NodeFS.promises.readFile(fixture.observationPath, "utf8");
+      expect(JSON.parse(text)).toEqual({
+        installResultObservation: unavailableInstallObservation,
+        phases: ["checking", "available"],
+      });
+      expect(text).not.toContain("private-userdata-canary");
+      expect(fixture.markerReads()).toBe(1);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it.each(["accessor", "inherited", "reflection fault", "marker accessor"])(
+    "quarantines %s without reading a property getter",
+    async (category) => {
+      let reads = 0;
+      const getter = () => {
+        reads++;
+        throw new Error("private-userdata-canary");
+      };
+      let observation: unknown = { ...refusedInstallObservation };
+      if (category === "accessor") Object.defineProperty(observation, "accepted", { get: getter });
+      if (category === "inherited") observation = Object.create(refusedInstallObservation);
+      if (category === "reflection fault")
+        observation = new Proxy(
+          {},
+          {
+            ownKeys() {
+              throw new Error("private-userdata-canary");
+            },
+          },
+        );
+      const marker = {
+        installAttempted: false,
+        installResultObservation: observation,
+        phases: ["checking"],
+      };
+      if (category === "marker accessor")
+        Object.defineProperty(marker, "installResultObservation", { get: getter });
+      const fixture = await installObservationRetentionFixture(
+        { installAttempted: false },
+        { parsedMarker: marker },
+      );
+      try {
+        const error = await fixture.run().catch((error: unknown) => error);
+        expect(error).toBe(fixture.verdictError());
+        expect(JSON.parse(await NodeFS.promises.readFile(fixture.observationPath, "utf8"))).toEqual(
+          { installResultObservation: unavailableInstallObservation, phases: ["checking"] },
+        );
+        expect(reads).toBe(0);
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  it("bounds and deduplicates own phase entries without invoking accessors", async () => {
+    let reads = 0;
+    const phases = ["checking", "available", "checking", "failed"];
+    Object.defineProperty(phases, "1", {
+      get() {
+        reads++;
+        throw new Error("private-userdata-canary");
+      },
+    });
+    const fixture = await installObservationRetentionFixture(
+      { installAttempted: false },
+      {
+        parsedMarker: {
+          installAttempted: false,
+          installResultObservation: refusedInstallObservation,
+          phases,
+        },
+      },
+    );
+    try {
+      await fixture.run().catch(() => undefined);
+      expect(JSON.parse(await NodeFS.promises.readFile(fixture.observationPath, "utf8"))).toEqual({
+        installResultObservation: refusedInstallObservation,
+        phases: ["checking", "failed"],
+      });
+      expect(reads).toBe(0);
+    } finally {
+      await fixture.dispose();
+    }
+    const oversized = await installObservationRetentionFixture({
+      installAttempted: false,
+      installResultObservation: refusedInstallObservation,
+      phases: Array(13).fill("checking"),
+    });
+    try {
+      await oversized.run().catch(() => undefined);
+      expect(JSON.parse(await NodeFS.promises.readFile(oversized.observationPath, "utf8"))).toEqual(
+        { installResultObservation: refusedInstallObservation, phases: [] },
+      );
+    } finally {
+      await oversized.dispose();
+    }
+  });
+
+  it.each([
+    { category: "missing marker", configuration: { markerMissing: true } },
+    { category: "unreadable marker", configuration: { markerReadFault: true } },
+    { category: "invalid JSON", configuration: { markerText: "private-userdata-canary" } },
+  ])(
+    "retains unavailable for $category with the unchanged phase failure",
+    async ({ configuration }) => {
+      const fixture = await installObservationRetentionFixture(
+        { installAttempted: true },
+        configuration,
+      );
+      try {
+        const error = await fixture.run().catch((error: unknown) => error);
+        expect(error).toBe(fixture.verdictError());
+        expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        expect(JSON.parse(await NodeFS.promises.readFile(fixture.observationPath, "utf8"))).toEqual(
+          { installResultObservation: unavailableInstallObservation, phases: [] },
+        );
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "observation write failure preserves original attempted=%s phase verdict",
+    async (attempted) => {
+      const fixture = await installObservationRetentionFixture(
+        { installAttempted: attempted, installResultObservation: refusedInstallObservation },
+        { observationWriteFault: true },
+      );
+      try {
+        const error = await fixture.run().catch((error: unknown) => error);
+        if (attempted) expect(error).toBeUndefined();
+        else {
+          expect(error).toBe(fixture.verdictError());
+          expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        }
+        expect(fixture.verdict).toHaveBeenCalledExactlyOnceWith({
+          exitCode: 1,
+          installAttempted: attempted,
+          lane: "previous-stable",
+          phase: "seed-and-install",
+        });
+        expect(NodeFS.existsSync(fixture.observationPath)).toBe(false);
+        expect(fixture.runCommand).toHaveBeenCalledOnce();
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
+
+  it("preserves an original command exception before optional retention", async () => {
+    const original = new Error("private-userdata-canary");
+    const fixture = await installObservationRetentionFixture(
+      { installAttempted: true },
+      { commandError: original },
+    );
+    try {
+      await expect(fixture.run()).rejects.toBe(original);
+      expect(fixture.markerReads()).toBe(0);
+      expect(fixture.verdict).not.toHaveBeenCalled();
+      expect(NodeFS.existsSync(fixture.observationPath)).toBe(false);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("retains the protected local receipt but does not replace it during verify or other-platform phases", async () => {
+    const marker = {
+      installAttempted: true,
+      installResultObservation: unavailableInstallObservation,
+      phases: ["protecting"],
+    };
+    const protectedLane = await installObservationRetentionFixture(marker, {
+      lane: "protected-baseline",
+    });
+    try {
+      await protectedLane.run();
+      const artifact = await protectedLane.copy();
+      expect(
+        NodeFS.existsSync(
+          NodePath.join(artifact, "protected-baseline-install-result-observation.json"),
+        ),
+      ).toBe(true);
+    } finally {
+      await protectedLane.dispose();
+    }
+    for (const configuration of [
+      { phase: "verify" as const, exitCode: 0 },
+      { platform: "linux" as const, exitCode: 0 },
+    ]) {
+      const fixture = await installObservationRetentionFixture(marker, configuration);
+      try {
+        const original = JSON.stringify({
+          installResultObservation: refusedInstallObservation,
+          phases: ["failed"],
+        });
+        await NodeFS.promises.writeFile(fixture.observationPath, original, { mode: 0o600 });
+        await fixture.run();
+        expect(await NodeFS.promises.readFile(fixture.observationPath, "utf8")).toBe(original);
+        expect(fixture.writes.filter((write) => write.path === fixture.observationPath)).toEqual(
+          [],
+        );
+      } finally {
+        await fixture.dispose();
+      }
+    }
+  });
+});
