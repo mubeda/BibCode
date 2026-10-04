@@ -4,6 +4,7 @@ import * as NodeModule from "node:module";
 import * as NodeVM from "node:vm";
 import { describe, expect, it } from "vite-plus/test";
 import type { VisualTextRowObservationInput } from "./release-visual-observation.ts";
+import { resolveSettingsVisualFailureScene } from "./release-visual-settings.ts";
 const controller = NodeFS.readFileSync(
   new URL("../qualify-delivery-retry.ts", import.meta.url),
   "utf8",
@@ -78,6 +79,7 @@ describe("visual preparation source boundaries", () => {
             throw new Error("private-token?grant=secret");
           },
           classifyQualificationFailure: () => "other",
+          resolveSettingsVisualFailureScene,
         },
       );
       expect(await run()).toBe(1);
