@@ -2511,6 +2511,59 @@ function removalReplay(
 }
 
 it.each([
+  { category: "empty", expected: "toast-recheck-empty", resolves: true },
+  { category: "replacement", expected: "toast-recheck-visible", resolves: false },
+  { category: "read-failure", expected: "toast-recheck-list", resolves: false },
+  { category: "unknown", expected: "toast-click-unrecognized", resolves: false },
+])("attributes toast recognition and the existing recheck branch: $category", async (testCase) => {
+  const original = new Error(
+    testCase.category === "unknown"
+      ? "unknown click failure"
+      : "no such element: owned close removed",
+  );
+  const probe = removalReplay(null, {
+    clickFailure: original,
+    disappears: true,
+    replacement: testCase.category === "replacement",
+    reobserveFailure:
+      testCase.category === "read-failure" ? new Error("inert read failure") : undefined,
+  });
+  const stages: string[] = [];
+  if (testCase.resolves)
+    await expect(
+      probe.remove(probe.host, (stage: string) => stages.push(stage)),
+    ).resolves.toBeUndefined();
+  else
+    await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(
+      original,
+    );
+  expect(stages.at(-1)).toBe(testCase.expected);
+  expect(stages).toContain(
+    testCase.category === "unknown" ? "toast-click-unrecognized" : "toast-click-matched",
+  );
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(
+    testCase.category === "unknown" ? 1 : 2,
+  );
+});
+
+it("contains toast decision observers without changing successful absence proof", async () => {
+  const probe = removalReplay(null, {
+    clickFailure: new Error("no such element: owned close removed"),
+    disappears: true,
+  });
+  const stages: string[] = [];
+  await expect(
+    probe.remove(probe.host, (stage: string) => {
+      stages.push(stage);
+      if (stage.startsWith("toast-click-") || stage.startsWith("toast-recheck-"))
+        throw new Error("inert observer failure");
+    }),
+  ).resolves.toBeUndefined();
+  expect(stages.at(-1)).toBe("toast-recheck-empty");
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+});
+
+it.each([
   new Error(
     'Can\'t call click on element with selector "button[data-slot="toast-close"]" because element wasn\'t found',
   ),
@@ -2550,6 +2603,10 @@ it.each([
     "toast-list",
     "toast-displayed",
     "toast-click",
+    "toast-click-inspect",
+    "toast-click-matched",
+    "toast-recheck-list",
+    "toast-recheck-empty",
   ]);
 });
 
@@ -2568,7 +2625,7 @@ it.each([
   const stages: string[] = [];
   await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(error);
   expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(1);
-  expect(stages.at(-1)).toBe("toast-click");
+  expect(stages.at(-1)).toBe("toast-click-unrecognized");
 });
 
 it("preserves the original stale click error when a re-rendered toast close remains visible", async () => {
@@ -2579,7 +2636,7 @@ it("preserves the original stale click error when a re-rendered toast close rema
   expect(probe.toastVisible()).toBe(true);
   expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
   expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
-  expect(stages.at(-1)).toBe("toast-click");
+  expect(stages.at(-1)).toBe("toast-recheck-visible");
 });
 
 it("preserves the original missing click error when the absence read fails", async () => {
@@ -2593,7 +2650,7 @@ it("preserves the original missing click error when the absence read fails", asy
   const stages: string[] = [];
   await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(error);
   expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
-  expect(stages.at(-1)).toBe("toast-click");
+  expect(stages.at(-1)).toBe("toast-recheck-list");
 });
 
 it("requires a fresh toast-free end state after successful cleanup clicks", async () => {
@@ -2710,7 +2767,7 @@ it.each([
       }),
     ).rejects.toBe(probe.failure);
     expect(probe.calls).toEqual(baseline.calls);
-    expect(stages.at(-1)).toBe(failed);
+    expect(stages.at(-1)).toBe(failed === "toast-click" ? "toast-click-unrecognized" : failed);
   },
 );
 
@@ -2807,7 +2864,9 @@ it.each([
       );
       await expect(run()).rejects.toBe(probe.failure);
       expect(probe.calls).toEqual(baseline.calls);
-      expect(phases.at(-1)).toBe(`success-remove-${failed}`);
+      expect(phases.at(-1)).toBe(
+        `success-remove-${failed === "toast-click" ? "toast-click-unrecognized" : failed}`,
+      );
       expect(phases[0]).toBe("success-remove-settings");
       expect(assertions).toEqual([
         {

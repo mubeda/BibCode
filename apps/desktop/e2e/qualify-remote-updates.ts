@@ -484,7 +484,15 @@ type RemoveHostOperation =
   | "tunnel-close"
   | "toast-list"
   | "toast-displayed"
-  | "toast-click";
+  | "toast-click"
+  | "toast-click-inspect"
+  | "toast-click-unavailable"
+  | "toast-click-unrecognized"
+  | "toast-click-matched"
+  | "toast-recheck-list"
+  | "toast-recheck-displayed"
+  | "toast-recheck-visible"
+  | "toast-recheck-empty";
 
 const SUCCESS_REMOVE_PHASES = {
   settings: "success-remove-settings",
@@ -506,6 +514,14 @@ const SUCCESS_REMOVE_PHASES = {
   "toast-list": "success-remove-toast-list",
   "toast-displayed": "success-remove-toast-displayed",
   "toast-click": "success-remove-toast-click",
+  "toast-click-inspect": "success-remove-toast-click-inspect",
+  "toast-click-unavailable": "success-remove-toast-click-unavailable",
+  "toast-click-unrecognized": "success-remove-toast-click-unrecognized",
+  "toast-click-matched": "success-remove-toast-click-matched",
+  "toast-recheck-list": "success-remove-toast-recheck-list",
+  "toast-recheck-displayed": "success-remove-toast-recheck-displayed",
+  "toast-recheck-visible": "success-remove-toast-recheck-visible",
+  "toast-recheck-empty": "success-remove-toast-recheck-empty",
 } as const satisfies Record<RemoveHostOperation, string>;
 
 async function removeHost(host: Host, observe?: (operation: RemoveHostOperation) => void) {
@@ -550,23 +566,37 @@ async function removeHost(host: Host, observe?: (operation: RemoveHostOperation)
         await close.click();
       } catch (error) {
         try {
+          observeStep("toast-click-inspect");
           const descriptor =
             error !== null && typeof error === "object"
               ? Object.getOwnPropertyDescriptor(error, "message")
               : undefined;
           const message =
             descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : null;
-          if (
-            typeof message !== "string" ||
-            (!/^(?:no such element|stale element reference)(?::|$)/.test(message) &&
-              message !==
-                `Can't call click on element with selector "${toastClose}" because element wasn't found`)
-          )
+          if (typeof message !== "string") {
+            observeStep("toast-click-unavailable");
             throw error;
+          }
+          if (
+            !/^(?:no such element|stale element reference)(?::|$)/.test(message) &&
+            message !==
+              `Can't call click on element with selector "${toastClose}" because element wasn't found`
+          ) {
+            observeStep("toast-click-unrecognized");
+            throw error;
+          }
+          observeStep("toast-click-matched");
           // There is no stable public toast ID. Accept only concrete absence of
-          // every visible close, keeping the original click phase and error.
-          for (const current of await required().$$(toastClose))
-            if (await current.isDisplayed()) throw error;
+          // every visible close, preserving the original click error on refusal.
+          observeStep("toast-recheck-list");
+          for (const current of await required().$$(toastClose)) {
+            observeStep("toast-recheck-displayed");
+            if (await current.isDisplayed()) {
+              observeStep("toast-recheck-visible");
+              throw error;
+            }
+          }
+          observeStep("toast-recheck-empty");
         } catch {
           throw error;
         }

@@ -751,6 +751,11 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   allowlisted manual assertion code registered by that controller's own check;
   errors from the browser, arbitrary check strings, exception text and copied
   commands must never supply that field. Missing ownership remains null.
+  Toast removal additionally records fixed recognition and existing recheck phases:
+  message inspection/unavailable/unrecognized/matched, fresh-list lookup, visibility
+  read, visible-replacement refusal, or confirmed-empty completion. These markers
+  add no lookup, request, retry, deadline or recovery. A later empty snapshot cannot
+  prove the earlier recheck succeeded; preserve the original click error on refusal.
 
   For the full Reload negative control, observe the primary rail connected,
   then disconnected and connected again around the same-version restart, with a
