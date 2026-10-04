@@ -601,6 +601,14 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   count as already gone only when a second fresh enumeration proves that same
   zero-visible end state. Unknown click errors, visible replacements and failed
   absence reads preserve the original failure and click phase. This conservative
+  recognition reads only an own data message. It admits the canonical missing/stale
+  prefixes, the exact public implicit-missing click message, and the pinned SDK's
+  `WebDriverError` wrapper only for a bounded element-ID click command with `POST`
+  and no argument suffix. Wrapped detail can contain the SDK's preserved line breaks
+  within its 1024-character bound; element IDs remain bounded. Other error
+  families, commands or methods, malformed wrappers and unavailable message data
+  preserve the original error. Keep raw messages, IDs, URLs and arguments private;
+  recognition adds no evidence beyond the existing fixed phase markers. This
   proof needs no fabricated toast identity or changes to toast lifetimes, Retry
   behavior or functional assertions. A missing element alone does not establish
   an auto-dismiss cause. A null Reload witness before its stage remains

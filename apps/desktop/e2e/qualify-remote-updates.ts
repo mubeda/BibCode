@@ -579,6 +579,11 @@ async function removeHost(host: Host, observe?: (operation: RemoveHostOperation)
           }
           if (
             !/^(?:no such element|stale element reference)(?::|$)/.test(message) &&
+            // The pinned SDK wraps response errors with this command/method suffix.
+            // Bound verbatim details (including line breaks) and ID; refuse args/other operations.
+            !/^WebDriverError: (?:no such element|stale element reference)(?::[\s\S]{0,1024})? when running "element\/[A-Za-z0-9._:-]{1,256}\/click" with method "POST"$/.test(
+              message,
+            ) &&
             message !==
               `Can't call click on element with selector "${toastClose}" because element wasn't found`
           ) {

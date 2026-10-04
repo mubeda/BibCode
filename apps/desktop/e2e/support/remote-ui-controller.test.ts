@@ -2407,6 +2407,7 @@ function removalReplay(
     replacement?: boolean;
     remainsAfterClick?: boolean;
     reobserveFailure?: unknown;
+    reobserveDisplayFailure?: unknown;
     toastCount?: number;
   } = {},
 ) {
@@ -2454,6 +2455,8 @@ function removalReplay(
       return Array.from({ length: toastCount }, () => ({
         isDisplayed: async () => {
           await action("toast-displayed");
+          if (toastLists > 1 && toastCase.reobserveDisplayFailure !== undefined)
+            throw toastCase.reobserveDisplayFailure;
           visibleReads++;
           if (visibleReads === 1 && toastCase.disappears && !toastCase.replacement) toastCount = 0;
           return true;
@@ -2509,6 +2512,270 @@ function removalReplay(
   );
   return { remove, host, calls, failure, deadlineFailure, toastVisible: () => toastCount > 0 };
 }
+
+// Execute the pinned SDK's error constructor without importing its HTTP/session runtime.
+function sdkClickResponseError(
+  category: string,
+  input: { message?: string; command?: string; method?: string; body?: object } = {},
+): Error {
+  const packagePath = NodeFS.realpathSync(
+    new URL("../../node_modules/webdriverio/package.json", import.meta.url),
+  );
+  const driverPath = NodeModule.createRequire(packagePath).resolve("webdriver");
+  const source = NodeFS.readFileSync(
+    NodePath.join(NodePath.dirname(driverPath), "node.js"),
+    "utf8",
+  );
+  const start = source.indexOf("var REG_EXPS =");
+  const end = source.indexOf("\n// package.json", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const utils = NodeFS.readFileSync(
+    NodePath.join(NodePath.dirname(driverPath), "../../@wdio/utils/build/index.js"),
+    "utf8",
+  );
+  const transformStart = utils.indexOf("function transformCommandLogResult(");
+  const transformEnd = utils.indexOf("\n}", transformStart) + 2;
+  expect(transformStart).toBeGreaterThan(0);
+  expect(transformEnd).toBeGreaterThan(transformStart);
+  const ResponseError = NodeVM.runInNewContext(
+    utils.slice(transformStart, transformEnd) +
+      "\nconst transformCommandLogResult2 = transformCommandLogResult;\n" +
+      source.slice(start, end) +
+      "\nWebDriverResponseError",
+  );
+  return new ResponseError(
+    {
+      body: {
+        value: { error: category, message: input.message ?? category + ": owned close removed" },
+      },
+    },
+    new URL(
+      "http://inert.invalid/session/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/" +
+        (input.command ?? "element/owned-node/click"),
+    ),
+    { method: input.method ?? "POST", body: input.body },
+  );
+}
+
+it.each(["no such element", "stale element reference"])(
+  "accepts the pinned SDK wrapped $0 click failure only after fresh toast absence",
+  async (category) => {
+    const error = sdkClickResponseError(category);
+    const probe = removalReplay(null, { clickFailure: error, disappears: true });
+    const stages: string[] = [];
+    await expect(
+      probe.remove(probe.host, (stage: string) => stages.push(stage)),
+    ).resolves.toBeUndefined();
+    expect(probe.toastVisible()).toBe(false);
+    expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+    expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+    expect(probe.calls.filter((call) => call[0] === "until")).toEqual([["until"]]);
+    expect(stages.at(-1)).toBe("toast-recheck-empty");
+  },
+);
+
+it.each([
+  {
+    category: "no such element",
+    shape: "LF",
+    details: " owned close removed\n  (Session info: inert browser)",
+  },
+  {
+    category: "stale element reference",
+    shape: "CRLF",
+    details: " owned close removed\r\n  (Session info: inert browser)",
+  },
+  { category: "no such element", shape: "detail bound", details: "\n" + "x".repeat(1023) },
+])(
+  "accepts bounded multiline SDK $category details ($shape) only after fresh toast absence",
+  async (input) => {
+    const error = sdkClickResponseError(input.category, {
+      message: input.category + ":" + input.details,
+    });
+    const probe = removalReplay(null, { clickFailure: error, disappears: true });
+    const stages: string[] = [];
+    await expect(
+      probe.remove(probe.host, (stage: string) => stages.push(stage)),
+    ).resolves.toBeUndefined();
+    expect(probe.toastVisible()).toBe(false);
+    expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+    expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+    expect(probe.calls.filter((call) => call[0] === "until")).toEqual([["until"]]);
+    expect(stages.at(-1)).toBe("toast-recheck-empty");
+  },
+);
+
+it.each([
+  { label: "session", category: "invalid session id" },
+  { label: "timeout", category: "timeout" },
+  { label: "interception", category: "element click intercepted" },
+  {
+    label: "mention",
+    category: "unknown error",
+    input: { message: "request failed while mentioning no such element" },
+  },
+  { label: "wrong GET", category: "no such element", input: { method: "GET" } },
+  { label: "other method", category: "stale element reference", input: { method: "DELETE" } },
+  {
+    label: "other command",
+    category: "no such element",
+    input: { command: "element/owned-node/text" },
+  },
+  { label: "other family", category: "no such element", input: { command: "actions" } },
+  { label: "arguments", category: "no such element", input: { body: { button: 0 } } },
+  {
+    label: "response beyond bound",
+    category: "no such element",
+    input: { message: "no such element:" + "x".repeat(1025) },
+  },
+  {
+    label: "element ID beyond bound",
+    category: "no such element",
+    input: { command: "element/" + "x".repeat(257) + "/click" },
+  },
+  {
+    label: "multiline response beyond bound",
+    category: "no such element",
+    input: { message: "no such element:\n" + "x".repeat(1024) },
+  },
+  {
+    label: "multiline wrong GET",
+    category: "no such element",
+    input: { message: "no such element: removed\n  (Session info: inert browser)", method: "GET" },
+  },
+  {
+    label: "multiline arguments",
+    category: "stale element reference",
+    input: {
+      message: "stale element reference: detached\n  (Session info: inert browser)",
+      body: { button: 0 },
+    },
+  },
+  {
+    label: "multiline unknown family",
+    category: "invalid session id",
+    input: { message: "invalid session id: gone\n  no such element mentioned" },
+  },
+  {
+    label: "name with wrong message family",
+    category: "no such element",
+    input: { message: "invalid session id: gone" },
+  },
+])(
+  "preserves the pinned SDK wrapped $label failure without an absence recheck",
+  async (testCase) => {
+    const error = sdkClickResponseError(testCase.category, testCase.input);
+    const probe = removalReplay(null, { clickFailure: error, disappears: true });
+    const stages: string[] = [];
+    await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(
+      error,
+    );
+    expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(1);
+    expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+    expect(stages.at(-1)).toBe("toast-click-unrecognized");
+  },
+);
+
+it.each([
+  "prefix",
+  "method quotes",
+  "trailing text",
+  "trailing newline",
+  "empty element ID",
+  "nested path",
+])("refuses a malformed SDK wrapper: %s", async (shape) => {
+  const error = sdkClickResponseError("no such element");
+  if (shape === "prefix")
+    error.message = error.message.replace("WebDriverError: ", "WebDriverError:");
+  else if (shape === "method quotes") error.message = error.message.replace('"POST"', "POST");
+  else if (shape === "trailing text") error.message += " unexpected suffix";
+  else if (shape === "trailing newline") error.message += "\n";
+  else if (shape === "empty element ID") error.message = error.message.replace("owned-node", "");
+  else error.message = error.message.replace("owned-node", "other/nested");
+  const probe = removalReplay(null, { clickFailure: error, disappears: true });
+  await expect(probe.remove(probe.host)).rejects.toBe(error);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(1);
+});
+
+it.each([
+  { refusal: "visible replacement", phase: "toast-recheck-visible" },
+  { refusal: "lookup failure", phase: "toast-recheck-list" },
+  { refusal: "display failure", phase: "toast-recheck-displayed" },
+])("preserves the original wrapped click error after $refusal", async (testCase) => {
+  const error = sdkClickResponseError("stale element reference");
+  const readFailure = new Error("inert observation unavailable");
+  const probe = removalReplay(null, {
+    clickFailure: error,
+    disappears: true,
+    replacement: testCase.refusal !== "lookup failure",
+    reobserveFailure: testCase.refusal === "lookup failure" ? readFailure : undefined,
+    reobserveDisplayFailure: testCase.refusal === "display failure" ? readFailure : undefined,
+  });
+  const stages: string[] = [];
+  await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(error);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+  expect(stages.at(-1)).toBe(testCase.phase);
+});
+
+it.each(["empty", "visible", "unknown"])(
+  "contains observer faults without changing the wrapped click outcome: %s",
+  async (outcome) => {
+    const error = sdkClickResponseError(
+      outcome === "unknown" ? "invalid session id" : "no such element",
+    );
+    const probe = removalReplay(null, {
+      clickFailure: error,
+      disappears: true,
+      replacement: outcome === "visible",
+    });
+    const observed = probe.remove(probe.host, () => {
+      throw new Error("inert observer fault");
+    });
+    if (outcome === "empty") await expect(observed).resolves.toBeUndefined();
+    else await expect(observed).rejects.toBe(error);
+    expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+    expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(
+      outcome === "unknown" ? 1 : 2,
+    );
+  },
+);
+
+it.each(["accessor", "inherited", "non-string", "reflection fault"])(
+  "refuses unavailable own message data without invoking an accessor: %s",
+  async (shape) => {
+    const source = sdkClickResponseError("no such element");
+    let accessorReads = 0;
+    let error: unknown = source;
+    if (shape === "accessor") {
+      Object.defineProperty(source, "message", {
+        get() {
+          accessorReads++;
+          throw new Error("inert private accessor");
+        },
+      });
+    } else if (shape === "inherited") error = Object.create(source);
+    else if (shape === "non-string") Object.defineProperty(source, "message", { value: 0 });
+    else
+      error = new Proxy(source, {
+        getOwnPropertyDescriptor() {
+          throw new Error("inert reflection fault");
+        },
+      });
+    const probe = removalReplay(null, { clickFailure: error, disappears: true });
+    const stages: string[] = [];
+    await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(
+      error,
+    );
+    expect(accessorReads).toBe(0);
+    expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(1);
+    expect(stages.at(-1)).toBe(
+      shape === "reflection fault" ? "toast-click-inspect" : "toast-click-unavailable",
+    );
+    expect(stages.every((stage) => Object.hasOwn(successRemovalPhases, stage))).toBe(true);
+  },
+);
 
 it.each([
   { category: "empty", expected: "toast-recheck-empty", resolves: true },
