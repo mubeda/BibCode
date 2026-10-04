@@ -256,6 +256,17 @@ version. The harness verifies the package manifests, both Rust manifests,
 their Cargo lock entries, and the Tauri overlay agree, so native app and embedded
 server versions describe the same build. The calling checkout is not rewritten.
 
+The three packages compile sequentially into separate Cargo output directories
+under the isolated run root; the workflow's cached repository `target` does not
+warm them. The macOS Intel packaging child has a 90-minute bound; every other
+target retains 45 minutes. Each checkout's frozen dependency install retains
+10 minutes. The complete Intel job allows 360 minutes: 270 for packaging, 30
+for those installs, and 60 for setup, all upgrade lanes, evidence, and cleanup.
+The other five native rows and the separate WSL job retain 240 minutes.
+The `remote-install` lane reuses the protected package rather than building a
+fourth package. These are build/job limits, not expected durations or changes
+to product, WebDriver, or restart deadlines.
+
 The harness uses an isolated root outside the checkout, an ephemeral Tauri
 updater key, a loopback-only mock updater, the packaged app's embedded
 WebDriver, and bounded redacted evidence. It never opens or copies the SQLite

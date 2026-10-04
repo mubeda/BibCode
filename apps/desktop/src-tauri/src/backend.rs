@@ -4682,6 +4682,11 @@ exit /b 9
 
     #[tokio::test]
     async fn default_restart_retries_the_bind_only_for_a_port_the_stopped_backend_held() {
+        let Some(isolated) = crate::test_support::isolated_scenario(
+            "backend::tests::default_restart_retries_the_bind_only_for_a_port_the_stopped_backend_held",
+        ) else {
+            return;
+        };
         use crate::config::IsolatedTestDataRoot;
         use tauri::test::{mock_builder, mock_context, noop_assets};
 
@@ -4733,6 +4738,7 @@ exit /b 9
             .stop(BackendShutdownConfig::default())
             .await
             .expect("default backend should stop");
+        isolated.complete();
     }
 
     #[test]

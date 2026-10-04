@@ -712,6 +712,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         platform: "linux",
         arch: "arm64",
         bundle: "appimage",
+        jobTimeoutMinutes: 240,
       },
       {
         label: "Linux x64 AppImage",
@@ -719,6 +720,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         platform: "linux",
         arch: "x64",
         bundle: "appimage",
+        jobTimeoutMinutes: 240,
       },
       {
         label: "Windows arm64 NSIS",
@@ -726,6 +728,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         platform: "win",
         arch: "arm64",
         bundle: "nsis",
+        jobTimeoutMinutes: 240,
       },
       {
         label: "Windows x64 NSIS",
@@ -733,6 +736,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         platform: "win",
         arch: "x64",
         bundle: "nsis",
+        jobTimeoutMinutes: 240,
       },
       {
         label: "macOS arm64",
@@ -740,6 +744,7 @@ describe("seeded packaged desktop upgrade contract", () => {
         platform: "mac",
         arch: "arm64",
         bundle: "dmg",
+        jobTimeoutMinutes: 240,
       },
       {
         label: "macOS x64",
@@ -747,8 +752,37 @@ describe("seeded packaged desktop upgrade contract", () => {
         platform: "mac",
         arch: "x64",
         bundle: "dmg",
+        jobTimeoutMinutes: 360,
       },
     ]);
+  });
+
+  it("budgets three cold Intel packages and retains setup, every upgrade lane, and evidence", () => {
+    const { workflow } = readWorkflow(DESKTOP_UPGRADE_WORKFLOW_PATH);
+    const smoke = requireJob(workflow, "seeded_upgrade_smoke");
+    expect(smoke["timeout-minutes"]).toBe("${{ matrix.jobTimeoutMinutes }}");
+    const intel = smoke.strategy?.matrix?.include?.find(
+      (row) => row.platform === "mac" && row.arch === "x64",
+    );
+    // Three separate Cargo outputs, three bounded frozen installs, plus an hour
+    // for setup, runtime verification, evidence retention, and cleanup.
+    expect(intel?.jobTimeoutMinutes).toBe(3 * 90 + 3 * 10 + 60);
+    expect(requireJob(workflow, "windows_wsl_upgrade_smoke")["timeout-minutes"]).toBe(240);
+    expect(smoke.steps?.map((step) => step.name)).toEqual([
+      "Checkout complete release history",
+      "Setup Vite+",
+      "Setup Rust",
+      "Cache Rust build output",
+      "Install Linux packaged-updater prerequisites",
+      "Install frozen dependencies",
+      "Resolve previous stable and isolated candidate versions",
+      "Generate ephemeral updater signing key",
+      "Run previous-stable, protected-baseline, and remote-install upgrades",
+      "Upload bounded seeded-upgrade evidence",
+    ]);
+    const commands = allStepCommands(smoke);
+    expect(commands).toContain("--restart-timeout-ms 180000");
+    expect(commands).toContain(". -> target");
   });
 
   it("runs both seeded lanes with ephemeral signing and bounded redacted evidence", () => {
