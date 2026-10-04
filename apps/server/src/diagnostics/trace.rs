@@ -5,6 +5,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use serde_json::{Value, json};
@@ -49,7 +50,28 @@ impl TraceDiagnosticsStore {
     }
 
     pub fn record_failure(&self, name: &str, error: &Value) -> io::Result<()> {
+        self.record_failure_inner(name, error, None)
+    }
+
+    pub fn record_timed_failure(
+        &self,
+        name: &str,
+        error: &Value,
+        elapsed: Duration,
+    ) -> io::Result<()> {
+        self.record_failure_inner(name, error, Some(elapsed))
+    }
+
+    fn record_failure_inner(
+        &self,
+        name: &str,
+        error: &Value,
+        elapsed: Option<Duration>,
+    ) -> io::Result<()> {
         let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let duration_ns = elapsed.map_or(0, |duration| {
+            i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX)
+        });
         let id = Uuid::new_v4().simple().to_string();
         let cause = redact_sensitive_text(&error_summary(&redact_sensitive_value(error)));
         self.append_record(&json!({
@@ -57,9 +79,10 @@ impl TraceDiagnosticsStore {
             "name": non_empty(name, "native.failure"),
             "traceId": id,
             "spanId": Uuid::new_v4().simple().to_string(),
-            "startTimeUnixNano": now.to_string(),
+            "startTimeUnixNano": now.saturating_sub(duration_ns).to_string(),
             "endTimeUnixNano": now.to_string(),
-            "durationMs": 0.0,
+            "durationMs": elapsed.map_or(0.0, |duration| duration.as_secs_f64() * 1000.0),
+            "durationMeasured": elapsed.is_some(),
             "events": [{
                 "name": cause,
                 "timeUnixNano": now.to_string(),
@@ -87,6 +110,7 @@ impl TraceDiagnosticsStore {
             "startTimeUnixNano": now.to_string(),
             "endTimeUnixNano": now.to_string(),
             "durationMs": 0.0,
+            "durationMeasured": false,
             "events": [{
                 "name": name,
                 "timeUnixNano": now.to_string(),
@@ -130,6 +154,7 @@ impl TraceDiagnosticsStore {
 struct SpanOccurrence {
     name: String,
     duration_ms: f64,
+    duration_measured: bool,
     ended_at_ns: i128,
     trace_id: String,
     span_id: String,
@@ -139,6 +164,7 @@ struct SpanOccurrence {
 struct SpanSummary {
     count: usize,
     failure_count: usize,
+    measured_count: usize,
     total_duration_ms: f64,
     max_duration_ms: f64,
 }
@@ -221,13 +247,17 @@ fn aggregate(path: &Path, max_files: usize) -> Value {
             let interrupted = exit_tag == Some("Interrupted");
             failure_count += usize::from(failed);
             interruption_count += usize::from(interrupted);
-            slow_span_count += usize::from(span.duration_ms >= SLOW_SPAN_THRESHOLD_MS);
+            slow_span_count +=
+                usize::from(span.duration_measured && span.duration_ms >= SLOW_SPAN_THRESHOLD_MS);
 
             let summary = spans.entry(span.name.clone()).or_default();
             summary.count += 1;
             summary.failure_count += usize::from(failed);
-            summary.total_duration_ms += span.duration_ms;
-            summary.max_duration_ms = summary.max_duration_ms.max(span.duration_ms);
+            if span.duration_measured {
+                summary.measured_count += 1;
+                summary.total_duration_ms += span.duration_ms;
+                summary.max_duration_ms = summary.max_duration_ms.max(span.duration_ms);
+            }
 
             if failed {
                 let cause = record
@@ -253,7 +283,9 @@ fn aggregate(path: &Path, max_files: usize) -> Value {
                 latest_failures.push((span.clone(), cause));
             }
             collect_log_events(&record, &span, &mut logs, &mut log_level_counts);
-            occurrences.push(span);
+            if span.duration_measured {
+                occurrences.push(span);
+            }
         }
     }
 
@@ -283,8 +315,9 @@ fn aggregate(path: &Path, max_files: usize) -> Value {
                 "name": name,
                 "count": span.count,
                 "failureCount": span.failure_count,
+                "measuredCount": span.measured_count,
                 "totalDurationMs": span.total_duration_ms,
-                "averageDurationMs": span.total_duration_ms / span.count as f64,
+                "averageDurationMs": if span.measured_count == 0 { 0.0 } else { span.total_duration_ms / span.measured_count as f64 },
                 "maxDurationMs": span.max_duration_ms,
             })
         })
@@ -370,9 +403,19 @@ fn aggregate(path: &Path, max_files: usize) -> Value {
 }
 
 fn parse_span(record: &Value) -> Option<SpanOccurrence> {
+    let duration_ms = record.get("durationMs")?.as_f64()?;
+    if !duration_ms.is_finite() || duration_ms < 0.0 {
+        return None;
+    }
+    let duration_measured = match record.get("durationMeasured") {
+        Some(value) => value.as_bool()?,
+        // Older native failure/event records wrote zero without taking a measurement.
+        None => duration_ms > 0.0,
+    };
     Some(SpanOccurrence {
         name: record.get("name")?.as_str()?.trim().to_owned(),
-        duration_ms: record.get("durationMs")?.as_f64()?,
+        duration_ms,
+        duration_measured,
         ended_at_ns: parse_nanos(record.get("endTimeUnixNano"))?,
         trace_id: record.get("traceId")?.as_str()?.trim().to_owned(),
         span_id: record.get("spanId")?.as_str()?.trim().to_owned(),
@@ -571,6 +614,7 @@ fn span_wire(span: SpanOccurrence) -> Value {
     json!({
         "name": span.name,
         "durationMs": span.duration_ms,
+        "durationMeasured": span.duration_measured,
         "endedAt": format_time(span.ended_at_ns),
         "traceId": span.trace_id,
         "spanId": span.span_id,
