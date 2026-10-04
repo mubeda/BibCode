@@ -16,7 +16,13 @@ import * as React from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { actualClearObserver, pinnedSetValue } from "../../test/pinned-wdio-input";
+import {
+  actualClearObserver,
+  actualVisualNameClear,
+  pinnedKeys,
+  pinnedSetValue,
+  type InertKeyboardAction,
+} from "../../test/pinned-wdio-input";
 
 type EffectCallback = () => void | (() => void);
 
@@ -1527,6 +1533,152 @@ if (browserRuntime) {
         expect(reuse?.checked).toBe(false);
         expect(testState.createWorktree).not.toHaveBeenCalled();
       } finally {
+        await React.act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("derives the exact occupied ref through the actual public clear and pinned keyboard commands", async () => {
+      testState.refs = [{ name: "visual-held", isRemote: false, worktreePath: "/owned/held" }];
+      const { container, root } = await mountDialog();
+      const keyboardWire: ReadonlyArray<InertKeyboardAction>[] = [];
+      const releaseActions = vi.fn(async () => {});
+      let controlDown = false;
+      const location = {
+        origin: "http://127.0.0.1:4885",
+        pathname: "/local/owned",
+        search: "",
+        hash: "",
+      };
+      const observer = actualClearObserver({ window, document, location, HTMLInputElement });
+      const observe = (operation: "start" | "finish") =>
+        observer.observeVisualNameClear({
+          origin: location.origin,
+          threadId: "owned",
+          operation,
+          admission: "00000000-0000-4000-8000-000000000004",
+          admitted: operation === "finish",
+        });
+      try {
+        const name = requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Worktree name']",
+        );
+        await setInputValue(name, "codex/delivery retry light");
+        await renderDialog(root, false);
+        await renderDialog(root, true);
+        await React.act(async () => requiredButton(container, "Branch").click());
+        const currentName = requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Worktree name']",
+        );
+        const source = requiredElement<HTMLInputElement>(
+          container,
+          "input[aria-label='Create From']",
+        );
+        await React.act(async () => currentName.focus());
+        const keyboard = {
+          releaseActions,
+          performActions: async (
+            packets: ReadonlyArray<{ type: string; actions: ReadonlyArray<InertKeyboardAction> }>,
+          ) => {
+            expect(packets).toHaveLength(1);
+            expect(packets[0]?.type).toBe("key");
+            const actions = packets[0]!.actions;
+            keyboardWire.push(actions);
+            for (const action of actions) {
+              if (action.type === "pause") continue;
+              expect(document.activeElement).toBe(currentName);
+              if (action.value === "\uE009") {
+                controlDown = action.type === "keyDown";
+              } else if (action.type === "keyDown" && action.value === "a" && controlDown) {
+                currentName.setSelectionRange(0, currentName.value.length);
+              } else if (action.type === "keyDown" && action.value === "\uE003") {
+                expect(controlDown).toBe(false);
+                expect(currentName.selectionStart).toBe(0);
+                expect(currentName.selectionEnd).toBe(currentName.value.length);
+                // Inert protocol endpoint models the browser's ordinary deletion input event.
+                await setInputValue(currentName, "");
+              }
+            }
+          },
+        };
+        const endpoint = (element: HTMLInputElement) => ({
+          elementId: element === currentName ? "owned-name" : "owned-source",
+          elementClear: async () => {
+            await React.act(async () => {
+              element.value = "";
+              element.dispatchEvent(new Event("change", { bubbles: true }));
+            });
+          },
+          elementSendKeys: async (_id: string, text: string) => {
+            if (text !== "") await setInputValue(element, text);
+          },
+        });
+        const clear = actualVisualNameClear({
+          popup: '[data-slot="dialog-popup"][role="dialog"]',
+          browser: {
+            $$: (selector: string) => ({
+              length: Promise.resolve(container.querySelectorAll(selector).length),
+            }),
+            $: (selector: string) => {
+              const element = requiredElement<HTMLInputElement>(container, selector);
+              return {
+                elementId: "owned-name",
+                isFocused: async () => document.activeElement === element,
+                waitForDisplayed: async () => {},
+                waitForEnabled: async () => {
+                  expect(element.disabled).toBe(false);
+                },
+                setValue: (value: string) => pinnedSetValue(endpoint(element), value),
+              };
+            },
+            keys: (value: string | string[]) => pinnedKeys(keyboard, value),
+          },
+          owner: {
+            until: async (read: () => Promise<boolean>) => {
+              expect(await read()).toBe(true);
+            },
+          },
+        });
+        expect(observe("start")).toBe(true);
+        await clear();
+        expect(observer.projectVisualNameClearObservation(observe("finish"))).toEqual({
+          nameCount: "one",
+          sameInput: true,
+          emptyBefore: false,
+          emptyAfter: true,
+          inputEvents: "one",
+          changeEvents: "none",
+          trustedInputEvents: "none",
+          trustedChangeEvents: "none",
+          observerClosed: true,
+        });
+        await pinnedSetValue(endpoint(source), "visual-held");
+        expect(currentName.value).toBe("visual-held");
+        expect(source.value).toBe("visual-held");
+        expect(container.querySelector('p[role="status"]')?.textContent).toContain(
+          '"visual-held-2"',
+        );
+        expect(keyboardWire).toEqual([
+          [
+            { type: "keyDown", value: "\uE009" },
+            { type: "keyDown", value: "a" },
+            { type: "pause", duration: 10 },
+            { type: "keyUp", value: "\uE009" },
+            { type: "keyUp", value: "a" },
+          ],
+          [
+            { type: "keyDown", value: "\uE003" },
+            { type: "pause", duration: 10 },
+            { type: "keyUp", value: "\uE003" },
+          ],
+        ]);
+        expect(controlDown).toBe(false);
+        expect(releaseActions).not.toHaveBeenCalled();
+        expect(testState.createWorktree).not.toHaveBeenCalled();
+      } finally {
+        observe("finish");
         await React.act(async () => root.unmount());
         container.remove();
       }

@@ -840,7 +840,13 @@ error. Other phases do not perform this read.
 
 The same failure receipt also records `createRefClearObservation`, captured by
 one disposable event observer around the existing Worktree name
-`setValue("")` command. Only the single name control at the owned local route
+public keyboard clear. Before selecting text, prove one displayed/enabled name
+control and its active focus through ordinary WebDriver actions. Use the pinned
+`keys(["Control", "a"])` command, then recheck the same element identity,
+unique control and active focus before `keys("Backspace")`. Missing, duplicated,
+replaced or unfocused controls refuse deletion; do not use empty `setValue`,
+force clicks, renderer state writes or synthetic input dispatch to clear this
+controlled field. Only the single name control at the owned local route
 is observed; its received `input`/`change` and trusted-event counts saturate at
 `none`, `one` or `multiple`, and value reads export only empty-before/after
 booleans. Finish removes the listeners before typing Create From. A replaced
@@ -848,9 +854,9 @@ control is reported without reading its value. Unsafe locations, unavailable
 observations or malformed fields remain `null`; probe failure does not replace
 the original command failure or approve capture. Inert endpoint regressions
 exercise the installed WDIO command sequence against the mounted controlled
-dialog, but do not prove which events native Chrome delivered. Establish that
-from this closed native observation before attributing a name mismatch to the
-clear command.
+dialog and compare the legacy change-only clear with keyboard deletion, but do
+not prove which events native Chrome delivers for the new gesture. Establish
+that from this closed native observation before claiming a native correction.
 
 Admission refuses preexisting marker and lifetime-anchor properties. Only an
 acknowledged start can finish its exact host-issued observation lifetime; finish

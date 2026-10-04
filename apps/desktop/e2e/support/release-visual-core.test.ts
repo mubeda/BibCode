@@ -139,7 +139,7 @@ it.each([
   "callback-reject",
   "clear-and-callback-reject",
 ])(
-  "observes the existing clear command before typing the ref without replacing its failure: %s",
+  "observes the public keyboard clear before typing the ref without replacing its failure: %s",
   async (mode) => {
     const order: string[] = [];
     let admission: string | undefined;
@@ -163,22 +163,26 @@ it.each([
       browser: {
         $$: () => ({ length: Promise.resolve(1) }),
         $: (selector: string) => ({
+          elementId: "owned-name",
           isFocused: async () => true,
           waitForDisplayed: async () => {},
           waitForEnabled: async () => {},
           click: async () => {},
           setValue: async (value: string) => {
-            if (selector.includes('placeholder="Worktree name"')) {
-              expect(value).toBe("");
-              order.push("existing-empty-setValue");
-              if (clearRejected) throw clearFailure;
-            } else {
-              expect(value).toBe("visual-held");
-              order.push("type-exact-ref");
-            }
+            expect(selector).not.toContain('placeholder="Worktree name"');
+            expect(value).toBe("visual-held");
+            order.push("type-exact-ref");
           },
         }),
-        keys: async () => {},
+        keys: async (value: string | string[]) => {
+          if (Array.isArray(value) && value[0] === "Control") {
+            expect(value).toEqual(["Control", "a"]);
+            order.push("select-owned-name");
+          } else if (value === "Backspace") {
+            order.push("delete-owned-name");
+            if (clearRejected) throw clearFailure;
+          }
+        },
         execute: async (
           read: unknown,
           value: { operation: string; admission: string; admitted?: boolean },
@@ -236,11 +240,76 @@ it.each([
     ]);
     expect(order).toEqual([
       "start-observer",
-      "existing-empty-setValue",
+      "select-owned-name",
+      "delete-owned-name",
       ...(mode === "start-reject" || mode === "start-unadmitted" ? [] : ["finish-observer"]),
       "record-closed-observation",
       ...(clearRejected ? [] : ["type-exact-ref"]),
     ]);
+  },
+);
+it.each(["missing", "duplicate", "focus-lost", "replacement"])(
+  "refuses keyboard deletion when the exact owned name proof fails: %s",
+  async (mode) => {
+    let focused = true;
+    const gestures: unknown[] = [];
+    const captures: string[] = [];
+    const sourceInput = vi.fn(async () => {});
+    const name = {
+      elementId: "owned-name",
+      isFocused: async () => focused,
+      waitForDisplayed: async () => {},
+      waitForEnabled: async () => {},
+    };
+    const input = {
+      browser: {
+        $$: (selector: string) => ({
+          length: Promise.resolve(
+            selector.includes('placeholder="Worktree name"')
+              ? mode === "missing"
+                ? 0
+                : mode === "duplicate"
+                  ? 2
+                  : 1
+              : 1,
+          ),
+        }),
+        $: (selector: string) =>
+          selector.includes('placeholder="Worktree name"')
+            ? name
+            : {
+                isFocused: async () => true,
+                waitForDisplayed: async () => {},
+                waitForEnabled: async () => {},
+                click: async () => {},
+                setValue: sourceInput,
+              },
+        keys: async (value: string | string[]) => {
+          if (Array.isArray(value) && value[0] === "Control") {
+            gestures.push(value);
+            if (mode === "focus-lost") focused = false;
+            if (mode === "replacement") name.elementId = "replacement";
+          } else if (value === "Backspace") gestures.push(value);
+        },
+      },
+      owner: {
+        until: async (read: () => Promise<boolean>) => {
+          expect(await read()).toBe(true);
+        },
+      },
+      threadId: "owned",
+      branch: "codex/delivery-retry-light",
+      step: () => {},
+      verifyManaged: async () => {},
+      openWorktreeDialog: async () => {},
+      capture: async (scene: string) => {
+        captures.push(scene);
+      },
+    } as unknown as VisualCoreInput;
+    await expect(runVisualCore(input)).rejects.toThrow("Visual public control refused.");
+    expect(gestures).toEqual(mode === "missing" || mode === "duplicate" ? [] : [["Control", "a"]]);
+    expect(sourceInput).not.toHaveBeenCalled();
+    expect(captures).toEqual(["workspace-composite", "workspace-card-menu"]);
   },
 );
 it("checks the shared managed-worktree identity before the first exact scene and propagates capture failure", async () => {
@@ -269,6 +338,7 @@ it("runs only the eight fixed scenes via public controls and keeps image inspect
   const element = (selector: string): object => ({
     waitForDisplayed: async () => {},
     waitForEnabled: async () => {},
+    elementId: "owned-element",
     isFocused: async () => true,
     isDisplayed: async () => selector !== "[data-right-panel-tabbar]",
     click: async () => {
@@ -331,8 +401,14 @@ it("runs only the eight fixed scenes via public controls and keeps image inspect
     "command-palette",
   ]);
   expect(calls.filter((call) => call === "shared-worktree-opener")).toHaveLength(1);
-  expect(calls).toContain(
+  expect(calls).not.toContain(
     'input:[data-slot="dialog-popup"][role="dialog"] input[placeholder="Worktree name"]:',
+  );
+  expect(calls).toContain('key:["Control","a"]');
+  expect(calls).toContain('key:"Backspace"');
+  expect(calls.indexOf('key:["Control","a"]')).toBeLessThan(calls.indexOf('key:"Backspace"'));
+  expect(calls.indexOf('key:"Backspace"')).toBeLessThan(
+    calls.indexOf("capture:worktree-create-ref"),
   );
   expect(calls).not.toContain(
     'click://*[@data-slot="dialog-popup"]//button[normalize-space()="visual-held"]',

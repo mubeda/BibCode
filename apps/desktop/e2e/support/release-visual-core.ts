@@ -97,6 +97,7 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
     await element.waitForEnabled();
     if ((await browser.$$(selector).length) !== 1 || !(await element.isFocused()))
       throw new Error("Visual public control refused.");
+    return element;
   };
   const composer =
     '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]';
@@ -135,7 +136,18 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
     }
   }
   try {
-    await browser.$(`${popup} input[placeholder="Worktree name"]`).setValue("");
+    const selector = `${popup} input[placeholder="Worktree name"]`;
+    const name = await focus(selector);
+    const nameId = name.elementId;
+    if (!nameId) throw new Error("Visual public control refused.");
+    await browser.keys(["Control", "a"]);
+    if (
+      (await browser.$$(selector).length) !== 1 ||
+      !(await name.isFocused()) ||
+      name.elementId !== nameId
+    )
+      throw new Error("Visual public control refused.");
+    await browser.keys("Backspace");
   } finally {
     if (input.recordClearObservation) {
       let observation = null;
