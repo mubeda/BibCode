@@ -3,6 +3,25 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { readVisualWitness } from "./release-visual-observation.ts";
 import * as Observations from "./release-visual-observation.ts";
 import { validateVisualWitness } from "./release-visual-evidence.ts";
+const textRowFacts = {
+  changesActive: true,
+  globalTextRows: "one",
+  scopedTextRows: "one",
+  firstMatchVisible: true,
+  listBoxPresent: true,
+  listBoxPositiveSize: true,
+  listBoxVisible: true,
+  emptyPresent: false,
+  loadingPresent: false,
+  errorPresent: false,
+  filterPresent: false,
+};
+function textRowObservation(value: Observations.VisualTextRowObservationInput) {
+  return Reflect.get(Observations, "readVisualTextRowFailure")?.(value) ?? null;
+}
+function projectTextRow(value: unknown) {
+  return Reflect.get(Observations, "projectVisualTextRowFailure")?.(value) ?? null;
+}
 const input = {
   scene: "command-palette" as const,
   theme: "light" as const,
@@ -279,6 +298,181 @@ describe("owned name-clear event observation", () => {
   });
 });
 describe("read-only visual observations", () => {
+  function textRowDom() {
+    palette();
+    vi.stubGlobal("location", {
+      origin: input.origin,
+      pathname: "/project/local/owned-project/git",
+      search: "",
+      hash: "",
+    });
+    document.body.innerHTML = `<div data-testid="environment-rail-local" aria-checked="true"><i data-status="connected"></i></div><header data-environment-id="local" data-project-id="owned-project"><button aria-label="Worktree">${input.branch}</button><button aria-label="Choose branch">${input.branch}</button></header><button role="tab" aria-selected="true" aria-controls="owned-changes">Changes</button><div role="tabpanel" id="owned-changes"><section aria-label="Changes"><div role="listbox" aria-label="Changed files"><div role="option" data-path="pierre-step5.ts">Owned text</div></div></section></div>`;
+    if (typeof HTMLElement.prototype.checkVisibility === "function")
+      vi.spyOn(HTMLElement.prototype, "checkVisibility").mockReturnValue(true);
+  }
+  it.each([
+    "ok",
+    "row-none",
+    "duplicate-hidden-first",
+    "history",
+    "zero-list",
+    "empty",
+    "loading",
+    "error",
+    "filter",
+  ])("reads only the source-backed current text-row failure facts: %s", (mode) => {
+    textRowDom();
+    if (mode === "row-none") document.querySelector('[data-path="pierre-step5.ts"]')!.remove();
+    if (mode === "duplicate-hidden-first") {
+      const hidden = document.createElement("div");
+      hidden.hidden = true;
+      hidden.append(document.querySelector('[data-path="pierre-step5.ts"]')!.cloneNode(true));
+      document.body.prepend(hidden);
+    }
+    if (mode === "history") {
+      document.querySelector('[role="tab"]')!.setAttribute("aria-selected", "false");
+      document.querySelector<HTMLElement>('[role="tabpanel"]')!.hidden = true;
+    }
+    if (mode === "zero-list")
+      Object.defineProperty(
+        document.querySelector<HTMLElement>('[role="listbox"]')!,
+        "getBoundingClientRect",
+        { value: () => new DOMRect() },
+      );
+    if (["empty", "loading", "error", "filter"].includes(mode)) {
+      const extra = document.createElement("div");
+      extra.innerHTML =
+        mode === "empty"
+          ? "<p>No local changes</p>"
+          : mode === "loading"
+            ? '<div role="status">Connecting to changes…</div>'
+            : mode === "error"
+              ? '<div role="alert">private error text</div>'
+              : '<input name="git-manager-change-filter" value="private filter value">';
+      document.querySelector('[role="tabpanel"]')!.append(extra);
+    }
+    const output = textRowObservation(input) as Record<string, unknown>;
+    const expected: Record<string, unknown> = { ...textRowFacts };
+    if (mode === "row-none")
+      Object.assign(expected, {
+        globalTextRows: "none",
+        scopedTextRows: "none",
+        firstMatchVisible: false,
+      });
+    if (mode === "duplicate-hidden-first")
+      Object.assign(expected, { globalTextRows: "multiple", firstMatchVisible: false });
+    if (mode === "history")
+      Object.assign(expected, {
+        changesActive: false,
+        scopedTextRows: "none",
+        firstMatchVisible: false,
+        listBoxPresent: false,
+        listBoxPositiveSize: false,
+        listBoxVisible: false,
+      });
+    if (mode === "zero-list")
+      Object.assign(expected, { listBoxPositiveSize: false, listBoxVisible: false });
+    if (["empty", "loading", "error", "filter"].includes(mode)) expected[mode + "Present"] = true;
+    expect(output).toEqual(expected);
+    expect(projectTextRow(output)).toEqual(expected);
+    expect(JSON.stringify(output)).not.toMatch(/private|owned|pierre|4885|http/);
+  });
+  it.each([
+    "origin",
+    "pathname",
+    "search",
+    "hash",
+    "theme",
+    "branch",
+    "credential",
+    "thread",
+    "project",
+    "rail",
+    "duplicate-header",
+    "worktree",
+    "missing-panel",
+  ])("refuses unsafe text-row diagnostic scope: %s", (mode) => {
+    textRowDom();
+    const value: Observations.VisualObservationInput = { ...input };
+    if (["origin", "pathname", "search", "hash"].includes(mode))
+      vi.stubGlobal("location", {
+        origin: input.origin,
+        pathname: "/project/local/owned-project/git",
+        search: "",
+        hash: "",
+        [mode]: "outside",
+      });
+    if (mode === "theme") value.theme = "dark";
+    if (mode === "branch") value.branch = "foreign";
+    if (mode === "credential") {
+      const field = document.createElement("input");
+      field.type = "password";
+      document.body.append(field);
+    }
+    if (mode === "thread") value.threadId = "unsafe/thread";
+    if (mode === "project")
+      document.querySelector("header")!.setAttribute("data-project-id", "foreign");
+    if (mode === "rail")
+      document
+        .querySelector('[data-testid="environment-rail-local"]')!
+        .setAttribute("aria-checked", "false");
+    if (mode === "duplicate-header")
+      document.body.append(document.querySelector("header")!.cloneNode(true));
+    if (mode === "worktree")
+      document.querySelector('[aria-label="Worktree"]')!.textContent = "foreign";
+    if (mode === "missing-panel") document.querySelector('[role="tabpanel"]')!.remove();
+    const query = vi.spyOn(document, "querySelectorAll");
+    expect(textRowObservation(value)).toBeNull();
+    expect(
+      query.mock.calls.some(([selector]) => String(selector).includes('data-path="pierre')),
+    ).toBe(false);
+  });
+  it("contains DOM and input accessor failures without exporting their errors", () => {
+    textRowDom();
+    const getter = vi.fn(() => {
+      throw new Error("private identity getter");
+    });
+    const malformed = { ...input };
+    Object.defineProperty(malformed, "origin", { get: getter });
+    expect(textRowObservation(malformed)).toBeNull();
+    expect(getter).toHaveBeenCalledTimes(1);
+    vi.spyOn(document, "querySelectorAll").mockImplementation(() => {
+      throw new Error("private DOM exception");
+    });
+    expect(textRowObservation(input)).toBeNull();
+  });
+  it("projects an exact closed own-data schema and contains getter/proxy failures", () => {
+    expect(projectTextRow(textRowFacts)).toEqual(textRowFacts);
+    for (const key of Object.keys(textRowFacts)) {
+      const missing: Record<string, unknown> = { ...textRowFacts };
+      delete missing[key];
+      expect(projectTextRow(missing)).toBeNull();
+      expect(projectTextRow({ ...textRowFacts, [key]: "private" })).toBeNull();
+      let reads = 0;
+      Object.defineProperty(missing, key, {
+        enumerable: true,
+        get: () => {
+          reads++;
+          throw new Error("private getter");
+        },
+      });
+      expect(projectTextRow(missing)).toBeNull();
+      expect(reads).toBe(0);
+    }
+    expect(projectTextRow({ ...textRowFacts, rawValue: "private" })).toBeNull();
+    const revoked = Proxy.revocable(textRowFacts, {});
+    revoked.revoke();
+    expect(projectTextRow(revoked.proxy)).toBeNull();
+    expect(
+      projectTextRow(
+        new Proxy(textRowFacts, {
+          getOwnPropertyDescriptor() {
+            throw new Error("private descriptor");
+          },
+        }),
+      ),
+    ).toBeNull();
+  });
   it.each([
     "ok",
     "wrong-route",

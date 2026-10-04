@@ -62,7 +62,10 @@ import {
   readVisualViewport,
   readVisualWitness,
   projectVisualNameClearObservation,
+  readVisualTextRowFailure,
+  projectVisualTextRowFailure,
   type VisualObservationInput,
+  type VisualTextRowObservationInput,
 } from "./support/release-visual-observation.ts";
 import { correctDesktopUiOuterSize } from "./support/window-size.ts";
 
@@ -231,6 +234,7 @@ export async function runDeliveryRetryQualification() {
   const captures: object[] = [];
   const capturedVisuals = new Set<string>();
   let createRefObservationInput: VisualObservationInput | null = null;
+  let textRowObservationInput: VisualTextRowObservationInput | null = null;
   let createRefClearObservation: ReturnType<typeof projectVisualNameClearObservation> = null;
   let browserDriverReadiness: OwnedDriverReadiness | null = null;
   let browserReadinessStage: "driver-readiness" | "session-create" | "online-proof" | null = null;
@@ -349,6 +353,18 @@ export async function runDeliveryRetryQualification() {
       );
     } catch {
       // The bounded diagnostic never replaces the original failure.
+      return null;
+    }
+  }
+
+  async function readTextRowFailureObservation() {
+    if (textRowObservationInput === null) return null;
+    try {
+      return projectVisualTextRowFailure(
+        await bounded(browser!.execute(readVisualTextRowFailure, textRowObservationInput), 2_000),
+      );
+    } catch {
+      // This sample cannot replace the original wait failure or owned cleanup.
       return null;
     }
   }
@@ -922,6 +938,7 @@ export async function runDeliveryRetryQualification() {
           step,
           openWorktreeDialog,
           verifyManaged: async () => {
+            textRowObservationInput = null;
             await owner.until(
               async () =>
                 (
@@ -940,6 +957,12 @@ export async function runDeliveryRetryQualification() {
                   commonDirectory: workspace.commonDirectory,
                 }),
             );
+            textRowObservationInput = {
+              theme,
+              origin,
+              threadId: workspace.threadId,
+              branch: workspace.branch,
+            };
           },
           partialStageMatches: () => visualPartialStageMatches(visualInput),
           recordClearObservation: (value) => {
@@ -1198,6 +1221,10 @@ export async function runDeliveryRetryQualification() {
     );
     success = true;
   } catch (error) {
+    const textRowObservation =
+      browser && phase === "visual-partial-stage-text-row-displayed"
+        ? await readTextRowFailureObservation()
+        : null;
     const createRefObservation =
       browser && phase === "visual-worktree-create-ref"
         ? await readCreateRefFailureObservation()
@@ -1228,6 +1255,7 @@ export async function runDeliveryRetryQualification() {
       importObservation,
       worktreeObservation,
       createRefObservation,
+      textRowObservation,
       createRefClearObservation:
         phase === "visual-worktree-create-ref" ? createRefClearObservation : null,
       browserDriverReadiness:

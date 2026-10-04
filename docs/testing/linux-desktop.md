@@ -879,6 +879,21 @@ unavailable, malformed or extra fields remain unknown (`null`). This observation
 never approves a screenshot and retains no page text, input, path, URL or driver
 error. Other phases do not perform this read.
 
+At only `visual-partial-stage-text-row-displayed`, `failure.json` additionally
+records `textRowObservation`: one failure-only DOM sample bounded to two seconds
+using the theme, origin, thread and branch already verified by the core managed
+worktree callback. The safe local Git route, empty query/hash, exact toolbar
+ownership and absent credential controls are checked before reading rows. The
+Changes tab's ARIA relation locates its active panel locally without retaining
+its ID. Closed facts report Changes active, capped global/scoped fixture text-row
+counts, first-match visibility, active Changes listbox presence/positive size/
+visibility, and known empty/loading/error/filter presence. They retain no text,
+values, names, paths, IDs, URLs, HTML or driver errors. Unsafe, unavailable or
+malformed observations remain `null`; failures in this sample cannot replace
+the original wait failure, approve capture, alter recovery or delay joined
+cleanup beyond the single bound. These facts describe the later sample, not
+the state at the earlier failed wait.
+
 The same failure receipt also records `createRefClearObservation`, captured by
 one disposable event observer around the existing Worktree name
 public keyboard clear. Before selecting text, prove one displayed/enabled name

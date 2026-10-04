@@ -7,6 +7,163 @@ export interface VisualObservationInput {
   branch: string;
 }
 
+export type VisualTextRowObservationInput = Omit<VisualObservationInput, "scene">;
+
+/** One failure-only DOM sample; no page identity, text or values leave this reader. */
+export function readVisualTextRowFailure(
+  input: VisualTextRowObservationInput,
+): Record<string, unknown> | null {
+  try {
+    const route = /^\/project\/local\/([A-Za-z0-9._:-]{1,128})\/git$/.exec(location.pathname);
+    if (
+      input.origin !== "http://127.0.0.1:4885" ||
+      location.origin !== input.origin ||
+      location.search !== "" ||
+      location.hash !== "" ||
+      route === null ||
+      !/^[A-Za-z0-9._:-]{1,128}$/.test(input.threadId) ||
+      (input.theme !== "light" && input.theme !== "dark") ||
+      document.documentElement.classList.contains("dark") !== (input.theme === "dark") ||
+      input.branch !== "codex/delivery-retry-" + input.theme ||
+      document.querySelector(
+        '#pairing-token,input[type="password"],input[autocomplete="one-time-code"],textarea[placeholder^="bibcode://pair"]',
+      ) !== null
+    )
+      return null;
+    const headers = document.querySelectorAll("header[data-environment-id][data-project-id]");
+    const rails = document.querySelectorAll('[data-testid="environment-rail-local"]');
+    const worktrees = document.querySelectorAll('[aria-label="Worktree"]');
+    const branches = document.querySelectorAll('[aria-label="Choose branch"]');
+    if (
+      headers.length !== 1 ||
+      headers[0]!.getAttribute("data-environment-id") !== "local" ||
+      headers[0]!.getAttribute("data-project-id") !== route[1] ||
+      rails.length !== 1 ||
+      rails[0]!.getAttribute("aria-checked") !== "true" ||
+      rails[0]!.querySelector('[data-status="connected"]') === null ||
+      worktrees.length !== 1 ||
+      branches.length !== 1 ||
+      !headers[0]!.contains(worktrees[0]!) ||
+      !headers[0]!.contains(branches[0]!) ||
+      worktrees[0]!.textContent?.trim() !== input.branch ||
+      branches[0]!.textContent?.trim() !== input.branch
+    )
+      return null;
+    const tabs = Array.from(document.querySelectorAll('[role="tab"]')).filter(
+      (tab) => tab.textContent?.trim() === "Changes",
+    );
+    if (tabs.length !== 1) return null;
+    const changesActive = tabs[0]!.getAttribute("aria-selected") === "true";
+    const panelId = tabs[0]!.getAttribute("aria-controls");
+    const panel = panelId ? document.getElementById(panelId) : null;
+    if (changesActive && panel?.getAttribute("role") !== "tabpanel") return null;
+    const scope = changesActive ? panel : null;
+    const selector = '[role="option"][data-path="pierre-step5.ts"]';
+    const globalRows = document.querySelectorAll(selector);
+    const scopedRows = scope?.querySelectorAll(selector);
+    const lists = scope?.querySelectorAll('[role="listbox"][aria-label="Changed files"]');
+    const list = lists?.length === 1 ? lists[0]! : null;
+    const positiveSize = (element: Element | null): boolean => {
+      if (!element) return false;
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const visible = (element: Element | null): boolean => {
+      if (!positiveSize(element)) return false;
+      for (let ancestor = element; ancestor !== null; ancestor = ancestor.parentElement) {
+        if (ancestor.hasAttribute("hidden") || ancestor.hasAttribute("inert")) return false;
+        const style = getComputedStyle(ancestor);
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")
+          return false;
+      }
+      return (
+        typeof element!.checkVisibility !== "function" ||
+        element!.checkVisibility({
+          contentVisibilityAuto: true,
+          opacityProperty: true,
+          visibilityProperty: true,
+        })
+      );
+    };
+    const count = (value: number) => (value === 0 ? "none" : value === 1 ? "one" : "multiple");
+    const paragraphs = Array.from(scope?.querySelectorAll("p") ?? []);
+    const loading = Array.from(scope?.querySelectorAll('[role="status"]') ?? []);
+    const filters = Array.from(
+      scope?.querySelectorAll<HTMLInputElement>('input[name="git-manager-change-filter"]') ?? [],
+    );
+    const filterNames = ["included", "excluded", "new", "modified", "deleted"];
+    return {
+      changesActive,
+      globalTextRows: count(globalRows.length),
+      scopedTextRows: count(scopedRows?.length ?? 0),
+      firstMatchVisible: visible(globalRows[0] ?? null),
+      listBoxPresent: (lists?.length ?? 0) > 0,
+      listBoxPositiveSize: positiveSize(list),
+      listBoxVisible: visible(list),
+      emptyPresent: paragraphs.some((element) =>
+        ["No local changes", "No changed files match these filters."].includes(
+          element.textContent?.trim() ?? "",
+        ),
+      ),
+      loadingPresent: loading.some(
+        (element) => element.textContent?.trim() === "Connecting to changes…",
+      ),
+      errorPresent: scope?.querySelector('[role="alert"]') !== null && scope !== null,
+      filterPresent:
+        filters.some((field) => field.value.length > 0) ||
+        filterNames.some(
+          (name) =>
+            scope?.querySelector(
+              '[role="checkbox"][aria-label="Filter ' +
+                name +
+                ' changed files"][aria-checked="true"]',
+            ) != null,
+        ),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Only the exact closed data schema may enter a failure receipt. */
+export function projectVisualTextRowFailure(input: unknown): Record<string, unknown> | null {
+  try {
+    if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+    const keys = [
+      "changesActive",
+      "globalTextRows",
+      "scopedTextRows",
+      "firstMatchVisible",
+      "listBoxPresent",
+      "listBoxPositiveSize",
+      "listBoxVisible",
+      "emptyPresent",
+      "loadingPresent",
+      "errorPresent",
+      "filterPresent",
+    ];
+    const ownKeys = Reflect.ownKeys(input);
+    if (
+      ownKeys.length !== keys.length ||
+      !ownKeys.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const result: Record<string, unknown> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      const value = descriptor.value;
+      if (key === "globalTextRows" || key === "scopedTextRows") {
+        if (value !== "none" && value !== "one" && value !== "multiple") return null;
+      } else if (typeof value !== "boolean") return null;
+      result[key] = value;
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+
 /** One disposable observer of real events around the existing owned clear command. */
 export function observeVisualNameClear(input: {
   origin: string;

@@ -22,6 +22,8 @@ import { prepareDesktopUiTestContext } from "./test-project.ts";
 import {
   projectVisualNameClearObservation,
   readVisualWitness,
+  readVisualTextRowFailure,
+  projectVisualTextRowFailure,
 } from "./release-visual-observation.ts";
 
 const environment = {
@@ -50,6 +52,236 @@ const createRefFacts = {
   agentControl: true,
   advancedControl: true,
 };
+
+const textRowFacts = {
+  changesActive: true,
+  globalTextRows: "one",
+  scopedTextRows: "one",
+  firstMatchVisible: false,
+  listBoxPresent: true,
+  listBoxPositiveSize: true,
+  listBoxVisible: true,
+  emptyPresent: false,
+  loadingPresent: false,
+  errorPresent: false,
+  filterPresent: false,
+};
+
+describe("closed text-row failure boundary", () => {
+  it.each(["verified", "selected-rejected", "git-rejected"])(
+    "binds the input only after the real existing core identity callback: %s",
+    async (mode) => {
+      const coreStart = controller.indexOf('if (config.selection === "release-visual-core")');
+      const start = controller.indexOf("          verifyManaged: async () => {", coreStart);
+      const end = controller.indexOf("          partialStageMatches:", start);
+      expect(start).toBeGreaterThan(coreStart);
+      expect(end).toBeGreaterThan(start);
+      const workspace = {
+        threadId: "owned-thread",
+        branch: "codex/delivery-retry-light",
+        path: "/owned/worktree",
+        commonDirectory: "/owned/common",
+      };
+      const calls: string[] = [];
+      const invoke = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          "let textRowObservationInput = { old: true }; const verify = ({" +
+            controller.slice(start, end) +
+            "}).verifyManaged; async () => { let failed = false; try { await verify(); } catch { failed = true; } return { input: textRowObservationInput, failed }; }",
+        ),
+        {
+          theme: "light",
+          origin: "http://127.0.0.1:4885",
+          workspace,
+          visualInput: { fixture: "owned" },
+          owner: {
+            until: async (predicate: () => Promise<boolean>) => {
+              calls.push("selected");
+              if (!(await predicate())) throw new Error("private selected identity");
+            },
+          },
+          b: () => ({
+            execute: async (reader: unknown, input: unknown) => {
+              expect(reader).toBe(readSelectedDeliveryWorktree);
+              expect(input).toEqual({
+                origin: "http://127.0.0.1:4885",
+                branch: workspace.branch,
+                boundThreadId: workspace.threadId,
+              });
+              return { threadId: mode === "selected-rejected" ? "foreign" : workspace.threadId };
+            },
+          }),
+          readSelectedDeliveryWorktree,
+          readOwnedDeliveryWorktree: () => {
+            calls.push("git");
+            return {
+              path: mode === "git-rejected" ? "/foreign" : workspace.path,
+              branch: workspace.branch,
+              commonDirectory: workspace.commonDirectory,
+            };
+          },
+          check: (value: boolean) => {
+            if (!value) throw new Error("private Git identity");
+          },
+        },
+      ) as () => Promise<{ input: unknown; failed: boolean }>;
+      const result = await invoke();
+      expect(result.failed).toBe(mode !== "verified");
+      expect(result.input).toEqual(
+        mode === "verified"
+          ? {
+              theme: "light",
+              origin: "http://127.0.0.1:4885",
+              threadId: workspace.threadId,
+              branch: workspace.branch,
+            }
+          : null,
+      );
+      expect(calls).toEqual(mode === "selected-rejected" ? ["selected"] : ["selected", "git"]);
+    },
+  );
+
+  it.each([
+    "record",
+    "wrong-phase",
+    "absent",
+    "unverified",
+    "malformed",
+    "accessor",
+    "proxy",
+    "reject",
+    "timeout",
+  ])("contains the actual one bounded read and joins original cleanup: %s", async (mode) => {
+    vi.useFakeTimers();
+    try {
+      const writes: Record<string, unknown>[] = [],
+        bounds: number[] = [],
+        events: string[] = [];
+      const getter = vi.fn(() => {
+        throw new Error("private getter");
+      });
+      const accessor = { ...textRowFacts };
+      Object.defineProperty(accessor, "changesActive", { enumerable: true, get: getter });
+      const revoked = Proxy.revocable(textRowFacts, {});
+      revoked.revoke();
+      const originalError = new Error(
+        "The required live observation did not arrive within its bound.",
+      );
+      const classify = vi.fn((error: unknown) => {
+        expect(error).toBe(originalError);
+        return classifyQualificationFailure(error);
+      });
+      const observationInput = {
+        theme: "light",
+        origin: "http://127.0.0.1:4885",
+        threadId: "owned-thread",
+        branch: "codex/delivery-retry-light",
+      };
+      let finishRead: (value: unknown) => void = () => {};
+      let reads = 0;
+      const helperStart = controller.indexOf("  async function readTextRowFailureObservation()");
+      const helperEnd = controller.indexOf(
+        "  async function readImportFailureObservation()",
+        helperStart,
+      );
+      const catchStart = controller.lastIndexOf("  } catch (error) {");
+      const finallyEnd = controller.indexOf("  return success ? 0 : 1;", catchStart);
+      expect(helperStart).toBeGreaterThan(0);
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          controller.slice(helperStart, helperEnd) +
+            "\nasync function fail() { try { throw error;" +
+            controller.slice(catchStart, finallyEnd) +
+            "}\nfail",
+        ),
+        {
+          browser:
+            mode === "absent"
+              ? undefined
+              : {
+                  execute: async (reader: unknown, input: unknown) => {
+                    reads++;
+                    expect(reader).toBe(readVisualTextRowFailure);
+                    expect(input).toEqual(observationInput);
+                    if (mode === "reject") throw new Error("private driver error");
+                    if (mode === "timeout")
+                      return new Promise((resolve) => {
+                        finishRead = resolve;
+                      });
+                    return mode === "malformed"
+                      ? { ...textRowFacts, raw: "private" }
+                      : mode === "accessor"
+                        ? accessor
+                        : mode === "proxy"
+                          ? revoked.proxy
+                          : textRowFacts;
+                  },
+                  deleteSession: async () => {
+                    events.push("delete-session");
+                  },
+                },
+          textRowObservationInput: mode === "unverified" ? null : observationInput,
+          phase:
+            mode === "wrong-phase"
+              ? "visual-partial-stage-text-row-enabled"
+              : "visual-partial-stage-text-row-displayed",
+          theme: "light",
+          error: originalError,
+          success: false,
+          config: { source: "a".repeat(40), selection: "release-visual-core" },
+          captures: [],
+          assertions: [],
+          networkProofs: [],
+          bounded: (promise: Promise<unknown>, ms: number) => {
+            bounds.push(ms);
+            return bounded(promise, ms);
+          },
+          readVisualTextRowFailure,
+          projectVisualTextRowFailure,
+          classifyQualificationFailure: classify,
+          owner: {
+            processes: [],
+            failures: [],
+            childrenClosed: () => true,
+            close: async (options: { browser?: () => Promise<void> }) => {
+              events.push("close");
+              await options.browser?.();
+              events.push("closed");
+            },
+          },
+          write: (name: string, value: Record<string, unknown>) => {
+            events.push(name);
+            writes.push(value);
+          },
+          createRefClearObservation: null,
+        },
+      ) as () => Promise<void>;
+      const pending = run();
+      if (mode === "timeout") await vi.advanceTimersByTimeAsync(2_001);
+      await pending;
+      expect(writes[0]?.textRowObservation).toEqual(mode === "record" ? textRowFacts : null);
+      expect(writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+      expect(classify).toHaveBeenCalledTimes(1);
+      expect(getter).not.toHaveBeenCalled();
+      const skipped = ["wrong-phase", "absent", "unverified"].includes(mode);
+      expect(reads).toBe(skipped ? 0 : 1);
+      expect(bounds).toEqual(skipped ? [] : [2_000]);
+      expect(events).toEqual(
+        mode === "absent"
+          ? ["failure", "close", "closed", "result"]
+          : ["failure", "close", "delete-session", "closed", "result"],
+      );
+      expect(writes[1]?.childProcessesClosed).toBe(true);
+      expect(JSON.stringify(writes)).not.toMatch(/private|owned-thread|http|pierre/);
+      const receipt = JSON.stringify(writes);
+      finishRead({ raw: "private late response" });
+      await Promise.resolve();
+      expect(JSON.stringify(writes)).toBe(receipt);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 function createRefFailureBoundary(
   options: {
