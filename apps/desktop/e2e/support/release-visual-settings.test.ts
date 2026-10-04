@@ -7,6 +7,7 @@ import * as NodePath from "node:path";
 import * as NodeVM from "node:vm";
 import * as NodeZlib from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import * as SettingsEvidence from "./release-visual-settings.ts";
 import {
   captureSettingsVisualScene,
   readSettingsVisualWitness,
@@ -359,6 +360,263 @@ function png() {
     chunk("IEND", Buffer.alloc(0)),
   ]);
 }
+
+const sourceControlFailureFacts = {
+  themeMatched: true,
+  selectedMatched: true,
+  expectedTextMatched: false,
+  targetInView: false,
+  credentialAbsent: true,
+  bootShellAbsent: true,
+  gitAvailable: true,
+  gitVersionVisible: false,
+  hostingUnavailable: true,
+  availabilityReasons: true,
+  fetchIntervalVisible: false,
+  scanSettled: true,
+};
+
+it("observes only the existing false capture facts while preserving the original capture error", async () => {
+  const evidence = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "settings-failure-facts-"));
+  const original = new Error("Original capture observation timeout.");
+  const calls: string[] = [];
+  const observed: Array<{ error: unknown; witness: unknown }> = [];
+  const input = {
+    ...observation,
+    scene: "settings-source-control",
+    evidence,
+    captured: new Set<string>(),
+    verifyOwnedIdentity: async () => {
+      calls.push("identity");
+    },
+    browser: {
+      isAlertOpen: async () => {
+        calls.push("alert");
+        return false;
+      },
+      execute: async (reader: unknown) => {
+        expect(reader).toBe(readSettingsVisualWitness);
+        calls.push("read");
+        return sourceControlFailureFacts;
+      },
+      takeScreenshot: async () => {
+        throw new Error("No screenshot on failed witness.");
+      },
+    },
+    owner: {
+      until: async (read: () => Promise<boolean>) => {
+        expect(await read()).toBe(false);
+        throw original;
+      },
+    },
+    observeFailure: (error: unknown, witness: unknown) => {
+      observed.push({ error, witness });
+    },
+  } as unknown as SettingsVisualCaptureInput;
+  try {
+    await expect(captureSettingsVisualScene(input)).rejects.toBe(original);
+    expect(observed).toEqual([{ error: original, witness: sourceControlFailureFacts }]);
+    expect(calls).toEqual(["alert", "identity", "read"]);
+    expect(NodeFS.readdirSync(evidence)).toEqual([]);
+  } finally {
+    NodeFS.rmSync(evidence, { recursive: true, force: true });
+  }
+});
+
+it.each(["false", "missing", "extra", "unsafe", "getter", "proxy", "non-boolean"])(
+  "projects only complete safe own boolean failure facts: %s",
+  (mode) => {
+    const project = Reflect.get(SettingsEvidence, "projectSettingsVisualFailureWitness");
+    expect(typeof project).toBe("function");
+    let input: unknown = { ...sourceControlFailureFacts };
+    let reads = 0;
+    if (mode === "missing") delete (input as Record<string, unknown>).scanSettled;
+    if (mode === "extra") Object.assign(input as object, { raw: "private" });
+    if (mode === "unsafe") Object.assign(input as object, { credentialAbsent: false });
+    if (mode === "non-boolean") Object.assign(input as object, { scanSettled: "private" });
+    if (mode === "getter")
+      Object.defineProperty(input, "gitVersionVisible", {
+        enumerable: true,
+        get() {
+          reads++;
+          throw new Error("private getter");
+        },
+      });
+    if (mode === "proxy") {
+      const revocable = Proxy.revocable(input as object, {});
+      revocable.revoke();
+      input = revocable.proxy;
+    }
+    const result = project("settings-source-control", input);
+    expect(result).toEqual(mode === "false" ? sourceControlFailureFacts : null);
+    expect(reads).toBe(0);
+    expect(JSON.stringify(result)).not.toContain("private");
+  },
+);
+
+it.each(["themeMatched", "selectedMatched", "credentialAbsent", "bootShellAbsent"])(
+  "quarantines unsafe %s context without treating it as a failed scene fact",
+  (guard) => {
+    expect(
+      SettingsEvidence.projectSettingsVisualFailureWitness("settings-source-control", {
+        ...sourceControlFailureFacts,
+        [guard]: false,
+      }),
+    ).toBeNull();
+  },
+);
+
+it.each(["transparent", "spoofing", "throwing", "revoked"])(
+  "quarantines native %s failure-witness proxies before any trap",
+  (mode) => {
+    let traps = 0;
+    const target = {
+      ...sourceControlFailureFacts,
+      credentialAbsent: mode !== "spoofing",
+    };
+    const handler: ProxyHandler<typeof target> = {
+      ownKeys(value) {
+        traps++;
+        if (mode === "throwing") throw new Error("inert proxy trap");
+        return Reflect.ownKeys(value);
+      },
+      getOwnPropertyDescriptor(value, key) {
+        traps++;
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        return key === "credentialAbsent" && mode === "spoofing"
+          ? { ...descriptor, value: true }
+          : descriptor;
+      },
+      get(value, key, receiver) {
+        traps++;
+        return Reflect.get(value, key, receiver);
+      },
+    };
+    const revocable = Proxy.revocable(target, handler);
+    if (mode === "revoked") revocable.revoke();
+    expect(
+      SettingsEvidence.projectSettingsVisualFailureWitness(
+        "settings-source-control",
+        revocable.proxy,
+      ),
+    ).toBeNull();
+    expect(traps).toBe(0);
+  },
+);
+
+it("reports the last actual poll result without adding a diagnostic execution", async () => {
+  const evidence = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "settings-latest-facts-"));
+  const original = new Error("Original repeated observation timeout.");
+  const latest = { ...sourceControlFailureFacts, scanSettled: false };
+  let reads = 0;
+  const observed: unknown[] = [];
+  try {
+    await expect(
+      captureSettingsVisualScene({
+        ...observation,
+        scene: "settings-source-control",
+        evidence,
+        captured: new Set(),
+        verifyOwnedIdentity: async () => {},
+        browser: {
+          isAlertOpen: async () => false,
+          execute: async () => (++reads === 1 ? sourceControlFailureFacts : latest),
+          takeScreenshot: async () => {
+            throw new Error("No screenshot expected.");
+          },
+        },
+        owner: {
+          until: async (read: () => Promise<boolean>) => {
+            expect(await read()).toBe(false);
+            expect(await read()).toBe(false);
+            throw original;
+          },
+        },
+        observeFailure: (error: unknown, witness: unknown) => {
+          expect(error).toBe(original);
+          observed.push(witness);
+        },
+      } as unknown as SettingsVisualCaptureInput),
+    ).rejects.toBe(original);
+    expect(reads).toBe(2);
+    expect(observed).toEqual([latest]);
+    expect(NodeFS.readdirSync(evidence)).toEqual([]);
+  } finally {
+    NodeFS.rmSync(evidence, { recursive: true, force: true });
+  }
+});
+
+it.each(["observer-fault", "pre-read", "read-reject", "after-read", "after-identity"])(
+  "contains failure observation without adding reads or replacing original error: %s",
+  async (mode) => {
+    const evidence = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "settings-failure-source-"));
+    const original = new Error("Original controlled capture failure.");
+    let identities = 0,
+      reads = 0,
+      shots = 0;
+    const observed: Array<{ error: unknown; witness: unknown }> = [];
+    const good = {
+      ...sourceControlFailureFacts,
+      expectedTextMatched: true,
+      targetInView: true,
+      gitVersionVisible: true,
+      fetchIntervalVisible: true,
+    };
+    const input = {
+      ...observation,
+      scene: "settings-source-control",
+      evidence,
+      captured: new Set<string>(),
+      verifyOwnedIdentity: async () => {
+        identities++;
+        if (mode === "pre-read" || (mode === "after-identity" && identities === 2)) throw original;
+      },
+      browser: {
+        isAlertOpen: async () => false,
+        execute: async () => {
+          reads++;
+          if (mode === "read-reject") throw original;
+          return ["after-read", "after-identity"].includes(mode) && reads === 1
+            ? good
+            : sourceControlFailureFacts;
+        },
+        takeScreenshot: async () => {
+          shots++;
+          return png().toString("base64");
+        },
+      },
+      owner: {
+        until: async (read: () => Promise<boolean>) => {
+          if (!(await read())) throw original;
+        },
+      },
+      observeFailure: (error: unknown, witness: unknown) => {
+        observed.push({ error, witness });
+        if (mode === "observer-fault") throw new Error("Optional observer fault.");
+      },
+    } as unknown as SettingsVisualCaptureInput;
+    try {
+      if (mode === "after-read")
+        await expect(captureSettingsVisualScene(input)).rejects.toThrow(
+          "Visual settings precondition failed.",
+        );
+      else await expect(captureSettingsVisualScene(input)).rejects.toBe(original);
+      expect(observed).toHaveLength(1);
+      if (mode !== "after-read") expect(observed[0]!.error).toBe(original);
+      expect(observed[0]!.witness).toEqual(
+        ["pre-read", "read-reject", "after-identity"].includes(mode)
+          ? null
+          : sourceControlFailureFacts,
+      );
+      expect(reads).toBe(mode === "pre-read" ? 0 : mode === "after-read" ? 2 : 1);
+      expect(shots).toBe(["after-read", "after-identity"].includes(mode) ? 1 : 0);
+      expect(input.captured.size).toBe(0);
+      expect(NodeFS.readdirSync(evidence)).toEqual([]);
+    } finally {
+      NodeFS.rmSync(evidence, { recursive: true, force: true });
+    }
+  },
+);
 describe("original settings PNG boundary", () => {
   it.each([
     "ok",

@@ -3,6 +3,7 @@ import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeVM from "node:vm";
 import { describe, expect, it } from "vite-plus/test";
+import { createSettingsCaptureFailureObserver } from "../qualify-delivery-retry.ts";
 import {
   projectSettingsVisualCapture,
   projectSettingsVisualAssertion,
@@ -120,6 +121,8 @@ function wiring(failure?: string) {
       visualInput,
       config: { evidence: "/owned-evidence" },
       capturedVisuals: new Set(),
+      settingsCaptureFailures: new WeakMap(),
+      createSettingsCaptureFailureObserver,
       captures,
       assertions,
       b: () => browser,

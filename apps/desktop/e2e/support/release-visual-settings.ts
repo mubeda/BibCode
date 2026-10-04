@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Finite original PNG evidence in the owned qualification root.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeUtil from "node:util";
 import {
   bounded,
   type QualificationBrowser,
@@ -64,6 +65,50 @@ const sceneFacts: Record<SettingsVisualScene, readonly string[]> = {
     "scanSettled",
   ],
 };
+
+/** Closed already-read failure facts; unsafe context is unavailable, never capture approval. */
+export function projectSettingsVisualFailureWitness(
+  scene: SettingsVisualScene,
+  input: unknown,
+): Readonly<Record<string, boolean>> | null {
+  try {
+    if (
+      !settingsVisualScenes.includes(scene) ||
+      !input ||
+      typeof input !== "object" ||
+      NodeUtil.types.isProxy(input) ||
+      Array.isArray(input)
+    )
+      return null;
+    const keys = [...commonFacts, ...sceneFacts[scene]];
+    const ownKeys = Reflect.ownKeys(input);
+    if (
+      ownKeys.length !== keys.length ||
+      !ownKeys.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const result: Record<string, boolean> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (
+        !descriptor?.enumerable ||
+        !Object.hasOwn(descriptor, "value") ||
+        typeof descriptor.value !== "boolean"
+      )
+        return null;
+      result[key] = descriptor.value;
+    }
+    if (
+      ["themeMatched", "selectedMatched", "credentialAbsent", "bootShellAbsent"].some(
+        (key) => result[key] !== true,
+      )
+    )
+      return null;
+    return Object.freeze(result);
+  } catch {
+    return null;
+  }
+}
 export function settingsVisualScreenshotName(scene: string, theme: string): string {
   if (
     !settingsVisualScenes.some((allowed) => allowed === scene) ||
@@ -498,47 +543,67 @@ export interface SettingsVisualCaptureInput extends SettingsVisualObservationInp
   evidence: string;
   captured: Set<string>;
   verifyOwnedIdentity: () => Promise<void>;
+  observeFailure?: (error: unknown, witness: Readonly<Record<string, boolean>> | null) => void;
 }
 export async function captureSettingsVisualScene(
   input: SettingsVisualCaptureInput,
 ): Promise<object> {
-  const file = settingsVisualScreenshotName(input.scene, input.theme),
-    path = NodePath.join(input.evidence, file);
-  if (input.captured.has(file) || NodeFS.existsSync(path) || (await input.browser.isAlertOpen()))
-    throw new Error("Visual settings capture refused.");
-  const observation: SettingsVisualObservationInput = {
-    scene: input.scene,
-    theme: input.theme,
-    origin: input.origin,
-    threadId: input.threadId,
-    branch: input.branch,
-  };
-  await input.verifyOwnedIdentity();
-  let witness: Record<string, true> | undefined;
-  await input.owner.until(async () => {
-    const value = await bounded(
+  let latestWitness: unknown = null;
+  let identityVerified = false;
+  try {
+    const file = settingsVisualScreenshotName(input.scene, input.theme),
+      path = NodePath.join(input.evidence, file);
+    if (input.captured.has(file) || NodeFS.existsSync(path) || (await input.browser.isAlertOpen()))
+      throw new Error("Visual settings capture refused.");
+    const observation: SettingsVisualObservationInput = {
+      scene: input.scene,
+      theme: input.theme,
+      origin: input.origin,
+      threadId: input.threadId,
+      branch: input.branch,
+    };
+    await input.verifyOwnedIdentity();
+    identityVerified = true;
+    let witness: Record<string, true> | undefined;
+    await input.owner.until(async () => {
+      const value = await bounded(
+        input.browser.execute(readSettingsVisualWitness, observation),
+        2_000,
+      );
+      latestWitness = value;
+      try {
+        witness = validateSettingsVisualWitness(input.scene, value);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    const bytes = Buffer.from(await bounded(input.browser.takeScreenshot(), 5_000), "base64");
+    identityVerified = false;
+    await input.verifyOwnedIdentity();
+    identityVerified = true;
+    latestWitness = await bounded(
       input.browser.execute(readSettingsVisualWitness, observation),
       2_000,
     );
+    validateSettingsVisualWitness(input.scene, latestWitness);
+    const image = inspectScreenshot(bytes);
+    if (image.width !== 1280 || image.height !== 960)
+      throw new Error("Visual settings viewport refused.");
+    NodeFS.writeFileSync(path, bytes, { mode: 0o600, flag: "wx" });
+    input.captured.add(file);
+    return { scene: input.scene, theme: input.theme, file, witness, ...image };
+  } catch (error) {
     try {
-      witness = validateSettingsVisualWitness(input.scene, value);
-      return true;
+      input.observeFailure?.(
+        error,
+        identityVerified ? projectSettingsVisualFailureWitness(input.scene, latestWitness) : null,
+      );
     } catch {
-      return false;
+      // Optional facts cannot replace the original capture failure.
     }
-  });
-  const bytes = Buffer.from(await bounded(input.browser.takeScreenshot(), 5_000), "base64");
-  await input.verifyOwnedIdentity();
-  validateSettingsVisualWitness(
-    input.scene,
-    await bounded(input.browser.execute(readSettingsVisualWitness, observation), 2_000),
-  );
-  const image = inspectScreenshot(bytes);
-  if (image.width !== 1280 || image.height !== 960)
-    throw new Error("Visual settings viewport refused.");
-  NodeFS.writeFileSync(path, bytes, { mode: 0o600, flag: "wx" });
-  input.captured.add(file);
-  return { scene: input.scene, theme: input.theme, file, witness, ...image };
+    throw error;
+  }
 }
 
 export interface SettingsVisualInput extends Omit<SettingsVisualObservationInput, "scene"> {

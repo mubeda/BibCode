@@ -980,6 +980,15 @@ Readonly availability requires native `disabled` or exact public
 `aria-disabled="true"`. Base UI switch roots use the latter; a data marker,
 muted style or disabled-looking text alone is not readonly evidence. Preserve
 the exact checked states and existing full geometry/identity/credential fences.
+At only `visual-settings-source-control`, the existing failure receipt may include
+`settingsCaptureFailureFacts` for that same thrown error and current scene/theme.
+It reuses the latest actual witness from existing capture reads; it adds no DOM
+execution or retry. Exact known own-data booleans may retain false scene/text or
+geometry facts. Unsafe theme, selection, credential or boot context, malformed or
+unavailable data and failed owned-identity checks remain null. No text, values,
+IDs, styles, HTML, URLs or credentials are retained. Observer faults preserve the
+original capture exception and joined cleanup; facts never approve a capture or
+identify its cause, and an earlier valid sample cannot prove the later state.
 The qualifier does not authenticate, forge, toggle availability or save settings. Providers
 is the current `/settings/providers` route, separate from Agents. Expand the
 existing Claude card to show actual non-secret fields and model controls.

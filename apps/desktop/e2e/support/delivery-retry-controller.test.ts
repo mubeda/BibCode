@@ -11,6 +11,9 @@ import {
   runOwnedGitProjectCommand,
   verifyOwnedGitProjectSource,
   readOwnedGitProjectSnapshot,
+  createSettingsCaptureFailureObserver,
+  readSettingsCaptureFailureFacts,
+  type SettingsCaptureFailureRecord,
 } from "../qualify-delivery-retry.ts";
 import { deliveryScenes, deliveryThemes } from "./delivery-retry-evidence.ts";
 import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
@@ -70,6 +73,261 @@ const textRowFacts = {
   errorPresent: false,
   filterPresent: false,
 };
+
+const settingsFailureFacts = {
+  themeMatched: true,
+  selectedMatched: true,
+  expectedTextMatched: false,
+  targetInView: false,
+  credentialAbsent: true,
+  bootShellAbsent: true,
+  gitAvailable: true,
+  gitVersionVisible: false,
+  hostingUnavailable: true,
+  availabilityReasons: true,
+  fetchIntervalVisible: false,
+  scanSettled: true,
+};
+
+it("binds actual failure facts to the exact error and immutable scene/theme/owned identity", () => {
+  const records = new WeakMap<object, SettingsCaptureFailureRecord>();
+  const first = new Error("inert light failure"),
+    second = new Error("inert dark failure");
+  const ownership = {
+    scene: "settings-source-control" as const,
+    theme: "light" as const,
+    origin: "http://127.0.0.1:4885",
+    threadId: "owned-light",
+    branch: "codex/delivery-retry-light",
+  };
+  const light = createSettingsCaptureFailureObserver(records, ownership);
+  const dark = createSettingsCaptureFailureObserver(records, {
+    ...ownership,
+    theme: "dark",
+    threadId: "owned-dark",
+    branch: "codex/delivery-retry-dark",
+  });
+  light(first, settingsFailureFacts);
+  dark(second, settingsFailureFacts);
+  expect(
+    readSettingsCaptureFailureFacts(records, first, "visual-settings-source-control", "light"),
+  ).toEqual({ scene: "settings-source-control", theme: "light", witness: settingsFailureFacts });
+  expect(
+    readSettingsCaptureFailureFacts(records, second, "visual-settings-source-control", "dark"),
+  ).toMatchObject({ theme: "dark" });
+  for (const [error, phase, theme] of [
+    [new Error(first.message), "visual-settings-source-control", "light"],
+    [first, "visual-settings-source-control-open", "light"],
+    [first, "visual-settings-source-control", "dark"],
+  ] as const)
+    expect(readSettingsCaptureFailureFacts(records, error, phase, theme)).toBeNull();
+  expect(records.get(first)!.ownership).toEqual(ownership);
+  expect(Object.isFrozen(records.get(first)!.ownership)).toBe(true);
+  expect(Object.isFrozen(records.get(first)!.witness)).toBe(true);
+  expect(
+    JSON.stringify(
+      readSettingsCaptureFailureFacts(records, first, "visual-settings-source-control", "light"),
+    ),
+  ).not.toMatch(/owned-|http|branch/);
+  light(first, null);
+  expect(
+    readSettingsCaptureFailureFacts(records, first, "visual-settings-source-control", "light"),
+  ).toBeNull();
+  light(first, settingsFailureFacts);
+  dark(first, settingsFailureFacts);
+  expect(
+    readSettingsCaptureFailureFacts(records, first, "visual-settings-source-control", "light"),
+  ).toBeNull();
+  expect(
+    readSettingsCaptureFailureFacts(records, first, "visual-settings-source-control", "dark"),
+  ).toMatchObject({ theme: "dark" });
+});
+
+it.each(["null", "extra", "getter", "proxy", "unsafe", "foreign-owner"])(
+  "leaves invalid settings capture observations unassociated: %s",
+  (mode) => {
+    const records = new WeakMap<object, SettingsCaptureFailureRecord>();
+    const error = new Error("inert original failure");
+    let value: unknown = { ...settingsFailureFacts },
+      reads = 0;
+    if (mode === "null") value = null;
+    if (mode === "extra") Object.assign(value as object, { raw: "private" });
+    if (mode === "unsafe") Object.assign(value as object, { selectedMatched: false });
+    if (mode === "getter")
+      Object.defineProperty(value, "gitAvailable", {
+        enumerable: true,
+        get() {
+          reads++;
+          throw new Error("private");
+        },
+      });
+    if (mode === "proxy") {
+      const p = Proxy.revocable(value as object, {});
+      p.revoke();
+      value = p.proxy;
+    }
+    const observe = createSettingsCaptureFailureObserver(records, {
+      scene: "settings-source-control",
+      theme: "light",
+      origin: mode === "foreign-owner" ? "outside" : "http://127.0.0.1:4885",
+      threadId: "owned",
+      branch: "codex/delivery-retry-light",
+    });
+    expect(() => observe(error, value)).not.toThrow();
+    expect(records.has(error)).toBe(false);
+    expect(reads).toBe(0);
+  },
+);
+
+it("refuses a native proxy safety spoof through the same-error observer and failure reader", () => {
+  const records = new WeakMap<object, SettingsCaptureFailureRecord>();
+  const error = new Error("inert original capture failure");
+  const observe = createSettingsCaptureFailureObserver(records, {
+    scene: "settings-source-control",
+    theme: "light",
+    origin: "http://127.0.0.1:4885",
+    threadId: "owned",
+    branch: "codex/delivery-retry-light",
+  });
+  const unsafe = { ...settingsFailureFacts, credentialAbsent: false };
+  let traps = 0;
+  const proxy = new Proxy(unsafe, {
+    ownKeys(value) {
+      traps++;
+      return Reflect.ownKeys(value);
+    },
+    getOwnPropertyDescriptor(value, key) {
+      traps++;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return key === "credentialAbsent" ? { ...descriptor, value: true } : descriptor;
+    },
+  });
+  observe(error, settingsFailureFacts);
+  expect(
+    readSettingsCaptureFailureFacts(records, error, "visual-settings-source-control", "light"),
+  ).toEqual({ scene: "settings-source-control", theme: "light", witness: settingsFailureFacts });
+  observe(error, unsafe);
+  expect(records.has(error)).toBe(false);
+  observe(error, settingsFailureFacts);
+  expect(() => observe(error, proxy)).not.toThrow();
+  expect(
+    readSettingsCaptureFailureFacts(records, error, "visual-settings-source-control", "light"),
+  ).toBeNull();
+  expect(records.has(error)).toBe(false);
+  expect(traps).toBe(0);
+});
+
+it.each(["transparent", "spoofing", "throwing", "revoked"])(
+  "refuses native %s ownership proxies before copying or reading them",
+  (mode) => {
+    const records = new WeakMap<object, SettingsCaptureFailureRecord>();
+    const error = new Error("inert original capture failure");
+    const target = {
+      scene: "settings-source-control" as const,
+      theme: "light" as const,
+      origin: mode === "spoofing" ? "outside" : "http://127.0.0.1:4885",
+      threadId: "owned",
+      branch: "codex/delivery-retry-light",
+    };
+    let traps = 0;
+    const revocable = Proxy.revocable(target, {
+      ownKeys(value) {
+        traps++;
+        if (mode === "throwing") throw new Error("inert proxy trap");
+        return Reflect.ownKeys(value);
+      },
+      getOwnPropertyDescriptor(value, key) {
+        traps++;
+        return Object.getOwnPropertyDescriptor(value, key);
+      },
+      get(value, key, receiver) {
+        traps++;
+        return key === "origin" && mode === "spoofing"
+          ? "http://127.0.0.1:4885"
+          : Reflect.get(value, key, receiver);
+      },
+    });
+    if (mode === "revoked") revocable.revoke();
+    let observe: ReturnType<typeof createSettingsCaptureFailureObserver> | undefined;
+    expect(() => {
+      observe = createSettingsCaptureFailureObserver(records, revocable.proxy);
+    }).not.toThrow();
+    expect(typeof observe).toBe("function");
+    expect(() => observe!(error, settingsFailureFacts)).not.toThrow();
+    expect(
+      readSettingsCaptureFailureFacts(records, error, "visual-settings-source-control", "light"),
+    ).toBeNull();
+    expect(traps).toBe(0);
+  },
+);
+
+it("executes the original failure writer and entire joined cleanup with same-error settings facts", async () => {
+  const records = new WeakMap<object, SettingsCaptureFailureRecord>();
+  const error = new Error("inert original capture failure");
+  createSettingsCaptureFailureObserver(records, {
+    scene: "settings-source-control",
+    theme: "light",
+    origin: "http://127.0.0.1:4885",
+    threadId: "owned",
+    branch: "codex/delivery-retry-light",
+  })(error, settingsFailureFacts);
+  const start = controller.lastIndexOf("  } catch (error) {");
+  const end = controller.indexOf("  return success ? 0 : 1;", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const events: string[] = [],
+    writes: Array<Record<string, unknown>> = [];
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      "async function fail() { try { throw original;" + controller.slice(start, end) + "}\nfail",
+    ),
+    {
+      original: error,
+      phase: "visual-settings-source-control",
+      theme: "light",
+      success: false,
+      settingsCaptureFailures: records,
+      readSettingsCaptureFailureFacts,
+      browser: {
+        deleteSession: async () => {
+          events.push("delete-session");
+        },
+      },
+      classifyQualificationFailure: (current: unknown) => {
+        expect(current).toBe(error);
+        return classifyQualificationFailure(current);
+      },
+      createRefClearObservation: null,
+      owner: {
+        processes: [],
+        failures: [],
+        childrenClosed: () => true,
+        close: async (options: { browser?: () => Promise<void> }) => {
+          events.push("close");
+          await options.browser?.();
+          events.push("closed");
+        },
+      },
+      config: { source: "a".repeat(40), selection: "release-visual-settings" },
+      captures: [],
+      assertions: [],
+      networkProofs: [],
+      write: (name: string, value: Record<string, unknown>) => {
+        events.push(name);
+        writes.push(value);
+      },
+    },
+  ) as () => Promise<void>;
+  await run();
+  expect(events).toEqual(["failure", "close", "delete-session", "closed", "result"]);
+  expect(writes[0]!.settingsCaptureFailureFacts).toEqual({
+    scene: "settings-source-control",
+    theme: "light",
+    witness: settingsFailureFacts,
+  });
+  expect(writes[1]!.childProcessesClosed).toBe(true);
+  expect(JSON.stringify(writes)).not.toMatch(/inert original|owned|http|branch/);
+});
 
 describe("closed text-row failure boundary", () => {
   it.each(["verified", "selected-rejected", "git-rejected"])(

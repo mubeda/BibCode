@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 import * as NodeNet from "node:net";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeModule from "node:module";
+import * as NodeUtil from "node:util";
 import { OrchestrationReadModel } from "../../../packages/contracts/src/orchestration.ts";
 import { ExecutionEnvironmentDescriptor } from "../../../packages/contracts/src/environment.ts";
 import {
@@ -77,6 +78,8 @@ import {
   projectSettingsVisualCapture,
   projectSettingsVisualAssertion,
   validateSettingsVisualJoins,
+  projectSettingsVisualFailureWitness,
+  type SettingsVisualObservationInput,
 } from "./support/release-visual-settings.ts";
 import { readSettingsVisualProviderConfiguration } from "./support/release-visual-settings-preflight.ts";
 import {
@@ -100,6 +103,51 @@ const origin = "http://127.0.0.1:4885";
 const surface = '[data-center-surface-host][data-visible="true"]';
 const composer = `${surface} [data-testid="composer-editor"]`;
 const form = `${surface} [data-chat-composer-form="true"]`;
+
+export interface SettingsCaptureFailureRecord {
+  readonly ownership: Readonly<SettingsVisualObservationInput>;
+  readonly witness: Readonly<Record<string, boolean>>;
+}
+
+/** Bound capture ownership stays private; only the already-read closed facts can be retained. */
+export function createSettingsCaptureFailureObserver(
+  records: WeakMap<object, SettingsCaptureFailureRecord>,
+  input: SettingsVisualObservationInput,
+) {
+  const ownership = NodeUtil.types.isProxy(input) ? null : Object.freeze({ ...input });
+  return (error: unknown, value: unknown) => {
+    try {
+      if (error === null || typeof error !== "object") return;
+      records.delete(error);
+      if (
+        ownership === null ||
+        ownership.origin !== origin ||
+        !["light", "dark"].includes(ownership.theme) ||
+        !/^[A-Za-z0-9._:-]{1,128}$/.test(ownership.threadId) ||
+        ownership.branch !== "codex/delivery-retry-" + ownership.theme
+      )
+        return;
+      const witness = projectSettingsVisualFailureWitness(ownership.scene, value);
+      if (witness !== null) records.set(error, Object.freeze({ ownership, witness }));
+    } catch {
+      // Optional failure facts cannot alter the capture outcome.
+    }
+  };
+}
+
+export function readSettingsCaptureFailureFacts(
+  records: WeakMap<object, SettingsCaptureFailureRecord>,
+  error: unknown,
+  phase: string,
+  theme: DeliveryTheme,
+) {
+  if (phase !== "visual-settings-source-control" || error === null || typeof error !== "object")
+    return null;
+  const record = records.get(error);
+  if (record?.ownership.scene !== "settings-source-control" || record.ownership.theme !== theme)
+    return null;
+  return { scene: record.ownership.scene, theme, witness: record.witness };
+}
 
 /** Existing isolated synchronous Git lifetime: bounded and reaped before returning. */
 export function runOwnedGitProjectCommand(
@@ -492,6 +540,7 @@ export async function runDeliveryRetryQualification() {
   const assertions: object[] = [];
   const captures: object[] = [];
   const capturedVisuals = new Set<string>();
+  const settingsCaptureFailures = new WeakMap<object, SettingsCaptureFailureRecord>();
   let createRefObservationInput: VisualObservationInput | null = null;
   let textRowObservationInput: VisualTextRowObservationInput | null = null;
   let createRefClearObservation: ReturnType<typeof projectVisualNameClearObservation> = null;
@@ -1369,6 +1418,13 @@ export async function runDeliveryRetryQualification() {
                   threadId: workspace.threadId,
                   branch: workspace.branch,
                   verifyOwnedIdentity,
+                  observeFailure: createSettingsCaptureFailureObserver(settingsCaptureFailures, {
+                    scene,
+                    theme,
+                    origin,
+                    threadId: workspace.threadId,
+                    branch: workspace.branch,
+                  }),
                 }),
               ),
             );
@@ -1585,6 +1641,10 @@ export async function runDeliveryRetryQualification() {
       worktreeObservation,
       createRefObservation,
       textRowObservation,
+      settingsCaptureFailureFacts:
+        phase === "visual-settings-source-control"
+          ? readSettingsCaptureFailureFacts(settingsCaptureFailures, error, phase, theme)
+          : null,
       createRefClearObservation:
         phase === "visual-worktree-create-ref" ? createRefClearObservation : null,
       browserDriverReadiness:
