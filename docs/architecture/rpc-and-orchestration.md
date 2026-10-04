@@ -197,6 +197,17 @@ Readiness failure, watcher loss, overflow, or unavailable delivery preserves the
 subscription in sticky fallback health. An ordinary later event cannot mark it
 healthy.
 
+When a local or full status observation, including a new subscription's snapshot,
+sees a previously unavailable repository become available, its active lifecycle
+reattaches automatic fetch if it has no fetch identity. One owned common-directory
+resolution runs at a time; rapid break/repair observations coalesce into a trailing
+resolution of the latest available state. Resolution and publication cross the
+same mutation epoch fence as status reads, so a retired read waits for settlement
+and resolves again. Publication verifies the lifecycle and attaches only its
+current subscribers to the shared physical-repository fetch owner. Final release
+and shutdown cancel and drain that owned work. Healthy unchanged observations and
+already attached lifecycles perform no additional attachment discovery.
+
 Working-tree and metadata signals use a 125 ms trailing debounce. A signal that
 arrives during a physical local read retains exactly one trailing read. Explicit
 mutation and workspace invalidations bypass that debounce, as do structured
@@ -1496,14 +1507,21 @@ current thread session; a live replacement is neither stopped nor settled.
 When no live session remains and the projection is starting, connecting, or
 running, it uses the shared restart reconciliation function at the loss time:
 streaming assistant text is retained and settled, the active turn is cleared,
-the turn ends as error, and the session reports `transport_error` with
+the turn ends as error, and the session reports `session_stopped` with
 "Provider session stopped because its workspace became unavailable. Review
 delivery status before continuing." A shutdown error does not skip settlement
 after detach. Cleanup also requests settlement without a captured identity, so
 a later attempt can retry a failed settlement. Ready projections are left alone;
-removal cleanup retains its existing stop-only behavior. A delivery accepted
-after its session's cancellation skips publishing running runtime and session
-state while retaining the accepted delivery outcome. Retry resolution repeats
+removal cleanup retains its existing stop-only behavior. Accepted start publication remains owned by the supervisor's current driver
+identity and delivery generation. A per-session publication fence captures the
+terminal revision before native delivery and serializes both running writes
+with the pump's complete core batches. Cancellation, closure or any terminal
+observed since admission suppresses optimistic running publication without
+changing Accepted or resending input, including unknown native turn IDs. A fresh
+later admission uses the newer revision. Detach closes and drains admitted
+submitted core writers before pump abort and runtime deletion; successful
+restart uses the same drain and a fresh replacement fence after native shutdown.
+Shutdown failure preserves the existing old-session behavior. Retry resolution repeats
 capture only while its transition ownership is current, and recovery/newer-loss
 cancellation still short-circuits the whole
 attempt. Terminal cleanup applies the same transition-scoped pattern to every
@@ -1701,10 +1719,12 @@ and hold metadata for snapshots and event replay; it is a view of the outbox,
 which remains the queue's source of truth.
 
 The outbox's nullable `failure_reason` and the message projection's nullable
-`delivery_reason` carry the typed delivery reason, set only for a failed
-delivery. The engine writes the reason with the state and delivery event in one
+`delivery_reason` carry a state-scoped typed reason: `modelSelectionRefused` only
+for a failed delivery, and `startedNewConversation` only for a delivered retry.
+The engine writes the reason with the state and delivery event in one
 transaction; `thread.turn-delivery-updated` projects its nested `delivery.reason`
-into messages and snapshots. Retry and dismiss clear it, and every later
+into messages and snapshots. Retry and dismiss clear failed-delivery reasons;
+delivered rows remain terminal. Every later
 delivery update replaces the projected reason, clearing it when absent. Event
 replay restores the reason. Old rows and events have no reason, and contracts
 decode unknown reason values as an absent key. Delivery events and projected
@@ -1777,7 +1797,7 @@ starts, startup reconciles abandoned live runtime rows and every projected
 session still starting, connecting, or running without a live runtime row,
 including rows removed by graceful shutdown. It settles the abandoned turn's
 streaming assistant messages, clears the active turn, and projects the existing
-restart error as `transport_error`. That error settlement holds queued messages
+restart error as `session_stopped`. That error settlement holds queued messages
 for explicit **Send now** and releases the pending-start claim gate. Completed
 reconciliation does not dispatch again on a later startup; ready/idle/stopped
 projections without live runtimes retain their existing state.
@@ -1786,12 +1806,27 @@ Workspace-loss settlement uses the same error rule: every queued row is held,
 and pending or sending steer rows latch the hold. The queued head shows
 **Waiting for you**; **Send now** works once no running or starting session
 exists and the workspace admits work again. Settlement wakes the delivery
-worker to re-examine pending, non-queued starts. While the workspace is
+worker to re-examine pending, non-queued starts. A refusal before provider routing
+is definitely not sent and may retry with backoff. Loss after routing has begun
+is uncertain: cancelling the route cannot undo a possible provider write. That
+message stays behind the existing explicit uncertain-retry confirmation, even
+after the workspace returns. While the workspace is
 unavailable, admission refuses and delivery retries with backoff; after recovery,
 the existing provider-loss relaunch starts a replacement session. A retry bound
-to the stopped session's native identity can still fail because stopping deleted
-its resume state. The settled turn retains its partial assistant text and ends
-as error.
+to the stopped session's native identity recovers when its exact provider/instance
+runtime is absent or has no resume cursor. A guarded update clears only that
+sending start's native identity at its current attempt, retaining the command
+receipt, FIFO position, payload, model/options and delivery key. It refuses changed
+delivery ownership or newly restored/conflicting runtime identity; another native
+session's cursor remains a rejection. The retry starts without resume, freezes to
+the new native session, and immediate acceptance records `startedNewConversation`
+with the delivered state. The user message shows "Sent in a new conversation. The
+agent won't remember earlier messages in this thread." in muted status text. A
+still-resumable frozen session resumes normally without that notice. Automatic
+reconciliation never unfreezes ambiguous work. Nonaccepted fresh attempts keep
+their existing outcomes and no notice; the fact is not retained for a later
+accepted attempt. Unfrozen fresh starts remain outside this recovery policy. The
+settled turn retains its partial assistant text and ends as error.
 
 `ThreadTurnSteer` validates the queued head, a running session with an active
 turn, and the driver-owned capability shared with inventory. It atomically

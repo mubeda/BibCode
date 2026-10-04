@@ -87,6 +87,8 @@ struct State {
 struct RepositoryState {
     lifecycle_id: u64,
     repository_key: Option<PathBuf>,
+    fetch_attachment_in_flight: bool,
+    fetch_attachment_requested: bool,
     local: VcsStatusLocalResult,
     remote: Option<Option<VcsStatusRemoteResult>>,
     remote_fence: Option<StatusReadFence>,
@@ -496,6 +498,8 @@ impl StatusBroadcaster {
                     RepositoryState {
                         lifecycle_id: subscriber_id,
                         repository_key: None,
+                        fetch_attachment_in_flight: false,
+                        fetch_attachment_requested: false,
                         local: local.clone(),
                         remote: None,
                         remote_fence: None,
@@ -578,7 +582,6 @@ impl StatusBroadcaster {
                 }
                 Err(error) => return Err(error),
             };
-            self.observe_repository_availability_change(&cwd, previous_local.as_ref(), &local);
             let registration = match registration {
                 None => return Err(broadcaster_shutdown_error(&cwd)),
                 Some(Err(())) => {
@@ -621,6 +624,12 @@ impl StatusBroadcaster {
                 lifecycle_tasks,
                 lifecycle_insertion_reservation,
             ) = registration;
+            self.observe_repository_availability_change(
+                &cwd,
+                Some(lifecycle_id),
+                previous_local.as_ref(),
+                &local,
+            );
             admission_attempts += 1;
             // Own release() cleanup across every setup await, retry, and cancellation.
             let subscription = match kind {
@@ -702,13 +711,7 @@ impl StatusBroadcaster {
                     remote_refresh_requests,
                     &lifecycle_tasks,
                 );
-                self.spawn_fetch_attachment(
-                    cwd.clone(),
-                    lifecycle_id,
-                    poller_cancellation,
-                    resolved_common_dir,
-                    &lifecycle_tasks,
-                );
+                self.spawn_fetch_attachment(cwd.clone(), lifecycle_id, resolved_common_dir);
                 lifecycle_tasks.close();
             }
             drop(lifecycle_insertion_reservation);
@@ -822,7 +825,12 @@ impl StatusBroadcaster {
             None
         };
         drop(state);
-        self.observe_repository_availability_change(cwd, previous_local.as_ref(), local);
+        self.observe_repository_availability_change(
+            cwd,
+            Some(lifecycle_id),
+            previous_local.as_ref(),
+            local,
+        );
         if accepted {
             self.inner
                 .fetch_owner
@@ -834,6 +842,7 @@ impl StatusBroadcaster {
     fn observe_repository_availability_change(
         &self,
         cwd: &Path,
+        lifecycle_id: Option<u64>,
         previous: Option<&VcsStatusLocalResult>,
         local: &VcsStatusLocalResult,
     ) {
@@ -842,6 +851,12 @@ impl StatusBroadcaster {
                 || previous.repository_unavailable_reason != local.repository_unavailable_reason
         }) {
             self.inner.status_owner.observe_local_change(cwd);
+        }
+        if local.is_repo
+            && previous.is_some_and(|previous| !previous.is_repo)
+            && let Some(lifecycle_id) = lifecycle_id
+        {
+            self.spawn_fetch_attachment(cwd.to_path_buf(), lifecycle_id, None);
         }
     }
 
@@ -1303,7 +1318,9 @@ impl StatusBroadcaster {
         let mut state = self.lock_state();
         let mut remove_repository = false;
         let mut previous_local = None;
+        let mut lifecycle_id = None;
         if let Some(entry) = state.repositories.get_mut(cwd) {
+            lifecycle_id = Some(entry.lifecycle_id);
             let changed = entry.local != status.local || entry.remote.as_ref() != Some(&remote);
             previous_local = Some(std::mem::replace(&mut entry.local, status.local.clone()));
             entry.remote = Some(remote);
@@ -1323,7 +1340,12 @@ impl StatusBroadcaster {
             None
         };
         drop(state);
-        self.observe_repository_availability_change(cwd, previous_local.as_ref(), &status.local);
+        self.observe_repository_availability_change(
+            cwd,
+            lifecycle_id,
+            previous_local.as_ref(),
+            &status.local,
+        );
         retirement
     }
 
@@ -1666,46 +1688,126 @@ impl StatusBroadcaster {
         &self,
         cwd: PathBuf,
         lifecycle_id: u64,
-        cancellation: CancellationToken,
         resolved_common_dir: Option<PathBuf>,
-        tasks: &TaskTracker,
     ) {
+        let mut state = self.lock_state();
+        if state.closed {
+            return;
+        }
+        let Some(entry) = state.repositories.get_mut(&cwd).filter(|entry| {
+            entry.lifecycle_id == lifecycle_id && !entry.poller_cancellation.is_cancelled()
+        }) else {
+            return;
+        };
+        if entry.repository_key.is_some() {
+            return;
+        }
+        if entry.fetch_attachment_in_flight {
+            entry.fetch_attachment_requested = true;
+            return;
+        }
+        entry.fetch_attachment_in_flight = true;
+        entry.fetch_attachment_requested = false;
+        let cancellation = entry.poller_cancellation.clone();
+        let tasks = entry.tasks.clone();
         let broadcaster = self.clone();
         #[cfg(test)]
         let attachment_finished = Arc::clone(&self.inner.fetch_attachment_finished);
         tasks.spawn(async move {
             #[cfg(test)]
             let _finished = NotifyOnDrop(attachment_finished);
-            let repository_key = match resolved_common_dir {
-                Some(repository_key) => repository_key,
-                None => tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    result = broadcaster.inner.repository.resolve_common_dir(&cwd, &cancellation) => {
-                        let Ok(repository_key) = result else { return };
-                        repository_key
+            let mut resolved_common_dir = resolved_common_dir;
+            loop {
+                let retired_read = broadcaster
+                    .resolve_fetch_attachment(
+                        &cwd,
+                        lifecycle_id,
+                        &cancellation,
+                        resolved_common_dir.take(),
+                    )
+                    .await;
+                let retry = {
+                    let mut state = broadcaster.lock_state();
+                    let Some(entry) = state
+                        .repositories
+                        .get_mut(&cwd)
+                        .filter(|entry| entry.lifecycle_id == lifecycle_id)
+                    else {
+                        break;
+                    };
+                    // Reservation release and a repair's trailing request share this lock,
+                    // so a repair arriving as resolution finishes cannot be lost.
+                    let retry = (retired_read || entry.fetch_attachment_requested)
+                        && entry.local.is_repo
+                        && entry.repository_key.is_none()
+                        && !cancellation.is_cancelled();
+                    entry.fetch_attachment_requested = false;
+                    if !retry {
+                        entry.fetch_attachment_in_flight = false;
                     }
-                },
-            };
-            let mut state = broadcaster.lock_state();
-            let Some(entry) = state.repositories.get_mut(&cwd) else {
-                return;
-            };
-            if entry.lifecycle_id != lifecycle_id || cancellation.is_cancelled() {
-                return;
-            }
-            entry.repository_key = Some(repository_key.clone());
-            let ref_name = entry.local.ref_name.clone();
-            let reconcile = entry.remote_refresh_requests.clone();
-            for subscriber_id in entry.subscribers.keys().copied() {
-                broadcaster.inner.fetch_owner.attach(
-                    repository_key.clone(),
-                    cwd.clone(),
-                    subscriber_id,
-                    ref_name.clone(),
-                    reconcile.clone(),
-                );
+                    retry
+                };
+                if !retry {
+                    break;
+                }
             }
         });
+    }
+
+    async fn resolve_fetch_attachment(
+        &self,
+        cwd: &Path,
+        lifecycle_id: u64,
+        cancellation: &CancellationToken,
+        resolved_common_dir: Option<PathBuf>,
+    ) -> bool {
+        let Ok(fence) = self
+            .inner
+            .status_owner
+            .acquire_read_fence(cwd, cancellation)
+            .await
+        else {
+            return false;
+        };
+        let repository_key = match resolved_common_dir {
+            Some(repository_key) => Some(repository_key),
+            None => tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return false,
+                result = self.inner.repository.resolve_common_dir(cwd, cancellation) => result.ok(),
+            },
+        };
+        self.inner
+            .status_owner
+            .publish_if_fence_current(&fence, || {
+                let mut state = self.lock_state();
+                let Some(entry) = state.repositories.get_mut(cwd).filter(|entry| {
+                    entry.lifecycle_id == lifecycle_id && !cancellation.is_cancelled()
+                }) else {
+                    return false;
+                };
+                if entry.fetch_attachment_requested && entry.local.is_repo {
+                    return true;
+                }
+                if entry.local.is_repo
+                    && let Some(repository_key) = repository_key
+                {
+                    entry.repository_key = Some(repository_key.clone());
+                    for subscriber_id in entry.subscribers.keys().copied() {
+                        self.inner.fetch_owner.attach(
+                            repository_key.clone(),
+                            cwd.to_path_buf(),
+                            subscriber_id,
+                            entry.local.ref_name.clone(),
+                            entry.remote_refresh_requests.clone(),
+                        );
+                    }
+                }
+                false
+            })
+            // Re-admission waits for a mutation's settlement. Only the same active,
+            // available lifecycle may resolve again; this adds no timer or status polling.
+            .unwrap_or(true)
     }
 
     fn release(&self, cwd: &Path, subscriber_id: u64) {
@@ -3390,11 +3492,24 @@ mod tests {
         .await
         .expect("native watcher notices repair without Retry, refresh, or the hourly safety read");
         assert!(repaired.repository_unavailable_reason.is_none());
+        test_timeout(
+            "repair attaches automatic fetch",
+            broadcaster
+                .inner
+                .fetch_owner
+                .wait_for_worktree_count_for_test(1),
+        )
+        .await;
+        assert_eq!(
+            broadcaster.lock_state().repositories[&cwd].repository_key,
+            Some(cwd.join(".git")),
+            "repair resolves fetch identity through Git"
+        );
         assert!(
-            broadcaster.lock_state().repositories[&cwd]
-                .repository_key
-                .is_none(),
-            "repair retains the existing automatic-fetch attachment behavior"
+            broadcaster
+                .inner
+                .fetch_owner
+                .has_subscriber_for_test(&cwd, subscription.subscriber_id)
         );
         drop(subscription);
         test_timeout("broadcaster shutdown", broadcaster.shutdown()).await;
@@ -5839,6 +5954,277 @@ mod tests {
         assert_eq!(broadcaster.inner.fetch_owner.repository_count_for_test(), 0);
     }
 
+    struct FetchRepairFixture {
+        _sandbox: TestSandbox,
+        cwd: PathBuf,
+        common_dir: PathBuf,
+        broadcaster: StatusBroadcaster,
+        resolution_started: mpsc::UnboundedReceiver<()>,
+        release_resolution: Arc<Semaphore>,
+    }
+
+    impl FetchRepairFixture {
+        fn new() -> Self {
+            let sandbox = TestSandbox::new("git-broadcaster-repaired-fetch");
+            let cwd = sandbox.path("main");
+            let common_dir = sandbox.path("common.git");
+            fs::create_dir_all(&cwd).expect("worktree fixture");
+            fs::create_dir_all(&common_dir).expect("common directory fixture");
+            let cwd = fs::canonicalize(cwd).expect("canonical worktree fixture");
+            let common_dir =
+                fs::canonicalize(common_dir).expect("canonical common directory fixture");
+            let (started, resolution_started) = mpsc::unbounded_channel();
+            let release_resolution = Arc::new(Semaphore::new(0));
+            let runner = Arc::new(SharedRepositoryFetchRunner {
+                common_dir: common_dir.clone(),
+                fetches: AtomicUsize::new(0),
+                fetch_failures: AtomicUsize::new(0),
+                remote_status_calls: Mutex::new(BTreeMap::new()),
+                remote_status_changed: Notify::new(),
+                dirty: AtomicBool::new(false),
+                common_dir_started: Some(started),
+                release_common_dir: Some(release_resolution.clone()),
+                fetch_started: None,
+                fetch_cancelled: None,
+                release_fetch: None,
+            });
+            let (interval, _) = watch::channel(Duration::ZERO);
+            let broadcaster = StatusBroadcaster::with_automatic_remote_refresh_interval(
+                Arc::new(GitRepository::with_runner_for_test(runner)),
+                Duration::from_secs(3_600),
+                interval,
+                4,
+            );
+            install_epoch_repository_for_lifecycle(&broadcaster, &cwd, 7, "main", 0);
+            {
+                let mut state = broadcaster.lock_state();
+                let entry = state.repositories.get_mut(&cwd).unwrap();
+                entry.local = VcsStatusLocalResult::non_repository();
+                entry.subscribers = HashMap::from([(7, RepositorySubscriber::GitManager)]);
+            }
+            Self {
+                _sandbox: sandbox,
+                cwd,
+                common_dir,
+                broadcaster,
+                resolution_started,
+                release_resolution,
+            }
+        }
+
+        async fn publish_availability(&self, is_repo: bool, full: bool) {
+            let mut local = VcsStatusLocalResult::non_repository();
+            local.is_repo = is_repo;
+            local.ref_name = is_repo.then(|| "main".to_owned());
+            let fence = self
+                .broadcaster
+                .acquire_read_fence(&self.cwd, &CancellationToken::new())
+                .await
+                .expect("repair publication fence");
+            if full {
+                self.broadcaster.publish_status(
+                    &self.cwd,
+                    &VcsStatusResult {
+                        local,
+                        remote: VcsStatusRemoteResult {
+                            has_upstream: false,
+                            ahead_count: 0,
+                            behind_count: 0,
+                            ahead_of_default_count: None,
+                            pr: None,
+                        },
+                    },
+                    &fence,
+                );
+            } else {
+                self.broadcaster.publish_local(&self.cwd, 7, &local, &fence);
+            }
+        }
+
+        async fn wait_for_resolution(&mut self) {
+            test_timeout(
+                "repair common-directory resolution",
+                self.resolution_started.recv(),
+            )
+            .await
+            .expect("resolution observer stays open");
+        }
+
+        async fn wait_for_attachment(&self) {
+            test_timeout(
+                "repaired fetch ownership",
+                self.broadcaster
+                    .inner
+                    .fetch_owner
+                    .wait_for_worktree_count_for_test(1),
+            )
+            .await;
+            assert_eq!(
+                self.broadcaster.lock_state().repositories[&self.cwd].repository_key,
+                Some(self.common_dir.clone())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_fetch_attachment_coalesces_changes_and_attaches_current_subscribers() {
+        let mut fixture = FetchRepairFixture::new();
+        fixture.publish_availability(true, false).await;
+        fixture.wait_for_resolution().await;
+        for full in [false, true, false] {
+            fixture.publish_availability(false, full).await;
+            fixture.publish_availability(true, full).await;
+        }
+        assert!(
+            matches!(
+                fixture.resolution_started.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "repair observations must share one in-flight resolution"
+        );
+        fixture
+            .broadcaster
+            .lock_state()
+            .repositories
+            .get_mut(&fixture.cwd)
+            .unwrap()
+            .subscribers
+            .insert(8, RepositorySubscriber::GitManager);
+        fixture.broadcaster.release(&fixture.cwd, 7);
+        fixture
+            .broadcaster
+            .lock_state()
+            .repositories
+            .get_mut(&fixture.cwd)
+            .unwrap()
+            .subscribers
+            .insert(9, RepositorySubscriber::GitManager);
+
+        fixture.release_resolution.add_permits(1);
+        fixture.wait_for_resolution().await;
+        assert_eq!(
+            fixture
+                .broadcaster
+                .inner
+                .fetch_owner
+                .worktree_count_for_test(),
+            0
+        );
+        fixture.release_resolution.add_permits(1);
+        fixture.wait_for_attachment().await;
+        assert!(
+            !fixture
+                .broadcaster
+                .inner
+                .fetch_owner
+                .has_subscriber_for_test(&fixture.cwd, 7)
+        );
+        for subscriber in [8, 9] {
+            assert!(
+                fixture
+                    .broadcaster
+                    .inner
+                    .fetch_owner
+                    .has_subscriber_for_test(&fixture.cwd, subscriber)
+            );
+        }
+        fixture.publish_availability(true, false).await;
+        fixture.publish_availability(true, true).await;
+        assert!(
+            matches!(
+                fixture.resolution_started.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "unchanged healthy status must not resolve or attach again"
+        );
+        assert_eq!(
+            fixture
+                .broadcaster
+                .inner
+                .fetch_owner
+                .repository_count_for_test(),
+            1
+        );
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn repair_fetch_attachment_rejects_a_resolution_from_a_retired_mutation_epoch() {
+        let mut fixture = FetchRepairFixture::new();
+        fixture.publish_availability(true, true).await;
+        fixture.wait_for_resolution().await;
+        let mutation = fixture.broadcaster.begin_mutation(&fixture.cwd).await;
+        fixture.release_resolution.add_permits(1);
+        assert_eq!(
+            fixture
+                .broadcaster
+                .inner
+                .fetch_owner
+                .worktree_count_for_test(),
+            0
+        );
+        drop(mutation);
+        fixture.wait_for_resolution().await;
+        fixture.release_resolution.add_permits(1);
+        fixture.wait_for_attachment().await;
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn repair_fetch_attachment_final_release_cancels_resolution_before_retirement_finishes() {
+        let mut fixture = FetchRepairFixture::new();
+        fixture.publish_availability(true, false).await;
+        fixture.wait_for_resolution().await;
+        let finished = fixture
+            .broadcaster
+            .inner
+            .fetch_attachment_finished
+            .notified();
+        tokio::pin!(finished);
+        finished.as_mut().enable();
+        fixture.broadcaster.release(&fixture.cwd, 7);
+        test_timeout("retired repair resolution cancellation", finished).await;
+        fixture.release_resolution.add_permits(1);
+        fixture
+            .broadcaster
+            .await_retired_lifecycle(&fixture.cwd)
+            .await;
+        assert_eq!(fixture.broadcaster.active_poller_count(), 0);
+        assert_eq!(
+            fixture
+                .broadcaster
+                .inner
+                .fetch_owner
+                .worktree_count_for_test(),
+            0
+        );
+        fixture.broadcaster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscriber_setup_that_observes_repair_attaches_the_existing_lifecycle() {
+        let mut fixture = FetchRepairFixture::new();
+        let subscription = fixture
+            .broadcaster
+            .subscribe(fixture.cwd.clone(), CancellationToken::new())
+            .await
+            .expect("healthy subscriber setup observes repair");
+        fixture.wait_for_resolution().await;
+        fixture.release_resolution.add_permits(1);
+        fixture.wait_for_attachment().await;
+        for subscriber in [7, subscription.subscriber_id] {
+            assert!(
+                fixture
+                    .broadcaster
+                    .inner
+                    .fetch_owner
+                    .has_subscriber_for_test(&fixture.cwd, subscriber)
+            );
+        }
+        drop(subscription);
+        fixture.broadcaster.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn final_release_retires_the_old_epoch_before_reattachment_can_read() {
         let sandbox = TestSandbox::new("git-broadcaster-final-release-epoch-order");
@@ -6828,6 +7214,8 @@ mod tests {
             RepositoryState {
                 lifecycle_id,
                 repository_key: None,
+                fetch_attachment_in_flight: false,
+                fetch_attachment_requested: false,
                 local,
                 remote: Some(Some(VcsStatusRemoteResult {
                     has_upstream: true,

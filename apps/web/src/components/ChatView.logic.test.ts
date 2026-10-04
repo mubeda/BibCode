@@ -1301,6 +1301,19 @@ describe("threadErrorAttribution", () => {
     ).toBe("BiBCode lost its connection to Codex");
   });
 
+  it.each(["codex", "claudeAgent", null])(
+    "describes an intentional session stop without claiming a lost connection (%s)",
+    (providerName) => {
+      expect(
+        threadErrorAttribution({
+          isBiBCodeAction: false,
+          errorClass: "session_stopped",
+          providerName,
+        }),
+      ).toBe("BiBCode stopped this session");
+    },
+  );
+
   it("separates credential rejection from a generic provider error", () => {
     expect(
       threadErrorAttribution({

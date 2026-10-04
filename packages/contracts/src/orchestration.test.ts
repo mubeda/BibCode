@@ -71,6 +71,16 @@ const decodeReplayEventsInput = Schema.decodeUnknownSync(OrchestrationReplayEven
 const decodeReplayEventsResult = Schema.decodeUnknownSync(
   OrchestrationRpcSchemas.replayEvents.output,
 );
+const decodeLegacyTurnDelivery = Schema.decodeUnknownSync(
+  Schema.Struct({
+    ...TurnDelivery.fields,
+    reason: Schema.optionalKey(
+      Schema.Literals(["modelSelectionRefused"]).pipe(
+        Schema.catchDecoding(() => Effect.succeedNone),
+      ),
+    ),
+  }),
+);
 
 describe("delivery failure reasons", () => {
   const delivery = { state: "failed", provider: "codex" };
@@ -80,6 +90,18 @@ describe("delivery failure reasons", () => {
       ...delivery,
       reason: "modelSelectionRefused",
     });
+  });
+
+  it("preserves the delivered notice for a new conversation", () => {
+    const delivered = { state: "delivered", provider: "codex", reason: "startedNewConversation" };
+    expect(decodeTurnDelivery(delivered)).toEqual(delivered);
+  });
+
+  it("lets an older client omit the new reason and keep the delivered message", () => {
+    const delivered = { state: "delivered", provider: "codex" };
+    expect(decodeLegacyTurnDelivery({ ...delivered, reason: "startedNewConversation" })).toEqual(
+      delivered,
+    );
   });
 
   it("decodes old deliveries without a reason", () => {
@@ -1291,6 +1313,21 @@ it.effect("decodes orchestration session runtime mode defaults", () =>
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
     assert.strictEqual(parsed.runtimeMode, DEFAULT_RUNTIME_MODE);
+  }),
+);
+
+it.effect("preserves intentional session stops in persisted snapshots", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeOrchestrationSession({
+      threadId: "thread-1",
+      status: "error",
+      providerName: "codex",
+      activeTurnId: null,
+      lastError: "Provider session ended when BiBCode stopped.",
+      lastErrorClass: "session_stopped",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(parsed.lastErrorClass, "session_stopped");
   }),
 );
 

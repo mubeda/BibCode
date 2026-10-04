@@ -808,6 +808,24 @@ const queueEventPayload = {
   updatedAt: queueCommandFields.createdAt,
 };
 const queueEvents = {
+  "session-stopped": {
+    type: "thread.session-set",
+    payload: {
+      threadId: "thread-1",
+      session: {
+        threadId: "thread-1",
+        status: "error",
+        providerName: "codex",
+        providerInstanceId: "codex",
+        runtimeMode: "full-access",
+        activeTurnId: null,
+        lastError:
+          "Provider session ended when BiBCode stopped. Review delivery status before continuing.",
+        lastErrorClass: "session_stopped",
+        updatedAt: queueCommandFields.createdAt,
+      },
+    },
+  },
   "steer-requested": {
     type: "thread.turn-steer-requested",
     payload: {
@@ -834,6 +852,19 @@ const queueEvents = {
       turnId: "turn-1",
       held: false,
       mode: "steer",
+    },
+  },
+  "delivery-new-conversation": {
+    type: "thread.turn-delivery-updated",
+    payload: {
+      ...queueEventPayload,
+      delivery: {
+        state: "delivered",
+        provider: "claudeAgent",
+        mode: "start",
+        reason: "startedNewConversation",
+      },
+      mode: "start",
     },
   },
   "delivery-withdrawn": {

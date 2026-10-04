@@ -182,6 +182,23 @@ describe("ProviderRuntimeEvent", () => {
     expect(parsed.payload.usage.usedTokens).toBe(31251);
   });
 
+  it.each(["session_stopped", "transport_error"])(
+    "preserves a known runtime error classification (%s)",
+    (errorClass) => {
+      const parsed = decodeRuntimeEvent({
+        type: "turn.completed",
+        eventId: "event-known-error-class",
+        provider: "codex",
+        createdAt: "2026-02-28T00:00:04.000Z",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        payload: { state: "failed", errorMessage: "Session ended.", errorClass },
+      });
+      if (parsed.type !== "turn.completed") throw new Error("expected turn.completed");
+      expect(parsed.payload.errorClass).toBe(errorClass);
+    },
+  );
+
   it("normalizes a newer runtime error class instead of rejecting the event", () => {
     const parsed = decodeRuntimeEvent({
       type: "turn.completed",

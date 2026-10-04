@@ -296,6 +296,18 @@ cargo test -p bibcode-server migrations -j 2
 Deliver a queued message at completion and let its turn run past the idle timeout;
 the session must stay live until one idle timeout after that turn completes.
 
+With a fake provider withholding acknowledgement, stop the session through
+workspace loss so its frozen delivery becomes uncertain, then restore the
+workspace and explicitly confirm **Retry**. A deleted or cursorless matching
+runtime must launch a fresh native conversation, preserve the user message and
+FIFO order, and show "Sent in a new conversation. The agent won't remember earlier
+messages in this thread." under the delivered message in muted text. Verify the
+native invocation starts a new session without resume, and capture light/dark
+screenshots. A still-resumable runtime must retain its conversation and show no
+new notice; conflicting runtime identities, stale attempt/state guards, steers,
+and already delivered rows must not trigger a fresh launch. Nonaccepted outcomes
+and unknown-reason decoding retain their existing behavior.
+
 Verify enqueue without a turn-start event or working projection, oldest-first
 promotion once per settle, explicit Send now clearing only its row's hold,
 interrupt/error holds, approval and user-input gates, and withdrawal without
@@ -318,6 +330,44 @@ recovery must preserve queued state, payload, mode, and existing holds without
 launching a provider. A starting/connecting/running projection without a live
 runtime, including after graceful shutdown, must become an error with no active
 turn, settle its partial assistant messages, and hold every queued message.
+For accepted-start publication, use deterministic supervisor and native-driver
+gates to cover both workspace-loss orderings: settle after native acceptance
+before publication, then hold an actor-owned publication and queue settlement
+behind it. Repeat ready/running projection, shutdown failure, retained partial
+text and queue holds, old-driver identity and wrong generation. Accepted and
+one native send must survive suppression, caller/actor acknowledgement closure
+and public shutdown; steers must retain their no-running-publication policy.
+
+Also cover normal terminal completion before queued Accepted publication with
+known and unknown native turn IDs and failed completion. In the opposite order,
+hold Accepted between its durable running writes and require the entire terminal
+batch to follow. Gate a terminal after status projection but before partial text
+completion; next native admission and later deltas/completions must wait until
+partial settlement and terminal activity finish. A late previous-turn terminal
+conservatively suppresses running publication; a fresh admission can publish.
+Exercise revision exhaustion without wraparound or reopening publication.
+
+Use the existing SQLite/engine persistence gate to pause a real submitted core
+command, then cancel/stop or restart. Drain must retain the writer through the
+complete core batch before pump abort, runtime deletion or replacement. Verify
+closed-fence stale writers make no runtime/session/message writes, successful
+restart uses a fresh fence, and failed native shutdown leaves the old session
+installed. Preserve EOF/fatal-exit partial settlement and idle-rearm controls.
+A bounded native output fixture must keep draining while the actor awaits a
+native control. Keep fake drivers, queued writes and tasks scoped and joined;
+no actual provider, account or host credential is needed. Run the closest owner
+group and adjacent provider supervisor tests before integrations:
+
+```sh
+cargo test -p bibcode-server --lib production::provider_runtime::workspace_loss_tests:: -j 2
+cargo test -p bibcode-server --test production_provider_runtime --test turn_delivery_recovery -j 2
+```
+
+In light and dark themes, both restart reconciliation and workspace-loss
+settlement must show "BiBCode stopped this session" above their existing
+actionable explanation. A genuine provider disconnect must retain the
+lost-connection title. A newer unknown error classification must decode to the
+generic banner without dropping the session or live event.
 Repeat startup to verify no duplicate events, then promote the head and prove
 the pending start is claimable. Keep original request digests stable when
 admission resolves the queued flag.
@@ -355,6 +405,18 @@ must reach its intentional abort boundary, rather than treating a setup panic
 as a successful crash probe. Run the recovery suite in the foreground with
 Cargo jobs bounded by `-j 2`; retain child diagnostics and report pipe/resource
 failures without weakening delivery assertions or production deadlines.
+
+On Unix, recovery-test children have a private re-executed monitor group and a
+parent-owned lifetime lease. Follow [the watchdog procedure](./flaky-tests.md#unix-recovery-test-watchdog)
+for `turn_delivery_recovery` on native Linux and native macOS: parent SIGKILL
+and SIGINT must remove handshake-proven child/grandchild/group identities while
+an owned peer survives. Verify raw child status, streamed binary diagnostics,
+normal root exit with descendant-held pipes, startup/protocol failure, original
+absolute deadlines, and monitor reaping. This is test-fixture ownership;
+production `ProcessRunner` behavior and Windows's direct helper are separate.
+Descendants that leave the group are excluded and retain an explicit fixture
+cleanup owner. Record paired base/change latency and reliability evidence;
+existing macOS desktop CI alone does not run this server integration target.
 
 For web queue behavior, run the focused renderer seams and then the web gates:
 
@@ -964,6 +1026,17 @@ the Git child; an interrupted or disconnected inline read (such as
 helper; and one explicit provider refresh after an idle interval that
 produced no provider process or browser network request.
 
+In a disposable repository, damage `.git/config` before opening the first status
+subscription, then repair it while that subscription remains open. Local status
+must recover and the same lifecycle must attach automatic fetch, without a
+restart or resubscription; repeat with a malformed `HEAD`. Confirm a subsequent
+automatic-fetch interval observes the remote change. Use the broadcaster's gated
+repair tests to cover rapid break/repair observations, overlapping local/full
+refreshes, a subscriber departing during common-directory resolution, a new
+subscriber joining, mutation epoch retirement, and final-release cancellation.
+Each current subscriber must attach to one shared physical-repository owner;
+departed subscribers and stale resolution results must not remain attached.
+
 For external Git Manager refresh, keep the automatic fetch interval at its
 180-second default. Default fixtures use ordinary `git init` without
 `--ref-format`, so supported older Git installations can run them. Reftable
@@ -1240,6 +1313,15 @@ remain intact. Exercise loading, empty folders, permission denial, and a dropped
 server connection; confirm **Refresh** can retry and returning to the form keeps
 its input. Capture the flow in light and dark. Local/WSL native picking must still
 work, and manual parent entry must remain available.
+
+For manual **Add Project → Type a path instead** during host initialization,
+verify that the path stays editable, **Open project** is disabled with a waiting
+status, and pointer, Enter and form submission do not create a project while host
+platform information is unknown. When it arrives, the same dialog must enable
+submission without clearing the path or changing the selected host; nothing is
+submitted automatically. A selected host that disconnects retains the existing
+fallback behavior. Run `AddProjectReadiness.test.tsx` through the web package's
+compiled happy-dom lane alongside the Add Project component/workflow tests.
 
 Create a disposable bare repository large enough that a clone at about
 600 KB/s takes well over 30 seconds (for example 20 MB or more of

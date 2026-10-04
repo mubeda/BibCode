@@ -2388,6 +2388,311 @@ async fn unchanged_frozen_route_relaunches_and_legacy_missing_route_fails_closed
     engine.shutdown().await;
 }
 
+struct FrozenRetryFixture {
+    engine: OrchestrationEngine,
+    database: Database,
+    settings: TempDir,
+    row: ProviderTurnDelivery,
+    command: OrchestrationCommand,
+    state: Arc<StdMutex<DriverState>>,
+    supervisor: ProviderRuntimeSupervisor,
+    _events: mpsc::Sender<ProviderEvent>,
+}
+
+impl FrozenRetryFixture {
+    async fn new(instance: Option<&str>, cursor: Option<Value>) -> Self {
+        let (engine, database) = engine_and_database().await;
+        let settings = TempDir::new().expect("frozen retry settings");
+        write_route_settings(&settings, "cursor-a", "https://route-a.invalid", "env-a");
+        let mut row = delivery_row("cursor", "lost-resume-state");
+        row.provider_instance_id = "route-cursor".to_owned();
+        row.provider_session_id = Some("old-conversation".to_owned());
+        row.payload = serde_json::to_value(durable_turn_command_for(
+            &row.command_id,
+            "preserve this retry",
+            "route-cursor",
+            "cursor-model",
+        ))
+        .expect("frozen retry command");
+        let command = freeze_row_route(&engine, &settings, &mut row).await;
+        seed_sending_delivery(&database, row.clone()).await;
+        if let Some(instance) = instance {
+            engine
+                .repositories()
+                .upsert_provider_session_runtime(ProviderSessionRuntime {
+                    thread_id: "t1".to_owned(),
+                    provider_name: "cursor".to_owned(),
+                    provider_instance_id: Some(instance.to_owned()),
+                    adapter_key: "cursor-acp".to_owned(),
+                    runtime_mode: "full-access".to_owned(),
+                    status: "suspended".to_owned(),
+                    last_seen_at: NOW.to_owned(),
+                    resume_cursor: cursor.clone(),
+                    runtime_payload: None,
+                })
+                .await
+                .expect("persist previous runtime");
+        }
+        let native_cursor = cursor
+            .filter(|cursor| cursor["sessionId"] == "old-conversation")
+            .unwrap_or_else(|| json!({"sessionId":"new-conversation"}));
+        let state = Arc::new(StdMutex::new(DriverState {
+            start_results: VecDeque::from([Ok(StartedSession {
+                resume_cursor: Some(native_cursor),
+                runtime_payload: None,
+                activity_capabilities: ActivityCapabilities::none(),
+            })]),
+            ..DriverState::default()
+        }));
+        let (events, events_rx) = mpsc::channel(1);
+        let supervisor = ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(FakeFactory {
+                state: state.clone(),
+                events: StdMutex::new(VecDeque::from([events_rx])),
+            }),
+            activity_projection(&engine),
+            SupervisorOptions::default(),
+        );
+        Self {
+            engine,
+            database,
+            settings,
+            row,
+            command,
+            state,
+            supervisor,
+            _events: events,
+        }
+    }
+
+    async fn deliver(&self) -> ProviderDeliveryOutcome {
+        deliver_durable_orchestration_turn(
+            &self.supervisor,
+            &self.engine,
+            &self.settings.path().to_path_buf(),
+            self.command.clone(),
+            self.row.delivery_key.clone(),
+        )
+        .await
+    }
+
+    async fn close(self) {
+        self.supervisor
+            .shutdown()
+            .await
+            .expect("retry supervisor shutdown");
+        self.engine.shutdown().await;
+    }
+}
+
+async fn assert_frozen_retry_launches_fresh(instance: Option<&str>) {
+    let fixture = FrozenRetryFixture::new(instance, None).await;
+    let outcome = fixture.deliver().await;
+    assert!(
+        matches!(
+            outcome,
+            ProviderDeliveryOutcome::AcceptedInNewConversation { .. }
+        ),
+        "a frozen retry with lost resume state must be accepted: {outcome:?}"
+    );
+    let current = fixture
+        .engine
+        .repositories()
+        .get_provider_turn_delivery(fixture.row.command_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.provider_session_id.as_deref(),
+        Some("new-conversation")
+    );
+    assert_eq!(current.command_id, fixture.row.command_id);
+    assert_eq!(current.delivery_key, fixture.row.delivery_key);
+    assert_eq!(current.payload, fixture.row.payload);
+    assert_eq!(current.attempts, fixture.row.attempts);
+    {
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.launches.len(), 1);
+        assert!(state.launches[0].resume_cursor.is_none());
+        assert_eq!(state.sends, ["preserve this retry"]);
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn frozen_retry_with_deleted_resume_state_launches_fresh() {
+    assert_frozen_retry_launches_fresh(None).await;
+}
+
+#[tokio::test]
+async fn frozen_retry_with_cursorless_runtime_launches_fresh() {
+    assert_frozen_retry_launches_fresh(Some("route-cursor")).await;
+}
+
+#[tokio::test]
+async fn frozen_retry_unfreeze_guard_miss_does_not_launch_or_resend_delivered_work() {
+    let fixture = FrozenRetryFixture::new(None, None).await;
+    fixture
+        .database
+        .call(|connection| {
+            connection.execute("UPDATE provider_turn_outbox SET state = 'delivered'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let outcome = fixture.deliver().await;
+    assert!(
+        matches!(outcome, ProviderDeliveryOutcome::DefinitelyNotSent { .. }),
+        "a moved outbox row must prevent a fresh launch: {outcome:?}"
+    );
+    assert!(fixture.state.lock().unwrap().launches.is_empty());
+    assert!(fixture.state.lock().unwrap().sends.is_empty());
+    let current = fixture
+        .engine
+        .repositories()
+        .get_provider_turn_delivery(fixture.row.command_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.state, TurnDeliveryState::Delivered);
+    assert_eq!(current.provider_session_id, fixture.row.provider_session_id);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn frozen_retry_with_valid_resume_state_keeps_the_native_conversation() {
+    let fixture = FrozenRetryFixture::new(
+        Some("route-cursor"),
+        Some(json!({"sessionId":"old-conversation"})),
+    )
+    .await;
+    assert!(matches!(
+        fixture.deliver().await,
+        ProviderDeliveryOutcome::Accepted { .. }
+    ));
+    assert_eq!(
+        fixture.state.lock().unwrap().launches[0].resume_cursor,
+        Some(json!({"sessionId":"old-conversation"}))
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .repositories()
+            .get_provider_turn_delivery(fixture.row.command_id.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .provider_session_id,
+        fixture.row.provider_session_id
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn frozen_retry_rejects_replacement_session_and_instance_without_unfreezing() {
+    for (instance, cursor, detail) in [
+        (
+            "route-cursor",
+            json!({"sessionId":"replacement"}),
+            "provider session mismatch",
+        ),
+        (
+            "other-cursor",
+            json!({"sessionId":"old-conversation"}),
+            "requires resumable runtime state",
+        ),
+    ] {
+        let fixture = FrozenRetryFixture::new(Some(instance), Some(cursor.clone())).await;
+        let outcome = fixture.deliver().await;
+        assert!(
+            matches!(outcome, ProviderDeliveryOutcome::Rejected { detail: ref message } if message.contains(detail)),
+            "replacement runtime must remain rejected: {outcome:?}"
+        );
+        assert!(fixture.state.lock().unwrap().launches.is_empty());
+        assert_eq!(
+            fixture
+                .engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .unwrap()
+                .unwrap()
+                .resume_cursor,
+            Some(cursor)
+        );
+        assert_eq!(
+            fixture
+                .engine
+                .repositories()
+                .get_provider_turn_delivery(fixture.row.command_id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .provider_session_id,
+            fixture.row.provider_session_id
+        );
+        fixture.close().await;
+    }
+}
+
+#[tokio::test]
+async fn frozen_retry_preserves_nonaccepted_fresh_delivery_outcomes() {
+    for expected in [
+        ProviderDeliveryOutcome::DefinitelyNotSent {
+            detail: "not sent".to_owned(),
+        },
+        ProviderDeliveryOutcome::Ambiguous {
+            detail: "possibly received".to_owned(),
+        },
+        ProviderDeliveryOutcome::Rejected {
+            detail: "rejected".to_owned(),
+        },
+        ProviderDeliveryOutcome::Refused {
+            detail: "options refused".to_owned(),
+        },
+    ] {
+        let fixture = FrozenRetryFixture::new(None, None).await;
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .delivery_outcomes
+            .push_back(expected.clone());
+        assert_eq!(fixture.deliver().await, expected);
+        assert_eq!(fixture.state.lock().unwrap().launches.len(), 1);
+        fixture.close().await;
+    }
+}
+
+#[tokio::test]
+async fn frozen_retry_reconciliation_does_not_unfreeze_ambiguous_work_automatically() {
+    let fixture = FrozenRetryFixture::new(None, None).await;
+    assert!(matches!(
+        reconcile_orchestration_turn(
+            &fixture.supervisor,
+            &fixture.engine,
+            &fixture.settings.path().to_path_buf(),
+            fixture.row.clone()
+        )
+        .await,
+        ProviderReconciliationOutcome::Unavailable { .. }
+    ));
+    assert!(fixture.state.lock().unwrap().launches.is_empty());
+    assert_eq!(
+        fixture
+            .engine
+            .repositories()
+            .get_provider_turn_delivery(fixture.row.command_id.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .provider_session_id,
+        fixture.row.provider_session_id
+    );
+    fixture.close().await;
+}
+
 #[tokio::test]
 async fn active_delivery_uses_its_frozen_launch_route_not_current_settings() {
     let (engine, database) = engine_and_database().await;
@@ -10518,6 +10823,7 @@ async fn restart_reconciles_abandoned_running_provider_sessions() {
         .unwrap();
     assert_eq!(session.status, "error");
     assert_eq!(session.active_turn_id, None);
+    assert_eq!(session.last_error_class.as_deref(), Some("session_stopped"));
     assert!(
         session
             .last_error
