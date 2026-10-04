@@ -18,11 +18,11 @@ jobs:
       matrix:
         include:
           - {
-              label: Windows x64 NSIS,
-              runner: windows-2025,
-              platform: win,
-              arch: x64,
-              bundle: nsis,
+              label: macOS arm64,
+              runner: macos-26,
+              platform: mac,
+              arch: arm64,
+              bundle: dmg,
               jobTimeoutMinutes: 240,
             }
     steps:
@@ -58,7 +58,7 @@ jobs:
 
       - name: Install frozen dependencies
         run: vp install --frozen-lockfile
-      - name: Validate Windows installer witness tooling before packaging
+      - name: Validate seeded upgrade QA observers before packaging
         run: vp test scripts/lib/windows-installer-witness.test.ts
           scripts/seeded-desktop-upgrade-smoke.test.ts
 
