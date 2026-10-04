@@ -1507,6 +1507,9 @@ separately from receiver bytes/digest and actual native control/Close frames.
 A normally returning native Ping write during incomplete message data is socket
 admission evidence; matching masked Pong receipt is independently attributed
 before or after final message completion. Do not call a later Pong interleaved.
+The receiver writes its native Close-1000 frame and keeps TCP open until the
+matching masked client Close is observed; sending TCP FIN with the initiating
+Close can let a forwarding socket end before that acknowledgement arrives.
 For queued-before-close, require positive browser queued data before the call,
 the complete matching data digest at the receiver, then an observed Close, and
 a clean browser Close event. Both listeners/sockets and proxies must be joined

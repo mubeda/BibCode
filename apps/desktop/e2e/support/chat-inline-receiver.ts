@@ -78,6 +78,55 @@ function verifyLiveOwner(proof: BrowserNetworkProof): void {
   }
 }
 
+/** Listener-free control seam; the live listener still requires its native owner proof. */
+export function createInlineProbeControl(
+  action: BrowserInlineAction,
+  recorder: ReturnType<typeof createNativeFrameRecorder>,
+  socket: Pick<NodeStream.Duplex, "write" | "end" | "destroy">,
+  isStopped: () => boolean,
+) {
+  if (action !== "mid-message-pong" && action !== "queued-before-close")
+    throw new Error("Inline probe action refused.");
+  let pingSent = false,
+    closeSent = false;
+  const receive = (bytes: Buffer) => {
+    if (isStopped()) return;
+    recorder.push(bytes);
+    const observed = recorder.read();
+    if (!observed.complete) {
+      socket.destroy();
+      return;
+    }
+    if (
+      action === "mid-message-pong" &&
+      !pingSent &&
+      observed.messageBytes >= 32768 &&
+      !observed.messageFinished
+    ) {
+      try {
+        socket.write(Buffer.from([0x89, 4, 17, 0, 17, 0]));
+        recorder.recordPingWrite();
+        pingSent = true;
+      } catch {
+        socket.destroy();
+        return;
+      }
+    }
+    if (
+      !closeSent &&
+      (observed.closeFrameReceived ||
+        (action === "mid-message-pong" &&
+          observed.messageFinished &&
+          observed.nativePongMidMessage + observed.nativePongAfterMessage === 1))
+    ) {
+      closeSent = true;
+      socket.write(Buffer.from([0x88, 2, 3, 232]));
+    }
+    if (observed.closeFrameReceived) socket.end();
+  };
+  return { receive, closeWritten: () => closeSent };
+}
+
 /** Start only inside the existing PID1-owned, no-external-route qualification namespace. */
 export async function startInlineProbeReceiver(
   action: BrowserInlineAction,
@@ -96,9 +145,8 @@ export async function startInlineProbeReceiver(
   let stopped = false,
     upgraded = false,
     upgradeCount = 0,
-    pingSent = false,
-    closeSent = false,
     timedOut = false;
+  let control: ReturnType<typeof createInlineProbeControl> | undefined;
   let probeTimer: ReturnType<typeof setTimeout> | undefined;
   const server = NodeHttp.createServer({ maxHeaderSize: 8192 }, (request, response) => {
     response.writeHead(request.method === "GET" && request.url === "/" ? 200 : 403, {
@@ -170,40 +218,8 @@ export async function startInlineProbeReceiver(
       timedOut = true;
       socket.destroy();
     }, 245000);
-    const receive = (bytes: Buffer) => {
-      if (stopped) return;
-      recorder.push(bytes);
-      const observed = recorder.read();
-      if (!observed.complete) {
-        socket.destroy();
-        return;
-      }
-      if (
-        action === "mid-message-pong" &&
-        !pingSent &&
-        observed.messageBytes >= 32768 &&
-        !observed.messageFinished
-      ) {
-        try {
-          socket.write(Buffer.from([0x89, 4, 17, 0, 17, 0]));
-          recorder.recordPingWrite();
-          pingSent = true;
-        } catch {
-          socket.destroy();
-          return;
-        }
-      }
-      if (
-        !closeSent &&
-        (observed.closeFrameReceived ||
-          (action === "mid-message-pong" &&
-            observed.messageFinished &&
-            observed.nativePongMidMessage + observed.nativePongAfterMessage === 1))
-      ) {
-        closeSent = true;
-        socket.end(Buffer.from([0x88, 2, 3, 232]));
-      }
-    };
+    control = createInlineProbeControl(action, recorder, socket, () => stopped);
+    const receive = control.receive;
     socket.on("data", receive);
     socket.on("error", () => socket.destroy());
     socket.once("close", () => {
@@ -229,7 +245,7 @@ export async function startInlineProbeReceiver(
       upgraded,
       upgradeCount,
       timedOut,
-      closeWritten: closeSent,
+      closeWritten: control?.closeWritten() ?? false,
       expectedBytes: messageBytes,
       expectedDigest,
     }),
