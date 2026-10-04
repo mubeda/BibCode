@@ -2383,3 +2383,211 @@ it("retains only the same-read closed primary witness at the exact failed proof 
     expect(JSON.stringify(records)).not.toMatch(/private|snapshot|http:\/\/|credential/);
   }
 });
+
+function removalReplay(failed: string | null = null) {
+  const start = controller.indexOf("async function removeHost(");
+  const end = controller.indexOf("async function importProject(", start);
+  const clickStart = controller.indexOf("const click = async");
+  const clickEnd = controller.indexOf("const text = async", clickStart);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const calls: unknown[][] = [];
+  const failure = new Error("inert private missing element");
+  const action = async (operation: string, args: unknown[] = []) => {
+    calls.push([operation, ...args]);
+    if (operation === failed) throw failure;
+  };
+  const control = (prefix: string) => ({
+    waitForDisplayed: (...args: unknown[]) => action(prefix + "-displayed", args),
+    waitForClickable: (...args: unknown[]) => action(prefix + "-clickable", args),
+    click: (...args: unknown[]) => action(prefix + "-click", args),
+  });
+  const host = {
+    label: "inert-private-label",
+    child: { role: "owned-child" },
+    closeTunnel: () => action("tunnel-close"),
+  };
+  const browser = {
+    $: (selector: string) => {
+      expect(selector).toBe("owned-row");
+      return { waitForExist: (...args: unknown[]) => action("row-removed", args) };
+    },
+    $$: async (selector: string) => {
+      expect(selector).toBe('button[data-slot="toast-close"]');
+      await action("toast-list", [selector]);
+      return [
+        {
+          isDisplayed: async () => {
+            await action("toast-displayed");
+            return true;
+          },
+          click: () => action("toast-click"),
+        },
+      ];
+    },
+  };
+  const remove = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      controller.slice(clickStart, clickEnd) + controller.slice(start, end) + "\nremoveHost",
+    ),
+    {
+      required: () => browser,
+      settings: () => action("settings"),
+      row: (label: string) => {
+        expect(label).toBe(host.label);
+        return "owned-row";
+      },
+      owner: { stop: (child: unknown) => action("child-stop", [child]) },
+      bounded: (promise: Promise<unknown>, budget: number) => {
+        calls.push(["bound", budget]);
+        return promise;
+      },
+      element: (selector: string) => {
+        calls.push(["resolve", selector]);
+        if (selector === 'button[aria-label="More actions for inert-private-label"]')
+          return control("more");
+        if (selector === '//*[@role="menuitem" and normalize-space()="Remove server…"]')
+          return control("remove");
+        if (selector === '[role="alertdialog"] button=Remove server') return control("confirm");
+        throw new Error("Unexpected public control.");
+      },
+    },
+  );
+  return { remove, host, calls, failure };
+}
+
+it("adds removal markers without changing existing control selectors, argument defaults or joins", async () => {
+  const baseline = removalReplay();
+  await baseline.remove(baseline.host);
+  expect(baseline.calls).toEqual([
+    ["settings"],
+    ["resolve", 'button[aria-label="More actions for inert-private-label"]'],
+    ["more-displayed"],
+    ["more-clickable"],
+    ["more-click"],
+    ["resolve", '//*[@role="menuitem" and normalize-space()="Remove server…"]'],
+    ["remove-displayed"],
+    ["remove-clickable"],
+    ["remove-click"],
+    ["resolve", '[role="alertdialog"] button=Remove server'],
+    ["confirm-displayed"],
+    ["confirm-clickable"],
+    ["confirm-click"],
+    ["row-removed", { reverse: true }],
+    ["child-stop", baseline.host.child],
+    ["tunnel-close"],
+    ["bound", 5_000],
+    ["toast-list", 'button[data-slot="toast-close"]'],
+    ["toast-displayed"],
+    ["toast-click"],
+  ]);
+  const stages: string[] = [];
+  const observed = removalReplay();
+  await observed.remove(observed.host, (operation: string) => stages.push(operation));
+  expect(observed.calls).toEqual(baseline.calls);
+  expect(stages).toEqual([
+    "settings",
+    "more",
+    "more-displayed",
+    "more-clickable",
+    "more-click",
+    "remove",
+    "remove-displayed",
+    "remove-clickable",
+    "remove-click",
+    "confirm",
+    "confirm-displayed",
+    "confirm-clickable",
+    "confirm-click",
+    "row-removed",
+    "child-stop",
+    "tunnel-close",
+    "toast-list",
+    "toast-displayed",
+    "toast-click",
+  ]);
+  for (const failed of stages) {
+    const probe = removalReplay();
+    await probe.remove(probe.host, (operation: string) => {
+      if (operation === failed) throw new Error("inert observer failure");
+    });
+    expect(probe.calls).toEqual(baseline.calls);
+  }
+});
+
+it.each([
+  "settings",
+  "more-displayed",
+  "more-clickable",
+  "more-click",
+  "remove-displayed",
+  "remove-clickable",
+  "remove-click",
+  "confirm-displayed",
+  "confirm-clickable",
+  "confirm-click",
+  "row-removed",
+  "child-stop",
+  "tunnel-close",
+  "toast-list",
+  "toast-click",
+])(
+  "keeps the original removal failure and identifies its existing boundary: %s",
+  async (failed) => {
+    const baseline = removalReplay(failed);
+    await expect(baseline.remove(baseline.host)).rejects.toBe(baseline.failure);
+    const probe = removalReplay(failed);
+    const stages: string[] = [];
+    await expect(
+      probe.remove(probe.host, (operation: string) => {
+        stages.push(operation);
+        throw new Error("inert diagnostic failure");
+      }),
+    ).rejects.toBe(probe.failure);
+    expect(probe.calls).toEqual(baseline.calls);
+    expect(stages.at(-1)).toBe(failed);
+  },
+);
+
+it("binds only fixed queue removal slot/stage markers after the unchanged core assertion", async () => {
+  const start = controller.indexOf(
+    "  for (const [index, host] of hosts.entries())",
+    controller.indexOf("async function queuedFlow()"),
+  );
+  const end = controller.indexOf("\n}\n\nasync function manualHost", start);
+  expect(start).toBeGreaterThan(
+    controller.indexOf(
+      'kind: "bounded-parallel"',
+      controller.indexOf("async function queuedFlow()"),
+    ),
+  );
+  expect(end).toBeGreaterThan(start);
+  const hosts = [{ label: "private-a" }, { label: "private-b" }, { label: "private-c" }];
+  const phases: string[] = [];
+  const removed: unknown[] = [];
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      "async function removeQueued(){" + controller.slice(start, end) + "}\nremoveQueued",
+    ),
+    {
+      hosts,
+      phase: (value: string) => phases.push(value),
+      removeHost: async (host: unknown, observe: (operation: string) => void) => {
+        removed.push(host);
+        observe("settings");
+        observe("toast-click");
+      },
+    },
+  );
+  await run();
+  expect(removed).toEqual(hosts);
+  expect(phases).toEqual([
+    "queued-remove-a-settings",
+    "queued-remove-a-toast-click",
+    "queued-remove-b-settings",
+    "queued-remove-b-toast-click",
+    "queued-remove-c-settings",
+    "queued-remove-c-toast-click",
+  ]);
+  expect(JSON.stringify(phases)).not.toMatch(/private|label|http/);
+});

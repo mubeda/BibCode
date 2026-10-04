@@ -371,6 +371,35 @@ The diagnostic follow-up passed 217 focused tests across nine files, desktop
 e2e TypeScript checking and the seven-file formatting/lint gate. A fresh native
 witness is still required; none was produced by these source/fixture checks.
 
+Fresh full trial `37163997898` at `9baee620` failed earlier with a missing-element
+classification at the broad `bounded-parallel` phase. It retained eighteen light
+originals, including `queued`, and twenty-seven assertions, including the final
+bounded-parallel core assertion. Source places that assertion immediately before
+the three-host removal loop. The failure is therefore in that existing removal
+path, while the core queue/admission/remount/dismiss checks had been reached.
+It is not evidence of a new raw-proof consumer problem; Reload was not reached
+and its null witness is correct. Cleanup reports no failures, closed children
+and no namespace survivors.
+
+The latest queue A child had exitCode zero before final cleanup, while B/C were
+still open. This is consistent with A's join being reached and a failure in its
+remaining tail or B's earlier removal actions; it does not identify a toast or
+other control. Settings owns separate Connect/Share tab state, More opens its
+menu, Remove opens an alert and then removes the catalog entry, and the original
+removal helper joins the child/tunnel before enumerating toast-close buttons.
+No receipt identifies which of those existing operations was missing.
+
+The follow-up adds only fixed A/B/C per-action markers to that unchanged helper
+and caller. Fault-injected execution of the actual source confirms identical
+selectors, arguments, default waits, joins and public action journals. Marker
+exceptions at every position leave the sequence intact; action failures preserve
+the same original Error object. No UI read/action/request, wait extension,
+selector, dialog/toast policy or acceptance change is added. The exact native
+removal operation remains unknown until the next root-owned observed run.
+The marker-only follow-up passed 234 focused tests across nine files, desktop
+e2e TypeScript and the four-file formatting/lint gate. These fault-injected
+checks establish diagnostic transparency, not the native missing-element cause.
+
 Root's focused visual inspection also found the Retry action visibly clipped at
 the right edge of the authoritative 1280x817 `not-back-light.png` original. This
 is a #16/UI.md follow-up for a later focused toast source check. It is not an

@@ -586,6 +586,16 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   wrong-version restart, the actual three-minute no-return deadline, two active
   updates plus one queued update, and the real browser Reload button. A core
   result explicitly lists those pending cases and is not full UI qualification.
+  The final bounded-parallel assertion records the core queue checks before
+  removing its three owned hosts. Completion of that assertion does not prove
+  host removal completed. Fixed `queued-remove-a/b/c-<operation>` markers
+  identify the existing settings, More/Remove/confirmation waits and clicks,
+  row-removal wait, child/tunnel joins and toast-display/click boundaries. Slot
+  names come from the fixed host order, never labels or identifiers. Optional
+  marker failures cannot skip an action, replace its original failure or alter
+  a budget; these markers add no UI read, request or interaction. Preserve the
+  existing removal and toast semantics until the native failing operation is
+  observed. A null Reload witness before its stage remains unavailable evidence.
   After the scripted wrong-version restart, its updater status has no latest
   version. Verify the exact wrong-version error first, then use Settings Retry
   and require the named confirmation without a version plus fresh work counts.

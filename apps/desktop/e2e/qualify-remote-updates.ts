@@ -472,17 +472,57 @@ async function addHost(
   await text(row(host.label), interactive ? "Update to v9.9.1…" : "Manual updates");
 }
 
-async function removeHost(host: Host) {
+type RemoveHostOperation =
+  | "settings"
+  | "more"
+  | "remove"
+  | "confirm"
+  | `${"more" | "remove" | "confirm"}-${"displayed" | "clickable" | "click"}`
+  | "row-removed"
+  | "child-stop"
+  | "tunnel-close"
+  | "toast-list"
+  | "toast-displayed"
+  | "toast-click";
+
+async function removeHost(host: Host, observe?: (operation: RemoveHostOperation) => void) {
+  const observeStep = (operation: RemoveHostOperation) => {
+    try {
+      observe?.(operation);
+    } catch {
+      // Optional removal attribution cannot change the original action or failure.
+    }
+  };
+  observeStep("settings");
   await settings();
-  await click(`button[aria-label="More actions for ${host.label}"]`);
-  await click('//*[@role="menuitem" and normalize-space()="Remove server…"]');
-  await click('[role="alertdialog"] button=Remove server');
+  observeStep("more");
+  await click(`button[aria-label="More actions for ${host.label}"]`, (operation) =>
+    observeStep(`more-${operation}`),
+  );
+  observeStep("remove");
+  await click('//*[@role="menuitem" and normalize-space()="Remove server…"]', (operation) =>
+    observeStep(`remove-${operation}`),
+  );
+  observeStep("confirm");
+  await click('[role="alertdialog"] button=Remove server', (operation) =>
+    observeStep(`confirm-${operation}`),
+  );
+  observeStep("row-removed");
   await required().$(row(host.label)).waitForExist({ reverse: true });
+  observeStep("child-stop");
   await owner.stop(host.child);
-  if (host.closeTunnel) await bounded(host.closeTunnel(), 5_000);
+  if (host.closeTunnel) {
+    observeStep("tunnel-close");
+    await bounded(host.closeTunnel(), 5_000);
+  }
   // End a completed fixture case through the real notification controls.
+  observeStep("toast-list");
   for (const close of await required().$$('button[data-slot="toast-close"]')) {
-    if (await close.isDisplayed().catch(() => false)) await close.click();
+    observeStep("toast-displayed");
+    if (await close.isDisplayed().catch(() => false)) {
+      observeStep("toast-click");
+      await close.click();
+    }
   }
 }
 
@@ -1038,7 +1078,10 @@ async function queuedFlow() {
     remountPreservedQueue: true,
     dismissDidNotCancelOtherRuns: true,
   });
-  for (const host of hosts) await removeHost(host);
+  for (const [index, host] of hosts.entries()) {
+    const slot = (["a", "b", "c"] as const)[index]!;
+    await removeHost(host, (operation) => phase(`queued-remove-${slot}-${operation}`));
+  }
 }
 
 async function manualHost(kind: "archive" | "package" | "unknown"): Promise<Host> {
