@@ -305,6 +305,21 @@ it("returns from real History PNG selection to exactly one visible working-tree 
       workingPane.querySelector('aside[aria-label="Partial staging selection gutter"]'),
     ).not.toBeNull();
     expect(workingPane.querySelectorAll("img")).toHaveLength(0);
+    const commitForm = container.querySelector<HTMLFormElement>(
+      'form[aria-label="Commit Changes"]',
+    )!;
+    const summary = commitForm.querySelector<HTMLInputElement>(
+      'input[name="git-manager-summary"]',
+    )!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(
+        summary,
+        "Owned layout draft",
+      );
+      summary.dispatchEvent(new Event("input", { bubbles: true }));
+      summary.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(summary.value).toBe("Owned layout draft");
     await act(async () => tab("History").click());
     const baseline = [...container.querySelectorAll<HTMLElement>('button[role="option"]')].find(
       (node) => node.getAttribute("aria-label")?.includes("Visual qualification baseline"),
@@ -324,7 +339,40 @@ it("returns from real History PNG selection to exactly one visible working-tree 
       1,
     );
     const text = firstText()!;
-    expect(text.closest('section[aria-label="Changes"]')).not.toBeNull();
+    const changes = text.closest('section[aria-label="Changes"]')!;
+    const list = changes.querySelector<HTMLElement>(
+      '[role="listbox"][aria-label="Changed files"]',
+    )!;
+    const retainedImage = changes.querySelector<HTMLElement>(
+      'section[aria-label="Diff for visual-swatch.png"]',
+    )!;
+    const retainedCommit = changes.querySelector<HTMLFormElement>(
+      'form[aria-label="Commit Changes"]',
+    )!;
+    expect(retainedImage).not.toBeNull();
+    expect(list.parentElement).toBe(changes);
+    expect(retainedImage.parentElement).toBe(changes);
+    expect(retainedCommit.parentElement).toBe(changes);
+    expect(
+      retainedCommit.querySelector<HTMLInputElement>('input[name="git-manager-summary"]')?.value,
+    ).toBe("Owned layout draft");
+    // Declared allocation contract only: Happy DOM does not resolve native flex heights.
+    for (const flexible of [list, retainedImage]) {
+      expect(flexible.classList.contains("flex-1")).toBe(true);
+      expect(flexible.classList.contains("min-h-0")).toBe(true);
+      expect(
+        [...flexible.classList].some(
+          (token) =>
+            token === "shrink-0" ||
+            token.startsWith("h-") ||
+            (token.startsWith("min-h-") && token !== "min-h-0"),
+        ),
+      ).toBe(false);
+    }
+    expect(
+      retainedImage.querySelector('aside[aria-label="Partial staging selection gutter"]'),
+    ).not.toBeNull();
+    expect(changes.querySelectorAll('section[aria-label^="Diff for "]')).toHaveLength(1);
     expect(text.closest("[hidden],[inert]")).toBeNull();
     expect(text.getBoundingClientRect().height).toBeGreaterThan(0);
     await act(async () => text.click());
