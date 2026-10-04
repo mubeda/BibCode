@@ -801,6 +801,7 @@ impl crate::source_control::GitLabCreateTransport for RevertCreateTransport {
                             crate::source_control::ProviderCommandFailure {
                                 code: error.code,
                                 host_detail: error.host_detail,
+                                process_failure: Some(failure.error.safe_facts()),
                             },
                         )),
                     }
