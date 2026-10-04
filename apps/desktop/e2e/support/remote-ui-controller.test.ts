@@ -2384,7 +2384,17 @@ it("retains only the same-read closed primary witness at the exact failed proof 
   }
 });
 
-function removalReplay(failed: string | null = null) {
+function removalReplay(
+  failed: string | null = null,
+  toastCase: {
+    clickFailure?: unknown;
+    disappears?: boolean;
+    replacement?: boolean;
+    remainsAfterClick?: boolean;
+    reobserveFailure?: unknown;
+    toastCount?: number;
+  } = {},
+) {
   const start = controller.indexOf("async function removeHost(");
   const end = controller.indexOf("async function importProject(", start);
   const clickStart = controller.indexOf("const click = async");
@@ -2393,6 +2403,13 @@ function removalReplay(failed: string | null = null) {
   expect(end).toBeGreaterThan(start);
   const calls: unknown[][] = [];
   const failure = new Error("inert private missing element");
+  const deadlineFailure = new Error(
+    "The required live observation did not arrive within its bound.",
+  );
+  let toastCount = toastCase.toastCount ?? 1;
+  let toastGeneration = 0;
+  let toastLists = 0;
+  let visibleReads = 0;
   const action = async (operation: string, args: unknown[] = []) => {
     calls.push([operation, ...args]);
     if (operation === failed) throw failure;
@@ -2415,15 +2432,28 @@ function removalReplay(failed: string | null = null) {
     $$: async (selector: string) => {
       expect(selector).toBe('button[data-slot="toast-close"]');
       await action("toast-list", [selector]);
-      return [
-        {
-          isDisplayed: async () => {
-            await action("toast-displayed");
-            return true;
-          },
-          click: () => action("toast-click"),
+      toastLists++;
+      if (toastLists > 1 && toastCase.reobserveFailure !== undefined)
+        throw toastCase.reobserveFailure;
+      const generation = toastGeneration;
+      return Array.from({ length: toastCount }, () => ({
+        isDisplayed: async () => {
+          await action("toast-displayed");
+          visibleReads++;
+          if (visibleReads === 1 && toastCase.disappears && !toastCase.replacement) toastCount = 0;
+          return true;
         },
-      ];
+        click: async () => {
+          await action("toast-click");
+          if (toastCase.clickFailure !== undefined) throw toastCase.clickFailure;
+          if (generation !== toastGeneration)
+            throw new Error("stale element reference: a later close was re-rendered");
+          if (!toastCase.remainsAfterClick) {
+            toastCount--;
+            toastGeneration++;
+          }
+        },
+      }));
     },
   };
   const remove = NodeVM.runInNewContext(
@@ -2437,7 +2467,16 @@ function removalReplay(failed: string | null = null) {
         expect(label).toBe(host.label);
         return "owned-row";
       },
-      owner: { stop: (child: unknown) => action("child-stop", [child]) },
+      owner: {
+        stop: (child: unknown) => action("child-stop", [child]),
+        until: async (read: () => Promise<boolean>, ...budgets: unknown[]) => {
+          calls.push(["until", ...budgets]);
+          for (let sample = 0; sample < 3; sample++) {
+            if (await read()) return;
+          }
+          throw deadlineFailure;
+        },
+      },
       bounded: (promise: Promise<unknown>, budget: number) => {
         calls.push(["bound", budget]);
         return promise;
@@ -2453,8 +2492,116 @@ function removalReplay(failed: string | null = null) {
       },
     },
   );
-  return { remove, host, calls, failure };
+  return { remove, host, calls, failure, deadlineFailure, toastVisible: () => toastCount > 0 };
 }
+
+it.each([
+  new Error(
+    'Can\'t call click on element with selector "button[data-slot="toast-close"]" because element wasn\'t found',
+  ),
+  new Error("no such element: close control removed"),
+  new Error("stale element reference: element is not attached to the page document"),
+])("confirms a vanished toast after a known visible close races dismissal: %s", async (error) => {
+  const probe = removalReplay(null, { clickFailure: error, disappears: true });
+  const stages: string[] = [];
+  await expect(
+    probe.remove(probe.host, (stage: string) => stages.push(stage)),
+  ).resolves.toBeUndefined();
+  expect(probe.toastVisible()).toBe(false);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+  expect(probe.calls.indexOf(probe.calls.find((call) => call[0] === "child-stop")!)).toBeLessThan(
+    probe.calls.indexOf(probe.calls.find((call) => call[0] === "toast-list")!),
+  );
+  expect(stages.slice(0, 15)).toEqual([
+    "settings",
+    "more",
+    "more-displayed",
+    "more-clickable",
+    "more-click",
+    "remove",
+    "remove-displayed",
+    "remove-clickable",
+    "remove-click",
+    "confirm",
+    "confirm-displayed",
+    "confirm-clickable",
+    "confirm-click",
+    "row-removed",
+    "child-stop",
+  ]);
+  expect(stages.slice(15)).toEqual([
+    "tunnel-close",
+    "toast-list",
+    "toast-displayed",
+    "toast-click",
+  ]);
+});
+
+it.each([
+  new Error("unknown click failure"),
+  new Error("invalid session id"),
+  new Error("socket hang up"),
+  new Error("request timed out while clicking"),
+  new Error("click intercepted by another element"),
+  new Error("request failed while mentioning no such element"),
+  new Error(
+    "Can't call click on element with selector \"another-control\" because element wasn't found",
+  ),
+])("preserves an unrecognized click error even when the toast is gone: %s", async (error) => {
+  const probe = removalReplay(null, { clickFailure: error, disappears: true });
+  const stages: string[] = [];
+  await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(error);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(1);
+  expect(stages.at(-1)).toBe("toast-click");
+});
+
+it("preserves the original stale click error when a re-rendered toast close remains visible", async () => {
+  const error = new Error("stale element reference: original node detached");
+  const probe = removalReplay(null, { clickFailure: error, disappears: true, replacement: true });
+  const stages: string[] = [];
+  await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(error);
+  expect(probe.toastVisible()).toBe(true);
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+  expect(stages.at(-1)).toBe("toast-click");
+});
+
+it("preserves the original missing click error when the absence read fails", async () => {
+  const error = new Error("no such element: original node removed");
+  const readFailure = new Error("invalid session id");
+  const probe = removalReplay(null, {
+    clickFailure: error,
+    disappears: true,
+    reobserveFailure: readFailure,
+  });
+  const stages: string[] = [];
+  await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(error);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(2);
+  expect(stages.at(-1)).toBe("toast-click");
+});
+
+it("requires a fresh toast-free end state after successful cleanup clicks", async () => {
+  const probe = removalReplay(null, { remainsAfterClick: true });
+  await expect(probe.remove(probe.host)).rejects.toBe(probe.deadlineFailure);
+  expect(probe.toastVisible()).toBe(true);
+  expect(probe.calls.filter((call) => call[0] === "until")).toEqual([["until"]]);
+});
+
+it("refetches current controls between toast dismissals when the remaining toast re-renders", async () => {
+  const probe = removalReplay(null, { toastCount: 2 });
+  await expect(probe.remove(probe.host)).resolves.toBeUndefined();
+  expect(probe.toastVisible()).toBe(false);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(3);
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(2);
+});
+
+it("keeps the original visibility-read failure without clicking or claiming absence", async () => {
+  const probe = removalReplay("toast-displayed");
+  await expect(probe.remove(probe.host)).rejects.toBe(probe.failure);
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toEqual([]);
+  expect(probe.toastVisible()).toBe(true);
+});
 
 it("adds removal markers without changing existing control selectors, argument defaults or joins", async () => {
   const baseline = removalReplay();
@@ -2477,9 +2624,11 @@ it("adds removal markers without changing existing control selectors, argument d
     ["child-stop", baseline.host.child],
     ["tunnel-close"],
     ["bound", 5_000],
+    ["until"],
     ["toast-list", 'button[data-slot="toast-close"]'],
     ["toast-displayed"],
     ["toast-click"],
+    ["toast-list", 'button[data-slot="toast-close"]'],
   ]);
   const stages: string[] = [];
   const observed = removalReplay();
@@ -2505,6 +2654,7 @@ it("adds removal markers without changing existing control selectors, argument d
     "toast-list",
     "toast-displayed",
     "toast-click",
+    "toast-list",
   ]);
   for (const failed of stages) {
     const probe = removalReplay();

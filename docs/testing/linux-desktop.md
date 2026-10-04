@@ -593,9 +593,18 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   row-removal wait, child/tunnel joins and toast-display/click boundaries. Slot
   names come from the fixed host order, never labels or identifiers. Optional
   marker failures cannot skip an action, replace its original failure or alter
-  a budget; these markers add no UI read, request or interaction. Preserve the
-  existing removal and toast semantics until the native failing operation is
-  observed. A null Reload witness before its stage remains unavailable evidence.
+  a budget; these markers add no UI read, request or interaction. After row
+  removal and owned child/tunnel joins, toast cleanup reads current visible close
+  controls one at a time within the existing thirty-second owner observation
+  bound. Re-fetch after each dismissal and require a fresh read with zero visible
+  close controls before completing cleanup. A recognized missing/stale click may
+  count as already gone only when a second fresh enumeration proves that same
+  zero-visible end state. Unknown click errors, visible replacements and failed
+  absence reads preserve the original failure and click phase. This conservative
+  proof needs no fabricated toast identity or changes to toast lifetimes, Retry
+  behavior or functional assertions. A missing element alone does not establish
+  an auto-dismiss cause. A null Reload witness before its stage remains
+  unavailable evidence.
   After the scripted wrong-version restart, its updater status has no latest
   version. Verify the exact wrong-version error first, then use Settings Retry
   and require the named confirmation without a version plus fresh work counts.

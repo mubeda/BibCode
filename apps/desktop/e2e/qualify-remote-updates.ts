@@ -516,14 +516,44 @@ async function removeHost(host: Host, observe?: (operation: RemoveHostOperation)
     await bounded(host.closeTunnel(), 5_000);
   }
   // End a completed fixture case through the real notification controls.
-  observeStep("toast-list");
-  for (const close of await required().$$('button[data-slot="toast-close"]')) {
-    observeStep("toast-displayed");
-    if (await close.isDisplayed().catch(() => false)) {
+  const toastClose = 'button[data-slot="toast-close"]';
+  await owner.until(async () => {
+    observeStep("toast-list");
+    for (const close of await required().$$(toastClose)) {
+      observeStep("toast-displayed");
+      if (!(await close.isDisplayed())) continue;
       observeStep("toast-click");
-      await close.click();
+      try {
+        await close.click();
+      } catch (error) {
+        try {
+          const descriptor =
+            error !== null && typeof error === "object"
+              ? Object.getOwnPropertyDescriptor(error, "message")
+              : undefined;
+          const message =
+            descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : null;
+          if (
+            typeof message !== "string" ||
+            (!/^(?:no such element|stale element reference)(?::|$)/.test(message) &&
+              message !==
+                `Can't call click on element with selector "${toastClose}" because element wasn't found`)
+          )
+            throw error;
+          // There is no stable public toast ID. Accept only concrete absence of
+          // every visible close, keeping the original click phase and error.
+          for (const current of await required().$$(toastClose))
+            if (await current.isDisplayed()) throw error;
+        } catch {
+          throw error;
+        }
+        return true;
+      }
+      // Re-fetch after each dismissal; later controls may have re-rendered.
+      return false;
     }
-  }
+    return true;
+  });
 }
 
 async function importProject(
