@@ -4,6 +4,7 @@ import { readVisualWitness } from "./release-visual-observation.ts";
 import * as Observations from "./release-visual-observation.ts";
 import { validateVisualWitness } from "./release-visual-evidence.ts";
 const textRowFacts = {
+  layout: null,
   changesActive: true,
   globalTextRows: "one",
   scopedTextRows: "one",
@@ -310,6 +311,308 @@ describe("read-only visual observations", () => {
     if (typeof HTMLElement.prototype.checkVisibility === "function")
       vi.spyOn(HTMLElement.prototype, "checkVisibility").mockReturnValue(true);
   }
+  const layoutFacts = {
+    listBoxCount: "one",
+    listBoxWidthPositive: true,
+    listBoxHeightPositive: true,
+    panelWidthPositive: true,
+    panelHeightPositive: true,
+    changesWidthPositive: true,
+    changesHeightPositive: true,
+    blockingAncestor: "none",
+    diffPanePresent: true,
+    commitBoxPresent: true,
+    nonListDemandExhaustsChanges: false,
+  };
+  function layoutDom(withSourceTopology = true) {
+    textRowDom();
+    const panel = document.querySelector<HTMLElement>('[role="tabpanel"]')!;
+    const changes = panel.querySelector<HTMLElement>('section[aria-label="Changes"]')!;
+    const list = changes.querySelector<HTMLElement>('[role="listbox"]')!;
+    const diff = document.createElement("section");
+    diff.setAttribute("aria-label", "Diff for visual-swatch.png");
+    const commit = document.createElement("form");
+    commit.setAttribute("aria-label", "Commit Changes");
+    changes.append(diff, commit);
+    const sizes = new Map<Element, { width: number; height: number }>([
+      [panel, { width: 300, height: 600 }],
+      [changes, { width: 300, height: 500 }],
+      [list, { width: 300, height: 100 }],
+      [diff, { width: 300, height: 250 }],
+      [commit, { width: 300, height: 100 }],
+    ]);
+    const styles = new Map<Element, Partial<CSSStyleDeclaration>>();
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        const size = sizes.get(this) ?? { width: 300, height: 100 };
+        return new DOMRect(0, 0, size.width, size.height);
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return sizes.get(this)?.height ?? 100;
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return sizes.get(this)?.height ?? 100;
+      },
+    );
+    vi.stubGlobal("getComputedStyle", (element: Element) => {
+      const value = {};
+      Object.assign(
+        value,
+        {
+          display: "flex",
+          visibility: "visible",
+          opacity: "1",
+          position: "static",
+          flexDirection: "column",
+          paddingTop: "0px",
+          paddingBottom: "0px",
+          marginTop: "0px",
+          marginBottom: "0px",
+          rowGap: "0px",
+        },
+        styles.get(element),
+      );
+      return value;
+    });
+    const topology = withSourceTopology ? sourceOwnerTopology(panel) : null;
+    return { panel, changes, list, diff, commit, sizes, styles, topology };
+  }
+  function sourceOwnerTopology(panel: HTMLElement) {
+    const header = document.querySelector<HTMLElement>("header")!;
+    const tab = document.querySelector<HTMLElement>('[role="tab"]')!;
+    const owner = document.createElement("div");
+    owner.className = "flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background";
+    const toolbar = document.createElement("div");
+    toolbar.className = "min-w-0 shrink-0";
+    const tabsRoot = document.createElement("div");
+    tabsRoot.className = "flex min-w-0 flex-col min-h-0 flex-1 gap-0";
+    header.parentElement!.insertBefore(owner, header);
+    toolbar.append(header);
+    tabsRoot.append(tab, panel);
+    owner.append(toolbar, tabsRoot);
+    return { owner, toolbar, tabsRoot };
+  }
+  it.each(["source-shaped", "outside-owner", "nested-owner", "body-owner"])(
+    "binds optional layout to the actual toolbar/repository sibling owner only: %s",
+    (mode) => {
+      const f = layoutDom(false);
+      const topology = sourceOwnerTopology(f.panel);
+      expect(topology.toolbar.contains(f.panel)).toBe(false);
+      if (mode === "outside-owner") {
+        const foreign = document.createElement("div");
+        document.body.append(foreign);
+        foreign.append(topology.tabsRoot);
+      }
+      if (mode === "nested-owner") {
+        const nested = document.createElement("div");
+        topology.owner.append(nested);
+        nested.append(topology.tabsRoot);
+      }
+      if (mode === "body-owner") {
+        document.body.append(topology.toolbar, topology.tabsRoot);
+        topology.owner.remove();
+      }
+      const output = textRowObservation(input);
+      expect(output).not.toBeNull();
+      expect(output?.layout).toEqual(mode === "source-shaped" ? layoutFacts : null);
+      const original: Record<string, unknown> = { ...output };
+      delete original.layout;
+      const expectedOriginal: Record<string, unknown> = { ...textRowFacts };
+      delete expectedOriginal.layout;
+      expect(original).toEqual(expectedOriginal);
+    },
+  );
+  it.each([
+    "positive",
+    "zero-width",
+    "zero-height",
+    "zero-panel",
+    "zero-section",
+    "multiple",
+    "none",
+    "hidden",
+    "inert",
+    "display",
+    "visibility",
+    "opacity",
+    "overfull",
+    "absolute",
+    "fixed",
+    "hidden-child",
+    "invalid-child-size",
+    "contents-child",
+    "unknown-child-display",
+    "invalid-gap",
+    "normal-gap",
+    "margin-gap",
+    "too-many-children",
+    "too-many-ancestors",
+    "unknown-css",
+    "duplicate-panel",
+    "wrong-parent",
+    "duplicate-commit",
+  ])("exports only bounded synthetic measurement facts, never a native CSS cause: %s", (mode) => {
+    const f = layoutDom();
+    const expected: Record<string, unknown> = { ...layoutFacts };
+    if (mode === "zero-width") {
+      f.sizes.set(f.list, { width: 0, height: 100 });
+      expected.listBoxWidthPositive = false;
+    }
+    if (mode === "zero-height") {
+      f.sizes.set(f.list, { width: 300, height: 0 });
+      expected.listBoxHeightPositive = false;
+    }
+    if (mode === "zero-panel") {
+      f.sizes.set(f.panel, { width: 300, height: 0 });
+      expected.panelHeightPositive = false;
+    }
+    if (mode === "zero-section") {
+      f.sizes.set(f.changes, { width: 300, height: 0 });
+      expected.changesHeightPositive = false;
+      expected.nonListDemandExhaustsChanges = true;
+    }
+    if (["multiple", "none"].includes(mode)) {
+      if (mode === "multiple") f.changes.prepend(f.list.cloneNode(true));
+      else f.list.remove();
+      Object.assign(expected, {
+        listBoxCount: mode === "none" ? "none" : "multiple",
+        listBoxWidthPositive: null,
+        listBoxHeightPositive: null,
+        blockingAncestor: null,
+        nonListDemandExhaustsChanges: null,
+      });
+    }
+    if (["hidden", "inert"].includes(mode)) {
+      f.panel.setAttribute(mode, "");
+      expected.blockingAncestor = "hidden-or-inert";
+    }
+    if (mode === "display") {
+      f.styles.set(f.panel, { display: "none" });
+      expected.blockingAncestor = "display-none";
+    }
+    if (mode === "visibility") {
+      f.styles.set(f.panel, { visibility: "hidden" });
+      expected.blockingAncestor = "visibility-hidden";
+    }
+    if (mode === "opacity") {
+      f.styles.set(f.panel, { opacity: "0" });
+      expected.blockingAncestor = "opacity-zero";
+    }
+    if (["overfull", "absolute", "fixed", "hidden-child"].includes(mode)) {
+      f.sizes.set(f.diff, { width: 300, height: 600 });
+      expected.nonListDemandExhaustsChanges = mode === "overfull";
+      if (mode === "absolute" || mode === "fixed") f.styles.set(f.diff, { position: mode });
+      if (mode === "hidden-child") f.diff.hidden = true;
+    }
+    if (mode === "contents-child" || mode === "unknown-child-display") {
+      f.styles.set(f.diff, {
+        display: mode === "contents-child" ? "contents" : "private-unavailable",
+      });
+      expected.nonListDemandExhaustsChanges = null;
+    }
+    if (mode === "invalid-child-size") {
+      f.sizes.set(f.diff, { width: 300, height: NaN });
+      expected.nonListDemandExhaustsChanges = null;
+    }
+    if (mode === "invalid-gap") {
+      f.styles.set(f.changes, { rowGap: "private-unavailable" });
+      expected.nonListDemandExhaustsChanges = null;
+    }
+    if (mode === "normal-gap") f.styles.set(f.changes, { rowGap: "normal" });
+    if (mode === "margin-gap") {
+      f.styles.set(f.diff, { marginTop: "70px", marginBottom: "70px" });
+      f.styles.set(f.changes, { rowGap: "10px" });
+      expected.nonListDemandExhaustsChanges = true;
+    }
+    if (mode === "too-many-children") {
+      for (let index = 0; index < 6; index++) f.changes.append(document.createElement("div"));
+      Object.assign(expected, {
+        diffPanePresent: null,
+        commitBoxPresent: null,
+        nonListDemandExhaustsChanges: null,
+      });
+    }
+    if (mode === "too-many-ancestors") {
+      for (let index = 0; index < 25; index++) {
+        const wrapper = document.createElement("div");
+        const owner = f.topology!.owner;
+        owner.parentElement!.insertBefore(wrapper, owner);
+        wrapper.append(owner);
+      }
+      expected.blockingAncestor = null;
+    }
+    if (mode === "unknown-css") {
+      f.styles.set(f.panel, { opacity: "private-unavailable" });
+      expected.blockingAncestor = null;
+    }
+    if (mode === "duplicate-panel") {
+      const duplicate = document.createElement("div");
+      duplicate.id = f.panel.id;
+      duplicate.setAttribute("role", "tabpanel");
+      document.body.append(duplicate);
+    }
+    if (mode === "wrong-parent") {
+      const wrapper = document.createElement("div");
+      f.changes.prepend(wrapper);
+      wrapper.append(f.list);
+    }
+    if (mode === "duplicate-commit") f.changes.append(f.commit.cloneNode(true));
+    const output = textRowObservation(input);
+    expect(output).not.toBeNull();
+    expect(output?.layout).toEqual(
+      ["duplicate-panel", "wrong-parent", "duplicate-commit"].includes(mode) ? null : expected,
+    );
+    expect(projectTextRow(output)).toEqual(output);
+    expect(JSON.stringify(output)).not.toMatch(
+      /private|owned|pierre|visual|4885|http|px|width":|height":/,
+    );
+  });
+  it("quarantines optional measurement exceptions without replacing original facts", () => {
+    const f = layoutDom();
+    Object.defineProperty(f.diff, "getBoundingClientRect", {
+      value: () => {
+        throw new Error("private measurement");
+      },
+    });
+    const output = textRowObservation(input);
+    expect(output).toMatchObject(textRowFacts);
+    expect(output?.layout).toBeNull();
+  });
+  it("requires exact nested own-data fields and never invokes payload getters", () => {
+    const valid = { ...textRowFacts, layout: layoutFacts };
+    expect(projectTextRow(valid)).toEqual(valid);
+    for (const key of Object.keys(layoutFacts)) {
+      const missing: Record<string, unknown> = { ...layoutFacts };
+      delete missing[key];
+      expect(projectTextRow({ ...valid, layout: missing })).toBeNull();
+      expect(projectTextRow({ ...valid, layout: { ...layoutFacts, [key]: "private" } })).toBeNull();
+      const getter = vi.fn(() => {
+        throw new Error("private getter");
+      });
+      Object.defineProperty(missing, key, { enumerable: true, get: getter });
+      expect(projectTextRow({ ...valid, layout: missing })).toBeNull();
+      expect(getter).not.toHaveBeenCalled();
+    }
+    expect(projectTextRow({ ...valid, layout: { ...layoutFacts, rawSize: 300 } })).toBeNull();
+    expect(projectTextRow({ ...valid, layout: [] })).toBeNull();
+    const revoked = Proxy.revocable(layoutFacts, {});
+    revoked.revoke();
+    expect(projectTextRow({ ...valid, layout: revoked.proxy })).toBeNull();
+    expect(
+      projectTextRow({
+        ...valid,
+        layout: new Proxy(layoutFacts, {
+          ownKeys() {
+            throw new Error("private proxy");
+          },
+        }),
+      }),
+    ).toBeNull();
+  });
   it.each([
     "ok",
     "row-none",

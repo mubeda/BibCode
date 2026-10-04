@@ -894,6 +894,22 @@ the original wait failure, approve capture, alter recovery or delay joined
 cleanup beyond the single bound. These facts describe the later sample, not
 the state at the earlier failed wait.
 
+The same sample additionally records optional `layout` facts, never capture
+approval: capped named-listbox cardinality; separate positive-width/height facts
+for that list, its ARIA-owned panel and unique Changes section; a fixed blocking-
+ancestor category; diff/Commit presence; and whether measured direct-flow box
+heights, margins and gap exhaust the section's available content height. Raw
+sizes, CSS strings, text, IDs, paths, HTML, errors and URLs are never retained.
+Only the unique owned direct-parent/sibling structure is measured. New layout
+inspection is bounded to eight direct children and twenty-four ancestors;
+unknown, ambiguous, invalid or exceptional optional measurements remain null.
+Nonflow children are excluded, and unsupported flow such as display:contents
+refuses the demand calculation rather than recursively reading descendants.
+The original eleven facts and the single failure-only two-second sample remain
+unchanged. Synthetic geometry regressions qualify measurement logic, not native
+CSS, zero-height diagnosis or a unique cause. Review the current projector schema
+and this procedure together when analyzing a failed sample.
+
 The same failure receipt also records `createRefClearObservation`, captured by
 one disposable event observer around the existing Worktree name
 public keyboard clear. Before selecting text, prove one displayed/enabled name
@@ -959,8 +975,12 @@ identity once before the ordinary baseline. Require exact 1280x960 and retain
 the current ready-model list/search/favorite controls. Keybindings opens the
 public filtered condition editor and cancels its unsaved new row. Source
 Control observes real Git version/availability, explained unavailable
-GitHub/GitLab indicators and an expanded fetch interval after discovery settles;
-it does not authenticate, forge, toggle availability or save settings. Providers
+GitHub/GitLab indicators and an expanded fetch interval after discovery settles.
+Readonly availability requires native `disabled` or exact public
+`aria-disabled="true"`. Base UI switch roots use the latter; a data marker,
+muted style or disabled-looking text alone is not readonly evidence. Preserve
+the exact checked states and existing full geometry/identity/credential fences.
+The qualifier does not authenticate, forge, toggle availability or save settings. Providers
 is the current `/settings/providers` route, separate from Agents. Expand the
 existing Claude card to show actual non-secret fields and model controls.
 

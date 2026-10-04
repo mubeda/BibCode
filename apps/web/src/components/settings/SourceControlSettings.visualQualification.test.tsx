@@ -66,6 +66,13 @@ import { Sidebar, SidebarInset, SidebarProvider } from "../ui/sidebar";
 import { SettingsSidebarNav } from "./SettingsSidebarNav";
 import { SourceControlSettingsPanel } from "./SourceControlSettings";
 
+const missingDetail = "Command was not found on the server PATH.";
+const missingAuth = (detail: string) => ({
+  status: "unknown" as const,
+  account: Option.none<string>(),
+  host: Option.none<string>(),
+  detail: Option.some(detail),
+});
 const discovery: SourceControlDiscoveryResult = {
   versionControlSystems: [
     {
@@ -75,11 +82,62 @@ const discovery: SourceControlDiscoveryResult = {
       implemented: true,
       status: "available",
       version: Option.some("git version 2.50.0"),
-      installHint: "Install Git.",
+      installHint: "Install Git from https://git-scm.com/downloads or with your package manager.",
       detail: Option.none(),
     },
+    {
+      kind: "jj",
+      label: "Jujutsu",
+      executable: "jj",
+      implemented: false,
+      status: "missing",
+      version: Option.none(),
+      installHint: "Install Jujutsu from https://github.com/jj-vcs/jj.",
+      detail: Option.some(missingDetail),
+    },
   ],
-  sourceControlProviders: [],
+  sourceControlProviders: [
+    {
+      kind: "github",
+      label: "GitHub",
+      executable: "gh",
+      status: "missing",
+      version: Option.none(),
+      installHint: "Install GitHub CLI from https://cli.github.com/.",
+      detail: Option.some(missingDetail),
+      auth: missingAuth("Hosting integration command was not found on the server PATH."),
+    },
+    {
+      kind: "gitlab",
+      label: "GitLab",
+      executable: "glab",
+      status: "missing",
+      version: Option.none(),
+      installHint: "Install GitLab CLI from https://gitlab.com/gitlab-org/cli.",
+      detail: Option.some(missingDetail),
+      auth: missingAuth("Hosting integration command was not found on the server PATH."),
+    },
+    {
+      kind: "azure-devops",
+      label: "Azure DevOps",
+      executable: "az",
+      status: "missing",
+      version: Option.none(),
+      installHint:
+        "Install Azure CLI from https://learn.microsoft.com/cli/azure/install-azure-cli.",
+      detail: Option.some(missingDetail),
+      auth: missingAuth("Hosting integration command was not found on the server PATH."),
+    },
+    {
+      kind: "bitbucket",
+      label: "Bitbucket",
+      status: "missing",
+      version: Option.none(),
+      installHint: "Configure Bitbucket API credentials in server settings.",
+      detail: Option.none(),
+      auth: missingAuth("Bitbucket API credentials are not configured."),
+    },
+  ],
 };
 
 function MountedSettings() {
@@ -215,6 +273,154 @@ it("uses the existing displayed wait before counting the cold mounted Git detail
               'input[aria-label="Automatic Git fetch interval in seconds"]',
             )?.value,
           ).toBe("180");
+          // Only external shell/identity and ideal geometry are inert; panel/hooks/reader remain real.
+          const rail = document.createElement("div");
+          rail.setAttribute("data-testid", "environment-rail-local");
+          rail.setAttribute("aria-checked", "true");
+          const connection = document.createElement("span");
+          connection.setAttribute("data-status", "connected");
+          rail.append(connection);
+          document.body.append(rail);
+          try {
+            vi.stubGlobal("location", {
+              origin: "http://127.0.0.1:4885",
+              pathname: "/settings/source-control",
+              search: "",
+              hash: "",
+            });
+            vi.stubGlobal("innerWidth", 1280);
+            vi.stubGlobal("innerHeight", 960);
+            vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+              new DOMRect(10, 10, 300, 200),
+            );
+            vi.spyOn(document, "elementFromPoint").mockImplementation(() =>
+              document.querySelector('[data-slot="sidebar-inset"]'),
+            );
+            const observation = {
+              scene: "settings-source-control",
+              theme: "light",
+              origin: "http://127.0.0.1:4885",
+              threadId: "owned",
+              branch: "codex/delivery-retry-light",
+            } as const;
+            // Execute serialized QA source; importing its desktop module violates the web project boundary.
+            const readerStart = source.indexOf("export function readSettingsVisualWitness(");
+            const readerEnd = source.indexOf("/** No click admission", readerStart);
+            const definitionsStart = source.indexOf("export const settingsVisualScenes");
+            const definitionsEnd = source.indexOf("const settingsUnpictured =", definitionsStart);
+            const captureSource = NodeFS.readFileSync(
+              new NodeURL.URL(
+                "../../../../desktop/e2e/support/remote-ui-evidence.ts",
+                import.meta.url,
+              ),
+              "utf8",
+            );
+            const captureStart = captureSource.indexOf("const witnessKeys =");
+            const captureEnd = captureSource.indexOf("/** Parse only", captureStart);
+            for (const [first, last] of [
+              [readerStart, readerEnd],
+              [definitionsStart, definitionsEnd],
+              [captureStart, captureEnd],
+            ] as const) {
+              expect(first).toBeGreaterThan(0);
+              expect(last).toBeGreaterThan(first);
+            }
+            const actual = NodeVM.runInNewContext(
+              NodeModule.stripTypeScriptTypes(
+                captureSource.slice(captureStart, captureEnd) +
+                  source.slice(definitionsStart, definitionsEnd) +
+                  source.slice(readerStart, readerEnd) +
+                  "\n({readSettingsVisualWitness, validateSettingsVisualWitness})",
+              ).replace(/^export /gm, ""),
+              {
+                document,
+                location,
+                innerWidth,
+                innerHeight,
+                HTMLElement,
+                HTMLInputElement,
+                HTMLButtonElement,
+                getComputedStyle,
+              },
+            ) as {
+              readSettingsVisualWitness: (
+                input: typeof observation,
+              ) => Record<string, boolean> | null;
+              validateSettingsVisualWitness: (
+                scene: "settings-source-control",
+                input: unknown,
+              ) => Record<string, true>;
+            };
+            const { validateSettingsVisualWitness } = actual;
+            const read = () => actual.readSettingsVisualWitness(observation);
+            const witness = read();
+            expect(witness).toMatchObject({ gitAvailable: true, hostingUnavailable: true });
+            expect(validateSettingsVisualWitness("settings-source-control", witness)).toEqual(
+              witness,
+            );
+            for (const label of ["Git", "GitHub", "GitLab"]) {
+              const original = document.querySelector<HTMLElement>(
+                `[role="switch"][aria-label="${label} availability"]`,
+              )!;
+              expect(original.hasAttribute("disabled")).toBe(false);
+              expect(original.getAttribute("aria-disabled")).toBe("true");
+              const checked = original.getAttribute("aria-checked")!;
+              const fact = label === "Git" ? "gitAvailable" : "hostingUnavailable";
+              // Negative mutations are confined to this inert DOM and restored before the next case.
+              for (const value of [null, "false", "TRUE", "true "]) {
+                try {
+                  if (value === null) original.removeAttribute("aria-disabled");
+                  else original.setAttribute("aria-disabled", value);
+                  expect(original.hasAttribute("data-disabled")).toBe(true);
+                  const refused = read();
+                  expect(refused?.[fact]).toBe(false);
+                  expect(() =>
+                    validateSettingsVisualWitness("settings-source-control", refused),
+                  ).toThrow("Visual settings precondition failed.");
+                } finally {
+                  original.setAttribute("aria-disabled", "true");
+                }
+              }
+              try {
+                original.setAttribute("aria-checked", checked === "true" ? "false" : "true");
+                const refused = read();
+                expect(refused?.[fact]).toBe(false);
+                expect(() =>
+                  validateSettingsVisualWitness("settings-source-control", refused),
+                ).toThrow("Visual settings precondition failed.");
+              } finally {
+                original.setAttribute("aria-checked", checked);
+              }
+              const replacement = document.createElement("button");
+              replacement.setAttribute("role", "switch");
+              replacement.setAttribute("aria-label", `${label} availability`);
+              replacement.setAttribute("aria-checked", checked);
+              replacement.setAttribute("data-disabled", "");
+              replacement.style.opacity = "0.64";
+              replacement.style.pointerEvents = "none";
+              replacement.textContent = "Disabled";
+              try {
+                original.replaceWith(replacement);
+                const refused = read();
+                expect(refused?.[fact]).toBe(false);
+                expect(() =>
+                  validateSettingsVisualWitness("settings-source-control", refused),
+                ).toThrow("Visual settings precondition failed.");
+                // A genuine native disabled attribute remains an independent admitted form.
+                replacement.disabled = true;
+                expect(
+                  validateSettingsVisualWitness("settings-source-control", read()),
+                ).toMatchObject({ gitAvailable: true, hostingUnavailable: true });
+              } finally {
+                replacement.replaceWith(original);
+              }
+            }
+            expect(validateSettingsVisualWitness("settings-source-control", read())).toEqual(
+              witness,
+            );
+          } finally {
+            rail.remove();
+          }
           captures++;
         },
       ),
@@ -248,6 +454,7 @@ it("uses the existing displayed wait before counting the cold mounted Git detail
     container.remove();
     registry.dispose();
     __resetClientSettingsPersistenceForTests();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
   }

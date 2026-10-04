@@ -57,6 +57,7 @@ const createRefFacts = {
 };
 
 const textRowFacts = {
+  layout: null,
   changesActive: true,
   globalTextRows: "one",
   scopedTextRows: "one",

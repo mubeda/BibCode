@@ -264,6 +264,9 @@ export function readSettingsVisualWitness(
     const element = one(selector);
     return element instanceof HTMLInputElement ? element : null;
   };
+  const readonlyAvailability = (element: Element | null) =>
+    element !== null &&
+    (element.hasAttribute("disabled") || element.getAttribute("aria-disabled") === "true");
   const surface = '[data-center-surface-host][data-visible="true"]';
   const route = {
     "model-picker": "/local/" + input.threadId,
@@ -404,9 +407,7 @@ export function readSettingsVisualWitness(
       const scan = one('button[aria-label="Rescan server environment"]');
       facts = {
         gitAvailable:
-          inView(git) &&
-          git?.getAttribute("aria-checked") === "true" &&
-          git.hasAttribute("disabled"),
+          inView(git) && git?.getAttribute("aria-checked") === "true" && readonlyAvailability(git),
         gitVersionVisible: Array.from(row?.querySelectorAll("code") ?? []).some(
           (code) => inView(code) && /^git version \d+\.\d+/.test(text(code)),
         ),
@@ -415,7 +416,7 @@ export function readSettingsVisualWitness(
             (host) =>
               inView(host) &&
               host?.getAttribute("aria-checked") === "false" &&
-              host.hasAttribute("disabled"),
+              readonlyAvailability(host),
           ) &&
           document.querySelector(
             'button[aria-label="Toggle source control account visibility"]',

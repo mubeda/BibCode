@@ -92,7 +92,7 @@ export function readVisualTextRowFailure(
       scope?.querySelectorAll<HTMLInputElement>('input[name="git-manager-change-filter"]') ?? [],
     );
     const filterNames = ["included", "excluded", "new", "modified", "deleted"];
-    return {
+    const facts = {
       changesActive,
       globalTextRows: count(globalRows.length),
       scopedTextRows: count(scopedRows?.length ?? 0),
@@ -120,6 +120,183 @@ export function readVisualTextRowFailure(
             ) != null,
         ),
     };
+    // Optional layout reads cannot replace any original fact or widen the caller's bound.
+    const layout = (() => {
+      try {
+        const toolbar = headers[0]!.parentElement;
+        const owner = toolbar?.parentElement;
+        const tabsRoot = scope?.parentElement;
+        // Current toolbar wrapper and repository Tabs are siblings in this exact owner.
+        if (
+          !scope ||
+          !panelId ||
+          toolbar?.tagName !== "DIV" ||
+          owner?.tagName !== "DIV" ||
+          tabsRoot?.tagName !== "DIV" ||
+          tabsRoot === toolbar ||
+          tabsRoot.parentElement !== owner ||
+          !tabsRoot.contains(tabs[0]!) ||
+          toolbar.contains(scope)
+        )
+          return null;
+        const ownedPanels = Array.from(document.querySelectorAll('[role="tabpanel"]')).filter(
+          (candidate) => candidate.getAttribute("id") === panelId,
+        );
+        if (ownedPanels.length !== 1 || ownedPanels[0] !== scope) return null;
+        const sections = scope.querySelectorAll('section[aria-label="Changes"]');
+        if (sections.length !== 1 || sections[0]!.parentElement !== scope) return null;
+        const changes = sections[0]!;
+        if (list && list.parentElement !== changes) return null;
+        const children = changes.children;
+        // The Commit form is required by this source branch. Do not guess a foreign structure.
+        const commits = changes.querySelectorAll('form[aria-label="Commit Changes"]');
+        if (commits.length !== 1 || commits[0]!.parentElement !== changes) return null;
+        const diffs = changes.querySelectorAll('section[aria-label^="Diff for "]');
+        if (diffs.length > 1 || (diffs.length === 1 && diffs[0]!.parentElement !== changes))
+          return null;
+        const dimensions = (element: Element | null) => {
+          if (!element) return { width: null, height: null };
+          const rect = element.getBoundingClientRect();
+          const axis = (value: unknown) =>
+            typeof value === "number" && Number.isFinite(value) && value >= 0 ? value > 0 : null;
+          return { width: axis(rect.width), height: axis(rect.height) };
+        };
+        const listDimensions = dimensions(list),
+          panelDimensions = dimensions(scope),
+          changesDimensions = dimensions(changes);
+        const blockingAncestor = (() => {
+          if (!list) return null;
+          let ancestor: Element | null = list;
+          for (let inspected = 0; ancestor !== null && inspected < 24; inspected++) {
+            if (ancestor.hasAttribute("hidden") || ancestor.hasAttribute("inert"))
+              return "hidden-or-inert";
+            const style = getComputedStyle(ancestor);
+            if (style.display === "none") return "display-none";
+            if (style.visibility === "hidden" || style.visibility === "collapse")
+              return "visibility-hidden";
+            if (style.opacity === "0") return "opacity-zero";
+            const opacity =
+              typeof style.opacity === "string" &&
+              /^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(style.opacity)
+                ? Number(style.opacity)
+                : null;
+            if (
+              typeof style.display !== "string" ||
+              style.display === "" ||
+              style.visibility !== "visible" ||
+              opacity === null
+            )
+              return null;
+            ancestor = ancestor.parentElement;
+          }
+          return ancestor === null ? "none" : null;
+        })();
+        const demandExhaustsChanges = (() => {
+          if (!list || children.length > 8) return null;
+          const style = getComputedStyle(changes);
+          if (
+            (style.display !== "flex" && style.display !== "inline-flex") ||
+            style.flexDirection !== "column"
+          )
+            return null;
+          const pixels = (value: unknown, normal = false): number | null => {
+            if (normal && value === "normal") return 0;
+            if (typeof value !== "string" || !/^-?(?:\d+(?:\.\d+)?|\.\d+)px$/.test(value))
+              return null;
+            const number = Number(value.slice(0, -2));
+            return Number.isFinite(number) ? number : null;
+          };
+          const paddingTop = pixels(style.paddingTop),
+            paddingBottom = pixels(style.paddingBottom),
+            gap = pixels(style.rowGap, true);
+          const height = changes.clientHeight;
+          if (
+            paddingTop === null ||
+            paddingBottom === null ||
+            gap === null ||
+            paddingTop < 0 ||
+            paddingBottom < 0 ||
+            gap < 0 ||
+            !Number.isFinite(height) ||
+            height < 0
+          )
+            return null;
+          let demand = 0,
+            flow = 0;
+          for (let index = 0; index < children.length; index++) {
+            const child = children[index]!;
+            const childStyle = getComputedStyle(child);
+            if (
+              child.hasAttribute("hidden") ||
+              childStyle.display === "none" ||
+              childStyle.position === "absolute" ||
+              childStyle.position === "fixed"
+            ) {
+              if (child === list) return null;
+              continue;
+            }
+            if (
+              ![
+                "block",
+                "flow-root",
+                "flex",
+                "inline-flex",
+                "grid",
+                "inline-grid",
+                "inline-block",
+                "list-item",
+              ].includes(childStyle.display) ||
+              !["static", "relative", "sticky"].includes(childStyle.position)
+            )
+              return null;
+            flow++;
+            const marginTop = pixels(childStyle.marginTop),
+              marginBottom = pixels(childStyle.marginBottom);
+            if (marginTop === null || marginBottom === null) return null;
+            if (child === list) {
+              demand += marginTop + marginBottom;
+              continue;
+            }
+            const rect = child.getBoundingClientRect();
+            if (
+              !Number.isFinite(rect.width) ||
+              !Number.isFinite(rect.height) ||
+              rect.width < 0 ||
+              rect.height < 0
+            )
+              return null;
+            if (
+              !(child instanceof HTMLElement) ||
+              !Number.isFinite(child.offsetHeight) ||
+              child.offsetHeight < 0
+            )
+              return null;
+            // CSS box height and clientHeight share a coordinate space even under transforms.
+            demand += child.offsetHeight + marginTop + marginBottom;
+          }
+          demand += gap * Math.max(0, flow - 1);
+          return Number.isFinite(demand)
+            ? demand >= Math.max(0, height - paddingTop - paddingBottom)
+            : null;
+        })();
+        return {
+          listBoxCount: count(lists?.length ?? 0),
+          listBoxWidthPositive: listDimensions.width,
+          listBoxHeightPositive: listDimensions.height,
+          panelWidthPositive: panelDimensions.width,
+          panelHeightPositive: panelDimensions.height,
+          changesWidthPositive: changesDimensions.width,
+          changesHeightPositive: changesDimensions.height,
+          blockingAncestor,
+          diffPanePresent: children.length <= 8 ? diffs.length === 1 : null,
+          commitBoxPresent: children.length <= 8 ? true : null,
+          nonListDemandExhaustsChanges: demandExhaustsChanges,
+        };
+      } catch {
+        return null;
+      }
+    })();
+    return { ...facts, layout };
   } catch {
     return null;
   }
@@ -141,6 +318,7 @@ export function projectVisualTextRowFailure(input: unknown): Record<string, unkn
       "loadingPresent",
       "errorPresent",
       "filterPresent",
+      "layout",
     ];
     const ownKeys = Reflect.ownKeys(input);
     if (
@@ -153,6 +331,56 @@ export function projectVisualTextRowFailure(input: unknown): Record<string, unkn
       const descriptor = Object.getOwnPropertyDescriptor(input, key);
       if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
       const value = descriptor.value;
+      if (key === "layout") {
+        if (value === null) {
+          result[key] = null;
+          continue;
+        }
+        if (typeof value !== "object" || Array.isArray(value)) return null;
+        const layoutKeys = [
+          "listBoxCount",
+          "listBoxWidthPositive",
+          "listBoxHeightPositive",
+          "panelWidthPositive",
+          "panelHeightPositive",
+          "changesWidthPositive",
+          "changesHeightPositive",
+          "blockingAncestor",
+          "diffPanePresent",
+          "commitBoxPresent",
+          "nonListDemandExhaustsChanges",
+        ];
+        const layoutOwnKeys = Reflect.ownKeys(value);
+        if (
+          layoutOwnKeys.length !== layoutKeys.length ||
+          !layoutOwnKeys.every((field) => typeof field === "string" && layoutKeys.includes(field))
+        )
+          return null;
+        const layout: Record<string, unknown> = {};
+        for (const field of layoutKeys) {
+          const property = Object.getOwnPropertyDescriptor(value, field);
+          if (!property?.enumerable || !Object.hasOwn(property, "value")) return null;
+          const fact = property.value;
+          if (field === "listBoxCount") {
+            if (fact !== "none" && fact !== "one" && fact !== "multiple") return null;
+          } else if (field === "blockingAncestor") {
+            if (
+              fact !== null &&
+              ![
+                "none",
+                "hidden-or-inert",
+                "display-none",
+                "visibility-hidden",
+                "opacity-zero",
+              ].includes(fact)
+            )
+              return null;
+          } else if (fact !== null && typeof fact !== "boolean") return null;
+          layout[field] = fact;
+        }
+        result[key] = layout;
+        continue;
+      }
       if (key === "globalTextRows" || key === "scopedTextRows") {
         if (value !== "none" && value !== "one" && value !== "multiple") return null;
       } else if (typeof value !== "boolean") return null;
