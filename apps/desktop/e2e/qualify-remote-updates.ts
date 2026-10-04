@@ -41,6 +41,8 @@ import {
   projectRemoteUiSetupObservation,
   projectRemoteUiCheckAgainObservation,
   projectRemoteUiSuccessRemovalObservation,
+  projectRemoteUiToastErrorSignature,
+  type RemoteUiToastErrorSignature,
   type RemoteUiTheme,
   type RemoteUiScene,
 } from "./support/remote-ui-evidence.ts";
@@ -125,6 +127,8 @@ const manualAssertionCodes = new Set([
   "manual-card-clipboard",
 ]);
 const manualAssertionFailures = new WeakMap<Error, string>();
+// Per-run immutable records belong only to the exact original failure object.
+const toastErrorSignatureFailures = new WeakMap<object, RemoteUiToastErrorSignature>();
 function check(value: unknown, code: string): asserts value {
   if (value !== true) {
     const error = new Error(`UI qualification assertion failed: ${code}.`);
@@ -588,6 +592,13 @@ async function removeHost(host: Host, observe?: (operation: RemoveHostOperation)
               `Can't call click on element with selector "${toastClose}" because element wasn't found`
           ) {
             observeStep("toast-click-unrecognized");
+            try {
+              const signature = projectRemoteUiToastErrorSignature(message, error);
+              if (signature !== null && error !== null && typeof error === "object")
+                toastErrorSignatureFailures.set(error, signature);
+            } catch {
+              // Optional string-shape attribution cannot change the original error.
+            }
             throw error;
           }
           observeStep("toast-click-matched");
@@ -1929,6 +1940,12 @@ try {
     setup,
     checkAgain,
     successRemoval,
+    toastErrorSignature:
+      currentPhase === "success-remove-toast-click-unrecognized" &&
+      error !== null &&
+      typeof error === "object"
+        ? (toastErrorSignatureFailures.get(error) ?? null)
+        : null,
     reloadPrimaryThreadProof:
       currentPhase === "reload-primary-thread-proof"
         ? projectReloadPrimaryThreadWitness(reloadPrimaryThreadWitness)

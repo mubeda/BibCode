@@ -764,6 +764,16 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   read, visible-replacement refusal, or confirmed-empty completion. These markers
   add no lookup, request, retry, deadline or recovery. A later empty snapshot cannot
   prove the earlier recheck succeeded; preserve the original click error on refusal.
+  At exactly `success-remove-toast-click-unrecognized`, the existing failure receipt
+  may include `toastErrorSignature` associated with that same thrown error object.
+  It contains only wrapper/canonical-message family, exact click-POST suffix,
+  argument-suffix shape, a coarse length bucket, exact toast-selector presence and
+  an own-data name family. Inspect at most 4096 message units; longer suffix/selector
+  facts remain null. Missing/accessor/proxy metadata stays unavailable, and no raw
+  message, name, selector, ID, URL or arguments leave the qualifier. Matched errors
+  and unrelated phases/errors supply no signature. This failure-only classification
+  adds no UI read, request, write, action, timer or recovery; it qualifies string
+  shape, never the native cause or a successful absence recheck.
 
   For the full Reload negative control, observe the primary rail connected,
   then disconnected and connected again around the same-version restart, with a

@@ -31,6 +31,70 @@ export const remoteUiScenes = [
 ] as const;
 export type RemoteUiScene = (typeof remoteUiScenes)[number];
 
+export interface RemoteUiToastErrorSignature {
+  readonly wrapperPrefix: boolean;
+  readonly messageFamily: "missing" | "stale" | "other";
+  readonly clickPostSuffix: boolean | null;
+  readonly argumentsSuffix: boolean | null;
+  readonly lengthBucket: "0-1024" | "1025-2048" | "2049-4096" | "over-4096";
+  readonly exactToastSelectorPresent: boolean | null;
+  readonly nameFamily: "missing" | "stale" | "other" | "unavailable";
+}
+
+/** Finite string-shape facts from an already-read own message; never a recovery verdict. */
+export function projectRemoteUiToastErrorSignature(
+  message: unknown,
+  error?: unknown,
+): RemoteUiToastErrorSignature | null {
+  if (typeof message !== "string") return null;
+  const wrapperPrefix = message.startsWith("WebDriverError: ");
+  const prefix = message.slice(wrapperPrefix ? "WebDriverError: ".length : 0, 80);
+  const boundary = wrapperPrefix ? '(?::| when running \\"|$)' : "(?::|$)";
+  const messageFamily = new RegExp("^no such element" + boundary).test(prefix)
+    ? "missing"
+    : new RegExp("^stale element reference" + boundary).test(prefix)
+      ? "stale"
+      : "other";
+  let nameFamily: RemoteUiToastErrorSignature["nameFamily"] = "unavailable";
+  try {
+    const descriptor =
+      error !== null && typeof error === "object"
+        ? Object.getOwnPropertyDescriptor(error, "name")
+        : undefined;
+    const name = descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : null;
+    if (typeof name === "string")
+      nameFamily =
+        name === "no such element"
+          ? "missing"
+          : name === "stale element reference"
+            ? "stale"
+            : "other";
+  } catch {
+    // Unreadable optional metadata cannot replace the original failure.
+  }
+  const bounded = message.length <= 4096;
+  return Object.freeze({
+    wrapperPrefix,
+    messageFamily,
+    clickPostSuffix: bounded
+      ? / when running "element\/[A-Za-z0-9._:-]{1,256}\/click" with method "POST"$/.test(message)
+      : null,
+    argumentsSuffix: bounded
+      ? / when running "[^\r\n"]{1,1024}" with method "[A-Z]{1,16}" and args [\s\S]+$/.test(message)
+      : null,
+    lengthBucket:
+      message.length <= 1024
+        ? "0-1024"
+        : message.length <= 2048
+          ? "1025-2048"
+          : bounded
+            ? "2049-4096"
+            : "over-4096",
+    exactToastSelectorPresent: bounded ? message.includes('button[data-slot="toast-close"]') : null,
+    nameFamily,
+  });
+}
+
 /** One current removal snapshot after failure; never proof of an earlier control's absence. */
 export function projectRemoteUiSuccessRemovalObservation(input: unknown) {
   if (input === null || typeof input !== "object") return null;

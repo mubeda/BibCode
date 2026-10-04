@@ -23,6 +23,7 @@ import {
   projectRemoteUiSetupObservation,
   projectRemoteUiCheckAgainObservation,
   projectRemoteUiSuccessRemovalObservation,
+  projectRemoteUiToastErrorSignature,
 } from "./remote-ui-evidence.ts";
 
 const controller = NodeFS.readFileSync(
@@ -2409,6 +2410,8 @@ function removalReplay(
     reobserveFailure?: unknown;
     reobserveDisplayFailure?: unknown;
     toastCount?: number;
+    signatures?: WeakMap<object, unknown>;
+    signatureFault?: boolean;
   } = {},
 ) {
   const start = controller.indexOf("async function removeHost(");
@@ -2418,6 +2421,7 @@ function removalReplay(
   expect(start).toBeGreaterThan(0);
   expect(end).toBeGreaterThan(start);
   const calls: unknown[][] = [];
+  const signatures = toastCase.signatures ?? new WeakMap<object, unknown>();
   const failure = new Error("inert private missing element");
   const deadlineFailure = new Error(
     "The required live observation did not arrive within its bound.",
@@ -2479,6 +2483,12 @@ function removalReplay(
       controller.slice(clickStart, clickEnd) + controller.slice(start, end) + "\nremoveHost",
     ),
     {
+      toastErrorSignatureFailures: signatures,
+      projectRemoteUiToastErrorSignature: toastCase.signatureFault
+        ? () => {
+            throw new Error("private signature fault");
+          }
+        : projectRemoteUiToastErrorSignature,
       required: () => browser,
       settings: () => action("settings"),
       row: (label: string) => {
@@ -2510,8 +2520,210 @@ function removalReplay(
       },
     },
   );
-  return { remove, host, calls, failure, deadlineFailure, toastVisible: () => toastCount > 0 };
+  return {
+    remove,
+    host,
+    calls,
+    failure,
+    deadlineFailure,
+    signatures,
+    toastVisible: () => toastCount > 0,
+  };
 }
+
+function toastFailureReceipt(
+  error: unknown,
+  signatures: WeakMap<object, unknown>,
+  currentPhase: string,
+) {
+  const start = controller.indexOf('  write("failure", {');
+  const end = controller.indexOf("\n} finally {", start);
+  const records: Record<string, unknown>[] = [];
+  NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes(controller.slice(start, end)), {
+    error,
+    currentPhase,
+    currentTheme: "light",
+    SUCCESS_REMOVE_PHASES: successRemovalPhases,
+    toastErrorSignatureFailures: signatures,
+    classifyQualificationFailure: () => ({ kind: "missing-element", errorClass: "Error" }),
+    readManualAssertionCode: () => null,
+    startup: null,
+    setup: null,
+    checkAgain: null,
+    successRemoval: null,
+    reloadPrimaryThreadWitness: null,
+    projectReloadPrimaryThreadWitness,
+    write: (_name: string, value: Record<string, unknown>) => records.push(value),
+  });
+  expect(records).toHaveLength(1);
+  return records[0]!;
+}
+
+it("retains only a closed signature for the actual unrecognized SDK error in the existing failure receipt", async () => {
+  const error = sdkClickResponseError("no such element", {
+    message: 'Unable to find button[data-slot="toast-close"] private-native-detail',
+  });
+  const probe = removalReplay(null, { clickFailure: error, disappears: true });
+  const stages: string[] = [];
+  await expect(probe.remove(probe.host, (stage: string) => stages.push(stage))).rejects.toBe(error);
+  const receipt = toastFailureReceipt(
+    error,
+    probe.signatures,
+    "success-remove-toast-click-unrecognized",
+  );
+  expect(receipt.toastErrorSignature).toEqual({
+    wrapperPrefix: true,
+    messageFamily: "other",
+    clickPostSuffix: true,
+    argumentsSuffix: false,
+    lengthBucket: "0-1024",
+    exactToastSelectorPresent: true,
+    nameFamily: "missing",
+  });
+  expect(stages.at(-1)).toBe("toast-click-unrecognized");
+  expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+  expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(1);
+  expect(JSON.stringify(receipt)).not.toMatch(
+    /private-|inert.invalid|owned-node|button\[|no such element|WebDriverError:/,
+  );
+});
+
+it.each([
+  { label: "canonical missing", category: "no such element", family: "missing" },
+  {
+    label: "canonical stale multiline",
+    category: "stale element reference",
+    family: "stale",
+    input: { message: "stale element reference: detached\n  (Session info: private browser)" },
+  },
+  {
+    label: "category-only missing",
+    category: "no such element",
+    family: "missing",
+    input: { message: "no such element" },
+  },
+  { label: "unknown protocol", category: "invalid session id", family: "other" },
+  {
+    label: "arguments",
+    category: "no such element",
+    family: "missing",
+    input: { body: { button: 0 } },
+  },
+  {
+    label: "wrong method",
+    category: "no such element",
+    family: "missing",
+    input: { method: "GET" },
+  },
+])("projects finite facts from the actual pinned SDK constructor: $label", (input) => {
+  const error = sdkClickResponseError(input.category, input.input);
+  const message = Object.getOwnPropertyDescriptor(error, "message")!.value;
+  const signature = projectRemoteUiToastErrorSignature(message, error);
+  expect(signature).toEqual({
+    wrapperPrefix: true,
+    messageFamily: input.family,
+    clickPostSuffix: !["arguments", "wrong method"].includes(input.label),
+    argumentsSuffix: input.label === "arguments",
+    lengthBucket: "0-1024",
+    exactToastSelectorPresent: false,
+    nameFamily: input.category === "invalid session id" ? "other" : input.family,
+  });
+  expect(JSON.stringify(signature)).not.toMatch(
+    /private|owned-node|inert.invalid|when running|no such element|stale element reference/,
+  );
+});
+
+it("associates concurrent unrecognized failures with their own immutable receipts only", async () => {
+  const signatures = new WeakMap<object, unknown>();
+  const first = sdkClickResponseError("no such element", { message: "unknown private first" });
+  const second = new Error("unknown private second");
+  const firstProbe = removalReplay(null, { clickFailure: first, signatures });
+  const secondProbe = removalReplay(null, { clickFailure: second, signatures });
+  await Promise.all([
+    expect(firstProbe.remove(firstProbe.host)).rejects.toBe(first),
+    expect(secondProbe.remove(secondProbe.host)).rejects.toBe(second),
+  ]);
+  const currentPhase = "success-remove-toast-click-unrecognized";
+  const firstReceipt = toastFailureReceipt(first, signatures, currentPhase);
+  const secondReceipt = toastFailureReceipt(second, signatures, currentPhase);
+  expect(firstReceipt.toastErrorSignature).toMatchObject({
+    wrapperPrefix: true,
+    nameFamily: "missing",
+  });
+  expect(secondReceipt.toastErrorSignature).toMatchObject({
+    wrapperPrefix: false,
+    nameFamily: "unavailable",
+  });
+  expect(Object.isFrozen(firstReceipt.toastErrorSignature)).toBe(true);
+  expect(
+    toastFailureReceipt(new Error(first.message), signatures, currentPhase).toastErrorSignature,
+  ).toBeNull();
+  expect(
+    toastFailureReceipt(first, signatures, "success-remove-toast-click").toastErrorSignature,
+  ).toBeNull();
+  expect(
+    toastFailureReceipt(second, signatures, "queued-remove-a-toast-click-unrecognized")
+      .toastErrorSignature,
+  ).toBeNull();
+  expect(JSON.stringify([firstReceipt, secondReceipt])).not.toContain("private");
+});
+
+it.each(["matched", "message accessor", "message reflection", "signature fault"])(
+  "leaves unavailable or unrelated toast signatures absent while preserving the original outcome: %s",
+  async (shape) => {
+    let reads = 0;
+    let error: unknown = new Error(
+      shape === "matched" ? "no such element: removed" : "unknown private error",
+    );
+    if (shape === "message accessor")
+      error = Object.defineProperty({}, "message", {
+        get() {
+          reads++;
+          throw new Error("private accessor");
+        },
+      });
+    else if (shape === "message reflection")
+      error = new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor() {
+            throw new Error("private reflection");
+          },
+        },
+      );
+    const probe = removalReplay(null, {
+      clickFailure: error,
+      disappears: true,
+      signatureFault: shape === "signature fault",
+    });
+    const stages: string[] = [];
+    const run = probe.remove(probe.host, (stage: string) => {
+      stages.push(stage);
+      throw new Error("private observer fault");
+    });
+    if (shape === "matched") await expect(run).resolves.toBeUndefined();
+    else await expect(run).rejects.toBe(error);
+    expect(probe.signatures.has(error as object)).toBe(false);
+    expect(reads).toBe(0);
+    expect(probe.calls.filter((call) => call[0] === "toast-click")).toHaveLength(1);
+    expect(probe.calls.filter((call) => call[0] === "toast-list")).toHaveLength(
+      shape === "matched" ? 2 : 1,
+    );
+    expect(stages.at(-1)).toBe(
+      shape === "matched"
+        ? "toast-recheck-empty"
+        : shape === "message accessor"
+          ? "toast-click-unavailable"
+          : shape === "message reflection"
+            ? "toast-click-inspect"
+            : "toast-click-unrecognized",
+    );
+    expect(
+      toastFailureReceipt(error, probe.signatures, "success-remove-toast-click-unrecognized")
+        .toastErrorSignature,
+    ).toBeNull();
+  },
+);
 
 // Execute the pinned SDK's error constructor without importing its HTTP/session runtime.
 function sdkClickResponseError(

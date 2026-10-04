@@ -11,7 +11,128 @@ import {
   projectRemoteUiSetupObservation,
   projectRemoteUiCheckAgainObservation,
   projectRemoteUiSuccessRemovalObservation,
+  projectRemoteUiToastErrorSignature,
 } from "./remote-ui-evidence.ts";
+
+it("keeps toast string-shape facts finite and separate from any recovery verdict", () => {
+  const message =
+    'WebDriverError: no such element: private detail button[data-slot="toast-close"] when running "element/private-id/click" with method "POST"';
+  const error = { name: "no such element", privateText: "private-value" };
+  const signature = projectRemoteUiToastErrorSignature(message, error);
+  expect(signature).toEqual({
+    wrapperPrefix: true,
+    messageFamily: "missing",
+    clickPostSuffix: true,
+    argumentsSuffix: false,
+    lengthBucket: "0-1024",
+    exactToastSelectorPresent: true,
+    nameFamily: "missing",
+  });
+  expect(Object.isFrozen(signature)).toBe(true);
+  expect(JSON.stringify(signature)).not.toMatch(
+    /private-|button\[|no such element|WebDriverError:/,
+  );
+  const unknown = projectRemoteUiToastErrorSignature("private text mentioning no such element", {
+    name: "unknown private name",
+  });
+  expect(unknown).toMatchObject({
+    wrapperPrefix: false,
+    messageFamily: "other",
+    nameFamily: "other",
+  });
+});
+
+it.each([
+  { size: 1024, bucket: "0-1024" },
+  { size: 1025, bucket: "1025-2048" },
+  { size: 2048, bucket: "1025-2048" },
+  { size: 2049, bucket: "2049-4096" },
+  { size: 4096, bucket: "2049-4096" },
+  { size: 4097, bucket: "over-4096" },
+])(
+  "bounds toast detail inspection at the $size size seam without retaining its length/text",
+  (input) => {
+    const signature = projectRemoteUiToastErrorSignature("x".repeat(input.size));
+    expect(signature).toEqual({
+      wrapperPrefix: false,
+      messageFamily: "other",
+      clickPostSuffix: input.size > 4096 ? null : false,
+      argumentsSuffix: input.size > 4096 ? null : false,
+      lengthBucket: input.bucket,
+      exactToastSelectorPresent: input.size > 4096 ? null : false,
+      nameFamily: "unavailable",
+    });
+  },
+);
+
+it.each(["missing", "accessor", "inherited", "non-string", "reflection", "revoked"])(
+  "quarantines unavailable own toast name metadata without evaluating readers: %s",
+  (shape) => {
+    let reads = 0;
+    let error: unknown = {};
+    if (shape === "accessor")
+      error = Object.defineProperty({}, "name", {
+        get() {
+          reads++;
+          throw new Error("private getter");
+        },
+      });
+    else if (shape === "inherited") error = Object.create({ name: "no such element" });
+    else if (shape === "non-string") error = { name: { private: "private-name" } };
+    else if (shape === "reflection")
+      error = new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor() {
+            throw new Error("private reflection");
+          },
+        },
+      );
+    else if (shape === "revoked") {
+      const proxy = Proxy.revocable({}, {});
+      proxy.revoke();
+      error = proxy.proxy;
+    }
+    const signature = projectRemoteUiToastErrorSignature("unknown private message", error);
+    expect(signature?.nameFamily).toBe("unavailable");
+    expect(reads).toBe(0);
+    expect(JSON.stringify(signature)).not.toContain("private");
+  },
+);
+
+it("never reads unrelated toast error properties or coerces non-string messages", () => {
+  let reads = 0;
+  const error: Record<string, unknown> = { name: "stale element reference" };
+  for (const key of ["message", "stack", "url", "opts", "cause", "_tag", "private"])
+    Object.defineProperty(error, key, {
+      get() {
+        reads++;
+        throw new Error("private reader");
+      },
+    });
+  expect(projectRemoteUiToastErrorSignature("unknown", error)?.nameFamily).toBe("stale");
+  for (const message of [undefined, null, [], {}, Object("private")])
+    expect(projectRemoteUiToastErrorSignature(message, error)).toBeNull();
+  expect(reads).toBe(0);
+});
+
+it.each(["GET", "args", "trailing text", "trailing newline", "malformed prefix"])(
+  "reports refused toast signature shapes without admitting a recovery: %s",
+  (shape) => {
+    let message =
+      'WebDriverError: stale element reference: detail when running "element/owned/click" with method "POST"';
+    if (shape === "GET") message = message.replace('"POST"', '"GET"');
+    else if (shape === "args") message += ' and args "{\\"button\\":0}"';
+    else if (shape === "trailing text") message += " private suffix";
+    else if (shape === "trailing newline") message += "\n";
+    else message = message.replace("WebDriverError: ", "WebDriverError:");
+    const signature = projectRemoteUiToastErrorSignature(message);
+    expect(signature?.clickPostSuffix).toBe(shape === "malformed prefix");
+    expect(signature?.argumentsSuffix).toBe(shape === "args");
+    expect(signature?.wrapperPrefix).toBe(shape !== "malformed prefix");
+    expect(JSON.stringify(signature)).not.toMatch(/private|button|owned\//);
+  },
+);
 
 it("projects only closed setup facts and preserves unknown versus absent observations", () => {
   for (const input of [undefined, null, [], "private-credential"])
