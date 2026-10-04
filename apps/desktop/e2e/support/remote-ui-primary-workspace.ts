@@ -188,6 +188,7 @@ export interface ReloadPrimaryThreadWitness {
   threadUnarchived: boolean | null;
   threadUndeleted: boolean | null;
   branchNull: boolean | null;
+  expectedBranchMatched: boolean | null;
   worktreeNull: boolean | null;
 }
 
@@ -212,6 +213,7 @@ export function projectReloadPrimaryThreadWitness(
       "threadUnarchived",
       "threadUndeleted",
       "branchNull",
+      "expectedBranchMatched",
       "worktreeNull",
     ]) {
       const descriptor = Object.getOwnPropertyDescriptor(input, key);
@@ -244,6 +246,7 @@ export function projectReloadPrimaryThreadWitness(
       threadUnarchived: flag("threadUnarchived"),
       threadUndeleted: flag("threadUndeleted"),
       branchNull: flag("branchNull"),
+      expectedBranchMatched: flag("expectedBranchMatched"),
       worktreeNull: flag("worktreeNull"),
     };
   } catch {
@@ -301,6 +304,7 @@ export async function readReloadPrimaryThread(
     threadUnarchived: null,
     threadUndeleted: null,
     branchNull: null,
+    expectedBranchMatched: null,
     worktreeNull: null,
   };
   const finish = (matched: boolean) => ({ matched, witness });
@@ -391,6 +395,7 @@ export async function readReloadPrimaryThread(
       witness.threadUnarchived = flag(thread[0], "archived_at", (value) => value === null);
       witness.threadUndeleted = flag(thread[0], "deleted_at", (value) => value === null);
       witness.branchNull = flag(thread[0], "branch", (value) => value === null);
+      witness.expectedBranchMatched = flag(thread[0], "branch", (value) => value === "main");
       witness.worktreeNull = flag(thread[0], "worktree_path", (value) => value === null);
     }
     return finish(
@@ -401,7 +406,9 @@ export async function readReloadPrimaryThread(
         own(thread[0], "kind") === "default" &&
         own(thread[0], "archived_at") === null &&
         own(thread[0], "deleted_at") === null &&
-        own(thread[0], "branch") === null &&
+        // initializeGitProject owns this fixture's main branch. The active UI may
+        // synchronize its initially null default-thread branch from live Git.
+        (own(thread[0], "branch") === null || own(thread[0], "branch") === "main") &&
         own(thread[0], "worktree_path") === null,
     );
   } catch {

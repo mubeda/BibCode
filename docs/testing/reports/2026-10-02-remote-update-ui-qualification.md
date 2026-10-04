@@ -404,3 +404,40 @@ Root's focused visual inspection also found the Retry action visibly clipped at
 the right edge of the authoritative 1280x817 `not-back-light.png` original. This
 is a #16/UI.md follow-up for a later focused toast source check. It is not an
 assumed cause of the composer boundary and no toast policy changes here.
+
+Fresh full trial `37167826282` at `240290098` reached light
+`reload-primary-thread-proof` and failed there. Its closed witness records an
+admitted successful HTTP read, parsed lists, exactly one matching project and
+thread, all live/default/project/lifecycle predicates true, null worktree true,
+and `branchNull: false`. No branch value was retained, so the native value is
+unknown. Joined namespace cleanup records `remaining: []` and
+`controllerReaped: true`. Actual Reload and the extended dark lane remain
+unqualified by that run.
+
+The current source supplies a concrete reader mismatch: the owned fixture
+initializes Git on `main`, and `GitActionsControl` calls the production
+`resolveLiveThreadBranchUpdate` resolver and persists the active server thread's
+live branch metadata. A null default-thread branch therefore can synchronize to
+`main` without creating a worktree or changing thread identity. The sidebar's
+always-null comment is stale and does not define that metadata policy. This
+source-backed path does not establish the unretained native branch value.
+
+The bounded QA correction accepts only null before synchronization or the owned
+fixture's literal `main` afterward. It keeps the captured IDs, raw snake_case
+producer shape, default/live/unarchived/undeleted predicates, null worktree,
+single read, fixed timeout and original public action sequence. Other branch
+strings and malformed values still fail proof. `branchNull` stays observable;
+the additional nullable boolean `expectedBranchMatched` carries only the fixed
+fixture-branch comparison. The existing endpoint/camelCase-contract disagreement
+remains unresolved outside this correction's scope.
+
+The regression creates the real Git fixture, runs the actual production resolver,
+projects through the current raw Serialize fixture, and exercises the public
+reader. It failed on the original reader's `matched: false`, then passed after
+the correction. The same regression replays the actual Reload preparation with
+the real card/reader and verifies exactly one proof request and the existing
+workspace/Local/bound-primary actions. All 190 tests across the five focused
+primary-workspace/controller/RPC/evidence/owner suites and desktop e2e TypeScript
+checking passed. TypeScript emitted four suggestions in unchanged client-runtime
+files. Root owns whole-workspace gates and a fresh native trial; these tests
+establish compatibility evidence, not a native Reload pass.

@@ -1,6 +1,9 @@
-// @effect-diagnostics nodeBuiltinImport:off - Inert DOM/card and public-reader replay only.
+// @effect-diagnostics nodeBuiltinImport:off - Owned Git fixture, DOM/card and public-reader replay.
 import * as NodeFS from "node:fs";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeModule from "node:module";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeVM from "node:vm";
 import { expect, it } from "vite-plus/test";
 import {
@@ -10,6 +13,7 @@ import {
   readReloadPrimaryThread,
   readReloadPrimaryWorkspace,
 } from "./remote-ui-primary-workspace.ts";
+import { prepareDesktopUiTestContext } from "./test-project.ts";
 
 const webRequire = NodeModule.createRequire(new URL("../../../web/package.json", import.meta.url));
 const { transformSync } = NodeModule.createRequire(webRequire.resolve("vite-plus"))("esbuild");
@@ -336,6 +340,119 @@ function publicThreadRead(
   return { read: async (input: unknown) => (await rawRead(input)).matched, rawRead, requests };
 }
 
+it("selects only the owned primary after the fixture's real Git branch synchronization", async () => {
+  const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-reload-branch-"));
+  const f = fixture(false, true, true);
+  try {
+    const context = prepareDesktopUiTestContext({
+      BIBCODE_E2E_RUN_ROOT: NodePath.join(root, "fixture"),
+      BIBCODE_E2E_ARTIFACT_DIR: NodePath.join(root, "artifacts"),
+      BIBCODE_E2E_PLATFORM: "linux",
+    });
+    const branch = NodeChildProcess.execFileSync(
+      "git",
+      ["-C", context.projectPath, "branch", "--show-current"],
+      {
+        encoding: "utf8",
+      },
+    ).trim();
+    const synchronize = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        productionFunction(
+          "components/GitActionsControl.logic.ts",
+          "resolveLiveThreadBranchUpdate",
+        ) + "\nresolveLiveThreadBranchUpdate",
+      ),
+    );
+    const update = synchronize({ threadBranch: null, gitStatus: { refName: branch } });
+    expect(update).toEqual({ branch: "main" });
+    const snapshot = {
+      ...f.snapshot,
+      threads: [
+        rawProjectionRow("ProjectionThread", { ...f.snapshot.threads[0], branch: update.branch }),
+      ],
+    };
+    const probe = publicThreadRead(f, snapshot);
+    const proof = await probe.rawRead({ ...binding, snapshotPath: "/api/orchestration/snapshot" });
+    expect(proof.matched).toBe(true);
+    expect(proof.witness.branchNull).toBe(false);
+    expect(proof.witness.expectedBranchMatched).toBe(true);
+    expect(probe.requests).toEqual([
+      {
+        url: "http://localhost:4887/api/orchestration/snapshot",
+        credentials: "include",
+        timeout: 10_000,
+      },
+    ]);
+    expect(JSON.stringify(proof)).not.toMatch(/main|owned-project|owned-thread|localhost|http:/);
+
+    // Replay the actual public preparation boundary with the real DOM and reader.
+    const controller = NodeFS.readFileSync(
+      new URL("../qualify-remote-updates.ts", import.meta.url),
+      "utf8",
+    );
+    const start = controller.indexOf(
+      '  phase("reload-open-workspace");',
+      controller.indexOf("async function reloadFlow("),
+    );
+    const end = controller.indexOf("  const draft =", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const actions: string[] = [];
+    const controllerProbe = publicThreadRead(f, snapshot);
+    const primaryWorkspace = { ...binding, sessionLinePresent: false };
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function prep(){" + controller.slice(start, end) + "}\nprep",
+      ),
+      {
+        phase: () => {},
+        workspace: async () => actions.push("workspace"),
+        click: async (selector: string) => {
+          actions.push(selector);
+          if (selector === '[data-testid="primary-card-button-owned-project"]') {
+            f.window.document.querySelector(selector).setAttribute("aria-current", "page");
+            f.location.pathname = "/primary/owned-thread";
+          } else expect(selector).toBe('[data-testid="environment-rail-local"]');
+        },
+        required: () => ({
+          execute: async (read: unknown, input: unknown) =>
+            read === readReloadPrimaryThread ? controllerProbe.rawRead(input) : f.read(input),
+          $: () => ({
+            waitForDisplayed: async () => expect(f.location.pathname).toBe("/primary/owned-thread"),
+          }),
+        }),
+        readReloadPrimaryWorkspace,
+        readReloadPrimaryThread,
+        decodeReloadPrimaryWorkspace,
+        decodeReloadPrimaryThreadProof,
+        EnvironmentOrchestrationHttpApi: {
+          endpoints: { snapshot: { path: "/api/orchestration/snapshot" } },
+        },
+        primaryWorkspace,
+        primaryRead: {
+          projectName: "BiBCode UI Fixture",
+          ...primaryWorkspace,
+          requireSelected: true,
+        },
+        owner: { until: async (read: () => Promise<boolean>) => expect(await read()).toBe(true) },
+        composer: "owned-composer",
+        check: (value: unknown) => expect(value).toBe(true),
+      },
+    );
+    await expect(run()).resolves.toBeUndefined();
+    expect(actions).toEqual([
+      "workspace",
+      '[data-testid="environment-rail-local"]',
+      '[data-testid="primary-card-button-owned-project"]',
+    ]);
+    expect(controllerProbe.requests).toEqual(probe.requests);
+  } finally {
+    await f.window.happyDOM.close();
+    NodeFS.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it("captures the actual empty primary card without starting or fabricating a provider session", async () => {
   const f = fixture(true, true, true);
   try {
@@ -389,6 +506,7 @@ it("adds closed witness to the same read without accepting a refused branch or r
       threadUnarchived: true,
       threadUndeleted: true,
       branchNull: false,
+      expectedBranchMatched: false,
       worktreeNull: true,
     });
     expect(decodeReloadPrimaryThreadProof(proof)?.matched).toBe(false);
@@ -462,11 +580,13 @@ it("keeps unavailable parse/list/count/predicate observations unknown rather tha
     expect(duplicate.matched).toBe(false);
     expect(duplicate.witness.threadMatches).toBe("multiple");
     expect(duplicate.witness.branchNull).toBeNull();
+    expect(duplicate.witness.expectedBranchMatched).toBeNull();
     const thread = { ...f.snapshot.threads[0] };
     delete thread.branch;
     const absent = await publicThreadRead(f, { ...f.snapshot, threads: [thread] }).rawRead(input);
     expect(absent.matched).toBe(false);
     expect(absent.witness.branchNull).toBeNull();
+    expect(absent.witness.expectedBranchMatched).toBeNull();
   } finally {
     await f.window.happyDOM.close();
   }
@@ -576,47 +696,58 @@ it("proves a current empty bound thread through the existing public read and ref
   }
 });
 
-it("refuses wrong, duplicated, deleted, archived or malformed public project/thread proof", async () => {
-  const f = fixture(false, true, true);
-  try {
-    const project = f.snapshot.projects[0]!,
-      thread = f.snapshot.threads[0]!;
-    for (const snapshot of [
-      null,
-      { projects: [], threads: [thread] },
-      { projects: [project, project], threads: [thread] },
-      { projects: [project], threads: [thread, thread] },
-      { projects: [{ ...project, deleted_at: "deleted" }], threads: [thread] },
-      ...[
-        { thread_id: "foreign-thread" },
-        { project_id: "foreign-project" },
-        { kind: "regular" },
-        { archived_at: "archived" },
-        { deleted_at: "deleted" },
-        { branch: "foreign-branch" },
-        { worktree_path: "private-path" },
-      ].map((change) => ({ projects: [project], threads: [{ ...thread, ...change }] })),
-    ]) {
-      const probe = publicThreadRead(f, snapshot);
-      expect(await probe.read({ ...binding, snapshotPath: "/api/orchestration/snapshot" })).toBe(
-        false,
-      );
+it.each([null, "main"])(
+  "refuses wrong, duplicated, deleted, archived or malformed proof with branch %s",
+  async (branch) => {
+    const f = fixture(false, true, true);
+    try {
+      const project = f.snapshot.projects[0]!,
+        thread = { ...f.snapshot.threads[0]!, branch };
+      for (const snapshot of [
+        null,
+        { projects: [], threads: [thread] },
+        { projects: [project, project], threads: [thread] },
+        { projects: [project], threads: [thread, thread] },
+        { projects: [{ ...project, deleted_at: "deleted" }], threads: [thread] },
+        ...[
+          { thread_id: "foreign-thread" },
+          { project_id: "foreign-project" },
+          { kind: "regular" },
+          { archived_at: "archived" },
+          { deleted_at: "deleted" },
+          { branch: "foreign-branch" },
+          { branch: "MAIN" },
+          { branch: "refs/heads/main" },
+          { branch: "main\n" },
+          { branch: "" },
+          { branch: true },
+          { branch: 1 },
+          { branch: [] },
+          { branch: {} },
+          { worktree_path: "private-path" },
+        ].map((change) => ({ projects: [project], threads: [{ ...thread, ...change }] })),
+      ]) {
+        const probe = publicThreadRead(f, snapshot);
+        expect(await probe.read({ ...binding, snapshotPath: "/api/orchestration/snapshot" })).toBe(
+          false,
+        );
+      }
+      for (const input of [
+        { ...binding, threadId: "invalid/thread" },
+        Object.create(binding),
+        { ...binding, sessionLinePresent: null },
+      ]) {
+        const probe = publicThreadRead(f);
+        expect(await probe.read({ ...input, snapshotPath: "/api/orchestration/snapshot" })).toBe(
+          false,
+        );
+        expect(probe.requests).toEqual([]);
+      }
+    } finally {
+      await f.window.happyDOM.close();
     }
-    for (const input of [
-      { ...binding, threadId: "invalid/thread" },
-      Object.create(binding),
-      { ...binding, sessionLinePresent: null },
-    ]) {
-      const probe = publicThreadRead(f);
-      expect(await probe.read({ ...input, snapshotPath: "/api/orchestration/snapshot" })).toBe(
-        false,
-      );
-      expect(probe.requests).toEqual([]);
-    }
-  } finally {
-    await f.window.happyDOM.close();
-  }
-});
+  },
+);
 
 it("refuses missing raw projection properties and never admits the camelCase contract as an alias", async () => {
   const f = fixture(false, true, true);

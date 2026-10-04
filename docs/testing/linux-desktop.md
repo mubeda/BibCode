@@ -632,12 +632,19 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   `worktree_path` fields; do not treat the contract's camelCase DTO as an alias.
   Report the existing endpoint/contract disagreement without changing product
   protocols as part of qualification.
-  Keep raw read values in the page. Its unchanged boolean verdict may carry
+  The owned fixture initializes Git on `main`. The active chat can synchronize
+  its default thread's initially null branch metadata from live Git. Admit only
+  null before that synchronization or exactly `main` afterward, with the same
+  captured project/thread IDs, default kind and null worktree path. Never infer
+  the permitted branch from the response or accept other non-null values.
+  Keep raw read values in the page. Its boolean verdict may carry
   one closed witness from that same request: request/parse/list admission,
   finite HTTP status and matching-row counts, and nullable live/default/
   branch/worktree predicate flags. Retain that witness only in `failure.json`
   at the exact `reload-primary-thread-proof` phase, and leave unavailable facts
-  null. Reproject own enumerable data and contain optional observation errors;
+  null. Preserve `branchNull` and record `expectedBranchMatched` as a separate nullable
+  boolean for the fixture's `main` branch; neither field exposes the value.
+  Reproject own enumerable data and contain optional observation errors;
   never retain response/input/identity/error/URL/token values or add a request.
   This witness does not establish a past native cause. Missing, duplicated,
   foreign, deleted, archived or failed proof still prevents the click. Refuse
