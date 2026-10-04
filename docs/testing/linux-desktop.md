@@ -812,11 +812,23 @@ write only its controlled text/image changes. Public partial staging must put
 exactly the first text hunk in the index while retaining the other two in the
 working tree.
 
+The baseline commit has one owned image-only parent so its PNG exists on both
+sides as different valid 64 by 64 swatches. Keep the baseline bytes, subject,
+tag, branch identities and stash inventory unchanged; never manufacture this
+history in a real repository.
+
 The browser uses public keyboard, pointer, scroll, input and menu actions.
 The Files scene opens its real nested file and adds a line comment through the
 editor gutter. The palette filters to and highlights Open settings without
-executing it. A genuine image diff is inspected before returning to the text
-Changes scene; its pixels are not in that scene's PNG. The Files context menu
+executing it. In Changes, select the working-tree PNG and require the owned
+image row, visible diff pane and disabled empty partial-staging gutter; that
+binary representation does not provide an image preview. Use public History
+controls to select the baseline commit and its PNG, then require the unchanged
+two-loaded-image 64 by 64 predicate on that supported commit image view before
+returning to Changes for text partial staging. Selecting the baseline commit
+again for the later History capture resets selection to its first changed file;
+the History/stash witness does not require a particular filename. The image
+pixels are not in the Changes PNG. The Files context menu
 and workspace terminal/other-chat substate also remain outside these eight
 captures. These omissions stay explicit in the closed interaction receipt;
 this batch does not visually qualify hidden components from a source inventory.

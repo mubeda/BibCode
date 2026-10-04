@@ -116,6 +116,18 @@ export function prepareVisualProject(input: VisualProjectInput): void {
     NodeFS.mkdirSync(NodePath.join(project, "src/nested"), { recursive: true, mode: 0o700 });
     for (const [file, bytes] of Object.entries(files))
       NodeFS.writeFileSync(NodePath.join(project, file), bytes, { flag: "wx", mode: 0o600 });
+    // The supported commit image view needs both sides. Keep the existing baseline
+    // bytes/subject/tag, with one additional owned image-only parent before it.
+    NodeFS.writeFileSync(
+      NodePath.join(project, visualFixture.image),
+      Buffer.from(swatches[1], "base64"),
+    );
+    git(project, ["add", "--", visualFixture.image]);
+    git(project, ["commit", "-m", "Visual image comparison parent"]);
+    NodeFS.writeFileSync(
+      NodePath.join(project, visualFixture.image),
+      Buffer.from(swatches[0], "base64"),
+    );
     git(project, ["add", "--", ...Object.keys(files)]);
     git(project, ["commit", "-m", visualFixture.historySubject]);
     git(project, ["branch", "visual-free"]);

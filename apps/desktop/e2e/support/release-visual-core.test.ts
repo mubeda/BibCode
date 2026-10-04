@@ -332,100 +332,135 @@ it("checks the shared managed-worktree identity before the first exact scene and
   await expect(runVisualCore(input)).rejects.toBe(stopped);
   expect(order).toEqual(["verified-managed", "visual-workspace-composite", "workspace-composite"]);
 });
-it("runs only the eight fixed scenes via public controls and keeps image inspection separate from PNG coverage", async () => {
-  const calls: string[] = [],
-    captures: string[] = [];
-  const element = (selector: string): object => ({
-    waitForDisplayed: async () => {},
-    waitForEnabled: async () => {},
-    elementId: "owned-element",
-    isFocused: async () => true,
-    isDisplayed: async () => selector !== "[data-right-panel-tabbar]",
-    click: async () => {
-      calls.push(`click:${selector}`);
-    },
-    setValue: async (value: string) => {
-      calls.push(`input:${selector}:${value}`);
-    },
-    moveTo: async () => {
-      calls.push(`hover:${selector}`);
-    },
-    scrollIntoView: async () => {
-      calls.push(`scroll:${selector}`);
-    },
-    getText: async () => "Owned visual review draft",
-    shadow$: (next: string) => element(selector + " >> " + next),
-  });
-  const input = {
-    browser: {
-      $: element,
-      $$: () => ({ length: Promise.resolve(1) }),
-      keys: async (key: unknown) => {
-        calls.push(`key:${JSON.stringify(key)}`);
+it.each([true, false])(
+  "runs only the eight fixed scenes and requires the supported image proof: loaded=%s",
+  async (imageLoaded) => {
+    const calls: string[] = [],
+      captures: string[] = [];
+    const element = (selector: string): object => ({
+      waitForDisplayed: async () => {},
+      waitForEnabled: async () => {},
+      elementId: "owned-element",
+      isFocused: async () => true,
+      isDisplayed: async () => selector !== "[data-right-panel-tabbar]",
+      click: async () => {
+        calls.push(`click:${selector}`);
       },
-      execute: async (read: { name: string }) =>
-        read.name === "readVisualImageLoaded" ? true : { x: 0, y: 0 },
-    },
-    owner: {
-      until: async (read: () => Promise<boolean>) => {
-        expect(await read()).toBe(true);
+      setValue: async (value: string) => {
+        calls.push(`input:${selector}:${value}`);
       },
-    },
-    threadId: "owned",
-    branch: "codex/delivery-retry-light",
-    step: () => {},
-    verifyManaged: async () => {
-      calls.push("verify-managed");
-    },
-    openWorktreeDialog: async () => {
-      calls.push("shared-worktree-opener");
-    },
-    partialStageMatches: () => {
-      calls.push("read-actual-partial-stage");
-      return true;
-    },
-    capture: async (scene: string) => {
-      calls.push(`capture:${scene}`);
-      captures.push(scene);
-    },
-  } as unknown as VisualCoreInput;
-  const result = await runVisualCore(input);
-  expect(captures).toEqual([
-    "workspace-composite",
-    "workspace-card-menu",
-    "worktree-create-ref",
-    "git-changes-diff",
-    "git-history-stashes",
-    "git-branch-menu",
-    "files-editor-comment",
-    "command-palette",
-  ]);
-  expect(calls.filter((call) => call === "shared-worktree-opener")).toHaveLength(1);
-  expect(calls).not.toContain(
-    'input:[data-slot="dialog-popup"][role="dialog"] input[placeholder="Worktree name"]:',
-  );
-  expect(calls).toContain('key:["Control","a"]');
-  expect(calls).toContain('key:"Backspace"');
-  expect(calls.indexOf('key:["Control","a"]')).toBeLessThan(calls.indexOf('key:"Backspace"'));
-  expect(calls.indexOf('key:"Backspace"')).toBeLessThan(
-    calls.indexOf("capture:worktree-create-ref"),
-  );
-  expect(calls).not.toContain(
-    'click://*[@data-slot="dialog-popup"]//button[normalize-space()="visual-held"]',
-  );
+      moveTo: async () => {
+        calls.push(`hover:${selector}`);
+      },
+      scrollIntoView: async () => {
+        calls.push(`scroll:${selector}`);
+      },
+      getText: async () => "Owned visual review draft",
+      shadow$: (next: string) => element(selector + " >> " + next),
+    });
+    const input = {
+      browser: {
+        $: element,
+        $$: () => ({ length: Promise.resolve(1) }),
+        keys: async (key: unknown) => {
+          calls.push(`key:${JSON.stringify(key)}`);
+        },
+        execute: async (read: { name: string }) => {
+          if (read.name === "readVisualWorkingImageSelected") {
+            calls.push("read-working-image-binary");
+            return true;
+          }
+          if (read.name === "readVisualImageLoaded") {
+            calls.push("read-supported-commit-image");
+            return imageLoaded;
+          }
+          return { x: 0, y: 0 };
+        },
+      },
+      owner: {
+        until: async (read: () => Promise<boolean>) => {
+          if (!(await read())) throw new Error("Inert required image load did not arrive.");
+        },
+      },
+      threadId: "owned",
+      branch: "codex/delivery-retry-light",
+      step: () => {},
+      verifyManaged: async () => {
+        calls.push("verify-managed");
+      },
+      openWorktreeDialog: async () => {
+        calls.push("shared-worktree-opener");
+      },
+      partialStageMatches: () => {
+        calls.push("read-actual-partial-stage");
+        return true;
+      },
+      capture: async (scene: string) => {
+        calls.push(`capture:${scene}`);
+        captures.push(scene);
+      },
+    } as unknown as VisualCoreInput;
+    if (!imageLoaded) {
+      await expect(runVisualCore(input)).rejects.toThrow(
+        "Inert required image load did not arrive.",
+      );
+      expect(captures).toEqual([
+        "workspace-composite",
+        "workspace-card-menu",
+        "worktree-create-ref",
+      ]);
+      expect(calls).toContain("read-working-image-binary");
+      expect(calls).toContain(
+        'click:[aria-label="Repository history"] [aria-label="Changed files"] button[data-changed-file-path="visual-swatch.png"]',
+      );
+      expect(calls).not.toContain("read-actual-partial-stage");
+      return;
+    }
+    const result = await runVisualCore(input);
+    expect(captures).toEqual([
+      "workspace-composite",
+      "workspace-card-menu",
+      "worktree-create-ref",
+      "git-changes-diff",
+      "git-history-stashes",
+      "git-branch-menu",
+      "files-editor-comment",
+      "command-palette",
+    ]);
+    expect(calls.filter((call) => call === "shared-worktree-opener")).toHaveLength(1);
+    expect(calls).not.toContain(
+      'input:[data-slot="dialog-popup"][role="dialog"] input[placeholder="Worktree name"]:',
+    );
+    expect(calls).toContain('key:["Control","a"]');
+    expect(calls).toContain('key:"Backspace"');
+    expect(calls.indexOf('key:["Control","a"]')).toBeLessThan(calls.indexOf('key:"Backspace"'));
+    expect(calls.indexOf('key:"Backspace"')).toBeLessThan(
+      calls.indexOf("capture:worktree-create-ref"),
+    );
+    expect(calls).not.toContain(
+      'click://*[@data-slot="dialog-popup"]//button[normalize-space()="visual-held"]',
+    );
 
-  expect(calls).toContain('key:["Shift","F10"]');
-  expect(calls.indexOf("read-actual-partial-stage")).toBeLessThan(
-    calls.indexOf("capture:git-changes-diff"),
-  );
-  expect(calls).toContain('scroll:button[aria-label="Select stash stash@{11}"]');
-  expect(result).toEqual({
-    managedIdentityMatched: true,
-    partialStageVerified: true,
-    imageDiffInspected: true,
-    dialogCancelled: true,
-    draftRetained: true,
-    noCommandExecuted: true,
-    unpictured: ["git-image-diff", "files-context-menu", "workspace-terminal-and-other-chat"],
-  });
-});
+    expect(calls).toContain('key:["Shift","F10"]');
+    const commitImage =
+      'click:[aria-label="Repository history"] [aria-label="Changed files"] button[data-changed-file-path="visual-swatch.png"]';
+    expect(calls.indexOf("read-working-image-binary")).toBeLessThan(calls.indexOf(commitImage));
+    expect(calls.indexOf(commitImage)).toBeLessThan(calls.indexOf("read-supported-commit-image"));
+    expect(calls.indexOf("read-supported-commit-image")).toBeLessThan(
+      calls.indexOf("read-actual-partial-stage"),
+    );
+    expect(calls.indexOf("read-actual-partial-stage")).toBeLessThan(
+      calls.indexOf("capture:git-changes-diff"),
+    );
+    expect(calls).toContain('scroll:button[aria-label="Select stash stash@{11}"]');
+    expect(result).toEqual({
+      managedIdentityMatched: true,
+      partialStageVerified: true,
+      imageDiffInspected: true,
+      dialogCancelled: true,
+      draftRetained: true,
+      noCommandExecuted: true,
+      unpictured: ["git-image-diff", "files-context-menu", "workspace-terminal-and-other-chat"],
+    });
+  },
+);

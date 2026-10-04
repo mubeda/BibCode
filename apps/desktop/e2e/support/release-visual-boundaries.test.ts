@@ -116,6 +116,7 @@ describe("visual preparation source boundaries", () => {
     expect(reads).toEqual([
       "observeVisualNameClear",
       "observeVisualNameClear",
+      "readVisualWorkingImageSelected",
       "readVisualImageLoaded",
       "readVisualPageScroll",
       "readVisualPageScroll",

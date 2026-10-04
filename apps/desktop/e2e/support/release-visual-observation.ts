@@ -402,6 +402,44 @@ export function readVisualWitness(input: VisualObservationInput): Record<string,
   };
 }
 
+/** The existing binary working-tree representation; this does not claim image preview support. */
+export function readVisualWorkingImageSelected(input: { branch: string }): boolean {
+  if (
+    location.origin !== "http://127.0.0.1:4885" ||
+    location.search ||
+    location.hash ||
+    !/^\/project\/local\/[A-Za-z0-9._:-]{1,128}\/git$/.test(location.pathname) ||
+    !/^codex\/delivery-retry-(light|dark)$/.test(input.branch)
+  )
+    return false;
+  const controls = (selector: string) => Array.from(document.querySelectorAll(selector));
+  const target = controls('section[aria-label="Diff for visual-swatch.png"]');
+  const worktree = controls('[aria-label="Worktree"]');
+  const branch = controls('[aria-label="Choose branch"]');
+  if (
+    target.length !== 1 ||
+    target[0]!.getBoundingClientRect().height <= 0 ||
+    controls('[role="option"][data-path="visual-swatch.png"][aria-selected="true"]').length !== 1 ||
+    worktree.length !== 1 ||
+    worktree[0]!.textContent?.trim() !== input.branch ||
+    branch.length !== 1 ||
+    branch[0]!.textContent?.trim() !== input.branch
+  )
+    return false;
+  const gutter = target[0]!.querySelector('aside[aria-label="Partial staging selection gutter"]');
+  const stage = Array.from(gutter?.querySelectorAll("button") ?? []).filter(
+    (button) => button.textContent?.trim() === "Stage selected lines",
+  );
+  return (
+    gutter !== null &&
+    stage.length === 1 &&
+    stage[0]!.disabled &&
+    gutter.querySelectorAll('button[aria-label^="Toggle changed-line run starting at line"]')
+      .length === 0 &&
+    target[0]!.querySelectorAll("img").length === 0
+  );
+}
+
 /** A genuine rendered image diff, checked before returning to the text-diff capture. */
 export function readVisualImageLoaded(): boolean {
   if (location.origin !== "http://127.0.0.1:4885" || location.search || location.hash) return false;

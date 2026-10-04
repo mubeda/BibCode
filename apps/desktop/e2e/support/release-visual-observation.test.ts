@@ -279,6 +279,30 @@ describe("owned name-clear event observation", () => {
   });
 });
 describe("read-only visual observations", () => {
+  it.each([
+    "ok",
+    "wrong-route",
+    "wrong-branch",
+    "duplicate-pane",
+    "unselected",
+    "selectable-lines",
+    "enabled-stage",
+    "image",
+  ])("binds only the owned nonselectable working-tree PNG presentation: %s", (mode) => {
+    palette();
+    vi.stubGlobal("location", {
+      origin: input.origin,
+      pathname: mode === "wrong-route" ? "/local/owned" : "/project/local/owned/git",
+      search: "",
+      hash: "",
+    });
+    document.body.innerHTML = `<button aria-label="Worktree">${input.branch}</button><button aria-label="Choose branch">${mode === "wrong-branch" ? "foreign" : input.branch}</button><button role="option" data-path="visual-swatch.png" aria-selected="${mode !== "unselected"}">Owned image row</button><section aria-label="Diff for visual-swatch.png"><aside aria-label="Partial staging selection gutter"><button ${mode === "enabled-stage" ? "" : "disabled"}>Stage selected lines</button>${mode === "selectable-lines" ? '<button aria-label="Toggle changed-line run starting at line 1"></button>' : ""}</aside>${mode === "image" ? '<img alt="Inert unrelated image">' : ""}</section>`;
+    if (mode === "duplicate-pane")
+      document.body.append(document.querySelector("section")!.cloneNode(true));
+    expect(
+      Reflect.get(Observations, "readVisualWorkingImageSelected")({ branch: input.branch }),
+    ).toBe(mode === "ok");
+  });
   it("admits the actually focused single public palette action without returning input contents", () => {
     palette();
     const witness = readVisualWitness(input);

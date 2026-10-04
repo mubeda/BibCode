@@ -16,6 +16,7 @@ import {
 import {
   readVisualWitness,
   readVisualImageLoaded,
+  readVisualWorkingImageSelected,
   readVisualPageScroll,
   observeVisualNameClear,
   projectVisualNameClearObservation,
@@ -187,10 +188,22 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
   await click('[aria-label="Worktree"]');
   await click(`//*[@role="option"][.//span[normalize-space()="${input.branch}"]]`);
   await click('//button[@role="tab" and normalize-space()="Changes"]');
-  step("visual-image-inspect");
+  step("visual-image-working-tree");
   await click('[role="option"][data-path="visual-swatch.png"]');
+  await owner.until(async () =>
+    bounded(browser.execute(readVisualWorkingImageSelected, { branch: input.branch }), 2_000),
+  );
+  // Image bytes are supported for commit diffs. Retain the binary working-tree
+  // row check, then inspect the existing two-sided baseline through History.
+  step("visual-image-inspect");
+  await click('//button[@role="tab" and normalize-space()="History"]');
+  await click('//button[@role="option" and contains(@aria-label,"Visual qualification baseline")]');
+  await click(
+    '[aria-label="Repository history"] [aria-label="Changed files"] button[data-changed-file-path="visual-swatch.png"]',
+  );
   await owner.until(async () => bounded(browser.execute(readVisualImageLoaded), 2_000));
   step("visual-partial-stage");
+  await click('//button[@role="tab" and normalize-space()="Changes"]');
   await click('[role="option"][data-path="pierre-step5.ts"]');
   await click(
     'aside[aria-label="Partial staging selection gutter"] button[aria-label="Toggle changed-line run starting at line 1"]',

@@ -3,6 +3,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeZlib from "node:zlib";
 import { describe, expect, it } from "vite-plus/test";
 import {
   prepareVisualProject,
@@ -88,6 +89,63 @@ describe.skipIf(!NodeFS.existsSync(git))("first visual batch private Git fixture
         " M pierre-step5.ts\n M visual-swatch.png\n",
       );
       expect(f.run(["diff", "--", "pierre-step5.ts"], path)).toContain('first = "changed one"');
+      const binary = f.run(
+        [
+          "diff",
+          "--no-ext-diff",
+          "--patch-with-raw",
+          "-z",
+          "--no-color",
+          "HEAD",
+          "--",
+          "visual-swatch.png",
+        ],
+        path,
+      );
+      expect(binary).toContain("Binary files a/visual-swatch.png and b/visual-swatch.png differ");
+      const readBlob = (ref: string) =>
+        NodeChildProcess.execFileSync(git, ["-C", path, "show", ref + ":visual-swatch.png"], {
+          timeout: 5_000,
+          maxBuffer: 65_536,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: {
+            HOME: f.home,
+            PATH: "/usr/bin:/bin",
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_CONFIG_SYSTEM: "/dev/null",
+          },
+        });
+      const before = readBlob("HEAD^"),
+        after = readBlob("HEAD");
+      expect(before.equals(after)).toBe(false);
+      expect(NodeFS.readFileSync(NodePath.join(path, "visual-swatch.png")).equals(before)).toBe(
+        true,
+      );
+      expect(f.run(["log", "-1", "--format=%s"])).toBe("Visual qualification baseline\n");
+      expect(f.run(["log", "-1", "--format=%s", "HEAD^"])).toBe("Visual image comparison parent\n");
+      for (const bytes of [before, after]) {
+        expect(bytes.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+        expect([bytes.readUInt32BE(16), bytes.readUInt32BE(20)]).toEqual([64, 64]);
+        expect(Array.from(bytes.subarray(24, 29))).toEqual([8, 2, 0, 0, 0]);
+        let cursor = 8;
+        const data: Buffer[] = [];
+        while (cursor < bytes.length) {
+          const length = bytes.readUInt32BE(cursor);
+          expect(bytes.readUInt32BE(cursor + 8 + length)).toBe(
+            NodeZlib.crc32(bytes.subarray(cursor + 4, cursor + 8 + length)),
+          );
+          if (bytes.toString("ascii", cursor + 4, cursor + 8) === "IDAT")
+            data.push(bytes.subarray(cursor + 8, cursor + 8 + length));
+          cursor += length + 12;
+        }
+        expect(cursor).toBe(bytes.length);
+        const rows = NodeZlib.inflateSync(Buffer.concat(data), {
+          maxOutputLength: 64 * (1 + 64 * 3) + 1,
+        });
+        expect(rows).toHaveLength(64 * (1 + 64 * 3));
+        for (let row = 0; row < 64; row++) expect(rows[row * (1 + 64 * 3)]).toBeLessThanOrEqual(4);
+      }
       expect(f.run(["status", "--porcelain"])).toBe("");
       expect(f.run(["remote", "get-url", "origin"])).toBe(
         NodePath.join(f.root, "visual-origin.git") + "\n",
