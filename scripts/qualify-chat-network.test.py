@@ -104,7 +104,7 @@ class NetworkTests(unittest.TestCase):
                              platform='linux', read_owner=lambda: ('\0'.join(OWNER if owner is None else owner) + '\0').encode(), read_capabilities=kwargs.pop('read_capabilities', lambda: b'CapEff:\t0000000000001000\n'), **kwargs)
 
     def test_actual_chat_and_both_ui_producers_satisfy_the_existing_containment_contract(self):
-        for scenario, matrix, length in [('chat-upload', 'core', 14), ('remote-updates-ui', 'core', 18), ('remote-updates-ui', 'full', 18), ('delivery-retry-ui', 'core', 16), ('release-visual-core', 'core', 16), ('release-visual-settings', 'core', 16)]:
+        for scenario, matrix, length in [('chat-upload', 'core', 14), ('remote-updates-ui', 'core', 18), ('remote-updates-ui', 'full', 18), ('delivery-retry-ui', 'core', 16), ('release-visual-core', 'core', 16), ('release-visual-settings', 'core', 16), ('release-visual-git-project', 'core', 16)]:
             with self.subTest(scenario=scenario, matrix=matrix), tempfile.TemporaryDirectory(prefix='bibcode-owner-contract-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario, matrix)
                 self.assertEqual(len(owner), length)
@@ -113,7 +113,7 @@ class NetworkTests(unittest.TestCase):
                 self.assertTrue(proof['linksContained'])
 
     def test_owner_argument_forms_refuse_extra_empty_and_truncated_arguments(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project']:
             with tempfile.TemporaryDirectory(prefix='bibcode-owner-arity-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 for invalid in [owner + [''], owner + ['unexpected'], owner[:-1]]:
@@ -200,8 +200,28 @@ class NetworkTests(unittest.TestCase):
                 with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=environment, owner=invalid)
                 self.assertEqual(fake.calls, [])
 
+    def test_git_project_selector_and_assets_remain_exactly_bound_before_ip_reads(self):
+        with tempfile.TemporaryDirectory(prefix='git-project-owner-identity-') as directory:
+            owner, env = actual_owner_handoff(Path(directory), 'release-visual-git-project')
+            self.assertEqual(env.get('BIBCODE_DELIVERY_UI_SELECTION'), 'release-visual-git-project')
+            alias = Path(directory) / 'alias-web'; alias.symlink_to(Path(owner[15]))
+            cases = []
+            for value in ['release-visual-core', 'release-visual-settings', 'delivery-retry-ui', 'remote-updates-ui', 'release-visual-full', '../arbitrary']:
+                changed = list(owner); changed[14] = value; cases.append((changed, env))
+                cases.append((owner, {**env, 'BIBCODE_DELIVERY_UI_SELECTION': value}))
+            for key in ['BIBCODE_DELIVERY_UI_SELECTION', 'BIBCODE_DELIVERY_UI_WEB']:
+                missing = dict(env); missing.pop(key); cases.append((owner, missing))
+            for value in [str(alias), 'relative-web', sys.executable]:
+                changed = list(owner); changed[15] = value
+                cases.append((changed, {**env, 'BIBCODE_DELIVERY_UI_WEB': value}))
+            cases.append((owner, {**env, 'BIBCODE_RELEASE_UI_MATRIX': 'core'}))
+            for invalid, environment in cases:
+                fake = FakeIp()
+                with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=environment, owner=invalid)
+                self.assertEqual(fake.calls, [])
+
     def test_original_owner_anchors_remain_required_for_both_forms(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project']:
             with tempfile.TemporaryDirectory(prefix='bibcode-owner-anchor-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 for index, value in [(0, '/missing-python'), (1, '/missing-helper'), (2, 'outer'), (11, 'net:[99]'), (13, '/missing-ip')]:

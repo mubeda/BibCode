@@ -8,6 +8,9 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import {
   deliveryConfiguration,
   projectVisualCreateRefObservation,
+  runOwnedGitProjectCommand,
+  verifyOwnedGitProjectSource,
+  readOwnedGitProjectSnapshot,
 } from "../qualify-delivery-retry.ts";
 import { deliveryScenes, deliveryThemes } from "./delivery-retry-evidence.ts";
 import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
@@ -1713,7 +1716,10 @@ function pairingBoundary(
   };
   const grantStart = controller.indexOf("      const grant =");
   const start = controller.lastIndexOf("      step(", grantStart);
-  const end = controller.indexOf('      step("import");', start);
+  const end = controller.indexOf(
+    '      if (config.selection === "release-visual-git-project") {',
+    start,
+  );
   const themeStart = controller.indexOf("  async function setTheme()");
   const themeEnd = controller.indexOf("  async function importProject(", themeStart);
   const helpersStart = controller.indexOf("  const step =");
@@ -2354,4 +2360,145 @@ describe("closed worktree-opening failure facts", () => {
       vi.useRealTimers();
     }
   });
+});
+
+it.each([0, 1, "error", "overflow", "missing-status", "foreign-cwd"])(
+  "executes only the admitted bounded private Git port with inert spawn: %s",
+  (mode) => {
+    const fixtureRoot = NodeFS.realpathSync(
+      NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "visual-git-port-")),
+    );
+    const root = NodePath.join(fixtureRoot, "light"),
+      home = NodePath.join(root, "home"),
+      bin = NodePath.join(fixtureRoot, "bin"),
+      cwd = NodePath.join(root, "rich");
+    NodeFS.mkdirSync(home, { recursive: true });
+    NodeFS.mkdirSync(bin);
+    NodeFS.mkdirSync(cwd);
+    const git = NodePath.join(bin, "git");
+    NodeFS.writeFileSync(git, "inert owned executable", { mode: 0o700 });
+    let calls = 0;
+    try {
+      const invoke = () =>
+        runOwnedGitProjectCommand(
+          { root, fixtureRoot, home, git },
+          mode === "foreign-cwd" ? fixtureRoot : cwd,
+          ["merge", "visual-conflict"],
+          (command, args, options) => {
+            calls++;
+            expect(command).toBe(git);
+            expect(args).toEqual([
+              "-C",
+              cwd,
+              "-c",
+              "core.fsmonitor=false",
+              "-c",
+              "core.hooksPath=/dev/null",
+              "-c",
+              "user.name=BiBCode UI Fixture",
+              "-c",
+              "user.email=fixture@example.test",
+              "merge",
+              "visual-conflict",
+            ]);
+            expect(options).toMatchObject({
+              shell: false,
+              timeout: 5000,
+              killSignal: "SIGKILL",
+              maxBuffer: 65536,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            expect(options.env).toEqual({
+              HOME: home,
+              PATH: bin,
+              GIT_CONFIG_NOSYSTEM: "1",
+              GIT_CONFIG_GLOBAL: "/dev/null",
+              GIT_CONFIG_SYSTEM: "/dev/null",
+              GIT_TERMINAL_PROMPT: "0",
+              LC_ALL: "C",
+            });
+            if (mode === "error")
+              return { error: new Error("private native error"), status: null, stdout: "private" };
+            return {
+              status: mode === "missing-status" ? null : mode === 1 ? 1 : 0,
+              stdout: mode === "overflow" ? "x".repeat(65537) : "owned output",
+            };
+          },
+        );
+      if (typeof mode === "number")
+        expect(invoke()).toEqual({ status: mode, stdout: "owned output" });
+      else expect(invoke).toThrow("Owned Git/project command refused.");
+      expect(calls).toBe(mode === "foreign-cwd" ? 0 : 1);
+    } finally {
+      NodeFS.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  },
+);
+it.each(["main", "wrong-ref", "symlink", "ordinary", "ordinary-git"])(
+  "binds the canonical source HEAD while broken config stays independently diagnosed: %s",
+  (mode) => {
+    const root = NodeFS.realpathSync(
+        NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "visual-git-head-")),
+      ),
+      cwd = NodePath.join(root, "rich"),
+      admin = NodePath.join(cwd, ".git");
+    NodeFS.mkdirSync(cwd);
+    if (mode !== "ordinary") {
+      NodeFS.mkdirSync(admin);
+      NodeFS.writeFileSync(
+        NodePath.join(admin, "HEAD"),
+        mode === "wrong-ref" ? "ref: refs/heads/other\n" : "ref: refs/heads/main\n",
+      );
+      NodeFS.writeFileSync(NodePath.join(admin, "config"), "[owned broken metadata\n");
+    }
+    if (mode === "symlink") {
+      NodeFS.renameSync(NodePath.join(admin, "HEAD"), NodePath.join(admin, "other"));
+      NodeFS.symlinkSync(NodePath.join(admin, "other"), NodePath.join(admin, "HEAD"));
+    }
+    const selection = {
+      environmentId: "local",
+      projectId: "owned",
+      threadId: "thread",
+      cwd,
+      title: "rich",
+      branch: mode.startsWith("ordinary") ? null : "main",
+    };
+    try {
+      const invoke = () => verifyOwnedGitProjectSource(root, selection);
+      if (["main", "ordinary"].includes(mode)) expect(invoke).not.toThrow();
+      else expect(invoke).toThrow();
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+it("reads only the current typed owned snapshot endpoint and keeps the pairing credential off results", async () => {
+  const fetcher = vi.fn(
+    async (url: string, options: { headers: { authorization: string }; signal: AbortSignal }) => {
+      expect(url).toBe("http://127.0.0.1:4885/api/orchestration/snapshot");
+      expect(options.headers).toEqual({ authorization: "Bearer owned-private-test-credential" });
+      expect(options.signal).toBeInstanceOf(AbortSignal);
+      return {
+        ok: true,
+        json: async () => ({
+          snapshotSequence: 0,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-10-04T00:00:00.000Z",
+        }),
+      };
+    },
+  );
+  vi.stubGlobal("fetch", fetcher);
+  try {
+    expect(await readOwnedGitProjectSnapshot("owned-private-test-credential")).toEqual({
+      snapshotSequence: 0,
+      projects: [],
+      threads: [],
+      updatedAt: "2026-10-04T00:00:00.000Z",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

@@ -1027,3 +1027,67 @@ perform the shared cleanup and final Git audit. Include distribution, display
 protocol, the app's verified GTK backend and override, monitor and GTK scaling,
 AppImage execution mode, unsupported host differences, screenshot
 paths, zero-survivor evidence, and whether anything was pushed.
+
+## Git and project visual preparation
+
+The same manual-only `qualify-release-visuals.yml` offers the fixed
+`release-visual-git-project` selection through the existing guarded CLI/server,
+private PID/network owner and current-source web build. Core remains the default;
+core and settings keep their existing commands, assertions and budgets. The
+Git/project selection uses the existing per-theme private run root and HOME,
+with one newly admitted fixture recipe before the server starts. Local tests
+use inert Git/browser/owner/HTTP ports; they do not run this recipe or launch the
+qualification runtime. Run the Git/project helper and fixture tests alongside
+the shared controller/owner and wrapper admission tests before a native trial.
+
+The exact owned private Git executable runs with a non-shell five-second bound,
+64 KiB output cap, isolated HOME/PATH/global/system configuration, noninteractive
+prompts, disabled hooks/fsmonitor and fixed fixture commit identity. Every short
+Git command returns reaped. The fixture contains real private rich/merge/unborn,
+ordinary-directory and recoverable broken-config cases, a bare origin, an
+external discovered worktree and a retained incomplete clone destination. The
+owned nested directory contains the real `Open nested` entry required by the
+strict directory witness. None of these files substitutes for rendered product
+state or screenshot evidence.
+
+For this selection only, verify the canonical owned private clone-alias file and
+its exact key/value, then set the actual server child's `GIT_CONFIG_GLOBAL` to
+that file before startup. The valid fixed clone URL maps to the private bare
+origin; it does not prove an HTTP transfer. Preserve the owner guard, discovery
+isolation and all other child environment settings. The incomplete destination
+must refuse before transfer and remain unimported and intact. Read actual typed
+orchestration snapshots before/after that attempt; no guessed project count or
+renderer store state supplies the import proof.
+
+Use the ordinary public Add Project/path/primary-card and project menu controls.
+Wait for an asynchronously mounted control to display before checking its unique
+cardinality, then require enabledness before interaction. Hidden project-header
+controls use their genuine keyboard focus/Enter path. Join the typed default
+thread/project/root with the actual local server storage/boot identity and owned
+source HEAD/branch before each capture; broken config remains independently
+observed while its owned HEAD stays unchanged. Preserve the existing route,
+credential, theme, 1280 by 960 geometry, unobstructed target, original nonblank
+PNG and post-screenshot witness checks. Missing, zero-size or stale controls
+refuse capture; do not force clicks, widen budgets or fabricate a busy state.
+
+The finite lane retains ten named originals per theme: `worktree-discovery`,
+`project-open-directory`, `project-clone-chooser`, `project-clone-incomplete`,
+`git-tags`, `git-switch-with-changes`, `git-merge-conflict`, `git-unborn`,
+`git-no-repository`, and `git-broken-recovery`. Only their explicit light/dark
+filenames and the same seven closed phase/failure/provenance/result/assertions/
+namespace-cleanup/supervisor JSON receipts enter the artifact allowlist. No
+private config, snapshots, names, paths, credentials, logs or raw errors are
+retained. The actual owner still joins browser/server/process cleanup and the
+Python namespace owner before deleting its private fixture.
+
+All eleven approved group IDs remain in the closed assertion. Tags pictures
+only groups/names: its disabled-actions check is unqualified. Rewrite preview
+remains unbound and has no retained PNG. `completeGroup` is always false; the
+complete approved 82-scene/164-original obligation remains unchanged. The
+initial discovery Add/Keep-hidden state is pictured, while the later real
+Show Hidden Worktrees state has no extra original. The clone chooser is opened
+and cancelled with input retention, but its named original pictures the returned
+form; chooser pixels are not separately retained. Broken recovery's real busy
+and focused Retry must survive both witness checks and may fail honestly.
+Review actual paired original pixels independently before any native, visual,
+group or full-matrix acceptance claim.

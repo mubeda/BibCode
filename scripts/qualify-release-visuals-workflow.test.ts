@@ -72,7 +72,7 @@ describe("first visual batch workflow boundary", () => {
       ),
     ).toBe(true);
   });
-  it("offers only core and the fixed settings manual selection with core as its default", () => {
+  it("offers only core, fixed settings and Git/project selections with core as its default", () => {
     const value = YAML.parse(
       NodeFS.readFileSync(
         new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
@@ -86,7 +86,7 @@ describe("first visual batch workflow boundary", () => {
           type: "choice",
           required: true,
           default: "release-visual-core",
-          options: ["release-visual-core", "release-visual-settings"],
+          options: ["release-visual-core", "release-visual-settings", "release-visual-git-project"],
         },
       },
     });
@@ -137,4 +137,62 @@ describe("first visual batch workflow boundary", () => {
     ])
       expect(gate).toContain(`support/${name}.test.ts`);
   });
+});
+
+it("retains the fixed partial Git/project lane identically in canonical and TEMP workflows", () => {
+  const scenes = [
+    "worktree-discovery",
+    "project-open-directory",
+    "project-clone-chooser",
+    "project-clone-incomplete",
+    "git-tags",
+    "git-switch-with-changes",
+    "git-merge-conflict",
+    "git-unborn",
+    "git-no-repository",
+    "git-broken-recovery",
+  ];
+  const read = (name: string) =>
+    YAML.parse(
+      NodeFS.readFileSync(new URL("../.github/workflows/" + name, import.meta.url), "utf8"),
+    );
+  const canonical = read("qualify-release-visuals.yml"),
+    temporary = read("desktop-upgrade-smoke.yml");
+  expect(temporary).toEqual(canonical);
+  expect(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
+      "utf8",
+    ).startsWith("# TEMPORARY QA alias: restore/exclude before final issue integration.\n"),
+  ).toBe(true);
+  const steps = canonical.jobs.visual_core.steps;
+  const run = steps.find(
+    (step: { name: string }) => step.name === "Run contained Git/project visual batch",
+  );
+  expect(run.if).toBe("${{ inputs.scene_selection == 'release-visual-git-project' }}");
+  expect(run.run).toBe(
+    "python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-git-project",
+  );
+  const evidence = steps.find(
+    (step: { name: string }) => step.name === "Retain explicit Git/project evidence",
+  );
+  expect(evidence.if).toBe(
+    "${{ always() && inputs.scene_selection == 'release-visual-git-project' }}",
+  );
+  expect(
+    evidence.with.path
+      .trim()
+      .split("\n")
+      .map((line: string) => line.slice(line.lastIndexOf("/") + 1)),
+  ).toEqual([
+    "phase.json",
+    "failure.json",
+    "provenance.json",
+    "result.json",
+    "assertions.json",
+    "namespace-cleanup.json",
+    "supervisor.json",
+    ...scenes.flatMap((scene) => [scene + "-light.png", scene + "-dark.png"]),
+  ]);
+  expect(evidence.with.path).not.toMatch(/\*|git-rewrite-preview/);
 });

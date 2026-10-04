@@ -94,6 +94,18 @@ class ScenarioSelectionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Unknown qualification owner payload'):
                 qualification.inner_resources(arguments)
 
+    def test_git_project_visual_selection_has_fixed_controller_bounds_and_exact_owner_payload(self):
+        self.assertEqual(qualification.scenario_settings('release-visual-git-project'), {
+            'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+            'inner_timeout': 600, 'outer_timeout': 660,
+            'evidence_prefix': 'issue29-git-project-', 'fixture_prefix': 'bc-vg-',
+        })
+        self.assertEqual(qualification.inner_resources(['release-visual-git-project', '/owned/web']),
+                         ('release-visual-git-project', None, '/owned/web', 'core'))
+        for arguments in [['release-visual-git-project'], ['release-visual-git-project', '/owned/web', 'full']]:
+            with self.assertRaisesRegex(RuntimeError, 'Unknown qualification owner payload'):
+                qualification.inner_resources(arguments)
+
     def test_first_visual_batch_reuses_the_managed_worktree_controller_and_original_bounds(self):
         try:
             selected = qualification.scenario_settings('release-visual-core')

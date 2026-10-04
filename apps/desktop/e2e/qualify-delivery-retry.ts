@@ -4,6 +4,27 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeNet from "node:net";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeModule from "node:module";
+import { OrchestrationReadModel } from "../../../packages/contracts/src/orchestration.ts";
+import { ExecutionEnvironmentDescriptor } from "../../../packages/contracts/src/environment.ts";
+import {
+  EnvironmentOrchestrationHttpApi,
+  EnvironmentMetadataHttpApi,
+} from "../../../packages/contracts/src/environmentHttp.ts";
+import {
+  prepareGitProjectVisualFixture,
+  type GitProjectVisualFixture,
+} from "./support/release-visual-git-project-fixture.ts";
+import {
+  runGitProjectVisual,
+  captureGitProjectVisualScene,
+  createGitProjectOwnerAdapters,
+  projectGitProjectVisualCapture,
+  projectGitProjectVisualAssertion,
+  gitProjectVisualScenes,
+  type GitProjectVisualSelection,
+} from "./support/release-visual-git-project.ts";
 import {
   QualificationOwner,
   bounded,
@@ -70,10 +91,239 @@ import {
 import { correctDesktopUiOuterSize } from "./support/window-size.ts";
 
 const root = NodePath.resolve(import.meta.dirname, "../../..");
+const contractsRequire = NodeModule.createRequire(
+  NodePath.join(root, "packages/contracts/package.json"),
+);
+const Schema: { decodeUnknownSync: <A>(schema: { readonly Type: A }) => (value: unknown) => A } =
+  contractsRequire("effect/Schema");
 const origin = "http://127.0.0.1:4885";
 const surface = '[data-center-surface-host][data-visible="true"]';
 const composer = `${surface} [data-testid="composer-editor"]`;
 const form = `${surface} [data-chat-composer-form="true"]`;
+
+/** Existing isolated synchronous Git lifetime: bounded and reaped before returning. */
+export function runOwnedGitProjectCommand(
+  input: { root: string; fixtureRoot: string; home: string; git: string },
+  cwd: string,
+  args: readonly string[],
+  spawn: (
+    command: string,
+    args: string[],
+    options: NodeChildProcess.SpawnSyncOptionsWithStringEncoding,
+  ) => Pick<
+    NodeChildProcess.SpawnSyncReturns<string>,
+    "error" | "status" | "stdout"
+  > = NodeChildProcess.spawnSync,
+) {
+  const refused = () => new Error("Owned Git/project command refused.");
+  try {
+    const inside = (parent: string, path: string) => {
+      const relative = NodePath.relative(parent, path);
+      return (
+        relative !== "" &&
+        relative !== ".." &&
+        !relative.startsWith(".." + NodePath.sep) &&
+        !NodePath.isAbsolute(relative)
+      );
+    };
+    for (const path of [input.root, input.fixtureRoot, input.home, cwd]) {
+      if (
+        !NodePath.isAbsolute(path) ||
+        NodeFS.realpathSync(path) !== path ||
+        !NodeFS.lstatSync(path).isDirectory() ||
+        NodeFS.lstatSync(path).isSymbolicLink()
+      )
+        throw refused();
+    }
+    const git = NodeFS.lstatSync(input.git);
+    if (
+      !inside(input.fixtureRoot, input.root) ||
+      !inside(input.root, input.home) ||
+      (cwd !== input.root && !inside(input.root, cwd)) ||
+      input.git !== NodePath.join(input.fixtureRoot, "bin", "git") ||
+      NodeFS.realpathSync(input.git) !== input.git ||
+      !git.isFile() ||
+      git.isSymbolicLink() ||
+      git.nlink !== 1 ||
+      git.uid !== NodeFS.lstatSync(input.fixtureRoot).uid ||
+      git.size < 1 ||
+      git.size > 4096 ||
+      (git.mode & 0o111) === 0
+    )
+      throw refused();
+    const result = spawn(
+      input.git,
+      [
+        "-C",
+        cwd,
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "user.name=BiBCode UI Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        ...args,
+      ],
+      {
+        encoding: "utf8",
+        shell: false,
+        timeout: 5_000,
+        killSignal: "SIGKILL",
+        maxBuffer: 65_536,
+        env: {
+          HOME: input.home,
+          PATH: NodePath.dirname(input.git),
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_SYSTEM: "/dev/null",
+          GIT_TERMINAL_PROMPT: "0",
+          LC_ALL: "C",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    if (
+      result.error ||
+      !Number.isInteger(result.status) ||
+      result.status === null ||
+      typeof result.stdout !== "string" ||
+      Buffer.byteLength(result.stdout) > 65_536
+    )
+      throw refused();
+    return { status: result.status, stdout: result.stdout };
+  } catch {
+    throw refused();
+  }
+}
+
+/** HTTP bodies are decoded by the current public contracts and remain private. */
+export async function readOwnedGitProjectSnapshot(credential: string) {
+  const response = await fetch(origin + EnvironmentOrchestrationHttpApi.endpoints.snapshot.path, {
+    headers: { authorization: `Bearer ${credential}` },
+    signal: AbortSignal.timeout(1000),
+  });
+  if (!response.ok) throw new Error("Owned Git/project snapshot refused.");
+  return Schema.decodeUnknownSync(OrchestrationReadModel)(await response.json());
+}
+export async function readOwnedGitProjectDescriptor() {
+  const response = await fetch(origin + EnvironmentMetadataHttpApi.endpoints.descriptor.path, {
+    signal: AbortSignal.timeout(1000),
+  });
+  if (!response.ok) throw new Error("Owned Git/project descriptor refused.");
+  return Schema.decodeUnknownSync(ExecutionEnvironmentDescriptor)(await response.json());
+}
+
+export function verifyOwnedGitProjectSource(root: string, selection: GitProjectVisualSelection) {
+  const relative = NodePath.relative(root, selection.cwd);
+  if (
+    !NodePath.isAbsolute(selection.cwd) ||
+    relative === "" ||
+    relative === ".." ||
+    relative.startsWith(".." + NodePath.sep) ||
+    NodePath.isAbsolute(relative) ||
+    NodeFS.realpathSync(selection.cwd) !== selection.cwd ||
+    NodeFS.lstatSync(selection.cwd).isSymbolicLink() ||
+    !NodeFS.lstatSync(selection.cwd).isDirectory()
+  )
+    throw new Error("Owned Git/project source refused.");
+  const head = NodePath.join(selection.cwd, ".git", "HEAD");
+  if (selection.branch === null) {
+    if (NodeFS.existsSync(NodePath.join(selection.cwd, ".git")))
+      throw new Error("Owned Git/project source refused.");
+    return;
+  }
+  const admin = NodePath.dirname(head),
+    stat = NodeFS.lstatSync(head);
+  if (
+    NodeFS.realpathSync(admin) !== admin ||
+    NodeFS.lstatSync(admin).isSymbolicLink() ||
+    !NodeFS.lstatSync(admin).isDirectory() ||
+    NodeFS.realpathSync(head) !== head ||
+    !stat.isFile() ||
+    stat.isSymbolicLink() ||
+    stat.nlink !== 1 ||
+    stat.uid !== NodeFS.lstatSync(root).uid ||
+    stat.size > 256 ||
+    selection.branch !== "main" ||
+    NodeFS.readFileSync(head, "utf8") !== "ref: refs/heads/" + selection.branch + "\n"
+  )
+    throw new Error("Owned Git/project source refused.");
+}
+
+/** The fixed producer's real owner adapters; credentials and identities stay in this call. */
+export async function runOwnedGitProjectSelection(input: {
+  browser: QualificationBrowser;
+  owner: QualificationOwner;
+  theme: "light" | "dark";
+  fixture: GitProjectVisualFixture;
+  credential: string;
+  evidence: string;
+  captured: Set<string>;
+  captures: object[];
+  assertions: object[];
+  importProject: (cwd: string) => Promise<void>;
+  step: (phase: string) => void;
+  write: (name: string, value: unknown) => void;
+  readBranch: (cwd: string) => string | null;
+}) {
+  const initial = await readOwnedGitProjectDescriptor();
+  if (initial.environmentId !== "local" || !initial.bootId || !initial.storageInstanceId)
+    throw new Error("Owned Git/project server identity refused.");
+  const adapters = createGitProjectOwnerAdapters({
+    browser: input.browser,
+    owner: input.owner,
+    origin,
+    fixture: input.fixture,
+    importProject: input.importProject,
+    readSnapshot: () => readOwnedGitProjectSnapshot(input.credential),
+    verifyServer: async () => {
+      const current = await readOwnedGitProjectDescriptor();
+      if (
+        current.environmentId !== initial.environmentId ||
+        current.bootId !== initial.bootId ||
+        current.storageInstanceId !== initial.storageInstanceId ||
+        current.serverVersion !== initial.serverVersion
+      )
+        throw new Error("Owned Git/project server identity refused.");
+    },
+    readBranch: input.readBranch,
+    verifySource: (selection) => verifyOwnedGitProjectSource(input.fixture.root, selection),
+  });
+  const proof = await runGitProjectVisual({
+    browser: input.browser,
+    owner: input.owner,
+    theme: input.theme,
+    origin,
+    fixture: input.fixture,
+    step: input.step,
+    ...adapters,
+    capture: async (scene, selection, coverage) => {
+      const receipt = projectGitProjectVisualCapture(
+        await captureGitProjectVisualScene({
+          scene,
+          selection,
+          coverage,
+          theme: input.theme,
+          origin,
+          directory: NodePath.join(input.fixture.ordinary, "nested"),
+          cloneUrl: input.fixture.cloneUrl,
+          cloneParent: input.fixture.cloneParent,
+          browser: input.browser,
+          owner: input.owner,
+          evidence: input.evidence,
+          captured: input.captured,
+          verifyOwnedIdentity: adapters.verifyOwnedIdentity,
+        }),
+      );
+      input.captures.push(receipt);
+      input.write("assertions", { captures: input.captures, assertions: input.assertions });
+    },
+  });
+  input.assertions.push(projectGitProjectVisualAssertion(input.theme, proof));
+  input.write("assertions", { captures: input.captures, assertions: input.assertions });
+}
 
 export function deliveryConfiguration(
   environment: NodeJS.ProcessEnv,
@@ -89,7 +339,12 @@ export function deliveryConfiguration(
     driver: environment.BIBCODE_UPLOAD_DRIVER,
   };
   if (
-    !["delivery-retry-ui", "release-visual-core", "release-visual-settings"].includes(selection) ||
+    ![
+      "delivery-retry-ui",
+      "release-visual-core",
+      "release-visual-settings",
+      "release-visual-git-project",
+    ].includes(selection) ||
     environment.CI !== "true" ||
     !/^[0-9a-f]{40}$/.test(environment.BIBCODE_UPLOAD_SOURCE ?? "") ||
     Object.values(values).some((value) => !value || !NodePath.isAbsolute(value)) ||
@@ -102,7 +357,11 @@ export function deliveryConfiguration(
     throw new Error("Owned delivery qualification namespace refused.");
   }
   return { ...values, selection, source: environment.BIBCODE_UPLOAD_SOURCE! } as {
-    selection: "delivery-retry-ui" | "release-visual-core" | "release-visual-settings";
+    selection:
+      | "delivery-retry-ui"
+      | "release-visual-core"
+      | "release-visual-settings"
+      | "release-visual-git-project";
     fixture: string;
     evidence: string;
     binary: string;
@@ -741,6 +1000,37 @@ export async function runDeliveryRetryQualification() {
         BIBCODE_LOG: "warn",
       };
       delete childEnv.BIBCODE_HERMETIC_GUARD;
+      let gitProjectFixture: GitProjectVisualFixture | null = null;
+      const gitProjectCommand = (cwd: string, args: readonly string[]) =>
+        runOwnedGitProjectCommand(
+          {
+            root: runRoot,
+            fixtureRoot: config.fixture,
+            home: context.fixtureUserHomePath,
+            git: NodePath.join(config.fixture, "bin", "git"),
+          },
+          cwd,
+          args,
+        );
+      if (config.selection === "release-visual-git-project") {
+        step("visual-git-project-fixture");
+        gitProjectFixture = await prepareGitProjectVisualFixture({
+          root: runRoot,
+          home: context.fixtureUserHomePath,
+          theme,
+          admitOwner: async () => {
+            const admitted = deliveryConfiguration(process.env);
+            check(
+              admitted.selection === config.selection &&
+                admitted.fixture === config.fixture &&
+                admitted.source === config.source,
+            );
+          },
+          git: async (cwd, args) => gitProjectCommand(cwd, args),
+        });
+        await gitProjectFixture.verifyCloneAlias();
+        childEnv.GIT_CONFIG_GLOBAL = gitProjectFixture.cloneGitConfig;
+      }
       const settingsPath = NodePath.join(context.stateRoot, "userdata", "settings.json");
       const configured = JSON.parse(NodeFS.readFileSync(settingsPath, "utf8"));
       const missing = NodePath.join(runRoot, "missing-provider");
@@ -870,6 +1160,43 @@ export async function runDeliveryRetryQualification() {
         .$('[data-testid="environment-rail-local"] [data-status="connected"]')
         .waitForDisplayed();
       await setTheme();
+      if (config.selection === "release-visual-git-project") {
+        check(gitProjectFixture !== null);
+        if (gitProjectFixture === null) throw new Error("Owned Git/project fixture unavailable.");
+        const fixture = gitProjectFixture;
+        await runOwnedGitProjectSelection({
+          browser,
+          owner,
+          theme,
+          fixture: gitProjectFixture,
+          credential,
+          evidence: config.evidence,
+          captured: capturedVisuals,
+          captures,
+          assertions,
+          importProject,
+          step,
+          write,
+          readBranch: (cwd) => {
+            if (cwd === fixture.ordinary) return null;
+            const result = gitProjectCommand(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+            check(result.status === 0 && result.stdout.trim() === "main");
+            return result.stdout.trim();
+          },
+        });
+        step("theme-cleanup");
+        await owner.cleanup("browser", () =>
+          bounded(
+            browser!.deleteSession().then(() => undefined),
+            15_000,
+          ),
+        );
+        browser = undefined;
+        await owner.stop(opened.driver);
+        await owner.stop(server);
+        check(owner.failures.length === 0);
+        continue;
+      }
       step("import");
       await importProject(context.projectPath);
       const workspace = await createOwnedWorkspace(context, runRoot);
@@ -1217,7 +1544,9 @@ export async function runDeliveryRetryQualification() {
             ? visualScenes.length
             : config.selection === "release-visual-settings"
               ? settingsVisualScenes.length
-              : deliveryScenes.length) && assertions.length === 2,
+              : config.selection === "release-visual-git-project"
+                ? gitProjectVisualScenes.length - 1
+                : deliveryScenes.length) && assertions.length === 2,
     );
     success = true;
   } catch (error) {
@@ -1303,7 +1632,9 @@ export async function runDeliveryRetryQualification() {
           ? "First eight Linux Chromium scene pairs only. Original PNGs require independent review; unpictured surfaces and the remaining issue29 matrix are unqualified. No Playwright, Tauri or final-release acceptance claim."
           : config.selection === "release-visual-settings"
             ? "Four Linux Chromium settings scene pairs only. Add instance wizard and declared unpictured substates remain unqualified. Original light/dark PNGs require independent review; no native or full-matrix qualification claim."
-            : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
+            : config.selection === "release-visual-git-project"
+              ? "Ten fixed Git/project originals per theme; Tags groups/names partial and rewrite unbound. completeGroup remains false. Full82/164 originals and unpictured substates remain obligatory and unqualified; independent original-pixel review required."
+              : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
     });
   }
   return success ? 0 : 1;
