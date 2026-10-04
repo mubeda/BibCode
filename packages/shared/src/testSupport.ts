@@ -27,6 +27,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     remoteUpdateControl: false,
     remoteUpdateProgress: false,
     vcsCloneReattach: false,
+    attachmentStaging: false,
     ...overrides,
   };
 }

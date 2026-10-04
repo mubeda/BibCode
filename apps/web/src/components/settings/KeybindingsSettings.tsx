@@ -161,7 +161,7 @@ function ExpandableHeaderSearch({
         }}
         placeholder="Search keybindings"
         aria-label="Search keybindings"
-        className="h-6 w-44 rounded-md border border-input bg-background pl-7 pr-2 text-[11px] text-foreground outline-none placeholder:text-muted-foreground/72 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24"
+        className="h-6 w-44 rounded-md border border-input bg-background pl-7 pr-2 text-xs text-foreground outline-none placeholder:text-muted-foreground/72 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24"
       />
     </div>
   );
@@ -365,7 +365,7 @@ function WhenExpressionNodeEditor({
           aria-label={`Negate ${condition.identifier}`}
           variant="outline"
           size="xs"
-          className="h-7 min-w-10 px-2 text-[11px] sm:h-7"
+          className="h-7 min-w-10 px-2 text-xs sm:h-7"
         >
           Not
         </Toggle>
@@ -406,7 +406,7 @@ function WhenExpressionNodeEditor({
             aria-label="Negate group"
             variant="outline"
             size="xs"
-            className="h-7 min-w-10 px-2 text-[11px] sm:h-7"
+            className="h-7 min-w-10 px-2 text-xs sm:h-7"
           >
             Not
           </Toggle>
@@ -683,7 +683,7 @@ function WhenExpressionBuilder({
           ) : null}
         </div>
         {parseError ? (
-          <div className="flex items-center gap-1.5 text-[11px] text-destructive">
+          <div className="flex items-center gap-1.5 text-xs text-destructive">
             <CircleXIcon className="size-3.5" />
             {parseError}
           </div>
@@ -840,7 +840,7 @@ function KeybindingTableRow({
             className="group inline-flex h-7 items-center gap-1.5 rounded-md border border-transparent px-1.5 outline-none transition-colors hover:border-border/70 hover:bg-background focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24"
           >
             <KeybindingPill value={row.key} />
-            <span className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground/0 transition-opacity group-hover:text-muted-foreground/70 group-focus-visible:text-muted-foreground/70">
+            <span className="text-xs uppercase tracking-[0.08em] text-muted-foreground/0 transition-opacity group-hover:text-muted-foreground/70 group-focus-visible:text-muted-foreground/70">
               Edit
             </span>
           </button>
@@ -1219,7 +1219,7 @@ export function KeybindingsSettingsPanel() {
   );
 
   const bindingsCount = (
-    <span className="text-[11px] text-muted-foreground">
+    <span className="text-xs text-muted-foreground">
       {rows.length + (isAddingBinding ? 1 : 0)}{" "}
       {rows.length + (isAddingBinding ? 1 : 0) === 1 ? "binding" : "bindings"}
     </span>
@@ -1293,7 +1293,7 @@ export function KeybindingsSettingsPanel() {
           hideScrollbars
           className="w-full max-w-full rounded-none"
         >
-          <div className="grid min-w-[680px] grid-cols-[minmax(190px,1.1fr)_minmax(220px,0.85fr)_minmax(210px,1fr)_60px] border-b border-border/70 bg-muted/25 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">
+          <div className="grid min-w-[680px] grid-cols-[minmax(190px,1.1fr)_minmax(220px,0.85fr)_minmax(210px,1fr)_60px] border-b border-border/70 bg-muted/25 px-4 py-2 text-xs font-semibold uppercase tracking-[0.07em] text-muted-foreground">
             <div>Command</div>
             <div>Keybinding</div>
             <div>When</div>

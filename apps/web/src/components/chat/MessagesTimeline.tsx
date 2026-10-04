@@ -1,4 +1,5 @@
 import { QueuedMessageTimelineRow } from "./QueuedMessageTimelineRow";
+import { AttachmentUploadNotice, type PendingAttachmentUpload } from "./AttachmentUploadNotice";
 import { deliveryProviderLabel, waitsBehind, type QueuedCardStatus } from "../ChatView.logic";
 import {
   type EnvironmentId,
@@ -161,6 +162,10 @@ interface TimelineRowActivityState {
 
 const TimelineRowCtx = createContext<TimelineRowSharedState>(null!);
 const TimelineRowActivityCtx = createContext<TimelineRowActivityState>(null!);
+const AttachmentUploadCtx = createContext<{
+  readonly uploads: Readonly<Record<string, PendingAttachmentUpload>>;
+  readonly onCancel: (messageId: MessageId) => void;
+}>(null!);
 const TIMELINE_LIST_HEADER = <div className="h-3 sm:h-4" />;
 const TIMELINE_LIST_FOOTER = <div className="h-3 sm:h-4" />;
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
@@ -170,6 +175,8 @@ const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "d
 // ---------------------------------------------------------------------------
 
 interface MessagesTimelineProps {
+  attachmentUploads: Readonly<Record<string, PendingAttachmentUpload>>;
+  onCancelAttachmentUpload: (messageId: MessageId) => void;
   isWorking: boolean;
   activeTurnInProgress: boolean;
   activeTurnStartedAt: string | null;
@@ -214,6 +221,8 @@ interface MessagesTimelineProps {
 // ---------------------------------------------------------------------------
 
 export const MessagesTimeline = memo(function MessagesTimeline({
+  attachmentUploads,
+  onCancelAttachmentUpload,
   isWorking,
   activeTurnInProgress,
   activeTurnStartedAt,
@@ -522,6 +531,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [],
   );
 
+  const attachmentUploadState = useMemo(
+    () => ({ uploads: attachmentUploads, onCancel: onCancelAttachmentUpload }),
+    [attachmentUploads, onCancelAttachmentUpload],
+  );
+
   if (rows.length === 0 && !isWorking) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -532,56 +546,58 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
   return (
     <TimelineRowCtx value={sharedState}>
-      <TimelineRowActivityCtx value={activityState}>
-        <div ref={setTimelineViewportElement} className="relative h-full min-h-0">
-          <LegendList<MessagesTimelineRow>
-            ref={listRef}
-            data={rows}
-            keyExtractor={keyExtractor}
-            getItemType={getItemType}
-            renderItem={renderItem}
-            estimatedItemSize={90}
-            initialScrollAtEnd
-            recycleItems={false}
-            {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
-            contentInsetEndAdjustment={contentInsetEndAdjustment}
-            maintainScrollAtEnd={
-              anchoredEndSpace
-                ? false
-                : {
-                    animated: false,
-                    on: {
-                      dataChange: true,
-                      itemLayout: true,
-                      layout: true,
-                    },
-                  }
-            }
-            maintainVisibleContentPosition={{
-              data: true,
-              size: false,
-            }}
-            onScroll={handleScroll}
-            className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
-            ListHeaderComponent={TIMELINE_LIST_HEADER}
-            ListFooterComponent={TIMELINE_LIST_FOOTER}
-          />
-          <TimelineMinimap
-            items={minimapItems}
-            bottomInset={contentInsetEndAdjustment}
-            hasPersistentGutter={minimapHasPersistentGutter}
-            stripMap={minimapStripMap}
-            onSelect={(item) => {
-              onManualNavigation();
-              void listRef.current?.scrollToIndex({
-                index: item.rowIndex,
-                animated: true,
-                viewOffset: 24,
-              });
-            }}
-          />
-        </div>
-      </TimelineRowActivityCtx>
+      <AttachmentUploadCtx value={attachmentUploadState}>
+        <TimelineRowActivityCtx value={activityState}>
+          <div ref={setTimelineViewportElement} className="relative h-full min-h-0">
+            <LegendList<MessagesTimelineRow>
+              ref={listRef}
+              data={rows}
+              keyExtractor={keyExtractor}
+              getItemType={getItemType}
+              renderItem={renderItem}
+              estimatedItemSize={90}
+              initialScrollAtEnd
+              recycleItems={false}
+              {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
+              contentInsetEndAdjustment={contentInsetEndAdjustment}
+              maintainScrollAtEnd={
+                anchoredEndSpace
+                  ? false
+                  : {
+                      animated: false,
+                      on: {
+                        dataChange: true,
+                        itemLayout: true,
+                        layout: true,
+                      },
+                    }
+              }
+              maintainVisibleContentPosition={{
+                data: true,
+                size: false,
+              }}
+              onScroll={handleScroll}
+              className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
+              ListHeaderComponent={TIMELINE_LIST_HEADER}
+              ListFooterComponent={TIMELINE_LIST_FOOTER}
+            />
+            <TimelineMinimap
+              items={minimapItems}
+              bottomInset={contentInsetEndAdjustment}
+              hasPersistentGutter={minimapHasPersistentGutter}
+              stripMap={minimapStripMap}
+              onSelect={(item) => {
+                onManualNavigation();
+                void listRef.current?.scrollToIndex({
+                  index: item.rowIndex,
+                  animated: true,
+                  viewOffset: 24,
+                });
+              }}
+            />
+          </div>
+        </TimelineRowActivityCtx>
+      </AttachmentUploadCtx>
     </TimelineRowCtx>
   );
 });
@@ -919,6 +935,18 @@ const QueuedTimelineRow = memo(function QueuedTimelineRow({
   );
 });
 
+const AttachmentUploadTimelineNotice = memo(function AttachmentUploadTimelineNotice({
+  messageId,
+}: {
+  messageId: MessageId;
+}) {
+  const state = use(AttachmentUploadCtx);
+  const progress = state.uploads[messageId];
+  return progress ? (
+    <AttachmentUploadNotice progress={progress} onCancel={() => state.onCancel(messageId)} />
+  ) : null;
+});
+
 function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
   const userImages = row.message.attachments ?? [];
@@ -1032,6 +1060,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           markdownCwd={ctx.markdownCwd}
         />
       </div>
+      <AttachmentUploadTimelineNotice messageId={row.message.id} />
       {row.message.delivery ? (
         <TurnDeliveryNotice
           delivery={row.message.delivery}

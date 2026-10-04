@@ -395,3 +395,27 @@ credentials are absent.
   credentials work in a server-side shell.
 - For Bitbucket, verify the server process inherited the environment variables
   and restart it after changes.
+
+## CLI launch failures
+
+The provider CLI must be available on the machine running the selected
+BiBCode environment. A failure to start `glab`, `gh`, or `az` is different from a
+CLI that starts and returns an authentication, network or hosting-service error.
+Launch errors report a closed operating-system category and, when available, its
+numeric error code. They do not expose command arguments, environment values,
+credentials or raw process output.
+
+A required file or directory being absent does not by itself prove the CLI is
+not installed: executable lookup, an interpreter or loader, and the repository
+working directory can fail at the same launch boundary. Check the CLI's
+availability to that environment and the repository folder's accessibility.
+Permission errors require checking executable and directory access. On macOS,
+desktop startup already attempts bounded login-shell PATH hydration; its local
+log records whether hydration succeeded or its failure category, without the
+PATH value. Do not change PATH merely because launching a CLI failed.
+
+The create-request dialog retains the reviewed branches, title and description.
+Retry remains explicit. A creation failure does not mean earlier commit or push
+steps were rolled back; retain and inspect any already-published work before
+retrying. The corresponding failed stacked action appears in local trace
+diagnostics with safe failure details and measured action timing.

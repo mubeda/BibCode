@@ -381,7 +381,7 @@ function ActivityRecordRow({
               {record.summary}
             </span>
           ) : null}
-          <span className="mt-1 flex gap-2 text-[11px] font-normal text-muted-foreground">
+          <span className="mt-1 flex gap-2 text-xs font-normal text-muted-foreground">
             <span>{typeLabel}</span>
             {record._tag === "actor" && record.parentActorId !== null ? (
               <span>Child agent</span>

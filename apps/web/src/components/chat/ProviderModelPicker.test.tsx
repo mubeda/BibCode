@@ -285,7 +285,7 @@ describe("ProviderModelPicker", () => {
     );
 
     expect(mounted.container.querySelector('[data-provider-icon="Accented"]')).toMatchObject({
-      dataset: { showBadge: "true", iconClass: "size-5" },
+      dataset: { showBadge: "true", iconClass: "h-5" },
     });
   });
 

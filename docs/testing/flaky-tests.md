@@ -23,6 +23,13 @@ unrelated fork. Keep a controlled port-reuse counterexample distinct from a
 natural stress failure rate, and verify that deliberately removing the cleanup
 wait makes the runtime-join regression fail before restoring the real code.
 
+Desktop bind/restart scenarios use `test_support::isolated_scenario` to run the
+exact test alone in a child and require entry and completion proof. Complete the
+phase only after every assertion and backend cleanup finishes. The free-port
+probe releases its listener; it does not reserve the port. Isolation excludes
+sibling tests that can fork with copies of open sockets, but an address-in-use
+failure alone does not identify the process that held the port.
+
 For WebSocket heartbeat integration, separate exact cadence from connection
 survival. Controlled-clock transport tests pin the 15-second cadence and the
 restart after a scheduler stall; real sockets verify Pong-only survival for

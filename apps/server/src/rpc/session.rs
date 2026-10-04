@@ -441,6 +441,10 @@ impl RpcRegistry {
         }
     }
 
+    pub(crate) fn trace_diagnostics(&self) -> Option<TraceDiagnosticsStore> {
+        self.trace_diagnostics.clone()
+    }
+
     pub(crate) fn admission_gate(&self) -> RpcAdmissionGate {
         self.admission_gate.clone()
     }
@@ -489,6 +493,7 @@ impl RpcRegistry {
         self.methods.insert(
             name,
             RpcMethod::Unary(Arc::new(move |request, context, cancellation| {
+                let started = tokio::time::Instant::now();
                 let future = handler(request, context, cancellation);
                 let trace_diagnostics = trace_diagnostics.clone();
                 let diagnostic_name = diagnostic_name.clone();
@@ -496,8 +501,11 @@ impl RpcRegistry {
                     let result = future.await;
                     if let (Some(trace_diagnostics), Err(error)) =
                         (&trace_diagnostics, &result.result)
-                        && let Err(write_error) =
-                            trace_diagnostics.record_failure(&diagnostic_name, error)
+                        && let Err(write_error) = trace_diagnostics.record_timed_failure(
+                            &diagnostic_name,
+                            error,
+                            started.elapsed(),
+                        )
                     {
                         tracing::warn!(
                             method = diagnostic_name,
@@ -2462,13 +2470,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unary_rpc_failures_are_persisted_for_restart_diagnostics() {
         let directory = tempfile::tempdir().expect("temporary diagnostics directory");
         let trace_path = directory.path().join("server.trace.ndjson");
         let diagnostics = TraceDiagnosticsStore::new(trace_path.clone());
         let mut registry = RpcRegistry::with_trace_diagnostics(diagnostics);
         registry.register_unary("git.createWorktree", |_request, _cancellation| async {
+            tokio::time::sleep(Duration::from_millis(25)).await;
             Err(json!({
                 "_tag": "GitCommandError",
                 "detail": "fatal: bad config line 3 in .gitmodules"
@@ -2498,9 +2507,145 @@ mod tests {
 
         let after_restart = TraceDiagnosticsStore::new(trace_path).read();
         assert_eq!(after_restart["failureCount"], 1);
+        assert_eq!(after_restart["latestFailures"][0]["durationMeasured"], true);
+        assert_eq!(after_restart["latestFailures"][0]["durationMs"], 25.0);
         assert_eq!(
             after_restart["latestFailures"][0]["cause"],
             "fatal: bad config line 3 in .gitmodules"
+        );
+    }
+
+    #[tokio::test]
+    async fn stacked_action_failure_is_recorded_once_by_its_owner() {
+        let directory = tempfile::tempdir().expect("temporary diagnostics directory");
+        let store = TraceDiagnosticsStore::new(directory.path().join("server.trace.ndjson"));
+        let mut registry = RpcRegistry::with_trace_diagnostics(store.clone());
+        crate::production::git_vcs::register_git_vcs_rpc(
+            &mut registry,
+            crate::production::git_vcs::GitVcsRpcServices::default(),
+        );
+        let RpcMethod::Stream(handler) = registry
+            .get("git.runStackedAction")
+            .expect("stacked handler")
+        else {
+            panic!("expected stream handler");
+        };
+        let mut stream = handler(
+            RpcRequest {
+                id: RequestId::try_from("1").unwrap(),
+                tag: "git.runStackedAction".into(),
+                payload: json!({"actionId":"private-action-sentinel", "cwd":directory.path(), "action":"create_pr"}),
+                headers: Vec::new(),
+                trace_id: None,
+                span_id: None,
+                sampled: None,
+            },
+            RpcSessionContext::unauthenticated(),
+            CancellationToken::new(),
+        );
+        let events = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut events = Vec::new();
+            while let Some(chunk) = stream.recv().await {
+                events.extend(chunk.expect("domain errors remain progress events"));
+            }
+            events
+        })
+        .await
+        .expect("owned stream settles");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["kind"] == "action_failed")
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["kind"] == "action_finished")
+        );
+        let result = store.read();
+        assert_eq!(result["failureCount"], 1);
+        assert_eq!(result["latestFailures"][0]["name"], "git.runStackedAction");
+        assert_eq!(result["latestFailures"][0]["durationMeasured"], true);
+        assert!(
+            !result["latestFailures"][0]["cause"]
+                .as_str()
+                .unwrap()
+                .contains("sentinel")
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_write_failure_preserves_unary_and_stacked_action_errors() {
+        let directory = tempfile::tempdir().expect("temporary diagnostics directory");
+        let blocked_path = directory.path().join("directory-instead-of-trace-file");
+        std::fs::create_dir(&blocked_path).expect("owned unwritable trace target");
+        let store = TraceDiagnosticsStore::new(blocked_path);
+        assert!(
+            store
+                .record_failure("fixture", &json!({"detail":"fixture"}))
+                .is_err()
+        );
+        let mut registry = RpcRegistry::with_trace_diagnostics(store);
+        let expected_error = json!({"_tag":"FixtureError", "detail":"original failure"});
+        let handler_error = expected_error.clone();
+        registry.register_unary("test.failure", move |_request, _cancellation| {
+            let error = handler_error.clone();
+            async move { Err(error) }
+        });
+        crate::production::git_vcs::register_git_vcs_rpc(
+            &mut registry,
+            crate::production::git_vcs::GitVcsRpcServices::default(),
+        );
+        let request = |tag: &str, payload| RpcRequest {
+            id: RequestId::try_from("1").unwrap(),
+            tag: tag.into(),
+            payload,
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        };
+        let RpcMethod::Unary(unary) = registry.get("test.failure").unwrap() else {
+            panic!("expected unary handler");
+        };
+        let result = unary(
+            request("test.failure", json!({})),
+            RpcSessionContext::unauthenticated(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result.result, Err(expected_error));
+
+        let RpcMethod::Stream(stacked) = registry.get("git.runStackedAction").unwrap() else {
+            panic!("expected stream handler");
+        };
+        let mut stream = stacked(
+            request(
+                "git.runStackedAction",
+                json!({
+                    "actionId":"owned-action", "cwd":directory.path(), "action":"create_pr",
+                }),
+            ),
+            RpcSessionContext::unauthenticated(),
+            CancellationToken::new(),
+        );
+        let events = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut events = Vec::new();
+            while let Some(chunk) = stream.recv().await {
+                events.extend(chunk.expect("domain failure keeps its progress event"));
+            }
+            events
+        })
+        .await
+        .expect("stream still settles when diagnostics cannot be written");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["kind"], "action_started");
+        assert_eq!(events[1]["kind"], "action_failed");
+        assert_eq!(
+            events[1]["message"],
+            "Select a target branch before creating a pull request."
         );
     }
 

@@ -280,7 +280,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
             ) : (
               <>
                 <p>{summary.message}</p>
-                <p className="mt-1 text-[10px] text-muted-foreground">
+                <p className="mt-1 text-xs text-muted-foreground">
                   Ahead {summary.ahead} · Behind {summary.behind}
                 </p>
               </>

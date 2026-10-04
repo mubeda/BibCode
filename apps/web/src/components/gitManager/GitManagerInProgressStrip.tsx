@@ -83,7 +83,7 @@ export const GitManagerInProgressStrip = memo(function GitManagerInProgressStrip
           </Button>
         </div>
         {blockedReason === null ? null : (
-          <p className="mt-1 text-[11px] text-muted-foreground" id={disabledReasonId}>
+          <p className="mt-1 text-xs text-muted-foreground" id={disabledReasonId}>
             {blockedReason}
           </p>
         )}

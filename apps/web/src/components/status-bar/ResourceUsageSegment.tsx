@@ -29,15 +29,15 @@ function ResourceTotalsCard({
       ) : (
         <div className="mt-2 grid grid-cols-3 gap-2">
           <div className="min-w-0">
-            <div className="text-[10px] text-muted-foreground">Memory</div>
+            <div className="text-xs text-muted-foreground">Memory</div>
             <div className="truncate font-mono tabular-nums">{totals.memoryLabel}</div>
           </div>
           <div className="min-w-0">
-            <div className="text-[10px] text-muted-foreground">CPU</div>
+            <div className="text-xs text-muted-foreground">CPU</div>
             <div className="truncate font-mono tabular-nums">{totals.cpuLabel}</div>
           </div>
           <div className="min-w-0">
-            <div className="text-[10px] text-muted-foreground">Processes</div>
+            <div className="text-xs text-muted-foreground">Processes</div>
             <div className="truncate font-mono tabular-nums">{totals.processCountLabel}</div>
           </div>
         </div>
@@ -108,7 +108,7 @@ export function ResourceUsageSegment({
   return (
     <Popover onOpenChange={handleOpenChange}>
       <PopoverTrigger
-        className="inline-flex h-5 items-center gap-1.5 rounded px-1 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+        className="inline-flex h-5 items-center gap-1.5 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
         aria-label={accessibleLabel}
         title={title}
       >
@@ -149,7 +149,7 @@ export function ResourceUsageSegment({
           )}
 
           <div className="rounded-md border border-border/70 p-2.5">
-            <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
               Combined
             </div>
             {headline === null ? (
@@ -178,7 +178,7 @@ export function ResourceUsageSegment({
                 key={consumer.processKey}
                 className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded px-1 py-0.5"
               >
-                <span className="rounded-sm bg-muted px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-muted-foreground">
+                <span className="rounded-sm bg-muted px-1 py-0.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
                   {consumer.scopeLabel}
                 </span>
                 <span className="min-w-0">
@@ -186,13 +186,13 @@ export function ResourceUsageSegment({
                     {consumer.label}
                   </span>
                   <span
-                    className="block truncate text-[10px] text-muted-foreground"
+                    className="block truncate text-xs text-muted-foreground"
                     title={consumer.command}
                   >
                     {consumer.command}
                   </span>
                 </span>
-                <span className="shrink-0 text-right font-mono text-[10px] tabular-nums">
+                <span className="shrink-0 text-right font-mono text-xs tabular-nums">
                   <span className="block">{consumer.memoryLabel}</span>
                   <span className="block text-muted-foreground">{consumer.cpuLabel} CPU</span>
                 </span>
@@ -218,7 +218,7 @@ export function ResourceUsageSegment({
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <div className="font-medium text-foreground">This device</div>
-                  <div className="text-[10px] text-muted-foreground">
+                  <div className="text-xs text-muted-foreground">
                     BiBCode Core
                     {presentation.localCore.totals?.coverageLabel === null ||
                     presentation.localCore.totals?.coverageLabel === undefined
@@ -229,7 +229,7 @@ export function ResourceUsageSegment({
                 {presentation.localCore.totals === null ? (
                   <div className="font-medium text-muted-foreground">Unavailable</div>
                 ) : (
-                  <div className="shrink-0 text-right font-mono text-[10px] tabular-nums">
+                  <div className="shrink-0 text-right font-mono text-xs tabular-nums">
                     <div>{presentation.localCore.totals.memoryLabel}</div>
                     <div className="text-muted-foreground">
                       {presentation.localCore.totals.cpuLabel} CPU ·{" "}

@@ -248,38 +248,86 @@ WSL primary when the runner declares WSL plus an installed distribution; an
 unavailable capability produces an explicit skip reason rather than emulated
 coverage.
 
+Each package is built from a disposable source checkout: the candidate and
+protected baseline use the tested commit, and the previous baseline uses its
+release tag. Before building, the maintained release-version helper pins the
+candidate to the requested candidate version and both baselines to the previous
+version. The harness verifies the package manifests, both Rust manifests,
+their Cargo lock entries, and the Tauri overlay agree, so native app and embedded
+server versions describe the same build. The calling checkout is not rewritten.
+
+The three packages compile sequentially into separate Cargo output directories
+under the isolated run root; the workflow's cached repository `target` does not
+warm them. The macOS Intel packaging child has a 90-minute bound; every other
+target retains 45 minutes. Each checkout's frozen dependency install retains
+10 minutes. The complete Intel job allows 360 minutes: 270 for packaging, 30
+for those installs, and 60 for setup, all upgrade lanes, evidence, and cleanup.
+The other five native rows and the separate WSL job retain 240 minutes.
+The `remote-install` lane reuses the protected package rather than building a
+fourth package. These are build/job limits, not expected durations or changes
+to product, WebDriver, or restart deadlines.
+
 The harness uses an isolated root outside the checkout, an ephemeral Tauri
 updater key, a loopback-only mock updater, the packaged app's embedded
 WebDriver, and bounded redacted evidence. It never opens or copies the SQLite
 database directly. Linux additionally requires the normal Tauri/AppImage
-libraries plus Xvfb. Run the host-compatible lane from the repository root with
-fresh ports and a work root outside the checkout:
+libraries plus Xvfb. The harness is **CI-only** and rejects local invocation before
+starting an application. Never run it on a machine with a user's BiBCode app:
+legacy lane cleanup can select the process name. Use the workflow's disposable
+native runners and ephemeral signing keys, not production signing credentials.
 
-```sh
-TAURI_SIGNING_PRIVATE_KEY=/absolute/path/to/ephemeral.key \
-TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<ephemeral password>' \
-node scripts/seeded-desktop-upgrade-smoke.ts \
-  --platform mac --arch arm64 --bundle dmg \
-  --candidate-version 0.3.11-upgrade.local.1 \
-  --previous-tag v0.3.10 --previous-version 0.3.10 \
-  --public-key-file /absolute/path/to/ephemeral.key.pub \
-  --run-id local-mac-arm64 \
-  --work-root /private/tmp/bibcode-seeded-upgrade/work \
-  --artifact-dir /private/tmp/bibcode-seeded-upgrade/evidence \
-  --updater-port 43120 --restart-timeout-ms 180000
-```
+The ordinary native matrix also runs `remote-install`, reusing the current-source
+protected baseline in a separate data/workspace root. It generates an **Another
+device** grant through the packaged UI and redeems it for a distinct test client.
+If widening is unavailable, evidence records `widened: false`; source/native
+transport tests then supply that leg, rather than claiming a wide live pass.
+The Node driver first checks the authenticated host's updater and requires the
+requested candidate to be available before starting the product coordinator.
+An already-running check is followed through status reads within one 30-second
+deadline; an unavailable, missing, mismatched, or failed candidate stops the lane
+before installation. This matches the UI's available-update prerequisite and
+ensures a fast local update cannot restart before the coordinator learns its
+target. The coordinator runs over authenticated loopback RPC; when widened, it
+waits for a candidate boot reachable through a local interface.
+A test-only metadata observer records brief percentages/stages without changing
+product coordinator deadlines.
+Before installation, the remote lane creates a dedicated witness directory in
+its private workspace and mints an ordinary signed upload through authenticated
+RPC. It exclusively writes and flushes the private capability receipt before
+starting HTTP. A real `100 Continue` admits the two-byte upload; the final byte
+is held until the product coordinator reports `waiting-for-mutations`. The
+helper's 20-second hold bound starts at admission. Expiry releases the harmless
+body but fails qualification; it never supplies fabricated progress or changes
+updater polling and deadlines. Once installation is dispatched, fixture failure
+still joins the update coordinator and the HTTP request before reporting failure.
+Success requires the completed upload's exact bytes and no partial file.
+Fallback residue removal runs only after the lane's application cleanup has
+joined; a failed stop preserves the directory.
+The remote lane records an install attempt only after its authenticated
+`updater.install` request is dispatched. A refused check or failed dispatch
+leaves that marker false, so a failed WebDriver phase cannot be mistaken for an
+installer handoff. Marker-write failures do not change the dispatched update.
 
-Generate the ephemeral key with `vp exec tauri signer generate` from
-`apps/desktop`, install frozen workspace dependencies, and ensure the host can
-build and launch the selected native bundle. Never use production signing
-secrets for this smoke. Evidence must remain bounded and redact roots,
-bootstrap credentials, update-signing secrets, tokens, and database contents.
-
-Run this harness only on a disposable host or session with no unrelated
-BiBCode instance. Its restarted-application cleanup currently selects the
-process name (`pkill -TERM -x bibcode-desktop` on Unix and an image-name
-`taskkill` on Windows), so an isolated data root does not protect another
-running app from that cleanup.
+Evidence requires a new boot on the candidate, unchanged storage identity,
+observed download/protection progress, a verified pre-update backup, and exactly
+one requester log line. Linux additionally requires one lane-specific AppImage
+mount/runtime and cleans only processes still carrying that lane's exact
+`BIBCODE_HOME`. Host evidence is captured before WebDriver teardown; backup and
+project retention are read through public bridge/RPC observations. Credentials
+stay in a private receipt outside retained evidence and are redacted from logs.
+The upload receipt is also private and immutable. Evidence redaction removes
+full, truncated and escaped transfer-capability labels before applying size
+bounds. An invalid private receipt prevents evidence retention; only fixed
+upload-witness booleans and bounds are added to the public result.
+Present `null` receipts are invalid. Once remote WebDriver launch is attempted,
+both phase logs and final evidence require the bootstrap receipt, even if
+installation was never dispatched; earlier local preparation failures do not.
+If the remote coordinator does not succeed, the phase log retains only its
+typed phase/failure kind, unique phase history, and bounded valid version
+strings. Host error messages and credential or identity details are omitted.
+The WSL-specific matrix retains its existing protected lane; it does not repeat
+the native remote-install scenario. First real remote-install execution is CI,
+separate from helper/unit/syntax checks.
 
 ## Maintainer branch flow
 

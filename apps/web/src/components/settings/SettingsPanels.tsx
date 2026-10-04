@@ -236,7 +236,7 @@ function ProviderLastChecked({ lastCheckedAt }: { lastCheckedAt: string | null }
   }
 
   return (
-    <span className="text-[11px] text-muted-foreground/60">
+    <span className="text-xs text-muted-foreground/60">
       {lastCheckedRelative.suffix ? (
         <>
           Checked <span className="font-mono tabular-nums">{lastCheckedRelative.value}</span>{" "}
@@ -253,7 +253,7 @@ function AboutVersionTitle({ availableVersion }: { readonly availableVersion?: s
   return (
     <span className="inline-flex items-center gap-2">
       <span>Version</span>
-      <code className="text-[11px] font-medium text-muted-foreground">
+      <code className="text-xs font-medium text-muted-foreground">
         {APP_VERSION}
         {availableVersion ? <> → {availableVersion}</> : null}
       </code>

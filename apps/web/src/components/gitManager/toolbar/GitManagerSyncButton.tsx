@@ -148,7 +148,7 @@ export const GitManagerSyncButton = memo(function GitManagerSyncButton({
         {state.ahead > 0 ? (
           <span
             aria-label={`${state.ahead} ahead`}
-            className="rounded bg-muted px-1 font-mono text-[10px]"
+            className="rounded bg-muted px-1 font-mono text-xs"
           >
             ↑{state.ahead}
           </span>
@@ -156,7 +156,7 @@ export const GitManagerSyncButton = memo(function GitManagerSyncButton({
         {state.behind > 0 ? (
           <span
             aria-label={`${state.behind} behind`}
-            className="rounded bg-muted px-1 font-mono text-[10px]"
+            className="rounded bg-muted px-1 font-mono text-xs"
           >
             ↓{state.behind}
           </span>
