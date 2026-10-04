@@ -3,6 +3,7 @@ import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeVM from "node:vm";
 import { describe, expect, it } from "vite-plus/test";
+import type { VisualTextRowObservationInput } from "./release-visual-observation.ts";
 const controller = NodeFS.readFileSync(
   new URL("../qualify-delivery-retry.ts", import.meta.url),
   "utf8",
@@ -132,26 +133,58 @@ it.each([false, true])(
     expect(end).toBeGreaterThan(begin);
     let reads = 0,
       gitReads = 0;
+    const calls: string[] = [];
+    const theme = "light";
+    const origin = "http://127.0.0.1:4885";
+    const visualInput = {};
+    const readSelected = () => {};
     const identity = {
       path: "/private/managed",
       branch: "codex/delivery-retry-light",
       commonDirectory: "/private/project/.git",
     };
-    const fn = NodeVM.runInNewContext(
-      NodeModule.stripTypeScriptTypes("({" + controller.slice(begin, end) + "}).verifyManaged"),
+    const inputDeclaration = controller.match(
+      /^  let textRowObservationInput: VisualTextRowObservationInput \| null = null;$/m,
+    )?.[0];
+    expect(inputDeclaration).toBeDefined();
+    const actual: {
+      verifyManaged: () => Promise<void>;
+      readInput: () => VisualTextRowObservationInput | null;
+    } = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        inputDeclaration +
+          "\nconst verifyManaged = ({" +
+          controller.slice(begin, end) +
+          "}).verifyManaged; ({ verifyManaged, readInput: () => textRowObservationInput })",
+      ),
       {
         b: () => ({
-          execute: async () => ({ threadId: ++reads === 1 || stale ? "other" : "owned" }),
+          execute: async (reader: unknown, input: unknown) => {
+            expect(reader).toBe(readSelected);
+            expect(input).toEqual({
+              origin,
+              branch: identity.branch,
+              boundThreadId: "owned",
+            });
+            expect(actual.readInput()).toBeNull();
+            calls.push("selected");
+            return { threadId: ++reads === 1 || stale ? "other" : "owned" };
+          },
         }),
-        readSelectedDeliveryWorktree: () => {},
-        readOwnedDeliveryWorktree: () => {
+        readSelectedDeliveryWorktree: readSelected,
+        readOwnedDeliveryWorktree: (input: unknown) => {
+          expect(input).toBe(visualInput);
+          expect(actual.readInput()).toBeNull();
+          calls.push("git");
           gitReads++;
           return identity;
         },
-        visualInput: {},
-        origin: "http://127.0.0.1:4885",
+        visualInput,
+        theme,
+        origin,
         workspace: { ...identity, threadId: "owned" },
         check: (value: unknown) => {
+          calls.push("check");
           if (!value) throw new Error("Owned refusal.");
         },
         owner: {
@@ -162,13 +195,23 @@ it.each([false, true])(
         },
       },
     );
+    expect(actual.readInput()).toBeNull();
     if (stale) {
-      await expect(fn()).rejects.toThrow("Owned refusal.");
+      await expect(actual.verifyManaged()).rejects.toThrow("Owned refusal.");
       expect(gitReads).toBe(0);
+      expect(actual.readInput()).toBeNull();
+      expect(calls).toEqual(["selected", "selected"]);
     } else {
-      await fn();
+      await actual.verifyManaged();
       expect(reads).toBe(2);
       expect(gitReads).toBe(1);
+      expect(calls).toEqual(["selected", "selected", "git", "check"]);
+      expect(actual.readInput()).toEqual({
+        theme,
+        origin,
+        threadId: "owned",
+        branch: identity.branch,
+      });
     }
   },
 );
