@@ -429,6 +429,43 @@ Xvfb alone does not provide a portal. Launch the AppImage with `GTK_THEME` and
 Record screenshots at launch and after changes, the portal/backend setup, and
 any unavailable native sessions. Restore settings only within the test session.
 
+## Manual visual workflow registration
+
+The default-branch `qualify-release-visuals.yml` is registration only. GitHub
+requires a manually dispatched workflow to exist on the default branch; the
+`--ref` option selects the workflow version on the nominated QA branch or tag.
+The default-branch version always fails with the closed
+`QUALIFICATION_REQUIRES_NOMINATED_QA_REF` classification before checkout,
+dependencies, runtime admission, or artifact retention. That refusal is not a
+native result. It does not install the QA owner or fixtures on `main`.
+
+Review and nominate the fully merged QA source before dispatch. Require that
+ref to contain the full workflow at the same path and its current owner,
+fixtures, helper tests, guarded CLI build, web build, static gates, and explicit
+evidence retention. Dispatch each existing selection separately:
+
+```sh
+qualification_ref="<nominated QA branch or tag>"
+gh workflow run qualify-release-visuals.yml --ref "$qualification_ref" -f scene_selection=release-visual-core
+gh workflow run qualify-release-visuals.yml --ref "$qualification_ref" -f scene_selection=release-visual-settings
+gh workflow run qualify-release-visuals.yml --ref "$qualification_ref" -f scene_selection=release-visual-git-project
+```
+
+Record the reviewed commit and require the actual run's head SHA to match it.
+The checkout, compiled inputs, and owner provenance must all name that same
+source; do not substitute a different checkout while retaining the dispatch
+SHA. Preserve the selected workflow's existing scene predicates, process and
+namespace ownership, bounds, cleanup proofs, and named light/dark originals.
+A completed preparation group does not prove the full 82-scene/164-original
+requirement, packaged Tauri scenarios, or other platforms. Keep execution refs,
+SHAs, counts, timings, and screenshot findings in the execution report.
+
+Verify registration policy without starting the qualification runtime:
+
+```sh
+vp test run scripts/qualify-release-visuals-registration.test.ts scripts/ci-platform-contract.test.ts
+```
+
 ## Packaged UI scenarios
 
 Include the shared [Pull Requests smoke](./cross-platform-validation.md#pull-requests-web-shell-validation):
