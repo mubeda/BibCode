@@ -16,6 +16,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::repository_identity::{RepositoryIdentityThrottle, reconcile_repository_identity};
 use crate::{
     crypto::sha256_hex,
     git::{
@@ -342,6 +343,8 @@ pub struct WorktreeCatalogRpcServices {
 #[derive(Clone)]
 pub struct WorktreeCatalogOperationRuntime {
     state: Arc<Mutex<WorktreeCatalogOperationState>>,
+    /// Cancelled by `shutdown` so background work stops with the runtime.
+    cancellation: CancellationToken,
     admission: Arc<Semaphore>,
 }
 
@@ -384,8 +387,26 @@ impl WorktreeCatalogOperationRuntime {
                 accepting: true,
                 tasks: Vec::new(),
             })),
+            cancellation: CancellationToken::new(),
             admission: Arc::new(Semaphore::new(PRODUCTION_MAX_IN_FLIGHT_WORKTREE_OPERATIONS)),
         }
+    }
+
+    /// Runs best-effort follow-up work owned by the runtime, outside the caller's locks, and drops
+    /// it once shutdown has begun. `shutdown` cancels the token and waits for it.
+    async fn spawn_background<F, Fut>(&self, work: F)
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self.state.lock().await;
+        if !state.accepting {
+            return;
+        }
+        state.tasks.retain(|task| !task.is_finished());
+        state
+            .tasks
+            .push(tokio::spawn(work(self.cancellation.child_token())));
     }
 
     pub(crate) async fn run(
@@ -425,6 +446,7 @@ impl WorktreeCatalogOperationRuntime {
         let tasks = {
             let mut state = self.state.lock().await;
             state.accepting = false;
+            self.cancellation.cancel();
             self.admission.close();
             std::mem::take(&mut state.tasks)
         };
@@ -472,8 +494,12 @@ impl WorktreeOperationError {
 impl WorktreeCatalogRpcServices {
     #[must_use]
     pub fn new(catalog: WorktreeCatalogService, orchestration: OrchestrationEngine) -> Self {
+        let operations = WorktreeCatalogOperationRuntime::new();
         catalog.set_healthy_snapshot_observer(Arc::new(BranchReconciliationObserver {
             orchestration: orchestration.clone(),
+            git: catalog.git_repository(),
+            identity_throttle: RepositoryIdentityThrottle::default(),
+            operations: operations.clone(),
         }));
         let creation_git = catalog.git_repository();
         let removal_git = creation_git
@@ -486,7 +512,7 @@ impl WorktreeCatalogRpcServices {
             removal_quiescer: Arc::new(NoopWorktreeRemovalQuiescer),
             removal_git,
             status_broadcaster: None,
-            operations: WorktreeCatalogOperationRuntime::new(),
+            operations,
             #[cfg(test)]
             removal_admission_timeout: REMOVAL_ADMISSION_DRAIN_TIMEOUT,
             #[cfg(test)]
@@ -614,6 +640,9 @@ impl WorktreeCatalogRpcServices {
 #[derive(Clone)]
 struct BranchReconciliationObserver {
     orchestration: OrchestrationEngine,
+    git: Option<Arc<GitRepository>>,
+    identity_throttle: RepositoryIdentityThrottle,
+    operations: WorktreeCatalogOperationRuntime,
 }
 
 impl CatalogHealthySnapshotObserver for BranchReconciliationObserver {
@@ -630,6 +659,27 @@ impl CatalogHealthySnapshotObserver for BranchReconciliationObserver {
 }
 
 impl BranchReconciliationObserver {
+    /// At most once per interval per project, and off the catalog's refresh lock.
+    async fn refresh_repository_identity(&self, project_id: &str) {
+        let Some(git) = self.git.clone() else {
+            return;
+        };
+        if !self
+            .identity_throttle
+            .admit(project_id, std::time::Instant::now())
+        {
+            return;
+        }
+        let orchestration = self.orchestration.clone();
+        let project_id = project_id.to_owned();
+        self.operations
+            .spawn_background(move |cancellation| async move {
+                reconcile_repository_identity(&orchestration, &git, &project_id, &cancellation)
+                    .await;
+            })
+            .await;
+    }
+
     async fn reconcile(&self, project_id: String, snapshot: Arc<WorktreeCatalogSnapshot>) {
         if !snapshot.authoritative
             || !matches!(
@@ -639,6 +689,7 @@ impl BranchReconciliationObserver {
         {
             return;
         }
+        self.refresh_repository_identity(&project_id).await;
         let threads = match self
             .orchestration
             .repositories()
@@ -4785,5 +4836,121 @@ mod mutation_invalidation_tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod repository_identity_refresh_tests {
+    use std::{process::Command, sync::Arc, time::Duration};
+
+    use tempfile::TempDir;
+
+    use super::{
+        BranchReconciliationObserver, CatalogHealthySnapshotObserver, RepositoryIdentityThrottle,
+        WorktreeCatalogOperationRuntime,
+    };
+    use crate::{
+        git::GitRepository,
+        orchestration::{EngineOptions, OrchestrationEngine},
+        persistence::{Database, run_migrations},
+        worktree_catalog::{CatalogScanStatus, WorktreeCatalogSnapshot},
+    };
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    async fn stored_key(engine: &OrchestrationEngine) -> Option<String> {
+        engine
+            .repositories()
+            .get_project("p".to_owned())
+            .await
+            .unwrap()
+            .unwrap()
+            .repository_identity
+            .map(|identity| identity["canonicalKey"].as_str().unwrap().to_owned())
+    }
+
+    /// A healthy scan refreshes the identity off the scan's own task, and a second scan inside the
+    /// throttle interval does not read `origin` again.
+    #[tokio::test]
+    async fn healthy_scans_refresh_the_identity_once_per_throttle_interval() {
+        let checkout = TempDir::new().unwrap();
+        git(checkout.path(), &["init", "-q"]);
+        git(
+            checkout.path(),
+            &["remote", "add", "origin", "git@github.com:acme/repo.git"],
+        );
+        let database = Database::open_in_memory().await.unwrap();
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .unwrap();
+        engine
+            .dispatch(
+                serde_json::from_value(serde_json::json!({
+                    "type":"project.create","commandId":"create","projectId":"p","title":"P",
+                    "workspaceRoot":checkout.path().to_string_lossy().replace('\\', "/"),
+                    "defaultModelSelection":null,"createdAt":"2026-10-05T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let operations = WorktreeCatalogOperationRuntime::new();
+        let observer = BranchReconciliationObserver {
+            orchestration: engine.clone(),
+            git: Some(Arc::new(GitRepository::default())),
+            identity_throttle: RepositoryIdentityThrottle::default(),
+            operations: operations.clone(),
+        };
+        let snapshot = Arc::new(WorktreeCatalogSnapshot {
+            repository_key: "repository".to_owned(),
+            generation: 1,
+            authoritative: true,
+            observed_at: "2026-10-05T00:00:00Z".to_owned(),
+            scan_status: CatalogScanStatus::Ready,
+            worktrees: Vec::new(),
+            adopted_workspaces: Vec::new(),
+        });
+
+        observer.observe("p".to_owned(), snapshot.clone()).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stored_key(&engine).await.is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the first healthy scan records the identity");
+
+        git(
+            checkout.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://gitlab.com/acme/other.git",
+            ],
+        );
+        observer.observe("p".to_owned(), snapshot).await;
+        operations.shutdown().await;
+        assert_eq!(
+            stored_key(&engine).await.as_deref(),
+            Some("github.com/acme/repo")
+        );
+        engine.shutdown().await;
     }
 }
