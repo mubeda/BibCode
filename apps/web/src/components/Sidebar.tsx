@@ -176,7 +176,9 @@ import {
   resolveGitManagerRepositoryUnavailable,
 } from "./gitManager/gitManagerRepositoryAvailability";
 import { AgentsNavRow } from "./sidebar/AgentsNavRow";
+import { EnvironmentCardHeader } from "./sidebar/EnvironmentCardHeader";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
+import type { EnvironmentCardIdentity } from "./sidebar/repositoryView.logic";
 import { ServerUpdateBadge, serverUpdateStatusFromQuery } from "./settings/ServerUpdateBadge";
 import {
   resolveAddProjectTargetLabel,
@@ -576,6 +578,7 @@ async function chooseProjectMember(
 function projectExpansionPreferenceKeys(project: SidebarProjectSnapshot): string[] {
   return [
     project.projectKey,
+    ...(project.sharedExpansionKey ? [project.sharedExpansionKey] : []),
     ...project.memberProjects.map((member) => member.physicalProjectKey),
     ...project.memberProjects.map((member) => legacyProjectCwdPreferenceKey(member.workspaceRoot)),
   ];
@@ -1690,6 +1693,7 @@ interface SidebarProjectItemProps {
   suppressProjectClickForContextMenuRef: React.RefObject<boolean>;
   isManualProjectSorting: boolean;
   dragHandleProps: SortableProjectHandleProps | null;
+  environmentCard?: EnvironmentCardIdentity | null;
 }
 
 const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjectItemProps) {
@@ -1712,6 +1716,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     suppressProjectClickForContextMenuRef,
     isManualProjectSorting,
     dragHandleProps,
+    environmentCard = null,
   } = props;
   const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
   const requestWorktreeRemoval = useContext(WorktreeRemovalRequestContext);
@@ -3236,7 +3241,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
 
   return (
     <>
-      <div className="group/project-header relative">
+      <div
+        className={`group/project-header relative ${environmentCard && !environmentCard.available ? "opacity-60" : ""}`}
+      >
         <SidebarMenuButton
           ref={isManualProjectSorting ? dragHandleProps?.setActivatorNodeRef : undefined}
           aria-expanded={projectExpanded}
@@ -3270,17 +3277,26 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
               }`}
             />
           )}
-          <ProjectFavicon environmentId={project.environmentId} cwd={project.workspaceRoot} />
-          <span className="flex min-w-0 flex-1 items-center gap-2">
-            <span className="truncate text-[13px] font-medium text-foreground/90">
-              {project.displayName}
-            </span>
-            {project.groupedProjectCount > 1 ? (
-              <span className="shrink-0 text-xs text-muted-foreground">
-                {project.groupedProjectCount} projects
+          {environmentCard ? (
+            <EnvironmentCardHeader
+              identity={environmentCard}
+              workspaceRoot={project.workspaceRoot}
+            />
+          ) : (
+            <>
+              <ProjectFavicon environmentId={project.environmentId} cwd={project.workspaceRoot} />
+              <span className="flex min-w-0 flex-1 items-center gap-2">
+                <span className="truncate text-[13px] font-medium text-foreground/90">
+                  {project.displayName}
+                </span>
+                {project.groupedProjectCount > 1 ? (
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {project.groupedProjectCount} projects
+                  </span>
+                ) : null}
               </span>
-            ) : null}
-          </span>
+            </>
+          )}
         </SidebarMenuButton>
         {/* The container badge tells WSL projects apart inside Local, which
             mixes this device and WSL. A saved server's scope shows only that
