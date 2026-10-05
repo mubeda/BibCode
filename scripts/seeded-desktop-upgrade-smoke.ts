@@ -934,9 +934,10 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
       const allowedStatuses = ${JSON.stringify(Object.keys(updateStatuses))};
       const allowedErrorContexts = ${JSON.stringify(Object.keys(updateErrorContexts))};
       let installResultObservation = { kind: "unavailable", accepted: null, completed: null, status: null, phase: null, errorContext: null };
-      const publishInstallObservation = (stage) => {
+      const publishInstallObservation = (stage, stateObservation) => {
         try {
-          const observation = stage === "returned" ? { stage, installResultObservation } : { stage };
+          const observation = stage === "returned" ? { stage, installResultObservation }
+            : stage === "pending-state" ? { stage, stateObservation } : { stage };
           console.info("seeded-upgrade-install-observation " + JSON.stringify(observation));
         } catch { /* Optional closed logging never replaces the install outcome. */ }
       };
@@ -954,9 +955,13 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
           errorContext: allowedErrorContexts.includes(errorContext) ? errorContext : null };
       };
       let settled = false;
+      let installPending = false;
+      let pendingStateTimer;
       const finish = (error) => {
         if (settled) return;
         settled = true;
+        installPending = false;
+        clearTimeout(pendingStateTimer);
         done({ error: error ?? null, phases: observed, installResultObservation });
       };
       Promise.resolve(bridge.onUpdateState?.((state) => {
@@ -965,9 +970,32 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
         if (lane === "protected-baseline" && state?.phase === "protecting") finish(null);
       })).then(async () => {
         publishInstallObservation("listener-settled");
+        installPending = true;
         const pendingInstall = bridge.installUpdate();
         publishInstallObservation("install-dispatched");
+        // One read-only sample cannot delay or replace the original installation result.
+        if (!settled) pendingStateTimer = setTimeout(() => {
+          if (settled || !installPending) return;
+          Promise.resolve().then(() => {
+            if (settled || !installPending) return;
+            return bridge.getUpdateState();
+          }).then((state) => {
+            if (settled || !installPending) return;
+            const status = ownData(state, "status"), phase = ownData(state, "phase"),
+              errorContext = ownData(state, "errorContext"), canRetry = ownData(state, "canRetry");
+            publishInstallObservation("pending-state", {
+              status: allowedStatuses.includes(status) ? status : null,
+              phase: allowedPhases.includes(phase) ? phase : null,
+              errorContext: allowedErrorContexts.includes(errorContext) ? errorContext : null,
+              canRetry: typeof canRetry === "boolean" ? canRetry : null,
+            });
+          }).catch(() => {
+            if (!settled && installPending) publishInstallObservation("pending-state-unavailable");
+          });
+        }, 1000);
         const install = await pendingInstall;
+        installPending = false;
+        clearTimeout(pendingStateTimer);
         // Observation cannot replace the original completion verdict or mutate an earlier done payload.
         installResultObservation = observeResult(install);
         publishInstallObservation("returned");

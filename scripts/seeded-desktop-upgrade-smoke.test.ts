@@ -2238,6 +2238,8 @@ function installResultFixture(
     preparationStates?: unknown[];
     installStates?: unknown[];
     logFault?: boolean;
+    pendingState?: unknown;
+    stateMode?: "returned" | "never" | "reject";
   } = {},
 ) {
   const input = {
@@ -2266,6 +2268,10 @@ function installResultFixture(
   const deferred = new Promise((resolve) => {
     returnInstall = resolve;
   });
+  let returnState!: (value: unknown) => void;
+  const deferredState = new Promise((resolve) => {
+    returnState = resolve;
+  });
   let executions = 0;
   const failure = options.error ?? new Error("inert existing bridge failure");
   const run = NodeVM.runInNewContext(
@@ -2286,6 +2292,8 @@ function installResultFixture(
         // @effect-diagnostics-next-line globalTimers:off - Generated callbacks use the controlled Vitest clock.
         return setTimeout(callback, delay);
       },
+      // Cancels the generated observer on the controlled clock.
+      clearTimeout: (timer: ReturnType<typeof setTimeout>) => clearTimeout(timer),
       NodeFS: {
         readFileSync: (path: string) => files.get(path),
         writeFileSync: (path: string, contents: string) => {
@@ -2331,6 +2339,12 @@ function installResultFixture(
               }
             );
           },
+          getUpdateState: async () => {
+            calls.push("state");
+            if (options.stateMode === "never") return deferredState;
+            if (options.stateMode === "reject") throw failure;
+            return options.pendingState;
+          },
         },
       },
       browser: {
@@ -2360,6 +2374,7 @@ function installResultFixture(
     writes,
     timers,
     returnInstall,
+    returnState,
     stageObservations,
     read: () => JSON.parse(files.get(input.resultPath)!) as Record<string, unknown>,
   };
@@ -2367,6 +2382,108 @@ function installResultFixture(
 
 describe("generated public install-result observation", () => {
   afterEach(() => vi.useRealTimers());
+  it("samples one closed native state only while the original installation remains pending", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({
+      mode: "never",
+      pendingState: {
+        status: "downloaded",
+        phase: "protecting",
+        errorContext: null,
+        canRetry: false,
+        message: "private-native-state",
+        requestedBy: "private-requester",
+      },
+    });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fixture.calls).not.toContain("state");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fixture.calls.filter((call) => call === "state")).toHaveLength(1);
+    expect(fixture.stageObservations.at(-1)).toEqual({
+      stage: "pending-state",
+      stateObservation: {
+        status: "downloaded",
+        phase: "protecting",
+        errorContext: null,
+        canRetry: false,
+      },
+    });
+    expect(JSON.stringify(fixture.stageObservations)).not.toContain("private-");
+    await vi.advanceTimersByTimeAsync(29000);
+    await expect(fixture.run).rejects.toThrow("timed out observing updater installation");
+    expect(fixture.calls.filter((call) => call === "install")).toHaveLength(1);
+    expect(fixture.calls.filter((call) => call === "state")).toHaveLength(1);
+  });
+
+  it.each(["never", "reject"] as const)(
+    "keeps the original deadline when optional state is %s",
+    async (stateMode) => {
+      vi.useFakeTimers();
+      const fixture = installResultFixture({ mode: "never", stateMode });
+      await vi.advanceTimersByTimeAsync(30000);
+      await expect(fixture.run).rejects.toThrow("timed out observing updater installation");
+      expect(fixture.calls.filter((call) => call === "state")).toHaveLength(1);
+      expect(fixture.calls.filter((call) => call === "install")).toHaveLength(1);
+      expect(JSON.stringify(fixture.stageObservations)).not.toContain(
+        "inert existing bridge failure",
+      );
+    },
+  );
+
+  it("cancels the state sample after an immediate original refusal", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({ result: { accepted: false, completed: false } });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(fixture.run).rejects.toThrow("install did not complete");
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(fixture.calls).not.toContain("state");
+  });
+
+  it("does not publish a late state or read private accessors after the original deadline", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({ mode: "never", stateMode: "never" });
+    await vi.advanceTimersByTimeAsync(30000);
+    await expect(fixture.run).rejects.toThrow("timed out observing updater installation");
+    const before = JSON.stringify(fixture.stageObservations);
+    const getter = vi.fn(() => {
+      throw new Error("private-state-getter");
+    });
+    fixture.returnState(Object.defineProperty({}, "status", { get: getter }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getter).not.toHaveBeenCalled();
+    expect(JSON.stringify(fixture.stageObservations)).toBe(before);
+    expect(fixture.calls.filter((call) => call === "state")).toHaveLength(1);
+  });
+
+  it("cancels observation when install resolves before the original post-install delay", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({ mode: "never" });
+    await vi.advanceTimersByTimeAsync(500);
+    fixture.returnInstall({ accepted: true, completed: true });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(fixture.calls).not.toContain("state");
+    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(30000);
+    await fixture.run;
+  });
+
+  it("ignores a state reply after install resolves but before the original post-install delay", async () => {
+    vi.useFakeTimers();
+    const fixture = installResultFixture({ mode: "never", stateMode: "never" });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fixture.calls.filter((call) => call === "state")).toHaveLength(1);
+    fixture.returnInstall({ accepted: true, completed: true });
+    await vi.advanceTimersByTimeAsync(0);
+    fixture.returnState({ status: "downloaded", phase: "installing" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fixture.stageObservations.some((record) => record.stage === "pending-state")).toBe(
+      false,
+    );
+    await vi.advanceTimersByTimeAsync(750);
+    await vi.advanceTimersByTimeAsync(30000);
+    await fixture.run;
+  });
+
   it("retains closed install dispatch stages before a never-returning native command", async () => {
     vi.useFakeTimers();
     const fixture = installResultFixture({ mode: "never" });
@@ -2376,10 +2493,11 @@ describe("generated public install-result observation", () => {
       { stage: "install-dispatched" },
     ]);
     expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
-    expect(fixture.timers).toEqual([30000]);
+    expect(fixture.timers).toEqual([30000, 1000]);
     await vi.advanceTimersByTimeAsync(30000);
     await expect(fixture.run).rejects.toThrow("timed out observing updater installation");
-    expect(fixture.stageObservations).toHaveLength(2);
+    expect(fixture.stageObservations).toHaveLength(3);
+    expect(fixture.calls.filter((call) => call === "state")).toHaveLength(1);
   });
 
   it.each([false, true])(
@@ -2403,7 +2521,7 @@ describe("generated public install-result observation", () => {
       await vi.advanceTimersByTimeAsync(0);
       await expect(fixture.run).rejects.toThrow("install did not complete");
       expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
-      expect(fixture.timers).toEqual([30000]);
+      expect(fixture.timers).toEqual([30000, 1000]);
       expect(fixture.stageObservations).toEqual(
         logFault
           ? []
@@ -2476,7 +2594,7 @@ describe("generated public install-result observation", () => {
       phase: "protecting",
       errorContext: null,
     });
-    expect(fixture.timers).toEqual([30000]);
+    expect(fixture.timers).toEqual([30000, 1000]);
     expect(fixture.writes).toHaveLength(2);
   });
 
@@ -2502,7 +2620,7 @@ describe("generated public install-result observation", () => {
         phase: "installing",
         errorContext: null,
       });
-      expect(fixture.timers).toEqual([30000, 750, 30000]);
+      expect(fixture.timers).toEqual([30000, 1000, 750, 30000]);
       expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
       expect(fixture.writes).toHaveLength(2);
     },
@@ -2564,8 +2682,15 @@ describe("generated public install-result observation", () => {
       completed: null,
     });
     expect(fixture.read().phases).toEqual(["checking", "available", "installing"]);
-    expect(fixture.calls).toEqual(["listener", "check", "download", "listener", "install"]);
-    expect(fixture.timers).toEqual([30000]);
+    expect(fixture.calls).toEqual([
+      "listener",
+      "check",
+      "download",
+      "listener",
+      "install",
+      "state",
+    ]);
+    expect(fixture.timers).toEqual([30000, 1000]);
   });
 
   it("preserves a disconnect object and the pre-execution unavailable receipt", async () => {

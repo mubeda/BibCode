@@ -467,16 +467,27 @@ IDs, paths, URLs and arguments are not added. The observation adds no bridge cal
 listener, retry, poll or deadline and does not replace the original
 completion verdict or establish a native failure cause.
 
-The generated local driver also emits at most three closed
+The generated local driver also emits at most four closed
 `seeded-upgrade-install-observation` console records through the configured
 private frontend-log collector: `listener-settled`, `install-dispatched`, and
-`returned`. The first means the existing optional registration continuation
+`returned`, with one optional `pending-state` or `pending-state-unavailable`
+record. The first means the existing optional registration continuation
 settled; the second means the existing install call returned an awaitable value.
 Neither proves that Rust received the command or an installer launched. The
 returned record includes only the existing closed install-result projection.
 These records survive independently of the WebDriver async result where the
 collector retains them. Missing records remain unobserved; logger faults cannot
-replace the original outcome. Calls, timers, verdicts and cleanup are unchanged.
+replace the original outcome. If installation is still pending after one second,
+sample the existing read-only `getUpdateState` bridge command once. Retain only
+its allowlisted status, phase, error context and nullable `canRetry` boolean;
+never retain versions, messages, requesters, protection entries or errors. Cancel
+the sample timer when the install resolves or the original callback finishes,
+and ignore a state result that arrives afterward, including during the existing
+post-install delay. The observation does not await or retry the state read,
+change the original thirty-second deadline, complete an installation, or relax
+the installer/process/version joins. A missing or unavailable sample does not
+prove where the native command stopped. Existing owner cleanup still closes the
+desktop and driver, including a state request that never returns.
 
 The CI harness also starts a bounded read-only process-event witness before the
 seed driver's installation dispatch and joins that exact observer after the
