@@ -900,7 +900,11 @@ export async function runVisualSettings(input: SettingsVisualInput): Promise<obj
     step("visual-settings-provider-details");
     await click('button[aria-label="Toggle Claude details"]');
     expandedClaude = true;
-    await browser.$("#provider-instance-claudeAgent-binaryPath").waitForDisplayed();
+    await browser
+      .$(
+        '[data-slot="collapsible-panel"][data-open][style*="--collapsible-panel-height: auto"] #provider-instance-claudeAgent-binaryPath',
+      )
+      .waitForDisplayed();
     await scroll("#provider-instance-claudeAgent-binaryPath", "start");
     await scroll("#provider-instance-claudeAgent-custom-model", "end");
     await capture("settings-provider-form");

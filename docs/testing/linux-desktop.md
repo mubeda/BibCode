@@ -797,10 +797,11 @@ The manual-only `qualify-release-visuals.yml` preparation lane selects
 `release-visual-core` through the same Python owner and real-server controller
 as delivery Retry. It retains the existing 600-second inner and 660-second
 outer bounds. Compile inputs beforehand. Do not add further scenes or widen
-those bounds to make this batch pass.
+those bounds to make this batch pass. The image original uses its already-approved
+scene; the full 82-scene/164-original obligation remains unchanged.
 
-The fixed output is eight light/dark pairs: `workspace-composite`,
-`workspace-card-menu`, `worktree-create-ref`, `git-changes-diff`,
+The fixed output is nine light/dark pairs: `workspace-composite`,
+`workspace-card-menu`, `worktree-create-ref`, `git-image-diff`, `git-changes-diff`,
 `git-history-stashes`, `git-branch-menu`, `files-editor-comment`, and
 `command-palette`. Root must assemble and independently approve the immutable
 release source before treating a later run as final-source evidence. This lane
@@ -907,22 +908,30 @@ behavior; native gesture delivery and the resulting PNG still need CI evidence.
 The palette filters to and highlights Open settings without executing it. In Changes, select the working-tree PNG and require the owned
 image row, visible diff pane and disabled empty partial-staging gutter; that
 binary representation does not provide an image preview. Use public History
-controls to select the baseline commit and its PNG, then require the unchanged
-two-loaded-image 64 by 64 predicate on that supported commit image view before
-returning to Changes for text partial staging. Selecting the baseline commit
-again for the later History capture resets selection to its first changed file;
-the History/stash witness does not require a particular filename. The image
-pixels are not in the Changes PNG. The Files context menu
-and workspace terminal/other-chat substate also remain outside these eight
-captures. These omissions stay explicit in the closed interaction receipt;
-this batch does not visually qualify hidden components from a source inventory.
+controls to select the baseline commit and its PNG, then select the actual 2-up
+mode and capture `git-image-diff` before returning to Changes for text partial
+staging. Both distinct repository PNGs must be loaded at natural 64 by 64 size;
+Before/After figures, captions and all four mode controls must be contained and
+visible, with 2-up uniquely pressed. Rejoin the local route/header/project,
+connected selected rail, owned managed card and selected worktree/branch/theme.
+Missing, ambiguous, clipped, hidden, credential or boot controls refuse admission.
+The source checker reuses the existing immutable owned Git identity instead of
+a chat-route substitute, before public image actions and after both outcomes.
+The shared original owner requires that same source checker before its existing
+capture polling and after screenshot, before retaining bytes. It keeps the
+ordinary witness/alert/nonblank/1280 by 960/post-read/write-once PNG checks. No
+renderer store, canonical event, state, CSS or viewport is injected to favor an
+original. The genuine fixture swatches are source inputs, never screenshots.
+Selecting the baseline commit again for the later History capture resets
+selection to its first changed file; its old witness remains unchanged. Files
+context menu and workspace terminal/other-chat remain unpictured and unqualified.
 
 Require the exact 1280 by 960 viewport and every scene's current read-only
 witness, in addition to the selected environment/workspace, real theme, visible
 unobstructed target, absent credential/boot controls and a nonblank original PNG.
 Recheck the witness after the screenshot returns before retaining its unchanged
 bytes. Missing, duplicated, stale, unknown or failed facts refuse capture;
-there is no screenshot fallback. Only the sixteen named PNGs and seven closed
+there is no screenshot fallback. Only the eighteen named PNGs and seven closed
 JSON receipt files enter the artifact allowlist. Inspect the originals
 independently before accepting visual quality. No private logs, provider inputs,
 credentials or profiles are retained.
@@ -1016,7 +1025,7 @@ zero guard refusals, joined browser/server cleanup, no namespace survivors and
 the unchanged host network identity. The private fixture is deleted only after
 both owners prove joined cleanup. A partial or failed run records only the
 captures it actually completed and keeps its failure classification; it cannot
-claim all eight pairs from the manifest alone.
+claim all nine pairs from the manifest alone.
 
 ### Settings release visual batch
 
@@ -1024,11 +1033,11 @@ The same manual-only `qualify-release-visuals.yml` offers the fixed
 `release-visual-settings` choice separately from its default
 `release-visual-core`. It uses the same real-server controller, Python namespace
 owner, browser profile, pairing, public theme/import/Claude model selection and
-one managed-worktree creator per theme. The original core selection, sixteen
-PNG filenames and 600/660-second bounds remain unchanged. Settings uses those
+one managed-worktree creator per theme. The core selection now has its fixed nine pairs/eighteen filenames; its
+600/660-second bounds remain unchanged. Settings uses those
 same bounds for exactly four pairs: `model-picker`, `settings-keybindings`,
 `settings-source-control`, and `settings-provider-form`. Never append these
-scenes to the eight-scene core sequence or widen its deadline.
+scenes to the nine-scene core sequence or widen its deadline.
 
 Compile the guarded CLI and UI before admission. The settings preflight joins
 the existing owner's `provenance.json` source/default-Abort/server hash to the
@@ -1088,7 +1097,13 @@ scroll; do not require an action failure to obtain its native fallback. Refuse
 foreign route/theme/selection, credential or boot context and ambiguous or missing
 owned inputs. Keep the existing before/after outer-page scroll guard and all
 one-scene visibility, clipping, identity, nonsecret-config and PNG admission
-predicates. Source/SDK tests do not prove native layout or an attainable field span.
+predicates. The existing binary-field SDK display wait additionally binds the
+opened Collapsible panel's public `--collapsible-panel-height: auto` state. The
+pinned component publishes it from its actual open-animation completion callback;
+input display alone can precede that completion. Keep the same wait command and
+configured timeout, then the same two native scroll actions and outer-page guard.
+Generated utility CSS and the pinned Web Animations/component regression establish
+this lifecycle contract; they do not prove native layout or an attainable field span.
 
 The qualifier does not authenticate, forge, toggle availability or save settings. Providers
 is the current `/settings/providers` route, separate from Agents. Expand the
@@ -1208,8 +1223,13 @@ unchanged path, geometry, context and screenshot fences.
 Directory-opening attribution preserves `visual-git-project-directory-open`, then
 marks only existing awaits with `visual-git-project-directory-` plus
 `add`, `browse` or `nested` and `displayed`, `unique`, `enabled` or `click`, or
-`path-fill`/`path-commit`. These closed phases add no browser read/action or wait,
-contain optional attribution faults and preserve original exceptions and cleanup.
+`path-focus`/`path-select`/`path-fill`/`path-commit`. These closed markers describe
+only their existing public awaits and contain attribution faults without replacing
+original exceptions or cleanup. Fill this Linux browser's buffered directory field
+through public focus, Control+A, SDK addValue and the existing Enter commit. SDK
+setValue clears and unfocuses before send-keys focuses again; the DraftInput can
+restore its server-backed value on that second focus. The public selection replaces
+that value without another blur/navigation. No extra wait or larger timeout is used.
 They identify an awaited boundary, not the cause of a native timeout. The real
 Add Project hook/dialog/directory browser and pinned SDK typing regression prove
 source behavior using inert operation/query ports; they do not qualify native

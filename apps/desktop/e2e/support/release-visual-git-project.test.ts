@@ -37,6 +37,8 @@ const directoryOperations = [
       (operation) => `${control}-${operation}`,
     ),
   ),
+  "path-focus",
+  "path-select",
   "path-fill",
   "path-commit",
 ];
@@ -76,16 +78,20 @@ function directoryFailure(fault: string, observerFails = false) {
         $: (selector: string) => ({
           waitForDisplayed: () => operation(selector, "displayed"),
           waitForEnabled: () => operation(selector, "enabled"),
-          click: () => operation(selector, "click"),
+          click: () => operation(selector, control(selector) === "path" ? "focus" : "click"),
+          addValue: () => operation(selector, "fill"),
           setValue: () => operation(selector, "fill"),
           getText: async () => "visual-discovered",
         }),
         $$: (selector: string) => ({
           length: operation(selector, "unique").then(() => 1),
         }),
-        keys: async (key: string) => {
-          expect(key).toBe("Enter");
-          await operation('[aria-label="Server directory path"]', "commit");
+        keys: async (key: string | string[]) => {
+          expect(key).toEqual(Array.isArray(key) ? ["Control", "a"] : "Enter");
+          await operation(
+            '[aria-label="Server directory path"]',
+            Array.isArray(key) ? "select" : "commit",
+          );
         },
       },
       owner: {},
@@ -121,6 +127,8 @@ it.each(directoryOperations)(
     expect(f.phases.at(-1)).toBe(`visual-git-project-directory-${operation}`);
     const order = [
       ...directoryOperations.slice(0, 8),
+      "path-focus",
+      "path-select",
       "path-fill",
       "path-commit",
       ...directoryOperations.slice(8, 12),
@@ -134,6 +142,8 @@ it("contains new directory attribution faults and preserves the later capture ex
   await expect(f.run()).rejects.toBe(f.original);
   expect(f.calls).toEqual([
     ...directoryOperations.slice(0, 8),
+    "path-focus",
+    "path-select",
     "path-fill",
     "path-commit",
     ...directoryOperations.slice(8, 12),
@@ -542,6 +552,9 @@ it("runs only the finite public sequence, cancels rewrite preview and keeps tags
         values.set('[aria-label="Server directory path"]', fixture.cloneParent);
     },
     setValue: async (value: string) => {
+      values.set(selector, value);
+    },
+    addValue: async (value: string) => {
       values.set(selector, value);
     },
     getValue: async () => values.get(selector),

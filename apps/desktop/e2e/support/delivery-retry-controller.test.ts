@@ -43,6 +43,15 @@ const runControllerSource = (
   options?: Parameters<typeof NodeVM.runInNewContext>[2],
 ) => NodeVM.runInNewContext(code, { resolveSettingsVisualFailureScene, ...context }, options);
 
+/** Keep the extracted callback's actual factored Git check in the same lexical scope. */
+function coreOwnedSourceFactoryCode() {
+  const start = controller.indexOf("        const verifyVisualOwnedSource = async () => {");
+  const end = controller.indexOf("        const proof = await runVisualCore({", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  return controller.slice(start, end);
+}
+
 const environment = {
   CI: "true",
   BIBCODE_UPLOAD_SOURCE: "a".repeat(40),
@@ -346,7 +355,7 @@ describe("closed text-row failure boundary", () => {
     async (mode) => {
       const coreStart = controller.indexOf('if (config.selection === "release-visual-core")');
       const start = controller.indexOf("          verifyManaged: async () => {", coreStart);
-      const end = controller.indexOf("          partialStageMatches:", start);
+      const end = controller.indexOf("          captureImageOriginal:", start);
       expect(start).toBeGreaterThan(coreStart);
       expect(end).toBeGreaterThan(start);
       const workspace = {
@@ -358,7 +367,9 @@ describe("closed text-row failure boundary", () => {
       const calls: string[] = [];
       const invoke = runControllerSource(
         NodeModule.stripTypeScriptTypes(
-          "let textRowObservationInput = { old: true }; const verify = ({" +
+          "let textRowObservationInput = { old: true }; " +
+            coreOwnedSourceFactoryCode() +
+            "const verify = ({" +
             controller.slice(start, end) +
             "}).verifyManaged; async () => { let failed = false; try { await verify(); } catch { failed = true; } return { input: textRowObservationInput, failed }; }",
         ),
@@ -1748,7 +1759,14 @@ describe.each(["visual", "pre-loss", "recovery"])(
     it.each(["owned-thread", "replaced-thread"])(
       "retains the captured card ID after its title changes: %s",
       async (selectedId) => {
-        const workspace = { branch: "codex/delivery-retry-light", threadId: "owned-thread" };
+        const workspace = {
+          branch: "codex/delivery-retry-light",
+          threadId: "owned-thread",
+          path: "/owned/worktree",
+          commonDirectory: "/owned/common",
+        };
+        const visualInput = { fixture: "owned" };
+        let sourceReads = 0;
         const anchor =
           phase === "visual"
             ? "          verifyManaged: async () => {"
@@ -1756,10 +1774,10 @@ describe.each(["visual", "pre-loss", "recovery"])(
               ? '        step("workspace-verify-identity");'
               : '        step("workspace-wait-recovered");';
         const opening = controller.indexOf(anchor);
-        const start = phase === "visual" ? opening + anchor.length : opening;
+        const start = opening;
         const end = controller.indexOf(
           phase === "visual"
-            ? "            check("
+            ? "          captureImageOriginal:"
             : phase === "pre-loss"
               ? "        check(\n          JSON.stringify("
               : "        check(\n          readOwnedDeliveryWorktree(",
@@ -1801,12 +1819,29 @@ describe.each(["visual", "pre-loss", "recovery"])(
         };
         const run = runControllerSource(
           NodeModule.stripTypeScriptTypes(
-            "async function verify() {" + controller.slice(start, end) + "}\nverify",
+            phase === "visual"
+              ? "let textRowObservationInput = null; " +
+                  coreOwnedSourceFactoryCode() +
+                  "const verify = ({" +
+                  controller.slice(start, end) +
+                  "}).verifyManaged; verify"
+              : "async function verify() {" + controller.slice(start, end) + "}\nverify",
           ),
           {
             origin: "http://127.0.0.1:4885",
+            theme: "light",
             workspace,
+            visualInput,
             readSelectedDeliveryWorktree,
+            readOwnedDeliveryWorktree: (input: unknown) => {
+              expect(input).toEqual(visualInput);
+              sourceReads++;
+              return {
+                path: workspace.path,
+                branch: workspace.branch,
+                commonDirectory: workspace.commonDirectory,
+              };
+            },
             step: () => {},
             check: (value: unknown) => {
               if (!value) throw new Error("Owned refusal.");
@@ -1822,6 +1857,7 @@ describe.each(["visual", "pre-loss", "recovery"])(
         ) as () => Promise<void>;
         if (selectedId === "owned-thread") await expect(run()).resolves.toBeUndefined();
         else await expect(run()).rejects.toThrow("Owned refusal.");
+        expect(sourceReads).toBe(phase === "visual" && selectedId === "owned-thread" ? 1 : 0);
       },
     );
   },

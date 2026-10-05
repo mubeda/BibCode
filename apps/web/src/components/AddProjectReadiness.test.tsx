@@ -31,7 +31,13 @@ vi.mock("~/state/filesystem", () => ({
 vi.mock("~/state/query", () => ({
   useEnvironmentQuery: (target: { environmentId: string; input: { partialPath: string } }) => {
     h.browseInputs.push(target);
-    const path = target.input.partialPath;
+    const requestedPath = target.input.partialPath;
+    const knownDirectory = [
+      "/owned/initial",
+      "/owned/visual-git-project/ordinary",
+      "/owned/visual-git-project/ordinary/nested",
+    ].includes(requestedPath);
+    const path = knownDirectory ? requestedPath : "/owned/initial";
     return {
       data: {
         directoryPath: path,
@@ -47,7 +53,9 @@ vi.mock("~/state/query", () => ({
               { name: "leaf", fullPath: path + "/leaf" },
               { name: "nested", fullPath: path + "/nested" },
             ]
-          : [{ name: "nested", fullPath: path + "/nested" }],
+          : path === "/owned/visual-git-project/ordinary"
+            ? [{ name: "nested", fullPath: path + "/nested" }]
+            : [],
       },
       error: null,
       isPending: false,
@@ -289,6 +297,7 @@ it("runs the actual QA directory path through public browser controls and instal
     { VALID_TYPES: ["string", "number"] },
   );
   const requested = "/owned/visual-git-project/ordinary";
+  let refocusRestoredValue = false;
   const nativeValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
   const findAll = (selector: string) => {
     // HappyDOM has no XPath engine. This inert transport admits only the unchanged public action.
@@ -318,30 +327,59 @@ it("runs the actual QA directory path through public browser controls and instal
         elementId: "owned-directory-input",
         clearValue: () => sdk.clearValue.call(input),
         addValue: (value: string) => sdk.addValue.call(input, value),
-        elementClear: async () =>
-          act(async () => {
-            const field = node();
+        elementClear: async () => {
+          const field = node();
+          // W3C clear focuses, clears, then unfocuses; each native event can settle React state.
+          await act(async () => {
             field.focus();
+          });
+          await act(async () => {
             nativeValue.call(field, "");
             field.dispatchEvent(new Event("input", { bubbles: true }));
-          }),
-        elementSendKeys: async (_id: string, value: string) =>
-          act(async () => {
-            const field = node();
-            nativeValue.call(field, value);
+          });
+          await act(async () => field.blur());
+        },
+        elementSendKeys: async (_id: string, value: string) => {
+          const field = node();
+          // Send Keys focuses a cleared field again and appends to its current controlled value.
+          const needsFocus = document.activeElement !== field;
+          if (needsFocus) await act(async () => field.focus());
+          refocusRestoredValue ||= needsFocus && (field as HTMLInputElement).value !== "";
+          await act(async () => {
+            const input = field as HTMLInputElement;
+            const start = needsFocus
+              ? input.value.length
+              : (input.selectionStart ?? input.value.length);
+            const end = needsFocus
+              ? input.value.length
+              : (input.selectionEnd ?? input.value.length);
+            nativeValue.call(field, input.value.slice(0, start) + value + input.value.slice(end));
+            input.setSelectionRange(start + value.length, start + value.length);
             field.dispatchEvent(new Event("input", { bubbles: true }));
-          }),
+          });
+        },
       };
       return {
         waitForDisplayed: async () => expect(node()).toBeInstanceOf(HTMLElement),
         waitForEnabled: async () => expect(node().hasAttribute("disabled")).toBe(false),
-        click: async () => act(async () => node().click()),
+        click: async () =>
+          act(async () => {
+            node().focus();
+            node().click();
+          }),
+        addValue: (value: string) => sdk.addValue.call(input, value),
         setValue: (value: string) => sdk.setValue.call(input, value),
       };
     },
     $$: (selector: string) => ({ length: Promise.resolve(findAll(selector).length) }),
-    keys: async (key: string) =>
+    keys: async (key: string | string[]) =>
       act(async () => {
+        if (Array.isArray(key)) {
+          expect(key).toEqual(["Control", "a"]);
+          expect(document.activeElement).toBeInstanceOf(HTMLInputElement);
+          (document.activeElement as HTMLInputElement).select();
+          return;
+        }
         expect(key).toBe("Enter");
         document.activeElement!.dispatchEvent(
           new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
@@ -376,7 +414,14 @@ it("runs the actual QA directory path through public browser controls and instal
       refused: () => new Error("Directory admission refused."),
     },
   );
-  await run();
+  await run().catch((error: unknown) => {
+    // This is a fixed synthetic-prefix comparison, never a retained native path.
+    expect(refocusRestoredValue).toBe(false);
+    expect(
+      h.browseInputs.some((target) => target.input.partialPath === "/owned/initial" + requested),
+    ).toBe(false);
+    throw error;
+  });
   expect(capture).toHaveBeenCalledOnce();
   expect(document.querySelectorAll('button[aria-label="Open nested"]')).toHaveLength(2);
   // Ideal geometry tests the serialized predicate, never native pixel layout or capture approval.

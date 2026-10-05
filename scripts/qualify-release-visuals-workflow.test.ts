@@ -6,6 +6,7 @@ const visualScenes = [
   "workspace-composite",
   "workspace-card-menu",
   "worktree-create-ref",
+  "git-image-diff",
   "git-changes-diff",
   "git-history-stashes",
   "git-branch-menu",
@@ -91,7 +92,7 @@ describe("first visual batch workflow boundary", () => {
       },
     });
   });
-  it("has no automatic trigger and retains only the fixed sixteen originals and closed receipts", () => {
+  it("has no automatic trigger and retains only the fixed eighteen originals and closed receipts", () => {
     const path = new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url);
     expect(NodeFS.existsSync(path)).toBe(true);
     const value = YAML.parse(NodeFS.readFileSync(path, "utf8"));
@@ -128,6 +129,7 @@ describe("first visual batch workflow boundary", () => {
     for (const name of [
       "release-visual-fixture",
       "release-visual-core",
+      "release-visual-core-image",
       "release-visual-evidence",
       "release-visual-observation",
       "release-visual-boundaries",

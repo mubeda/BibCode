@@ -1,3 +1,4 @@
+import { runCoreImageDiffOriginal } from "./release-visual-core-image.ts";
 // @vitest-environment happy-dom
 // @effect-diagnostics nodeBuiltinImport:off - Synthetic PNG and inert WebDriver boundary only; no browser or server starts.
 import * as NodeFS from "node:fs";
@@ -1735,7 +1736,7 @@ it("checks the shared managed-worktree identity before the first exact scene and
   expect(order).toEqual(["verified-managed", "visual-workspace-composite", "workspace-composite"]);
 });
 it.each([true, false])(
-  "runs only the eight fixed scenes and requires the supported image proof: loaded=%s",
+  "runs only the nine fixed scenes and requires the supported image proof: loaded=%s",
   async (imageLoaded) => {
     const calls: string[] = [],
       captures: string[] = [];
@@ -1772,14 +1773,32 @@ it.each([true, false])(
             calls.push("read-working-image-binary");
             return true;
           }
-          if (read.name === "readVisualImageLoaded") {
+          if (read.name === "readCoreImageDiffWitness") {
             calls.push("read-supported-commit-image");
-            return imageLoaded;
+            return Object.fromEntries(
+              [
+                "themeMatched",
+                "selectedMatched",
+                "expectedTextMatched",
+                "targetInView",
+                "credentialAbsent",
+                "bootShellAbsent",
+                "selectedBaseline",
+                "selectedImage",
+                "loadedImages",
+                "beforeAfterVisible",
+                "twoUpMode",
+              ].map((key) => [
+                key,
+                key === "loadedImages" || key === "expectedTextMatched" ? imageLoaded : true,
+              ]),
+            );
           }
           return { x: 0, y: 0 };
         },
       },
       owner: {
+        cleanup: async (_role: string, run: () => Promise<void>) => run(),
         until: async (read: () => Promise<boolean>) => {
           if (!(await read())) throw new Error("Inert required image load did not arrive.");
         },
@@ -1793,6 +1812,20 @@ it.each([true, false])(
       openWorktreeDialog: async () => {
         calls.push("shared-worktree-opener");
       },
+      captureImageOriginal: (capture: () => Promise<void>) =>
+        runCoreImageDiffOriginal({
+          browser: input.browser,
+          owner: input.owner,
+          theme: "light",
+          origin: "http://127.0.0.1:4885",
+          threadId: input.threadId,
+          branch: input.branch,
+          verifyOwnedSource: async () => {
+            calls.push("verify-image-source");
+          },
+          capture,
+          step: () => {},
+        }),
       partialStageMatches: () => {
         calls.push("read-actual-partial-stage");
         return true;
@@ -1823,6 +1856,7 @@ it.each([true, false])(
       "workspace-composite",
       "workspace-card-menu",
       "worktree-create-ref",
+      "git-image-diff",
       "git-changes-diff",
       "git-history-stashes",
       "git-branch-menu",
@@ -1862,7 +1896,7 @@ it.each([true, false])(
       dialogCancelled: true,
       draftRetained: true,
       noCommandExecuted: true,
-      unpictured: ["git-image-diff", "files-context-menu", "workspace-terminal-and-other-chat"],
+      unpictured: ["files-context-menu", "workspace-terminal-and-other-chat"],
     });
   },
 );

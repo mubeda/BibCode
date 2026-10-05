@@ -805,6 +805,8 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
   const observeDirectoryAwait = (
     operation:
       | `${DirectoryControl}-${"displayed" | "unique" | "enabled" | "click"}`
+      | "path-focus"
+      | "path-select"
       | "path-fill"
       | "path-commit",
   ) => {
@@ -888,8 +890,13 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
     '//button[@data-add-project-action="true"][.//span[normalize-space()="Browse folder"]]',
     "browse",
   );
+  const directoryPath = browser.$('[aria-label="Server directory path"]');
+  observeDirectoryAwait("path-focus");
+  await directoryPath.click();
+  observeDirectoryAwait("path-select");
+  await browser.keys(["Control", "a"]);
   observeDirectoryAwait("path-fill");
-  await browser.$('[aria-label="Server directory path"]').setValue(fixture.ordinary);
+  await directoryPath.addValue(fixture.ordinary);
   observeDirectoryAwait("path-commit");
   await browser.keys("Enter");
   await click('button[aria-label="Open nested"]', "nested");

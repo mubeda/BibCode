@@ -1,3 +1,4 @@
+import { runCoreImageDiffOriginal } from "./support/release-visual-core-image.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Disposable CI browser qualifier owns fixture paths.
 // @effect-diagnostics globalFetch:off - Only the owned loopback CLI is probed.
 // @effect-diagnostics globalTimers:off - Real bounded negative observation windows.
@@ -1388,6 +1389,16 @@ export async function runDeliveryRetryQualification() {
       check(!(await browser.$(surface).getText()).includes(newConversationNotice));
       if (config.selection === "release-visual-core") {
         await type("Owned visual review draft");
+        const verifyVisualOwnedSource = async () => {
+          check(
+            JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
+              JSON.stringify({
+                path: workspace.path,
+                branch: workspace.branch,
+                commonDirectory: workspace.commonDirectory,
+              }),
+          );
+        };
         const proof = await runVisualCore({
           browser,
           owner,
@@ -1407,14 +1418,7 @@ export async function runDeliveryRetryQualification() {
                   })
                 )?.threadId === workspace.threadId,
             );
-            check(
-              JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
-                JSON.stringify({
-                  path: workspace.path,
-                  branch: workspace.branch,
-                  commonDirectory: workspace.commonDirectory,
-                }),
-            );
+            await verifyVisualOwnedSource();
             textRowObservationInput = {
               theme,
               origin,
@@ -1422,6 +1426,18 @@ export async function runDeliveryRetryQualification() {
               branch: workspace.branch,
             };
           },
+          captureImageOriginal: (capture) =>
+            runCoreImageDiffOriginal({
+              browser: b(),
+              owner,
+              theme,
+              origin,
+              threadId: workspace.threadId,
+              branch: workspace.branch,
+              verifyOwnedSource: verifyVisualOwnedSource,
+              capture,
+              step,
+            }),
           partialStageMatches: () => visualPartialStageMatches(visualInput),
           recordClearObservation: (value) => {
             createRefClearObservation = projectVisualNameClearObservation(value);
@@ -1446,6 +1462,9 @@ export async function runDeliveryRetryQualification() {
                 origin,
                 threadId: workspace.threadId,
                 branch: workspace.branch,
+                ...(scene === "git-image-diff"
+                  ? { verifyOwnedSource: verifyVisualOwnedSource }
+                  : {}),
                 ...(scene === "git-branch-menu"
                   ? {
                       observeFailure: createCoreBranchCaptureFailureObserver(
@@ -1801,7 +1820,7 @@ export async function runDeliveryRetryQualification() {
       childProcessesClosed: owner.childrenClosed(),
       scope:
         config.selection === "release-visual-core"
-          ? "First eight Linux Chromium scene pairs only. Original PNGs require independent review; unpictured surfaces and the remaining issue29 matrix are unqualified. No Playwright, Tauri or final-release acceptance claim."
+          ? "First nine Linux Chromium scene pairs only. Original PNGs require independent review; unpictured surfaces and the remaining issue29 matrix are unqualified. No Playwright, Tauri or final-release acceptance claim."
           : config.selection === "release-visual-settings"
             ? "Four Linux Chromium settings scene pairs only. Add instance wizard and declared unpictured substates remain unqualified. Original light/dark PNGs require independent review; no native or full-matrix qualification claim."
             : config.selection === "release-visual-git-project"

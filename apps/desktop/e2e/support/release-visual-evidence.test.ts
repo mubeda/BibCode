@@ -17,6 +17,13 @@ const scenes = {
     "agentControl",
     "advancedControl",
   ],
+  "git-image-diff": [
+    "selectedBaseline",
+    "selectedImage",
+    "loadedImages",
+    "beforeAfterVisible",
+    "twoUpMode",
+  ],
   "git-changes-diff": ["selectedTextDiff", "stagingGutter", "stagedAndUnstaged", "imageRow"],
   "git-history-stashes": [
     "selectedCommit",
@@ -39,7 +46,7 @@ const common = {
 };
 
 describe("finite first visual batch evidence", () => {
-  it("admits exactly eight scene pairs and refuses arbitrary file names", () => {
+  it("admits exactly nine scene pairs and refuses arbitrary file names", () => {
     const filenames = Object.keys(scenes).flatMap((scene) => [
       visualScreenshotName(scene, "light"),
       visualScreenshotName(scene, "dark"),
@@ -51,6 +58,8 @@ describe("finite first visual batch evidence", () => {
       "workspace-card-menu-dark.png",
       "worktree-create-ref-light.png",
       "worktree-create-ref-dark.png",
+      "git-image-diff-light.png",
+      "git-image-diff-dark.png",
       "git-changes-diff-light.png",
       "git-changes-diff-dark.png",
       "git-history-stashes-light.png",

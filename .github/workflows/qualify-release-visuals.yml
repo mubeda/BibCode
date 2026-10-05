@@ -44,7 +44,7 @@ jobs:
           python3 -B scripts/qualify-chat-uploads.test.py
           python3 -B scripts/qualify-chat-network.test.py
           python3 -B scripts/qualify-chat-uploads.py preflight
-          vp test run scripts/qualify-release-visuals-workflow.test.ts apps/desktop/e2e/support/release-visual-fixture.test.ts apps/desktop/e2e/support/release-visual-core.test.ts apps/desktop/e2e/support/release-visual-evidence.test.ts apps/desktop/e2e/support/release-visual-observation.test.ts apps/desktop/e2e/support/release-visual-boundaries.test.ts apps/desktop/e2e/support/provider-shims.test.ts apps/desktop/e2e/support/qualification-owner.test.ts apps/desktop/e2e/support/remote-ui-evidence.test.ts apps/desktop/e2e/support/delivery-retry-evidence.test.ts apps/desktop/e2e/support/delivery-retry-flow.test.ts apps/desktop/e2e/support/delivery-retry-controller.test.ts apps/desktop/e2e/support/delivery-import-observation.test.ts apps/desktop/e2e/support/delivery-retry-workspace.test.ts apps/desktop/e2e/support/browser-network.test.ts
+          vp test run scripts/qualify-release-visuals-workflow.test.ts apps/desktop/e2e/support/release-visual-fixture.test.ts apps/desktop/e2e/support/release-visual-core.test.ts apps/desktop/e2e/support/release-visual-core-image.test.ts apps/desktop/e2e/support/release-visual-evidence.test.ts apps/desktop/e2e/support/release-visual-observation.test.ts apps/desktop/e2e/support/release-visual-boundaries.test.ts apps/desktop/e2e/support/provider-shims.test.ts apps/desktop/e2e/support/qualification-owner.test.ts apps/desktop/e2e/support/remote-ui-evidence.test.ts apps/desktop/e2e/support/delivery-retry-evidence.test.ts apps/desktop/e2e/support/delivery-retry-flow.test.ts apps/desktop/e2e/support/delivery-retry-controller.test.ts apps/desktop/e2e/support/delivery-import-observation.test.ts apps/desktop/e2e/support/delivery-retry-workspace.test.ts apps/desktop/e2e/support/browser-network.test.ts
           vp test run apps/desktop/e2e/support/release-visual-settings.test.ts apps/desktop/e2e/support/release-visual-settings-fixture.test.ts apps/desktop/e2e/support/release-visual-settings-preflight.test.ts apps/desktop/e2e/support/release-visual-settings-wiring.test.ts
           vp test run apps/desktop/e2e/support/release-visual-git-project.test.ts apps/desktop/e2e/support/release-visual-git-project-fixture.test.ts
       - name: Build the source UI once with owned loopback targets
@@ -110,6 +110,8 @@ jobs:
             ${{ runner.temp }}/issue29-core-${{ github.run_id }}/workspace-card-menu-dark.png
             ${{ runner.temp }}/issue29-core-${{ github.run_id }}/worktree-create-ref-light.png
             ${{ runner.temp }}/issue29-core-${{ github.run_id }}/worktree-create-ref-dark.png
+            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-image-diff-light.png
+            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-image-diff-dark.png
             ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-changes-diff-light.png
             ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-changes-diff-dark.png
             ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-history-stashes-light.png

@@ -1,3 +1,4 @@
+import { readCoreImageDiffWitness } from "./release-visual-core-image.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Writes only finite original PNG evidence in the owned root.
 import * as NodeFS from "node:fs";
 import * as NodeCrypto from "node:crypto";
@@ -22,7 +23,6 @@ import {
 } from "./release-visual-evidence.ts";
 import {
   readVisualWitness,
-  readVisualImageLoaded,
   readVisualWorkingImageSelected,
   readVisualPageScroll,
   observeVisualNameClear,
@@ -35,6 +35,8 @@ export interface VisualCaptureInput extends VisualObservationInput {
   evidence: string;
   captured: Set<string>;
   observeFailure?: (error: unknown, witness: Readonly<Record<string, boolean>> | null) => void;
+  /** Required for the owned image original; ordinary scene behavior remains unchanged. */
+  verifyOwnedSource?: () => Promise<void>;
 }
 export async function captureVisualScene(input: VisualCaptureInput): Promise<object> {
   let latestFailureFacts: Readonly<Record<string, boolean>> | null = null;
@@ -42,6 +44,12 @@ export async function captureVisualScene(input: VisualCaptureInput): Promise<obj
     const file = visualScreenshotName(input.scene, input.theme);
     if (input.captured.has(file) || (await input.browser.isAlertOpen()))
       throw new Error("Visual capture refused.");
+    const verifyImageSource = input.scene === "git-image-diff" ? input.verifyOwnedSource : null;
+    if (input.scene === "git-image-diff" && typeof verifyImageSource !== "function")
+      throw new Error("Owned image capture source refused.");
+    if (verifyImageSource) await verifyImageSource();
+    const readWitness: (value: VisualObservationInput) => Record<string, boolean> | null =
+      input.scene === "git-image-diff" ? readCoreImageDiffWitness : readVisualWitness;
     const observation: VisualObservationInput = {
       scene: input.scene,
       theme: input.theme,
@@ -51,7 +59,7 @@ export async function captureVisualScene(input: VisualCaptureInput): Promise<obj
     };
     let witness: Record<string, true> | undefined;
     await input.owner.until(async () => {
-      const value = await bounded(input.browser.execute(readVisualWitness, observation), 2_000);
+      const value = await bounded(input.browser.execute(readWitness, observation), 2_000);
       if (input.scene === "git-branch-menu")
         latestFailureFacts = projectCoreBranchCaptureFailureWitness(value);
       try {
@@ -62,10 +70,8 @@ export async function captureVisualScene(input: VisualCaptureInput): Promise<obj
       }
     });
     const bytes = Buffer.from(await bounded(input.browser.takeScreenshot(), 5_000), "base64");
-    const finalWitness = await bounded(
-      input.browser.execute(readVisualWitness, observation),
-      2_000,
-    );
+    if (verifyImageSource) await verifyImageSource();
+    const finalWitness = await bounded(input.browser.execute(readWitness, observation), 2_000);
     if (input.scene === "git-branch-menu")
       latestFailureFacts = projectCoreBranchCaptureFailureWitness(finalWitness);
     validateVisualWitness(input.scene, finalWitness);
@@ -93,9 +99,10 @@ export interface VisualCoreInput {
   openWorktreeDialog: () => Promise<void>;
   verifyManaged: () => Promise<void>;
   partialStageMatches: () => boolean;
+  captureImageOriginal: (capture: () => Promise<void>) => Promise<void>;
   recordClearObservation?: (value: ReturnType<typeof projectVisualNameClearObservation>) => void;
 }
-/** One fixed eight-scene sequence. Every UI mutation is an ordinary WebDriver action. */
+/** One fixed nine-scene sequence. Every UI mutation is an ordinary WebDriver action. */
 export async function runVisualCore(input: VisualCoreInput): Promise<object> {
   const { browser, owner, step } = input;
   const capture = async (scene: VisualScene) => {
@@ -254,12 +261,7 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
   // Image bytes are supported for commit diffs. Retain the binary working-tree
   // row check, then inspect the existing two-sided baseline through History.
   step("visual-image-inspect");
-  await click('//button[@role="tab" and normalize-space()="History"]');
-  await click('//button[@role="option" and contains(@aria-label,"Visual qualification baseline")]');
-  await click(
-    '[aria-label="Repository history"] [aria-label="Changed files"] button[data-changed-file-path="visual-swatch.png"]',
-  );
-  await owner.until(async () => bounded(browser.execute(readVisualImageLoaded), 2_000));
+  await input.captureImageOriginal(() => capture("git-image-diff"));
   step("visual-partial-stage");
   await click('//button[@role="tab" and normalize-space()="Changes"]', "changes-tab");
   await click('[role="option"][data-path="pierre-step5.ts"]', "text-row");
@@ -381,6 +383,6 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
     dialogCancelled: true,
     draftRetained: true,
     noCommandExecuted: true,
-    unpictured: ["git-image-diff", "files-context-menu", "workspace-terminal-and-other-chat"],
+    unpictured: ["files-context-menu", "workspace-terminal-and-other-chat"],
   };
 }

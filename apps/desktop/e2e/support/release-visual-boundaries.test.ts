@@ -102,7 +102,8 @@ describe("visual preparation source boundaries", () => {
     for (const boundary of [
       "openWorktreeDialog,",
       "readSelectedDeliveryWorktree",
-      "readOwnedDeliveryWorktree(visualInput)",
+      "verifyVisualOwnedSource",
+      "runCoreImageDiffOriginal",
       "captureVisualScene",
       "visualPartialStageMatches(visualInput)",
     ])
@@ -120,7 +121,6 @@ describe("visual preparation source boundaries", () => {
       "observeVisualNameClear",
       "observeVisualNameClear",
       "readVisualWorkingImageSelected",
-      "readVisualImageLoaded",
       "readVisualPageScroll",
       "readVisualPageScroll",
     ]);
@@ -149,12 +149,21 @@ it.each([false, true])(
       /^  let textRowObservationInput: VisualTextRowObservationInput \| null = null;$/m,
     )?.[0];
     expect(inputDeclaration).toBeDefined();
+    const sourceStart = controller.indexOf("        const verifyVisualOwnedSource = async () => {");
+    const sourceEnd = controller.indexOf(
+      "        const proof = await runVisualCore({",
+      sourceStart,
+    );
+    expect(sourceStart).toBeGreaterThan(0);
+    expect(sourceEnd).toBeGreaterThan(sourceStart);
     const actual: {
       verifyManaged: () => Promise<void>;
       readInput: () => VisualTextRowObservationInput | null;
     } = NodeVM.runInNewContext(
       NodeModule.stripTypeScriptTypes(
         inputDeclaration +
+          "\n" +
+          controller.slice(sourceStart, sourceEnd) +
           "\nconst verifyManaged = ({" +
           controller.slice(begin, end) +
           "}).verifyManaged; ({ verifyManaged, readInput: () => textRowObservationInput })",

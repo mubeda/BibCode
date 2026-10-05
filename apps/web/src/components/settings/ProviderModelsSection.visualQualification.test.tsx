@@ -12,7 +12,8 @@ import {
   RouterProvider,
 } from "@tanstack/react-router";
 import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@bibcode/contracts";
-import { act } from "react";
+import { act, useState } from "react";
+import { compile } from "tailwindcss";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vite-plus/test";
 import { Route as SettingsRoute } from "../../routes/settings";
@@ -64,6 +65,122 @@ function installedSdkScroll(browser: unknown) {
     action: () => new sdk.WheelAction(browser),
   };
 }
+
+it("keeps the actual controller's existing field wait pending until the real panel opening completes", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("BASE_UI_ANIMATIONS_DISABLED", false);
+  let finishOpening!: () => void;
+  const opening = {
+    promise: new Promise<void>((resolve) => {
+      finishOpening = resolve;
+    }),
+    resolve: () => finishOpening(),
+  };
+  let animationObserved = false;
+  const animations = Object.getOwnPropertyDescriptor(Element.prototype, "getAnimations");
+  Object.defineProperty(Element.prototype, "getAnimations", {
+    configurable: true,
+    value: function (this: Element) {
+      if (this.getAttribute("data-slot") !== "collapsible-panel") return [];
+      animationObserved = true;
+      return [{ finished: opening.promise, playState: "running", pending: false }];
+    },
+  });
+  const styles = document.createElement("style");
+  styles.textContent = (await compile("@tailwind utilities;"))
+    .build([
+      "h-(--collapsible-panel-height)",
+      "overflow-hidden",
+      "transition-[height]",
+      "duration-200",
+      "data-starting-style:h-0",
+    ])
+    .replaceAll("@layer properties;", "");
+  document.head.append(styles);
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const driver = ProviderDriverKind.make("claudeAgent"),
+    instanceId = ProviderInstanceId.make("claudeAgent");
+  function Card() {
+    const [expanded, setExpanded] = useState(false);
+    return (
+      <ProviderInstanceCard
+        instanceId={instanceId}
+        instance={{
+          driver,
+          enabled: true,
+          config: { binaryPath: "claude", homePath: "", launchArgs: "" },
+        }}
+        driverOption={DRIVER_OPTION_BY_VALUE[driver]}
+        liveProvider={undefined}
+        isExpanded={expanded}
+        onExpandedChange={setExpanded}
+        onUpdate={() => {}}
+        hiddenModels={[]}
+        favoriteModels={[]}
+        modelOrder={[]}
+        onHiddenModelsChange={() => {}}
+        onFavoriteModelsChange={() => {}}
+        onModelOrderChange={() => {}}
+      />
+    );
+  }
+  try {
+    await act(async () => root.render(<Card />));
+    expect(document.querySelector("#provider-instance-claudeAgent-binaryPath")).toBeNull();
+    await act(async () =>
+      document
+        .querySelector<HTMLButtonElement>('button[aria-label="Toggle Claude details"]')!
+        .click(),
+    );
+    await vi.waitFor(() => expect(animationObserved).toBe(true));
+    const panel = document.querySelector<HTMLElement>('[data-slot="collapsible-panel"]')!;
+    expect(panel.style.getPropertyValue("--collapsible-panel-height")).not.toBe("auto");
+    expect(document.querySelector("#provider-instance-claudeAgent-binaryPath")).not.toBeNull();
+    const source = NodeFS.readFileSync(
+      new NodeURL.URL(
+        "../../../../desktop/e2e/support/release-visual-settings.ts",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    const start = source.indexOf("    expandedClaude = true;"),
+      end = source.indexOf(
+        '    await scroll("#provider-instance-claudeAgent-binaryPath", "start");',
+        start,
+      );
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function wait() {" + source.slice(start, end) + "}\nwait",
+      ),
+      {
+        expandedClaude: false,
+        browser: {
+          $: (selector: string) => ({
+            waitForDisplayed: async () => {
+              // This checks the real lifecycle/selector contract, never HappyDOM pixel layout.
+              expect(document.querySelector(selector)).toBeNull();
+              await act(async () => opening.resolve());
+              await vi.waitFor(() => expect(document.querySelector(selector)).not.toBeNull());
+            },
+          }),
+        },
+      },
+    );
+    await run();
+    expect(panel.style.getPropertyValue("--collapsible-panel-height")).toBe("auto");
+  } finally {
+    await act(async () => opening.resolve());
+    await act(async () => root.unmount());
+    container.remove();
+    styles.remove();
+    if (animations) Object.defineProperty(Element.prototype, "getAnimations", animations);
+    else Reflect.deleteProperty(Element.prototype, "getAnimations");
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  }
+});
 
 it.each([false, true])(
   "reads the actual mounted Opus models card with favorite=%s",
