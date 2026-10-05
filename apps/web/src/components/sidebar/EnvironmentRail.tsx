@@ -44,12 +44,19 @@ const RAIL_BUTTON_CLASS =
 const RAIL_BUTTON_SELECTED_CLASS =
   "bg-accent text-foreground ring-2 ring-primary before:absolute before:top-2 before:bottom-2 before:-left-2 before:w-[3px] before:rounded-full before:bg-primary";
 
-function StatusDot({ status }: { readonly status: EnvironmentRailStatus }) {
+export function EnvironmentStatusDot({
+  status,
+  className = "absolute right-0.5 bottom-0.5",
+}: {
+  readonly status: EnvironmentRailStatus;
+  readonly className?: string;
+}) {
   return (
     <span
       data-status={status}
       className={cn(
-        "absolute right-0.5 bottom-0.5 size-2 rounded-full border-2 border-sidebar",
+        "size-2 rounded-full border-2 border-sidebar",
+        className,
         STATUS_DOT_CLASS[status],
       )}
     />
@@ -90,7 +97,7 @@ function RemoteEntryButton({
         >
           {entry.avatar}
         </span>
-        <StatusDot status={entry.status} />
+        <EnvironmentStatusDot status={entry.status} />
       </TooltipTrigger>
       <TooltipPopup side="right">{entry.label}</TooltipPopup>
     </Tooltip>
@@ -231,7 +238,7 @@ export function EnvironmentRail() {
           <Menu>
             <MenuTrigger render={<button {...localButtonProps} />}>
               <MonitorIcon className="size-[18px]" />
-              <StatusDot status={model.localStatus} />
+              <EnvironmentStatusDot status={model.localStatus} />
             </MenuTrigger>
             <MenuPopup side="right" align="start">
               {model.localSubEntries.map((entry) => (
@@ -259,7 +266,7 @@ export function EnvironmentRail() {
               }
             >
               <MonitorIcon className="size-[18px]" />
-              <StatusDot status={model.localStatus} />
+              <EnvironmentStatusDot status={model.localStatus} />
             </TooltipTrigger>
             <TooltipPopup side="right">Local — this machine</TooltipPopup>
           </Tooltip>
