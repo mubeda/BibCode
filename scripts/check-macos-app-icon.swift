@@ -9,10 +9,12 @@ enum IconVerificationStage: String {
   case workspaceReturned = "workspace-returned"
   case imageSizeDispatched = "image-size-dispatched"
   case imageSizeReturned = "image-size-returned"
-  case tiffDispatched = "tiff-dispatched"
-  case tiffReturned = "tiff-returned"
   case bitmapDispatched = "bitmap-dispatched"
   case bitmapReturned = "bitmap-returned"
+  case contextDispatched = "context-dispatched"
+  case contextReturned = "context-returned"
+  case drawDispatched = "draw-dispatched"
+  case drawReturned = "draw-returned"
   case pixelScanDispatched = "pixel-scan-dispatched"
   case pixelScanReturned = "pixel-scan-returned"
   case verdictRejected = "verdict-rejected"
@@ -41,7 +43,127 @@ func observeIconStage(
   fflush(stderr)
 }
 
+// Rasterize the selected Finder representation, rather than serializing every
+// representation through TIFF. Keep the pixel grid at 1024 square and the icon
+// at 256 points, independent of the runner display scale.
+func renderIcon(_ image: NSImage, observing: Bool = true) -> NSBitmapImageRep? {
+  if observing { observeIconStage(.bitmapDispatched) }
+  let bitmap = NSBitmapImageRep(
+    bitmapDataPlanes: nil, pixelsWide: 1024, pixelsHigh: 1024,
+    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+  )
+  if observing { observeIconStage(.bitmapReturned) }
+  guard let bitmap = bitmap else { return nil }
+  if observing { observeIconStage(.contextDispatched) }
+  let context = NSGraphicsContext(bitmapImageRep: bitmap)
+  if observing { observeIconStage(.contextReturned) }
+  guard let context = context else { return nil }
+  NSGraphicsContext.saveGraphicsState()
+  defer { NSGraphicsContext.restoreGraphicsState() }
+  NSGraphicsContext.current = context
+  context.cgContext.clear(CGRect(x: 0, y: 0, width: 1024, height: 1024))
+  context.cgContext.scaleBy(x: 4, y: 4)
+  if observing { observeIconStage(.drawDispatched) }
+  image.draw(
+    in: NSRect(x: 0, y: 0, width: 256, height: 256),
+    from: .zero, operation: .copy, fraction: 1
+  )
+  if observing { observeIconStage(.drawReturned) }
+  return bitmap
+}
+
+struct IconPixelCounts {
+  let opaque: Int
+  let dark: Int
+  let pale: Int
+
+  var exitStatus: Int32 {
+    if opaque == 0 { return 2 }
+    let darkRatio = Double(dark) / Double(opaque)
+    let paleRatio = Double(pale) / Double(opaque)
+    return darkRatio < 0.70 || paleRatio > 0.25 ? 1 : 0
+  }
+}
+
+func scanIcon(_ bitmap: NSBitmapImageRep) -> IconPixelCounts {
+  var opaque = 0
+  var dark = 0
+  var pale = 0
+  for y in 0..<bitmap.pixelsHigh {
+    for x in 0..<bitmap.pixelsWide {
+      guard
+        let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+        color.alphaComponent > 0.5
+      else { continue }
+      opaque += 1
+      let luminance =
+        0.2126 * color.redComponent +
+        0.7152 * color.greenComponent +
+        0.0722 * color.blueComponent
+      if luminance < 0.15 { dark += 1 }
+      if luminance > 0.70 { pale += 1 }
+    }
+  }
+  return IconPixelCounts(opaque: opaque, dark: dark, pale: pale)
+}
+
+// This CI-only entry checks the real renderer and verdict together. It cannot
+// replace the subsequent check of the exact application mounted from the DMG.
+func runRasterFixtures() -> Bool {
+  let fixtures: [(String, CGFloat?, CGFloat?, Int32)] = [
+    ("black", 256, nil, 0),
+    ("white", nil, 256, 1),
+    ("transparent", nil, nil, 2),
+    ("dark-below-limit", 176, nil, 1),
+    ("pale-above-limit", 184, 256, 1),
+    ("accepted-border", 192, 256, 0),
+  ]
+  for (name, blackWidth, whiteWidth, expected) in fixtures {
+    let image = NSImage(size: NSSize(width: 256, height: 256), flipped: false) { rect in
+      if let whiteWidth = whiteWidth {
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: whiteWidth, height: rect.height).fill()
+      } else if blackWidth != nil {
+        NSColor.gray.setFill()
+        rect.fill()
+      }
+      if let blackWidth = blackWidth {
+        NSColor.black.setFill()
+        NSRect(x: 0, y: 0, width: blackWidth, height: rect.height).fill()
+      }
+      return true
+    }
+    guard let bitmap = renderIcon(image, observing: false),
+      bitmap.pixelsWide == 1024, bitmap.pixelsHigh == 1024
+    else { return false }
+    let counts = scanIcon(bitmap)
+    guard counts.exitStatus == expected else { return false }
+    if name == "black" && (counts.opaque != 1_048_576 || counts.dark != counts.opaque || counts.pale != 0) {
+      return false
+    }
+    if name == "white" && (counts.opaque != 1_048_576 || counts.pale != counts.opaque || counts.dark != 0) {
+      return false
+    }
+    if name == "transparent" && counts.opaque != 0 { return false }
+  }
+  // Independent edge expectations retain both ratio limits and the empty rule.
+  return IconPixelCounts(opaque: 100, dark: 70, pale: 25).exitStatus == 0
+    && IconPixelCounts(opaque: 100, dark: 69, pale: 0).exitStatus == 1
+    && IconPixelCounts(opaque: 100, dark: 74, pale: 26).exitStatus == 1
+    && IconPixelCounts(opaque: 0, dark: 0, pale: 0).exitStatus == 2
+}
+
 observeIconStage(.swiftEntry)
+
+if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test" {
+  guard runRasterFixtures() else {
+    fputs("FAIL: Finder icon raster fixtures\n", stderr)
+    exit(1)
+  }
+  print("PASS: Finder icon raster fixtures")
+  exit(0)
+}
 
 guard CommandLine.arguments.count == 2 else {
   fputs("Usage: check-macos-app-icon.swift /path/to/BiBCode.app\n", stderr)
@@ -61,40 +183,16 @@ observeIconStage(.workspaceReturned)
 observeIconStage(.imageSizeDispatched)
 image.size = NSSize(width: 256, height: 256)
 observeIconStage(.imageSizeReturned)
-observeIconStage(.tiffDispatched)
-let renderedTIFF = image.tiffRepresentation
-observeIconStage(.tiffReturned)
-guard let tiff = renderedTIFF else {
-  fputs("Could not render application icon: \(appPath)\n", stderr)
-  exit(2)
-}
-observeIconStage(.bitmapDispatched)
-let renderedBitmap = NSBitmapImageRep(data: tiff)
-observeIconStage(.bitmapReturned)
-guard let bitmap = renderedBitmap else {
+guard let bitmap = renderIcon(image) else {
   fputs("Could not render application icon: \(appPath)\n", stderr)
   exit(2)
 }
 
-var opaque = 0
-var dark = 0
-var pale = 0
 observeIconStage(.pixelScanDispatched, dimensions: (width: bitmap.pixelsWide, height: bitmap.pixelsHigh))
-for y in 0..<bitmap.pixelsHigh {
-  for x in 0..<bitmap.pixelsWide {
-    guard
-      let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
-      color.alphaComponent > 0.5
-    else { continue }
-    opaque += 1
-    let luminance =
-      0.2126 * color.redComponent +
-      0.7152 * color.greenComponent +
-      0.0722 * color.blueComponent
-    if luminance < 0.15 { dark += 1 }
-    if luminance > 0.70 { pale += 1 }
-  }
-}
+let counts = scanIcon(bitmap)
+let opaque = counts.opaque
+let dark = counts.dark
+let pale = counts.pale
 observeIconStage(.pixelScanReturned, counts: (opaque: opaque, dark: dark, pale: pale))
 guard opaque > 0 else {
   observeIconStage(.verdictRejected)
@@ -111,7 +209,7 @@ print(
     paleRatio * 100
   )
 )
-if darkRatio < 0.70 || paleRatio > 0.25 {
+if counts.exitStatus == 1 {
   observeIconStage(.verdictRejected)
   fputs("FAIL: macOS adds a large pale surround to the BiBCode icon\n", stderr)
   exit(1)
