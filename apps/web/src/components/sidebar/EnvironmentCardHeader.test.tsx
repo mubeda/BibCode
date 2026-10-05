@@ -11,6 +11,7 @@ describe("EnvironmentCardHeader", () => {
         identity={{
           environmentId: EnvironmentId.make("env-ai"),
           label: "ai-server",
+          isPrimary: false,
           isLocal: false,
           avatar: "AS",
           status: "connected",
@@ -33,6 +34,7 @@ describe("EnvironmentCardHeader", () => {
         identity={{
           environmentId: EnvironmentId.make("env-local"),
           label: "Local",
+          isPrimary: true,
           isLocal: true,
           avatar: "LO",
           status: "connected",

@@ -8,6 +8,7 @@ import { buildEnvironmentCardIdentities, groupProjectsByRepository } from "./rep
 const LOCAL = EnvironmentId.make("env-local");
 const AI = EnvironmentId.make("env-ai");
 const OFF = EnvironmentId.make("env-off");
+const WSL = EnvironmentId.make("env-wsl");
 
 function candidate(
   environmentId: EnvironmentId,
@@ -30,6 +31,7 @@ const identities = buildEnvironmentCardIdentities([
   candidate(AI, "ai-server"),
   candidate(LOCAL, "This machine", { isPrimary: true }),
   candidate(OFF, "build box", { phase: "offline" }),
+  candidate(WSL, "Alpine WSL", { isDesktopLocal: true }),
 ]);
 
 function card(
@@ -99,6 +101,24 @@ describe("groupProjectsByRepository", () => {
     ]);
     expect(groups[0]!.cards.map((project) => project.id)).toEqual(["a-local", "a-ai"]);
     expect(groups[0]).toMatchObject({ title: "a", environmentCount: 2, showHost: false });
+  });
+
+  it("orders the primary Local first, then desktop-local environments, then remotes by label", () => {
+    const [group] = groupProjectsByRepository({
+      environments: identities,
+      projects: [
+        card("remote", AI, "/work/a", "github.com/acme/a"),
+        card("wsl", WSL, "/home/a", "github.com/acme/a"),
+        card("offline", OFF, "/srv/a", "github.com/acme/a"),
+        card("primary", LOCAL, "/Users/a", "github.com/acme/a"),
+      ],
+    });
+    expect(group!.cards.map((project) => project.id)).toEqual([
+      "primary",
+      "wsl",
+      "remote",
+      "offline",
+    ]);
   });
 
   it("keeps two checkouts in one environment as two cards", () => {
