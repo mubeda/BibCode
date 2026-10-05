@@ -238,7 +238,9 @@ export function readCoreImageDiffWitness(
           matches[0]!.querySelectorAll('img[alt="' + label + ' image"]').length === 1 &&
           inView(matches[0]!) &&
           inView(matches[0]!.querySelector("figcaption")) &&
-          inView(matches[0]!.querySelector("img"))
+          inView(matches[0]!.querySelector("img")) &&
+          matches[0]!.querySelector("img")!.getBoundingClientRect().width >= 64 &&
+          matches[0]!.querySelector("img")!.getBoundingClientRect().height >= 64
         );
       });
     const groups = pane.querySelectorAll('[role="group"][aria-label="Image diff mode"]');

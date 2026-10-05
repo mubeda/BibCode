@@ -74,9 +74,9 @@ import {
 import {
   captureVisualScene,
   runVisualCore,
-  createCoreBranchCaptureFailureObserver,
-  readCoreBranchCaptureFailureFacts,
-  type CoreBranchCaptureFailureRecord,
+  createCoreCaptureFailureObserver,
+  readCoreCaptureFailureFacts,
+  type CoreCaptureFailureRecord,
 } from "./support/release-visual-core.ts";
 import { visualScenes } from "./support/release-visual-evidence.ts";
 import {
@@ -583,7 +583,7 @@ export async function runDeliveryRetryQualification() {
   const assertions: object[] = [];
   const captures: object[] = [];
   const capturedVisuals = new Set<string>();
-  const coreBranchCaptureFailures = new WeakMap<object, CoreBranchCaptureFailureRecord>();
+  const coreCaptureFailures = new WeakMap<object, CoreCaptureFailureRecord>();
   const settingsCaptureFailures = new WeakMap<object, SettingsCaptureFailureRecord>();
   let createRefObservationInput: VisualObservationInput | null = null;
   let textRowObservationInput: VisualTextRowObservationInput | null = null;
@@ -1465,10 +1465,10 @@ export async function runDeliveryRetryQualification() {
                 ...(scene === "git-image-diff"
                   ? { verifyOwnedSource: verifyVisualOwnedSource }
                   : {}),
-                ...(scene === "git-branch-menu"
+                ...(scene === "git-branch-menu" || scene === "command-palette"
                   ? {
-                      observeFailure: createCoreBranchCaptureFailureObserver(
-                        coreBranchCaptureFailures,
+                      observeFailure: createCoreCaptureFailureObserver(
+                        coreCaptureFailures,
                         {
                           source: config.source,
                           scene,
@@ -1758,11 +1758,11 @@ export async function runDeliveryRetryQualification() {
       worktreeObservation,
       createRefObservation,
       textRowObservation,
-      coreBranchCaptureFailureFacts:
-        phase === "visual-git-branch-menu"
-          ? readCoreBranchCaptureFailureFacts(coreBranchCaptureFailures, error, {
+      coreCaptureFailureFacts:
+        phase === "visual-git-branch-menu" || phase === "visual-command-palette"
+          ? readCoreCaptureFailureFacts(coreCaptureFailures, error, {
               source: config.source,
-              scene: "git-branch-menu",
+              scene: phase === "visual-git-branch-menu" ? "git-branch-menu" : "command-palette",
               phase,
               theme,
               origin,

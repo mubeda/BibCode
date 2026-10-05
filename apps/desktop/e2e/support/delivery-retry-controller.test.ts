@@ -35,6 +35,7 @@ import {
   projectVisualTextRowFailure,
 } from "./release-visual-observation.ts";
 import { resolveSettingsVisualFailureScene } from "./release-visual-settings.ts";
+import * as CoreCapture from "./release-visual-core.ts";
 
 /** Execute controller regions with their actual shared closed-scene dependency. */
 const runControllerSource = (
@@ -51,6 +52,152 @@ function coreOwnedSourceFactoryCode() {
   expect(end).toBeGreaterThan(start);
   return controller.slice(start, end);
 }
+
+it.each([
+  "verified",
+  "unverified",
+  "other-thread",
+  "other-source",
+  "other-phase",
+  "other-theme",
+  "replacement-error",
+  "private-extra",
+  "getter",
+  "live-proxy",
+  "revoked-proxy",
+  "other-scene-witness",
+])(
+  "binds both core scene failures through the actual capture caller and closed writer: %s",
+  async (mode) => {
+    const core = controller.indexOf("        const proof = await runVisualCore({");
+    const start = controller.indexOf("          capture: async (scene) => {", core);
+    const end = controller.indexOf("\n        });", start);
+    const failureStart = controller.indexOf(
+      "      coreCaptureFailureFacts:",
+      controller.lastIndexOf('    write("failure", {'),
+    );
+    const failureEnd = controller.indexOf("      settingsCaptureFailureFacts:", failureStart);
+    expect(start).toBeGreaterThan(core);
+    expect(end).toBeGreaterThan(start);
+    expect(failureStart).toBeGreaterThan(0);
+    expect(failureEnd).toBeGreaterThan(failureStart);
+    for (const scene of ["git-branch-menu", "command-palette"] as const) {
+      const managed = {
+        theme: "light",
+        origin: "http://127.0.0.1:4885",
+        threadId: "owned",
+        branch: "codex/delivery-retry-light",
+      };
+      const original = new Error("Inert original capture failure.");
+      const records = new WeakMap<object, CoreCapture.CoreCaptureFailureRecord>();
+      const common = {
+        themeMatched: true,
+        selectedMatched: true,
+        expectedTextMatched: false,
+        targetInView: true,
+        credentialAbsent: true,
+        bootShellAbsent: true,
+      };
+      const branchFacts = {
+        ...common,
+        currentBranch: false,
+        remoteBranch: true,
+        occupiedBranch: true,
+        renameDeleteControls: true,
+      };
+      const paletteFacts = {
+        ...common,
+        singlePalette: true,
+        filteredAction: true,
+        singleActiveRow: false,
+        inputFocused: true,
+      };
+      const facts = scene === "git-branch-menu" ? branchFacts : paletteFacts;
+      let value: object = { ...facts },
+        reads = 0;
+      if (mode === "private-extra") Object.assign(value, { private: "Inert private value." });
+      if (mode === "getter")
+        Object.defineProperty(value, "targetInView", {
+          enumerable: true,
+          get() {
+            reads++;
+            return true;
+          },
+        });
+      if (mode.endsWith("proxy")) {
+        const proxy = Proxy.revocable(value, {
+          ownKeys() {
+            reads++;
+            throw new Error("Inert proxy trap.");
+          },
+          getOwnPropertyDescriptor() {
+            reads++;
+            throw new Error("Inert descriptor trap.");
+          },
+        });
+        if (mode === "revoked-proxy") proxy.revoke();
+        value = proxy.proxy;
+      }
+      if (mode === "other-scene-witness")
+        value = scene === "git-branch-menu" ? paletteFacts : branchFacts;
+      const captures: unknown[] = [],
+        writes = vi.fn();
+      const run = runControllerSource(
+        NodeModule.stripTypeScriptTypes("({" + controller.slice(start, end) + "}).capture"),
+        {
+          workspace: managed,
+          theme: managed.theme,
+          origin: managed.origin,
+          config: { source: "a".repeat(40), evidence: "/owned/evidence" },
+          b: () => ({}),
+          owner: {},
+          captures,
+          assertions: [],
+          capturedVisuals: new Set<string>(),
+          coreCaptureFailures: records,
+          textRowObservationInput:
+            mode === "unverified"
+              ? null
+              : mode === "other-thread"
+                ? { ...managed, threadId: "other" }
+                : managed,
+          createCoreCaptureFailureObserver: CoreCapture.createCoreCaptureFailureObserver,
+          captureVisualScene: async (input: {
+            observeFailure?: (error: unknown, witness: unknown) => void;
+          }) => {
+            expect(input.observeFailure).toBeTypeOf("function");
+            input.observeFailure?.(original, value);
+            throw original;
+          },
+          write: writes,
+        },
+      );
+      await expect(run(scene)).rejects.toBe(original);
+      expect(captures).toHaveLength(0);
+      expect(writes).not.toHaveBeenCalled();
+      const receipt = runControllerSource(
+        NodeModule.stripTypeScriptTypes("({" + controller.slice(failureStart, failureEnd) + "})"),
+        {
+          phase: mode === "other-phase" ? `visual-${scene}-extra` : `visual-${scene}`,
+          theme: mode === "other-theme" ? "dark" : managed.theme,
+          origin: managed.origin,
+          config: { source: (mode === "other-source" ? "b" : "a").repeat(40) },
+          textRowObservationInput: managed,
+          coreCaptureFailures: records,
+          error: mode === "replacement-error" ? new Error("Inert replacement error.") : original,
+          readCoreCaptureFailureFacts: CoreCapture.readCoreCaptureFailureFacts,
+        },
+      );
+      expect(receipt.coreCaptureFailureFacts).toEqual(
+        mode === "verified" ? { scene, theme: "light", witness: facts } : null,
+      );
+      expect(reads).toBe(0);
+      expect(JSON.stringify(receipt)).not.toMatch(
+        /owned|4885|delivery-retry|private|aaaa|evidence/,
+      );
+    }
+  },
+);
 
 const environment = {
   CI: "true",

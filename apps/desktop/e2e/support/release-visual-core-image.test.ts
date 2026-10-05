@@ -140,6 +140,30 @@ it.each(["light", "dark"] as const)(
   },
 );
 
+it.each(["Before image", "After image"])(
+  "refuses a loaded image reduced to one pixel: %s",
+  async (label) => {
+    const f = await mountedImage("light");
+    try {
+      const button = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+        (node) => node.textContent === "2-up",
+      )!;
+      await f.act(async () => button.click());
+      const image = document.querySelector<HTMLImageElement>(`img[alt="${label}"]`)!;
+      vi.spyOn(image, "getBoundingClientRect").mockReturnValue(new DOMRect(10, 10, 1, 1));
+      const witness = f.reader(f.observation);
+      expect(witness?.loadedImages).toBe(true);
+      expect(witness?.beforeAfterVisible).toBe(false);
+      expect(() => validateCoreImageDiffWitness(witness)).toThrow(
+        "Image visual precondition failed.",
+      );
+      expect(f.network).not.toHaveBeenCalled();
+    } finally {
+      await f.close();
+    }
+  },
+);
+
 it("captures one original through ordinary History/commit/file/mode actions and owned source checks", async () => {
   const calls: string[] = [];
   await runCoreImageDiffOriginal({

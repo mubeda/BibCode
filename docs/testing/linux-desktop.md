@@ -910,7 +910,9 @@ image row, visible diff pane and disabled empty partial-staging gutter; that
 binary representation does not provide an image preview. Use public History
 controls to select the baseline commit and its PNG, then select the actual 2-up
 mode and capture `git-image-diff` before returning to Changes for text partial
-staging. Both distinct repository PNGs must be loaded at natural 64 by 64 size;
+staging. Both distinct repository PNGs must be loaded at natural 64 by 64 size
+and each rendered preview must occupy at least 64 by 64 CSS pixels; loaded
+metadata and a nonzero one-pixel box do not qualify an inspectable preview.
 Before/After figures, captions and all four mode controls must be contained and
 visible, with 2-up uniquely pressed. Rejoin the local route/header/project,
 connected selected rail, owned managed card and selected worktree/branch/theme.
@@ -936,11 +938,12 @@ JSON receipt files enter the artifact allowlist. Inspect the originals
 independently before accepting visual quality. No private logs, provider inputs,
 credentials or profiles are retained.
 
-At exactly `visual-git-branch-menu`, the existing failure receipt may retain
-`coreBranchCaptureFailureFacts` from the last witness already returned by the
-capture's existing polling or post-screenshot read. It adds no browser/RPC read,
-action, timer, deadline, retry or capture fallback. The fixed ten booleans retain
-false scene/text/geometry facts only when theme, selected context, credential
+At exactly `visual-git-branch-menu` or `visual-command-palette`, the existing
+failure receipt may retain `coreCaptureFailureFacts` from the last witness already
+returned by the capture's existing polling or post-screenshot read. It adds no
+browser/RPC read, action, timer, deadline, retry or capture fallback. Each scene's
+fixed ten booleans retain false scene/text/geometry facts only when theme,
+selected context, credential
 absence and boot absence remain safe. Before reflection, native Node proxy
 checks reject live or revoked witnesses, ownership and association inputs;
 accessors, inherited/missing/extra keys, malformed data and reflection faults

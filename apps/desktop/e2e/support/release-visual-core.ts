@@ -3,12 +3,12 @@ import { readCoreImageDiffWitness } from "./release-visual-core-image.ts";
 import * as NodeFS from "node:fs";
 import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
-import { projectCoreBranchCaptureFailureWitness } from "./release-visual-core-capture-facts.ts";
+import { projectCoreCaptureFailureWitness } from "./release-visual-core-capture-facts.ts";
 export {
-  projectCoreBranchCaptureFailureWitness,
-  createCoreBranchCaptureFailureObserver,
-  readCoreBranchCaptureFailureFacts,
-  type CoreBranchCaptureFailureRecord,
+  projectCoreCaptureFailureWitness,
+  createCoreCaptureFailureObserver,
+  readCoreCaptureFailureFacts,
+  type CoreCaptureFailureRecord,
 } from "./release-visual-core-capture-facts.ts";
 import {
   bounded,
@@ -60,8 +60,8 @@ export async function captureVisualScene(input: VisualCaptureInput): Promise<obj
     let witness: Record<string, true> | undefined;
     await input.owner.until(async () => {
       const value = await bounded(input.browser.execute(readWitness, observation), 2_000);
-      if (input.scene === "git-branch-menu")
-        latestFailureFacts = projectCoreBranchCaptureFailureWitness(value);
+      if (input.scene === "git-branch-menu" || input.scene === "command-palette")
+        latestFailureFacts = projectCoreCaptureFailureWitness(input.scene, value);
       try {
         witness = validateVisualWitness(input.scene, value);
         return true;
@@ -72,8 +72,8 @@ export async function captureVisualScene(input: VisualCaptureInput): Promise<obj
     const bytes = Buffer.from(await bounded(input.browser.takeScreenshot(), 5_000), "base64");
     if (verifyImageSource) await verifyImageSource();
     const finalWitness = await bounded(input.browser.execute(readWitness, observation), 2_000);
-    if (input.scene === "git-branch-menu")
-      latestFailureFacts = projectCoreBranchCaptureFailureWitness(finalWitness);
+    if (input.scene === "git-branch-menu" || input.scene === "command-palette")
+      latestFailureFacts = projectCoreCaptureFailureWitness(input.scene, finalWitness);
     validateVisualWitness(input.scene, finalWitness);
     const image = inspectScreenshot(bytes);
     if (image.width !== 1280 || image.height !== 960) throw new Error("Visual viewport refused.");

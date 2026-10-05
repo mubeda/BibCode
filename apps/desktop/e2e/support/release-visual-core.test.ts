@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import {
   captureVisualScene,
   type VisualCaptureInput,
-  type CoreBranchCaptureFailureRecord,
+  type CoreCaptureFailureRecord,
 } from "./release-visual-core.ts";
 import * as CoreCapture from "./release-visual-core.ts";
 import { readVisualWitness, observeVisualNameClear } from "./release-visual-observation.ts";
@@ -1020,30 +1020,28 @@ const currentOwnership = {
   ...captureOwnership,
   phase: "visual-git-branch-menu",
 };
-function projectBranchFailure(value: unknown) {
-  return Reflect.get(CoreCapture, "projectCoreBranchCaptureFailureWitness")?.(value) ?? null;
+function projectCoreFailure(
+  value: unknown,
+  scene: "git-branch-menu" | "command-palette" = "git-branch-menu",
+) {
+  return Reflect.get(CoreCapture, "projectCoreCaptureFailureWitness")?.(scene, value) ?? null;
 }
-function createBranchFailureObserver(
-  records: WeakMap<object, CoreBranchCaptureFailureRecord>,
+function createCoreFailureObserver(
+  records: WeakMap<object, CoreCaptureFailureRecord>,
   ownership: unknown = captureOwnership,
   managed: unknown = managedOwnership,
 ) {
   return (
-    Reflect.get(CoreCapture, "createCoreBranchCaptureFailureObserver")?.(
-      records,
-      ownership,
-      managed,
-    ) ?? (() => {})
+    Reflect.get(CoreCapture, "createCoreCaptureFailureObserver")?.(records, ownership, managed) ??
+    (() => {})
   );
 }
-function readBranchFailure(
-  records: WeakMap<object, CoreBranchCaptureFailureRecord>,
+function readCoreFailure(
+  records: WeakMap<object, CoreCaptureFailureRecord>,
   error: unknown,
   current: unknown = currentOwnership,
 ) {
-  return (
-    Reflect.get(CoreCapture, "readCoreBranchCaptureFailureFacts")?.(records, error, current) ?? null
-  );
+  return Reflect.get(CoreCapture, "readCoreCaptureFailureFacts")?.(records, error, current) ?? null;
 }
 function boundary() {
   const evidence = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "visual-evidence-test-"));
@@ -1081,17 +1079,17 @@ function boundary() {
 describe("original visual capture boundary", () => {
   it("retains the actual post-screenshot refusal without a third witness read or a PNG", async () => {
     const f = boundary();
-    const records = new WeakMap<object, CoreBranchCaptureFailureRecord>();
+    const records = new WeakMap<object, CoreCaptureFailureRecord>();
     const admitted = { ...branchFailureProof, expectedTextMatched: true, currentBranch: true };
     const refused = { ...admitted, targetInView: false };
-    const observe = vi.fn(createBranchFailureObserver(records));
+    const observe = vi.fn(createCoreFailureObserver(records));
     Object.assign(f.input, { scene: "git-branch-menu", observeFailure: observe });
     f.browser.execute.mockResolvedValueOnce(admitted).mockResolvedValueOnce(refused);
     try {
       const failure = await captureVisualScene(f.input).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(Error);
       expect(observe).toHaveBeenCalledWith(failure, refused);
-      expect(readBranchFailure(records, failure)).toEqual({
+      expect(readCoreFailure(records, failure)).toEqual({
         scene: "git-branch-menu",
         theme: "light",
         witness: refused,
@@ -1107,22 +1105,22 @@ describe("original visual capture boundary", () => {
   it("reports the last existing branch witness only after the original capture fails", async () => {
     const f = boundary();
     const original = new Error("Inert original observation timeout.");
-    const records = new WeakMap<object, CoreBranchCaptureFailureRecord>();
+    const records = new WeakMap<object, CoreCaptureFailureRecord>();
     const last = { ...branchFailureProof, currentBranch: true, remoteBranch: false };
     Object.assign(f.input, {
       scene: "git-branch-menu",
-      observeFailure: createBranchFailureObserver(records),
+      observeFailure: createCoreFailureObserver(records),
     });
     f.browser.execute.mockResolvedValueOnce(branchFailureProof).mockResolvedValueOnce(last);
     f.input.owner.until = async (read) => {
       expect(await read()).toBe(false);
-      expect(readBranchFailure(records, original)).toBeNull();
+      expect(readCoreFailure(records, original)).toBeNull();
       expect(await read()).toBe(false);
       throw original;
     };
     try {
       await expect(captureVisualScene(f.input)).rejects.toBe(original);
-      expect(readBranchFailure(records, original)).toEqual({
+      expect(readCoreFailure(records, original)).toEqual({
         scene: "git-branch-menu",
         theme: "light",
         witness: last,
@@ -1130,7 +1128,7 @@ describe("original visual capture boundary", () => {
       expect(f.browser.execute).toHaveBeenCalledTimes(2);
       expect(f.browser.takeScreenshot).not.toHaveBeenCalled();
       expect(NodeFS.readdirSync(f.input.evidence)).toEqual([]);
-      expect(readBranchFailure(records, new Error(original.message))).toBeNull();
+      expect(readCoreFailure(records, new Error(original.message))).toBeNull();
     } finally {
       f.close();
     }
@@ -1220,17 +1218,188 @@ describe("original visual capture boundary", () => {
   );
 });
 
+it.each(["last-poll", "after-png", "before-read", "unsafe-latest", "observer-fault", "success"])(
+  "retains only the existing palette witness after an actual capture failure: %s",
+  async (mode) => {
+    const f = boundary();
+    const original = new Error("Inert original palette capture failure.");
+    const records = new WeakMap<object, CoreCaptureFailureRecord>();
+    const ownership = { ...captureOwnership, scene: "command-palette" };
+    const current = { ...ownership, phase: "visual-command-palette" };
+    const first = { ...proof, expectedTextMatched: false, singleActiveRow: false };
+    const last = { ...first, inputFocused: false };
+    const observe = vi.fn((error: unknown, value: unknown) => {
+      if (mode === "observer-fault") throw new Error("Inert optional observer failure.");
+      createCoreFailureObserver(records, ownership)(error, value);
+    });
+    f.input.observeFailure = observe;
+    if (mode === "before-read") f.browser.isAlertOpen.mockRejectedValue(original);
+    else if (mode === "after-png")
+      f.browser.execute.mockResolvedValueOnce(proof).mockResolvedValueOnce(last);
+    else if (mode !== "success") {
+      f.browser.execute
+        .mockResolvedValueOnce(first)
+        .mockResolvedValueOnce(
+          mode === "unsafe-latest" ? { ...last, credentialAbsent: false } : last,
+        );
+      f.input.owner.until = async (read) => {
+        expect(await read()).toBe(false);
+        expect(readCoreFailure(records, original, current)).toBeNull();
+        expect(await read()).toBe(false);
+        throw original;
+      };
+    }
+    try {
+      if (mode === "success") {
+        await captureVisualScene(f.input);
+        expect(observe).not.toHaveBeenCalled();
+        expect(f.browser.execute).toHaveBeenCalledTimes(2);
+        expect(f.browser.takeScreenshot).toHaveBeenCalledTimes(1);
+        expect(f.input.captured.size).toBe(1);
+        return;
+      }
+      const error = await captureVisualScene(f.input).catch((failure: unknown) => failure);
+      if (mode !== "after-png") expect(error).toBe(original);
+      else expect(error).toBeInstanceOf(Error);
+      const expected = ["before-read", "unsafe-latest"].includes(mode) ? null : last;
+      expect(observe).toHaveBeenCalledWith(error, expected);
+      expect(readCoreFailure(records, error, current)).toEqual(
+        expected !== null && mode !== "observer-fault"
+          ? { scene: "command-palette", theme: "light", witness: expected }
+          : null,
+      );
+      expect(readCoreFailure(records, new Error("Inert replacement error."), current)).toBeNull();
+      expect(f.browser.execute).toHaveBeenCalledTimes(mode === "before-read" ? 0 : 2);
+      expect(f.browser.takeScreenshot).toHaveBeenCalledTimes(mode === "after-png" ? 1 : 0);
+      expect(f.input.captured.size).toBe(0);
+      expect(NodeFS.readdirSync(f.input.evidence)).toEqual([]);
+    } finally {
+      f.close();
+    }
+  },
+);
+
+it.each([
+  "missing",
+  "extra",
+  "symbol",
+  "getter",
+  "inherited",
+  "hidden",
+  "non-boolean",
+  "credential",
+  "theme",
+  "selection",
+  "boot",
+  "live-proxy",
+  "revoked-proxy",
+  "reflection",
+])("refuses unsafe palette failure facts without reading private fields: %s", (mode) => {
+  const facts = { ...proof, expectedTextMatched: false, singleActiveRow: false };
+  let value: object = { ...facts },
+    reads = 0;
+  if (mode === "missing") Reflect.deleteProperty(value, "singleActiveRow");
+  if (mode === "extra") Object.assign(value, { private: "Inert private value." });
+  if (mode === "symbol") Object.assign(value, { [Symbol("private")]: true });
+  if (mode === "getter")
+    Object.defineProperty(value, "singleActiveRow", {
+      enumerable: true,
+      get() {
+        reads++;
+        return true;
+      },
+    });
+  if (mode === "inherited") value = Object.create(facts);
+  if (mode === "hidden")
+    Object.defineProperty(value, "singleActiveRow", { enumerable: false, value: false });
+  if (mode === "non-boolean") Object.assign(value, { singleActiveRow: "Inert private value." });
+  for (const [name, key] of [
+    ["credential", "credentialAbsent"],
+    ["theme", "themeMatched"],
+    ["selection", "selectedMatched"],
+    ["boot", "bootShellAbsent"],
+  ])
+    if (mode === name) Object.assign(value, { [key!]: false });
+  if (mode.endsWith("proxy")) {
+    const proxy = Proxy.revocable(value, {
+      ownKeys() {
+        reads++;
+        throw new Error("Inert proxy trap.");
+      },
+      getOwnPropertyDescriptor() {
+        reads++;
+        throw new Error("Inert descriptor trap.");
+      },
+    });
+    if (mode === "revoked-proxy") proxy.revoke();
+    value = proxy.proxy;
+  }
+  const fault =
+    mode === "reflection"
+      ? vi.spyOn(Reflect, "ownKeys").mockImplementation(() => {
+          throw new Error("Inert reflection fault.");
+        })
+      : null;
+  try {
+    expect(projectCoreFailure(value, "command-palette")).toBeNull();
+  } finally {
+    fault?.mockRestore();
+  }
+  expect(reads).toBe(0);
+});
+
+it("joins palette snapshots only to their same error, scene, source and verified managed context", () => {
+  const facts = { ...proof, expectedTextMatched: false, singleActiveRow: false };
+  const ownership = { ...captureOwnership, scene: "command-palette" };
+  const current = { ...ownership, phase: "visual-command-palette" };
+  const records = new WeakMap<object, CoreCaptureFailureRecord>();
+  const error = new Error("Inert original palette failure.");
+  const observe = createCoreFailureObserver(records, ownership);
+  observe(error, facts);
+  expect(readCoreFailure(records, error, current)).toEqual({
+    scene: "command-palette",
+    theme: "light",
+    witness: facts,
+  });
+  facts.singleActiveRow = true;
+  expect(readCoreFailure(records, error, current)?.witness.singleActiveRow).toBe(false);
+  for (const patch of [
+    { source: "b".repeat(40) },
+    { threadId: "other" },
+    { theme: "dark", branch: "codex/delivery-retry-dark" },
+    { origin: "http://inert.invalid" },
+    { scene: "git-branch-menu" },
+    { phase: "visual-git-branch-menu" },
+    { scene: "workspace-composite", phase: "visual-workspace-composite" },
+  ])
+    expect(readCoreFailure(records, error, { ...current, ...patch })).toBeNull();
+  let traps = 0;
+  const currentProxy = new Proxy(current, {
+    ownKeys() {
+      traps++;
+      throw new Error("Inert proxy trap.");
+    },
+  });
+  expect(readCoreFailure(records, error, currentProxy)).toBeNull();
+  expect(traps).toBe(0);
+  expect(readCoreFailure(records, new Error("Inert replacement error."), current)).toBeNull();
+  expect(projectCoreFailure(branchFailureProof, "command-palette")).toBeNull();
+  expect(projectCoreFailure(proof, "git-branch-menu")).toBeNull();
+  observe(error, { ...facts, selectedMatched: false });
+  expect(readCoreFailure(records, error, current)).toBeNull();
+});
+
 describe("closed core branch capture failure facts", () => {
   it("snapshots only safe data and deletes prior facts when the same error receives an unsafe witness", () => {
-    const records = new WeakMap<object, CoreBranchCaptureFailureRecord>();
+    const records = new WeakMap<object, CoreCaptureFailureRecord>();
     const error = new Error("Inert capture failure.");
-    const observe = createBranchFailureObserver(records);
+    const observe = createCoreFailureObserver(records);
     const value = { ...branchFailureProof };
     observe(error, value);
     value.currentBranch = true;
-    expect(readBranchFailure(records, error)?.witness.currentBranch).toBe(false);
+    expect(readCoreFailure(records, error)?.witness.currentBranch).toBe(false);
     observe(error, { ...value, credentialAbsent: false });
-    expect(readBranchFailure(records, error)).toBeNull();
+    expect(readCoreFailure(records, error)).toBeNull();
   });
   it("refuses ownership and record accessors without invoking them, and tolerates reflection faults", () => {
     let reads = 0;
@@ -1244,31 +1413,29 @@ describe("closed core branch capture failure facts", () => {
       });
       return value;
     };
-    const records = new WeakMap<object, CoreBranchCaptureFailureRecord>();
+    const records = new WeakMap<object, CoreCaptureFailureRecord>();
     const error = new Error("Inert capture failure.");
-    createBranchFailureObserver(records, accessor({ ...captureOwnership }, "source"))(
+    createCoreFailureObserver(records, accessor({ ...captureOwnership }, "source"))(
       error,
       branchFailureProof,
     );
-    createBranchFailureObserver(
+    createCoreFailureObserver(
       records,
       captureOwnership,
       accessor({ ...managedOwnership }, "threadId"),
     )(error, branchFailureProof);
-    expect(
-      readBranchFailure(records, error, accessor({ ...currentOwnership }, "source")),
-    ).toBeNull();
+    expect(readCoreFailure(records, error, accessor({ ...currentOwnership }, "source"))).toBeNull();
     WeakMap.prototype.set.call(
       records,
       error,
       accessor({ ownership: captureOwnership, witness: branchFailureProof }, "witness"),
     );
-    expect(readBranchFailure(records, error)).toBeNull();
+    expect(readCoreFailure(records, error)).toBeNull();
     const fault = vi.spyOn(Reflect, "ownKeys").mockImplementation(() => {
       throw new Error("Inert reflection fault.");
     });
     try {
-      expect(projectBranchFailure(branchFailureProof)).toBeNull();
+      expect(projectCoreFailure(branchFailureProof)).toBeNull();
     } finally {
       fault.mockRestore();
     }
@@ -1278,7 +1445,7 @@ describe("closed core branch capture failure facts", () => {
     "refuses native proxies on the %s association boundary before a trap",
     (boundary) => {
       let traps = 0;
-      const records = new WeakMap<object, CoreBranchCaptureFailureRecord>();
+      const records = new WeakMap<object, CoreCaptureFailureRecord>();
       const error = new Error("Inert capture failure.");
       const revoked = <T extends object>(value: T) => {
         const proxy = Proxy.revocable(value, {
@@ -1298,13 +1465,13 @@ describe("closed core branch capture failure facts", () => {
       const observedRecords = boundary === "records" ? revoked(records) : records;
       if (boundary === "stored-record")
         records.set(error, revoked({ ownership: captureOwnership, witness: branchFailureProof }));
-      else createBranchFailureObserver(observedRecords)(observedError, branchFailureProof);
-      expect(readBranchFailure(observedRecords, observedError)).toBeNull();
+      else createCoreFailureObserver(observedRecords)(observedError, branchFailureProof);
+      expect(readCoreFailure(observedRecords, observedError)).toBeNull();
       expect(traps).toBe(0);
     },
   );
   it("retains a frozen complete boolean witness with failed scene facts", () => {
-    const result = projectBranchFailure(branchFailureProof);
+    const result = projectCoreFailure(branchFailureProof);
     expect(result).toEqual(branchFailureProof);
     expect(Object.isFrozen(result)).toBe(true);
   });
@@ -1347,7 +1514,7 @@ describe("closed core branch capture failure facts", () => {
       ["boot", "bootShellAbsent"],
     ])
       if (mode === failure) Object.assign(value, { [key!]: false });
-    expect(projectBranchFailure(value)).toBeNull();
+    expect(projectCoreFailure(value)).toBeNull();
     expect(reads).toBe(0);
   });
   it.each(["live", "spoofing", "throwing", "revoked"])(
@@ -1376,24 +1543,24 @@ describe("closed core branch capture failure facts", () => {
         return proxy.proxy;
       };
       const error = new Error("Inert capture failure.");
-      const records = new WeakMap<object, CoreBranchCaptureFailureRecord>();
-      expect(projectBranchFailure(wrap(branchFailureProof))).toBeNull();
-      createBranchFailureObserver(records, wrap(captureOwnership))(error, branchFailureProof);
-      createBranchFailureObserver(
+      const records = new WeakMap<object, CoreCaptureFailureRecord>();
+      expect(projectCoreFailure(wrap(branchFailureProof))).toBeNull();
+      createCoreFailureObserver(records, wrap(captureOwnership))(error, branchFailureProof);
+      createCoreFailureObserver(
         records,
         captureOwnership,
         wrap(managedOwnership),
       )(error, branchFailureProof);
-      expect(readBranchFailure(records, error, wrap(currentOwnership))).toBeNull();
-      expect(readBranchFailure(records, error)).toBeNull();
+      expect(readCoreFailure(records, error, wrap(currentOwnership))).toBeNull();
+      expect(readCoreFailure(records, error)).toBeNull();
       expect(traps).toBe(0);
     },
   );
   it("joins the original capture error to current private source, managed identity, scene and theme", () => {
     const error = new Error("Inert capture failure.");
-    const records = new WeakMap<object, CoreBranchCaptureFailureRecord>();
-    createBranchFailureObserver(records)(error, branchFailureProof);
-    expect(readBranchFailure(records, error)).toEqual({
+    const records = new WeakMap<object, CoreCaptureFailureRecord>();
+    createCoreFailureObserver(records)(error, branchFailureProof);
+    expect(readCoreFailure(records, error)).toEqual({
       scene: "git-branch-menu",
       theme: "light",
       witness: branchFailureProof,
@@ -1406,14 +1573,14 @@ describe("closed core branch capture failure facts", () => {
       { phase: "visual-git-history-stashes" },
       { origin: "http://inert.invalid" },
     ])
-      expect(readBranchFailure(records, error, { ...currentOwnership, ...patch })).toBeNull();
-    const records2 = new WeakMap<object, CoreBranchCaptureFailureRecord>();
-    createBranchFailureObserver(records2, captureOwnership, {
+      expect(readCoreFailure(records, error, { ...currentOwnership, ...patch })).toBeNull();
+    const records2 = new WeakMap<object, CoreCaptureFailureRecord>();
+    createCoreFailureObserver(records2, captureOwnership, {
       ...managedOwnership,
       threadId: "other",
     })(error, branchFailureProof);
-    expect(readBranchFailure(records2, error)).toBeNull();
-    expect(JSON.stringify(readBranchFailure(records, error))).not.toMatch(
+    expect(readCoreFailure(records2, error)).toBeNull();
+    expect(JSON.stringify(readCoreFailure(records, error))).not.toMatch(
       /owned|delivery-retry|4885|aaaa|private/,
     );
   });
