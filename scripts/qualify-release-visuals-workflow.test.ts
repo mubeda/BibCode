@@ -73,7 +73,7 @@ describe("first visual batch workflow boundary", () => {
       ),
     ).toBe(true);
   });
-  it("offers only core, fixed settings and Git/project selections with core as its default", () => {
+  it("offers core, fixed settings, Git/project and the dedicated Cursor row with core as its default", () => {
     const value = YAML.parse(
       NodeFS.readFileSync(
         new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
@@ -87,7 +87,12 @@ describe("first visual batch workflow boundary", () => {
           type: "choice",
           required: true,
           default: "release-visual-core",
-          options: ["release-visual-core", "release-visual-settings", "release-visual-git-project"],
+          options: [
+            "release-visual-core",
+            "release-visual-settings",
+            "release-visual-git-project",
+            "release-visual-cursor-question",
+          ],
         },
       },
     });
@@ -200,4 +205,70 @@ it("retains the fixed partial Git/project lane separately from native upgrade qu
     ...scenes.flatMap((scene) => [scene + "-light.png", scene + "-dark.png"]),
   ]);
   expect(evidence.with.path).not.toMatch(/\*/);
+});
+
+it("runs one separate Cursor row with the actual inert-runtime gate and closed two-original evidence", () => {
+  const value = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const steps = value.jobs.visual_core.steps as Array<{
+    name: string;
+    if?: string;
+    run?: string;
+    with?: { path?: string };
+    env?: Record<string, string>;
+  }>;
+  const run = steps.find((step) => step.name === "Run contained Cursor later-question pair")!;
+  expect(run.if).toBe("${{ inputs.scene_selection == 'release-visual-cursor-question' }}");
+  expect(run.run).toBe(
+    "python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-cursor-question",
+  );
+  expect(run.env).toEqual({
+    BIBCODE_UPLOAD_SERVER: "${{ runner.temp }}/issue29-visual-build/bibcode",
+    BIBCODE_DELIVERY_UI_WEB: "${{ runner.temp }}/issue29-visual-build/web",
+  });
+  const replay = steps.find(
+    (step) => step.name === "Verify inert Cursor runtime question protocol",
+  )!;
+  expect(replay.if).toBe(run.if);
+  expect(replay.run).toContain(
+    "provider::cursor::runtime::tests::owned_later_question_keeps_multiple_labels_and_original_prompt_correlation",
+  );
+  expect(replay.run).toContain("-- --exact");
+  const evidence = steps.find((step) => step.name === "Retain explicit Cursor question evidence")!;
+  expect(evidence.if).toBe(
+    "${{ always() && inputs.scene_selection == 'release-visual-cursor-question' }}",
+  );
+  expect(
+    evidence
+      .with!.path!.trim()
+      .split("\n")
+      .map((line) => line.slice(line.lastIndexOf("/") + 1)),
+  ).toEqual([
+    "phase.json",
+    "failure.json",
+    "provenance.json",
+    "result.json",
+    "assertions.json",
+    "namespace-cleanup.json",
+    "supervisor.json",
+    "question-multiselect-light.png",
+    "question-multiselect-dark.png",
+  ]);
+  expect(evidence.with!.path).not.toMatch(/\*|private|profile|\.log/);
+  expect(value.jobs.visual_core["timeout-minutes"]).toBe(120);
+  expect(visualScenes).toHaveLength(9);
+  const tests = steps.find(
+    (step) => step.name === "Check owned helpers and namespace admission",
+  )!.run!;
+  for (const helper of [
+    "git-project-tab-interception",
+    "owned-visual-capture",
+    "release-visual-cursor-question",
+    "release-visual-cursor-question-fixture",
+  ])
+    expect(tests).toContain("support/" + helper + ".test.ts");
 });

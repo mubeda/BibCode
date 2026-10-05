@@ -37,7 +37,7 @@ class FixturePathBudgetTests(unittest.TestCase):
     def test_actual_roots_fit_branded_and_unbranded_chromium_unix_socket_paths(self):
         # Chromium branch 8037 FormatTemporaryFileName + SingletonSocket; Linux sun_path[108].
         # Portable SetupSockAddr requires byte length below 108, including room for NUL.
-        for scenario in ['remote-updates-ui', 'chat-upload', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project']:
+        for scenario in ['remote-updates-ui', 'chat-upload', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question']:
             for run_id in ['37096649000', '9' * 20, '9' * 128]:
                 fixture, _ = self.actual_paths(scenario, run_id)
                 for brand in ['com.google.Chrome', 'org.chromium.Chromium']:
@@ -46,7 +46,7 @@ class FixturePathBudgetTests(unittest.TestCase):
                         self.assertLess(len(str(socket).encode('utf8')), 108)
 
     def test_only_private_root_omits_run_id_while_evidence_keeps_it(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question']:
             selection = qualification.scenario_settings(scenario)
             roots = []
             for run_id in ['37096649000', '9' * 128]:
@@ -69,6 +69,18 @@ class FixturePathBudgetTests(unittest.TestCase):
 
 
 class ScenarioSelectionTests(unittest.TestCase):
+    def test_cursor_question_selection_is_separate_fixed_and_owned(self):
+        self.assertEqual(qualification.scenario_settings('release-visual-cursor-question'), {
+            'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+            'inner_timeout': 600, 'outer_timeout': 660,
+            'evidence_prefix': 'issue29-cursor-question-', 'fixture_prefix': 'bc-vq-',
+        })
+        self.assertEqual(qualification.inner_resources(['release-visual-cursor-question', '/owned/web']),
+                         ('release-visual-cursor-question', None, '/owned/web', 'core'))
+        for args in [['release-visual-cursor-question'], ['release-visual-cursor-question', '/owned/web', 'full']]:
+            with self.assertRaisesRegex(RuntimeError, 'Unknown qualification owner payload'):
+                qualification.inner_resources(args)
+
     def test_settings_cleanup_keeps_private_state_until_the_existing_owner_joins(self):
         with tempfile.TemporaryDirectory() as evidence_dir:
             evidence = Path(evidence_dir)

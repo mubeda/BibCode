@@ -1,14 +1,10 @@
 // @effect-diagnostics nodeBuiltinImport:off - Finite owned original images; runtime/Git ownership remains with the existing controller.
-import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import type { OrchestrationReadModel } from "../../../../packages/contracts/src/orchestration.ts";
-import {
-  bounded,
-  type QualificationBrowser,
-  type QualificationOwner,
-} from "./qualification-owner.ts";
-import { inspectScreenshot, validateCaptureWitness } from "./remote-ui-evidence.ts";
+import { type QualificationBrowser, type QualificationOwner } from "./qualification-owner.ts";
+import { validateCaptureWitness } from "./remote-ui-evidence.ts";
 import type { GitProjectVisualFixture } from "./release-visual-git-project-fixture.ts";
+import { captureOwnedVisualScene } from "./owned-visual-capture.ts";
 
 export const gitProjectVisualScenes = [
   "worktree-discovery",
@@ -57,7 +53,12 @@ const sceneFacts: Record<GitProjectVisualScene, readonly string[]> = {
   "project-clone-chooser": ["urlAndInferredName", "parentRetained", "editableForm"],
   "project-clone-incomplete": ["actionableRefusal", "retainedForm", "enabledRetry"],
   "git-tags": ["localTags", "remoteTags", "tagNames", "disabledTagActions"],
-  "git-switch-with-changes": ["namedBranch", "safeChoices", "ordinaryStashExplanation"],
+  "git-switch-with-changes": [
+    "namedBranch",
+    "safeChoices",
+    "ordinaryStashExplanation",
+    "dialogSettled",
+  ],
   "git-merge-conflict": ["conflictFile", "inProgress", "continueAbort", "blockedExplanation"],
   "git-rewrite-preview": ["targetBranch", "operationDescription", "safeWarning"],
   "git-unborn": ["noCommits", "notDetached", "disabledReason"],
@@ -542,6 +543,28 @@ export function readGitProjectVisualWitness(
       ordinaryStashExplanation:
         text(popup).includes("ordinary, visible stash entry") &&
         text(popup).includes("working-tree changes across"),
+      dialogSettled: (() => {
+        try {
+          if (
+            !popup ||
+            popup.hasAttribute("data-starting-style") ||
+            popup.hasAttribute("data-ending-style")
+          )
+            return false;
+          const animations = popup.getAnimations();
+          return (
+            Array.isArray(animations) &&
+            animations.every(
+              (animation) =>
+                (animation.playState === "finished" || animation.playState === "idle") &&
+                animation.pending === false,
+            )
+          );
+        } catch {
+          // Missing or failed presentation evidence cannot qualify original pixels.
+          return false;
+        }
+      })(),
     };
   } else if (input.scene === "git-merge-conflict") {
     target = pane;
@@ -675,54 +698,34 @@ export interface GitProjectVisualCaptureInput extends GitProjectVisualObservatio
 export async function captureGitProjectVisualScene(
   input: GitProjectVisualCaptureInput,
 ): Promise<object> {
-  const file = gitProjectVisualScreenshotName(input.scene, input.theme),
-    path = NodePath.join(input.evidence, file);
-  if (input.captured.has(file) || NodeFS.existsSync(path) || (await input.browser.isAlertOpen()))
-    throw refused();
-  const observation: GitProjectVisualObservationInput = {
-    scene: input.scene,
-    coverage: input.coverage,
-    theme: input.theme,
-    origin: input.origin,
-    selection: input.selection,
-    directory: input.directory,
-    cloneUrl: input.cloneUrl,
-    cloneParent: input.cloneParent,
-  };
-  await input.verifyOwnedIdentity(input.selection);
-  let witness: Record<string, true> | undefined;
-  await input.owner.until(async () => {
-    const value = await bounded(
-      input.browser.execute(readGitProjectVisualWitness, observation),
-      2000,
-    );
-    try {
-      witness = validateGitProjectVisualWitness(input.scene, input.coverage, value);
-      return true;
-    } catch {
-      return false;
-    }
+  return captureOwnedVisualScene({
+    browser: input.browser,
+    owner: input.owner,
+    evidence: input.evidence,
+    file: gitProjectVisualScreenshotName(input.scene, input.theme),
+    captured: input.captured,
+    observation: (): GitProjectVisualObservationInput => ({
+      scene: input.scene,
+      coverage: input.coverage,
+      theme: input.theme,
+      origin: input.origin,
+      selection: input.selection,
+      directory: input.directory,
+      cloneUrl: input.cloneUrl,
+      cloneParent: input.cloneParent,
+    }),
+    read: (observation) => input.browser.execute(readGitProjectVisualWitness, observation),
+    verifyOwnedIdentity: () => input.verifyOwnedIdentity(input.selection),
+    validate: (value) => validateGitProjectVisualWitness(input.scene, input.coverage, value),
+    project: (record) =>
+      projectGitProjectVisualCapture({
+        scene: input.scene,
+        coverage: input.coverage,
+        theme: input.theme,
+        ...record,
+      }),
+    refused,
   });
-  const bytes = Buffer.from(await bounded(input.browser.takeScreenshot(), 5000), "base64");
-  await input.verifyOwnedIdentity(input.selection);
-  validateGitProjectVisualWitness(
-    input.scene,
-    input.coverage,
-    await bounded(input.browser.execute(readGitProjectVisualWitness, observation), 2000),
-  );
-  const image = inspectScreenshot(bytes);
-  if (image.width !== 1280 || image.height !== 960) throw refused();
-  const receipt = projectGitProjectVisualCapture({
-    scene: input.scene,
-    coverage: input.coverage,
-    theme: input.theme,
-    file,
-    witness,
-    ...image,
-  });
-  NodeFS.writeFileSync(path, bytes, { mode: 0o600, flag: "wx" });
-  input.captured.add(file);
-  return receipt;
 }
 
 export interface GitProjectVisualInput {
@@ -819,16 +822,35 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
       // Optional attribution cannot replace an existing action or exception.
     }
   };
-  const click = async (selector: string, directoryControl?: DirectoryControl) => {
+  const click = async (
+    selector: string,
+    directoryControl?: DirectoryControl,
+    tabControl?: "Changes" | "History" | "Tags",
+  ) => {
+    const observeTabAwait = (
+      operation: "displayed" | "unique" | "enabled" | "click" | "completed",
+    ) => {
+      if (!tabControl) return;
+      try {
+        input.step(`visual-git-project-tab-${tabControl.toLowerCase()}-${operation}`);
+      } catch {
+        // Optional attribution cannot replace the original command or outcome.
+      }
+    };
     const control = browser.$(selector);
     if (directoryControl) observeDirectoryAwait(`${directoryControl}-displayed`);
+    observeTabAwait("displayed");
     await control.waitForDisplayed();
     if (directoryControl) observeDirectoryAwait(`${directoryControl}-unique`);
+    observeTabAwait("unique");
     if ((await browser.$$(selector).length) !== 1) throw refused();
     if (directoryControl) observeDirectoryAwait(`${directoryControl}-enabled`);
+    observeTabAwait("enabled");
     await control.waitForEnabled();
     if (directoryControl) observeDirectoryAwait(`${directoryControl}-click`);
+    observeTabAwait("click");
     await control.click();
+    observeTabAwait("completed");
   };
   const capture = async (
     scene: GitProjectVisualScene,
@@ -857,8 +879,8 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
     await browser.keys("Escape");
     await browser.$(popup).waitForDisplayed({ reverse: true });
   };
-  const tab = async (label: string) =>
-    click(`//button[@role="tab" and normalize-space()="${label}"]`);
+  const tab = async (label: "Changes" | "History" | "Tags") =>
+    click(`//button[@role="tab" and normalize-space()="${label}"]`, undefined, label);
   const openGit = async (selection: GitProjectVisualSelection) => {
     if (selection.title !== NodePath.basename(selection.cwd)) throw refused();
     const selector = `button[aria-label="Git Manager for ${selection.title}"]`;

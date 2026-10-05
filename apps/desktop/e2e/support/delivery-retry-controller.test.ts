@@ -18,6 +18,7 @@ import {
 } from "../qualify-delivery-retry.ts";
 import { deliveryScenes, deliveryThemes } from "./delivery-retry-evidence.ts";
 import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
+import { projectGitProjectTabInterception } from "./git-project-tab-interception.ts";
 import { bounded, projectOwnedDriverReadiness } from "./qualification-owner.ts";
 import { correctDesktopUiOuterSize } from "./window-size.ts";
 import { readVisualViewport } from "./release-visual-observation.ts";
@@ -35,14 +36,53 @@ import {
   projectVisualTextRowFailure,
 } from "./release-visual-observation.ts";
 import { resolveSettingsVisualFailureScene } from "./release-visual-settings.ts";
+import { gitProjectVisualScenes } from "./release-visual-git-project.ts";
 import * as CoreCapture from "./release-visual-core.ts";
+
+it.each([
+  [22, 2, true],
+  [20, 2, false],
+  [21, 2, false],
+  [23, 2, false],
+  [22, 1, false],
+  [22, 3, false],
+] as const)(
+  "counts every original including partial Tags without reducing completeness: captures=%s themes=%s",
+  (images, themes, accepted) => {
+    const source = NodeFS.readFileSync(
+      NodePath.resolve("apps/desktop/e2e/qualify-delivery-retry.ts"),
+      "utf8",
+    );
+    const start = source.indexOf("    check(\n      captures.length ===");
+    const end = source.indexOf("    success = true;", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    let admitted: boolean | undefined;
+    NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes(source.slice(start, end)), {
+      captures: Array.from({ length: images }, () => ({})),
+      assertions: Array.from({ length: themes }, () => ({ completeGroup: false })),
+      deliveryThemes,
+      gitProjectVisualScenes,
+      config: { selection: "release-visual-git-project" },
+      check: (value: boolean) => {
+        admitted = value;
+      },
+    });
+    expect(admitted).toBe(accepted);
+  },
+);
 
 /** Execute controller regions with their actual shared closed-scene dependency. */
 const runControllerSource = (
   code: string,
   context: NodeVM.Context,
   options?: Parameters<typeof NodeVM.runInNewContext>[2],
-) => NodeVM.runInNewContext(code, { resolveSettingsVisualFailureScene, ...context }, options);
+) =>
+  NodeVM.runInNewContext(
+    code,
+    { resolveSettingsVisualFailureScene, projectGitProjectTabInterception, ...context },
+    options,
+  );
 
 /** Keep the extracted callback's actual factored Git check in the same lexical scope. */
 function coreOwnedSourceFactoryCode() {
@@ -1426,6 +1466,88 @@ describe.each(["projector", "failure-seam"])("create-ref descriptor admission: %
 });
 
 describe("delivery controller admission", () => {
+  it("preserves only the installed Cursor question instance through the actual provider restriction block", () => {
+    const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "cursor-owned-config-"));
+    const env = {
+      CI: "true",
+      BIBCODE_E2E_PLATFORM: "linux",
+      BIBCODE_E2E_RUN_ROOT: directory,
+      BIBCODE_E2E_ARTIFACT_DIR: NodePath.join(directory, "private"),
+    };
+    try {
+      const context = prepareDesktopUiTestContext(env, undefined, "question-multiselect-v1");
+      const start = controller.indexOf(
+        '      const settingsPath = NodePath.join(context.stateRoot, "userdata", "settings.json");',
+      );
+      const end = controller.indexOf("      configured.enableProviderUpdateChecks = false;", start);
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      const restrict = runControllerSource(
+        NodeModule.stripTypeScriptTypes(
+          "function configure(){" +
+            controller.slice(start, end) +
+            "\nreturn configured;}\nconfigure",
+        ),
+        {
+          NodeFS,
+          NodePath,
+          context,
+          runRoot: directory,
+          structuredClone,
+          config: { selection: "release-visual-cursor-question" },
+          cursorQuestionFixtureSelection: "question-multiselect-v1",
+          check: (allowed: unknown) => {
+            if (allowed !== true) throw new Error("Owned fixture admission refused.");
+          },
+        },
+      ) as () => {
+        providers: Record<string, { enabled: boolean; binaryPath: string }>;
+        providerInstances: Record<
+          string,
+          {
+            enabled: boolean;
+            config: { binaryPath: string };
+            environment?: Array<{ name: string; value: string; sensitive: boolean }>;
+          }
+        >;
+      };
+      const configured = restrict();
+      expect(configured.providers.cursor).toEqual({
+        enabled: true,
+        binaryPath: NodePath.join(context.shimDirectory, "cursor-agent"),
+      });
+      expect(configured.providerInstances.cursor!.environment).toEqual([
+        { name: "HOME", value: context.fixtureUserHomePath, sensitive: false },
+        {
+          name: "BIBCODE_E2E_CURSOR_QUESTION_FIXTURE",
+          value: "question-multiselect-v1",
+          sensitive: false,
+        },
+      ]);
+      expect(configured.providers.claudeAgent!.enabled).toBe(true);
+      for (const [name, provider] of Object.entries(configured.providers))
+        if (!["cursor", "claudeAgent"].includes(name)) expect(provider.enabled).toBe(false);
+      for (const [name, instance] of Object.entries(configured.providerInstances))
+        if (!["cursor", "claudeAgent"].includes(name)) expect(instance.enabled).toBe(false);
+    } finally {
+      NodeFS.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  it("admits the dedicated Cursor question row through the unchanged CI/source/namespace fences", () => {
+    const selected = {
+      ...environment,
+      BIBCODE_DELIVERY_UI_SELECTION: "release-visual-cursor-question",
+    };
+    expect(deliveryConfiguration(selected, () => "net:[owned]").selection).toBe(
+      "release-visual-cursor-question",
+    );
+    expect(() => deliveryConfiguration(selected, () => "net:[foreign]")).toThrow(
+      "Owned delivery qualification namespace refused.",
+    );
+    expect(() => deliveryConfiguration({ ...selected, CI: "false" }, () => "net:[owned]")).toThrow(
+      "Owned delivery qualification configuration refused.",
+    );
+  });
   it("admits only the fixed settings selector through the same namespace fence", () => {
     expect(
       deliveryConfiguration(
@@ -2039,7 +2161,7 @@ describe.each(["delivery-retry-ui", "release-visual-core"])(
         expect(before.has("cursor")).toBe(true);
         expect(before.has("cursor-agent")).toBe(true);
         expect(before.has("claude")).toBe(true);
-        const start = controller.indexOf("      const context = prepareDesktopUiTestContext(env);");
+        const start = controller.indexOf("      const context =");
         const end = controller.indexOf("      delete childEnv.BIBCODE_HERMETIC_GUARD;", start);
         expect(start).toBeGreaterThan(0);
         expect(end).toBeGreaterThan(start);

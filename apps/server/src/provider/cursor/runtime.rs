@@ -1324,4 +1324,158 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[tokio::test]
+    async fn owned_later_question_keeps_multiple_labels_and_original_prompt_correlation() {
+        let (stdout, mut responses) = duplex(4096);
+        let (requests, stdin) = duplex(4096);
+        let (stderr, _stderr_peer) = duplex(4096);
+        let (connection, incoming) =
+            AcpJsonRpcConnection::spawn(stdout, stdin, stderr, AcpConnectionConfig::default());
+        let runtime = CursorSessionRuntime::new(
+            CursorSessionOptions {
+                thread_id: "owned-question-thread".to_owned(),
+                cwd: "/owned/question-workspace".to_owned(),
+                runtime_mode: "approval-required".to_owned(),
+                interaction_mode: "default".to_owned(),
+                model: String::new(),
+                resume_session_id: None,
+                mcp_servers: Vec::new(),
+            },
+            connection,
+            incoming,
+        );
+        let peer = tokio::spawn(async move {
+            let mut requests = BufReader::new(requests).lines();
+            for method in ["initialize", "authenticate", "session/new"] {
+                let request: Value =
+                    serde_json::from_str(&requests.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(request["method"], method);
+                let result = if method == "session/new" {
+                    json!({ "sessionId": "bibcode-ui-cursor-session" })
+                } else {
+                    json!({})
+                };
+                responses
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            json!({
+                                "jsonrpc": "2.0", "id": request["id"], "result": result
+                            })
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let prompt: Value =
+                serde_json::from_str(&requests.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(prompt["method"], "session/prompt");
+            assert_eq!(prompt["params"]["sessionId"], "bibcode-ui-cursor-session");
+            let question_id = format!(
+                "owned-visual-cursor-question:{}",
+                json!(["bibcode-ui-cursor-session", prompt["id"]])
+            );
+            responses.write_all(format!("{}\n", json!({
+                "jsonrpc": "2.0", "id": question_id, "method": "cursor/ask_question",
+                "params": { "sessionId": "bibcode-ui-cursor-session", "questions": [
+                    { "id": "first", "prompt": "Choose the first scope.", "allowMultiple": false,
+                      "options": [{ "id": "workspace", "label": "Workspace" }, { "id": "project", "label": "Project" }] },
+                    { "id": "later", "prompt": "Choose the later checks.", "allowMultiple": true,
+                      "options": [{ "id": "tests", "label": "Tests" }, { "id": "docs", "label": "Docs" }, { "id": "types", "label": "Types" }] }
+                ] }
+            })).as_bytes()).await.unwrap();
+            let answer: Value =
+                serde_json::from_str(&requests.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(
+                answer,
+                json!({
+                    "jsonrpc": "2.0", "id": question_id,
+                    "result": { "answers": { "first": "Workspace", "later": ["Tests", "Docs"] } }
+                })
+            );
+            responses.write_all(format!("{}\n", json!({
+                "jsonrpc": "2.0", "id": prompt["id"], "result": { "stopReason": "end_turn" }
+            })).as_bytes()).await.unwrap();
+        });
+        timeout(Duration::from_secs(2), runtime.start())
+            .await
+            .unwrap()
+            .unwrap();
+        let receipt = runtime
+            .send_turn_with_receipt(Some("Owned later multiselect question"), Vec::new())
+            .await
+            .unwrap();
+        let turn_id = receipt.turn_id.clone();
+        let mut requested = None;
+        for _ in 0..8 {
+            let event = timeout(Duration::from_secs(2), runtime.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            if event.event_type == "user-input.requested" {
+                requested = Some(event);
+                break;
+            }
+        }
+        let requested = requested.expect("actual Cursor request event");
+        assert_eq!(requested.turn_id, Some(turn_id.clone()));
+        assert_eq!(requested.payload["questions"].as_array().unwrap().len(), 2);
+        assert_eq!(requested.payload["questions"][0]["id"], "first");
+        assert_eq!(requested.payload["questions"][0]["multiSelect"], false);
+        assert_eq!(requested.payload["questions"][1]["id"], "later");
+        assert_eq!(requested.payload["questions"][1]["multiSelect"], true);
+        assert_eq!(
+            requested.payload["questions"][1]["options"][0]["label"],
+            "Tests"
+        );
+        assert_eq!(
+            requested.payload["questions"][1]["options"][1]["label"],
+            "Docs"
+        );
+        let mut completion = Box::pin(receipt.completion());
+        assert!(
+            timeout(Duration::from_millis(100), completion.as_mut())
+                .await
+                .is_err()
+        );
+        runtime
+            .respond_to_user_input(
+                requested.request_id.as_deref().unwrap(),
+                json!({ "first": "Workspace", "later": ["Tests", "Docs"] }),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(2), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut resolved = false;
+        let mut completed = false;
+        for _ in 0..4 {
+            let event = timeout(Duration::from_secs(2), runtime.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            if event.event_type == "user-input.resolved" {
+                assert_eq!(event.turn_id, Some(turn_id.clone()));
+                assert_eq!(event.request_id, requested.request_id);
+                assert_eq!(event.payload["answers"]["later"], json!(["Tests", "Docs"]));
+                resolved = true;
+            } else if event.event_type == "turn.completed" {
+                assert_eq!(event.turn_id, Some(turn_id.clone()));
+                assert_eq!(event.payload["stopReason"], "end_turn");
+                completed = true;
+            }
+            if resolved && completed {
+                break;
+            }
+        }
+        assert!(resolved && completed);
+    }
 }

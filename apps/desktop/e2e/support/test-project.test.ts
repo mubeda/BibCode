@@ -6,11 +6,13 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeReadline from "node:readline";
+import * as NodeVM from "node:vm";
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import { desktopActivityFixture, desktopActivitySessionCommands } from "./activity-events.ts";
 import { readProviderInputLog } from "./provider-input-log.ts";
+import { cursorQuestionFixtureSelection } from "./release-visual-cursor-question-fixture.ts";
 import {
   archiveAndCleanupDesktopUiTestContext,
   clearDesktopActivityMarker,
@@ -98,6 +100,77 @@ afterEach(() => {
     NodeFS.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+it("installs the owned Cursor question opt-in only in its CI fixture instance", () => {
+  const environment: NodeJS.ProcessEnv = { CI: "true", BIBCODE_E2E_PLATFORM: "linux" };
+  const context = prepareDesktopUiTestContext(
+    environment,
+    undefined,
+    cursorQuestionFixtureSelection,
+  );
+  contexts.push(context);
+  const source = NodeFS.readFileSync(
+    NodePath.join(context.shimDirectory, "cursor-agent-fixture.mjs"),
+    "utf8",
+  );
+  expect(source).toContain("const ownedCursorQuestion =");
+  const settings = JSON.parse(
+    NodeFS.readFileSync(NodePath.join(context.stateRoot, "userdata", "settings.json"), "utf8"),
+  );
+  expect(settings.providerInstances.cursor.environment).toEqual([
+    { name: "HOME", value: context.fixtureUserHomePath, sensitive: false },
+    {
+      name: "BIBCODE_E2E_CURSOR_QUESTION_FIXTURE",
+      value: cursorQuestionFixtureSelection,
+      sensitive: false,
+    },
+  ]);
+  expect(environment.BIBCODE_E2E_CURSOR_QUESTION_FIXTURE).toBeUndefined();
+  for (const provider of ["codex", "claude", "grok", "opencode"])
+    expect(
+      NodeFS.readFileSync(NodePath.join(context.shimDirectory, `${provider}-fixture.mjs`), "utf8"),
+    ).not.toContain("ownedCursorQuestion");
+});
+
+it("keeps the default Cursor shim and instance environment byte-compatible", () => {
+  const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: "linux" };
+  const context = prepareDesktopUiTestContext(environment);
+  contexts.push(context);
+  const source = NodeFS.readFileSync(new URL("./test-project.ts", import.meta.url), "utf8");
+  const start = source.indexOf("const cursorFixtureSource = String.raw`");
+  const end = source.indexOf("const grokFixtureSource", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const original = NodeVM.runInNewContext(source.slice(start, end) + "\ncursorFixtureSource");
+  expect(
+    NodeFS.readFileSync(NodePath.join(context.shimDirectory, "cursor-agent-fixture.mjs"), "utf8"),
+  ).toBe(original);
+  const settings = JSON.parse(
+    NodeFS.readFileSync(NodePath.join(context.stateRoot, "userdata", "settings.json"), "utf8"),
+  );
+  expect(settings.providerInstances.cursor.environment).toEqual([
+    { name: "HOME", value: context.fixtureUserHomePath, sensitive: false },
+  ]);
+});
+
+it.each([undefined, "false", "TRUE"])(
+  "refuses Cursor question selection outside CI before creating its fixture (%s)",
+  (CI) => {
+    const parent = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "owned-question-admission-"));
+    hostTemporaryDirectories.push(parent);
+    const runRoot = NodePath.join(parent, "run");
+    const environment = { CI, BIBCODE_E2E_PLATFORM: "linux", BIBCODE_E2E_RUN_ROOT: runRoot };
+    expect(() =>
+      prepareDesktopUiTestContext(environment, parent, cursorQuestionFixtureSelection),
+    ).toThrow("Owned Cursor question fixture refused.");
+    expect(NodeFS.existsSync(runRoot)).toBe(false);
+    expect(environment).toEqual({
+      CI,
+      BIBCODE_E2E_PLATFORM: "linux",
+      BIBCODE_E2E_RUN_ROOT: runRoot,
+    });
+  },
+);
 
 describe.each([
   { platform: "mac", executableSuffix: "" },

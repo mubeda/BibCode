@@ -5,6 +5,10 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { desktopActivityFixture, desktopActivityMarkerFileName } from "./activity-events.ts";
+import {
+  cursorQuestionFixtureSelection,
+  extendOwnedCursorQuestionFixture,
+} from "./release-visual-cursor-question-fixture.ts";
 
 const FIXTURE_PROJECT_NAME = "BiBCode UI Fixture";
 const STREAMED_RESPONSE = "BiBCode deterministic streamed fixture response.";
@@ -986,11 +990,15 @@ function writeExecutable(path: string, contents: string, isWindows: boolean): vo
   }
 }
 
-function createProviderShims(shimDirectory: string, isWindows: boolean): void {
+function createProviderShims(
+  shimDirectory: string,
+  isWindows: boolean,
+  cursorQuestion?: typeof cursorQuestionFixtureSelection,
+): void {
   const fixtureSources = {
     codex: codexFixtureSource,
     claude: claudeFixtureSource,
-    "cursor-agent": cursorFixtureSource,
+    "cursor-agent": extendOwnedCursorQuestionFixture(cursorFixtureSource, cursorQuestion),
     grok: grokFixtureSource,
     opencode: opencodeFixtureSource,
   } as const;
@@ -1075,6 +1083,7 @@ function writeProviderSettings(
   shimDirectory: string,
   fixtureUserHomePath: string,
   isWindows: boolean,
+  cursorQuestion?: typeof cursorQuestionFixtureSelection,
 ): void {
   const executablePath = (name: string): string =>
     NodePath.join(shimDirectory, isWindows ? `${name}.cmd` : name);
@@ -1101,6 +1110,15 @@ function writeProviderSettings(
                 value: fixtureUserHomePath,
                 sensitive: false,
               },
+              ...(cursorQuestion === undefined
+                ? []
+                : [
+                    {
+                      name: "BIBCODE_E2E_CURSOR_QUESTION_FIXTURE",
+                      value: cursorQuestion,
+                      sensitive: false,
+                    },
+                  ]),
             ],
           },
         },
@@ -1202,7 +1220,13 @@ function desktopUiHostTemporaryDirectory(): string {
 export function prepareDesktopUiTestContext(
   environment: NodeJS.ProcessEnv = process.env,
   hostTemporaryDirectory: string = desktopUiHostTemporaryDirectory(),
+  cursorQuestion?: typeof cursorQuestionFixtureSelection,
 ): DesktopUiTestContext {
+  if (
+    cursorQuestion !== undefined &&
+    (cursorQuestion !== cursorQuestionFixtureSelection || environment.CI !== "true")
+  )
+    throw new Error("Owned Cursor question fixture refused.");
   // oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone WDIO fixture injects the detected host into its adapters.
   const hostPlatform = environment.BIBCODE_E2E_PLATFORM ?? process.platform;
   const isWindows = hostPlatform === "win" || hostPlatform === "win32";
@@ -1242,8 +1266,8 @@ export function prepareDesktopUiTestContext(
   NodeFS.writeFileSync(providerInputLogPath, "");
   initializeGitProject(projectPath);
   writeFixtureFiles(fixtureUserHomePath, cursorInventoryFiles);
-  createProviderShims(shimDirectory, isWindows);
-  writeProviderSettings(stateRoot, shimDirectory, fixtureUserHomePath, isWindows);
+  createProviderShims(shimDirectory, isWindows, cursorQuestion);
+  writeProviderSettings(stateRoot, shimDirectory, fixtureUserHomePath, isWindows, cursorQuestion);
 
   environment.BIBCODE_E2E_RUN_ROOT = runRoot;
   environment.BIBCODE_E2E_ARTIFACT_DIR = artifactDirectory;

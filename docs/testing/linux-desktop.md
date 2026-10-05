@@ -1465,6 +1465,25 @@ selection. The source-derived primary composer surface is `chat:host`;
 `chat:<thread-id>` is a sibling surface and cannot stand in for the default
 thread. Other core/settings/delivery import actions retain their existing order.
 
+Each controlled Changes, History, or Tags tab reports its displayed, uniqueness,
+enabled, click, and completed awaits. A later failure therefore does not inherit
+the import's model-verification phase after a successful tab click. Optional
+reporting failures preserve the original command and outcome. Only a failure
+at one of those exact click phases may add `gitProjectTabInterception`: the
+fixed tab name, receiving-slot enum, and receiving element's own ending-style
+boolean decoded from the original error. No raw error, markup, identifier, new
+DOM/RPC read, action, delay, retry, or cause verdict is retained. Unknown or
+unsafe error data remains null; this attribution never qualifies an original.
+
+The switch-with-changes original also requires `dialogSettled`: neither starting
+nor ending style is present, and the popup's own Web Animations samples are
+finished or idle with no pending animation. Unknown, missing, or failed samples
+refuse capture. This read is part of the existing witness polling; no sleep,
+extra navigation, retry, or wider deadline is introduced. A visible dialog can
+still be between presentation frames, so geometry alone cannot establish a
+steady original. Component tests qualify this admission check; independently
+review the CI original to establish actual paint quality.
+
 At `import-verify-claude-opus`, the existing single bounded `importObservation`
 read may also retain `modelFacts` from that private binding. Exact route,
 selected project card, local rail, primary host/form and trigger must join;
@@ -1603,3 +1622,61 @@ form; chooser pixels are not separately retained. Broken recovery's real busy
 and focused Retry must survive both witness checks and may fail honestly.
 Review actual paired original pixels independently before any native, visual,
 group or full-matrix acceptance claim.
+
+## Cursor later-question visual preparation
+
+The manual visual workflow offers a separate fixed
+`release-visual-cursor-question` selection for the existing later-multiselect
+row. It retains one named `question-multiselect` original per theme. It is not
+appended to the bounded nine-scene core sequence; `completeGroup` stays false
+and the full 82-scene/164-original obligation remains unchanged.
+
+Only the reviewed CI owner passes `question-multiselect-v1` to the existing
+fixture installer. Undefined selection retains the default Cursor shim bytes
+and settings. Selection outside CI is refused before fixture creation. The
+fixed question flag belongs only to the owned Cursor instance environment;
+other providers and ordinary callers remain unchanged. The controller preserves
+that environment while restricting provider executables to its private shims.
+It enables no real host provider and changes no production inventory/capability.
+
+The fixture uses Cursor's actual newline ACP `cursor/ask_question` route: the
+first question is single-select and the later question retains `allowMultiple`.
+The original prompt remains pending until an exact correlated label-array
+answer completes both questions. CI first runs the inert
+`provider::cursor::runtime::tests::owned_later_question_keeps_multiple_labels_and_original_prompt_correlation`
+library replay, which checks actual runtime mapping, original wire/turn
+correlation and first scalar/later label-array preservation. This compatibility
+proof does not replace the real product/provider/browser qualification below.
+
+Select the owned Cursor Fixture model through public model controls in the real
+managed thread. Send the fixed owned prompt through the existing delivery path;
+click Workspace, allow the actual single-select advance, then click Tests and
+Docs. Require the later question, readable 2/2, both genuine selection indicators,
+all three owned options and visible/enabled explicit Submit. Capture before
+submitting, submit once publicly, then require the typed public snapshot to
+report that exact newly started Cursor turn as completed with its completion
+timestamp. A missing question or working row alone does not prove success;
+failed, interrupted, foreign, or timestamp-free turns refuse qualification.
+Restore the original Claude/Opus identity through the existing cleanup owner and join every
+owned child on all exits. Failed restoration remains fatal; capture failures
+and their original errors are preserved. Never inject a canonical pending input
+or renderer state, force a click or replace the question with static markup.
+
+The shared owned original-capture helper preserves the existing Git/project
+lifecycle: duplicate/file/alert refusal, identity before and after the original,
+owner-bounded 2-second observations and 5-second screenshot, both witness
+checks, original nonblank PNG validation at 1280 by 960, strict closed receipt
+and private mode-0600 exclusive write. Scene readers retain route/theme/selected-card,
+provider, credential, boot-shell, visibility, hit-testing and clipping fences.
+The new selection retains the existing 600/660-second controller/outer bounds,
+private profile/network/guard admission and joined namespace cleanup. Capture
+metadata contains only fixed enums/booleans/counts/dimensions and hashes; no
+question replies, IDs, input, HTML, credentials, logs or private paths enter
+retained evidence. Its allowlist is only two named originals plus the same seven
+closed phase/failure/provenance/result/assertions/namespace/supervisor receipts.
+
+Run the Cursor fixture/installer/public-flow/shared-capture tests with existing
+Git/project capture negatives and the actual mounted question controls before a
+native trial. Inspect both CI original images independently. Hermetic ports,
+geometry, scripted transport and static gates do not establish native pixels,
+Tauri behavior, a final product nomination or full-matrix acceptance.

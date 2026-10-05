@@ -39,11 +39,20 @@ import {
   type OwnedDriverReadiness,
 } from "./support/qualification-owner.ts";
 import { prepareDesktopUiTestContext } from "./support/test-project.ts";
+import { cursorQuestionFixtureSelection } from "./support/release-visual-cursor-question-fixture.ts";
+import {
+  runCursorQuestionVisual,
+  captureCursorQuestionVisual,
+  readCursorQuestionObservation,
+  validateCursorQuestionWitness,
+  successfulCursorQuestionTurn,
+} from "./support/release-visual-cursor-question.ts";
 import {
   classifyQualificationFailure,
   projectQualificationProcess,
 } from "./support/chat-upload-evidence.ts";
 import { inspectScreenshot, validateCaptureWitness } from "./support/remote-ui-evidence.ts";
+import { projectGitProjectTabInterception } from "./support/git-project-tab-interception.ts";
 import {
   deliveryThemes,
   deliveryScenes,
@@ -435,6 +444,7 @@ export function deliveryConfiguration(
       "release-visual-core",
       "release-visual-settings",
       "release-visual-git-project",
+      "release-visual-cursor-question",
     ].includes(selection) ||
     environment.CI !== "true" ||
     !/^[0-9a-f]{40}$/.test(environment.BIBCODE_UPLOAD_SOURCE ?? "") ||
@@ -452,7 +462,8 @@ export function deliveryConfiguration(
       | "delivery-retry-ui"
       | "release-visual-core"
       | "release-visual-settings"
-      | "release-visual-git-project";
+      | "release-visual-git-project"
+      | "release-visual-cursor-question";
     fixture: string;
     evidence: string;
     binary: string;
@@ -1104,7 +1115,10 @@ export async function runDeliveryRetryQualification() {
         BIBCODE_E2E_ARTIFACT_DIR: NodePath.join(runRoot, "private"),
         BIBCODE_E2E_PLATFORM: "linux",
       };
-      const context = prepareDesktopUiTestContext(env);
+      const context =
+        config.selection === "release-visual-cursor-question"
+          ? prepareDesktopUiTestContext(env, undefined, cursorQuestionFixtureSelection)
+          : prepareDesktopUiTestContext(env);
       const control = NodePath.join(runRoot, "delivery-retry");
       if (config.selection === "delivery-retry-ui") NodeFS.mkdirSync(control, { mode: 0o700 });
       if (config.selection === "release-visual-core") {
@@ -1160,6 +1174,10 @@ export async function runDeliveryRetryQualification() {
       }
       const settingsPath = NodePath.join(context.stateRoot, "userdata", "settings.json");
       const configured = JSON.parse(NodeFS.readFileSync(settingsPath, "utf8"));
+      const ownedCursorInstance =
+        config.selection === "release-visual-cursor-question"
+          ? structuredClone(configured.providerInstances.cursor)
+          : null;
       const missing = NodePath.join(runRoot, "missing-provider");
       for (const entry of Object.values(configured.providers) as Record<string, unknown>[]) {
         entry.enabled = false;
@@ -1180,6 +1198,25 @@ export async function runDeliveryRetryQualification() {
         enabled: true,
         config: { binaryPath: claude },
       };
+      if (config.selection === "release-visual-cursor-question") {
+        check(
+          ownedCursorInstance !== null &&
+            ownedCursorInstance.driver === "cursor" &&
+            ownedCursorInstance.environment.some(
+              (entry: { name: string; value: string; sensitive: boolean }) =>
+                entry.name === "BIBCODE_E2E_CURSOR_QUESTION_FIXTURE" &&
+                entry.value === cursorQuestionFixtureSelection &&
+                entry.sensitive === false,
+            ),
+        );
+        const cursor = NodePath.join(context.shimDirectory, "cursor-agent");
+        configured.providers.cursor = { enabled: true, binaryPath: cursor };
+        configured.providerInstances.cursor = {
+          ...ownedCursorInstance,
+          enabled: true,
+          config: { binaryPath: cursor },
+        };
+      }
       configured.enableProviderUpdateChecks = false;
       configured.worktreeBaseDirectory = NodePath.join(runRoot, "managed-worktrees");
       NodeFS.mkdirSync(configured.worktreeBaseDirectory, { mode: 0o700 });
@@ -1356,8 +1393,15 @@ export async function runDeliveryRetryQualification() {
           const viewport = await bounded(browser!.execute(readVisualViewport), 2_000);
           return viewport.width === 1280 && viewport.height === 960;
         });
-      } else if (config.selection === "release-visual-settings") {
-        step("visual-settings-viewport");
+      } else if (
+        config.selection === "release-visual-settings" ||
+        config.selection === "release-visual-cursor-question"
+      ) {
+        step(
+          config.selection === "release-visual-cursor-question"
+            ? "visual-cursor-question-viewport"
+            : "visual-settings-viewport",
+        );
         const observed = await bounded(browser.execute(readVisualViewport), 2_000);
         const outer = await browser.getWindowSize();
         const corrected = correctDesktopUiOuterSize(
@@ -1487,6 +1531,125 @@ export async function runDeliveryRetryQualification() {
           },
         });
         assertions.push({ theme, ...proof });
+      } else if (config.selection === "release-visual-cursor-question") {
+        const snapshot = createOwnedGitProjectSnapshotReader(() =>
+          owner.json(
+            config.binary,
+            ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
+            childEnv,
+          ),
+        );
+        const currentThread = async () => {
+          const model = await snapshot();
+          const matching = model.threads.filter(
+            (entry) =>
+              entry.id === workspace.threadId &&
+              entry.deletedAt === null &&
+              entry.archivedAt === null &&
+              entry.worktreePath === workspace.path,
+          );
+          check(matching.length === 1);
+          return matching[0]!;
+        };
+        let originalTurnId: string | null = null;
+        const verifyOwnedIdentity = async () => {
+          check(
+            JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
+              JSON.stringify({
+                path: workspace.path,
+                branch: workspace.branch,
+                commonDirectory: workspace.commonDirectory,
+              }),
+          );
+          check(
+            (
+              await b().execute(readSelectedDeliveryWorktree, {
+                origin,
+                branch: workspace.branch,
+                boundThreadId: workspace.threadId,
+              })
+            )?.threadId === workspace.threadId,
+          );
+        };
+        const proof = await runCursorQuestionVisual({
+          browser: b(),
+          owner,
+          verifyOwnedIdentity,
+          step,
+          selectCursor: async () => {
+            await click(`${form} [data-chat-provider-model-picker="true"]`);
+            await click(
+              '[data-model-picker-content="true"] [data-model-picker-instance-id="cursor"][data-model-picker-model-slug="cursor-fixture"]',
+            );
+            await owner.until(
+              async () =>
+                (await b()
+                  .$(`${form} [data-chat-provider-model-picker="true"]`)
+                  .getAttribute("aria-label")) === "Cursor · Cursor Fixture",
+            );
+          },
+          restoreOriginal: () => selectClaudeModel("worktree"),
+          send: async (text) => {
+            const before = (await currentThread()).latestTurn?.turnId ?? null;
+            await send(text);
+            await owner.until(async () => {
+              const thread = await currentThread(),
+                turn = thread.latestTurn;
+              if (
+                !turn ||
+                turn.turnId === before ||
+                turn.state !== "running" ||
+                thread.session?.activeTurnId !== turn.turnId ||
+                thread.session.providerName !== "cursor"
+              )
+                return false;
+              originalTurnId = turn.turnId;
+              return true;
+            });
+          },
+          capture: async () => {
+            captures.push(
+              await captureCursorQuestionVisual({
+                browser: b(),
+                owner,
+                theme,
+                origin,
+                threadId: workspace.threadId,
+                branch: workspace.branch,
+                evidence: config.evidence,
+                captured: capturedVisuals,
+                verifyOwnedIdentity,
+              }),
+            );
+            write("assertions", { captures, assertions });
+          },
+          waitOriginalTurnCompleted: () =>
+            owner.until(async () => {
+              if (
+                originalTurnId === null ||
+                !successfulCursorQuestionTurn(await currentThread(), originalTurnId)
+              )
+                return false;
+              const observed = await bounded(
+                b().execute(readCursorQuestionObservation, {
+                  phase: "quiescent" as const,
+                  theme,
+                  origin,
+                  threadId: workspace.threadId,
+                  branch: workspace.branch,
+                }),
+                2000,
+              );
+              try {
+                validateCursorQuestionWitness("quiescent", observed);
+                return true;
+              } catch {
+                return false;
+              }
+            }),
+        });
+        assertions.push({ theme, ...proof });
+        write("assertions", { captures, assertions });
       } else if (config.selection === "release-visual-settings") {
         await type("Owned visual review draft");
         const verifyOwnedIdentity = async () => {
@@ -1718,8 +1881,10 @@ export async function runDeliveryRetryQualification() {
             : config.selection === "release-visual-settings"
               ? settingsVisualScenes.length
               : config.selection === "release-visual-git-project"
-                ? gitProjectVisualScenes.length - 1
-                : deliveryScenes.length) && assertions.length === 2,
+                ? gitProjectVisualScenes.length
+                : config.selection === "release-visual-cursor-question"
+                  ? 1
+                  : deliveryScenes.length) && assertions.length === 2,
     );
     success = true;
   } catch (error) {
@@ -1758,6 +1923,12 @@ export async function runDeliveryRetryQualification() {
       worktreeObservation,
       createRefObservation,
       textRowObservation,
+      gitProjectTabInterception:
+        phase === "visual-git-project-tab-changes-click" ||
+        phase === "visual-git-project-tab-history-click" ||
+        phase === "visual-git-project-tab-tags-click"
+          ? projectGitProjectTabInterception(error, phase, config.selection)
+          : null,
       coreCaptureFailureFacts:
         phase === "visual-git-branch-menu" || phase === "visual-command-palette"
           ? readCoreCaptureFailureFacts(coreCaptureFailures, error, {
@@ -1824,8 +1995,10 @@ export async function runDeliveryRetryQualification() {
           : config.selection === "release-visual-settings"
             ? "Four Linux Chromium settings scene pairs only. Add instance wizard and declared unpictured substates remain unqualified. Original light/dark PNGs require independent review; no native or full-matrix qualification claim."
             : config.selection === "release-visual-git-project"
-              ? "Ten fixed Git/project originals per theme; Tags groups/names partial and rewrite unbound. completeGroup remains false. Full82/164 originals and unpictured substates remain obligatory and unqualified; independent original-pixel review required."
-              : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
+              ? "Eleven fixed Git/project originals per theme; Tags groups/names remain partial. completeGroup remains false. Full82/164 originals and unpictured substates remain obligatory and unqualified; independent original-pixel review required."
+              : config.selection === "release-visual-cursor-question"
+                ? "One fixed Cursor later-multiselect question pair only through native ACP and public choices/Submit. completeGroup remains false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
+                : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
     });
   }
   return success ? 0 : 1;
