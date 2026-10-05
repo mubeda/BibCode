@@ -1,7 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off - Finite owned original images; runtime/Git ownership remains with the existing controller.
 import * as NodePath from "node:path";
+import * as NodeUtil from "node:util";
 import type { OrchestrationReadModel } from "../../../../packages/contracts/src/orchestration.ts";
-import { type QualificationBrowser, type QualificationOwner } from "./qualification-owner.ts";
+import {
+  bounded,
+  type QualificationBrowser,
+  type QualificationOwner,
+} from "./qualification-owner.ts";
 import { validateCaptureWitness } from "./remote-ui-evidence.ts";
 import type { GitProjectVisualFixture } from "./release-visual-git-project-fixture.ts";
 import { captureOwnedVisualScene } from "./owned-visual-capture.ts";
@@ -66,6 +71,230 @@ const sceneFacts: Record<GitProjectVisualScene, readonly string[]> = {
   "git-broken-recovery": ["actionableReason", "retryBusy", "retryFocused", "selectedTab"],
 };
 const refused = () => new Error("Visual Git/project precondition failed.");
+
+const directoryFailurePhase = "visual-git-project-directory-nested-displayed";
+const directoryFailureBooleanKeys = [
+  "popupVisible",
+  "popupInView",
+  "popupHit",
+  "popupStarting",
+  "popupEnding",
+  "popupAnimationsSettled",
+  "pathMatchesOrdinary",
+  "pathFocused",
+  "pathInView",
+  "pathHit",
+  "ordinaryBreadcrumbSelected",
+  "nestedFolderVisible",
+  "nestedFolderInView",
+  "nestedFolderHit",
+  "loadingShown",
+  "fallbackShown",
+  "errorShown",
+  "newFolderEnabled",
+  "openProjectEnabled",
+] as const;
+const directoryFailureCountKeys = [
+  "pathCount",
+  "nestedFolderCount",
+  "nestedBreadcrumbCount",
+] as const;
+const directoryFailures = new WeakMap<object, Readonly<Record<string, boolean | string | null>>>();
+
+/** Closed failure facts only; no page values, markup or private identity is retained. */
+export function projectGitProjectDirectoryFailure(value: unknown) {
+  try {
+    if (
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      NodeUtil.types.isProxy(value)
+    )
+      return null;
+    const keys: readonly string[] = [...directoryFailureBooleanKeys, ...directoryFailureCountKeys];
+    const own = Reflect.ownKeys(value);
+    if (
+      own.length !== keys.length ||
+      !own.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const result: Record<string, boolean | string | null> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      const field: unknown = descriptor.value;
+      if (directoryFailureCountKeys.some((count) => count === key)) {
+        if (field !== "none" && field !== "one" && field !== "many") return null;
+      } else if (field !== null && typeof field !== "boolean") return null;
+      result[key] = field as boolean | string | null;
+    }
+    return Object.freeze(result);
+  } catch {
+    return null;
+  }
+}
+
+/** One serialized, failure-only DOM read. Absence facts do not establish a cause or admit a capture. */
+export function readGitProjectDirectoryFailure(input: {
+  origin: string;
+  theme: "light" | "dark";
+  selection: GitProjectVisualSelection;
+  ordinary: string;
+}) {
+  try {
+    const { selection } = input;
+    if (
+      input.origin !== "http://127.0.0.1:4885" ||
+      location.origin !== input.origin ||
+      location.search ||
+      location.hash ||
+      (input.theme !== "light" && input.theme !== "dark") ||
+      document.documentElement.classList.contains("dark") !== (input.theme === "dark") ||
+      selection.environmentId !== "local" ||
+      ![selection.threadId, selection.projectId].every(
+        (value) => typeof value === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(value),
+      ) ||
+      typeof input.ordinary !== "string" ||
+      !input.ordinary.startsWith("/") ||
+      input.ordinary.length > 4096 ||
+      document.querySelector(
+        '#pairing-token,input[type="password"],input[autocomplete="one-time-code"],textarea[placeholder^="bibcode://pair"]',
+      ) !== null ||
+      document.getElementById("boot-shell") !== null ||
+      document.querySelector("vite-error-overlay") !== null ||
+      document.querySelector(
+        '[data-testid="environment-rail-local"][aria-checked="true"] [data-status="connected"]',
+      ) === null
+    )
+      return null;
+    const cards = document.querySelectorAll(
+      `[data-testid="primary-card-button-${selection.projectId}"]`,
+    );
+    const card = cards.length === 1 ? cards[0]! : null;
+    if (
+      location.pathname !== "/local/" + selection.threadId ||
+      !card ||
+      card.getAttribute("aria-current") !== "page" ||
+      card.closest("[hidden],[inert]")
+    )
+      return null;
+    const popups = document.querySelectorAll('[data-slot="dialog-popup"][role="dialog"]');
+    if (popups.length !== 1) return null;
+    const popup = popups[0]!;
+    const visible = (node: Element | null) => {
+      if (!node) return false;
+      const box = node.getBoundingClientRect();
+      if (box.width <= 0 || box.height <= 0) return false;
+      for (let parent: Element | null = node; parent; parent = parent.parentElement) {
+        const style = getComputedStyle(parent);
+        if (
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          Number.parseFloat(style.opacity) === 0 ||
+          parent.hasAttribute("hidden") ||
+          parent.hasAttribute("inert")
+        )
+          return false;
+      }
+      return true;
+    };
+    if (!visible(card)) return null;
+    const inView = (node: Element | null) => {
+      if (!visible(node)) return false;
+      const box = node!.getBoundingClientRect();
+      return box.left >= 0 && box.top >= 0 && box.right <= innerWidth && box.bottom <= innerHeight;
+    };
+    const hit = (node: Element | null) => {
+      if (!inView(node)) return false;
+      const box = node!.getBoundingClientRect();
+      const receiving = document.elementFromPoint(
+        box.left + box.width / 2,
+        box.top + box.height / 2,
+      );
+      return receiving !== null && (receiving === node || node!.contains(receiving));
+    };
+    const count = (nodes: NodeListOf<Element>) =>
+      nodes.length === 0 ? "none" : nodes.length === 1 ? "one" : "many";
+    const paths = popup.querySelectorAll('[aria-label="Server directory path"]');
+    const path = paths.length === 1 && paths[0] instanceof HTMLInputElement ? paths[0] : null;
+    const folders = popup.querySelectorAll(
+      'button[aria-label="Open nested"]:has(> [data-directory-folder-icon])',
+    );
+    const folder = folders.length === 1 ? folders[0]! : null;
+    const breadcrumbs = popup.querySelectorAll(
+      '[aria-label="Directory breadcrumbs"] button[aria-label="Open nested"]',
+    );
+    const currentBreadcrumbs = popup.querySelectorAll(
+      '[aria-label="Directory breadcrumbs"] button[aria-current="page"]',
+    );
+    const enabled = (nodes: Element[]) =>
+      nodes.length === 1 ? !nodes[0]!.matches(':disabled,[aria-disabled="true"]') : null;
+    const statuses = Array.from(popup.querySelectorAll('[role="status"]')).filter(visible);
+    let animationsSettled: boolean | null = null;
+    try {
+      animationsSettled = popup
+        .getAnimations()
+        .every(
+          (animation) =>
+            !animation.pending &&
+            (animation.playState === "finished" || animation.playState === "idle"),
+        );
+    } catch {
+      /* Unknown animation sampling remains unknown. */
+    }
+    return {
+      popupVisible: visible(popup),
+      popupInView: inView(popup),
+      popupHit: hit(popup),
+      popupStarting: popup.hasAttribute("data-starting-style"),
+      popupEnding: popup.hasAttribute("data-ending-style"),
+      popupAnimationsSettled: animationsSettled,
+      pathCount: count(paths),
+      pathMatchesOrdinary: path ? path.value === input.ordinary : null,
+      pathFocused: path ? document.activeElement === path : null,
+      pathInView: path ? inView(path) : null,
+      pathHit: path ? hit(path) : null,
+      ordinaryBreadcrumbSelected:
+        currentBreadcrumbs.length === 1
+          ? currentBreadcrumbs[0]!.getAttribute("title") === input.ordinary
+          : null,
+      nestedFolderCount: count(folders),
+      nestedFolderVisible: folder ? visible(folder) : null,
+      nestedFolderInView: folder ? inView(folder) : null,
+      nestedFolderHit: folder ? hit(folder) : null,
+      nestedBreadcrumbCount: count(breadcrumbs),
+      loadingShown: statuses.some((node) => node.textContent?.trim() === "Loading folders…"),
+      fallbackShown: statuses.some(
+        (node) =>
+          node.textContent?.trim() ===
+          "The previous folder is unavailable. Showing the server home directory.",
+      ),
+      errorShown: Array.from(popup.querySelectorAll('[role="alert"]')).some(visible),
+      newFolderEnabled: enabled(
+        Array.from(popup.querySelectorAll('button[aria-label="New folder"]')),
+      ),
+      openProjectEnabled: enabled(
+        Array.from(popup.querySelectorAll("button")).filter(
+          (node) => node.textContent?.trim() === "Open project",
+        ),
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Only the exact failing await and original object may retrieve the admitted closed sample. */
+export function gitProjectDirectoryFailureFacts(error: unknown, phase: unknown) {
+  if (
+    phase !== directoryFailurePhase ||
+    !error ||
+    typeof error !== "object" ||
+    NodeUtil.types.isProxy(error)
+  )
+    return null;
+  return directoryFailures.get(error) ?? null;
+}
 
 /** Fixed public selection identity; renderer IDs and page values never enter receipts. */
 export function readGitProjectSelection(input: {
@@ -840,7 +1069,34 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
     const control = browser.$(selector);
     if (directoryControl) observeDirectoryAwait(`${directoryControl}-displayed`);
     observeTabAwait("displayed");
-    await control.waitForDisplayed();
+    try {
+      await control.waitForDisplayed();
+    } catch (error) {
+      if (
+        directoryControl === "nested" &&
+        error !== null &&
+        typeof error === "object" &&
+        !NodeUtil.types.isProxy(error)
+      ) {
+        directoryFailures.delete(error);
+        try {
+          const value = await bounded(
+            browser.execute(readGitProjectDirectoryFailure, {
+              origin: input.origin,
+              theme: input.theme,
+              selection: rich,
+              ordinary: fixture.ordinary,
+            }),
+            2_000,
+          );
+          const facts = projectGitProjectDirectoryFailure(value);
+          if (facts !== null) directoryFailures.set(error, facts);
+        } catch {
+          /* Late/unavailable diagnostics cannot replace the original display failure. */
+        }
+      }
+      throw error;
+    }
     if (directoryControl) observeDirectoryAwait(`${directoryControl}-unique`);
     observeTabAwait("unique");
     if ((await browser.$$(selector).length) !== 1) throw refused();

@@ -19,6 +19,7 @@ import {
 import { deliveryScenes, deliveryThemes } from "./delivery-retry-evidence.ts";
 import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
 import { projectGitProjectTabInterception } from "./git-project-tab-interception.ts";
+import { gitProjectDirectoryFailureFacts } from "./release-visual-git-project.ts";
 import { bounded, projectOwnedDriverReadiness } from "./qualification-owner.ts";
 import { correctDesktopUiOuterSize } from "./window-size.ts";
 import { readVisualViewport } from "./release-visual-observation.ts";
@@ -80,7 +81,12 @@ const runControllerSource = (
 ) =>
   NodeVM.runInNewContext(
     code,
-    { resolveSettingsVisualFailureScene, projectGitProjectTabInterception, ...context },
+    {
+      resolveSettingsVisualFailureScene,
+      projectGitProjectTabInterception,
+      gitProjectDirectoryFailureFacts,
+      ...context,
+    },
     options,
   );
 

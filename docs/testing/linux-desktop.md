@@ -1543,6 +1543,27 @@ Add Project hook/dialog/directory browser and pinned SDK typing regression prove
 source behavior using inert operation/query ports; they do not qualify native
 XPath lookup, geometry, process timing or pixels.
 
+At the exact `visual-git-project-directory-nested-displayed` failure, the existing
+producer may retain `gitProjectDirectoryFailureFacts`. One failure-only browser
+read uses the existing two-second bound and the already verified rich-project
+binding. The read requires the exact origin, route, theme, selected primary card,
+connected Local rail, unique dialog and unchanged credential/boot fences. It
+retains only nullable booleans for path equality/focus, selected ordinary
+breadcrumb, loading/fallback/error presence, control availability, visibility,
+viewport/hit testing and the popup's own transition/animation state; path, folder
+and breadcrumb counts use only `none`, `one` and `many`. Folder rows and
+breadcrumbs are counted separately using the folder icon marker. No path, text,
+HTML, source/server/thread identifier, native error or credential is retained.
+Missing/foreign/ambiguous surfaces, malformed/accessor/proxy output, unavailable
+or late reads leave the field null. A reused original error cannot retain an
+older sample. The original display exception, public action order, capture
+admission, 30-second existing wait and 600/660-second batch bounds remain
+unchanged. These facts identify a sampled state; they do not establish the
+native timeout's cause, qualify an original or replace full82/164 coverage.
+The manual workflow's existing Git helper test gate includes
+`release-visual-git-project-directory-failure.test.ts`; current-source root
+check/type and independent native-original review remain required.
+
 For this selection only, verify the canonical owned private clone-alias file and
 its exact key/value, then set the actual server child's `GIT_CONFIG_GLOBAL` to
 that file before startup. The valid fixed clone URL maps to the private bare

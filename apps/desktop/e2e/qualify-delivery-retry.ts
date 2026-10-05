@@ -31,6 +31,7 @@ import {
   projectGitProjectVisualCapture,
   projectGitProjectVisualAssertion,
   gitProjectVisualScenes,
+  gitProjectDirectoryFailureFacts,
   type GitProjectVisualSelection,
 } from "./support/release-visual-git-project.ts";
 import {
@@ -2079,6 +2080,7 @@ export async function runDeliveryRetryQualification() {
       worktreeObservation,
       createRefObservation,
       textRowObservation,
+      gitProjectDirectoryFailureFacts: gitProjectDirectoryFailureFacts(error, phase),
       gitProjectTabInterception:
         phase === "visual-git-project-tab-changes-click" ||
         phase === "visual-git-project-tab-history-click" ||
