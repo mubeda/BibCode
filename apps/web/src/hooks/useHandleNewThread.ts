@@ -22,8 +22,8 @@ import { newDraftId, newThreadId } from "../lib/utils";
 import { orderItemsByPreferredIds } from "../components/Sidebar.logic";
 import {
   deriveLogicalProjectKeyFromSettings,
-  derivePhysicalProjectKey,
   getProjectOrderKey,
+  projectDraftFallbackKeys,
   selectProjectGroupingSettings,
 } from "../logicalProject";
 import { readThreadShell, useProjects, useServerConfigs, useThread } from "../state/entities";
@@ -80,7 +80,8 @@ export function useNewThreadHandler() {
       const hasStartFromOriginOption = options?.startFromOrigin !== undefined;
       const storedDraftThread = getDraftSessionByLogicalProjectKey(
         logicalProjectKey,
-        project ? [derivePhysicalProjectKey(project)] : [],
+        project ? projectDraftFallbackKeys(project, logicalProjectKey) : [],
+        projectRef,
       );
       const storedDraftThreadRef = storedDraftThread
         ? scopeThreadRef(storedDraftThread.environmentId, storedDraftThread.threadId)

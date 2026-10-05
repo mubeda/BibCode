@@ -84,6 +84,7 @@ import {
   PersistedComposerAttachment,
 } from "./composerDraftStore";
 const isPersistedComposerAttachment = Schema.is(PersistedComposerAttachment);
+import { derivePhysicalProjectKeyFromPath } from "./logicalProject";
 import { type ReviewCommentContext } from "./reviewCommentContext";
 import { removeLocalStorageItem, setLocalStorageItem } from "./hooks/useLocalStorage";
 import {
@@ -1252,7 +1253,7 @@ describe("composerDraftStore project draft thread mapping", () => {
 
   it("finds a draft stored under a project's earlier key through fallback keys", () => {
     const store = useComposerDraftStore.getState();
-    const earlierKey = scopedProjectKey(projectRef);
+    const earlierKey = derivePhysicalProjectKeyFromPath(TEST_ENVIRONMENT_ID, "/work/repo");
     store.setLogicalProjectDraftThreadId(earlierKey, projectRef, draftId, { threadId });
 
     const current = useComposerDraftStore.getState();
@@ -1260,6 +1261,58 @@ describe("composerDraftStore project draft thread mapping", () => {
     expect(
       current.getDraftSessionByLogicalProjectKey("github.com/acme/repo", [earlierKey])?.draftId,
     ).toBe(draftId);
+  });
+
+  it("prefers a draft under the current key over one under a fallback key", () => {
+    const store = useComposerDraftStore.getState();
+    const earlierKey = derivePhysicalProjectKeyFromPath(TEST_ENVIRONMENT_ID, "/work/repo");
+    store.setLogicalProjectDraftThreadId(earlierKey, projectRef, draftId, { threadId });
+    store.setLogicalProjectDraftThreadId("github.com/acme/repo", projectRef, otherDraftId, {
+      threadId: otherThreadId,
+    });
+
+    expect(
+      useComposerDraftStore
+        .getState()
+        .getDraftSessionByLogicalProjectKey("github.com/acme/repo", [earlierKey])?.draftId,
+    ).toBe(otherDraftId);
+  });
+
+  it("ignores a fallback-key draft owned by a different project", () => {
+    const store = useComposerDraftStore.getState();
+    const canonicalKey = "github.com/acme/repo";
+    store.setLogicalProjectDraftThreadId(canonicalKey, otherProjectRef, otherDraftId, {
+      threadId: otherThreadId,
+    });
+
+    const current = useComposerDraftStore.getState();
+    expect(
+      current.getDraftSessionByLogicalProjectKey("separate-key", [canonicalKey], projectRef),
+    ).toBeNull();
+    expect(
+      current.getDraftSessionByLogicalProjectKey("separate-key", [canonicalKey], otherProjectRef)
+        ?.draftId,
+    ).toBe(otherDraftId);
+    // The current key is never ownership-filtered: group members share one draft.
+    expect(current.getDraftSessionByLogicalProjectKey(canonicalKey, [], projectRef)?.draftId).toBe(
+      otherDraftId,
+    );
+  });
+
+  it("moves a draft to the current key so it lives under exactly one logical key", () => {
+    const store = useComposerDraftStore.getState();
+    const earlierKey = derivePhysicalProjectKeyFromPath(TEST_ENVIRONMENT_ID, "/work/repo");
+    store.setLogicalProjectDraftThreadId(earlierKey, projectRef, draftId, { threadId });
+    store.setLogicalProjectDraftThreadId("github.com/acme/repo", projectRef, draftId, {
+      threadId,
+    });
+
+    const state = useComposerDraftStore.getState();
+    expect(state.logicalProjectDraftThreadKeyByLogicalProjectKey).toEqual({
+      "github.com/acme/repo": draftId,
+    });
+    expect(state.getDraftSessionByLogicalProjectKey(earlierKey)).toBeNull();
+    expect(state.getDraftSessionByLogicalProjectKey("github.com/acme/repo")?.draftId).toBe(draftId);
   });
 
   it("clears branch and worktree context when remapping a draft to another environment", () => {

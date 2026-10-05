@@ -61,10 +61,10 @@ vi.mock("../state/entities", () => ({
   readThreadShell: () => (testState.shellExists ? { status: "ready" } : null),
 }));
 
-vi.mock("../logicalProject", () => ({
+vi.mock("../logicalProject", async (importOriginal) => ({
   deriveLogicalProjectKeyFromSettings: () => testState.logicalProjectKey,
-  derivePhysicalProjectKey: (project: { environmentId: string; workspaceRoot: string }) =>
-    `${project.environmentId}:${project.workspaceRoot}`,
+  projectDraftFallbackKeys: (await importOriginal<typeof import("../logicalProject")>())
+    .projectDraftFallbackKeys,
   getProjectOrderKey: (project: { environmentId: string; id: string }) =>
     `${project.environmentId}:${project.id}`,
   selectProjectGroupingSettings: (settings: unknown) => settings,
@@ -939,6 +939,33 @@ describe("useNewThreadHandler", () => {
         .getState()
         .getDraftSessionByLogicalProjectKey(scopedProjectKey(projectRef))?.draftId,
     ).toBe(draftId);
+  });
+
+  it("finds a draft stored under the project's physical key and moves it to the current key", async () => {
+    testState.projects = [project(projectId, environmentId, { repositoryIdentity: null })];
+    // derivePhysicalProjectKey lowercases the workspace path.
+    const physicalKey = `${environmentId}:x:\\repos\\${projectId}`;
+    const storedDraftId = "draft-physical" as never;
+    useComposerDraftStore
+      .getState()
+      .setLogicalProjectDraftThreadId(physicalKey, projectRef, storedDraftId, {
+        threadId: ThreadId.make("thread-physical"),
+      });
+    const lookup = vi.spyOn(useComposerDraftStore.getState(), "getDraftSessionByLogicalProjectKey");
+    useComposerDraftStore.setState({ getDraftSessionByLogicalProjectKey: lookup });
+    setRoute({ draftId: "draft-other" });
+    await mount(<NewThreadHarness />);
+    await clickNewThread();
+
+    expect(lookup).toHaveBeenCalledWith(testState.logicalProjectKey, [physicalKey], projectRef);
+    expect(testState.router.navigate).toHaveBeenCalledWith({
+      to: "/draft/$draftId",
+      params: { draftId: storedDraftId },
+    });
+    const mappings =
+      useComposerDraftStore.getState().logicalProjectDraftThreadKeyByLogicalProjectKey;
+    expect(mappings[testState.logicalProjectKey]).toBe(storedDraftId);
+    expect(mappings[physicalKey]).toBeUndefined();
   });
 
   it("navigates back to a reusable stored draft from another route", async () => {
