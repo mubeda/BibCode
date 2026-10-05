@@ -41,6 +41,14 @@ process deadline must cover that bound plus setup and teardown, and every
 selected invocation must actually execute the test. Keep the controlled-stall
 counterexample distinct from naturally observed failures.
 
+For the remote-pairing fixture with a delayed interpreter, establish its intended
+TERM immunity in the fixture's parent shell before launching the stand-in.
+The whole-second watchdog can expire before a newly spawned interpreter runs
+its first trap command. A probe through the actual interpreter must observe the
+inherited ignored disposition before the fixture installs any handler. Retain
+the watchdog exit, elapsed-time bounds, readiness, and cleanup assertions; the
+production pairing script and its signal policy remain the behavior under test.
+
 ## Unix recovery-test watchdog
 
 The private `turn_delivery_recovery` child helper uses an exactly selected,

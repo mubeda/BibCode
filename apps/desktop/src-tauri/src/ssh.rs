@@ -4872,6 +4872,43 @@ while True:
             }
         }
 
+        fn delayed_interpreter_pairing_script() -> String {
+            // The one-second watchdog may fire immediately at a clock boundary.
+            // This fixture deliberately ignores TERM, so establish that inherited
+            // disposition before the stand-in's first interpreter can start.
+            format!("trap '' TERM\n{REMOTE_PAIRING_SCRIPT}")
+        }
+
+        #[test]
+        fn delayed_pairing_fixture_inherits_term_immunity_before_its_first_interpreter() {
+            let python = find_on_path("python3").expect("Python fixture interpreter");
+            let python = fs::canonicalize(python).expect("absolute Python fixture interpreter");
+            for shell in shells() {
+                let host = ScriptHost::new();
+                write_executable(
+                    &host.dir.path().join("bin/bibcode"),
+                    r#"#!/bin/sh
+exec "$BIBCODE_FIXTURE_PYTHON" -c 'import signal
+print("ignored" if signal.getsignal(signal.SIGTERM) == signal.SIG_IGN else "default")'
+"#,
+                );
+                let script = delayed_interpreter_pairing_script();
+                let run = host.run(
+                    &shell,
+                    &script,
+                    &["35"],
+                    &[("BIBCODE_FIXTURE_PYTHON", python.display().to_string())],
+                    ScriptOutput::Files,
+                );
+                assert_eq!(run.code(), Some(0), "{run:?}");
+                assert_eq!(
+                    run.stdout.trim(),
+                    "ignored",
+                    "TERM immunity must be inherited before the stand-in can execute any trap"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn pairing_watchdog_escalates_when_the_interpreter_starts_late() {
             let python = find_on_path("python3").expect("Python fixture interpreter");
@@ -4889,9 +4926,10 @@ time.sleep(1.2)
 os.execv(sys.argv[1], sys.argv[1:])' "$BIBCODE_FIXTURE_PYTHON" "$@"
 "#,
                 );
+                let script = delayed_interpreter_pairing_script();
                 let run = host.run(
                     &shell,
-                    REMOTE_PAIRING_SCRIPT,
+                    &script,
                     &["1"],
                     &[
                         ("FIXTURE_PAIRING", "ignore-term".to_string()),
