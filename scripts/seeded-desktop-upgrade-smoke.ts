@@ -83,7 +83,11 @@ export interface SeededUpgradeObservationAfter {
 }
 
 export class SeededDesktopUpgradeSmokeError extends Error {
-  override readonly name = "SeededDesktopUpgradeSmokeError";
+  override readonly name: string = "SeededDesktopUpgradeSmokeError";
+}
+
+export class SeededUpgradeCommandTimeoutError extends SeededDesktopUpgradeSmokeError {
+  override readonly name = "SeededUpgradeCommandTimeoutError";
 }
 
 export const REMOTE_INSTALL_FORBIDDEN_PORTS: ReadonlySet<number> = new Set([
@@ -927,6 +931,27 @@ export function windowsCandidateIsInstalled(
   );
 }
 
+export async function readWindowsCandidateProbe(
+  run: () => Promise<CommandResult>,
+): Promise<{ readonly exitCode: number | null; readonly observation: unknown }> {
+  try {
+    const result = await run();
+    let observation: unknown;
+    try {
+      observation = JSON.parse(result.stdout.trim().replace(/^\uFEFF/, ""));
+    } catch {
+      observation = { error: "Windows version probe returned invalid JSON" };
+    }
+    return { exitCode: result.exitCode, observation };
+  } catch (cause) {
+    if (!(cause instanceof SeededUpgradeCommandTimeoutError)) throw cause;
+    return {
+      exitCode: null,
+      observation: { error: "Windows version probe command deadline" },
+    };
+  }
+}
+
 // Read-only, CI-only evidence. Paths and versions cross as environment values,
 // never PowerShell source; process command lines and credentials are not collected.
 export const windowsUpgradeObservationScript = `
@@ -973,31 +998,25 @@ async function waitForWindowsInstalledCandidate(input: {
     intervalMs: 1_000,
     timeoutMs: input.timeoutMs,
     probe: async () => {
-      const result = await runBoundedCommand({
-        command: "powershell.exe",
-        args: ["-NoProfile", "-NonInteractive", "-Command", windowsUpgradeObservationScript],
-        cwd: NodePath.dirname(input.appBinaryPath),
-        env: {
-          ...process.env,
-          BIBCODE_SEEDED_APPLICATION_PATH: input.appBinaryPath,
-          BIBCODE_SEEDED_CANDIDATE_VERSION: input.candidateVersion,
-        },
-        timeoutMs: 10_000,
-      });
-      let observation: unknown;
-      try {
-        observation = JSON.parse(result.stdout.trim().replace(/^\uFEFF/, ""));
-      } catch {
-        observation = { error: "Windows version probe returned invalid JSON" };
-      }
+      const { exitCode, observation } = await readWindowsCandidateProbe(() =>
+        runBoundedCommand({
+          command: "powershell.exe",
+          args: ["-NoProfile", "-NonInteractive", "-Command", windowsUpgradeObservationScript],
+          cwd: NodePath.dirname(input.appBinaryPath),
+          env: {
+            ...process.env,
+            BIBCODE_SEEDED_APPLICATION_PATH: input.appBinaryPath,
+            BIBCODE_SEEDED_CANDIDATE_VERSION: input.candidateVersion,
+          },
+          timeoutMs: 10_000,
+        }),
+      );
       await NodeFS.promises.appendFile(
         NodePath.join(input.evidenceDirectory, "windows-install-handoff.log"),
-        `${JSON.stringify({ exitCode: result.exitCode, observation })}\n`,
+        `${JSON.stringify({ exitCode, observation })}\n`,
         { mode: 0o600 },
       );
-      return (
-        result.exitCode === 0 && windowsCandidateIsInstalled(observation, input.candidateVersion)
-      );
+      return exitCode === 0 && windowsCandidateIsInstalled(observation, input.candidateVersion);
     },
   });
 }
@@ -1222,18 +1241,41 @@ interface CommandResult {
 
 export const seededUpgradeVitePlusExecutable = "vp";
 
-const terminateChild = async (child: NodeChildProcess.ChildProcess): Promise<void> => {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill("SIGTERM");
-  await new Promise<void>((resolve) => {
+const closedOwnedChildren = new WeakSet<NodeChildProcess.ChildProcess>();
+
+const observeOwnedChildClose = (child: NodeChildProcess.ChildProcess): void => {
+  child.once("close", () => closedOwnedChildren.add(child));
+};
+
+export const terminateSeededUpgradeChild = async (
+  child: NodeChildProcess.ChildProcess,
+): Promise<void> => {
+  if (closedOwnedChildren.has(child)) return;
+  await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-      resolve();
+      try {
+        child.kill("SIGKILL");
+      } catch (cause) {
+        reject(cause);
+        return;
+      }
+      reject(
+        new SeededDesktopUpgradeSmokeError("Owned child cleanup did not close within 5000ms."),
+      );
     }, 5_000);
-    child.once("exit", () => {
+    child.once("close", () => {
+      closedOwnedChildren.add(child);
       clearTimeout(timeout);
       resolve();
     });
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill("SIGTERM");
+      } catch (cause) {
+        clearTimeout(timeout);
+        reject(cause);
+      }
+    }
   });
 };
 
@@ -1253,6 +1295,7 @@ export const runBoundedCommand = async (input: {
       stdio: input.inherit ? "inherit" : ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
+    observeOwnedChildClose(child);
     let settled = false;
     let stdout = "";
     let stderr = "";
@@ -1268,10 +1311,10 @@ export const runBoundedCommand = async (input: {
         : setTimeout(() => {
             if (settled) return;
             settled = true;
-            void terminateChild(child).then(
+            void terminateSeededUpgradeChild(child).then(
               () =>
                 reject(
-                  new SeededDesktopUpgradeSmokeError(
+                  new SeededUpgradeCommandTimeoutError(
                     `${NodePath.basename(input.command)} timed out after ${input.timeoutMs}ms.`,
                   ),
                 ),
@@ -1284,7 +1327,7 @@ export const runBoundedCommand = async (input: {
       if (timeout !== undefined) clearTimeout(timeout);
       reject(error);
     });
-    child.once("exit", (code) => {
+    child.once("close", (code) => {
       if (settled) return;
       settled = true;
       if (timeout !== undefined) clearTimeout(timeout);
@@ -1843,6 +1886,7 @@ const startMockUpdateServer = async (input: {
       windowsHide: true,
     },
   );
+  observeOwnedChildClose(child);
   let startupError: Error | undefined;
   child.once("error", (error) => {
     startupError = error;
@@ -1866,7 +1910,7 @@ const startMockUpdateServer = async (input: {
     });
     return child;
   } catch (error) {
-    await terminateChild(child);
+    await terminateSeededUpgradeChild(child);
     throw error;
   }
 };
@@ -2303,7 +2347,7 @@ export async function runSeededDesktopUpgradeSmoke(
       requestLogPath,
       updaterRoot: layout.updaterRoot,
     });
-    cleanup.add("local test updater", () => terminateChild(updater));
+    cleanup.add("local test updater", () => terminateSeededUpgradeChild(updater));
 
     if (!input.wsl) {
       const previousPackage = await baselinePackage(

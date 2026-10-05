@@ -68,6 +68,18 @@ describe("GitManagerImageDiff", () => {
     expect(container.textContent).toContain("Before image unavailable");
   });
 
+  it("lets side-by-side previews use their intrinsic image size within each pane", async () => {
+    await render("two-up");
+    const images = [...container.querySelectorAll<HTMLImageElement>("figure img")];
+    expect(images).toHaveLength(2);
+    for (const image of images) {
+      expect(image.hasAttribute("width")).toBe(false);
+      expect(image.hasAttribute("height")).toBe(false);
+      expect(image.classList.contains("max-h-full")).toBe(true);
+      expect(image.classList.contains("max-w-full")).toBe(true);
+    }
+  });
+
   it("offers keyboard-operable swipe and onion controls and reports mode changes", async () => {
     const onModeChange = vi.fn();
     await act(async () =>

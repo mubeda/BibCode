@@ -769,7 +769,7 @@ describe("packaged provider composer fixture", () => {
           "logout",
           "quit",
         ],
-        slashSkills: ["frontend"],
+        slashSkills: ["docs", "frontend"],
         dollarSkills: [],
         mentionableAgents: [],
       },
@@ -803,6 +803,14 @@ describe("packaged provider composer fixture", () => {
         NodeFS.readFileSync(NodePath.join(context.projectPath, relativePath), "utf8"),
       ).not.toBe("");
     }
+    const compatibleCursorSkills = new Set(
+      [".claude/skills", ".cursor/skills"].flatMap((root) =>
+        NodeFS.readdirSync(NodePath.join(context.projectPath, root)),
+      ),
+    );
+    expect(composerProviderProfiles.cursor.slashSkills.toSorted()).toEqual(
+      [...compatibleCursorSkills].toSorted(),
+    );
     expect(NodePath.isAbsolute(context.providerInputLogPath)).toBe(true);
     expect(environment.BIBCODE_E2E_PROVIDER_INPUT_LOG).toBe(context.providerInputLogPath);
     expect(NodePath.isAbsolute(context.nativeActionLogPath)).toBe(true);
