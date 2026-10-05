@@ -101,7 +101,7 @@ import { isDesktopHost } from "../env";
 import { APP_BASE_NAME, APP_STAGE_LABEL } from "../branding";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
 import { isTerminalFocused } from "../lib/terminalFocus";
-import { isMacPlatform, newCommandId, newThreadId } from "../lib/utils";
+import { cn, isMacPlatform, newCommandId, newThreadId } from "../lib/utils";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
 import { useSidebarWorkspaceMetaStore } from "../sidebarWorkspaceMetaStore";
 import {
@@ -575,13 +575,28 @@ async function chooseProjectMember(
   return members.find((member) => member.physicalProjectKey === clickedResult.value) ?? null;
 }
 
-function projectExpansionPreferenceKeys(project: SidebarProjectSnapshot): string[] {
+export function projectExpansionPreferenceKeys(project: SidebarProjectSnapshot): string[] {
   return [
     project.projectKey,
     ...(project.sharedExpansionKey ? [project.sharedExpansionKey] : []),
     ...project.memberProjects.map((member) => member.physicalProjectKey),
     ...project.memberProjects.map((member) => legacyProjectCwdPreferenceKey(member.workspaceRoot)),
   ];
+}
+
+// An environment card has a two-line header, taller than the fixed `sm` button
+// height; `h-auto` lets it grow while normal project rows keep their height.
+export function projectHeaderButtonClassName(input: {
+  readonly showsSandboxBadge: boolean;
+  readonly isManualProjectSorting: boolean;
+  readonly isEnvironmentCard: boolean;
+}): string {
+  return cn(
+    "gap-2 px-2 py-1.5 text-left hover:bg-accent group-hover/project-header:bg-accent group-hover/project-header:text-sidebar-accent-foreground",
+    input.showsSandboxBadge ? "pr-20" : "pr-14",
+    input.isManualProjectSorting ? "cursor-grab active:cursor-grabbing" : "cursor-pointer",
+    input.isEnvironmentCard && "h-auto",
+  );
 }
 
 function projectGroupingModeDescription(mode: SidebarProjectGroupingMode): string {
@@ -3239,10 +3254,18 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     ],
   );
 
+  const showsSandboxBadge =
+    !environmentCard &&
+    project.environmentPresence === "remote-only" &&
+    project.allRemoteMembersAreDesktopLocal;
+
   return (
     <>
       <div
-        className={`group/project-header relative ${environmentCard && !environmentCard.available ? "opacity-60" : ""}`}
+        className={cn(
+          "group/project-header relative",
+          environmentCard && !environmentCard.available && "opacity-60",
+        )}
       >
         <SidebarMenuButton
           ref={isManualProjectSorting ? dragHandleProps?.setActivatorNodeRef : undefined}
@@ -3251,11 +3274,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           data-selected={projectSelected}
           isActive={moduleRouteActive || projectSelected}
           size="sm"
-          className={`gap-2 px-2 py-1.5 text-left hover:bg-accent group-hover/project-header:bg-accent group-hover/project-header:text-sidebar-accent-foreground ${
-            project.environmentPresence === "remote-only" && project.allRemoteMembersAreDesktopLocal
-              ? "pr-20"
-              : "pr-14"
-          } ${isManualProjectSorting ? "cursor-grab active:cursor-grabbing" : "cursor-pointer"}`}
+          className={projectHeaderButtonClassName({
+            showsSandboxBadge,
+            isManualProjectSorting,
+            isEnvironmentCard: environmentCard !== null,
+          })}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.attributes : {})}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.listeners : {})}
           onPointerDownCapture={handleProjectButtonPointerDownCapture}
@@ -3301,9 +3324,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         {/* The container badge tells WSL projects apart inside Local, which
             mixes this device and WSL. A saved server's scope shows only that
             server's projects, so a cloud there said nothing and is gone. The
-            badge crossfades with the hover strip. */}
-        {project.environmentPresence === "remote-only" &&
-        project.allRemoteMembersAreDesktopLocal ? (
+            badge crossfades with the hover strip. An environment card already
+            names its environment, so it shows no badge. */}
+        {showsSandboxBadge ? (
           <Tooltip>
             <TooltipTrigger
               render={
