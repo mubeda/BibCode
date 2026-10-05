@@ -408,6 +408,10 @@ jobs:
             exit 1
           fi
 
+      - name: Verify macOS icon raster fixtures
+        if: matrix.platform == 'mac'
+        run: swift scripts/check-macos-app-icon.swift --self-test
+
       - name: Build desktop artifact
         shell: bash
         run: |

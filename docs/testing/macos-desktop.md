@@ -188,7 +188,7 @@ does not qualify the release DMG.
 
 The CI verifier emits closed `mac-icon-observation` stage records to stderr and
 flushes them individually. These locate Swift entry, workspace icon retrieval,
-TIFF and bitmap materialization, pixel scanning, and the existing verdict.
+bitmap and drawing-context creation, icon drawing, pixel scanning, and the existing verdict.
 The scan-start record includes capped bitmap dimensions; scan-return includes
 capped opaque, dark, and pale counts. Diagnostic caps never change the scan or
 verdict calculations.
@@ -197,6 +197,15 @@ return alone does not verify detach success. A missing record remains unobserved
 Do not classify an icon pixel defect, compiler hang, or native service failure
 without the corresponding boundary or verdict evidence. The native payload,
 thresholds, platform rows, and existing job budget remain required.
+
+The verifier rasterizes the workspace-provided image at 256 points into a fixed
+1024-square RGBA bitmap, avoiding serialization of every image representation
+through TIFF. Both macOS release jobs first run
+`swift scripts/check-macos-app-icon.swift --self-test` in CI. These fixtures
+exercise the same renderer and pixel verdict with opaque black, opaque white,
+transparent, and ratio-boundary images. They preserve the existing alpha,
+luminance, dark-area, and pale-area limits. Their pass does not replace the
+mandatory check against the exact mounted DMG application.
 
 Build and run packaged E2E with:
 
