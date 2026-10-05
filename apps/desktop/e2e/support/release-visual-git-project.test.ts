@@ -1449,6 +1449,146 @@ it.each(["light", "dark"] as const)(
   },
 );
 
+it.each([
+  ["light", "owned"],
+  ["dark", "owned"],
+  ["light", "outside"],
+  ["dark", "outside"],
+  ["light", "duplicate"],
+  ["light", "disabled"],
+  ["light", "click-refused"],
+] as const)(
+  "cancels the actual %s rebase warning through the production cleanup and installed SDK: %s",
+  async (theme, mode) => {
+    const f = await mountedRewritePreview(theme);
+    const desktop = NodeModule.createRequire(NodePath.resolve("apps/desktop/package.json"));
+    const sdk = NodeFS.readFileSync(
+      NodePath.join(NodePath.dirname(desktop.resolve("webdriverio")), "node.js"),
+      "utf8",
+    );
+    const strategyStart = sdk.indexOf("var DEFAULT_STRATEGY =");
+    const strategyEnd = sdk.indexOf("\n//", strategyStart);
+    expect(strategyStart).toBeGreaterThan(0);
+    const strategy = NodeVM.runInNewContext(
+      sdk.slice(strategyStart, strategyEnd) + "\nfindStrategy",
+      { DEEP_SELECTOR: ">>>", ARIA_SELECTOR: "aria/" },
+    );
+    const source = NodeFS.readFileSync(
+      NodePath.resolve("apps/desktop/e2e/support/release-visual-git-project.ts"),
+      "utf8",
+    );
+    const functionStart = source.indexOf("export async function runGitRewritePreview(");
+    const helpersStart = source.indexOf("  const popup =", functionStart);
+    const helpersEnd = source.indexOf("  await input.verifyOwnedIdentity", helpersStart);
+    const cleanupStart = source.indexOf(
+      '    await input.owner.cleanup("visual-owned-rewrite-preview",',
+      helpersEnd,
+    );
+    const cleanupEnd = source.indexOf("\n    });\n  }\n  if (!cancelled)", cleanupStart);
+    expect(helpersStart).toBeGreaterThan(functionStart);
+    expect(helpersEnd).toBeGreaterThan(helpersStart);
+    expect(cleanupStart).toBeGreaterThan(helpersEnd);
+    expect(cleanupEnd).toBeGreaterThan(cleanupStart);
+    const popup = '[data-slot="dialog-popup"][role="dialog"]';
+    const ownedXPath =
+      '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Cancel"]';
+    const original = new Error("Inert original cancellation failure.");
+    const owner = new QualificationOwner("/owned/evidence", "/owned/fixture");
+    const controls: string[] = [];
+    const retained: string[] = [];
+    const extra = document.createElement("button");
+    extra.textContent = "Cancel";
+    const ownedCancel = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(`${popup} button`),
+    ).find((button) => button.textContent?.trim() === "Cancel")!;
+    if (mode === "outside") document.body.append(extra);
+    if (mode === "duplicate") ownedCancel.parentElement!.append(extra);
+    if (mode === "disabled") ownedCancel.disabled = true;
+    const targets = (selector: string) => {
+      const locator = strategy(selector, true, false);
+      if (locator.using === "css selector") {
+        try {
+          return Array.from(document.querySelectorAll<HTMLElement>(locator.value));
+        } catch {
+          return [];
+        }
+      }
+      expect(locator.using).toBe("xpath");
+      expect(locator.value).toBe(ownedXPath);
+      // HappyDOM lacks XPath. Resolve this exact SDK expression's owned-dialog semantics only.
+      return Array.from(document.querySelectorAll<HTMLButtonElement>(`${popup} button`)).filter(
+        (button) => button.textContent?.trim() === "Cancel",
+      );
+    };
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function cancel(){let cancelled=false;" +
+          source.slice(helpersStart, helpersEnd) +
+          source.slice(cleanupStart, cleanupEnd + "\n    });".length) +
+          "if(!cancelled)throw refused();return cancelled;}\ncancel",
+      ),
+      {
+        refused: () => original,
+        input: {
+          selection: f.input.selection,
+          owner,
+          step: () => {},
+          verifyOwnedIdentity: async (selection: unknown) => {
+            expect(selection).toBe(f.input.selection);
+          },
+          fixture: { verifyRewriteRetained: async () => retained.push("verified") },
+          browser: {
+            $: (selector: string) => ({
+              isDisplayed: async () => targets(selector).length > 0,
+              getText: async () => targets(selector)[0]?.textContent ?? "",
+              waitForDisplayed: async (options?: { reverse?: boolean }) => {
+                if (options?.reverse) {
+                  controls.push("closed");
+                  expect(f.state().step).toBeNull();
+                  expect(targets(selector)).toHaveLength(0);
+                  return;
+                }
+                controls.push("displayed");
+                if (targets(selector).length === 0) throw original;
+              },
+              waitForEnabled: async () => {
+                controls.push("enabled");
+                if ((targets(selector)[0] as HTMLButtonElement)?.disabled) throw original;
+              },
+              click: async () => {
+                controls.push("click");
+                if (mode === "click-refused") throw original;
+                await f.act(async () => targets(selector)[0]!.click());
+              },
+            }),
+            $$: (selector: string) => {
+              controls.push("unique");
+              return { length: Promise.resolve(targets(selector).length) };
+            },
+          },
+        },
+      },
+    );
+    try {
+      if (mode === "owned" || mode === "outside") {
+        await expect(run()).resolves.toBe(true);
+        expect(controls).toEqual(["displayed", "unique", "enabled", "click", "closed"]);
+        expect(f.events).toEqual(["branch-chosen", "cancelled"]);
+        expect(owner.failures).toEqual([]);
+      } else {
+        await expect(run()).rejects.toBe(original);
+        expect(f.state().step).toBe("warn-force-push");
+        expect(f.events).toEqual(["branch-chosen"]);
+        expect(owner.failures).toHaveLength(1);
+      }
+      expect(retained).toEqual(["verified"]);
+    } finally {
+      extra.remove();
+      await f.close();
+    }
+  },
+);
+
 it("refuses missing rewrite target/warning/content and private credential controls in the actual dialog seam", async () => {
   const f = await mountedRewritePreview("light");
   try {

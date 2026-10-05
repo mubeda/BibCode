@@ -784,7 +784,10 @@ export async function runGitRewritePreview(
             throw refused();
           input.step("visual-git-project-rewrite-preview-cancel");
           if (title === "Choose a Branch to Rebase") await input.browser.keys("Escape");
-          else await click(`${popup} button=Cancel`);
+          else
+            await click(
+              '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Cancel"]',
+            );
           await input.browser.$(popup).waitForDisplayed({ reverse: true });
         }
       } finally {

@@ -105,6 +105,8 @@ it.each(["cancel", "capture-failure", "chooser-failure", "cancel-failure"])(
     let title = "",
       displayed = false;
     const popup = '[data-slot="dialog-popup"][role="dialog"]';
+    const cancel =
+      '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Cancel"]';
     const element = (selector: string) => ({
       waitForDisplayed: async (options?: { reverse?: boolean }) => {
         if (options?.reverse) expect(displayed).toBe(false);
@@ -120,7 +122,7 @@ it.each(["cancel", "capture-failure", "chooser-failure", "cancel-failure"])(
         } else if (selector.includes("visual-switch")) {
           if (mode === "chooser-failure") throw original;
           title = "Rewrite Rebase History?";
-        } else if (selector === `${popup} button=Cancel`) {
+        } else if (selector === cancel) {
           if (mode === "cancel-failure") throw cleanupError;
           displayed = false;
         } else throw new Error("Unexpected UI action.");
@@ -163,7 +165,7 @@ it.each(["cancel", "capture-failure", "chooser-failure", "cancel-failure"])(
       await f.fixture.verifyRewriteRetained();
       expect(owner.failures).toHaveLength(mode === "cancel-failure" ? 1 : 0);
       expect(actions).not.toContain(`${popup} button=Rewrite History`);
-      expect(actions.at(-1)).toBe(mode === "chooser-failure" ? "Escape" : `${popup} button=Cancel`);
+      expect(actions.at(-1)).toBe(mode === "chooser-failure" ? "Escape" : cancel);
       expect(f.calls.some((args) => args.includes("rebase") || args.includes("reset"))).toBe(false);
       expect(NodeFS.readFileSync(NodePath.join(f.fixture.rich, "visual-note.txt"), "utf8")).toBe(
         "Owned dirty work must remain.\n",
