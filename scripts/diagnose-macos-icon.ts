@@ -38,6 +38,8 @@ const STAGES = new Set([
 
 interface Observation {
   readonly stage: string;
+  readonly elapsedMs?: number;
+  readonly elapsedCapped?: boolean;
   readonly width?: number;
   readonly height?: number;
   readonly opaque?: number;
@@ -61,9 +63,14 @@ export function decodeMacIconObservations(raw: string): ReadonlyArray<Observatio
       throw new Error("ICON_OBSERVATION_STAGE");
     }
     const result: Record<string, string | number | boolean> = { stage: record.stage };
-    for (const field of ["width", "height", "opaque", "dark", "pale"] as const) {
+    for (const field of ["width", "height", "opaque", "dark", "pale", "elapsedMs"] as const) {
       if (record[field] === undefined) continue;
-      const cap = field === "width" || field === "height" ? 16_384 : 1_048_576;
+      const cap =
+        field === "elapsedMs"
+          ? 3_600_000
+          : field === "width" || field === "height"
+            ? 16_384
+            : 1_048_576;
       if (
         !Number.isSafeInteger(record[field]) ||
         (record[field] as number) < 0 ||
@@ -73,7 +80,7 @@ export function decodeMacIconObservations(raw: string): ReadonlyArray<Observatio
       }
       result[field] = record[field] as number;
     }
-    for (const field of ["countsCapped", "dimensionsCapped"] as const) {
+    for (const field of ["countsCapped", "dimensionsCapped", "elapsedCapped"] as const) {
       if (record[field] === undefined) continue;
       if (typeof record[field] !== "boolean") throw new Error("ICON_OBSERVATION_VALUE");
       result[field] = record[field];

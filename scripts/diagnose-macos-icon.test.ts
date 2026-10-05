@@ -99,6 +99,8 @@ describe("macOS icon diagnostic protocol", () => {
     expect(lookup).toContain("label: Intel control");
     expect(lookup).toContain("label: Intel application initialization");
     expect(lookup).toContain("label: ARM control");
+    expect(lookup).toContain("label: Intel 15 control");
+    expect(lookup).toContain("runner: macos-15-intel");
     expect(lookup).toContain("fail-fast: false");
     expect(lookup).toContain('MAC_ICON_DIAGNOSTIC_LOOKUP_ONLY: "1"');
     expect(lookup).toContain("MAC_ICON_DIAGNOSTIC_SINGLE_ARM: ${{ matrix.arm }}");
@@ -255,6 +257,23 @@ describe("macOS icon diagnostic protocol", () => {
     expect(() => decodeMacIconObservations('{"stage":"swift-entry"}\n'.repeat(65))).toThrow(
       "COUNT",
     );
+  });
+
+  it("retains bounded per-stage elapsed time without machine timestamps", () => {
+    expect(
+      decodeMacIconObservations(
+        '{"stage":"icon-lookup-returned","elapsedMs":111057,"elapsedCapped":false,"machineTimestamp":"private"}',
+      ),
+    ).toEqual([{ stage: "icon-lookup-returned", elapsedMs: 111057, elapsedCapped: false }]);
+    expect(() =>
+      decodeMacIconObservations('{"stage":"icon-lookup-returned","elapsedMs":-1}'),
+    ).toThrow("VALUE");
+    expect(() =>
+      decodeMacIconObservations('{"stage":"icon-lookup-returned","elapsedMs":3600001}'),
+    ).toThrow("VALUE");
+    expect(() =>
+      decodeMacIconObservations('{"stage":"icon-lookup-returned","elapsedCapped":"false"}'),
+    ).toThrow("VALUE");
   });
 
   it("waits for the prior owner before admitting treatment and repeats control to detect warming", async () => {

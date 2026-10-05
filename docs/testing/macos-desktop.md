@@ -227,13 +227,18 @@ Do not run this native diagnostic locally.
 When workspace lookup itself exceeds a diagnostic bound, avoid inferring a
 drawing failure from a censored process. The no-build
 `macos-workspace-diagnostic.yml` control uses separate fresh Intel jobs for the
-control and explicit application initialization, with a fresh ARM control.
+control and explicit application initialization, with fresh ARM and supported
+macOS 15 Intel controls.
 Each owns one synthetic plain-text file and stops after the first lookup return
 or verified-close timeout. Split observations distinguish creation of the
 process workspace singleton from `icon(forFile:)`. A `LOOKUP_RETURNED` result
 establishes those API returns only; it asserts no BiBCode pixels or release
 acceptance. The payload-building diagnostic remains manual-only so pushing
 lookup instrumentation cannot start another product build accidentally.
+Private diagnostic observations include capped process-relative elapsed
+milliseconds and a cap flag. Compare boundary durations only when both records
+are present; a timeout before a return remains censored. These are monotonic
+durations, not machine timestamps, and never change the command or job bounds.
 
 Build and run packaged E2E with:
 

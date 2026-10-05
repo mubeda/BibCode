@@ -2,6 +2,8 @@
 
 import AppKit
 
+let iconVerificationStartedAt = ProcessInfo.processInfo.systemUptime
+
 enum IconVerificationStage: String {
   case swiftEntry = "swift-entry"
   case applicationInitDispatched = "application-init-dispatched"
@@ -34,6 +36,11 @@ func observeIconStage(
   dimensions: (width: Int, height: Int)? = nil
 ) {
   var fields = "\"stage\":\"\(stage.rawValue)\""
+  if ProcessInfo.processInfo.environment["MAC_ICON_DIAGNOSTIC_RECORDS_PATH"] != nil {
+    let elapsed = max(0, Int((ProcessInfo.processInfo.systemUptime - iconVerificationStartedAt) * 1000))
+    let cap = 3_600_000
+    fields += ",\"elapsedMs\":\(min(elapsed, cap)),\"elapsedCapped\":\(elapsed > cap)"
+  }
   if let counts = counts {
     let cap = 1_048_576
     fields += ",\"opaque\":\(min(counts.opaque, cap)),\"dark\":\(min(counts.dark, cap)),\"pale\":\(min(counts.pale, cap))"
