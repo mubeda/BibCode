@@ -119,6 +119,41 @@ afterEach(async () => {
 });
 
 describe("GitManagerBranchDropdown", () => {
+  it.each(["codex/delivery-retry-light", "codex/" + "owned-long-branch-".repeat(24)])(
+    "keeps footer actions bounded while preserving full branch identity and disabled explanation: %s",
+    async (current) => {
+      const reason = "An owned operation is still running.";
+      await renderDropdown([branch(current, { current: true })], {
+        currentBranchName: current,
+        mergeDisabledReason: reason,
+      });
+      const merge = rowButton("Choose a branch to merge into " + current);
+      const create = rowButton("New branch");
+      expect(merge.disabled).toBe(true);
+      expect(merge.title).toBe(reason);
+      expect(merge.textContent).toContain(current);
+      const text = Array.from(merge.children).find((child) => child.tagName === "SPAN");
+      expect(text).toBeDefined();
+      expect(text!.textContent).toBe("Choose a branch to merge into " + current);
+      const { compile } = await import("tailwindcss");
+      const style = document.createElement("style");
+      style.textContent = (
+        await compile("@theme { --spacing: 0.25rem; } @tailwind utilities;")
+      ).build([...create.classList, ...merge.classList, ...text!.classList]);
+      document.head.append(style);
+      try {
+        expect(getComputedStyle(create).minWidth).toBe("0px");
+        expect(getComputedStyle(merge).minWidth).toBe("0px");
+        expect(getComputedStyle(text!).minWidth).toBe("0px");
+        expect(getComputedStyle(text!).overflow).toBe("hidden");
+        expect(getComputedStyle(text!).textOverflow).toBe("ellipsis");
+        expect(getComputedStyle(text!).whiteSpace).toBe("nowrap");
+      } finally {
+        style.remove();
+      }
+    },
+  );
+
   it.each([null, "An owned operation is still running."])(
     "restores current refs and focuses the occupied row through actual QA keys without activation: %s",
     async (branchDisabledReason) => {

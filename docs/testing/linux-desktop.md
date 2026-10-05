@@ -833,7 +833,12 @@ rule exposes those controls even when their mutation actions are disabled.
 Inert endpoint regressions cover actual controlled state and keyboard focus;
 installed Tailwind compilation verifies the actual CSS rule. HappyDOM does not
 implement focus-within visibility, so native CI must prove the gesture and
-pixels. No capture predicate or request bound is relaxed.
+pixels. No capture predicate or request bound is relaxed. Independently inspect
+the two footer actions as well: their bounded button and label spans use ellipsis
+for long branch instructions while retaining full accessible text and disabled
+explanations. Do not accept text clipped by the popup viewport, widen the window,
+or infer visual approval from a successful capture witness. Compiled CSS/source
+regressions establish the containment policy; fresh CI originals establish pixels.
 
 After the branch-menu original, send Escape and require the public branch
 popup to become undisplayed before selecting the managed card or opening Files.
