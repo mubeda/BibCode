@@ -705,8 +705,22 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   actual replacement document. They add only fixed phase markers: preserve all
   public actions, clock/boot checks, negative observation windows, draft checks
   and existing bounds. An incomplete phase is not proof of a reload defect.
-  At exactly `primary-import-composer`, the existing one failure sample may
-  retain `primaryImport` with only closed facts: safe owned page, input cardinality,
+  Before each theme's primary import, measure the content viewport and current
+  outer window size, then use the existing desktop window-size correction to
+  request a 1280 by 960 content viewport. Require that exact content size to
+  settle within the existing owner bound before import; viewport reads retain
+  their two-second bound. This is one outer-size correction, with no retry or
+  extended deadline. Every retained original PNG must independently decode to
+  exactly 1280 by 960 before its existing write-once capture.
+  After the original host-path `setValue`, require exactly one current path
+  input with the same nonempty WebDriver element identity, the exact owned
+  value and native focus before the original single Open project click. Keep
+  the existing owner bound, one typing operation and composer wait. Refuse
+  mismatched, ambiguous, remounted, unfocused or unreadable input without
+  retyping, clicking another control or changing the imported fixture.
+  At `primary-import-path-input`, `primary-import-submit` or
+  `primary-import-composer`, the existing one failure sample may retain
+  `primaryImport` with only closed facts: safe owned page, input cardinality,
   current value matching the expected owned path, actual owning form, submit
   cardinality/disabledness, form absent/idle/pending/ambiguous and composer
   cardinality. Missing, unsafe or malformed facts stay null. The private expected

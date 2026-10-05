@@ -22,6 +22,8 @@ import {
   type QualificationProcess,
 } from "./support/qualification-owner.ts";
 import { prepareDesktopUiTestContext } from "./support/test-project.ts";
+import { correctDesktopUiOuterSize } from "./support/window-size.ts";
+import { readVisualViewport } from "./support/release-visual-observation.ts";
 import {
   classifyQualificationFailure,
   projectQualificationProcess,
@@ -102,6 +104,11 @@ let browser: QualificationBrowser | undefined;
 let currentTheme: RemoteUiTheme = "light";
 let currentPhase = "prepare";
 let primaryImportExpectedPath: string | null = null;
+const primaryImportObservationPhases = new Set([
+  "primary-import-path-input",
+  "primary-import-submit",
+  "primary-import-composer",
+]);
 let success = false;
 const captures: Array<Record<string, unknown>> = [];
 const assertions: Array<Record<string, unknown>> = [];
@@ -707,8 +714,24 @@ async function importProject(
     await click("button=Type a path instead");
   primaryPhase("primary-import-path-input");
   if (host.devUrl) primaryImportExpectedPath = host.project;
-  await required().$("#add-project-host-path").waitForDisplayed();
-  await required().$("#add-project-host-path").setValue(host.project);
+  const pathInput = required().$("#add-project-host-path");
+  await pathInput.waitForDisplayed();
+  const pathInputId = await pathInput.elementId;
+  await pathInput.setValue(host.project);
+  await owner.until(async () => {
+    if (
+      typeof pathInputId !== "string" ||
+      pathInputId.length === 0 ||
+      (await required().$$("#add-project-host-path").length) !== 1
+    )
+      return false;
+    const current = required().$("#add-project-host-path");
+    return (
+      (await current.elementId) === pathInputId &&
+      (await current.getValue()) === host.project &&
+      (await current.isFocused())
+    );
+  });
   primaryPhase("primary-import-submit");
   await click("button=Open project");
   primaryPhase("primary-import-composer");
@@ -854,6 +877,7 @@ async function capture(scene: RemoteUiScene, host: Host, target: string, expecte
   const bytes = Buffer.from(await bounded(required().takeScreenshot(), 5_000), "base64");
   const image = inspectScreenshot(bytes),
     file = screenshotName(currentTheme, scene);
+  check(image.width === 1280 && image.height === 960, "approved-screenshot-viewport");
   NodeFS.writeFileSync(NodePath.join(evidence, file), bytes, { mode: 0o600, flag: "wx" });
   captures.push({ theme: currentTheme, scene, file, ...proof, ...image });
   write("assertions", { captures, assertions });
@@ -1741,6 +1765,20 @@ try {
     await click("button=Continue");
     phase("primary-pair-wait-sidebar");
     await browser.$('[data-testid="sidebar-add-project-trigger"]').waitForDisplayed();
+    phase("primary-content-viewport");
+    const observedViewport = await bounded(browser.execute(readVisualViewport), 2_000);
+    const outerSize = await browser.getWindowSize();
+    const correctedSize = correctDesktopUiOuterSize(
+      outerSize,
+      { width: 1280, height: 960 },
+      observedViewport,
+      observedViewport.devicePixelRatio,
+    );
+    await browser.setWindowSize(correctedSize.width, correctedSize.height);
+    await owner.until(async () => {
+      const viewport = await bounded(browser!.execute(readVisualViewport), 2_000);
+      return viewport.width === 1280 && viewport.height === 960;
+    });
     phase("primary-import");
     await importProject(primary);
     let primaryWorkspace: ReloadPrimaryWorkspace | null = null;
@@ -2121,7 +2159,7 @@ try {
               (value) => value === currentPhase,
             ),
             ...(manualRemovalKind ? { manualRemoval: manualRemovalKind } : {}),
-            ...(currentPhase === "primary-import-composer"
+            ...(primaryImportObservationPhases.has(currentPhase)
               ? { primaryImport: true, expectedImportPath: primaryImportExpectedPath }
               : {}),
             theme: currentTheme,
@@ -2131,10 +2169,9 @@ try {
       );
       startup = projectBrowserStartupObservation(observed.startup);
       setup = projectRemoteUiSetupObservation(observed.setup);
-      primaryImport =
-        currentPhase === "primary-import-composer"
-          ? projectRemoteUiPrimaryImportObservation(observed.primaryImport)
-          : null;
+      primaryImport = primaryImportObservationPhases.has(currentPhase)
+        ? projectRemoteUiPrimaryImportObservation(observed.primaryImport)
+        : null;
       checkAgain = projectRemoteUiCheckAgainObservation(observed.checkAgain);
       successRemoval = projectRemoteUiSuccessRemovalObservation(observed.successRemoval);
       manualRemoval = manualRemovalKind
@@ -2151,7 +2188,7 @@ try {
     manualAssertionCode: readManualAssertionCode(error),
     startup,
     setup,
-    primaryImport: currentPhase === "primary-import-composer" ? primaryImport : null,
+    primaryImport: primaryImportObservationPhases.has(currentPhase) ? primaryImport : null,
     checkAgain,
     checkAgainInterception,
     successRemoval,

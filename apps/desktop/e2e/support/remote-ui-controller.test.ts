@@ -4,6 +4,8 @@ import * as NodeVM from "node:vm";
 import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
+import { correctDesktopUiOuterSize } from "./window-size.ts";
+import { readVisualViewport } from "./release-visual-observation.ts";
 import {
   decodeReloadPrimaryWorkspace,
   decodeReloadPrimaryThreadProof,
@@ -32,6 +34,15 @@ import {
 const controller = NodeFS.readFileSync(
   new URL("../qualify-remote-updates.ts", import.meta.url),
   "utf8",
+);
+
+const primaryImportObservationPhases: ReadonlySet<string> = NodeVM.runInNewContext(
+  NodeModule.stripTypeScriptTypes(
+    controller.slice(
+      controller.indexOf("const primaryImportObservationPhases"),
+      controller.indexOf("let success = false;"),
+    ) + "\nprimaryImportObservationPhases",
+  ),
 );
 
 const successRemovalPhases: Record<string, string> = NodeVM.runInNewContext(
@@ -66,6 +77,9 @@ it.each([false, true])(
       process: { execPath: "/owned-node", env: {}, exitCode: undefined },
       currentTheme: "light",
       currentPhase: "prepare",
+      primaryImportObservationPhases,
+      correctDesktopUiOuterSize,
+      readVisualViewport,
       success: false,
       browser: undefined,
       captures: [],
@@ -101,8 +115,18 @@ it.each([false, true])(
             sendCommandAndGetResult: async () => {},
             url: async () => {},
             $: () => ({ waitForDisplayed: async () => {}, setValue: async () => {} }),
+            getWindowSize: async () => ({ width: 1280, height: 960 }),
+            setWindowSize: async (width: number, height: number) => {
+              expect({ width, height }).toEqual({ width: 1280, height: 960 });
+            },
             deleteSession: async () => {},
-            execute: async () => {
+            execute: async (read: () => unknown) => {
+              if (read === readVisualViewport)
+                return NodeVM.runInNewContext("(" + read.toString() + ")()", {
+                  innerWidth: 1280,
+                  innerHeight: 960,
+                  devicePixelRatio: 1,
+                });
               throw new Error("inert unavailable observation");
             },
           },
@@ -943,6 +967,7 @@ it.each(["unavailable", "no-browser", "write-failure", "manual-assertion"])(
         projectRemoteUiCheckAgainObservation,
         projectRemoteUiCheckAgainInterception,
         projectRemoteUiSuccessRemovalObservation,
+        primaryImportObservationPhases,
         SUCCESS_REMOVE_PHASES: successRemovalPhases,
         classifyQualificationFailure: () => ({ kind: "timeout" }),
         owner: {
@@ -986,12 +1011,19 @@ it("separates real primary import/theme waits without relabeling remote host imp
   const start = controller.indexOf("async function importProject(");
   const end = controller.indexOf("async function capture(", start);
   const phases: string[] = [];
+  let pathValue = "";
   const browser = {
+    $$: () => ({ length: Promise.resolve(1) }),
     $: () => ({
+      elementId: "owned-import-path",
       isDisplayed: async () => true,
       isExisting: async () => true,
       waitForDisplayed: async () => {},
-      setValue: async () => {},
+      setValue: async (value: string) => {
+        pathValue = value;
+      },
+      getValue: async () => pathValue,
+      isFocused: async () => true,
     }),
     waitUntil: async (read: () => Promise<boolean>) => {
       expect(await read()).toBe(true);
@@ -1040,6 +1072,10 @@ it.each([
   ["fill", "primary-pair-fill-token"],
   ["submit", "primary-pair-submit"],
   ["sidebar", "primary-pair-wait-sidebar"],
+  ["viewport-read", "primary-content-viewport"],
+  ["viewport-outer", "primary-content-viewport"],
+  ["viewport-size", "primary-content-viewport"],
+  ["viewport-settle", "primary-content-viewport"],
   ["import", "primary-import"],
   ["theme", "primary-theme"],
 ])("reports the exact primary setup boundary for an inert %s failure", async (failAt, expected) => {
@@ -1062,12 +1098,37 @@ it.each([
       primary: {},
       plan: { flows: ["success"] },
       theme: "light",
+      correctDesktopUiOuterSize,
+      readVisualViewport,
+      bounded: async (value: Promise<unknown>, timeout: number) => {
+        expect(timeout).toBe(2000);
+        return value;
+      },
+      owner: {
+        until: async (read: () => Promise<boolean>) => {
+          await stop("viewport-settle");
+          expect(await read()).toBe(true);
+        },
+      },
       browser: {
         url: async () => {},
         $: (selector: string) => ({
           waitForDisplayed: () => stop(selector.includes("sidebar") ? "sidebar" : "token"),
           setValue: () => stop("fill"),
         }),
+        execute: async (read: () => unknown) => {
+          await stop("viewport-read");
+          return NodeVM.runInNewContext("(" + read.toString() + ")()", {
+            innerWidth: 1280,
+            innerHeight: 960,
+            devicePixelRatio: 1,
+          });
+        },
+        getWindowSize: () => stop("viewport-outer").then(() => ({ width: 1280, height: 960 })),
+        setWindowSize: (width: number, height: number) => {
+          expect({ width, height }).toEqual({ width: 1280, height: 960 });
+          return stop("viewport-size");
+        },
       },
       grant: () => stop("grant").then(() => "inert-credential"),
       click: () => stop("submit"),
@@ -1830,6 +1891,7 @@ it.each([
           return projectRemoteUiCheckAgainInterception(error);
         },
         projectRemoteUiSuccessRemovalObservation,
+        primaryImportObservationPhases,
         SUCCESS_REMOVE_PHASES: successRemovalPhases,
         classifyQualificationFailure: (error: unknown) => {
           expect(error).toBe(failure);
@@ -2005,7 +2067,9 @@ it.each([
           },
         },
         required: () => ({
+          $$: () => ({ length: Promise.resolve(1) }),
           $: (selector: string) => ({
+            elementId: "owned-import-path",
             isDisplayed: async () => true,
             isExisting: async () => true,
             waitForDisplayed: async () => {
@@ -2015,6 +2079,8 @@ it.each([
                 throw stopped;
             },
             setValue: async (value: string) => expect(value).toBe("/owned/project"),
+            getValue: async () => "/owned/project",
+            isFocused: async () => true,
           }),
         }),
         composer: "owned-composer",
@@ -2249,6 +2315,7 @@ function preparationObserverReplay(
   );
   const calls: unknown[][] = [],
     phases: string[] = [];
+  let pathValue = "";
   const failure = new Error("inert observer/operation failure");
   const record = async (name: string, ...args: unknown[]) => {
     calls.push([name, ...args]);
@@ -2293,9 +2360,16 @@ function preparationObserverReplay(
       },
     },
     required: () => ({
+      $$: () => ({ length: Promise.resolve(1) }),
       $: (selector: string) => ({
+        elementId: "owned-import-path",
         waitForDisplayed: (...args: unknown[]) => record("displayed", selector, ...args),
-        setValue: (value: string) => record("input", selector, value),
+        setValue: async (value: string) => {
+          await record("input", selector, value);
+          if (selector === "#add-project-host-path") pathValue = value;
+        },
+        getValue: async () => pathValue,
+        isFocused: async () => true,
         isDisplayed: async (...args: unknown[]) => {
           await record("visible", selector, ...args);
           return true;
@@ -2686,6 +2760,7 @@ it("retains only the same-read closed primary witness at the exact failed proof 
     NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes(controller.slice(start, end)), {
       currentPhase,
       currentTheme: "light",
+      primaryImportObservationPhases,
       error: new Error("private-error"),
       classifyQualificationFailure: () => ({ kind: "unclassified", errorClass: "Error" }),
       readManualAssertionCode: () => null,
@@ -2875,6 +2950,7 @@ function toastFailureReceipt(
     error,
     currentPhase,
     currentTheme: "light",
+    primaryImportObservationPhases,
     SUCCESS_REMOVE_PHASES: successRemovalPhases,
     toastErrorSignatureFailures: signatures,
     classifyQualificationFailure: () => ({ kind: "missing-element", errorClass: "Error" }),
@@ -4404,6 +4480,7 @@ it.each([
           success: false,
           BrowserConnectivityFailure: class extends Error {},
           networkProofs: [],
+          primaryImportObservationPhases,
           SUCCESS_REMOVE_PHASES: successRemovalPhases,
           browser: {
             execute: async (_read: unknown, input: unknown) => {
@@ -4470,13 +4547,17 @@ it.each([
 );
 
 it.each([
-  "primary-import-composer",
-  "primary-import-submit",
-  "success-import-composer",
-  "primary-theme-settings",
+  ["primary-import-composer", true],
+  ["primary-import-submit", true],
+  ["primary-import-path-input", true],
+  ["success-import-composer", false],
+  ["primary-theme-settings", false],
+  ["primary-import-path-input-extra", false],
+  ["primary-import-submit-extra", false],
+  ["primary-import-workspace", false],
 ])(
   "retains primary import facts only at the exact original failure sample and joins cleanup: %s",
-  async (currentPhase) => {
+  async (currentPhase, admitted) => {
     const facts = {
       safePage: true,
       pathCount: "one",
@@ -4487,7 +4568,6 @@ it.each([
       formState: "idle",
       composerCount: "none",
     };
-    const admitted = currentPhase === "primary-import-composer";
     for (const unavailable of [false, true]) {
       const start = controller.indexOf(
         "} catch (error) {",
@@ -4510,6 +4590,7 @@ it.each([
           success: false,
           BrowserConnectivityFailure: class extends Error {},
           networkProofs: [],
+          primaryImportObservationPhases,
           SUCCESS_REMOVE_PHASES: successRemovalPhases,
           browser: {
             execute: async (_read: unknown, input: unknown) => {
@@ -4652,6 +4733,7 @@ it.each([
           success: false,
           BrowserConnectivityFailure: class extends Error {},
           networkProofs: [],
+          primaryImportObservationPhases,
           SUCCESS_REMOVE_PHASES: successRemovalPhases,
           toastErrorSignatureFailures: new WeakMap<object, unknown>(),
           browser: {

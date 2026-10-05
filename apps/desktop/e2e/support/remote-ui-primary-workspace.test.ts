@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 // @effect-diagnostics nodeBuiltinImport:off - Owned Git fixture, DOM/card and public-reader replay.
 import * as NodeFS from "node:fs";
 import * as NodeChildProcess from "node:child_process";
@@ -5,7 +6,8 @@ import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeVM from "node:vm";
-import { expect, it } from "vite-plus/test";
+import * as NodeURL from "node:url";
+import { expect, it, vi } from "vite-plus/test";
 import {
   decodeReloadPrimaryWorkspace,
   decodeReloadPrimaryThreadProof,
@@ -15,7 +17,9 @@ import {
 } from "./remote-ui-primary-workspace.ts";
 import { prepareDesktopUiTestContext } from "./test-project.ts";
 
-const webRequire = NodeModule.createRequire(new URL("../../../web/package.json", import.meta.url));
+const webRequire = NodeModule.createRequire(
+  new NodeURL.URL("../../../web/package.json", import.meta.url),
+);
 const { transformSync } = NodeModule.createRequire(webRequire.resolve("vite-plus"))("esbuild");
 const React = webRequire("react");
 const { renderToStaticMarkup } = webRequire("react-dom/server");
@@ -24,7 +28,7 @@ const cardModule = { exports: {} as Record<string, any> };
 NodeVM.runInNewContext(
   transformSync(
     NodeFS.readFileSync(
-      new URL("../../../web/src/components/sidebar/WorkspaceCard.tsx", import.meta.url),
+      new NodeURL.URL("../../../web/src/components/sidebar/WorkspaceCard.tsx", import.meta.url),
       "utf8",
     ),
     { loader: "tsx", format: "cjs", jsx: "transform" },
@@ -59,7 +63,10 @@ NodeVM.runInNewContext(
   },
 );
 function productionFunction(file: string, name: string) {
-  const source = NodeFS.readFileSync(new URL("../../../web/src/" + file, import.meta.url), "utf8");
+  const source = NodeFS.readFileSync(
+    new NodeURL.URL("../../../web/src/" + file, import.meta.url),
+    "utf8",
+  );
   const start = source.indexOf("export function " + name + "(");
   const end = source.indexOf("\n}\n", start) + 3;
   expect(start).toBeGreaterThanOrEqual(0);
@@ -87,7 +94,7 @@ const previewLogic = NodeVM.runInNewContext(
   },
 );
 const sidebarSource = NodeFS.readFileSync(
-  new URL("../../../web/src/components/Sidebar.tsx", import.meta.url),
+  new NodeURL.URL("../../../web/src/components/Sidebar.tsx", import.meta.url),
   "utf8",
 );
 const primaryStart = sidebarSource.indexOf("const SidebarPrimaryCard = memo(");
@@ -138,7 +145,7 @@ const input = { projectName: "BiBCode UI Fixture", ...binding, requireSelected: 
 
 const publicHttpFixture = JSON.parse(
   NodeFS.readFileSync(
-    new URL(
+    new NodeURL.URL(
       "../../../../packages/contracts/fixtures/http-orchestration/full-read-model.json",
       import.meta.url,
     ),
@@ -183,7 +190,7 @@ function httpSnapshotFixture(existing: boolean): typeof publicHttpFixture {
 
 it("uses the actual public HTTP read-model serializer and populated cross-language fixture", () => {
   const runtime = NodeFS.readFileSync(
-    new URL("../../../server/src/production/runtime.rs", import.meta.url),
+    new NodeURL.URL("../../../server/src/production/runtime.rs", import.meta.url),
     "utf8",
   );
   const producer = runtime.slice(
@@ -358,7 +365,7 @@ it("selects only the owned primary after the fixture's real Git branch synchroni
 
     // Replay the actual public preparation boundary with the real DOM and reader.
     const controller = NodeFS.readFileSync(
-      new URL("../qualify-remote-updates.ts", import.meta.url),
+      new NodeURL.URL("../qualify-remote-updates.ts", import.meta.url),
       "utf8",
     );
     const start = controller.indexOf(
@@ -948,3 +955,346 @@ it("refuses an inactive duplicate of the selected bound card at capture and rese
     await f.window.happyDOM.close();
   }
 });
+
+it.each(["input-and-change", "change-only"])(
+  "runs the actual primary import typing against the controlled host-path form: %s",
+  async (clearEvents) => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const hostPathModule = "../../../web/src/components/add-project/AddProjectSteps.tsx";
+    const workflowModule = "../../../web/src/components/add-project/useAddProjectWorkflow.ts";
+    const { AddProjectHostPathStep } = await import(hostPathModule);
+    const { useAddProjectWorkflowState } = await import(workflowModule);
+    const { createRoot } = webRequire("react-dom/client");
+    const { act, createElement, useState } = React;
+    const expected = "/owned/dark/project with spaces";
+    const submitted: string[] = [];
+    const host = {
+      environmentId: "primary",
+      label: "Owned host",
+      platform: "Linux",
+      baseDirectory: "/owned/initial",
+      isPrimary: true,
+      desktopInstanceId: null,
+      nativePickerAvailable: false,
+    };
+    function Harness() {
+      const [closed, setClosed] = useState(false);
+      const state = useAddProjectWorkflowState({
+        open: !closed,
+        onOpenChange: (open: boolean) => setClosed(!open),
+        hosts: [host] as any,
+        locationLabel: "Host",
+        primaryEnvironmentId: "primary" as any,
+        initialEnvironmentId: null,
+        operations: {
+          addFolder: async (value: { workspaceRoot: string }) => {
+            submitted.push(value.workspaceRoot);
+            return value.workspaceRoot === expected;
+          },
+          clone: async () => ({ _tag: "Opened" as const }),
+          create: async () => true,
+          cancelClone: async () => ({ _tag: "Success" as const, value: { cancelled: true } }),
+        } as any,
+        pickFolder: async () => ({ _tag: "Cancelled" as const }),
+      });
+      return closed
+        ? createElement("div", { "data-testid": "composer-editor" })
+        : createElement(AddProjectHostPathStep, {
+            hostLabel: "Owned host",
+            path: state.hostPath,
+            platform: "Linux",
+            busy: state.busy,
+            error: state.error,
+            onPathChange: state.setHostPath,
+            onSubmit: () => void state.submitHostPath(),
+          });
+    }
+    const desktop = NodeModule.createRequire(
+      new NodeURL.URL("../../package.json", import.meta.url),
+    );
+    const sdkSource = NodeFS.readFileSync(
+      NodePath.join(NodePath.dirname(desktop.resolve("webdriverio")), "node.js"),
+      "utf8",
+    );
+    const cut = (name: string, async: boolean) => {
+      const start = sdkSource.indexOf(`${async ? "async " : ""}function ${name}(`);
+      const end = sdkSource.indexOf("\n//", start);
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      return sdkSource.slice(start, end);
+    };
+    const sdk = NodeVM.runInNewContext(
+      cut("clearValue", false) +
+        cut("addValue", false) +
+        cut("setValue", true) +
+        "\n({clearValue, addValue, setValue})",
+      { VALID_TYPES: ["string", "number"] },
+    );
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const field = () => document.querySelector<HTMLInputElement>("#add-project-host-path")!;
+    const nativeValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    let clears = 0,
+      types = 0,
+      clicks = 0;
+    const input = {
+      elementId: "owned-primary-path",
+      clearValue: () => sdk.clearValue.call(input),
+      addValue: (value: string) => sdk.addValue.call(input, value),
+      elementClear: async () => {
+        clears++;
+        await act(async () => field().focus());
+        await act(async () => {
+          nativeValue.call(field(), "");
+          if (clearEvents === "input-and-change")
+            field().dispatchEvent(new Event("input", { bubbles: true }));
+          field().dispatchEvent(new Event("change", { bubbles: true }));
+        });
+        await act(async () => field().blur());
+      },
+      elementSendKeys: async (_id: string, value: string) => {
+        types++;
+        await act(async () => field().focus());
+        await act(async () => {
+          nativeValue.call(field(), field().value + value);
+          field().dispatchEvent(new Event("input", { bubbles: true }));
+        });
+      },
+    };
+    const browser = {
+      $$: () => ({
+        length: Promise.resolve(document.querySelectorAll("#add-project-host-path").length),
+      }),
+      $: (selector: string) =>
+        selector === "#add-project-host-path"
+          ? {
+              elementId: "owned-primary-path",
+              waitForDisplayed: async () => expect(field()).toBeInstanceOf(HTMLInputElement),
+              setValue: (value: string) => sdk.setValue.call(input, value),
+              getValue: async () => field().value,
+              isFocused: async () => document.activeElement === field(),
+            }
+          : {
+              waitForDisplayed: async () =>
+                expect(document.querySelector('[data-testid="composer-editor"]')).not.toBeNull(),
+            },
+    };
+    const source = NodeFS.readFileSync(
+      new NodeURL.URL("../qualify-remote-updates.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf('  primaryPhase("primary-import-path-input");');
+    const end = source.indexOf("  if (host.devUrl) primaryImportExpectedPath = null;", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){ let primaryImportExpectedPath = null;" +
+          source.slice(start, end) +
+          "}\nrun",
+      ),
+      {
+        host: { devUrl: "http://owned.invalid", project: expected },
+        primaryPhase: () => {},
+        required: () => browser,
+        owner: { until: async (check: () => Promise<boolean>) => expect(await check()).toBe(true) },
+        composer: '[data-testid="composer-editor"]',
+        click: async (selector: string) => {
+          expect(selector).toBe("button=Open project");
+          clicks++;
+          await act(async () => {
+            const form = field().form!;
+            form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+          });
+        },
+      },
+    );
+    try {
+      await act(async () => root.render(createElement(Harness, {})));
+      await run();
+      expect(submitted).toEqual([expected]);
+      expect({ clears, types, clicks }).toEqual({ clears: 1, types: 1, clicks: 1 });
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      vi.unstubAllGlobals();
+    }
+  },
+);
+
+it.each([
+  "matched",
+  "mismatched",
+  "focus-lost",
+  "stale",
+  "duplicate",
+  "read-failed",
+  "malformed-id",
+  "malformed-value",
+])(
+  "refuses primary import submission until the same focused path has its owned value: %s",
+  async (mode) => {
+    const expected = "/owned/dark/project with spaces";
+    const original = new Error("Inert owned path read failed.");
+    const calls: string[] = [];
+    const field = {
+      elementId: mode === "malformed-id" ? null : "owned-path",
+      waitForDisplayed: async () => {},
+      setValue: async () => calls.push("type"),
+      isFocused: async () => mode !== "focus-lost",
+      getValue: async () => {
+        if (mode === "read-failed") throw original;
+        return mode === "malformed-value"
+          ? { value: expected }
+          : mode === "mismatched"
+            ? "/owned/unexpected"
+            : expected;
+      },
+    };
+    const browser = {
+      $: (selector: string) =>
+        selector === "#add-project-host-path"
+          ? mode === "stale" && calls.length
+            ? { ...field, elementId: "replacement-path" }
+            : field
+          : { waitForDisplayed: async () => {} },
+      $$: () => ({ length: Promise.resolve(mode === "duplicate" ? 2 : 1) }),
+    };
+    const source = NodeFS.readFileSync(
+      new NodeURL.URL("../qualify-remote-updates.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf('  primaryPhase("primary-import-path-input");');
+    const end = source.indexOf("  if (host.devUrl) primaryImportExpectedPath = null;", start);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){ let primaryImportExpectedPath = null;" +
+          source.slice(start, end) +
+          "}\nrun",
+      ),
+      {
+        host: { devUrl: "http://owned.invalid", project: expected },
+        primaryPhase: () => {},
+        required: () => browser,
+        composer: "owned-composer",
+        click: async () => calls.push("submit"),
+        owner: {
+          until: async (check: () => Promise<boolean>) => {
+            for (let i = 0; i < 2; i++) if (await check()) return;
+            throw new Error("Inert owned path admission did not arrive.");
+          },
+        },
+      },
+    );
+    const error = await run().catch((value: unknown) => value);
+    if (mode === "matched") {
+      expect(error).toBeUndefined();
+      expect(calls).toEqual(["type", "submit"]);
+    } else {
+      if (mode === "read-failed") expect(error).toBe(original);
+      else expect(error).toBeDefined();
+      expect(calls).toEqual(["type"]);
+    }
+  },
+);
+
+it("corrects the actual content viewport before admitting the primary import", async () => {
+  const { correctDesktopUiOuterSize } = await import("./window-size.ts");
+  const { readVisualViewport } = await import("./release-visual-observation.ts");
+  const source = NodeFS.readFileSync(
+    new NodeURL.URL("../qualify-remote-updates.ts", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf('    phase("primary-pair-wait-sidebar");');
+  const end = source.indexOf("    let primaryWorkspace:", start);
+  const sizes: unknown[] = [];
+  const viewport = { width: 1280, height: 817, devicePixelRatio: 1 };
+  const browser = {
+    $: () => ({ waitForDisplayed: async () => {} }),
+    getWindowSize: async () => ({ width: 1280, height: 960 }),
+    setWindowSize: async (width: number, height: number) => {
+      sizes.push({ width, height });
+      viewport.width = width;
+      viewport.height = height - 143;
+    },
+    execute: async (read: () => unknown) =>
+      NodeVM.runInNewContext("(" + read.toString() + ")()", {
+        innerWidth: viewport.width,
+        innerHeight: viewport.height,
+        devicePixelRatio: 1,
+      }),
+  };
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes("async function run(){" + source.slice(start, end) + "}\nrun"),
+    {
+      phase: () => {},
+      browser,
+      primary: {},
+      bounded: async (value: Promise<unknown>, timeout: number) => {
+        expect(timeout).toBe(2000);
+        return value;
+      },
+      owner: { until: async (check: () => Promise<boolean>) => expect(await check()).toBe(true) },
+      correctDesktopUiOuterSize,
+      readVisualViewport,
+      importProject: async () =>
+        expect(viewport).toEqual({ width: 1280, height: 960, devicePixelRatio: 1 }),
+    },
+  );
+  await run();
+  expect(sizes).toEqual([{ width: 1280, height: 1103 }]);
+});
+
+it.each([817, 960])(
+  "admits only approved screenshot content height before writing originals: %s",
+  async (height) => {
+    const source = NodeFS.readFileSync(
+      new NodeURL.URL("../qualify-remote-updates.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf("  const proof = validateCaptureWitness(witness);");
+    const end = source.indexOf("\n}\n", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const written: unknown[] = [];
+    const captures: unknown[] = [];
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" + source.slice(start, end) + "}\nrun",
+      ),
+      {
+        validateCaptureWitness: () => ({}),
+        witness: {},
+        Buffer,
+        required: () => ({
+          takeScreenshot: async () => Buffer.from("owned-inert-image").toString("base64"),
+        }),
+        bounded: async (value: Promise<unknown>) => value,
+        inspectScreenshot: () => ({ width: 1280, height, nonBlank: true, sha256: "owned-hash" }),
+        screenshotName: () => "owned-light.png",
+        currentTheme: "light",
+        scene: "owned",
+        check: (value: boolean) => {
+          if (!value) throw new Error("Inert approved viewport refusal.");
+        },
+        NodeFS: { writeFileSync: () => written.push(true) },
+        NodePath,
+        evidence: "/owned/inert",
+        captures,
+        assertions: [],
+        write: () => {},
+      },
+    );
+    const error = await run().catch((value: unknown) => value);
+    if (height === 960) {
+      expect(error).toBeUndefined();
+      expect(written).toHaveLength(1);
+      expect(captures).toHaveLength(1);
+    } else {
+      expect(error).toBeDefined();
+      expect(written).toHaveLength(0);
+      expect(captures).toHaveLength(0);
+    }
+  },
+);
