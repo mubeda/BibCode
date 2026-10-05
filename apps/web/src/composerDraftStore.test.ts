@@ -1250,6 +1250,18 @@ describe("composerDraftStore project draft thread mapping", () => {
     });
   });
 
+  it("finds a draft stored under a project's earlier key through fallback keys", () => {
+    const store = useComposerDraftStore.getState();
+    const earlierKey = scopedProjectKey(projectRef);
+    store.setLogicalProjectDraftThreadId(earlierKey, projectRef, draftId, { threadId });
+
+    const current = useComposerDraftStore.getState();
+    expect(current.getDraftSessionByLogicalProjectKey("github.com/acme/repo")).toBeNull();
+    expect(
+      current.getDraftSessionByLogicalProjectKey("github.com/acme/repo", [earlierKey])?.draftId,
+    ).toBe(draftId);
+  });
+
   it("clears branch and worktree context when remapping a draft to another environment", () => {
     const store = useComposerDraftStore.getState();
     store.setProjectDraftThreadId(projectRef, draftId, {
