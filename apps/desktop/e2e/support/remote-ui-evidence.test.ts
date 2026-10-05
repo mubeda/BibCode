@@ -15,6 +15,7 @@ import {
   remoteUiPlan,
   projectRemoteUiSetupObservation,
   projectRemoteUiCheckAgainObservation,
+  projectRemoteUiCheckAgainInterception,
   projectRemoteUiSuccessRemovalObservation,
   projectRemoteUiManualRemovalObservation,
   projectRemoteUiToastErrorSignature,
@@ -840,4 +841,125 @@ it("retains only an exact safe manual-removal own-data snapshot", () => {
       visibleToastCloseCount: value,
       endingToastCount: value,
     });
+});
+
+it("keeps ambiguous self-closing receiver fragments unknown", () => {
+  const error = new Error(
+    'element click intercepted: Other element would receive the click: <button data-slot="toast-close" />',
+  );
+  expect(projectRemoteUiCheckAgainInterception(error)).toBeNull();
+});
+
+it("refuses a receiver marker embedded in the target element's quoted attribute", () => {
+  const error = new Error(
+    'element click intercepted: Element <button title="Other element would receive the click: <button data-slot=\"toast-close\">\"',
+  );
+  expect(projectRemoteUiCheckAgainInterception(error)).toBeNull();
+});
+
+it.each([
+  [
+    '<button data-slot="toast-close" data-ending-style id="private-id" title="private input > detail"></button>',
+    { receiverSlot: "toast-close", receiverEndingStyle: true },
+  ],
+  [
+    "<div data-slot='toast-description'></div>",
+    { receiverSlot: "toast-description", receiverEndingStyle: false },
+  ],
+  [
+    '<div role="alertdialog" data-position="top-right" style="--toast-index: 0; --toast-offset-y: 0px;" data-ending-style="">',
+    { receiverSlot: "toast-root", receiverEndingStyle: true },
+  ],
+  [
+    '<div role="dialog" data-slot="dialog-popup">',
+    { receiverSlot: "dialog-popup", receiverEndingStyle: false },
+  ],
+  [
+    '<span data-slot="private-unknown-slot" id="private-id">',
+    { receiverSlot: "other", receiverEndingStyle: false },
+  ],
+  ['<span id="private-id">', { receiverSlot: null, receiverEndingStyle: false }],
+])("retains only the receiver's fixed own slot and ending fact", (fragment, expected) => {
+  const error = new Error(
+    "element click intercepted: Other element would receive the click: " + fragment,
+  );
+  const facts = projectRemoteUiCheckAgainInterception(error);
+  expect(facts).toEqual(expected);
+  expect(Object.isFrozen(facts)).toBe(true);
+  expect(Object.keys(facts!)).toEqual(["receiverSlot", "receiverEndingStyle"]);
+  expect(JSON.stringify(facts)).not.toMatch(/private|id=|title=|style=|</);
+});
+
+it.each([
+  "element click intercepted: private input without a receiver",
+  'Other element would receive the click: <button data-slot="toast-close">',
+  'element click intercepted: Other element would receive the click: &lt;button data-slot="toast-close"&gt;',
+  "element click intercepted: Other element would receive the click: </button>",
+  "element click intercepted: Other element would receive the click: <!--private-->",
+  'element click intercepted: Other element would receive the click: <button data-slot="toast-close"',
+  'element click intercepted: Other element would receive the click: <button data-slot="toast-close" title="private>',
+  'element click intercepted: Other element would receive the click: <button data-slot="toast-close" DATA-SLOT="dialog-popup">',
+  'element click intercepted: Other element would receive the click: <button data-slot="toast-close" data-ending-style data-ending-style>',
+  "element click intercepted: Other element would receive the click: <button data-slot=toast-close>",
+  'element click intercepted: Other element would receive the click: <button data-slot="toast-close"></button><div data-slot="dialog-popup">',
+  'element click intercepted: Other element would receive the click: <button data-slot="toast-close"> Other element would receive the click: <div>',
+  'element click intercepted: Other element would receive the click: <button data-slot="toast-close">' +
+    "p".repeat(4096),
+  "element click intercepted: Other element would receive the click: <button " +
+    ' x="private"'.repeat(65) +
+    ">",
+])(
+  "keeps unavailable or ambiguous receiver data unknown without retaining its string",
+  (message) => {
+    expect(projectRemoteUiCheckAgainInterception(new Error(message))).toBeNull();
+  },
+);
+
+it("refuses inherited, accessor, live-proxy and revoked-proxy messages before reflection", () => {
+  let reads = 0;
+  const message =
+    'element click intercepted: Other element would receive the click: <button data-slot="toast-close">';
+  const inherited = Object.create({ message });
+  const accessor = Object.defineProperty({}, "message", {
+    get() {
+      reads++;
+      throw new Error("private getter");
+    },
+  });
+  const proxy = new Proxy(
+    { message },
+    {
+      ownKeys() {
+        reads++;
+        return [];
+      },
+      getOwnPropertyDescriptor() {
+        reads++;
+        throw new Error("private trap");
+      },
+      get() {
+        reads++;
+        return message;
+      },
+    },
+  );
+  const revoked = Proxy.revocable({ message }, {});
+  revoked.revoke();
+  for (const value of [
+    null,
+    undefined,
+    1,
+    "private",
+    [],
+    () => {},
+    inherited,
+    accessor,
+    proxy,
+    revoked.proxy,
+    { message: Symbol("private") },
+    { message: new String(message) },
+  ]) {
+    expect(projectRemoteUiCheckAgainInterception(value)).toBeNull();
+  }
+  expect(reads).toBe(0);
 });

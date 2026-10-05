@@ -32,6 +32,142 @@ export const remoteUiScenes = [
 ] as const;
 export type RemoteUiScene = (typeof remoteUiScenes)[number];
 
+export interface RemoteUiCheckAgainInterception {
+  readonly receiverSlot:
+    | "toast-root"
+    | "toast-viewport"
+    | "toast-close"
+    | "toast-title"
+    | "toast-description"
+    | "toast-action"
+    | "dialog-popup"
+    | "other"
+    | null;
+  /** The receiving element's own attribute only; never its ancestors' state. */
+  readonly receiverEndingStyle: boolean;
+}
+
+/** Closed receiving-tag facts from the original error; never HTML, an action or a cause verdict. */
+export function projectRemoteUiCheckAgainInterception(
+  error: unknown,
+): RemoteUiCheckAgainInterception | null {
+  try {
+    if (
+      error === null ||
+      typeof error !== "object" ||
+      NodeUtil.types.isProxy(error) ||
+      Array.isArray(error)
+    )
+      return null;
+    const descriptor = Object.getOwnPropertyDescriptor(error, "message");
+    const message = descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : null;
+    if (typeof message !== "string" || message.length > 4096) return null;
+    const marker = "other element would receive the click:";
+    const lower = message.toLowerCase();
+    const index = lower.indexOf(marker);
+    if (index < 0 || lower.indexOf(marker, index + marker.length) >= 0) return null;
+    const prefix = message.slice(0, index);
+    if (
+      !/^(?:WebDriverError: )?element click intercepted\b/i.test(prefix) &&
+      !/^Element\b[\s\S]* is not clickable at point\b/i.test(prefix)
+    )
+      return null;
+    // A marker inside the target's quoted markup is not the driver's receiver clause.
+    let inTag = false;
+    let attributeQuote: string | null = null;
+    for (const character of prefix) {
+      if (!inTag) {
+        if (character === "<") inTag = true;
+      } else if (attributeQuote !== null) {
+        if (character === attributeQuote) attributeQuote = null;
+      } else if (character === '\"' || character === "'") {
+        attributeQuote = character;
+      } else if (character === ">") {
+        inTag = false;
+      }
+    }
+    if (inTag) return null;
+    const fragment = message.slice(index + marker.length).trimStart();
+    const name = /^<([a-z][a-z0-9:-]{0,63})/i.exec(fragment);
+    if (!name) return null;
+    const tag = name[1]!.toLowerCase();
+    const attributes = new Map<string, string | null>();
+    let cursor = name[0].length;
+    let complete = false;
+    while (cursor < fragment.length) {
+      const beforeWhitespace = cursor;
+      while (/[\t\n\f\r ]/.test(fragment[cursor] ?? "")) cursor++;
+      if (fragment[cursor] === ">") {
+        cursor++;
+        complete = true;
+        break;
+      }
+      if (fragment[cursor] === "/") return null;
+      if (cursor === beforeWhitespace || attributes.size >= 64) return null;
+      const attribute = /^[a-z_:][a-z0-9_.:-]{0,127}/i.exec(fragment.slice(cursor));
+      if (!attribute) return null;
+      const key = attribute[0].toLowerCase();
+      if (attributes.has(key)) return null;
+      cursor += attribute[0].length;
+      const beforeEqualsWhitespace = cursor;
+      while (/[\t\n\f\r ]/.test(fragment[cursor] ?? "")) cursor++;
+      let value: string | null = null;
+      if (fragment[cursor] === "=") {
+        cursor++;
+        while (/[\t\n\f\r ]/.test(fragment[cursor] ?? "")) cursor++;
+        const quote = fragment[cursor];
+        if (quote !== '\"' && quote !== "'") return null;
+        const end = fragment.indexOf(quote, cursor + 1);
+        if (end < 0) return null;
+        value = fragment.slice(cursor + 1, end);
+        cursor = end + 1;
+      } else {
+        cursor = beforeEqualsWhitespace;
+      }
+      attributes.set(key, value);
+    }
+    if (!complete) return null;
+    let remainder = fragment.slice(cursor).trimStart();
+    const closing = new RegExp("^</" + tag + "\\s*>", "i").exec(remainder);
+    if (closing) remainder = remainder.slice(closing[0].length);
+    if (/[<>]/.test(remainder)) return null;
+    const slot = attributes.get("data-slot");
+    let receiverSlot: RemoteUiCheckAgainInterception["receiverSlot"] =
+      slot === undefined ? null : "other";
+    if (
+      slot === "toast-viewport" ||
+      slot === "toast-close" ||
+      slot === "toast-title" ||
+      slot === "toast-description" ||
+      slot === "toast-action" ||
+      slot === "dialog-popup"
+    ) {
+      receiverSlot = slot;
+    } else if (
+      slot === undefined &&
+      tag === "div" &&
+      ["dialog", "alertdialog"].includes(attributes.get("role") ?? "") &&
+      [
+        "top-left",
+        "top-center",
+        "top-right",
+        "bottom-left",
+        "bottom-center",
+        "bottom-right",
+      ].includes(attributes.get("data-position") ?? "") &&
+      /(?:^|;)\s*--toast-index\s*:\s*\d{1,3}(?=;|$)/.test(attributes.get("style") ?? "")
+    ) {
+      receiverSlot = "toast-root";
+    }
+    return Object.freeze({
+      receiverSlot,
+      receiverEndingStyle: attributes.has("data-ending-style"),
+    });
+  } catch {
+    return null;
+  }
+}
+
 export interface RemoteUiToastErrorSignature {
   readonly wrapperPrefix: boolean;
   readonly messageFamily: "missing" | "stale" | "other";

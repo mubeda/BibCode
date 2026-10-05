@@ -650,6 +650,22 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   leaves the page. These are current post-failure facts, not proof of the earlier
   native click's blocker. Preserve the one public action, owner and every
   existing wait, request-count, version and draft assertion.
+  At only `failure-check-again-click`, `checkAgainInterception` may separately
+  retain `receiverSlot` and `receiverEndingStyle` from that same original error
+  before the existing post-failure observation. The message must be an own
+  primitive data value of at most 4096 units, with a recognized interception
+  prefix and exactly one explicit receiving-element clause. Decode only its
+  single bounded opening tag; quoted values are opaque, attribute names must
+  be unique, and self-closing, malformed or ambiguous markup remains null.
+  The slot is one of the fixed toast slots, the toast-root attribute fingerprint,
+  `dialog-popup`, `other`, or null. Ending means the receiving element's own
+  `data-ending-style` attribute is present; it says nothing about an ancestor
+  or why the toast remains. Inherited/accessor messages and live/revoked proxies
+  are refused without invoking their getters or traps. No message, HTML, ID,
+  input, style, URL or argument is retained. This optional projection adds no
+  DOM read, action, retry or deadline and cannot replace the original error,
+  existing observations or joined cleanup. It locates the driver's explicit
+  receiver, not a native timer, toast-lifecycle or click-time root cause.
   Full Reload captures the initially imported primary project, thread and route
   from public selected-card markup. The rail changes sidebar presentation only;
   it cannot establish an active chat. After selecting Local, select the same

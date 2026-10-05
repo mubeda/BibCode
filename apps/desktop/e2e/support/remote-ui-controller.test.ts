@@ -23,6 +23,7 @@ import {
   projectRemoteUiSetupObservation,
   projectRemoteUiPrimaryImportObservation,
   projectRemoteUiCheckAgainObservation,
+  projectRemoteUiCheckAgainInterception,
   projectRemoteUiSuccessRemovalObservation,
   projectRemoteUiManualRemovalObservation,
   projectRemoteUiToastErrorSignature,
@@ -940,6 +941,7 @@ it.each(["unavailable", "no-browser", "write-failure", "manual-assertion"])(
         },
         projectRemoteUiSetupObservation,
         projectRemoteUiCheckAgainObservation,
+        projectRemoteUiCheckAgainInterception,
         projectRemoteUiSuccessRemovalObservation,
         SUCCESS_REMOVE_PHASES: successRemovalPhases,
         classifyQualificationFailure: () => ({ kind: "timeout" }),
@@ -1738,6 +1740,10 @@ it.each(["light", "dark"])(
 
 it.each([
   "own",
+  "receiver",
+  "diagnostic-throw",
+  "inactive-phase",
+  "mutated-message",
   "inherited",
   "accessor",
   "throwing-accessor",
@@ -1781,7 +1787,11 @@ it.each([
       });
     const start = controller.indexOf("} catch (error) {", controller.indexOf('phase("complete")'));
     const end = controller.indexOf("\nprocess.exitCode", start);
-    const failure = new Error("private intercepted selector/error");
+    const failure = new Error(
+      ["receiver", "diagnostic-throw", "inactive-phase", "mutated-message"].includes(kind)
+        ? 'element click intercepted: Other element would receive the click: <button data-slot="toast-close" data-ending-style id="private-host-identifier" title="private credential/token"></button>'
+        : "private intercepted selector/error",
+    );
     const writes = new Map<string, Record<string, unknown>>();
     const run = NodeVM.runInNewContext(
       NodeModule.stripTypeScriptTypes(
@@ -1791,12 +1801,14 @@ it.each([
         original: failure,
         BrowserConnectivityFailure: class extends Error {},
         networkProofs: [],
-        currentPhase: "failure-check-again-click",
+        currentPhase:
+          kind === "inactive-phase" ? "failure-check-again-clickable" : "failure-check-again-click",
         currentTheme: "light",
         success: false,
         browser: {
           execute: async (_read: unknown, input: unknown) => {
             samples++;
+            if (kind === "mutated-message") failure.message = "private later message";
             expect(input).toEqual({ checkAgain: true, successRemoval: false, theme: "light" });
             return { startup: {}, setup: null, checkAgain: payload };
           },
@@ -1811,6 +1823,12 @@ it.each([
         projectBrowserStartupObservation: () => ({ errors: 0 }),
         projectRemoteUiSetupObservation,
         projectRemoteUiCheckAgainObservation,
+        projectRemoteUiCheckAgainInterception: (error: unknown) => {
+          expect(error).toBe(failure);
+          if (kind === "inactive-phase") throw new Error("inactive attribution called");
+          if (kind === "diagnostic-throw") throw new Error("private diagnostic refusal");
+          return projectRemoteUiCheckAgainInterception(error);
+        },
         projectRemoteUiSuccessRemovalObservation,
         SUCCESS_REMOVE_PHASES: successRemovalPhases,
         classifyQualificationFailure: (error: unknown) => {
@@ -1840,13 +1858,23 @@ it.each([
     expect(reads).toBe(0);
     expect(joined).toBe(true);
     const observed = writes.get("failure")!;
-    expect(observed.phase).toBe("failure-check-again-click");
+    expect(observed.phase).toBe(
+      kind === "inactive-phase" ? "failure-check-again-clickable" : "failure-check-again-click",
+    );
     expect(observed.failure).toEqual({ kind: "click-intercepted" });
     expect(observed.startup).toEqual({ errors: 0 });
-    if (kind === "own") expect(observed.checkAgain).toEqual(known);
+    if (kind === "receiver" || kind === "mutated-message")
+      expect(observed.checkAgainInterception).toEqual({
+        receiverSlot: "toast-close",
+        receiverEndingStyle: true,
+      });
+    if (["own", "receiver", "diagnostic-throw", "inactive-phase", "mutated-message"].includes(kind))
+      expect(observed.checkAgain).toEqual(known);
     else if (kind === "inherited")
       expect(Object.values(observed.checkAgain as object)).toEqual(Array(10).fill(null));
     else expect(observed.checkAgain).toBeNull();
+    if (kind === "diagnostic-throw" || kind === "inactive-phase")
+      expect(observed.checkAgainInterception).toBeNull();
     expect(JSON.stringify(Array.from(writes.values()))).not.toContain("private");
     expect(writes.get("result")?.childProcessesClosed).toBe(true);
   },
@@ -2664,6 +2692,7 @@ it("retains only the same-read closed primary witness at the exact failed proof 
       startup: null,
       setup: null,
       checkAgain: null,
+      checkAgainInterception: null,
       successRemoval: null,
       manualRemoval: null,
       reloadPrimaryThreadWitness: {
@@ -2853,6 +2882,7 @@ function toastFailureReceipt(
     startup: null,
     setup: null,
     checkAgain: null,
+    checkAgainInterception: null,
     successRemoval: null,
     manualRemoval: null,
     reloadPrimaryThreadWitness: null,
@@ -3118,6 +3148,20 @@ function sdkClickResponseError(
     { method: input.method ?? "POST", body: input.body },
   );
 }
+
+it("projects only closed receiver facts from the pinned SDK's original click error", () => {
+  const error = sdkClickResponseError("element click intercepted", {
+    message:
+      'element click intercepted: Element <button id="private-target">Check</button> is not clickable at point (10, 20). Other element would receive the click: <button data-slot="toast-close" data-ending-style id="private-receiver"></button>',
+  });
+  expect(projectRemoteUiCheckAgainInterception(error)).toEqual({
+    receiverSlot: "toast-close",
+    receiverEndingStyle: true,
+  });
+  expect(JSON.stringify(projectRemoteUiCheckAgainInterception(error))).not.toMatch(
+    /private|owned-node|element\/|https?:|button|Check/,
+  );
+});
 
 // Execute the actual Classic click recovery, without importing a session or HTTP runtime.
 function sdkInternalMissingClick(
@@ -4388,6 +4432,7 @@ it.each([
           projectBrowserStartupObservation: () => null,
           projectRemoteUiSetupObservation,
           projectRemoteUiCheckAgainObservation,
+          projectRemoteUiCheckAgainInterception,
           projectRemoteUiSuccessRemovalObservation,
           classifyQualificationFailure: (error: unknown) => {
             expect(error).toBe(original);
@@ -4497,6 +4542,7 @@ it.each([
           projectBrowserStartupObservation: () => null,
           projectRemoteUiSetupObservation,
           projectRemoteUiCheckAgainObservation,
+          projectRemoteUiCheckAgainInterception,
           projectRemoteUiSuccessRemovalObservation,
           projectRemoteUiPrimaryImportObservation,
           classifyQualificationFailure: (error: unknown) => {
@@ -4630,6 +4676,7 @@ it.each([
           projectRemoteUiSetupObservation,
           projectRemoteUiPrimaryImportObservation,
           projectRemoteUiCheckAgainObservation,
+          projectRemoteUiCheckAgainInterception,
           projectRemoteUiSuccessRemovalObservation,
           projectRemoteUiManualRemovalObservation,
           classifyQualificationFailure: (error: unknown) => {

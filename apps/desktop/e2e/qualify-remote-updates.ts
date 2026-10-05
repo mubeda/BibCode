@@ -41,6 +41,7 @@ import {
   projectRemoteUiSetupObservation,
   projectRemoteUiPrimaryImportObservation,
   projectRemoteUiCheckAgainObservation,
+  projectRemoteUiCheckAgainInterception,
   projectRemoteUiSuccessRemovalObservation,
   projectRemoteUiManualRemovalObservation,
   projectRemoteUiToastErrorSignature,
@@ -1788,6 +1789,14 @@ try {
   phase("complete");
 } catch (error) {
   if (error instanceof BrowserConnectivityFailure) networkProofs.push(error.proof);
+  let checkAgainInterception: ReturnType<typeof projectRemoteUiCheckAgainInterception> = null;
+  if (currentPhase === "failure-check-again-click") {
+    try {
+      checkAgainInterception = projectRemoteUiCheckAgainInterception(error);
+    } catch {
+      // Optional attribution cannot replace the original failure or existing observations.
+    }
+  }
   let startup: unknown = null;
   let setup: ReturnType<typeof projectRemoteUiSetupObservation> = null;
   let primaryImport: ReturnType<typeof projectRemoteUiPrimaryImportObservation> = null;
@@ -2144,6 +2153,7 @@ try {
     setup,
     primaryImport: currentPhase === "primary-import-composer" ? primaryImport : null,
     checkAgain,
+    checkAgainInterception,
     successRemoval,
     manualRemoval,
     toastErrorSignature:
