@@ -466,6 +466,40 @@ Verify registration policy without starting the qualification runtime:
 vp test run scripts/qualify-release-visuals-registration.test.ts scripts/ci-platform-contract.test.ts
 ```
 
+## Manual remote update UI registration
+
+The default-branch `qualify-release-ui.yml` also registers dispatch only. It
+has the existing `matrix` choices `core` and `full`, with `core` as the default,
+and refuses execution before checkout or runtime admission. Its historical
+presence in the Actions workflow list is insufficient: verify that the file
+exists on the current default branch before dispatching the nominated QA ref.
+
+Choose one matrix on the reviewed QA source. The full workflow on that ref
+retains its guarded server, maintained interactive fake host, source web build,
+private PID/network owners, static/helper gates, and explicit original-image
+and receipt retention. Its existing QA-branch push trigger stays in that
+version; the default registration stub has no automatic trigger.
+
+```sh
+qualification_ref="<nominated QA branch or tag>"
+qualification_matrix="full"
+gh workflow run qualify-release-ui.yml --ref "$qualification_ref" -f matrix="$qualification_matrix"
+```
+
+Require the actual run's head SHA, compiled inputs and owner provenance to
+match the reviewed nomination. Check joined controller/supervisor/namespace
+cleanup and unchanged build inputs before independently inspecting the
+originals. The controlled browser matrix does not qualify Tauri native dialogs,
+real remote installers, other platforms, or the full screenshot obligation.
+Record source and scope in the execution report; do not turn a registration
+refusal or a partial matrix into acceptance evidence.
+
+The static registration policy is safe to verify without starting its owner:
+
+```sh
+vp test run scripts/qualify-release-ui-registration.test.ts
+```
+
 ## Packaged UI scenarios
 
 Include the shared [Pull Requests smoke](./cross-platform-validation.md#pull-requests-web-shell-validation):
