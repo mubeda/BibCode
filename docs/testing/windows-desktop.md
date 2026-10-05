@@ -446,6 +446,13 @@ candidate-named updater installer. Its bounded `windows-install-handoff.log`
 records path/version/hash and installer PID/path observations without command
 lines or credentials. Inspect that artifact on timeout; the later public
 runtime-version and retained-data checks remain required.
+Each PowerShell observation keeps its ten-second command bound. A command
+deadline becomes an unavailable sample only after the exact child emits
+`close`; the next sample remains inside the original overall installation
+deadline. Cleanup that cannot prove `close` within its existing five-second
+budget fails the lane, including after forced termination. Spawn and other
+cleanup errors remain fatal. An unavailable sample never satisfies the exact
+version/hash/no-installer predicate.
 
 Build and run packaged E2E with the supported platform value
 `BIBCODE_E2E_PLATFORM=win`:

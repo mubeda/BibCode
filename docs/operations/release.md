@@ -269,6 +269,15 @@ The `remote-install` lane reuses the protected package rather than building a
 fourth package. These are build/job limits, not expected durations or changes
 to product, WebDriver, or restart deadlines.
 
+Windows installed-version observation retains a ten-second PowerShell child
+bound. A timed-out child must be observed closed, including its pipes, before
+the timeout can be recorded as an unavailable sample within the unchanged
+overall restart deadline. The shared command owner tracks `close` from spawn
+admission; cleanup that reaches its five-second bound without that proof fails
+closed. Successful installation still requires the exact candidate version,
+readable checksum, no candidate installer, and the later native runtime and
+retained-data checks.
+
 The harness uses an isolated root outside the checkout, an ephemeral Tauri
 updater key, a loopback-only mock updater, the packaged app's embedded
 WebDriver, and bounded redacted evidence. It never opens or copies the SQLite

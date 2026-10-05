@@ -49,6 +49,17 @@ inherited ignored disposition before the fixture installs any handler. Retain
 the watchdog exit, elapsed-time bounds, readiness, and cleanup assertions; the
 production pairing script and its signal policy remain the behavior under test.
 
+For a CI Windows upgrade observation deadline, distinguish the PowerShell
+sample from the overall installer wait. `runBoundedCommand` can publish its
+typed deadline only after the exact owned child emits `close`, including pipe
+closure. Exit status or a kill request alone is insufficient. The installed
+candidate poll records that deadline as unavailable and retries within its
+existing overall bound; a five-second cleanup deadline, failed spawn, or other
+cleanup error stays fatal. Keep unavailable observations in the private handoff
+log and retain the strict version/hash/no-installer predicate. Hermetic support
+tests cover exit-before-close, cleanup failure, transient samples, and an
+all-unavailable poll; actual installer qualification remains CI-only.
+
 ## Unix recovery-test watchdog
 
 The private `turn_delivery_recovery` child helper uses an exactly selected,

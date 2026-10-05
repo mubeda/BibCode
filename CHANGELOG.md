@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.7.4] - 2026-10-04
+## [v0.7.4] - 2026-10-05
 
 BiBCode v0.7.4 improves message recovery, attachment uploads, Git workflows, and remote-update feedback. This release includes the changes since v0.7.2.
 
@@ -31,6 +31,7 @@ BiBCode v0.7.4 improves message recovery, attachment uploads, Git workflows, and
 - Automated provider, hosting, Git, SSH, and desktop fixtures isolate user configuration and credentials. The hermetic guard rejects host provider/hosting executable resolution and credential reads; Unix test-child watchdogs reap owned descendants after parent interruption or death.
 - Desktop shutdown-race tests observe the exact runtime join. SSH fixtures retain explicit cleanup and loopback behavior across native platforms; delayed-interpreter watchdog fixtures establish their intended TERM immunity before interpreter startup.
 - Packaged composer fixtures advertise the native Claude skill catalog consistently. Queue smoke checks verify visual FIFO independently of temporary virtualized DOM slot order, retaining reload, steering, and exact provider-input checks.
+- Windows upgrade evidence records a timed-out version probe as unavailable after verified child cleanup, preserving the overall installer deadline and strict installed-version checks.
 - Release preflight explains workflow-token permission mismatches before native builds. Cold macOS Intel CI and seeded-build budgets account for the complete required jobs, preserving runtime assertions and all supported platform rows. Both macOS release jobs verify Finder's rendered icon from their exact mounted DMG payload before upload.
 - AppImage packaging reports unsupported GdkPixbuf loader layouts with actionable guidance. Native Windows trust-command coverage, living procedures, and issue-specific evidence reports were expanded.
 
