@@ -16,6 +16,7 @@ BiBCode v0.7.4 improves message recovery, attachment uploads, Git workflows, and
 - Automatic fetch attaches again when an unavailable Git repository is repaired.
 - Hosting CLI launch failures retain their category and recovery guidance in request dialogs. Diagnostics distinguish unavailable timing from measured short operations without exposing private launch context.
 - Git Manager keeps selected rows aligned with the opened diff, preserves selection through unchanged status refreshes, and shares remaining Changes-panel space between its list and diff. Settings uses the height available above the status bar.
+- Side-by-side image diffs use each image's natural dimensions within the preview pane, avoiding one-pixel thumbnails.
 - Expanded the readable text-size floor across chat, Git Manager, Settings, sidebar, and other controls. Complete native visual and typography qualification remains tracked below.
 
 ### Remote updates and protocol reliability

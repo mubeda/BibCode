@@ -61,9 +61,7 @@ const ImagePane = memo(function ImagePane({ label, src }: ImagePaneProps) {
             alt={`${label} image`}
             className="max-h-full max-w-full object-contain"
             draggable={false}
-            height={1}
             src={src}
-            width={1}
           />
         )}
       </div>
