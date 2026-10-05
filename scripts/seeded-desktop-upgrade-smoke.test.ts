@@ -25,6 +25,9 @@ import {
   assertSeededUpgradeBuildVersion,
   assertWebDriverPhaseExit,
   windowsCandidateIsInstalled,
+  readWindowsCandidateProbe,
+  terminateSeededUpgradeChild,
+  SeededUpgradeCommandTimeoutError,
   buildLocalUpdaterManifest,
   buildSeededUpgradeOverlay,
   canonicalizeSeededUpgradeWorkRoot,
@@ -836,6 +839,111 @@ describe("seeded packaging build budgets", () => {
 });
 
 describe("seeded packaged desktop upgrade harness", () => {
+  it("keeps polling after a joined command deadline but still requires the installed candidate", async () => {
+    const candidate = "0.7.4-upgrade.synthetic";
+    const installed = {
+      exists: true,
+      productVersion: candidate,
+      sha256: "a".repeat(64),
+      installers: [],
+      error: null,
+    };
+    const run = vi
+      .fn()
+      .mockRejectedValueOnce(new SeededUpgradeCommandTimeoutError("synthetic command deadline"))
+      .mockResolvedValue({ exitCode: 0, stdout: JSON.stringify(installed), stderr: "" });
+    let now = 0;
+    const observations: unknown[] = [];
+    await waitForUpgradeCondition({
+      description: "installed Windows candidate",
+      intervalMs: 10,
+      now: () => now,
+      sleep: async (milliseconds) => {
+        now += milliseconds;
+      },
+      timeoutMs: 50,
+      probe: async () => {
+        const result = await readWindowsCandidateProbe(run);
+        observations.push(result);
+        return result.exitCode === 0 && windowsCandidateIsInstalled(result.observation, candidate);
+      },
+    });
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(observations[0]).toEqual({
+      exitCode: null,
+      observation: { error: "Windows version probe command deadline" },
+    });
+    expect(now).toBe(10);
+  });
+
+  it("fails the unchanged overall poll when every joined command sample is unavailable", async () => {
+    const run = vi.fn(async () => {
+      throw new SeededUpgradeCommandTimeoutError("synthetic command deadline");
+    });
+    let now = 0;
+    await expect(
+      waitForUpgradeCondition({
+        description: "installed Windows candidate",
+        intervalMs: 10,
+        now: () => now,
+        sleep: async (milliseconds) => {
+          now += milliseconds;
+        },
+        timeoutMs: 20,
+        probe: async () => {
+          const result = await readWindowsCandidateProbe(run);
+          return result.exitCode === 0 && windowsCandidateIsInstalled(result.observation, "0.7.4");
+        },
+      }),
+    ).rejects.toThrow(/installed Windows candidate.*20ms/);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(now).toBe(20);
+  });
+
+  it("propagates unverified cleanup and spawn failures instead of retrying their messages", async () => {
+    for (const error of [
+      new SeededDesktopUpgradeSmokeError("synthetic cleanup deadline"),
+      new Error("synthetic command timed out without joined cleanup"),
+    ]) {
+      await expect(readWindowsCandidateProbe(async () => Promise.reject(error))).rejects.toBe(
+        error,
+      );
+    }
+  });
+
+  it("joins close rather than treating an exit code as completed child cleanup", async () => {
+    const child = new NodeChildProcess.ChildProcess();
+    Object.defineProperty(child, "exitCode", { value: 0 });
+    const kill = vi.spyOn(child, "kill").mockReturnValue(true);
+    let settled = false;
+    const cleanup = terminateSeededUpgradeChild(child).then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    child.emit("close", 0, null);
+    await cleanup;
+    expect(kill).not.toHaveBeenCalled();
+    await expect(terminateSeededUpgradeChild(child)).resolves.toBeUndefined();
+  });
+
+  it("fails closed at the existing cleanup deadline when the exact child never closes", async () => {
+    vi.useFakeTimers();
+    const child = new NodeChildProcess.ChildProcess();
+    const kill = vi.spyOn(child, "kill").mockReturnValue(true);
+    const rejection = expect(terminateSeededUpgradeChild(child)).rejects.toThrow(
+      /child cleanup did not close within 5000ms/,
+    );
+    try {
+      await vi.advanceTimersByTimeAsync(5_000);
+      await rejection;
+      expect(kill.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"]]);
+    } finally {
+      child.emit("close", null, "SIGKILL");
+      vi.useRealTimers();
+    }
+  });
+
   it("waits for the exact Windows candidate and installer exit before cleanup", () => {
     const candidate = "0.7.3-upgrade.46";
     const installed = {
@@ -1552,20 +1660,20 @@ describe("seeded packaged desktop upgrade harness", () => {
     const pidPath = NodePath.join(root, "pid.txt");
     try {
       const command = process.execPath;
-      await expect(
-        runBoundedCommand({
-          command,
-          args: [
-            "-e",
-            `require("node:fs").writeFileSync(${JSON.stringify(pidPath)}, String(process.pid)); setInterval(() => {}, 1000);`,
-          ],
-          cwd: root,
-          // Node startup can be delayed while the full release graph is
-          // compiling Rust targets. Give the child time to publish its PID;
-          // runBoundedCommand still owns the timeout and reap assertion.
-          timeoutMs: 2_000,
-        }),
-      ).rejects.toThrow(/timed out/);
+      const pendingCommand = runBoundedCommand({
+        command,
+        args: [
+          "-e",
+          `require("node:fs").writeFileSync(${JSON.stringify(pidPath)}, String(process.pid)); setInterval(() => {}, 1000);`,
+        ],
+        cwd: root,
+        // Node startup can be delayed while the full release graph is
+        // compiling Rust targets. Give the child time to publish its PID;
+        // runBoundedCommand still owns the timeout and reap assertion.
+        timeoutMs: 2_000,
+      });
+      await expect(pendingCommand).rejects.toBeInstanceOf(SeededUpgradeCommandTimeoutError);
+      await expect(pendingCommand).rejects.toThrow(/timed out/);
 
       const pid = Number(await NodeFS.promises.readFile(pidPath, "utf8"));
       let alive = true;
@@ -1576,6 +1684,51 @@ describe("seeded packaged desktop upgrade harness", () => {
       }
       expect(alive).toBe(false);
     } finally {
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains late stdout and waits for close after the normal command exits", async () => {
+    const root = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "bibcode-command-close-"),
+    );
+    const finishedPath = NodePath.join(root, "writer-finished");
+    const writerSource = `
+      setTimeout(() => {
+        process.stdout.write("late-tail");
+        require("node:fs").writeFileSync(${JSON.stringify(finishedPath)}, "finished");
+      }, 125);
+    `;
+    const parentSource = `
+      const writer = require("node:child_process").spawn(
+        process.execPath,
+        ["-e", ${JSON.stringify(writerSource)}],
+        { stdio: ["ignore", "inherit", "inherit"] }
+      );
+      writer.once("spawn", () => {
+        process.stdout.write("early|");
+        process.exit(0);
+      });
+    `;
+    try {
+      const result = await runBoundedCommand({
+        command: process.execPath,
+        args: ["-e", parentSource],
+        cwd: root,
+        timeoutMs: 2_000,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("early|late-tail");
+      expect(NodeFS.existsSync(finishedPath)).toBe(true);
+    } finally {
+      // Even the old exit-only counterexample owns its bounded writer until
+      // completion, before removing the directory that writer uses.
+      await waitForUpgradeCondition({
+        description: "synthetic writer completion",
+        intervalMs: 10,
+        timeoutMs: 2_000,
+        probe: async () => NodeFS.existsSync(finishedPath),
+      });
       await NodeFS.promises.rm(root, { recursive: true, force: true });
     }
   });
