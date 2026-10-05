@@ -177,7 +177,16 @@ images. A content array without a text block matches the empty-text registration
 used for attachment-only input. Any array containing a `tool_result` block is
 ignored, even when it also has matching text or images. Unrelated first text
 blocks cannot acknowledge delivery. Pending acknowledgements are scoped to the
-live process/session and keyed by the written text; matching echoes resolve one waiter in order. An outstanding steer does
+live process/session and keyed by the written text; matching echoes resolve one waiter in order.
+Text that starts with `/` is a slash command, which Claude replays expanded when
+it knows the command or skill
+(`<command-message>name</command-message>`, `<command-name>/name</command-name>`,
+then `<command-args>…</command-args>` with the arguments trimmed at both ends,
+omitted when empty) and as written when it does not. Both sides therefore reduce
+to `/name args` (arguments trimmed) before matching, so either replay
+acknowledges the write, while a different command or different arguments do
+not. Text with any other first character, including whitespace before the
+slash, is matched exactly. An outstanding steer does
 not prevent a normal delivery from registering its own waiter. Acceptance uses
 the runtime turn ID current when the matching echo arrives.
 
