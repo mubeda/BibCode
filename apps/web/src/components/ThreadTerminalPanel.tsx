@@ -43,7 +43,7 @@ import {
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { Button } from "~/components/ui/button";
 import { type TerminalContextSelection } from "~/lib/terminalContext";
-import { randomUUID } from "~/lib/utils";
+import { isMacPlatform, randomUUID } from "~/lib/utils";
 import { useOpenInPreferredEditor } from "../editorPreferences";
 import {
   collectWrappedTerminalLinkLine,
@@ -1073,6 +1073,7 @@ export function TerminalViewport({
     const fitAddon = new FitAddon();
     const terminal = new Terminal({
       cursorBlink: true,
+      macOptionClickForcesSelection: true,
       lineHeight: 1,
       fontSize: 12,
       scrollback: 5_000,
@@ -1581,6 +1582,34 @@ export function TerminalViewport({
       clearSelectionAction();
       terminal.focus();
     };
+    // Mouse-capturing CLIs (Codex, opencode) would receive a plain drag and
+    // leave nothing for Ctrl+C to copy. Invert xterm's force-selection
+    // modifier: a plain drag selects, Shift (Option on macOS) + drag reaches
+    // the app. A gesture sent to the app keeps the inversion through its drag
+    // and release, which xterm reports from document listeners. A selection
+    // gesture inverts only its mousedown: a synthesized Option on release would
+    // trigger xterm's Option-click cursor movement on macOS.
+    const forceSelectionKey = isMacPlatform(navigator.platform) ? "altKey" : "shiftKey";
+    const invertForceSelectionKey = (event: MouseEvent) =>
+      Object.defineProperty(event, forceSelectionKey, { value: !event[forceSelectionKey] });
+    let invertingGesture = false;
+    const handleMouseDown = (event: MouseEvent) => {
+      if (event.button !== 0 || terminal.modes.mouseTrackingMode === "none") {
+        invertingGesture = false;
+        return;
+      }
+      invertingGesture = event[forceSelectionKey];
+      invertForceSelectionKey(event);
+    };
+    const handleGestureMouse = (event: MouseEvent) => {
+      if (!invertingGesture) return;
+      invertForceSelectionKey(event);
+      if (event.type === "mouseup" && event.button === 0) invertingGesture = false;
+    };
+    const ownerDocument = mount.ownerDocument;
+    mount.addEventListener("mousedown", handleMouseDown, true);
+    ownerDocument.addEventListener("mousemove", handleGestureMouse, true);
+    ownerDocument.addEventListener("mouseup", handleGestureMouse, true);
     mount.addEventListener("contextmenu", handleContextMenu);
     mount.addEventListener("pointerdown", handlePointerDown);
     const handleFocus = () => handleSizeTrigger("focus");
@@ -1627,6 +1656,9 @@ export function TerminalViewport({
       selectionDisposable.dispose();
       terminalLinksDisposable.dispose();
       clearSelectionAction();
+      mount.removeEventListener("mousedown", handleMouseDown, true);
+      ownerDocument.removeEventListener("mousemove", handleGestureMouse, true);
+      ownerDocument.removeEventListener("mouseup", handleGestureMouse, true);
       mount.removeEventListener("contextmenu", handleContextMenu);
       mount.removeEventListener("pointerdown", handlePointerDown);
       mount.removeEventListener("focusin", handleFocus);
