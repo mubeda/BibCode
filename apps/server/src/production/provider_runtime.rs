@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
     future::Future,
@@ -10293,7 +10294,7 @@ impl ClaudeAcknowledgements {
         let mut state = self.state.lock().expect("Claude acknowledgement lock");
         state.next_id = state.next_id.wrapping_add(1);
         let id = state.next_id;
-        let text: Arc<str> = Arc::from(text);
+        let text: Arc<str> = Arc::from(claude_acknowledgement_key(text));
         state
             .pending
             .entry(text.clone())
@@ -10311,6 +10312,8 @@ impl ClaudeAcknowledgements {
     }
 
     fn acknowledge(&self, text: &str, turn_id: Option<String>) {
+        let text = claude_acknowledgement_key(text);
+        let text = text.as_ref();
         let mut state = self.state.lock().expect("Claude acknowledgement lock");
         let Some(pending) = state.pending.get_mut(text) else {
             return;
@@ -10344,6 +10347,40 @@ impl Drop for ClaudeAcknowledgementRegistration {
             }
         }
     }
+}
+
+/// The key a written message and its replay share. Claude replays a message that starts with
+/// a known command or skill expanded (`<command-message>name</command-message>\n<command-name>
+/// /name</command-name>`, then `\n<command-args>args</command-args>` when there are arguments,
+/// trimmed at both ends), and any other message as written, so both reduce to `/name args`.
+fn claude_acknowledgement_key(text: &str) -> Cow<'_, str> {
+    fn command(name: &str, args: &str) -> Cow<'static, str> {
+        match args.trim() {
+            "" => Cow::Owned(format!("/{name}")),
+            args => Cow::Owned(format!("/{name} {args}")),
+        }
+    }
+    if let Some(expanded) = text.strip_prefix("<command-message>")
+        && let Some((_, invocation)) = expanded.split_once("</command-message>\n<command-name>/")
+        && let Some((name, rest)) = invocation.split_once("</command-name>")
+    {
+        if rest.is_empty() {
+            return command(name, "");
+        }
+        if let Some(args) = rest
+            .strip_prefix("\n<command-args>")
+            .and_then(|rest| rest.strip_suffix("</command-args>"))
+        {
+            return command(name, args);
+        }
+    }
+    if let Some(invocation) = text.strip_prefix('/') {
+        let (name, args) = invocation
+            .split_once(char::is_whitespace)
+            .unwrap_or((invocation, ""));
+        return command(name, args);
+    }
+    Cow::Borrowed(text)
 }
 
 fn claude_replayed_user_text(value: &Value) -> Option<&str> {
@@ -16869,6 +16906,114 @@ done
             Some("live-turn")
         );
         assert!(slot.state.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn claude_slash_command_is_acknowledged_by_its_expanded_echo() {
+        // Echo shapes recorded from the real CLI with `--replay-user-messages`: a known
+        // command or skill is replayed expanded, with its arguments trimmed at both ends;
+        // an unknown command, or text with whitespace before the slash, is replayed raw.
+        fn resolves(registered: &str, echo: &str) -> bool {
+            let slot = super::ClaudeAcknowledgements::default();
+            let (sender, mut receiver) = tokio::sync::oneshot::channel();
+            let _registration = slot.register(
+                registered,
+                sender,
+                tokio_util::sync::CancellationToken::new(),
+            );
+            slot.acknowledge(echo, Some("turn".into()));
+            match receiver.try_recv() {
+                Ok(turn_id) => {
+                    assert_eq!(turn_id.as_deref(), Some("turn"));
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        let expanded = |name: &str, args: Option<&str>| {
+            let mut echo = format!(
+                "<command-message>{name}</command-message>\n<command-name>/{name}</command-name>"
+            );
+            if let Some(args) = args {
+                echo.push_str(&format!("\n<command-args>{args}</command-args>"));
+            }
+            echo
+        };
+        assert!(resolves(
+            "/caveman Reply with exactly PONG.",
+            &expanded("caveman", Some("Reply with exactly PONG."))
+        ));
+        assert!(resolves(
+            "/caveman   Reply with exactly PONG.  \n\n  Second line here.  \n",
+            &expanded(
+                "caveman",
+                Some("Reply with exactly PONG.  \n\n  Second line here.")
+            )
+        ));
+        assert!(resolves("/caveman", &expanded("caveman", None)));
+        assert!(resolves(
+            "/superpowers:receiving-code-review Reply with exactly PONG and nothing else.",
+            &expanded(
+                "superpowers:receiving-code-review",
+                Some("Reply with exactly PONG and nothing else.")
+            )
+        ));
+        assert!(resolves(
+            "/nosuchcommandxyz Reply with exactly PONG.",
+            "/nosuchcommandxyz Reply with exactly PONG."
+        ));
+        assert!(resolves(
+            "  /caveman Reply with exactly PONG.",
+            "  /caveman Reply with exactly PONG."
+        ));
+        // A different command, or the same command with other arguments, is another message.
+        assert!(!resolves(
+            "/caveman Reply with exactly PONG.",
+            &expanded("other", Some("Reply with exactly PONG."))
+        ));
+        assert!(!resolves(
+            "/caveman Reply with exactly PONG.",
+            &expanded("caveman", Some("Reply with exactly PING."))
+        ));
+        assert!(!resolves(
+            "/caveman Reply with exactly PONG.",
+            &expanded("caveman", None)
+        ));
+        // Plain text keeps exact matching.
+        assert!(resolves(
+            "Reply with exactly PONG.",
+            "Reply with exactly PONG."
+        ));
+        assert!(!resolves(
+            "Reply with exactly PONG.",
+            "Reply with exactly PONG. "
+        ));
+        assert!(!resolves(
+            "  /caveman Reply with exactly PONG.",
+            &expanded("caveman", Some("Reply with exactly PONG."))
+        ));
+    }
+
+    #[test]
+    fn claude_identical_slash_commands_are_acknowledged_in_write_order() {
+        let slot = super::ClaudeAcknowledgements::default();
+        let session = tokio_util::sync::CancellationToken::new();
+        let (first_sender, mut first_receiver) = tokio::sync::oneshot::channel();
+        let _first = slot.register("/caveman go", first_sender, session.clone());
+        let (next_sender, mut next_receiver) = tokio::sync::oneshot::channel();
+        let _next = slot.register("/caveman go", next_sender, session);
+        let echo = "<command-message>caveman</command-message>\n<command-name>/caveman</command-name>\n<command-args>go</command-args>";
+        slot.acknowledge(echo, Some("first-turn".into()));
+        assert_eq!(
+            first_receiver.try_recv().unwrap().as_deref(),
+            Some("first-turn")
+        );
+        assert!(next_receiver.try_recv().is_err());
+        slot.acknowledge(echo, Some("next-turn".into()));
+        assert_eq!(
+            next_receiver.try_recv().unwrap().as_deref(),
+            Some("next-turn")
+        );
     }
 
     #[test]
