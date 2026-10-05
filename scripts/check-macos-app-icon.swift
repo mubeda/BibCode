@@ -9,6 +9,10 @@ enum IconVerificationStage: String {
   case fileCheckSucceeded = "file-check-succeeded"
   case workspaceDispatched = "workspace-dispatched"
   case workspaceReturned = "workspace-returned"
+  case workspaceSharedDispatched = "workspace-shared-dispatched"
+  case workspaceSharedReturned = "workspace-shared-returned"
+  case iconLookupDispatched = "icon-lookup-dispatched"
+  case iconLookupReturned = "icon-lookup-returned"
   case imageSizeDispatched = "image-size-dispatched"
   case imageSizeReturned = "image-size-returned"
   case bitmapDispatched = "bitmap-dispatched"
@@ -197,8 +201,17 @@ guard FileManager.default.fileExists(atPath: appPath) else {
 
 observeIconStage(.fileCheckSucceeded)
 observeIconStage(.workspaceDispatched)
-let image = NSWorkspace.shared.icon(forFile: appPath)
+observeIconStage(.workspaceSharedDispatched)
+let workspace = NSWorkspace.shared
+observeIconStage(.workspaceSharedReturned)
+observeIconStage(.iconLookupDispatched)
+let image = workspace.icon(forFile: appPath)
+observeIconStage(.iconLookupReturned)
 observeIconStage(.workspaceReturned)
+if ProcessInfo.processInfo.environment["MAC_ICON_DIAGNOSTIC_LOOKUP_ONLY"] == "1" {
+  print("PASS: diagnostic workspace lookup returned")
+  exit(0)
+}
 observeIconStage(.imageSizeDispatched)
 image.size = NSSize(width: 256, height: 256)
 observeIconStage(.imageSizeReturned)

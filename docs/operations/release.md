@@ -159,6 +159,12 @@ unverified child cleanup, and retains all original pixel limits and coverage.
 Follow [the macOS procedure](../testing/macos-desktop.md) for the controlled
 initialization, warming, and equivalent-grid comparisons. A diagnostic pass
 does not replace the six desktop/six server matrix or qualify release assets.
+If that diagnostic bound censors workspace lookup, the separate no-build
+workspace control uses one owned document and one selected arm per fresh
+native job. It distinguishes singleton creation from icon retrieval and stops
+after lookup return or joined timeout; it does not assert the release pixel
+verdict. Keep payload-building diagnostics manual-only while running these
+controls.
 
 Windows artifacts remain without Authenticode. macOS remains ad-hoc
 signed/unnotarized by decision (2026-09-18): an ad-hoc identity changes with

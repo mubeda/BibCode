@@ -1,12 +1,6 @@
 name: macOS Finder icon diagnostic
 
 on:
-  push:
-    branches: [codex/release-v074-mac-bootstrap]
-    paths:
-      - .github/workflows/macos-icon-diagnostic.yml
-      - scripts/check-macos-app-icon.swift
-      - scripts/diagnose-macos-icon.ts
   workflow_dispatch:
 
 permissions:

@@ -1,5 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFSP from "node:fs/promises";
+import * as NodeChildProcess from "node:child_process";
+import { HostProcessPlatform } from "@bibcode/shared/hostProcess";
+import * as Effect from "effect/Effect";
+import { it as effectIt } from "@effect/vitest";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
@@ -79,6 +83,146 @@ describe("macOS icon diagnostic protocol", () => {
     expect(() =>
       requireMacIconDiagnosticCI({ CI: "true", GITHUB_ACTIONS: "true" }, "darwin"),
     ).not.toThrow();
+  });
+
+  it("uses independent no-build lookup jobs and leaves payload diagnosis manual-only", async () => {
+    const lookup = await NodeFSP.readFile(
+      new URL("../.github/workflows/macos-workspace-diagnostic.yml", import.meta.url),
+      "utf8",
+    );
+    const payload = await NodeFSP.readFile(
+      new URL("../.github/workflows/macos-icon-diagnostic.yml", import.meta.url),
+      "utf8",
+    );
+    expect(payload).not.toContain("  push:");
+    expect(payload).toContain("  workflow_dispatch:");
+    expect(lookup).toContain("label: Intel control");
+    expect(lookup).toContain("label: Intel application initialization");
+    expect(lookup).toContain("label: ARM control");
+    expect(lookup).toContain("fail-fast: false");
+    expect(lookup).toContain('MAC_ICON_DIAGNOSTIC_LOOKUP_ONLY: "1"');
+    expect(lookup).toContain("MAC_ICON_DIAGNOSTIC_SINGLE_ARM: ${{ matrix.arm }}");
+    expect(lookup).toContain("diagnostic-evidence/document.txt");
+    expect(lookup).not.toContain("build-desktop-artifact");
+    expect(lookup).not.toContain("Setup Rust");
+    expect(lookup).not.toContain("hdiutil");
+  });
+
+  effectIt.effect("refuses a reused or symlinked witness namespace before any native call", () =>
+    Effect.gen(function* () {
+      const platform = yield* HostProcessPlatform;
+      if (platform === "win32") return;
+      yield* Effect.promise(async () => {
+        const config = await setup();
+        const workflow = await NodeFSP.readFile(
+          new URL("../.github/workflows/macos-workspace-diagnostic.yml", import.meta.url),
+          "utf8",
+        );
+        const prelude = workflow
+          .split("run: |\n")[1]!
+          .split("node scripts/diagnose-macos-icon.ts")[0]!
+          .replace(/^          /gm, "");
+        const run = () =>
+          NodeChildProcess.spawnSync("bash", ["-c", prelude], {
+            cwd: config.cwd,
+            encoding: "utf8",
+          });
+        expect(run().status).toBe(0);
+        const document = NodePath.join(config.cwd, "diagnostic-evidence", "document.txt");
+        await NodeFSP.writeFile(document, "preserved witness");
+        expect(run().status).not.toBe(0);
+        expect(await NodeFSP.readFile(document, "utf8")).toBe("preserved witness");
+        await NodeFSP.rm(NodePath.dirname(document), { recursive: true });
+        const other = NodePath.join(config.cwd, "unrelated");
+        await NodeFSP.mkdir(other);
+        await NodeFSP.writeFile(NodePath.join(other, "document.txt"), "preserved other witness");
+        await NodeFSP.symlink(other, NodePath.dirname(document));
+        expect(run().status).not.toBe(0);
+        expect(await NodeFSP.readFile(NodePath.join(other, "document.txt"), "utf8")).toBe(
+          "preserved other witness",
+        );
+      });
+    }),
+  );
+
+  it.each(["CONTROL", "SHARED_INIT"] as const)(
+    "stops a fresh %s job after lookup return without asserting pixel acceptance",
+    async (singleArm) => {
+      const config = await setup();
+      const results = await runMacIconExperiment({
+        ...config,
+        singleArm,
+        lookupOnly: true,
+        execute: async (input) => {
+          const fixtures = input.args[1] === "--self-test";
+          expect(input.env!.MAC_ICON_DIAGNOSTIC_INITIALIZE_APPLICATION).toBe(
+            singleArm === "SHARED_INIT" ? "1" : "0",
+          );
+          expect(input.env!.MAC_ICON_DIAGNOSTIC_LOOKUP_ONLY).toBe(fixtures ? "0" : "1");
+          await NodeFSP.writeFile(
+            input.env!.MAC_ICON_DIAGNOSTIC_RECORDS_PATH!,
+            fixtures
+              ? '{"stage":"swift-entry"}\n'
+              : '{"stage":"workspace-shared-returned"}\n{"stage":"icon-lookup-returned"}\n',
+          );
+          return successful(fixtures);
+        },
+      });
+      expect(results).toHaveLength(2);
+      expect(results[1]).toMatchObject({
+        arm: singleArm,
+        phase: "LOOKUP",
+        outcome: "LOOKUP_RETURNED",
+        closeVerified: true,
+      });
+      expect(results.every((row) => row.phase !== "PAYLOAD")).toBe(true);
+    },
+  );
+
+  it("stops a fresh lookup job after its first timeout instead of reusing system-service state", async () => {
+    const config = await setup();
+    const results = await runMacIconExperiment({
+      ...config,
+      singleArm: "CONTROL",
+      lookupOnly: true,
+      execute: async (input) => {
+        const fixtures = input.args[1] === "--self-test";
+        await NodeFSP.writeFile(
+          input.env!.MAC_ICON_DIAGNOSTIC_RECORDS_PATH!,
+          '{"stage":"workspace-shared-dispatched"}\n',
+        );
+        if (!fixtures)
+          throw new SeededUpgradeCommandTimeoutError("synthetic joined lookup deadline");
+        return successful(true);
+      },
+    });
+    expect(results).toHaveLength(2);
+    expect(results[1]).toMatchObject({
+      phase: "LOOKUP",
+      outcome: "TIMED_OUT",
+      closeVerified: true,
+    });
+  });
+
+  it("requires both split returns and single-arm isolation for a lookup-only report", async () => {
+    const config = await setup();
+    await expect(
+      runMacIconExperiment({ ...config, lookupOnly: true, execute: async () => successful(true) }),
+    ).rejects.toThrow("SINGLE_ARM_REQUIRED");
+    const results = await runMacIconExperiment({
+      ...config,
+      singleArm: "CONTROL",
+      lookupOnly: true,
+      execute: async (input) => {
+        const fixtures = input.args[1] === "--self-test";
+        await NodeFSP.writeFile(
+          input.env!.MAC_ICON_DIAGNOSTIC_RECORDS_PATH!,
+          '{"stage":"workspace-returned"}\n',
+        );
+        return successful(fixtures);
+      },
+    });
+    expect(results[1]).toMatchObject({ phase: "LOOKUP", outcome: "EXIT_WITHOUT_VERDICT" });
   });
 
   it("refuses real native execution through the exported runner outside CI", async () => {

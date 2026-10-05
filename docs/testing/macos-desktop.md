@@ -224,6 +224,17 @@ stops admission and prevents unmount. Closed private observations remain
 diagnostic evidence; they cannot replace any release platform or payload gate.
 Do not run this native diagnostic locally.
 
+When workspace lookup itself exceeds a diagnostic bound, avoid inferring a
+drawing failure from a censored process. The no-build
+`macos-workspace-diagnostic.yml` control uses separate fresh Intel jobs for the
+control and explicit application initialization, with a fresh ARM control.
+Each owns one synthetic plain-text file and stops after the first lookup return
+or verified-close timeout. Split observations distinguish creation of the
+process workspace singleton from `icon(forFile:)`. A `LOOKUP_RETURNED` result
+establishes those API returns only; it asserts no BiBCode pixels or release
+acceptance. The payload-building diagnostic remains manual-only so pushing
+lookup instrumentation cannot start another product build accidentally.
+
 Build and run packaged E2E with:
 
 ```sh

@@ -1,0 +1,66 @@
+name: macOS workspace lookup diagnostic
+
+on:
+  push:
+    branches: [codex/release-v074-mac-bootstrap]
+    paths:
+      - .github/workflows/macos-workspace-diagnostic.yml
+      - scripts/check-macos-app-icon.swift
+      - scripts/diagnose-macos-icon.ts
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    name: Workspace lookup ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Intel control
+            runner: macos-26-intel
+            arm: CONTROL
+          - label: Intel application initialization
+            runner: macos-26-intel
+            arm: SHARED_INIT
+          - label: ARM control
+            runner: macos-26
+            arm: CONTROL
+    steps:
+      - name: Checkout diagnostic source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          run-install: true
+          cache: true
+
+      - name: Probe one owned document icon before any product build
+        shell: bash
+        env:
+          MAC_ICON_DIAGNOSTIC_SINGLE_ARM: ${{ matrix.arm }}
+          MAC_ICON_DIAGNOSTIC_LOOKUP_ONLY: "1"
+        run: |
+          set -euo pipefail
+          set -o noclobber
+          umask 077
+          mkdir diagnostic-evidence
+          printf '%s\n' 'icon lookup witness' >diagnostic-evidence/document.txt
+          shasum -a 256 diagnostic-evidence/document.txt | awk '{print $1}' >diagnostic-evidence/document.sha256
+          node scripts/diagnose-macos-icon.ts scripts/check-macos-app-icon.swift diagnostic-evidence/document.txt diagnostic-evidence
+
+      - name: Retain closed lookup observations
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-lookup-${{ matrix.label }}
+          path: |
+            diagnostic-evidence/observations.json
+            diagnostic-evidence/document.sha256
+          if-no-files-found: warn

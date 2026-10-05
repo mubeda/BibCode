@@ -18,6 +18,10 @@ const STAGES = new Set([
   "file-check-succeeded",
   "workspace-dispatched",
   "workspace-returned",
+  "workspace-shared-dispatched",
+  "workspace-shared-returned",
+  "icon-lookup-dispatched",
+  "icon-lookup-returned",
   "image-size-dispatched",
   "image-size-returned",
   "bitmap-dispatched",
@@ -79,12 +83,12 @@ export function decodeMacIconObservations(raw: string): ReadonlyArray<Observatio
 }
 
 type Arm = "CONTROL" | "SHARED_INIT" | "CONTROL_REPEAT" | "RECT_ONLY";
-type Outcome = "ACCEPTED" | "REJECTED" | "TIMED_OUT" | "EXIT_WITHOUT_VERDICT";
+type Outcome = "ACCEPTED" | "REJECTED" | "TIMED_OUT" | "EXIT_WITHOUT_VERDICT" | "LOOKUP_RETURNED";
 type Execute = typeof runBoundedCommand;
 
 interface ProbeResult {
   readonly arm: Arm;
-  readonly phase: "FIXTURES" | "PAYLOAD";
+  readonly phase: "FIXTURES" | "PAYLOAD" | "LOOKUP";
   readonly outcome: Outcome;
   readonly exitCode: number | null;
   readonly closeVerified: true;
@@ -100,11 +104,15 @@ export async function runMacIconExperiment(input: {
   readonly evidenceRoot: string;
   readonly cwd: string;
   readonly execute?: Execute;
+  readonly singleArm?: "CONTROL" | "SHARED_INIT" | undefined;
+  readonly lookupOnly?: boolean | undefined;
 }): Promise<ReadonlyArray<ProbeResult>> {
   if (input.execute === undefined) {
     requireMacIconDiagnosticCI(process.env, Effect.runSync(HostProcessPlatform));
   }
   const execute = input.execute ?? runBoundedCommand;
+  if (input.lookupOnly && input.singleArm === undefined)
+    throw new Error("ICON_LOOKUP_SINGLE_ARM_REQUIRED");
   const safePath = NodePath.join(input.evidenceRoot, "cleanup-safe");
   const results: Array<ProbeResult> = [];
   await NodeFSP.mkdir(input.evidenceRoot, { recursive: true, mode: 0o700 });
@@ -128,6 +136,7 @@ export async function runMacIconExperiment(input: {
           MAC_ICON_DIAGNOSTIC_RECORDS_PATH: receiptPath,
           MAC_ICON_DIAGNOSTIC_INITIALIZE_APPLICATION: arm === "SHARED_INIT" ? "1" : "0",
           MAC_ICON_DIAGNOSTIC_RECT_ONLY: arm === "RECT_ONLY" ? "1" : "0",
+          MAC_ICON_DIAGNOSTIC_LOOKUP_ONLY: phase === "LOOKUP" ? "1" : "0",
         },
         timeoutMs: 120_000,
       });
@@ -152,6 +161,14 @@ export async function runMacIconExperiment(input: {
       outcome = "TIMED_OUT";
     }
     const observations = decodeMacIconObservations(await NodeFSP.readFile(receiptPath, "utf8"));
+    if (
+      phase === "LOOKUP" &&
+      exitCode === 0 &&
+      observations.some((row) => row.stage === "workspace-shared-returned") &&
+      observations.some((row) => row.stage === "icon-lookup-returned")
+    ) {
+      outcome = "LOOKUP_RETURNED";
+    }
     if (
       phase === "PAYLOAD" &&
       exitCode === 0 &&
@@ -190,8 +207,14 @@ export async function runMacIconExperiment(input: {
 
   const runArm = async (arm: Arm): Promise<ProbeResult> => {
     const fixtures = await probe(arm, "FIXTURES");
-    return fixtures.outcome === "ACCEPTED" ? probe(arm, "PAYLOAD") : fixtures;
+    return fixtures.outcome === "ACCEPTED"
+      ? probe(arm, input.lookupOnly ? "LOOKUP" : "PAYLOAD")
+      : fixtures;
   };
+  if (input.singleArm !== undefined) {
+    await runArm(input.singleArm);
+    return results;
+  }
   const control = await runArm("CONTROL");
   const treatment = await runArm("SHARED_INIT");
   const pairedPayloads = control.phase === "PAYLOAD" && treatment.phase === "PAYLOAD";
@@ -223,11 +246,17 @@ if (
   try {
     requireMacIconDiagnosticCI(process.env, Effect.runSync(HostProcessPlatform));
     if (process.argv.length !== 5) throw new Error("ICON_DIAGNOSTIC_ARGUMENTS");
+    const singleArm = process.env.MAC_ICON_DIAGNOSTIC_SINGLE_ARM;
+    if (singleArm !== undefined && singleArm !== "CONTROL" && singleArm !== "SHARED_INIT") {
+      throw new Error("ICON_DIAGNOSTIC_ARGUMENTS");
+    }
     await runMacIconExperiment({
       scriptPath: NodePath.resolve(process.argv[2]!),
       appPath: NodePath.resolve(process.argv[3]!),
       evidenceRoot: NodePath.resolve(process.argv[4]!),
       cwd: process.cwd(),
+      singleArm,
+      lookupOnly: process.env.MAC_ICON_DIAGNOSTIC_LOOKUP_ONLY === "1",
     });
   } catch {
     process.stderr.write("ICON_DIAGNOSTIC_FAILED\n");
