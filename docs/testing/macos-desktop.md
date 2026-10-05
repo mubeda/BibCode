@@ -179,12 +179,20 @@ contained application, and detach that mount during cleanup. Report configured
 signing, ad-hoc signing, and notarization separately. Never claim notarization
 when credentials or a notarized ticket are absent.
 
-Before publishing a macOS 26 release, verify the Finder-rendered icon from that
+Before publishing a macOS release, verify the Finder-rendered icon from that
 mounted payload with `swift scripts/check-macos-app-icon.swift` and its exact
 application path. The release workflow runs this check on both native macOS
 targets after recursive signature verification and before upload. A failed icon
 check is a failed native build; a check against a different installed bundle
 does not qualify the release DMG.
+
+The release producer hosts are macOS 26 ARM64 and supported macOS 15 Intel for
+both desktop and standalone server artifacts. Native Intel main CI, packaged
+UI, and upgrade validation retain macOS 26. The producer hosts run the same
+mounted-application signature and Finder pixel criteria, with all platform
+rows and updater targets intact. macOS 15 Intel evidence cannot establish a
+macOS 26 Intel Finder pass. Record that distinction in execution reports;
+neither producer selection nor lookup-only controls qualify another OS image.
 
 The CI verifier emits closed `mac-icon-observation` stage records to stderr and
 flushes them individually. These locate Swift entry, workspace icon retrieval,

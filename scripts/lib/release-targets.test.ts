@@ -23,7 +23,7 @@ describe("native release targets", () => {
       {
         platform: "mac",
         arch: "x64",
-        runner: "macos-26-intel",
+        runner: "macos-15-intel",
         rustTarget: "x86_64-apple-darwin",
         updaterTarget: "darwin-x86_64",
       },

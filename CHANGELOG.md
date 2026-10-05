@@ -34,6 +34,7 @@ BiBCode v0.7.4 improves message recovery, attachment uploads, Git workflows, and
 - Packaged composer fixtures advertise the native Claude skill catalog consistently. Queue smoke checks verify visual FIFO independently of temporary virtualized DOM slot order, retaining reload, steering, and exact provider-input checks.
 - Windows upgrade evidence records a timed-out version probe as unavailable after verified child cleanup, preserving the overall installer deadline and strict installed-version checks.
 - Release preflight explains workflow-token permission mismatches before native builds. Cold macOS Intel CI and seeded-build budgets account for the complete required jobs, preserving runtime assertions and all supported platform rows. Both macOS release jobs verify Finder's rendered icon from their exact mounted DMG payload before upload.
+- Intel desktop and server distributions build on supported macOS 15; desktop installers retain the same signature and Finder pixel checks. Native macOS 26 Intel runtime validation remains separate. macOS 15 verification does not establish hosted macOS 26 Intel Finder qualification.
 - AppImage packaging reports unsupported GdkPixbuf loader layouts with actionable guidance. Native Windows trust-command coverage, living procedures, and issue-specific evidence reports were expanded.
 
 ### Known limitations and qualification still in progress

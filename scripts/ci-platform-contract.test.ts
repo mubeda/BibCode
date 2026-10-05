@@ -409,7 +409,7 @@ describe("cross-platform release contract", () => {
 
     expect(desktop.strategy?.matrix?.include).toEqual([
       { label: "macOS arm64", runner: "macos-26", platform: "mac", target: "dmg", arch: "arm64" },
-      { label: "macOS x64", runner: "macos-26-intel", platform: "mac", target: "dmg", arch: "x64" },
+      { label: "macOS x64", runner: "macos-15-intel", platform: "mac", target: "dmg", arch: "x64" },
       {
         label: "Linux arm64",
         runner: "ubuntu-22.04-arm",
@@ -450,7 +450,7 @@ describe("cross-platform release contract", () => {
       },
       {
         label: "macOS x64",
-        runner: "macos-26-intel",
+        runner: "macos-15-intel",
         platform: "mac",
         arch: "x64",
         serverOs: "darwin",

@@ -330,7 +330,7 @@ jobs:
             target: dmg
             arch: arm64
           - label: macOS x64
-            runner: macos-26-intel
+            runner: macos-15-intel
             platform: mac
             target: dmg
             arch: x64
@@ -521,7 +521,7 @@ jobs:
             serverOs: darwin
             serverArch: aarch64
           - label: macOS x64
-            runner: macos-26-intel
+            runner: macos-15-intel
             platform: mac
             arch: x64
             serverOs: darwin
