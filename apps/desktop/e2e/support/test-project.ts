@@ -562,6 +562,9 @@ reader.on("line", (line) => {
             commands: [{
               name: "compact",
               description: "Compact the deterministic fixture context."
+            }, {
+              name: "docs",
+              description: "Use deterministic fixture documentation."
             }],
             agents: [{
               name: "claude-prose-agent",
