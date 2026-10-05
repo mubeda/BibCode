@@ -17,7 +17,7 @@ use tokio::{
     sync::{broadcast, mpsc},
     task::JoinHandle,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use crate::{
@@ -397,7 +397,9 @@ fn bootstrap_process_error(error: ProcessError) -> String {
 
 pub struct OrchestrationEffects {
     cancellation: CancellationToken,
-    backfill: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Identity reconciles run off the sequential worker so a slow `git` read never delays turn
+    /// baselines; shutdown cancels and drains them.
+    identity_tasks: TaskTracker,
     producer: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -424,14 +426,16 @@ impl OrchestrationEffects {
             callbacks: callbacks.clone(),
         }));
 
-        let backfill = tokio::spawn(backfill_repository_identities(
+        let identity_tasks = TaskTracker::new();
+        identity_tasks.spawn(backfill_repository_identities(
             engine.clone(),
             repository.clone(),
-            cancellation.clone(),
+            cancellation.child_token(),
         ));
         let worker = tokio::spawn(run_worker(
             engine.clone(),
             repository,
+            identity_tasks.clone(),
             callbacks,
             receiver,
             cancellation.clone(),
@@ -446,7 +450,7 @@ impl OrchestrationEffects {
 
         Ok(Self {
             cancellation,
-            backfill: tokio::sync::Mutex::new(Some(backfill)),
+            identity_tasks,
             producer: tokio::sync::Mutex::new(Some(producer)),
             worker: tokio::sync::Mutex::new(Some(worker)),
         })
@@ -454,15 +458,14 @@ impl OrchestrationEffects {
 
     pub async fn shutdown(&self) {
         self.cancellation.cancel();
-        if let Some(backfill) = self.backfill.lock().await.take() {
-            let _ = backfill.await;
-        }
         if let Some(producer) = self.producer.lock().await.take() {
             let _ = producer.await;
         }
         if let Some(worker) = self.worker.lock().await.take() {
             let _ = worker.await;
         }
+        self.identity_tasks.close();
+        self.identity_tasks.wait().await;
     }
 }
 
@@ -589,6 +592,7 @@ fn is_reactor_event(event: &OrchestrationEvent) -> bool {
 async fn run_worker(
     engine: OrchestrationEngine,
     repository: Arc<GitRepository>,
+    identity_tasks: TaskTracker,
     callbacks: Arc<dyn OrchestrationEffectCallbacks>,
     mut receiver: mpsc::Receiver<OrchestrationEvent>,
     cancellation: CancellationToken,
@@ -598,7 +602,7 @@ async fn run_worker(
             () = cancellation.cancelled() => return,
             event = receiver.recv() => {
                 let Some(event) = event else { return };
-                if let Err(error) = process_event(&engine, &repository, callbacks.as_ref(), &event, &cancellation).await {
+                if let Err(error) = process_event(&engine, &repository, &identity_tasks, callbacks.as_ref(), &event, &cancellation).await {
                     tracing::warn!(event_type = %event.event.event_type, sequence = event.sequence, %error, "orchestration side effect failed");
                     append_failure_activity(&engine, &event, &error.to_string()).await;
                 }
@@ -609,7 +613,8 @@ async fn run_worker(
 
 async fn process_event(
     engine: &OrchestrationEngine,
-    repository: &GitRepository,
+    repository: &Arc<GitRepository>,
+    identity_tasks: &TaskTracker,
     callbacks: &dyn OrchestrationEffectCallbacks,
     event: &OrchestrationEvent,
     cancellation: &CancellationToken,
@@ -642,28 +647,38 @@ async fn process_event(
             Ok(())
         }
         "project.created" => {
-            reconcile_event_project(engine, repository, event, cancellation).await;
+            reconcile_event_project(engine, repository, identity_tasks, event, cancellation);
             Ok(())
         }
         // Only a moved workspace changes the checkout; the identity update itself carries no
         // workspaceRoot, so this cannot loop.
         "project.meta-updated" if event.event.payload.get("workspaceRoot").is_some() => {
-            reconcile_event_project(engine, repository, event, cancellation).await;
+            reconcile_event_project(engine, repository, identity_tasks, event, cancellation);
             Ok(())
         }
         _ => Ok(()),
     }
 }
 
-async fn reconcile_event_project(
+fn reconcile_event_project(
     engine: &OrchestrationEngine,
-    repository: &GitRepository,
+    repository: &Arc<GitRepository>,
+    identity_tasks: &TaskTracker,
     event: &OrchestrationEvent,
     cancellation: &CancellationToken,
 ) {
-    if let Some(project_id) = event.event.payload.get("projectId").and_then(Value::as_str) {
-        reconcile_repository_identity(engine, repository, project_id, cancellation).await;
-    }
+    let Some(project_id) = event.event.payload.get("projectId").and_then(Value::as_str) else {
+        return;
+    };
+    let (engine, repository, project_id, cancellation) = (
+        engine.clone(),
+        repository.clone(),
+        project_id.to_owned(),
+        cancellation.child_token(),
+    );
+    identity_tasks.spawn(async move {
+        reconcile_repository_identity(&engine, &repository, &project_id, &cancellation).await;
+    });
 }
 
 async fn resolve_workspace(
