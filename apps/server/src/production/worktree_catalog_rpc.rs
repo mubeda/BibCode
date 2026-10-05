@@ -16,7 +16,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::repository_identity::{RepositoryIdentityThrottle, reconcile_repository_identity};
+use super::repository_identity::{
+    RepositoryIdentityThrottle, git_config_stamp, reconcile_repository_identity,
+};
 use crate::{
     crypto::sha256_hex,
     git::{
@@ -659,14 +661,29 @@ impl CatalogHealthySnapshotObserver for BranchReconciliationObserver {
 }
 
 impl BranchReconciliationObserver {
-    /// At most once per interval per project, and off the catalog's refresh lock.
-    async fn refresh_repository_identity(&self, project_id: &str) {
+    /// At most once per interval per project, or at once when the primary checkout's
+    /// `.git/config` changed, and off the catalog's refresh lock.
+    async fn refresh_repository_identity(
+        &self,
+        project_id: &str,
+        snapshot: &WorktreeCatalogSnapshot,
+    ) {
         let Some(git) = self.git.clone() else {
             return;
         };
+        // The primary checkout's config is the one every worktree of the repository reads `origin`
+        // from, so this catches `git remote set-url` run in any of them.
+        let config = match snapshot
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.is_primary)
+        {
+            Some(primary) => git_config_stamp(std::path::Path::new(&primary.path)).await,
+            None => None,
+        };
         if !self
             .identity_throttle
-            .admit(project_id, std::time::Instant::now())
+            .admit(project_id, std::time::Instant::now(), config)
         {
             return;
         }
@@ -689,7 +706,8 @@ impl BranchReconciliationObserver {
         {
             return;
         }
-        self.refresh_repository_identity(&project_id).await;
+        self.refresh_repository_identity(&project_id, &snapshot)
+            .await;
         let threads = match self
             .orchestration
             .repositories()
@@ -4853,7 +4871,10 @@ mod repository_identity_refresh_tests {
         git::GitRepository,
         orchestration::{EngineOptions, OrchestrationEngine},
         persistence::{Database, run_migrations},
-        worktree_catalog::{CatalogScanStatus, WorktreeCatalogSnapshot},
+        worktree_catalog::{
+            CatalogScanStatus, WorktreeAdoptionState, WorktreeCatalogSnapshot, WorktreeDescriptor,
+            WorktreeDirectoryState, WorktreeRegistrationState,
+        },
     };
 
     fn git(dir: &std::path::Path, args: &[&str]) {
@@ -4878,16 +4899,7 @@ mod repository_identity_refresh_tests {
             .map(|identity| identity["canonicalKey"].as_str().unwrap().to_owned())
     }
 
-    /// A healthy scan refreshes the identity off the scan's own task, and a second scan inside the
-    /// throttle interval does not read `origin` again.
-    #[tokio::test]
-    async fn healthy_scans_refresh_the_identity_once_per_throttle_interval() {
-        let checkout = TempDir::new().unwrap();
-        git(checkout.path(), &["init", "-q"]);
-        git(
-            checkout.path(),
-            &["remote", "add", "origin", "git@github.com:acme/repo.git"],
-        );
+    async fn engine_with_project(checkout: &TempDir) -> OrchestrationEngine {
         let database = Database::open_in_memory().await.unwrap();
         database
             .call(|connection| {
@@ -4910,31 +4922,77 @@ mod repository_identity_refresh_tests {
             )
             .await
             .unwrap();
-        let operations = WorktreeCatalogOperationRuntime::new();
-        let observer = BranchReconciliationObserver {
+        engine
+    }
+
+    fn checkout_with_origin(origin: &str) -> TempDir {
+        let checkout = TempDir::new().unwrap();
+        git(checkout.path(), &["init", "-q"]);
+        git(checkout.path(), &["remote", "add", "origin", origin]);
+        checkout
+    }
+
+    async fn wait_for_key(engine: &OrchestrationEngine, key: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stored_key(engine).await.as_deref() != Some(key) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the identity becomes {key}"));
+    }
+
+    fn observer(engine: &OrchestrationEngine) -> BranchReconciliationObserver {
+        BranchReconciliationObserver {
             orchestration: engine.clone(),
             git: Some(Arc::new(GitRepository::default())),
             identity_throttle: RepositoryIdentityThrottle::default(),
-            operations: operations.clone(),
-        };
-        let snapshot = Arc::new(WorktreeCatalogSnapshot {
+            operations: WorktreeCatalogOperationRuntime::new(),
+        }
+    }
+
+    fn snapshot(worktrees: Vec<WorktreeDescriptor>) -> Arc<WorktreeCatalogSnapshot> {
+        Arc::new(WorktreeCatalogSnapshot {
             repository_key: "repository".to_owned(),
             generation: 1,
             authoritative: true,
             observed_at: "2026-10-05T00:00:00Z".to_owned(),
             scan_status: CatalogScanStatus::Ready,
-            worktrees: Vec::new(),
+            worktrees,
             adopted_workspaces: Vec::new(),
-        });
+        })
+    }
+
+    fn primary(checkout: &TempDir) -> WorktreeDescriptor {
+        WorktreeDescriptor {
+            worktree_key: "primary".to_owned(),
+            path: checkout.path().to_string_lossy().into_owned(),
+            branch: None,
+            head: None,
+            is_primary: true,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            registration_state: WorktreeRegistrationState::Registered,
+            directory_state: WorktreeDirectoryState::Present,
+            adoption_state: WorktreeAdoptionState::None,
+            adopted_thread_id: None,
+            eligible_for_adoption: false,
+        }
+    }
+
+    /// A healthy scan refreshes the identity off the scan's own task, and a second scan inside the
+    /// throttle interval does not read `origin` again when no primary checkout config is known.
+    #[tokio::test]
+    async fn healthy_scans_refresh_the_identity_once_per_throttle_interval() {
+        let checkout = checkout_with_origin("git@github.com:acme/repo.git");
+        let engine = engine_with_project(&checkout).await;
+        let observer = observer(&engine);
+        let operations = observer.operations.clone();
+        let snapshot = snapshot(Vec::new());
 
         observer.observe("p".to_owned(), snapshot.clone()).await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while stored_key(&engine).await.is_none() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the first healthy scan records the identity");
+        wait_for_key(&engine, "github.com/acme/repo").await;
 
         git(
             checkout.path(),
@@ -4950,6 +5008,58 @@ mod repository_identity_refresh_tests {
         assert_eq!(
             stored_key(&engine).await.as_deref(),
             Some("github.com/acme/repo")
+        );
+        engine.shutdown().await;
+    }
+
+    /// `git remote set-url` rewrites the primary checkout's `.git/config`, so the next healthy scan
+    /// reconciles inside the throttle interval; a config with the same size and mtime does not.
+    #[tokio::test]
+    async fn a_changed_git_config_reconciles_on_the_next_healthy_scan() {
+        let checkout = checkout_with_origin("git@github.com:acme/repo.git");
+        let engine = engine_with_project(&checkout).await;
+        let observer = observer(&engine);
+        let operations = observer.operations.clone();
+        let snapshot = snapshot(vec![primary(&checkout)]);
+
+        observer.observe("p".to_owned(), snapshot.clone()).await;
+        wait_for_key(&engine, "github.com/acme/repo").await;
+
+        git(
+            checkout.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://gitlab.com/acme/other.git",
+            ],
+        );
+        observer.observe("p".to_owned(), snapshot.clone()).await;
+        wait_for_key(&engine, "gitlab.com/acme/other").await;
+
+        // Same length, and the previous mtime restored: the stamp is unchanged.
+        let config = checkout.path().join(".git").join("config");
+        let modified = std::fs::metadata(&config).unwrap().modified().unwrap();
+        git(
+            checkout.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://gitlab.com/acme/aaaaa.git",
+            ],
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&config)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        observer.observe("p".to_owned(), snapshot).await;
+        operations.shutdown().await;
+        assert_eq!(
+            stored_key(&engine).await.as_deref(),
+            Some("gitlab.com/acme/other")
         );
         engine.shutdown().await;
     }
