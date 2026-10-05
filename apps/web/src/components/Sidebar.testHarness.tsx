@@ -220,6 +220,20 @@ const h = vi.hoisted(() => {
     setDefaultAdvertisedEndpointKey: vi.fn(),
     setProjectExpanded: spies.setProjectExpanded,
     reorderProjects: spies.reorderProjects,
+    sidebarView: "environments" as "environments" | "repositories",
+    repositoryGroupExpandedById: {} as Record<string, boolean>,
+    setSidebarView: vi.fn((view: "environments" | "repositories") =>
+      uiStore.setState({ sidebarView: view }),
+    ),
+    setRepositoryGroupExpanded: vi.fn((key: string, expanded: boolean) =>
+      uiStore.setState({
+        repositoryGroupExpandedById: {
+          ...(uiStore.getState() as { repositoryGroupExpandedById: Record<string, boolean> })
+            .repositoryGroupExpandedById,
+          [key]: expanded,
+        },
+      }),
+    ),
   }));
 
   const selectionStore = makeStore(() => ({
