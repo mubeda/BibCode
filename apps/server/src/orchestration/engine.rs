@@ -354,6 +354,15 @@ pub enum OrchestrationCommand {
         )]
         worktree_discovery: Option<Value>,
     },
+    #[serde(rename = "project.repository-identity.set")]
+    ProjectRepositoryIdentitySet {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "projectId")]
+        project_id: String,
+        #[serde(rename = "repositoryIdentity", default)]
+        repository_identity: Option<Value>,
+    },
     #[serde(rename = "project.delete")]
     ProjectDelete {
         #[serde(rename = "commandId")]
@@ -3529,6 +3538,32 @@ async fn plan_command(
                 payload,
             )])
         }
+        OrchestrationCommand::ProjectRepositoryIdentitySet {
+            command_id,
+            project_id,
+            repository_identity,
+        } => {
+            require_project(model, command, project_id)?;
+            // Keep updatedAt: an identity refresh is not user activity and must not reorder projects.
+            let updated_at = repositories
+                .get_project(project_id.clone())
+                .await
+                .map_err(wrap_persistence)?
+                .map_or_else(|| occurred_at.to_owned(), |project| project.updated_at);
+            Ok(vec![make_event(
+                "project.meta-updated",
+                "project",
+                project_id,
+                occurred_at,
+                command_id,
+                metadata,
+                json!({
+                    "projectId": project_id,
+                    "repositoryIdentity": repository_identity,
+                    "updatedAt": updated_at,
+                }),
+            )])
+        }
         OrchestrationCommand::ProjectDelete {
             command_id,
             project_id,
@@ -5525,7 +5560,7 @@ fn apply_projects_projector_tx(
         }
         "project.meta-updated" => {
             transaction.execute(
-            "UPDATE projection_projects SET title = COALESCE(?, title), workspace_root = COALESCE(?, workspace_root), default_model_selection_json = CASE WHEN ? THEN ? ELSE default_model_selection_json END, scripts_json = COALESCE(?, scripts_json), worktree_discovery_json = CASE WHEN ? THEN ? ELSE worktree_discovery_json END, updated_at = ? WHERE project_id = ?",
+            "UPDATE projection_projects SET title = COALESCE(?, title), workspace_root = COALESCE(?, workspace_root), default_model_selection_json = CASE WHEN ? THEN ? ELSE default_model_selection_json END, scripts_json = COALESCE(?, scripts_json), worktree_discovery_json = CASE WHEN ? THEN ? ELSE worktree_discovery_json END, repository_identity_json = CASE WHEN ? THEN ? ELSE repository_identity_json END, updated_at = ? WHERE project_id = ?",
             params![
                 optional_string(payload.get("title")),
                 optional_string(payload.get("workspaceRoot")),
@@ -5534,6 +5569,8 @@ fn apply_projects_projector_tx(
                 payload.get("scripts").map(json_string).transpose()?,
                 payload.get("worktreeDiscovery").is_some(),
                 payload.get("worktreeDiscovery").map(json_string).transpose()?,
+                payload.get("repositoryIdentity").is_some(),
+                optional_json_string(payload.get("repositoryIdentity").filter(|value| !value.is_null()))?,
                 required_str(payload, "updatedAt")?,
                 required_str(payload, "projectId")?,
             ],
@@ -6535,6 +6572,7 @@ impl OrchestrationCommand {
         match self {
             Self::ProjectCreate { .. } => "project.create",
             Self::ProjectMetaUpdate { .. } => "project.meta.update",
+            Self::ProjectRepositoryIdentitySet { .. } => "project.repository-identity.set",
             Self::ProjectDelete { .. } => "project.delete",
             Self::WorktreeAdoptResolved { .. } => "worktree.adopt-resolved",
             Self::WorktreeDetachResolved { .. } => "worktree.detach-resolved",
@@ -6569,6 +6607,7 @@ impl OrchestrationCommand {
         match self {
             Self::ProjectCreate { command_id, .. }
             | Self::ProjectMetaUpdate { command_id, .. }
+            | Self::ProjectRepositoryIdentitySet { command_id, .. }
             | Self::ProjectDelete { command_id, .. }
             | Self::WorktreeAdoptResolved { command_id, .. }
             | Self::WorktreeDetachResolved { command_id, .. }
@@ -6602,6 +6641,7 @@ impl OrchestrationCommand {
     pub fn occurred_at(&self) -> Option<&str> {
         match self {
             Self::ProjectMetaUpdate { .. }
+            | Self::ProjectRepositoryIdentitySet { .. }
             | Self::ProjectDelete { .. }
             | Self::WorktreeAdoptResolved { .. }
             | Self::WorktreeDetachResolved { .. }
@@ -6636,9 +6676,9 @@ impl OrchestrationCommand {
     pub fn aggregate_ref(&self) -> (&str, &str) {
         match self {
             Self::ProjectCreate { project_id, .. } => ("project", project_id),
-            Self::ProjectMetaUpdate { project_id, .. } | Self::ProjectDelete { project_id, .. } => {
-                ("project", project_id)
-            }
+            Self::ProjectMetaUpdate { project_id, .. }
+            | Self::ProjectRepositoryIdentitySet { project_id, .. }
+            | Self::ProjectDelete { project_id, .. } => ("project", project_id),
             Self::WorktreeAdoptResolved { project_id, .. } => ("project", project_id),
             Self::WorktreeDetachResolved { project_id, .. } => ("project", project_id),
             Self::WorktreeBranchReconcileResolved { thread_id, .. } => ("thread", thread_id),
@@ -6672,7 +6712,8 @@ impl OrchestrationCommand {
     pub fn is_server_internal(&self) -> bool {
         matches!(
             self,
-            Self::WorktreeAdoptResolved { .. }
+            Self::ProjectRepositoryIdentitySet { .. }
+                | Self::WorktreeAdoptResolved { .. }
                 | Self::WorktreeDetachResolved { .. }
                 | Self::WorktreeBranchReconcileResolved { .. }
         )
@@ -7454,6 +7495,62 @@ mod tests {
                 })
                 .await
                 .expect("thread");
+        }
+
+        #[tokio::test]
+        async fn repository_identity_set_updates_projection_without_touching_updated_at() {
+            let engine = adoption_engine(TestHooks::default()).await;
+            let before = engine
+                .repositories()
+                .get_project(PROJECT_ID.into())
+                .await
+                .unwrap()
+                .unwrap();
+            let identity = json!({"canonicalKey":"github.com/acme/repo","locator":{"source":"git-remote","remoteName":"origin","remoteUrl":"git@github.com:acme/repo.git"},"name":"repo"});
+            engine
+                .dispatch(OrchestrationCommand::ProjectRepositoryIdentitySet {
+                    command_id: "identity-1".into(),
+                    project_id: PROJECT_ID.into(),
+                    repository_identity: Some(identity.clone()),
+                })
+                .await
+                .unwrap();
+            let after = engine
+                .repositories()
+                .get_project(PROJECT_ID.into())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.repository_identity, Some(identity));
+            assert_eq!(after.updated_at, before.updated_at);
+
+            engine
+                .dispatch(OrchestrationCommand::ProjectRepositoryIdentitySet {
+                    command_id: "identity-2".into(),
+                    project_id: PROJECT_ID.into(),
+                    repository_identity: None,
+                })
+                .await
+                .unwrap();
+            let cleared = engine
+                .repositories()
+                .get_project(PROJECT_ID.into())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cleared.repository_identity, None);
+        }
+
+        #[test]
+        fn repository_identity_set_is_server_internal() {
+            let command: OrchestrationCommand = serde_json::from_value(json!({
+                "type":"project.repository-identity.set",
+                "commandId":"c",
+                "projectId":"p",
+                "repositoryIdentity":null
+            }))
+            .unwrap();
+            assert!(command.is_server_internal());
         }
 
         #[tokio::test]
