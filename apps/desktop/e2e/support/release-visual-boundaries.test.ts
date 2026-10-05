@@ -6,6 +6,7 @@ import { describe, expect, it } from "vite-plus/test";
 import type { VisualTextRowObservationInput } from "./release-visual-observation.ts";
 import { resolveSettingsVisualFailureScene } from "./release-visual-settings.ts";
 import { gitProjectDirectoryFailureFacts } from "./release-visual-git-project.ts";
+import { gitProjectTabFailureFacts } from "./git-project-tab-observation.ts";
 const controller = NodeFS.readFileSync(
   new URL("../qualify-delivery-retry.ts", import.meta.url),
   "utf8",
@@ -82,6 +83,7 @@ describe("visual preparation source boundaries", () => {
           classifyQualificationFailure: () => "other",
           resolveSettingsVisualFailureScene,
           gitProjectDirectoryFailureFacts,
+          gitProjectTabFailureFacts,
         },
       );
       expect(await run()).toBe(1);

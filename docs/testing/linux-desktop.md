@@ -1509,6 +1509,22 @@ boolean decoded from the original error. No raw error, markup, identifier, new
 DOM/RPC read, action, delay, retry, or cause verdict is retained. Unknown or
 unsafe error data remains null; this attribution never qualifies an original.
 
+Only a failed existing Changes, History or Tags click may also retain
+`gitProjectTabFailureFacts` from one two-second failure-only browser read. Reuse
+the already verified selected project/thread binding and require the exact
+origin, Git Manager project route, theme, unique visible primary card, matching
+Git environment/project header and checkout title, connected Local rail and
+credential absence. Retain only tab cardinality (`none`/`one`/`many`), nullable visibility,
+enabled, viewport, hit and selected-state flags, plus a fixed receiving-slot enum
+and its own ending-style flag. No values, names, markup, identifiers, paths,
+coordinates or raw errors leave the read. Project only exact own data fields;
+proxy/accessor/malformed/unavailable/late samples remain null. Associate the
+sample with the original error and exact tab, clearing stale reused-error data.
+The original exception, public actions, waits and joined cleanup remain unchanged.
+These facts describe the sampled state and cannot identify a cause or qualify
+pixels. The manual workflow includes the closest observer test in its existing
+Git helper gate; new CI receipts still require independent inspection.
+
 The switch-with-changes original also requires `dialogSettled`: neither starting
 nor ending style is present, and the popup's own Web Animations samples are
 finished or idle with no pending animation. Unknown, missing, or failed samples
@@ -1735,6 +1751,18 @@ Git/project capture negatives and the actual mounted question controls before a
 native trial. Inspect both CI original images independently. Hermetic ports,
 geometry, scripted transport and static gates do not establish native pixels,
 Tauri behavior, a final product nomination or full-matrix acceptance.
+
+For the dedicated Cursor question producer, record an original failure only
+before restore cleanup, using the original exception and one of the seven
+existing closed Cursor phase names. On the same exception only, restore that
+phase before existing failure observations and receipts. Clear the attribution
+record before each producer entry; a reused error cannot borrow an earlier
+phase. Optional attribution/reporting failure cannot replace the original
+exception, skip the public restore or hide a logical cleanup failure. This
+changes failure attribution only: model choices, native question actions,
+capture count, wait bounds and owner cleanup remain unchanged. A restore failure
+can otherwise overwrite the global phase, so an old recorded worktree model
+phase alone does not prove that the question producer was never entered.
 
 ### Existing workspace row substates
 

@@ -34,6 +34,7 @@ import {
   gitProjectDirectoryFailureFacts,
   type GitProjectVisualSelection,
 } from "./support/release-visual-git-project.ts";
+import { gitProjectTabFailureFacts } from "./support/git-project-tab-observation.ts";
 import {
   QualificationOwner,
   bounded,
@@ -608,6 +609,20 @@ export async function runDeliveryRetryQualification() {
   let createRefObservationInput: VisualObservationInput | null = null;
   let textRowObservationInput: VisualTextRowObservationInput | null = null;
   let importModelBinding: DeliveryImportModelBinding | null | undefined;
+  let cursorOriginalFailure: { readonly error: unknown; readonly phase: string } | null = null;
+  const readCursorOriginalFailure = (): {
+    readonly error: unknown;
+    readonly phase: string;
+  } | null => cursorOriginalFailure;
+  const cursorOriginalFailurePhases = new Set([
+    "visual-cursor-question-select",
+    "visual-cursor-question-send",
+    "visual-cursor-question-first-choice",
+    "visual-cursor-question-later-tests",
+    "visual-cursor-question-later-docs",
+    "visual-cursor-question-capture",
+    "visual-cursor-question-submit",
+  ]);
   let createRefClearObservation: ReturnType<typeof projectVisualNameClearObservation> = null;
   let browserDriverReadiness: OwnedDriverReadiness | null = null;
   let browserReadinessStage: "driver-readiness" | "session-create" | "online-proof" | null = null;
@@ -1724,11 +1739,15 @@ export async function runDeliveryRetryQualification() {
             )?.threadId === workspace.threadId,
           );
         };
+        cursorOriginalFailure = null;
         const proof = await runCursorQuestionVisual({
           browser: b(),
           owner,
           verifyOwnedIdentity,
           step,
+          observeFailure: (error) => {
+            if (cursorOriginalFailurePhases.has(phase)) cursorOriginalFailure = { error, phase };
+          },
           selectCursor: async () => {
             await click(`${form} [data-chat-provider-model-picker="true"]`);
             await click(
@@ -2045,6 +2064,15 @@ export async function runDeliveryRetryQualification() {
     );
     success = true;
   } catch (error) {
+    const originalCursorFailure = readCursorOriginalFailure();
+    if (originalCursorFailure !== null && originalCursorFailure.error === error) {
+      phase = originalCursorFailure.phase;
+      try {
+        write("phase", { phase, theme });
+      } catch {
+        // The original failure still owns its receipt and joined cleanup.
+      }
+    }
     const textRowObservation =
       browser && phase === "visual-partial-stage-text-row-displayed"
         ? await readTextRowFailureObservation()
@@ -2081,6 +2109,10 @@ export async function runDeliveryRetryQualification() {
       createRefObservation,
       textRowObservation,
       gitProjectDirectoryFailureFacts: gitProjectDirectoryFailureFacts(error, phase),
+      gitProjectTabFailureFacts:
+        config.selection === "release-visual-git-project"
+          ? gitProjectTabFailureFacts(error, phase)
+          : null,
       gitProjectTabInterception:
         phase === "visual-git-project-tab-changes-click" ||
         phase === "visual-git-project-tab-history-click" ||

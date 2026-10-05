@@ -10,6 +10,7 @@ import {
 import { validateCaptureWitness } from "./remote-ui-evidence.ts";
 import type { GitProjectVisualFixture } from "./release-visual-git-project-fixture.ts";
 import { captureOwnedVisualScene } from "./owned-visual-capture.ts";
+import { observeGitProjectTabFailure } from "./git-project-tab-observation.ts";
 
 export const gitProjectVisualScenes = [
   "worktree-discovery",
@@ -1055,6 +1056,7 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
     selector: string,
     directoryControl?: DirectoryControl,
     tabControl?: "Changes" | "History" | "Tags",
+    tabSelection?: GitProjectVisualSelection,
   ) => {
     const observeTabAwait = (
       operation: "displayed" | "unique" | "enabled" | "click" | "completed",
@@ -1105,7 +1107,19 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
     await control.waitForEnabled();
     if (directoryControl) observeDirectoryAwait(`${directoryControl}-click`);
     observeTabAwait("click");
-    await control.click();
+    try {
+      await control.click();
+    } catch (error) {
+      if (tabControl && tabSelection)
+        await observeGitProjectTabFailure(error, {
+          browser,
+          origin: input.origin,
+          theme: input.theme,
+          tab: tabControl === "Changes" ? "changes" : tabControl === "History" ? "history" : "tags",
+          selection: tabSelection,
+        });
+      throw error;
+    }
     observeTabAwait("completed");
   };
   const capture = async (
@@ -1135,8 +1149,8 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
     await browser.keys("Escape");
     await browser.$(popup).waitForDisplayed({ reverse: true });
   };
-  const tab = async (label: "Changes" | "History" | "Tags") =>
-    click(`//button[@role="tab" and normalize-space()="${label}"]`, undefined, label);
+  const tab = async (label: "Changes" | "History" | "Tags", selection: GitProjectVisualSelection) =>
+    click(`//button[@role="tab" and normalize-space()="${label}"]`, undefined, label, selection);
   const openGit = async (selection: GitProjectVisualSelection) => {
     if (selection.title !== NodePath.basename(selection.cwd)) throw refused();
     const selector = `button[aria-label="Git Manager for ${selection.title}"]`;
@@ -1219,9 +1233,9 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
   await close();
 
   await openGit(rich);
-  await tab("Tags");
+  await tab("Tags", rich);
   await capture("git-tags", rich, "groups-and-names-only");
-  await tab("History");
+  await tab("History", rich);
   const rewrite = await runGitRewritePreview({
     ...input,
     selection: rich,
@@ -1235,7 +1249,7 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
 
   const merge = await select("merge");
   await openGit(merge);
-  await tab("Changes");
+  await tab("Changes", merge);
   await capture("git-merge-conflict", merge);
   await click('//*[@data-in-progress-kind="merge"]//button[normalize-space()="Abort"]');
   await click(`${popup} button=Abort Merge`);
@@ -1251,15 +1265,15 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
 
   const unborn = await select("unborn");
   await openGit(unborn);
-  await tab("History");
+  await tab("History", unborn);
   await capture("git-unborn", unborn);
   const ordinary = await select("ordinary");
   await openGit(ordinary);
-  await tab("History");
+  await tab("History", ordinary);
   await capture("git-no-repository", ordinary);
   const broken = await select("broken");
   await openGit(broken);
-  await tab("Tags");
+  await tab("Tags", broken);
   await fixture.breakMetadata();
   let metadataRestored = false;
   try {

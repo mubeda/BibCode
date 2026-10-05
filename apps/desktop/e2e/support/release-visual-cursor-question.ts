@@ -349,6 +349,8 @@ export interface CursorQuestionVisualDriver {
   capture: () => Promise<void>;
   waitOriginalTurnCompleted: () => Promise<void>;
   step: (phase: string) => void;
+  /** Failure-only attribution before restore cleanup; cannot replace the original exception. */
+  observeFailure?: (error: unknown) => void;
 }
 
 const formXPath =
@@ -391,6 +393,13 @@ export async function runCursorQuestionVisual(input: CursorQuestionVisualDriver)
     await click(cursorQuestionSubmitSelector);
     await input.waitOriginalTurnCompleted();
     await input.verifyOwnedIdentity();
+  } catch (error) {
+    try {
+      input.observeFailure?.(error);
+    } catch {
+      // Optional attribution cannot replace the original failure or restore cleanup.
+    }
+    throw error;
   } finally {
     await input.owner.cleanup("cursor-question-model-restore", async () => {
       await input.restoreOriginal();
