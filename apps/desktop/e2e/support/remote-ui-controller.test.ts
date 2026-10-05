@@ -1337,12 +1337,20 @@ it("executes the actual read-only capture callback with real modal/toast distinc
     wrongTheme = false,
     blocked = false,
     boot = false,
-    unrelatedModal = false;
+    unrelatedModal = false,
+    clippedToast = false,
+    hiddenToast = false;
+  toast.getBoundingClientRect = () =>
+    clippedToast
+      ? { x: 1240, y: 10, width: 200, height: 100, right: 1440, bottom: 110 }
+      : { x: 10, y: 10, width: 200, height: 100, right: 210, bottom: 110 };
   const read = NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes("(" + callback + ")"), {
     HTMLElement: Element,
     innerWidth: 1280,
     innerHeight: 960,
-    getComputedStyle: () => ({ visibility: "visible" }),
+    getComputedStyle: (candidate: unknown) => ({
+      visibility: candidate === toast && hiddenToast ? "hidden" : "visible",
+    }),
     location: { origin: "http://localhost:4901", search: "", hash: "" },
     document: {
       documentElement: { classList: { contains: () => wrongTheme } },
@@ -1369,6 +1377,12 @@ it("executes the actual read-only capture callback with real modal/toast distinc
     primary: false,
   };
   expect(Object.values(read(input)).every((value) => value === true)).toBe(true);
+  clippedToast = true;
+  expect(read(input).targetInView).toBe(false);
+  hiddenToast = true;
+  expect(read(input).targetInView).toBe(true);
+  hiddenToast = false;
+  clippedToast = false;
   credential = true;
   expect(read(input).credentialAbsent).toBe(false);
   credential = false;

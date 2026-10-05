@@ -790,6 +790,15 @@ async function capture(scene: RemoteUiScene, host: Host, target: string, expecte
                 '[data-slot="dialog-popup"],[data-slot="alert-dialog-popup"]',
               ),
             ).every((popup) => !visible(popup) || popup === element || popup.contains(element));
+            const visibleToastsContained = Array.from(
+              document.querySelectorAll('[data-slot="toast-viewport"] > [data-position]'),
+            ).every((toast) => {
+              if (!visible(toast)) return true;
+              const box = toast.getBoundingClientRect();
+              return (
+                box.x >= 0 && box.y >= 0 && box.right <= innerWidth && box.bottom <= innerHeight
+              );
+            });
             return {
               themeMatched:
                 document.documentElement.classList.contains("dark") === (input.theme === "dark"),
@@ -805,7 +814,8 @@ async function capture(scene: RemoteUiScene, host: Host, target: string, expecte
                 bounds.right <= innerWidth &&
                 bounds.bottom <= innerHeight &&
                 unobstructed &&
-                noOtherDialog,
+                noOtherDialog &&
+                visibleToastsContained,
               credentialAbsent:
                 location.origin === input.origin &&
                 location.search === "" &&

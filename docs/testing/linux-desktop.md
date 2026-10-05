@@ -709,6 +709,14 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Neither selection installs software, supplies native host-toast evidence, or
   replaces the final integrated screenshot sweep.
 
+  Each capture's existing viewport witness also requires nonzero, nonhidden
+  fixed toast roots to fit within the viewport. This prevents accepting a host
+  row while a notification is partly outside the image during entry or exit.
+  Hidden or zero-area roots do not block capture. Use the same bounded screenshot
+  wait and original six-field receipt; add no sleep, notification mutation or
+  relaxed row, modal, identity, credential or image requirement. Source tests
+  establish admission behavior; new CI originals are required for visual approval.
+
   Run this workflow only after independent harness review and the separate
   browser-startup prerequisite. It builds the web source once, copies the guarded
   server/example outside Cargo output and records source/build hashes; it serves
