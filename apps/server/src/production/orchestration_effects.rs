@@ -1774,6 +1774,7 @@ mod tests {
                 created_at: "2026-07-16T00:00:00Z".to_owned(),
                 updated_at: "2026-07-16T00:00:00Z".to_owned(),
                 deleted_at: None,
+                repository_identity: None,
             })
             .await
             .expect("malformed project fixture");
@@ -1789,6 +1790,7 @@ mod tests {
                 created_at: "2026-07-16T00:00:01Z".to_owned(),
                 updated_at: "2026-07-16T00:00:01Z".to_owned(),
                 deleted_at: None,
+                repository_identity: None,
             })
             .await
             .expect("empty project fixture");
@@ -1809,6 +1811,7 @@ mod tests {
                 created_at: "2026-07-16T00:00:02Z".to_owned(),
                 updated_at: "2026-07-16T00:00:02Z".to_owned(),
                 deleted_at: None,
+                repository_identity: None,
             })
             .await
             .expect("setup project fixture");
@@ -2004,6 +2007,7 @@ mod tests {
                 created_at: "2026-08-01T00:00:00Z".to_owned(),
                 updated_at: "2026-08-01T00:00:00Z".to_owned(),
                 deleted_at: None,
+                repository_identity: None,
             })
             .await
             .expect("project");
