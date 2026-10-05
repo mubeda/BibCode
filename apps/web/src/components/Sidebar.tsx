@@ -95,13 +95,16 @@ import {
   type SidebarThreadSortOrder,
 } from "@bibcode/contracts/settings";
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
-import { selectRemoteUpdateControlCapability } from "../connection/environmentCompat";
+import {
+  resolveEnvironmentCompatVerdict,
+  selectRemoteUpdateControlCapability,
+} from "../connection/environmentCompat";
 import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstraps";
 import { isDesktopHost } from "../env";
 import { APP_BASE_NAME, APP_STAGE_LABEL } from "../branding";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
 import { isTerminalFocused } from "../lib/terminalFocus";
-import { isMacPlatform, newCommandId, newThreadId } from "../lib/utils";
+import { cn, isMacPlatform, newCommandId, newThreadId } from "../lib/utils";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
 import { useSidebarWorkspaceMetaStore } from "../sidebarWorkspaceMetaStore";
 import {
@@ -176,11 +179,21 @@ import {
   resolveGitManagerRepositoryUnavailable,
 } from "./gitManager/gitManagerRepositoryAvailability";
 import { AgentsNavRow } from "./sidebar/AgentsNavRow";
+import { EnvironmentCardHeader } from "./sidebar/EnvironmentCardHeader";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
+import {
+  buildEnvironmentCardIdentities,
+  groupProjectsByRepository,
+  type EnvironmentCardIdentity,
+  type RepositoryGroup,
+} from "./sidebar/repositoryView.logic";
+import { SidebarRepositoryGroup } from "./sidebar/SidebarRepositoryGroup";
+import { SidebarViewToggle } from "./sidebar/SidebarViewToggle";
 import { ServerUpdateBadge, serverUpdateStatusFromQuery } from "./settings/ServerUpdateBadge";
 import {
   resolveAddProjectTargetLabel,
   selectRailVisibleEnvironmentIds,
+  toEnvironmentRailCandidate,
 } from "./sidebar/environmentRail.logic";
 import { Kbd } from "./ui/kbd";
 import {
@@ -316,10 +329,12 @@ import {
 } from "~/hooks/useSettings";
 import { primaryServerConfigAtom, primaryServerKeybindingsAtom } from "../state/server";
 import {
+  deriveLogicalProjectKeyFromSettings,
   derivePhysicalProjectKey,
   deriveProjectGroupingOverrideKey,
   getProjectOrderKey,
   selectProjectGroupingSettings,
+  type ProjectGroupingSettings,
 } from "../logicalProject";
 import type { SidebarThreadSummary } from "../types";
 import {
@@ -573,12 +588,28 @@ async function chooseProjectMember(
   return members.find((member) => member.physicalProjectKey === clickedResult.value) ?? null;
 }
 
-function projectExpansionPreferenceKeys(project: SidebarProjectSnapshot): string[] {
+export function projectExpansionPreferenceKeys(project: SidebarProjectSnapshot): string[] {
   return [
     project.projectKey,
+    ...(project.sharedExpansionKey ? [project.sharedExpansionKey] : []),
     ...project.memberProjects.map((member) => member.physicalProjectKey),
     ...project.memberProjects.map((member) => legacyProjectCwdPreferenceKey(member.workspaceRoot)),
   ];
+}
+
+// An environment card has a two-line header, taller than the fixed `sm` button
+// height; `h-auto` lets it grow while normal project rows keep their height.
+export function projectHeaderButtonClassName(input: {
+  readonly showsSandboxBadge: boolean;
+  readonly isManualProjectSorting: boolean;
+  readonly isEnvironmentCard: boolean;
+}): string {
+  return cn(
+    "gap-2 px-2 py-1.5 text-left hover:bg-accent group-hover/project-header:bg-accent group-hover/project-header:text-sidebar-accent-foreground",
+    input.showsSandboxBadge ? "pr-20" : "pr-14",
+    input.isManualProjectSorting ? "cursor-grab active:cursor-grabbing" : "cursor-pointer",
+    input.isEnvironmentCard && "h-auto",
+  );
 }
 
 function projectGroupingModeDescription(mode: SidebarProjectGroupingMode): string {
@@ -1690,6 +1721,7 @@ interface SidebarProjectItemProps {
   suppressProjectClickForContextMenuRef: React.RefObject<boolean>;
   isManualProjectSorting: boolean;
   dragHandleProps: SortableProjectHandleProps | null;
+  environmentCard?: EnvironmentCardIdentity | null;
 }
 
 const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjectItemProps) {
@@ -1712,6 +1744,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     suppressProjectClickForContextMenuRef,
     isManualProjectSorting,
     dragHandleProps,
+    environmentCard = null,
   } = props;
   const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
   const requestWorktreeRemoval = useContext(WorktreeRemovalRequestContext);
@@ -3234,9 +3267,19 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     ],
   );
 
+  const showsSandboxBadge =
+    !environmentCard &&
+    project.environmentPresence === "remote-only" &&
+    project.allRemoteMembersAreDesktopLocal;
+
   return (
     <>
-      <div className="group/project-header relative">
+      <div
+        className={cn(
+          "group/project-header relative",
+          environmentCard && !environmentCard.available && "opacity-60",
+        )}
+      >
         <SidebarMenuButton
           ref={isManualProjectSorting ? dragHandleProps?.setActivatorNodeRef : undefined}
           aria-expanded={projectExpanded}
@@ -3244,11 +3287,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           data-selected={projectSelected}
           isActive={moduleRouteActive || projectSelected}
           size="sm"
-          className={`gap-2 px-2 py-1.5 text-left hover:bg-accent group-hover/project-header:bg-accent group-hover/project-header:text-sidebar-accent-foreground ${
-            project.environmentPresence === "remote-only" && project.allRemoteMembersAreDesktopLocal
-              ? "pr-20"
-              : "pr-14"
-          } ${isManualProjectSorting ? "cursor-grab active:cursor-grabbing" : "cursor-pointer"}`}
+          className={projectHeaderButtonClassName({
+            showsSandboxBadge,
+            isManualProjectSorting,
+            isEnvironmentCard: environmentCard !== null,
+          })}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.attributes : {})}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.listeners : {})}
           onPointerDownCapture={handleProjectButtonPointerDownCapture}
@@ -3270,24 +3313,33 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
               }`}
             />
           )}
-          <ProjectFavicon environmentId={project.environmentId} cwd={project.workspaceRoot} />
-          <span className="flex min-w-0 flex-1 items-center gap-2">
-            <span className="truncate text-[13px] font-medium text-foreground/90">
-              {project.displayName}
-            </span>
-            {project.groupedProjectCount > 1 ? (
-              <span className="shrink-0 text-xs text-muted-foreground">
-                {project.groupedProjectCount} projects
+          {environmentCard ? (
+            <EnvironmentCardHeader
+              identity={environmentCard}
+              workspaceRoot={project.workspaceRoot}
+            />
+          ) : (
+            <>
+              <ProjectFavicon environmentId={project.environmentId} cwd={project.workspaceRoot} />
+              <span className="flex min-w-0 flex-1 items-center gap-2">
+                <span className="truncate text-[13px] font-medium text-foreground/90">
+                  {project.displayName}
+                </span>
+                {project.groupedProjectCount > 1 ? (
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {project.groupedProjectCount} projects
+                  </span>
+                ) : null}
               </span>
-            ) : null}
-          </span>
+            </>
+          )}
         </SidebarMenuButton>
         {/* The container badge tells WSL projects apart inside Local, which
             mixes this device and WSL. A saved server's scope shows only that
             server's projects, so a cloud there said nothing and is gone. The
-            badge crossfades with the hover strip. */}
-        {project.environmentPresence === "remote-only" &&
-        project.allRemoteMembersAreDesktopLocal ? (
+            badge crossfades with the hover strip. An environment card already
+            names its environment, so it shows no badge. */}
+        {showsSandboxBadge ? (
           <Tooltip>
             <TooltipTrigger
               render={
@@ -3644,7 +3696,8 @@ function ProjectSortMenu({
 }: {
   projectSortOrder: SidebarProjectSortOrder;
   threadSortOrder: SidebarThreadSortOrder;
-  projectGroupingMode: SidebarProjectGroupingMode;
+  // Null hides the grouping choice (the Repositories view always groups by repository).
+  projectGroupingMode: SidebarProjectGroupingMode | null;
   threadPreviewCount: SidebarThreadPreviewCount;
   onProjectSortOrderChange: (sortOrder: SidebarProjectSortOrder) => void;
   onThreadSortOrderChange: (sortOrder: SidebarThreadSortOrder) => void;
@@ -3752,30 +3805,38 @@ function ProjectSortMenu({
             </NumberField>
           </div>
         </MenuGroup>
-        <MenuSeparator />
-        <MenuGroup>
-          <div className="px-2 pt-2 pb-1 font-medium text-muted-foreground sm:text-xs">
-            Group projects
-          </div>
-          <MenuRadioGroup
-            value={projectGroupingMode}
-            onValueChange={(value) => {
-              if (value === "repository" || value === "repository_path" || value === "separate") {
-                onProjectGroupingModeChange(value);
-              }
-            }}
-          >
-            {(
-              Object.entries(PROJECT_GROUPING_MODE_LABELS) as Array<
-                [SidebarProjectGroupingMode, string]
+        {projectGroupingMode === null ? null : (
+          <>
+            <MenuSeparator />
+            <MenuGroup>
+              <div className="px-2 pt-2 pb-1 font-medium text-muted-foreground sm:text-xs">
+                Group projects
+              </div>
+              <MenuRadioGroup
+                value={projectGroupingMode}
+                onValueChange={(value) => {
+                  if (
+                    value === "repository" ||
+                    value === "repository_path" ||
+                    value === "separate"
+                  ) {
+                    onProjectGroupingModeChange(value);
+                  }
+                }}
               >
-            ).map(([value, label]) => (
-              <MenuRadioItem key={value} value={value} className="min-h-7 py-1 sm:text-xs">
-                {label}
-              </MenuRadioItem>
-            ))}
-          </MenuRadioGroup>
-        </MenuGroup>
+                {(
+                  Object.entries(PROJECT_GROUPING_MODE_LABELS) as Array<
+                    [SidebarProjectGroupingMode, string]
+                  >
+                ).map(([value, label]) => (
+                  <MenuRadioItem key={value} value={value} className="min-h-7 py-1 sm:text-xs">
+                    {label}
+                  </MenuRadioItem>
+                ))}
+              </MenuRadioGroup>
+            </MenuGroup>
+          </>
+        )}
       </MenuPopup>
     </Menu>
   );
@@ -3923,6 +3984,10 @@ interface SidebarProjectsContentProps {
   archiveThread: ReturnType<typeof useThreadActions>["archiveThread"];
   deleteThread: ReturnType<typeof useThreadActions>["deleteThread"];
   sortedProjects: readonly SidebarProjectSnapshot[];
+  repositoriesView: boolean;
+  repositoryGroups: readonly RepositoryGroup[] | null;
+  repositoryGroupExpandedById: Readonly<Record<string, boolean>>;
+  environmentCardIdentities: ReadonlyMap<EnvironmentId, EnvironmentCardIdentity>;
   expandedThreadListsByProject: ReadonlySet<string>;
   activeRouteProjectKey: string | null;
   routeThreadKey: string | null;
@@ -3976,6 +4041,10 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     archiveThread,
     deleteThread,
     sortedProjects,
+    repositoriesView,
+    repositoryGroups,
+    repositoryGroupExpandedById,
+    environmentCardIdentities,
     expandedThreadListsByProject,
     activeRouteProjectKey,
     routeThreadKey,
@@ -4080,38 +4149,80 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
       <LocalSecondaryStatus />
       <SidebarGroup className="px-2 py-2" data-testid="sidebar-projects-group">
         <div className="mb-1 flex items-center justify-between pl-2 pr-1.5">
-          <span className="text-xs font-medium text-muted-foreground">Projects</span>
+          <span className="text-xs font-medium text-muted-foreground">
+            {repositoriesView ? "Repositories · all environments" : "Projects"}
+          </span>
           <div className="flex items-center gap-1">
             <ProjectSortMenu
               projectSortOrder={projectSortOrder}
               threadSortOrder={threadSortOrder}
-              projectGroupingMode={projectGroupingMode}
+              projectGroupingMode={repositoriesView ? null : projectGroupingMode}
               threadPreviewCount={threadPreviewCount}
               onProjectSortOrderChange={handleProjectSortOrderChange}
               onThreadSortOrderChange={handleThreadSortOrderChange}
               onProjectGroupingModeChange={handleProjectGroupingModeChange}
               onThreadPreviewCountChange={handleThreadPreviewCountChange}
             />
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <button
-                    type="button"
-                    aria-label={addProjectLabel}
-                    data-testid="sidebar-add-project-trigger"
-                    className="inline-flex h-6 min-w-6 cursor-pointer items-center justify-center rounded-md px-[calc(--spacing(1)-1px)] text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
-                    onClick={openAddProject}
-                  />
-                }
-              >
-                <FolderPlusIcon className="size-3.5" />
-              </TooltipTrigger>
-              <TooltipPopup side="right">{addProjectLabel}</TooltipPopup>
-            </Tooltip>
+            {/* Adding a project needs a target environment, which this view does not pick. */}
+            {repositoriesView ? null : (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label={addProjectLabel}
+                      data-testid="sidebar-add-project-trigger"
+                      className="inline-flex h-6 min-w-6 cursor-pointer items-center justify-center rounded-md px-[calc(--spacing(1)-1px)] text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
+                      onClick={openAddProject}
+                    />
+                  }
+                >
+                  <FolderPlusIcon className="size-3.5" />
+                </TooltipTrigger>
+                <TooltipPopup side="right">{addProjectLabel}</TooltipPopup>
+              </Tooltip>
+            )}
           </div>
         </div>
 
-        {isManualProjectSorting ? (
+        {repositoryGroups !== null ? (
+          <SidebarMenu className="gap-2" data-testid="sidebar-project-list">
+            {repositoryGroups.map((group) => (
+              <SidebarRepositoryGroup
+                key={group.key}
+                group={group}
+                expanded={repositoryGroupExpandedById[group.key] !== false}
+              >
+                {group.cards.map((project) => (
+                  <SidebarProjectListRow
+                    key={project.projectKey}
+                    project={project}
+                    environmentCard={environmentCardIdentities.get(project.environmentId) ?? null}
+                    isThreadListExpanded={expandedThreadListsByProject.has(project.projectKey)}
+                    activeRouteThreadKey={
+                      activeRouteProjectKey === project.projectKey ? routeThreadKey : null
+                    }
+                    moduleRouteActive={moduleRouteProjectKey === project.projectKey}
+                    selectedProjectKey={selectedProjectKey}
+                    selectProject={selectProject}
+                    openCreateWorktreeDialog={openCreateWorktreeDialog}
+                    archiveThread={archiveThread}
+                    deleteThread={deleteThread}
+                    threadJumpLabelByKey={threadJumpLabelByKey}
+                    attachThreadListAutoAnimateRef={attachThreadListAutoAnimateRef}
+                    expandThreadListForProject={expandThreadListForProject}
+                    collapseThreadListForProject={collapseThreadListForProject}
+                    dragInProgressRef={dragInProgressRef}
+                    suppressProjectClickAfterDragRef={suppressProjectClickAfterDragRef}
+                    suppressProjectClickForContextMenuRef={suppressProjectClickForContextMenuRef}
+                    isManualProjectSorting={false}
+                    dragHandleProps={null}
+                  />
+                ))}
+              </SidebarRepositoryGroup>
+            ))}
+          </SidebarMenu>
+        ) : isManualProjectSorting ? (
           <DndContext
             sensors={projectDnDSensors}
             collisionDetection={projectCollisionDetection}
@@ -4209,6 +4320,11 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
   );
 });
 
+const SEPARATE_PROJECT_GROUPING: ProjectGroupingSettings = {
+  sidebarProjectGroupingMode: "separate",
+  sidebarProjectGroupingOverrides: {},
+};
+
 export default function Sidebar() {
   const allProjects = useProjects();
   const { environments } = useEnvironments();
@@ -4239,22 +4355,25 @@ export default function Sidebar() {
     });
     return remoteLabel === null ? "Add project" : `Add project on ${remoteLabel}`;
   }, [activeEnvironmentId, environments]);
+  const sidebarView = useUiStateStore((store) => store.sidebarView);
+  const repositoriesView = sidebarView === "repositories";
+  // The Repositories view lists every environment; the rail filter applies only to Environments.
   const projects = useMemo(
     () =>
-      visibleEnvironmentIds === null
+      repositoriesView || visibleEnvironmentIds === null
         ? allProjects
         : allProjects.filter((project) => visibleEnvironmentIds.has(project.environmentId)),
-    [allProjects, visibleEnvironmentIds],
+    [allProjects, repositoriesView, visibleEnvironmentIds],
   );
   const presentation = useMemo(readCurrentEnvironmentPresentationPolicy, []);
   const shellSummary = useEnvironmentShellSummary();
   const allSidebarThreads = useThreadShells();
   const sidebarThreads = useMemo(
     () =>
-      visibleEnvironmentIds === null
+      repositoriesView || visibleEnvironmentIds === null
         ? allSidebarThreads
         : allSidebarThreads.filter((thread) => visibleEnvironmentIds.has(thread.environmentId)),
-    [allSidebarThreads, visibleEnvironmentIds],
+    [allSidebarThreads, repositoriesView, visibleEnvironmentIds],
   );
   const projectExpandedById = useUiStateStore((store) => store.projectExpandedById);
   const projectOrder = useUiStateStore((store) => store.projectOrder);
@@ -4272,6 +4391,10 @@ export default function Sidebar() {
   const sidebarProjectSortOrder = useClientSettings((s) => s.sidebarProjectSortOrder);
   const sidebarProjectGroupingMode = useClientSettings((s) => s.sidebarProjectGroupingMode);
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
+  // One project node per environment checkout; repositories are grouped at render time.
+  const effectiveGroupingSettings = repositoriesView
+    ? SEPARATE_PROJECT_GROUPING
+    : projectGroupingSettings;
   const sidebarThreadPreviewCount = useClientSettings((s) => s.sidebarThreadPreviewCount);
   const updateSettings = useUpdateClientSettings();
   // "New workspace" entry points open CreateWorktreeDialog
@@ -4458,9 +4581,9 @@ export default function Sidebar() {
   const physicalToLogicalKey = useMemo(() => {
     return buildPhysicalToLogicalProjectKeyMap({
       projects: orderedProjects,
-      settings: projectGroupingSettings,
+      settings: effectiveGroupingSettings,
     });
-  }, [orderedProjects, projectGroupingSettings]);
+  }, [orderedProjects, effectiveGroupingSettings]);
   const projectPhysicalKeyByScopedRef = useMemo(
     () =>
       new Map(
@@ -4473,19 +4596,31 @@ export default function Sidebar() {
   );
 
   const sidebarProjects = useMemo<SidebarProjectSnapshot[]>(() => {
-    return buildSidebarProjectSnapshots({
+    const snapshots = buildSidebarProjectSnapshots({
       projects: orderedProjects,
-      settings: projectGroupingSettings,
+      settings: effectiveGroupingSettings,
       primaryEnvironmentId,
       resolveEnvironmentLabel: (environmentId) => environmentLabelById.get(environmentId) ?? null,
       isDesktopLocalEnvironment: (environmentId) => desktopLocalEnvironmentIds.has(environmentId),
     });
+    // A card shares expansion with the row that holds it in the Environments view.
+    return repositoriesView
+      ? snapshots.map((snapshot) => ({
+          ...snapshot,
+          sharedExpansionKey: deriveLogicalProjectKeyFromSettings(
+            snapshot,
+            projectGroupingSettings,
+          ),
+        }))
+      : snapshots;
   }, [
     environmentLabelById,
     desktopLocalEnvironmentIds,
+    effectiveGroupingSettings,
     orderedProjects,
     projectGroupingSettings,
     primaryEnvironmentId,
+    repositoriesView,
   ]);
 
   const sidebarProjectByKey = useMemo(
@@ -4701,10 +4836,47 @@ export default function Sidebar() {
     sidebarProjects,
     visibleThreads,
   ]);
+  const environmentCardIdentities = useMemo(
+    () =>
+      buildEnvironmentCardIdentities(
+        environments.map((environment) =>
+          toEnvironmentRailCandidate({
+            environmentId: environment.environmentId,
+            label: environment.label,
+            target: environment.entry.target,
+            phase: environment.connection.phase,
+            compat: resolveEnvironmentCompatVerdict(environment.serverConfig),
+            updateAvailable: false,
+          }),
+        ),
+      ),
+    [environments],
+  );
+  const repositoryGroupExpandedById = useUiStateStore((store) => store.repositoryGroupExpandedById);
+  const repositoryGroups = useMemo(
+    () =>
+      repositoriesView
+        ? groupProjectsByRepository({
+            projects: sortedProjects,
+            environments: environmentCardIdentities,
+          })
+        : null,
+    [environmentCardIdentities, repositoriesView, sortedProjects],
+  );
+  // Projects in the order they appear on screen, so jump labels follow the current view.
+  const visibleProjectsInOrder = useMemo(
+    () =>
+      repositoryGroups === null
+        ? sortedProjects
+        : repositoryGroups.flatMap((group) =>
+            repositoryGroupExpandedById[group.key] === false ? [] : group.cards,
+          ),
+    [repositoryGroupExpandedById, repositoryGroups, sortedProjects],
+  );
   const isManualProjectSorting = sidebarProjectSortOrder === "manual";
   const visibleSidebarThreadKeys = useMemo(
     () =>
-      sortedProjects.flatMap((project) => {
+      visibleProjectsInOrder.flatMap((project) => {
         const projectThreads = sortThreads(
           (threadsByProjectKey.get(project.projectKey) ?? []).filter(
             (thread) => thread.archivedAt === null,
@@ -4745,8 +4917,8 @@ export default function Sidebar() {
       expandedThreadListsByProject,
       projectExpandedById,
       routeThreadKey,
-      sortedProjects,
       threadsByProjectKey,
+      visibleProjectsInOrder,
     ],
   );
   const threadJumpCommandByKey = useMemo(() => {
@@ -4984,7 +5156,8 @@ export default function Sidebar() {
         <SettingsSidebarNav pathname={pathname} />
       ) : (
         <>
-          <SidebarEnvironmentContextCard />
+          <SidebarViewToggle />
+          {repositoriesView ? null : <SidebarEnvironmentContextCard />}
           <SidebarProjectsContent
             showArm64IntelBuildWarning={showArm64IntelBuildWarning}
             arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
@@ -5008,6 +5181,10 @@ export default function Sidebar() {
             archiveThread={archiveThread}
             deleteThread={deleteThread}
             sortedProjects={sortedProjects}
+            repositoriesView={repositoriesView}
+            repositoryGroups={repositoryGroups}
+            repositoryGroupExpandedById={repositoryGroupExpandedById}
+            environmentCardIdentities={environmentCardIdentities}
             expandedThreadListsByProject={expandedThreadListsByProject}
             activeRouteProjectKey={activeRouteProjectKey}
             routeThreadKey={routeThreadKey}
