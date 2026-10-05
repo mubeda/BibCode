@@ -19,6 +19,8 @@ import {
 import { deliveryScenes, deliveryThemes } from "./delivery-retry-evidence.ts";
 import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
 import { bounded, projectOwnedDriverReadiness } from "./qualification-owner.ts";
+import { correctDesktopUiOuterSize } from "./window-size.ts";
+import { readVisualViewport } from "./release-visual-observation.ts";
 import {
   readDeliveryImportObservation,
   projectDeliveryImportObservation,
@@ -3303,4 +3305,107 @@ it("retains the provider custom-model prefix booleans through the exact existing
       "light",
     ),
   ).toBeNull();
+});
+
+function gitProjectViewportBoundary(scale: number, refuseResize = false) {
+  const calls: string[] = [];
+  const phases: string[] = [];
+  let viewport = { width: 1240, height: 817, devicePixelRatio: scale };
+  const outer = { width: 1280, height: 960 };
+  const original = new Error("owned viewport did not settle");
+  const input = {
+    browser: {
+      execute: async (callback: () => unknown) => {
+        calls.push("read-viewport");
+        return NodeVM.runInNewContext("(" + callback.toString() + ")()", {
+          innerWidth: viewport.width,
+          innerHeight: viewport.height,
+          devicePixelRatio: scale,
+        });
+      },
+      getWindowSize: async () => {
+        calls.push("read-outer");
+        return outer;
+      },
+      setWindowSize: async (width: number, height: number) => {
+        calls.push("resize");
+        expect({ width, height }).toEqual(
+          correctDesktopUiOuterSize(outer, { width: 1280, height: 960 }, viewport, scale),
+        );
+        if (!refuseResize)
+          viewport = {
+            width: viewport.width + (width - outer.width) / scale,
+            height: viewport.height + (height - outer.height) / scale,
+            devicePixelRatio: scale,
+          };
+      },
+    },
+    owner: {
+      until: async (check: () => Promise<boolean>) => {
+        if (!(await check())) throw original;
+      },
+    },
+    theme: "light",
+    fixture: { root: "owned-root" },
+    issueSnapshotGrant: () => {
+      throw new Error("viewport proof must not issue a grant");
+    },
+    assertions: [],
+    captures: [],
+    step: (value: string) => phases.push(value),
+    write: () => {},
+  };
+  const start = controller.indexOf("export async function runOwnedGitProjectSelection(");
+  const end = controller.indexOf("export function deliveryConfiguration(", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const run = runControllerSource(
+    NodeModule.stripTypeScriptTypes(controller.slice(start, end).replace("export ", "")) +
+      "\nrunOwnedGitProjectSelection",
+    {
+      origin: "http://127.0.0.1:4885",
+      bounded,
+      readVisualViewport,
+      correctDesktopUiOuterSize,
+      readOwnedGitProjectDescriptor: async () => ({
+        environmentId: "local",
+        bootId: "owned-boot",
+        storageInstanceId: "owned-storage",
+        serverVersion: "0.7.2",
+      }),
+      createOwnedGitProjectSnapshotReader: () => () => {},
+      createGitProjectOwnerAdapters: () => ({}),
+      verifyOwnedGitProjectSource: () => {},
+      runGitProjectVisual: async () => {
+        calls.push("produce");
+        expect(viewport.width).toBe(1280);
+        expect(viewport.height).toBe(960);
+        return {};
+      },
+      projectGitProjectVisualAssertion: (_theme: string, value: unknown) => value,
+    },
+  ) as (value: unknown) => Promise<void>;
+  return { run: () => run(input), calls, phases, original };
+}
+
+it.each([1, 2])(
+  "the actual Git/project caller corrects browser chrome before strict capture at scale %i",
+  async (scale) => {
+    const fixture = gitProjectViewportBoundary(scale);
+    await fixture.run();
+    expect(fixture.calls).toEqual([
+      "read-viewport",
+      "read-outer",
+      "resize",
+      "read-viewport",
+      "produce",
+    ]);
+    expect(fixture.phases).toContain("visual-git-project-viewport");
+  },
+);
+
+it("the actual Git/project caller refuses an unsettled viewport before any producer or grant", async () => {
+  const fixture = gitProjectViewportBoundary(1, true);
+  await expect(fixture.run()).rejects.toBe(fixture.original);
+  expect(fixture.calls).not.toContain("produce");
 });

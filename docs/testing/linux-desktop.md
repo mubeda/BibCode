@@ -842,8 +842,19 @@ keep-mounted hidden popup cannot satisfy the proof. Use the existing reverse-
 display wait with its existing SDK wait bound. Escape completion alone does not
 admit the next interaction. The real BaseUI popup may remain mounted through
 close settlement; its ending positioner is inert, so that lifecycle observation
-alone does not prove an intercepted native click. Keep fixed phase attribution
-for the existing Files control waits/clicks, owned identity, panel visibility,
+alone does not prove an intercepted native click. Git Manager is a project
+page, with no required Back or Close action before sidebar navigation. Return
+through the unique managed card's standard keyboard activation: use ordinary
+Tab under the existing focus owner, require displayed/enabled control, unique
+card and active focus, then press Enter. Retain the existing selected-thread
+route and owned-worktree identity proof before opening Files. The card's visible
+content intentionally includes pointer-enabled siblings above its button;
+WebDriver center-click admission cannot assume those siblings are button
+descendants. Never force a click or change the card's product layout. A mounted
+real-card/actual-caller regression and pinned SDK with inert geometry establish
+this supported interaction contract; they do not identify the native covering
+node or establish native capture success. Keep fixed phase attribution for
+card focus/Enter and the remaining Files control waits/clicks, owned identity, panel visibility,
 tree entries, line and comment draft. Phase labels export no selector, path,
 text or identity and add no action, browser read, retry or time budget. A failed
 close proof stops before Files, while existing click/read exceptions propagate
@@ -1202,6 +1213,14 @@ and existing request bounds remain unchanged. The added CLI issue and OAuth
 exchange each use their existing ten-second owner/request bound. No grant,
 access token, header, cookie or private snapshot payload enters retained
 evidence.
+
+The Git/project producer corrects browser outer size to the same 1280 by 960
+content viewport required by its existing witness and original-PNG checks.
+Read the actual content size and device scale, use the shared outer-size
+correction, then require the content size to settle before producer admission.
+A requested outer window size alone does not establish content dimensions.
+Keep the existing owner deadline and refuse an unsettled viewport before
+capturing; do not relax target geometry or synthesize browser layout.
 
 Snapshot admission must decode the endpoint's public `OrchestrationReadModel`,
 not raw persistence rows. The server uses its shared project/thread projection

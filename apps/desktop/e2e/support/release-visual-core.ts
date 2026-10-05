@@ -318,7 +318,12 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
     .waitForDisplayed({ reverse: true });
 
   step("visual-files-open");
-  await click(card, undefined, "card");
+  // Card content intentionally receives pointer events above its sibling button.
+  // Use standard button activation after the existing public focus admission.
+  step("visual-files-card-focus");
+  await focus(card);
+  step("visual-files-card-enter");
+  await browser.keys("Enter");
   step("visual-files-managed-identity");
   await input.verifyManaged();
   step("visual-files-panel-visible");

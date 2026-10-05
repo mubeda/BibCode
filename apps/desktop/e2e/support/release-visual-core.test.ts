@@ -15,6 +15,407 @@ import {
 import * as CoreCapture from "./release-visual-core.ts";
 import { readVisualWitness, observeVisualNameClear } from "./release-visual-observation.ts";
 
+it("returns from Git through the actual card's public keyboard activation when its sibling covers the button", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const webRequire = NodeModule.createRequire(NodePath.resolve("apps/web/package.json"));
+  const { act, createElement } = webRequire("react") as {
+    act: (run: () => void | Promise<void>) => Promise<void>;
+    createElement: (type: unknown, props: unknown, ...children: unknown[]) => unknown;
+  };
+  const { createRoot } = webRequire("react-dom/client") as {
+    createRoot: (container: Element) => { render: (node: unknown) => void; unmount: () => void };
+  };
+  const cardModule = "../../../web/src/components/sidebar/WorkspaceCard.tsx";
+  const {
+    WorkspaceCardShell,
+    WorkspaceCardTitleLine,
+    WorkspaceCardBranchLine,
+    isWorkspaceCardControlTarget,
+  } = await import(cardModule);
+  const routesModule = "../../../web/src/threadRoutes.ts";
+  const { buildThreadRouteParams } = await import(routesModule);
+  const logicModule = "../../../web/src/components/Sidebar.logic.ts";
+  const { isTrailingDoubleClick, isContextMenuShortcut, contextMenuAnchorForRect } = await import(
+    logicModule
+  );
+  const utilsModule = "../../../web/src/lib/utils.ts";
+  const { isMacPlatform } = await import(utilsModule);
+  const sidebar = NodeFS.readFileSync(
+    NodePath.resolve("apps/web/src/components/Sidebar.tsx"),
+    "utf8",
+  );
+  const threadBegin = sidebar.indexOf("  const handleThreadClick = useCallback(");
+  const threadEnd = sidebar.indexOf(
+    "  const handleMultiSelectContextMenu = useCallback(",
+    threadBegin,
+  );
+  const cardBegin = sidebar.indexOf("  const handleCardClick = useCallback(");
+  const cardEnd = sidebar.indexOf("  const handleCardDoubleClick = useCallback(", cardBegin);
+  const keyBegin = sidebar.indexOf("  const handleCardKeyDown = useCallback(");
+  const keyEnd = sidebar.indexOf("  const handlePrClick = useCallback(", keyBegin);
+  expect(threadBegin).toBeGreaterThan(0);
+  expect(threadEnd).toBeGreaterThan(threadBegin);
+  expect(cardBegin).toBeGreaterThan(0);
+  expect(cardEnd).toBeGreaterThan(cardBegin);
+  expect(keyBegin).toBeGreaterThan(0);
+  expect(keyEnd).toBeGreaterThan(keyBegin);
+  const navigation = vi.fn();
+  const markRead = vi.fn();
+  const { handleCardClick, handleCardKeyDown } = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      sidebar.slice(threadBegin, threadEnd) +
+        sidebar.slice(cardBegin, cardEnd) +
+        sidebar.slice(keyBegin, keyEnd) +
+        "\n({handleCardClick,handleCardKeyDown})",
+    ),
+    {
+      useCallback: (callback: unknown) => callback,
+      isWorkspaceCardControlTarget,
+      isMacPlatform,
+      isTrailingDoubleClick,
+      isContextMenuShortcut,
+      contextMenuAnchorForRect,
+      keyboardMenuOpenedAtRef: { current: null },
+      markKeyboardContextMenuOpened: () => {
+        throw new Error("Unexpected context-menu command.");
+      },
+      openCardMenu: () => {
+        throw new Error("Unexpected context-menu command.");
+      },
+      buildThreadRouteParams,
+      navigator: { platform: "Linux" },
+      threadRef: { environmentId: "local", threadId: "owned-card" },
+      threadKey: "owned-card",
+      orderedProjectThreadKeys: ["owned-card"],
+      scopedThreadKey: () => "owned-card",
+      useThreadSelectionStore: { getState: () => ({ selectedThreadKeys: new Set() }) },
+      markWorkspaceRowRead: markRead,
+      clearSelection: vi.fn(),
+      setSelectionAnchor: vi.fn(),
+      toggleThreadSelection: vi.fn(),
+      rangeSelectTo: vi.fn(),
+      isMobile: false,
+      setOpenMobile: vi.fn(),
+      router: { navigate: navigation },
+    },
+  );
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const style = document.createElement("style");
+  document.head.append(style);
+  try {
+    await act(async () =>
+      root.render(
+        createElement(
+          WorkspaceCardShell,
+          {
+            testId: "thread-row-owned-card",
+            buttonTestId: "thread-card-button-owned-card",
+            idBase: "owned-card",
+            className: "",
+            isActive: false,
+            hasFlags: false,
+            hasBranchLine: true,
+            hasSessionLine: false,
+            status: { kind: "idle", label: "Idle", colorClass: "text-foreground" },
+            onClick: handleCardClick,
+            onContextMenu: () => {},
+            onButtonKeyDown: handleCardKeyDown,
+          },
+          createElement(WorkspaceCardTitleLine, {
+            id: "owned-card-title",
+            flagsId: "owned-card-flags",
+            title: "Owned fixture",
+            titleTestId: "owned-card-title",
+            unread: false,
+            pinned: false,
+          }),
+          createElement(WorkspaceCardBranchLine, {
+            id: "owned-card-branch",
+            branch: "codex/delivery-retry-light",
+            branchTooltip: null,
+          }),
+        ),
+      ),
+    );
+    const card = container.querySelector<HTMLButtonElement>(
+      '[data-testid="thread-card-button-owned-card"]',
+    )!;
+    const branch = container.querySelector<HTMLElement>(
+      '#owned-card-branch [data-slot="tooltip-trigger"]',
+    )!;
+    expect(card.contains(branch)).toBe(false);
+    const content = branch.closest<HTMLElement>(".z-10")!;
+    expect(card.classList.contains("z-0")).toBe(true);
+    expect(content.classList.contains("pointer-events-none")).toBe(true);
+    expect(branch.classList.contains("pointer-events-auto")).toBe(true);
+    const { compile } = webRequire("tailwindcss") as {
+      compile: (source: string) => Promise<{ build: (classes: string[]) => string }>;
+    };
+    style.textContent = (await compile("@tailwind utilities;")).build([
+      "z-0",
+      "z-10",
+      "pointer-events-none",
+      "pointer-events-auto",
+    ]);
+    expect(getComputedStyle(card).zIndex).toBe("0");
+    expect(getComputedStyle(content).zIndex).toBe("10");
+    expect(getComputedStyle(content).pointerEvents).toBe("none");
+    expect(getComputedStyle(branch).pointerEvents).toBe("auto");
+    // Geometry and center-hit placement are explicitly inert. The real DOM/CSS
+    // permits this sibling overlap; it does not identify the native covering node.
+    const rect = new DOMRect(80, 100, 300, 60);
+    vi.spyOn(card, "getBoundingClientRect").mockReturnValue(rect);
+    vi.spyOn(card, "getClientRects").mockReturnValue({
+      0: rect,
+      length: 1,
+      item: () => rect,
+      [Symbol.iterator]: () => [rect][Symbol.iterator](),
+    });
+    vi.spyOn(card, "clientWidth", "get").mockReturnValue(300);
+    vi.spyOn(card, "clientHeight", "get").mockReturnValue(60);
+    const hit = vi.spyOn(document, "elementFromPoint").mockReturnValue(branch);
+    const desktopRequire = NodeModule.createRequire(NodePath.resolve("apps/desktop/package.json"));
+    const sdkRequire = NodeModule.createRequire(desktopRequire.resolve("webdriverio"));
+    const sdk = NodeFS.readFileSync(
+      NodePath.join(NodePath.dirname(desktopRequire.resolve("webdriverio")), "index.js"),
+      "utf8",
+    );
+    const clickableBegin = sdk.indexOf("function isElementClickable(elem) {");
+    const clickableEnd = sdk.indexOf("\n// src/commands/element/isClickable.ts", clickableBegin);
+    const clickable = NodeVM.runInNewContext(
+      sdk.slice(clickableBegin, clickableEnd) + "\nisElementClickable",
+      { document, window },
+    ) as (element: HTMLElement) => boolean;
+    expect(clickable(card)).toBe(false);
+    hit.mockReturnValue(card);
+    expect(clickable(card)).toBe(true);
+    hit.mockReturnValue(branch);
+    const keysBegin = sdk.indexOf("async function keys(value) {");
+    const keysEnd = sdk.indexOf("\n// src/commands/browser/mock.ts", keysBegin);
+    const unicodeBegin = sdk.indexOf("function checkUnicode(value) {");
+    const unicodeEnd = sdk.indexOf("\nfunction fetchElementByJSFunction", unicodeBegin);
+    const utilsEntry = NodePath.resolve(
+      NodePath.dirname(desktopRequire.resolve("webdriverio")),
+      "..",
+      "..",
+      "@wdio/utils/build/index.js",
+    );
+    const { UNICODE_CHARACTERS } = await import(utilsEntry);
+    const sdkKeys = NodeVM.runInNewContext(
+      sdk.slice(keysBegin, keysEnd) + sdk.slice(unicodeBegin, unicodeEnd) + "\nkeys",
+      {
+        Key: desktopRequire("webdriverio").Key,
+        UNICODE_CHARACTERS2: UNICODE_CHARACTERS,
+        GraphemeSplitter: sdkRequire("grapheme-splitter"),
+      },
+    ) as (this: unknown, key: string) => Promise<void>;
+    const calls: string[] = [];
+    const keyPort = {
+      isIOS: false,
+      action: (type: string) => {
+        expect(type).toBe("key");
+        const actions: Array<{ operation: string; value: string | number }> = [];
+        const action = {
+          down: (value: string) => {
+            actions.push({ operation: "down", value });
+            return action;
+          },
+          pause: (value: number) => {
+            actions.push({ operation: "pause", value });
+            return action;
+          },
+          up: (value: string) => {
+            actions.push({ operation: "up", value });
+            return action;
+          },
+          perform: async (release: boolean) => {
+            expect(release).toBe(true);
+            const key = actions[0]!.value;
+            expect(actions).toEqual([
+              { operation: "down", value: key },
+              { operation: "pause", value: 10 },
+              { operation: "up", value: key },
+            ]);
+            // Fake WebDriver endpoint models only standard Tab focus and native
+            // button Enter activation. HappyDOM does not supply native key defaults.
+            if (key === desktopRequire("webdriverio").Key.Tab) {
+              card.focus();
+              calls.push("Tab");
+            } else {
+              expect(key).toBe(desktopRequire("webdriverio").Key.Enter);
+              expect(document.activeElement).toBe(card);
+              await act(async () => {
+                const event = new KeyboardEvent("keydown", {
+                  key: "Enter",
+                  bubbles: true,
+                  cancelable: true,
+                });
+                card.dispatchEvent(event);
+                expect(event.defaultPrevented).toBe(false);
+                card.click();
+              });
+              calls.push("Enter");
+            }
+          },
+        };
+        return action;
+      },
+    };
+    const source = NodeFS.readFileSync(
+      NodePath.join(import.meta.dirname, "release-visual-core.ts"),
+      "utf8",
+    );
+    const focusBegin = source.indexOf("  const focus = async");
+    const focusEnd = source.indexOf("  const clearOwnedInput = async", focusBegin);
+    const filesBegin = source.indexOf('  step("visual-files-open");');
+    const filesEnd = source.indexOf('  step("visual-files-panel-visible");', filesBegin);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" +
+          source.slice(focusBegin, focusEnd) +
+          source.slice(filesBegin, filesEnd) +
+          "}\nrun",
+      ),
+      {
+        card: '[data-testid="thread-card-button-owned-card"]',
+        step: () => {},
+        click: async () => {
+          expect(clickable(card)).toBe(true);
+        },
+        input: {
+          verifyManaged: async () => {
+            expect(navigation).toHaveBeenCalledOnce();
+            calls.push("identity");
+          },
+        },
+        owner: { until: async (check: () => Promise<boolean>) => expect(await check()).toBe(true) },
+        browser: {
+          $$: () => ({
+            length: Promise.resolve(
+              container.querySelectorAll('[data-testid="thread-card-button-owned-card"]').length,
+            ),
+          }),
+          $: () => ({
+            isFocused: async () => document.activeElement === card,
+            waitForDisplayed: async () => {},
+            waitForEnabled: async () => {},
+          }),
+          keys: (key: string) => sdkKeys.call(keyPort, key),
+        },
+      },
+    ) as () => Promise<void>;
+    await run();
+    expect(calls).toEqual(["Tab", "Enter", "identity"]);
+    expect(markRead).toHaveBeenCalledExactlyOnceWith("owned-card");
+    expect(navigation).toHaveBeenCalledExactlyOnceWith({
+      to: "/$environmentId/$threadId",
+      params: { environmentId: "local", threadId: "owned-card" },
+    });
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    style.remove();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  }
+});
+
+it.each(["ready", "missing", "duplicate", "focus", "displayed", "enabled", "enter", "identity"])(
+  "preserves card keyboard admission and the original failure before Files: %s",
+  async (mode) => {
+    const source = NodeFS.readFileSync(
+      NodePath.join(import.meta.dirname, "release-visual-core.ts"),
+      "utf8",
+    );
+    const focusBegin = source.indexOf("  const focus = async");
+    const focusEnd = source.indexOf("  const clearOwnedInput = async", focusBegin);
+    const filesBegin = source.indexOf('  step("visual-files-open");');
+    const filesEnd = source.indexOf('  step("visual-files-panel-visible");', filesBegin);
+    const calls: string[] = [],
+      phases: string[] = [];
+    let focused = false;
+    const original = new Error("Inert original card admission failure.");
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" +
+          source.slice(focusBegin, focusEnd) +
+          source.slice(filesBegin, filesEnd) +
+          "}\nrun",
+      ),
+      {
+        Error,
+        card: "owned-card",
+        step: (phase: string) => phases.push(phase),
+        click: async () => {
+          throw new Error("Unexpected center click.");
+        },
+        input: {
+          verifyManaged: async () => {
+            calls.push("identity");
+            if (mode === "identity") throw original;
+          },
+        },
+        owner: { until: async (check: () => Promise<boolean>) => expect(await check()).toBe(true) },
+        browser: {
+          $$: () => ({
+            length: Promise.resolve(mode === "missing" ? 0 : mode === "duplicate" ? 2 : 1),
+          }),
+          $: () => ({
+            isFocused: async () => {
+              if (mode === "focus") throw original;
+              return focused;
+            },
+            waitForDisplayed: async () => {
+              calls.push("displayed");
+              if (mode === "displayed") throw original;
+            },
+            waitForEnabled: async () => {
+              calls.push("enabled");
+              if (mode === "enabled") throw original;
+            },
+          }),
+          keys: async (key: string) => {
+            calls.push(key);
+            if (key === "Tab") focused = true;
+            else {
+              expect(key).toBe("Enter");
+              if (mode === "enter") throw original;
+            }
+          },
+        },
+      },
+    ) as () => Promise<void>;
+    if (mode === "ready") {
+      await run();
+      expect(calls).toEqual(["Tab", "displayed", "enabled", "Enter", "identity"]);
+      expect(phases).toEqual([
+        "visual-files-open",
+        "visual-files-card-focus",
+        "visual-files-card-enter",
+        "visual-files-managed-identity",
+      ]);
+    } else {
+      const failure = await run().catch((error: unknown) => error);
+      if (mode === "missing" || mode === "duplicate") {
+        expect(failure).toBeInstanceOf(Error);
+        expect(calls).toEqual([]);
+      } else expect(failure).toBe(original);
+      expect(phases.at(-1)).toBe(
+        mode === "identity"
+          ? "visual-files-managed-identity"
+          : mode === "enter"
+            ? "visual-files-card-enter"
+            : "visual-files-card-focus",
+      );
+      if (mode !== "identity") expect(calls).not.toContain("identity");
+      if (mode !== "identity" && mode !== "enter") expect(calls).not.toContain("Enter");
+    }
+    expect(JSON.stringify(phases)).not.toMatch(/owned-card|data-|aria-|private/);
+  },
+);
+
 it("awaits the actual keep-mounted BaseUI popup close before the next Files card interaction", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("BASE_UI_ANIMATIONS_DISABLED", false);
@@ -111,14 +512,20 @@ it("awaits the actual keep-mounted BaseUI popup close before the next Files card
           expect(positioner.hidden).toBe(false);
         },
         step: () => {},
-        click: async (selector: string) => {
+        focus: async (selector: string) => {
           expect(selector).toBe("owned-card");
           expect(closeCompleted).toBe(true);
           expect(positioner.hidden).toBe(true);
-          calls.push("card");
+          calls.push("focus");
         },
         browser: {
           keys: async (key: string) => {
+            if (key === "Enter") {
+              expect(closeCompleted).toBe(true);
+              expect(positioner.hidden).toBe(true);
+              calls.push("Enter");
+              return;
+            }
             expect(key).toBe("Escape");
             calls.push("Escape");
             await act(async () => {
@@ -155,7 +562,7 @@ it("awaits the actual keep-mounted BaseUI popup close before the next Files card
       },
     ) as () => Promise<void>;
     await run();
-    expect(calls).toEqual(["capture", "Escape", "close-proof", "card"]);
+    expect(calls).toEqual(["capture", "Escape", "close-proof", "focus", "Enter"]);
   } finally {
     finish();
     await act(async () => root.unmount());
@@ -212,7 +619,6 @@ it.each(["escape", "hidden"])(
 );
 
 it.each([
-  "card",
   "right-panel",
   "open",
   "collapse",
@@ -267,12 +673,17 @@ it.each([
       ),
       {
         card: "owned-card",
+        focus: async () => actions.push("focus"),
         step: (phase: string) => phases.push(phase),
         input: { verifyManaged: async () => actions.push("identity") },
         observePartialAwait: () => {
           throw new Error("Unexpected partial-stage observer.");
         },
         browser: {
+          keys: async (key: string) => {
+            expect(key).toBe("Enter");
+            actions.push("Enter");
+          },
           $: (selector: string) =>
             element(
               selector === "owned-card"

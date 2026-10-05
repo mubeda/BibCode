@@ -347,6 +347,20 @@ export async function runOwnedGitProjectSelection(input: {
   const initial = await readOwnedGitProjectDescriptor();
   if (initial.environmentId !== "local" || !initial.bootId || !initial.storageInstanceId)
     throw new Error("Owned Git/project server identity refused.");
+  input.step("visual-git-project-viewport");
+  const observed = await bounded(input.browser.execute(readVisualViewport), 2_000);
+  const outer = await input.browser.getWindowSize();
+  const corrected = correctDesktopUiOuterSize(
+    outer,
+    { width: 1280, height: 960 },
+    observed,
+    observed.devicePixelRatio,
+  );
+  await input.browser.setWindowSize(corrected.width, corrected.height);
+  await input.owner.until(async () => {
+    const viewport = await bounded(input.browser.execute(readVisualViewport), 2_000);
+    return viewport.width === 1280 && viewport.height === 960;
+  });
   const adapters = createGitProjectOwnerAdapters({
     browser: input.browser,
     owner: input.owner,
