@@ -220,6 +220,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Progress/queued/restart/version checking, closing the view, and row Dismiss:
 - Manual archive/package/OS/architecture/SSH steps and Copy:
 - Browser explicit Reload and composer input retained:
+- Exact failed primary-thread proof phase, same-read closed `branchNull`/`expectedBranchMatched` observations, request count and joined cleanup (no raw branch or identity values):
 - Host request notice and Manage devices (native | tests-only | unavailable):
 - Fake-host UI/session evidence and light/dark screenshots:
 - Real seeded CI run link, target, lane and `widened` result:

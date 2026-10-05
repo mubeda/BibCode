@@ -1,4 +1,10 @@
 // @vitest-environment happy-dom
+// @effect-diagnostics nodeBuiltinImport:off - Actual QA caller/SDK source uses inert command and DOM endpoints only.
+
+import * as NodeFS from "node:fs";
+import * as NodeModule from "node:module";
+import * as NodeURL from "node:url";
+import * as NodeVM from "node:vm";
 
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -14,11 +20,12 @@ import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import type { ConnectionTarget } from "@bibcode/client-runtime/connection";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { EnvironmentPresentationPolicy } from "~/connection/environmentPresentationPolicy";
+import { AddProjectHostPathStep } from "./AddProjectSteps";
 
 type AddProjectPresentation = Pick<
   EnvironmentPresentationPolicy,
@@ -268,6 +275,61 @@ function WorkflowProbe() {
   return null;
 }
 
+function PrimaryImportProbe() {
+  const [open, setOpen] = useState(true);
+  currentWorkflow = useAddProjectWorkflow({
+    open,
+    onOpenChange: (next) => {
+      harness.onOpenChange(next);
+      setOpen(next);
+    },
+  });
+  return open ? (
+    <AddProjectHostPathStep
+      hostLabel={currentWorkflow.selectedHost.label}
+      path={currentWorkflow.hostPath}
+      platform={currentWorkflow.selectedHost.platform}
+      busy={currentWorkflow.busy}
+      error={currentWorkflow.error}
+      onPathChange={currentWorkflow.setHostPath}
+      onSubmit={() => {
+        void currentWorkflow.submitHostPath();
+      }}
+    />
+  ) : (
+    <div data-center-surface-host data-visible="true">
+      <div data-testid="composer-editor" />
+    </div>
+  );
+}
+
+function importSdkCommands() {
+  const source = NodeFS.readFileSync(
+    new NodeURL.URL("../../../../desktop/node_modules/webdriverio/build/node.js", import.meta.url),
+    "utf8",
+  );
+  const addStart = source.indexOf("var VALID_TYPES =");
+  const addEnd = source.indexOf("// src/commands/element/clearValue.ts", addStart);
+  const clearStart = source.indexOf("function clearValue()", addEnd);
+  const clearEnd = source.indexOf("// src/commands/element/click.ts", clearStart);
+  const clickStart = source.indexOf("function click(options)", clearEnd);
+  const clickEnd = source.indexOf("async function actionClick(", clickStart);
+  const setStart = source.indexOf("async function setValue(");
+  const setEnd = source.indexOf("// src/commands/element/shadow$$.ts", setStart);
+  expect(
+    [addStart, addEnd, clearStart, clearEnd, clickStart, clickEnd, setStart, setEnd].every(
+      (n) => n > 0,
+    ),
+  ).toBe(true);
+  return NodeVM.runInNewContext(
+    source.slice(addStart, addEnd) +
+      source.slice(clearStart, clearEnd) +
+      source.slice(clickStart, clickEnd) +
+      source.slice(setStart, setEnd) +
+      "\n({setValue,addValue,clearValue,click})",
+  );
+}
+
 async function mountWorkflow(): Promise<AddProjectWorkflow> {
   container = document.createElement("div");
   document.body.append(container);
@@ -322,6 +384,238 @@ afterEach(async () => {
 });
 
 describe("useAddProjectWorkflow public adapter", () => {
+  it.each(["success", "command-failure", "pending"])(
+    "executes the actual original QA import and pinned SDK against the real controlled form/public hook: %s",
+    async (outcome) => {
+      let settle: () => void = () => {};
+      if (outcome === "pending") {
+        const pending = new Promise<void>((resolve) => {
+          settle = resolve;
+        });
+        harness.createProject.mockImplementation(async (command) => {
+          await pending;
+          return AsyncResult.success({
+            projectId: command.input.projectId,
+            threadId: defaultThreadId,
+          });
+        });
+      } else if (outcome === "command-failure") {
+        harness.createProject.mockResolvedValueOnce(
+          AsyncResult.failure(
+            Cause.fail(
+              new GitCommandError({
+                operation: "project.create",
+                command: "owned",
+                cwd: "/code",
+                detail: "Synthetic command refusal.",
+              }),
+            ),
+          ),
+        );
+      }
+      container = document.createElement("div");
+      document.body.append(container);
+      root = createRoot(container);
+      await act(async () => root?.render(<PrimaryImportProbe />));
+      await act(async () => currentWorkflow.openHostPath());
+      expect(currentWorkflow.step).toBe("host-path");
+      const sdk = importSdkCommands();
+      const path = document.querySelector<HTMLInputElement>("#add-project-host-path")!;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+      const actions: string[] = [];
+      const endpoint = {
+        elementId: "owned-path",
+        clearValue() {
+          return sdk.clearValue.call(this);
+        },
+        addValue(value: string) {
+          return sdk.addValue.call(this, value);
+        },
+        elementClear: async () => {
+          actions.push("clear");
+          await act(async () => {
+            setter.call(path, "");
+            path.dispatchEvent(new Event("change", { bubbles: true }));
+          });
+        },
+        elementSendKeys: async (_id: string, value: string) => {
+          actions.push("keys");
+          // An inert native-input endpoint, not a QA DOM compensation action.
+          await act(async () => {
+            setter.call(path, path.value + value);
+            path.dispatchEvent(new Event("input", { bubbles: true }));
+          });
+        },
+      };
+      const deadline = new Error("Inert original composer readiness deadline.");
+      const source = NodeFS.readFileSync(
+        new NodeURL.URL("../../../../desktop/e2e/qualify-remote-updates.ts", import.meta.url),
+        "utf8",
+      );
+      const start = source.indexOf("async function importProject(");
+      const end = source.indexOf("async function setTheme(", start);
+      const clickStart = source.indexOf("const click = async");
+      const clickEnd = source.indexOf("const text = async", clickStart);
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          source.slice(clickStart, clickEnd) + source.slice(start, end),
+        ) + "\nimportProject",
+        {
+          phase: () => {},
+          workspace: async () => {},
+          SUCCESS_IMPORT_PHASES: {},
+          composer: "owned-composer",
+          owner: { until: async (read: () => Promise<boolean>) => expect(await read()).toBe(true) },
+          element: (selector: string) => {
+            if (selector !== "button=Open project")
+              return {
+                waitForDisplayed: async () => {},
+                waitForClickable: async () => {},
+                click: async () => {},
+              };
+            const button = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+              (node) => node.textContent === "Open project",
+            )!;
+            expect(button.type).toBe("submit");
+            expect(button.form).toBe(path.form);
+            expect(button.disabled).toBe(false);
+            return {
+              waitForDisplayed: async () => expect(button.isConnected).toBe(true),
+              waitForClickable: async () => expect(button.disabled).toBe(false),
+              click: () =>
+                sdk.click.call({
+                  elementId: "owned-submit",
+                  elementClick: async () => {
+                    actions.push("click");
+                    await act(async () => button.click());
+                  },
+                }),
+            };
+          },
+          required: () => ({
+            $: (selector: string) => ({
+              isDisplayed: async () => true,
+              isExisting: async () => true,
+              setValue: (value: string) => sdk.setValue.call(endpoint, value),
+              waitForDisplayed: async () => {
+                if (
+                  selector === "owned-composer" &&
+                  !document.querySelector('[data-testid="composer-editor"]')
+                )
+                  throw deadline;
+              },
+            }),
+          }),
+        },
+      ) as (host: unknown) => Promise<void>;
+      try {
+        const result = run({ project: "/code/owned", devUrl: "owned" });
+        if (outcome === "success") await expect(result).resolves.toBeUndefined();
+        else await expect(result).rejects.toBe(deadline);
+        expect(actions).toEqual(["clear", "keys", "click"]);
+        expect(harness.createProject).toHaveBeenCalledTimes(1);
+        expect(harness.createProject.mock.calls[0]?.[0]).toMatchObject({
+          input: { workspaceRoot: "/code/owned" },
+        });
+        expect(harness.replaceMainWithTerminal).not.toHaveBeenCalled();
+        if (outcome === "success") {
+          expect(harness.navigate).toHaveBeenCalledTimes(1);
+          expect(harness.onOpenChange).toHaveBeenCalledWith(false);
+          expect(document.querySelector("#add-project-host-path")).toBeNull();
+        } else {
+          expect(document.querySelector("#add-project-host-path")).not.toBeNull();
+          expect(currentWorkflow.error).toBeNull();
+          expect(currentWorkflow.busy).toBe(outcome === "pending");
+          expect(harness.onOpenChange).not.toHaveBeenCalled();
+        }
+        const readStart = source.indexOf("            const observer =");
+        const readEnd = source.indexOf(
+          "          },\n          {\n            checkAgain:",
+          readStart,
+        );
+        expect(readStart).toBeGreaterThan(0);
+        expect(readEnd).toBeGreaterThan(readStart);
+        const read = NodeVM.runInNewContext(
+          NodeModule.stripTypeScriptTypes(
+            "function read(input){" + source.slice(readStart, readEnd) + "}\nread",
+          ),
+          {
+            window,
+            document,
+            HTMLInputElement,
+            HTMLButtonElement,
+            location: { origin: "http://localhost:4901", pathname: "/", search: "", hash: "" },
+          },
+        ) as (input: unknown) => { primaryImport?: unknown };
+        expect(
+          read({
+            checkAgain: false,
+            successRemoval: false,
+            primaryImport: true,
+            expectedImportPath: "/code/owned",
+            theme: "light",
+          }).primaryImport,
+        ).toEqual({
+          safePage: true,
+          pathCount: outcome === "success" ? "none" : "one",
+          expectedPathMatched: outcome === "success" ? null : true,
+          formUnique: outcome !== "success",
+          submitCount: outcome === "success" ? "none" : "one",
+          submitDisabled: outcome === "success" ? null : outcome === "pending",
+          formState: outcome === "success" ? "absent" : outcome === "pending" ? "pending" : "idle",
+          composerCount: outcome === "success" ? "one" : "none",
+        });
+        if (outcome === "command-failure") {
+          const observe = (extra: object = {}) =>
+            read({
+              checkAgain: false,
+              successRemoval: false,
+              primaryImport: true,
+              expectedImportPath: "/code/owned",
+              theme: "light",
+              ...extra,
+            }).primaryImport;
+          path.value = "/code/other";
+          expect(observe()).toMatchObject({ expectedPathMatched: false, formState: "idle" });
+          path.value = "/code/owned";
+          const duplicate = path.cloneNode(true);
+          document.body.append(duplicate);
+          expect(observe()).toMatchObject({
+            pathCount: "multiple",
+            expectedPathMatched: null,
+            formUnique: false,
+            formState: "ambiguous",
+          });
+          duplicate.parentNode?.removeChild(duplicate);
+          const duplicateSubmit = path
+            .form!.querySelector('button[type="submit"]')!
+            .cloneNode(true);
+          path.form!.append(duplicateSubmit);
+          expect(observe()).toMatchObject({ submitCount: "multiple", submitDisabled: null });
+          duplicateSubmit.parentNode?.removeChild(duplicateSubmit);
+          const values = vi.spyOn(path, "value", "get");
+          expect(observe({ primaryImport: false })).toBeNull();
+          expect(observe({ expectedImportPath: null })).toBeNull();
+          const secret = document.createElement("input");
+          secret.type = "password";
+          document.body.append(secret);
+          expect(observe()).toBeNull();
+          secret.remove();
+          const pairing = document.createElement("textarea");
+          pairing.placeholder = "bibcode://pair owned pairing link";
+          document.body.append(pairing);
+          expect(observe()).toBeNull();
+          pairing.remove();
+          expect(values).not.toHaveBeenCalled();
+          values.mockRestore();
+        }
+      } finally {
+        await act(async () => {
+          settle();
+        });
+      }
+    },
+  );
   it("keeps saved remote hosts on desktop and defaults to the rail selection", async () => {
     harness.environments = [
       ...harness.environments,

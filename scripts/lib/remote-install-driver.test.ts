@@ -236,7 +236,9 @@ const terminalFixture = (input: {
           targetVersion: availableVersion,
           support: { installMode: "interactive", reason: "available", installKind: "unknown" },
           downloadPercent: null,
-          installStage: input.installStage ?? "waiting-for-mutations",
+          installStage:
+            input.installStage ??
+            (input.hostError ? "sentinel-private-stage" : "waiting-for-mutations"),
         };
         let value: unknown;
         switch (request.tag) {

@@ -2,6 +2,9 @@
 //!
 //! Usage: cargo run -p bibcode-server --example remote_update_fake_host -- \
 //!   <base-dir> <port 4800-4899> <server-version> [label, default "Fake-host"]
+//! Primary browser QA only: append `--dev-url http://localhost:4901` after an
+//! explicit label on port 4887. Its pairing command must select the same dev URL.
+//! Default/remote hosts use userdata; the primary opt-in uses guarded dev state.
 //! Always binds 127.0.0.1. Pair separately with:
 //!   bibcode pairing offer --base-dir <base-dir> --endpoint http://127.0.0.1:<port> \
 //!     --reach this-computer --json
@@ -19,7 +22,6 @@ use std::{
     env,
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -144,6 +146,15 @@ fn validate_fake_host_config(config: &ServerConfig) -> io::Result<()> {
     {
         return Err(io::Error::other(
             "fake host requires loopback and a port in 4800-4899; never 3773",
+        ));
+    }
+    if config
+        .dev_url
+        .as_ref()
+        .is_some_and(|dev_url| config.port != 4887 || dev_url.as_str() != "http://localhost:4901/")
+    {
+        return Err(io::Error::other(
+            "fake host primary development profile requires port 4887 and the fixed QA origin",
         ));
     }
     Ok(())
@@ -414,8 +425,8 @@ impl Drop for CommandReader {
     }
 }
 
-fn disable_provider_processes(base_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let settings_dir = base_dir.join("userdata");
+fn disable_provider_processes(config: &ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let settings_dir = config.state_dir();
     fs::create_dir_all(&settings_dir)?;
     let file = match OpenOptions::new()
         .write(true)
@@ -496,13 +507,30 @@ async fn report_started(handle: &ServerHandle) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-async fn start_server(
-    base_dir: &Path,
-    port: u16,
-    version: &str,
-    label: &str,
-    status: Arc<Mutex<ScriptedStatus>>,
-) -> Result<ServerHandle, Box<dyn std::error::Error>> {
+fn fake_host_config(
+    mut args: impl Iterator<Item = String>,
+) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let base_dir = args.next().ok_or("missing base-dir argument")?;
+    let port = args
+        .next()
+        .ok_or("missing port argument (expected 4800-4899)")?
+        .parse::<u16>()
+        .ok()
+        .filter(|port| (4800..=4899).contains(port))
+        .ok_or("port must be in 4800-4899; port 3773 is forbidden")?;
+    let version = args.next().ok_or("missing server-version argument")?;
+    let label = args.next().unwrap_or_else(|| "Fake-host".to_owned());
+    let dev_url = match args.next() {
+        None => None,
+        Some(flag) if flag == "--dev-url" => {
+            let value = args.next().ok_or("missing fixed primary development URL")?;
+            if value != "http://localhost:4901" || args.next().is_some() {
+                return Err("only the exact primary development URL is accepted".into());
+            }
+            Some(value.parse()?)
+        }
+        Some(_) => return Err("unexpected extra argument".into()),
+    };
     let mut config = ServerConfig::new(base_dir)
         .with_bind("127.0.0.1", port)
         .with_remote_update_support(RemoteUpdateSupport {
@@ -510,11 +538,20 @@ async fn start_server(
             reason: RemoteUpdateSupportReason::Available,
             install_kind: RemoteUpdateInstallKind::Unknown,
         });
+    config.dev_url = dev_url;
     validate_fake_host_config(&config)?;
-    config.server_version = version.to_owned();
-    config.environment_label = label.to_owned();
+    config.server_version = version;
+    config.environment_label = label;
     config.no_browser = true;
     config.startup_pairing_offer = false;
+    Ok(config)
+}
+
+async fn start_server(
+    config: ServerConfig,
+    status: Arc<Mutex<ScriptedStatus>>,
+) -> Result<ServerHandle, Box<dyn std::error::Error>> {
+    validate_fake_host_config(&config)?;
     let handle = ServerRuntime::start_with_desktop_integration(
         config,
         Arc::new(UnavailableDesktopUiProcessObserver),
@@ -539,23 +576,11 @@ async fn shutdown(handle: &mut Option<ServerHandle>) -> Result<(), bibcode_serve
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = env::args().skip(1);
-    let base_dir = args.next().ok_or("missing base-dir argument")?;
-    let port = args
-        .next()
-        .ok_or("missing port argument (expected 4800-4899)")?
-        .parse::<u16>()
-        .ok()
-        .filter(|port| (4800..=4899).contains(port))
-        .ok_or("port must be in 4800-4899; port 3773 is forbidden")?;
-    let mut version = args.next().ok_or("missing server-version argument")?;
-    let label = args.next().unwrap_or_else(|| "Fake-host".to_owned());
-    if args.next().is_some() {
-        return Err("unexpected extra argument".into());
-    }
-    let data_root = resolve_data_root(ServerConfig::new(base_dir).data_root_request)?;
-    let base_dir = data_root.effective.as_path();
-    disable_provider_processes(base_dir)?;
+    let mut config = fake_host_config(env::args().skip(1))?;
+    let data_root = resolve_data_root(config.data_root_request.clone())?;
+    config.base_dir = data_root.effective.clone();
+    config.resolved_data_root = Some(data_root);
+    disable_provider_processes(&config)?;
 
     let status = Arc::new(Mutex::new(ScriptedStatus {
         state: Some(RemoteUpdateState::UpdateAvailable),
@@ -566,7 +591,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut reader, mut commands) = CommandReader::start(CommandInput::stdin()?);
     let mut handle = None;
     let result: Result<(), Box<dyn std::error::Error>> = async {
-    handle = Some(start_server(base_dir, port, &version, &label, status.clone()).await?);
+    handle = Some(start_server(config.clone(), status.clone()).await?);
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
     let mut restart_at = None;
@@ -577,7 +602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 command = commands.recv() => command,
                 () = tokio::time::sleep_until(deadline) => {
                     *status.lock().expect("scripted status") = ScriptedStatus::default();
-                    handle = Some(start_server(base_dir, port, &version, &label, status.clone()).await?);
+                    handle = Some(start_server(config.clone(), status.clone()).await?);
                     restart_at = None;
                     continue;
                 }
@@ -598,7 +623,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Some(Command::Restart(restart)) => {
                 shutdown(&mut handle).await?;
-                version = restart.server_version;
+                config.server_version = restart.server_version;
                 restart_at =
                     Some(tokio::time::Instant::now() + Duration::from_millis(restart.after_ms));
             }
@@ -619,10 +644,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    #[test]
+    fn fixture_config_preserves_default_profile_and_refuses_other_dev_origins() {
+        let args = |extra: &[&str]| {
+            ["unused-owned-root", "4887", "9.9.0", "QA Primary"]
+                .into_iter()
+                .chain(extra.iter().copied())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        let config = fake_host_config(args(&[])).unwrap();
+        assert!(config.dev_url.is_none());
+        assert_eq!(config.state_dir(), config.base_dir.join("userdata"));
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 4887);
+        assert!(!config.unsafe_no_auth);
+        assert!(config.no_browser);
+        assert!(!config.startup_pairing_offer);
+        for extra in [
+            vec!["--dev-url"],
+            vec!["--unknown", "http://localhost:4901"],
+            vec!["--dev-url", "http://localhost:4901", "extra"],
+            vec!["--dev-url", "http://127.0.0.1:4901"],
+            vec!["--dev-url", "https://localhost:4901"],
+            vec!["--dev-url", "http://localhost:4902"],
+            vec!["--dev-url", "http://localhost:4901/"],
+            vec!["--dev-url", "http://localhost:4901/?token=private"],
+            vec!["--dev-url", "http://private@localhost:4901"],
+            vec!["--dev-url", "http://example.test:4901"],
+        ] {
+            assert!(fake_host_config(args(&extra)).is_err());
+        }
+        let mut remote = args(&["--dev-url", "http://localhost:4901"]).collect::<Vec<_>>();
+        remote[1] = "4888".to_owned();
+        assert!(fake_host_config(remote.into_iter()).is_err());
+        let default = fake_host_config(
+            ["unused-owned-root", "4888", "9.9.0"]
+                .map(str::to_owned)
+                .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(default.environment_label, "Fake-host");
+        assert!(default.dev_url.is_none());
+    }
+
+    #[test]
+    fn fixture_config_primary_dev_profile_is_explicit_and_fixed() {
+        let config = fake_host_config(
+            [
+                "unused-owned-root",
+                "4887",
+                "9.9.0",
+                "QA Primary",
+                "--dev-url",
+                "http://localhost:4901",
+            ]
+            .map(str::to_owned)
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.dev_url.as_ref().unwrap().as_str(),
+            "http://localhost:4901/"
+        );
+        assert_eq!(config.state_dir(), config.base_dir.join("dev"));
+    }
+
+    #[test]
+    fn fixture_settings_follow_the_selected_dev_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = ServerConfig::new(temp.path())
+            .with_bind("127.0.0.1", 4887)
+            .with_dev_url("http://localhost:4901".parse().unwrap());
+        disable_provider_processes(&config).unwrap();
+        let path = config.state_dir().join("settings.json");
+        assert!(
+            path.is_file(),
+            "provider guards must cover the active dev profile"
+        );
+        assert!(!temp.path().join("userdata").exists());
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["enableProviderUpdateChecks"], false);
+        for driver in hermetic_providers::BUILTIN_PROVIDER_DRIVERS {
+            assert_eq!(value["providers"][driver]["enabled"], false);
+            let pin = Path::new(value["providers"][driver]["binaryPath"].as_str().unwrap());
+            assert!(pin.starts_with(config.state_dir()));
+            assert!(!pin.exists());
+        }
+        let unsafe_settings = b"{\"enableProviderUpdateChecks\":true}";
+        fs::write(&path, unsafe_settings).unwrap();
+        assert!(disable_provider_processes(&config).is_err());
+        assert_eq!(fs::read(path).unwrap(), unsafe_settings);
+    }
     #[test]
     fn fixture_settings_disable_checks_and_pin_every_provider_without_overwriting_existing_work() {
         let temp = tempfile::tempdir().unwrap();
-        disable_provider_processes(temp.path()).unwrap();
+        disable_provider_processes(&ServerConfig::new(temp.path())).unwrap();
         let path = temp.path().join("userdata/settings.json");
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["enableProviderUpdateChecks"], false);
@@ -634,14 +753,14 @@ mod tests {
         }
         let unsafe_settings = b"{\"enableProviderUpdateChecks\":true}";
         fs::write(&path, unsafe_settings).unwrap();
-        assert!(disable_provider_processes(temp.path()).is_err());
+        assert!(disable_provider_processes(&ServerConfig::new(temp.path())).is_err());
         assert_eq!(fs::read(path).unwrap(), unsafe_settings);
     }
 
     #[test]
     fn fixture_settings_accept_disabled_instances_with_their_configured_pin() {
         let temp = tempfile::tempdir().unwrap();
-        disable_provider_processes(temp.path()).unwrap();
+        disable_provider_processes(&ServerConfig::new(temp.path())).unwrap();
         let path = temp.path().join("userdata/settings.json");
         let mut settings: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -651,14 +770,14 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&settings).unwrap();
         fs::write(&path, &bytes).unwrap();
-        disable_provider_processes(temp.path()).unwrap();
+        disable_provider_processes(&ServerConfig::new(temp.path())).unwrap();
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]
     fn fixture_settings_reject_a_safe_shadow_field_over_an_ambient_instance_binary() {
         let temp = tempfile::tempdir().unwrap();
-        disable_provider_processes(temp.path()).unwrap();
+        disable_provider_processes(&ServerConfig::new(temp.path())).unwrap();
         let path = temp.path().join("userdata/settings.json");
         let mut settings: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -671,7 +790,7 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&settings).unwrap();
         fs::write(&path, &bytes).unwrap();
-        assert!(disable_provider_processes(temp.path()).is_err());
+        assert!(disable_provider_processes(&ServerConfig::new(temp.path())).is_err());
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
 

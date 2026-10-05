@@ -586,17 +586,168 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   wrong-version restart, the actual three-minute no-return deadline, two active
   updates plus one queued update, and the real browser Reload button. A core
   result explicitly lists those pending cases and is not full UI qualification.
+  The final bounded-parallel assertion records the core queue checks before
+  removing its three owned hosts. Completion of that assertion does not prove
+  host removal completed. Fixed `queued-remove-a/b/c-<operation>` markers
+  identify the existing settings, More/Remove/confirmation waits and clicks,
+  row-removal wait, child/tunnel joins and toast-display/click boundaries. Slot
+  names come from the fixed host order, never labels or identifiers. Optional
+  marker failures cannot skip an action, replace its original failure or alter
+  a budget; these markers add no UI read, request or interaction. After row
+  removal and owned child/tunnel joins, toast cleanup reads current visible close
+  controls and their pinned SDK public clickability before dispatch. Skip
+  displayed but ineligible controls during the current enumeration; click one
+  eligible close at a time within the existing thirty-second owner observation
+  bound. Keep cleanup incomplete while any visible close remains, even when none
+  is currently clickable. Fixed `toast-clickable` phases attribute that read.
+  Ending/reflowing roots can remain displayed while outside the viewport or
+  covered; display alone does not establish interaction eligibility. Re-fetch
+  after each dismissal and require a fresh read with zero visible
+  close controls before completing cleanup. A recognized missing/stale click may
+  count as already gone only when a second fresh enumeration proves that same
+  zero-visible end state. Unknown click errors, visible replacements and failed
+  absence reads preserve the original failure and click phase. This conservative
+  recognition reads an own data message. It admits the canonical missing/stale
+  prefixes, the exact public implicit-missing click message, the pinned SDK's exact
+  internal scroll-missing or getHTML-missing message for that same toast-close
+  selector during its Classic click fallbacks, and the pinned SDK's
+  `WebDriverError` wrapper only for a bounded element-ID click command with `POST`
+  and no argument suffix. Wrapped detail can contain the SDK's preserved line breaks
+  within its 1024-character bound; element IDs remain bounded. Other error
+  families, commands or methods, malformed wrappers and unavailable message data
+  preserve the original error. The successful-HTML SDK middleware variant additionally
+  requires its exact own data middleware name, at most 1024 message units, exact
+  `Element … did not become interactable` framing and a single outer button with
+  exactly one real `data-slot="toast-close"` attribute. The bounded opening-tag
+  attribute check treats quoted values as opaque, rejects duplicate/spoofed markers,
+  and never parses the inner markup. It still requires the unchanged fresh zero-visible
+  close proof; visible/replacement controls and failed reads preserve the same error.
+  Native closed shape alone does not identify this as the native cause. Keep raw
+  HTML, messages, IDs, URLs and arguments private;
+  recognition adds no evidence beyond the existing fixed phase markers. This
+  proof needs no fabricated toast identity or changes to toast lifetimes, Retry
+  behavior or functional assertions. A missing element alone does not establish
+  an auto-dismiss cause. A null Reload witness before its stage remains
+  unavailable evidence.
+  After the scripted wrong-version restart, its updater status has no latest
+  version. Verify the exact wrong-version error first, then use Settings Retry
+  and require the named confirmation without a version plus fresh work counts.
+  Cancel must retain exactly the original one install request. Do not invent a
+  target or change the fixture's status to preserve the pre-restart dialog title.
+  Separate Retry, reconfirmation, Cancel, request-count and removal phases locate
+  failures without retaining page text or weakening the existing action bounds.
+  The final failure-flow Check/Check again boundary separately records its
+  displayed wait, clickability wait, click and row-state wait. A failure there
+  adds one guarded row sample to the existing two-second failure observation:
+  fixed row/control count and label categories, visibility/disabled flags,
+  known update badge, expected version-action and Dismiss presence, and a finite
+  center-point hit category. It requires the fixed QA origin, exact Remote
+  Servers route, empty query/fragment and a light/dark fixture name before row
+  inspection. Unknown, unsafe, missing or ambiguous scope remains unavailable.
+  Decode only own enumerable data facts; refuse recognized accessors/nonenumerable
+  descriptors or reflection failures locally, and leave inherited facts unknown.
+  No text, input, path, URL, credential, selector, coordinate or raw interceptor
+  leaves the page. These are current post-failure facts, not proof of the earlier
+  native click's blocker. Preserve the one public action, owner and every
+  existing wait, request-count, version and draft assertion.
+  At only `failure-check-again-click`, `checkAgainInterception` may separately
+  retain `receiverSlot` and `receiverEndingStyle` from that same original error
+  before the existing post-failure observation. The message must be an own
+  primitive data value of at most 4096 units, with a recognized interception
+  prefix and exactly one explicit receiving-element clause. Decode only its
+  single bounded opening tag; quoted values are opaque, attribute names must
+  be unique, and self-closing, malformed or ambiguous markup remains null.
+  The slot is one of the fixed toast slots, the toast-root attribute fingerprint,
+  `dialog-popup`, `other`, or null. Ending means the receiving element's own
+  `data-ending-style` attribute is present; it says nothing about an ancestor
+  or why the toast remains. Inherited/accessor messages and live/revoked proxies
+  are refused without invoking their getters or traps. No message, HTML, ID,
+  input, style, URL or argument is retained. This optional projection adds no
+  DOM read, action, retry or deadline and cannot replace the original error,
+  existing observations or joined cleanup. It locates the driver's explicit
+  receiver, not a native timer, toast-lifecycle or click-time root cause.
+  Full Reload captures the initially imported primary project, thread and route
+  from public selected-card markup. The rail changes sidebar presentation only;
+  it cannot establish an active chat. After selecting Local, select the same
+  bound existing primary card only if its owned route is not already selected,
+  then verify that identity before composer/draft work and after replacement.
+  Capture the actual presence or absence of the primary session line; an empty
+  existing thread has no session or preview and legitimately omits that line.
+  Require the same public footprint throughout. Before an inactive-card click,
+  use the existing authenticated primary `/api/orchestration/snapshot` read to
+  prove exactly one live default thread matches the bound project/thread IDs.
+  The HTTP producer uses the declared read model through the shared Rust
+  serializers. Match project/thread `id` and thread `projectId`; require the
+  explicit `deletedAt`, `archivedAt` and `worktreePath` fields. The populated
+  cross-language HTTP fixture defines this public shape. Missing fields and
+  legacy persistence-row names refuse proof; add no compatibility aliases.
+  The owned fixture initializes Git on `main`. The active chat can synchronize
+  its default thread's initially null branch metadata from live Git. Admit only
+  null before that synchronization or exactly `main` afterward, with the same
+  captured project/thread IDs, default kind and null worktree path. Never infer
+  the permitted branch from the response or accept other non-null values.
+  Keep raw read values in the page. Its boolean verdict may carry
+  one closed witness from that same request: request/parse/list admission,
+  finite HTTP status and matching-row counts, and nullable live/default/
+  branch/worktree predicate flags. Retain that witness only in `failure.json`
+  at the exact `reload-primary-thread-proof` phase, and leave unavailable facts
+  null. Preserve `branchNull` and record `expectedBranchMatched` as a separate nullable
+  boolean for the fixture's `main` branch; neither field exposes the value.
+  Reproject own enumerable data and contain optional observation errors;
+  never retain response/input/identity/error/URL/token values or add a request.
+  This witness does not establish a past native cause. Missing, duplicated,
+  foreign, deleted, archived or failed proof still prevents the click. Refuse
+  missing/ambiguous/unbackfilled cards and changed identities; never create a
+  thread, fabricate a session, pick another card or mutate renderer stores.
+  Binding and snapshot values never enter retained evidence.
+  Reload diagnostics similarly identify workspace/primary selection, composer
+  readiness, the same-version connection transition, changed-version offer and
+  actual replacement document. They add only fixed phase markers: preserve all
+  public actions, clock/boot checks, negative observation windows, draft checks
+  and existing bounds. An incomplete phase is not proof of a reload defect.
+  At exactly `primary-import-composer`, the existing one failure sample may
+  retain `primaryImport` with only closed facts: safe owned page, input cardinality,
+  current value matching the expected owned path, actual owning form, submit
+  cardinality/disabledness, form absent/idle/pending/ambiguous and composer
+  cardinality. Missing, unsafe or malformed facts stay null. The private expected
+  path is passed only to that failure sample, compared locally and never retained;
+  credential/boot/foreign/query/hash contexts refuse. Exact own data, live/revoked
+  proxies, getters and coercive values are handled without exporting raw data.
+  Preserve the original input/send/click/composer waits and bounds, and all
+  non-primary failure sample arguments. These facts do not prove a submit event
+  or command outcome: an idle retained form with no form error can follow a
+  typed create/open failure reported as a toast. Absent form and composer presence
+  alone do not establish owned project identity. Do not infer a terminal fallback
+  or native cause; no native rerun, delay, retry or product repair follows from
+  modal presence alone.
   Only a push to `codex/qualify-release-ui` or a manual dispatch starts it; a push
   selects core, and manual dispatch offers core/full. There is no main-branch trigger.
   Neither selection installs software, supplies native host-toast evidence, or
   replaces the final integrated screenshot sweep.
 
+  Each capture's existing viewport witness also requires nonzero, nonhidden
+  fixed toast roots to fit within the viewport. This prevents accepting a host
+  row while a notification is partly outside the image during entry or exit.
+  Hidden or zero-area roots do not block capture. Use the same bounded screenshot
+  wait and original six-field receipt; add no sleep, notification mutation or
+  relaxed row, modal, identity, credential or image requirement. Source tests
+  establish admission behavior; new CI originals are required for visual approval.
+
   Run this workflow only after independent harness review and the separate
   browser-startup prerequisite. It builds the web source once, copies the guarded
   server/example outside Cargo output and records source/build hashes; it serves
-  those web assets with the existing preview configuration. Its shared Python
+  those web assets with the existing preview configuration. One immutable
+  preview server spans both themes; each theme still starts a fresh primary
+  backend, browser profile and driver. Do not stop and rebind the preview between
+  themes: terminating its launcher need not terminate its listening descendant.
+  Final owner and PID1 cleanup still join and verify the whole private scope.
+  Its shared Python
   owner admits only a disposable CI PID/network namespace, and its shared browser
-  owner enables no performance logging. Prepare the reviewed contained topology
+  owner enables no performance logging. Keep its private TMPDIR short: Chromium
+  adds a branded temporary subdirectory and Unix socket filename within the
+  platform pathname limit. The allocated scenario prefix plus random UUID stays
+  exclusive and `0700`; workflow run IDs belong in evidence/artifact names, not this
+  private root. Prepare the reviewed contained topology
   before any fixture, service or browser admission. Browser state before setup is
   unobserved (`before:null`); each created browser must pass one bounded actual
   online read. No post-launch network mutation, repair, sleep or retry is allowed.
@@ -605,6 +756,56 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   canonical input identities and matching core/full selection. An owner-shape
   refusal precedes all network reads/mutations; preserve that receipt and repair
   the handoff instead of bypassing its ownership checks.
+  The browser primary uses `localhost` for both its page and configured HTTP/WS
+  target. Its fake host alone opts into the fixed `http://localhost:4901` dev
+  origin on port `4887`, with the same dev profile selected by the grant command.
+  Provider-disable settings must cover that active `dev` state directory before
+  startup, and restarts reuse the configuration. Remote fake hosts remain in
+  normal `userdata` mode. Do not widen CORS, rewrite cookies or add a grant-only
+  dev URL to repair a pairing failure.
+  Pairing, import and theme setup have separate phases. A failure may retain a
+  bounded closed setup observation alongside the startup receipt: route/readiness
+  categories, control presence/disabled flags and a known pairing-error category.
+  Missing observations stay null; presence is not proof of authentication or
+  visibility. No input values, URLs, page/error text, credentials or network logs
+  are retained, and unavailable diagnostics cannot skip joined cleanup.
+  Success preparation also records fixed host-start, Add Server action/read,
+  project-import, draft, Settings and first-row-capture phases. These observers
+  add no UI action or wait and do not identify a native cause by themselves.
+  After that capture, fixed success markers distinguish the first card's
+  workspace/capture, row confirmation/idle proof/capture, each row or card
+  cancellation/request-count/draft proof, the row's return to the workspace,
+  and card confirmation/capture. A retained capture can prove an earlier
+  predicate passed even when an older failure phase remains. These markers
+  change attribution only; preserve actions, read order, budgets, capture
+  guards, original errors and the success/failure verdict.
+  Isolate optional preparation-observer exceptions so the original actions
+  continue; keep ordinary phase, UI/read and capture failures fail-closed.
+  Success-case removal records fixed Settings/menu/confirmation, row-absence,
+  child/tunnel cleanup and notification-list/visibility/click phases through the
+  existing observer. One existing bounded failure sample may retain a closed
+  `successRemoval` snapshot only for those phases on the exact owned origin and
+  Remote Servers route, with no query/hash or credential controls and the admitted
+  theme. It contains row/notification-close/visible-close/ending-toast count
+  categories and removal-dialog presence; missing or unsafe observations remain
+  unavailable. Ending-toast counts use distinct ending ancestors of the current
+  close controls. These current facts do not prove an earlier target disappeared
+  or identify the failed click. Keep the original failure and joined cleanup;
+  add no actions, waits, retries, forced clicks or changed notification lifetime.
+  Import diagnostics also retain the path control's disabled/busy flag and a
+  finite category for the form's existing validation messages. Missing forms are
+  unknown; other errors are unclassified. The path value and error text never
+  leave the page, and these failure-only reads do not resubmit the form.
+  Each action waits for its displayed target and the pinned WebDriverIO public
+  clickability check under the existing readiness bounds, then invokes the existing
+  public click command once. A displayed, enabled control may still be covered by a transient toast;
+  it must not be clicked through an overlay. A persistent obstruction fails before
+  dispatch, and a rejected click command is not retried by the qualifier. The pinned
+  driver's existing internal scroll/interception fallback is unchanged; this is
+  not a claim of one wire-level attempt. Keep toast
+  lifetime and modal behavior unchanged, with separate Dismiss and Check phases
+  for the final failure/retry flow. Do not force clicks, remove overlays, or close
+  notifications merely to make the test pass.
   Remote pairing uses the real Add Server
   flow through an owned loopback tunnel. The fresh-terminal setup uses genuine
   authenticated public RPC and a pinned owned executable; dialog counts and all
@@ -612,6 +813,64 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   creation. Manual CLI layouts qualify descriptor kind, visible instructions and
   actual clipboard contents; their install dispatch remains unobserved, and their
   instructions are never executed.
+  Manual cases wait for the visible instruction block's running-version marker
+  under the existing text-readiness bound before reading and validating its full
+  text. Keep all platform/command, row-versus-card, clipboard and absent-install
+  assertions. Record fixed per-kind setup/read/copy/capture phases so failures
+  do not collapse into one manual stage.
+  Manual row copying records displayed, clickable, click, and success-toast
+  phases immediately before those existing awaits, without another browser
+  read or action. Clipboard comparison remains a separate required step.
+  Manual removal keeps its per-kind `remove-host` entry phase and forwards the
+  existing removal observer as `manual-archive/package/unknown-remove-<operation>`.
+  Those fixed phases identify the existing Settings/menu/confirmation, row-absence,
+  child/tunnel joins and toast boundaries without another read, action or budget.
+  The retry/dismiss flow also records the six existing import-helper boundaries as
+  `failure-primary-import-workspace/menu/path-mode/path-input/submit/composer`.
+  These fixed phases reuse the helper's optional observer; they add no browser
+  read, action, wait or budget. After import succeeds, restore the original
+  `failure-retry-dismiss` phase. A last marker identifies the attempted boundary,
+  not a unique timeout cause or evidence that the operation completed.
+  At exactly the per-kind `toast-list`, `toast-displayed`, `toast-clickable`, or
+  `toast-click` removal phase, the same existing bounded failure sample may retain
+  `manualRemoval` with the six closed removal-snapshot fields. Compare only the
+  fixed owned manual row label locally on the exact Remote Servers origin, route
+  and theme, with no query/hash or credential controls. Missing, unsafe, malformed,
+  accessor or proxy-backed observations remain null. Failure of this optional
+  manual snapshot preserves the other existing sample fields. Visible-close counts
+  describe the existing current box/style checks; they do not substitute for the
+  pinned SDK's visibility or clickability checks. A last visibility marker can also
+  precede an owner failure after earlier controls remained visible and unclickable.
+  These facts do not identify a failed operation or prove earlier absence. Preserve
+  the original actions, owner loop, error, budgets, verdict and joined cleanup;
+  add no requests, waits, retries or notification recovery.
+  A failure receipt may contain only an
+  allowlisted manual assertion code registered by that controller's own check;
+  errors from the browser, arbitrary check strings, exception text and copied
+  commands must never supply that field. Missing ownership remains null.
+  Toast removal additionally records fixed recognition and existing recheck phases:
+  message inspection/unavailable/unrecognized/matched, fresh-list lookup, visibility
+  read, visible-replacement refusal, or confirmed-empty completion. These markers
+  add no lookup, request, retry, deadline or recovery. A later empty snapshot cannot
+  prove the earlier recheck succeeded; preserve the original click error on refusal.
+  At exactly `success-remove-toast-click-unrecognized`, the existing failure receipt
+  may include `toastErrorSignature` associated with that same thrown error object.
+  The same owned signature is admitted at exactly
+  `manual-archive-remove-toast-click-unrecognized`,
+  `manual-package-remove-toast-click-unrecognized`, or
+  `manual-unknown-remove-toast-click-unrecognized`. Retrieval uses the existing
+  error-keyed WeakMap; it adds no message inspection or browser observation.
+  It contains only wrapper/canonical-message family, exact click-POST suffix,
+  argument-suffix shape, a coarse length bucket, exact toast-selector presence and
+  an own-data name family. Three additional closed fields identify a fixed SDK
+  template prefix, an allowlisted implicit command, and a recognized wait condition.
+  These categories describe the message shape; they do not identify its native cause
+  or admit recovery. Inspect at most 4096 message units; longer suffix/selector and
+  SDK-category facts remain null. Missing/accessor/proxy metadata stays unavailable, and no raw
+  message, name, selector, ID, URL or arguments leave the qualifier. Matched errors
+  and unrelated phases/errors supply no signature. This failure-only classification
+  adds no UI read, request, write, action, timer or recovery; it qualifies string
+  shape, never the native cause or a successful absence recheck.
 
   For the full Reload negative control, observe the primary rail connected,
   then disconnected and connected again around the same-version restart, with a

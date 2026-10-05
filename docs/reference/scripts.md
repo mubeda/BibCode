@@ -210,6 +210,14 @@ performing a production install.
   `bibcode pairing offer --base-dir <base-dir> --endpoint http://127.0.0.1:<port> --reach this-computer --json`;
   the example prints only a `started` JSON event with `port`, `serverVersion`,
   and `bootId`, without pairing credentials.
+  The temporary browser UI qualifier alone selects the primary dev profile with
+  `<base-dir> 4887 <server-version> <label> --dev-url http://localhost:4901`.
+  This exact optional origin is the only accepted dev URL; other origins, ports
+  or extra arguments are refused. Provider-disable settings use the selected
+  `ServerConfig.state_dir()` before the first start, and restarts retain that
+  configuration. Its primary grant must use the same `--dev-url` and base root.
+  Ordinary/default and remote fake hosts keep their `userdata` profile. This
+  opt-in changes no production authentication or CORS policy.
 - `bash scripts/test-linux-git-compatibility.sh TEST_BINARY [IMAGE ...]`: run the
   compiled Linux Git-runner regression in disposable Debian, Ubuntu, Fedora,
   and Arch containers. Build the executable on the Ubuntu 22.04 glibc baseline;

@@ -37,7 +37,7 @@ class FixturePathBudgetTests(unittest.TestCase):
     def test_actual_roots_fit_branded_and_unbranded_chromium_unix_socket_paths(self):
         # Chromium branch 8037 FormatTemporaryFileName + SingletonSocket; Linux sun_path[108].
         # Portable SetupSockAddr requires byte length below 108, including room for NUL.
-        for scenario in ['remote-updates-ui', 'chat-upload', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings']:
+        for scenario in ['remote-updates-ui', 'chat-upload', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project']:
             for run_id in ['37096649000', '9' * 20, '9' * 128]:
                 fixture, _ = self.actual_paths(scenario, run_id)
                 for brand in ['com.google.Chrome', 'org.chromium.Chromium']:
@@ -46,7 +46,7 @@ class FixturePathBudgetTests(unittest.TestCase):
                         self.assertLess(len(str(socket).encode('utf8')), 108)
 
     def test_only_private_root_omits_run_id_while_evidence_keeps_it(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project']:
             selection = qualification.scenario_settings(scenario)
             roots = []
             for run_id in ['37096649000', '9' * 128]:

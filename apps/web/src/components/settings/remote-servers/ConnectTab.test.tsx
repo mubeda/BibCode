@@ -3,6 +3,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Test-only read of the actual QA capture reader.
+import * as NodeFS from "node:fs";
+import * as NodeVM from "node:vm";
+import * as NodeModule from "node:module";
+import { remoteUpdateStatusRefreshIntervalMs } from "@bibcode/client-runtime/state/remoteUpdates";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
@@ -2064,6 +2069,105 @@ describe("Remote Servers tabs", () => {
   });
 
   describe("Check for Server Updates placement", () => {
+    it.each(["light", "dark"])(
+      "keeps the actual initial-row reader eligible across a pending read and remount in %s",
+      async (theme) => {
+        stubBrowserWindow();
+        h.hasCloudConfig = false;
+        const id = EnvironmentId.make("owned-initial-row");
+        const label = `QA Success ${theme}`;
+        const snapshot = {
+          ...UP_TO_DATE_SNAPSHOT,
+          serverVersion: "9.9.0",
+          latestVersion: "9.9.1",
+          state: "update-available",
+        } as const;
+        h.environments = [
+          environment({
+            id,
+            label,
+            connection: { phase: "connected" },
+            serverConfig: updateCapableConfig(),
+          }),
+        ];
+        const source = NodeFS.readFileSync(
+          new URL("../../../../../desktop/e2e/qualify-remote-updates.ts", import.meta.url),
+          "utf8",
+        );
+        const start = source.indexOf("(input) => {", source.indexOf("async function capture("));
+        const end = source.indexOf("\n          },\n          {", start);
+        expect(start).toBeGreaterThan(0);
+        expect(end).toBeGreaterThan(start);
+        const dom = domWindow!;
+        document.documentElement.classList.toggle("dark", theme === "dark");
+        const selected = document.createElement("button");
+        selected.setAttribute("role", "radio");
+        selected.setAttribute("aria-label", label);
+        selected.setAttribute("aria-checked", "true");
+        document.body.append(selected);
+        expect(remoteUpdateStatusRefreshIntervalMs(snapshot)).toBeNull();
+        for (const pending of [false, true]) {
+          h.remoteUpdateQueries.set(id, { ...settledUpdateQuery(snapshot), isPending: pending });
+          const container = await mountConnections(<ConnectTab />);
+          const target = [...container.querySelectorAll("h3")].find(
+            (heading) => heading.textContent === label,
+          )?.parentElement?.parentElement?.parentElement;
+          expect(target).toBeDefined();
+          // HappyDOM has no XPath API. Resolve only the actual caller's fixed heading/ancestor path.
+          const selector = `//h3[normalize-space()="${label}"]/../../..`;
+          Object.defineProperty(document, "evaluate", {
+            configurable: true,
+            value: (path: string) => {
+              expect(path).toBe(selector);
+              return { singleNodeValue: target };
+            },
+          });
+          // Ideal geometry tests reader semantics only; native XPath/layout/hit testing stays unqualified.
+          Object.defineProperty(target, "getBoundingClientRect", {
+            value: () => new dom.DOMRect(40, 40, 600, 160),
+          });
+          Object.defineProperty(document, "elementFromPoint", {
+            configurable: true,
+            value: () => target,
+          });
+          const read = NodeVM.runInNewContext(
+            "(" + NodeModule.stripTypeScriptTypes(source.slice(start, end) + "\n}") + ")",
+            {
+              document,
+              HTMLElement: dom.HTMLElement,
+              XPathResult: { FIRST_ORDERED_NODE_TYPE: 9 },
+              location: dom.location,
+              innerWidth: 1280,
+              innerHeight: 960,
+              getComputedStyle: dom.getComputedStyle.bind(dom),
+            },
+          );
+          expect(
+            read({
+              selector,
+              label,
+              expected: "Update to v9.9.1…",
+              theme,
+              origin: dom.location.origin,
+              primary: false,
+            }),
+          ).toEqual({
+            themeMatched: true,
+            selectedMatched: true,
+            expectedTextMatched: true,
+            targetInView: true,
+            credentialAbsent: true,
+            bootShellAbsent: true,
+          });
+          const tree = mountedTrees.pop()!;
+          await act(async () => tree.root.unmount());
+          tree.container.remove();
+        }
+        expect(h.commands.remoteUpdateInstall).not.toHaveBeenCalled();
+        expect(h.requestRemoteUpdate).not.toHaveBeenCalled();
+      },
+    );
+
     it("requests confirmation instead of directly installing from Settings", async () => {
       stubBrowserWindow();
       h.hasCloudConfig = false;

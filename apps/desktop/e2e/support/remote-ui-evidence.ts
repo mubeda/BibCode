@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Inspect original CI screenshots without editing them.
 import * as NodeCrypto from "node:crypto";
 import * as NodeZlib from "node:zlib";
+import * as NodeUtil from "node:util";
 
 export const remoteUiThemes = ["light", "dark"] as const;
 export type RemoteUiTheme = (typeof remoteUiThemes)[number];
@@ -30,6 +31,534 @@ export const remoteUiScenes = [
   "reload-complete",
 ] as const;
 export type RemoteUiScene = (typeof remoteUiScenes)[number];
+
+export interface RemoteUiCheckAgainInterception {
+  readonly receiverSlot:
+    | "toast-root"
+    | "toast-viewport"
+    | "toast-close"
+    | "toast-title"
+    | "toast-description"
+    | "toast-action"
+    | "dialog-popup"
+    | "other"
+    | null;
+  /** The receiving element's own attribute only; never its ancestors' state. */
+  readonly receiverEndingStyle: boolean;
+}
+
+/** Closed receiving-tag facts from the original error; never HTML, an action or a cause verdict. */
+export function projectRemoteUiCheckAgainInterception(
+  error: unknown,
+): RemoteUiCheckAgainInterception | null {
+  try {
+    if (
+      error === null ||
+      typeof error !== "object" ||
+      NodeUtil.types.isProxy(error) ||
+      Array.isArray(error)
+    )
+      return null;
+    const descriptor = Object.getOwnPropertyDescriptor(error, "message");
+    const message = descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : null;
+    if (typeof message !== "string" || message.length > 4096) return null;
+    const marker = "other element would receive the click:";
+    const lower = message.toLowerCase();
+    const index = lower.indexOf(marker);
+    if (index < 0 || lower.indexOf(marker, index + marker.length) >= 0) return null;
+    const prefix = message.slice(0, index);
+    if (
+      !/^(?:WebDriverError: )?element click intercepted\b/i.test(prefix) &&
+      !/^Element\b[\s\S]* is not clickable at point\b/i.test(prefix)
+    )
+      return null;
+    // A marker inside the target's quoted markup is not the driver's receiver clause.
+    let inTag = false;
+    let attributeQuote: string | null = null;
+    for (const character of prefix) {
+      if (!inTag) {
+        if (character === "<") inTag = true;
+      } else if (attributeQuote !== null) {
+        if (character === attributeQuote) attributeQuote = null;
+      } else if (character === '\"' || character === "'") {
+        attributeQuote = character;
+      } else if (character === ">") {
+        inTag = false;
+      }
+    }
+    if (inTag) return null;
+    const fragment = message.slice(index + marker.length).trimStart();
+    const name = /^<([a-z][a-z0-9:-]{0,63})/i.exec(fragment);
+    if (!name) return null;
+    const tag = name[1]!.toLowerCase();
+    const attributes = new Map<string, string | null>();
+    let cursor = name[0].length;
+    let complete = false;
+    while (cursor < fragment.length) {
+      const beforeWhitespace = cursor;
+      while (/[\t\n\f\r ]/.test(fragment[cursor] ?? "")) cursor++;
+      if (fragment[cursor] === ">") {
+        cursor++;
+        complete = true;
+        break;
+      }
+      if (fragment[cursor] === "/") return null;
+      if (cursor === beforeWhitespace || attributes.size >= 64) return null;
+      const attribute = /^[a-z_:][a-z0-9_.:-]{0,127}/i.exec(fragment.slice(cursor));
+      if (!attribute) return null;
+      const key = attribute[0].toLowerCase();
+      if (attributes.has(key)) return null;
+      cursor += attribute[0].length;
+      const beforeEqualsWhitespace = cursor;
+      while (/[\t\n\f\r ]/.test(fragment[cursor] ?? "")) cursor++;
+      let value: string | null = null;
+      if (fragment[cursor] === "=") {
+        cursor++;
+        while (/[\t\n\f\r ]/.test(fragment[cursor] ?? "")) cursor++;
+        const quote = fragment[cursor];
+        if (quote !== '\"' && quote !== "'") return null;
+        const end = fragment.indexOf(quote, cursor + 1);
+        if (end < 0) return null;
+        value = fragment.slice(cursor + 1, end);
+        cursor = end + 1;
+      } else {
+        cursor = beforeEqualsWhitespace;
+      }
+      attributes.set(key, value);
+    }
+    if (!complete) return null;
+    let remainder = fragment.slice(cursor).trimStart();
+    const closing = new RegExp("^</" + tag + "\\s*>", "i").exec(remainder);
+    if (closing) remainder = remainder.slice(closing[0].length);
+    if (/[<>]/.test(remainder)) return null;
+    const slot = attributes.get("data-slot");
+    let receiverSlot: RemoteUiCheckAgainInterception["receiverSlot"] =
+      slot === undefined ? null : "other";
+    if (
+      slot === "toast-viewport" ||
+      slot === "toast-close" ||
+      slot === "toast-title" ||
+      slot === "toast-description" ||
+      slot === "toast-action" ||
+      slot === "dialog-popup"
+    ) {
+      receiverSlot = slot;
+    } else if (
+      slot === undefined &&
+      tag === "div" &&
+      ["dialog", "alertdialog"].includes(attributes.get("role") ?? "") &&
+      [
+        "top-left",
+        "top-center",
+        "top-right",
+        "bottom-left",
+        "bottom-center",
+        "bottom-right",
+      ].includes(attributes.get("data-position") ?? "") &&
+      /(?:^|;)\s*--toast-index\s*:\s*\d{1,3}(?=;|$)/.test(attributes.get("style") ?? "")
+    ) {
+      receiverSlot = "toast-root";
+    }
+    return Object.freeze({
+      receiverSlot,
+      receiverEndingStyle: attributes.has("data-ending-style"),
+    });
+  } catch {
+    return null;
+  }
+}
+
+export interface RemoteUiToastErrorSignature {
+  readonly wrapperPrefix: boolean;
+  readonly messageFamily: "missing" | "stale" | "other";
+  readonly clickPostSuffix: boolean | null;
+  readonly argumentsSuffix: boolean | null;
+  readonly lengthBucket: "0-1024" | "1025-2048" | "2049-4096" | "over-4096";
+  readonly exactToastSelectorPresent: boolean | null;
+  readonly nameFamily: "missing" | "stale" | "other" | "unavailable";
+  readonly sdkTemplate:
+    | "protocol"
+    | "implicit"
+    | "wait"
+    | "wait-wrapper"
+    | "execute"
+    | "lookup"
+    | "interactable"
+    | "other"
+    | null;
+  readonly sdkCommand:
+    | "click"
+    | "scrollIntoView"
+    | "waitForExist"
+    | "waitForDisplayed"
+    | "waitForClickable"
+    | "getElement"
+    | "getHTML"
+    | "isDisplayed"
+    | "isClickable"
+    | "$"
+    | "$$"
+    | "other"
+    | null;
+  readonly sdkCondition: "existing" | "displayed" | "clickable" | "enabled" | null;
+}
+
+/** Finite string-shape facts from an already-read own message; never a recovery verdict. */
+export function projectRemoteUiToastErrorSignature(
+  message: unknown,
+  error?: unknown,
+): RemoteUiToastErrorSignature | null {
+  if (typeof message !== "string") return null;
+  const wrapperPrefix = message.startsWith("WebDriverError: ");
+  const prefix = message.slice(wrapperPrefix ? "WebDriverError: ".length : 0, 80);
+  const boundary = wrapperPrefix ? '(?::| when running \\"|$)' : "(?::|$)";
+  const messageFamily = new RegExp("^no such element" + boundary).test(prefix)
+    ? "missing"
+    : new RegExp("^stale element reference" + boundary).test(prefix)
+      ? "stale"
+      : "other";
+  let nameFamily: RemoteUiToastErrorSignature["nameFamily"] = "unavailable";
+  try {
+    const descriptor =
+      error !== null && typeof error === "object"
+        ? Object.getOwnPropertyDescriptor(error, "name")
+        : undefined;
+    const name = descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : null;
+    if (typeof name === "string")
+      nameFamily =
+        name === "no such element"
+          ? "missing"
+          : name === "stale element reference"
+            ? "stale"
+            : "other";
+  } catch {
+    // Unreadable optional metadata cannot replace the original failure.
+  }
+  const bounded = message.length <= 4096;
+  // Fixed SDK prefixes describe string shape only. They never admit a failed click.
+  const sdkTemplate: RemoteUiToastErrorSignature["sdkTemplate"] = !bounded
+    ? null
+    : wrapperPrefix
+      ? "protocol"
+      : message.startsWith("Can't call ")
+        ? "implicit"
+        : message.startsWith('element ("')
+          ? "wait"
+          : message.startsWith("waitUntil condition ")
+            ? "wait-wrapper"
+            : message.startsWith('The element with selector "')
+              ? "execute"
+              : message.startsWith("Couldn't find element with selector \"")
+                ? "lookup"
+                : message.startsWith("Element ")
+                  ? "interactable"
+                  : "other";
+  const command =
+    sdkTemplate === "implicit" ? /^Can't call ([A-Za-z$]{1,32}) on /.exec(message)?.[1] : null;
+  const sdkCommand: RemoteUiToastErrorSignature["sdkCommand"] =
+    sdkTemplate !== "implicit"
+      ? null
+      : [
+            "click",
+            "scrollIntoView",
+            "waitForExist",
+            "waitForDisplayed",
+            "waitForClickable",
+            "getElement",
+            "getHTML",
+            "isDisplayed",
+            "isClickable",
+            "$",
+            "$$",
+          ].includes(command ?? "")
+        ? (command as Exclude<RemoteUiToastErrorSignature["sdkCommand"], "other" | null>)
+        : "other";
+  const condition =
+    sdkTemplate === "wait"
+      ? /^element \("[\s\S]*"\) still (?:not )?(existing|displayed|clickable|enabled)(?: within viewport)? after \d{1,9}ms$/.exec(
+          message,
+        )?.[1]
+      : null;
+  const sdkCondition: RemoteUiToastErrorSignature["sdkCondition"] =
+    condition === "existing" ||
+    condition === "displayed" ||
+    condition === "clickable" ||
+    condition === "enabled"
+      ? condition
+      : null;
+  return Object.freeze({
+    wrapperPrefix,
+    messageFamily,
+    clickPostSuffix: bounded
+      ? / when running "element\/[A-Za-z0-9._:-]{1,256}\/click" with method "POST"$/.test(message)
+      : null,
+    argumentsSuffix: bounded
+      ? / when running "[^\r\n"]{1,1024}" with method "[A-Z]{1,16}" and args [\s\S]+$/.test(message)
+      : null,
+    lengthBucket:
+      message.length <= 1024
+        ? "0-1024"
+        : message.length <= 2048
+          ? "1025-2048"
+          : bounded
+            ? "2049-4096"
+            : "over-4096",
+    exactToastSelectorPresent: bounded ? message.includes('button[data-slot="toast-close"]') : null,
+    nameFamily,
+    sdkTemplate,
+    sdkCommand,
+    sdkCondition,
+  });
+}
+
+/** One current removal snapshot after failure; never proof of an earlier control's absence. */
+export function projectRemoteUiSuccessRemovalObservation(input: unknown) {
+  if (input === null || typeof input !== "object") return null;
+  const row: Record<string, unknown> = {};
+  try {
+    if (Array.isArray(input)) return null;
+    for (const key of [
+      "safeLocation",
+      "rowCount",
+      "toastCloseCount",
+      "visibleToastCloseCount",
+      "endingToastCount",
+      "removalDialogPresent",
+    ]) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (descriptor === undefined) continue;
+      if (!descriptor.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      row[key] = descriptor.value;
+    }
+  } catch {
+    return null;
+  }
+  const safeLocation = typeof row.safeLocation === "boolean" ? row.safeLocation : null;
+  const source: Record<string, unknown> = safeLocation === true ? row : {};
+  const count = (key: string) =>
+    typeof source[key] === "string" && ["none", "one", "multiple"].includes(source[key])
+      ? source[key]
+      : null;
+  return {
+    safeLocation,
+    rowCount: count("rowCount"),
+    toastCloseCount: count("toastCloseCount"),
+    visibleToastCloseCount: count("visibleToastCloseCount"),
+    endingToastCount: count("endingToastCount"),
+    removalDialogPresent:
+      typeof source.removalDialogPresent === "boolean" ? source.removalDialogPresent : null,
+  };
+}
+
+/** Exact current manual-removal facts; never proof of an earlier close or SDK operation. */
+export function projectRemoteUiManualRemovalObservation(input: unknown) {
+  try {
+    if (
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      NodeUtil.types.isProxy(input)
+    )
+      return null;
+    const keys = [
+      "safeLocation",
+      "rowCount",
+      "toastCloseCount",
+      "visibleToastCloseCount",
+      "endingToastCount",
+      "removalDialogPresent",
+    ];
+    const own = Reflect.ownKeys(input);
+    if (
+      own.length !== keys.length ||
+      !own.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const row: Record<string, unknown> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      row[key] = descriptor.value;
+    }
+    const facts = projectRemoteUiSuccessRemovalObservation(row);
+    if (
+      !facts ||
+      facts.safeLocation !== true ||
+      Object.values(facts).some((value) => value === null)
+    )
+      return null;
+    return Object.freeze(facts);
+  } catch {
+    return null;
+  }
+}
+
+/** Closed facts from one current row after failure; never proof of the earlier click. */
+export function projectRemoteUiCheckAgainObservation(input: unknown) {
+  if (input === null || typeof input !== "object") return null;
+  const row: Record<string, unknown> = {};
+  try {
+    if (Array.isArray(input)) return null;
+    for (const key of [
+      "safeLocation",
+      "rowCount",
+      "controlCount",
+      "controlLabel",
+      "controlVisible",
+      "controlDisabled",
+      "hitTarget",
+      "updateActionPresent",
+      "badgeVariant",
+      "dismissPresent",
+    ]) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (descriptor === undefined) continue;
+      if (!descriptor.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      row[key] = descriptor.value;
+    }
+  } catch {
+    return null;
+  }
+  const safeLocation = typeof row.safeLocation === "boolean" ? row.safeLocation : null;
+  const source: Record<string, unknown> = safeLocation === true ? row : {};
+  const choice = (key: string, values: readonly string[]) =>
+    typeof source[key] === "string" && values.includes(source[key]) ? source[key] : null;
+  const rowCount = choice("rowCount", ["none", "one", "multiple"]);
+  const fields: Record<string, unknown> = rowCount === "one" ? source : {};
+  const flag = (key: string) => (typeof fields[key] === "boolean" ? fields[key] : null);
+  const enumField = (key: string, values: readonly string[]) =>
+    typeof fields[key] === "string" && values.includes(fields[key]) ? fields[key] : null;
+  const controlCount = enumField("controlCount", ["none", "one", "multiple"]);
+  return {
+    safeLocation,
+    rowCount,
+    controlCount,
+    controlLabel:
+      controlCount === "one"
+        ? enumField("controlLabel", ["check", "check-again", "checking"])
+        : null,
+    controlVisible: controlCount === "one" ? flag("controlVisible") : null,
+    controlDisabled: controlCount === "one" ? flag("controlDisabled") : null,
+    hitTarget:
+      controlCount === "one"
+        ? enumField("hitTarget", ["target", "toast", "dialog", "other", "none", "outside-viewport"])
+        : null,
+    updateActionPresent: flag("updateActionPresent"),
+    badgeVariant: enumField("badgeVariant", [
+      "checking",
+      "not-checked",
+      "unreachable",
+      "check-failed",
+      "up-to-date",
+      "update-available",
+      "busy",
+      "manual",
+      "error",
+    ]),
+    dismissPresent: flag("dismissPresent"),
+  };
+}
+
+/** Exact own-data primary import failure facts; private form values never enter receipts. */
+export function projectRemoteUiPrimaryImportObservation(input: unknown) {
+  try {
+    if (
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      NodeUtil.types.isProxy(input)
+    )
+      return null;
+    const keys = [
+      "safePage",
+      "pathCount",
+      "expectedPathMatched",
+      "formUnique",
+      "submitCount",
+      "submitDisabled",
+      "formState",
+      "composerCount",
+    ];
+    const own = Reflect.ownKeys(input);
+    if (
+      own.length !== keys.length ||
+      !own.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const row: Record<string, unknown> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      row[key] = descriptor.value;
+    }
+    const choice = (key: string, values: readonly string[]) => {
+      const value = row[key];
+      return typeof value === "string" && values.includes(value);
+    };
+    if (
+      row.safePage !== true ||
+      typeof row.formUnique !== "boolean" ||
+      !["pathCount", "submitCount", "composerCount"].every((key) =>
+        choice(key, ["none", "one", "multiple"]),
+      ) ||
+      !choice("formState", ["absent", "idle", "pending", "ambiguous"]) ||
+      !(row.expectedPathMatched === null || typeof row.expectedPathMatched === "boolean") ||
+      !(row.submitDisabled === null || typeof row.submitDisabled === "boolean")
+    )
+      return null;
+    if (
+      (row.pathCount !== "one" &&
+        (row.expectedPathMatched !== null ||
+          row.formUnique !== false ||
+          row.submitCount !== "none" ||
+          row.submitDisabled !== null)) ||
+      (row.submitCount !== "one" && row.submitDisabled !== null) ||
+      (row.pathCount === "none" ? row.formState !== "absent" : row.formState === "absent") ||
+      ((row.formState === "idle" || row.formState === "pending") && row.formUnique !== true)
+    )
+      return null;
+    return Object.freeze(row);
+  } catch {
+    return null;
+  }
+}
+
+/** Closed, presence-only failure facts. Missing/invalid observations stay unavailable. */
+export function projectRemoteUiSetupObservation(input: unknown) {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+  const row = input as Record<string, unknown>;
+  const choice = (key: string, values: readonly string[]) =>
+    typeof row[key] === "string" && values.includes(row[key]) ? row[key] : null;
+  const flag = (key: string) => (typeof row[key] === "boolean" ? row[key] : null);
+  return {
+    route: choice("route", ["pair", "settings", "other"]),
+    readyState: choice("readyState", ["loading", "interactive", "complete"]),
+    tokenPresent: flag("tokenPresent"),
+    submitPresent: flag("submitPresent"),
+    submitDisabled: flag("submitDisabled"),
+    sidebarPresent: flag("sidebarPresent"),
+    importPathPresent: flag("importPathPresent"),
+    importBusy: flag("importBusy"),
+    importError: choice("importError", [
+      "none",
+      "path-required",
+      "host-loading",
+      "unsupported-windows",
+      "path-relative",
+      "unknown",
+    ]),
+    themeControlPresent: flag("themeControlPresent"),
+    pairingPendingPresent: flag("pairingPendingPresent"),
+    pairingError: choice("pairingError", [
+      "none",
+      "credential-required",
+      "credential-rejected",
+      "session-timeout",
+      "request-failed",
+      "unknown",
+    ]),
+  };
+}
 
 export function remoteUiPlan(input: string | undefined) {
   const selection = input ?? "core";
