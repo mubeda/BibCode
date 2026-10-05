@@ -470,7 +470,7 @@ export function readGitProjectVisualWitness(
     target = popup;
     facts = {
       breadcrumbs: inView(popup?.querySelector('[aria-label="Directory breadcrumbs"]') ?? null),
-      folderSelection: inView(button(popup, "Select folder")),
+      folderSelection: inView(button(popup, "Open project")),
       newFolder: inView(popup?.querySelector('button[aria-label="New folder"]') ?? null),
       hostContext:
         /Open project folder on .+/.test(text(popup)) &&

@@ -462,6 +462,7 @@ it("runs the actual QA directory path through public browser controls and instal
       directory: requested + "/nested",
     });
   expect(observe()?.hostContext).toBe(true);
+  expect(observe()?.folderSelection).toBe(true);
   expect(observe()?.selectedMatched).toBe(false);
   const folder = Array.from(
     document.querySelectorAll<HTMLButtonElement>('button[aria-label="Open nested"]'),

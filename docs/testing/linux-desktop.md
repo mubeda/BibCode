@@ -1217,6 +1217,9 @@ state or screenshot evidence. That reader requires the unique folder-row button
 inside the current Add Project dialog, identified by its existing direct
 `data-directory-folder-icon` child. The current directory's same-label breadcrumb
 is a distinct public control; it cannot substitute for the required child folder.
+The Add Project browser's confirmation action is `Open project`; require that
+actual control rather than the standalone directory browser's default
+`Select folder` caption. Preserve its visibility and geometry requirements.
 Missing, hidden, clipped, duplicate or outside-dialog folder rows refuse the
 unchanged path, geometry, context and screenshot fences.
 
