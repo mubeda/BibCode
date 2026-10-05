@@ -1,3 +1,9 @@
+import {
+  runWorkspaceSubstateBatch,
+  captureWorkspaceSubstate,
+  validateWorkspaceSubstateJoins,
+  workspaceSubstates,
+} from "./support/release-visual-workspace-substates.ts";
 import { runCoreImageDiffOriginal } from "./support/release-visual-core-image.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Disposable CI browser qualifier owns fixture paths.
 // @effect-diagnostics globalFetch:off - Only the owned loopback CLI is probed.
@@ -445,6 +451,7 @@ export function deliveryConfiguration(
       "release-visual-settings",
       "release-visual-git-project",
       "release-visual-cursor-question",
+      "release-visual-workspace-substates",
     ].includes(selection) ||
     environment.CI !== "true" ||
     !/^[0-9a-f]{40}$/.test(environment.BIBCODE_UPLOAD_SOURCE ?? "") ||
@@ -463,7 +470,8 @@ export function deliveryConfiguration(
       | "release-visual-core"
       | "release-visual-settings"
       | "release-visual-git-project"
-      | "release-visual-cursor-question";
+      | "release-visual-cursor-question"
+      | "release-visual-workspace-substates";
     fixture: string;
     evidence: string;
     binary: string;
@@ -1121,7 +1129,10 @@ export async function runDeliveryRetryQualification() {
           : prepareDesktopUiTestContext(env);
       const control = NodePath.join(runRoot, "delivery-retry");
       if (config.selection === "delivery-retry-ui") NodeFS.mkdirSync(control, { mode: 0o700 });
-      if (config.selection === "release-visual-core") {
+      if (
+        config.selection === "release-visual-core" ||
+        config.selection === "release-visual-workspace-substates"
+      ) {
         // This selector witnesses a genuine installation without an editor.
         // Cursor's editor launcher is distinct from the cursor-agent provider.
         NodeFS.unlinkSync(NodePath.join(context.shimDirectory, "cursor"));
@@ -1376,7 +1387,10 @@ export async function runDeliveryRetryQualification() {
         git: NodePath.join(config.fixture, "bin", "git"),
         branch: workspace.branch,
       };
-      if (config.selection === "release-visual-core") {
+      if (
+        config.selection === "release-visual-core" ||
+        config.selection === "release-visual-workspace-substates"
+      ) {
         step("visual-fixture-managed");
         check(prepareVisualWorktree(visualInput).path === workspace.path);
         step("visual-viewport");
@@ -1431,7 +1445,145 @@ export async function runDeliveryRetryQualification() {
       );
       await browser.$(`${form} button[aria-label="Send message"]`).waitForDisplayed();
       check(!(await browser.$(surface).getText()).includes(newConversationNotice));
-      if (config.selection === "release-visual-core") {
+      if (config.selection === "release-visual-workspace-substates") {
+        step("visual-workspace-substates-open");
+        await type("Owned visual review draft");
+        const descriptor = await readOwnedGitProjectDescriptor();
+        check(
+          descriptor.environmentId === "local" &&
+            !!descriptor.bootId &&
+            !!descriptor.storageInstanceId,
+        );
+        const readSnapshot = createOwnedGitProjectSnapshotReader(() =>
+          owner.json(
+            config.binary,
+            ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
+            childEnv,
+          ),
+        );
+        const initial = await readSnapshot();
+        const threads = initial.threads.filter(
+          (thread) => thread.id === workspace.threadId && thread.deletedAt === null,
+        );
+        check(threads.length === 1);
+        const boundThread = threads[0]!;
+        check(
+          boundThread.kind === "workspace" &&
+            boundThread.branch === workspace.branch &&
+            boundThread.worktreePath === workspace.path,
+        );
+        const projects = initial.projects.filter(
+          (project) => project.id === boundThread.projectId && project.deletedAt === null,
+        );
+        check(projects.length === 1 && projects[0]!.workspaceRoot === context.projectPath);
+        const binding = Object.freeze({
+          origin,
+          theme,
+          threadId: workspace.threadId,
+          projectId: boundThread.projectId,
+          branch: workspace.branch,
+        });
+        const verifyManaged = async () => {
+          const currentDescriptor = await readOwnedGitProjectDescriptor();
+          check(
+            currentDescriptor.environmentId === descriptor.environmentId &&
+              currentDescriptor.bootId === descriptor.bootId &&
+              currentDescriptor.storageInstanceId === descriptor.storageInstanceId,
+          );
+          check(
+            JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
+              JSON.stringify({
+                path: workspace.path,
+                branch: workspace.branch,
+                commonDirectory: workspace.commonDirectory,
+              }),
+          );
+          const snapshot = await readSnapshot();
+          const currentThreads = snapshot.threads.filter(
+            (thread) => thread.id === binding.threadId && thread.deletedAt === null,
+          );
+          const currentProjects = snapshot.projects.filter(
+            (project) => project.id === binding.projectId && project.deletedAt === null,
+          );
+          check(
+            currentThreads.length === 1 &&
+              currentProjects.length === 1 &&
+              currentProjects[0]!.workspaceRoot === context.projectPath &&
+              currentThreads[0]!.kind === "workspace" &&
+              currentThreads[0]!.projectId === binding.projectId &&
+              currentThreads[0]!.branch === binding.branch &&
+              currentThreads[0]!.worktreePath === workspace.path,
+          );
+          // Before choosing Worktree, bind the public project route; the strict
+          // substate reader separately requires the chosen exact branch at admission/capture.
+          check(
+            await bounded(
+              b().execute((input) => {
+                if (
+                  location.origin !== input.origin ||
+                  location.search ||
+                  location.hash ||
+                  document.documentElement.classList.contains("dark") !==
+                    (input.theme === "dark") ||
+                  document.querySelector(
+                    '[data-testid="environment-rail-local"][aria-checked="true"] [data-status="connected"]',
+                  ) === null ||
+                  document.querySelector(
+                    '#pairing-token,input[type="password"],input[autocomplete="one-time-code"],textarea[placeholder^="bibcode://pair"]',
+                  ) !== null ||
+                  document.getElementById("boot-shell") !== null ||
+                  document.querySelector("vite-error-overlay") !== null
+                )
+                  return false;
+                if (location.pathname === "/local/" + input.threadId) {
+                  return (
+                    document.querySelectorAll(
+                      '[data-testid="thread-card-button-' +
+                        input.threadId +
+                        '"][aria-current="page"]',
+                    ).length === 1
+                  );
+                }
+                const headers = document.querySelectorAll(
+                  "header[data-environment-id][data-project-id]",
+                );
+                return (
+                  location.pathname === "/project/local/" + input.projectId + "/git" &&
+                  headers.length === 1 &&
+                  headers[0]!.getAttribute("data-environment-id") === "local" &&
+                  headers[0]!.getAttribute("data-project-id") === input.projectId
+                );
+              }, binding),
+              2_000,
+            ),
+          );
+        };
+        const proof = await runWorkspaceSubstateBatch({
+          ...binding,
+          browser: b(),
+          owner,
+          verifyManaged,
+          observeCleanupFailure: () => {
+            success = false;
+          },
+          capture: async (substate) => {
+            step("visual-workspace-substate-" + substate);
+            captures.push(
+              await captureWorkspaceSubstate({
+                ...binding,
+                substate,
+                browser: b(),
+                owner,
+                evidence: config.evidence,
+                captured: capturedVisuals,
+                verifyManaged,
+              }),
+            );
+            write("assertions", { captures, assertions });
+          },
+        });
+        assertions.push({ theme, ...proof });
+      } else if (config.selection === "release-visual-core") {
         await type("Owned visual review draft");
         const verifyVisualOwnedSource = async () => {
           check(
@@ -1873,6 +2025,8 @@ export async function runDeliveryRetryQualification() {
     }
     if (config.selection === "release-visual-settings")
       validateSettingsVisualJoins(captures, assertions);
+    if (config.selection === "release-visual-workspace-substates")
+      validateWorkspaceSubstateJoins(captures, assertions);
     check(
       captures.length ===
         deliveryThemes.length *
@@ -1884,7 +2038,9 @@ export async function runDeliveryRetryQualification() {
                 ? gitProjectVisualScenes.length
                 : config.selection === "release-visual-cursor-question"
                   ? 1
-                  : deliveryScenes.length) && assertions.length === 2,
+                  : config.selection === "release-visual-workspace-substates"
+                    ? workspaceSubstates.length
+                    : deliveryScenes.length) && assertions.length === 2,
     );
     success = true;
   } catch (error) {
@@ -1998,7 +2154,9 @@ export async function runDeliveryRetryQualification() {
               ? "Eleven fixed Git/project originals per theme; Tags groups/names remain partial. completeGroup remains false. Full82/164 originals and unpictured substates remain obligatory and unqualified; independent original-pixel review required."
               : config.selection === "release-visual-cursor-question"
                 ? "One fixed Cursor later-multiselect question pair only through native ACP and public choices/Submit. completeGroup remains false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
-                : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
+                : config.selection === "release-visual-workspace-substates"
+                  ? "Three existing-row substates in six extra originals only: selected stash diff, owned Files item menu and public terminal/activity/more-chat lines. Core nine and full82/164 remain unchanged; completeGroup false, independent original pixel review and native/final acceptance remain required."
+                  : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
     });
   }
   return success ? 0 : 1;

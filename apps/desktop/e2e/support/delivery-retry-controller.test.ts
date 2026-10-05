@@ -3726,3 +3726,207 @@ it("the actual Git/project caller refuses an unsettled viewport before any produ
   await expect(fixture.run()).rejects.toBe(fixture.original);
   expect(fixture.calls).not.toContain("produce");
 });
+
+it("admits only the fixed workspace-substate selector inside the already owned CI namespace", () => {
+  const env = {
+    CI: "true",
+    BIBCODE_UPLOAD_SOURCE: "a".repeat(40),
+    BIBCODE_UPLOAD_NETNS: "owned-net",
+    BIBCODE_UPLOAD_FIXTURE: "/owned/fixture",
+    BIBCODE_UPLOAD_EVIDENCE: "/owned/evidence",
+    BIBCODE_UPLOAD_SERVER: "/owned/server",
+    BIBCODE_DELIVERY_UI_WEB: "/owned/web",
+    BIBCODE_UPLOAD_CHROME: "/owned/chrome",
+    BIBCODE_UPLOAD_DRIVER: "/owned/driver",
+    BIBCODE_DELIVERY_UI_SELECTION: "release-visual-workspace-substates",
+  };
+  expect(deliveryConfiguration(env, () => "owned-net").selection).toBe(
+    "release-visual-workspace-substates",
+  );
+  for (const changed of [
+    { CI: "false" },
+    { BIBCODE_DELIVERY_UI_SELECTION: "workspace-composite" },
+    { BIBCODE_UPLOAD_SOURCE: "private" },
+  ])
+    expect(() => deliveryConfiguration({ ...env, ...changed }, () => "owned-net")).toThrow();
+  expect(() => deliveryConfiguration(env, () => "other-net")).toThrow();
+});
+
+it.each([
+  "owned-workspace",
+  "owned-git-route",
+  "foreign-initial-server",
+  "duplicate-thread",
+  "foreign-project",
+  "foreign-kind",
+  "changed-server",
+  "changed-git",
+  "changed-snapshot",
+  "foreign-origin",
+  "foreign-selected-card",
+])(
+  "binds the actual workspace-substate controller caller to its immutable public/source owner: %s",
+  async (mode) => {
+    const start = controller.indexOf(
+      '      if (config.selection === "release-visual-workspace-substates") {',
+    );
+    const end = controller.indexOf(
+      '      } else if (config.selection === "release-visual-core") {',
+      start,
+    );
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const original = new Error("Inert owned workspace binding refusal.");
+    const workspace = {
+      threadId: "owned-thread",
+      path: "/owned/managed",
+      branch: "codex/delivery-retry-light",
+      commonDirectory: "/owned/project/.git",
+    };
+    let descriptors = 0,
+      snapshots = 0,
+      capturesStarted = 0;
+    const captures: object[] = [],
+      assertions: object[] = [];
+    const document = {
+      documentElement: { classList: { contains: () => false } },
+      querySelector: (selector: string) =>
+        selector.includes("environment-rail-local") ? {} : null,
+      getElementById: () => null,
+      querySelectorAll: (selector: string) =>
+        selector.startsWith("header")
+          ? [
+              {
+                getAttribute: (name: string) =>
+                  name === "data-environment-id" ? "local" : "owned-project",
+              },
+            ]
+          : mode === "foreign-selected-card"
+            ? []
+            : [{}],
+    };
+    const run = runControllerSource(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" + controller.slice(start, end) + "\n}}\nrun",
+      ),
+      {
+        config: { selection: "release-visual-workspace-substates", evidence: "/owned/evidence" },
+        context: { projectPath: "/owned/project", stateRoot: "/owned/state" },
+        workspace,
+        visualInput: {},
+        origin: "http://127.0.0.1:4885",
+        theme: "light",
+        childEnv: {},
+        captures,
+        assertions,
+        capturedVisuals: new Set<string>(),
+        success: false,
+        step: () => {},
+        write: () => {},
+        type: async (value: string) => expect(value).toBe("Owned visual review draft"),
+        check: (value: boolean) => {
+          if (!value) throw original;
+        },
+        bounded,
+        owner: {},
+        b: () => ({
+          execute: async (read: (value: object) => boolean, input: object) => read(input),
+        }),
+        document,
+        location: {
+          origin: mode === "foreign-origin" ? "https://example.test" : "http://127.0.0.1:4885",
+          search: "",
+          hash: "",
+          pathname:
+            mode === "owned-git-route" ? "/project/local/owned-project/git" : "/local/owned-thread",
+        },
+        readOwnedGitProjectDescriptor: async () => {
+          descriptors++;
+          return {
+            environmentId: mode === "foreign-initial-server" ? "foreign" : "local",
+            bootId: mode === "changed-server" && descriptors > 1 ? "changed" : "owned",
+            storageInstanceId: "owned",
+          };
+        },
+        createOwnedGitProjectSnapshotReader: () => async () => {
+          snapshots++;
+          const thread = {
+            id: workspace.threadId,
+            deletedAt: null,
+            kind: mode === "foreign-kind" ? "panel" : "workspace",
+            branch: mode === "changed-snapshot" && snapshots > 1 ? "foreign" : workspace.branch,
+            worktreePath: workspace.path,
+            projectId: "owned-project",
+          };
+          return {
+            threads: mode === "duplicate-thread" ? [thread, thread] : [thread],
+            projects: [
+              {
+                id: "owned-project",
+                deletedAt: null,
+                workspaceRoot: mode === "foreign-project" ? "/foreign/project" : "/owned/project",
+              },
+            ],
+          };
+        },
+        readOwnedDeliveryWorktree: () => ({
+          path: mode === "changed-git" ? "/foreign/path" : workspace.path,
+          branch: workspace.branch,
+          commonDirectory: workspace.commonDirectory,
+        }),
+        runWorkspaceSubstateBatch: async (input: {
+          verifyManaged: () => Promise<void>;
+          capture: (value: string) => Promise<void>;
+        }) => {
+          await input.verifyManaged();
+          for (const substate of [
+            "workspace-activity-lines",
+            "selected-stash-diff",
+            "files-item-context-menu",
+          ])
+            await input.capture(substate);
+          return {
+            existingRowsOnly: true,
+            fixedSubstates: true,
+            extraOriginals: true,
+            completeGroup: false,
+          };
+        },
+        captureWorkspaceSubstate: async (input: {
+          verifyManaged: () => Promise<void>;
+          threadId: string;
+          projectId: string;
+          substate: string;
+        }) => {
+          await input.verifyManaged();
+          capturesStarted++;
+          expect(input.threadId).toBe(workspace.threadId);
+          expect(input.projectId).toBe("owned-project");
+          return { substate: input.substate, theme: "light", admitted: true };
+        },
+      },
+    ) as () => Promise<void>;
+    if (mode === "owned-workspace" || mode === "owned-git-route") {
+      await run();
+      expect(capturesStarted).toBe(3);
+      expect(captures).toHaveLength(3);
+      expect(assertions).toEqual([
+        {
+          theme: "light",
+          existingRowsOnly: true,
+          fixedSubstates: true,
+          extraOriginals: true,
+          completeGroup: false,
+        },
+      ]);
+    } else {
+      await expect(run()).rejects.toBe(original);
+      expect(capturesStarted).toBe(0);
+      expect(captures).toHaveLength(0);
+      expect(assertions).toHaveLength(0);
+    }
+    expect(JSON.stringify({ captures, assertions })).not.toMatch(
+      /owned-thread|owned-project|\/owned|http|boot|storage/,
+    );
+  },
+);

@@ -92,6 +92,7 @@ describe("first visual batch workflow boundary", () => {
             "release-visual-settings",
             "release-visual-git-project",
             "release-visual-cursor-question",
+            "release-visual-workspace-substates",
           ],
         },
       },
@@ -271,4 +272,55 @@ it("runs one separate Cursor row with the actual inert-runtime gate and closed t
     "release-visual-cursor-question-fixture",
   ])
     expect(tests).toContain("support/" + helper + ".test.ts");
+});
+
+it("keeps six workspace substate originals separate from the unchanged core nine", () => {
+  const value = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const steps = value.jobs.visual_core.steps;
+  const run = steps.find(
+    (entry: { name: string }) => entry.name === "Run contained workspace substate batch",
+  );
+  expect(run.if).toBe("${{ inputs.scene_selection == 'release-visual-workspace-substates' }}");
+  expect(run.run).toBe(
+    "python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-workspace-substates",
+  );
+  const evidence = steps.find(
+    (entry: { name: string }) => entry.name === "Retain explicit workspace substate evidence",
+  );
+  expect(evidence.if).toBe(
+    "${{ always() && inputs.scene_selection == 'release-visual-workspace-substates' }}",
+  );
+  expect(evidence.with["if-no-files-found"]).toBe("error");
+  expect(evidence.with["retention-days"]).toBe(7);
+  expect(
+    evidence.with.path
+      .trim()
+      .split("\n")
+      .map((line: string) => line.slice(line.lastIndexOf("/") + 1)),
+  ).toEqual([
+    "phase.json",
+    "failure.json",
+    "provenance.json",
+    "result.json",
+    "assertions.json",
+    "namespace-cleanup.json",
+    "supervisor.json",
+    ...[
+      "git-history-stashes-selected-diff",
+      "files-editor-comment-item-context-menu",
+      "workspace-composite-activity-lines",
+    ].flatMap((prefix) => [prefix + "-light.png", prefix + "-dark.png"]),
+  ]);
+  expect(evidence.with.path).not.toMatch(/\*|private|profile|\.log/);
+  expect(
+    steps.find(
+      (entry: { name: string }) => entry.name === "Check owned helpers and namespace admission",
+    ).run,
+  ).toContain("support/release-visual-workspace-substates.test.ts");
+  expect(visualScenes).toHaveLength(9);
 });

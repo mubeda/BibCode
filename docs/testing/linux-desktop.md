@@ -1680,3 +1680,42 @@ Git/project capture negatives and the actual mounted question controls before a
 native trial. Inspect both CI original images independently. Hermetic ports,
 geometry, scripted transport and static gates do not establish native pixels,
 Tauri behavior, a final product nomination or full-matrix acceptance.
+
+### Existing workspace row substates
+
+The fixed manual `release-visual-workspace-substates` selection uses the same
+real-server controller, public pairing/import, selected managed Git worktree,
+owned Claude fixture and private Python PID/network namespace. Its separate
+600-second inner and 660-second outer batch leaves the original nine core scenes
+and full82/164 base obligation unchanged. This is six extra originals bound to
+three existing rows, not three new scenes or substitutes for base originals.
+
+The `git-history-stashes-selected-diff-{light,dark}.png` originals select only the
+owned last stash and its actual `visual-stash.txt` diff. Scrolling remains inside
+the stash list; selection returns to baseline history afterward. Never apply,
+pop or drop a stash. The `files-editor-comment-item-context-menu-{light,dark}.png`
+originals open the actual selected owned file's shadow-tree item menu by public
+right-click, retain the real editor and comment, then close the menu with Escape.
+
+The `workspace-composite-activity-lines-{light,dark}.png` originals use New panel
+→ Open Terminal, ordinary terminal focus and the fixed `/bin/sleep 600` subprocess
+inside CI. Open one actual Claude chat panel through the same public menu, send
+the owned prompt and wait for the fixture response. Return to the original host
+chat and hover its existing Terminal process running indicator. Require its own
+linked tooltip, provider/model/age session line, exactly `1 more chat`, original
+response and original unsent draft. Terminal activity means the existing
+indicator/tooltip; it does not invent a terminal text preview row. Interrupt and
+close only the created terminal, close the created chat and prove counts gone.
+Missing/disabled public controls, foreign identities or incomplete cleanup fail.
+
+Every capture rechecks the actual local server boot/storage identity, schema-decoded
+public snapshot thread/project/worktree binding and filesystem Git identity,
+then reads strict closed facts before and after the original screenshot. Six
+unique 1280×960 nonblank originals must join both incomplete-group assertions.
+Only those six named PNGs and the existing seven closed JSON receipts are uploaded;
+credentials, IDs, paths, provider inputs, profiles and raw logs remain private.
+Outer controller/process and Python supervisor/namespace joins remain required.
+Compile inputs beforehand and execute only in the disposable Linux CI namespace;
+local source/HappyDOM/TempGit/fake-port tests prove compatibility, not pixels or
+native acceptance. Independently inspect both-theme original pixels, and keep
+completeGroup false; no full matrix, Tauri or final release acceptance follows.
