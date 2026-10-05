@@ -7,6 +7,7 @@ import {
   readProviderInputLog,
   waitForProviderInputLogEntry,
 } from "../support/provider-input-log.ts";
+import { queuedCardIdsInVisualOrder } from "../support/queued-card-order.ts";
 import { completeDesktopUiSlowTurn, desktopUiFixture } from "../support/test-project.ts";
 import {
   ensureMainSidebarOpen,
@@ -126,8 +127,25 @@ async function submitWithEnter(text: string): Promise<void> {
 }
 
 async function assertQueuedCards(prompts: readonly string[]): Promise<string[]> {
+  let visibleIds: string[] = [];
   await browser.waitUntil(
-    async () => (await browser.$$(queuedRowSelector).length) === prompts.length,
+    async () => {
+      const cards = await browser.$$(queuedRowSelector);
+      const observations = await Promise.all(
+        Array.from(cards, async (card) => ({
+          id: (await card.getAttribute("data-queued-message-row")) ?? "",
+          text: await card.getText(),
+          y: await card.getLocation("y"),
+          displayed: await card.isDisplayed(),
+        })),
+      );
+      // LegendList positions pooled slots independently of DOM order and
+      // reorders its DOM later. Observe visual FIFO before retaining row IDs.
+      const ids = queuedCardIdsInVisualOrder(observations, prompts);
+      if (ids === null) return false;
+      visibleIds = ids;
+      return true;
+    },
     {
       timeoutMsg: `Expected ${prompts.length} queued cards: ${prompts.join(", ")}.`,
     },
@@ -137,10 +155,8 @@ async function assertQueuedCards(prompts: readonly string[]): Promise<string[]> 
   );
   expect(await wrappers.length).toBe(prompts.length);
   const ids: string[] = [];
-  const cards = await browser.$$(queuedRowSelector);
-  const count = await cards.length;
-  for (let index = 0; index < count; index += 1) {
-    const card = cards[index]!;
+  for (let index = 0; index < visibleIds.length; index += 1) {
+    const card = queuedCard(visibleIds[index]!);
     await expect(card).toBeDisplayed();
     await expect(card).toHaveText(expect.stringContaining(prompts[index]!));
     await expect(card).toHaveText(expect.stringContaining("Queued"));
