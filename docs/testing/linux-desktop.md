@@ -896,6 +896,26 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Retain only the workflow's finite screenshot names and closed JSON evidence.
   Each original image requires actual theme, selected environment, expected text,
   unobstructed visible target, nonblank PNG and no credential control or URL.
+
+  For the exact `dismissed` scene, that same read also requires exactly one
+  Check button, one button with the expected update label and one Disconnect
+  button inside the owned row. Each must be enabled and visible through its
+  ancestors, with finite positive own rectangles fully inside the viewport. Test
+  an interior grid of points on every own rectangle and require the button or
+  its descendant to receive each hit. Reject any overlap with a visible fixed
+  toast root rectangle even when that toast is pointer-transparent. A clear row
+  container alone cannot prove that its right-side actions are inspectable.
+  Keep the original six-field witness and extend only `targetInView`; pass the
+  fixed scene through the existing single two-second DOM read. Other scenes keep
+  their existing admission. Preserve the existing pointer move, thirty-second
+  capture wait with 250ms polling, original actions, deadlines, PNG validation,
+  write-once originals and joined cleanup. The same wait may observe normal
+  notification ending; do not close toasts, change their lifetime, move controls,
+  add sleeps/actions/reads, mutate product state or relax the owner bound to make
+  an original pass. Persistent obstruction remains a bounded qualification
+  failure. Inert source tests establish admission logic; new original CI pixels
+  and independent inspection are required for visual approval.
+
   Inspect the original images before accepting visual quality. Shared cleanup
   joins the browser, proxies and children; PID1 then reaps descendants. The
   private fixture is deleted only after both owners report joined cleanup. Require

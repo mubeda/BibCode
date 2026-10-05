@@ -1515,6 +1515,207 @@ it("executes the actual read-only capture callback with real modal/toast distinc
   expect(read(input).bootShellAbsent).toBe(false);
 });
 
+function dismissedCaptureWitness(mode: string, theme: "light" | "dark", scene = "dismissed") {
+  const start = controller.indexOf(
+    "          (input) => {",
+    controller.indexOf("async function capture("),
+  );
+  const end = controller.indexOf("\n          {\n            selector:", start);
+  const argumentEnd = controller.indexOf("\n          },\n        ),", end);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  expect(argumentEnd).toBeGreaterThan(end);
+  const callback = controller.slice(start, end).trim().replace(/,$/, "");
+  const expected = "Update to v9.9.1…";
+  const input = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      "(" + controller.slice(end, argumentEnd + "\n          }".length).trim() + ")",
+    ),
+    {
+      target: ".owned-row",
+      host: { label: "Owned host", port: 4888 },
+      expected,
+      currentTheme: theme,
+      webOrigin: "http://localhost:4901",
+      scene,
+    },
+  );
+  const box = (x: number, y: number, width: number, height: number) => ({
+    x,
+    y,
+    left: x,
+    top: y,
+    width,
+    height,
+    right: x + width,
+    bottom: y + height,
+  });
+  class Element {
+    textContent = expected;
+    parentElement: Element | null = null;
+    rectangle = box(467, 182, 768, 99);
+    style = { display: "block", visibility: "visible", opacity: "1", pointerEvents: "auto" };
+    disabled = false;
+    attributes = new Set<string>();
+    emptyRects = false;
+    getBoundingClientRect() {
+      return this.rectangle;
+    }
+    getClientRects() {
+      return this.emptyRects ? [] : [this.rectangle];
+    }
+    getAttribute(name: string) {
+      return name === "aria-checked" ? "true" : null;
+    }
+    hasAttribute(name: string) {
+      return this.attributes.has(name);
+    }
+    matches(selector: string) {
+      expect(selector).toBe(':disabled,[aria-disabled="true"]');
+      return this.disabled;
+    }
+    contains(other: Element | null) {
+      for (let current = other; current; current = current.parentElement)
+        if (current === this) return true;
+      return false;
+    }
+    querySelectorAll(selector: string): Element[] {
+      expect(selector).toBe("button");
+      return buttons;
+    }
+  }
+  const target = new Element();
+  const buttons: Element[] = ["Check", expected, "Disconnect"].map((label, index) => {
+    const button = new Element();
+    button.textContent = label;
+    button.parentElement = target;
+    button.rectangle = box([935, 995, 1120][index]!, 219, [45, 110, 90][index]!, 24);
+    return button;
+  });
+  for (const [index, label] of ["check", "update", "disconnect"].entries()) {
+    const button = buttons[index]!;
+    if (mode === "hidden-" + label) button.style.visibility = "hidden";
+    if (mode === "disabled-" + label) button.disabled = true;
+    if (mode === "missing-" + label) buttons[index] = null as never;
+    if (mode === "duplicate-" + label) buttons.push(button);
+  }
+  for (let index = buttons.length - 1; index >= 0; index--)
+    if (buttons[index] === null) buttons.splice(index, 1);
+  if (mode === "ancestor-hidden") target.style.display = "none";
+  if (mode === "inert") buttons[0]!.attributes.add("inert");
+  if (mode === "offscreen") buttons[2]!.rectangle = box(1270, 219, 90, 24);
+  if (mode === "no-rects") buttons[1]!.emptyRects = true;
+  if (mode === "nonfinite") buttons[0]!.rectangle = box(Number.NaN, 219, 45, 24);
+  const toast = new Element();
+  toast.parentElement = null;
+  toast.rectangle = box(889, 84, 359, 148);
+  if (mode === "toast-hidden") toast.style.visibility = "hidden";
+  if (mode === "toast-transparent") {
+    toast.style.opacity = "0";
+    toast.style.pointerEvents = "none";
+  }
+  if (mode === "toast-zero") toast.rectangle = box(889, 84, 0, 0);
+  if (mode === "toast-nonoverlap") toast.rectangle = box(889, 84, 359, 88);
+  if (mode === "pointer-transparent-toast") toast.style.pointerEvents = "none";
+  const toasts = mode.includes("toast") ? [toast] : [];
+  const obstruction = new Element();
+  const inside = (rectangle: ReturnType<typeof box>, x: number, y: number) =>
+    x >= rectangle.x && x <= rectangle.right && y >= rectangle.y && y <= rectangle.bottom;
+  const read = NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes("(" + callback + ")"), {
+    HTMLElement: Element,
+    HTMLButtonElement: Element,
+    innerWidth: 1280,
+    innerHeight: 960,
+    getComputedStyle: (candidate: Element) => candidate.style,
+    location: { origin: "http://localhost:4901", search: "", hash: "" },
+    document: {
+      documentElement: { classList: { contains: () => theme === "dark" } },
+      querySelector: (selector: string) =>
+        selector === ".owned-row" || selector.startsWith('[role="radio"]') ? target : null,
+      querySelectorAll: (selector: string) =>
+        selector.includes('data-slot="dialog-popup"') ? [] : toasts,
+      getElementById: () => null,
+      elementFromPoint: (x: number, y: number) => {
+        if (
+          toasts.length > 0 &&
+          toast.style.visibility === "visible" &&
+          toast.style.pointerEvents !== "none" &&
+          inside(toast.rectangle, x, y)
+        )
+          return toast;
+        const button = buttons.find((candidate) => inside(candidate.rectangle, x, y));
+        if (button && mode === "covered") return obstruction;
+        if (button && mode === "corner-covered" && x < button.rectangle.x + 3 && y < 222)
+          return obstruction;
+        return button ?? target;
+      },
+    },
+  });
+  return read(input) as Record<string, boolean>;
+}
+
+it.each(["light", "dark"] as const)(
+  "admits the actual dismissed capture's unobstructed actions in %s",
+  (theme) => {
+    for (const mode of [
+      "clear",
+      "toast-hidden",
+      "toast-transparent",
+      "toast-zero",
+      "toast-nonoverlap",
+    ]) {
+      const witness = dismissedCaptureWitness(mode, theme);
+      expect(Object.keys(witness)).toEqual([
+        "themeMatched",
+        "selectedMatched",
+        "expectedTextMatched",
+        "targetInView",
+        "credentialAbsent",
+        "bootShellAbsent",
+      ]);
+      expect(Object.values(witness).every((value) => value === true)).toBe(true);
+    }
+  },
+);
+
+it.each([
+  "missing-check",
+  "missing-update",
+  "missing-disconnect",
+  "duplicate-check",
+  "duplicate-update",
+  "duplicate-disconnect",
+  "hidden-check",
+  "hidden-update",
+  "hidden-disconnect",
+  "disabled-check",
+  "disabled-update",
+  "disabled-disconnect",
+  "ancestor-hidden",
+  "inert",
+  "offscreen",
+  "no-rects",
+  "nonfinite",
+  "covered",
+  "corner-covered",
+  "right-toast",
+  "pointer-transparent-toast",
+])("refuses the actual dismissed capture's uninspectable action: %s", (mode) => {
+  for (const theme of ["light", "dark"] as const) {
+    expect(dismissedCaptureWitness(mode, theme).targetInView).toBe(false);
+    expect(dismissedCaptureWitness(mode, theme, "initial-row").targetInView).toBe(true);
+  }
+});
+
+it.each(remoteUiScenes.filter((scene) => scene !== "dismissed"))(
+  "preserves other actual capture admissions with a right-side toast: %s",
+  (scene) => {
+    expect(dismissedCaptureWitness("pointer-transparent-toast", "light", scene).targetInView).toBe(
+      true,
+    );
+  },
+);
+
 it.each(["displayed", "clickable", "click", "row"])(
   "identifies the exact Check again failed operation without another action: %s",
   async (failed) => {

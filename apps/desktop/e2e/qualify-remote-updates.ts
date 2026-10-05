@@ -815,15 +815,87 @@ async function capture(scene: RemoteUiScene, host: Host, target: string, expecte
                 '[data-slot="dialog-popup"],[data-slot="alert-dialog-popup"]',
               ),
             ).every((popup) => !visible(popup) || popup === element || popup.contains(element));
-            const visibleToastsContained = Array.from(
+            const toasts = Array.from(
               document.querySelectorAll('[data-slot="toast-viewport"] > [data-position]'),
-            ).every((toast) => {
+            );
+            const visibleToastsContained = toasts.every((toast) => {
               if (!visible(toast)) return true;
               const box = toast.getBoundingClientRect();
               return (
                 box.x >= 0 && box.y >= 0 && box.right <= innerWidth && box.bottom <= innerHeight
               );
             });
+            const dismissedControlsInView =
+              input.scene !== "dismissed" ||
+              (() => {
+                if (!element) return false;
+                const shown = (candidate: Element) => {
+                  for (let node: Element | null = candidate; node; node = node.parentElement) {
+                    const style = getComputedStyle(node);
+                    const opacity = Number.parseFloat(style.opacity);
+                    if (
+                      style.display === "none" ||
+                      style.visibility !== "visible" ||
+                      !Number.isFinite(opacity) ||
+                      opacity <= 0 ||
+                      node.hasAttribute("hidden") ||
+                      node.hasAttribute("inert")
+                    )
+                      return false;
+                  }
+                  return true;
+                };
+                const toastBoxes = toasts
+                  .filter((toast) => visible(toast) && shown(toast))
+                  .map((toast) => toast.getBoundingClientRect());
+                const buttons = Array.from(element.querySelectorAll("button"));
+                return ["Check", input.expected, "Disconnect"].every((label) => {
+                  const matches = buttons.filter((button) => button.textContent?.trim() === label);
+                  const control = matches.length === 1 ? matches[0]! : null;
+                  if (
+                    !(control instanceof HTMLButtonElement) ||
+                    control.matches(':disabled,[aria-disabled="true"]') ||
+                    !shown(control)
+                  )
+                    return false;
+                  const rectangles = Array.from(control.getClientRects());
+                  return (
+                    rectangles.length > 0 &&
+                    rectangles.every((box) => {
+                      if (
+                        ![box.x, box.y, box.width, box.height, box.right, box.bottom].every(
+                          Number.isFinite,
+                        ) ||
+                        box.width <= 0 ||
+                        box.height <= 0 ||
+                        box.x < 0 ||
+                        box.y < 0 ||
+                        box.right > innerWidth ||
+                        box.bottom > innerHeight ||
+                        toastBoxes.some(
+                          (toast) =>
+                            box.x < toast.right &&
+                            box.right > toast.x &&
+                            box.y < toast.bottom &&
+                            box.bottom > toast.y,
+                        )
+                      )
+                        return false;
+                      const insetX = Math.min(2, box.width / 4);
+                      const insetY = Math.min(2, box.height / 4);
+                      return [box.x + insetX, box.x + box.width / 2, box.right - insetX].every(
+                        (x) =>
+                          [box.y + insetY, box.y + box.height / 2, box.bottom - insetY].every(
+                            (y) => {
+                              const hit = document.elementFromPoint(x, y);
+                              return hit !== null && (hit === control || control.contains(hit));
+                            },
+                          ),
+                      );
+                    })
+                  );
+                });
+              })();
             return {
               themeMatched:
                 document.documentElement.classList.contains("dark") === (input.theme === "dark"),
@@ -840,7 +912,8 @@ async function capture(scene: RemoteUiScene, host: Host, target: string, expecte
                 bounds.bottom <= innerHeight &&
                 unobstructed &&
                 noOtherDialog &&
-                visibleToastsContained,
+                visibleToastsContained &&
+                dismissedControlsInView,
               credentialAbsent:
                 location.origin === input.origin &&
                 location.search === "" &&
@@ -855,6 +928,7 @@ async function capture(scene: RemoteUiScene, host: Host, target: string, expecte
           },
           {
             selector: target,
+            scene,
             label: host.label,
             expected,
             theme: currentTheme,
