@@ -113,7 +113,7 @@ class NetworkTests(unittest.TestCase):
                 self.assertTrue(proof['linksContained'])
 
     def test_owner_argument_forms_refuse_extra_empty_and_truncated_arguments(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates']:
             with tempfile.TemporaryDirectory(prefix='bibcode-owner-arity-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 for invalid in [owner + [''], owner + ['unexpected'], owner[:-1]]:
@@ -221,12 +221,61 @@ class NetworkTests(unittest.TestCase):
                 self.assertEqual(fake.calls, [])
 
     def test_original_owner_anchors_remain_required_for_both_forms(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates']:
             with tempfile.TemporaryDirectory(prefix='bibcode-owner-anchor-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 for index, value in [(0, '/missing-python'), (1, '/missing-helper'), (2, 'outer'), (11, 'net:[99]'), (13, '/missing-ip')]:
                     invalid = list(owner); invalid[index] = value; fake = FakeIp()
                     with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=env, owner=invalid)
+                    self.assertEqual(fake.calls, [])
+
+    def test_fixed_cursor_and_workspace_visual_producers_keep_the_containment_contract(self):
+        for scenario in ['release-visual-cursor-question', 'release-visual-workspace-substates']:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory(prefix='visual-owner-contract-') as directory:
+                owner, env = actual_owner_handoff(Path(directory), scenario)
+                self.assertEqual(len(owner), 16)
+                self.assertEqual(owner[14], scenario)
+                self.assertEqual(env.get('BIBCODE_DELIVERY_UI_SELECTION'), scenario)
+                fake = FakeIp()
+                try:
+                    proof = self.setup_network(fake, env=env, owner=owner)
+                except network.NetworkRefused as refusal:
+                    self.fail('Fixed visual owner refused at ' + refusal.proof['stage'])
+                self.assertEqual(fake.mutations, MUTATIONS)
+                self.assertTrue(proof['privateNet'])
+                self.assertTrue(proof['linksContained'])
+                self.assertTrue(proof['routeContained'])
+                self.assertEqual(proof['interfaceCount'], 3)
+
+    def test_fixed_cursor_and_workspace_visual_owners_refuse_forged_selectors_assets_and_namespaces(self):
+        for scenario in ['release-visual-cursor-question', 'release-visual-workspace-substates']:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory(prefix='visual-owner-identity-') as directory:
+                owner, env = actual_owner_handoff(Path(directory), scenario)
+                other = Path(directory) / 'other-web'; other.mkdir()
+                alias = Path(directory) / 'alias-web'; alias.symlink_to(Path(owner[15]))
+                cases = []
+                for value in ['release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'delivery-retry-ui', 'remote-updates-ui', 'release-visual-full', '../arbitrary', 'release-visual-workspace-substates' if scenario == 'release-visual-cursor-question' else 'release-visual-cursor-question']:
+                    changed = list(owner); changed[14] = value; cases.append((changed, env))
+                    cases.append((owner, {**env, 'BIBCODE_DELIVERY_UI_SELECTION': value}))
+                for value in ['release-visual-full', '../arbitrary']:
+                    changed = list(owner); changed[14] = value
+                    cases.append((changed, {**env, 'BIBCODE_DELIVERY_UI_SELECTION': value}))
+                for key in ['BIBCODE_DELIVERY_UI_SELECTION', 'BIBCODE_DELIVERY_UI_WEB']:
+                    missing = dict(env); missing.pop(key); cases.append((owner, missing))
+                changed = list(owner); changed[15] = str(other.resolve()); cases.append((changed, env))
+                for value in [str(alias), 'relative-web', sys.executable]:
+                    changed = list(owner); changed[15] = value
+                    cases.append((changed, {**env, 'BIBCODE_DELIVERY_UI_WEB': value}))
+                for key in ['BIBCODE_RELEASE_UI_FAKE_HOST', 'BIBCODE_RELEASE_UI_WEB', 'BIBCODE_RELEASE_UI_MATRIX']:
+                    cases.append((owner, {**env, key: 'unexpected'}))
+                cases.append((owner, {**env, 'CI': 'false'}))
+                for invalid, environment in cases:
+                    fake = FakeIp()
+                    with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=environment, owner=invalid)
+                    self.assertEqual(fake.calls, [])
+                for path, wrong in [('/proc/self/ns/net', 'net:[1]'), ('/proc/1/ns/net', 'net:[8]'), ('/proc/self/ns/pid', 'pid:[8]'), ('/proc/1/ns/user', 'user:[8]')]:
+                    fake = FakeIp(); namespaces = {**NAMESPACES, path: wrong}
+                    with self.assertRaises(network.NetworkRefused): self.setup_network(fake, env=env, namespaces=namespaces, owner=owner)
                     self.assertEqual(fake.calls, [])
     def test_wrong_namespace_refuses_before_ip_mutations(self):
         for path, wrong in [('/proc/self/ns/net', 'net:[1]'), ('/proc/1/ns/net', 'net:[8]'),

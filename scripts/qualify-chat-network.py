@@ -89,7 +89,7 @@ def _setup(environment, run_owned, context, readlink, platform, clock, read_owne
         if len(owner) == 14:
             require(not any(key in environment for key in ui_keys + [delivery_key, delivery_selection]))
         elif len(owner) == 16:
-            require(owner[14] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project'] and not any(key in environment for key in ui_keys))
+            require(owner[14] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates'] and not any(key in environment for key in ui_keys))
             require(environment.get(delivery_selection) == owner[14])
             web = Path(owner[15])
             require(web.is_absolute())
