@@ -1,12 +1,17 @@
 // @effect-diagnostics nodeBuiltinImport:off - The generated qualification handoff runs in an inert VM.
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeVM from "node:vm";
+import * as NodeHttp from "node:http";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import type * as NodeNet from "node:net";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
-import { afterEach, describe, expect, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, vi } from "vite-plus/test";
 import type { RemoteUpdateSnapshot } from "@bibcode/contracts";
 import {
   assertWebDriverPhaseExit,
@@ -20,6 +25,7 @@ import {
 } from "./remote-install-driver.ts";
 
 const decodeFixtureJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+const encodeFixtureJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const readAuthFixture = Effect.fn("RemoteInstallTest.readAuthFixture")(function* (name: string) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -28,6 +34,117 @@ const readAuthFixture = Effect.fn("RemoteInstallTest.readAuthFixture")(function*
   );
   return yield* decodeFixtureJson(yield* fs.readFileString(filename));
 }, Effect.provide(NodeServices.layer));
+
+async function ownedUploadServer() {
+  const root = await NodeFS.promises.mkdtemp(
+    NodePath.join(NodeOS.tmpdir(), "remote-install-http-"),
+  );
+  const workspaceRoot = NodePath.join(root, "workspace");
+  await NodeFS.promises.mkdir(workspaceRoot);
+  const headers = Promise.withResolvers<void>();
+  const prefix = Promise.withResolvers<void>();
+  const completed = Promise.withResolvers<void>();
+  const sockets = new Set<NodeNet.Socket>();
+  const joins: Promise<void>[] = [];
+  const writes: Promise<void>[] = [];
+  const state = {
+    root,
+    workspaceRoot,
+    uploadReceiptPath: NodePath.join(root, "upload.secret.json"),
+    endpoint: "",
+    headers,
+    prefix,
+    completed,
+    requests: 0,
+    receiptBeforeHttp: false,
+    received: Buffer.alloc(0),
+    allowContinue: true,
+    continueBody: () => {},
+    mode: "success" as "success" | "refuse" | "drop-response" | "wrong-bytes",
+    onCompleted: () => {},
+  };
+  const server = NodeHttp.createServer();
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    const closed = Promise.withResolvers<void>();
+    joins.push(closed.promise);
+    socket.once("close", () => {
+      sockets.delete(socket);
+      closed.resolve();
+    });
+  });
+  server.on("checkContinue", (request, response) => {
+    state.requests++;
+    request.on("error", () => undefined);
+    response.on("error", () => undefined);
+    const work = (async () => {
+      const receipt = JSON.parse(
+        await NodeFS.promises.readFile(state.uploadReceiptPath, "utf8"),
+      ) as { relativeDirectory: string; relativeUrl: string };
+      state.receiptBeforeHttp = receipt.relativeUrl === request.url;
+      let continued = false;
+      state.continueBody = () => {
+        if (continued || response.headersSent || response.destroyed) return;
+        continued = true;
+        response.writeContinue();
+      };
+      headers.resolve();
+      if (state.mode === "refuse") {
+        response.writeHead(403);
+        response.end();
+        return;
+      }
+      request.on("data", (chunk: Buffer) => {
+        state.received = Buffer.concat([state.received, chunk]);
+        prefix.resolve();
+      });
+      request.once("end", () => {
+        const write = (async () => {
+          await NodeFS.promises.writeFile(
+            NodePath.join(workspaceRoot, receipt.relativeDirectory, "protection-witness.txt"),
+            state.mode === "wrong-bytes" ? "no" : state.received,
+          );
+          if (state.mode === "drop-response") request.socket.destroy();
+          else {
+            response.writeHead(201, { "content-type": "application/json" });
+            response.end(JSON.stringify({ relativePath: "protection-witness.txt" }));
+          }
+          state.onCompleted();
+          completed.resolve();
+        })();
+        writes.push(write);
+        void write.catch(() => request.socket.destroy());
+      });
+      if (state.allowContinue) state.continueBody();
+    })();
+    writes.push(work);
+    void work.catch(() => request.socket.destroy());
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string")
+    throw new Error("Owned HTTP fixture address");
+  state.endpoint = "http://127.0.0.1:" + address.port;
+  return {
+    ...state,
+    state,
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await Promise.allSettled(writes);
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+      await Promise.all(joins);
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    },
+  };
+}
+let owned: Awaited<ReturnType<typeof ownedUploadServer>>;
+const uploadInput = () => ({
+  endpoint: owned.state.endpoint,
+  workspaceRoot: owned.state.workspaceRoot,
+  uploadReceiptPath: owned.state.uploadReceiptPath,
+});
 
 const authenticationFixture = (ticket: unknown, token: unknown) => {
   vi.stubGlobal("fetch", async (input: URL) => {
@@ -61,6 +178,10 @@ const terminalFixture = (input: {
   readonly disconnectDuringCheck?: boolean;
   readonly holdStatusAfter?: number;
   readonly rejectInstallDispatch?: boolean;
+  readonly holdInstallReply?: boolean;
+  readonly holdVerification?: boolean;
+  readonly installStage?: string;
+  readonly maxUploadBytes?: number;
 }) => {
   authenticationFixture(input.ticket, input.token);
   let opened = 0;
@@ -71,6 +192,13 @@ const terminalFixture = (input: {
   const requests: string[] = [];
   const installSnapshots: RemoteUpdateSnapshot[] = [];
   const closed = vi.fn();
+  const installRequested = Promise.withResolvers<void>();
+  const waitingObserved = Promise.withResolvers<void>();
+  const verificationRequested = Promise.withResolvers<void>();
+  let releaseInstall = () => {};
+  let releaseVerification = () => {};
+  let installHeld = input.holdInstallReply === true;
+  let verificationHeld = input.holdVerification === true;
   vi.stubGlobal(
     "WebSocket",
     class extends EventTarget {
@@ -88,7 +216,12 @@ const terminalFixture = (input: {
         this.dispatchEvent(new Event("close"));
       }
       send(raw: string) {
-        const request = JSON.parse(raw) as { _tag: string; tag: string; id: string };
+        const request = JSON.parse(raw) as {
+          _tag: string;
+          tag: string;
+          id: string;
+          payload?: unknown;
+        };
         if (request._tag !== "Request") return;
         if (request.tag === "updater.install" && input.rejectInstallDispatch)
           throw new Error("Fixture install send was rejected.");
@@ -103,7 +236,9 @@ const terminalFixture = (input: {
           targetVersion: availableVersion,
           support: { installMode: "interactive", reason: "available", installKind: "unknown" },
           downloadPercent: null,
-          installStage: "sentinel-private-stage",
+          installStage:
+            input.installStage ??
+            (input.hostError ? "sentinel-private-stage" : "waiting-for-mutations"),
         };
         let value: unknown;
         switch (request.tag) {
@@ -120,6 +255,13 @@ const terminalFixture = (input: {
           case "updater.activeWork":
             value = { runningTurns: 0, liveTerminals: 0, queuedMessages: 0 };
             break;
+          case "projects.createUploadUrl":
+            value = {
+              relativeUrl: "/api/transfers/fixture-private-upload",
+              expiresAt: 1,
+              maxBytes: input.maxUploadBytes ?? 1024,
+            };
+            break;
           case "updater.check":
           case "updater.status": {
             if (request.tag === "updater.check") {
@@ -130,6 +272,7 @@ const terminalFixture = (input: {
               }
             }
             if (!checked || installed) {
+              if (installed && request.tag === "updater.status") waitingObserved.resolve();
               value = snapshot;
               break;
             }
@@ -154,28 +297,50 @@ const terminalFixture = (input: {
           }
           case "updater.install":
             installed = true;
+            installRequested.resolve();
+            if (!input.hostError) owned.state.onCompleted = () => this.close();
             installSnapshots.push(snapshot);
             value = snapshot;
             break;
           default:
             throw new Error("Unexpected fixture RPC.");
         }
-        queueMicrotask(() => {
-          this.dispatchEvent(
-            new MessageEvent("message", {
-              data: JSON.stringify({
-                _tag: "Exit",
-                requestId: request.id,
-                exit: { _tag: "Success", value },
+        const reply = () =>
+          queueMicrotask(() => {
+            this.dispatchEvent(
+              new MessageEvent("message", {
+                data: JSON.stringify({
+                  _tag: "Exit",
+                  requestId: request.id,
+                  exit: { _tag: "Success", value },
+                }),
               }),
-            }),
-          );
-          if (request.tag === "updater.install" && !input.hostError) this.close();
-        });
+            );
+          });
+        if (request.tag === "updater.install" && installHeld) releaseInstall = reply;
+        else if (request.tag === "server.getConfig" && this.boot > 1 && verificationHeld) {
+          verificationRequested.resolve();
+          releaseVerification = reply;
+        } else reply();
       }
     },
   );
-  return { requests, closed, installSnapshots };
+  return {
+    requests,
+    closed,
+    installSnapshots,
+    installRequested,
+    waitingObserved,
+    verificationRequested,
+    releaseInstall: () => {
+      installHeld = false;
+      releaseInstall();
+    },
+    releaseVerification: () => {
+      verificationHeld = false;
+      releaseVerification();
+    },
+  };
 };
 
 /** Runs the actual generated marker handoff with the real driver and inert transport. */
@@ -187,12 +352,13 @@ const generatedInstallFixture = (failMarkerWrite = false) => {
     phase: "seed-and-install" as const,
     projectId: "fixture-project",
     resultPath: "/fixture/before.json",
-    workspaceRoot: "/fixture/workspace",
+    workspaceRoot: owned.state.workspaceRoot,
     platform: "linux" as const,
     appBinaryPath: "/fixture/RemoteLane.AppImage",
     remoteInstallDriverPath: "fixture:driver",
     remoteHarnessPath: "fixture:host",
     remoteSecretPath: "/fixture/private.json",
+    remoteUploadSecretPath: owned.state.uploadReceiptPath,
     remoteEvidencePath: "/fixture/evidence.json",
   };
   const spec = createSeededUpgradeDriverSpec(input);
@@ -206,7 +372,7 @@ const generatedInstallFixture = (failMarkerWrite = false) => {
   const attempts: boolean[] = [];
   const context = {
     input,
-    credentials: { endpoint: "http://127.0.0.1:43123", bootstrapToken: "fixture-sharing-grant" },
+    credentials: { endpoint: owned.state.endpoint, bootstrapToken: "fixture-sharing-grant" },
     observation: { projectId: "fixture-project" },
     widened: false,
     NodeFS: {
@@ -237,10 +403,283 @@ const generatedInstallFixture = (failMarkerWrite = false) => {
 };
 
 describe("remote install RPC driver", () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
+  beforeEach(async () => {
+    owned = await ownedUploadServer();
   });
+  afterEach(async () => {
+    vi.useRealTimers();
+    await owned.close();
+    vi.unstubAllGlobals();
+  });
+
+  it.effect(
+    "refuses a witness larger than the advertised upload capacity before HTTP or install",
+    () =>
+      Effect.gen(function* () {
+        const fixture = terminalFixture({
+          ticket: yield* readAuthFixture("websocket-ticket"),
+          token: yield* readAuthFixture("token"),
+          beforeVersion: "0.7.2",
+          runningVersion: "0.7.3-upgrade.49",
+          maxUploadBytes: 1,
+        });
+        const error = yield* Effect.promise(() =>
+          runRemoteInstallDriver({
+            ...uploadInput(),
+            bootstrapToken: "fixture-grant",
+            candidateVersion: "0.7.3-upgrade.49",
+          }).catch((error: unknown) => error),
+        );
+        expect(error).toBeInstanceOf(Error);
+        expect(owned.state.requests).toBe(0);
+        expect(fixture.requests).not.toContain("updater.install");
+      }),
+  );
+  it.effect("omits invalid endpoint input from its public error", () =>
+    Effect.gen(function* () {
+      const error = yield* Effect.promise(() =>
+        runRemoteInstallDriver({
+          ...uploadInput(),
+          endpoint: "http://[private-endpoint-input",
+          bootstrapToken: "fixture-grant",
+          candidateVersion: "0.7.3-upgrade.49",
+        }).catch((error: unknown) => error),
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error) + encodeFixtureJson(error)).not.toContain("private-endpoint-input");
+      expect(owned.state.requests).toBe(0);
+    }),
+  );
+
+  it.effect(
+    "holds the real HTTP body until the product coordinator observes the waiting stage",
+    () =>
+      Effect.gen(function* () {
+        const fixture = terminalFixture({
+          ticket: yield* readAuthFixture("websocket-ticket"),
+          token: yield* readAuthFixture("token"),
+          beforeVersion: "0.7.2",
+          runningVersion: "0.7.3-upgrade.49",
+          holdInstallReply: true,
+        });
+        owned.state.allowContinue = false;
+        const running = runRemoteInstallDriver({
+          ...uploadInput(),
+          bootstrapToken: "fixture-grant",
+          candidateVersion: "0.7.3-upgrade.49",
+        });
+        try {
+          const httpFirst = yield* Effect.promise(() =>
+            Promise.race([
+              owned.state.headers.promise.then(() => true),
+              fixture.installRequested.promise.then(() => false),
+              running.then(
+                () => false,
+                () => false,
+              ),
+            ]),
+          );
+          expect(httpFirst).toBe(true);
+          expect(owned.state.receiptBeforeHttp).toBe(true);
+          expect(fixture.requests).not.toContain("updater.install");
+          owned.state.continueBody();
+          yield* Effect.promise(() => owned.state.prefix.promise);
+          yield* Effect.promise(() => fixture.waitingObserved.promise);
+          expect(owned.state.received.toString()).toBe("o");
+          fixture.releaseInstall();
+          const result = yield* Effect.promise(() => running);
+          expect(owned.state.received.toString()).toBe("ok");
+          expect(result).toMatchObject({
+            heldUpload: {
+              admitted: true,
+              releasedOnWaitingStage: true,
+              completed: true,
+              bytesMatch: true,
+              noPartials: true,
+              requestClosed: true,
+            },
+          });
+        } finally {
+          owned.state.continueBody();
+          fixture.releaseInstall();
+          owned.state.onCompleted();
+          yield* Effect.promise(() => running.catch(() => undefined));
+        }
+      }),
+  );
+
+  it.effect("joins coordinator verification after an installed upload response fails", () =>
+    Effect.gen(function* () {
+      const fixture = terminalFixture({
+        ticket: yield* readAuthFixture("websocket-ticket"),
+        token: yield* readAuthFixture("token"),
+        beforeVersion: "0.7.2",
+        runningVersion: "0.7.3-upgrade.49",
+        holdVerification: true,
+      });
+      owned.state.mode = "drop-response";
+      let settled = false;
+      const running = runRemoteInstallDriver({
+        ...uploadInput(),
+        bootstrapToken: "fixture-grant",
+        candidateVersion: "0.7.3-upgrade.49",
+      }).then(
+        (value) => {
+          settled = true;
+          return value;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      try {
+        const began = yield* Effect.promise(() =>
+          Promise.race([
+            owned.state.headers.promise.then(() => true),
+            fixture.installRequested.promise.then(() => false),
+            running.then(() => false),
+          ]),
+        );
+        expect(began).toBe(true);
+        yield* Effect.promise(() => owned.state.completed.promise);
+        yield* Effect.promise(() => fixture.verificationRequested.promise);
+        expect(settled).toBe(false);
+        fixture.releaseVerification();
+        const error = yield* Effect.promise(() => running);
+        expect(error).toBeInstanceOf(Error);
+        expect(String(error)).toContain("held upload");
+        expect(String(error)).not.toContain("fixture-private-upload");
+        expect(fixture.closed.mock.calls).toEqual([[1], [2]]);
+      } finally {
+        fixture.releaseVerification();
+        owned.state.onCompleted();
+        yield* Effect.promise(() => running);
+      }
+    }),
+  );
+
+  it.effect("refuses an existing capability receipt before HTTP or install dispatch", () =>
+    Effect.gen(function* () {
+      const fixture = terminalFixture({
+        ticket: yield* readAuthFixture("websocket-ticket"),
+        token: yield* readAuthFixture("token"),
+        beforeVersion: "0.7.2",
+        runningVersion: "0.7.3-upgrade.49",
+      });
+      yield* Effect.promise(() =>
+        NodeFS.promises.writeFile(owned.state.uploadReceiptPath, "private-existing-receipt"),
+      );
+      const running = runRemoteInstallDriver({
+        ...uploadInput(),
+        bootstrapToken: "fixture-grant",
+        candidateVersion: "0.7.3-upgrade.49",
+      });
+      // An old driver has no held request; release its inert host solely to bound the RED control.
+      const dispatched = fixture.installRequested.promise.then(() => owned.state.onCompleted());
+      yield* Effect.promise(() => expect(running).rejects.toThrow("private upload receipt"));
+      void dispatched;
+      expect(owned.state.requests).toBe(0);
+      expect(fixture.requests).not.toContain("updater.install");
+      expect(
+        yield* Effect.promise(() =>
+          NodeFS.promises.readFile(owned.state.uploadReceiptPath, "utf8"),
+        ),
+      ).toBe("private-existing-receipt");
+    }),
+  );
+
+  for (const mode of ["refuse", "wrong-bytes"] as const) {
+    it.effect("fails a real held upload " + mode + " without accepting false qualification", () =>
+      Effect.gen(function* () {
+        const fixture = terminalFixture({
+          ticket: yield* readAuthFixture("websocket-ticket"),
+          token: yield* readAuthFixture("token"),
+          beforeVersion: "0.7.2",
+          runningVersion: "0.7.3-upgrade.49",
+        });
+        owned.state.mode = mode;
+        const error = yield* Effect.promise(() =>
+          runRemoteInstallDriver({
+            ...uploadInput(),
+            bootstrapToken: "fixture-grant",
+            candidateVersion: "0.7.3-upgrade.49",
+          }).catch((error: unknown) => error),
+        );
+        expect(error).toBeInstanceOf(Error);
+        expect(String(error)).not.toContain("fixture-private-upload");
+        expect(owned.state.receiptBeforeHttp).toBe(true);
+        if (mode === "refuse") {
+          expect(fixture.requests).not.toContain("updater.install");
+          expect(fixture.closed.mock.calls).toEqual([[1]]);
+        } else {
+          expect(fixture.requests).toContain("updater.install");
+          expect(fixture.closed.mock.calls).toEqual([[1], [2]]);
+          expect(String(error)).toContain("bytes or residue");
+        }
+        const receipt = (yield* decodeFixtureJson(
+          yield* Effect.promise(() =>
+            NodeFS.promises.readFile(owned.state.uploadReceiptPath, "utf8"),
+          ),
+        )) as { relativeDirectory: string };
+        expect(
+          NodeFS.existsSync(NodePath.join(owned.state.workspaceRoot, receipt.relativeDirectory)),
+        ).toBe(true);
+      }),
+    );
+  }
+
+  it.effect(
+    "joins a successful update but fails qualification when the real hold budget expires",
+    () =>
+      Effect.gen(function* () {
+        const fixture = terminalFixture({
+          ticket: yield* readAuthFixture("websocket-ticket"),
+          token: yield* readAuthFixture("token"),
+          beforeVersion: "0.7.2",
+          runningVersion: "0.7.3-upgrade.49",
+          installStage: "installing",
+        });
+        vi.useFakeTimers();
+        let settled = false;
+        const running = runRemoteInstallDriver({
+          ...uploadInput(),
+          bootstrapToken: "fixture-grant",
+          candidateVersion: "0.7.3-upgrade.49",
+        }).then(
+          (result) => {
+            settled = true;
+            return result;
+          },
+          (error: unknown) => {
+            settled = true;
+            return error;
+          },
+        );
+        try {
+          yield* Effect.promise(() => owned.state.prefix.promise);
+          yield* Effect.promise(() => fixture.installRequested.promise);
+          expect(owned.state.received.toString()).toBe("o");
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(20_001));
+          yield* Effect.promise(() => owned.state.completed.promise);
+          for (let count = 0; count < 10; count++) {
+            if (settled) break;
+            yield* Effect.promise(() => vi.advanceTimersByTimeAsync(1_000));
+          }
+          expect(settled).toBe(true);
+          const error = yield* Effect.promise(() => running);
+          expect(String(error)).toContain('"reason":"hold-timeout"');
+          expect(String(error)).toContain('"coordinatorPhase":"succeeded"');
+          expect(owned.state.received.toString()).toBe("ok");
+          expect(fixture.closed.mock.calls).toEqual([[1], [2]]);
+        } finally {
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(25_000));
+          owned.state.onCompleted();
+          yield* Effect.promise(() => running);
+          vi.useRealTimers();
+        }
+      }),
+  );
 
   for (const [name, options] of [
     ["refused precheck", { checkSnapshots: [{ state: "up-to-date" as const }] }],
@@ -308,14 +747,20 @@ describe("remote install RPC driver", () => {
       });
       const result = yield* Effect.promise(() =>
         runRemoteInstallDriver({
-          endpoint: "http://127.0.0.1:43123",
+          ...uploadInput(),
           bootstrapToken: "fixture-sharing-grant",
           candidateVersion: "0.7.3-upgrade.51",
         }),
       );
       expect(result.before.serverVersion).toBe("0.7.2");
       expect(result.after.serverVersion).toBe("0.7.3-upgrade.51");
-      expect(result.phases).toEqual(["starting", "restarting", "verifying", "succeeded"]);
+      expect(result.phases).toEqual([
+        "starting",
+        "installing",
+        "restarting",
+        "verifying",
+        "succeeded",
+      ]);
       expect(fixture.requests.indexOf("updater.check")).toBeLessThan(
         fixture.requests.indexOf("updater.install"),
       );
@@ -339,7 +784,7 @@ describe("remote install RPC driver", () => {
       });
       const result = yield* Effect.promise(() =>
         runRemoteInstallDriver({
-          endpoint: "http://127.0.0.1:43123",
+          ...uploadInput(),
           bootstrapToken: "fixture-sharing-grant",
           candidateVersion: "0.7.3-upgrade.49",
         }),
@@ -383,7 +828,7 @@ describe("remote install RPC driver", () => {
         yield* Effect.promise(() =>
           expect(
             runRemoteInstallDriver({
-              endpoint: "http://127.0.0.1:43123",
+              ...uploadInput(),
               bootstrapToken: "fixture-sharing-grant",
               candidateVersion: "0.7.3-upgrade.49",
             }),
@@ -406,7 +851,7 @@ describe("remote install RPC driver", () => {
       yield* Effect.promise(() =>
         expect(
           runRemoteInstallDriver({
-            endpoint: "http://127.0.0.1:43123",
+            ...uploadInput(),
             bootstrapToken: "fixture-sharing-grant",
             candidateVersion: "0.7.3-upgrade.49",
           }),
@@ -432,7 +877,7 @@ describe("remote install RPC driver", () => {
           yield* Effect.promise(async () => {
             vi.useFakeTimers();
             const result = runRemoteInstallDriver({
-              endpoint: "http://127.0.0.1:43123",
+              ...uploadInput(),
               bootstrapToken: "fixture-sharing-grant",
               candidateVersion: "0.7.3-upgrade.49",
             }).catch((error: unknown) => error);
@@ -459,7 +904,7 @@ describe("remote install RPC driver", () => {
         yield* Effect.promise(() =>
           expect(
             runRemoteInstallDriver({
-              endpoint: "http://127.0.0.1:43123",
+              ...uploadInput(),
               bootstrapToken: "fixture-sharing-grant",
               candidateVersion: "0.7.3-upgrade.49",
             }),
@@ -467,7 +912,7 @@ describe("remote install RPC driver", () => {
         );
         expect(connected).toHaveBeenCalledOnce();
         const url = connected.mock.calls[0]![0];
-        expect(url.origin).toBe("ws://127.0.0.1:43123");
+        expect(url.origin).toBe(owned.state.endpoint.replace("http:", "ws:"));
         expect(url.pathname).toBe("/ws");
         expect(url.searchParams.get("wsTicket")).toBe(ticketFixture.ticket);
       }),
@@ -486,7 +931,7 @@ describe("remote install RPC driver", () => {
       yield* Effect.promise(() =>
         expect(
           runRemoteInstallDriver({
-            endpoint: "http://127.0.0.1:43123",
+            ...uploadInput(),
             bootstrapToken: "fixture-sharing-grant",
             candidateVersion: "0.7.3-upgrade.49",
           }),
@@ -506,7 +951,7 @@ describe("remote install RPC driver", () => {
       const failure = yield* Effect.promise(async () => {
         try {
           await runRemoteInstallDriver({
-            endpoint: "http://127.0.0.1:43123",
+            ...uploadInput(),
             bootstrapToken: "sentinel-private-grant",
             candidateVersion: "0.7.3-upgrade.49",
           });
@@ -521,7 +966,9 @@ describe("remote install RPC driver", () => {
       expect(message).toContain('"failureKind":"wrong-version"');
       expect(message).toContain('"runningVersion":"0.7.2"');
       expect(message).toContain('"targetVersion":"0.7.3-upgrade.49"');
-      expect(message).toContain('"phases":["starting","restarting","verifying","failed"]');
+      expect(message).toContain(
+        '"phases":["starting","installing","restarting","verifying","failed"]',
+      );
       expect(message).not.toContain("sentinel-private");
       expect(message.length).toBeLessThan(1024);
       expect(fixture.requests).toContain("updater.install");
@@ -543,7 +990,7 @@ describe("remote install RPC driver", () => {
           const failure = yield* Effect.promise(async () => {
             try {
               await runRemoteInstallDriver({
-                endpoint: "http://127.0.0.1:43123",
+                ...uploadInput(),
                 bootstrapToken: "sentinel-private-grant",
                 candidateVersion: "0.7.3-upgrade.49",
               });

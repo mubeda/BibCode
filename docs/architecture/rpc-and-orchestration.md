@@ -4,6 +4,20 @@ BiBCode uses Effect RPC over one authenticated WebSocket per connected
 environment. The same protocol is used by browser and Tauri clients; the
 desktop bridge is reserved for host-native capabilities.
 
+## Full orchestration HTTP snapshot
+
+The existing `GET /api/orchestration/snapshot` endpoint requires
+`orchestration:read` and returns the declared `OrchestrationReadModel`.
+Its camel-case project/default-thread identities and full message, activity,
+plan, checkpoint and session records come from one repository snapshot load.
+The HTTP projection includes archived and deleted records with their markers;
+WS shell snapshots retain their existing active/archived filtering.
+Shared pure project/thread serializers keep the public field policy aligned,
+with borrowed rows grouped once per thread for the full response. Persistence
+states, command receipts and raw projection column names are not wire fields.
+HTTP fields declared optional rather than nullable are omitted when absent;
+the existing WS shell/thread output remains unchanged.
+
 ## Provider capabilities by workspace
 
 `server.getProviderCapabilities` is a read-only unary RPC with
@@ -1549,9 +1563,16 @@ the turn ends as error, and the session reports `session_stopped` with
 delivery status before continuing." A shutdown error does not skip settlement
 after detach. Cleanup also requests settlement without a captured identity, so
 a later attempt can retry a failed settlement. Ready projections are left alone;
-removal cleanup retains its existing stop-only behavior. A delivery accepted
-after its session's cancellation skips publishing running runtime and session
-state while retaining the accepted delivery outcome. Retry resolution repeats
+removal cleanup retains its existing stop-only behavior. Accepted start publication remains owned by the supervisor's current driver
+identity and delivery generation. A per-session publication fence captures the
+terminal revision before native delivery and serializes both running writes
+with the pump's complete core batches. Cancellation, closure or any terminal
+observed since admission suppresses optimistic running publication without
+changing Accepted or resending input, including unknown native turn IDs. A fresh
+later admission uses the newer revision. Detach closes and drains admitted
+submitted core writers before pump abort and runtime deletion; successful
+restart uses the same drain and a fresh replacement fence after native shutdown.
+Shutdown failure preserves the existing old-session behavior. Retry resolution repeats
 capture only while its transition ownership is current, and recovery/newer-loss
 cancellation still short-circuits the whole
 attempt. Terminal cleanup applies the same transition-scoped pattern to every

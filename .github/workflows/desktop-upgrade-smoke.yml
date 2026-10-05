@@ -11,7 +11,7 @@ jobs:
   seeded_upgrade_smoke:
     name: Seeded upgrade - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 240
+    timeout-minutes: ${{ matrix.jobTimeoutMinutes }}
     strategy:
       fail-fast: false
       matrix:
@@ -22,6 +22,7 @@ jobs:
               platform: linux,
               arch: arm64,
               bundle: appimage,
+              jobTimeoutMinutes: 240,
             }
           - {
               label: Linux x64 AppImage,
@@ -29,6 +30,7 @@ jobs:
               platform: linux,
               arch: x64,
               bundle: appimage,
+              jobTimeoutMinutes: 240,
             }
           - {
               label: Windows arm64 NSIS,
@@ -36,6 +38,7 @@ jobs:
               platform: win,
               arch: arm64,
               bundle: nsis,
+              jobTimeoutMinutes: 240,
             }
           - {
               label: Windows x64 NSIS,
@@ -43,9 +46,25 @@ jobs:
               platform: win,
               arch: x64,
               bundle: nsis,
+              jobTimeoutMinutes: 240,
             }
-          - { label: macOS arm64, runner: macos-26, platform: mac, arch: arm64, bundle: dmg }
-          - { label: macOS x64, runner: macos-26-intel, platform: mac, arch: x64, bundle: dmg }
+          - {
+              label: macOS arm64,
+              runner: macos-26,
+              platform: mac,
+              arch: arm64,
+              bundle: dmg,
+              jobTimeoutMinutes: 240,
+            }
+          # Three cold 90-minute builds + three 10-minute installs + setup and all upgrade lanes.
+          - {
+              label: macOS x64,
+              runner: macos-26-intel,
+              platform: mac,
+              arch: x64,
+              bundle: dmg,
+              jobTimeoutMinutes: 360,
+            }
     steps:
       - name: Checkout complete release history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

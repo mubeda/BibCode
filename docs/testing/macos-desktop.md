@@ -144,6 +144,17 @@ the user's running instance for this check.
 
 ## Application and DMG build inspection
 
+The CI-only seeded-upgrade matrix gives Intel x64 packaging children 90 minutes
+and its complete job 360 minutes. ARM64 keeps 45-minute packaging children and
+a 240-minute job. There are three sequential cold packages with separate Cargo
+outputs (candidate, previous stable, protected baseline), each with a separate
+10-minute frozen install; the cached repository `target` does not warm these
+outputs. Intel's remaining 60 minutes cover setup, all upgrade lanes, evidence,
+and cleanup. `remote-install` reuses the protected package. These allowances
+leave product, WebDriver, and restart deadlines intact; record a packaging
+timeout separately from native upgrade results, and never run this CI harness
+locally. See the [seeded matrix procedure](../operations/release.md#seeded-packaged-upgrade-matrix).
+
 Build the host-native artifact:
 
 ```sh
@@ -167,6 +178,13 @@ Mount the exact test-owned DMG read-only at a fresh mount point, inspect the
 contained application, and detach that mount during cleanup. Report configured
 signing, ad-hoc signing, and notarization separately. Never claim notarization
 when credentials or a notarized ticket are absent.
+
+Before publishing a macOS 26 release, verify the Finder-rendered icon from that
+mounted payload with `swift scripts/check-macos-app-icon.swift` and its exact
+application path. The release workflow runs this check on both native macOS
+targets after recursive signature verification and before upload. A failed icon
+check is a failed native build; a check against a different installed bundle
+does not qualify the release DMG.
 
 Build and run packaged E2E with:
 

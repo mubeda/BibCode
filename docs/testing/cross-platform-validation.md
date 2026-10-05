@@ -330,6 +330,39 @@ recovery must preserve queued state, payload, mode, and existing holds without
 launching a provider. A starting/connecting/running projection without a live
 runtime, including after graceful shutdown, must become an error with no active
 turn, settle its partial assistant messages, and hold every queued message.
+For accepted-start publication, use deterministic supervisor and native-driver
+gates to cover both workspace-loss orderings: settle after native acceptance
+before publication, then hold an actor-owned publication and queue settlement
+behind it. Repeat ready/running projection, shutdown failure, retained partial
+text and queue holds, old-driver identity and wrong generation. Accepted and
+one native send must survive suppression, caller/actor acknowledgement closure
+and public shutdown; steers must retain their no-running-publication policy.
+
+Also cover normal terminal completion before queued Accepted publication with
+known and unknown native turn IDs and failed completion. In the opposite order,
+hold Accepted between its durable running writes and require the entire terminal
+batch to follow. Gate a terminal after status projection but before partial text
+completion; next native admission and later deltas/completions must wait until
+partial settlement and terminal activity finish. A late previous-turn terminal
+conservatively suppresses running publication; a fresh admission can publish.
+Exercise revision exhaustion without wraparound or reopening publication.
+
+Use the existing SQLite/engine persistence gate to pause a real submitted core
+command, then cancel/stop or restart. Drain must retain the writer through the
+complete core batch before pump abort, runtime deletion or replacement. Verify
+closed-fence stale writers make no runtime/session/message writes, successful
+restart uses a fresh fence, and failed native shutdown leaves the old session
+installed. Preserve EOF/fatal-exit partial settlement and idle-rearm controls.
+A bounded native output fixture must keep draining while the actor awaits a
+native control. Keep fake drivers, queued writes and tasks scoped and joined;
+no actual provider, account or host credential is needed. Run the closest owner
+group and adjacent provider supervisor tests before integrations:
+
+```sh
+cargo test -p bibcode-server --lib production::provider_runtime::workspace_loss_tests:: -j 2
+cargo test -p bibcode-server --test production_provider_runtime --test turn_delivery_recovery -j 2
+```
+
 In light and dark themes, both restart reconciliation and workspace-loss
 settlement must show "BiBCode stopped this session" above their existing
 actionable explanation. A genuine provider disconnect must retain the
@@ -372,6 +405,18 @@ must reach its intentional abort boundary, rather than treating a setup panic
 as a successful crash probe. Run the recovery suite in the foreground with
 Cargo jobs bounded by `-j 2`; retain child diagnostics and report pipe/resource
 failures without weakening delivery assertions or production deadlines.
+
+On Unix, recovery-test children have a private re-executed monitor group and a
+parent-owned lifetime lease. Follow [the watchdog procedure](./flaky-tests.md#unix-recovery-test-watchdog)
+for `turn_delivery_recovery` on native Linux and native macOS: parent SIGKILL
+and SIGINT must remove handshake-proven child/grandchild/group identities while
+an owned peer survives. Verify raw child status, streamed binary diagnostics,
+normal root exit with descendant-held pipes, startup/protocol failure, original
+absolute deadlines, and monitor reaping. This is test-fixture ownership;
+production `ProcessRunner` behavior and Windows's direct helper are separate.
+Descendants that leave the group are excluded and retain an explicit fixture
+cleanup owner. Record paired base/change latency and reliability evidence;
+existing macOS desktop CI alone does not run this server integration target.
 
 For web queue behavior, run the focused renderer seams and then the web gates:
 
@@ -1273,6 +1318,19 @@ whether a live native grant actually widened; `widened: false` is not a wide
 live pass. Host notice can remain tests-only under the approved validation
 contract. Never execute the seeded harness locally, even with an isolated data
 root; legacy cleanup can terminate another desktop app.
+
+For seeded CI qualification, distinguish a packaging-child timeout from a
+runtime-upgrade failure. The candidate, previous stable, and protected baseline
+are three sequential builds with separate cold Cargo outputs outside the
+workflow's cached repository `target`; `remote-install` reuses the protected
+package. Only macOS x64 gives each packaging child 90 minutes and the complete
+job 360 minutes. Other targets keep 45-minute packaging children and 240-minute
+jobs; the separate WSL job also keeps 240 minutes. Frozen installs remain
+10 minutes per checkout. Intel's job reserves 60 additional minutes after the
+three packaging and install bounds for setup, all lanes, evidence, and cleanup.
+Product, WebDriver, and restart deadlines remain unchanged. Record a command
+timeout and the last completed phase as unavailable native evidence; passing
+tooling tests cannot substitute for completed upgrade observations.
 
 ## Clone from URL network scenario
 

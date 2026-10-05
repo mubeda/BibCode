@@ -539,7 +539,7 @@ impl ProductionRuntime {
                     .await
                     .map_err(internal_error)?;
                 Ok(JsonRouteResponse::ok(
-                    serde_json::to_value(snapshot).map_err(internal_error)?,
+                    super::orchestration_rpc::read_model_snapshot(&snapshot, &now_iso()),
                 ))
             }
             JsonOperation::OrchestrationDispatch => {
@@ -2429,7 +2429,11 @@ mod tests {
             .await
             .expect("snapshot route should succeed");
         assert_eq!(snapshot.status, StatusCode::OK);
-        assert!(snapshot.body.is_object());
+        assert_eq!(snapshot.body["snapshotSequence"], json!(0));
+        assert!(snapshot.body["updatedAt"].is_string());
+        assert_eq!(snapshot.body["projects"], json!([]));
+        assert_eq!(snapshot.body["threads"], json!([]));
+        assert!(snapshot.body.get("states").is_none());
 
         assert!(
             runtime

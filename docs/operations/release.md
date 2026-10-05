@@ -135,7 +135,9 @@ seals the complete bundle so Gatekeeper can verify that it is intact, but it
 does not associate the app with an Apple Developer team or notarize it. Users
 must approve a browser-downloaded build through Settings > Privacy & Security.
 Release CI mounts both macOS DMGs and verifies their recursive bundle
-signatures before upload.
+signatures and Finder-rendered application icons before upload. The existing
+icon verifier reads the application from that exact read-only DMG mount; its
+failure stops the native build job before assets can be uploaded.
 
 Windows artifacts remain without Authenticode. macOS remains ad-hoc
 signed/unnotarized by decision (2026-09-18): an ad-hoc identity changes with
@@ -256,6 +258,17 @@ version. The harness verifies the package manifests, both Rust manifests,
 their Cargo lock entries, and the Tauri overlay agree, so native app and embedded
 server versions describe the same build. The calling checkout is not rewritten.
 
+The three packages compile sequentially into separate Cargo output directories
+under the isolated run root; the workflow's cached repository `target` does not
+warm them. The macOS Intel packaging child has a 90-minute bound; every other
+target retains 45 minutes. Each checkout's frozen dependency install retains
+10 minutes. The complete Intel job allows 360 minutes: 270 for packaging, 30
+for those installs, and 60 for setup, all upgrade lanes, evidence, and cleanup.
+The other five native rows and the separate WSL job retain 240 minutes.
+The `remote-install` lane reuses the protected package rather than building a
+fourth package. These are build/job limits, not expected durations or changes
+to product, WebDriver, or restart deadlines.
+
 The harness uses an isolated root outside the checkout, an ephemeral Tauri
 updater key, a loopback-only mock updater, the packaged app's embedded
 WebDriver, and bounded redacted evidence. It never opens or copies the SQLite
@@ -280,6 +293,18 @@ target. The coordinator runs over authenticated loopback RPC; when widened, it
 waits for a candidate boot reachable through a local interface.
 A test-only metadata observer records brief percentages/stages without changing
 product coordinator deadlines.
+Before installation, the remote lane creates a dedicated witness directory in
+its private workspace and mints an ordinary signed upload through authenticated
+RPC. It exclusively writes and flushes the private capability receipt before
+starting HTTP. A real `100 Continue` admits the two-byte upload; the final byte
+is held until the product coordinator reports `waiting-for-mutations`. The
+helper's 20-second hold bound starts at admission. Expiry releases the harmless
+body but fails qualification; it never supplies fabricated progress or changes
+updater polling and deadlines. Once installation is dispatched, fixture failure
+still joins the update coordinator and the HTTP request before reporting failure.
+Success requires the completed upload's exact bytes and no partial file.
+Fallback residue removal runs only after the lane's application cleanup has
+joined; a failed stop preserves the directory.
 The remote lane records an install attempt only after its authenticated
 `updater.install` request is dispatched. A refused check or failed dispatch
 leaves that marker false, so a failed WebDriver phase cannot be mistaken for an
@@ -292,6 +317,13 @@ mount/runtime and cleans only processes still carrying that lane's exact
 `BIBCODE_HOME`. Host evidence is captured before WebDriver teardown; backup and
 project retention are read through public bridge/RPC observations. Credentials
 stay in a private receipt outside retained evidence and are redacted from logs.
+The upload receipt is also private and immutable. Evidence redaction removes
+full, truncated and escaped transfer-capability labels before applying size
+bounds. An invalid private receipt prevents evidence retention; only fixed
+upload-witness booleans and bounds are added to the public result.
+Present `null` receipts are invalid. Once remote WebDriver launch is attempted,
+both phase logs and final evidence require the bootstrap receipt, even if
+installation was never dispatched; earlier local preparation failures do not.
 If the remote coordinator does not succeed, the phase log retains only its
 typed phase/failure kind, unique phase history, and bounded valid version
 strings. Host error messages and credential or identity details are omitted.
