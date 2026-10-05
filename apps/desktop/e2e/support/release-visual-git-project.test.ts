@@ -31,6 +31,116 @@ afterEach(() => {
   document.documentElement.className = "";
 });
 
+const directoryOperations = [
+  ...(["add", "browse", "nested"] as const).flatMap((control) =>
+    (["displayed", "unique", "enabled", "click"] as const).map(
+      (operation) => `${control}-${operation}`,
+    ),
+  ),
+  "path-fill",
+  "path-commit",
+];
+
+function directoryFailure(fault: string, observerFails = false) {
+  const original = new Error("Inert original directory operation failure.");
+  const calls: string[] = [];
+  const phases: string[] = [];
+  const control = (selector: string) =>
+    selector.includes("sidebar-add-project-trigger")
+      ? "add"
+      : selector.includes("Browse folder")
+        ? "browse"
+        : selector === 'button[aria-label="Open nested"]'
+          ? "nested"
+          : selector === '[aria-label="Server directory path"]'
+            ? "path"
+            : null;
+  const operation = async (selector: string, name: string) => {
+    const owned = control(selector);
+    if (owned === null) return;
+    const kind = `${owned}-${name}`;
+    calls.push(kind);
+    if (fault === kind) throw original;
+  };
+  const selected = {
+    projectId: "owned-rich",
+    threadId: "owned-default",
+    environmentId: "primary",
+    cwd: "/owned/visual-git-project/rich",
+    branch: "main",
+    title: "rich",
+  };
+  const run = () =>
+    runGitProjectVisual({
+      browser: {
+        $: (selector: string) => ({
+          waitForDisplayed: () => operation(selector, "displayed"),
+          waitForEnabled: () => operation(selector, "enabled"),
+          click: () => operation(selector, "click"),
+          setValue: () => operation(selector, "fill"),
+          getText: async () => "visual-discovered",
+        }),
+        $$: (selector: string) => ({
+          length: operation(selector, "unique").then(() => 1),
+        }),
+        keys: async (key: string) => {
+          expect(key).toBe("Enter");
+          await operation('[aria-label="Server directory path"]', "commit");
+        },
+      },
+      owner: {},
+      theme: "light",
+      origin: "http://127.0.0.1:4885",
+      fixture: { rich: selected.cwd, ordinary: "/owned/visual-git-project/ordinary" },
+      step: (phase: string) => {
+        phases.push(phase);
+        if (
+          observerFails &&
+          phase.startsWith("visual-git-project-directory-") &&
+          phase !== "visual-git-project-directory-open"
+        )
+          throw new Error("Inert attribution failure.");
+      },
+      selectProject: async () => selected,
+      verifyOwnedIdentity: async () => {},
+      openHiddenWorktrees: async () => {},
+      capture: async (scene: string) => {
+        if (scene === "project-open-directory") throw original;
+        expect(scene).toBe("worktree-discovery");
+      },
+    } as never);
+  return { original, calls, phases, run };
+}
+
+it.each(directoryOperations)(
+  "attributes the existing directory await at %s without changing the original failure",
+  async (operation) => {
+    const f = directoryFailure(operation);
+    await expect(f.run()).rejects.toBe(f.original);
+    expect(f.phases).toContain("visual-git-project-directory-open");
+    expect(f.phases.at(-1)).toBe(`visual-git-project-directory-${operation}`);
+    const order = [
+      ...directoryOperations.slice(0, 8),
+      "path-fill",
+      "path-commit",
+      ...directoryOperations.slice(8, 12),
+    ];
+    expect(f.calls).toEqual(order.slice(0, order.indexOf(operation) + 1));
+  },
+);
+
+it("contains new directory attribution faults and preserves the later capture exception", async () => {
+  const f = directoryFailure("capture", true);
+  await expect(f.run()).rejects.toBe(f.original);
+  expect(f.calls).toEqual([
+    ...directoryOperations.slice(0, 8),
+    "path-fill",
+    "path-commit",
+    ...directoryOperations.slice(8, 12),
+  ]);
+  expect(f.phases.at(-1)).toBe("visual-git-project-project-open-directory");
+});
+
 async function mountedNoRepositoryCard(theme: "light" | "dark") {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const webRequire = NodeModule.createRequire(NodePath.resolve("apps/web/package.json"));

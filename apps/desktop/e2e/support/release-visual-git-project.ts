@@ -475,7 +475,11 @@ export function readGitProjectVisualWitness(
       hostContext:
         /Open project folder on .+/.test(text(popup)) &&
         field('[aria-label="Server directory path"]')?.value === input.directory &&
-        inView(one('button[aria-label="Open nested"]')),
+        inView(
+          one(
+            '[data-slot="dialog-popup"][role="dialog"] button[aria-label="Open nested"]:has(> [data-directory-folder-icon])',
+          ),
+        ),
     };
   } else if (
     input.scene === "project-clone-chooser" ||
@@ -797,11 +801,28 @@ export async function runGitRewritePreview(
 export async function runGitProjectVisual(input: GitProjectVisualInput): Promise<object> {
   const { browser, fixture } = input;
   const completed: GitProjectVisualScene[] = [];
-  const click = async (selector: string) => {
+  type DirectoryControl = "add" | "browse" | "nested";
+  const observeDirectoryAwait = (
+    operation:
+      | `${DirectoryControl}-${"displayed" | "unique" | "enabled" | "click"}`
+      | "path-fill"
+      | "path-commit",
+  ) => {
+    try {
+      input.step(`visual-git-project-directory-${operation}`);
+    } catch {
+      // Optional attribution cannot replace an existing action or exception.
+    }
+  };
+  const click = async (selector: string, directoryControl?: DirectoryControl) => {
     const control = browser.$(selector);
+    if (directoryControl) observeDirectoryAwait(`${directoryControl}-displayed`);
     await control.waitForDisplayed();
+    if (directoryControl) observeDirectoryAwait(`${directoryControl}-unique`);
     if ((await browser.$$(selector).length) !== 1) throw refused();
+    if (directoryControl) observeDirectoryAwait(`${directoryControl}-enabled`);
     await control.waitForEnabled();
+    if (directoryControl) observeDirectoryAwait(`${directoryControl}-click`);
     await control.click();
   };
   const capture = async (
@@ -862,13 +883,16 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
   await input.verifyOwnedIdentity(rich);
 
   input.step("visual-git-project-directory-open");
-  await click('[data-testid="sidebar-add-project-trigger"]');
+  await click('[data-testid="sidebar-add-project-trigger"]', "add");
   await click(
     '//button[@data-add-project-action="true"][.//span[normalize-space()="Browse folder"]]',
+    "browse",
   );
+  observeDirectoryAwait("path-fill");
   await browser.$('[aria-label="Server directory path"]').setValue(fixture.ordinary);
+  observeDirectoryAwait("path-commit");
   await browser.keys("Enter");
-  await click('button[aria-label="Open nested"]');
+  await click('button[aria-label="Open nested"]', "nested");
   await capture("project-open-directory", rich);
   await click("button=Type a path instead");
   await browser.$("#add-project-host-path").waitForDisplayed();

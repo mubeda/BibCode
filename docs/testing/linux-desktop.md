@@ -1193,7 +1193,22 @@ ordinary-directory and recoverable broken-config cases, a bare origin, an
 external discovered worktree and a retained incomplete clone destination. The
 owned nested directory contains the real `Open nested` entry required by the
 strict directory witness. None of these files substitutes for rendered product
-state or screenshot evidence.
+state or screenshot evidence. That reader requires the unique folder-row button
+inside the current Add Project dialog, identified by its existing direct
+`data-directory-folder-icon` child. The current directory's same-label breadcrumb
+is a distinct public control; it cannot substitute for the required child folder.
+Missing, hidden, clipped, duplicate or outside-dialog folder rows refuse the
+unchanged path, geometry, context and screenshot fences.
+
+Directory-opening attribution preserves `visual-git-project-directory-open`, then
+marks only existing awaits with `visual-git-project-directory-` plus
+`add`, `browse` or `nested` and `displayed`, `unique`, `enabled` or `click`, or
+`path-fill`/`path-commit`. These closed phases add no browser read/action or wait,
+contain optional attribution faults and preserve original exceptions and cleanup.
+They identify an awaited boundary, not the cause of a native timeout. The real
+Add Project hook/dialog/directory browser and pinned SDK typing regression prove
+source behavior using inert operation/query ports; they do not qualify native
+XPath lookup, geometry, process timing or pixels.
 
 For this selection only, verify the canonical owned private clone-alias file and
 its exact key/value, then set the actual server child's `GIT_CONFIG_GLOBAL` to
