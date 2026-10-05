@@ -86,6 +86,23 @@ impl StoreFixture {
     }
 }
 
+// Use only after backup work has settled and the fixture will never use this database again.
+// Dropping the handle only releases its sender; acknowledge actual file closure before
+// offline marker changes or snapshots. The detached worker retains only an inert memory DB.
+async fn close_prepared_store_for_offline_fixture(prepared: PreparedStore) {
+    prepared
+        .database
+        .call(|connection| {
+            let replacement = Connection::open_in_memory()?;
+            let file_connection = std::mem::replace(connection, replacement);
+            file_connection.close().map_err(|(_, error)| error)?;
+            Ok(())
+        })
+        .await
+        .expect("close prepared fixture file connection");
+    drop(prepared);
+}
+
 fn server_endpoint(handle: &bibcode_server::ServerHandle, path: &str) -> String {
     format!("http://{}{path}", handle.local_addr())
 }
@@ -731,6 +748,70 @@ async fn dangling_marker_entry_with_missing_database_is_not_first_run() {
 }
 
 #[tokio::test]
+async fn offline_fixture_teardown_waits_for_owned_work_and_closes_the_file_connection() {
+    let fixture = StoreFixture::with_project("Before queued work").await;
+    fixture.write_marker(Uuid::new_v4());
+    let prepared = fixture.prepare().await.expect("prepare teardown fixture");
+    let database = prepared.database.clone();
+    let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let held_work = tokio::spawn(async move {
+        database
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE projection_projects SET title = 'After queued work' WHERE project_id = 'protected-project'",
+                    [],
+                )?;
+                entered_sender.send(()).expect("worker entered held work");
+                release_receiver
+                    .recv()
+                    .map_err(|_| bibcode_server::persistence::PersistenceError::WorkerUnavailable)?;
+                Ok(())
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_receiver)
+        .await
+        .expect("worker admission deadline")
+        .expect("worker entered held work");
+    assert!(sqlite_sidecar(&fixture.paths.database, "-wal").is_file());
+
+    tokio::time::pause();
+    let teardown = close_prepared_store_for_offline_fixture(prepared);
+    tokio::pin!(teardown);
+    assert!(futures_util::poll!(teardown.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        futures_util::poll!(teardown.as_mut()).is_pending(),
+        "offline teardown must await the held file connection instead of a delay"
+    );
+    tokio::time::resume();
+
+    release_sender
+        .send(())
+        .expect("release owned database work");
+    tokio::time::timeout(Duration::from_secs(5), held_work)
+        .await
+        .expect("owned work completion deadline")
+        .expect("owned database task joins")
+        .expect("owned database work completes");
+    tokio::time::timeout(Duration::from_secs(5), teardown)
+        .await
+        .expect("file connection close deadline");
+    assert!(!sqlite_sidecar(&fixture.paths.database, "-wal").exists());
+    assert!(!sqlite_sidecar(&fixture.paths.database, "-shm").exists());
+    let connection = Connection::open(&fixture.paths.database).expect("closed fixture database");
+    let title: String = connection
+        .query_row(
+            "SELECT title FROM projection_projects WHERE project_id = 'protected-project'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("owned work persisted before offline teardown");
+    assert_eq!(title, "After queued work");
+}
+
+#[tokio::test]
 async fn recovery_restore_preserves_the_live_store_before_installing_a_verified_backup() {
     let fixture = StoreFixture::with_project("Before restore").await;
     let storage_instance_id = Uuid::new_v4();
@@ -755,8 +836,7 @@ async fn recovery_restore_preserves_the_live_store_before_installing_a_verified_
         })
         .await
         .expect("mutate live project after backup");
-    drop(prepared);
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    close_prepared_store_for_offline_fixture(prepared).await;
 
     let result = restore_backup(
         fixture
@@ -810,8 +890,7 @@ async fn recovery_restore_rejects_a_backup_from_a_different_known_storage_identi
     )
     .await
     .expect("create verified recovery generation");
-    drop(prepared);
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    close_prepared_store_for_offline_fixture(prepared).await;
     fixture.write_marker(Uuid::new_v4());
     let database_before = std::fs::read(&fixture.paths.database).expect("live database bytes");
     let marker_before = std::fs::read(&fixture.paths.environment_id).expect("live marker bytes");
@@ -857,8 +936,7 @@ async fn recovery_restore_rejects_a_tampered_manifest_without_mutating_the_live_
     )
     .await
     .expect("create verified recovery generation");
-    drop(prepared);
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    close_prepared_store_for_offline_fixture(prepared).await;
     let mut manifest: Value = serde_json::from_slice(
         &std::fs::read(&backup.manifest_path).expect("backup manifest bytes"),
     )
@@ -1038,8 +1116,7 @@ async fn recovery_restore_preserves_a_malformed_marker_and_installs_the_verified
     )
     .await
     .expect("create verified recovery generation");
-    drop(prepared);
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    close_prepared_store_for_offline_fixture(prepared).await;
     let malformed = b"not-a-storage-uuid\n";
     fixture.write_marker_bytes(malformed);
 
@@ -1265,8 +1342,7 @@ async fn recovery_inspection_reports_verified_store_state_without_mutating_it() 
     )
     .await
     .expect("create verified inspection generation");
-    drop(prepared);
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    close_prepared_store_for_offline_fixture(prepared).await;
     let database_before = std::fs::read(&fixture.paths.database).expect("database bytes");
     let marker_before = std::fs::read(&fixture.paths.environment_id).expect("marker bytes");
     let entries_before = directory_entry_names(&fixture.paths.state_dir);
