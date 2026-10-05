@@ -63,7 +63,10 @@ flowchart TB
   ungrouped), once at startup for every project, and after a healthy
   worktree-catalog scan: at most every five minutes per project, or at once
   when the primary checkout's `.git/config` size or modification time changed
-  since the last scan (one stat, no Git process). Reconciles are serialized
+  since the last scan (one stat in a tracked task, bounded to three seconds, one
+  outstanding per project; an unknown stamp falls back to the interval, and the
+  catalog refresh never waits for it, so a stalled network mount cannot block it).
+  Reconciles are serialized
   per project, bounded to four concurrent Git reads, cancellable while waiting
   for either, and run as tracked tasks
   off the effects worker and catalog refresh paths, joined at shutdown. A
