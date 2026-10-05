@@ -43,12 +43,24 @@ const sceneFacts: Record<SettingsVisualScene, readonly string[]> = {
     "containedScroll",
   ],
   "settings-provider-form": [
+    "binaryFieldPresent",
+    "binaryFieldVisible",
+    "binaryFieldViewportContained",
+    "binaryFieldAncestorsContained",
     "nonSecretFieldsVisible",
     "ownedConfigOnly",
+    "modelsCustomFieldPresent",
+    "modelsCustomFieldVisible",
+    "modelsCustomFieldViewportContained",
+    "modelsCustomFieldAncestorsContained",
     "modelsCustomFieldInView",
     "modelsCustomFieldReady",
     "modelsVisible",
     "modelControlsVisible",
+    "modelOrderControlPresent",
+    "modelOrderControlVisible",
+    "modelOrderControlViewportContained",
+    "modelOrderControlAncestorsContained",
     "accountsRedacted",
   ],
   "settings-keybindings": [
@@ -277,6 +289,35 @@ export function readSettingsVisualWitness(
     !["light", "dark"].includes(input.theme)
   )
     return null;
+  const prefix = () => ({
+    node: null as Element | null,
+    present: false,
+    visible: false,
+    viewportContained: false,
+    ancestorsContained: false,
+  });
+  const binaryPrefix = prefix(),
+    customPrefix = prefix(),
+    orderPrefix = prefix();
+  const tracked = {
+    "#provider-instance-claudeAgent-binaryPath": binaryPrefix,
+    "#provider-instance-claudeAgent-custom-model": customPrefix,
+    'button[aria-label="Move Opus 5 up"]': orderPrefix,
+  };
+  const trackedSelector = (selector: string) =>
+    input.scene === "settings-provider-form" && Object.hasOwn(tracked, selector)
+      ? tracked[selector as keyof typeof tracked]
+      : undefined;
+  const trackedNode = (node: Element | null) =>
+    node === null
+      ? undefined
+      : node === binaryPrefix.node
+        ? binaryPrefix
+        : node === customPrefix.node
+          ? customPrefix
+          : node === orderPrefix.node
+            ? orderPrefix
+            : undefined;
   const visible = (element: Element | null): element is HTMLElement => {
     if (!element) return false;
     const box = element.getBoundingClientRect(),
@@ -289,16 +330,31 @@ export function readSettingsVisualWitness(
       style.opacity !== "0"
     );
   };
-  const all = (selector: string) => Array.from(document.querySelectorAll(selector)).filter(visible);
+  const all = (selector: string) => {
+    const matches = Array.from(document.querySelectorAll(selector));
+    const observed = trackedSelector(selector);
+    if (observed) observed.present = matches.length > 0;
+    return matches.filter(visible);
+  };
   const one = (selector: string) => {
     const matches = all(selector);
-    return matches.length === 1 ? matches[0]! : null;
+    const node = matches.length === 1 ? matches[0]! : null;
+    const observed = trackedSelector(selector);
+    if (observed) {
+      observed.node = node;
+      observed.visible = node !== null;
+    }
+    return node;
   };
   const inView = (element: Element | null) => {
-    if (!visible(element)) return false;
+    const ownVisible = visible(element);
+    const observed = trackedNode(element);
+    if (observed) observed.visible = ownVisible;
+    if (!ownVisible) return false;
     const box = element.getBoundingClientRect();
     if (box.left < 0 || box.top < 0 || box.right > innerWidth || box.bottom > innerHeight)
       return false;
+    if (observed) observed.viewportContained = true;
     for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
       const style = getComputedStyle(ancestor),
         clip = ancestor.getBoundingClientRect();
@@ -313,12 +369,19 @@ export function readSettingsVisualWitness(
       )
         return false;
     }
+    if (observed) observed.ancestorsContained = true;
     return true;
   };
   const text = (element: Element | null) => element?.textContent?.trim() ?? "";
   const field = (selector: string) => {
     const element = one(selector);
-    return element instanceof HTMLInputElement ? element : null;
+    const value = element instanceof HTMLInputElement ? element : null;
+    const observed = trackedSelector(selector);
+    if (observed) {
+      observed.node = value;
+      observed.visible = value !== null;
+    }
+    return value;
   };
   const readonlyAvailability = (element: Element | null) =>
     element !== null &&
@@ -424,13 +487,26 @@ export function readSettingsVisualWitness(
             'button[aria-label="Add Opus 5 to favorites"],button[aria-label="Remove Opus 5 from favorites"]',
           ),
         );
+      const modelControlsVisible = inView(one('button[aria-label="Move Opus 5 up"]'));
       facts = {
+        binaryFieldPresent: binaryPrefix.present,
+        binaryFieldVisible: binaryPrefix.visible,
+        binaryFieldViewportContained: binaryPrefix.viewportContained,
+        binaryFieldAncestorsContained: binaryPrefix.ancestorsContained,
         nonSecretFieldsVisible,
         ownedConfigOnly,
+        modelsCustomFieldPresent: customPrefix.present,
+        modelsCustomFieldVisible: customPrefix.visible,
+        modelsCustomFieldViewportContained: customPrefix.viewportContained,
+        modelsCustomFieldAncestorsContained: customPrefix.ancestorsContained,
         modelsCustomFieldInView,
         modelsCustomFieldReady,
         modelsVisible,
-        modelControlsVisible: inView(one('button[aria-label="Move Opus 5 up"]')),
+        modelControlsVisible,
+        modelOrderControlPresent: orderPrefix.present,
+        modelOrderControlVisible: orderPrefix.visible,
+        modelOrderControlViewportContained: orderPrefix.viewportContained,
+        modelOrderControlAncestorsContained: orderPrefix.ancestorsContained,
         accountsRedacted: Array.from(
           document.querySelectorAll('button[aria-label="Toggle account email visibility"]'),
         ).every((account) => getComputedStyle(account).filter.includes("blur(")),

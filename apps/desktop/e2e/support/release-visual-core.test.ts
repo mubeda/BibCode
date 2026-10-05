@@ -15,6 +15,250 @@ import {
 import * as CoreCapture from "./release-visual-core.ts";
 import { readVisualWitness, observeVisualNameClear } from "./release-visual-observation.ts";
 
+it("waits for the actual L1 draft produced by the pinned file gutter selection and panel callbacks", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const webRequire = NodeModule.createRequire(NodePath.resolve("apps/web/package.json"));
+  const { act, createElement, useState, useCallback } = webRequire("react") as {
+    act: (run: () => void | Promise<void>) => Promise<void>;
+    createElement: (type: unknown, props: unknown, ...children: unknown[]) => unknown;
+    useState: <T>(value: T) => [T, (value: T | ((prior: T) => T)) => void];
+    useCallback: <T>(value: T, deps: unknown[]) => T;
+  };
+  const { createRoot } = webRequire("react-dom/client") as {
+    createRoot: (container: Element) => { render: (node: unknown) => void; unmount: () => void };
+  };
+  const annotationModule = "../../../web/src/components/files/LocalCommentAnnotation.tsx";
+  const { LocalCommentAnnotation } = await import(annotationModule);
+  const rangeModule = "../../../web/src/components/files/fileCommentAnnotations.ts";
+  const { normalizeFileCommentRange, formatFileCommentRange, nextFileCommentId } = await import(
+    rangeModule
+  );
+  const surface = NodeFS.readFileSync(
+    NodePath.resolve("apps/web/src/components/files/FilePreviewPanel.tsx"),
+    "utf8",
+  );
+  const between = (source: string, begin: string, end: string) => {
+    const start = source.indexOf(begin),
+      finish = source.indexOf(end, start);
+    expect(start).toBeGreaterThan(0);
+    expect(finish).toBeGreaterThan(start);
+    return source.slice(start, finish);
+  };
+  const callbacks =
+    between(surface, "  const setSelectedRange = useCallback(", "  const surfaceRef =") +
+    between(surface, "  const beginComment = useCallback(", "  const hasOpenCommentForm =") +
+    between(surface, "  const handleLineSelectionEnd = useCallback(", "  const handlePostRender =");
+  type Entry = { id: string; kind: string; startLine: number; endLine: number; text: string };
+  type Annotation = { lineNumber: number; metadata: { entries: Entry[] } };
+  let handlers: {
+    setSelectedRange: (range: unknown) => void;
+    handleLineSelectionEnd: (range: unknown) => void;
+  };
+  const selections: unknown[] = [];
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  function CommentProbe() {
+    const [annotations, setLineAnnotations] = useState<Annotation[]>([]);
+    handlers = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(callbacks) + "\n({setSelectedRange,handleLineSelectionEnd})",
+      {
+        useCallback,
+        setLineAnnotations,
+        normalizeFileCommentRange,
+        nextFileCommentId,
+        revealRequestId: 1,
+        setSelectionOverride: (value: unknown) => selections.push(value),
+      },
+    );
+    const entry = annotations[0]?.metadata.entries[0];
+    return entry
+      ? createElement(LocalCommentAnnotation, {
+          kind: entry.kind,
+          rangeLabel: formatFileCommentRange(entry.startLine, entry.endLine),
+          text: entry.text,
+          onCancel: () => {},
+          onComment: () => {},
+          onDelete: () => {},
+        })
+      : null;
+  }
+  const pierreEntry = NodePath.resolve("apps/web/node_modules/@pierre/diffs/package.json");
+  const fileModule = NodePath.join(NodePath.dirname(pierreEntry), "dist/components/File.js");
+  const ssrModule = NodePath.join(NodePath.dirname(pierreEntry), "dist/ssr/index.js");
+  const { File } = await import(fileModule);
+  const { preloadFile } = await import(ssrModule);
+  let viewer: { hydrate: (input: unknown) => void; cleanUp: () => void } | undefined;
+  let fileContainer: HTMLElement | undefined;
+  try {
+    await act(async () => root.render(createElement(CommentProbe, null)));
+    const options = NodeVM.runInNewContext(
+      "(" +
+        between(surface, "            options={{", "            selectedLines=")
+          .replace("            options={{", "{")
+          .replace(/}}\s*$/, "}") +
+        ")",
+      {
+        hasOpenCommentForm: false,
+        setSelectedRange: handlers!.setSelectedRange,
+        handleLineSelectionEnd: handlers!.handleLineSelectionEnd,
+        wordWrap: true,
+        resolveDiffThemeName: () => "pierre-light",
+        resolvedTheme: "light",
+        FILE_LINK_REVEAL_UNSAFE_CSS: "",
+        handlePostRender: () => {},
+      },
+    );
+    expect(options.enableLineSelection).toBe(true);
+    const file = {
+      name: "src/nested/visual-note.ts",
+      contents: 'export const review = "Review this owned file";\nexport const count = 2;\n',
+    };
+    const rendered = await preloadFile({ file, options });
+    fileContainer = document.createElement("diffs-container");
+    document.body.append(fileContainer);
+    viewer = new File({ ...options, controlledSelection: true, disableErrorHandling: true });
+    viewer!.hydrate({ ...rendered, fileContainer });
+    const line = fileContainer.shadowRoot!.querySelector<HTMLElement>(
+      '[data-gutter] [data-column-number="1"]',
+    )!;
+    expect(line).not.toBeNull();
+    // A JS click alone is not native pointer selection. The fake protocol endpoint
+    // below supplies ordinary pointer down/up; native delivery and geometry remain unproved.
+    await act(async () => line.click());
+    expect(document.querySelector("textarea")).toBeNull();
+    const desktopRequire = NodeModule.createRequire(NodePath.resolve("apps/desktop/package.json"));
+    const sdk = NodeFS.readFileSync(
+      NodePath.join(NodePath.dirname(desktopRequire.resolve("webdriverio")), "index.js"),
+      "utf8",
+    );
+    const sdkClick = NodeVM.runInNewContext(
+      between(sdk, "function click(options) {", "async function actionClick(") + "\nclick",
+    ) as (this: unknown) => Promise<void>;
+    const source = NodeFS.readFileSync(
+      NodePath.join(import.meta.dirname, "release-visual-core.ts"),
+      "utf8",
+    );
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" +
+          between(
+            source,
+            '  const file = browser.$("[data-preview-panel-mode] diffs-container");',
+            '  step("visual-files-comment-draft");',
+          ) +
+          "}\nrun",
+      ),
+      {
+        step: () => {},
+        browser: {
+          $: (selector: string) =>
+            selector.includes("diffs-container")
+              ? {
+                  shadow$: (target: string) => {
+                    expect(fileContainer!.shadowRoot!.querySelector(target)).toBe(line);
+                    return {
+                      waitForDisplayed: async () => {},
+                      click: () =>
+                        sdkClick.call({
+                          elementId: "owned-line",
+                          elementClick: async (id: string) => {
+                            expect(id).toBe("owned-line");
+                            await act(async () => {
+                              line.dispatchEvent(
+                                new PointerEvent("pointerdown", {
+                                  bubbles: true,
+                                  composed: true,
+                                  pointerType: "mouse",
+                                  pointerId: 1,
+                                  button: 0,
+                                }),
+                              );
+                              line.dispatchEvent(
+                                new PointerEvent("pointerup", {
+                                  bubbles: true,
+                                  composed: true,
+                                  pointerType: "mouse",
+                                  pointerId: 1,
+                                  button: 0,
+                                }),
+                              );
+                              line.click();
+                            });
+                          },
+                        }),
+                    };
+                  },
+                }
+              : {
+                  waitForDisplayed: async () => {
+                    expect(
+                      document.querySelector('textarea[aria-label="Comment on lines L1"]'),
+                    ).not.toBeNull();
+                    expect(document.querySelector(selector)).not.toBeNull();
+                  },
+                },
+        },
+      },
+    ) as () => Promise<void>;
+    await run();
+    expect(document.querySelectorAll('textarea[aria-label="Comment on lines L1"]')).toHaveLength(1);
+    expect(document.querySelector('textarea[aria-label="Comment on lines 1"]')).toBeNull();
+    expect(selections).toContainEqual({ revealRequestId: 1, range: { start: 1, end: 1 } });
+  } finally {
+    viewer?.cleanUp();
+    fileContainer?.remove();
+    await act(async () => root.unmount());
+    container.remove();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  }
+});
+
+it.each(["displayed", "draft"])(
+  "preserves the actual comment %s failure and fixed phase",
+  async (stage) => {
+    const source = NodeFS.readFileSync(
+      NodePath.join(import.meta.dirname, "release-visual-core.ts"),
+      "utf8",
+    );
+    const start = source.indexOf("  const comment = browser.$("),
+      end = source.indexOf("  await click('//button[normalize-space()=\"Comment\"]'", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const original = new Error("Inert original comment operation failure.");
+    const phases: string[] = [];
+    const values: string[] = [];
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" + source.slice(start, end) + "}\nrun",
+      ),
+      {
+        step: (phase: string) => phases.push(phase),
+        browser: {
+          $: (selector: string) => {
+            expect(selector).toBe('textarea[aria-label="Comment on lines L1"]');
+            return {
+              waitForDisplayed: async () => {
+                if (stage === "displayed") throw original;
+              },
+              setValue: async (value: string) => {
+                values.push(value);
+                throw original;
+              },
+            };
+          },
+        },
+      },
+    ) as () => Promise<void>;
+    await expect(run()).rejects.toBe(original);
+    expect(phases.at(-1)).toBe(
+      stage === "displayed" ? "visual-files-comment-input-displayed" : "visual-files-comment-draft",
+    );
+    expect(values).toEqual(stage === "displayed" ? [] : ["Review this owned line"]);
+  },
+);
+
 it("returns from Git through the actual card's public keyboard activation when its sibling covers the button", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const webRequire = NodeModule.createRequire(NodePath.resolve("apps/web/package.json"));

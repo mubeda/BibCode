@@ -891,8 +891,15 @@ history in a real repository.
 
 The browser uses public keyboard, pointer, scroll, input and menu actions.
 The Files scene opens its real nested file and adds a line comment through the
-editor gutter. The palette filters to and highlights Open settings without
-executing it. In Changes, select the working-tree PNG and require the owned
+editor's public line-number gutter selection. The existing selection-end callback
+creates the local draft; a generic JS click alone does not prove that gesture.
+For line one, the actual range formatter yields `L1`, so wait for the real
+textarea labelled `Comment on lines L1` before entering the fixed review text
+and pressing Comment. Keep the ordinary gutter action, input/submit sequence,
+owner bounds and original capture guards. The pinned file viewer, real panel
+callbacks, mounted annotation and SDK/fake-endpoint regression establish source
+behavior; native gesture delivery and the resulting PNG still need CI evidence.
+The palette filters to and highlights Open settings without executing it. In Changes, select the working-tree PNG and require the owned
 image row, visible diff pane and disabled empty partial-staging gutter; that
 binary representation does not provide an image preview. Use public History
 controls to select the baseline commit and its PNG, then require the unchanged
@@ -1043,14 +1050,23 @@ the exact checked states and existing full geometry/identity/credential fences.
 At only `visual-settings-source-control` or `visual-settings-provider-form`, the
 existing failure receipt may include
 `settingsCaptureFailureFacts` for that same thrown error and current scene/theme.
-The provider form retains only its existing `nonSecretFieldsVisible`,
+The provider form retains its existing `nonSecretFieldsVisible`,
 `ownedConfigOnly`, `modelsVisible`, `modelControlsVisible` and `accountsRedacted`
-booleans alongside the unchanged common facts. Two model prefixes additionally
-retain `modelsCustomFieldInView` and `modelsCustomFieldReady` (in-view and empty).
-A false first prefix identifies input visibility; true first/false ready identifies
-a non-empty input; both true with false `modelsVisible` identifies the existing
-favorite-control predicate. Later reads preserve the original short circuit: an
-unready input adds no favorite query, and no raw value or geometry is retained.
+booleans alongside the unchanged common facts. `modelsCustomFieldInView` and
+`modelsCustomFieldReady` retain the original in-view and empty-input conjunctions.
+The same existing selector, box and style reads additionally retain ordered
+`Present`, `Visible`, `ViewportContained` and `AncestorsContained` boolean prefixes
+for `binaryField`, `modelsCustomField` and `modelOrderControl`. Presence means an
+existing selector found a node; visible means the unique matching node passed
+its own visibility checks, and fields also require the original input type.
+With visible true, viewport false identifies failed viewport containment. With
+viewport true, ancestors false identifies failed ancestor containment. A later
+false prefix does not claim its checks ran after an earlier failure. These facts
+cannot distinguish an ambiguous, wrong-kind or hidden node by themselves.
+Binary prefixes do not add home/launch-field reads. Custom ready false after
+in-view true identifies a non-empty input; ready true with models visible false
+identifies the existing favorite-control predicate. An unready input adds no
+favorite query. No raw value, geometry, style or ancestor identity is retained.
 Capture admission remains equivalent on the actual reader, not relaxed.
 It reuses the latest actual witness from existing capture reads; it adds no DOM
 execution or retry. Exact known own-data booleans may retain false scene/text or

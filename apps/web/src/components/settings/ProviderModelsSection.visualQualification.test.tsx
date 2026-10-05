@@ -81,7 +81,10 @@ it.each([false, true])(
       status: "ready",
       auth: { status: "unauthenticated" },
       checkedAt: "2026-07-06T00:00:00.000Z",
-      models: [{ slug: "opus", name: "Opus 5", isCustom: false, capabilities: null }],
+      models: [
+        { slug: "opus", name: "Opus 5", isCustom: false, capabilities: null },
+        { slug: "sonnet", name: "Sonnet 5", isCustom: false, capabilities: null },
+      ],
       slashCommands: [],
       skills: [],
       agents: [],
@@ -200,6 +203,18 @@ it.each([false, true])(
       expect(custom.value).toBe("");
       expect(favoriteButton).not.toBeNull();
       expect(observe()).toMatchObject({
+        binaryFieldPresent: true,
+        binaryFieldVisible: true,
+        binaryFieldViewportContained: true,
+        binaryFieldAncestorsContained: true,
+        modelsCustomFieldPresent: true,
+        modelsCustomFieldVisible: true,
+        modelsCustomFieldViewportContained: true,
+        modelsCustomFieldAncestorsContained: true,
+        modelOrderControlPresent: true,
+        modelOrderControlVisible: true,
+        modelOrderControlViewportContained: true,
+        modelOrderControlAncestorsContained: true,
         modelsVisible: true,
         modelsCustomFieldInView: true,
         modelsCustomFieldReady: true,
@@ -378,6 +393,10 @@ it.each([false, true])(
         modelsVisible: false,
         modelsCustomFieldInView: false,
         modelsCustomFieldReady: false,
+        modelsCustomFieldPresent: true,
+        modelsCustomFieldVisible: true,
+        modelsCustomFieldViewportContained: false,
+        modelsCustomFieldAncestorsContained: false,
         modelControlsVisible: true,
       });
       expect(valueReads).not.toHaveBeenCalled();
@@ -388,6 +407,25 @@ it.each([false, true])(
             'button[aria-label="Add Opus 5 to favorites"],button[aria-label="Remove Opus 5 from favorites"]',
         ),
       ).toBe(false);
+      const parent = custom.parentElement!;
+      custom.remove();
+      expect(observe()).toMatchObject({
+        modelsCustomFieldPresent: false,
+        modelsCustomFieldVisible: false,
+        modelsCustomFieldViewportContained: false,
+        modelsCustomFieldAncestorsContained: false,
+        modelsCustomFieldInView: false,
+      });
+      parent.append(custom);
+      custom.style.display = "none";
+      expect(observe()).toMatchObject({
+        modelsCustomFieldPresent: true,
+        modelsCustomFieldVisible: false,
+        modelsCustomFieldViewportContained: false,
+        modelsCustomFieldAncestorsContained: false,
+        modelsCustomFieldInView: false,
+      });
+      custom.style.display = "";
       expect(update).not.toHaveBeenCalled();
       expect(network).not.toHaveBeenCalled();
     } finally {

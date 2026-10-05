@@ -354,7 +354,7 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
   await line.waitForDisplayed();
   step("visual-files-line-click");
   await line.click();
-  const comment = browser.$('textarea[aria-label="Comment on lines 1"]');
+  const comment = browser.$('textarea[aria-label="Comment on lines L1"]');
   step("visual-files-comment-input-displayed");
   await comment.waitForDisplayed();
   step("visual-files-comment-draft");
