@@ -8,8 +8,8 @@ permissions:
 
 jobs:
   diagnostic:
-    name: Diagnose unchanged Intel payload
-    runs-on: macos-26-intel
+    name: Diagnose unchanged Intel payload on macOS 15
+    runs-on: macos-15-intel
     timeout-minutes: 90
     steps:
       - name: Checkout unchanged candidate product
@@ -54,6 +54,9 @@ jobs:
 
       - name: Compare owned verifier processes on one exact mounted payload
         shell: bash
+        env:
+          MAC_ICON_DIAGNOSTIC_SINGLE_ARM: CONTROL
+          MAC_ICON_DIAGNOSTIC_LOOKUP_ONLY: "0"
         run: |
           set -euo pipefail
           umask 077

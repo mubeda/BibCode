@@ -60,7 +60,9 @@ describe("macOS icon diagnostic protocol", () => {
     expect(workflow).toContain("ref: f0632e2550ee4ca16363c18b8a4b1ed7c548f32e");
     expect(workflow).toContain("ref: ${{ github.sha }}");
     expect(workflow).toContain("path: diagnostic-tooling");
-    expect(workflow).toContain("runs-on: macos-26-intel");
+    expect(workflow).toContain("runs-on: macos-15-intel");
+    expect(workflow).toContain("MAC_ICON_DIAGNOSTIC_SINGLE_ARM: CONTROL");
+    expect(workflow).toContain('MAC_ICON_DIAGNOSTIC_LOOKUP_ONLY: "0"');
     expect(workflow).toContain("timeout-minutes: 90");
     expect(workflow).toContain("hdiutil attach -readonly -nobrowse -noautoopen");
     expect(workflow).toContain("codesign --verify --deep --strict");

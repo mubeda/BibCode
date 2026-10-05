@@ -209,13 +209,15 @@ mandatory check against the exact mounted DMG application.
 
 For a payload-only Finder drawing stall, use a separate native CI diagnostic
 checkout before changing the mandatory gate. The temporary
-`macos-icon-diagnostic.yml` workflow builds an unchanged candidate once and
-compares fresh verifier processes on that same read-only mounted application:
-the control, explicit `NSApplication.shared` initialization, then either a
-control repeat to detect warming or equivalent-grid rectangle scaling when
-both payload probes time out. Each arm runs the shared raster fixtures first;
-if either arm cannot complete those fixtures, optional payload comparisons
-are not admitted.
+`macos-icon-diagnostic.yml` workflow builds an unchanged candidate once on the
+supported macOS 15 Intel runner and runs one fresh control verifier on that same
+read-only mounted application, without a preceding timed-out lookup. It verifies
+the ad-hoc signature and retains the full pixel verdict; generic document lookup
+cannot replace this actual-payload observation. The controller also supports
+explicitly selected paired initialization experiments, where optional warming
+or equivalent-grid comparisons require both payload observations. Each arm runs
+the shared raster fixtures first; if either arm cannot complete those fixtures,
+optional payload comparisons are not admitted.
 The rectangle arm retains the 1024-square bitmap and 256-point source image;
 it changes the destination rectangle instead of the explicit context scale.
 Diagnostic commands have a 120-second bound and reuse the command owner's
