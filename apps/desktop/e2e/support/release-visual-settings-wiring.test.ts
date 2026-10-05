@@ -327,7 +327,7 @@ describe("actual separate settings callsite", () => {
     const begin = source.indexOf(
       "      const workspace = await createOwnedWorkspace(context, runRoot);",
     );
-    const end = source.indexOf('      if (config.selection === "release-visual-core") {', begin);
+    const end = source.indexOf("\n      if (", begin);
     expect(begin).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(begin);
     let creates = 0;
