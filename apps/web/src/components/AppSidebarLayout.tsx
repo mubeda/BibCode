@@ -4,6 +4,7 @@ import * as TanStackRouter from "@tanstack/react-router";
 
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import { primaryServerKeybindingsAtom } from "../state/server";
+import { useUiStateStore } from "../uiStateStore";
 import ThreadSidebar from "./Sidebar";
 import { EnvironmentRail } from "./sidebar/EnvironmentRail";
 import {
@@ -134,6 +135,7 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
   const navigate = TanStackRouter.useNavigate();
   const pathname = useAppPathname();
   const [initialSidebarWidth] = useState(resolveInitialSidebarWidth);
+  const sidebarView = useUiStateStore((state) => state.sidebarView);
   useEffect(() => {
     const onMenuAction = window.desktopBridge?.onMenuAction;
     if (typeof onMenuAction !== "function") {
@@ -177,7 +179,8 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
         resizable={THREAD_SIDEBAR_RESIZABLE_OPTIONS}
       >
         <div className="flex h-full min-h-0 flex-row">
-          <EnvironmentRail />
+          {/* Each environment card names its environment, so the Repositories view drops the rail. */}
+          {sidebarView === "repositories" ? null : <EnvironmentRail />}
           <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
             <ThreadSidebar />
           </div>

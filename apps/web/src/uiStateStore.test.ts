@@ -16,6 +16,8 @@ import {
   setAgentsSectionExpanded,
   setDefaultAdvertisedEndpointKey,
   setProjectExpanded,
+  setRepositoryGroupExpanded,
+  setSidebarView,
   setThreadChangedFilesExpanded,
   type UiState,
 } from "./uiStateStore";
@@ -24,6 +26,8 @@ function makeUiState(overrides: Partial<UiState> = {}): UiState {
   return {
     agentsSectionExpanded: true,
     agentsGroupExpandedById: {},
+    sidebarView: "environments",
+    repositoryGroupExpandedById: {},
     projectExpandedById: {},
     projectOrder: [],
     threadLastVisitedAtById: {},
@@ -53,6 +57,28 @@ describe("agents section expansion", () => {
     const next = setAgentsGroupExpanded(initialUiState, "done", true);
     expect(next.agentsGroupExpandedById).toEqual({ done: true });
     expect(setAgentsGroupExpanded(next, "done", true)).toBe(next);
+  });
+});
+
+describe("sidebar view preference", () => {
+  it("defaults to environments and restores persisted values", () => {
+    expect(parsePersistedState({}).sidebarView).toBe("environments");
+    expect(parsePersistedState({ sidebarView: "bogus" as never }).sidebarView).toBe("environments");
+    const restored = parsePersistedState({
+      sidebarView: "repositories",
+      repositoryGroupExpandedById: { "github.com/acme/repo": false },
+    });
+    expect(restored.sidebarView).toBe("repositories");
+    expect(restored.repositoryGroupExpandedById).toEqual({ "github.com/acme/repo": false });
+  });
+
+  it("updates without copying unchanged state", () => {
+    const state = parsePersistedState({});
+    expect(setSidebarView(state, "environments")).toBe(state);
+    expect(setSidebarView(state, "repositories").sidebarView).toBe("repositories");
+    const collapsed = setRepositoryGroupExpanded(state, "key", false);
+    expect(collapsed.repositoryGroupExpandedById).toEqual({ key: false });
+    expect(setRepositoryGroupExpanded(collapsed, "key", false)).toBe(collapsed);
   });
 });
 
@@ -208,6 +234,8 @@ describe("parsePersistedState", () => {
 
     expect(parsed).toEqual({
       agentsSectionExpanded: false,
+      sidebarView: "environments",
+      repositoryGroupExpandedById: {},
       agentsGroupExpandedById: {
         done: true,
       },
@@ -319,6 +347,8 @@ describe("uiStateStore persistence", () => {
       agentsGroupExpandedById: {
         done: true,
       },
+      sidebarView: "repositories",
+      repositoryGroupExpandedById: { "github.com/acme/repo": false },
       projectExpandedById: {
         logical: false,
       },
@@ -342,6 +372,8 @@ describe("uiStateStore persistence", () => {
     ) as PersistedUiState;
     expect(persisted).toEqual({
       agentsSectionExpanded: false,
+      sidebarView: "repositories",
+      repositoryGroupExpandedById: { "github.com/acme/repo": false },
       agentsGroupExpandedById: {
         done: true,
       },

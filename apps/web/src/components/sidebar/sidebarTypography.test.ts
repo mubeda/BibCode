@@ -18,7 +18,9 @@ const LEFT_PANEL_SOURCES = [
   "./RelativeAge.tsx",
   "./SidebarProjectAvailability.tsx",
   "./SidebarProviderUpdatePill.tsx",
+  "./SidebarRepositoryGroup.tsx",
   "./SidebarUpdatePill.tsx",
+  "./SidebarViewToggle.tsx",
   "./WorkspaceCard.tsx",
 ] as const;
 
@@ -43,13 +45,16 @@ describe("left panel typography", () => {
     expect(textSizesBelowTextXs(icon)).toEqual([]);
   });
 
-  it("sets 6 px spacing in both project SidebarMenu branches", () => {
+  it("sets 6 px spacing in both project-row SidebarMenu branches and 8 px between repositories", () => {
     const source = NodeFS.readFileSync(new URL("../Sidebar.tsx", import.meta.url), "utf8");
     const menus = [
       ...source.matchAll(/<SidebarMenu\b[^>]*data-testid="sidebar-project-list"[^>]*>/g),
     ];
-    expect(menus).toHaveLength(2);
-    for (const [tag] of menus) expect(tag).toContain('className="gap-1.5"');
+    expect(menus.map(([tag]) => tag.match(/className="([^"]*)"/)?.[1]).toSorted()).toEqual([
+      "gap-1.5",
+      "gap-1.5",
+      "gap-2",
+    ]);
     expect(menus.some(([tag]) => tag.includes("ref={attachProjectListAutoAnimateRef}"))).toBe(true);
   });
 
