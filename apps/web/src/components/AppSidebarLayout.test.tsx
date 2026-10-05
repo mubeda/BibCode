@@ -59,6 +59,7 @@ vi.mock("./ui/tooltip", () => ({
   TooltipTrigger: ({ render }: { render?: ReactNode }) => <>{render}</>,
 }));
 
+import { useUiStateStore } from "../uiStateStore";
 import { AppSidebarLayout } from "./AppSidebarLayout";
 import { toastManager } from "./ui/toast";
 
@@ -88,6 +89,7 @@ afterEach(async () => {
   delete (window as { desktopBridge?: unknown }).desktopBridge;
   Object.defineProperty(window, "innerWidth", { configurable: true, value: initialInnerWidth });
   readStoredSidebarWidthMock = () => null;
+  useUiStateStore.setState({ sidebarView: "environments" });
 });
 
 describe("AppSidebarLayout", () => {
@@ -217,6 +219,25 @@ describe("AppSidebarLayout", () => {
     expect(panel).not.toBeNull();
     if (rail === null || panel === null) throw new Error("sidebar layout markers missing");
     expect(rail.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("does not render the environment rail in the Repositories view", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    mounted.push({ root, container });
+    const rail = () => container.querySelector('[data-testid="environment-rail-mock"]');
+
+    useUiStateStore.setState({ sidebarView: "repositories" });
+    await act(async () => {
+      root.render(<AppSidebarLayout>Workspace</AppSidebarLayout>);
+    });
+    expect(rail()).toBeNull();
+    expect(container.querySelector('[data-testid="thread-sidebar-mock"]')).not.toBeNull();
+
+    await act(async () => {
+      useUiStateStore.setState({ sidebarView: "environments" });
+    });
+    expect(rail()).not.toBeNull();
   });
 
   it("routes supported desktop menu actions independently", async () => {
