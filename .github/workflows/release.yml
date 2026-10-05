@@ -456,6 +456,7 @@ jobs:
           printf '%s\n' "$signature_details"
           grep -Fq 'Signature=adhoc' <<< "$signature_details"
           grep -Fq 'TeamIdentifier=not set' <<< "$signature_details"
+          swift scripts/check-macos-app-icon.swift "${app_paths[0]}"
 
       - name: Collect release assets
         shell: bash

@@ -135,7 +135,9 @@ seals the complete bundle so Gatekeeper can verify that it is intact, but it
 does not associate the app with an Apple Developer team or notarize it. Users
 must approve a browser-downloaded build through Settings > Privacy & Security.
 Release CI mounts both macOS DMGs and verifies their recursive bundle
-signatures before upload.
+signatures and Finder-rendered application icons before upload. The existing
+icon verifier reads the application from that exact read-only DMG mount; its
+failure stops the native build job before assets can be uploaded.
 
 Windows artifacts remain without Authenticode. macOS remains ad-hoc
 signed/unnotarized by decision (2026-09-18): an ad-hoc identity changes with
