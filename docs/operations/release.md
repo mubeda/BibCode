@@ -138,6 +138,12 @@ Release CI mounts both macOS DMGs and verifies their recursive bundle
 signatures and Finder-rendered application icons before upload. The existing
 icon verifier reads the application from that exact read-only DMG mount; its
 failure stops the native build job before assets can be uploaded.
+The closed `mac-icon-observation` stderr records distinguish Swift entry,
+workspace/TIFF/bitmap/pixel boundaries, and workflow cleanup return. The scan
+records retain capped bitmap dimensions and pixel counts, never application
+paths or native errors. Diagnostic caps never change the scan or verdict.
+These are observations, not alternate success criteria; missing records
+remain unobserved and the mandatory Finder verdict and job budget are unchanged.
 
 Windows artifacts remain without Authenticode. macOS remains ad-hoc
 signed/unnotarized by decision (2026-09-18): an ad-hoc identity changes with

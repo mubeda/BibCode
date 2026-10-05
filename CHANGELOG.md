@@ -37,7 +37,8 @@ BiBCode v0.7.4 improves message recovery, attachment uploads, Git workflows, and
 
 ### Known limitations and qualification still in progress
 
-- Remote-update native qualification ([#16](https://github.com/mubeda/BibCode/issues/16)), the remaining typography audit ([#27](https://github.com/mubeda/BibCode/issues/27)), the complete light/dark screenshot matrix ([#29](https://github.com/mubeda/BibCode/issues/29)), and the required manual SSH check on a real Mac ([#38](https://github.com/mubeda/BibCode/issues/38)) remain open. Source and hermetic tests do not establish those native scenarios as passed.
+- The remote-update feature is integrated ([#16](https://github.com/mubeda/BibCode/issues/16)); native qualification remains incomplete. The previous-stable Windows qualification did not establish the installed candidate, and observation hardening is separate from an actual installation pass.
+- The remaining typography audit ([#27](https://github.com/mubeda/BibCode/issues/27)), complete light/dark screenshot matrix ([#29](https://github.com/mubeda/BibCode/issues/29)), and required manual SSH check on a real Mac ([#38](https://github.com/mubeda/BibCode/issues/38)) remain open. Source and hermetic tests do not establish those native scenarios as passed.
 - End-to-end-encrypted file transfers ([#18](https://github.com/mubeda/BibCode/issues/18)) remain deferred and are excluded from this release.
 - The supplementary throttled browser immediate-close profile for legacy whole-request attachment delivery remains unqualified. API-side queue completion does not guarantee receiver delivery; staged uploads require their normal completion/admission flow.
 - The desktop restart guard retains its documented check-then-exit limitation around an update admitted concurrently with a manual restart.

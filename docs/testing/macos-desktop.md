@@ -186,6 +186,18 @@ targets after recursive signature verification and before upload. A failed icon
 check is a failed native build; a check against a different installed bundle
 does not qualify the release DMG.
 
+The CI verifier emits closed `mac-icon-observation` stage records to stderr and
+flushes them individually. These locate Swift entry, workspace icon retrieval,
+TIFF and bitmap materialization, pixel scanning, and the existing verdict.
+The scan-start record includes capped bitmap dimensions; scan-return includes
+capped opaque, dark, and pale counts. Diagnostic caps never change the scan or
+verdict calculations.
+The workflow records Swift dispatch/success and cleanup entry/return; cleanup
+return alone does not verify detach success. A missing record remains unobserved.
+Do not classify an icon pixel defect, compiler hang, or native service failure
+without the corresponding boundary or verdict evidence. The native payload,
+thresholds, platform rows, and existing job budget remain required.
+
 Build and run packaged E2E with:
 
 ```sh
