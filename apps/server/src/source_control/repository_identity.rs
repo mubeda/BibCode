@@ -5,12 +5,16 @@ use serde_json::{Value, json};
 use super::{ProviderKind, provider_from_remote, remote_host, remote_repository_path};
 
 /// The identity of the repository behind `remote_url`, or `None` for a local
-/// path or a remote without a host and repository path.
+/// path, a remote without a host and repository path, or a path with an empty
+/// segment (`a/.git`, `a//b`), whose name or owner clients would reject.
 #[must_use]
 pub fn repository_identity(remote_url: &str, root_path: &str) -> Option<Value> {
     let remote_url = remote_url.trim();
     let host = remote_host(remote_url)?;
     let path = remote_repository_path(remote_url)?;
+    if path.split('/').any(|segment| segment.trim().is_empty()) {
+        return None;
+    }
     let (owner, name) = match path.rsplit_once('/') {
         Some((owner, name)) => (Some(owner), name),
         None => (None, path.as_str()),
@@ -36,9 +40,9 @@ pub fn repository_identity(remote_url: &str, root_path: &str) -> Option<Value> {
     Some(identity)
 }
 
-/// The remote without the userinfo of a `scheme://` URL, which can carry an access token as the
-/// username or a password. The identity is persisted and sent to every client, so it must never
-/// hold one. The URL is parsed and re-serialized by the same parser that validates the identity
+/// The remote without the userinfo, query, and fragment of a `scheme://` URL, any of which can
+/// carry an access token. The identity is persisted in the append-only event log and sent to every
+/// client, so it must never hold one. The URL is parsed and re-serialized by the same parser that validates the identity
 /// (`remote_host`), so no parser disagreement can leave userinfo behind. scp-style
 /// `user@host:path` remotes carry no secret and stay as written. `None` means the URL does not parse.
 fn without_credentials(remote_url: &str) -> Option<String> {
@@ -49,6 +53,8 @@ fn without_credentials(remote_url: &str) -> Option<String> {
     // Only fails for URLs that cannot carry userinfo, which then have none to remove.
     let _ = url.set_username("");
     let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
     Some(url.into())
 }
 
@@ -94,6 +100,8 @@ mod tests {
         let mut url = url::Url::parse(remote).unwrap();
         url.set_username("").unwrap();
         url.set_password(None).unwrap();
+        url.set_query(None);
+        url.set_fragment(None);
         url.into()
     }
 
@@ -130,7 +138,11 @@ mod tests {
             ),
             (
                 "https://user:p%40ss@host:8443/o/r.git?x=1#f",
-                "https://host:8443/o/r.git?x=1#f",
+                "https://host:8443/o/r.git",
+            ),
+            (
+                "https://host/o/r.git?private_token=secret#secret",
+                "https://host/o/r.git",
             ),
             ("https://host/o/r@v1.git", "https://host/o/r@v1.git"),
             ("ssh://git@host:2222/o/r.git", "ssh://host:2222/o/r.git"),
@@ -175,6 +187,10 @@ mod tests {
             "./relative",
             "https://host/",
             "",
+            "https://host/a/.git",
+            "git@host:a/.git",
+            "https://host/a//b.git",
+            "git@host:a/ /b.git",
         ] {
             assert_eq!(repository_identity(remote, "/r"), None, "{remote}");
         }

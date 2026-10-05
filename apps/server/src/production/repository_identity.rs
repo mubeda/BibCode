@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{Arc, LazyLock, Mutex, PoisonError},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use serde_json::Value;
@@ -62,7 +62,12 @@ pub(crate) async fn reconcile_repository_identity(
     cancellation: &CancellationToken,
 ) -> bool {
     let project_lock = project_lock(project_id);
-    let _serialized = project_lock.lock().await;
+    // Biased so an already-cancelled reconcile never wins an uncontended race and dispatches.
+    let _serialized = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return false,
+        guard = project_lock.lock() => guard,
+    };
     let Ok(Some(project)) = engine
         .repositories()
         .get_project(project_id.to_owned())
@@ -74,8 +79,13 @@ pub(crate) async fn reconcile_repository_identity(
         return false;
     }
     let workspace_root = Path::new(&project.workspace_root);
-    let Ok(_permit) = GIT_READS.acquire().await else {
-        return false;
+    let _permit = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return false,
+        permit = GIT_READS.acquire() => match permit {
+            Ok(permit) => permit,
+            Err(_) => return false,
+        },
     };
     let observed = match read_repository_identity(repository, workspace_root, cancellation).await {
         Ok(Some(observed)) => observed,
@@ -132,22 +142,44 @@ pub(crate) async fn backfill_repository_identities(
     }
 }
 
+/// The `(modified, len)` of a checkout's `.git/config`, where `origin` lives. `None` when `.git` is
+/// not a directory (a linked worktree's `.git` file, a bare repository) or the stat fails.
+pub(crate) type GitConfigStamp = (SystemTime, u64);
+
+/// One stat, no Git process: cheap enough to run on every healthy catalog snapshot.
+pub(crate) async fn git_config_stamp(checkout: &Path) -> Option<GitConfigStamp> {
+    let metadata = tokio::fs::metadata(checkout.join(".git").join("config"))
+        .await
+        .ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
+}
+
 /// ponytail: one global map, fine for hundreds of projects; prune it if projects ever churn heavily.
 #[derive(Clone, Default)]
-pub(crate) struct RepositoryIdentityThrottle(Arc<Mutex<HashMap<String, Instant>>>);
+pub(crate) struct RepositoryIdentityThrottle(Arc<Mutex<HashMap<String, LastReconcile>>>);
+
+/// When a project last reconciled, and its `.git/config` stamp then.
+type LastReconcile = (Instant, Option<GitConfigStamp>);
 
 impl RepositoryIdentityThrottle {
     pub(crate) const INTERVAL: Duration = Duration::from_secs(300);
 
-    pub(crate) fn admit(&self, project_id: &str, now: Instant) -> bool {
+    /// Admits a project once per interval, or at once when its `.git/config` stamp differs from the
+    /// last one seen (for example after `git remote set-url`). An unknown stamp never bypasses.
+    pub(crate) fn admit(
+        &self,
+        project_id: &str,
+        now: Instant,
+        config: Option<GitConfigStamp>,
+    ) -> bool {
         let mut checked = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if checked
-            .get(project_id)
-            .is_some_and(|last| now.duration_since(*last) < Self::INTERVAL)
-        {
+        if checked.get(project_id).is_some_and(|(last, last_config)| {
+            now.duration_since(*last) < Self::INTERVAL
+                && (config.is_none() || config == *last_config)
+        }) {
             return false;
         }
-        checked.insert(project_id.to_owned(), now);
+        checked.insert(project_id.to_owned(), (now, config));
         true
     }
 }
@@ -364,9 +396,78 @@ mod tests {
     fn throttle_admits_each_project_once_per_interval() {
         let throttle = RepositoryIdentityThrottle::default();
         let start = Instant::now();
-        assert!(throttle.admit("p", start));
-        assert!(!throttle.admit("p", start + Duration::from_secs(10)));
-        assert!(throttle.admit("q", start));
-        assert!(throttle.admit("p", start + RepositoryIdentityThrottle::INTERVAL));
+        assert!(throttle.admit("p", start, None));
+        assert!(!throttle.admit("p", start + Duration::from_secs(10), None));
+        assert!(throttle.admit("q", start, None));
+        assert!(throttle.admit("p", start + RepositoryIdentityThrottle::INTERVAL, None));
+    }
+
+    #[test]
+    fn a_changed_git_config_bypasses_the_throttle_and_an_unchanged_one_does_not() {
+        let throttle = RepositoryIdentityThrottle::default();
+        let start = Instant::now();
+        let written = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let soon = start + Duration::from_secs(10);
+        assert!(throttle.admit("p", start, Some((written, 100))));
+        assert!(!throttle.admit("p", soon, Some((written, 100))));
+        assert!(!throttle.admit("p", soon, None));
+        assert!(throttle.admit("p", soon, Some((written, 101))));
+        let rewritten = written + Duration::from_secs(1);
+        assert!(throttle.admit("p", soon, Some((rewritten, 101))));
+        assert!(!throttle.admit("p", soon, Some((rewritten, 101))));
+    }
+
+    #[tokio::test]
+    async fn the_git_config_stamp_needs_a_git_directory() {
+        let checkout = TempDir::new().unwrap();
+        assert_eq!(git_config_stamp(checkout.path()).await, None);
+        std::fs::write(checkout.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(git_config_stamp(checkout.path()).await, None);
+        std::fs::remove_file(checkout.path().join(".git")).unwrap();
+        git(checkout.path(), &["init", "-q"]);
+        let before = git_config_stamp(checkout.path()).await.unwrap();
+        git(
+            checkout.path(),
+            &["remote", "add", "origin", "git@github.com:acme/repo.git"],
+        );
+        assert_ne!(git_config_stamp(checkout.path()).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_reconcile_waiting_for_the_project_lock_dispatches_nothing() {
+        let checkout = TempDir::new().unwrap();
+        git(checkout.path(), &["init", "-q"]);
+        git(
+            checkout.path(),
+            &["remote", "add", "origin", "git@github.com:acme/repo.git"],
+        );
+        let root = checkout.path().to_string_lossy().replace('\\', "/");
+        let engine = engine_with_project(&root).await;
+        let events = engine.repositories().max_event_sequence().await.unwrap();
+        let cancel = CancellationToken::new();
+        let lock = project_lock("p");
+        let held = lock.lock().await;
+        let reconcile = tokio::spawn({
+            let engine = engine.clone();
+            let cancel = cancel.clone();
+            async move {
+                reconcile_repository_identity(&engine, &GitRepository::default(), "p", &cancel)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), reconcile)
+                .await
+                .expect("cancellation ends the wait for the project lock")
+                .unwrap()
+        );
+        drop(held);
+        assert_eq!(
+            engine.repositories().max_event_sequence().await.unwrap(),
+            events
+        );
+        assert_eq!(stored(&engine).await, None);
     }
 }
