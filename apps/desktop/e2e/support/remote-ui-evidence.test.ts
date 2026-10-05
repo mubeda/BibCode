@@ -16,6 +16,7 @@ import {
   projectRemoteUiSetupObservation,
   projectRemoteUiCheckAgainObservation,
   projectRemoteUiSuccessRemovalObservation,
+  projectRemoteUiManualRemovalObservation,
   projectRemoteUiToastErrorSignature,
 } from "./remote-ui-evidence.ts";
 
@@ -748,4 +749,95 @@ it("quarantines unreadable success-removal proxies and leaves unrelated private 
   expect(
     Object.values(projectRemoteUiSuccessRemovalObservation(Object.create(successRemovalFacts))!),
   ).toEqual(Array(6).fill(null));
+});
+
+it("retains only an exact safe manual-removal own-data snapshot", () => {
+  const facts = {
+    safeLocation: true,
+    rowCount: "none",
+    toastCloseCount: "multiple",
+    visibleToastCloseCount: "one",
+    endingToastCount: "one",
+    removalDialogPresent: false,
+  };
+  expect(projectRemoteUiManualRemovalObservation(facts)).toEqual(facts);
+  expect(Object.isFrozen(projectRemoteUiManualRemovalObservation(facts))).toBe(true);
+  for (const input of [
+    undefined,
+    null,
+    [],
+    "private",
+    Object.create(facts),
+    { ...facts, safeLocation: false },
+    { ...facts, private: "private" },
+    { ...facts, [Symbol("private")]: true },
+  ])
+    expect(projectRemoteUiManualRemovalObservation(input)).toBeNull();
+  for (const field of Object.keys(facts)) {
+    expect(projectRemoteUiManualRemovalObservation({ ...facts, [field]: "private" })).toBeNull();
+    for (const kind of ["getter", "nonenumerable", "missing"]) {
+      let reads = 0;
+      const input: Record<string, unknown> = { ...facts };
+      delete input[field];
+      if (kind !== "missing")
+        Object.defineProperty(
+          input,
+          field,
+          kind === "getter"
+            ? {
+                enumerable: true,
+                get() {
+                  reads++;
+                  throw new Error("private getter");
+                },
+              }
+            : { value: Reflect.get(facts, field), enumerable: false },
+        );
+      expect(projectRemoteUiManualRemovalObservation(input)).toBeNull();
+      expect(reads).toBe(0);
+    }
+  }
+  let traps = 0;
+  const proxy = new Proxy(facts, {
+    ownKeys() {
+      traps++;
+      return Reflect.ownKeys(facts);
+    },
+    getOwnPropertyDescriptor() {
+      traps++;
+      throw new Error("private reflection");
+    },
+  });
+  const revoked = Proxy.revocable(facts, {});
+  revoked.revoke();
+  for (const input of [new Proxy(facts, {}), proxy, revoked.proxy])
+    expect(projectRemoteUiManualRemovalObservation(input)).toBeNull();
+  expect(traps).toBe(0);
+  let getters = 0;
+  const extra = Object.assign(Object.create(null), facts);
+  Object.defineProperty(extra, "private", {
+    enumerable: true,
+    get() {
+      getters++;
+      throw new Error("private accessor");
+    },
+  });
+  expect(projectRemoteUiManualRemovalObservation(extra)).toBeNull();
+  expect(getters).toBe(0);
+  for (const value of ["none", "one", "multiple"])
+    expect(
+      projectRemoteUiManualRemovalObservation({
+        ...facts,
+        rowCount: value,
+        toastCloseCount: value,
+        visibleToastCloseCount: value,
+        endingToastCount: value,
+      }),
+    ).toEqual({
+      ...facts,
+      rowCount: value,
+      toastCloseCount: value,
+      visibleToastCloseCount: value,
+      endingToastCount: value,
+    });
 });

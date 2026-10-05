@@ -809,6 +809,19 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   existing removal observer as `manual-archive/package/unknown-remove-<operation>`.
   Those fixed phases identify the existing Settings/menu/confirmation, row-absence,
   child/tunnel joins and toast boundaries without another read, action or budget.
+  At exactly the per-kind `toast-list`, `toast-displayed`, `toast-clickable`, or
+  `toast-click` removal phase, the same existing bounded failure sample may retain
+  `manualRemoval` with the six closed removal-snapshot fields. Compare only the
+  fixed owned manual row label locally on the exact Remote Servers origin, route
+  and theme, with no query/hash or credential controls. Missing, unsafe, malformed,
+  accessor or proxy-backed observations remain null. Failure of this optional
+  manual snapshot preserves the other existing sample fields. Visible-close counts
+  describe the existing current box/style checks; they do not substitute for the
+  pinned SDK's visibility or clickability checks. A last visibility marker can also
+  precede an owner failure after earlier controls remained visible and unclickable.
+  These facts do not identify a failed operation or prove earlier absence. Preserve
+  the original actions, owner loop, error, budgets, verdict and joined cleanup;
+  add no requests, waits, retries or notification recovery.
   A failure receipt may contain only an
   allowlisted manual assertion code registered by that controller's own check;
   errors from the browser, arbitrary check strings, exception text and copied

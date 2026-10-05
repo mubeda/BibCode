@@ -24,6 +24,7 @@ import {
   projectRemoteUiPrimaryImportObservation,
   projectRemoteUiCheckAgainObservation,
   projectRemoteUiSuccessRemovalObservation,
+  projectRemoteUiManualRemovalObservation,
   projectRemoteUiToastErrorSignature,
 } from "./remote-ui-evidence.ts";
 
@@ -2612,6 +2613,7 @@ it("retains only the same-read closed primary witness at the exact failed proof 
       setup: null,
       checkAgain: null,
       successRemoval: null,
+      manualRemoval: null,
       reloadPrimaryThreadWitness: {
         requestAdmitted: true,
         httpStatus: "forbidden",
@@ -2800,6 +2802,7 @@ function toastFailureReceipt(
     setup: null,
     checkAgain: null,
     successRemoval: null,
+    manualRemoval: null,
     reloadPrimaryThreadWitness: null,
     projectReloadPrimaryThreadWitness,
     write: (_name: string, value: Record<string, unknown>) => records.push(value),
@@ -4476,6 +4479,196 @@ it.each([
       });
       expect(writes.get("result")).toMatchObject({ success: false, childProcessesClosed: true });
       expect(JSON.stringify([...writes.values()])).not.toMatch(/private-owned|expectedImportPath/);
+    }
+  },
+);
+
+it.each([
+  ...["archive", "package", "unknown"].flatMap((kind) =>
+    ["toast-list", "toast-displayed", "toast-clickable", "toast-click"].map(
+      (operation) => `manual-${kind}-remove-${operation}`,
+    ),
+  ),
+  "manual-unknown-remove-toast-displayed-extra",
+  "manual-foreign-remove-toast-displayed",
+  "manual-unknown-remove-toast-click-unrecognized",
+  "success-remove-toast-displayed",
+])(
+  "admits manual removal facts only from the original one failure sample: %s",
+  async (currentPhase) => {
+    const kind = ["archive", "package", "unknown"].find((candidate) =>
+      ["toast-list", "toast-displayed", "toast-clickable", "toast-click"].some(
+        (operation) => currentPhase === `manual-${candidate}-remove-${operation}`,
+      ),
+    );
+    const start = controller.indexOf("} catch (error) {", controller.indexOf('phase("complete")'));
+    const end = controller.indexOf("\nprocess.exitCode", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const original = new Error("inert original removal failure");
+    for (const refusal of [
+      "none",
+      "route",
+      "origin",
+      "query",
+      "hash",
+      "theme",
+      "credential",
+      "read",
+      "unavailable",
+    ]) {
+      let samples = 0,
+        joined = false,
+        rowReads = 0,
+        closeLists = 0,
+        boxes = 0,
+        styles = 0;
+      const writes = new Map<string, Record<string, unknown>>();
+      const ending = {};
+      const closes = [
+        {
+          getClientRects: () => {
+            boxes++;
+            return [{}];
+          },
+          closest: () => ending,
+        },
+        {
+          getClientRects: () => {
+            boxes++;
+            return [];
+          },
+          closest: () => ending,
+        },
+      ];
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          "async function fail(){ try { throw original; " +
+            controller.slice(start, end) +
+            "}\nfail",
+        ),
+        {
+          original,
+          currentPhase,
+          currentTheme: "light",
+          success: false,
+          BrowserConnectivityFailure: class extends Error {},
+          networkProofs: [],
+          SUCCESS_REMOVE_PHASES: successRemovalPhases,
+          toastErrorSignatureFailures: new WeakMap<object, unknown>(),
+          browser: {
+            execute: async (
+              read: (input: unknown) => unknown,
+              input: { manualRemoval?: string },
+            ) => {
+              samples++;
+              expect(input.manualRemoval).toBe(kind);
+              if (refusal === "unavailable") throw new Error("inert observation failure");
+              return read(input);
+            },
+            deleteSession: async () => {
+              joined = true;
+            },
+          },
+          bounded: (promise: Promise<unknown>, budget: number) => {
+            expect(budget).toBe(2_000);
+            return promise;
+          },
+          projectBrowserStartupObservation: () => null,
+          projectRemoteUiSetupObservation,
+          projectRemoteUiPrimaryImportObservation,
+          projectRemoteUiCheckAgainObservation,
+          projectRemoteUiSuccessRemovalObservation,
+          projectRemoteUiManualRemovalObservation,
+          classifyQualificationFailure: (error: unknown) => {
+            expect(error).toBe(original);
+            return { kind: "unclassified", errorClass: "Error" };
+          },
+          readManualAssertionCode: () => null,
+          owner: {
+            processes: [],
+            failures: [],
+            childrenClosed: () => joined,
+            close: async (resources: { browser?: () => Promise<void> }) => {
+              await resources.browser?.();
+            },
+          },
+          tunnels: [],
+          plan: remoteUiPlan("full"),
+          captures: [],
+          assertions: [],
+          bundleVersion: "0.7.2",
+          process: { env: {} },
+          write: (name: string, value: Record<string, unknown>) => writes.set(name, value),
+          window: {},
+          HTMLButtonElement: class {},
+          location: {
+            origin: refusal === "origin" ? "http://foreign.invalid" : "http://localhost:4901",
+            pathname: refusal === "route" ? "/settings/providers" : "/settings/remote-servers",
+            search: refusal === "query" ? "?foreign" : "",
+            hash: refusal === "hash" ? "#foreign" : "",
+          },
+          document: {
+            readyState: "complete",
+            documentElement: { classList: { contains: () => refusal === "theme" } },
+            getElementById: () => null,
+            querySelector: (selector: string) =>
+              refusal === "credential" && selector.startsWith("#pairing-token,") ? {} : null,
+            querySelectorAll: (selector: string) => {
+              if (selector === "h3") {
+                rowReads++;
+                return [
+                  { textContent: `QA Manual ${kind} light` },
+                  { textContent: "QA Success light" },
+                  { textContent: "foreign owned-row-like label" },
+                ];
+              }
+              expect(selector).toBe('button[data-slot="toast-close"]');
+              closeLists++;
+              return closes;
+            },
+          },
+          getComputedStyle: () => {
+            styles++;
+            if (refusal === "read") throw new Error("inert style failure");
+            return { visibility: "visible", display: "block" };
+          },
+        },
+      );
+      await run();
+      const admitted = kind !== undefined && refusal === "none";
+      expect(samples).toBe(1);
+      expect(joined).toBe(true);
+      expect(writes.get("failure")?.manualRemoval).toEqual(
+        admitted
+          ? {
+              safeLocation: true,
+              rowCount: "one",
+              toastCloseCount: "multiple",
+              visibleToastCloseCount: "one",
+              endingToastCount: "one",
+              removalDialogPresent: false,
+            }
+          : null,
+      );
+      expect(writes.get("failure")?.failure).toEqual({ kind: "unclassified", errorClass: "Error" });
+      if (kind && refusal === "read")
+        expect(writes.get("failure")?.setup).toMatchObject({ route: "settings" });
+      expect(writes.get("result")).toMatchObject({ success: false, childProcessesClosed: true });
+      if (admitted) {
+        expect(rowReads).toBe(1);
+        expect(closeLists).toBe(1);
+        expect(boxes).toBe(2);
+        expect(styles).toBe(2);
+      } else if (kind && !["read", "unavailable"].includes(refusal)) {
+        expect(rowReads).toBe(0);
+        expect(closeLists).toBe(0);
+        expect(boxes).toBe(0);
+        expect(styles).toBe(0);
+      }
+      expect(JSON.stringify(writes.get("failure")?.manualRemoval)).not.toMatch(
+        /foreign|QA Manual|private|http|path|label/,
+      );
     }
   },
 );

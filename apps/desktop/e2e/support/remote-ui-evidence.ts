@@ -214,6 +214,49 @@ export function projectRemoteUiSuccessRemovalObservation(input: unknown) {
   };
 }
 
+/** Exact current manual-removal facts; never proof of an earlier close or SDK operation. */
+export function projectRemoteUiManualRemovalObservation(input: unknown) {
+  try {
+    if (
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      NodeUtil.types.isProxy(input)
+    )
+      return null;
+    const keys = [
+      "safeLocation",
+      "rowCount",
+      "toastCloseCount",
+      "visibleToastCloseCount",
+      "endingToastCount",
+      "removalDialogPresent",
+    ];
+    const own = Reflect.ownKeys(input);
+    if (
+      own.length !== keys.length ||
+      !own.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const row: Record<string, unknown> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      row[key] = descriptor.value;
+    }
+    const facts = projectRemoteUiSuccessRemovalObservation(row);
+    if (
+      !facts ||
+      facts.safeLocation !== true ||
+      Object.values(facts).some((value) => value === null)
+    )
+      return null;
+    return Object.freeze(facts);
+  } catch {
+    return null;
+  }
+}
+
 /** Closed facts from one current row after failure; never proof of the earlier click. */
 export function projectRemoteUiCheckAgainObservation(input: unknown) {
   if (input === null || typeof input !== "object") return null;

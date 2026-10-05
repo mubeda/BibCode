@@ -42,6 +42,7 @@ import {
   projectRemoteUiPrimaryImportObservation,
   projectRemoteUiCheckAgainObservation,
   projectRemoteUiSuccessRemovalObservation,
+  projectRemoteUiManualRemovalObservation,
   projectRemoteUiToastErrorSignature,
   type RemoteUiToastErrorSignature,
   type RemoteUiTheme,
@@ -1791,13 +1792,20 @@ try {
   let primaryImport: ReturnType<typeof projectRemoteUiPrimaryImportObservation> = null;
   let checkAgain: ReturnType<typeof projectRemoteUiCheckAgainObservation> = null;
   let successRemoval: ReturnType<typeof projectRemoteUiSuccessRemovalObservation> = null;
+  let manualRemoval: ReturnType<typeof projectRemoteUiManualRemovalObservation> = null;
   if (browser) {
     try {
+      const manualRemovalKind = (["archive", "package", "unknown"] as const).find((kind) =>
+        ["toast-list", "toast-displayed", "toast-clickable", "toast-click"].some(
+          (operation) => currentPhase === `manual-${kind}-remove-${operation}`,
+        ),
+      );
       const observed = await bounded(
         browser.execute(
           (input?: {
             checkAgain: boolean;
             successRemoval: boolean;
+            manualRemoval?: "archive" | "package" | "unknown";
             primaryImport?: boolean;
             expectedImportPath?: string | null;
             theme: string;
@@ -1992,8 +2000,13 @@ try {
                 dismissPresent: buttons.some((button) => label(button) === "Dismiss"),
               };
             };
-            const readSuccessRemoval = () => {
-              if (input?.successRemoval !== true) return null;
+            const readRemoval = () => {
+              if (
+                !input ||
+                (input.successRemoval !== true &&
+                  !["archive", "package", "unknown"].includes(input.manualRemoval ?? ""))
+              )
+                return null;
               const safeLocation =
                 (input.theme === "light" || input.theme === "dark") &&
                 location.origin === "http://localhost:4901" &&
@@ -2009,7 +2022,13 @@ try {
                 size === 0 ? "none" : size === 1 ? "one" : "multiple";
               const rows = Array.from(document.querySelectorAll("h3")).filter((heading) => {
                 const content = heading.textContent ?? "";
-                return content.length <= 64 && content.trim() === `QA Success ${input.theme}`;
+                return (
+                  content.length <= 64 &&
+                  content.trim() ===
+                    (input.successRemoval
+                      ? `QA Success ${input.theme}`
+                      : `QA Manual ${input.manualRemoval} ${input.theme}`)
+                );
               });
               const closes = Array.from(
                 document.querySelectorAll('button[data-slot="toast-close"]'),
@@ -2036,10 +2055,23 @@ try {
                 removalDialogPresent: document.querySelector('[role="alertdialog"]') !== null,
               };
             };
+            const readManualRemoval = () => {
+              if (
+                input?.successRemoval !== false ||
+                !["archive", "package", "unknown"].includes(input.manualRemoval ?? "")
+              )
+                return null;
+              try {
+                return readRemoval();
+              } catch {
+                return null;
+              }
+            };
             return {
               startup: observer?.read?.() ?? null,
               checkAgain: readCheckAgain(),
-              successRemoval: readSuccessRemoval(),
+              successRemoval: input?.successRemoval === true ? readRemoval() : null,
+              manualRemoval: readManualRemoval(),
               primaryImport: readPrimaryImport(),
               setup: {
                 route:
@@ -2078,6 +2110,7 @@ try {
             successRemoval: Object.values(SUCCESS_REMOVE_PHASES).some(
               (value) => value === currentPhase,
             ),
+            ...(manualRemovalKind ? { manualRemoval: manualRemovalKind } : {}),
             ...(currentPhase === "primary-import-composer"
               ? { primaryImport: true, expectedImportPath: primaryImportExpectedPath }
               : {}),
@@ -2094,6 +2127,9 @@ try {
           : null;
       checkAgain = projectRemoteUiCheckAgainObservation(observed.checkAgain);
       successRemoval = projectRemoteUiSuccessRemovalObservation(observed.successRemoval);
+      manualRemoval = manualRemovalKind
+        ? projectRemoteUiManualRemovalObservation(observed.manualRemoval)
+        : null;
     } catch {
       /* Closed unavailable evidence; no fallback app state. */
     }
@@ -2108,6 +2144,7 @@ try {
     primaryImport: currentPhase === "primary-import-composer" ? primaryImport : null,
     checkAgain,
     successRemoval,
+    manualRemoval,
     toastErrorSignature:
       [
         "success-remove-toast-click-unrecognized",
