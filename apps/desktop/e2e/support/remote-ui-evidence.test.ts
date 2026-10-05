@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import { expect, it } from "vite-plus/test";
 import {
+  projectRemoteUiPrimaryImportObservation,
   remoteUiScenes,
   screenshotName,
   validateCaptureWitness,
@@ -299,6 +300,66 @@ it("projects only closed setup facts and preserves unknown versus absent observa
   });
   expect(JSON.stringify(projected)).not.toContain("private-");
   expect(Object.values(projectRemoteUiSetupObservation({})!)).toEqual(Array(12).fill(null));
+});
+
+it("admits only exact safe primary import facts and refuses private/coercive/getter/proxy inputs", () => {
+  const facts = {
+    safePage: true,
+    pathCount: "one",
+    expectedPathMatched: true,
+    formUnique: true,
+    submitCount: "one",
+    submitDisabled: false,
+    formState: "idle",
+    composerCount: "none",
+  };
+  expect(projectRemoteUiPrimaryImportObservation(facts)).toEqual(facts);
+  expect(Object.isFrozen(projectRemoteUiPrimaryImportObservation(facts))).toBe(true);
+  for (const value of [
+    null,
+    undefined,
+    [],
+    { ...facts, safePage: false },
+    { ...facts, pathCount: "private" },
+    { ...facts, rawValue: "private path" },
+    { ...facts, pathCount: "multiple" },
+    { ...facts, expectedPathMatched: "true" },
+    { ...facts, submitCount: "none" },
+    { ...facts, formState: "absent" },
+  ])
+    expect(projectRemoteUiPrimaryImportObservation(value)).toBeNull();
+  let reads = 0;
+  const coercive = {
+    toString() {
+      reads++;
+      return "one";
+    },
+  };
+  expect(projectRemoteUiPrimaryImportObservation({ ...facts, pathCount: coercive })).toBeNull();
+  for (const key of Object.keys(facts)) {
+    const missing = { ...facts };
+    Reflect.deleteProperty(missing, key);
+    expect(projectRemoteUiPrimaryImportObservation(missing)).toBeNull();
+    Object.defineProperty(missing, key, {
+      enumerable: true,
+      get() {
+        reads++;
+        return true;
+      },
+    });
+    expect(projectRemoteUiPrimaryImportObservation(missing)).toBeNull();
+  }
+  const proxy = new Proxy(facts, {
+    ownKeys() {
+      reads++;
+      throw new Error("Private reflection trap.");
+    },
+  });
+  expect(projectRemoteUiPrimaryImportObservation(proxy)).toBeNull();
+  const revoked = Proxy.revocable(facts, {});
+  revoked.revoke();
+  expect(projectRemoteUiPrimaryImportObservation(revoked.proxy)).toBeNull();
+  expect(reads).toBe(0);
 });
 
 it("defaults to an honestly partial core and requires an explicit full matrix selection", () => {

@@ -39,6 +39,7 @@ import {
   inspectScreenshot,
   countInstallRequests,
   projectRemoteUiSetupObservation,
+  projectRemoteUiPrimaryImportObservation,
   projectRemoteUiCheckAgainObservation,
   projectRemoteUiSuccessRemovalObservation,
   projectRemoteUiToastErrorSignature,
@@ -98,6 +99,7 @@ const owner = new QualificationOwner(root, fixture);
 let browser: QualificationBrowser | undefined;
 let currentTheme: RemoteUiTheme = "light";
 let currentPhase = "prepare";
+let primaryImportExpectedPath: string | null = null;
 let success = false;
 const captures: Array<Record<string, unknown>> = [];
 const assertions: Array<Record<string, unknown>> = [];
@@ -702,12 +704,14 @@ async function importProject(
   if (!(await required().$("#add-project-host-path").isExisting()))
     await click("button=Type a path instead");
   primaryPhase("primary-import-path-input");
+  if (host.devUrl) primaryImportExpectedPath = host.project;
   await required().$("#add-project-host-path").waitForDisplayed();
   await required().$("#add-project-host-path").setValue(host.project);
   primaryPhase("primary-import-submit");
   await click("button=Open project");
   primaryPhase("primary-import-composer");
   await required().$(composer).waitForDisplayed();
+  if (host.devUrl) primaryImportExpectedPath = null;
 }
 
 async function setTheme(theme: RemoteUiTheme) {
@@ -1774,13 +1778,20 @@ try {
   if (error instanceof BrowserConnectivityFailure) networkProofs.push(error.proof);
   let startup: unknown = null;
   let setup: ReturnType<typeof projectRemoteUiSetupObservation> = null;
+  let primaryImport: ReturnType<typeof projectRemoteUiPrimaryImportObservation> = null;
   let checkAgain: ReturnType<typeof projectRemoteUiCheckAgainObservation> = null;
   let successRemoval: ReturnType<typeof projectRemoteUiSuccessRemovalObservation> = null;
   if (browser) {
     try {
       const observed = await bounded(
         browser.execute(
-          (input?: { checkAgain: boolean; successRemoval: boolean; theme: string }) => {
+          (input?: {
+            checkAgain: boolean;
+            successRemoval: boolean;
+            primaryImport?: boolean;
+            expectedImportPath?: string | null;
+            theme: string;
+          }) => {
             const observer = Reflect.get(window, "__browserStartupObservation") as
               | { read?: () => unknown }
               | undefined;
@@ -1825,6 +1836,55 @@ try {
                       : importMessage === "Enter an absolute or home-relative path."
                         ? "path-relative"
                         : "unknown";
+            const readPrimaryImport = () => {
+              if (input?.primaryImport !== true) return null;
+              const safePage =
+                (input.theme === "light" || input.theme === "dark") &&
+                location.origin === "http://localhost:4901" &&
+                location.search === "" &&
+                location.hash === "" &&
+                typeof input.expectedImportPath === "string" &&
+                input.expectedImportPath.length > 0 &&
+                input.expectedImportPath.length <= 4096 &&
+                document.querySelector(
+                  '#pairing-token,input[type="password"],input[autocomplete="one-time-code"],textarea[placeholder^="bibcode://pair"]',
+                ) === null &&
+                document.getElementById("boot-shell") === null &&
+                document.querySelector("vite-error-overlay") === null;
+              if (!safePage) return null;
+              const count = (size: number) =>
+                size === 0 ? "none" : size === 1 ? "one" : "multiple";
+              const paths = document.querySelectorAll("#add-project-host-path");
+              const path =
+                paths.length === 1 && paths[0] instanceof HTMLInputElement ? paths[0] : null;
+              const form = path?.form ?? null;
+              const submits = form?.querySelectorAll('button[type="submit"]');
+              const submit =
+                submits?.length === 1 && submits[0] instanceof HTMLButtonElement
+                  ? submits[0]
+                  : null;
+              return {
+                safePage,
+                pathCount: count(paths.length),
+                expectedPathMatched: path === null ? null : path.value === input.expectedImportPath,
+                formUnique: path !== null && form !== null,
+                submitCount: count(submits?.length ?? 0),
+                submitDisabled: submit?.disabled ?? null,
+                formState:
+                  paths.length === 0
+                    ? "absent"
+                    : path === null || form === null
+                      ? "ambiguous"
+                      : path.disabled
+                        ? "pending"
+                        : "idle",
+                composerCount: count(
+                  document.querySelectorAll(
+                    '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]',
+                  ).length,
+                ),
+              };
+            };
             // One failure-only sample. No page values, selectors or hit-test details leave it.
             const readCheckAgain = () => {
               if (input?.checkAgain !== true) return null;
@@ -1970,6 +2030,7 @@ try {
               startup: observer?.read?.() ?? null,
               checkAgain: readCheckAgain(),
               successRemoval: readSuccessRemoval(),
+              primaryImport: readPrimaryImport(),
               setup: {
                 route:
                   location.pathname === "/pair"
@@ -2007,6 +2068,9 @@ try {
             successRemoval: Object.values(SUCCESS_REMOVE_PHASES).some(
               (value) => value === currentPhase,
             ),
+            ...(currentPhase === "primary-import-composer"
+              ? { primaryImport: true, expectedImportPath: primaryImportExpectedPath }
+              : {}),
             theme: currentTheme,
           },
         ),
@@ -2014,6 +2078,10 @@ try {
       );
       startup = projectBrowserStartupObservation(observed.startup);
       setup = projectRemoteUiSetupObservation(observed.setup);
+      primaryImport =
+        currentPhase === "primary-import-composer"
+          ? projectRemoteUiPrimaryImportObservation(observed.primaryImport)
+          : null;
       checkAgain = projectRemoteUiCheckAgainObservation(observed.checkAgain);
       successRemoval = projectRemoteUiSuccessRemovalObservation(observed.successRemoval);
     } catch {
@@ -2027,6 +2095,7 @@ try {
     manualAssertionCode: readManualAssertionCode(error),
     startup,
     setup,
+    primaryImport: currentPhase === "primary-import-composer" ? primaryImport : null,
     checkAgain,
     successRemoval,
     toastErrorSignature:

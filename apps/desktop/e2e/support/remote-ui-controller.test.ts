@@ -21,6 +21,7 @@ import {
   remoteUiThemes,
   screenshotName,
   projectRemoteUiSetupObservation,
+  projectRemoteUiPrimaryImportObservation,
   projectRemoteUiCheckAgainObservation,
   projectRemoteUiSuccessRemovalObservation,
   projectRemoteUiToastErrorSignature,
@@ -4350,6 +4351,117 @@ it.each([
         successRemoval: admitted && !unavailable ? facts : null,
       });
       expect(writes.get("result")).toMatchObject({ success: false, childProcessesClosed: true });
+    }
+  },
+);
+
+it.each([
+  "primary-import-composer",
+  "primary-import-submit",
+  "success-import-composer",
+  "primary-theme-settings",
+])(
+  "retains primary import facts only at the exact original failure sample and joins cleanup: %s",
+  async (currentPhase) => {
+    const facts = {
+      safePage: true,
+      pathCount: "one",
+      expectedPathMatched: true,
+      formUnique: true,
+      submitCount: "one",
+      submitDisabled: false,
+      formState: "idle",
+      composerCount: "none",
+    };
+    const admitted = currentPhase === "primary-import-composer";
+    for (const unavailable of [false, true]) {
+      const start = controller.indexOf(
+        "} catch (error) {",
+        controller.indexOf('phase("complete")'),
+      );
+      const end = controller.indexOf("\nprocess.exitCode", start);
+      const original = new Error("Inert original composer failure.");
+      let samples = 0,
+        joined = false;
+      const writes = new Map<string, Record<string, unknown>>();
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          "async function fail(){try {throw original;" + controller.slice(start, end) + "}\nfail",
+        ),
+        {
+          original,
+          currentPhase,
+          currentTheme: "light",
+          primaryImportExpectedPath: "/private-owned-project",
+          success: false,
+          BrowserConnectivityFailure: class extends Error {},
+          networkProofs: [],
+          SUCCESS_REMOVE_PHASES: successRemovalPhases,
+          browser: {
+            execute: async (_read: unknown, input: unknown) => {
+              samples++;
+              expect(input).toEqual({
+                checkAgain: false,
+                successRemoval: false,
+                ...(admitted
+                  ? { primaryImport: true, expectedImportPath: "/private-owned-project" }
+                  : {}),
+                theme: "light",
+              });
+              if (unavailable) throw new Error("Inert diagnostic failure.");
+              return {
+                startup: null,
+                setup: null,
+                checkAgain: null,
+                successRemoval: null,
+                primaryImport: facts,
+              };
+            },
+            deleteSession: async () => {
+              joined = true;
+            },
+          },
+          bounded: (promise: Promise<unknown>, budget: number) => {
+            expect(budget).toBe(2000);
+            return promise;
+          },
+          projectBrowserStartupObservation: () => null,
+          projectRemoteUiSetupObservation,
+          projectRemoteUiCheckAgainObservation,
+          projectRemoteUiSuccessRemovalObservation,
+          projectRemoteUiPrimaryImportObservation,
+          classifyQualificationFailure: (error: unknown) => {
+            expect(error).toBe(original);
+            return { kind: "observation-timeout" };
+          },
+          readManualAssertionCode: () => null,
+          owner: {
+            processes: [],
+            failures: [],
+            childrenClosed: () => joined,
+            close: async (resources: { browser?: () => Promise<void> }) => {
+              await resources.browser?.();
+            },
+          },
+          tunnels: [],
+          plan: remoteUiPlan("core"),
+          captures: [],
+          assertions: [],
+          bundleVersion: "0.7.2",
+          process: { env: {} },
+          write: (name: string, value: Record<string, unknown>) => writes.set(name, value),
+        },
+      ) as () => Promise<void>;
+      await run();
+      expect(samples).toBe(1);
+      expect(joined).toBe(true);
+      expect(writes.get("failure")).toMatchObject({
+        phase: currentPhase,
+        failure: { kind: "observation-timeout" },
+        primaryImport: admitted && !unavailable ? facts : null,
+      });
+      expect(writes.get("result")).toMatchObject({ success: false, childProcessesClosed: true });
+      expect(JSON.stringify([...writes.values()])).not.toMatch(/private-owned|expectedImportPath/);
     }
   },
 );

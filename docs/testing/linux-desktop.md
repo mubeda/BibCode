@@ -689,6 +689,21 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   actual replacement document. They add only fixed phase markers: preserve all
   public actions, clock/boot checks, negative observation windows, draft checks
   and existing bounds. An incomplete phase is not proof of a reload defect.
+  At exactly `primary-import-composer`, the existing one failure sample may
+  retain `primaryImport` with only closed facts: safe owned page, input cardinality,
+  current value matching the expected owned path, actual owning form, submit
+  cardinality/disabledness, form absent/idle/pending/ambiguous and composer
+  cardinality. Missing, unsafe or malformed facts stay null. The private expected
+  path is passed only to that failure sample, compared locally and never retained;
+  credential/boot/foreign/query/hash contexts refuse. Exact own data, live/revoked
+  proxies, getters and coercive values are handled without exporting raw data.
+  Preserve the original input/send/click/composer waits and bounds, and all
+  non-primary failure sample arguments. These facts do not prove a submit event
+  or command outcome: an idle retained form with no form error can follow a
+  typed create/open failure reported as a toast. Absent form and composer presence
+  alone do not establish owned project identity. Do not infer a terminal fallback
+  or native cause; no native rerun, delay, retry or product repair follows from
+  modal presence alone.
   Only a push to `codex/qualify-release-ui` or a manual dispatch starts it; a push
   selects core, and manual dispatch offers core/full. There is no main-branch trigger.
   Neither selection installs software, supplies native host-toast evidence, or

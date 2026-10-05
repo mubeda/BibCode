@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Inspect original CI screenshots without editing them.
 import * as NodeCrypto from "node:crypto";
 import * as NodeZlib from "node:zlib";
+import * as NodeUtil from "node:util";
 
 export const remoteUiThemes = ["light", "dark"] as const;
 export type RemoteUiTheme = (typeof remoteUiThemes)[number];
@@ -277,6 +278,70 @@ export function projectRemoteUiCheckAgainObservation(input: unknown) {
     ]),
     dismissPresent: flag("dismissPresent"),
   };
+}
+
+/** Exact own-data primary import failure facts; private form values never enter receipts. */
+export function projectRemoteUiPrimaryImportObservation(input: unknown) {
+  try {
+    if (
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      NodeUtil.types.isProxy(input)
+    )
+      return null;
+    const keys = [
+      "safePage",
+      "pathCount",
+      "expectedPathMatched",
+      "formUnique",
+      "submitCount",
+      "submitDisabled",
+      "formState",
+      "composerCount",
+    ];
+    const own = Reflect.ownKeys(input);
+    if (
+      own.length !== keys.length ||
+      !own.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const row: Record<string, unknown> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return null;
+      row[key] = descriptor.value;
+    }
+    const choice = (key: string, values: readonly string[]) => {
+      const value = row[key];
+      return typeof value === "string" && values.includes(value);
+    };
+    if (
+      row.safePage !== true ||
+      typeof row.formUnique !== "boolean" ||
+      !["pathCount", "submitCount", "composerCount"].every((key) =>
+        choice(key, ["none", "one", "multiple"]),
+      ) ||
+      !choice("formState", ["absent", "idle", "pending", "ambiguous"]) ||
+      !(row.expectedPathMatched === null || typeof row.expectedPathMatched === "boolean") ||
+      !(row.submitDisabled === null || typeof row.submitDisabled === "boolean")
+    )
+      return null;
+    if (
+      (row.pathCount !== "one" &&
+        (row.expectedPathMatched !== null ||
+          row.formUnique !== false ||
+          row.submitCount !== "none" ||
+          row.submitDisabled !== null)) ||
+      (row.submitCount !== "one" && row.submitDisabled !== null) ||
+      (row.pathCount === "none" ? row.formState !== "absent" : row.formState === "absent") ||
+      ((row.formState === "idle" || row.formState === "pending") && row.formUnique !== true)
+    )
+      return null;
+    return Object.freeze(row);
+  } catch {
+    return null;
+  }
 }
 
 /** Closed, presence-only failure facts. Missing/invalid observations stay unavailable. */
