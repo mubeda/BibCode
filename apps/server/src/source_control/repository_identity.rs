@@ -17,7 +17,11 @@ pub fn repository_identity(remote_url: &str, root_path: &str) -> Option<Value> {
     };
     let mut identity = json!({
         "canonicalKey": format!("{host}/{path}"),
-        "locator": {"source": "git-remote", "remoteName": "origin", "remoteUrl": remote_url},
+        "locator": {
+            "source": "git-remote",
+            "remoteName": "origin",
+            "remoteUrl": without_credentials(remote_url),
+        },
         "rootPath": root_path,
         "displayName": name,
         "name": name,
@@ -30,6 +34,22 @@ pub fn repository_identity(remote_url: &str, root_path: &str) -> Option<Value> {
         identity["provider"] = json!(provider);
     }
     Some(identity)
+}
+
+/// The remote without the userinfo of a `scheme://` URL, which can carry an access token as the
+/// username or a password. The identity is persisted and sent to every client, so it must never
+/// hold one. scp-style `user@host:path` remotes carry no secret and stay as written.
+fn without_credentials(remote_url: &str) -> String {
+    let Some((scheme, rest)) = remote_url.split_once("://") else {
+        return remote_url.to_owned();
+    };
+    // The authority ends at the first of these, exactly as the URL parser finds it.
+    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}{tail}")
 }
 
 #[cfg(test)]
@@ -59,7 +79,40 @@ mod tests {
             assert_eq!(identity["rootPath"], "/work/repo");
             assert_eq!(identity["locator"]["source"], "git-remote");
             assert_eq!(identity["locator"]["remoteName"], "origin");
-            assert_eq!(identity["locator"]["remoteUrl"], remote);
+            assert_eq!(identity["locator"]["remoteUrl"], without_userinfo(remote));
+        }
+    }
+
+    fn without_userinfo(remote: &str) -> String {
+        remote
+            .replacen("ssh://git@", "ssh://", 1)
+            .replacen("https://user@", "https://", 1)
+    }
+
+    #[test]
+    fn credentials_never_reach_the_stored_remote_url() {
+        for (remote, stored) in [
+            (
+                "https://oauth2:glpat-secret@gitlab.example/g/r.git",
+                "https://gitlab.example/g/r.git",
+            ),
+            (
+                "https://ghp_secret@github.com/o/r.git",
+                "https://github.com/o/r.git",
+            ),
+            (
+                "https://user:p%40ss@host:8443/o/r.git?x=1#f",
+                "https://host:8443/o/r.git?x=1#f",
+            ),
+            ("https://host/o/r@v1.git", "https://host/o/r@v1.git"),
+            ("ssh://git@host:2222/o/r.git", "ssh://host:2222/o/r.git"),
+            ("git@github.com:o/r.git", "git@github.com:o/r.git"),
+            ("https://github.com/o/r.git", "https://github.com/o/r.git"),
+        ] {
+            let identity = repository_identity(remote, "/r").expect(remote);
+            assert_eq!(identity["locator"]["remoteUrl"], stored, "{remote}");
+            assert!(!identity.to_string().contains("secret"), "{remote}");
+            assert!(!identity.to_string().contains("p%40ss"), "{remote}");
         }
     }
 

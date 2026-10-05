@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, LazyLock, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -17,11 +17,21 @@ use crate::{
     source_control::repository_identity::repository_identity,
 };
 
-/// Serializes reconciles so a slow `origin` read cannot overwrite a newer one for the same
-/// project: each reconcile reads the project and the checkout under the lock, and a workspace move
-/// queues its own reconcile behind any stale one.
-/// ponytail: one global lock; shard per project if a reconcile ever blocks others noticeably.
-static RECONCILE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// One lock per project serializes its reconciles, so a slow `origin` read cannot overwrite a newer
+/// one: each reconcile reads the project and the checkout under the lock, and a workspace move
+/// queues its own reconcile behind any stale one. Entries nobody holds are pruned on each lookup.
+static PROJECT_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Mutex::default);
+
+/// Bounds the `git` children reconciles run at once across projects; a burst of creations or
+/// workspace moves waits here instead of launching a process each.
+static GIT_READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+fn project_lock(project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = PROJECT_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    locks.entry(project_id.to_owned()).or_default().clone()
+}
 
 /// `Some(identity)` only when the checkout is confirmed to be a repository, where `identity` is
 /// `None` for an `origin` that names no hosted repository. `None` means the checkout could not be
@@ -51,7 +61,8 @@ pub(crate) async fn reconcile_repository_identity(
     project_id: &str,
     cancellation: &CancellationToken,
 ) -> bool {
-    let _serialized = RECONCILE.lock().await;
+    let project_lock = project_lock(project_id);
+    let _serialized = project_lock.lock().await;
     let Ok(Some(project)) = engine
         .repositories()
         .get_project(project_id.to_owned())
@@ -59,16 +70,22 @@ pub(crate) async fn reconcile_repository_identity(
     else {
         return false;
     };
-    let workspace_root = Path::new(&project.workspace_root);
-    if project.deleted_at.is_some() || !tokio::fs::try_exists(workspace_root).await.unwrap_or(false)
-    {
+    if project.deleted_at.is_some() {
         return false;
     }
+    let workspace_root = Path::new(&project.workspace_root);
+    let Ok(_permit) = GIT_READS.acquire().await else {
+        return false;
+    };
     let observed = match read_repository_identity(repository, workspace_root, cancellation).await {
         Ok(Some(observed)) => observed,
         Ok(None) => return false,
-        Err(error) => {
-            tracing::debug!(project_id, %error, "repository identity read failed; keeping the stored value");
+        // The error text can include Git output such as the remote URL, so it is not logged.
+        Err(_) => {
+            tracing::debug!(
+                project_id,
+                "repository identity read failed; keeping the stored value"
+            );
             return false;
         }
     };
@@ -83,6 +100,7 @@ pub(crate) async fn reconcile_repository_identity(
     match engine.dispatch(command).await {
         Ok(_) => true,
         Err(error) => {
+            let error = crate::diagnostics::redact_sensitive_text(&error.to_string());
             tracing::warn!(project_id, %error, "could not record the repository identity");
             false
         }
@@ -95,8 +113,12 @@ pub(crate) async fn backfill_repository_identities(
     repository: Arc<GitRepository>,
     cancellation: CancellationToken,
 ) {
-    let Ok(projects) = engine.repositories().list_projects().await else {
-        return;
+    let projects = match engine.repositories().list_projects().await {
+        Ok(projects) => projects,
+        Err(error) => {
+            tracing::warn!(%error, "could not list projects for the repository identity backfill");
+            return;
+        }
     };
     for project in projects
         .into_iter()
@@ -268,6 +290,74 @@ mod tests {
             stored(&engine).await.unwrap()["canonicalKey"],
             "github.com/acme/repo"
         );
+    }
+
+    #[tokio::test]
+    async fn backfill_sets_a_missing_identity_and_a_second_run_dispatches_nothing() {
+        let checkout = TempDir::new().unwrap();
+        git(checkout.path(), &["init", "-q"]);
+        git(
+            checkout.path(),
+            &["remote", "add", "origin", "git@github.com:acme/repo.git"],
+        );
+        let root = checkout.path().to_string_lossy().replace('\\', "/");
+        let engine = engine_with_project(&root).await;
+        let git_repository = Arc::new(GitRepository::default());
+        let backfill = || {
+            backfill_repository_identities(
+                engine.clone(),
+                git_repository.clone(),
+                CancellationToken::new(),
+            )
+        };
+
+        backfill().await;
+        assert_eq!(
+            stored(&engine).await.unwrap()["canonicalKey"],
+            "github.com/acme/repo"
+        );
+        let events = engine.repositories().max_event_sequence().await.unwrap();
+        backfill().await;
+        assert_eq!(
+            engine.repositories().max_event_sequence().await.unwrap(),
+            events
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stored_identity_never_contains_remote_credentials() {
+        let checkout = TempDir::new().unwrap();
+        git(checkout.path(), &["init", "-q"]);
+        git(
+            checkout.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://oauth2:glpat-secret@gitlab.example/g/r.git",
+            ],
+        );
+        let root = checkout.path().to_string_lossy().replace('\\', "/");
+        let engine = engine_with_project(&root).await;
+        let cancel = CancellationToken::new();
+        assert!(
+            reconcile_repository_identity(&engine, &GitRepository::default(), "p", &cancel).await
+        );
+        let identity = stored(&engine).await.unwrap();
+        assert_eq!(
+            identity["locator"]["remoteUrl"],
+            "https://gitlab.example/g/r.git"
+        );
+        assert!(!identity.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn project_locks_are_shared_while_held_and_pruned_after() {
+        let held = project_lock("lock-test");
+        assert!(Arc::ptr_eq(&held, &project_lock("lock-test")));
+        drop(held);
+        project_lock("other");
+        assert!(!PROJECT_LOCKS.lock().unwrap().contains_key("lock-test"));
     }
 
     #[test]

@@ -907,6 +907,8 @@ async fn created_projects_receive_their_repository_identity_once() {
     assert_eq!(identity.0["canonicalKey"], "github.com/acme/repo");
     assert_eq!(identity.1, NOW);
 
+    // Give a spurious second reconcile time to show up before counting.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let identity_events = engine
         .repositories()
         .read_events_from_sequence(0, 100)
