@@ -63,6 +63,8 @@ vi.mock("../state/entities", () => ({
 
 vi.mock("../logicalProject", () => ({
   deriveLogicalProjectKeyFromSettings: () => testState.logicalProjectKey,
+  derivePhysicalProjectKey: (project: { environmentId: string; workspaceRoot: string }) =>
+    `${project.environmentId}:${project.workspaceRoot}`,
   getProjectOrderKey: (project: { environmentId: string; id: string }) =>
     `${project.environmentId}:${project.id}`,
   selectProjectGroupingSettings: (settings: unknown) => settings,

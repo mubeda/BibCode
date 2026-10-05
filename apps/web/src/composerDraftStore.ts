@@ -344,8 +344,14 @@ interface ComposerDraftStoreState {
   /** Returns the editable composer content for a draft session or server thread. */
   getComposerDraft: (target: ComposerThreadTarget) => ComposerThreadDraftState | null;
   /** Looks up the active draft session for a logical project identity. */
-  getDraftThreadByLogicalProjectKey: (logicalProjectKey: string) => ProjectDraftSession | null;
-  getDraftSessionByLogicalProjectKey: (logicalProjectKey: string) => ProjectDraftSession | null;
+  getDraftThreadByLogicalProjectKey: (
+    logicalProjectKey: string,
+    fallbackKeys?: readonly string[],
+  ) => ProjectDraftSession | null;
+  getDraftSessionByLogicalProjectKey: (
+    logicalProjectKey: string,
+    fallbackKeys?: readonly string[],
+  ) => ProjectDraftSession | null;
   getDraftThreadByProjectRef: (projectRef: ScopedProjectRef) => ProjectDraftSession | null;
   getDraftSessionByProjectRef: (projectRef: ScopedProjectRef) => ProjectDraftSession | null;
   /** Reads mutable draft-session metadata by `DraftId`. */
@@ -2253,24 +2259,21 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
         stickyModelSelectionByProvider: {},
         stickyActiveProvider: null,
         getComposerDraft: (target) => getComposerDraftState(get(), target),
-        getDraftThreadByLogicalProjectKey: (logicalProjectKey) => {
-          return get().getDraftSessionByLogicalProjectKey(logicalProjectKey);
+        getDraftThreadByLogicalProjectKey: (logicalProjectKey, fallbackKeys) => {
+          return get().getDraftSessionByLogicalProjectKey(logicalProjectKey, fallbackKeys);
         },
-        getDraftSessionByLogicalProjectKey: (logicalProjectKey) => {
-          const normalizedLogicalProjectKey = logicalProjectDraftKey(logicalProjectKey);
-          if (normalizedLogicalProjectKey.length === 0) {
-            return null;
+        getDraftSessionByLogicalProjectKey: (logicalProjectKey, fallbackKeys = []) => {
+          for (const candidate of [logicalProjectKey, ...fallbackKeys]) {
+            const normalizedLogicalProjectKey = logicalProjectDraftKey(candidate);
+            if (normalizedLogicalProjectKey.length === 0) continue;
+            const draftId =
+              get().logicalProjectDraftThreadKeyByLogicalProjectKey[normalizedLogicalProjectKey];
+            if (!draftId) continue;
+            const draftThread = get().draftThreadsByThreadKey[draftId];
+            if (!draftThread || isDraftThreadPromoting(draftThread)) continue;
+            return toProjectDraftSession(DraftId.make(draftId), draftThread);
           }
-          const draftId =
-            get().logicalProjectDraftThreadKeyByLogicalProjectKey[normalizedLogicalProjectKey];
-          if (!draftId) {
-            return null;
-          }
-          const draftThread = get().draftThreadsByThreadKey[draftId];
-          if (!draftThread || isDraftThreadPromoting(draftThread)) {
-            return null;
-          }
-          return toProjectDraftSession(DraftId.make(draftId), draftThread);
+          return null;
         },
         getDraftThreadByProjectRef: (projectRef) => {
           return get().getDraftSessionByProjectRef(projectRef);

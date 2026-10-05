@@ -255,6 +255,7 @@ import { getTerminalFocusOwner } from "../lib/terminalFocus";
 import { DesktopPreviewTabHosts } from "../browser/DesktopPreviewTabHosts";
 import {
   deriveLogicalProjectKeyFromSettings,
+  derivePhysicalProjectKey,
   selectProjectGroupingSettings,
 } from "../logicalProject";
 import { buildDraftThreadRouteParams } from "../threadRoutes";
@@ -2232,7 +2233,9 @@ function ChatViewContent(props: ChatViewProps) {
         activeProject,
         projectGroupingSettings,
       );
-      const storedDraftSession = getDraftSessionByLogicalProjectKey(logicalProjectKey);
+      const storedDraftSession = getDraftSessionByLogicalProjectKey(logicalProjectKey, [
+        derivePhysicalProjectKey(activeProject),
+      ]);
       if (storedDraftSession) {
         setDraftThreadContext(storedDraftSession.draftId, input);
         setLogicalProjectDraftThreadId(

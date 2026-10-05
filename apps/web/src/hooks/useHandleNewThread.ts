@@ -22,6 +22,7 @@ import { newDraftId, newThreadId } from "../lib/utils";
 import { orderItemsByPreferredIds } from "../components/Sidebar.logic";
 import {
   deriveLogicalProjectKeyFromSettings,
+  derivePhysicalProjectKey,
   getProjectOrderKey,
   selectProjectGroupingSettings,
 } from "../logicalProject";
@@ -77,7 +78,10 @@ export function useNewThreadHandler() {
       const hasWorktreePathOption = options?.worktreePath !== undefined;
       const hasEnvModeOption = options?.envMode !== undefined;
       const hasStartFromOriginOption = options?.startFromOrigin !== undefined;
-      const storedDraftThread = getDraftSessionByLogicalProjectKey(logicalProjectKey);
+      const storedDraftThread = getDraftSessionByLogicalProjectKey(
+        logicalProjectKey,
+        project ? [derivePhysicalProjectKey(project)] : [],
+      );
       const storedDraftThreadRef = storedDraftThread
         ? scopeThreadRef(storedDraftThread.environmentId, storedDraftThread.threadId)
         : null;
