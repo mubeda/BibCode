@@ -2390,8 +2390,10 @@ sizes. Cover relevant:
   repository lists both environments with their state and path; an offline
   environment's entry is dimmed. Its `…` menu shows the normal project menu for
   that environment. Change the remote checkout's `origin` with
-  `git remote set-url` and, within five minutes of the next catalog refresh,
-  confirm the entry moves to its new card. Switch back to **Environments** and
+  `git remote set-url` and, after the next catalog refresh of that project
+  (window focus, a Git action, or reopening the project), confirm the entry
+  moves to its new card. Collapse one environment's entry and confirm the
+  other environment's entry stays open. Switch back to **Environments** and
   confirm the rail returns with the same environment selected;
 - provider settings and provider/terminal action menus;
 - status-bar Claude/Codex usage with different accounts or usage values on local

@@ -42,7 +42,8 @@ Decisions made in review:
    environment card and acts on that environment's project.
 4. The group card exposes no edit, menu, delete or drag affordance.
 5. Changing `origin` on a checkout moves its card to the new group without a
-   reload.
+   reload, after the next catalog refresh of that project (window focus, a Git
+   action, or reopening the project).
 6. The view adds no client RPCs; grouping is derived from already loaded
    projects.
 
@@ -58,7 +59,7 @@ and `ProjectMetaUpdatedPayload`). The server never sets it today. It will set:
 | Field | Value |
 | --- | --- |
 | `canonicalKey` | `<host>/<repository path>`: host lowercased, path without a trailing `.git`, nested groups kept. SSH (`git@host:a/b.git`), `ssh://` (with or without port) and HTTPS forms of one remote yield the same key. Path case is preserved. |
-| `locator` | `{ source: "git-remote", remoteName: "origin", remoteUrl: <raw url> }` |
+| `locator` | `{ source: "git-remote", remoteName: "origin", remoteUrl: <url> }`, the URL without userinfo, query or fragment (any of which can carry a token) |
 | `rootPath` | The checkout's top level (`git rev-parse --show-toplevel`), not the common directory; required by the `repository_path` grouping mode. |
 | `name` | Last path segment (`pathfinder-application-server`). |
 | `owner` | Path before the last segment, when present. |
@@ -66,7 +67,9 @@ and `ProjectMetaUpdatedPayload`). The server never sets it today. It will set:
 | `provider` | Kind from the existing provider detection (`github`, `gitlab`, `azure-devops`, `bitbucket`), omitted when unknown. |
 
 A project whose checkout has no `origin` remote, or is not a Git repository,
-has `repositoryIdentity: null`.
+has `repositoryIdentity: null`. So does a remote whose repository path has an
+empty segment (`https://host/a/.git`, `git@host:a//b`), which would yield an
+empty name or owner.
 
 Normalization reuses `source_control::remote_host`,
 `source_control::remote_repository_path`, `provider_from_remote` and
@@ -98,8 +101,12 @@ Normalization reuses `source_control::remote_host`,
 2. Startup backfill: one bounded pass over `list_projects()` after startup
    computes each identity and dispatches a server-resolved project meta update
    only when the stored value differs. A second startup emits nothing.
-3. Worktree catalog scan of the primary checkout: recompute and dispatch an
-   update only on change (for example after `git remote set-url`).
+3. Healthy worktree catalog scan: recompute and dispatch an update only on
+   change (for example after `git remote set-url`). A scan reconciles at most
+   every five minutes per project, or at once when the primary checkout's
+   `.git/config` size or modification time differs from the last scan (one
+   stat, no Git process; a `.git` that is not a directory keeps the five-minute
+   throttle).
 
 The read is one `git config --get remote.origin.url` plus `rev-parse
 --show-toplevel` per project, bounded by the existing Git command limits and
@@ -109,8 +116,9 @@ is logged at debug level; it never clears a known identity.
 ### Trust boundary
 
 `repositoryIdentity` is server-authored. Client `project.meta.update` commands
-that contain it are rejected, as `worktreeDiscovery` already is
-(`orchestration_rpc.rs`).
+that contain it are ignored: the field is not part of the client command, so
+decoding drops it and the command's other fields apply. Only the
+server-internal `project.repository-identity.set` command can set it.
 
 ### Client compatibility
 
@@ -169,8 +177,10 @@ that contain it are rejected, as `worktreeDiscovery` already is
   monitor icon or the rail's letter avatar, with the rail's status dot),
   environment label, connection state text (Connected, This device,
   Reconnecting, Offline), and the project folder path in monospace, truncated.
-- Expanded state reuses the project's existing expansion keys, so the same
-  project collapses or expands consistently in both views.
+- Expanded state reuses the project's existing expansion keys. A card's toggle
+  writes only that checkout's own keys and reads the Environments row's key as
+  a fallback, so collapsing one environment's card leaves its sibling cards
+  open, and a card without its own state follows the Environments row.
 - One environment with two checkouts of the repository shows two cards,
   distinguished by path.
 - Unavailable environments: the card is dimmed and its actions behave as they
@@ -201,7 +211,11 @@ that contain it are rejected, as `worktreeDiscovery` already is
 ## Failure, lifecycle and performance
 
 - Identity changes arrive through the snapshot stream; cards regroup without a
-  reload and keep their expansion state.
+  reload and keep their expansion state. An `origin` change is read on the next
+  healthy catalog refresh of that project (window focus, a Git action, or
+  reopening the project): at once when the primary checkout's `.git/config`
+  changed, otherwise within the five-minute throttle. Watching the config file
+  is out of scope for this change.
 - Grouping is recomputed from each snapshot, never accumulated, so duplicate or
   partial snapshots cannot leave stale cards.
 - A removed environment's cards disappear; empty groups disappear.
@@ -218,7 +232,8 @@ Server (Rust):
 - Startup backfill sets missing identities and is idempotent.
 - Catalog scan emits exactly one update after an origin change and none
   without a change; a failed read does not clear the value.
-- Client meta updates containing `repositoryIdentity` are rejected.
+- Client meta updates containing `repositoryIdentity` cannot change the stored
+  identity (the field is ignored).
 - Migration adds the column; projection replay reproduces it.
 
 Client:
