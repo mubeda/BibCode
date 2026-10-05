@@ -36,11 +36,20 @@ matrix then creates native Tauri installers on the matching operating system:
 | Platform | Runner                  | Architecture | Installer       |
 | -------- | ----------------------- | ------------ | --------------- |
 | macOS    | `macos-26`              | arm64        | DMG             |
-| macOS    | `macos-26-intel`        | x64          | DMG             |
+| macOS    | `macos-15-intel`        | x64          | DMG             |
 | Linux    | `ubuntu-22.04-arm`      | arm64        | AppImage        |
 | Linux    | `ubuntu-22.04`          | x64          | AppImage        |
 | Windows  | `windows-11-vs2026-arm` | arm64        | NSIS executable |
 | Windows  | `windows-2025`          | x64          | NSIS executable |
+
+The native Intel release producers use supported macOS 15 for both desktop and
+server packaging. macOS 26 remains the ARM producer and the Intel runtime-test
+environment in main CI, packaged UI, and upgrade validation. Both release
+producer hosts still require the exact mounted DMG's recursive ad-hoc signature
+and the same Finder pixel check before upload. A macOS 15 Intel pass does not
+qualify macOS 26 Intel Finder rendering; that hosted-runner scenario remains
+separate. The producer selection does not alter the configured minimum macOS
+version, Rust/updater/archive identities, platform count, or signing policy.
 
 Release builds retain `panic=unwind`. Wry's macOS custom-protocol handlers use
 Objective-C exception recovery when navigation cancels an in-flight request;
@@ -670,7 +679,7 @@ Build the native artifact for the current operating system:
 vp run build:desktop
 ```
 
-On macOS 26, verify Finder's rendered application icon from the generated DMG
+On each macOS producer host, verify Finder's rendered application icon from the generated DMG
 before publishing it. Build through the artifact wrapper without `--arch` so it
 uses the current Mac's architecture. Choose a fresh, empty output directory and
 use that same directory for the mount check:
