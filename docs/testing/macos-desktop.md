@@ -179,6 +179,13 @@ contained application, and detach that mount during cleanup. Report configured
 signing, ad-hoc signing, and notarization separately. Never claim notarization
 when credentials or a notarized ticket are absent.
 
+Before publishing a macOS 26 release, verify the Finder-rendered icon from that
+mounted payload with `swift scripts/check-macos-app-icon.swift` and its exact
+application path. The release workflow runs this check on both native macOS
+targets after recursive signature verification and before upload. A failed icon
+check is a failed native build; a check against a different installed bundle
+does not qualify the release DMG.
+
 Build and run packaged E2E with:
 
 ```sh

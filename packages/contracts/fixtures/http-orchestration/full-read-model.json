@@ -1,0 +1,194 @@
+{
+  "snapshotSequence": 42,
+  "projects": [
+    {
+      "id": "project-live",
+      "title": "Owned live",
+      "workspaceRoot": "/owned/live",
+      "defaultModelSelection": null,
+      "scripts": [],
+      "worktreeDiscovery": {
+        "visibility": "hidden",
+        "initialPromptDismissedAt": null,
+        "baselinePaths": []
+      },
+      "createdAt": "2026-07-11T00:00:00.000Z",
+      "updatedAt": "2026-07-11T00:00:00.000Z",
+      "deletedAt": null
+    },
+    {
+      "id": "project-deleted",
+      "title": "Owned deleted",
+      "workspaceRoot": "/owned/deleted",
+      "defaultModelSelection": null,
+      "scripts": [],
+      "worktreeDiscovery": {
+        "visibility": "hidden",
+        "initialPromptDismissedAt": null,
+        "baselinePaths": []
+      },
+      "createdAt": "2026-07-11T00:00:00.000Z",
+      "updatedAt": "2026-07-11T00:00:00.000Z",
+      "deletedAt": "2026-07-11T00:00:00.000Z"
+    }
+  ],
+  "threads": [
+    {
+      "id": "thread-live",
+      "projectId": "project-live",
+      "title": "thread-live",
+      "modelSelection": {
+        "instanceId": "codex",
+        "model": "gpt-5"
+      },
+      "runtimeMode": "full-access",
+      "interactionMode": "default",
+      "kind": "default",
+      "branch": null,
+      "worktreePath": null,
+      "latestTurn": {
+        "turnId": "turn-live",
+        "state": "completed",
+        "requestedAt": "2026-07-11T00:00:00.000Z",
+        "startedAt": "2026-07-11T00:00:00.000Z",
+        "completedAt": "2026-07-11T00:00:00.000Z",
+        "assistantMessageId": null
+      },
+      "createdAt": "2026-07-11T00:00:00.000Z",
+      "updatedAt": "2026-07-11T00:00:00.000Z",
+      "archivedAt": null,
+      "session": {
+        "threadId": "thread-live",
+        "status": "ready",
+        "providerName": "codex",
+        "runtimeMode": "full-access",
+        "activeTurnId": null,
+        "lastError": null,
+        "lastErrorClass": null,
+        "updatedAt": "2026-07-11T00:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-07-11T00:00:00.000Z",
+      "hasPendingApprovals": false,
+      "hasPendingUserInput": false,
+      "hasActionableProposedPlan": false,
+      "unresolvedDelivery": null,
+      "deletedAt": null,
+      "messages": [
+        {
+          "id": "message-live",
+          "turnId": "turn-live",
+          "role": "user",
+          "text": "Owned message",
+          "attachments": [],
+          "streaming": false,
+          "createdAt": "2026-07-11T00:00:00.000Z",
+          "updatedAt": "2026-07-11T00:00:00.000Z"
+        }
+      ],
+      "activities": [
+        {
+          "id": "activity-live",
+          "turnId": "turn-live",
+          "tone": "warning",
+          "kind": "status",
+          "summary": "Owned status",
+          "payload": {},
+          "sequence": 1,
+          "createdAt": "2026-07-11T00:00:00.000Z"
+        }
+      ],
+      "proposedPlans": [
+        {
+          "id": "plan-live",
+          "turnId": "turn-live",
+          "planMarkdown": "Owned plan",
+          "implementedAt": null,
+          "implementationThreadId": null,
+          "createdAt": "2026-07-11T00:00:00.000Z",
+          "updatedAt": "2026-07-11T00:00:00.000Z"
+        }
+      ],
+      "checkpoints": [
+        {
+          "turnId": "turn-live",
+          "checkpointTurnCount": 1,
+          "checkpointRef": "refs/checkpoints/owned",
+          "status": "ready",
+          "files": [],
+          "assistantMessageId": null,
+          "completedAt": "2026-07-11T00:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "id": "thread-archived",
+      "projectId": "project-live",
+      "title": "thread-archived",
+      "modelSelection": {
+        "instanceId": "codex",
+        "model": "gpt-5"
+      },
+      "runtimeMode": "full-access",
+      "interactionMode": "default",
+      "kind": "workspace",
+      "branch": null,
+      "worktreePath": null,
+      "latestTurn": null,
+      "createdAt": "2026-07-11T00:00:00.000Z",
+      "updatedAt": "2026-07-11T00:00:00.000Z",
+      "archivedAt": "2026-07-11T00:00:00.000Z",
+      "session": null,
+      "latestUserMessageAt": null,
+      "hasPendingApprovals": false,
+      "hasPendingUserInput": false,
+      "hasActionableProposedPlan": false,
+      "unresolvedDelivery": null,
+      "deletedAt": null,
+      "messages": [],
+      "activities": [],
+      "proposedPlans": [],
+      "checkpoints": []
+    },
+    {
+      "id": "thread-deleted",
+      "projectId": "project-deleted",
+      "title": "thread-deleted",
+      "modelSelection": {
+        "instanceId": "codex",
+        "model": "gpt-5"
+      },
+      "runtimeMode": "full-access",
+      "interactionMode": "default",
+      "kind": "workspace",
+      "branch": null,
+      "worktreePath": null,
+      "latestTurn": null,
+      "createdAt": "2026-07-11T00:00:00.000Z",
+      "updatedAt": "2026-07-11T00:00:00.000Z",
+      "archivedAt": null,
+      "session": null,
+      "latestUserMessageAt": null,
+      "hasPendingApprovals": false,
+      "hasPendingUserInput": false,
+      "hasActionableProposedPlan": false,
+      "unresolvedDelivery": null,
+      "deletedAt": "2026-07-11T00:00:00.000Z",
+      "messages": [
+        {
+          "id": "message-deleted",
+          "turnId": null,
+          "role": "assistant",
+          "text": "Owned deleted message",
+          "attachments": [],
+          "streaming": false,
+          "createdAt": "2026-07-11T00:00:00.000Z",
+          "updatedAt": "2026-07-11T00:00:00.000Z"
+        }
+      ],
+      "activities": [],
+      "proposedPlans": [],
+      "checkpoints": []
+    }
+  ],
+  "updatedAt": "2026-07-11T00:00:00.000Z"
+}

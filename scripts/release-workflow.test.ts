@@ -42,6 +42,21 @@ it("documents nightly releases as manual-only", () => {
   assert.match(releaseDocumentation, /manual nightly\s+releases are GitHub prereleases/i);
 });
 
+it("checks Finder's rendered icon from the exact macOS release DMG before upload", () => {
+  const macVerification =
+    /- name: Verify macOS ad-hoc application signature\n[\s\S]*?(?=\n      - name:)/.exec(
+      releaseWorkflow,
+    )?.[0];
+  assert.isDefined(macVerification);
+  assert.include(macVerification!, "if: matrix.platform == 'mac'");
+  assert.include(macVerification!, "set -euo pipefail");
+  assert.include(macVerification!, "hdiutil attach -readonly -nobrowse -noautoopen");
+  assert.include(macVerification!, 'app_paths=("$mount_dir"/*.app)');
+  assert.include(macVerification!, 'swift scripts/check-macos-app-icon.swift "${app_paths[0]}"');
+  assert.notInclude(macVerification!, "continue-on-error");
+  assert.notInclude(macVerification!, 'check-macos-app-icon.swift "${app_paths[0]}" ||');
+});
+
 it("publishes stable updater metadata atomically from a verified draft", () => {
   assert.include(releaseWorkflow, 'echo "name=BiBCode v$version"');
   assert.match(releaseWorkflow, /build-tauri-update-manifest\.ts/);

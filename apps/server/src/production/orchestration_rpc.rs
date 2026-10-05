@@ -1002,18 +1002,7 @@ pub async fn shell_snapshot(engine: &OrchestrationEngine, archived: bool) -> Rpc
         .projects
         .iter()
         .filter(|project| project.deleted_at.is_none())
-        .map(|project| {
-            json!({
-                "id": project.project_id,
-                "title": project.title,
-                "workspaceRoot": project.workspace_root,
-                "defaultModelSelection": project.default_model_selection,
-                "scripts": project.scripts,
-                "worktreeDiscovery": project.worktree_discovery,
-                "createdAt": project.created_at,
-                "updatedAt": project.updated_at,
-            })
-        })
+        .map(project_shell)
         .collect::<Vec<_>>();
     let previews = build_conversation_previews(&snapshot);
     let threads = snapshot
@@ -1050,16 +1039,20 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
         .map(|state| state.last_applied_sequence)
         .max()
         .unwrap_or(0);
-    let mut detail = thread_shell(thread, &snapshot, None);
+    let rows = thread_detail_rows(&snapshot, thread);
+    let detail = thread_detail(thread, &rows);
+    Ok(json!({ "snapshotSequence": sequence, "thread": detail }))
+}
+
+fn thread_detail(thread: &ProjectionThread, rows: &ThreadDetailRows<'_>) -> Value {
+    let mut detail = thread_shell_with_records(thread, rows.latest_turn, rows.session, None);
     let object = detail.as_object_mut().expect("thread shell is an object");
     object.insert("deletedAt".to_owned(), json!(thread.deleted_at));
     object.insert(
         "messages".to_owned(),
         Value::Array(
-            snapshot
-                .messages
+            rows.messages
                 .iter()
-                .filter(|row| row.thread_id == thread_id)
                 .map(|row| {
                     let mut message = json!({
                         "id": row.message_id,
@@ -1100,10 +1093,8 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
     object.insert(
         "activities".to_owned(),
         Value::Array(
-            snapshot
-                .activities
+            rows.activities
                 .iter()
-                .filter(|row| row.thread_id == thread_id)
                 .map(|row| {
                     json!({
                         "id": row.activity_id,
@@ -1122,10 +1113,8 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
     object.insert(
         "proposedPlans".to_owned(),
         Value::Array(
-            snapshot
-                .proposed_plans
+            rows.proposed_plans
                 .iter()
-                .filter(|row| row.thread_id == thread_id)
                 .map(|row| {
                     json!({
                         "id": row.plan_id,
@@ -1143,10 +1132,8 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
     object.insert(
         "checkpoints".to_owned(),
         Value::Array(
-            snapshot
-                .checkpoints
+            rows.checkpoints
                 .iter()
-                .filter(|row| row.thread_id == thread_id)
                 .map(|row| {
                     json!({
                         "turnId": row.turn_id,
@@ -1161,7 +1148,166 @@ async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcRe
                 .collect(),
         ),
     );
-    Ok(json!({ "snapshotSequence": sequence, "thread": detail }))
+    detail
+}
+
+#[derive(Default)]
+struct ThreadDetailRows<'a> {
+    messages: Vec<&'a crate::persistence::ProjectionThreadMessage>,
+    activities: Vec<&'a crate::persistence::ProjectionThreadActivity>,
+    proposed_plans: Vec<&'a crate::persistence::ProjectionThreadProposedPlan>,
+    checkpoints: Vec<&'a crate::orchestration::engine::ProjectionCheckpointRow>,
+    session: Option<&'a crate::persistence::ProjectionThreadSession>,
+    latest_turn: Option<&'a crate::persistence::ProjectionTurn>,
+}
+
+fn thread_detail_rows<'a>(
+    snapshot: &'a crate::orchestration::Snapshot,
+    thread: &ProjectionThread,
+) -> ThreadDetailRows<'a> {
+    ThreadDetailRows {
+        messages: snapshot
+            .messages
+            .iter()
+            .filter(|row| row.thread_id == thread.thread_id)
+            .collect(),
+        activities: snapshot
+            .activities
+            .iter()
+            .filter(|row| row.thread_id == thread.thread_id)
+            .collect(),
+        proposed_plans: snapshot
+            .proposed_plans
+            .iter()
+            .filter(|row| row.thread_id == thread.thread_id)
+            .collect(),
+        checkpoints: snapshot
+            .checkpoints
+            .iter()
+            .filter(|row| row.thread_id == thread.thread_id)
+            .collect(),
+        session: snapshot
+            .sessions
+            .iter()
+            .find(|row| row.thread_id == thread.thread_id),
+        latest_turn: thread.latest_turn_id.as_ref().and_then(|latest_id| {
+            snapshot.turns.iter().find(|row| {
+                row.thread_id == thread.thread_id && row.turn_id.as_ref() == Some(latest_id)
+            })
+        }),
+    }
+}
+
+/// Borrow each row once; an HTTP snapshot must not reload or rescan the full history per thread.
+fn all_thread_detail_rows(
+    snapshot: &crate::orchestration::Snapshot,
+) -> HashMap<&str, ThreadDetailRows<'_>> {
+    let mut rows: HashMap<&str, ThreadDetailRows<'_>> = HashMap::new();
+    for row in &snapshot.messages {
+        rows.entry(&row.thread_id).or_default().messages.push(row);
+    }
+    for row in &snapshot.activities {
+        rows.entry(&row.thread_id).or_default().activities.push(row);
+    }
+    for row in &snapshot.proposed_plans {
+        rows.entry(&row.thread_id)
+            .or_default()
+            .proposed_plans
+            .push(row);
+    }
+    for row in &snapshot.checkpoints {
+        rows.entry(&row.thread_id)
+            .or_default()
+            .checkpoints
+            .push(row);
+    }
+    for row in &snapshot.sessions {
+        let group = rows.entry(&row.thread_id).or_default();
+        if group.session.is_none() {
+            group.session = Some(row);
+        }
+    }
+    let latest_ids: HashMap<&str, &str> = snapshot
+        .threads
+        .iter()
+        .filter_map(|thread| {
+            thread
+                .latest_turn_id
+                .as_deref()
+                .map(|id| (thread.thread_id.as_str(), id))
+        })
+        .collect();
+    for row in &snapshot.turns {
+        if let Some(id) = latest_ids.get(row.thread_id.as_str())
+            && row.turn_id.as_deref() == Some(*id)
+        {
+            let group = rows.entry(&row.thread_id).or_default();
+            if group.latest_turn.is_none() {
+                group.latest_turn = Some(row);
+            }
+        }
+    }
+    rows
+}
+
+fn project_shell(project: &crate::persistence::ProjectionProject) -> Value {
+    json!({
+        "id": project.project_id,
+        "title": project.title,
+        "workspaceRoot": project.workspace_root,
+        "defaultModelSelection": project.default_model_selection,
+        "scripts": project.scripts,
+        "worktreeDiscovery": project.worktree_discovery,
+        "createdAt": project.created_at,
+        "updatedAt": project.updated_at,
+    })
+}
+
+/// The already-declared HTTP read model includes archived/deleted records and full thread details.
+/// Legacy WS null optionals stay unchanged; HTTP omits only fields declared optional, not nullable.
+pub(crate) fn read_model_snapshot(
+    snapshot: &crate::orchestration::Snapshot,
+    updated_at: &str,
+) -> Value {
+    let mut grouped = all_thread_detail_rows(snapshot);
+    let projects = snapshot
+        .projects
+        .iter()
+        .map(|project| {
+            let mut wire = project_shell(project);
+            wire["deletedAt"] = json!(project.deleted_at);
+            wire
+        })
+        .collect::<Vec<_>>();
+    let threads = snapshot
+        .threads
+        .iter()
+        .map(|thread| {
+            let rows = grouped
+                .remove(thread.thread_id.as_str())
+                .unwrap_or_default();
+            let mut wire = thread_detail(thread, &rows);
+            if let Some(turn) = wire.get_mut("latestTurn").and_then(Value::as_object_mut)
+                && turn.get("sourceProposedPlan").is_some_and(Value::is_null)
+            {
+                turn.remove("sourceProposedPlan");
+            }
+            if let Some(session) = wire.get_mut("session").and_then(Value::as_object_mut)
+                && session
+                    .get("providerInstanceId")
+                    .is_some_and(Value::is_null)
+            {
+                session.remove("providerInstanceId");
+            }
+            wire
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "snapshotSequence": snapshot.states.iter().map(|state| state.last_applied_sequence).max().unwrap_or(0),
+        "projects": projects,
+        "threads": threads,
+        "updatedAt": updated_at,
+    })
 }
 
 fn thread_activity_tone(tone: &str) -> &str {
@@ -1290,11 +1436,24 @@ fn thread_shell(
     preview: Option<&ConversationPreview>,
 ) -> Value {
     let latest_turn = thread.latest_turn_id.as_ref().and_then(|latest_id| {
-        snapshot
-            .turns
-            .iter()
-            .find(|turn| turn.thread_id == thread.thread_id && turn.turn_id.as_ref() == Some(latest_id))
-            .map(|turn| json!({
+        snapshot.turns.iter().find(|turn| {
+            turn.thread_id == thread.thread_id && turn.turn_id.as_ref() == Some(latest_id)
+        })
+    });
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.thread_id == thread.thread_id);
+    thread_shell_with_records(thread, latest_turn, session, preview)
+}
+
+fn thread_shell_with_records(
+    thread: &ProjectionThread,
+    latest_turn: Option<&crate::persistence::ProjectionTurn>,
+    session: Option<&crate::persistence::ProjectionThreadSession>,
+    preview: Option<&ConversationPreview>,
+) -> Value {
+    let latest_turn = latest_turn.map(|turn| json!({
                 "turnId": turn.turn_id,
                 "state": turn.state,
                 "requestedAt": turn.requested_at,
@@ -1306,24 +1465,20 @@ fn thread_shell(
                     _ => None,
                 },
             }))
+    ;
+    let session = session.map(|session| {
+        json!({
+            "threadId": session.thread_id,
+            "status": session.status,
+            "providerName": session.provider_name,
+            "providerInstanceId": session.provider_instance_id,
+            "runtimeMode": session.runtime_mode,
+            "activeTurnId": session.active_turn_id,
+            "lastError": session.last_error,
+            "lastErrorClass": session.last_error_class,
+            "updatedAt": session.updated_at,
+        })
     });
-    let session = snapshot
-        .sessions
-        .iter()
-        .find(|session| session.thread_id == thread.thread_id)
-        .map(|session| {
-            json!({
-                "threadId": session.thread_id,
-                "status": session.status,
-                "providerName": session.provider_name,
-                "providerInstanceId": session.provider_instance_id,
-                "runtimeMode": session.runtime_mode,
-                "activeTurnId": session.active_turn_id,
-                "lastError": session.last_error,
-                "lastErrorClass": session.last_error_class,
-                "updatedAt": session.updated_at,
-            })
-        });
     let mut shell = json!({
         "id": thread.thread_id,
         "projectId": thread.project_id,
@@ -1768,6 +1923,174 @@ mod tests {
         );
         let without = thread_shell(thread, &snapshot, None);
         assert!(without.get("conversationPreview").is_none());
+    }
+
+    fn http_read_model_fixture() -> Snapshot {
+        let mut snapshot = preview_snapshot_fixture("completed");
+        let mut live = snapshot.threads.remove(0);
+        live.thread_id = "thread-live".to_owned();
+        live.project_id = "project-live".to_owned();
+        live.title = "thread-live".to_owned();
+        live.latest_turn_id = Some("turn-live".to_owned());
+        live.created_at = CREATED_AT.to_owned();
+        live.updated_at = CREATED_AT.to_owned();
+        live.latest_user_message_at = Some(CREATED_AT.to_owned());
+        let mut archived = live.clone();
+        archived.thread_id = "thread-archived".to_owned();
+        archived.title = "thread-archived".to_owned();
+        archived.kind = "workspace".to_owned();
+        archived.archived_at = Some(CREATED_AT.to_owned());
+        archived.latest_turn_id = None;
+        archived.latest_user_message_at = None;
+        let mut deleted = archived.clone();
+        deleted.thread_id = "thread-deleted".to_owned();
+        deleted.project_id = "project-deleted".to_owned();
+        deleted.title = "thread-deleted".to_owned();
+        deleted.archived_at = None;
+        deleted.deleted_at = Some(CREATED_AT.to_owned());
+        snapshot.threads = vec![live, archived, deleted];
+        let project = crate::persistence::ProjectionProject {
+            project_id: "project-live".to_owned(),
+            title: "Owned live".to_owned(),
+            workspace_root: "/owned/live".to_owned(),
+            default_model_selection: None,
+            scripts: json!([]),
+            worktree_discovery: json!({ "visibility": "hidden", "initialPromptDismissedAt": null, "baselinePaths": [] }),
+            worktree_repository_key: None,
+            created_at: CREATED_AT.to_owned(),
+            updated_at: CREATED_AT.to_owned(),
+            deleted_at: None,
+        };
+        let mut deleted_project = project.clone();
+        deleted_project.project_id = "project-deleted".to_owned();
+        deleted_project.title = "Owned deleted".to_owned();
+        deleted_project.workspace_root = "/owned/deleted".to_owned();
+        deleted_project.deleted_at = Some(CREATED_AT.to_owned());
+        snapshot.projects = vec![project, deleted_project];
+        let mut message = snapshot.messages.remove(0);
+        message.message_id = "message-live".to_owned();
+        message.thread_id = "thread-live".to_owned();
+        message.turn_id = Some("turn-live".to_owned());
+        message.text = "Owned message".to_owned();
+        let mut deleted_message = message.clone();
+        deleted_message.message_id = "message-deleted".to_owned();
+        deleted_message.thread_id = "thread-deleted".to_owned();
+        deleted_message.turn_id = None;
+        deleted_message.role = "assistant".to_owned();
+        deleted_message.text = "Owned deleted message".to_owned();
+        snapshot.messages = vec![message, deleted_message];
+        let mut activity = snapshot.activities.remove(0);
+        activity.activity_id = "activity-live".to_owned();
+        activity.thread_id = "thread-live".to_owned();
+        activity.turn_id = Some("turn-live".to_owned());
+        activity.tone = "warning".to_owned();
+        activity.kind = "status".to_owned();
+        activity.summary = "Owned status".to_owned();
+        activity.created_at = CREATED_AT.to_owned();
+        snapshot.activities = vec![activity];
+        let mut turn = snapshot.turns.remove(0);
+        turn.thread_id = "thread-live".to_owned();
+        turn.turn_id = Some("turn-live".to_owned());
+        turn.requested_at = CREATED_AT.to_owned();
+        turn.started_at = Some(CREATED_AT.to_owned());
+        turn.completed_at = Some(CREATED_AT.to_owned());
+        snapshot.turns = vec![turn];
+        snapshot.sessions = vec![crate::persistence::ProjectionThreadSession {
+            thread_id: "thread-live".to_owned(),
+            status: "ready".to_owned(),
+            provider_name: Some("codex".to_owned()),
+            provider_instance_id: None,
+            runtime_mode: "full-access".to_owned(),
+            active_turn_id: None,
+            last_error: None,
+            last_error_class: None,
+            updated_at: CREATED_AT.to_owned(),
+        }];
+        snapshot.proposed_plans = vec![crate::persistence::ProjectionThreadProposedPlan {
+            plan_id: "plan-live".to_owned(),
+            thread_id: "thread-live".to_owned(),
+            turn_id: Some("turn-live".to_owned()),
+            plan_markdown: "Owned plan".to_owned(),
+            implemented_at: None,
+            implementation_thread_id: None,
+            created_at: CREATED_AT.to_owned(),
+            updated_at: CREATED_AT.to_owned(),
+        }];
+        snapshot.checkpoints = vec![crate::orchestration::engine::ProjectionCheckpointRow {
+            thread_id: "thread-live".to_owned(),
+            turn_id: "turn-live".to_owned(),
+            checkpoint_turn_count: 1,
+            checkpoint_ref: "refs/checkpoints/owned".to_owned(),
+            status: "ready".to_owned(),
+            files: json!([]),
+            assistant_message_id: None,
+            completed_at: CREATED_AT.to_owned(),
+        }];
+        snapshot.states = vec![crate::persistence::ProjectionState {
+            projector: "owned".to_owned(),
+            last_applied_sequence: 42,
+            updated_at: CREATED_AT.to_owned(),
+        }];
+        snapshot
+    }
+
+    #[test]
+    fn http_read_model_matches_public_fixture_and_preserves_ws_detail() {
+        let snapshot = http_read_model_fixture();
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../../../packages/contracts/fixtures/http-orchestration/full-read-model.json"
+        ))
+        .expect("public full-read-model fixture");
+        let model = read_model_snapshot(&snapshot, CREATED_AT);
+        assert_eq!(model, expected);
+        assert!(model.get("states").is_none());
+        assert!(model.get("receipts").is_none());
+        let thread = &snapshot.threads[0];
+        let ws_detail = thread_detail(thread, &thread_detail_rows(&snapshot, thread));
+        let mut expected_ws = expected["threads"][0].clone();
+        expected_ws["latestTurn"]["sourceProposedPlan"] = Value::Null;
+        expected_ws["session"]["providerInstanceId"] = Value::Null;
+        assert_eq!(ws_detail, expected_ws);
+        let shell = thread_shell(thread, &snapshot, None);
+        let mut detail_shell = ws_detail;
+        for field in [
+            "deletedAt",
+            "messages",
+            "activities",
+            "proposedPlans",
+            "checkpoints",
+        ] {
+            detail_shell
+                .as_object_mut()
+                .expect("detail object")
+                .remove(field);
+        }
+        assert_eq!(shell, detail_shell);
+    }
+
+    #[test]
+    fn http_read_model_keeps_present_optionals_and_first_matching_ws_rows() {
+        let mut snapshot = http_read_model_fixture();
+        snapshot.sessions[0].provider_instance_id = Some("codex-custom".to_owned());
+        snapshot.turns[0].source_proposed_plan_thread_id = Some("thread-source".to_owned());
+        snapshot.turns[0].source_proposed_plan_id = Some("plan-source".to_owned());
+        let mut later_session = snapshot.sessions[0].clone();
+        later_session.status = "error".to_owned();
+        snapshot.sessions.push(later_session);
+        let mut later_turn = snapshot.turns[0].clone();
+        later_turn.state = "error".to_owned();
+        snapshot.turns.push(later_turn);
+        let model = read_model_snapshot(&snapshot, CREATED_AT);
+        let thread = &snapshot.threads[0];
+        let ws = thread_detail(thread, &thread_detail_rows(&snapshot, thread));
+        assert_eq!(model["threads"][0], ws);
+        assert_eq!(ws["session"]["providerInstanceId"], "codex-custom");
+        assert_eq!(ws["session"]["status"], "ready");
+        assert_eq!(ws["latestTurn"]["state"], "completed");
+        assert_eq!(
+            ws["latestTurn"]["sourceProposedPlan"],
+            json!({ "threadId": "thread-source", "planId": "plan-source" })
+        );
     }
 
     struct NeverFactory;

@@ -48,6 +48,11 @@ four job groups:
   the Windows command processor and writes its exact action record. Simulated
   target fixture assertions on other hosts are compatibility evidence, not a
   native Windows pass.
+  The repository-availability contract additionally executes the generated
+  drive/UNC trust commands through native Windows PowerShell and Git, including
+  spaces, dollar signs, backticks, and typographic quotes. Every Git/home
+  configuration input is fixture-owned. Other platforms skip that native case;
+  their string assertions remain compatibility evidence.
   The Windows rows then run
   `node scripts/run-msvc.mjs cargo check -p bibcode-server --all-targets` so
   Unix-only test helpers or imports that are unused on Windows fail there under
