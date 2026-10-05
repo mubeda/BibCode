@@ -2,6 +2,7 @@ pub mod checks;
 mod discovery;
 mod hosts;
 mod pull_request;
+pub mod repository_identity;
 
 pub(crate) use discovery::provider_install_hint;
 pub use hosts::{IdentifiedProvider, ProviderHosts};
@@ -225,14 +226,10 @@ fn looks_like_host(value: &str) -> bool {
 
 pub fn remote_host(remote: &str) -> Option<String> {
     let value = remote.trim();
-    if let Some(after_scheme) = value.split_once("://").map(|(_, value)| value) {
-        return after_scheme
-            .rsplit_once('@')
-            .map_or(after_scheme, |(_, host)| host)
-            .split(['/', ':'])
-            .next()
-            .and_then(non_empty)
-            .map(|host| host.to_lowercase());
+    if value.contains("://") {
+        let url = url::Url::parse(value).ok()?;
+        // IPv6 hosts come back bracketed; scp-like remotes carry them bare.
+        return non_empty(url.host_str()?.trim_matches(['[', ']'])).map(|host| host.to_lowercase());
     }
     scp_host_and_path(value).map(|(host, _)| host.to_lowercase())
 }
@@ -371,6 +368,8 @@ mod tests {
             ("github.com:team/repo.git", Some("github.com")),
             ("git@Host.Example:team/repo.git", Some("host.example")),
             ("[fe80::1]:team/repo.git", Some("fe80::1")),
+            ("ssh://git@[2001:DB8::1]:2222/a/b.git", Some("2001:db8::1")),
+            ("https://host/path@thing.git", Some("host")),
             ("C:\\work\\repo", None),
             ("./relative:repo", None),
             ("local", None),

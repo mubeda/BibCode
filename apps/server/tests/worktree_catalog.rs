@@ -580,6 +580,7 @@ fn project(main: &Path) -> ProjectionProject {
         created_at: NOW.to_owned(),
         updated_at: NOW.to_owned(),
         deleted_at: None,
+        repository_identity: None,
     }
 }
 

@@ -140,6 +140,7 @@ impl Fixture {
                 created_at: "2026-09-01T00:00:00Z".to_owned(),
                 updated_at: "2026-09-01T00:00:00Z".to_owned(),
                 deleted_at: None,
+                repository_identity: None,
             })
             .await
             .expect("project projection");
