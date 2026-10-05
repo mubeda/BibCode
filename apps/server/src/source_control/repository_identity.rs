@@ -20,7 +20,7 @@ pub fn repository_identity(remote_url: &str, root_path: &str) -> Option<Value> {
         "locator": {
             "source": "git-remote",
             "remoteName": "origin",
-            "remoteUrl": without_credentials(remote_url),
+            "remoteUrl": without_credentials(remote_url)?,
         },
         "rootPath": root_path,
         "displayName": name,
@@ -38,18 +38,18 @@ pub fn repository_identity(remote_url: &str, root_path: &str) -> Option<Value> {
 
 /// The remote without the userinfo of a `scheme://` URL, which can carry an access token as the
 /// username or a password. The identity is persisted and sent to every client, so it must never
-/// hold one. scp-style `user@host:path` remotes carry no secret and stay as written.
-fn without_credentials(remote_url: &str) -> String {
-    let Some((scheme, rest)) = remote_url.split_once("://") else {
-        return remote_url.to_owned();
-    };
-    // The authority ends at the first of these, exactly as the URL parser finds it.
-    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    format!("{scheme}://{host}{tail}")
+/// hold one. The URL is parsed and re-serialized by the same parser that validates the identity
+/// (`remote_host`), so no parser disagreement can leave userinfo behind. scp-style
+/// `user@host:path` remotes carry no secret and stay as written. `None` means the URL does not parse.
+fn without_credentials(remote_url: &str) -> Option<String> {
+    if !remote_url.contains("://") {
+        return Some(remote_url.to_owned());
+    }
+    let mut url = url::Url::parse(remote_url).ok()?;
+    // Only fails for URLs that cannot carry userinfo, which then have none to remove.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    Some(url.into())
 }
 
 #[cfg(test)]
@@ -79,14 +79,42 @@ mod tests {
             assert_eq!(identity["rootPath"], "/work/repo");
             assert_eq!(identity["locator"]["source"], "git-remote");
             assert_eq!(identity["locator"]["remoteName"], "origin");
-            assert_eq!(identity["locator"]["remoteUrl"], without_userinfo(remote));
+            assert_eq!(
+                identity["locator"]["remoteUrl"],
+                url_without_userinfo(remote)
+            );
         }
     }
 
-    fn without_userinfo(remote: &str) -> String {
-        remote
-            .replacen("ssh://git@", "ssh://", 1)
-            .replacen("https://user@", "https://", 1)
+    /// The stored form: re-serialized by the URL parser, so the host is lowercased.
+    fn url_without_userinfo(remote: &str) -> String {
+        if !remote.contains("://") {
+            return remote.to_owned();
+        }
+        let mut url = url::Url::parse(remote).unwrap();
+        url.set_username("").unwrap();
+        url.set_password(None).unwrap();
+        url.into()
+    }
+
+    /// A backslash credential matches the stored form of its credential-free remote, so the
+    /// canonical key never depends on userinfo.
+    #[test]
+    fn canonical_key_is_unchanged_by_credentials() {
+        for (with, without) in [
+            ("ssh://tok\\en-secret@host/a/b", "ssh://host/a/b"),
+            (
+                "git+ssh://user:pa%2Fss-secret@host/a/b",
+                "git+ssh://host/a/b",
+            ),
+            ("https://oauth2:tok-secret@host/a/b", "https://host/a/b"),
+        ] {
+            assert_eq!(
+                repository_identity(with, "/r").unwrap()["canonicalKey"],
+                repository_identity(without, "/r").unwrap()["canonicalKey"],
+                "{with}"
+            );
+        }
     }
 
     #[test]
@@ -106,6 +134,12 @@ mod tests {
             ),
             ("https://host/o/r@v1.git", "https://host/o/r@v1.git"),
             ("ssh://git@host:2222/o/r.git", "ssh://host:2222/o/r.git"),
+            ("ssh://tok\\en-secret@host/a/b", "ssh://host/a/b"),
+            (
+                "git+ssh://user:pa%2Fss-secret@host/a/b",
+                "git+ssh://host/a/b",
+            ),
+            ("https://tok%5Cen-secret@host/a/b", "https://host/a/b"),
             ("git@github.com:o/r.git", "git@github.com:o/r.git"),
             ("https://github.com/o/r.git", "https://github.com/o/r.git"),
         ] {
