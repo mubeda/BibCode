@@ -39,12 +39,13 @@ the folder path; that entry is the project itself, with the same menu, actions,
 threads and worktrees. Projects without an `origin` get a card of their own
 named after their folder. Unavailable environments appear dimmed. In this view
 the sort menu's grouping choice is hidden, and each entry's menu is the normal
-project menu; its **Project grouping…** item affects the Environments view.
-Collapsing a repository card hides all its entries. An entry and the matching
-row in the Environments view share one collapse state per checkout, so they can
-disagree only after you toggle the same repository from a different environment
-in the Environments view. Switching back to **Environments** restores the rail
-with its previous selection.
+project menu; its **Group into…** item affects the Environments view.
+Collapsing a repository card hides all its entries. Collapse state is kept per
+checkout, so collapsing an entry in Repositories and opening the same checkout
+in Environments shows the same state. Toggling the same repository from another
+environment's checkout in the Environments view does not update this entry.
+Switching back to **Environments** restores the rail with its previous
+selection.
 
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
 unread-count badge covers agents across all connected environments and is hidden when nothing is unread. Selecting
