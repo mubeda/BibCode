@@ -347,10 +347,18 @@ interface ComposerDraftStoreState {
   getDraftThreadByLogicalProjectKey: (
     logicalProjectKey: string,
     fallbackKeys?: readonly string[],
+    fallbackOwner?: ScopedProjectRef,
   ) => ProjectDraftSession | null;
+  /**
+   * Looks up the draft under `logicalProjectKey`, then under each earlier key in
+   * `fallbackKeys`. When `fallbackOwner` is given, a fallback hit is accepted only
+   * if that project owns the draft, so a canonical repository key cannot hand one
+   * project another project's unsent draft.
+   */
   getDraftSessionByLogicalProjectKey: (
     logicalProjectKey: string,
     fallbackKeys?: readonly string[],
+    fallbackOwner?: ScopedProjectRef,
   ) => ProjectDraftSession | null;
   getDraftThreadByProjectRef: (projectRef: ScopedProjectRef) => ProjectDraftSession | null;
   getDraftSessionByProjectRef: (projectRef: ScopedProjectRef) => ProjectDraftSession | null;
@@ -2259,10 +2267,18 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
         stickyModelSelectionByProvider: {},
         stickyActiveProvider: null,
         getComposerDraft: (target) => getComposerDraftState(get(), target),
-        getDraftThreadByLogicalProjectKey: (logicalProjectKey, fallbackKeys) => {
-          return get().getDraftSessionByLogicalProjectKey(logicalProjectKey, fallbackKeys);
+        getDraftThreadByLogicalProjectKey: (logicalProjectKey, fallbackKeys, fallbackOwner) => {
+          return get().getDraftSessionByLogicalProjectKey(
+            logicalProjectKey,
+            fallbackKeys,
+            fallbackOwner,
+          );
         },
-        getDraftSessionByLogicalProjectKey: (logicalProjectKey, fallbackKeys = []) => {
+        getDraftSessionByLogicalProjectKey: (
+          logicalProjectKey,
+          fallbackKeys = [],
+          fallbackOwner,
+        ) => {
           for (const candidate of [logicalProjectKey, ...fallbackKeys]) {
             const normalizedLogicalProjectKey = logicalProjectDraftKey(candidate);
             if (normalizedLogicalProjectKey.length === 0) continue;
@@ -2271,6 +2287,14 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             if (!draftId) continue;
             const draftThread = get().draftThreadsByThreadKey[draftId];
             if (!draftThread || isDraftThreadPromoting(draftThread)) continue;
+            if (
+              fallbackOwner &&
+              candidate !== logicalProjectKey &&
+              (draftThread.environmentId !== fallbackOwner.environmentId ||
+                draftThread.projectId !== fallbackOwner.projectId)
+            ) {
+              continue;
+            }
             return toProjectDraftSession(DraftId.make(draftId), draftThread);
           }
           return null;
@@ -2338,13 +2362,28 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               options,
             );
             const hasSameLogicalMapping = previousThreadKeyForLogicalProject === draftId;
-            if (hasSameLogicalMapping && draftThreadsEqual(existingThread, nextDraftThread)) {
+            // A draft lives under exactly one logical key: writing the current key
+            // moves it off any earlier key it was found through.
+            const hasOtherMappingForDraft = Object.entries(
+              state.logicalProjectDraftThreadKeyByLogicalProjectKey,
+            ).some(
+              ([key, threadKey]) => threadKey === draftId && key !== normalizedLogicalProjectKey,
+            );
+            if (
+              hasSameLogicalMapping &&
+              !hasOtherMappingForDraft &&
+              draftThreadsEqual(existingThread, nextDraftThread)
+            ) {
               return state;
             }
-            const nextLogicalProjectDraftThreadKeyByLogicalProjectKey: Record<string, string> = {
-              ...state.logicalProjectDraftThreadKeyByLogicalProjectKey,
-              [normalizedLogicalProjectKey]: draftId,
-            };
+            const nextLogicalProjectDraftThreadKeyByLogicalProjectKey: Record<string, string> =
+              Object.fromEntries(
+                Object.entries(state.logicalProjectDraftThreadKeyByLogicalProjectKey).filter(
+                  ([, threadKey]) => threadKey !== draftId,
+                ),
+              );
+            nextLogicalProjectDraftThreadKeyByLogicalProjectKey[normalizedLogicalProjectKey] =
+              draftId;
             const nextDraftThreadsByThreadKey: Record<string, DraftThreadState> = {
               ...state.draftThreadsByThreadKey,
               [draftId]: nextDraftThread,
