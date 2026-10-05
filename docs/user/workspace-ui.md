@@ -40,10 +40,18 @@ threads and worktrees. Projects without an `origin` get a card of their own
 named after their folder. Unavailable environments appear dimmed. In this view
 the sort menu's grouping choice is hidden, and each entry's menu is the normal
 project menu; its **Group into…** item affects the Environments view.
-Collapsing a repository card hides all its entries. Collapse state is kept per
-checkout, so collapsing an entry in Repositories and opening the same checkout
-in Environments shows the same state. Toggling the same repository from another
-environment's checkout in the Environments view does not update this entry.
+Collapsing a repository card hides all its entries. Each entry keeps its own
+collapse state, so collapsing one environment's entry leaves the others open.
+Collapsing or expanding the project in Environments also updates its entries
+here, except other environments' entries you have already toggled in this
+view. With no projects, the view offers **Show Environments**, where projects
+are added. A changed `origin`
+moves its entry to the new card after the next refresh of that project: when
+the window regains focus, after a Git action, or when you reopen the project.
+An unsent message draft belongs to the repository's project rather than one
+checkout: starting a new thread from another environment's entry of the same
+repository continues that draft there, and its branch and worktree choice
+resets.
 Switching back to **Environments** restores the rail with its previous
 selection.
 

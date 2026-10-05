@@ -53,15 +53,19 @@ flowchart TB
   and is not a persisted live catalog.
   Each project also carries a server-authored `repositoryIdentity` derived from
   its checkout's `origin` remote: a canonical key of the lowercased host and the
-  repository path without `.git`, plus the remote (stored without userinfo, so
-  no credentials persist), name, owner, provider and checkout root. It lives in
+  repository path without `.git`, plus the remote (stored without userinfo,
+  query or fragment, so no credentials persist), name, owner, provider and
+  checkout root. A remote whose path has an empty segment has no identity. It lives in
   the rebuildable project projection and changes only through the
   server-internal `project.repository-identity.set` command, which emits
   `project.meta-updated` without changing `updatedAt`. A reconcile runs right
   after project creation or a workspace move (so a new project is briefly
-  ungrouped), once at startup for every project, and at most every five minutes
-  per project after a healthy worktree-catalog scan. Reconciles are serialized
-  per project, bounded to four concurrent Git reads, and run as tracked tasks
+  ungrouped), once at startup for every project, and after a healthy
+  worktree-catalog scan: at most every five minutes per project, or at once
+  when the primary checkout's `.git/config` size or modification time changed
+  since the last scan (one stat, no Git process). Reconciles are serialized
+  per project, bounded to four concurrent Git reads, cancellable while waiting
+  for either, and run as tracked tasks
   off the effects worker and catalog refresh paths, joined at shutdown. A
   checkout that is missing, unreadable, refused, or no longer a repository
   keeps the stored value; only a confirmed repository whose `origin` was
