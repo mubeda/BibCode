@@ -50,7 +50,24 @@ flowchart TB
   rebuildable projection, established only by a trusted primary-checkout scan,
   and joined into project reads; generic projection writes cannot change it,
   and projection rewind/replay preserves it. It fences later fallback anchors
-  and is not a persisted live catalog. Projects sharing a repository may share
+  and is not a persisted live catalog.
+  Each project also carries a server-authored `repositoryIdentity` derived from
+  its checkout's `origin` remote: a canonical key of the lowercased host and the
+  repository path without `.git`, plus the remote (stored without userinfo, so
+  no credentials persist), name, owner, provider and checkout root. It lives in
+  the rebuildable project projection and changes only through the
+  server-internal `project.repository-identity.set` command, which emits
+  `project.meta-updated` without changing `updatedAt`. A reconcile runs right
+  after project creation or a workspace move (so a new project is briefly
+  ungrouped), once at startup for every project, and at most every five minutes
+  per project after a healthy worktree-catalog scan. Reconciles are serialized
+  per project, bounded to four concurrent Git reads, and run as tracked tasks
+  off the effects worker and catalog refresh paths, joined at shutdown. A
+  checkout that is missing, unreadable, refused, or no longer a repository
+  keeps the stored value; only a confirmed repository whose `origin` was
+  removed or changed updates it. Clients group projects by it but cannot set
+  it. It is unrelated to the path-based repository-key pin, which fences
+  worktree adoption on one machine. Projects sharing a repository may share
   Git observation, but retain isolated latest-value snapshots, streams, thread
   joins, subscribers, suppressions, and mutation epochs. Catalog views retain
   the last authoritative arrays through degraded observations and cancel

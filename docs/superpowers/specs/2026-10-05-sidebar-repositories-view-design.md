@@ -92,8 +92,9 @@ Normalization reuses `source_control::remote_host`,
 
 ### Computation triggers
 
-1. Project creation: `prepare_project_create` returns the identity and the
-   engine includes it in the `project.created` payload.
+1. Project creation or workspace move: a reconcile runs right after the change
+   and dispatches the identity update (one extra `project.meta-updated`; the
+   project is briefly ungrouped).
 2. Startup backfill: one bounded pass over `list_projects()` after startup
    computes each identity and dispatches a server-resolved project meta update
    only when the stored value differs. A second startup emits nothing.
@@ -213,7 +214,7 @@ Server (Rust):
 
 - Normalization table: SSH, `ssh://` with port, HTTPS, nested GitLab groups,
   `.git` suffix, host case, IPv6 host, missing origin.
-- `project.created` carries the identity; the shell snapshot emits it.
+- A reconcile after project creation sets the identity; the shell snapshot emits it.
 - Startup backfill sets missing identities and is idempotent.
 - Catalog scan emits exactly one update after an origin change and none
   without a change; a failed read does not clear the value.

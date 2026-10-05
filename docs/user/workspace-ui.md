@@ -29,6 +29,23 @@ the selected server is removed, the rail returns to Local. Saved servers show
 the name you gave them on this device (see
 [Remote access](./remote-access.md#name-a-saved-server)).
 
+The **Environments | Repositories** switch at the top of the left panel picks
+how projects are listed; the choice is remembered on this device.
+**Environments** is the per-environment view described above. **Repositories**
+hides the environment rail and lists one read-only card per Git repository,
+matched by its `origin` remote, across every connected environment. Each card
+holds one entry per checkout showing the environment, its connection state and
+the folder path; that entry is the project itself, with the same menu, actions,
+threads and worktrees. Projects without an `origin` get a card of their own
+named after their folder. Unavailable environments appear dimmed. In this view
+the sort menu's grouping choice is hidden, and each entry's menu is the normal
+project menu; its **Project grouping…** item affects the Environments view.
+Collapsing a repository card hides all its entries. An entry and the matching
+row in the Environments view share one collapse state per checkout, so they can
+disagree only after you toggle the same repository from a different environment
+in the Environments view. Switching back to **Environments** restores the rail
+with its previous selection.
+
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
 unread-count badge covers agents across all connected environments and is hidden when nothing is unread. Selecting
 the row opens the full-screen Agents view; its top strip has a back arrow for
