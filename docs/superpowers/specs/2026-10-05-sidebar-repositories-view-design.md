@@ -186,9 +186,11 @@ that contain it are rejected, as `worktreeDiscovery` already is
 
 ### Rail and header
 
-- The rail stays visible for status, Add server and Manage remote servers. In
-  the Repositories view no rail entry is selected; activating one switches to
-  the Environments view with that environment selected.
+- The environment rail is hidden in the Repositories view, and the panel takes
+  its width. Each environment card already names its environment and status,
+  so the rail would only compete with the toggle. Add server and Manage remote
+  servers stay reachable from the Environments view and Settings. Switching
+  back to Environments restores the rail and its previous selection.
 - The environment context card is not shown in the Repositories view.
 - The Projects header reads "Repositories · all environments"; sort stays and
   "Add project" is hidden (adding needs a target environment).
@@ -223,8 +225,8 @@ Client:
 - Grouping logic: cross-environment grouping, same-name repositories on
   different hosts, identity-less projects, two checkouts in one environment,
   ordering rules.
-- Toggle persistence; rail activation from the Repositories view switches back
-  with that environment selected.
+- Toggle persistence; the rail is not rendered in the Repositories view and
+  returns with its previous selection when switching back.
 - Environment card renders badge, label, state and path, and its menu equals the
   project menu for that environment.
 - Shared expansion state between views; offline cards dimmed with disabled
