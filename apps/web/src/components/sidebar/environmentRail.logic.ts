@@ -8,6 +8,9 @@ import type { EnvironmentId } from "@bibcode/contracts";
 import { isDesktopLocalConnectionTarget } from "../../connection/desktopLocal";
 import { compareSidebarDisplayText } from "../../sidebarProjectGrouping";
 
+/** The rail's width. The thread sidebar header reserves it when the rail is hidden. */
+export const ENVIRONMENT_RAIL_WIDTH_PX = 52;
+
 export type EnvironmentRailStatus = "connected" | "disconnected" | "attention" | "error";
 
 export interface EnvironmentRailCandidate {

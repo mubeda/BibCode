@@ -759,6 +759,14 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).not.toContain("environment-card-header-");
   });
 
+  it("reserves the environment rail's width at the header start only in the Repositories view", () => {
+    const reserve = "md:pl-[var(--environment-rail-width)]";
+    expect(render(<Sidebar />)).not.toContain(reserve);
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    expect(markup).toContain(reserve);
+  });
+
   it("switches views from the toggle", () => {
     baseScenario();
     expect(render(<Sidebar />)).toContain("Group projects");
