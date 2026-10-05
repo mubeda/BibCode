@@ -65,8 +65,10 @@ import Sidebar, {
   handleSidebarNavigationKeyDown,
   handleSidebarSelectionMouseDown,
   projectExpansionPreferenceKeys,
+  projectExpansionToggleKeys,
   projectHeaderButtonClassName,
 } from "./Sidebar";
+import { resolveProjectExpanded, setProjectExpanded, type UiState } from "../uiStateStore";
 import { WORKSPACE_CARD_STATUS } from "./Sidebar.logic";
 
 const decodeStatusSummary = Schema.decodeUnknownSync(VcsStatusSummary);
@@ -123,6 +125,35 @@ staticDescribe("Sidebar global event helpers", () => {
     expect(projectExpansionPreferenceKeys(withoutShared)).toEqual(
       keys.filter((key) => key !== "github.com/acme/repo-a"),
     );
+  });
+
+  it("collapses one environment card without collapsing its sibling", () => {
+    type Snapshot = Parameters<typeof projectExpansionPreferenceKeys>[0];
+    const card = (physical: string, workspaceRoot: string) =>
+      ({
+        projectKey: physical,
+        sharedExpansionKey: "github.com/acme/repo-a",
+        memberProjects: [{ physicalProjectKey: physical, workspaceRoot }],
+      }) as unknown as Snapshot;
+    // The same checkout path on both environments: the path-only legacy key must stay read-only.
+    const cardA = card("env-a:/work/repo", "/work/repo");
+    const cardB = card("env-b:/work/repo", "/work/repo");
+    const fresh = { projectExpandedById: {} } as unknown as UiState;
+    const expanded = (state: UiState, project: Snapshot) =>
+      resolveProjectExpanded(state.projectExpandedById, projectExpansionPreferenceKeys(project));
+
+    const collapsedA = setProjectExpanded(fresh, projectExpansionToggleKeys(cardA), false);
+    expect(expanded(collapsedA, cardA)).toBe(false);
+    expect(expanded(collapsedA, cardB)).toBe(true);
+    expect(new Set(projectExpansionToggleKeys(cardA))).toEqual(new Set(["env-a:/work/repo"]));
+
+    // An Environments-view row toggle writes the shared key, which a card without its own state reads.
+    const row = {
+      projectKey: "github.com/acme/repo-a",
+      memberProjects: [{ physicalProjectKey: "env-a:/work/repo", workspaceRoot: "/work/repo" }],
+    } as unknown as Snapshot;
+    const collapsedRow = setProjectExpanded(fresh, projectExpansionToggleKeys(row), false);
+    expect(expanded(collapsedRow, cardB)).toBe(false);
   });
 
   it("lets the project header button grow only for an environment card", () => {
@@ -448,6 +479,27 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).toContain("No projects yet");
   });
 
+  it("points an empty Repositories view to Environments, where projects are added", () => {
+    h.state.shellSummary = {
+      ...h.state.shellSummary,
+      catalogReady: true,
+      desiredEnvironmentCount: 1,
+      statuses: [{ environmentId: ENV_MAIN, status: "live", hasSnapshot: true, error: null }],
+      canShowEmptyProjects: true,
+      hasSnapshot: true,
+      hasLiveShell: true,
+    };
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("No projects yet. Switch to Environments to add one.");
+    invoke(
+      mustFindProps((props) => props["children"] === "Show Environments", "show environments"),
+      "onClick",
+      mouseEvent(),
+    );
+    expect(h.uiStore.getState().setSidebarView).toHaveBeenCalledWith("environments");
+  });
+
   it("renders loading rather than claiming an empty catalog before catalog readiness", () => {
     const markup = render(<Sidebar />);
     expect(markup).toContain("Project data is still loading");
@@ -636,7 +688,7 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).not.toContain('data-testid="primary-card-project-a"');
   });
 
-  it("writes an environment card's expansion to the repository row's key too", () => {
+  it("writes only an environment card's own expansion keys, not the repository row's", () => {
     groupedScenario();
     h.uiStore.setState({ sidebarView: "repositories" });
     // The header's test id sits on EnvironmentCardHeader's own output, which the harness does not capture.
@@ -649,9 +701,10 @@ staticDescribe("Sidebar full render", () => {
       "environment card toggle",
     );
     invoke(toggle, "onClick", mouseEvent());
-    expect(h.spies.setProjectExpanded).toHaveBeenCalledWith(
+    expect(h.spies.setProjectExpanded).toHaveBeenCalledTimes(1);
+    expect(h.spies.setProjectExpanded).not.toHaveBeenCalledWith(
       expect.arrayContaining(["github.com/acme/repo-a"]),
-      false,
+      expect.anything(),
     );
   });
 

@@ -15,6 +15,8 @@ import {
 export interface EnvironmentCardIdentity {
   readonly environmentId: EnvironmentId;
   readonly label: string;
+  /** This device's own environment; sorts before desktop-local ones. */
+  readonly isPrimary: boolean;
   readonly isLocal: boolean;
   readonly avatar: string;
   readonly status: EnvironmentRailStatus;
@@ -54,6 +56,7 @@ export function buildEnvironmentCardIdentities(
       {
         environmentId: candidate.environmentId,
         label: candidate.isPrimary ? "Local" : candidate.label,
+        isPrimary: candidate.isPrimary,
         isLocal: isLocalRailCandidate(candidate),
         avatar: environmentLetterAvatar(candidate.label),
         status: resolveEnvironmentRailStatus(candidate),
@@ -80,15 +83,18 @@ export function groupProjectsByRepository(input: {
     if (bucket) bucket.push(project);
     else buckets.set(key, [project]);
   }
-  const isLocal = (project: SidebarProjectSnapshot) =>
-    input.environments.get(project.environmentId)?.isLocal ?? false;
+  // Primary Local, then desktop-local environments, then remotes.
+  const rank = (project: SidebarProjectSnapshot) => {
+    const environment = input.environments.get(project.environmentId);
+    return environment?.isPrimary ? 0 : environment?.isLocal ? 1 : 2;
+  };
   const label = (project: SidebarProjectSnapshot) =>
     input.environments.get(project.environmentId)?.label ?? project.environmentId;
   const groups = [...buckets].map(([key, projects]) => {
     const identity = projects[0]!.repositoryIdentity ?? null;
     const cards = projects.toSorted(
       (left, right) =>
-        Number(isLocal(right)) - Number(isLocal(left)) ||
+        rank(left) - rank(right) ||
         compareSidebarDisplayText(label(left), label(right)) ||
         compareSidebarDisplayText(left.workspaceRoot, right.workspaceRoot),
     );

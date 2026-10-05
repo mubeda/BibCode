@@ -593,8 +593,27 @@ export function projectExpansionPreferenceKeys(project: SidebarProjectSnapshot):
     project.projectKey,
     ...(project.sharedExpansionKey ? [project.sharedExpansionKey] : []),
     ...project.memberProjects.map((member) => member.physicalProjectKey),
-    ...project.memberProjects.map((member) => legacyProjectCwdPreferenceKey(member.workspaceRoot)),
+    ...legacyExpansionKeys(project),
   ];
+}
+
+/**
+ * The keys a toggle writes. A Repositories-view card writes only its own physical keys and reads
+ * the shared and legacy path keys as fallbacks: both can be shared with another environment's card
+ * (the legacy key is the bare checkout path), so writing them would collapse siblings too.
+ */
+export function projectExpansionToggleKeys(project: SidebarProjectSnapshot): string[] {
+  return [
+    project.projectKey,
+    ...project.memberProjects.map((member) => member.physicalProjectKey),
+    ...(project.sharedExpansionKey ? [] : legacyExpansionKeys(project)),
+  ];
+}
+
+function legacyExpansionKeys(project: SidebarProjectSnapshot): string[] {
+  return project.memberProjects.map((member) =>
+    legacyProjectCwdPreferenceKey(member.workspaceRoot),
+  );
 }
 
 // An environment card has a two-line header, taller than the fixed `sm` button
@@ -1909,6 +1928,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   sidebarThreadByKeyRef.current = sidebarThreadByKey;
   const projectThreads = sidebarThreads;
   const projectPreferenceKeys = useMemo(() => projectExpansionPreferenceKeys(project), [project]);
+  const projectToggleKeys = useMemo(() => projectExpansionToggleKeys(project), [project]);
   const projectExpanded = useUiStateStore((state) =>
     resolveProjectExpanded(state.projectExpandedById, projectPreferenceKeys),
   );
@@ -2118,14 +2138,14 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
       // The clicked header becomes the selected node; expansion still toggles.
       selectProject(project.projectKey);
-      setProjectExpanded(projectPreferenceKeys, !projectExpanded);
+      setProjectExpanded(projectToggleKeys, !projectExpanded);
     },
     [
       clearSelection,
       dragInProgressRef,
       project.projectKey,
       projectExpanded,
-      projectPreferenceKeys,
+      projectToggleKeys,
       selectProject,
       setProjectExpanded,
       suppressProjectClickAfterDragRef,
@@ -2141,13 +2161,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         return;
       }
       selectProject(project.projectKey);
-      setProjectExpanded(projectPreferenceKeys, !projectExpanded);
+      setProjectExpanded(projectToggleKeys, !projectExpanded);
     },
     [
       dragInProgressRef,
       project.projectKey,
       projectExpanded,
-      projectPreferenceKeys,
+      projectToggleKeys,
       selectProject,
       setProjectExpanded,
     ],
@@ -4303,22 +4323,45 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
           </SidebarMenu>
         )}
 
-        <SidebarProjectAvailability
-          view={projectAvailability}
-          environment={projectAvailabilityEnvironment}
-          showRetry={showProjectAvailabilityRetry}
-          showConnectionSettings={showProjectAvailabilityConnectionSettings}
-          showOpenRemoteServers={showProjectAvailabilityOpenRemoteServers}
-          onRetry={onRetryProjectEnvironment}
-          onOpenSettings={onOpenProjectSettings}
-          onViewDiagnostics={onViewProjectDiagnostics}
-          onAdoptStorage={onAdoptProjectStorage}
-          onRecoverData={onRecoverProjectData}
-        />
+        {repositoriesView && projectAvailability.kind === "empty-confirmed" ? (
+          <RepositoriesViewEmptyState />
+        ) : (
+          <SidebarProjectAvailability
+            view={projectAvailability}
+            environment={projectAvailabilityEnvironment}
+            showRetry={showProjectAvailabilityRetry}
+            showConnectionSettings={showProjectAvailabilityConnectionSettings}
+            showOpenRemoteServers={showProjectAvailabilityOpenRemoteServers}
+            onRetry={onRetryProjectEnvironment}
+            onOpenSettings={onOpenProjectSettings}
+            onViewDiagnostics={onViewProjectDiagnostics}
+            onAdoptStorage={onAdoptProjectStorage}
+            onRecoverData={onRecoverProjectData}
+          />
+        )}
       </SidebarGroup>
     </SidebarContent>
   );
 });
+
+/** Adding a project needs a target environment, which only the Environments view picks. */
+function RepositoriesViewEmptyState() {
+  const setSidebarView = useUiStateStore((store) => store.setSidebarView);
+  return (
+    <div className="px-2 pt-4 text-center text-xs text-muted-foreground">
+      <div>No projects yet. Switch to Environments to add one.</div>
+      <div className="mt-2 flex justify-center">
+        <Button size="xs" variant="ghost" onClick={() => setSidebarView("environments")}>
+          Show Environments
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+const NO_ENVIRONMENT_CARD_IDENTITIES: ReadonlyMap<EnvironmentId, EnvironmentCardIdentity> =
+  new Map();
+const NO_REPOSITORY_GROUP_EXPANSION: Readonly<Record<string, boolean>> = {};
 
 const SEPARATE_PROJECT_GROUPING: ProjectGroupingSettings = {
   sidebarProjectGroupingMode: "separate",
@@ -4836,23 +4879,29 @@ export default function Sidebar() {
     sidebarProjects,
     visibleThreads,
   ]);
+  // Built and subscribed only in the Repositories view, so connection-phase changes do not
+  // re-render the Environments view's project list.
   const environmentCardIdentities = useMemo(
     () =>
-      buildEnvironmentCardIdentities(
-        environments.map((environment) =>
-          toEnvironmentRailCandidate({
-            environmentId: environment.environmentId,
-            label: environment.label,
-            target: environment.entry.target,
-            phase: environment.connection.phase,
-            compat: resolveEnvironmentCompatVerdict(environment.serverConfig),
-            updateAvailable: false,
-          }),
-        ),
-      ),
-    [environments],
+      repositoriesView
+        ? buildEnvironmentCardIdentities(
+            environments.map((environment) =>
+              toEnvironmentRailCandidate({
+                environmentId: environment.environmentId,
+                label: environment.label,
+                target: environment.entry.target,
+                phase: environment.connection.phase,
+                compat: resolveEnvironmentCompatVerdict(environment.serverConfig),
+                updateAvailable: false,
+              }),
+            ),
+          )
+        : NO_ENVIRONMENT_CARD_IDENTITIES,
+    [environments, repositoriesView],
   );
-  const repositoryGroupExpandedById = useUiStateStore((store) => store.repositoryGroupExpandedById);
+  const repositoryGroupExpandedById = useUiStateStore((store) =>
+    repositoriesView ? store.repositoryGroupExpandedById : NO_REPOSITORY_GROUP_EXPANSION,
+  );
   const repositoryGroups = useMemo(
     () =>
       repositoriesView
