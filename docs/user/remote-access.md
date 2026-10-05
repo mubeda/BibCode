@@ -235,6 +235,13 @@ settings page, where you connect, rename, or remove the environment. The
 sidebar notice names the environment and offers the same action; hover or
 focus it for the reason.
 
+If a network fetch fails before receiving a server response, its connection
+notice asks you to check that the server is running and reachable. BiBCode keeps
+reconnecting automatically. Framework transport diagnostics and request URLs
+stay out of this fetch-failure notice; the original transport cause remains
+available to diagnostic handling. Timeout and other failure notices keep their
+own guidance.
+
 ## Windows Subsystem for Linux
 
 The optional WSL backend runs a native Linux `bibcode` binary. It does not invoke
