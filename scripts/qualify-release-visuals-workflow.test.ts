@@ -141,7 +141,7 @@ describe("first visual batch workflow boundary", () => {
   });
 });
 
-it("retains the fixed partial Git/project lane identically in canonical and TEMP workflows", () => {
+it("retains the fixed partial Git/project lane separately from native upgrade qualification", () => {
   const scenes = [
     "worktree-discovery",
     "project-open-directory",
@@ -159,15 +159,17 @@ it("retains the fixed partial Git/project lane identically in canonical and TEMP
     YAML.parse(
       NodeFS.readFileSync(new URL("../.github/workflows/" + name, import.meta.url), "utf8"),
     );
-  const canonical = read("qualify-release-visuals.yml"),
-    temporary = read("desktop-upgrade-smoke.yml");
-  expect(temporary).toEqual(canonical);
+  const canonical = read("qualify-release-visuals.yml");
+  const upgrade = read("desktop-upgrade-smoke.yml");
+  expect(Object.keys(upgrade.jobs)).toEqual(["seeded_upgrade_smoke", "windows_wsl_upgrade_smoke"]);
+  expect(upgrade.jobs.visual_core).toBeUndefined();
+  expect(upgrade.jobs.seeded_upgrade_smoke.strategy.matrix.include).toHaveLength(6);
   expect(
     NodeFS.readFileSync(
       new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
       "utf8",
-    ).startsWith("# TEMPORARY QA alias: restore/exclude before final issue integration.\n"),
-  ).toBe(true);
+    ).includes("TEMPORARY QA alias"),
+  ).toBe(false);
   const steps = canonical.jobs.visual_core.steps;
   const run = steps.find(
     (step: { name: string }) => step.name === "Run contained Git/project visual batch",

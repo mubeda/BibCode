@@ -330,7 +330,7 @@ jobs:
             target: dmg
             arch: arm64
           - label: macOS x64
-            runner: macos-26-intel
+            runner: macos-15-intel
             platform: mac
             target: dmg
             arch: x64
@@ -408,6 +408,10 @@ jobs:
             exit 1
           fi
 
+      - name: Verify macOS icon raster fixtures
+        if: matrix.platform == 'mac'
+        run: swift scripts/check-macos-app-icon.swift --self-test
+
       - name: Build desktop artifact
         shell: bash
         run: |
@@ -437,8 +441,10 @@ jobs:
 
           mount_dir="$(mktemp -d)"
           cleanup() {
+            printf '%s\n' 'mac-icon-observation {"stage":"workflow-cleanup-entered"}' >&2 || true
             hdiutil detach "$mount_dir" >/dev/null 2>&1 || hdiutil detach -force "$mount_dir" >/dev/null 2>&1 || true
             rmdir "$mount_dir" >/dev/null 2>&1 || true
+            printf '%s\n' 'mac-icon-observation {"stage":"workflow-cleanup-returned"}' >&2 || true
           }
           trap cleanup EXIT
 
@@ -456,6 +462,9 @@ jobs:
           printf '%s\n' "$signature_details"
           grep -Fq 'Signature=adhoc' <<< "$signature_details"
           grep -Fq 'TeamIdentifier=not set' <<< "$signature_details"
+          printf '%s\n' 'mac-icon-observation {"stage":"workflow-swift-dispatched"}' >&2 || true
+          swift scripts/check-macos-app-icon.swift "${app_paths[0]}"
+          printf '%s\n' 'mac-icon-observation {"stage":"workflow-swift-succeeded"}' >&2 || true
 
       - name: Collect release assets
         shell: bash
@@ -512,7 +521,7 @@ jobs:
             serverOs: darwin
             serverArch: aarch64
           - label: macOS x64
-            runner: macos-26-intel
+            runner: macos-15-intel
             platform: mac
             arch: x64
             serverOs: darwin

@@ -448,6 +448,18 @@ The scenario releases it only after reload assertions. Support tests cover
 steer/start log discrimination, turn identity, release, timeout, and interrupt
 cleanup without requiring provider accounts or listeners.
 
+The native composer fixture must advertise each user-invocable Claude skill in
+both the `initialize.commands` catalog and `reload_skills.skills`. The server
+filters out reload-only model skills, so adding a fixture skill only to the
+reload response cannot make it appear in the native slash menu. Run
+`node scripts/run-local-vp.mjs test run apps/desktop/e2e/support/provider-shims.test.ts`
+to check the generated provider protocols before the six-platform packaged UI
+matrix. Keep the menu-group and exact native-input assertions in that matrix.
+Cursor's fixture profile must include the generated skills in its native
+compatibility roots, including `.claude/skills` as well as `.cursor/skills`.
+The fixture-files regression checks that union; keep the exact native menu
+inventory assertion so omitted or unexpected skills still fail qualification.
+
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head
 and verify exactly one `kind: "steer"` log entry for its text and the original
@@ -459,6 +471,14 @@ new provider input. Release the slow turn, then require exactly one
 cards. Retain `provider-input.jsonl`, the named `message-queue-*.png` screenshots,
 and any failure screenshot/page source from the artifact directory. This stub
 scenario proves the packaged controls; record real-provider behavior separately.
+
+Observe queued-card FIFO by the displayed cards' vertical screen positions and
+durable IDs. The virtualizer positions its pooled slots before it reorders the
+DOM, so a WebDriver collection's DOM index is not the visible queue order.
+The existing bounded wait must require the expected count, visible distinct
+positions, and matching prompt order before retaining IDs; a visually reversed
+queue must still fail. Keep the working-row placement, head-only Steer, Cancel,
+reload identity, and exact provider-input checks.
 
 On a host that can start the development server, use `vp run dev` and perform
 the following live acceptance on both Codex and Claude, capturing and viewing
@@ -1318,6 +1338,19 @@ whether a live native grant actually widened; `widened: false` is not a wide
 live pass. Host notice can remain tests-only under the approved validation
 contract. Never execute the seeded harness locally, even with an isolated data
 root; legacy cleanup can terminate another desktop app.
+
+For seeded CI qualification, distinguish a packaging-child timeout from a
+runtime-upgrade failure. The candidate, previous stable, and protected baseline
+are three sequential builds with separate cold Cargo outputs outside the
+workflow's cached repository `target`; `remote-install` reuses the protected
+package. Only macOS x64 gives each packaging child 90 minutes and the complete
+job 360 minutes. Other targets keep 45-minute packaging children and 240-minute
+jobs; the separate WSL job also keeps 240 minutes. Frozen installs remain
+10 minutes per checkout. Intel's job reserves 60 additional minutes after the
+three packaging and install bounds for setup, all lanes, evidence, and cleanup.
+Product, WebDriver, and restart deadlines remain unchanged. Record a command
+timeout and the last completed phase as unavailable native evidence; passing
+tooling tests cannot substitute for completed upgrade observations.
 
 ## Clone from URL network scenario
 

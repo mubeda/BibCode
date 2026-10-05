@@ -10,7 +10,11 @@ import * as Schema from "effect/Schema";
 import type * as SchemaAST from "effect/SchemaAST";
 import * as FastCheck from "fast-check";
 
-import { OrchestrationEvent, ORCHESTRATION_WS_METHODS } from "./orchestration.ts";
+import {
+  OrchestrationEvent,
+  OrchestrationReadModel,
+  ORCHESTRATION_WS_METHODS,
+} from "./orchestration.ts";
 import { WS_METHODS, WsRpcGroup } from "./rpc.ts";
 import {
   ServerProcessDiagnosticsResult,
@@ -52,6 +56,47 @@ describe("Rust RPC fixture parity", () => {
   const fixtureDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-wire");
   const readFixture = (name: string): unknown =>
     JSON.parse(NodeFS.readFileSync(NodePath.join(fixtureDirectory, name), "utf8")) as unknown;
+
+  it("decodes the populated HTTP read model emitted by the Rust snapshot projection", () => {
+    const fixture: unknown = JSON.parse(
+      NodeFS.readFileSync(
+        NodePath.resolve(fixtureDirectory, "../http-orchestration/full-read-model.json"),
+        "utf8",
+      ),
+    );
+    const decoded = Schema.decodeUnknownSync(OrchestrationReadModel)(fixture);
+
+    expect(decoded.snapshotSequence).toBe(42);
+    expect(decoded.projects.map((project) => project.id)).toEqual([
+      "project-live",
+      "project-deleted",
+    ]);
+    expect(decoded.threads.map((thread) => thread.id)).toEqual([
+      "thread-live",
+      "thread-archived",
+      "thread-deleted",
+    ]);
+    expect(decoded.threads[0]?.messages[0]?.text).toBe("Owned message");
+    expect(decoded.threads[0]?.activities[0]?.tone).toBe("warning");
+    expect(decoded.threads[0]?.proposedPlans[0]?.id).toBe("plan-live");
+    expect(decoded.threads[0]?.checkpoints[0]?.turnId).toBe("turn-live");
+    expect(decoded.threads[1]?.archivedAt).not.toBeNull();
+    expect(decoded.threads[2]?.deletedAt).not.toBeNull();
+    expect(decoded.projects[1]?.deletedAt).not.toBeNull();
+    expect(decoded.threads[0]?.session).not.toHaveProperty("providerInstanceId");
+    expect(decoded.threads[0]?.latestTurn).not.toHaveProperty("sourceProposedPlan");
+    // The raw public payload carries additive shell fields; the full-thread
+    // decoder strips them while the Rust golden test pins their wire values.
+    for (const field of [
+      "latestUserMessageAt",
+      "hasPendingApprovals",
+      "hasPendingUserInput",
+      "hasActionableProposedPlan",
+      "unresolvedDelivery",
+    ]) {
+      expect(decoded.threads[0]).not.toHaveProperty(field);
+    }
+  });
 
   it("pins the remote update snapshot wire shape the Rust mirror round-trips", () => {
     const fixture = readFixture("contract-shapes/updater__status-success.json") as {

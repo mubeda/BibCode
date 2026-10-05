@@ -1,7 +1,4 @@
 // @vitest-environment happy-dom
-// @effect-diagnostics nodeBuiltinImport:off - Read only the controlled PNG fixture input bytes.
-import * as NodeFS from "node:fs";
-import * as NodePath from "node:path";
 import { AVAILABLE_CONNECTION_STATE } from "@bibcode/client-runtime/connection";
 import {
   EnvironmentId,
@@ -167,12 +164,11 @@ vi.mock("../DiffWorkerPoolProvider", () => ({
 import { GitManagerPanel } from "./GitManagerPanel";
 
 it("returns from real History PNG selection to exactly one visible working-tree text option", async () => {
-  const rootPath = NodePath.resolve(import.meta.dirname, "../../../../..");
-  const fixture = NodeFS.readFileSync(
-    NodePath.join(rootPath, "apps/desktop/e2e/support/release-visual-fixture.ts"),
-    "utf8",
-  );
-  h.swatches = [...fixture.matchAll(/"(iVBORw0KGgo[A-Za-z0-9+/=]+)"/g)].map((match) => match[1]!);
+  // Two inert 64px PNG swatches keep this regression independent of desktop QA tooling.
+  h.swatches = [
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAeklEQVR4nO3PUQkAIBTAwBfHsEY0jCH8OITBAtxm7fN1wwUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWPHYBSIgBeLUco5MAAAAASUVORK5CYII=",
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAeklEQVR4nO3PUQkAIBTAwBfH2EY0giH8OITBAtzm7PV1wwUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWPHYBks2BloRD0lIAAAAASUVORK5CYII=",
+  ];
   const environmentId = EnvironmentId.make("local"),
     projectId = ProjectId.make(h.project.id);
   const branch = "codex/delivery-retry-light";

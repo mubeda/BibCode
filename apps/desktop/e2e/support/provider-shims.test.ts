@@ -545,7 +545,10 @@ describe("generated provider shims", () => {
         response: expect.objectContaining({
           request_id: "initialize",
           response: expect.objectContaining({
-            commands: [expect.objectContaining({ name: "compact" })],
+            commands: [
+              expect.objectContaining({ name: "compact" }),
+              expect.objectContaining({ name: "docs" }),
+            ],
           }),
         }),
       }),

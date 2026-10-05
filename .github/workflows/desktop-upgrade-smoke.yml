@@ -1,186 +1,303 @@
-# TEMPORARY QA alias: restore/exclude before final issue integration.
-# Registered default-branch workflow path; canonical core default is preserved.
-name: First release visual batch (manual preparation lane)
+name: Seeded Packaged Desktop Upgrade
 
 on:
+  pull_request:
   workflow_dispatch:
-    inputs:
-      scene_selection:
-        description: Fixed visual preparation selection
-        type: choice
-        required: true
-        default: release-visual-core
-        options:
-          - release-visual-core
-          - release-visual-settings
-          - release-visual-git-project
 
 permissions:
   contents: read
 
 jobs:
-  visual_core:
-    name: ${{ inputs.scene_selection == 'release-visual-git-project' && 'Linux Chromium Git/project partial group in both themes' || inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 120
-    env:
-      CARGO_BUILD_JOBS: "2"
-      CARGO_PROFILE_DEV_DEBUG: "0"
+  seeded_upgrade_smoke:
+    name: Seeded upgrade - ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.jobTimeoutMinutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {
+              label: Linux arm64 AppImage,
+              runner: ubuntu-22.04-arm,
+              platform: linux,
+              arch: arm64,
+              bundle: appimage,
+              jobTimeoutMinutes: 240,
+            }
+          - {
+              label: Linux x64 AppImage,
+              runner: ubuntu-22.04,
+              platform: linux,
+              arch: x64,
+              bundle: appimage,
+              jobTimeoutMinutes: 240,
+            }
+          - {
+              label: Windows arm64 NSIS,
+              runner: windows-11-vs2026-arm,
+              platform: win,
+              arch: arm64,
+              bundle: nsis,
+              jobTimeoutMinutes: 240,
+            }
+          - {
+              label: Windows x64 NSIS,
+              runner: windows-2025,
+              platform: win,
+              arch: x64,
+              bundle: nsis,
+              jobTimeoutMinutes: 240,
+            }
+          - {
+              label: macOS arm64,
+              runner: macos-26,
+              platform: mac,
+              arch: arm64,
+              bundle: dmg,
+              jobTimeoutMinutes: 240,
+            }
+          # Three cold 90-minute builds + three 10-minute installs + setup and all upgrade lanes.
+          - {
+              label: macOS x64,
+              runner: macos-26-intel,
+              platform: mac,
+              arch: x64,
+              bundle: dmg,
+              jobTimeoutMinutes: 360,
+            }
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout complete release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
-      - uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
         with:
           node-version-file: package.json
           cache: true
           run-install: false
-      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: . -> target
+          workspaces: |
+            . -> target
+
+      - name: Install Linux packaged-updater prerequisites
+        if: matrix.platform == 'linux'
+        run: |
+          s''udo apt-get update
+          s''udo apt-get install -y \
+            build-essential curl wget file libxdo-dev libssl-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev xdg-utils patchelf xvfb xdotool
+
       - name: Install frozen dependencies
         run: vp install --frozen-lockfile
-      - name: Check owned helpers and namespace admission
+
+      - id: versions
+        name: Resolve previous stable and isolated candidate versions
+        shell: bash
         run: |
-          python3 -B scripts/qualify-chat-uploads.test.py
-          python3 -B scripts/qualify-chat-network.test.py
-          python3 -B scripts/qualify-chat-uploads.py preflight
-          vp test run scripts/qualify-release-visuals-workflow.test.ts apps/desktop/e2e/support/release-visual-fixture.test.ts apps/desktop/e2e/support/release-visual-core.test.ts apps/desktop/e2e/support/release-visual-core-image.test.ts apps/desktop/e2e/support/release-visual-evidence.test.ts apps/desktop/e2e/support/release-visual-observation.test.ts apps/desktop/e2e/support/release-visual-boundaries.test.ts apps/desktop/e2e/support/provider-shims.test.ts apps/desktop/e2e/support/qualification-owner.test.ts apps/desktop/e2e/support/remote-ui-evidence.test.ts apps/desktop/e2e/support/delivery-retry-evidence.test.ts apps/desktop/e2e/support/delivery-retry-flow.test.ts apps/desktop/e2e/support/delivery-retry-controller.test.ts apps/desktop/e2e/support/delivery-import-observation.test.ts apps/desktop/e2e/support/delivery-retry-workspace.test.ts apps/desktop/e2e/support/browser-network.test.ts
-          vp test run apps/desktop/e2e/support/release-visual-settings.test.ts apps/desktop/e2e/support/release-visual-settings-fixture.test.ts apps/desktop/e2e/support/release-visual-settings-preflight.test.ts apps/desktop/e2e/support/release-visual-settings-wiring.test.ts
-          vp test run apps/desktop/e2e/support/release-visual-git-project.test.ts apps/desktop/e2e/support/release-visual-git-project-fixture.test.ts
-      - name: Build the source UI once with owned loopback targets
-        env:
-          VITE_WS_URL: ws://127.0.0.1:4885
-          VITE_HTTP_URL: http://127.0.0.1:4885
-          VITE_DEV_SERVER_URL: http://127.0.0.1:4885
-        run: vp run --filter @bibcode/web build
-      - name: Required static gates
+          set -euo pipefail
+          previous_line="$(node scripts/resolve-previous-release-tag.ts \
+            --channel stable --current-tag "v2147483647.0.0")"
+          previous_tag="${previous_line#previous_tag=}"
+          test -n "$previous_tag"
+          previous_version="${previous_tag#v}"
+          previous_core="${previous_version%%[-+]*}"
+          IFS=. read -r major minor patch <<< "$previous_core"
+          candidate_version="$major.$minor.$((patch + 1))-upgrade.${GITHUB_RUN_NUMBER}"
+          {
+            echo "candidate_version=$candidate_version"
+            echo "previous_tag=$previous_tag"
+            echo "previous_version=$previous_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate ephemeral updater signing key
+        shell: bash
         run: |
-          vp check
-          vp exec tsc --noEmit -p apps/desktop/e2e/tsconfig.json
-          vp exec tsc --noEmit -p scripts/tsconfig.json
-      - name: Build guarded production CLI
-        run: cargo build -p bibcode-server --bin bibcode --features hermetic-test-guard -j 2
-      - name: Copy immutable inputs outside Cargo output
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/bibcode-seeded-upgrade.key"
+          key_password="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"
+          echo "::add-mask::$key_password"
+          (cd apps/desktop && vp exec tauri signer generate \
+            --ci --password "$key_password" --write-keys "$key_path" >/dev/null)
+          test -s "$key_path"
+          test -s "$key_path.pub"
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$key_path"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$key_password"
+            echo "BIBCODE_UPGRADE_PUBLIC_KEY_FILE=$key_path.pub"
+          } >> "$GITHUB_ENV"
+
+      - name: Run previous-stable, protected-baseline, and remote-install upgrades
+        shell: bash
         run: |
-          python3 - <<'PYTHON'
-          import os, shutil
-          from pathlib import Path
-          target = Path(os.environ['RUNNER_TEMP']) / 'issue29-visual-build'
-          target.mkdir(mode=0o700)
-          shutil.copy2('target/debug/bibcode', target / 'bibcode')
-          shutil.copytree('apps/web/dist', target / 'web')
-          (target / 'bibcode').chmod(0o500)
-          PYTHON
-      - name: Run contained first visual batch
-        if: ${{ inputs.scene_selection == 'release-visual-core' || inputs.scene_selection == '' }}
-        env:
-          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-visual-build/bibcode
-          BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue29-visual-build/web
-        run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-core
-      - name: Run contained settings visual batch
-        if: ${{ inputs.scene_selection == 'release-visual-settings' }}
-        env:
-          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-visual-build/bibcode
-          BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue29-visual-build/web
-        run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-settings
-      - name: Run contained Git/project visual batch
-        if: ${{ inputs.scene_selection == 'release-visual-git-project' }}
-        env:
-          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-visual-build/bibcode
-          BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue29-visual-build/web
-        run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-git-project
-      - name: Retain explicit safe evidence
-        if: ${{ always() && (inputs.scene_selection == 'release-visual-core' || inputs.scene_selection == '') }}
+          set -euo pipefail
+          args=(node scripts/seeded-desktop-upgrade-smoke.ts
+            --platform "${{ matrix.platform }}"
+            --arch "${{ matrix.arch }}"
+            --bundle "${{ matrix.bundle }}"
+            --candidate-version "${{ steps.versions.outputs.candidate_version }}"
+            --previous-tag "${{ steps.versions.outputs.previous_tag }}"
+            --previous-version "${{ steps.versions.outputs.previous_version }}"
+            --public-key-file "$BIBCODE_UPGRADE_PUBLIC_KEY_FILE"
+            --run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}-${{ matrix.arch }}"
+            --work-root "$RUNNER_TEMP/bibcode-seeded-upgrade/work"
+            --artifact-dir "$RUNNER_TEMP/bibcode-seeded-upgrade/evidence"
+            --updater-port 43120
+            --restart-timeout-ms 180000)
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            xvfb-run --auto-servernum "${args[@]}"
+          else
+            "${args[@]}"
+          fi
+
+      - name: Upload bounded seeded-upgrade evidence
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: issue29-core-${{ github.run_id }}-${{ github.run_attempt }}
+          name: seeded-upgrade-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/bibcode-seeded-upgrade/evidence/*
           if-no-files-found: error
           retention-days: 7
-          path: |
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/phase.json
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/failure.json
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/provenance.json
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/result.json
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/assertions.json
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/namespace-cleanup.json
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/supervisor.json
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/workspace-composite-light.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/workspace-composite-dark.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/workspace-card-menu-light.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/workspace-card-menu-dark.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/worktree-create-ref-light.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/worktree-create-ref-dark.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-image-diff-light.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-image-diff-dark.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-changes-diff-light.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-changes-diff-dark.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-history-stashes-light.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-history-stashes-dark.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-branch-menu-light.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/git-branch-menu-dark.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/files-editor-comment-light.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/files-editor-comment-dark.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/command-palette-light.png
-            ${{ runner.temp }}/issue29-core-${{ github.run_id }}/command-palette-dark.png
-      - name: Retain explicit settings evidence
-        if: ${{ always() && inputs.scene_selection == 'release-visual-settings' }}
+
+  windows_wsl_upgrade_smoke:
+    name: Seeded upgrade - Windows WSL primary
+    runs-on: windows-2025
+    timeout-minutes: 240
+    steps:
+      - name: Checkout complete release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - id: wsl
+        name: Detect declared WSL capability
+        shell: pwsh
+        run: |
+          $output = wsl --status 2>&1 | Out-String
+          $statusAvailable = $LASTEXITCODE -eq 0
+          $distros = @()
+          if ($statusAvailable) {
+            $distros = @(wsl --list --quiet 2>$null | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ })
+          }
+          if ($statusAvailable -and $distros.Count -gt 0) {
+            "available=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "capability_reason=WSL and an installed distribution are available" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            $reason = if (-not $statusAvailable) { "wsl --status is unavailable" } else { "WSL has no installed distribution" }
+            "available=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "capability_reason=$reason" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Record unavailable WSL capability
+        if: steps.wsl.outputs.available != 'true'
+        shell: pwsh
+        run: |
+          "WSL packaged-upgrade smoke skipped: ${{ steps.wsl.outputs.capability_reason }}" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Setup Vite+
+        if: steps.wsl.outputs.available == 'true'
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Setup Rust
+        if: steps.wsl.outputs.available == 'true'
+        uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+
+      - name: Install frozen dependencies
+        if: steps.wsl.outputs.available == 'true'
+        run: vp install --frozen-lockfile
+
+      - name: Build the WSL server used by the packaged desktop
+        if: steps.wsl.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $workspaceWsl = (wsl wslpath -a "$env:GITHUB_WORKSPACE").Trim()
+          if ([string]::IsNullOrWhiteSpace($workspaceWsl)) {
+            throw "WSL could not resolve the checkout path"
+          }
+          wsl bash -lc "set -euo pipefail; s''udo apt-get update; s''udo apt-get install -y build-essential clang cmake curl pkg-config libssl-dev"
+          if ($LASTEXITCODE -ne 0) { throw "WSL build prerequisites failed" }
+          wsl bash -lc "set -euo pipefail; if ! command -v cargo >/dev/null; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0; fi"
+          if ($LASTEXITCODE -ne 0) { throw "WSL Rust setup failed" }
+          $build = "set -euo pipefail; cd '$workspaceWsl'; export PATH=`"`$HOME/.cargo/bin:`$PATH`"; CARGO_TARGET_DIR='$workspaceWsl/target/x86_64-unknown-linux-gnu' cargo build -p bibcode-server --bin bibcode --release"
+          wsl bash -lc $build
+          if ($LASTEXITCODE -ne 0) { throw "WSL server build failed" }
+          $serverBinary = Join-Path $env:GITHUB_WORKSPACE "target\x86_64-unknown-linux-gnu\release\bibcode"
+          if (-not (Test-Path -LiteralPath $serverBinary -PathType Leaf)) {
+            throw "WSL server build did not produce the expected binary"
+          }
+          "BIBCODE_WSL_SERVER_BINARY=$serverBinary" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - id: wsl_versions
+        name: Resolve WSL previous and candidate versions
+        if: steps.wsl.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_line="$(node scripts/resolve-previous-release-tag.ts --channel stable --current-tag "v2147483647.0.0")"
+          previous_tag="${previous_line#previous_tag=}"
+          test -n "$previous_tag"
+          previous_version="${previous_tag#v}"
+          previous_core="${previous_version%%[-+]*}"
+          IFS=. read -r major minor patch <<< "$previous_core"
+          candidate_version="$major.$minor.$((patch + 1))-wsl.${GITHUB_RUN_NUMBER}"
+          {
+            echo "candidate_version=$candidate_version"
+            echo "previous_tag=$previous_tag"
+            echo "previous_version=$previous_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate WSL ephemeral updater signing key
+        if: steps.wsl.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/bibcode-seeded-wsl-upgrade.key"
+          key_password="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"
+          echo "::add-mask::$key_password"
+          (cd apps/desktop && vp exec tauri signer generate --ci --password "$key_password" --write-keys "$key_path" >/dev/null)
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$key_path"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$key_password"
+            echo "BIBCODE_UPGRADE_PUBLIC_KEY_FILE=$key_path.pub"
+          } >> "$GITHUB_ENV"
+
+      - name: Run protected WSL storage-identity upgrade
+        if: steps.wsl.outputs.available == 'true'
+        shell: bash
+        run: |
+          node scripts/seeded-desktop-upgrade-smoke.ts \
+            --wsl \
+            --platform win \
+            --arch x64 \
+            --bundle nsis \
+            --candidate-version "${{ steps.wsl_versions.outputs.candidate_version }}" \
+            --previous-tag "${{ steps.wsl_versions.outputs.previous_tag }}" \
+            --previous-version "${{ steps.wsl_versions.outputs.previous_version }}" \
+            --public-key-file "$BIBCODE_UPGRADE_PUBLIC_KEY_FILE" \
+            --run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-windows-wsl" \
+            --work-root "$RUNNER_TEMP/bibcode-seeded-wsl-upgrade/work" \
+            --artifact-dir "$RUNNER_TEMP/bibcode-seeded-wsl-upgrade/evidence" \
+            --updater-port 43220 \
+            --restart-timeout-ms 240000
+
+      - name: Upload bounded WSL seeded-upgrade evidence
+        if: always() && steps.wsl.outputs.available == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: issue29-settings-${{ github.run_id }}-${{ github.run_attempt }}
+          name: seeded-upgrade-windows-wsl
+          path: ${{ runner.temp }}/bibcode-seeded-wsl-upgrade/evidence/*
           if-no-files-found: error
           retention-days: 7
-          path: |
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/phase.json
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/failure.json
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/provenance.json
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/result.json
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/assertions.json
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/namespace-cleanup.json
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/supervisor.json
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-provider-form-light.png
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-provider-form-dark.png
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/model-picker-light.png
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/model-picker-dark.png
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-keybindings-light.png
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-keybindings-dark.png
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-source-control-light.png
-            ${{ runner.temp }}/issue29-settings-${{ github.run_id }}/settings-source-control-dark.png
-      - name: Retain explicit Git/project evidence
-        if: ${{ always() && inputs.scene_selection == 'release-visual-git-project' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: issue29-git-project-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: error
-          retention-days: 7
-          path: |
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/phase.json
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/failure.json
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/provenance.json
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/result.json
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/assertions.json
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/namespace-cleanup.json
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/supervisor.json
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/worktree-discovery-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/worktree-discovery-dark.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/project-open-directory-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/project-open-directory-dark.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/project-clone-chooser-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/project-clone-chooser-dark.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/project-clone-incomplete-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/project-clone-incomplete-dark.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-tags-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-tags-dark.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-switch-with-changes-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-switch-with-changes-dark.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-merge-conflict-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-merge-conflict-dark.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-rewrite-preview-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-rewrite-preview-dark.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-unborn-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-unborn-dark.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-no-repository-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-no-repository-dark.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-broken-recovery-light.png
-            ${{ runner.temp }}/issue29-git-project-${{ github.run_id }}/git-broken-recovery-dark.png

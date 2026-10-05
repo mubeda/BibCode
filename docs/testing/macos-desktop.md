@@ -144,6 +144,17 @@ the user's running instance for this check.
 
 ## Application and DMG build inspection
 
+The CI-only seeded-upgrade matrix gives Intel x64 packaging children 90 minutes
+and its complete job 360 minutes. ARM64 keeps 45-minute packaging children and
+a 240-minute job. There are three sequential cold packages with separate Cargo
+outputs (candidate, previous stable, protected baseline), each with a separate
+10-minute frozen install; the cached repository `target` does not warm these
+outputs. Intel's remaining 60 minutes cover setup, all upgrade lanes, evidence,
+and cleanup. `remote-install` reuses the protected package. These allowances
+leave product, WebDriver, and restart deadlines intact; record a packaging
+timeout separately from native upgrade results, and never run this CI harness
+locally. See the [seeded matrix procedure](../operations/release.md#seeded-packaged-upgrade-matrix).
+
 Build the host-native artifact:
 
 ```sh
@@ -167,6 +178,42 @@ Mount the exact test-owned DMG read-only at a fresh mount point, inspect the
 contained application, and detach that mount during cleanup. Report configured
 signing, ad-hoc signing, and notarization separately. Never claim notarization
 when credentials or a notarized ticket are absent.
+
+Before publishing a macOS release, verify the Finder-rendered icon from that
+mounted payload with `swift scripts/check-macos-app-icon.swift` and its exact
+application path. The release workflow runs this check on both native macOS
+targets after recursive signature verification and before upload. A failed icon
+check is a failed native build; a check against a different installed bundle
+does not qualify the release DMG.
+
+The release producer hosts are macOS 26 ARM64 and supported macOS 15 Intel for
+both desktop and standalone server artifacts. Native Intel main CI, packaged
+UI, and upgrade validation retain macOS 26. The producer hosts run the same
+mounted-application signature and Finder pixel criteria, with all platform
+rows and updater targets intact. macOS 15 Intel evidence cannot establish a
+macOS 26 Intel Finder pass. Record that distinction in execution reports;
+neither producer selection nor lookup-only controls qualify another OS image.
+
+The CI verifier emits closed `mac-icon-observation` stage records to stderr and
+flushes them individually. These locate Swift entry, workspace icon retrieval,
+bitmap and drawing-context creation, icon drawing, pixel scanning, and the existing verdict.
+The scan-start record includes capped bitmap dimensions; scan-return includes
+capped opaque, dark, and pale counts. Diagnostic caps never change the scan or
+verdict calculations.
+The workflow records Swift dispatch/success and cleanup entry/return; cleanup
+return alone does not verify detach success. A missing record remains unobserved.
+Do not classify an icon pixel defect, compiler hang, or native service failure
+without the corresponding boundary or verdict evidence. The native payload,
+thresholds, platform rows, and existing job budget remain required.
+
+The verifier rasterizes the workspace-provided image at 256 points into a fixed
+1024-square RGBA bitmap, avoiding serialization of every image representation
+through TIFF. Both macOS release jobs first run
+`swift scripts/check-macos-app-icon.swift --self-test` in CI. These fixtures
+exercise the same renderer and pixel verdict with opaque black, opaque white,
+transparent, and ratio-boundary images. They preserve the existing alpha,
+luminance, dark-area, and pale-area limits. Their pass does not replace the
+mandatory check against the exact mounted DMG application.
 
 Build and run packaged E2E with:
 

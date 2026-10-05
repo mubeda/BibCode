@@ -23,6 +23,13 @@ unrelated fork. Keep a controlled port-reuse counterexample distinct from a
 natural stress failure rate, and verify that deliberately removing the cleanup
 wait makes the runtime-join regression fail before restoring the real code.
 
+Desktop bind/restart scenarios use `test_support::isolated_scenario` to run the
+exact test alone in a child and require entry and completion proof. Complete the
+phase only after every assertion and backend cleanup finishes. The free-port
+probe releases its listener; it does not reserve the port. Isolation excludes
+sibling tests that can fork with copies of open sockets, but an address-in-use
+failure alone does not identify the process that held the port.
+
 For WebSocket heartbeat integration, separate exact cadence from connection
 survival. Controlled-clock transport tests pin the 15-second cadence and the
 restart after a scheduler stall; real sockets verify Pong-only survival for
@@ -33,6 +40,25 @@ intentionally restarts its cadence after a late check. A contention harness's
 process deadline must cover that bound plus setup and teardown, and every
 selected invocation must actually execute the test. Keep the controlled-stall
 counterexample distinct from naturally observed failures.
+
+For the remote-pairing fixture with a delayed interpreter, establish its intended
+TERM immunity in the fixture's parent shell before launching the stand-in.
+The whole-second watchdog can expire before a newly spawned interpreter runs
+its first trap command. A probe through the actual interpreter must observe the
+inherited ignored disposition before the fixture installs any handler. Retain
+the watchdog exit, elapsed-time bounds, readiness, and cleanup assertions; the
+production pairing script and its signal policy remain the behavior under test.
+
+For a CI Windows upgrade observation deadline, distinguish the PowerShell
+sample from the overall installer wait. `runBoundedCommand` can publish its
+typed deadline only after the exact owned child emits `close`, including pipe
+closure. Exit status or a kill request alone is insufficient. The installed
+candidate poll records that deadline as unavailable and retries within its
+existing overall bound; a five-second cleanup deadline, failed spawn, or other
+cleanup error stays fatal. Keep unavailable observations in the private handoff
+log and retain the strict version/hash/no-installer predicate. Hermetic support
+tests cover exit-before-close, cleanup failure, transient samples, and an
+all-unavailable poll; actual installer qualification remains CI-only.
 
 ## Unix recovery-test watchdog
 
