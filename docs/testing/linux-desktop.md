@@ -692,6 +692,14 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
 Capture original-resolution screenshots plus focused crops and keep diagnostic
 frames separate from acceptance evidence.
 
+Inspect the Git Manager branch popup footer with a long branch name in both
+themes. Its New branch and merge-instruction buttons and label spans must stay
+inside the bounded popup and use ellipsis while retaining complete accessible
+text and disabled explanations. Reject text clipped by the popup viewport; do
+not widen the window to hide a layout failure. Compiled CSS and component
+regressions establish the containment policy; fresh native originals establish
+pixel quality.
+
 ## Process-group cleanup
 
 Capture PID, PPID, process group, start time, executable, and command line for

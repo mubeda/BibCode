@@ -509,7 +509,7 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
             aria-describedby={
               branchDisabledReason === null ? undefined : "git-manager-create-branch-reason"
             }
-            className="flex-1 justify-start"
+            className="min-w-0 flex-1 justify-start"
             disabled={branchDisabledReason !== null}
             size="sm"
             title={branchDisabledReason ?? undefined}
@@ -517,7 +517,7 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
             onClick={handleCreateBranch}
           >
             <PlusIcon aria-hidden="true" />
-            New branch
+            <span className="min-w-0 flex-1 truncate">New branch</span>
           </Button>
           <Button
             aria-describedby={
@@ -525,7 +525,7 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
                 ? undefined
                 : "git-manager-branch-merge-reason"
             }
-            className={cn("flex-1 justify-start", mergeMode && "bg-accent")}
+            className={cn("min-w-0 flex-1 justify-start", mergeMode && "bg-accent")}
             disabled={mergeDisabledReason !== null || currentBranchName === null}
             size="sm"
             title={
@@ -536,9 +536,11 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
             onClick={handleMergeMode}
           >
             <GitMergeIcon aria-hidden="true" />
-            {mergeMode
-              ? "Select a branch above"
-              : `Choose a branch to merge into ${currentBranchName ?? "HEAD"}`}
+            <span className="min-w-0 flex-1 truncate">
+              {mergeMode
+                ? "Select a branch above"
+                : `Choose a branch to merge into ${currentBranchName ?? "HEAD"}`}
+            </span>
           </Button>
           {branchDisabledReason === null ? null : (
             <span className="sr-only" id="git-manager-create-branch-reason">
