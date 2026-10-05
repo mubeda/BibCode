@@ -136,86 +136,52 @@ const binding = {
 };
 const input = { projectName: "BiBCode UI Fixture", ...binding, requireSelected: true };
 
-const storedProjectionFixture = JSON.parse(
+const publicHttpFixture = JSON.parse(
   NodeFS.readFileSync(
     new URL(
-      "../../../../packages/contracts/fixtures/persistence/current-v33/snapshot.json",
+      "../../../../packages/contracts/fixtures/http-orchestration/full-read-model.json",
       import.meta.url,
     ),
     "utf8",
   ),
-).tables;
+) as {
+  snapshotSequence: number;
+  updatedAt: string;
+  projects: Record<string, unknown>[];
+  threads: Record<string, unknown>[];
+};
 
-function rawSerializeFields(file: string, name: string) {
-  const source = NodeFS.readFileSync(
-    new URL("../../../server/src/" + file, import.meta.url),
-    "utf8",
-  );
-  const declaration = source.match(
-    new RegExp("#\\[derive\\(([^\\n]*)\\)\\]\\s*pub struct " + name + " \\{([\\s\\S]*?)\\n\\}"),
-  );
-  expect(declaration).not.toBeNull();
-  expect(declaration![1]).toMatch(/\bSerialize\b/);
-  expect(declaration![2]).not.toContain("#[serde");
-  return Array.from(declaration![2]!.matchAll(/^\s*pub (\w+): ([^,\n]+),$/gm), (field) => ({
-    name: field[1]!,
-    type: field[2]!,
-  }));
+function httpSnapshotFixture(existing: boolean): typeof publicHttpFixture {
+  const templateThread = publicHttpFixture.threads.find(
+    (thread) =>
+      thread.kind === "default" && thread.archivedAt === null && thread.deletedAt === null,
+  )!;
+  const templateProject = publicHttpFixture.projects.find(
+    (project) => project.id === templateThread.projectId,
+  )!;
+  expect(templateThread).toBeDefined();
+  expect(templateProject).toBeDefined();
+  return {
+    ...publicHttpFixture,
+    projects: [{ ...templateProject, id: binding.projectId, deletedAt: null }],
+    threads: existing
+      ? [
+          {
+            ...templateThread,
+            id: binding.threadId,
+            projectId: binding.projectId,
+            kind: "default",
+            branch: null,
+            worktreePath: null,
+            archivedAt: null,
+            deletedAt: null,
+          },
+        ]
+      : [],
+  };
 }
 
-function rawProjectionRow(
-  name: "ProjectionProject" | "ProjectionThread",
-  changes: Record<string, unknown>,
-) {
-  const table = name === "ProjectionProject" ? "projection_projects" : "projection_threads";
-  const stored = { ...storedProjectionFixture[table][0], ...changes };
-  // Mirror current unrenamed Serialize fields; decode JSON columns as the real row decoder does.
-  return Object.fromEntries(
-    rawSerializeFields("persistence/repositories.rs", name).map((field) => {
-      if (Object.hasOwn(stored, field.name)) return [field.name, stored[field.name]];
-      if (Object.hasOwn(stored, field.name + "_json"))
-        return [field.name, JSON.parse(stored[field.name + "_json"])];
-      if (field.type.startsWith("Option<")) return [field.name, null];
-      if (field.type === "i64") return [field.name, 0];
-      expect(field.type).toBe("Value");
-      return [field.name, {}];
-    }),
-  );
-}
-
-function rawHttpSnapshot(existing: boolean) {
-  return Object.fromEntries(
-    rawSerializeFields("orchestration/engine.rs", "Snapshot").map((field) => [
-      field.name,
-      field.name === "projects"
-        ? [
-            rawProjectionRow("ProjectionProject", {
-              project_id: binding.projectId,
-              deleted_at: null,
-            }),
-          ]
-        : field.name === "threads" && existing
-          ? [
-              rawProjectionRow("ProjectionThread", {
-                thread_id: binding.threadId,
-                project_id: binding.projectId,
-                kind: "default",
-                branch: null,
-                worktree_path: null,
-                latest_turn_id: null,
-                archived_at: null,
-                deleted_at: null,
-                pending_approval_count: 0,
-                pending_user_input_count: 0,
-                has_actionable_proposed_plan: 0,
-              }),
-            ]
-          : [],
-    ]),
-  ) as { projects: Record<string, unknown>[]; threads: Record<string, unknown>[] };
-}
-
-it("takes HTTP fixture names from the actual unrenamed projection serializer, not the RPC contract", () => {
+it("uses the actual public HTTP read-model serializer and populated cross-language fixture", () => {
   const runtime = NodeFS.readFileSync(
     new URL("../../../server/src/production/runtime.rs", import.meta.url),
     "utf8",
@@ -225,20 +191,26 @@ it("takes HTTP fixture names from the actual unrenamed projection serializer, no
     runtime.indexOf("JsonOperation::OrchestrationDispatch =>"),
   );
   expect(producer).toContain("load_snapshot(&self.orchestration.repositories())");
-  expect(producer).toContain("serde_json::to_value(snapshot)");
-  const snapshot = rawHttpSnapshot(true);
-  expect(snapshot.projects[0]).toMatchObject({ project_id: binding.projectId, deleted_at: null });
+  expect(producer).toContain("read_model_snapshot(&snapshot, &now_iso())");
+  expect(producer).not.toContain("serde_json::to_value(snapshot)");
+  const snapshot = httpSnapshotFixture(true);
+  expect(Object.keys(snapshot).sort()).toEqual([
+    "projects",
+    "snapshotSequence",
+    "threads",
+    "updatedAt",
+  ]);
+  expect(snapshot.projects[0]).toMatchObject({ id: binding.projectId, deletedAt: null });
   expect(snapshot.threads[0]).toMatchObject({
-    thread_id: binding.threadId,
-    project_id: binding.projectId,
+    id: binding.threadId,
+    projectId: binding.projectId,
     kind: "default",
-    archived_at: null,
-    deleted_at: null,
-    worktree_path: null,
+    archivedAt: null,
+    deletedAt: null,
+    worktreePath: null,
   });
-  expect(snapshot.projects[0]).not.toHaveProperty("id");
-  expect(snapshot.threads[0]).not.toHaveProperty("id");
-  expect(snapshot.threads[0]).not.toHaveProperty("projectId");
+  expect(snapshot.projects[0]).not.toHaveProperty("project_id");
+  expect(snapshot.threads[0]).not.toHaveProperty("thread_id");
 });
 
 function fixture(active = true, existing = true, empty = false) {
@@ -317,7 +289,7 @@ function fixture(active = true, existing = true, empty = false) {
     window,
     location,
     read,
-    snapshot: rawHttpSnapshot(existing),
+    snapshot: httpSnapshotFixture(existing),
   };
 }
 
@@ -368,9 +340,7 @@ it("selects only the owned primary after the fixture's real Git branch synchroni
     expect(update).toEqual({ branch: "main" });
     const snapshot = {
       ...f.snapshot,
-      threads: [
-        rawProjectionRow("ProjectionThread", { ...f.snapshot.threads[0], branch: update.branch }),
-      ],
+      threads: [{ ...f.snapshot.threads[0], branch: update.branch }],
     };
     const probe = publicThreadRead(f, snapshot);
     const proof = await probe.rawRead({ ...binding, snapshotPath: "/api/orchestration/snapshot" });
@@ -708,13 +678,13 @@ it.each([null, "main"])(
         { projects: [], threads: [thread] },
         { projects: [project, project], threads: [thread] },
         { projects: [project], threads: [thread, thread] },
-        { projects: [{ ...project, deleted_at: "deleted" }], threads: [thread] },
+        { projects: [{ ...project, deletedAt: "deleted" }], threads: [thread] },
         ...[
-          { thread_id: "foreign-thread" },
-          { project_id: "foreign-project" },
+          { id: "foreign-thread" },
+          { projectId: "foreign-project" },
           { kind: "regular" },
-          { archived_at: "archived" },
-          { deleted_at: "deleted" },
+          { archivedAt: "archived" },
+          { deletedAt: "deleted" },
           { branch: "foreign-branch" },
           { branch: "MAIN" },
           { branch: "refs/heads/main" },
@@ -724,7 +694,7 @@ it.each([null, "main"])(
           { branch: 1 },
           { branch: [] },
           { branch: {} },
-          { worktree_path: "private-path" },
+          { worktreePath: "private-path" },
         ].map((change) => ({ projects: [project], threads: [{ ...thread, ...change }] })),
       ]) {
         const probe = publicThreadRead(f, snapshot);
@@ -749,16 +719,13 @@ it.each([null, "main"])(
   },
 );
 
-it("refuses missing raw projection properties and never admits the camelCase contract as an alias", async () => {
+it("refuses missing public properties and never admits legacy projection rows as aliases", async () => {
   const f = fixture(false, true, true);
   const proofInput = { ...binding, snapshotPath: "/api/orchestration/snapshot" };
   try {
     for (const [collection, fields] of [
-      ["projects", ["project_id", "deleted_at"]],
-      [
-        "threads",
-        ["thread_id", "project_id", "kind", "archived_at", "deleted_at", "branch", "worktree_path"],
-      ],
+      ["projects", ["id", "deletedAt"]],
+      ["threads", ["id", "projectId", "kind", "archivedAt", "deletedAt", "branch", "worktreePath"]],
     ] as const) {
       for (const field of fields) {
         const snapshot = {
@@ -769,21 +736,21 @@ it("refuses missing raw projection properties and never admits the camelCase con
         expect(await publicThreadRead(f, snapshot).read(proofInput)).toBe(false);
       }
     }
-    const desiredContract = {
-      projects: [{ id: binding.projectId, deletedAt: null }],
+    const legacyProjection = {
+      projects: [{ project_id: binding.projectId, deleted_at: null }],
       threads: [
         {
-          id: binding.threadId,
-          projectId: binding.projectId,
+          thread_id: binding.threadId,
+          project_id: binding.projectId,
           kind: "default",
-          archivedAt: null,
-          deletedAt: null,
+          archived_at: null,
+          deleted_at: null,
           branch: null,
-          worktreePath: null,
+          worktree_path: null,
         },
       ],
     };
-    expect(await publicThreadRead(f, desiredContract).read(proofInput)).toBe(false);
+    expect(await publicThreadRead(f, legacyProjection).read(proofInput)).toBe(false);
   } finally {
     await f.window.happyDOM.close();
   }

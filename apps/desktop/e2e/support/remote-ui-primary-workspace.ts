@@ -376,10 +376,10 @@ export async function readReloadPrimaryThread(
       threads = own(snapshot, "threads");
     witness.listsAdmitted = Array.isArray(projects) && Array.isArray(threads);
     if (!Array.isArray(projects) || !Array.isArray(threads)) return finish(false);
-    // This endpoint currently serializes raw unrenamed Rust projection rows.
-    // Its existing camelCase contract disagrees; do not add compatibility aliases.
-    const project = projects.filter((value) => own(value, "project_id") === projectId);
-    const thread = threads.filter((value) => own(value, "thread_id") === threadId);
+    // Read the declared HTTP read model emitted by the shared Rust serializers.
+    // Legacy persistence-row names are not compatibility aliases for this proof.
+    const project = projects.filter((value) => own(value, "id") === projectId);
+    const thread = threads.filter((value) => own(value, "id") === threadId);
     const count = (size: number) => (size === 0 ? "none" : size === 1 ? "one" : "multiple");
     witness.projectMatches = count(project.length);
     witness.threadMatches = count(thread.length);
@@ -388,28 +388,28 @@ export async function readReloadPrimaryThread(
       return value === undefined ? null : predicate(value);
     };
     if (project.length === 1)
-      witness.projectLive = flag(project[0], "deleted_at", (value) => value === null);
+      witness.projectLive = flag(project[0], "deletedAt", (value) => value === null);
     if (thread.length === 1) {
-      witness.threadProjectMatched = flag(thread[0], "project_id", (value) => value === projectId);
+      witness.threadProjectMatched = flag(thread[0], "projectId", (value) => value === projectId);
       witness.threadDefault = flag(thread[0], "kind", (value) => value === "default");
-      witness.threadUnarchived = flag(thread[0], "archived_at", (value) => value === null);
-      witness.threadUndeleted = flag(thread[0], "deleted_at", (value) => value === null);
+      witness.threadUnarchived = flag(thread[0], "archivedAt", (value) => value === null);
+      witness.threadUndeleted = flag(thread[0], "deletedAt", (value) => value === null);
       witness.branchNull = flag(thread[0], "branch", (value) => value === null);
       witness.expectedBranchMatched = flag(thread[0], "branch", (value) => value === "main");
-      witness.worktreeNull = flag(thread[0], "worktree_path", (value) => value === null);
+      witness.worktreeNull = flag(thread[0], "worktreePath", (value) => value === null);
     }
     return finish(
       project.length === 1 &&
-        own(project[0], "deleted_at") === null &&
+        own(project[0], "deletedAt") === null &&
         thread.length === 1 &&
-        own(thread[0], "project_id") === projectId &&
+        own(thread[0], "projectId") === projectId &&
         own(thread[0], "kind") === "default" &&
-        own(thread[0], "archived_at") === null &&
-        own(thread[0], "deleted_at") === null &&
+        own(thread[0], "archivedAt") === null &&
+        own(thread[0], "deletedAt") === null &&
         // initializeGitProject owns this fixture's main branch. The active UI may
         // synchronize its initially null default-thread branch from live Git.
         (own(thread[0], "branch") === null || own(thread[0], "branch") === "main") &&
-        own(thread[0], "worktree_path") === null,
+        own(thread[0], "worktreePath") === null,
     );
   } catch {
     return finish(false);

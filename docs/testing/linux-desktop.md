@@ -660,11 +660,11 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Require the same public footprint throughout. Before an inactive-card click,
   use the existing authenticated primary `/api/orchestration/snapshot` read to
   prove exactly one live default thread matches the bound project/thread IDs.
-  This HTTP producer currently serializes raw Rust projection rows. Read only
-  its actual `project_id`, `thread_id`, `deleted_at`, `archived_at` and
-  `worktree_path` fields; do not treat the contract's camelCase DTO as an alias.
-  Report the existing endpoint/contract disagreement without changing product
-  protocols as part of qualification.
+  The HTTP producer uses the declared read model through the shared Rust
+  serializers. Match project/thread `id` and thread `projectId`; require the
+  explicit `deletedAt`, `archivedAt` and `worktreePath` fields. The populated
+  cross-language HTTP fixture defines this public shape. Missing fields and
+  legacy persistence-row names refuse proof; add no compatibility aliases.
   The owned fixture initializes Git on `main`. The active chat can synchronize
   its default thread's initially null branch metadata from live Git. Admit only
   null before that synchronization or exactly `main` afterward, with the same
