@@ -56,7 +56,7 @@ export const composerProviderProfiles = {
       "logout",
       "quit",
     ],
-    slashSkills: ["frontend"],
+    slashSkills: ["docs", "frontend"],
     dollarSkills: [],
     mentionableAgents: [],
   },
