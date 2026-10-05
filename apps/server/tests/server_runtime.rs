@@ -926,9 +926,26 @@ async fn production_runtime_adapters_serve_snapshot_and_asset_errors() {
     assert_eq!(snapshot_response.status(), StatusCode::OK);
     assert_eq!(snapshot_response.headers()["cache-control"], "no-store");
     let snapshot: Value = snapshot_response.json().await.expect("snapshot JSON");
-    for collection in [
-        "projects",
-        "threads",
+    assert_eq!(snapshot["snapshotSequence"], serde_json::json!(0));
+    let updated_at = snapshot["updatedAt"]
+        .as_str()
+        .expect("public snapshot timestamp");
+    time::OffsetDateTime::parse(updated_at, &time::format_description::well_known::Rfc3339)
+        .expect("public snapshot timestamp is RFC 3339");
+    for collection in ["projects", "threads"] {
+        assert_eq!(snapshot[collection], serde_json::json!([]), "{collection}");
+    }
+    assert_eq!(
+        snapshot,
+        serde_json::json!({
+            "snapshotSequence": 0,
+            "projects": [],
+            "threads": [],
+            "updatedAt": updated_at,
+        }),
+        "empty snapshot follows the complete public read-model contract"
+    );
+    for internal_collection in [
         "messages",
         "activities",
         "sessions",
@@ -940,7 +957,10 @@ async fn production_runtime_adapters_serve_snapshot_and_asset_errors() {
         "receipts",
         "diffs",
     ] {
-        assert_eq!(snapshot[collection], serde_json::json!([]), "{collection}");
+        assert!(
+            snapshot.get(internal_collection).is_none(),
+            "persistence collection must not escape the public read model: {internal_collection}"
+        );
     }
 
     assert_json_wire(
