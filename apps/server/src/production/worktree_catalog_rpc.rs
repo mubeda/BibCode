@@ -16,6 +16,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::repository_identity::{RepositoryIdentityThrottle, reconcile_repository_identity};
 use crate::{
     crypto::sha256_hex,
     git::{
@@ -474,6 +475,8 @@ impl WorktreeCatalogRpcServices {
     pub fn new(catalog: WorktreeCatalogService, orchestration: OrchestrationEngine) -> Self {
         catalog.set_healthy_snapshot_observer(Arc::new(BranchReconciliationObserver {
             orchestration: orchestration.clone(),
+            git: catalog.git_repository(),
+            identity_throttle: RepositoryIdentityThrottle::default(),
         }));
         let creation_git = catalog.git_repository();
         let removal_git = creation_git
@@ -614,6 +617,8 @@ impl WorktreeCatalogRpcServices {
 #[derive(Clone)]
 struct BranchReconciliationObserver {
     orchestration: OrchestrationEngine,
+    git: Option<Arc<GitRepository>>,
+    identity_throttle: RepositoryIdentityThrottle,
 }
 
 impl CatalogHealthySnapshotObserver for BranchReconciliationObserver {
@@ -638,6 +643,19 @@ impl BranchReconciliationObserver {
             )
         {
             return;
+        }
+        if let Some(git) = self.git.as_deref()
+            && self
+                .identity_throttle
+                .admit(&project_id, std::time::Instant::now())
+        {
+            reconcile_repository_identity(
+                &self.orchestration,
+                git,
+                &project_id,
+                &CancellationToken::new(),
+            )
+            .await;
         }
         let threads = match self
             .orchestration
