@@ -1853,6 +1853,14 @@ for explicit **Send now** and releases the pending-start claim gate. Completed
 reconciliation does not dispatch again on a later startup; ready/idle/stopped
 projections without live runtimes retain their existing state.
 
+A deleted thread (including every thread of a deleted project) can never accept
+a session projection, so its work is terminal rather than retryable. Each
+delivery-worker pass dismisses every `pending` row whose thread is deleted,
+with a plain detail, before any claim, bootstrap, or provider launch; this also
+settles rows stranded by an earlier retry loop. Other states are untouched.
+Startup reconciliation skips a deleted thread and drops any runtime row a late
+delivery left behind, so it does not warn and retry on every start.
+
 Workspace-loss settlement uses the same error rule: every queued row is held,
 and pending or sending steer rows latch the hold. The queued head shows
 **Waiting for you**; **Send now** works once no running or starting session
