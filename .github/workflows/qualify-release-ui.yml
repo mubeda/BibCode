@@ -1,0 +1,27 @@
+# Registration only: the nominated QA ref retains the full controlled UI owner.
+name: Issue 16 controlled remote update UI
+
+on:
+  workflow_dispatch:
+    inputs:
+      matrix:
+        description: Core feedback or the complete browser matrix
+        type: choice
+        required: true
+        default: core
+        options: [core, full]
+
+permissions:
+  contents: read
+
+jobs:
+  registration_only:
+    name: Nominated QA ref required
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Refuse registration-only execution
+        shell: bash
+        run: |
+          printf '%s\n' 'QUALIFICATION_REQUIRES_NOMINATED_QA_REF'
+          exit 1
