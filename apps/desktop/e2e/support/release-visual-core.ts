@@ -369,6 +369,22 @@ export async function runVisualCore(input: VisualCoreInput): Promise<object> {
   const search = browser.$('[data-testid="command-palette"] [data-slot="autocomplete-input"]');
   await search.waitForDisplayed();
   await search.setValue("settings");
+  // The query updates before deferred results. Navigate only the committed, focused result.
+  await owner.until(async () => {
+    if (
+      (await browser.$$('[data-testid="command-palette"]').length) !== 1 ||
+      (await browser.$$('[data-testid="command-palette"] [data-slot="command-item"]').length) !==
+        1 ||
+      (await search.getValue()) !== "settings" ||
+      !(await search.isFocused())
+    )
+      return false;
+    return browser
+      .$(
+        '//*[@data-testid="command-palette"]//*[@data-slot="command-item" and contains(normalize-space(.),"Open settings")]',
+      )
+      .isDisplayed();
+  });
   await browser.keys("ArrowDown");
   await capture("command-palette");
   await browser.keys("Escape");

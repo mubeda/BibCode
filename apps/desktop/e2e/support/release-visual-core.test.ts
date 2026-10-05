@@ -16,6 +16,84 @@ import {
 import * as CoreCapture from "./release-visual-core.ts";
 import { readVisualWitness, observeVisualNameClear } from "./release-visual-observation.ts";
 
+describe("public palette navigation readiness", () => {
+  it.each([
+    "settles",
+    "duplicate-palette",
+    "duplicate-rows",
+    "unfiltered",
+    "focus-lost",
+    "hidden-row",
+    "read-failed",
+  ])("sends one navigation key only after the owned filtered row is ready: %s", async (mode) => {
+    const source = NodeFS.readFileSync(
+      NodePath.resolve("apps/desktop/e2e/support/release-visual-core.ts"),
+      "utf8",
+    );
+    const start = source.indexOf('  const search = browser.$(\'[data-testid="command-palette"]');
+    const end = source.indexOf('  await browser.keys("Escape");', start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    let reads = 0;
+    const calls: string[] = [];
+    const original = new Error("Inert original palette read failure.");
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" + source.slice(start, end) + "}\nrun",
+      ),
+      {
+        browser: {
+          $$: (selector: string) => ({
+            length: Promise.resolve(
+              selector === '[data-testid="command-palette"]'
+                ? mode === "duplicate-palette"
+                  ? 2
+                  : 1
+                : mode === "duplicate-rows" || reads === 1
+                  ? 2
+                  : 1,
+            ),
+          }),
+          $: (selector: string) =>
+            selector.includes("autocomplete-input")
+              ? {
+                  waitForDisplayed: async () => {},
+                  setValue: async () => calls.push("type"),
+                  getValue: async () => {
+                    if (mode === "read-failed") throw original;
+                    return mode === "unfiltered" ? "set" : "settings";
+                  },
+                  isFocused: async () => mode !== "focus-lost",
+                }
+              : {
+                  isDisplayed: async () => mode !== "hidden-row",
+                },
+          keys: async (key: string) => {
+            calls.push(key);
+          },
+        },
+        owner: {
+          until: async (check: () => Promise<boolean>) => {
+            for (reads = 1; reads <= 3; reads++) if (await check()) return;
+            throw new Error("Inert palette readiness timed out.");
+          },
+        },
+        capture: async () => calls.push("capture"),
+      },
+    ) as () => Promise<void>;
+    if (mode === "settles") {
+      await run();
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(calls).toEqual(["type", "ArrowDown", "capture"]);
+    } else {
+      const error: unknown = await run().catch((value: unknown) => value);
+      if (mode === "read-failed") expect(error).toBe(original);
+      else expect(error).toBeDefined();
+      expect(calls).toEqual(["type"]);
+    }
+  });
+});
+
 it("waits for the actual L1 draft produced by the pinned file gutter selection and panel callbacks", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const webRequire = NodeModule.createRequire(NodePath.resolve("apps/web/package.json"));
@@ -1919,6 +1997,7 @@ it.each([true, false])(
       setValue: async (value: string) => {
         calls.push(`input:${selector}:${value}`);
       },
+      getValue: async () => "settings",
       moveTo: async () => {
         calls.push(`hover:${selector}`);
       },

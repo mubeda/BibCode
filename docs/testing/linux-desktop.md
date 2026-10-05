@@ -1197,6 +1197,16 @@ JSON receipt files enter the artifact allowlist. Inspect the originals
 independently before accepting visual quality. No private logs, provider inputs,
 credentials or profiles are retained.
 
+Before the palette's single ArrowDown, the owner waits within its existing
+polling bound for one palette and one displayed `Open settings` result, with
+the search input still focused and its value equal to `settings`. The query
+updates before the deferred result collection, so typing alone does not prove
+that keyboard navigation will target the filtered collection. Failed reads or
+readiness refuse navigation and capture; no extra key, sleep, retry, deadline
+extension, or relaxed highlighted-row witness is permitted. The component/SDK
+ordering replay covers this preparation seam; the CI original pixels and
+post-capture witness still supply the actual browser qualification.
+
 At exactly `visual-git-branch-menu` or `visual-command-palette`, the existing
 failure receipt may retain `coreCaptureFailureFacts` from the last witness already
 returned by the capture's existing polling or post-screenshot read. It adds no
