@@ -56,6 +56,7 @@ import { useRightPanelStore } from "~/rightPanelStore";
 import { useSourceControlPanelStore } from "~/sourceControlPanelStore";
 import { getSourceControlPresentation } from "~/sourceControlPresentation";
 import { useSourceControlDraft } from "~/sourceControlDraft";
+import { useServerConfigs } from "~/state/entities";
 import { usePrimaryEnvironmentId } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
 import { primaryServerAvailableEditorsAtom } from "~/state/server";
@@ -174,6 +175,9 @@ export default function SourceControlPanel({
   );
 
   const runAction = useGitStackedAction(scope);
+  const pullRequestBranchSelection =
+    useServerConfigs().get(environmentId)?.environment.capabilities
+      .gitPullRequestBranchSelection === true;
   const pullAction = useVcsPullAction(scope);
   const stageAction = useVcsStageAction(scope);
   const unstageAction = useVcsUnstageAction(scope);
@@ -335,15 +339,31 @@ export default function SourceControlPanel({
             ? { filePaths: files.map((file) => file.path) }
             : {}
         : {};
-      if (action === "create_pr" || action === "commit_push_pr") {
+      if (action === "commit_push_pr") {
         if (gitCwd === null) return;
         setPendingPullRequest({
           scope: { environmentId, cwd: gitCwd },
-          ...(actionCanCommit
-            ? { commitInput: { ...commitInput, ...(message ? { commitMessage: message } : {}) } }
-            : {}),
+          commitInput: { ...commitInput, ...(message ? { commitMessage: message } : {}) },
         });
         return;
+      }
+      if (action === "create_pr") {
+        if (gitCwd === null) return;
+        // Publish first only where a plain push is the explicit
+        // `push --set-upstream origin <branch>`. A tracked branch may follow a
+        // differently named or non-origin upstream; the dialog's create action
+        // publishes it to origin explicitly. When the dialog cannot create (no
+        // branch-selection support, no identified host, or uncommitted changes),
+        // nothing is pushed.
+        if (
+          !pullRequestBranchSelection ||
+          status?.sourceControlProvider == null ||
+          status.hasWorkingTreeChanges ||
+          status.hasUpstream !== false
+        ) {
+          setPendingPullRequest({ scope: { environmentId, cwd: gitCwd } });
+          return;
+        }
       }
       const toastId = toastManager.add({
         type: "loading",
@@ -352,9 +372,10 @@ export default function SourceControlPanel({
         timeout: 0,
         data: threadToastData,
       });
+      // Create MR/PR publishes the branch first, then reviews it in the shared dialog.
       const result = await runAction.run({
         actionId: randomUUID(),
-        action,
+        action: action === "create_pr" ? "push" : action,
         ...(message ? { commitMessage: message } : {}),
         ...commitInput,
       });
@@ -388,6 +409,9 @@ export default function SourceControlPanel({
         timeout: 0,
         data: { ...threadToastData, dismissAfterVisibleMs: 10_000 },
       });
+      if (action === "create_pr" && gitCwd !== null) {
+        setPendingPullRequest({ scope: { environmentId, cwd: gitCwd } });
+      }
     },
     [
       draft.message,
@@ -400,6 +424,7 @@ export default function SourceControlPanel({
       threadToastData,
       gitCwd,
       environmentId,
+      pullRequestBranchSelection,
     ],
   );
 

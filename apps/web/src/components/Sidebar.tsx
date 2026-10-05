@@ -1533,6 +1533,8 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
     ? scopedThreadKey(scopeThreadRef(primaryThread.environmentId, primaryThread.id))
     : null;
   const primaryKeyInfo = primaryThread ? cardLookups.keys.get(primaryThread) : undefined;
+  const primaryThreadActive =
+    primaryThreadKey !== null && activeRouteThreadKey === primaryThreadKey;
   const primaryChats = chatSummaries.get(
     workspaceCheckoutKey({
       environmentId: primaryThread?.environmentId ?? project.environmentId,
@@ -1548,7 +1550,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
       ref={attachThreadListAutoAnimateRef}
       className="mx-0.5 my-0 w-full translate-x-0 gap-1.5 overflow-hidden px-1 sm:mx-1 sm:px-1.5"
     >
-      {shouldShowThreadPanel && showDiscovery ? (
+      {projectExpanded && showDiscovery ? (
         <WorktreeDiscoverySection
           project={project}
           serverConfigs={serverConfigs}
@@ -1557,7 +1559,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
           onHiddenCountChange={onDiscoveryHiddenCountChange}
         />
       ) : null}
-      {shouldShowThreadPanel ? (
+      {projectExpanded || primaryThreadActive ? (
         <SidebarPrimaryCard
           project={project}
           primaryThread={primaryThread}
@@ -1573,7 +1575,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
               ? (cardLookups.ports.get(primaryThreadKey) ?? EMPTY_CARD_PORTS)
               : EMPTY_CARD_PORTS
           }
-          isActive={primaryThreadKey !== null && activeRouteThreadKey === primaryThreadKey}
+          isActive={primaryThreadActive}
           modelLabel={primaryThread ? resolveWorkspaceModelLabel(modelLabels, primaryThread) : ""}
           moreChatsCount={primaryChats?.count ?? 0}
           moreChatsStatus={primaryChats?.status ?? null}
@@ -2544,8 +2546,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             supportedWorktreeDiscoveryMembers.length > 0
               ? {
                   visibility: discoveryVisibility,
-                  // A collapsed project routed to one of its threads keeps its
-                  // discovery section mounted; the count belongs to expanded ones.
+                  // Discovery is mounted only while expanded, so only then is the count known.
                   hiddenCount: projectExpanded ? discoveryHiddenCountRef.current : null,
                 }
               : null,

@@ -77,7 +77,9 @@ The glyph's shape carries the status: a hand (needs approval), a question mark
 (waiting for your answer), a spinner (working or connecting), a warning
 triangle (failed), a checklist (plan ready), a filled dot (finished, not opened
 yet) and a hollow ring (idle). A collapsed project and the **Show more** row
-show the most urgent glyph among the cards they hide.
+show the most urgent glyph among the cards they hide. A collapsed project keeps
+only the card you are viewing visible; its other cards and discovered worktrees
+appear again when you expand it.
 
 - The primary card represents the project's live checkout. Its title is the
   checkout's current branch, refreshed from Git rather than from a stored
@@ -884,7 +886,9 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
 
 - The primary action is adaptive. With staged files it defaults to Commit. With
   only unstaged or untracked files it becomes Stage All Changes. Clean-tree
-  states then move through pull, push, and PR actions when available. Publish is
+  states then move through pull, push, and PR actions when available. **Push &
+  create MR/PR** and **Create MR/PR** publish a branch that is not on the remote
+  yet, then open the shared review dialog with that branch as the source. Publish is
   currently shown disabled in this right-panel surface; the separate GitHub
   publish flow lives in the chat-header Git actions control.
 - The dropdown is always rendered and disables unavailable actions instead of

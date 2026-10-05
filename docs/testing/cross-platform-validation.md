@@ -258,7 +258,10 @@ that enables bracketed paste. Selecting text must leave keyboard focus in the
 terminal and must not open the **Add to chat** menu or overwrite the clipboard.
 Right-click the selected text and choose **Add to chat**; the selection must
 still attach to the composer. With no selection, **Ctrl+C** must interrupt the
-running terminal program. Repeat copy/paste where asynchronous Clipboard API
+running terminal program. Start a CLI that enables mouse tracking (for example
+`codex`), drag across its output and copy with **Ctrl+C**; the selected text must
+reach the clipboard without interrupting the CLI. **Shift+drag** (**Option+drag**
+on macOS) must reach the CLI instead of selecting. Repeat copy/paste where asynchronous Clipboard API
 access is unavailable; native clipboard events must still work. These packaged
 checks supplement the focused terminal and keybinding component tests.
 
@@ -2049,18 +2052,26 @@ starts.
     option is selected; typing alone must not enable it. Choose a non-default
     target (for example `release/next`) and confirm a status refresh preserves
     the choice, clearing it disables creation again, and reopening starts
-    unselected. Repeat from Source Control's **Push & create PR/MR** and its
-    Create menu action, and from the chat Git action; combined commit/push/request
+    unselected. Repeat from the chat Git action; combined commit/push/request
     actions must also require target review before any mutation. No push,
-    provider process, or pull request may run just by opening the dialog.
-    Cancel it and confirm the branch, its upstream, and the forge are unchanged.
+    provider process, or pull request may run just by opening the dialog from
+    these entry points. Cancel it and confirm the branch, its upstream, and the
+    forge are unchanged. From Source Control, **Push & create PR/MR** and its
+    Create menu action must push an unpublished branch first, then open the
+    dialog with that branch selected as the source and listed among the origin
+    branches; a rejected push must show an error and leave the dialog closed, and
+    cancelling the dialog after the push must not create a request. A branch
+    created with `git checkout -b feature origin/main` (upstream `origin/main`)
+    must open the dialog without a push and publish `origin/feature` only when
+    the request is created.
     With a disposable configured forge, create once and verify the exact selected
     non-default target; plain **Push** must never create a request. Only the
     dialog's explicit primary action may publish or create.
     Both selectors must contain only origin branches, including those with a
     same-named local branch. Verify local-only branches, other remotes, and `HEAD`
-    are absent. A local-only checkout must leave the ordinary creation dialog's
-    source unselected and creation disabled, with push/fetch guidance.
+    are absent. A local-only checkout must still start with its branch as the
+    source, state that it will be published first, and publish it only when the
+    primary action runs.
     Change the source to another published branch and then an origin-only branch.
     Each change must clear the target, retain edited title/description, and seed
     untouched fields from that source's tip rather than another branch's newer

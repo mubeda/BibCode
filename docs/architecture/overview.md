@@ -963,7 +963,10 @@ including bracketed paste, without requiring the asynchronous Clipboard API.
 Shifted copy selects xterm's hidden textarea for the native copy command, then
 restores its pending input. Bare Ctrl+C remains terminal input when nothing is
 selected. Selecting output keeps keyboard focus in the terminal; **Add to chat**
-is available from the selected text's explicit context menu.
+is available from the selected text's explicit context menu. While the running
+program has enabled mouse tracking (Codex, opencode and other TUIs), the viewport
+inverts xterm's force-selection modifier: a plain primary drag selects text for
+copying, and Shift+drag (Option+drag on macOS) is reported to the program.
 
 ### Terminal attachment fidelity
 

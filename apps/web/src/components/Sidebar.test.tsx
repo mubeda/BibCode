@@ -606,9 +606,10 @@ staticDescribe("Sidebar full render", () => {
       projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
     });
     const markup = render(<Sidebar />);
-    // Active thread peeks through even while collapsed.
+    // Active thread peeks through even while collapsed; the inactive primary card does not.
     expect(markup).toContain("thread-row-thread-active");
     expect(markup).not.toContain("thread-row-thread-idle");
+    expect(markup).not.toContain('data-testid="primary-card-project-a"');
   });
 
   it("shows the overflow 'Show more' affordance and expands on click", () => {

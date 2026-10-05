@@ -449,6 +449,52 @@ describe("SidebarThreadRow browser interactions", () => {
     outside.remove();
   });
 
+  it.each([true, false])(
+    "shows discovered worktrees only while the project is expanded (expanded=%s)",
+    async (expanded) => {
+      baseScenario();
+      h.state.serverConfigs = new Map([
+        [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+      ]);
+      h.state.worktreeCatalogs.set(`${ENV_MAIN}:${projectA.id}`, {
+        repositoryKey: WorktreeRepositoryKey.make("repository:C:/worktrees/discovered"),
+        generation: 1,
+        authoritative: true,
+        observedAt: "2026-08-09T12:00:00.000Z",
+        scanStatus: { _tag: "ready" },
+        worktrees: [
+          {
+            worktreeKey: WorktreeKey.make("worktree:C:/worktrees/discovered"),
+            path: "C:/worktrees/discovered",
+            branch: "feature/discovered",
+            head: "abcdef0123456789",
+            isPrimary: false,
+            isBare: false,
+            locked: false,
+            registrationState: "registered",
+            directoryState: "present",
+            adoptionState: "none",
+            eligibleForAdoption: true,
+          },
+        ],
+        adoptedWorkspaces: [],
+      });
+      // Routed to one of the project's threads: collapsing must still hide discovery.
+      h.uiStore.setState({
+        projectExpandedById: { [derivePhysicalProjectKey(projectA)]: expanded },
+      });
+      const { container, root } = await mount(<Sidebar />);
+      try {
+        await React.act(async () => flush());
+        expect(container.querySelector('[data-testid^="worktree-discovery-card-"]') !== null).toBe(
+          expanded,
+        );
+      } finally {
+        await unmount(root, container);
+      }
+    },
+  );
+
   it.each([
     { expanded: true, label: "Show Hidden Worktrees (1)" },
     { expanded: false, label: "Show Hidden Worktrees" },
@@ -482,8 +528,7 @@ describe("SidebarThreadRow browser interactions", () => {
         ],
         adoptedWorkspaces: [],
       });
-      // Collapsed but routed to one of its threads, so the discovery section
-      // stays mounted and still reports its count.
+      // Only an expanded project mounts discovery, so only it reports a count.
       h.uiStore.setState({
         projectExpandedById: { [derivePhysicalProjectKey(projectA)]: expanded },
       });

@@ -30,6 +30,7 @@ import type { TerminalThemeMode } from "./terminalTheme";
 
 interface FakeTerminalInstance {
   readonly options: Record<string, unknown>;
+  readonly modes: { mouseTrackingMode: "none" | "x10" | "vt200" | "drag" | "any" };
   readonly textarea: HTMLTextAreaElement;
   cols: number;
   rows: number;
@@ -388,6 +389,9 @@ vi.mock("@xterm/xterm", () => ({
     selectionHandler: (() => void) | null = null;
     keyHandler: ((event: KeyboardEvent) => boolean) | null = null;
     hasActiveSelection = false;
+    modes: { mouseTrackingMode: "none" | "x10" | "vt200" | "drag" | "any" } = {
+      mouseTrackingMode: "none",
+    };
     selectionText = "";
     selectionPosition: { start: { y: number } } | null = null;
 
@@ -4251,6 +4255,95 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(terminal.textarea.selectionStart).toBe(3);
     expect(terminal.textarea.selectionEnd).toBe(5);
     expect(testState.writeCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["Linux", "none", {}, { shiftKey: false, altKey: false }],
+    ["Linux", "drag", {}, { shiftKey: true, altKey: false }],
+    ["Linux", "any", { shiftKey: true }, { shiftKey: false, altKey: false }],
+    ["MacIntel", "drag", {}, { shiftKey: false, altKey: true }],
+    ["MacIntel", "drag", { altKey: true }, { shiftKey: false, altKey: false }],
+  ] as const)(
+    "on %s with %s mouse tracking, a primary drag %j selects unless the modifier sends it to the app",
+    async (platform, mouseTrackingMode, modifiers, seen) => {
+      vi.stubGlobal("navigator", { platform });
+      const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+      const terminal = xtermState.terminals[0]!;
+      terminal.modes.mouseTrackingMode = mouseTrackingMode;
+      const surface = mounted.container.querySelector("[data-terminal-xterm-mount]");
+      expect(surface).toBeInstanceOf(HTMLElement);
+      const target = document.createElement("div");
+      surface!.append(target);
+      let observed: { shiftKey: boolean; altKey: boolean } | null = null;
+      // xterm's own listeners sit below the mount and read the force-selection modifier.
+      target.addEventListener("mousedown", (event) => {
+        observed = { shiftKey: event.shiftKey, altKey: event.altKey };
+      });
+      target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0, ...modifiers }));
+
+      expect(observed).toEqual(seen);
+      if (platform === "MacIntel") {
+        expect(terminal.options).toMatchObject({ macOptionClickForcesSelection: true });
+      }
+    },
+  );
+
+  it("keeps the inverted modifier for the drag and release of the same gesture", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.modes.mouseTrackingMode = "drag";
+    const surface = mounted.container.querySelector("[data-terminal-xterm-mount]")!;
+    const target = document.createElement("div");
+    surface.append(target);
+    const seen: Array<[string, boolean]> = [];
+    const record = (event: MouseEvent) => seen.push([event.type, event.shiftKey]);
+    target.addEventListener("mousedown", record);
+    document.addEventListener("mousemove", record);
+    document.addEventListener("mouseup", record);
+    try {
+      target.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, button: 0, shiftKey: true }),
+      );
+      target.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, shiftKey: true }));
+      target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0, shiftKey: true }));
+      target.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, shiftKey: true }));
+    } finally {
+      document.removeEventListener("mousemove", record);
+      document.removeEventListener("mouseup", record);
+    }
+
+    expect(seen).toEqual([
+      ["mousedown", false],
+      ["mousemove", false],
+      ["mouseup", false],
+      ["mousemove", true],
+    ]);
+  });
+
+  it("does not carry a synthesized Option past the mousedown of a macOS selection", async () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.modes.mouseTrackingMode = "drag";
+    const surface = mounted.container.querySelector("[data-terminal-xterm-mount]")!;
+    const target = document.createElement("div");
+    surface.append(target);
+    const seen: Array<[string, boolean]> = [];
+    const record = (event: MouseEvent) => seen.push([event.type, event.altKey]);
+    target.addEventListener("mousedown", record);
+    document.addEventListener("mouseup", record);
+    try {
+      target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+      target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    } finally {
+      document.removeEventListener("mouseup", record);
+    }
+
+    expect(seen).toEqual([
+      ["mousedown", true],
+      ["mouseup", false],
+    ]);
   });
 
   it("keeps Ctrl+C as an interrupt without a selection and consumes explicit copy", async () => {

@@ -394,15 +394,10 @@ describe("GitManagerCreatePullRequestDialog", () => {
     },
   );
 
-  it("leaves a local-only checkout unselected until a remote source is chosen", async () => {
+  it("selects the checkout's branch even before origin has it", async () => {
     h.currentSourceRemote = false;
     await renderDialog();
-    expect(input("git-manager-create-pr-head").value).toBe("");
-    expect(text("create-pr-status")).toBe("Select a source branch.");
-    await chooseTarget("main");
-    expect(button("Publish and create pull request").disabled).toBe(true);
-    await chooseSource("feature/other");
-    expect(input("git-manager-create-pr-base").value).toBe("");
+    expect(input("git-manager-create-pr-head").value).toBe("feature/reviewed");
     await chooseTarget("main");
     expect(button("Publish and create pull request").disabled).toBe(false);
     expect(h.runs).toEqual([]);

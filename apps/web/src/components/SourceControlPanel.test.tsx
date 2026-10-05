@@ -111,6 +111,7 @@ const testState = vi.hoisted(() => ({
   generatePending: false,
   isBusy: false,
   primaryEnvironmentId: null as unknown,
+  pullRequestBranchSelection: true,
   availableEditors: [] as string[],
   preferredEditor: null as string | null,
   localApi: undefined as unknown,
@@ -241,6 +242,16 @@ vi.mock("~/state/vcs", () => ({
   vcsEnvironment: {
     status: (args: unknown) => ({ kind: "status-atom", args }),
   },
+}));
+
+vi.mock("~/state/entities", () => ({
+  useServerConfigs: () => ({
+    get: () => ({
+      environment: {
+        capabilities: { gitPullRequestBranchSelection: testState.pullRequestBranchSelection },
+      },
+    }),
+  }),
 }));
 
 vi.mock("~/state/environments", () => ({
@@ -621,6 +632,7 @@ beforeEach(() => {
   testState.groupByFolder = true;
   testState.setGroupByFolder.mockReset();
   testState.primaryEnvironmentId = ENVIRONMENT_ID;
+  testState.pullRequestBranchSelection = true;
   testState.availableEditors = ["vscode"];
   testState.preferredEditor = "vscode";
   testState.localApi = { shell: { openExternal: vi.fn() } };
@@ -648,7 +660,7 @@ beforeEach(() => {
 });
 
 describe("SourceControlPanel", () => {
-  it("opens target review before publishing a merge request, and cancel does no work", async () => {
+  it("pushes before opening the merge request review, and cancel does no further work", async () => {
     testState.statusQuery.data = status({
       refName: "feature/test",
       hasUpstream: false,
@@ -662,7 +674,8 @@ describe("SourceControlPanel", () => {
     create?.onClick?.();
     await flushPromises();
     render(props);
-    expect(testState.runAction).not.toHaveBeenCalled();
+    expect(testState.runAction).toHaveBeenCalledTimes(1);
+    expect(testState.runAction).toHaveBeenCalledWith(expect.objectContaining({ action: "push" }));
     expect(captured.createPullRequest).toMatchObject({
       open: true,
       scope: { environmentId: props.threadRef.environmentId, cwd: props.gitCwd },
@@ -671,10 +684,60 @@ describe("SourceControlPanel", () => {
     captured.createPullRequest?.onOpenChange(false);
     render(props);
     expect(captured.createPullRequest).toBeNull();
-    expect(testState.runAction).not.toHaveBeenCalled();
-    captured.menuItems.find((item) => flattenText(item.children) === "Push")?.onClick?.();
+    expect(testState.runAction).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["a tracked branch", { hasUpstream: true, aheadCount: 1 }, true],
+    ["a server without branch selection", { hasUpstream: false, aheadCount: 1 }, false],
+    [
+      "an unidentified host",
+      { hasUpstream: false, aheadCount: 1, sourceControlProvider: undefined },
+      true,
+    ],
+    [
+      "uncommitted changes",
+      { hasUpstream: false, aheadCount: 1, hasWorkingTreeChanges: true },
+      true,
+    ],
+  ] as const)(
+    "opens the merge request review without a preliminary push for %s",
+    async (_case, remote, branchSelection) => {
+      testState.pullRequestBranchSelection = branchSelection;
+      testState.statusQuery.data = status({
+        refName: "feature/test",
+        sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+        ...remote,
+      });
+      const props = buildProps();
+      render(props);
+      const create = buttonsByText("Push & create MR")[0] ?? buttonsByText("Push & create PR")[0];
+      expect(create).toBeDefined();
+      create?.onClick?.();
+      await flushPromises();
+      render(props);
+      expect(testState.runAction).not.toHaveBeenCalled();
+      expect(captured.createPullRequest).toMatchObject({ open: true });
+    },
+  );
+
+  it("keeps the merge request review closed when the push fails", async () => {
+    testState.statusQuery.data = status({
+      refName: "feature/test",
+      hasUpstream: false,
+      aheadCount: 1,
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+    });
+    testState.runAction.mockResolvedValueOnce(
+      AsyncResult.failure(Cause.fail(new Error("push rejected"))),
+    );
+    const props = buildProps();
+    render(props);
+    buttonsByText("Push & create MR")[0]?.onClick?.();
     await flushPromises();
+    render(props);
     expect(testState.runAction).toHaveBeenCalledWith(expect.objectContaining({ action: "push" }));
+    expect(captured.createPullRequest).toBeNull();
   });
 
   it("uses the shared workspace guard instead of starting Git work", () => {
