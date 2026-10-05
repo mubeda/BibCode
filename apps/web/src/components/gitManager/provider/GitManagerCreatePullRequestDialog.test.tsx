@@ -645,9 +645,7 @@ describe("GitManagerCreatePullRequestDialog", () => {
     await renderDialog();
 
     expect(document.body.textContent).toContain("Create merge request");
-    expect(document.body.textContent).toContain(
-      "Review the merge request before anything is published.",
-    );
+    expect(document.body.textContent).toContain("Review the merge request before it is created.");
     expect(text("create-pr-repository")).toBe("GitLab · https://luna.tripunkt.de");
     expect(
       document.querySelector('[data-testid="create-pr-summary"]')?.getAttribute("aria-label"),
@@ -693,9 +691,7 @@ describe("GitManagerCreatePullRequestDialog", () => {
     h.status = null;
     await renderDialog();
     expect(document.body.textContent).toContain("Create change request");
-    expect(document.body.textContent).toContain(
-      "Review the change request before anything is published.",
-    );
+    expect(document.body.textContent).toContain("Review the change request before it is created.");
     expect(document.body.textContent).not.toContain("ull request");
     expect(
       document.querySelector('[data-testid="create-pr-summary"]')?.getAttribute("aria-label"),

@@ -7,6 +7,7 @@ import { primaryServerKeybindingsAtom } from "../state/server";
 import { useUiStateStore } from "../uiStateStore";
 import ThreadSidebar from "./Sidebar";
 import { EnvironmentRail } from "./sidebar/EnvironmentRail";
+import { ENVIRONMENT_RAIL_WIDTH_PX } from "./sidebar/environmentRail.logic";
 import {
   readStoredSidebarWidth,
   Sidebar,
@@ -20,12 +21,11 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 
 // v2: widths stored under the retired key belong to the 256px default era.
 const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "bibcode:sidebar-width:v2";
-const ENVIRONMENT_RAIL_WIDTH = 52;
-const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16 + ENVIRONMENT_RAIL_WIDTH;
+const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16 + ENVIRONMENT_RAIL_WIDTH_PX;
 // Measured from the user's screenshot: a 370px projects panel beside the 52px
 // rail (422px total). A width the user has dragged to is stored under the
 // storage key and wins over this default.
-const THREAD_SIDEBAR_DEFAULT_WIDTH = 370 + ENVIRONMENT_RAIL_WIDTH;
+const THREAD_SIDEBAR_DEFAULT_WIDTH = 370 + ENVIRONMENT_RAIL_WIDTH_PX;
 const THREAD_MAIN_CONTENT_MIN_WIDTH = 40 * 16;
 // No configured ceiling: matches how `ui/sidebar.tsx` resolves an omitted
 // `maxWidth`. Shared between the resizable options below and

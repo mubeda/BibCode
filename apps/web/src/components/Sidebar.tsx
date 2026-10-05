@@ -24,6 +24,7 @@ import { CreateWorktreeDialog } from "./CreateWorktreeDialog";
 import { useAtomValue } from "@effect/atom-react";
 import { autoAnimate } from "@formkit/auto-animate";
 import React, {
+  type CSSProperties,
   createContext,
   useCallback,
   useContext,
@@ -191,6 +192,7 @@ import { SidebarRepositoryGroup } from "./sidebar/SidebarRepositoryGroup";
 import { SidebarViewToggle } from "./sidebar/SidebarViewToggle";
 import { ServerUpdateBadge, serverUpdateStatusFromQuery } from "./settings/ServerUpdateBadge";
 import {
+  ENVIRONMENT_RAIL_WIDTH_PX,
   resolveAddProjectTargetLabel,
   selectRailVisibleEnvironmentIds,
   toEnvironmentRailCandidate,
@@ -3900,8 +3902,18 @@ function SortableProjectItem({
 }
 
 const SidebarChromeHeader = memo(function SidebarChromeHeader() {
+  // The fixed sidebar toggle overlays the rail's top strip. With the rail
+  // hidden (Repositories view) reserve that strip here so the brand stays put.
+  // Below `md` the header carries its own trigger, so nothing is reserved.
+  const railHidden = useUiStateStore((state) => state.sidebarView === "repositories");
   return (
-    <SidebarHeader className="@container/sidebar-header h-[var(--workspace-topbar-height)] shrink-0 flex-row items-center border-b border-panel-separator px-3 py-0 md:px-0">
+    <SidebarHeader
+      className={cn(
+        "@container/sidebar-header h-[var(--workspace-topbar-height)] shrink-0 flex-row items-center border-b border-panel-separator px-3 py-0 md:px-0",
+        railHidden && "md:pl-[var(--environment-rail-width)]",
+      )}
+      style={{ "--environment-rail-width": `${ENVIRONMENT_RAIL_WIDTH_PX}px` } as CSSProperties}
+    >
       <SidebarTrigger className="md:hidden" />
       <SidebarBrand />
     </SidebarHeader>

@@ -19,6 +19,7 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
   buildEnvironmentRailModel,
+  ENVIRONMENT_RAIL_WIDTH_PX,
   resolveEnvironmentRailStatus,
   toEnvironmentRailCandidate,
   type EnvironmentRailEntry,
@@ -218,7 +219,8 @@ export function EnvironmentRail() {
   return (
     <div
       data-testid="environment-rail"
-      className="flex h-full w-[52px] shrink-0 flex-col items-center gap-2 border-r border-panel-separator bg-sidebar pb-2"
+      style={{ width: ENVIRONMENT_RAIL_WIDTH_PX }}
+      className="flex h-full shrink-0 flex-col items-center gap-2 border-r border-panel-separator bg-sidebar pb-2"
     >
       {/* The fixed sidebar toggle is pinned over the rail's top strip; reserve
           the same topbar height the thread sidebar header reserves so the

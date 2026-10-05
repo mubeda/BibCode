@@ -375,7 +375,7 @@ function CreatePullRequestReviewDialog({
         <DialogHeader className="pb-4">
           <DialogTitle>Create {noun}</DialogTitle>
           <DialogDescription>
-            {capabilityBlockedReason ?? `Review the ${noun} before anything is published.`}
+            {capabilityBlockedReason ?? `Review the ${noun} before it is created.`}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-5">

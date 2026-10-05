@@ -2386,7 +2386,8 @@ sizes. Cover relevant:
   rail to that row's environment;
 - the **Environments | Repositories** switch: open one repository as a project
   on Local and on a remote environment. Switch the left panel to
-  **Repositories**: the environment rail disappears and one card named after the
+  **Repositories**: the environment rail disappears, the BiBCode brand stays where it was
+  beside the sidebar toggle (not under it), and one card named after the
   repository lists both environments with their state and path; an offline
   environment's entry is dimmed. Its `…` menu shows the normal project menu for
   that environment. Change the remote checkout's `origin` with
