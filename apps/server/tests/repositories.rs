@@ -81,7 +81,31 @@ fn project(id: &str, created_at: &str) -> ProjectionProject {
         created_at: created_at.to_owned(),
         updated_at: created_at.to_owned(),
         deleted_at: None,
+        repository_identity: None,
     }
+}
+
+#[tokio::test]
+async fn project_repository_identity_round_trips() {
+    let repositories = migrated_repositories().await;
+    let identity = json!({
+        "canonicalKey": "github.com/acme/repo",
+        "locator": {"source": "git-remote", "remoteName": "origin", "remoteUrl": "git@github.com:acme/repo.git"},
+        "name": "repo"
+    });
+    let mut row = project("p-identity", T0);
+    row.repository_identity = Some(identity.clone());
+    repositories.upsert_project(row).await.expect("upsert");
+    let stored = repositories
+        .get_project("p-identity".to_owned())
+        .await
+        .expect("read")
+        .expect("project exists");
+    assert_eq!(stored.repository_identity, Some(identity));
+    assert_eq!(
+        repositories.list_projects().await.expect("list")[0].repository_identity,
+        stored.repository_identity
+    );
 }
 
 #[tokio::test]
