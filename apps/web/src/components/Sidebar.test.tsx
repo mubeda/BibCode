@@ -64,6 +64,8 @@ import Sidebar, {
   SidebarThreadRow,
   handleSidebarNavigationKeyDown,
   handleSidebarSelectionMouseDown,
+  projectExpansionPreferenceKeys,
+  projectHeaderButtonClassName,
 } from "./Sidebar";
 import { WORKSPACE_CARD_STATUS } from "./Sidebar.logic";
 
@@ -108,6 +110,28 @@ staticDescribe("Sidebar global event helpers", () => {
       stopPropagation: vi.fn(),
     };
   }
+
+  it("writes a shared expansion key right after the project key", () => {
+    const project = {
+      projectKey: "project-key",
+      sharedExpansionKey: "github.com/acme/repo-a",
+      memberProjects: [{ physicalProjectKey: "member-key", workspaceRoot: "/work/repo" }],
+    } as unknown as Parameters<typeof projectExpansionPreferenceKeys>[0];
+    const keys = projectExpansionPreferenceKeys(project);
+    expect(keys.slice(0, 3)).toEqual(["project-key", "github.com/acme/repo-a", "member-key"]);
+    const { sharedExpansionKey: _omitted, ...withoutShared } = project;
+    expect(projectExpansionPreferenceKeys(withoutShared)).toEqual(
+      keys.filter((key) => key !== "github.com/acme/repo-a"),
+    );
+  });
+
+  it("lets the project header button grow only for an environment card", () => {
+    const base = { showsSandboxBadge: false, isManualProjectSorting: false };
+    expect(projectHeaderButtonClassName({ ...base, isEnvironmentCard: true })).toContain("h-auto");
+    expect(projectHeaderButtonClassName({ ...base, isEnvironmentCard: false })).not.toContain(
+      "h-auto",
+    );
+  });
 
   it("handles traversal and numbered jump shortcuts across every guard", () => {
     const first = makeThread("first");

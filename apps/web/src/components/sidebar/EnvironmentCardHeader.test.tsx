@@ -26,4 +26,23 @@ describe("EnvironmentCardHeader", () => {
     expect(markup).toContain("AS");
     expect(markup).toContain("/work/tripunkt/pathfinder-application-server");
   });
+
+  it("shows the monitor icon instead of avatar text for the local environment", () => {
+    const markup = renderToStaticMarkup(
+      <EnvironmentCardHeader
+        identity={{
+          environmentId: EnvironmentId.make("env-local"),
+          label: "Local",
+          isLocal: true,
+          avatar: "LO",
+          status: "connected",
+          statusLabel: "Connected",
+          available: true,
+        }}
+        workspaceRoot="/work/app"
+      />,
+    );
+    expect(markup).toContain("<svg");
+    expect(markup).not.toContain(">LO<");
+  });
 });
