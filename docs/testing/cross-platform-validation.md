@@ -455,6 +455,10 @@ reload response cannot make it appear in the native slash menu. Run
 `node scripts/run-local-vp.mjs test run apps/desktop/e2e/support/provider-shims.test.ts`
 to check the generated provider protocols before the six-platform packaged UI
 matrix. Keep the menu-group and exact native-input assertions in that matrix.
+Cursor's fixture profile must include the generated skills in its native
+compatibility roots, including `.claude/skills` as well as `.cursor/skills`.
+The fixture-files regression checks that union; keep the exact native menu
+inventory assertion so omitted or unexpected skills still fail qualification.
 
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head

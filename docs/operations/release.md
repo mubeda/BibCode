@@ -138,6 +138,18 @@ Release CI mounts both macOS DMGs and verifies their recursive bundle
 signatures and Finder-rendered application icons before upload. The existing
 icon verifier reads the application from that exact read-only DMG mount; its
 failure stops the native build job before assets can be uploaded.
+The closed `mac-icon-observation` stderr records distinguish Swift entry,
+workspace/bitmap/context/drawing/pixel boundaries, and workflow cleanup return. The scan
+records retain capped bitmap dimensions and pixel counts, never application
+paths or native errors. Diagnostic caps never change the scan or verdict.
+These are observations, not alternate success criteria; missing records
+remain unobserved and the mandatory Finder verdict and job budget are unchanged.
+The verifier draws the workspace-provided icon at 256 points into a fixed
+1024-square RGBA bitmap instead of serializing all image representations to
+TIFF. Native macOS jobs run its `--self-test` raster and threshold fixtures
+before building, then require the separate mounted-application verdict after
+signature verification. The alpha, luminance, dark-area, and pale-area limits
+remain the same; synthetic fixtures cannot qualify a release payload.
 
 Windows artifacts remain without Authenticode. macOS remains ad-hoc
 signed/unnotarized by decision (2026-09-18): an ad-hoc identity changes with
@@ -268,6 +280,15 @@ The other five native rows and the separate WSL job retain 240 minutes.
 The `remote-install` lane reuses the protected package rather than building a
 fourth package. These are build/job limits, not expected durations or changes
 to product, WebDriver, or restart deadlines.
+
+Windows installed-version observation retains a ten-second PowerShell child
+bound. A timed-out child must be observed closed, including its pipes, before
+the timeout can be recorded as an unavailable sample within the unchanged
+overall restart deadline. The shared command owner tracks `close` from spawn
+admission; cleanup that reaches its five-second bound without that proof fails
+closed. Successful installation still requires the exact candidate version,
+readable checksum, no candidate installer, and the later native runtime and
+retained-data checks.
 
 The harness uses an isolated root outside the checkout, an ephemeral Tauri
 updater key, a loopback-only mock updater, the packaged app's embedded

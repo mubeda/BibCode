@@ -57,6 +57,24 @@ it("checks Finder's rendered icon from the exact macOS release DMG before upload
   assert.notInclude(macVerification!, 'check-macos-app-icon.swift "${app_paths[0]}" ||');
 });
 
+it("runs native raster fixtures before building without replacing the mounted icon check", () => {
+  const fixtureStep = /- name: Verify macOS icon raster fixtures\n[\s\S]*?(?=\n      - name:)/.exec(
+    releaseWorkflow,
+  )?.[0];
+  assert.isDefined(fixtureStep);
+  assert.include(fixtureStep!, "if: matrix.platform == 'mac'");
+  assert.include(fixtureStep!, "swift scripts/check-macos-app-icon.swift --self-test");
+  assert.notInclude(fixtureStep!, "continue-on-error");
+  assert.isBelow(
+    releaseWorkflow.indexOf(fixtureStep!),
+    releaseWorkflow.indexOf("- name: Build desktop artifact"),
+  );
+  assert.isAbove(
+    releaseWorkflow.indexOf('swift scripts/check-macos-app-icon.swift "${app_paths[0]}"'),
+    releaseWorkflow.indexOf("- name: Build desktop artifact"),
+  );
+});
+
 it("publishes stable updater metadata atomically from a verified draft", () => {
   assert.include(releaseWorkflow, 'echo "name=BiBCode v$version"');
   assert.match(releaseWorkflow, /build-tauri-update-manifest\.ts/);
