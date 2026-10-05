@@ -926,7 +926,9 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
   await capture("project-clone-chooser", rich);
   fixture.verifyIncompleteRetained();
   await input.verifyNoCloneImport();
-  await click(`${popup} button=Clone`);
+  await click(
+    '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Clone"]',
+  );
   await input.owner.until(async () =>
     (await browser.$(popup).getText()).includes("An incomplete clone exists at"),
   );

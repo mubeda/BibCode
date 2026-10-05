@@ -1248,7 +1248,15 @@ origin; it does not prove an HTTP transfer. Preserve the owner guard, discovery
 isolation and all other child environment settings. The incomplete destination
 must refuse before transfer and remain unimported and intact. Read actual typed
 orchestration snapshots before/after that attempt; no guessed project count or
-renderer store state supplies the import proof.
+renderer store state supplies the import proof. Submit Clone with the explicit
+owned-dialog XPath matching its existing dialog role/data-slot and exact caption.
+The pinned SDK does not compose this CSS ancestor with its bare text-selector
+syntax. Keep the original displayed, unique, enabled and click order, fixture
+retention and snapshot checks, public submission and refusal polling. The real
+mounted Clone form and installed-SDK regression use inert operation ports;
+native XPath execution, layout and pixels still require CI evidence. A retained
+chooser original and its later unchanged phase do not identify which subsequent
+check or await failed.
 
 Use the ordinary public Add Project/path/primary-card and project menu controls.
 Wait for an asynchronously mounted control to display before checking its unique

@@ -43,6 +43,199 @@ const directoryOperations = [
   "path-commit",
 ];
 
+it.each(["owned", "duplicate", "outside", "disabled", "snapshot-refused", "click-refused"])(
+  "resolves the actual post-chooser Clone action with the installed SDK and mounted form: %s",
+  async (mode) => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const cloneModule = "../../../web/src/components/add-project/AddProjectSteps.tsx";
+    const { AddProjectCloneStep } = await import(cloneModule);
+    const web = NodeModule.createRequire(NodePath.resolve("apps/web/package.json"));
+    const desktop = NodeModule.createRequire(NodePath.resolve("apps/desktop/package.json"));
+    const { createElement, act, useState } = web("react") as {
+      createElement: (type: unknown, props: unknown, ...children: unknown[]) => unknown;
+      act: (run: () => void | Promise<void>) => Promise<void>;
+      useState: <T>(value: T) => [T, (value: T) => void];
+    };
+    const { createRoot } = web("react-dom/client") as {
+      createRoot: (container: HTMLElement) => {
+        render: (value: unknown) => void;
+        unmount: () => void;
+      };
+    };
+    const sdk = NodeFS.readFileSync(
+      NodePath.join(NodePath.dirname(desktop.resolve("webdriverio")), "node.js"),
+      "utf8",
+    );
+    const strategyStart = sdk.indexOf("var DEFAULT_STRATEGY ="),
+      strategyEnd = sdk.indexOf("\n//", strategyStart);
+    expect(strategyStart).toBeGreaterThan(0);
+    const strategy = NodeVM.runInNewContext(
+      sdk.slice(strategyStart, strategyEnd) + "\nfindStrategy",
+      { DEEP_SELECTOR: ">>>", ARIA_SELECTOR: "aria/" },
+    );
+    const source = NodeFS.readFileSync(
+      NodePath.resolve("apps/desktop/e2e/support/release-visual-git-project.ts"),
+      "utf8",
+    );
+    const runStart = source.indexOf("export async function runGitProjectVisual(");
+    const helpersStart = source.indexOf("  const click = async", runStart);
+    const helpersEnd = source.indexOf("  const select = async", helpersStart);
+    const begin = source.indexOf('  await capture("project-clone-chooser", rich);', runStart);
+    const finish = source.indexOf("  await close();", begin);
+    expect(helpersStart).toBeGreaterThan(runStart);
+    expect(helpersEnd).toBeGreaterThan(helpersStart);
+    expect(finish).toBeGreaterThan(begin);
+    const popup = '[data-slot="dialog-popup"][role="dialog"]';
+    const ownedXPath =
+      '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Clone"]';
+    const original = new Error("Inert original Clone operation failure.");
+    const order: string[] = [];
+    const controls: string[] = [];
+    const rich = {};
+    const owner = new QualificationOwner("/owned/evidence", "/owned/fixture");
+    function Form() {
+      const [error, setError] = useState<string | null>(null);
+      return createElement(AddProjectCloneStep, {
+        url: "https://visual.invalid/visual-origin.git",
+        parentDir: "/owned/clone-parent",
+        platform: "Linux",
+        busy: mode === "disabled",
+        progress: "idle",
+        canPickParent: true,
+        error,
+        notice: null,
+        onUrlChange: () => {},
+        onParentDirChange: () => {},
+        onPickParent: () => {},
+        onCancel: () => {},
+        onClone: () => {
+          order.push("submit");
+          setError("An incomplete clone exists at the synthetic owned destination.");
+        },
+      });
+    }
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const targets = (selector: string) => {
+      const locator = strategy(selector, true, false);
+      if (locator.using === "css selector") {
+        try {
+          return Array.from(document.querySelectorAll<HTMLButtonElement>(locator.value));
+        } catch {
+          return [];
+        }
+      }
+      expect(locator.using).toBe("xpath");
+      expect(locator.value).toBe(ownedXPath);
+      // HappyDOM has no native XPath engine; resolve only this exact owned expression's semantics.
+      return Array.from(document.querySelectorAll<HTMLButtonElement>(`${popup} button`)).filter(
+        (button) => button.textContent?.trim() === "Clone",
+      );
+    };
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function clone(){ const completed = [];" +
+          source.slice(helpersStart, helpersEnd) +
+          source.slice(begin, finish) +
+          "return completed;}\nclone",
+      ),
+      {
+        popup,
+        rich,
+        refused: () => new Error("Inert admission refusal."),
+        fixture: { verifyIncompleteRetained: () => order.push("retained") },
+        input: {
+          step: () => {},
+          owner,
+          verifyOwnedIdentity: async (selection: unknown) => {
+            expect(selection).toBe(rich);
+            order.push("identity");
+          },
+          capture: async (scene: string) => order.push(scene),
+          verifyNoCloneImport: async () => {
+            order.push("snapshot");
+            if (mode === "snapshot-refused") throw original;
+          },
+        },
+        browser: {
+          $: (selector: string) => ({
+            waitForDisplayed: async () => {
+              controls.push("displayed");
+              if (targets(selector).length === 0) throw original;
+            },
+            waitForEnabled: async () => {
+              controls.push("enabled");
+              if (targets(selector)[0]?.disabled) throw original;
+            },
+            click: async () => {
+              controls.push("click");
+              if (mode === "click-refused") throw original;
+              await act(async () => targets(selector)[0]!.click());
+            },
+            getText: async () => {
+              expect(selector).toBe(popup);
+              order.push("refusal-read");
+              return document.querySelector(popup)?.textContent ?? "";
+            },
+          }),
+          $$: (selector: string) => {
+            controls.push("unique");
+            return { length: Promise.resolve(targets(selector).length) };
+          },
+        },
+      },
+    );
+    try {
+      await act(async () =>
+        root.render(
+          createElement(
+            "div",
+            mode === "outside" ? {} : { "data-slot": "dialog-popup", role: "dialog" },
+            createElement(Form, {}),
+            mode === "duplicate" ? createElement(Form, {}) : null,
+          ),
+        ),
+      );
+      if (mode === "owned") {
+        await expect(run()).resolves.toEqual(["project-clone-chooser", "project-clone-incomplete"]);
+        expect(controls).toEqual(["displayed", "unique", "enabled", "click"]);
+        expect(order).toEqual([
+          "identity",
+          "project-clone-chooser",
+          "retained",
+          "snapshot",
+          "submit",
+          "refusal-read",
+          "retained",
+          "snapshot",
+          "identity",
+          "project-clone-incomplete",
+        ]);
+      } else {
+        if (mode === "duplicate") await expect(run()).rejects.toThrow();
+        else await expect(run()).rejects.toBe(original);
+        expect(order).not.toContain("submit");
+        expect(order).not.toContain("project-clone-incomplete");
+        expect(controls).toEqual(
+          mode === "duplicate"
+            ? ["displayed", "unique"]
+            : mode === "outside"
+              ? ["displayed"]
+              : mode === "disabled"
+                ? ["displayed", "unique", "enabled"]
+                : mode === "snapshot-refused"
+                  ? []
+                  : ["displayed", "unique", "enabled", "click"],
+        );
+      }
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+    }
+  },
+);
+
 function directoryFailure(fault: string, observerFails = false) {
   const original = new Error("Inert original directory operation failure.");
   const calls: string[] = [];
