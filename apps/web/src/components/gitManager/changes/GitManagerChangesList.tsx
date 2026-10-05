@@ -74,6 +74,7 @@ export const GitManagerChangesList = memo(function GitManagerChangesList({
         data={stableRows}
         drawDistance={GIT_MANAGER_CHANGE_ROW_HEIGHT * 12}
         estimatedItemSize={GIT_MANAGER_CHANGE_ROW_HEIGHT}
+        extraData={selectedPath}
         getFixedItemSize={fixedItemSize}
         itemsAreEqual={changeRowsEqual}
         keyExtractor={keyExtractor}
