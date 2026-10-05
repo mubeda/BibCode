@@ -850,3 +850,75 @@ async fn thread_deletion_attempts_provider_and_terminal_cleanup_independently() 
     effects.shutdown().await;
     engine.shutdown().await;
 }
+
+#[tokio::test]
+async fn created_projects_receive_their_repository_identity_once() {
+    let checkout = tempfile::tempdir().unwrap();
+    git(checkout.path(), &["init", "-q"]);
+    git(
+        checkout.path(),
+        &["remote", "add", "origin", "git@github.com:acme/repo.git"],
+    );
+    let database = Database::open_in_memory().await.unwrap();
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let engine = OrchestrationEngine::start(database, EngineOptions::default())
+        .await
+        .unwrap();
+    let effects = OrchestrationEffects::start(
+        engine.clone(),
+        Arc::new(GitRepository::default()),
+        Arc::new(CallbackState::default()),
+        EffectsOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    dispatch(
+        &engine,
+        json!({
+            "type":"project.create", "commandId":"project", "projectId":"p",
+            "title":"Project", "workspaceRoot":checkout.path(), "createdAt":NOW
+        }),
+    )
+    .await;
+
+    let identity = tokio::time::timeout(ORCHESTRATION_EFFECTS_INTEGRATION_DEADLINE, async {
+        loop {
+            let project = engine
+                .repositories()
+                .get_project("p".to_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            if let Some(identity) = project.repository_identity {
+                return (identity, project.updated_at);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the repository identity was recorded before the fixture deadline");
+    assert_eq!(identity.0["canonicalKey"], "github.com/acme/repo");
+    assert_eq!(identity.1, NOW);
+
+    let identity_events = engine
+        .repositories()
+        .read_events_from_sequence(0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event.event.event_type == "project.meta-updated"
+                && event.event.payload.get("repositoryIdentity").is_some()
+        })
+        .count();
+    assert_eq!(identity_events, 1);
+    effects.shutdown().await;
+    engine.shutdown().await;
+}

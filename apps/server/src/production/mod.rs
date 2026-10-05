@@ -20,6 +20,7 @@ pub mod provider_runtime;
 pub mod pull_requests_rpc;
 pub mod relay;
 pub mod remote_update_rpc;
+mod repository_identity;
 pub mod runtime;
 pub mod server_terminal;
 pub mod transfer_routes;

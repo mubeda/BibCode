@@ -38,6 +38,7 @@ use super::host_paths::{
     HostPathError, normalize_host_path_lexically, resolve_host_directory,
     resolve_host_directory_identity,
 };
+use super::repository_identity::{backfill_repository_identities, reconcile_repository_identity};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
@@ -396,6 +397,7 @@ fn bootstrap_process_error(error: ProcessError) -> String {
 
 pub struct OrchestrationEffects {
     cancellation: CancellationToken,
+    backfill: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     producer: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -418,12 +420,18 @@ impl OrchestrationEffects {
         install_project_command_effects(&engine);
         engine.set_bootstrap_effects(Arc::new(ProductionBootstrapEffects {
             repositories: engine.repositories(),
-            repository,
+            repository: repository.clone(),
             callbacks: callbacks.clone(),
         }));
 
+        let backfill = tokio::spawn(backfill_repository_identities(
+            engine.clone(),
+            repository.clone(),
+            cancellation.clone(),
+        ));
         let worker = tokio::spawn(run_worker(
             engine.clone(),
+            repository,
             callbacks,
             receiver,
             cancellation.clone(),
@@ -438,6 +446,7 @@ impl OrchestrationEffects {
 
         Ok(Self {
             cancellation,
+            backfill: tokio::sync::Mutex::new(Some(backfill)),
             producer: tokio::sync::Mutex::new(Some(producer)),
             worker: tokio::sync::Mutex::new(Some(worker)),
         })
@@ -445,6 +454,9 @@ impl OrchestrationEffects {
 
     pub async fn shutdown(&self) {
         self.cancellation.cancel();
+        if let Some(backfill) = self.backfill.lock().await.take() {
+            let _ = backfill.await;
+        }
         if let Some(producer) = self.producer.lock().await.take() {
             let _ = producer.await;
         }
@@ -569,11 +581,14 @@ fn is_reactor_event(event: &OrchestrationEvent) -> bool {
             | "thread.turn-diff-completed"
             | "thread.checkpoint-revert-requested"
             | "thread.deleted"
+            | "project.created"
+            | "project.meta-updated"
     )
 }
 
 async fn run_worker(
     engine: OrchestrationEngine,
+    repository: Arc<GitRepository>,
     callbacks: Arc<dyn OrchestrationEffectCallbacks>,
     mut receiver: mpsc::Receiver<OrchestrationEvent>,
     cancellation: CancellationToken,
@@ -583,7 +598,7 @@ async fn run_worker(
             () = cancellation.cancelled() => return,
             event = receiver.recv() => {
                 let Some(event) = event else { return };
-                if let Err(error) = process_event(&engine, callbacks.as_ref(), &event, &cancellation).await {
+                if let Err(error) = process_event(&engine, &repository, callbacks.as_ref(), &event, &cancellation).await {
                     tracing::warn!(event_type = %event.event.event_type, sequence = event.sequence, %error, "orchestration side effect failed");
                     append_failure_activity(&engine, &event, &error.to_string()).await;
                 }
@@ -594,6 +609,7 @@ async fn run_worker(
 
 async fn process_event(
     engine: &OrchestrationEngine,
+    repository: &GitRepository,
     callbacks: &dyn OrchestrationEffectCallbacks,
     event: &OrchestrationEvent,
     cancellation: &CancellationToken,
@@ -625,7 +641,28 @@ async fn process_event(
             cleanup_deleted_thread(callbacks, event).await;
             Ok(())
         }
+        "project.created" => {
+            reconcile_event_project(engine, repository, event, cancellation).await;
+            Ok(())
+        }
+        // Only a moved workspace changes the checkout; the identity update itself carries no
+        // workspaceRoot, so this cannot loop.
+        "project.meta-updated" if event.event.payload.get("workspaceRoot").is_some() => {
+            reconcile_event_project(engine, repository, event, cancellation).await;
+            Ok(())
+        }
         _ => Ok(()),
+    }
+}
+
+async fn reconcile_event_project(
+    engine: &OrchestrationEngine,
+    repository: &GitRepository,
+    event: &OrchestrationEvent,
+    cancellation: &CancellationToken,
+) {
+    if let Some(project_id) = event.event.payload.get("projectId").and_then(Value::as_str) {
+        reconcile_repository_identity(engine, repository, project_id, cancellation).await;
     }
 }
 
