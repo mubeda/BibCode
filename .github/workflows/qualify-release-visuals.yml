@@ -1,0 +1,31 @@
+# Registration only: dispatch the version of this file on the nominated QA ref.
+# Its capture owner and fixtures deliberately remain on that reviewed ref.
+name: First release visual batch (manual preparation lane)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scene_selection:
+        description: Fixed visual preparation selection
+        type: choice
+        required: true
+        default: release-visual-core
+        options:
+          - release-visual-core
+          - release-visual-settings
+          - release-visual-git-project
+
+permissions:
+  contents: read
+
+jobs:
+  registration_only:
+    name: Nominated QA ref required
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Refuse registration-only execution
+        shell: bash
+        run: |
+          printf '%s\n' 'QUALIFICATION_REQUIRES_NOMINATED_QA_REF'
+          exit 1
