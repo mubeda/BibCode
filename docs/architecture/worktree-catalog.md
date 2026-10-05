@@ -114,6 +114,9 @@ repository trust from mutable project metadata and prevents a temporarily
 missing primary checkout from transferring authority to an unrelated
 repository.
 
+The pin is a local Git-common-directory hash; cross-environment grouping uses
+the separate `repositoryIdentity` described in the architecture overview.
+
 ## Observation and catalog snapshots
 
 One repository observation is shared by every subscribed project with the same

@@ -2384,6 +2384,15 @@ sizes. Cover relevant:
   session in the right pane, the back arrow returns to the normal view, and the
   per-row jump-to-workspace action returns to the normal view and re-points the
   rail to that row's environment;
+- the **Environments | Repositories** switch: open one repository as a project
+  on Local and on a remote environment. Switch the left panel to
+  **Repositories**: the environment rail disappears and one card named after the
+  repository lists both environments with their state and path; an offline
+  environment's entry is dimmed. Its `…` menu shows the normal project menu for
+  that environment. Change the remote checkout's `origin` with
+  `git remote set-url` and, within five minutes of the next catalog refresh,
+  confirm the entry moves to its new card. Switch back to **Environments** and
+  confirm the rail returns with the same environment selected;
 - provider settings and provider/terminal action menus;
 - status-bar Claude/Codex usage with different accounts or usage values on local
   and remote servers: switching the environment rail changes the displayed
