@@ -131,7 +131,8 @@ const failRemoteRequest = (
   }
   return Effect.fail(
     new RemoteEnvironmentAuthFetchError({
-      message: `Failed to fetch remote environment endpoint ${requestUrl} (${String(cause)}).`,
+      message:
+        "Could not reach the server. Check that it is running and that this device can reach its network.",
       cause,
     }),
   );
