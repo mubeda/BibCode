@@ -809,6 +809,12 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   existing removal observer as `manual-archive/package/unknown-remove-<operation>`.
   Those fixed phases identify the existing Settings/menu/confirmation, row-absence,
   child/tunnel joins and toast boundaries without another read, action or budget.
+  The retry/dismiss flow also records the six existing import-helper boundaries as
+  `failure-primary-import-workspace/menu/path-mode/path-input/submit/composer`.
+  These fixed phases reuse the helper's optional observer; they add no browser
+  read, action, wait or budget. After import succeeds, restore the original
+  `failure-retry-dismiss` phase. A last marker identifies the attempted boundary,
+  not a unique timeout cause or evidence that the operation completed.
   At exactly the per-kind `toast-list`, `toast-displayed`, `toast-clickable`, or
   `toast-click` removal phase, the same existing bounded failure sample may retain
   `manualRemoval` with the six closed removal-snapshot fields. Compare only the

@@ -1094,7 +1094,8 @@ async function failureFlow() {
   phase("failure-retry-dismiss");
   const host = await fakeHost("update-a", 4888, `QA Failure ${currentTheme}`);
   await addHost(host);
-  await importProject(host);
+  await importProject(host, (operation) => phase(`failure-${operation}`));
+  phase("failure-retry-dismiss");
   const draft = `retained failure draft ${currentTheme}`;
   await required().$(composer).setValue(draft);
   await openConfirmation(host, "row");

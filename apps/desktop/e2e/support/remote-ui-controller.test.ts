@@ -592,6 +592,58 @@ it("reconfirms a wrong-version retry with the restarted host's unknown target an
   ]);
 });
 
+it.each(["workspace", "menu", "path-mode", "path-input", "submit", "composer", "completed"])(
+  "attributes the existing remote failure-flow import wait: %s",
+  async (operation) => {
+    const phases: string[] = [];
+    let currentPhase = "";
+    const targetPhase =
+      operation === "completed" ? "failure-retry-dismiss" : `failure-primary-import-${operation}`;
+    const stopped = new Error("inert import boundary failure");
+    const publicOperation = async () => {
+      if (operation !== "completed" && currentPhase === targetPhase) throw stopped;
+      return true;
+    };
+    const importStart = controller.indexOf("async function importProject(");
+    const importEnd = controller.indexOf("async function setTheme(", importStart);
+    const flowStart = controller.indexOf("async function failureFlow()");
+    const flowEnd = controller.indexOf("async function restartFailures()", flowStart);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        controller.slice(importStart, importEnd) +
+          controller.slice(flowStart, flowEnd) +
+          "\nfailureFlow",
+      ),
+      {
+        phase: (value: string) => {
+          currentPhase = value;
+          phases.push(value);
+        },
+        currentTheme: "light",
+        composer: "composer",
+        fakeHost: async () => ({ label: "QA Failure light", project: "/owned-project" }),
+        addHost: async () => {},
+        workspace: publicOperation,
+        click: publicOperation,
+        owner: { until: async (read: () => Promise<boolean>) => read() },
+        required: () => ({
+          $: () => ({
+            isDisplayed: publicOperation,
+            isExisting: publicOperation,
+            waitForDisplayed: publicOperation,
+            setValue: publicOperation,
+          }),
+        }),
+        openConfirmation: async () => {
+          throw stopped;
+        },
+      },
+    );
+    await expect(run()).rejects.toBe(stopped);
+    expect(phases.at(-1)).toBe(targetPhase);
+  },
+);
+
 it.each(["Dismiss", "Check"])("identifies the final failure-flow %s boundary", async (action) => {
   const start = controller.indexOf("async function failureFlow()");
   const end = controller.indexOf("async function restartFailures()", start);
