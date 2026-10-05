@@ -1,0 +1,100 @@
+name: macOS Finder icon diagnostic
+
+on:
+  push:
+    branches: [codex/release-v074-mac-bootstrap]
+    paths:
+      - .github/workflows/macos-icon-diagnostic.yml
+      - scripts/check-macos-app-icon.swift
+      - scripts/diagnose-macos-icon.ts
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    name: Diagnose unchanged Intel payload
+    runs-on: macos-26-intel
+    timeout-minutes: 90
+    steps:
+      - name: Checkout unchanged candidate product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: f0632e2550ee4ca16363c18b8a4b1ed7c548f32e
+
+      - name: Checkout diagnostic tooling separately
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: diagnostic-tooling
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          run-install: true
+          cache: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Build unchanged candidate DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p diagnostic-evidence
+          printf '%s\n' 'mac-icon-diagnostic {"stage":"build-dispatched"}'
+          if node scripts/build-desktop-artifact.ts --platform mac --target dmg --arch x64 --output-dir diagnostic-payload >diagnostic-evidence/build.private.log 2>&1; then
+            printf '%s\n' 'mac-icon-diagnostic {"stage":"build-returned"}'
+          else
+            printf '%s\n' 'mac-icon-diagnostic {"stage":"build-failed"}'
+            exit 1
+          fi
+
+      - name: Compare owned verifier processes on one exact mounted payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          shopt -s nullglob
+          dmg_paths=(diagnostic-payload/*.dmg)
+          test "${#dmg_paths[@]}" -eq 1
+          mount_dir="$(mktemp -d)"
+          printf '%s\n' closed >diagnostic-evidence/cleanup-safe
+          cleanup() {
+            if [[ -f diagnostic-evidence/cleanup-safe ]]; then
+              hdiutil detach "$mount_dir" >/dev/null 2>&1 || hdiutil detach -force "$mount_dir" >/dev/null 2>&1 || true
+              rmdir "$mount_dir" >/dev/null 2>&1 || true
+              printf '%s\n' 'mac-icon-diagnostic {"stage":"cleanup-returned","detachVerified":false}'
+            else
+              printf '%s\n' 'mac-icon-diagnostic {"stage":"cleanup-refused-unjoined-child"}'
+            fi
+          }
+          trap cleanup EXIT
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$mount_dir" "${dmg_paths[0]}" >diagnostic-evidence/mount.private.log 2>&1
+          app_paths=("$mount_dir"/*.app)
+          test "${#app_paths[@]}" -eq 1
+          codesign --verify --deep --strict "${app_paths[0]}" >diagnostic-evidence/signature.private.log 2>&1
+          codesign --display --verbose=4 "${app_paths[0]}" >>diagnostic-evidence/signature.private.log 2>&1
+          grep -Fq 'Signature=adhoc' diagnostic-evidence/signature.private.log
+          grep -Fq 'TeamIdentifier=not set' diagnostic-evidence/signature.private.log
+          shasum -a 256 "${dmg_paths[0]}" | awk '{print $1}' >diagnostic-evidence/payload.sha256
+          cp diagnostic-tooling/scripts/diagnose-macos-icon.ts scripts/diagnose-macos-icon.ts
+          node scripts/diagnose-macos-icon.ts diagnostic-tooling/scripts/check-macos-app-icon.swift "${app_paths[0]}" diagnostic-evidence
+
+      - name: Retain closed diagnostic observations
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-icon-diagnostic-closed
+          path: |
+            diagnostic-evidence/observations.json
+            diagnostic-evidence/payload.sha256
+          if-no-files-found: warn

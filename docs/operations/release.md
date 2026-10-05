@@ -150,6 +150,15 @@ TIFF. Native macOS jobs run its `--self-test` raster and threshold fixtures
 before building, then require the separate mounted-application verdict after
 signature verification. The alpha, luminance, dark-area, and pale-area limits
 remain the same; synthetic fixtures cannot qualify a release payload.
+When the exact native payload stalls, a separate focused CI diagnostic may
+compare fresh verifier processes against one unchanged, signature-verified
+mounted application. The temporary `macos-icon-diagnostic.yml` workflow keeps
+its fixed diagnostic outcomes separate from release acceptance. It reuses the
+owned command close/timeout contract, never admits another arm or unmounts after
+unverified child cleanup, and retains all original pixel limits and coverage.
+Follow [the macOS procedure](../testing/macos-desktop.md) for the controlled
+initialization, warming, and equivalent-grid comparisons. A diagnostic pass
+does not replace the six desktop/six server matrix or qualify release assets.
 
 Windows artifacts remain without Authenticode. macOS remains ad-hoc
 signed/unnotarized by decision (2026-09-18): an ad-hoc identity changes with

@@ -4,6 +4,8 @@ import AppKit
 
 enum IconVerificationStage: String {
   case swiftEntry = "swift-entry"
+  case applicationInitDispatched = "application-init-dispatched"
+  case applicationInitReturned = "application-init-returned"
   case fileCheckSucceeded = "file-check-succeeded"
   case workspaceDispatched = "workspace-dispatched"
   case workspaceReturned = "workspace-returned"
@@ -39,8 +41,19 @@ func observeIconStage(
     fields += ",\"dimensionsCapped\":\(dimensions.width > cap || dimensions.height > cap)"
   }
   // Logging remains optional; write or flush refusal cannot replace the verdict.
-  fputs("mac-icon-observation {\(fields)}\n", stderr)
+  let record = "{\(fields)}\n"
+  fputs("mac-icon-observation \(record)", stderr)
   fflush(stderr)
+  // Diagnostic-only receipt: logging refusal still cannot replace the verdict.
+  if let path = ProcessInfo.processInfo.environment["MAC_ICON_DIAGNOSTIC_RECORDS_PATH"],
+    let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path))
+  {
+    defer { try? handle.close() }
+    do {
+      try handle.seekToEnd()
+      try handle.write(contentsOf: Data(record.utf8))
+    } catch {}
+  }
 }
 
 // Rasterize the selected Finder representation, rather than serializing every
@@ -63,10 +76,11 @@ func renderIcon(_ image: NSImage, observing: Bool = true) -> NSBitmapImageRep? {
   defer { NSGraphicsContext.restoreGraphicsState() }
   NSGraphicsContext.current = context
   context.cgContext.clear(CGRect(x: 0, y: 0, width: 1024, height: 1024))
-  context.cgContext.scaleBy(x: 4, y: 4)
+  let rectangleOnly = ProcessInfo.processInfo.environment["MAC_ICON_DIAGNOSTIC_RECT_ONLY"] == "1"
+  if !rectangleOnly { context.cgContext.scaleBy(x: 4, y: 4) }
   if observing { observeIconStage(.drawDispatched) }
   image.draw(
-    in: NSRect(x: 0, y: 0, width: 256, height: 256),
+    in: NSRect(x: 0, y: 0, width: rectangleOnly ? 1024 : 256, height: rectangleOnly ? 1024 : 256),
     from: .zero, operation: .copy, fraction: 1
   )
   if observing { observeIconStage(.drawReturned) }
@@ -155,6 +169,11 @@ func runRasterFixtures() -> Bool {
 }
 
 observeIconStage(.swiftEntry)
+if ProcessInfo.processInfo.environment["MAC_ICON_DIAGNOSTIC_INITIALIZE_APPLICATION"] == "1" {
+  observeIconStage(.applicationInitDispatched)
+  _ = NSApplication.shared
+  observeIconStage(.applicationInitReturned)
+}
 
 if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test" {
   guard runRasterFixtures() else {

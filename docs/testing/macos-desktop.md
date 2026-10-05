@@ -207,6 +207,23 @@ transparent, and ratio-boundary images. They preserve the existing alpha,
 luminance, dark-area, and pale-area limits. Their pass does not replace the
 mandatory check against the exact mounted DMG application.
 
+For a payload-only Finder drawing stall, use a separate native CI diagnostic
+checkout before changing the mandatory gate. The temporary
+`macos-icon-diagnostic.yml` workflow builds an unchanged candidate once and
+compares fresh verifier processes on that same read-only mounted application:
+the control, explicit `NSApplication.shared` initialization, then either a
+control repeat to detect warming or equivalent-grid rectangle scaling when
+both payload probes time out. Each arm runs the shared raster fixtures first;
+if either arm cannot complete those fixtures, optional payload comparisons
+are not admitted.
+The rectangle arm retains the 1024-square bitmap and 256-point source image;
+it changes the destination rectangle instead of the explicit context scale.
+Diagnostic commands have a 120-second bound and reuse the command owner's
+verified-close timeout and five-second cleanup contract. An unjoined child
+stops admission and prevents unmount. Closed private observations remain
+diagnostic evidence; they cannot replace any release platform or payload gate.
+Do not run this native diagnostic locally.
+
 Build and run packaged E2E with:
 
 ```sh
