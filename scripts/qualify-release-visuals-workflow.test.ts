@@ -94,6 +94,7 @@ describe("first visual batch workflow boundary", () => {
             "release-visual-cursor-question",
             "release-visual-workspace-substates",
             "release-visual-provider-chat",
+            "release-visual-native-sharing",
           ],
         },
       },

@@ -22,6 +22,79 @@ qualification = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(qualification)
 
 
+class LifecycleAdoptedReaperTests(unittest.TestCase):
+    def test_unassigned_controller_callbacks_cannot_reap_any_process(self):
+        children = mock.Mock(return_value=[(42, 'Z'), (57, 'Z')]); waitpid = mock.Mock()
+        current = [None]
+        reap = qualification.lifecycle_adopted_reaper(lambda: current[0], children, waitpid)
+        reap(signal.SIGCHLD, None)
+        children.assert_not_called(); waitpid.assert_not_called()
+        current[0] = types.SimpleNamespace(pid=42)
+        reap()
+        self.assertEqual(waitpid.call_args_list, [mock.call(57, os.WNOHANG)])
+
+    def test_specific_zombies_only_excluding_controller_and_reparent_races(self):
+        children = mock.Mock(return_value=[(42, 'Z'), (57, 'Z'), (59, 'S'), (61, 'Z')])
+        def waitpid(pid, flags):
+            self.assertEqual(flags, os.WNOHANG)
+            if pid == 61: raise ChildProcessError()
+            return (0, 0)  # The observation raced with reparent/exit; never block or signal.
+        waits = mock.Mock(side_effect=waitpid)
+        reap = qualification.lifecycle_adopted_reaper(lambda: types.SimpleNamespace(pid=42), children, waits)
+        reap(signal.SIGCHLD, None)
+        self.assertEqual(waits.call_args_list, [mock.call(57, os.WNOHANG), mock.call(61, os.WNOHANG)])
+        children.side_effect = ProcessLookupError()
+        reap()  # A disappearing namespace entry cannot replace the controller's result.
+
+    def test_actual_inner_handler_covers_assignment_and_early_or_late_adoption_without_stealing_status(self):
+        for timing in ['before-install', 'during-assignment', 'during-wait']:
+            with self.subTest(timing=timing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(); fixture = root / 'fixture'; fixture.mkdir(); evidence = root / 'evidence'; evidence.mkdir(); web = root / 'web'; web.mkdir()
+                handlers = {signal.SIGCHLD: 'original'}; states = {}; current = [None]; seen = []; tick = [0]; case = self
+                original_readlink = qualification.os.readlink
+                def readlink(path): return 'net:[private]' if str(path) == '/proc/self/ns/net' else original_readlink(path)
+                def clock(): tick[0] += 10; return tick[0]
+                if timing == 'before-install': states[57] = 'Z'
+                def install(number, callback): handlers[number] = callback
+                def waitpid(pid, flags):
+                    self.assertEqual(flags, os.WNOHANG); self.assertNotEqual(pid, 42)
+                    seen.append(pid); states.pop(pid, None); return pid, 0
+                class FakeProcess:
+                    pid = 42
+                    status = None
+                    def wait(self, timeout):
+                        if timing == 'during-wait':
+                            states[57] = 'Z'
+                            if callable(handlers[signal.SIGCHLD]): handlers[signal.SIGCHLD](signal.SIGCHLD, None)
+                        case.assertNotIn(57, states)  # Producer must see the hook reaped before its own exit.
+                        self.status = 23; states.pop(42, None); return self.status
+                    def poll(self): return self.status
+                def popen(*args, **kwargs):
+                    if timing == 'during-assignment':
+                        states[42] = 'Z'; states[57] = 'Z'
+                        if callable(handlers[signal.SIGCHLD]): handlers[signal.SIGCHLD](signal.SIGCHLD, None)
+                        self.assertEqual(seen, [])
+                    process = FakeProcess(); current[0] = process; return process
+                with mock.patch.object(qualification.os, 'getpid', return_value=1), \
+                     mock.patch.object(qualification.os, 'readlink', side_effect=readlink), \
+                     mock.patch.object(qualification.signal, 'getsignal', side_effect=lambda number: handlers[number]), \
+                     mock.patch.object(qualification.signal, 'signal', side_effect=install), \
+                     mock.patch.object(qualification.os, 'waitpid', side_effect=waitpid), \
+                     mock.patch.object(qualification, 'namespace_children', side_effect=lambda: list(states.items())), \
+                     mock.patch.object(qualification, 'network_environment', return_value={}), \
+                     mock.patch.object(qualification, 'run_ip', return_value='[]'), \
+                     mock.patch.object(qualification, 'prepare_tools'), \
+                     mock.patch.object(qualification.subprocess, 'Popen', side_effect=popen), \
+                     mock.patch.object(qualification, 'reap_children'), \
+                     mock.patch.object(qualification.time, 'monotonic', side_effect=clock), \
+                     mock.patch.object(qualification.os, 'kill') as kill:
+                    status = qualification.inner(evidence, fixture, 'node', 'server', 'chrome', 'driver', 'git', 'dirname', 'net:[host]', 'a' * 40, 'ip', 'release-visual-project-lifecycle', str(web))
+                self.assertEqual(status, 23)
+                self.assertEqual(seen, [57]); kill.assert_not_called()
+                self.assertEqual(handlers[signal.SIGCHLD], 'original')
+                self.assertEqual(json.loads((evidence / 'namespace-cleanup.json').read_text())['remaining'], [])
+
+
 class FixturePathBudgetTests(unittest.TestCase):
     def actual_paths(self, scenario, run_id):
         module = ast.parse(SOURCE.read_text())
@@ -69,6 +142,42 @@ class FixturePathBudgetTests(unittest.TestCase):
 
 
 class ScenarioSelectionTests(unittest.TestCase):
+    def test_lifecycle_cleanup_preserves_private_state_until_exact_restoration_and_all_owners_join(self):
+        for mode in ['missing', 'false', 'wrong-selection', 'wrong-source', 'live-child', 'cleanup-failure', 'malformed', 'safe']:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as evidence_dir:
+                evidence = Path(evidence_dir)
+                fixture = Path(tempfile.mkdtemp(prefix='bc-vl-unit-', dir='/tmp'))
+                try:
+                    (evidence / 'namespace-cleanup.json').write_text(json.dumps({'remaining': [], 'controllerReaped': True}))
+                    result = {'selection': 'release-visual-project-lifecycle', 'source': 'a' * 40,
+                              'projectLifecycleFixtureSafeToDelete': True, 'childProcessesClosed': True, 'cleanupFailures': []}
+                    if mode == 'missing': result.pop('projectLifecycleFixtureSafeToDelete')
+                    if mode == 'false': result['projectLifecycleFixtureSafeToDelete'] = False
+                    if mode == 'wrong-selection': result['selection'] = 'release-visual-core'
+                    if mode == 'wrong-source': result['source'] = 'b' * 40
+                    if mode == 'live-child': result['childProcessesClosed'] = False
+                    if mode == 'cleanup-failure': result['cleanupFailures'] = [{}]
+                    (evidence / 'result.json').write_text('invalid' if mode == 'malformed' else json.dumps(result))
+                    with mock.patch.dict(os.environ, {'GITHUB_SHA': 'a' * 40}):
+                        deleted = qualification.cleanup_ui_fixture(fixture, evidence, {'supervisorReaped': True}, 'release-visual-project-lifecycle')
+                    self.assertEqual(deleted, mode == 'safe')
+                    self.assertEqual(fixture.exists(), mode != 'safe')
+                finally:
+                    shutil.rmtree(fixture, ignore_errors=True)
+
+    def test_project_lifecycle_has_fixed_controller_bounds_and_exact_owner_payload(self):
+        self.assertEqual(qualification.scenario_settings('release-visual-project-lifecycle'), {
+            'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+            'inner_timeout': 600, 'outer_timeout': 660,
+            'evidence_prefix': 'issue29-project-lifecycle-', 'fixture_prefix': 'bc-vl-',
+        })
+        self.assertEqual(qualification.inner_resources(['release-visual-project-lifecycle', '/owned/web']),
+                         ('release-visual-project-lifecycle', None, '/owned/web', 'core'))
+        for args in [['release-visual-project-lifecycle'], ['release-visual-project-lifecycle', '/owned/web', 'full'],
+                     ['release-visual-project-lifecycle', '/owned/web', '']]:
+            with self.assertRaisesRegex(RuntimeError, 'Unknown qualification owner payload'):
+                qualification.inner_resources(args)
+
     def test_provider_chat_cleanup_requires_the_actual_safe_restoration_and_join_receipt(self):
         for mode in ['missing', 'false', 'wrong-selection', 'wrong-source', 'live-child', 'cleanup-failure', 'malformed', 'safe']:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as evidence_dir:

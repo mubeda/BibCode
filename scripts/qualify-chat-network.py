@@ -86,17 +86,25 @@ def _setup(environment, run_owned, context, readlink, platform, clock, read_owne
         ui_keys = ['BIBCODE_RELEASE_UI_FAKE_HOST', 'BIBCODE_RELEASE_UI_WEB', 'BIBCODE_RELEASE_UI_MATRIX']
         delivery_key = 'BIBCODE_DELIVERY_UI_WEB'
         delivery_selection = 'BIBCODE_DELIVERY_UI_SELECTION'
+        native_key = 'BIBCODE_NATIVE_SHARING_APP'
         if len(owner) == 14:
+            require(not any(key in environment for key in ui_keys + [delivery_key, delivery_selection, native_key]))
+        elif len(owner) == 16 and owner[14] == 'release-visual-native-sharing':
             require(not any(key in environment for key in ui_keys + [delivery_key, delivery_selection]))
+            app = Path(owner[15])
+            require(app.is_absolute() and app.suffix == '.AppImage' and not app.is_symlink())
+            canonical = app.resolve(strict=True)
+            require(canonical.is_file() and str(canonical) == owner[15] == environment.get(native_key))
         elif len(owner) == 16:
-            require(owner[14] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat'] and not any(key in environment for key in ui_keys))
+            require(native_key not in environment)
+            require(owner[14] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle'] and not any(key in environment for key in ui_keys))
             require(environment.get(delivery_selection) == owner[14])
             web = Path(owner[15])
             require(web.is_absolute())
             canonical = web.resolve(strict=True)
             require(canonical.is_dir() and str(canonical) == owner[15] == environment.get(delivery_key))
         else:
-            require(delivery_key not in environment and delivery_selection not in environment)
+            require(delivery_key not in environment and delivery_selection not in environment and native_key not in environment)
             require(owner[14] == 'remote-updates-ui')
             require(owner[17] in ['core', 'full'] and owner[17] == environment.get(ui_keys[2]))
             for index, key, directory in [(15, ui_keys[0], False), (16, ui_keys[1], True)]:

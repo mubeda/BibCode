@@ -99,6 +99,38 @@ class FakeIp:
         return result, json.dumps(value).encode()
 
 class NetworkTests(unittest.TestCase):
+    def test_actual_project_lifecycle_owner_keeps_exact_sixteen_argument_containment(self):
+        with tempfile.TemporaryDirectory(prefix='lifecycle-owner-contract-') as directory:
+            owner, env = actual_owner_handoff(Path(directory), 'release-visual-project-lifecycle')
+            self.assertEqual(len(owner), 16)
+            self.assertEqual(owner[14], 'release-visual-project-lifecycle')
+            fake = FakeIp()
+            proof = self.setup_network(fake, env=env, owner=owner)
+            self.assertEqual(fake.mutations, MUTATIONS)
+            self.assertTrue(proof['privateNet'])
+            self.assertTrue(proof['pidOwnerMatches'])
+            self.assertTrue(proof['linksContained'])
+            self.assertTrue(proof['routeContained'])
+
+    def test_project_lifecycle_owner_refuses_wrong_tuple_assets_namespace_and_extra_arguments(self):
+        with tempfile.TemporaryDirectory(prefix='lifecycle-owner-negative-') as directory:
+            owner, env = actual_owner_handoff(Path(directory), 'release-visual-project-lifecycle')
+            other = Path(directory) / 'foreign-web'; other.mkdir()
+            cases = [owner + [''], owner + ['extra'], owner[:-1]]
+            for index, value in [(14, 'release-visual-core'), (14, '../arbitrary'), (15, str(other.resolve()))]:
+                invalid = list(owner); invalid[index] = value; cases.append(invalid)
+            for invalid in cases:
+                fake = FakeIp()
+                with self.assertRaises(network.NetworkRefused):
+                    self.setup_network(fake, env=env, owner=invalid)
+                self.assertEqual(fake.calls, [])
+            for key, value in [('BIBCODE_DELIVERY_UI_SELECTION', 'release-visual-core'),
+                               ('BIBCODE_UPLOAD_NETNS', 'net:[999]'), ('BIBCODE_UPLOAD_USERNS', 'user:[999]')]:
+                fake = FakeIp(); bad = {**env, key: value}
+                with self.assertRaises(network.NetworkRefused):
+                    self.setup_network(fake, env=bad, owner=owner)
+                self.assertEqual(fake.calls, [])
+
     def setup_network(self, fake, env=None, namespaces=None, owner=None, **kwargs):
         return network.setup(env or ENV, fake, readlink=(namespaces or NAMESPACES).__getitem__,
                              platform='linux', read_owner=lambda: ('\0'.join(OWNER if owner is None else owner) + '\0').encode(), read_capabilities=kwargs.pop('read_capabilities', lambda: b'CapEff:\t0000000000001000\n'), **kwargs)

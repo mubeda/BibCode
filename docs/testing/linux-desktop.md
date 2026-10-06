@@ -2039,3 +2039,38 @@ inputs. Local HappyDOM, VM, fake-port and TempGit results prove those boundaries
 the real provider/server/browser run remains CI-only. Independently inspect
 all fourteen paired original pixels before accepting these rows. No full-matrix,
 Tauri, native application or final release acceptance follows from this batch.
+
+### Contained native sharing visual qualification
+
+The manual release visual workflow also accepts `release-visual-native-sharing`.
+Dispatch it from the same reviewed candidate ref used for the visual report:
+
+```sh
+gh workflow run qualify-release-visuals.yml --ref '<qualified-ref>' -f scene_selection=release-visual-native-sharing
+```
+
+This selection calls the packaged desktop workflow in its native-sharing mode.
+It builds a Linux x64 E2E AppImage with the embedded Tauri driver and the server
+hermetic guard, then runs it with a private data root, owned Xvfb and the
+checked PID1/network namespace. The ordinary six-platform packaged smoke
+selection retains its original matrix and commands.
+
+The native controller uses public Theme, Share this host and Refresh addresses
+controls. It removes and restores only the already-admitted private default
+route, checks the real native bridge and typed loopback descriptor, and never
+mints an offer or widens exposure. Boot, storage, endpoint, input bytes, window,
+route ownership and original UI restoration must stay joined across captures.
+The four original PNGs bind the existing native-share-no-route and
+native-share-refresh rows in both themes at 1280 by 960. These are native
+main-webview sharing observations; they do not qualify OS menus, separate
+Preview windows, updater recovery or WSL.
+
+Retained artifacts are the four exact original names plus the finite phase,
+failure, provenance, result, assertions, owned-cleanup, namespace-cleanup and
+supervisor JSON receipts. Preserve original bytes and inspect each original at
+original detail. A green local helper or compiled component test is not native
+evidence. Candidate source/input hashes, zero guard refusals, joined controller
+and child cleanup, unchanged host namespace and safe fixture deletion must be
+verified from the same CI run. Unsafe or unproven cleanup preserves the fixture
+and fails qualification. Record run-specific SHAs, timings and original hashes
+in the execution report, not this runbook.

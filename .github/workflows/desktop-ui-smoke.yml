@@ -2,13 +2,24 @@ name: Packaged Desktop UI Smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      native_sharing:
+        description: Qualify only the existing native sharing rows
+        type: boolean
+        default: false
   workflow_call:
+    inputs:
+      native_sharing:
+        description: Qualify only the existing native sharing rows
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   desktop_ui_smoke:
+    if: ${{ !inputs.native_sharing }}
     name: Desktop UI - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -78,7 +89,7 @@ jobs:
 
       - name: Install Linux desktop automation dependencies
         if: matrix.platform == 'linux'
-        run: |
+        run: &linux_desktop_dependencies |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
@@ -255,3 +266,90 @@ jobs:
             ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*.png
             ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*.log
           if-no-files-found: warn
+
+  native_sharing:
+    name: Linux packaged native sharing in both themes
+    if: ${{ inputs.native_sharing }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+      - name: Install native build and private display dependencies
+        run: *linux_desktop_dependencies
+      - name: Install frozen dependencies
+        run: vp install --frozen-lockfile
+      - name: Check native ownership and namespace admission
+        run: |
+          python3 -B scripts/qualify-chat-uploads.test.py
+          python3 -B scripts/qualify-chat-network.test.py
+          python3 -B scripts/qualify-native-sharing.test.py
+          python3 -B scripts/qualify-chat-uploads.py preflight
+          vp test run scripts/qualify-native-sharing-workflow.test.ts apps/desktop/e2e/support/release-visual-native-sharing-route.test.ts apps/desktop/e2e/support/release-visual-native-sharing-network.test.ts apps/desktop/e2e/support/release-visual-native-sharing-host.test.ts apps/desktop/e2e/support/release-visual-native-sharing-application.test.ts apps/desktop/e2e/support/release-visual-native-sharing-dom.test.ts apps/desktop/e2e/support/release-visual-native-sharing-identity.test.ts apps/desktop/e2e/support/release-visual-native-sharing-browser.test.ts apps/desktop/e2e/support/release-visual-native-sharing.test.ts apps/desktop/e2e/support/owned-visual-capture.test.ts apps/desktop/e2e/support/qualification-owner.test.ts
+      - name: Check compiled public native sharing views
+        working-directory: apps/web
+        run: vp test run --project unit src/release-visual-native-sharing.public.test.tsx
+      - name: Required native static gates
+        run: |
+          vp check
+          vp run typecheck
+      - name: Build guarded packaged native app
+        working-directory: apps/desktop
+        env:
+          VITE_BIBCODE_DESKTOP_E2E: "1"
+          NO_STRIP: "1"
+        run: vp exec tauri build --features desktop-e2e,bibcode-server/hermetic-test-guard --config ./src-tauri/tauri.e2e.conf.json --bundles appimage --target x86_64-unknown-linux-gnu
+      - name: Copy immutable native inputs
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, re, shutil
+          from pathlib import Path
+          version = json.loads(Path('apps/desktop/package.json').read_text())['version']
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+              raise RuntimeError('Native fixture version refused')
+          app = Path('target/x86_64-unknown-linux-gnu/release/bundle/appimage') / f'BiBCode_{version}_amd64.AppImage'
+          if app.is_symlink() or not app.is_file() or app.stat().st_size == 0:
+              raise RuntimeError('Native packaged input refused')
+          target = Path(os.environ['RUNNER_TEMP']) / 'issue29-native-build'
+          target.mkdir(mode=0o700)
+          shutil.copy2(app, target / 'BiBCode.AppImage')
+          (target / 'BiBCode.AppImage').chmod(0o500)
+          PYTHON
+      - name: Run contained native sharing scenes
+        env:
+          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-native-build/BiBCode.AppImage
+          BIBCODE_NATIVE_SHARING_APP: ${{ runner.temp }}/issue29-native-build/BiBCode.AppImage
+        run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-native-sharing
+      - name: Retain explicit native sharing evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue29-native-sharing-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/assertions.json
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/owned-cleanup.json
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/native-share-no-route-light.png
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/native-share-no-route-dark.png
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/native-share-refresh-light.png
+            ${{ runner.temp }}/issue29-native-sharing-${{ github.run_id }}/native-share-refresh-dark.png

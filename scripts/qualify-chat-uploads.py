@@ -54,7 +54,29 @@ def scenario_settings(name):
         return {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
                 'inner_timeout': 600, 'outer_timeout': 660,
                 'evidence_prefix': 'issue29-provider-chat-', 'fixture_prefix': 'bc-vp-'}
+    if name == 'release-visual-project-lifecycle':
+        return {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+                'inner_timeout': 600, 'outer_timeout': 660,
+                'evidence_prefix': 'issue29-project-lifecycle-', 'fixture_prefix': 'bc-vl-'}
+    if name == 'release-visual-native-sharing':
+        return {'controller': 'apps/desktop/e2e/qualify-native-sharing.ts',
+                'inner_timeout': 600, 'outer_timeout': 660,
+                'evidence_prefix': 'issue29-native-sharing-', 'fixture_prefix': 'bc-vn-'}
     raise RuntimeError('Unknown qualification scenario')
+
+def native_input_hashes(app, xvfb):
+    """Exactly the immutable packaged application and its owned display executable."""
+    result = {}
+    for key, raw in [('appSha256', app), ('xvfbSha256', xvfb)]:
+        path = Path(raw)
+        if (not path.is_absolute() or path.is_symlink() or not path.is_file()
+                or str(path.resolve(strict=True)) != raw or path.stat().st_size > 512 * 1024 * 1024):
+            raise RuntimeError('Owned native build input refused')
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''): digest.update(chunk)
+        result[key] = digest.hexdigest()
+    return result
 
 def ui_input_hashes(server, fake_host, web_root):
     def digest(path):
@@ -89,14 +111,16 @@ def cleanup_ui_fixture(fixture, evidence, supervisor, scenario='remote-updates-u
         cleanup = json.loads(receipt.read_text())
         if cleanup.get('remaining') != [] or cleanup.get('controllerReaped') is not True:
             return False
-        if scenario == 'release-visual-provider-chat':
+        if scenario in ['release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-native-sharing']:
             result_path = evidence / 'result.json'
             metadata = result_path.lstat()
             if result_path.is_symlink() or not result_path.is_file() or metadata.st_nlink != 1 or metadata.st_size > 131072:
                 return False
             result = json.loads(result_path.read_text())
             if (result.get('selection') != scenario or result.get('source') != os.environ.get('GITHUB_SHA')
-                    or result.get('providerChatFixtureSafeToDelete') is not True
+                    or result.get({'release-visual-provider-chat': 'providerChatFixtureSafeToDelete',
+                                   'release-visual-project-lifecycle': 'projectLifecycleFixtureSafeToDelete',
+                                   'release-visual-native-sharing': 'nativeSharingFixtureSafeToDelete'}[scenario]) is not True
                     or result.get('childProcessesClosed') is not True or result.get('cleanupFailures') != []):
                 return False
         shutil.rmtree(fixture)
@@ -215,15 +239,59 @@ def namespace_children():
                 pass
     return children
 
+def lifecycle_adopted_reaper(read_controller, children=None, waitpid=None):
+    """Best-effort specific adopted-zombie reaping; the direct controller keeps its status owner."""
+    children = children or namespace_children
+    waitpid = waitpid or os.waitpid
+    def reap(*_):
+        try:
+            controller = read_controller()
+            if controller is None:
+                return  # SIGCHLD may arrive while Popen has not yet assigned its direct child.
+            direct = controller.pid
+            if type(direct) is not int or not 2 <= direct <= 2147483647:
+                return
+            observed = children()
+            if len(observed) > 256:
+                return
+            for pid, state in observed:
+                if type(pid) is not int or not 2 <= pid <= 2147483647 or pid == direct or state != 'Z':
+                    continue
+                try:
+                    waitpid(pid, os.WNOHANG)
+                except (ChildProcessError, ProcessLookupError):
+                    pass  # Adoption/exit can race the private namespace sample.
+        except Exception:
+            pass  # Optional reaping never replaces Popen.wait or the final cleanup proof.
+    return reap
+
+
 def prepare_tools(fixture, node, git, dirname):
     import shlex
     for name, executable in [('node', node), ('git', git), ('dirname', dirname)]:
         path = fixture / 'bin' / name
         path.write_text('#!/bin/sh\nexec ' + shlex.quote(executable) + ' "$@"\n')
         path.chmod(0o700)
+
     for name in ['gh', 'glab']:
         path = fixture / 'bin' / name
         path.write_text('#!/bin/sh\nexit 127\n')
+        path.chmod(0o700)
+
+def prepare_native_launcher_tools(fixture, which=shutil.which):
+    """Only the pinned AppRun interpreter/path reader, without widening PATH."""
+    import shlex
+    for name in ['bash', 'readlink']:
+        raw = which(name)
+        if not raw or not Path(raw).is_absolute():
+            raise RuntimeError('Owned native launcher tool unavailable')
+        executable = Path(raw).resolve(strict=True)
+        if (not executable.is_file() or not os.access(executable, os.X_OK)
+                or executable.stat().st_mode & 0o022):
+            raise RuntimeError('Owned native launcher executable refused')
+        path = fixture / 'bin' / name
+        with path.open('x') as stream:
+            stream.write('#!/bin/sh\nexec ' + shlex.quote(str(executable)) + ' "$@"\n')
         path.chmod(0o700)
 
 
@@ -265,7 +333,10 @@ def inner_resources(arguments):
         return 'chat-upload', None, None, 'core'
     if len(arguments) == 4 and arguments[0] == 'remote-updates-ui':
         return arguments[0], arguments[1], arguments[2], ui_matrix_selection(arguments[3])
-    if len(arguments) == 2 and arguments[0] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
+    if (len(arguments) == 2 and arguments[0] == 'release-visual-native-sharing'
+            and Path(arguments[1]).is_absolute() and arguments[1].endswith('.AppImage')):
+        return arguments[0], None, arguments[1], 'core'
+    if len(arguments) == 2 and arguments[0] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle']:
         return arguments[0], None, arguments[1], 'core'
     raise RuntimeError('Unknown qualification owner payload')
 
@@ -282,6 +353,8 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
     signal.signal(signal.SIGINT, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     process = None
     status = 1
+    lifecycle_reaper = None
+    previous_sigchld = None
     try:
         trusted_network = network_environment(host_namespace, ip)
         run_ip(ip, 'link', 'set', 'lo', 'up')
@@ -290,6 +363,8 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
         for directory in ['home', 'config', 'cache', 'data', 'runtime', 'bin']:
             (fixture / directory).mkdir(mode=0o700)
         prepare_tools(fixture, node, git, dirname)
+        if scenario == 'release-visual-native-sharing':
+            prepare_native_launcher_tools(fixture, shutil.which)
         environment = {
             'CI': 'true', 'PATH': str(Path(node).parent) + os.pathsep + os.environ['PATH'],
             'HOME': str(fixture / 'home'), 'XDG_CONFIG_HOME': str(fixture / 'config'),
@@ -306,17 +381,36 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
             environment.update({'BIBCODE_RELEASE_UI_FAKE_HOST': str(Path(fake_host).resolve(strict=True)),
                                 'BIBCODE_RELEASE_UI_WEB': str(Path(web_root).resolve(strict=True)),
                                 'BIBCODE_RELEASE_UI_MATRIX': ui_matrix})
-        elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
+        elif scenario == 'release-visual-native-sharing':
+            app = Path(web_root)
+            xvfb = Path(shutil.which('Xvfb') or '')
+            if (not app.is_absolute() or app.is_symlink() or not app.is_file()
+                    or str(app.resolve(strict=True)) != web_root or not os.access(app, os.X_OK)
+                    or not xvfb.is_absolute() or not xvfb.is_file()):
+                raise RuntimeError('Owned native executable handoff refused')
+            environment.update({'BIBCODE_NATIVE_SHARING_APP': str(app),
+                                'BIBCODE_NATIVE_SHARING_XVFB': str(xvfb.resolve(strict=True)),
+                                'GIT_CONFIG_NOSYSTEM': '1',
+                                'GIT_CONFIG_GLOBAL': str(fixture / 'empty-git-config')})
+        elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle']:
             environment.update({'BIBCODE_DELIVERY_UI_WEB': str(Path(web_root).resolve(strict=True)),
                                 'BIBCODE_DELIVERY_UI_SELECTION': scenario,
                                 'GIT_CONFIG_NOSYSTEM': '1',
                                 'GIT_CONFIG_GLOBAL': str(fixture / 'empty-git-config')})
         with os.fdopen(os.open(fixture / 'private-controller.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
+            if scenario == 'release-visual-project-lifecycle':
+                previous_sigchld = signal.getsignal(signal.SIGCHLD)
+                lifecycle_reaper = lifecycle_adopted_reaper(lambda: process)
+                signal.signal(signal.SIGCHLD, lifecycle_reaper)
             process = subprocess.Popen([node, selection['controller']],
                                        env=environment, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
+            if lifecycle_reaper is not None:
+                lifecycle_reaper()  # Also cover adoption before installation/assignment without another signal.
             status = process.wait(timeout=selection['inner_timeout'])
     finally:
+        if lifecycle_reaper is not None:
+            signal.signal(signal.SIGCHLD, previous_sigchld)
         observed = namespace_children()
         for number in [signal.SIGTERM, signal.SIGKILL]:
             for pid, state in namespace_children():
@@ -426,13 +520,18 @@ def outer(scenario='chat-upload', ui_matrix='core'):
                '--fork', '--kill-child', sys.executable, __file__, 'inner', str(evidence), str(fixture),
                node, server, programs['google-chrome'], programs['chromedriver'], programs['git'], programs['dirname'],
                namespace, os.environ['GITHUB_SHA'], str(Path(programs['ip']).resolve(strict=True))]
-    if scenario == 'remote-updates-ui':
+    if scenario == 'release-visual-native-sharing':
+        app = str(Path(os.environ['BIBCODE_NATIVE_SHARING_APP']).resolve(strict=True))
+        xvfb = str(Path(shutil.which('Xvfb') or '').resolve(strict=True))
+        provenance.update({'scenario': scenario, 'inputs': native_input_hashes(app, xvfb)})
+        command.extend([scenario, app])
+    elif scenario == 'remote-updates-ui':
         fake_host = str(Path(os.environ['BIBCODE_RELEASE_UI_FAKE_HOST']).resolve(strict=True))
         web_root = str(Path(os.environ['BIBCODE_RELEASE_UI_WEB']).resolve(strict=True))
         provenance.update({'scenario': scenario, 'selection': ui_matrix,
                            'inputs': ui_input_hashes(server, fake_host, web_root)})
         command.extend([scenario, fake_host, web_root, ui_matrix])
-    elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
+    elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle']:
         fake_host = None
         web_root = str(Path(os.environ['BIBCODE_DELIVERY_UI_WEB']).resolve(strict=True))
         provenance.update({'scenario': scenario, 'inputs': ui_input_hashes(server, None, web_root)})
@@ -442,7 +541,12 @@ def outer(scenario='chat-upload', ui_matrix='core'):
     write_json(evidence / 'provenance.json', provenance)
     result, _ = run_owned_command(command, timeout=selection['outer_timeout'], grace=15)
     result['hostNetworkNamespaceUnchanged'] = os.readlink('/proc/self/ns/net') == namespace
-    if scenario in ['remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
+    if scenario == 'release-visual-native-sharing':
+        result['buildInputsUnchanged'] = native_input_hashes(app, xvfb) == provenance['inputs']
+        result['privateFixtureDeleted'] = cleanup_ui_fixture(fixture, evidence, result, scenario)
+        if not result['privateFixtureDeleted'] or not result['hostNetworkNamespaceUnchanged'] or not result['buildInputsUnchanged']:
+            result['exitCode'] = result['exitCode'] or 1
+    elif scenario in ['remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle']:
         result['buildInputsUnchanged'] = ui_input_hashes(server, fake_host, web_root) == provenance['inputs']
         result['privateFixtureDeleted'] = cleanup_ui_fixture(fixture, evidence, result, scenario)
         if not result['privateFixtureDeleted'] or not result['hostNetworkNamespaceUnchanged'] or not result['buildInputsUnchanged']:
@@ -461,6 +565,13 @@ if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'inner':
         sys.exit(inner(Path(sys.argv[2]), Path(sys.argv[3]), *sys.argv[4:]))
     if len(sys.argv) == 3 and sys.argv[1] == '--scenario':
+        if sys.argv[2] == 'release-visual-native-sharing':
+            try:
+                sys.exit(outer(sys.argv[2]))
+            except Exception:
+                # Native admission failure never publishes raw executable paths or exceptions.
+                print(json.dumps({'refused': True, 'stage': 'native-controller'}))
+                sys.exit(1)
         sys.exit(outer(sys.argv[2]))
     if len(sys.argv) == 5 and sys.argv[1:4] == ['--scenario', 'remote-updates-ui', '--matrix']:
         sys.exit(outer('remote-updates-ui', sys.argv[4]))
