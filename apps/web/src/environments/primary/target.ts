@@ -153,7 +153,9 @@ export function isLoopbackHostname(hostname: string): boolean {
   return LOOPBACK_HOSTNAMES.has(normalizeHostname(hostname));
 }
 
-function resolveHttpRequestBaseUrl(primaryTarget: PrimaryEnvironmentTarget): string {
+export function resolvePrimaryEnvironmentHttpBaseUrl(
+  primaryTarget: PrimaryEnvironmentTarget,
+): string {
   const httpBaseUrl = primaryTarget.target.httpBaseUrl;
   // A desktop-managed bootstrap token is scoped to the native backend that
   // issued it. Routing through Vite would send that token to the separate web
@@ -295,7 +297,7 @@ export function resolvePrimaryEnvironmentHttpUrl(
   const primaryTarget = readPrimaryEnvironmentTarget();
 
   const url = parseTargetUrl({
-    rawValue: resolveHttpRequestBaseUrl(primaryTarget),
+    rawValue: resolvePrimaryEnvironmentHttpBaseUrl(primaryTarget),
     source: primaryTarget.source,
     urlKind: "http-base-url",
   });

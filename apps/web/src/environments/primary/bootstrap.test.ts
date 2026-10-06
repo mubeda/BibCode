@@ -492,3 +492,96 @@ describe("environmentBootstrap", () => {
     });
   });
 });
+
+import { it as effectIt } from "@effect/vitest";
+import { IDBFactory } from "fake-indexeddb";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
+import { PlatformConnectionSource } from "@bibcode/client-runtime/platform";
+import { connectionPlatformLayer } from "../../connection/platform";
+import { PrimaryEnvironmentHttpClient, layer as primaryHttpClientLayer } from "./httpClient";
+import { makePrimaryEnvironmentHttpLayer } from "./httpLayer";
+
+describe("cookie primary platform bootstrap", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  effectIt.effect(
+    "uses the same proxy HTTP target after cookie auth and during platform discovery",
+    () => {
+      const ui = "http://127.0.0.1:4885";
+      vi.stubEnv("VITE_HTTP_URL", "http://127.0.0.1:4887");
+      vi.stubEnv("VITE_WS_URL", "ws://127.0.0.1:4887");
+      vi.stubEnv("VITE_DEV_SERVER_URL", ui);
+      installTestBrowser(ui + "/");
+      vi.stubGlobal("indexedDB", new IDBFactory());
+      let cookieStored = false;
+      const requests: Array<{ path: string; port: string; credentials: RequestCredentials }> = [];
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init),
+          url = new URL(request.url);
+        requests.push({ path: url.pathname, port: url.port, credentials: request.credentials });
+        // Node has no browser cookie jar or CORS enforcement. Model the normal Rust
+        // wildcard/no-credentials CORS response, with actual URLs/options from the client.
+        if (url.origin !== ui && request.credentials === "include")
+          throw new TypeError("Credentialed cross-origin wildcard response refused");
+        const permitsCookie =
+          request.credentials !== "omit" &&
+          (request.credentials === "include" || url.origin === ui);
+        if (url.pathname === "/api/auth/browser-session") {
+          cookieStored = permitsCookie;
+          return Response.json({
+            authenticated: true,
+            scopes: ["orchestration:read"],
+            sessionMethod: "browser-session-cookie",
+            expiresAt: "2030-10-06T00:00:00.000Z",
+          });
+        }
+        if (url.pathname === "/api/auth/session")
+          return Response.json({
+            authenticated: cookieStored && permitsCookie,
+            auth: {
+              policy: "loopback-browser",
+              bootstrapMethods: ["one-time-token"],
+              sessionMethods: ["browser-session-cookie", "bearer-access-token"],
+              sessionCookieName: "inert-session",
+            },
+          });
+        if (url.pathname === "/.well-known/bibcode/environment")
+          return Response.json(BASE_ENVIRONMENT);
+        throw new Error("Unexpected primary bootstrap request");
+      });
+      return Effect.gen(function* () {
+        const session = yield* Effect.gen(function* () {
+          const client = yield* PrimaryEnvironmentHttpClient;
+          yield* client.auth.browserSession({
+            payload: { credential: "inert-pairing-credential" },
+          });
+          return yield* client.auth.session({ headers: {} });
+        }).pipe(
+          Effect.provide(
+            primaryHttpClientLayer.pipe(Layer.provide(makePrimaryEnvironmentHttpLayer())),
+          ),
+        );
+        expect(session.authenticated).toBe(true);
+        const source = yield* PlatformConnectionSource;
+        const registrations = Option.getOrThrow(yield* Stream.runHead(source.registrations));
+        expect(registrations).toHaveLength(1);
+        expect(registrations[0]?.target).toMatchObject({
+          environmentId: BASE_ENVIRONMENT.environmentId,
+          httpBaseUrl: ui,
+          wsBaseUrl: "ws://127.0.0.1:4887/",
+        });
+        expect(requests.map((request) => [request.path, request.port])).toEqual([
+          ["/api/auth/browser-session", "4885"],
+          ["/api/auth/session", "4885"],
+          ["/.well-known/bibcode/environment", "4885"],
+        ]);
+        expect(requests.at(-1)?.credentials).toBe("include");
+      }).pipe(Effect.provide(connectionPlatformLayer), Effect.scoped);
+    },
+  );
+});
