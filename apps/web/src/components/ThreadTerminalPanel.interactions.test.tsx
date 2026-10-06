@@ -316,7 +316,11 @@ vi.mock("@xterm/xterm", () => ({
     displayedText = "";
     resetCount = 0;
     private disposed = false;
-    readonly open = vi.fn();
+    readonly open = vi.fn((parent: HTMLElement) => {
+      const screen = document.createElement("div");
+      screen.className = "xterm-screen";
+      parent.append(screen);
+    });
     readonly focus = vi.fn();
     readonly refresh = vi.fn();
     readonly resize = vi.fn((cols: number, rows: number) => {
@@ -4346,6 +4350,64 @@ describe("TerminalViewport mounted lifecycle", () => {
     ]);
   });
 
+  // xterm clears its selection on every mouse report it sends the app, so a
+  // selection must not leak hover (any-motion tracking) to the report listener
+  // on `.xterm`, while link detection on `.xterm-screen` still sees it.
+  it.each([
+    ["any", true, 0, false],
+    ["any", true, 1, true],
+    ["any", false, 0, true],
+    ["drag", true, 0, true],
+  ] as const)(
+    "with %s mouse tracking and selection=%s, a move with buttons=%s is reported: %s",
+    async (mouseTrackingMode, selected, buttons, reported) => {
+      vi.stubGlobal("navigator", { platform: "Linux" });
+      const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+      const terminal = xtermState.terminals[0]!;
+      terminal.modes.mouseTrackingMode = mouseTrackingMode;
+      terminal.hasActiveSelection = selected;
+      const screen = mounted.container.querySelector(".xterm-screen")!;
+      const target = document.createElement("div");
+      screen.append(target);
+      const linkDetection = vi.fn();
+      const reports = vi.fn();
+      screen.addEventListener("mousemove", linkDetection);
+      screen.parentElement!.addEventListener("mousemove", reports);
+
+      target.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, buttons }));
+
+      expect(linkDetection).toHaveBeenCalledOnce();
+      expect(reports).toHaveBeenCalledTimes(reported ? 1 : 0);
+    },
+  );
+
+  it.each([
+    ["Linux", true, {}, { shiftKey: true, altKey: false }],
+    ["Linux", true, { shiftKey: true }, { shiftKey: true, altKey: false }],
+    ["Linux", false, {}, { shiftKey: false, altKey: false }],
+    ["MacIntel", true, {}, { shiftKey: false, altKey: true }],
+    ["MacIntel", true, { altKey: true }, { shiftKey: false, altKey: true }],
+  ] as const)(
+    "on %s a right-click with selection=%s and %j is kept from the app: %j",
+    async (platform, selected, modifiers, seen) => {
+      vi.stubGlobal("navigator", { platform });
+      const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+      const terminal = xtermState.terminals[0]!;
+      terminal.modes.mouseTrackingMode = "vt200";
+      terminal.hasActiveSelection = selected;
+      const target = document.createElement("div");
+      mounted.container.querySelector("[data-terminal-xterm-mount]")!.append(target);
+      let observed: { shiftKey: boolean; altKey: boolean } | null = null;
+      target.addEventListener("mousedown", (event) => {
+        observed = { shiftKey: event.shiftKey, altKey: event.altKey };
+      });
+
+      target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 2, ...modifiers }));
+
+      expect(observed).toEqual(seen);
+    },
+  );
+
   it("keeps Ctrl+C as an interrupt without a selection and consumes explicit copy", async () => {
     vi.stubGlobal("navigator", { platform: "Linux" });
     await mount(<TerminalViewport {...viewportProps()} />);
@@ -4438,7 +4500,10 @@ describe("TerminalViewport mounted lifecycle", () => {
     });
 
     expect(testState.contextMenuShow).toHaveBeenCalledWith(
-      [{ id: "add-to-chat", label: "Add to chat" }],
+      [
+        { id: "copy", label: "Copy" },
+        { id: "add-to-chat", label: "Add to chat" },
+      ],
       expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }),
     );
     expect(onAddTerminalContext).toHaveBeenCalledWith({
@@ -4453,6 +4518,95 @@ describe("TerminalViewport mounted lifecycle", () => {
 
     terminal.hasActiveSelection = false;
     terminal.selectionHandler?.();
+  });
+
+  it.each([
+    ["the clipboard API", "resolve", true, null],
+    ["execCommand after a rejected clipboard write", "reject", true, null],
+    ["a visible failure when both refuse", "reject", false, "Copy failed. Try Cmd+C."],
+  ] as const)(
+    "copies the selection from the context menu through %s",
+    async (_label, clipboardResult, execCommandResult, failure) => {
+      testState.localApiAvailable = true;
+      testState.contextMenuShow.mockResolvedValue("copy");
+      const writeText = vi.fn(() =>
+        clipboardResult === "resolve" ? Promise.resolve() : Promise.reject(new Error("denied")),
+      );
+      vi.stubGlobal("navigator", { platform: "MacIntel", clipboard: { writeText } });
+      const execCommand = vi.fn(() => execCommandResult);
+      Object.defineProperty(document, "execCommand", { configurable: true, value: execCommand });
+      const onAddTerminalContext = vi.fn();
+      const mounted = await mount(
+        <TerminalViewport {...viewportProps({ onAddTerminalContext })} />,
+      );
+      const terminal = xtermState.terminals[0]!;
+      terminal.hasActiveSelection = true;
+      terminal.selectionText = "\nfirst\nsecond\n";
+      terminal.selectionPosition = { start: { y: 0 } };
+      terminal.textarea.value = "pending";
+      const clearsBefore = terminal.clearSelection.mock.calls.length;
+
+      await act(async () => {
+        mounted.container
+          .querySelector('[data-terminal-xterm-mount="term-1"]')!
+          .dispatchEvent(
+            new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 }),
+          );
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+
+      expect(writeText).toHaveBeenCalledWith("\nfirst\nsecond\n");
+      expect(execCommand).toHaveBeenCalledTimes(clipboardResult === "resolve" ? 0 : 1);
+      expect(terminal.textarea.value).toBe("pending");
+      expect(onAddTerminalContext).not.toHaveBeenCalled();
+      expect(terminal.clearSelection).toHaveBeenCalledTimes(clearsBefore);
+      expect(terminal.focus).toHaveBeenCalled();
+      if (failure === null) {
+        expect(terminal.writes.join("")).not.toContain("Copy failed");
+      } else {
+        expect(terminal.writes).toContain(`\r\n[terminal] ${failure}\r\n`);
+      }
+    },
+  );
+
+  it("drops a menu copy whose viewport is torn down while the clipboard write is pending", async () => {
+    testState.localApiAvailable = true;
+    testState.contextMenuShow.mockResolvedValue("copy");
+    let rejectWrite!: (error: Error) => void;
+    const writeText = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectWrite = reject;
+        }),
+    );
+    vi.stubGlobal("navigator", { platform: "Linux", clipboard: { writeText } });
+    const execCommand = vi.fn(() => true);
+    Object.defineProperty(document, "execCommand", { configurable: true, value: execCommand });
+    const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.hasActiveSelection = true;
+    terminal.selectionText = "selected";
+    terminal.selectionPosition = { start: { y: 0 } };
+    await act(async () => {
+      mounted.container
+        .querySelector('[data-terminal-xterm-mount="term-1"]')!
+        .dispatchEvent(
+          new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 }),
+        );
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    expect(writeText).toHaveBeenCalledWith("selected");
+
+    await unmount(mounted);
+    const focusCalls = terminal.focus.mock.calls.length;
+    await act(async () => {
+      rejectWrite(new Error("denied"));
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+
+    expect(execCommand).not.toHaveBeenCalled();
+    expect(terminal.focus).toHaveBeenCalledTimes(focusCalls);
+    expect(terminal.writes.join("")).not.toContain("Copy failed");
   });
 
   it("leaves context menus alone when selection UI is unavailable", async () => {
