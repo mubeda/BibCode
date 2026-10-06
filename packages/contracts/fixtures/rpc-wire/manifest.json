@@ -238,6 +238,10 @@
       "mode": "unary"
     },
     {
+      "name": "pullRequests.getCreateDefaults",
+      "mode": "unary"
+    },
+    {
       "name": "pullRequests.getFiles",
       "mode": "unary"
     },
@@ -753,6 +757,7 @@
     "typed-failures/pullRequests__getChecks-00.json",
     "typed-failures/pullRequests__getCommits-00.json",
     "typed-failures/pullRequests__getContext-00.json",
+    "typed-failures/pullRequests__getCreateDefaults-00.json",
     "typed-failures/pullRequests__getFiles-00.json",
     "typed-failures/pullRequests__getTimeline-00.json",
     "typed-failures/pullRequests__getVocabulary-00.json",
@@ -1080,6 +1085,7 @@
     "typed-failures/pullRequests__getChecks-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
     "typed-failures/pullRequests__getCommits-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
     "typed-failures/pullRequests__getContext-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
+    "typed-failures/pullRequests__getCreateDefaults-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
     "typed-failures/pullRequests__getFiles-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
     "typed-failures/pullRequests__getTimeline-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
     "typed-failures/pullRequests__getVocabulary-00.json": "af1f2578bb3450b7492ccefc0142cc25e859d26726baad23eaa85ef840db5792",
@@ -1548,6 +1554,7 @@
     "typed-failures/pullRequests__getChecks-00.json",
     "typed-failures/pullRequests__getCommits-00.json",
     "typed-failures/pullRequests__getContext-00.json",
+    "typed-failures/pullRequests__getCreateDefaults-00.json",
     "typed-failures/pullRequests__getFiles-00.json",
     "typed-failures/pullRequests__getTimeline-00.json",
     "typed-failures/pullRequests__getVocabulary-00.json",

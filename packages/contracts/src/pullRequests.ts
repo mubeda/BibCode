@@ -210,6 +210,24 @@ export const PullRequestsVocabulary = Schema.Struct({
 });
 export type PullRequestsVocabulary = typeof PullRequestsVocabulary.Type;
 
+export const PullRequestsSquashOption = Schema.Literals([
+  "never",
+  "always",
+  "default_on",
+  "default_off",
+]);
+export type PullRequestsSquashOption = typeof PullRequestsSquashOption.Type;
+
+/** What the create dialog prefills: the viewer for "Assign to me" and GitLab's merge defaults. */
+export const PullRequestsCreateDefaults = Schema.Struct({
+  viewer: Schema.NullOr(
+    Schema.Struct({ id: TrimmedNonEmptyStringSchema, label: TrimmedNonEmptyStringSchema }),
+  ),
+  squash: Schema.NullOr(PullRequestsSquashOption),
+  removeSourceBranch: Schema.NullOr(Schema.Boolean),
+});
+export type PullRequestsCreateDefaults = typeof PullRequestsCreateDefaults.Type;
+
 export const PullRequestsListInput = Schema.Struct({
   ...PullRequestsCwdInput.fields,
   state: Schema.Literals(["open", "closed", "merged", "all"]),

@@ -33,6 +33,8 @@ import {
   PullRequestsTimeline,
   PullRequestsVocabulary,
   PullRequestsVocabularyInput,
+  PullRequestsCwdInput,
+  PullRequestsCreateDefaults,
 } from "./pullRequests.ts";
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
@@ -464,6 +466,7 @@ export const WS_METHODS = {
   // Pull Requests methods
   pullRequestsGetContext: "pullRequests.getContext",
   pullRequestsGetVocabulary: "pullRequests.getVocabulary",
+  pullRequestsGetCreateDefaults: "pullRequests.getCreateDefaults",
   pullRequestsList: "pullRequests.list",
   pullRequestsGet: "pullRequests.get",
   pullRequestsGetTimeline: "pullRequests.getTimeline",
@@ -1283,6 +1286,15 @@ export const WsPullRequestsGetVocabularyRpc = Rpc.make(WS_METHODS.pullRequestsGe
   error: PullRequestsOperationError,
 });
 
+export const WsPullRequestsGetCreateDefaultsRpc = Rpc.make(
+  WS_METHODS.pullRequestsGetCreateDefaults,
+  {
+    payload: PullRequestsCwdInput,
+    success: PullRequestsCreateDefaults,
+    error: PullRequestsOperationError,
+  },
+);
+
 export const WsPullRequestsListRpc = Rpc.make(WS_METHODS.pullRequestsList, {
   payload: PullRequestsListInput,
   success: PullRequestsListPage,
@@ -1758,6 +1770,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeGitManagerSignalRpc,
   WsPullRequestsGetContextRpc,
   WsPullRequestsGetVocabularyRpc,
+  WsPullRequestsGetCreateDefaultsRpc,
   WsPullRequestsListRpc,
   WsPullRequestsGetRpc,
   WsPullRequestsGetTimelineRpc,

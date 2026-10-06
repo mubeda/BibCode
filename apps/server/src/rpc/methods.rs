@@ -113,6 +113,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("pullRequests.getChecks"),
     read_unary("pullRequests.getCommits"),
     read_unary("pullRequests.getContext"),
+    read_unary("pullRequests.getCreateDefaults"),
     read_unary("pullRequests.getFiles"),
     read_unary("pullRequests.getTimeline"),
     read_unary("pullRequests.getVocabulary"),
@@ -212,6 +213,7 @@ mod tests {
         for name in [
             "pullRequests.getContext",
             "pullRequests.getVocabulary",
+            "pullRequests.getCreateDefaults",
             "pullRequests.list",
             "pullRequests.get",
             "pullRequests.getTimeline",
