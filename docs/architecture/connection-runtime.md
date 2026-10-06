@@ -42,6 +42,20 @@ public package has no root export; callers use focused subpaths such as
 - Domain modules under `state/*` consume the registry and expose focused Atom
   constructors. React presentation does not own sockets or retry loops.
 
+For a browser primary behind the configured loopback UI proxy, the web adapter
+resolves one topology snapshot through the existing primary HTTP routing policy.
+Descriptor discovery, the emitted `PrimaryConnectionTarget` and its registration
+cache signature use that effective HTTP address, so later broker preparation
+uses the same HTTP route as cookie authentication. The WebSocket address stays
+at the snapshot's backend endpoint. Desktop-managed primaries bypass the UI
+proxy and retain their native HTTP address and bearer owner. A non-loopback
+backend or an unmatched development origin also retains its direct HTTP address.
+A change in the effective HTTP address refreshes the registration instead of
+reusing a broker target from the previous route; failed or withheld topology
+reads keep the existing retention rules. HTTP routing validation is part of that
+same topology-read boundary, so an invalid development-origin hint retains the
+cached primary and polling continues when the hint is corrected.
+
 `ConnectionWakeups` exposes two streams. `changes` carries credential changes
 and `application-active`, which the browser emits only on `visibilitychange`
 to a visible document. Window focus alone does not emit it or trigger the

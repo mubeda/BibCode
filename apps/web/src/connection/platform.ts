@@ -51,6 +51,7 @@ import { readDesktopPrimaryBearerToken } from "../environments/primary/desktopAu
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
 import {
   readPrimaryEnvironmentTarget,
+  resolvePrimaryEnvironmentHttpBaseUrl,
   type PrimaryEnvironmentTarget,
 } from "../environments/primary/target";
 import { clearComposerDraftsEnvironment } from "../composerDraftStore";
@@ -405,16 +406,16 @@ const capabilitiesLayer = Layer.effectContext(
 
 const loadPrimaryConnectionRegistration = Effect.fn(
   "web.connectionPlatform.loadPrimaryConnectionRegistration",
-)(function* (resolved: PrimaryEnvironmentTarget) {
+)(function* (target: PrimaryEnvironmentTarget["target"]) {
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({
-    httpBaseUrl: resolved.target.httpBaseUrl,
+    httpBaseUrl: target.httpBaseUrl,
   }).pipe(Effect.provide(primaryEnvironmentHttpLayer), Effect.mapError(mapRemoteEnvironmentError));
   return new PrimaryConnectionRegistration({
     target: new PrimaryConnectionTarget({
       environmentId: descriptor.environmentId,
       label: descriptor.label,
-      httpBaseUrl: resolved.target.httpBaseUrl,
-      wsBaseUrl: resolved.target.wsBaseUrl,
+      httpBaseUrl: target.httpBaseUrl,
+      wsBaseUrl: target.wsBaseUrl,
     }),
   });
 });
@@ -539,7 +540,20 @@ export function readPrimaryEnvironmentTargetResult(
   readTarget: () => PrimaryEnvironmentTarget | null = readPrimaryEnvironmentTarget,
 ): PrimaryEnvironmentTargetRead {
   try {
-    return { _tag: "Success", target: readTarget() };
+    const snapshot = readTarget();
+    return {
+      _tag: "Success",
+      target:
+        snapshot === null
+          ? null
+          : {
+              ...snapshot,
+              target: {
+                httpBaseUrl: resolvePrimaryEnvironmentHttpBaseUrl(snapshot),
+                wsBaseUrl: snapshot.target.wsBaseUrl,
+              },
+            },
+    };
   } catch (cause) {
     return { _tag: "Failure", cause };
   }
@@ -625,8 +639,8 @@ const platformConnectionSourceLayer = Layer.effect(
           cause: primaryTopologyRead.cause,
         });
       } else if (primaryTopologyRead.target !== null) {
-        const primaryTarget = primaryTopologyRead.target;
-        const signature = `primary|${primaryTarget.target.httpBaseUrl}|${primaryTarget.target.wsBaseUrl}`;
+        const target = primaryTopologyRead.target.target;
+        const signature = `primary|${target.httpBaseUrl}|${target.wsBaseUrl}`;
         const cached = previous.get(PRIMARY_LOCAL_ENVIRONMENT_ID);
         if (
           cached !== undefined &&
@@ -635,7 +649,7 @@ const platformConnectionSourceLayer = Layer.effect(
           next.set(PRIMARY_LOCAL_ENVIRONMENT_ID, cached);
           registrations.push(cached.registration);
         } else {
-          const built = yield* loadPrimaryConnectionRegistration(primaryTarget).pipe(
+          const built = yield* loadPrimaryConnectionRegistration(target).pipe(
             Effect.tapError((error) =>
               Effect.logWarning("Could not discover the primary environment.", { error }),
             ),
