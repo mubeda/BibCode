@@ -1053,7 +1053,7 @@ use a short case prefix plus the complete UUID, with exclusive `0700` creation;
 run IDs remain in evidence paths, keeping Chromium's branded and unbranded
 Unix socket names within their limit.
 
-For delivery Retry and the first release visual batch, a failure in the existing
+For delivery Retry and release visual batches, a failure in the existing
 `browser` phase records `browserReadinessStage`: `driver-readiness`,
 `session-create`, or `online-proof`. These are the existing await boundaries;
 the phase alone cannot identify which one failed. `browserDriverReadiness`
@@ -1068,6 +1068,20 @@ failure, launch options, request count, waits or cleanup. No response body,
 request URL, error text or driver log enters these receipts; preserve an unknown
 cause until the closed evidence identifies a boundary. Other failure phases
 retain null for both fields.
+
+The same `browser` failure receipt also contains `browserSessionObservation`,
+an exact four-boolean packet: `protocolClientCreated`, `remoteReturned`,
+`alertBindingAttempted`, and `alertBindingCompleted`. The installed SDK's passive
+client modifier records construction after the session handshake and returns
+the identical client without reading it. The other facts come from the existing
+remote await and alert-binding call boundaries. A constructed client with no
+remote return narrows the failure to SDK post-handshake initialization; a remote
+return without completed alert binding narrows it to that binding. These facts
+add no request, client property or body read, timer, retry or changed launch option.
+Missing, malformed, accessor, proxy or extra-field metadata stays unknown; other
+failure phases retain null. The facts distinguish a boundary and do not name a
+runtime cause or admit a visual original. Optional observer errors preserve
+successful startup and the original failure and deadlines.
 
 In each theme, the driver pairs and imports through the public UI, then creates
 and selects a genuine managed worktree through **New worktree**. Its configured
@@ -1543,7 +1557,12 @@ an unpictured tab or dialog.
 
 Run this producer only in the workflow's private user/network namespace. It
 prepares separate GitHub and GitLab repositories and private bare origins
-before the server starts. Their exact invalid host remotes resolve only to
+before the server starts. Before the unchanged desktop context factory runs,
+the PR selection exclusively creates each themed root with mode `0700` beneath
+the admitted private fixture and verifies its canonical path and current-user
+ownership. Existing directories, aliases, foreign ownership or non-private
+permissions are refused; the owner never repairs an existing root with `chmod`
+or changes the ordinary context factory or process umask. Their exact invalid host remotes resolve only to
 those owned local origins through the sealed fixture Git configuration. Owned
 `gh`/`glab` protocol executables provide raw source-bound replies to the normal
 hosting drivers; they refuse unmatched requests and never forward to a real

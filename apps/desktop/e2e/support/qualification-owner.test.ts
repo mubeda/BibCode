@@ -4,6 +4,10 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeVM from "node:vm";
 import * as NodeModule from "node:module";
+import * as NodeHttp from "node:http";
+import * as NodeCrypto from "node:crypto";
+import { remote } from "webdriverio";
+import * as OwnerModule from "./qualification-owner.ts";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
@@ -21,6 +25,10 @@ import {
 } from "./browser-network.ts";
 
 const roots: string[] = [];
+const projectSession = (input: unknown): unknown => {
+  const project = Reflect.get(OwnerModule, "projectOwnedBrowserSessionObservation");
+  return typeof project === "function" ? project(input) : null;
+};
 function owner() {
   const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-qa-owner-"));
   roots.push(root);
@@ -29,6 +37,245 @@ function owner() {
 afterEach(() => {
   vi.unstubAllGlobals();
   for (const root of roots.splice(0)) NodeFS.rmSync(root, { recursive: true, force: true });
+});
+describe("closed owned browser session observations", () => {
+  const empty = {
+    protocolClientCreated: false,
+    remoteReturned: false,
+    alertBindingAttempted: false,
+    alertBindingCompleted: false,
+  };
+  it("projects exactly four immutable own boolean data fields", () => {
+    const value = { ...empty, protocolClientCreated: true, remoteReturned: true };
+    expect(projectSession(value)).toEqual(value);
+    expect(Object.isFrozen(projectSession(value))).toBe(true);
+  });
+  it.each(["extra", "missing", "getter", "proxy", "revoked", "array", "wrong-type"])(
+    "quarantines %s packets without accessing values or proxy traps",
+    (mode) => {
+      let reads = 0;
+      const value: Record<string, unknown> = { ...empty };
+      if (mode === "extra") value.rawClient = "inert private value";
+      if (mode === "missing") delete value.remoteReturned;
+      if (mode === "getter")
+        Object.defineProperty(value, "remoteReturned", {
+          enumerable: true,
+          get: () => {
+            reads++;
+            throw new Error("inert getter");
+          },
+        });
+      if (mode === "wrong-type") value.remoteReturned = "inert private value";
+      const revoked = Proxy.revocable(value, {});
+      if (mode === "revoked") revoked.revoke();
+      const input =
+        mode === "proxy"
+          ? new Proxy(value, {
+              ownKeys: () => {
+                reads++;
+                throw new Error("inert proxy");
+              },
+            })
+          : mode === "revoked"
+            ? revoked.proxy
+            : mode === "array"
+              ? [value]
+              : value;
+      expect(projectSession(input)).toBeNull();
+      expect(reads).toBe(0);
+    },
+  );
+});
+
+it("distinguishes actual SDK handshake/context/binding boundaries without changing original requests, errors or bounds", async () => {
+  const source = NodeFS.readFileSync(new URL("./qualification-owner.ts", import.meta.url), "utf8");
+  const start = source.indexOf("export async function openOwnedBrowser("),
+    end = source.indexOf("export async function prepareOwnedNetwork(", start);
+  let mode = "success",
+    requests: string[] = [],
+    bodies: string[] = [];
+  const server = NodeHttp.createServer(async (request, response) => {
+    const digest = NodeCrypto.createHash("sha256");
+    for await (const chunk of request) digest.update(chunk);
+    bodies.push(digest.digest("hex"));
+    response.setHeader("content-type", "application/json");
+    if (request.method === "POST" && request.url === "/session") {
+      requests.push("session-post");
+      if (mode === "handshake") {
+        response.statusCode = 500;
+        response.end(
+          JSON.stringify({
+            value: { error: "unknown error", message: "Inert handshake failure.", stacktrace: "" },
+          }),
+        );
+      } else
+        response.end(
+          JSON.stringify({
+            value: {
+              sessionId: "inert-owned-session",
+              capabilities: {
+                browserName: "chrome",
+                browserVersion: "142.0.0.0",
+                platformName: "linux",
+                webSocketUrl: false,
+              },
+            },
+          }),
+        );
+    } else if (request.method === "GET" && request.url?.endsWith("/window")) {
+      requests.push("session-window-get");
+      if (mode === "context") {
+        response.statusCode = 500;
+        response.end(
+          JSON.stringify({
+            value: { error: "unknown error", message: "Inert context failure.", stacktrace: "" },
+          }),
+        );
+      } else response.end(JSON.stringify({ value: "inert-main" }));
+    } else if (request.method === "DELETE") response.end(JSON.stringify({ value: null }));
+    else {
+      response.statusCode = 500;
+      response.end(
+        JSON.stringify({
+          value: { error: "unknown error", message: "Inert path refused.", stacktrace: "" },
+        }),
+      );
+    }
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(4915, "127.0.0.1", resolve);
+  });
+  const results: Array<{
+    mode: string;
+    observer: string;
+    observations: unknown[];
+    requests: string[];
+    bodies: string[];
+  }> = [];
+  try {
+    for (const current of ["success", "handshake", "context", "binding"])
+      for (const observer of ["record", "throw", "direct-control"]) {
+        mode = current;
+        requests = [];
+        bodies = [];
+        const observations: unknown[] = [],
+          stages: string[] = [],
+          bounds: number[] = [];
+        let original: unknown,
+          originalMessage: string | undefined,
+          sdkClient: Awaited<ReturnType<typeof remote>> | undefined,
+          returned: unknown;
+        const create = async (
+          options: Parameters<typeof remote>[0],
+          modifier?: Parameters<typeof remote>[1],
+        ) => {
+          try {
+            sdkClient = await remote(options, (client) => {
+              const same = modifier ? modifier(client, options) : client;
+              expect(same).toBe(client);
+              return same;
+            });
+            if (mode === "binding") sdkClient.addCommand("isAlertOpen", async () => false);
+            return sdkClient;
+          } catch (error) {
+            original = error;
+            originalMessage = (error as Error).message;
+            Object.freeze(error);
+            throw error;
+          }
+        };
+        const bind = (browser: Parameters<typeof bindOwnedBrowserAlertObservation>[0]) => {
+          try {
+            return bindOwnedBrowserAlertObservation(browser);
+          } catch (error) {
+            original = error;
+            originalMessage = (error as Error).message;
+            Object.freeze(error);
+            throw error;
+          }
+        };
+        const open = NodeVM.runInNewContext(
+          NodeModule.stripTypeScriptTypes(source.slice(start, end)).replace(/^export /gm, "") +
+            "\nopenOwnedBrowser",
+          {
+            startOwnedBrowserDriver: async () => ({}),
+            remote: create,
+            ownedBrowserOptions,
+            projectOwnedBrowserSessionObservation: projectSession,
+            bindOwnedBrowserAlertObservation: bind,
+            bounded: (promise: Promise<unknown>, ms: number) => {
+              bounds.push(ms);
+              return promise;
+            },
+          },
+        ) as (...args: unknown[]) => Promise<unknown>;
+        try {
+          if (observer === "direct-control") {
+            sdkClient = await remote(
+              ownedBrowserOptions("/inert/chrome", "/inert/profile", "http://127.0.0.1:4885"),
+            );
+            if (mode === "binding") sdkClient.addCommand("isAlertOpen", async () => false);
+            bindOwnedBrowserAlertObservation(sdkClient);
+            returned = { browser: sdkClient };
+          } else
+            returned = await open(
+              {},
+              "/inert/chrome",
+              "/inert/driver",
+              "http://127.0.0.1:4885",
+              "/inert/profile",
+              undefined,
+              (stage: string) => stages.push(stage),
+              (value: unknown) => {
+                observations.push(value);
+                if (observer === "throw") throw new Error("Inert observation failure.");
+              },
+            );
+        } catch (error) {
+          if (observer !== "direct-control") {
+            expect(error).toBe(original);
+            expect((error as Error).message).toBe(originalMessage);
+          }
+        }
+        if (mode === "success") expect(returned).toMatchObject({ browser: sdkClient });
+        else expect(returned).toBeUndefined();
+        expect(bounds).toEqual(observer === "direct-control" ? [] : [45000]);
+        expect(stages).toEqual(
+          observer === "direct-control" ? [] : ["driver-readiness", "session-create"],
+        );
+        results.push({
+          mode,
+          observer,
+          observations,
+          requests: [...requests],
+          bodies: [...bodies],
+        });
+        if (sdkClient) await sdkClient.deleteSession();
+      }
+    for (const current of ["success", "handshake", "context", "binding"]) {
+      const record = results.find(
+          (value) => value.mode === current && value.observer === "record",
+        )!,
+        throwing = results.find((value) => value.mode === current && value.observer === "throw")!,
+        control = results.find(
+          (value) => value.mode === current && value.observer === "direct-control",
+        )!;
+      expect(record.requests).toEqual(throwing.requests);
+      expect(record.bodies).toEqual(throwing.bodies);
+      expect(record.requests).toEqual(control.requests);
+      expect(record.bodies).toEqual(control.bodies);
+      expect(record.observations.at(-1)).toEqual({
+        protocolClientCreated: current !== "handshake",
+        remoteReturned: current === "success" || current === "binding",
+        alertBindingAttempted: current === "success" || current === "binding",
+        alertBindingCompleted: current === "success",
+      });
+      expect(record.observations).toEqual(throwing.observations);
+    }
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 function driverReadinessReplay(

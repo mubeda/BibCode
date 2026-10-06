@@ -91,6 +91,8 @@ import {
   type QualificationBrowser,
   projectOwnedDriverReadiness,
   type OwnedDriverReadiness,
+  projectOwnedBrowserSessionObservation,
+  type OwnedBrowserSessionObservation,
 } from "./support/qualification-owner.ts";
 import { prepareDesktopUiTestContext } from "./support/test-project.ts";
 import {
@@ -707,6 +709,7 @@ export async function runDeliveryRetryQualification() {
   let createRefClearObservation: ReturnType<typeof projectVisualNameClearObservation> = null;
   let browserDriverReadiness: OwnedDriverReadiness | null = null;
   let browserReadinessStage: "driver-readiness" | "session-create" | "online-proof" | null = null;
+  let browserSessionObservation: OwnedBrowserSessionObservation | null = null;
   const networkProofs: object[] = [];
   const write = (name: string, value: unknown) =>
     NodeFS.writeFileSync(
@@ -1238,6 +1241,31 @@ export async function runDeliveryRetryQualification() {
       theme = nextTheme;
       step("prepare-fixture");
       const runRoot = NodePath.join(config.fixture, theme);
+      if (config.selection === "release-visual-pull-requests") {
+        const outer = NodeFS.lstatSync(config.fixture);
+        if (
+          !outer.isDirectory() ||
+          outer.isSymbolicLink() ||
+          NodeFS.realpathSync(config.fixture) !== config.fixture ||
+          (outer.mode & 0o777) !== 0o700 ||
+          typeof process.getuid !== "function" ||
+          outer.uid !== process.getuid() ||
+          NodePath.dirname(runRoot) !== config.fixture ||
+          !["light", "dark"].includes(NodePath.basename(runRoot))
+        )
+          throw new Error("Owned request themed root refused.");
+        // Exclusive creation refuses every collision; never repair an existing root's permissions.
+        NodeFS.mkdirSync(runRoot, { mode: 0o700 });
+        const themed = NodeFS.lstatSync(runRoot);
+        if (
+          !themed.isDirectory() ||
+          themed.isSymbolicLink() ||
+          NodeFS.realpathSync(runRoot) !== runRoot ||
+          (themed.mode & 0o777) !== 0o700 ||
+          themed.uid !== outer.uid
+        )
+          throw new Error("Owned request themed root refused.");
+      }
       const env = {
         ...process.env,
         BIBCODE_E2E_RUN_ROOT: runRoot,
@@ -1528,6 +1556,7 @@ export async function runDeliveryRetryQualification() {
       step("browser");
       browserDriverReadiness = null;
       browserReadinessStage = null;
+      browserSessionObservation = null;
       const opened = await openOwnedBrowser(
         owner,
         config.chrome,
@@ -1540,6 +1569,9 @@ export async function runDeliveryRetryQualification() {
         (value) => {
           browserReadinessStage =
             value === "driver-readiness" || value === "session-create" ? value : null;
+        },
+        (value) => {
+          browserSessionObservation = projectOwnedBrowserSessionObservation(value);
         },
       );
       browser = opened.browser;
@@ -3096,6 +3128,10 @@ export async function runDeliveryRetryQualification() {
         phase === "browser" &&
         ["driver-readiness", "session-create", "online-proof"].includes(browserReadinessStage ?? "")
           ? browserReadinessStage
+          : null,
+      browserSessionObservation:
+        phase === "browser"
+          ? projectOwnedBrowserSessionObservation(browserSessionObservation)
           : null,
     });
   } finally {

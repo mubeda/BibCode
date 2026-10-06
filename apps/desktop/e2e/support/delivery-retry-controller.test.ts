@@ -22,6 +22,7 @@ import { projectGitProjectTabInterception } from "./git-project-tab-interception
 import { gitProjectDirectoryFailureFacts } from "./release-visual-git-project.ts";
 import { gitProjectTabFailureFacts } from "./git-project-tab-observation.ts";
 import { bounded, projectOwnedDriverReadiness } from "./qualification-owner.ts";
+import * as OwnerModule from "./qualification-owner.ts";
 import { correctDesktopUiOuterSize } from "./window-size.ts";
 import { readVisualViewport } from "./release-visual-observation.ts";
 import {
@@ -881,6 +882,7 @@ function createRefFailureBoundary(
     clearObservation?: unknown;
     readiness?: unknown;
     readinessStage?: unknown;
+    sessionObservation?: unknown;
     importObservation?: unknown;
   } = {},
 ) {
@@ -938,9 +940,14 @@ function createRefFailureBoundary(
       createRefClearObservation: options.clearObservation ?? null,
       browserDriverReadiness: options.readiness ?? null,
       browserReadinessStage: options.readinessStage ?? null,
+      browserSessionObservation: options.sessionObservation ?? null,
       error: new Error("The required live observation did not arrive within its bound."),
       bounded,
       projectOwnedDriverReadiness,
+      projectOwnedBrowserSessionObservation: (value: unknown) => {
+        const project = Reflect.get(OwnerModule, "projectOwnedBrowserSessionObservation");
+        return typeof project === "function" ? project(value) : null;
+      },
       readVisualWitness,
       classifyQualificationFailure,
       readStartupFailureObservation: async () => null,
@@ -1319,6 +1326,96 @@ it.each([
 );
 
 describe("closed browser startup failure facts", () => {
+  const session = {
+    protocolClientCreated: true,
+    remoteReturned: true,
+    alertBindingAttempted: true,
+    alertBindingCompleted: false,
+  };
+  it("composes four session boundary booleans only in browser failures without an extra browser read", async () => {
+    const f = createRefFailureBoundary({
+      phase: "browser",
+      readinessStage: "session-create",
+      sessionObservation: session,
+    });
+    await f.run();
+    expect(f.writes[0]?.browserSessionObservation).toEqual(session);
+    expect(f.reads()).toBe(0);
+    const other = createRefFailureBoundary({
+      phase: "pair-issue-credential",
+      sessionObservation: session,
+    });
+    await other.run();
+    expect(other.writes[0]?.browserSessionObservation).toBeNull();
+  });
+  it("refuses unsafe session metadata and keeps the failure exception untouched", async () => {
+    let reads = 0;
+    const getter = { ...session };
+    Object.defineProperty(getter, "remoteReturned", {
+      enumerable: true,
+      get: () => {
+        reads++;
+        throw new Error("inert private getter");
+      },
+    });
+    const proxy = new Proxy(session, {
+      ownKeys: () => {
+        reads++;
+        throw new Error("inert private proxy");
+      },
+    });
+    for (const value of [getter, proxy, { ...session, token: "inert private token" }, [session]]) {
+      const f = createRefFailureBoundary({ phase: "browser", sessionObservation: value });
+      await f.run();
+      expect(f.writes[0]?.browserSessionObservation).toBeNull();
+      expect(f.writes[0]?.failure).toMatchObject({ kind: "observation-timeout" });
+      expect(f.reads()).toBe(0);
+    }
+    expect(reads).toBe(0);
+  });
+  it.each(["records-session", "before-observation"])(
+    "resets the actual browser attempt and preserves open/online calls: %s",
+    async (mode) => {
+      const start = controller.indexOf('      step("browser");'),
+        end = controller.indexOf('      step("pair-issue-credential");', start),
+        calls: string[] = [];
+      const project = Reflect.get(OwnerModule, "projectOwnedBrowserSessionObservation");
+      const original = new Error("inert exact session failure");
+      const run = runControllerSource(
+        NodeModule.stripTypeScriptTypes(
+          "async function run() { let browserDriverReadiness=null, browserReadinessStage=null, browserSessionObservation={raw:'inert stale'}, browser; try {" +
+            controller.slice(start, end) +
+            "} catch(error) { return {browserSessionObservation,error}; }}\nrun",
+        ),
+        {
+          owner: {},
+          config: { chrome: "/inert/chrome", driver: "/inert/driver" },
+          origin: "http://127.0.0.1:4885",
+          runRoot: "/inert",
+          NodePath,
+          network: {},
+          networkProofs: [],
+          step: () => calls.push("browser"),
+          projectOwnedDriverReadiness,
+          projectOwnedBrowserSessionObservation:
+            typeof project === "function" ? project : () => null,
+          openOwnedBrowser: async (...args: unknown[]) => {
+            calls.push("open");
+            if (mode === "records-session" && typeof args[7] === "function") args[7](session);
+            throw original;
+          },
+          verifyOwnedBrowserOnline: async () => {
+            calls.push("online");
+            return {};
+          },
+        },
+      ) as () => Promise<{ browserSessionObservation: unknown; error: unknown }>;
+      const value = await run();
+      expect(value.error).toBe(original);
+      expect(value.browserSessionObservation).toEqual(mode === "records-session" ? session : null);
+      expect(calls).toEqual(["browser", "open"]);
+    },
+  );
   const ready = {
     attempts: 2,
     attemptsCapped: false,
@@ -1393,7 +1490,7 @@ describe("closed browser startup failure facts", () => {
       const originalFailure = new Error("Inert original startup failure.");
       const run = runControllerSource(
         NodeModule.stripTypeScriptTypes(
-          "async function run() { let browserDriverReadiness = null, browserReadinessStage = null, browser; try {" +
+          "async function run() { let browserDriverReadiness = null, browserReadinessStage = null, browserSessionObservation = null, browser; try {" +
             controller.slice(start, end) +
             "return {browserDriverReadiness, browserReadinessStage}; } catch (error) { return {browserDriverReadiness, browserReadinessStage, error}; }}\nrun",
         ),

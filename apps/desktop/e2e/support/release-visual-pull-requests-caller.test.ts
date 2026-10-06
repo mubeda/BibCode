@@ -804,7 +804,10 @@ it("seals the actual hosting setup before server startup without forwarding Node
       new URL("../qualify-delivery-retry.ts", import.meta.url),
       "utf8",
     ),
-    start = source.indexOf('if (config.selection === "release-visual-pull-requests")'),
+    start = source.indexOf(
+      'if (config.selection === "release-visual-pull-requests")',
+      source.indexOf("const gitProjectCommand ="),
+    ),
     end = source.indexOf('if (config.selection === "release-visual-git-project")', start);
   expect(start).toBeGreaterThan(source.indexOf("const gitProjectCommand ="));
   expect(end).toBeLessThan(source.indexOf("const server = owner.spawn(", end));

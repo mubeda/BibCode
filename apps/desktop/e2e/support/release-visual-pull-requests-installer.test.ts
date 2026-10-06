@@ -4,6 +4,9 @@ import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
 import * as NodeURL from "node:url";
 import * as NodeChildProcess from "node:child_process";
+import * as NodeModule from "node:module";
+import * as NodeVM from "node:vm";
+import { prepareDesktopUiTestContext } from "./test-project.ts";
 import { expect, it } from "vite-plus/test";
 const path = "./release-visual-pull-requests-installer.ts";
 const api = await import(path).catch((error) => {
@@ -185,6 +188,240 @@ it.each(["not-ci", "source", "symlink", "git-failure"])(
       expect(NodeFS.existsSync(NodePath.join(root, "hosting", "bin", "gh"))).toBe(false);
     } finally {
       NodeFS.rmSync(base, { recursive: true, force: true });
+    }
+  },
+);
+
+const qualifierPath = new NodeURL.URL("../qualify-delivery-retry.ts", import.meta.url);
+const qualifierSource = () => NodeFS.readFileSync(qualifierPath, "utf8");
+function actualRequestContext(
+  fixture: string,
+  theme: string,
+  selection = "release-visual-pull-requests",
+  source = qualifierSource(),
+  context = prepareDesktopUiTestContext,
+  uid: number | null = process.getuid?.() ?? null,
+) {
+  const start = source.indexOf("      const runRoot = NodePath.join(config.fixture, theme);");
+  const end = source.indexOf("      const control = NodePath.join(runRoot", start);
+  if (start < 0 || end < start) throw new Error("Actual request context boundary missing.");
+  return NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(source.slice(start, end)) + "\ncontext;",
+    {
+      NodeFS,
+      NodePath,
+      process: { env: { CI: "true" }, getuid: uid === null ? undefined : () => uid },
+      config: { fixture, selection },
+      theme,
+      prepareDesktopUiTestContext: context,
+      cursorQuestionFixtureSelection: "cursor-question-v1",
+      Error,
+    },
+  ) as ReturnType<typeof prepareDesktopUiTestContext>;
+}
+function actualRequestGit(root: string, fixtureRoot: string, home: string) {
+  const source = qualifierSource(),
+    start = source.indexOf("export function runOwnedGitProjectCommand("),
+    end = source.indexOf("export async function readOwnedGitProjectSnapshot(", start);
+  if (start < 0 || end < start) throw new Error("Actual request Git boundary missing.");
+  const owner = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(source.slice(start, end).replace(/^export /gm, "")) +
+      "\nrunOwnedGitProjectCommand;",
+    { NodeFS, NodePath, NodeChildProcess, Buffer, Error },
+  ) as (
+    input: { root: string; fixtureRoot: string; home: string; git: string },
+    cwd: string,
+    args: readonly string[],
+  ) => { status: number; stdout: string };
+  let calls = 0;
+  return {
+    calls: () => calls,
+    git: async (cwd: string, args: readonly string[]) => {
+      calls++;
+      return owner(
+        { root, fixtureRoot, home, git: NodePath.join(fixtureRoot, "bin", "git") },
+        cwd,
+        args,
+      );
+    },
+  };
+}
+function actualRequestTools(fixture: string) {
+  NodeFS.mkdirSync(NodePath.join(fixture, "bin"), { mode: 0o700 });
+  const result = NodeChildProcess.spawnSync(
+    "python3",
+    [
+      "-B",
+      "-c",
+      "import importlib.util,shutil,sys\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('owned',sys.argv[1]);owner=importlib.util.module_from_spec(spec);spec.loader.exec_module(owner);owner.prepare_tools(Path(sys.argv[2]),sys.argv[3],shutil.which('git'),shutil.which('dirname'))",
+      NodeURL.fileURLToPath(
+        new NodeURL.URL("../../../../scripts/qualify-chat-uploads.py", import.meta.url),
+      ),
+      fixture,
+      NodeFS.realpathSync(process.execPath),
+    ],
+    { encoding: "utf8", timeout: 5000, maxBuffer: 65536 },
+  );
+  if (result.error || result.status !== 0) throw new Error("Actual request tool setup refused.");
+}
+it.each(["light", "dark"])(
+  "prepares the actual PR context/installer/Git port privately under ordinary umask: %s",
+  async (theme) => {
+    const fixture = parent(),
+      oldUmask = process.umask(0o022);
+    try {
+      actualRequestTools(fixture);
+      const context = actualRequestContext(fixture, theme),
+        root = NodePath.join(fixture, theme),
+        port = actualRequestGit(root, fixture, context.fixtureUserHomePath);
+      expect(NodeFS.lstatSync(root).mode & 0o777).toBe(0o700);
+      const result = await prepare({
+        root,
+        sourceSha: "a".repeat(40),
+        node: NodeFS.realpathSync(process.execPath),
+        ci: true,
+        git: port.git,
+      });
+      expect(result !== null).toBe(true);
+      expect(port.calls()).toBe(30);
+      expect(Object.keys(result.projects)).toEqual(["github", "gitlab"]);
+      expect(NodeFS.lstatSync(root).mode & 0o777).toBe(0o700);
+    } finally {
+      process.umask(oldUmask);
+      NodeFS.rmSync(fixture, { recursive: true, force: true });
+    }
+  },
+);
+it("retains the installer refusal when the actual PR pre-context preparation is absent", async () => {
+  const fixture = parent(),
+    oldUmask = process.umask(0o022);
+  try {
+    actualRequestTools(fixture);
+    const source = qualifierSource(),
+      begin = source.indexOf(
+        '      if (config.selection === "release-visual-pull-requests") {',
+        source.indexOf("      const runRoot = NodePath.join(config.fixture, theme);"),
+      ),
+      end = source.indexOf("      const env = {", begin);
+    expect(begin >= 0 && end > begin).toBe(true);
+    const context = actualRequestContext(
+        fixture,
+        "light",
+        undefined,
+        source.slice(0, begin) + source.slice(end),
+      ),
+      root = NodePath.join(fixture, "light"),
+      port = actualRequestGit(root, fixture, context.fixtureUserHomePath);
+    expect(NodeFS.lstatSync(root).mode & 0o777).toBe(0o755);
+    await expect(
+      prepare({
+        root,
+        sourceSha: "a".repeat(40),
+        node: NodeFS.realpathSync(process.execPath),
+        ci: true,
+        git: port.git,
+      }),
+    ).rejects.toThrow("Owned hosting fixture refused.");
+    expect(port.calls()).toBe(0);
+  } finally {
+    process.umask(oldUmask);
+    NodeFS.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+it.each([
+  "private-collision",
+  "public-collision",
+  "file-collision",
+  "symlink-collision",
+  "public-parent",
+  "alias-parent",
+  "foreign-owner",
+  "missing-owner",
+  "foreign-theme",
+])("refuses PR root ownership before the actual context factory: %s", (mode) => {
+  const fixture = parent(),
+    root = NodePath.join(fixture, "light"),
+    target = NodePath.join(fixture, "target");
+  let fixtureInput = fixture,
+    contextCalls = 0;
+  try {
+    if (mode === "private-collision" || mode === "public-collision") {
+      NodeFS.mkdirSync(root, { mode: mode === "private-collision" ? 0o700 : 0o755 });
+      NodeFS.writeFileSync(NodePath.join(root, "retain"), "retained", { mode: 0o600 });
+    } else if (mode === "file-collision") NodeFS.writeFileSync(root, "retained", { mode: 0o600 });
+    else if (mode === "symlink-collision") {
+      NodeFS.mkdirSync(target, { mode: 0o700 });
+      NodeFS.symlinkSync(target, root);
+    } else if (mode === "public-parent") NodeFS.chmodSync(fixture, 0o755);
+    else if (mode === "alias-parent") {
+      fixtureInput = NodePath.join(fixture, "alias");
+      NodeFS.symlinkSync(fixture, fixtureInput);
+    }
+    const context = (...args: Parameters<typeof prepareDesktopUiTestContext>) => {
+      contextCalls++;
+      return prepareDesktopUiTestContext(...args);
+    };
+    expect(() =>
+      actualRequestContext(
+        fixtureInput,
+        mode === "foreign-theme" ? "foreign" : "light",
+        undefined,
+        undefined,
+        context,
+        mode === "foreign-owner"
+          ? (process.getuid?.() ?? 0) + 1
+          : mode === "missing-owner"
+            ? null
+            : (process.getuid?.() ?? null),
+      ),
+    ).toThrow();
+    expect(contextCalls).toBe(0);
+    expect(NodeFS.existsSync(NodePath.join(root, "state"))).toBe(false);
+    if (mode === "private-collision" || mode === "public-collision") {
+      expect(NodeFS.readFileSync(NodePath.join(root, "retain"), "utf8")).toBe("retained");
+      expect(NodeFS.lstatSync(root).mode & 0o777).toBe(
+        mode === "private-collision" ? 0o700 : 0o755,
+      );
+    }
+    if (mode === "symlink-collision") expect(NodeFS.readdirSync(target).length).toBe(0);
+  } finally {
+    NodeFS.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+it("keeps source admission before Git after private context preparation", async () => {
+  const fixture = parent();
+  try {
+    actualRequestTools(fixture);
+    const context = actualRequestContext(fixture, "light"),
+      root = NodePath.join(fixture, "light"),
+      port = actualRequestGit(root, fixture, context.fixtureUserHomePath);
+    await expect(
+      prepare({
+        root,
+        sourceSha: "foreign",
+        node: NodeFS.realpathSync(process.execPath),
+        ci: true,
+        git: port.git,
+      }),
+    ).rejects.toThrow("Owned hosting fixture refused.");
+    expect(port.calls()).toBe(0);
+    expect(NodeFS.existsSync(NodePath.join(root, "requests"))).toBe(false);
+  } finally {
+    NodeFS.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+it.each(["delivery-retry-ui", "release-visual-settings", "release-visual-core"])(
+  "retains the actual default context behavior for other selections: %s",
+  (selection) => {
+    const fixture = parent(),
+      oldUmask = process.umask(0o022);
+    try {
+      const context = actualRequestContext(fixture, "light", selection);
+      expect(NodeFS.lstatSync(NodePath.join(fixture, "light")).mode & 0o777).toBe(0o755);
+      expect(NodeFS.existsSync(context.projectPath)).toBe(true);
+    } finally {
+      process.umask(oldUmask);
+      NodeFS.rmSync(fixture, { recursive: true, force: true });
     }
   },
 );

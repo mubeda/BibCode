@@ -5,6 +5,7 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeUtil from "node:util";
 import { remote } from "webdriverio";
 import { bindOwnedBrowserAlertObservation } from "./owned-browser-alert.ts";
 import { classifyQualificationFailure, qualificationProcessRoles } from "./chat-upload-evidence.ts";
@@ -225,6 +226,50 @@ export function ownedBrowserOptions(chrome: string, profile: string, _webOrigin:
       },
     },
   };
+}
+
+export interface OwnedBrowserSessionObservation {
+  readonly protocolClientCreated: boolean;
+  readonly remoteReturned: boolean;
+  readonly alertBindingAttempted: boolean;
+  readonly alertBindingCompleted: boolean;
+}
+
+/** Four fixed boundary facts only; opaque SDK clients and protocol values never enter this packet. */
+export function projectOwnedBrowserSessionObservation(
+  input: unknown,
+): OwnedBrowserSessionObservation | null {
+  try {
+    if (
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      NodeUtil.types.isProxy(input)
+    )
+      return null;
+    const keys = [
+      "protocolClientCreated",
+      "remoteReturned",
+      "alertBindingAttempted",
+      "alertBindingCompleted",
+    ];
+    const own = Reflect.ownKeys(input);
+    if (
+      own.length !== keys.length ||
+      !own.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return null;
+    const values: Record<string, boolean> = {};
+    for (const key of keys) {
+      const field = Object.getOwnPropertyDescriptor(input, key);
+      if (!field?.enumerable || !Object.hasOwn(field, "value") || typeof field.value !== "boolean")
+        return null;
+      values[key] = field.value;
+    }
+    return Object.freeze(values) as unknown as OwnedBrowserSessionObservation;
+  } catch {
+    return null;
+  }
 }
 
 export interface OwnedDriverReadiness {
@@ -451,6 +496,7 @@ export async function openOwnedBrowser(
   profile: string,
   observeReadiness?: (value: OwnedDriverReadiness | null) => void,
   observeStage?: (value: "driver-readiness" | "session-create") => void,
+  observeSession?: (value: OwnedBrowserSessionObservation | null) => void,
 ) {
   try {
     observeStage?.("driver-readiness");
@@ -463,8 +509,35 @@ export async function openOwnedBrowser(
   } catch {
     /* Preserve the original session result or failure. */
   }
-  const browser = await bounded(remote(ownedBrowserOptions(chrome, profile, webOrigin)), 45_000);
+  const observation = {
+    protocolClientCreated: false,
+    remoteReturned: false,
+    alertBindingAttempted: false,
+    alertBindingCompleted: false,
+  };
+  const observe = () => {
+    try {
+      observeSession?.(projectOwnedBrowserSessionObservation(observation));
+    } catch {
+      /* Optional attribution cannot replace a genuine operation result or failure. */
+    }
+  };
+  observe();
+  const browser = await bounded(
+    remote(ownedBrowserOptions(chrome, profile, webOrigin), (client) => {
+      observation.protocolClientCreated = true;
+      observe();
+      return client;
+    }),
+    45_000,
+  );
+  observation.remoteReturned = true;
+  observe();
+  observation.alertBindingAttempted = true;
+  observe();
   bindOwnedBrowserAlertObservation(browser);
+  observation.alertBindingCompleted = true;
+  observe();
   return { browser, driver: child };
 }
 
