@@ -105,7 +105,7 @@ impl GeometrySnapshot {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) enum GeometryRequest {
-    Acquire,
+    Acquire {},
     Read {
         lease: String,
     },
@@ -253,7 +253,7 @@ impl GeometryOwner {
             return Err(GeometryError::StateRefused);
         }
         match request {
-            GeometryRequest::Acquire => {
+            GeometryRequest::Acquire {} => {
                 if self.unsafe_cleanup.load(Ordering::SeqCst) {
                     return Err(GeometryError::StateRefused);
                 }
@@ -707,6 +707,10 @@ mod tests {
 
     #[test]
     fn unknown_command_fields_and_noninteger_native_values_are_not_contracts() {
+        assert!(matches!(
+            serde_json::from_value::<GeometryRequest>(serde_json::json!({"operation":"acquire"})),
+            Ok(GeometryRequest::Acquire {})
+        ));
         assert!(
             serde_json::from_value::<GeometryRequest>(
                 serde_json::json!({"operation":"acquire","window":"preview"})
@@ -769,7 +773,7 @@ mod tests {
     async fn acquire(owner: &Arc<GeometryOwner>, native: &Arc<NativePort>) -> String {
         match owner
             .request(
-                GeometryRequest::Acquire,
+                GeometryRequest::Acquire {},
                 Arc::new(Immediate(Arc::clone(native))),
             )
             .await
@@ -963,7 +967,7 @@ mod tests {
         let dispatch: Arc<dyn GeometryDispatch> = delayed.clone();
         let pending = tokio::spawn(async move {
             request_owner
-                .request(GeometryRequest::Acquire, dispatch)
+                .request(GeometryRequest::Acquire {}, dispatch)
                 .await
         });
         for _ in 0..8 {
@@ -994,7 +998,7 @@ mod tests {
     async fn dispatch_refusal_is_not_replaced_by_a_timeout() {
         assert!(matches!(
             GeometryOwner::new()
-                .request(GeometryRequest::Acquire, Arc::new(Refused))
+                .request(GeometryRequest::Acquire {}, Arc::new(Refused))
                 .await,
             Err(GeometryError::DispatchRefused)
         ));
