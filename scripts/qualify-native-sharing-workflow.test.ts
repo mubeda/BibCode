@@ -19,6 +19,23 @@ const packagedWorkflow = () =>
       "utf8",
     ),
   );
+it("runs actual SDK navigation and native cleanup regressions before packaged capture builds", () => {
+  const steps = packagedWorkflow().jobs.native_sharing.steps;
+  const admission = steps.findIndex(
+    (step: { name: string }) => step.name === "Check native ownership and namespace admission",
+  );
+  const build = steps.findIndex(
+    (step: { name: string }) => step.name === "Build guarded packaged native app",
+  );
+  expect(admission).toBeGreaterThanOrEqual(0);
+  expect(build).toBeGreaterThan(admission);
+  expect(steps[admission].run).toContain(
+    "apps/desktop/e2e/support/release-visual-native-sharing-navigation.test.ts",
+  );
+  expect(steps[admission].run).toContain(
+    "apps/desktop/e2e/support/release-visual-native-sharing-session.test.ts",
+  );
+});
 it("admits a separate Linux packaged-app selection and skips the Chromium owner for it", () => {
   const value = workflow();
   expect(value.on.workflow_dispatch.inputs.scene_selection.options).toContain(

@@ -228,8 +228,8 @@ it("keeps cleanup facts separate and observational errors from replacing the ori
   expect(facts.cleanupSessionDeleteFailed).toBe(true);
   expect(f.calls).toEqual(["desktop_e2e_prepare_for_exit", "deleteSession"]);
 });
-it.each(["size", "navigation", "ports"])(
-  "attributes actual UI setup without adding actions: %s",
+it.each(["size", "navigation", "settlement", "ports"])(
+  "attributes actual UI setup failures at their native boundary: %s",
   async (fault) => {
     const source = NodeFS.readFileSync(
         new NodeURL.URL("../qualify-native-sharing.ts", import.meta.url),
@@ -256,13 +256,20 @@ it.each(["size", "navigation", "ports"])(
             calls.push("navigation");
             if (fault === "navigation") throw original;
           },
+          getUrl: async () => "tauri://localhost/#/settings/general",
         },
         createNativeSharingBrowserPorts: async () => {
           calls.push("ports");
           if (fault === "ports") throw original;
           return {};
         },
-        owner: {},
+        owner: {
+          until: async (check: () => Promise<boolean>) => {
+            calls.push("settlement");
+            if (fault === "settlement") throw original;
+            expect(await check()).toBe(true);
+          },
+        },
         evidence: "private",
         captured: new Set(),
         verify: async () => {},
@@ -280,14 +287,18 @@ it.each(["size", "navigation", "ports"])(
         ? "native-ui-window-size"
         : fault === "navigation"
           ? "native-ui-navigation"
-          : "native-ui-ports",
+          : fault === "settlement"
+            ? "native-ui-navigation-settle"
+            : "native-ui-ports",
     );
     expect(calls).toEqual(
       fault === "size"
         ? ["size"]
         : fault === "navigation"
           ? ["size", "navigation"]
-          : ["size", "navigation", "ports"],
+          : fault === "settlement"
+            ? ["size", "navigation", "settlement"]
+            : ["size", "navigation", "settlement", "ports"],
     );
   },
 );

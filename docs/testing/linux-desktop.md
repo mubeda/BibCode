@@ -2055,6 +2055,15 @@ hermetic guard, then runs it with a private data root, owned Xvfb and the
 checked PID1/network namespace. The ordinary six-platform packaged smoke
 selection retains its original matrix and commands.
 
+The native Classic driver acknowledges the URL assignment before navigation
+has necessarily settled. Before admitting the public UI ports or capturing, the
+controller follows that acknowledgement with the existing bounded read-only
+proof of the exact requested `tauri://localhost/#/settings/general` route. The
+owner deadline and strict capture guards remain unchanged; original driver
+errors propagate. The closed navigation phase and boolean distinguish an
+acknowledged assignment from an observed route without retaining URLs or window
+identities in the evidence.
+
 The native controller uses public Theme, Share this host and Refresh addresses
 controls. It removes and restores only the already-admitted private default
 route, checks the real native bridge and typed loopback descriptor, and never

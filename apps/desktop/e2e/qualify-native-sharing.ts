@@ -58,6 +58,7 @@ interface NativeSharingAdmissionFacts extends NativeSharingBrowserPreparationFac
   initialIdentityVerified: boolean;
   uiWindowSizeSet: boolean;
   uiNavigationCompleted: boolean;
+  uiNavigationSettled: boolean;
   uiPortsCreated: boolean;
   cleanupPrepareSucceeded: boolean;
   cleanupPrepareFailed: boolean;
@@ -435,6 +436,11 @@ export async function qualifyNativeSharing(
           step("native-ui-navigation");
           await browser.url("tauri://localhost/#/settings/general");
           observe({ uiNavigationCompleted: true });
+          step("native-ui-navigation-settle");
+          await owner.until(
+            async () => (await browser.getUrl()) === "tauri://localhost/#/settings/general",
+          );
+          observe({ uiNavigationSettled: true });
           step("native-ui-ports");
           const ports = await createNativeSharingBrowserPorts({
             browser,
