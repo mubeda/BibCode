@@ -8,9 +8,16 @@ on:
         description: Only the existing native visual follow-up partitions
         type: boolean
         default: false
+      native_windows_only:
+        description: Run only the Windows WSL native follow-up partition
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       native_followups:
+        type: boolean
+        default: false
+      native_windows_only:
         type: boolean
         default: false
 
@@ -459,7 +466,7 @@ jobs:
           retention-days: 7
 
   native_followups_linux:
-    if: ${{ inputs.native_followups == true }}
+    if: ${{ inputs.native_followups == true && inputs.native_windows_only != true }}
     name: Existing native menu and update originals - Linux x64
     runs-on: ubuntu-22.04
     timeout-minutes: 240

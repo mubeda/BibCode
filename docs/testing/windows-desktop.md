@@ -836,6 +836,12 @@ for setup failures and refuses an app that has not joined.
 
 Run the declared helper and Pester controls before the native job. Local source,
 TempFS or fake-command tests do not prove WSL, Windows ACLs or native originals.
+For a changed Windows recipe, dispatch `desktop-upgrade-smoke.yml` from its
+reviewed QA ref with both `native_followups=true` and `native_windows_only=true`.
+This selects the existing Windows partition without repeating Linux. The
+selector defaults to false for manual and reusable calls, preserving the combined
+native group and ordinary upgrade lanes. Linux qualification remains required;
+the Windows-only run does not complete the full native group.
 Keep command logs, names, registry IDs, paths and private manifests outside public
 evidence. The existing two original Local/WSL frames remain 1280 by 960; Preview
 and complete-group acceptance remain pending.

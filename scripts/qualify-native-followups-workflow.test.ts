@@ -401,6 +401,39 @@ it("preserves the normal matrix/default lanes and binds finite native evidence t
   expect(visual.jobs.native_followups.if).toContain("github.event.repository.default_branch");
 });
 
+it("selects the existing Windows partition without repeating Linux only when explicitly requested", () => {
+  const upgrade = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  for (const event of ["workflow_dispatch", "workflow_call"]) {
+    expect(upgrade.on[event].inputs.native_windows_only).toMatchObject({
+      type: "boolean",
+      default: false,
+    });
+  }
+  const admits = (condition: string | undefined, native: boolean, windows: boolean) =>
+    condition === undefined ||
+    NodeVM.runInNewContext(condition.slice(3, -2).trim(), {
+      inputs: { native_followups: native, native_windows_only: windows },
+    });
+  const combinations: ReadonlyArray<
+    readonly [native: boolean, windows: boolean, linuxExpected: boolean, ordinaryExpected: boolean]
+  > = [
+    [false, false, false, true],
+    [false, true, false, true],
+    [true, false, true, false],
+    [true, true, false, false],
+  ];
+  for (const [native, windows, linuxExpected, ordinaryExpected] of combinations) {
+    expect(admits(upgrade.jobs.native_followups_linux.if, native, windows)).toBe(linuxExpected);
+    expect(admits(upgrade.jobs.seeded_upgrade_smoke.if, native, windows)).toBe(ordinaryExpected);
+    expect(admits(upgrade.jobs.windows_wsl_upgrade_smoke.if, native, windows)).toBe(true);
+  }
+});
+
 it("retains only fixed owning terminal phases in the existing status packet", () => {
   expect(
     nativeFollowupWorkflowStatus(
