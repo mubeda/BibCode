@@ -11045,6 +11045,47 @@ async fn reconciliation_keeps_projection_failures_retryable_and_continues_later_
 }
 
 #[tokio::test]
+async fn reconciliation_discards_the_runtime_of_a_deleted_thread_instead_of_retrying_it() {
+    for status in ["ready", "error"] {
+        let (engine, _database) = engine_and_database().await;
+        project_session(&engine, "t1", "running").await;
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.delete", "commandId":"delete-t1", "threadId":"t1", "createdAt":NOW
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // A delivery retried against the deleted thread relaunches a session after the delete
+        // projection removed the runtime row, which is how the orphan survives restarts.
+        engine
+            .repositories()
+            .upsert_provider_session_runtime(persisted_runtime("t1", status, NOW))
+            .await
+            .unwrap();
+        let event_count = engine.read_events(0).await.unwrap().len();
+
+        reconcile_abandoned_provider_sessions(&engine)
+            .await
+            .unwrap();
+
+        assert!(
+            engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .unwrap()
+                .is_none(),
+            "a {status} runtime for a deleted thread is discarded, not left for the next startup"
+        );
+        assert_eq!(engine.read_events(0).await.unwrap().len(), event_count);
+        engine.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn reconciliation_retries_runtime_write_after_projection_without_duplicate_events() {
     let (engine, database) = engine_and_database().await;
     project_session(&engine, "t1", "ready").await;
