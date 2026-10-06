@@ -26,6 +26,7 @@ describe("Pull Requests environment atoms", () => {
       "getChecks",
       "getCommits",
       "getContext",
+      "getCreateDefaults",
       "getFiles",
       "getTimeline",
       "getVocabulary",

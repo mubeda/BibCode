@@ -95,6 +95,11 @@ export function createPullRequestsEnvironmentAtoms<R, E>(
       tag: WS_METHODS.pullRequestsGetVocabulary,
       staleTimeMs: 60_000,
     }),
+    getCreateDefaults: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:pull-requests:get-create-defaults",
+      tag: WS_METHODS.pullRequestsGetCreateDefaults,
+      staleTimeMs: 60_000,
+    }),
     list: createEnvironmentQueryAtomFamily(runtime, {
       label: "environment-data:pull-requests:list",
       staleTimeMs: 5_000,
