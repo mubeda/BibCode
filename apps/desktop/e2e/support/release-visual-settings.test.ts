@@ -952,6 +952,7 @@ describe("original settings PNG boundary", () => {
 function controller(failure?: string) {
   const actions: string[] = [];
   const captures: string[] = [];
+  let providerReads = 0;
   let route = "chat",
     popup = "",
     newBinding = false,
@@ -1005,8 +1006,14 @@ function controller(failure?: string) {
           actions.push("scroll:" + options?.selector);
           return;
         }
-        if (read === readSettingsAddProviderVisibility)
+        if (read === readSettingsAddProviderVisibility) {
+          providerReads++;
+          if (failure === "provider-pending" && providerReads === 1) return null;
+          if (failure === "provider-missing") return null;
+          if (failure === "provider-malformed")
+            return { oneControl: false, visible: false, hidden: true, enabled: true };
           return { oneControl: true, visible: false, hidden: true, enabled: true };
+        }
         return { x: 0, y: 0 };
       },
     },
@@ -1032,9 +1039,46 @@ function controller(failure?: string) {
       captures.push(scene);
     },
   } as unknown as SettingsVisualInput;
-  return { input, actions, captures, failed, state: () => ({ route, popup, newBinding, details }) };
+  return {
+    input,
+    actions,
+    captures,
+    failed,
+    providerReads: () => providerReads,
+    state: () => ({ route, popup, newBinding, details }),
+  };
 }
 describe("fixed public settings controller", () => {
+  it("waits for the Providers route metadata after one navigation without repeating actions", async () => {
+    const c = controller("provider-pending");
+    await expect(runVisualSettings(c.input)).resolves.toMatchObject({
+      addProviderDialog: "unsupported-hidden-control",
+      noSettingsSaved: true,
+    });
+    expect(c.captures).toEqual([
+      "model-picker",
+      "settings-keybindings",
+      "settings-source-control",
+      "settings-provider-form",
+    ]);
+    expect(c.actions.filter((action) => action === "button=Providers")).toHaveLength(1);
+    expect(c.providerReads()).toBe(2);
+    expect(c.state()).toEqual({ route: "chat", popup: "", newBinding: false, details: false });
+  });
+  it.each([
+    ["provider-missing", "Inert wait refused.", 2],
+    ["provider-malformed", "Visual settings Add admission refused.", 1],
+  ] as const)(
+    "refuses %s metadata without repeating navigation or capturing it",
+    async (mode, message, reads) => {
+      const c = controller(mode);
+      await expect(runVisualSettings(c.input)).rejects.toThrow(message);
+      expect(c.providerReads()).toBe(reads);
+      expect(c.actions.filter((action) => action === "button=Providers")).toHaveLength(1);
+      expect(c.captures).not.toContain("settings-provider-form");
+      expect(c.state()).toEqual({ route: "chat", popup: "", newBinding: false, details: false });
+    },
+  );
   it("uses public actions, cancels the new condition draft, returns to the same chat and labels hidden Add unpictured", async () => {
     const c = controller();
     const receipt = await runVisualSettings(c.input);

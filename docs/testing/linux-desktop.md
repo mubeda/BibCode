@@ -1530,6 +1530,10 @@ The qualifier does not authenticate, forge, toggle availability or save settings
 is the current `/settings/providers` route, separate from Agents. Expand the
 existing Claude card to show actual non-secret fields and model controls.
 
+After the single public Providers navigation, wait within the existing owner
+bound when the fixed Add-control observer returns null during route/render
+handoff. Keep each read's two-second bound. Malformed non-null metadata still
+refuses immediately, and readiness waiting never repeats navigation or Add.
 Keep the hidden Add instance opener hidden. Its computed visibility determines
 the closed unsupported diagnostic; a source inventory does not establish Add
 wizard pixels. Provider account/status overviews, the Add wizard, Effort/Fast

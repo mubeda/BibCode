@@ -871,17 +871,25 @@ export async function runVisualSettings(input: SettingsVisualInput): Promise<obj
     await click('button[aria-label="Toggle Git details"]');
     await capture("settings-source-control");
 
+    step("visual-settings-providers-open");
     await click("button=Providers");
-    const add = await bounded(
-      browser.execute(readSettingsAddProviderVisibility, {
-        scene: "settings-provider-form" as const,
-        theme: input.theme,
-        origin: input.origin,
-        threadId: input.threadId,
-        branch: input.branch,
-      }),
-      2_000,
-    );
+    const readAdd = () =>
+      bounded(
+        browser.execute(readSettingsAddProviderVisibility, {
+          scene: "settings-provider-form" as const,
+          theme: input.theme,
+          origin: input.origin,
+          threadId: input.threadId,
+          branch: input.branch,
+        }),
+        2_000,
+      );
+    let add = await readAdd();
+    await input.owner.until(async () => {
+      if (add !== null) return true;
+      add = await readAdd();
+      return add !== null;
+    });
     if (
       !add ||
       add.oneControl !== true ||
