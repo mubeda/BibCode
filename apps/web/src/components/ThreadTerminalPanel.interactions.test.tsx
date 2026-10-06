@@ -30,7 +30,10 @@ import type { TerminalThemeMode } from "./terminalTheme";
 
 interface FakeTerminalInstance {
   readonly options: Record<string, unknown>;
-  readonly modes: { mouseTrackingMode: "none" | "x10" | "vt200" | "drag" | "any" };
+  readonly modes: {
+    mouseTrackingMode: "none" | "x10" | "vt200" | "drag" | "any";
+    bracketedPasteMode: boolean;
+  };
   readonly textarea: HTMLTextAreaElement;
   cols: number;
   rows: number;
@@ -393,8 +396,12 @@ vi.mock("@xterm/xterm", () => ({
     selectionHandler: (() => void) | null = null;
     keyHandler: ((event: KeyboardEvent) => boolean) | null = null;
     hasActiveSelection = false;
-    modes: { mouseTrackingMode: "none" | "x10" | "vt200" | "drag" | "any" } = {
+    modes: {
+      mouseTrackingMode: "none" | "x10" | "vt200" | "drag" | "any";
+      bracketedPasteMode: boolean;
+    } = {
       mouseTrackingMode: "none",
+      bracketedPasteMode: false,
     };
     selectionText = "";
     selectionPosition: { start: { y: number } } | null = null;
@@ -471,7 +478,11 @@ const testState = vi.hoisted(() => ({
     availableEditors: string[];
     environment: {
       platform: { os: string };
-      capabilities?: { terminalOrderedInput?: boolean; terminalSizeOwnership?: boolean };
+      capabilities?: {
+        terminalOrderedInput?: boolean;
+        terminalSizeOwnership?: boolean;
+        terminalImagePaste?: boolean;
+      };
     };
   } | null,
   session: {
@@ -490,6 +501,7 @@ const testState = vi.hoisted(() => ({
   reattachCommand: vi.fn(),
   resizeCommand: vi.fn(),
   restartCommand: vi.fn(),
+  stageImagePasteCommand: vi.fn(),
   previewCommand: vi.fn(),
   openPath: vi.fn(),
   contextMenuShow: vi.fn(),
@@ -539,6 +551,7 @@ vi.mock("../state/terminal", () => ({
     resetInput: "terminal-reset-input",
     resize: "terminal-resize",
     restart: "terminal-restart",
+    stageImagePaste: "terminal-stage-image-paste",
   },
 }));
 vi.mock("../state/use-atom-command", () => ({
@@ -548,6 +561,7 @@ vi.mock("../state/use-atom-command", () => ({
     if (command === "terminal-reset-input") return testState.resetInputCommand;
     if (command === "terminal-resize") return testState.resizeCommand;
     if (command === "terminal-restart") return testState.restartCommand;
+    if (command === "terminal-stage-image-paste") return testState.stageImagePasteCommand;
     return testState.previewCommand;
   },
 }));
@@ -1223,6 +1237,9 @@ beforeEach(() => {
   testState.reattachCommand.mockReset();
   testState.resizeCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.restartCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
+  testState.stageImagePasteCommand
+    .mockReset()
+    .mockResolvedValue(AsyncResult.success("/state/terminal-pastes/paste.png"));
   testState.previewCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.openPath.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.contextMenuShow.mockReset().mockResolvedValue(undefined);
@@ -4607,6 +4624,204 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(execCommand).not.toHaveBeenCalled();
     expect(terminal.focus).toHaveBeenCalledTimes(focusCalls);
     expect(terminal.writes.join("")).not.toContain("Copy failed");
+  });
+
+  describe("image paste", () => {
+    const withCapabilities = (capabilities: { terminalImagePaste?: boolean }) => {
+      testState.serverConfig = {
+        availableEditors: ["vscode"],
+        environment: { platform: { os: "windows" }, capabilities },
+      };
+    };
+    const sentData = () =>
+      testState.writeCommand.mock.calls
+        .map(([request]) => (request as { input: { data: string } }).input.data)
+        .join("");
+    const pasteEvent = (text: string, files: File[]) => {
+      const event = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "clipboardData", {
+        value: { getData: (type: string) => (type === "text/plain" ? text : ""), files },
+      });
+      return event;
+    };
+    const png = () =>
+      new File([new Uint8Array([137, 80, 78, 71])], "image.png", { type: "image/png" });
+    const pasteInto = async (event: Event) => {
+      const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+      const screen = mounted.container.querySelector(".xterm-screen")!;
+      const xtermPaste = vi.fn();
+      screen.addEventListener("paste", xtermPaste);
+      await act(async () => {
+        screen.dispatchEvent(event);
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      return { terminal: xtermState.terminals[0]!, xtermPaste };
+    };
+
+    it("uploads an image-only paste and pastes the path of its server copy", async () => {
+      withCapabilities({ terminalImagePaste: true });
+      const image = png();
+      const event = pasteEvent("", [image]);
+
+      const { xtermPaste } = await pasteInto(event);
+
+      expect(event.defaultPrevented).toBe(true);
+      expect(xtermPaste).not.toHaveBeenCalled();
+      expect(testState.stageImagePasteCommand).toHaveBeenCalledWith(
+        {
+          environmentId: ENVIRONMENT_ID,
+          input: { file: image, name: "image.png", mimeType: "image/png" },
+        },
+        { signal: expect.any(AbortSignal) },
+      );
+      expect(sentData()).toBe("/state/terminal-pastes/paste.png");
+    });
+
+    it("brackets the path and holds input typed while the image uploads", async () => {
+      withCapabilities({ terminalImagePaste: true });
+      let finishUpload!: (result: unknown) => void;
+      testState.stageImagePasteCommand.mockReturnValue(
+        new Promise((resolve) => {
+          finishUpload = resolve;
+        }),
+      );
+      const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+      const terminal = xtermState.terminals[0]!;
+      terminal.modes.bracketedPasteMode = true;
+      await act(async () => {
+        mounted.container.querySelector(".xterm-screen")!.dispatchEvent(pasteEvent("", [png()]));
+        terminal.dataHandler?.(" what is this?\r");
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(sentData()).toBe("");
+
+      await act(async () => {
+        finishUpload(AsyncResult.success("/state/terminal-pastes/paste.png"));
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+
+      expect(sentData()).toBe("\x1b[200~/state/terminal-pastes/paste.png\x1b[201~ what is this?\r");
+    });
+
+    it("shows the upload and lets Cancel release the input held behind it", async () => {
+      withCapabilities({ terminalImagePaste: true });
+      testState.stageImagePasteCommand.mockImplementation(
+        (_request: unknown, { signal }: { signal: AbortSignal }) =>
+          new Promise((resolve) => {
+            signal.addEventListener("abort", () => resolve(AsyncResult.failure(Cause.interrupt())));
+          }),
+      );
+      const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+      const terminal = xtermState.terminals[0]!;
+      await act(async () => {
+        mounted.container.querySelector(".xterm-screen")!.dispatchEvent(pasteEvent("", [png()]));
+        terminal.dataHandler?.("typed");
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      const status = mounted.container.querySelector('[role="status"]');
+      expect(status?.textContent).toContain("Uploading pasted image");
+      expect(sentData()).toBe("");
+
+      await click(
+        [...status!.querySelectorAll("button")].find((button) => button.textContent === "Cancel")!,
+      );
+      await act(async () => {
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+
+      expect(mounted.container.querySelector('[role="status"]')).toBeNull();
+      expect(sentData()).toBe("typed");
+      expect(terminal.writes.join("")).not.toContain("Image paste failed");
+    });
+
+    it("does not upload or paste into an unavailable workspace", async () => {
+      withCapabilities({ terminalImagePaste: true });
+      const mounted = await mount(
+        <TerminalViewport
+          {...viewportProps()}
+          workspaceUnavailable="Workspace folder is missing"
+        />,
+      );
+      const event = pasteEvent("", [png()]);
+      await act(async () => {
+        mounted.container.querySelector(".xterm-screen")!.dispatchEvent(event);
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+
+      expect(event.defaultPrevented).toBe(true);
+      expect(testState.stageImagePasteCommand).not.toHaveBeenCalled();
+      expect(sentData()).toBe("");
+    });
+
+    it("aborts a pending upload when the viewport is torn down", async () => {
+      withCapabilities({ terminalImagePaste: true });
+      testState.stageImagePasteCommand.mockReturnValue(new Promise(() => undefined));
+      const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+      await act(async () => {
+        mounted.container.querySelector(".xterm-screen")!.dispatchEvent(pasteEvent("", [png()]));
+      });
+      const { signal } = testState.stageImagePasteCommand.mock.calls[0]![1] as {
+        signal: AbortSignal;
+      };
+      expect(signal.aborted).toBe(false);
+
+      await unmount(mounted);
+
+      expect(signal.aborted).toBe(true);
+    });
+
+    it("leaves text pastes to xterm even when files are attached", async () => {
+      withCapabilities({ terminalImagePaste: true });
+      const event = pasteEvent("echo hi", [png()]);
+
+      const { terminal, xtermPaste } = await pasteInto(event);
+
+      expect(event.defaultPrevented).toBe(false);
+      expect(xtermPaste).toHaveBeenCalledOnce();
+      expect(testState.stageImagePasteCommand).not.toHaveBeenCalled();
+      expect(sentData()).toBe("");
+    });
+
+    it.each([
+      [
+        "an older server",
+        {},
+        png(),
+        "Image paste needs a newer BiBCode server on this environment.",
+      ],
+      [
+        "an unsupported image type",
+        { terminalImagePaste: true },
+        new File(["<svg/>"], "drawing.svg", { type: "image/svg+xml" }),
+        "Image paste supports PNG, JPEG, GIF and WebP images.",
+      ],
+    ] as const)(
+      "explains %s instead of pasting nothing",
+      async (_label, capabilities, image, message) => {
+        withCapabilities(capabilities);
+        const event = pasteEvent("", [image]);
+
+        const { terminal } = await pasteInto(event);
+
+        expect(event.defaultPrevented).toBe(true);
+        expect(testState.stageImagePasteCommand).not.toHaveBeenCalled();
+        expect(terminal.writes).toContain(`\r\n[terminal] ${message}\r\n`);
+      },
+    );
+
+    it("reports a failed upload in the terminal", async () => {
+      withCapabilities({ terminalImagePaste: true });
+      testState.stageImagePasteCommand.mockResolvedValue(
+        AsyncResult.failure(Cause.fail(new Error("Attachment exceeds upload size limit"))),
+      );
+
+      const { terminal } = await pasteInto(pasteEvent("", [png()]));
+
+      expect(sentData()).toBe("");
+      expect(terminal.writes).toContain(
+        "\r\n[terminal] Image paste failed: Attachment exceeds upload size limit\r\n",
+      );
+    });
   });
 
   it("leaves context menus alone when selection UI is unavailable", async () => {

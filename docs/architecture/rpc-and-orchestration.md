@@ -1391,6 +1391,32 @@ Observation result publication takes the lifecycle mutex before repository
 state and skips publication after terminal transition. Later subscribe,
 refresh, invalidation, and release paths cannot restart the service.
 
+### Terminal image paste
+
+Servers with `capabilities.terminalImagePaste` accept
+`terminal.stageImagePaste { uploadId, name, mimeType, sizeBytes }`, which needs
+`terminal:operate`; the upload before it needs `orchestration:operate`, which
+every issued scope bundle that grants `terminal:operate` includes. A terminal program reads its own host's clipboard, never the
+client's, so the web terminal turns an image-only paste (no `text/plain`) into a
+staged upload and asks the server for a file the program can open. The upload
+uses the `chat-attachment` target with type `image`, so it shares the staging
+limits, ownership, and expiry above. The server binds the completed upload,
+accepts only PNG, JPEG, GIF, and WebP, copies it to
+`terminal-pastes/<uuid>.<ext>` under the state directory, retires the stage, and
+returns the absolute path. The client sends that path as terminal input,
+escaped for the server platform (backslashes on POSIX, quotes on Windows) when
+it contains other characters, and wrapped in bracketed-paste markers when the
+program enabled them. The paste
+reserves its place in the terminal's persistent input queue, so input typed
+during the upload waits behind the path within the 1 MiB pending limit, and a
+terminal restart drops both. The terminal shows the upload with a Cancel
+action, which releases the held input. A result for an earlier terminal process is dropped, a failed commit
+releases its stage, and closing the viewport aborts the upload. Codex and Claude Code
+attach an image from a pasted path. Copies are not tied to threads: each paste
+removes files in `terminal-pastes/` older than 24 hours. Against a server
+without the capability, the terminal reports that image paste needs a newer
+server instead of sending an empty paste.
+
 ### Missing-workspace runtime guard
 
 The production runtime owns one `WorkspaceAvailabilityRegistry` and injects

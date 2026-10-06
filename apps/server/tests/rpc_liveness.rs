@@ -1163,7 +1163,7 @@ async fn staged_upload_trial(mode: Mode, up_rate: u64) {
         let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
         let (ended_tx, mut ended_rx) = tokio::sync::mpsc::channel(1);
         let handle = start_server_with(&temp, |registry| {
-            bibcode_server::production::uploads_rpc::register_uploads_rpc(registry, uploads.clone());
+            bibcode_server::production::uploads_rpc::register_uploads_rpc(registry, uploads.clone(), temp.path().join("terminal-pastes"));
             registry.register_stream("fixture.watch", move |_, cancellation| {
                 let (sender, receiver) = tokio::sync::mpsc::channel(1);
                 let started = started_tx.clone(); let ended = ended_tx.clone();

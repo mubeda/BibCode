@@ -984,6 +984,9 @@ the departed renderer or its terminal buffers reachable.
 
 Terminal clipboard shortcuts use xterm's trusted native copy/paste events,
 including bracketed paste, without requiring the asynchronous Clipboard API.
+An image-only paste is uploaded to the terminal's environment, which returns
+the path of a server copy for the program to read
+([terminal image paste](rpc-and-orchestration.md#terminal-image-paste)).
 Shifted copy selects xterm's hidden textarea for the native copy command, then
 restores its pending input. Bare Ctrl+C remains terminal input when nothing is
 selected. Selecting output keeps keyboard focus in the terminal; **Copy** and

@@ -1,5 +1,6 @@
 import {
   type EnvironmentId,
+  type TerminalImagePasteMimeType,
   type TerminalMetadataStreamEvent,
   type TerminalSummary,
   type TerminalSessionSnapshot,
@@ -18,6 +19,7 @@ import {
   environmentRpcKey,
   followStreamInEnvironment,
   parseEnvironmentRpcKey,
+  runInEnvironment,
 } from "./runtime.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
@@ -42,6 +44,8 @@ import {
 } from "./terminalTranscriptRuntime.ts";
 
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { releaseStagedAttachments } from "../operations/attachmentStaging.ts";
+import { createUploadPort, stageUpload } from "../operations/uploadStager.ts";
 import {
   createTerminalInputBindingRegistry,
   type TerminalInputTarget,
@@ -65,6 +69,49 @@ export function accumulateTerminalMetadataEvents<E, R>(
     Stream.drop(1),
   );
 }
+
+export interface TerminalImagePasteInput {
+  readonly file: Blob;
+  readonly name: string;
+  readonly mimeType: TerminalImagePasteMimeType;
+}
+
+/** Uploads a pasted image and returns the server path of its copy for the terminal program. */
+export const stageTerminalImagePaste = Effect.fn("terminal.stageImagePaste")(function* (
+  input: TerminalImagePasteInput,
+) {
+  const environmentId = (yield* EnvironmentSupervisor).target.environmentId;
+  const port = yield* createUploadPort("attachmentStaging");
+  const staged = yield* stageUpload(
+    {
+      target: {
+        _tag: "chat-attachment",
+        type: "image",
+        name: input.name,
+        mimeType: input.mimeType,
+      },
+      file: input.file,
+      fileName: input.name,
+    },
+    port,
+  );
+  // The upload may have resumed on a replacement connection, so the commit (and
+  // the release of a stage it did not consume) resolve the current one.
+  const { path } = yield* runInEnvironment(
+    environmentId,
+    request(WS_METHODS.terminalStageImagePaste, {
+      uploadId: staged.uploadId,
+      name: input.name,
+      mimeType: input.mimeType,
+      sizeBytes: staged.sizeBytes,
+    }),
+  ).pipe(
+    Effect.onError(() =>
+      runInEnvironment(environmentId, releaseStagedAttachments([staged])).pipe(Effect.ignore),
+    ),
+  );
+  return path;
+});
 
 export function createTerminalEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
@@ -252,6 +299,16 @@ export function createTerminalEnvironmentAtoms<R, E>(
       }),
       scheduler: lifecycleScheduler,
       concurrency: lifecycleConcurrency,
+    }),
+    stageImagePaste: createEnvironmentCommand<
+      EnvironmentRegistry | R,
+      E,
+      TerminalImagePasteInput,
+      Effect.Success<ReturnType<typeof stageTerminalImagePaste>>,
+      Effect.Error<ReturnType<typeof stageTerminalImagePaste>>
+    >(runtime, {
+      label: "environment-data:terminal:stage-image-paste",
+      execute: stageTerminalImagePaste,
     }),
     close: createEnvironmentCommand(runtime, {
       label: "environment-data:terminal:close",
