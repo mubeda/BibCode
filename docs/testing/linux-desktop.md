@@ -2393,6 +2393,25 @@ gsettings actions change and restore that session's real appearance preference.
 Require the actual portal reply, native GTK menu grouping and original root
 pixels. Missing services or controls remain unavailable, never synthesized.
 
+The Linux session atomically allocates its own short `0700` directory directly
+beneath the same canonical private work root. Admit the physical parent and new
+directory by current-user ownership, exact private mode and canonical identity;
+check the actual filesystem D-Bus address against its 99-byte capacity before
+launching any service. Keep the session outside the longer build/driver directory
+tree. Aliases, foreign ownership, non-private permissions or an oversized address
+fail closed; never repair an existing directory or substitute a fabricated bus.
+Joined session children and finite raw logs remain private to that owned session.
+
+The existing workflow-status artifact retains a fixed owning phase for package
+build/publish, updater readiness, package installation, private Linux session
+admission/services, the driver, cleanup, evidence retention and final result
+admission. These observations bracket existing operations without another
+SDK/RPC/native request, poll, retry or changed deadline. A first failure keeps
+its original phase and exception through secondary cleanup failures; optional
+diagnostic errors cannot replace it. Raw errors, paths and identities stay
+private. A terminal phase identifies a boundary and does not establish a native
+cause or visual acceptance.
+
 The existing owner builds both a current-source protected baseline and a valid
 ephemeral-signed candidate in isolated checkouts. Its nonroot read-only install
 parent creates a genuine permission failure while retaining the original app.

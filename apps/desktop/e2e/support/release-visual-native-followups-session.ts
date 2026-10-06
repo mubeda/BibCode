@@ -3,10 +3,46 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeProcess from "node:process";
 import { bounded } from "./qualification-owner.ts";
 import { NativeFollowupCommandOwner } from "./release-visual-native-followups-process.ts";
+function createNativeFollowupsLinuxSessionRoot(workRoot: string, observe: (phase: string) => void) {
+  const uid = typeof NodeProcess.getuid === "function" ? NodeProcess.getuid() : -1;
+  const parent = NodeFS.lstatSync(workRoot);
+  if (
+    !NodePath.isAbsolute(workRoot) ||
+    NodeFS.realpathSync(workRoot) !== workRoot ||
+    !parent.isDirectory() ||
+    parent.isSymbolicLink() ||
+    (parent.mode & 0o777) !== 0o700 ||
+    uid < 1 ||
+    parent.uid !== uid
+  )
+    throw new Error("Native follow-up private OS parent refused.");
+  const root = NodeFS.mkdtempSync(NodePath.join(workRoot, "s-"));
+  const owned = NodeFS.lstatSync(root);
+  if (
+    NodeFS.realpathSync(root) !== root ||
+    !owned.isDirectory() ||
+    owned.isSymbolicLink() ||
+    (owned.mode & 0o777) !== 0o700 ||
+    owned.uid !== parent.uid ||
+    NodePath.dirname(root) !== workRoot
+  )
+    throw new Error("Native follow-up private OS root refused.");
+  observe("native-linux-address");
+  // D-Bus 1.12's filesystem socket contract caps the UTF-8 socket path at 99 bytes.
+  if (Buffer.byteLength(NodePath.join(root, "runtime", "bus"), "utf8") > 99)
+    throw new Error("Native follow-up private bus address refused.");
+  return root;
+}
 export async function withNativeFollowupsLinuxSession<A>(
-  input: { environment: NodeJS.ProcessEnv; root: string; platform: string },
+  input: {
+    environment: NodeJS.ProcessEnv;
+    workRoot: string;
+    platform: string;
+    onStage?: (phase: string) => void;
+  },
   run: (environment: NodeJS.ProcessEnv) => Promise<A>,
 ): Promise<A> {
   if (
@@ -14,16 +50,23 @@ export async function withNativeFollowupsLinuxSession<A>(
     input.environment.CI !== "true" ||
     input.environment.GITHUB_ACTIONS !== "true" ||
     !input.environment.DISPLAY ||
-    !NodePath.isAbsolute(input.root) ||
-    NodeFS.existsSync(input.root)
+    !NodePath.isAbsolute(input.workRoot)
   )
     throw new Error("Native follow-up private OS session refused.");
-  NodeFS.mkdirSync(input.root, { mode: 0o700 });
-  const home = NodePath.join(input.root, "home"),
-    config = NodePath.join(input.root, "config"),
-    cache = NodePath.join(input.root, "cache"),
-    data = NodePath.join(input.root, "data"),
-    runtime = NodePath.join(input.root, "runtime"),
+  const observe = (phase: string) => {
+    try {
+      input.onStage?.(phase);
+    } catch {
+      /* A diagnostic sink never replaces a genuine operation result. */
+    }
+  };
+  observe("native-linux-root");
+  const root = createNativeFollowupsLinuxSessionRoot(input.workRoot, observe);
+  const home = NodePath.join(root, "home"),
+    config = NodePath.join(root, "config"),
+    cache = NodePath.join(root, "cache"),
+    data = NodePath.join(root, "data"),
+    runtime = NodePath.join(root, "runtime"),
     bus = NodePath.join(runtime, "bus");
   for (const path of [home, config, cache, data, runtime]) NodeFS.mkdirSync(path, { mode: 0o700 });
   const environment = {
@@ -53,12 +96,12 @@ export async function withNativeFollowupsLinuxSession<A>(
     if (!stat.isFile() || (stat.mode & 0o022) !== 0)
       throw new Error("Native follow-up session tool refused.");
     const fd = NodeFS.openSync(
-        NodePath.join(input.root, "session-" + children.length + ".log"),
+        NodePath.join(root, "session-" + children.length + ".log"),
         "wx",
         0o600,
       ),
       child = NodeChildProcess.spawn(executable, args, {
-        cwd: input.root,
+        cwd: root,
         env: environment,
         detached: true,
         stdio: ["ignore", "pipe", "pipe"],
@@ -93,6 +136,7 @@ export async function withNativeFollowupsLinuxSession<A>(
     value: A | undefined,
     cleanupSafe = true;
   try {
+    observe("native-linux-bus");
     start("/usr/bin/dbus-daemon", [
       "--session",
       "--nofork",
@@ -104,9 +148,10 @@ export async function withNativeFollowupsLinuxSession<A>(
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     // Real private settings/accessibility owners are prerequisites, never fabricated portal replies.
+    observe("native-linux-settings");
     const settings = new NativeFollowupCommandOwner(
       environment,
-      input.root,
+      root,
       () => {
         cleanupSafe = false;
       },
@@ -119,6 +164,7 @@ export async function withNativeFollowupsLinuxSession<A>(
       "true",
     ]);
     settings.assertClosed();
+    observe("native-linux-services");
     start("/usr/bin/openbox", ["--sm-disable"]);
     const xsettings = [
       "/usr/libexec/gsd-xsettings",
@@ -141,6 +187,7 @@ export async function withNativeFollowupsLinuxSession<A>(
     if (!backend || !portal) throw new Error("Native follow-up real GTK portal unavailable.");
     start(backend, []);
     start(portal, []);
+    observe("native-linux-driver");
     value = await run(environment);
     if (children.some((entry) => entry.done || entry.overflow))
       throw new Error("Native follow-up private OS session exited early.");
@@ -148,6 +195,7 @@ export async function withNativeFollowupsLinuxSession<A>(
     failed = true;
     original = error;
   } finally {
+    if (!failed) observe("native-linux-cleanup");
     for (const entry of children.toReversed()) {
       try {
         if (!entry.done && entry.child.pid) {
@@ -177,7 +225,7 @@ export async function withNativeFollowupsLinuxSession<A>(
       }
     }
     NodeFS.writeFileSync(
-      NodePath.join(input.root, "cleanup.json"),
+      NodePath.join(root, "cleanup.json"),
       JSON.stringify({
         childCount: children.length,
         childProcessesClosed: children.every((entry) => entry.done),

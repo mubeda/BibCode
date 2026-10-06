@@ -369,3 +369,38 @@ it("preserves the normal matrix/default lanes and binds finite native evidence t
   expect(visual.jobs.native_followups.with.native_followups).toBe(true);
   expect(visual.jobs.native_followups.if).toContain("github.event.repository.default_branch");
 });
+
+it("retains only fixed owning terminal phases in the existing status packet", () => {
+  expect(
+    nativeFollowupWorkflowStatus(
+      "a".repeat(40),
+      "linux-menu-update",
+      "failed",
+      0,
+      "native-linux-address",
+    ),
+  ).toMatchObject({
+    phase: "native-linux-address",
+    originalCount: 0,
+    status: "failed",
+    completeGroup: false,
+  });
+  expect(() =>
+    nativeFollowupWorkflowStatus(
+      "a".repeat(40),
+      "linux-menu-update",
+      "failed",
+      0,
+      "inert private value" as never,
+    ),
+  ).toThrow();
+  const source = NodeFS.readFileSync(
+    new URL("./qualify-native-followups-workflow.ts", import.meta.url),
+    "utf8",
+  );
+  expect(source).toContain("observeNativeFollowupPhase:");
+  expect(source).toContain('phase = "native-result-admission";');
+  expect(source).toContain(
+    "nativeFollowupWorkflowStatus(sourceSha, plan.partition, status, count, phase)",
+  );
+});

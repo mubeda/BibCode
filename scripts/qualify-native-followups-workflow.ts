@@ -11,6 +11,8 @@ import {
   parseSeededDesktopUpgradeSmokeArgs,
   runSeededDesktopUpgradeSmoke,
   type SeededDesktopUpgradeSmokeInput,
+  nativeFollowupPhases,
+  type NativeFollowupPhase,
 } from "./seeded-desktop-upgrade-smoke.ts";
 const refused = () => new Error("Native follow-up workflow admission refused.");
 export function nativeFollowupWorkflowPlan(
@@ -57,9 +59,11 @@ export function nativeFollowupWorkflowStatus(
   partition: "linux-menu-update" | "windows-wsl",
   status: "partition-complete" | "unavailable" | "failed",
   originalCount: number,
+  phase: NativeFollowupPhase = "native-owner-start",
 ) {
   const count = partition === "linux-menu-update" ? 6 : 2;
   if (
+    !nativeFollowupPhases.includes(phase) ||
     !["linux-menu-update", "windows-wsl"].includes(partition) ||
     !["partition-complete", "unavailable", "failed"].includes(status) ||
     (status === "unavailable" && originalCount !== 0) ||
@@ -73,6 +77,7 @@ export function nativeFollowupWorkflowStatus(
   return {
     schemaVersion: 1,
     selection: "release-visual-native-followups",
+    phase,
     sourceSha,
     partition,
     status,
@@ -118,8 +123,15 @@ async function main() {
   });
   let status: "partition-complete" | "failed" = "failed",
     count = 0;
+  let phase: NativeFollowupPhase = "native-owner-start";
   try {
-    await runSeededDesktopUpgradeSmoke(input);
+    await runSeededDesktopUpgradeSmoke({
+      ...input,
+      observeNativeFollowupPhase: (value) => {
+        phase = value;
+      },
+    });
+    phase = "native-result-admission";
     const retained = JSON.parse(
       NodeFS.readFileSync(
         NodePath.join(input.artifactDirectory, "native-followups-result.json"),
@@ -219,7 +231,7 @@ async function main() {
     privateWrite(
       input.artifactDirectory,
       "native-followups-workflow-status.json",
-      nativeFollowupWorkflowStatus(sourceSha, plan.partition, status, count),
+      nativeFollowupWorkflowStatus(sourceSha, plan.partition, status, count, phase),
     );
   }
 }

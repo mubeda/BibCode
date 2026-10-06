@@ -261,6 +261,15 @@ describe("private held upload receipt and cleanup", () => {
   });
 });
 
+function nativePhasePrelude(source: string): string {
+  const list = source.match(/export const nativeFollowupPhases = ([\s\S]*?) as const;/);
+  const begin = source.indexOf("  const observeNativePhase = (value: string) => {");
+  const end = source.indexOf("  const workRoot =", begin);
+  return begin < 0 || !list
+    ? ""
+    : "const nativeFollowupPhases = " + list[1] + ";\n" + source.slice(begin, end);
+}
+
 /** Execute the real retention/dispatch bodies with inert native ports and owned temporary files. */
 const remoteRetentionFixture = async () => {
   const root = await NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "remote-retention-"));
@@ -349,9 +358,13 @@ const remoteRetentionFixture = async () => {
     cleanup: { cleanup },
   });
   const evaluate = (body: string): Promise<unknown> =>
-    NodeVM.runInContext(NodeModule.stripTypeScriptTypes(`(async () => { ${body} })()`), context, {
-      timeout: 1_000,
-    }) as Promise<unknown>;
+    NodeVM.runInContext(
+      NodeModule.stripTypeScriptTypes(`(async () => { ${nativePhasePrelude(source)}\n${body} })()`),
+      context,
+      {
+        timeout: 1_000,
+      },
+    ) as Promise<unknown>;
   const runPhase = async (prepareFailure = false) => {
     if (prepareFailure) {
       await NodeFS.promises.writeFile(NodePath.join(runRoot, "seed-and-install-driver"), "owned");
@@ -751,7 +764,7 @@ describe("seeded packaging build budgets", () => {
       run: () =>
         NodeVM.runInNewContext(
           NodeModule.stripTypeScriptTypes(
-            `(async () => { ${source.slice(commandStart, commandEnd)}\n${source.slice(buildStart, buildEnd)}\n${source.slice(callsStart, callsEnd)} })()`,
+            `(async () => { ${nativePhasePrelude(source)}\n${source.slice(commandStart, commandEnd)}\n${source.slice(buildStart, buildEnd)}\n${source.slice(callsStart, callsEnd)} })()`,
           ),
           context,
           { timeout: 1_000 },
@@ -1874,3 +1887,283 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(config).toContain("captureBackendLogs: true");
   });
 });
+
+describe("native follow-up owning setup stages", () => {
+  const nativeSource = () =>
+    NodeFS.readFileSync(new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url), "utf8");
+  it("passes the same canonical owned work root to the session instead of the long build/driver tree", () => {
+    const source = nativeSource(),
+      layout = createSeededUpgradeRunLayout("/owned/" + "x".repeat(52), "n".repeat(26), true),
+      nativeRoot = NodePath.dirname(layout.nativeFollowups!.dataRoot);
+    const begin = source.indexOf(").withNativeFollowupsLinuxSession(");
+    const actual = begin >= 0 ? begin : source.indexOf(".withNativeFollowupsLinuxSession(");
+    const open = source.indexOf("{", actual),
+      end = source.indexOf(",\n          runDriver,", open),
+      phaseLineStart = source.indexOf(
+        "  const phaseRoot = NodePath.join(input.runRoot, `${input.phase}-driver`);",
+      );
+    expect(actual >= 0 && open > actual && end > open && phaseLineStart >= 0).toBe(true);
+    const phaseLine = source.slice(phaseLineStart, source.indexOf("\n", phaseLineStart));
+    const input = NodeVM.runInNewContext(phaseLine + "\n(" + source.slice(open, end) + ")", {
+      NodePath,
+      process: { env: {} },
+      seededUpgradeNativeHostPlatform: "linux",
+      input: { runRoot: nativeRoot, phase: "seed-and-install" },
+    }) as { root?: string; workRoot?: string };
+    expect(input.workRoot === "/owned/" + "x".repeat(52)).toBe(true);
+    expect(input.root).toBeUndefined();
+  });
+  it.each([
+    "candidate",
+    "protected",
+    "publish",
+    "updater",
+    "driver",
+    "cleanup",
+    "publish-observer",
+  ] as const)(
+    "attributes actual owner %s failure and preserves original error against cleanup",
+    async (mode) => {
+      const boundaryMode = mode === "publish-observer" ? "publish" : mode;
+      const base = NodeFS.realpathSync(NodeFS.mkdtempSync("/tmp/nf-stage-")),
+        repository = NodePath.join(base, "repository"),
+        work = NodePath.join(base, "work"),
+        original = Object.freeze(new Error("Inert original owning failure.")),
+        cleanupError = new Error("Inert secondary cleanup failure."),
+        phases: string[] = [];
+      NodeFS.mkdirSync(repository, { mode: 0o700 });
+      NodeFS.mkdirSync(work, { mode: 0o700 });
+      const key = NodePath.join(base, "key.pub");
+      NodeFS.writeFileSync(key, "inert public fixture", { mode: 0o600 });
+      const source = nativeSource(),
+        start = source.indexOf("export async function runSeededDesktopUpgradeSmoke("),
+        end = source.indexOf("async function main()", start),
+        list = source.match(/export const nativeFollowupPhases = ([\s\S]*?) as const;/),
+        nativePhases = list ? NodeVM.runInNewContext(list[1]!) : [];
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(source.slice(start, end)).replace(/^export /gm, "") +
+          "\nrunSeededDesktopUpgradeSmoke;",
+        {
+          NodeFS,
+          NodePath,
+          NodeURL,
+          process: {
+            env: {
+              CI: "true",
+              TAURI_SIGNING_PRIVATE_KEY: "inert",
+              TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "inert",
+            },
+          },
+          nativeFollowupPhases: nativePhases,
+          SeededDesktopUpgradeSmokeError,
+          assertBaselineVersionIsOlder,
+          createSeededUpgradeRunLayout,
+          canonicalizeSeededUpgradeWorkRoot,
+          MOCK_UPDATE_LOOPBACK_HOST: "127.0.0.1",
+          seededUpgradeNativeHostPlatform: "linux",
+          assertRemoteInstallPort,
+          writeBuildOverlay: async () => {},
+          ManagedProcessRegistry: class {
+            add() {}
+            async cleanup() {
+              if (boundaryMode === "cleanup") throw original;
+              throw cleanupError;
+            }
+          },
+          requireCommandSuccess: async () => {},
+          runCommand: async () => ({ stdout: "a".repeat(40) }),
+          buildPackagedApplication: async (value: { checkout: string }) => {
+            if (
+              (boundaryMode === "candidate" && value.checkout.endsWith("candidate-checkout")) ||
+              (boundaryMode === "protected" && value.checkout.endsWith("/protected/checkout"))
+            )
+              throw original;
+          },
+          publishCandidateUpdater: async () => {
+            if (boundaryMode === "publish") throw original;
+          },
+          startMockUpdateServer: async () => {
+            if (boundaryMode === "updater") throw original;
+            return {};
+          },
+          baselinePackage: async () => "inert",
+          installBaselinePackage: async (value: { laneRoot: string }) => {
+            const dir = NodePath.join(value.laneRoot, "installed");
+            NodeFS.mkdirSync(dir, { recursive: true, mode: 0o700 });
+            return NodePath.join(dir, "inert");
+          },
+          runUpgradeLane: async (value: { observeNativePhase: (phase: string) => void }) => {
+            if (boundaryMode === "driver") {
+              value.observeNativePhase("native-linux-address");
+              value.observeNativePhase("inert private stage");
+              throw original;
+            }
+          },
+          readObservation: async () => {
+            throw new Error("Absent private receipt.");
+          },
+          readRemoteFixtureSecrets: async () => [],
+        },
+      ) as (input: object) => Promise<void>;
+      try {
+        const outcome = await run({
+          repositoryRoot: repository,
+          workRoot: work,
+          runId: "owned",
+          previousVersion: "0.8.0",
+          candidateVersion: "0.8.1-native.1",
+          publicKeyFile: key,
+          platform: "linux",
+          arch: "x64",
+          bundle: "appimage",
+          updaterPort: 43120,
+          nativeFollowups: true,
+          observeNativeFollowupPhase: (phase: string) => {
+            phases.push(phase);
+            if (mode === "publish-observer") throw new Error("Inert diagnostic failure.");
+          },
+        }).catch((error: unknown) => error);
+        expect(outcome).toBe(original);
+        const expected = {
+          candidate: "native-candidate-build",
+          protected: "native-protected-build",
+          publish: "native-candidate-publish",
+          updater: "native-updater-start",
+          driver: "native-linux-address",
+          cleanup: "native-cleanup",
+        };
+        expect(phases.at(-1)).toBe(expected[boundaryMode]);
+        expect(phases).not.toContain("inert private stage");
+        if (boundaryMode !== "cleanup") expect(phases).not.toContain("native-cleanup");
+      } finally {
+        NodeFS.rmSync(base, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+it.each(["nonzero", "retention-failure", "observer-throw"] as const)(
+  "attributes actual session/caller result admission instead of successful cleanup: %s",
+  async (mode) => {
+    const base = NodeFS.realpathSync(NodeFS.mkdtempSync("/tmp/nf-result-")),
+      nativeRoot = NodePath.join(base, "run", "native"),
+      evidence = NodePath.join(nativeRoot, "evidence");
+    NodeFS.mkdirSync(nativeRoot, { recursive: true, mode: 0o700 });
+    NodeFS.mkdirSync(evidence, { mode: 0o700 });
+    const source = NodeFS.readFileSync(
+        new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+        "utf8",
+      ),
+      leaf = NodeFS.readFileSync(
+        new URL(
+          "../apps/desktop/e2e/support/release-visual-native-followups-session.ts",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+      declarationStart = leaf.indexOf("  let failed = false"),
+      declarationEnd = leaf.indexOf("  try {", declarationStart),
+      actionStart = leaf.indexOf('    observe("native-linux-driver");', declarationStart),
+      tailStart = leaf.indexOf("  } catch (error)", actionStart),
+      functionStart = source.indexOf("const runWebDriverPhase = async"),
+      functionEnd = source.indexOf("const startMockUpdateServer", functionStart),
+      phases: string[] = [],
+      retentionError = Object.freeze(new Error("Inert original result retention refusal."));
+    let original: unknown = retentionError;
+    const effect = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function effect(input, run) { const environment=input.environment, root=input.workRoot, children=[]; const observe=(phase)=>{try{input.onStage?.(phase)}catch{}};" +
+          leaf.slice(declarationStart, declarationEnd) +
+          "try {" +
+          leaf.slice(actionStart, tailStart) +
+          leaf.slice(tailStart) +
+          "\neffect;",
+      ),
+      {
+        NodeFS: {
+          ...NodeFS,
+          writeFileSync: (file: string, value: string, options: NodeFS.WriteFileOptions) => {
+            const relative = NodePath.relative(base, file);
+            if (relative.startsWith("..") || NodePath.isAbsolute(relative))
+              throw new Error("Inert fixture write outside ownership.");
+            NodeFS.writeFileSync(file, value, options);
+          },
+        },
+        NodePath,
+        Error,
+      },
+    ) as (input: object, run: (environment: object) => Promise<object>) => Promise<object>;
+    let body = source.slice(functionStart, functionEnd);
+    const importEnd = body.indexOf(").withNativeFollowupsLinuxSession"),
+      importStart = body.lastIndexOf("await import(", importEnd);
+    expect(importStart >= 0 && importEnd > importStart).toBe(true);
+    body = body.slice(0, importStart) + "await loadSession()\n        " + body.slice(importEnd);
+    let commands = 0,
+      admissions = 0;
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(body) + "\nrunWebDriverPhase;",
+      {
+        NodeFS,
+        NodePath,
+        NodeURL,
+        process: { env: {} },
+        seededUpgradeNativeHostPlatform: "linux",
+        seededUpgradeVitePlusExecutable,
+        createSeededUpgradeDriverSpec: () => "inert",
+        createSeededUpgradeWdioConfig: () => "inert",
+        redactAndBoundUpgradeEvidence: () => {
+          if (mode === "retention-failure") throw retentionError;
+          return "inert bounded output";
+        },
+        loadSession: async () => ({ withNativeFollowupsLinuxSession: effect }),
+        runCommand: async () => {
+          commands++;
+          return { exitCode: mode === "retention-failure" ? 0 : 7, stdout: "", stderr: "" };
+        },
+        assertWebDriverPhaseExit: (value: Parameters<typeof assertWebDriverPhaseExit>[0]) => {
+          admissions++;
+          try {
+            assertWebDriverPhaseExit(value);
+          } catch (error) {
+            original = error;
+            Object.freeze(error);
+            throw error;
+          }
+        },
+      },
+    ) as (input: object) => Promise<void>;
+    try {
+      const outcome = await run({
+        appBinaryPath: "inert",
+        backendPort: 43124,
+        candidateVersion: "0.8.1-native.1",
+        dataRoot: NodePath.join(nativeRoot, "data"),
+        evidenceDirectory: evidence,
+        expectedDataRoot: NodePath.join(nativeRoot, "data"),
+        lane: "native-followups",
+        phase: "seed-and-install",
+        platform: "linux",
+        projectId: "owned",
+        repositoryRoot: base,
+        restartTimeoutMs: 1,
+        resultPath: NodePath.join(nativeRoot, "before.json"),
+        runRoot: nativeRoot,
+        workspaceRoot: NodePath.join(nativeRoot, "workspace"),
+        webdriverPort: 43224,
+        wsl: false,
+        sourceSha: "a".repeat(40),
+        observeNativePhase: (phase: string) => {
+          phases.push(phase);
+          if (mode === "observer-throw") throw new Error("Inert diagnostic failure.");
+        },
+      }).catch((error: unknown) => error);
+      expect(outcome).toBe(original);
+      expect(commands).toBe(1);
+      expect(admissions).toBe(mode === "retention-failure" ? 0 : 1);
+      expect(phases).toContain("native-linux-cleanup");
+      expect(phases.at(-1)).toBe("native-driver-result-admission");
+    } finally {
+      NodeFS.rmSync(base, { recursive: true, force: true });
+    }
+  },
+);

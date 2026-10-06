@@ -31,6 +31,28 @@ export type SeededUpgradeLane =
   | "remote-install"
   | "native-followups";
 
+export const nativeFollowupPhases = [
+  "native-owner-start",
+  "native-candidate-build",
+  "native-protected-build",
+  "native-candidate-publish",
+  "native-updater-start",
+  "native-protected-package",
+  "native-baseline-install",
+  "native-driver",
+  "native-driver-result-admission",
+  "native-linux-root",
+  "native-linux-address",
+  "native-linux-bus",
+  "native-linux-settings",
+  "native-linux-services",
+  "native-linux-driver",
+  "native-linux-cleanup",
+  "native-cleanup",
+  "native-retain",
+  "native-result-admission",
+] as const;
+export type NativeFollowupPhase = (typeof nativeFollowupPhases)[number];
 const MOCK_UPDATE_READY_TIMEOUT_MS = 60_000;
 // oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone CI owner snapshots its actual host once.
 const seededUpgradeNativeHostPlatform = process.platform;
@@ -51,6 +73,7 @@ export interface SeededDesktopUpgradeSmokeInput {
   readonly wsl: boolean;
   readonly workRoot: string;
   readonly nativeFollowups?: boolean;
+  readonly observeNativeFollowupPhase?: (phase: NativeFollowupPhase) => void;
 }
 
 interface SeededUpgradeLaneLayout {
@@ -1812,6 +1835,7 @@ const runWebDriverPhase = async (input: {
   readonly wsl: boolean;
   readonly onRemotePhaseStarted?: (() => void) | undefined;
   readonly sourceSha?: string;
+  readonly observeNativePhase?: (phase: string) => void;
 }): Promise<void> => {
   const phaseRoot = NodePath.join(input.runRoot, `${input.phase}-driver`);
   await NodeFS.promises.mkdir(phaseRoot, { recursive: true });
@@ -1959,12 +1983,20 @@ const runWebDriverPhase = async (input: {
         ).withNativeFollowupsLinuxSession(
           {
             environment: process.env,
-            root: NodePath.join(phaseRoot, "native-os"),
+            workRoot: NodePath.dirname(NodePath.dirname(input.runRoot)),
             platform: seededUpgradeNativeHostPlatform,
+            onStage: input.observeNativePhase,
           },
           runDriver,
         )
       : await runDriver(process.env);
+  if (input.lane === "native-followups") {
+    try {
+      input.observeNativePhase?.("native-driver-result-admission");
+    } catch {
+      /* Preserve result admission and its original failure. */
+    }
+  }
   const resultExists = NodeFS.existsSync(input.resultPath);
   let installAttempted = false;
   if (input.phase === "seed-and-install" && resultExists) {
@@ -2143,6 +2175,7 @@ const runUpgradeLane = async (input: {
   readonly wsl: boolean;
   readonly onRemotePhaseStarted?: (() => void) | undefined;
   readonly sourceSha?: string;
+  readonly observeNativePhase?: (phase: string) => void;
 }): Promise<void> => {
   await NodeFS.promises.mkdir(input.layout.dataRoot, { recursive: true, mode: 0o700 });
   await NodeFS.promises.mkdir(input.layout.evidenceDirectory, { recursive: true, mode: 0o700 });
@@ -2169,6 +2202,7 @@ const runUpgradeLane = async (input: {
     wsl: input.wsl,
     onRemotePhaseStarted: input.onRemotePhaseStarted,
     ...(input.sourceSha ? { sourceSha: input.sourceSha } : {}),
+    ...(input.observeNativePhase ? { observeNativePhase: input.observeNativePhase } : {}),
   } as const;
   await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
   if (input.platform === "win" && input.lane !== "native-followups") {
@@ -2330,6 +2364,16 @@ export async function runSeededDesktopUpgradeSmoke(
     );
   assertBaselineVersionIsOlder(input.previousVersion, input.candidateVersion);
   const runId = input.runId;
+  const observeNativePhase = (value: string) => {
+    if (!input.nativeFollowups) return;
+    const phase = nativeFollowupPhases.find((phase) => phase === value);
+    if (phase === undefined) return;
+    try {
+      input.observeNativeFollowupPhase?.(phase);
+    } catch {
+      /* Attribution cannot replace an original operation result. */
+    }
+  };
   const workRoot = await canonicalizeSeededUpgradeWorkRoot(input.workRoot);
   const layout = createSeededUpgradeRunLayout(workRoot, runId, input.nativeFollowups === true);
   const runRoot = NodePath.dirname(layout.updaterRoot);
@@ -2476,6 +2520,7 @@ export async function runSeededDesktopUpgradeSmoke(
       });
     });
 
+    observeNativePhase("native-candidate-build");
     await buildPackagedApplication({
       arch: input.arch,
       bundle: input.bundle,
@@ -2500,6 +2545,7 @@ export async function runSeededDesktopUpgradeSmoke(
         version: input.previousVersion,
       });
     }
+    observeNativePhase("native-protected-build");
     await buildPackagedApplication({
       arch: input.arch,
       bundle: input.bundle,
@@ -2511,6 +2557,7 @@ export async function runSeededDesktopUpgradeSmoke(
       targetDirectory: layout.protectedBaseline.buildRoot,
       version: input.previousVersion,
     });
+    observeNativePhase("native-candidate-publish");
     await publishCandidateUpdater({
       arch: input.arch,
       candidateBuildRoot: layout.candidateBuildRoot,
@@ -2520,6 +2567,7 @@ export async function runSeededDesktopUpgradeSmoke(
       updaterRoot: layout.updaterRoot,
     });
 
+    observeNativePhase("native-updater-start");
     const updater = await startMockUpdateServer({
       port: input.updaterPort,
       repositoryRoot: input.repositoryRoot,
@@ -2554,6 +2602,7 @@ export async function runSeededDesktopUpgradeSmoke(
       });
     }
 
+    observeNativePhase("native-protected-package");
     const protectedPackage = await baselinePackage(
       layout.protectedBaseline.buildRoot,
       input.platform,
@@ -2561,6 +2610,7 @@ export async function runSeededDesktopUpgradeSmoke(
     );
     if (input.nativeFollowups) {
       const nativeLayout = layout.nativeFollowups!;
+      observeNativePhase("native-baseline-install");
       const nativeApp = await installBaselinePackage({
         laneRoot: NodePath.dirname(nativeLayout.dataRoot),
         packagePath: protectedPackage,
@@ -2585,6 +2635,7 @@ export async function runSeededDesktopUpgradeSmoke(
           environment: process.env,
         });
       });
+      observeNativePhase("native-driver");
       await runUpgradeLane({
         appBinaryPath: nativeApp,
         backendPort: assertRemoteInstallPort(input.updaterPort + 4),
@@ -2598,6 +2649,7 @@ export async function runSeededDesktopUpgradeSmoke(
         webdriverPort: assertRemoteInstallPort(input.updaterPort + 104),
         wsl: input.wsl,
         sourceSha: currentCommit,
+        observeNativePhase,
       });
     }
     if (!input.nativeFollowups) {
@@ -2699,6 +2751,7 @@ export async function runSeededDesktopUpgradeSmoke(
         secrets,
       }).catch(() => undefined);
     try {
+      if (failure === undefined) observeNativePhase("native-cleanup");
       await cleanup.cleanup();
     } catch (cleanupError) {
       failure ??= cleanupError;
@@ -2750,6 +2803,7 @@ export async function runSeededDesktopUpgradeSmoke(
             ),
           ).href
         );
+        observeNativePhase("native-retain");
         retainNativeFollowupEvidence({
           privateEvidence: NodePath.join(
             layout.nativeFollowups!.evidenceDirectory,
