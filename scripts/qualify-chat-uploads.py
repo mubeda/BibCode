@@ -38,6 +38,10 @@ def scenario_settings(name):
         return {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
                 'inner_timeout': 600, 'outer_timeout': 660,
                 'evidence_prefix': 'issue29-settings-', 'fixture_prefix': 'bc-vs-'}
+    if name == 'release-visual-settings-followups':
+        return {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+                'inner_timeout': 600, 'outer_timeout': 660,
+                'evidence_prefix': 'issue29-settings-followups-', 'fixture_prefix': 'bc-vf-'}
     if name == 'release-visual-git-project':
         return {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
                 'inner_timeout': 600, 'outer_timeout': 660,
@@ -111,7 +115,7 @@ def cleanup_ui_fixture(fixture, evidence, supervisor, scenario='remote-updates-u
         cleanup = json.loads(receipt.read_text())
         if cleanup.get('remaining') != [] or cleanup.get('controllerReaped') is not True:
             return False
-        if scenario in ['release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-native-sharing']:
+        if scenario in ['release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-native-sharing', 'release-visual-settings-followups']:
             result_path = evidence / 'result.json'
             metadata = result_path.lstat()
             if result_path.is_symlink() or not result_path.is_file() or metadata.st_nlink != 1 or metadata.st_size > 131072:
@@ -120,7 +124,8 @@ def cleanup_ui_fixture(fixture, evidence, supervisor, scenario='remote-updates-u
             if (result.get('selection') != scenario or result.get('source') != os.environ.get('GITHUB_SHA')
                     or result.get({'release-visual-provider-chat': 'providerChatFixtureSafeToDelete',
                                    'release-visual-project-lifecycle': 'projectLifecycleFixtureSafeToDelete',
-                                   'release-visual-native-sharing': 'nativeSharingFixtureSafeToDelete'}[scenario]) is not True
+                                   'release-visual-native-sharing': 'nativeSharingFixtureSafeToDelete',
+                                   'release-visual-settings-followups': 'settingsFollowupFixtureSafeToDelete'}[scenario]) is not True
                     or result.get('childProcessesClosed') is not True or result.get('cleanupFailures') != []):
                 return False
         shutil.rmtree(fixture)
@@ -336,7 +341,7 @@ def inner_resources(arguments):
     if (len(arguments) == 2 and arguments[0] == 'release-visual-native-sharing'
             and Path(arguments[1]).is_absolute() and arguments[1].endswith('.AppImage')):
         return arguments[0], None, arguments[1], 'core'
-    if len(arguments) == 2 and arguments[0] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle']:
+    if len(arguments) == 2 and arguments[0] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups']:
         return arguments[0], None, arguments[1], 'core'
     raise RuntimeError('Unknown qualification owner payload')
 
@@ -392,13 +397,13 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
                                 'BIBCODE_NATIVE_SHARING_XVFB': str(xvfb.resolve(strict=True)),
                                 'GIT_CONFIG_NOSYSTEM': '1',
                                 'GIT_CONFIG_GLOBAL': str(fixture / 'empty-git-config')})
-        elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle']:
+        elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups']:
             environment.update({'BIBCODE_DELIVERY_UI_WEB': str(Path(web_root).resolve(strict=True)),
                                 'BIBCODE_DELIVERY_UI_SELECTION': scenario,
                                 'GIT_CONFIG_NOSYSTEM': '1',
                                 'GIT_CONFIG_GLOBAL': str(fixture / 'empty-git-config')})
         with os.fdopen(os.open(fixture / 'private-controller.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
-            if scenario == 'release-visual-project-lifecycle':
+            if scenario in ['release-visual-project-lifecycle', 'release-visual-settings-followups']:
                 previous_sigchld = signal.getsignal(signal.SIGCHLD)
                 lifecycle_reaper = lifecycle_adopted_reaper(lambda: process)
                 signal.signal(signal.SIGCHLD, lifecycle_reaper)
@@ -531,7 +536,7 @@ def outer(scenario='chat-upload', ui_matrix='core'):
         provenance.update({'scenario': scenario, 'selection': ui_matrix,
                            'inputs': ui_input_hashes(server, fake_host, web_root)})
         command.extend([scenario, fake_host, web_root, ui_matrix])
-    elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle']:
+    elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups']:
         fake_host = None
         web_root = str(Path(os.environ['BIBCODE_DELIVERY_UI_WEB']).resolve(strict=True))
         provenance.update({'scenario': scenario, 'inputs': ui_input_hashes(server, None, web_root)})
@@ -546,13 +551,14 @@ def outer(scenario='chat-upload', ui_matrix='core'):
         result['privateFixtureDeleted'] = cleanup_ui_fixture(fixture, evidence, result, scenario)
         if not result['privateFixtureDeleted'] or not result['hostNetworkNamespaceUnchanged'] or not result['buildInputsUnchanged']:
             result['exitCode'] = result['exitCode'] or 1
-    elif scenario in ['remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle']:
+    elif scenario in ['remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups']:
         result['buildInputsUnchanged'] = ui_input_hashes(server, fake_host, web_root) == provenance['inputs']
         result['privateFixtureDeleted'] = cleanup_ui_fixture(fixture, evidence, result, scenario)
         if not result['privateFixtureDeleted'] or not result['hostNetworkNamespaceUnchanged'] or not result['buildInputsUnchanged']:
             result['exitCode'] = result['exitCode'] or 1
     write_json(evidence / 'supervisor.json', result)
-    print(json.dumps({'exitCode': result['exitCode'], 'evidence': str(evidence),
+    print(json.dumps({'exitCode': result['exitCode'],
+                      **({'selection': scenario} if scenario == 'release-visual-settings-followups' else {'evidence': str(evidence)}),
                       'supervisorReaped': result['supervisorReaped']}))
     return result['exitCode']
 
@@ -565,6 +571,12 @@ if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'inner':
         sys.exit(inner(Path(sys.argv[2]), Path(sys.argv[3]), *sys.argv[4:]))
     if len(sys.argv) == 3 and sys.argv[1] == '--scenario':
+        if sys.argv[2] == 'release-visual-settings-followups':
+            try:
+                sys.exit(outer(sys.argv[2]))
+            except Exception:
+                print(json.dumps({'refused': True, 'stage': 'settings-controller'}))
+                sys.exit(1)
         if sys.argv[2] == 'release-visual-native-sharing':
             try:
                 sys.exit(outer(sys.argv[2]))

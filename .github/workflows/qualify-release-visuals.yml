@@ -18,6 +18,7 @@ on:
           - release-visual-provider-chat
           - release-visual-native-sharing
           - release-visual-project-lifecycle
+          - release-visual-settings-followups
 
 permissions:
   contents: read
@@ -25,7 +26,7 @@ permissions:
 jobs:
   visual_core:
     if: ${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' }}
-    name: ${{ inputs.scene_selection == 'release-visual-project-lifecycle' && 'Linux Chromium three project lifecycle rows in both themes' || inputs.scene_selection == 'release-visual-provider-chat' && 'Linux Chromium seven provider chat rows in both themes' || inputs.scene_selection == 'release-visual-workspace-substates' && 'Linux Chromium three existing workspace substates in both themes' || inputs.scene_selection == 'release-visual-cursor-question' && 'Linux Chromium Cursor later-question pair' || inputs.scene_selection == 'release-visual-git-project' && 'Linux Chromium Git/project partial group in both themes' || inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
+    name: ${{ inputs.scene_selection == 'release-visual-settings-followups' && 'Linux Chromium four Settings rows in eighteen originals' || inputs.scene_selection == 'release-visual-project-lifecycle' && 'Linux Chromium three project lifecycle rows in both themes' || inputs.scene_selection == 'release-visual-provider-chat' && 'Linux Chromium seven provider chat rows in both themes' || inputs.scene_selection == 'release-visual-workspace-substates' && 'Linux Chromium three existing workspace substates in both themes' || inputs.scene_selection == 'release-visual-cursor-question' && 'Linux Chromium Cursor later-question pair' || inputs.scene_selection == 'release-visual-git-project' && 'Linux Chromium Git/project partial group in both themes' || inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -53,6 +54,7 @@ jobs:
           python3 -B scripts/qualify-chat-uploads.py preflight
           vp test run scripts/qualify-release-visuals-workflow.test.ts apps/desktop/e2e/support/release-visual-fixture.test.ts apps/desktop/e2e/support/release-visual-core.test.ts apps/desktop/e2e/support/git-project-tab-interception.test.ts apps/desktop/e2e/support/release-visual-git-dialog-settled.test.tsx apps/desktop/e2e/support/owned-visual-capture.test.ts apps/desktop/e2e/support/release-visual-cursor-question-fixture.test.ts apps/desktop/e2e/support/release-visual-cursor-question.test.ts apps/desktop/e2e/support/release-visual-cursor-question.public.test.ts apps/desktop/e2e/support/test-project.test.ts apps/desktop/e2e/support/release-visual-palette-readiness.test.tsx apps/desktop/e2e/support/release-visual-core-image.test.ts apps/desktop/e2e/support/release-visual-evidence.test.ts apps/desktop/e2e/support/release-visual-observation.test.ts apps/desktop/e2e/support/release-visual-boundaries.test.ts apps/desktop/e2e/support/provider-shims.test.ts apps/desktop/e2e/support/qualification-owner.test.ts apps/desktop/e2e/support/remote-ui-evidence.test.ts apps/desktop/e2e/support/delivery-retry-evidence.test.ts apps/desktop/e2e/support/delivery-retry-flow.test.ts apps/desktop/e2e/support/delivery-retry-controller.test.ts apps/desktop/e2e/support/delivery-import-observation.test.ts apps/desktop/e2e/support/delivery-retry-workspace.test.ts apps/desktop/e2e/support/browser-network.test.ts
           vp test run apps/desktop/e2e/support/release-visual-settings.test.ts apps/desktop/e2e/support/release-visual-settings-fixture.test.ts apps/desktop/e2e/support/release-visual-settings-preflight.test.ts apps/desktop/e2e/support/release-visual-settings-wiring.test.ts
+          vp test run apps/desktop/e2e/support/release-visual-settings-followups.test.ts apps/desktop/e2e/support/release-visual-settings-followups-api.test.ts apps/desktop/e2e/support/release-visual-settings-followups-fixture.test.ts apps/desktop/e2e/support/release-visual-settings-followups-public.test.ts apps/desktop/e2e/support/release-visual-settings-followups-socket.test.ts apps/desktop/e2e/support/release-visual-settings-followups-transport.test.ts apps/desktop/e2e/support/release-visual-settings-followups-views.test.ts apps/desktop/e2e/support/release-visual-settings-followups-receiving.test.ts apps/desktop/e2e/support/release-visual-settings-followups-source.test.ts apps/desktop/e2e/support/release-visual-settings-followups-producer.test.ts apps/desktop/e2e/support/release-visual-settings-followups-dom.test.ts apps/desktop/e2e/support/release-visual-settings-followups-caller.test.ts
           vp test run apps/desktop/e2e/support/release-visual-git-project.test.ts apps/desktop/e2e/support/release-visual-git-project-fixture.test.ts apps/desktop/e2e/support/release-visual-git-project-directory-failure.test.ts apps/desktop/e2e/support/git-project-tab-observation.test.ts
           vp test run apps/desktop/e2e/support/release-visual-workspace-substates.test.ts
           vp test run apps/desktop/e2e/support/release-visual-provider-chat.test.ts apps/desktop/e2e/support/release-visual-provider-chat-fixture.test.ts apps/desktop/e2e/support/release-visual-provider-chat-installer.test.ts apps/desktop/e2e/support/release-visual-provider-chat-loss.test.ts apps/desktop/e2e/support/release-visual-provider-chat-api.test.ts apps/desktop/e2e/support/release-visual-provider-chat-media.test.ts apps/desktop/e2e/support/release-visual-provider-chat-turns.test.ts apps/desktop/e2e/support/release-visual-provider-chat-producer.test.ts apps/desktop/e2e/support/release-visual-provider-chat-public.test.ts apps/desktop/e2e/support/release-visual-provider-chat-wiring.test.ts
@@ -280,6 +282,46 @@ jobs:
             ${{ runner.temp }}/issue29-provider-chat-${{ github.run_id }}/chat-refused-model-dark.png
             ${{ runner.temp }}/issue29-provider-chat-${{ github.run_id }}/chat-held-workspace-loss-light.png
             ${{ runner.temp }}/issue29-provider-chat-${{ github.run_id }}/chat-held-workspace-loss-dark.png
+
+      - name: Run contained settings follow-up visual batch
+        if: ${{ inputs.scene_selection == 'release-visual-settings-followups' }}
+        env:
+          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-visual-build/bibcode
+          BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue29-visual-build/web
+        run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-settings-followups
+      - name: Retain explicit settings follow-up evidence
+        if: ${{ always() && inputs.scene_selection == 'release-visual-settings-followups' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue29-settings-followups-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/assertions.json
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/settings-diagnostics-light.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/settings-diagnostics-dark.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/diagnostics-live-processes-light.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/diagnostics-live-processes-dark.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/diagnostics-unknown-duration-light.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/diagnostics-unknown-duration-dark.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/usage-detail-available-light.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/usage-detail-available-dark.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/usage-detail-light.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/usage-detail-dark.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/remote-rename-light.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/remote-rename-dark.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/remote-rename-applied-light.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/remote-rename-applied-dark.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/receiving-settings-row-light.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/receiving-settings-row-dark.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/remote-receiving-settings-light.png
+            ${{ runner.temp }}/issue29-settings-followups-${{ github.run_id }}/remote-receiving-settings-dark.png
 
       - name: Run contained project lifecycle visual batch
         if: ${{ inputs.scene_selection == 'release-visual-project-lifecycle' }}

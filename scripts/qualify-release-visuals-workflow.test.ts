@@ -96,6 +96,7 @@ describe("first visual batch workflow boundary", () => {
             "release-visual-provider-chat",
             "release-visual-native-sharing",
             "release-visual-project-lifecycle",
+            "release-visual-settings-followups",
           ],
         },
       },
@@ -148,6 +149,69 @@ describe("first visual batch workflow boundary", () => {
     ])
       expect(gate).toContain(`support/${name}.test.ts`);
   });
+});
+
+it("binds the four Settings follow-up rows to exactly eighteen originals and seven closed receipts", () => {
+  const value = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const steps = value.jobs.visual_core.steps as Array<{
+    name: string;
+    if?: string;
+    run?: string;
+    env?: Record<string, string>;
+    with?: { name?: string; path?: string };
+  }>;
+  expect(value.jobs.visual_core.if).toBe(
+    "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' }}",
+  );
+  const run = steps.find((step) => step.name === "Run contained settings follow-up visual batch")!;
+  expect(run.if).toBe("${{ inputs.scene_selection == 'release-visual-settings-followups' }}");
+  expect(run.run).toBe(
+    "python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-settings-followups",
+  );
+  expect(run.env).toEqual({
+    BIBCODE_UPLOAD_SERVER: "${{ runner.temp }}/issue29-visual-build/bibcode",
+    BIBCODE_DELIVERY_UI_WEB: "${{ runner.temp }}/issue29-visual-build/web",
+  });
+  const evidence = steps.find(
+    (step) => step.name === "Retain explicit settings follow-up evidence",
+  )!;
+  expect(evidence.with!.name).toBe(
+    "issue29-settings-followups-${{ github.run_id }}-${{ github.run_attempt }}",
+  );
+  expect(
+    evidence
+      .with!.path!.trim()
+      .split("\n")
+      .map((path) => path.slice(path.lastIndexOf("/") + 1)),
+  ).toEqual([
+    "phase.json",
+    "failure.json",
+    "provenance.json",
+    "result.json",
+    "assertions.json",
+    "namespace-cleanup.json",
+    "supervisor.json",
+    ...[
+      "settings-diagnostics",
+      "diagnostics-live-processes",
+      "diagnostics-unknown-duration",
+      "usage-detail-available",
+      "usage-detail",
+      "remote-rename",
+      "remote-rename-applied",
+      "receiving-settings-row",
+      "remote-receiving-settings",
+    ].flatMap((scene) => [scene + "-light.png", scene + "-dark.png"]),
+  ]);
+  expect(evidence.with!.path).not.toMatch(/\*|private|profile|\.log/);
+  expect(
+    steps.find((step) => step.name === "Check owned helpers and namespace admission")!.run,
+  ).toContain("support/release-visual-settings-followups-caller.test.ts");
 });
 
 it("retains exactly fourteen provider originals and seven closed receipts in a separate manual lane", () => {

@@ -22,6 +22,58 @@ qualification = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(qualification)
 
 
+class SettingsFollowupBoundariesTests(unittest.TestCase):
+    def test_actual_entrypoint_closes_private_native_failures(self):
+        tree = ast.parse(SOURCE.read_text())
+        entrypoint = tree.body[-1]
+        output = io.StringIO()
+        def stop(code): raise SystemExit(code)
+        namespace = {'__name__': '__main__', 'sys': types.SimpleNamespace(argv=['qualifier', '--scenario', 'release-visual-settings-followups'], exit=stop),
+                     'json': json, 'outer': mock.Mock(side_effect=RuntimeError('private native error and arguments'))}
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as ended:
+            exec(compile(ast.Module(body=[entrypoint], type_ignores=[]), 'owned-entrypoint', 'exec'), namespace)
+        self.assertEqual(ended.exception.code, 1)
+        self.assertEqual(json.loads(output.getvalue()), {'refused': True, 'stage': 'settings-controller'})
+
+    def test_actual_outer_stdout_has_only_closed_settings_fields(self):
+        outer = next(node for node in ast.parse(SOURCE.read_text()).body if isinstance(node, ast.FunctionDef) and node.name == 'outer')
+        emission = next(node for node in reversed(outer.body) if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == 'print')
+        output = io.StringIO()
+        namespace = {'json': json, 'scenario': 'release-visual-settings-followups', 'result': {'exitCode': 1, 'supervisorReaped': True}, 'evidence': Path('/private/owned/evidence')}
+        with contextlib.redirect_stdout(output): exec(compile(ast.Module(body=[emission], type_ignores=[]), 'owned-emission', 'exec'), namespace)
+        self.assertEqual(json.loads(output.getvalue()), {'exitCode': 1, 'selection': 'release-visual-settings-followups', 'supervisorReaped': True})
+
+    def test_fixed_controller_payload_and_original_budgets(self):
+        self.assertEqual(qualification.scenario_settings('release-visual-settings-followups'), {
+            'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts', 'inner_timeout': 600, 'outer_timeout': 660,
+            'evidence_prefix': 'issue29-settings-followups-', 'fixture_prefix': 'bc-vf-',
+        })
+        self.assertEqual(qualification.inner_resources(['release-visual-settings-followups', '/owned/web']),
+                         ('release-visual-settings-followups', None, '/owned/web', 'core'))
+        for args in [['release-visual-settings-followups'], ['release-visual-settings-followups', '/owned/web', 'full']]:
+            with self.assertRaises(RuntimeError): qualification.inner_resources(args)
+
+    def test_unsafe_or_unjoined_settings_restoration_preserves_fixture(self):
+        for mode in ['missing', 'false', 'wrong-selection', 'wrong-source', 'live-child', 'cleanup-failure', 'safe']:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                evidence = Path(directory); fixture = Path(tempfile.mkdtemp(prefix='bc-vf-', dir='/tmp'))
+                try:
+                    (evidence / 'namespace-cleanup.json').write_text(json.dumps({'remaining': [], 'controllerReaped': True}))
+                    result = {'selection': 'release-visual-settings-followups', 'source': 'a' * 40,
+                              'settingsFollowupFixtureSafeToDelete': True, 'childProcessesClosed': True, 'cleanupFailures': []}
+                    if mode == 'missing': result.pop('settingsFollowupFixtureSafeToDelete')
+                    if mode == 'false': result['settingsFollowupFixtureSafeToDelete'] = False
+                    if mode == 'wrong-selection': result['selection'] = 'release-visual-core'
+                    if mode == 'wrong-source': result['source'] = 'b' * 40
+                    if mode == 'live-child': result['childProcessesClosed'] = False
+                    if mode == 'cleanup-failure': result['cleanupFailures'] = [{}]
+                    (evidence / 'result.json').write_text(json.dumps(result))
+                    with mock.patch.dict(os.environ, {'GITHUB_SHA': 'a' * 40}):
+                        deleted = qualification.cleanup_ui_fixture(fixture, evidence, {'supervisorReaped': True}, 'release-visual-settings-followups')
+                    self.assertEqual(deleted, mode == 'safe'); self.assertEqual(fixture.exists(), mode != 'safe')
+                finally: shutil.rmtree(fixture, ignore_errors=True)
+
+
 class LifecycleAdoptedReaperTests(unittest.TestCase):
     def test_unassigned_controller_callbacks_cannot_reap_any_process(self):
         children = mock.Mock(return_value=[(42, 'Z'), (57, 'Z')]); waitpid = mock.Mock()
@@ -47,8 +99,8 @@ class LifecycleAdoptedReaperTests(unittest.TestCase):
         reap()  # A disappearing namespace entry cannot replace the controller's result.
 
     def test_actual_inner_handler_covers_assignment_and_early_or_late_adoption_without_stealing_status(self):
-        for timing in ['before-install', 'during-assignment', 'during-wait']:
-            with self.subTest(timing=timing), tempfile.TemporaryDirectory() as directory:
+        for scenario, timing in [(scenario, timing) for scenario in ['release-visual-project-lifecycle', 'release-visual-settings-followups'] for timing in ['before-install', 'during-assignment', 'during-wait']]:
+            with self.subTest(scenario=scenario, timing=timing), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve(); fixture = root / 'fixture'; fixture.mkdir(); evidence = root / 'evidence'; evidence.mkdir(); web = root / 'web'; web.mkdir()
                 handlers = {signal.SIGCHLD: 'original'}; states = {}; current = [None]; seen = []; tick = [0]; case = self
                 original_readlink = qualification.os.readlink
@@ -88,7 +140,7 @@ class LifecycleAdoptedReaperTests(unittest.TestCase):
                      mock.patch.object(qualification, 'reap_children'), \
                      mock.patch.object(qualification.time, 'monotonic', side_effect=clock), \
                      mock.patch.object(qualification.os, 'kill') as kill:
-                    status = qualification.inner(evidence, fixture, 'node', 'server', 'chrome', 'driver', 'git', 'dirname', 'net:[host]', 'a' * 40, 'ip', 'release-visual-project-lifecycle', str(web))
+                    status = qualification.inner(evidence, fixture, 'node', 'server', 'chrome', 'driver', 'git', 'dirname', 'net:[host]', 'a' * 40, 'ip', scenario, str(web))
                 self.assertEqual(status, 23)
                 self.assertEqual(seen, [57]); kill.assert_not_called()
                 self.assertEqual(handlers[signal.SIGCHLD], 'original')

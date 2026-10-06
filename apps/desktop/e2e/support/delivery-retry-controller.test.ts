@@ -40,6 +40,7 @@ import {
 import { resolveSettingsVisualFailureScene } from "./release-visual-settings.ts";
 import { gitProjectVisualScenes } from "./release-visual-git-project.ts";
 import * as CoreCapture from "./release-visual-core.ts";
+import { prepareSettingsFollowupCallerUsage } from "./release-visual-settings-followups-caller.ts";
 
 it.each([
   [22, 2, true],
@@ -90,10 +91,114 @@ const runControllerSource = (
       cursorOriginalFailure: null,
       readCursorOriginalFailure: () => null,
       config: { selection: "delivery-retry-ui" },
+      settingsFollowupUsageFixtures: [],
       ...context,
     },
     options,
   );
+
+it.each(["safe", "already-unsafe", "first-refused", "signal-during-join", "unjoined"])(
+  "the actual final owner retries joins while preserving unsafe Settings inputs: %s",
+  async (mode) => {
+    const temporary = NodeFS.realpathSync(
+      NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "settings-cleanup-")),
+    );
+    try {
+      const home = NodePath.join(temporary, "home"),
+        node = NodePath.join(temporary, "source-node");
+      NodeFS.mkdirSync(home, { mode: 0o700 });
+      NodeFS.writeFileSync(node, "inert interpreter", { mode: 0o500 });
+      let safe = true,
+        joined = false,
+        joins = 0,
+        inputsClosed = 0;
+      const events: string[] = [],
+        writes: Array<Record<string, unknown>> = [];
+      const fixture = await prepareSettingsFollowupCallerUsage({
+        CI: "true",
+        root: temporary,
+        home,
+        nodeExecutable: node,
+        environment: { CI: "true" },
+        admitOwner: async () => {},
+        childrenJoined: () => joined,
+        inputsSafeToDelete: () => safe,
+        observeUnsafeCleanup: () => {
+          safe = false;
+        },
+      });
+      const executable = NodeFS.readFileSync(fixture.executable),
+        interpreter = NodeFS.readFileSync(fixture.node);
+      if (mode === "first-refused") expect(() => fixture.close()).toThrow();
+      if (mode === "already-unsafe") safe = false;
+      const start = controller.lastIndexOf("  } finally {"),
+        end = controller.indexOf("  return success ? 0 : 1;", start);
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          "async function cleanup(){" +
+            controller.slice(start + "  } finally {".length, end) +
+            "\ncleanup",
+        ),
+        {
+          owner: {
+            processes: [],
+            failures: [],
+            childrenClosed: () => joined,
+            close: async () => {
+              events.push("owner-join");
+              joins++;
+              joined = mode !== "unjoined";
+              if (mode === "signal-during-join") safe = false;
+            },
+          },
+          browser: undefined,
+          success: true,
+          phase: "theme-cleanup",
+          theme: "light",
+          config: { source: "a".repeat(40), selection: "release-visual-settings-followups" },
+          captures: [],
+          assertions: [],
+          networkProofs: [],
+          settingsFollowupUsageFixtures: [
+            {
+              close: () => {
+                events.push("input-close");
+                inputsClosed++;
+                fixture.close();
+              },
+            },
+          ],
+          get settingsFollowupFixtureSafeToDelete() {
+            return safe;
+          },
+          set settingsFollowupFixtureSafeToDelete(value: boolean) {
+            safe = value;
+          },
+          write: (_name: string, value: Record<string, unknown>) => writes.push(value),
+        },
+      ) as () => Promise<void>;
+      await run();
+      await run();
+      expect(joins).toBe(2);
+      expect(events[0]).toBe("owner-join");
+      if (mode === "safe") {
+        expect(inputsClosed).toBe(2);
+        expect(NodeFS.existsSync(fixture.executable)).toBe(false);
+        expect(NodeFS.existsSync(fixture.node)).toBe(false);
+        expect(writes[0]!.success).toBe(true);
+      } else {
+        expect(safe).toBe(false);
+        expect(inputsClosed).toBe(mode === "unjoined" ? 1 : 0);
+        expect(NodeFS.readFileSync(fixture.executable)).toEqual(executable);
+        expect(NodeFS.readFileSync(fixture.node)).toEqual(interpreter);
+        expect(writes[0]!.settingsFollowupFixtureSafeToDelete).toBe(false);
+        expect(writes[0]!.success).toBe(false);
+      }
+    } finally {
+      NodeFS.rmSync(temporary, { recursive: true, force: true });
+    }
+  },
+);
 
 /** Keep the extracted callback's actual factored Git check in the same lexical scope. */
 function coreOwnedSourceFactoryCode() {

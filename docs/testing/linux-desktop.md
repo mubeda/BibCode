@@ -2143,3 +2143,84 @@ local results establish source behavior only. Real application/server/provider
 execution remains CI-only; independent inspection of all six original pixels
 is still required. completeGroup remains false, the 82-row/164-original scope
 is unchanged, and this batch provides no final native or release acceptance.
+
+### Contained Settings follow-up visual qualification
+
+The manual release visual workflow accepts `release-visual-settings-followups`
+on a nominated QA ref. Its default remains `release-visual-core`; the default
+branch refuses capture jobs. Run this lane in CI only:
+
+```sh
+gh workflow run qualify-release-visuals.yml --ref '<qualified-ref>' -f scene_selection=release-visual-settings-followups
+```
+
+This selector covers the existing `settings-diagnostics`, `usage-detail`,
+`remote-rename`, and `remote-receiving-settings` rows. It emits nine original
+PNG scenes per theme: `settings-diagnostics`, `diagnostics-live-processes`,
+`diagnostics-unknown-duration`, `usage-detail-available`, `usage-detail`,
+`remote-rename`, `remote-rename-applied`, `receiving-settings-row`, and
+`remote-receiving-settings`. The eight base originals retain their names; the
+ten supplementary originals join the same four rows. `completeGroup` stays
+false, and the full 82-row/164-original obligation remains unchanged. Add
+instance wizard, unrelated substates, native/final acceptance and independent
+original-pixel review remain separate obligations.
+
+The actual delivery caller starts server A on owned loopback 4885 and server B
+on 4888 using the admitted native CLI and separate private HOME/state/project
+roots. A owns its managed workspace, selected model and preserved draft. A
+uses an exclusively created empty Codex auth file and a copied, pinned Node
+development interpreter running a bounded native app-server protocol fixture.
+The production usage mapper creates the displayed session and weekly windows;
+B has no Codex auth file and produces the genuine unavailable state. Only child
+environment copies clear inherited `CODEX_HOME`; no host credentials are read.
+All other providers remain disabled/missing except the existing owned Claude
+fixture. No renderer store, canonical runtime state or provider availability is
+injected.
+
+The caller obtains separate private Node grants for the typed A/B APIs and a
+genuine B pairing offer for the browser. The public Add Server form, remote
+rail, Browse folder import, Rename form, Disconnect/Connect and Remove server
+confirmation own every browser mutation. Native descriptors remain `local`;
+the remote client ID is derived from the native storage ID, and route joins
+encode both environment and thread segments. Decoded native config/snapshots,
+full repository identity, registered managed Git identity, physical branch,
+common directory and HEAD join the same boot/storage/project/thread before
+and after each original. Diagnostics include a real safe owned read-only Git
+failure, native process ancestry and measured/unknown-duration source rows.
+
+The transparent owned listener on 4889 forwards to B4888. Initial connection
+and pairing pass unchanged. After public Disconnect, the returning Noise
+upgrade and authentication bytes pass unchanged; the gate holds only subsequent
+original encrypted application records. The caller waits within its existing
+30-second owner bound for actual held bytes from exactly the returning owned
+Noise generation, then requires strict holding and the actual public Receiving
+notice/read-only widgets before capture. The gate retains its 20-second expiry,
+record/byte limits, joined timers and original-byte release. Counts and dots do
+not substitute for authentication or UI readiness.
+
+The caller delegates B import to the same shared public import adapter used by A,
+without its local-only optional source callback; it does not maintain duplicate
+Browse folder or path-mode selectors. B native/default-thread source binding
+still waits after the real import and public Claude selection.
+
+The producer restores the original alias, releases held bytes, removes only the
+owned remote browser registration, and restores A's model/draft/selection while
+both native source owners remain alive. Typed API scopes and gate join before B
+stops. Browser/driver/A join before usage files and the copied interpreter may be
+removed; unsafe cleanup preserves the private fixture and the original failure.
+Input deletion refusal is monotonic in each fixture and in the shared owner: after
+any unsafe callback or refused close, both exact usage executable and copied
+interpreter bytes remain intact even if a later resource join succeeds. Resource
+join retries still execute; only unsafe input deletion is prohibited.
+The existing private PID1 adopted-child reaper also covers this selector without
+signalling live children or stealing the controller status. Safe deletion requires
+`settingsFollowupFixtureSafeToDelete`, closed children, empty cleanup failures,
+the matching source/selection, and empty joined namespace/supervisor receipts.
+The original inner/outer budgets stay 600/660 seconds.
+
+Retain only the eighteen explicitly named PNGs and seven closed JSON receipts
+from `issue29-settings-followups-<run-id>`. Private pairing material, provider
+inputs, interpreter files, logs, profiles, IDs, paths and process arguments are
+never artifact entries. Hermetic caller/producer/source/transport tests and
+workflow/Python boundary checks establish the source contract; only this CI
+lane and independent original-pixel review can establish visual qualification.
