@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
     future::Future,
@@ -108,6 +109,10 @@ pub type BoxRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 const MAX_PARALLEL_PROVIDER_SESSION_SHUTDOWNS: usize = 8;
 const CODEX_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PROVIDER_STREAM_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// After Stop, a provider that has neither answered the interrupt nor settled the turn within
+/// this deadline is treated as hung: its session is retired and the turn projected interrupted.
+/// Providers normally settle an interrupt within a second or two.
+const PROVIDER_INTERRUPT_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
@@ -392,6 +397,11 @@ pub trait ProviderDriver: Send + Sync {
     fn rollback(&self, turn_count: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
     fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>>;
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
+    /// Whether `shutdown` ends the provider's native work. An externally owned server keeps
+    /// running its turn after BiBCode detaches, so Stop must not settle it by retirement.
+    fn owns_native_work(&self) -> bool {
+        true
+    }
 }
 
 pub trait ProviderDriverFactory: Send + Sync {
@@ -581,6 +591,10 @@ enum SupervisorMessage {
         thread_id: String,
         idle_generation: Arc<AtomicU64>,
         generation: u64,
+    },
+    InterruptDeadline {
+        identity: ProviderSessionIdentity,
+        turn_id: String,
     },
     ActivityDispatchTaskComplete {
         thread_id: String,
@@ -2031,6 +2045,14 @@ pub async fn reconcile_abandoned_provider_sessions(
         .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
     for runtime in runtimes {
         let thread_id = runtime.thread_id.clone();
+        match discard_runtime_of_deleted_thread(&repositories, &thread_id).await {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(error) => {
+                tracing::warn!(thread_id, %error, "provider session remains eligible for startup reconciliation retry");
+                continue;
+            }
+        }
         let result = match runtime.status.as_str() {
             "starting" | "connecting" | "ready" | "running" => {
                 let session = SessionInput {
@@ -2081,6 +2103,9 @@ pub async fn reconcile_abandoned_provider_sessions(
     for session in sessions {
         let thread_id = session.thread_id.clone();
         let result = async {
+            if discard_runtime_of_deleted_thread(&repositories, &thread_id).await? {
+                return Ok(());
+            }
             let runtime = repositories
                 .get_provider_session_runtime(thread_id.clone())
                 .await
@@ -2121,6 +2146,27 @@ pub async fn reconcile_abandoned_provider_sessions(
         }
     }
     Ok(())
+}
+
+/// A deleted thread can never accept a session projection, so reconciling it would fail on every
+/// startup. Drops any runtime row left behind (a retried delivery can relaunch one after the delete
+/// projection removed it) and reports whether the thread is deleted.
+async fn discard_runtime_of_deleted_thread(
+    repositories: &Repositories,
+    thread_id: &str,
+) -> Result<bool, ProviderRuntimeError> {
+    let deleted = repositories
+        .get_thread(thread_id.to_owned())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+        .is_some_and(|thread| thread.deleted_at.is_some());
+    if deleted {
+        repositories
+            .delete_provider_session_runtime(thread_id.to_owned())
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+    }
+    Ok(deleted)
 }
 
 async fn reconcile_failed_provider_session_messages(
@@ -5542,6 +5588,23 @@ async fn run_supervisor(
                     });
                 }
             }
+            SupervisorMessage::InterruptDeadline { identity, turn_id } => {
+                if let Err(error) = retire_unsettled_interrupt(
+                    &engine,
+                    &activity,
+                    &mut sessions,
+                    &identity,
+                    &turn_id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        %error,
+                        thread_id = %identity.thread_id,
+                        "failed to retire a provider session that did not settle its interrupted turn"
+                    );
+                }
+            }
             SupervisorMessage::Shutdown { response } => {
                 reject_all_deferred(&mut deferred_configuration, ProviderRuntimeError::Shutdown);
                 let result =
@@ -6478,8 +6541,54 @@ async fn handle_command(
             publish_running_session(engine, entry, terminal_revision, turn_id, false).await
         }
         OrchestrationCommand::ThreadTurnInterrupt { turn_id, .. } => {
-            entry.driver.interrupt(turn_id).await?;
-            persist_entry(&engine.repositories(), entry, "ready").await
+            let repositories = engine.repositories();
+            // Stop must end the turn even if the provider never answers or settles it.
+            match repositories.get_thread_session(thread_id.clone()).await {
+                Ok(session) => {
+                    // A late Stop for an earlier turn must not retire the turn running now.
+                    if let Some(running_turn) = session
+                        .filter(|_| entry.driver.owns_native_work())
+                        .filter(|session| session.status == "running")
+                        .and_then(|session| session.active_turn_id)
+                        .filter(|running| {
+                            turn_id
+                                .as_deref()
+                                .is_none_or(|requested| requested == running)
+                        })
+                    {
+                        schedule_interrupt_deadline(
+                            entry.terminal_sender.clone(),
+                            ProviderSessionIdentity {
+                                thread_id: thread_id.clone(),
+                                driver: entry.driver.clone(),
+                            },
+                            running_turn,
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, thread_id, "interrupt deadline not armed: projected session unreadable");
+                }
+            }
+            // Bounded because the single supervisor actor awaits it for every session.
+            match tokio::time::timeout(
+                PROVIDER_INTERRUPT_SETTLEMENT_TIMEOUT,
+                entry.driver.interrupt(turn_id),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::warn!(
+                        thread_id,
+                        provider = %entry.launch.provider,
+                        "provider did not answer the interrupt request before its deadline"
+                    );
+                    // The armed deadline retires the session next.
+                    return Ok(());
+                }
+            }
+            persist_entry(&repositories, entry, "ready").await
         }
         OrchestrationCommand::ThreadApprovalRespond {
             request_id,
@@ -7437,6 +7546,93 @@ fn schedule_idle_suspend(
             generation,
         });
     });
+}
+
+fn schedule_interrupt_deadline(
+    sender: mpsc::UnboundedSender<SupervisorMessage>,
+    identity: ProviderSessionIdentity,
+    turn_id: String,
+) {
+    // Fixed now, not when the task first runs, so the deadline is measured from Stop.
+    let deadline = tokio::time::Instant::now() + PROVIDER_INTERRUPT_SETTLEMENT_TIMEOUT;
+    tokio::spawn(async move {
+        tokio::time::sleep_until(deadline).await;
+        let _ = sender.send(SupervisorMessage::InterruptDeadline { identity, turn_id });
+    });
+}
+
+/// Retires the session if `turn_id` is still the running turn of the same live session at the
+/// interrupt deadline. The resume cursor is kept, so the next message resumes the conversation
+/// in a new provider process through the normal missing-session launch path.
+async fn retire_unsettled_interrupt(
+    engine: &OrchestrationEngine,
+    activity: &ActivityProjection,
+    sessions: &mut HashMap<String, SessionEntry>,
+    identity: &ProviderSessionIdentity,
+    turn_id: &str,
+) -> Result<(), ProviderRuntimeError> {
+    let thread_id = identity.thread_id.as_str();
+    let Some(launch) = sessions
+        .get(thread_id)
+        .filter(|entry| Arc::ptr_eq(&entry.driver, &identity.driver))
+        .map(|entry| entry.launch.clone())
+    else {
+        return Ok(());
+    };
+    let repositories = engine.repositories();
+    let unsettled = || async {
+        repositories
+            .get_thread_session(thread_id.to_owned())
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))
+            .map(|session| {
+                session.is_some_and(|session| {
+                    session.status == "running"
+                        && session.active_turn_id.as_deref() == Some(turn_id)
+                })
+            })
+    };
+    if !unsettled().await? {
+        return Ok(());
+    }
+    tracing::warn!(
+        thread_id,
+        provider = %launch.provider,
+        "provider did not settle an interrupted turn before its deadline; retiring its session"
+    );
+    let retired = suspend_idle_session(&repositories, activity, sessions, thread_id).await;
+    // Detachment drained any terminal batch the event pump had already admitted; if that
+    // settled the turn, the provider's own settlement stands.
+    if !unsettled().await? {
+        engine.wake_turn_delivery();
+        return retired;
+    }
+    dispatch_session_state(
+        engine,
+        &launch,
+        "interrupted",
+        None,
+        Some(format!(
+            "{} did not stop within {} seconds, so BiBCode ended its session. Your next message starts it again.",
+            launch.provider_label,
+            PROVIDER_INTERRUPT_SETTLEMENT_TIMEOUT.as_secs()
+        )),
+        Some("session_stopped".to_owned()),
+    )
+    .await?;
+    if let Err(error) = settle_streaming_assistant_messages(
+        engine,
+        thread_id,
+        Some(turn_id.to_owned()),
+        &format!("provider-interrupt-deadline:{}", Uuid::new_v4()),
+        &now(),
+    )
+    .await
+    {
+        tracing::warn!(%error, thread_id, "assistant messages remained streaming after the interrupt deadline");
+    }
+    engine.wake_turn_delivery();
+    retired
 }
 
 async fn provider_thread_was_deleted(repositories: &Repositories, thread_id: &str) -> bool {
@@ -10053,6 +10249,9 @@ impl OpenCodeDriver {
 }
 
 impl ProviderDriver for OpenCodeDriver {
+    fn owns_native_work(&self) -> bool {
+        self.child.is_some()
+    }
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
         Box::pin(async move {
             let id = match &self.resume_session_id {
@@ -10293,7 +10492,7 @@ impl ClaudeAcknowledgements {
         let mut state = self.state.lock().expect("Claude acknowledgement lock");
         state.next_id = state.next_id.wrapping_add(1);
         let id = state.next_id;
-        let text: Arc<str> = Arc::from(text);
+        let text: Arc<str> = Arc::from(claude_acknowledgement_key(text));
         state
             .pending
             .entry(text.clone())
@@ -10307,18 +10506,21 @@ impl ClaudeAcknowledgements {
             id,
             text,
             state: self.state.clone(),
+            expired: false,
         }
     }
 
     fn acknowledge(&self, text: &str, turn_id: Option<String>) {
+        let text = claude_acknowledgement_key(text);
+        let text = text.as_ref();
         let mut state = self.state.lock().expect("Claude acknowledgement lock");
         let Some(pending) = state.pending.get_mut(text) else {
             return;
         };
+        // The oldest live write owns the replay, even one whose wait expired.
         while let Some(entry) = pending.pop_front() {
-            if !entry.session_cancellation.is_cancelled()
-                && entry.sender.send(turn_id.clone()).is_ok()
-            {
+            if !entry.session_cancellation.is_cancelled() {
+                let _ = entry.sender.send(turn_id.clone());
                 break;
             }
         }
@@ -10332,10 +10534,23 @@ struct ClaudeAcknowledgementRegistration {
     id: u64,
     text: Arc<str>,
     state: Arc<StdMutex<ClaudeAcknowledgementState>>,
+    expired: bool,
+}
+
+impl ClaudeAcknowledgementRegistration {
+    /// Gives up waiting but keeps the write's place in the FIFO, so its late replay is consumed
+    /// here instead of acknowledging a later identical write. Once the session is retired the
+    /// entry is skipped, and it is freed with the next matching replay or the driver.
+    fn expire(mut self) {
+        self.expired = true;
+    }
 }
 
 impl Drop for ClaudeAcknowledgementRegistration {
     fn drop(&mut self) {
+        if self.expired {
+            return;
+        }
         let mut state = self.state.lock().expect("Claude acknowledgement lock");
         if let Some(pending) = state.pending.get_mut(self.text.as_ref()) {
             pending.retain(|entry| entry.id != self.id);
@@ -10344,6 +10559,40 @@ impl Drop for ClaudeAcknowledgementRegistration {
             }
         }
     }
+}
+
+/// The key a written message and its replay share. Claude replays a message that starts with
+/// a known command or skill expanded (`<command-message>name</command-message>\n<command-name>
+/// /name</command-name>`, then `\n<command-args>args</command-args>` when there are arguments,
+/// trimmed at both ends), and any other message as written, so both reduce to `/name args`.
+fn claude_acknowledgement_key(text: &str) -> Cow<'_, str> {
+    fn command(name: &str, args: &str) -> Cow<'static, str> {
+        match args.trim() {
+            "" => Cow::Owned(format!("/{name}")),
+            args => Cow::Owned(format!("/{name} {args}")),
+        }
+    }
+    if let Some(expanded) = text.strip_prefix("<command-message>")
+        && let Some((_, invocation)) = expanded.split_once("</command-message>\n<command-name>/")
+        && let Some((name, rest)) = invocation.split_once("</command-name>")
+    {
+        if rest.is_empty() {
+            return command(name, "");
+        }
+        if let Some(args) = rest
+            .strip_prefix("\n<command-args>")
+            .and_then(|rest| rest.strip_suffix("</command-args>"))
+        {
+            return command(name, args);
+        }
+    }
+    if let Some(invocation) = text.strip_prefix('/') {
+        let (name, args) = invocation
+            .split_once(char::is_whitespace)
+            .unwrap_or((invocation, ""));
+        return command(name, args);
+    }
+    Cow::Borrowed(text)
 }
 
 fn claude_replayed_user_text(value: &Value) -> Option<&str> {
@@ -11528,6 +11777,8 @@ struct ClaudeDriver {
     sequence: Mutex<u64>,
     attachments: AttachmentMaterializer,
     pending_acknowledgement: ClaudeAcknowledgements,
+    /// How long a written message may wait for Claude's replay before it is uncertain.
+    acknowledgement_timeout: Duration,
     hook_sink: Option<Arc<ClaudeHookSinkHandle>>,
     output: Arc<ClaudeOutputHandle>,
 }
@@ -11547,6 +11798,10 @@ impl ClaudeOutputHandle {
 }
 
 const CLAUDE_ACTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Claude replays a written message as soon as it reads it (under two seconds from a cold
+/// start on a local machine). Without a replay by this deadline the delivery is uncertain, so
+/// a replay BiBCode cannot recognise never holds the thread's delivery slot indefinitely.
+const CLAUDE_DELIVERY_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(60);
 const CLAUDE_CONTEXT_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const CLAUDE_ACTIVITY_PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 const CLAUDE_ACTIVITY_PROBE_CACHE_CAPACITY: usize = 64;
@@ -12366,6 +12621,7 @@ impl ClaudeDriver {
             sequence: Mutex::new(0),
             attachments,
             pending_acknowledgement,
+            acknowledgement_timeout: CLAUDE_DELIVERY_ACKNOWLEDGEMENT_TIMEOUT,
             hook_sink: hook_handle,
             output,
         })
@@ -12532,6 +12788,18 @@ impl ClaudeDriver {
                 };
             }
         };
+        // A steer is replayed only when Claude consumes it, possibly after a long tool call, so
+        // its acknowledgement deadline starts once the steered turn stops taking input.
+        let acknowledgement_deadline = {
+            let steered_turn_input = steer_cancellation.clone();
+            let timeout = self.acknowledgement_timeout;
+            async move {
+                if let Some(input) = steered_turn_input {
+                    input.cancelled().await;
+                }
+                tokio::time::sleep(timeout).await;
+            }
+        };
         let write_cancellation = steer_cancellation.unwrap_or_default();
         let mut writer = tokio::select! {
             biased;
@@ -12575,6 +12843,7 @@ impl ClaudeDriver {
         // The message was written, so each outcome below means it probably arrived. Their details
         // are what an uncertain turn shows, so they say that plainly, naming the instance.
         let label = &self.provider_label;
+        let mut expired = false;
         let outcome = tokio::select! {
             biased;
             result = acknowledgement_rx => match result {
@@ -12594,8 +12863,19 @@ impl ClaudeDriver {
                     detail: format!("{label} stopped before it confirmed it received this message."),
                 }
             }
+            // No recognisable replay arrived in time; the write may still have been consumed.
+            () = acknowledgement_deadline => {
+                expired = true;
+                ProviderDeliveryOutcome::Ambiguous {
+                    detail: format!("{label} did not confirm it received this message."),
+                }
+            }
         };
-        drop(acknowledgement_registration);
+        if expired {
+            acknowledgement_registration.expire();
+        } else {
+            drop(acknowledgement_registration);
+        }
         outcome
     }
 }
@@ -12865,8 +13145,9 @@ impl ProviderDriver for ClaudeDriver {
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.control_responses.close();
-            let _ = self.writer.lock().await.shutdown().await;
+            // Kill first: a write Claude stopped reading holds the writer until the pipe breaks.
             kill_child(&self.child).await;
+            let _ = self.writer.lock().await.shutdown().await;
             if let Some(hook_sink) = self.hook_sink.as_ref() {
                 hook_sink.shutdown().await;
             }
@@ -13910,6 +14191,9 @@ mod tests {
         sends: Vec<String>,
         send_turn_ids: std::collections::VecDeque<String>,
         interrupts: usize,
+        interrupt_entered: Option<Arc<tokio::sync::Notify>>,
+        interrupt_never_returns: bool,
+        externally_owned: bool,
         approvals: usize,
         answers: usize,
         modes: Vec<String>,
@@ -14173,6 +14457,9 @@ mod tests {
     }
 
     impl ProviderDriver for SupervisorDriver {
+        fn owns_native_work(&self) -> bool {
+            !self.state.lock().unwrap().externally_owned
+        }
         fn start(
             &self,
         ) -> super::BoxRuntimeFuture<'_, Result<super::StartedSession, super::ProviderRuntimeError>>
@@ -14236,7 +14523,20 @@ mod tests {
             _: Option<String>,
         ) -> super::BoxRuntimeFuture<'_, Result<(), super::ProviderRuntimeError>> {
             Box::pin(async move {
-                self.state.lock().unwrap().interrupts += 1;
+                let (entered, never_returns) = {
+                    let mut state = self.state.lock().unwrap();
+                    state.interrupts += 1;
+                    (
+                        state.interrupt_entered.clone(),
+                        state.interrupt_never_returns,
+                    )
+                };
+                if let Some(entered) = entered {
+                    entered.notify_one();
+                }
+                if never_returns {
+                    std::future::pending::<()>().await;
+                }
                 Ok(())
             })
         }
@@ -16204,6 +16504,150 @@ done
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_unacknowledged_delivery_becomes_uncertain_at_its_deadline() {
+        // CLAUDE_FIXTURE reads every line and never replays one.
+        let temp = TempDir::new().unwrap();
+        let capture = temp.path().join("unacknowledged.jsonl");
+        let mut driver = claude_delivery_fixture(
+            &temp,
+            "claude-unacknowledged",
+            CLAUDE_FIXTURE,
+            &capture,
+            None,
+            None,
+        )
+        .await;
+        Arc::get_mut(&mut driver)
+            .expect("fixture driver is not shared yet")
+            .acknowledgement_timeout = Duration::from_millis(200);
+        driver.start().await.unwrap();
+        for text in ["first", "second"] {
+            let outcome = timeout(
+                Duration::from_secs(5),
+                driver.deliver(text.into(), vec![], "default".into(), text.into()),
+            )
+            .await
+            .expect("the acknowledgement wait ends at its deadline");
+            assert_eq!(
+                outcome,
+                super::ProviderDeliveryOutcome::Ambiguous {
+                    detail: "Work Claude did not confirm it received this message.".to_owned(),
+                }
+            );
+        }
+        // The expired wait released the writer: the next message was written too.
+        captured_request(ProviderFixtureDeadline::integration(), &capture, |value| {
+            value.to_string().contains("second")
+        })
+        .await
+        .unwrap();
+        driver.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_shutdown_is_not_blocked_by_a_write_claude_stopped_reading() {
+        // A hung Claude stops reading stdin; a message larger than the pipe buffer then
+        // blocks mid-frame while holding the writer. Retiring the session must still end.
+        let temp = TempDir::new().unwrap();
+        let capture = temp.path().join("not-reading.jsonl");
+        let driver = claude_delivery_fixture(
+            &temp,
+            "claude-not-reading",
+            "#!/bin/sh\nexec sleep 600\n",
+            &capture,
+            None,
+            None,
+        )
+        .await;
+        driver.start().await.unwrap();
+        let sender = driver.clone();
+        let delivery = tokio::spawn(async move {
+            sender
+                .deliver(
+                    "x".repeat(4 * 1024 * 1024),
+                    vec![],
+                    "default".into(),
+                    "key".into(),
+                )
+                .await
+        });
+        let started = Instant::now();
+        while driver.writer.try_lock().is_ok() {
+            assert!(started.elapsed() < Duration::from_secs(5), "write started");
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(driver.writer.try_lock().is_err(), "the write is blocked");
+        timeout(Duration::from_secs(5), driver.shutdown())
+            .await
+            .expect("shutdown does not wait for the blocked write")
+            .unwrap();
+        let outcome = timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("the blocked write ends with the process")
+            .unwrap();
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Ambiguous { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_steer_acknowledgement_deadline_starts_when_its_turn_ends() {
+        // A steer is replayed only when Claude consumes it, which can wait for a long tool
+        // call; its deadline therefore runs only after the steered turn stops taking input.
+        let temp = TempDir::new().unwrap();
+        let capture = temp.path().join("steer-deadline.jsonl");
+        let mut driver = claude_delivery_fixture(
+            &temp,
+            "claude-steer-deadline",
+            CLAUDE_STEER_ACK_FIXTURE,
+            &capture,
+            None,
+            None,
+        )
+        .await;
+        Arc::get_mut(&mut driver)
+            .expect("fixture driver is not shared yet")
+            .acknowledgement_timeout = Duration::from_millis(200);
+        driver.start().await.unwrap();
+        let active = driver
+            .send("initial".into(), vec![], "default".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let sender = driver.clone();
+        let mut steer = tokio::spawn(async move {
+            sender
+                .steer("follow up".into(), vec![], active, "key".into())
+                .await
+        });
+        captured_request(ProviderFixtureDeadline::integration(), &capture, |value| {
+            value.to_string().contains("follow up")
+        })
+        .await
+        .unwrap();
+        assert!(
+            timeout(Duration::from_secs(1), &mut steer).await.is_err(),
+            "a steer waiting on a running turn must not expire"
+        );
+        claude_fixture_action(&driver, "settle").await;
+        claude_fixture_output(&driver, "turn.completed").await;
+        let outcome = timeout(Duration::from_secs(5), steer)
+            .await
+            .expect("the steer expires after its turn ended")
+            .unwrap();
+        driver.shutdown().await.unwrap();
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Ambiguous { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
     async fn claude_pending_steer_fixture() -> (
         TempDir,
         Arc<super::ClaudeDriver>,
@@ -16869,6 +17313,137 @@ done
             Some("live-turn")
         );
         assert!(slot.state.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn claude_slash_command_is_acknowledged_by_its_expanded_echo() {
+        // Echo shapes recorded from the real CLI with `--replay-user-messages`: a known
+        // command or skill is replayed expanded, with its arguments trimmed at both ends;
+        // an unknown command, or text with whitespace before the slash, is replayed raw.
+        fn resolves(registered: &str, echo: &str) -> bool {
+            let slot = super::ClaudeAcknowledgements::default();
+            let (sender, mut receiver) = tokio::sync::oneshot::channel();
+            let _registration = slot.register(
+                registered,
+                sender,
+                tokio_util::sync::CancellationToken::new(),
+            );
+            slot.acknowledge(echo, Some("turn".into()));
+            match receiver.try_recv() {
+                Ok(turn_id) => {
+                    assert_eq!(turn_id.as_deref(), Some("turn"));
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        let expanded = |name: &str, args: Option<&str>| {
+            let mut echo = format!(
+                "<command-message>{name}</command-message>\n<command-name>/{name}</command-name>"
+            );
+            if let Some(args) = args {
+                echo.push_str(&format!("\n<command-args>{args}</command-args>"));
+            }
+            echo
+        };
+        assert!(resolves(
+            "/caveman Reply with exactly PONG.",
+            &expanded("caveman", Some("Reply with exactly PONG."))
+        ));
+        assert!(resolves(
+            "/caveman   Reply with exactly PONG.  \n\n  Second line here.  \n",
+            &expanded(
+                "caveman",
+                Some("Reply with exactly PONG.  \n\n  Second line here.")
+            )
+        ));
+        assert!(resolves("/caveman", &expanded("caveman", None)));
+        assert!(resolves(
+            "/superpowers:receiving-code-review Reply with exactly PONG and nothing else.",
+            &expanded(
+                "superpowers:receiving-code-review",
+                Some("Reply with exactly PONG and nothing else.")
+            )
+        ));
+        assert!(resolves(
+            "/nosuchcommandxyz Reply with exactly PONG.",
+            "/nosuchcommandxyz Reply with exactly PONG."
+        ));
+        assert!(resolves(
+            "  /caveman Reply with exactly PONG.",
+            "  /caveman Reply with exactly PONG."
+        ));
+        // A different command, or the same command with other arguments, is another message.
+        assert!(!resolves(
+            "/caveman Reply with exactly PONG.",
+            &expanded("other", Some("Reply with exactly PONG."))
+        ));
+        assert!(!resolves(
+            "/caveman Reply with exactly PONG.",
+            &expanded("caveman", Some("Reply with exactly PING."))
+        ));
+        assert!(!resolves(
+            "/caveman Reply with exactly PONG.",
+            &expanded("caveman", None)
+        ));
+        // Plain text keeps exact matching.
+        assert!(resolves(
+            "Reply with exactly PONG.",
+            "Reply with exactly PONG."
+        ));
+        assert!(!resolves(
+            "Reply with exactly PONG.",
+            "Reply with exactly PONG. "
+        ));
+        assert!(!resolves(
+            "  /caveman Reply with exactly PONG.",
+            &expanded("caveman", Some("Reply with exactly PONG."))
+        ));
+    }
+
+    #[test]
+    fn claude_identical_slash_commands_are_acknowledged_in_write_order() {
+        let slot = super::ClaudeAcknowledgements::default();
+        let session = tokio_util::sync::CancellationToken::new();
+        let (first_sender, mut first_receiver) = tokio::sync::oneshot::channel();
+        let _first = slot.register("/caveman go", first_sender, session.clone());
+        let (next_sender, mut next_receiver) = tokio::sync::oneshot::channel();
+        let _next = slot.register("/caveman go", next_sender, session);
+        let echo = "<command-message>caveman</command-message>\n<command-name>/caveman</command-name>\n<command-args>go</command-args>";
+        slot.acknowledge(echo, Some("first-turn".into()));
+        assert_eq!(
+            first_receiver.try_recv().unwrap().as_deref(),
+            Some("first-turn")
+        );
+        assert!(next_receiver.try_recv().is_err());
+        slot.acknowledge(echo, Some("next-turn".into()));
+        assert_eq!(
+            next_receiver.try_recv().unwrap().as_deref(),
+            Some("next-turn")
+        );
+    }
+
+    #[test]
+    fn claude_expired_write_still_owns_its_late_replay() {
+        // An identical retry must not be confirmed by the replay of the write that expired.
+        let slot = super::ClaudeAcknowledgements::default();
+        let session = tokio_util::sync::CancellationToken::new();
+        let (expired_sender, expired_receiver) = tokio::sync::oneshot::channel();
+        let expired = slot.register("same text", expired_sender, session.clone());
+        drop(expired_receiver);
+        expired.expire();
+        let (retry_sender, mut retry_receiver) = tokio::sync::oneshot::channel();
+        let _retry = slot.register("same text", retry_sender, session);
+        slot.acknowledge("same text", Some("late-turn".into()));
+        assert!(matches!(
+            retry_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        slot.acknowledge("same text", Some("retry-turn".into()));
+        assert_eq!(
+            retry_receiver.try_recv().unwrap().as_deref(),
+            Some("retry-turn")
+        );
     }
 
     #[test]
@@ -20358,6 +20933,257 @@ done
 
         supervisor.shutdown().await.unwrap();
         engine.shutdown().await;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InterruptResponse {
+        Settles,
+        IgnoresInterrupt,
+        NeverAnswers,
+        /// A late Stop names a turn that is no longer the running one.
+        StaleTurn,
+        /// The turn's terminal projection is admitted but unfinished when the deadline fires.
+        SettlesDuringRetirement,
+        /// An external server keeps working after detachment, so retiring it cannot stop it.
+        ExternallyOwned,
+    }
+
+    #[tokio::test]
+    async fn interrupt_that_settles_in_time_keeps_the_session() {
+        interrupt_deadline_case(InterruptResponse::Settles).await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_the_provider_ignores_retires_the_session_at_its_deadline() {
+        interrupt_deadline_case(InterruptResponse::IgnoresInterrupt).await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_the_provider_never_answers_retires_the_session_at_its_deadline() {
+        interrupt_deadline_case(InterruptResponse::NeverAnswers).await;
+    }
+
+    #[tokio::test]
+    async fn stale_interrupt_for_another_turn_keeps_the_running_session() {
+        interrupt_deadline_case(InterruptResponse::StaleTurn).await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_deadline_keeps_an_externally_owned_session_running() {
+        interrupt_deadline_case(InterruptResponse::ExternallyOwned).await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_deadline_does_not_overwrite_a_settlement_it_raced() {
+        interrupt_deadline_case(InterruptResponse::SettlesDuringRetirement).await;
+    }
+
+    // One case per test: each needs its own paused clock.
+    async fn interrupt_deadline_case(response: InterruptResponse) {
+        {
+            let engine = supervisor_engine().await;
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let first = Arc::new(StdMutex::new(SupervisorDriverState {
+                interrupt_entered: Some(entered.clone()),
+                interrupt_never_returns: matches!(response, InterruptResponse::NeverAnswers),
+                externally_owned: matches!(response, InterruptResponse::ExternallyOwned),
+                ..SupervisorDriverState::default()
+            }));
+            let second = Arc::new(StdMutex::new(SupervisorDriverState::default()));
+            let (first_events, first_rx) = mpsc::channel(2);
+            let (_second_events, second_rx) = mpsc::channel(2);
+            let supervisor = super::ProviderRuntimeSupervisor::start(
+                engine.clone(),
+                Arc::new(SequencedSupervisorFactory {
+                    drivers: StdMutex::new(
+                        [(first.clone(), first_rx), (second.clone(), second_rx)].into(),
+                    ),
+                }),
+                super::ActivityProjection::new(crate::activity::ActivityRepository::new(
+                    engine.repositories().database().clone(),
+                )),
+                super::SupervisorOptions::default(),
+            );
+            let workspace = TempDir::new().unwrap();
+            let mut request = native_launch(&workspace, "codex");
+            request.thread_id = "t1".to_owned();
+            supervisor.launch(request.clone()).await.unwrap();
+            let start = |id: &str| -> OrchestrationCommand {
+                serde_json::from_value(json!({
+                    "type":"thread.turn.start", "commandId":id, "threadId":"t1",
+                    "message":{"messageId":format!("user-{id}"),"role":"user","text":id,"attachments":[]},
+                    "runtimeMode":"full-access", "interactionMode":"default",
+                    "createdAt":"2026-07-16T00:00:01Z"
+                }))
+                .unwrap()
+            };
+            let session = || async {
+                engine
+                    .repositories()
+                    .get_thread_session("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .expect("projected session")
+            };
+            supervisor
+                .handle_orchestration(start("first"))
+                .await
+                .unwrap();
+            assert_eq!(session().await.status, "running");
+
+            tokio::time::pause();
+            let clock = keep_idle_clock_paused();
+            let requested_turn = if matches!(response, InterruptResponse::StaleTurn) {
+                "earlier-turn"
+            } else {
+                "unit-turn"
+            };
+            let mut interrupt =
+                Some(tokio::spawn({
+                    let supervisor = supervisor.clone();
+                    async move {
+                        supervisor
+                        .handle_orchestration(serde_json::from_value(json!({
+                            "type":"thread.turn.interrupt", "commandId":"stop", "threadId":"t1",
+                            "turnId":requested_turn, "createdAt":"2026-07-16T00:00:02Z"
+                        })).unwrap())
+                        .await
+                    }
+                }));
+            entered.notified().await;
+            let completion = super::ProviderEvent {
+                native_event_id: None,
+                event_type: "turn.completed".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: Some("unit-turn".to_owned()),
+                item_id: None,
+                request_id: None,
+                payload: json!({"state":"interrupted"}),
+                activity: Vec::new(),
+                activity_controls: Default::default(),
+            };
+            if matches!(response, InterruptResponse::StaleTurn) {
+                interrupt.take().unwrap().await.unwrap().unwrap();
+            }
+            let mut held_settlement = None;
+            if matches!(response, InterruptResponse::SettlesDuringRetirement) {
+                interrupt.take().unwrap().await.unwrap().unwrap();
+                let held = engine.test_hooks().pause_before_next_command_persist();
+                first_events.send(completion.clone()).await.unwrap();
+                held.wait_until_entered().await;
+                held_settlement = Some(held);
+            }
+            if matches!(response, InterruptResponse::Settles) {
+                interrupt.take().unwrap().await.unwrap().unwrap();
+                first_events.send(completion).await.unwrap();
+                let started = Instant::now();
+                while session().await.status != "ready" {
+                    assert!(started.elapsed() < Duration::from_secs(5), "turn settles");
+                    tokio::task::yield_now().await;
+                }
+            }
+            // Timer deadlines round up to the next millisecond.
+            tokio::time::advance(
+                super::PROVIDER_INTERRUPT_SETTLEMENT_TIMEOUT + Duration::from_millis(1),
+            )
+            .await;
+            if let Some(interrupt) = interrupt.take() {
+                interrupt
+                    .await
+                    .unwrap()
+                    .expect("Stop returns once the provider is given up on");
+            }
+            if let Some(held) = held_settlement {
+                // Let the actor check the still-running projection and wait on detachment.
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_millis(300) {
+                    tokio::task::yield_now().await;
+                }
+                held.release();
+            }
+            // The deadline is evaluated on the actor; a round trip orders after it.
+            let started = Instant::now();
+            let retired = loop {
+                let live = supervisor
+                    .capture_session_identity("t1")
+                    .await
+                    .unwrap()
+                    .is_some();
+                let status = session().await.status;
+                let kept = matches!(
+                    response,
+                    InterruptResponse::Settles
+                        | InterruptResponse::StaleTurn
+                        | InterruptResponse::ExternallyOwned
+                );
+                let raced = matches!(response, InterruptResponse::SettlesDuringRetirement);
+                if kept || raced && !live || !live && status != "running" {
+                    break !live;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "{response:?}: the unsettled turn is retired at its deadline"
+                );
+                tokio::task::yield_now().await;
+            };
+            drop(clock);
+            tokio::time::resume();
+
+            if matches!(
+                response,
+                InterruptResponse::Settles
+                    | InterruptResponse::StaleTurn
+                    | InterruptResponse::ExternallyOwned
+            ) {
+                assert!(!retired, "{response:?}: the session is kept");
+                assert_eq!(first.lock().unwrap().shutdowns, 0);
+                if matches!(response, InterruptResponse::ExternallyOwned) {
+                    assert_eq!(session().await.status, "running");
+                }
+                supervisor.shutdown().await.unwrap();
+                engine.shutdown().await;
+                return;
+            }
+            assert_eq!(first.lock().unwrap().shutdowns, 1, "{response:?}");
+            if matches!(response, InterruptResponse::SettlesDuringRetirement) {
+                // Retired, but the provider's own settlement stands.
+                let projected = session().await;
+                assert_eq!(projected.status, "ready");
+                assert_eq!(projected.last_error, None);
+                supervisor.shutdown().await.unwrap();
+                engine.shutdown().await;
+                return;
+            }
+            let projected = session().await;
+            assert_eq!(projected.status, "interrupted", "{response:?}");
+            assert_eq!(projected.active_turn_id, None);
+            assert_eq!(
+                projected.last_error_class.as_deref(),
+                Some("session_stopped")
+            );
+            let runtime = engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("resume state is retained");
+            assert_eq!(runtime.status, "suspended");
+            assert_eq!(
+                runtime.resume_cursor,
+                Some(json!({"threadId":"unit-session"}))
+            );
+
+            // The next message starts a fresh provider session.
+            supervisor.launch(request).await.unwrap();
+            supervisor
+                .handle_orchestration(start("second"))
+                .await
+                .unwrap();
+            assert_eq!(second.lock().unwrap().sends, vec!["second".to_owned()]);
+            assert_eq!(session().await.status, "running");
+            supervisor.shutdown().await.unwrap();
+            engine.shutdown().await;
+        }
     }
 
     const BUSY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);

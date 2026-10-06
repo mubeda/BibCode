@@ -29,6 +29,8 @@ export interface SidebarProjectSnapshot extends Project {
   memberProjects: readonly SidebarProjectGroupMember[];
   memberProjectRefs: readonly ScopedProjectRef[];
   remoteEnvironmentLabels: readonly string[];
+  // Repositories view: the Environments row key that shares this card's expansion.
+  sharedExpansionKey?: string;
 }
 
 export function compareSidebarDisplayText(left: string, right: string): number {

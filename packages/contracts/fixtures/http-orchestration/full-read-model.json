@@ -7,6 +7,7 @@
       "workspaceRoot": "/owned/live",
       "defaultModelSelection": null,
       "scripts": [],
+      "repositoryIdentity": null,
       "worktreeDiscovery": {
         "visibility": "hidden",
         "initialPromptDismissedAt": null,
@@ -22,6 +23,7 @@
       "workspaceRoot": "/owned/deleted",
       "defaultModelSelection": null,
       "scripts": [],
+      "repositoryIdentity": null,
       "worktreeDiscovery": {
         "visibility": "hidden",
         "initialPromptDismissedAt": null,

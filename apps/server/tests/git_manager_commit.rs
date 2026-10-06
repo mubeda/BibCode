@@ -131,6 +131,7 @@ async fn commit_amend_undo_discard_scope_and_concurrency_follow_the_wire_contrac
             created_at: "2026-08-31T00:00:00Z".to_owned(),
             updated_at: "2026-08-31T00:00:00Z".to_owned(),
             deleted_at: None,
+            repository_identity: None,
         })
         .await
         .expect("project projection");

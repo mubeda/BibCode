@@ -159,9 +159,15 @@ chat Git actions opens the same review dialog. It reads local status and refs,
 shows the detected provider and separate **Source branch** and **Target branch**
 selectors. Both lists contain only origin-tracking branches; local-only branches,
 other remotes, and symbolic `HEAD` entries are excluded. The source starts at the
-current checkout only if it has a matching origin branch; otherwise it starts
-unselected, with guidance to push or fetch before selecting. Selecting another
-source never checks it out. Title and description suggestions
+current checkout's branch; if origin does not have it yet, creating the request
+publishes it first. In Source Control, **Push & create** and **Create** first publish
+a branch that has no upstream yet (`push --set-upstream origin <branch>`), so the
+dialog opens with that branch already on origin; a failed push reports the error
+and leaves the dialog closed. A branch that already tracks an upstream, which may
+have another name or remote, a host that is not identified yet, a checkout with
+uncommitted changes, and any server without branch-selection support open the
+dialog directly; creating the request then publishes the source explicitly to
+its same-named origin branch. Selecting another source never checks it out. Title and description suggestions
 come from that source's tip commit, using a pinned commit query rather than the
 repository-wide history. Changing source preserves edited content and replaces
 only untouched suggestions. The target branch
@@ -186,8 +192,8 @@ identify it (open Pull Requests for the project, or Rescan in **Settings →
 Source Control**); without an `origin` remote it asks for one. Opened from Pull
 Requests, the dialog shows the host that panel already identified while the
 status has not named it yet, and leaves the provider check to the server. A
-disabled primary button explains why on hover and to screen readers. Nothing is
-pushed or created until
+disabled primary button explains why on hover and to screen readers. Apart from
+that Source Control push, nothing is pushed or created until
 the dialog's primary action runs the existing `git.runStackedAction`
 `create_pr` route with the reviewed `pullRequestTitle`, `pullRequestBody`, and
 required `pullRequestBaseBranch`, plus `pullRequestHeadBranch` for the selected

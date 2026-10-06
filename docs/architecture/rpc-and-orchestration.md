@@ -1838,7 +1838,12 @@ steering emits no turn-start event and preserves the message's enqueue time.
 
 Interrupt requests and error/interrupted session updates atomically hold every
 queued row and emit a complete delivery update per message. A later ready event preserves
-those holds. Cancelling accepts only queued rows: the row becomes dismissed,
+those holds. A provider that has not settled the turn 10 seconds after Stop is
+retired by the provider supervisor and projected `interrupted`, so a hung
+provider cannot keep the session `running`
+([providers](./providers.md#failure-attribution)); a Claude write without a replay
+60 seconds after it was written settles as an uncertain delivery instead of
+holding its delivery slot. Cancelling accepts only queued rows: the row becomes dismissed,
 the delivery event carries `withdrawn: true`, and its projector deletes only
 the addressed message. The row and original payload remain durable, while
 same-command replay remains idempotent. Queued rows never enter crash
@@ -1852,6 +1857,14 @@ restart error as `session_stopped`. That error settlement holds queued messages
 for explicit **Send now** and releases the pending-start claim gate. Completed
 reconciliation does not dispatch again on a later startup; ready/idle/stopped
 projections without live runtimes retain their existing state.
+
+A deleted thread (including every thread of a deleted project) can never accept
+a session projection, so its work is terminal rather than retryable. Each
+delivery-worker pass dismisses every `pending` row whose thread is deleted,
+with a plain detail, before any claim, bootstrap, or provider launch; this also
+settles rows stranded by an earlier retry loop. Other states are untouched.
+Startup reconciliation skips a deleted thread and drops any runtime row a late
+delivery left behind, so it does not warn and retry on every start.
 
 Workspace-loss settlement uses the same error rule: every queued row is held,
 and pending or sending steer rows latch the hold. The queued head shows
