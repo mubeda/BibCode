@@ -99,6 +99,27 @@ class FakeIp:
         return result, json.dumps(value).encode()
 
 class NetworkTests(unittest.TestCase):
+    def test_settings_followup_owner_keeps_exact_selector_assets_and_namespaces(self):
+        with tempfile.TemporaryDirectory(prefix='settings-owner-contract-') as directory:
+            owner, env = actual_owner_handoff(Path(directory), 'release-visual-settings-followups')
+            self.assertEqual(len(owner), 16)
+            self.assertEqual(owner[14], 'release-visual-settings-followups')
+            foreign = Path(directory) / 'foreign-web'; foreign.mkdir()
+            invalid_owners = [owner + ['extra'], owner[:-1]]
+            for index, value in [(14, 'release-visual-settings'), (14, '../arbitrary'), (15, str(foreign.resolve()))]:
+                invalid = list(owner); invalid[index] = value; invalid_owners.append(invalid)
+            for invalid in invalid_owners:
+                fake = FakeIp()
+                with self.assertRaises(network.NetworkRefused):
+                    self.setup_network(fake, env=env, owner=invalid)
+                self.assertEqual(fake.calls, [])
+            for key, value in [('BIBCODE_DELIVERY_UI_SELECTION', 'release-visual-settings'),
+                               ('BIBCODE_UPLOAD_NETNS', 'net:[999]'), ('BIBCODE_UPLOAD_USERNS', 'user:[999]')]:
+                fake = FakeIp()
+                with self.assertRaises(network.NetworkRefused):
+                    self.setup_network(fake, env={**env, key: value}, owner=owner)
+                self.assertEqual(fake.calls, [])
+
     def test_actual_project_lifecycle_owner_keeps_exact_sixteen_argument_containment(self):
         with tempfile.TemporaryDirectory(prefix='lifecycle-owner-contract-') as directory:
             owner, env = actual_owner_handoff(Path(directory), 'release-visual-project-lifecycle')
@@ -136,7 +157,7 @@ class NetworkTests(unittest.TestCase):
                              platform='linux', read_owner=lambda: ('\0'.join(OWNER if owner is None else owner) + '\0').encode(), read_capabilities=kwargs.pop('read_capabilities', lambda: b'CapEff:\t0000000000001000\n'), **kwargs)
 
     def test_actual_chat_and_both_ui_producers_satisfy_the_existing_containment_contract(self):
-        for scenario, matrix, length in [('chat-upload', 'core', 14), ('remote-updates-ui', 'core', 18), ('remote-updates-ui', 'full', 18), ('delivery-retry-ui', 'core', 16), ('release-visual-core', 'core', 16), ('release-visual-settings', 'core', 16), ('release-visual-git-project', 'core', 16)]:
+        for scenario, matrix, length in [('chat-upload', 'core', 14), ('remote-updates-ui', 'core', 18), ('remote-updates-ui', 'full', 18), ('delivery-retry-ui', 'core', 16), ('release-visual-core', 'core', 16), ('release-visual-settings', 'core', 16), ('release-visual-git-project', 'core', 16), ('release-visual-settings-followups', 'core', 16)]:
             with self.subTest(scenario=scenario, matrix=matrix), tempfile.TemporaryDirectory(prefix='bibcode-owner-contract-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario, matrix)
                 self.assertEqual(len(owner), length)
