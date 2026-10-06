@@ -496,7 +496,7 @@ impl GeometryOwner {
     }
 }
 
-#[cfg(all(feature = "desktop-e2e", target_os = "linux"))]
+#[cfg(all(feature = "desktop-e2e", target_os = "linux", not(test)))]
 pub(crate) mod linux {
     use super::*;
     use gtk::prelude::*;
