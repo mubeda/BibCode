@@ -282,7 +282,7 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
           if($newCommands.Count -ne 1){throw ('Pinned GPG '+$Operation+' refused; commandReceiptPresent=false; commandExit='+$script:OwnedWslSignedMetadata.commandExit)}
           $command=Get-Content -LiteralPath $newCommands[0].FullName -Raw|ConvertFrom-Json
           @($command.PSObject.Properties.Name|Sort-Object)|Should -Be @('exitCode','stderr','stdout')
-          ($command.exitCode -is [int])|Should -BeTrue
+          ($command.exitCode -is [int] -or $command.exitCode -is [long])|Should -BeTrue
           ($command.exitCode -ge 0 -and $command.exitCode -le 255)|Should -BeTrue
           ($command.stdout -is [string])|Should -BeTrue;($command.stderr -is [string])|Should -BeTrue
           $command.exitCode|Should -Be $script:OwnedWslSignedMetadata.commandExit
