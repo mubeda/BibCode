@@ -107,7 +107,11 @@ it.each([
   }
 });
 
-async function actualLifecycleCaller(mode = "valid", theme: "light" | "dark" = "light") {
+async function actualLifecycleCaller(
+  mode = "valid",
+  theme: "light" | "dark" = "light",
+  initialFailure?: string,
+) {
   const source = NodeFS.readFileSync(
       new NodeURL.URL("../qualify-delivery-retry.ts", import.meta.url),
       "utf8",
@@ -590,6 +594,20 @@ async function actualLifecycleCaller(mode = "valid", theme: "light" | "dark" = "
     projectLifecycleFixtureSafeToDelete: true,
     visualInput: {},
   };
+  const refusedInitial = () => {
+    throw original;
+  };
+  if (initialFailure === "snapshot") scope.lifecycleSnapshot = refusedInitial;
+  if (initialFailure === "descriptor") scope.readOwnedGitProjectDescriptor = refusedInitial;
+  if (initialFailure === "path") scope.configured.worktreeBaseDirectory = root + "/foreign";
+  if (initialFailure === "checkout") scope.NodeFS.lstatSync = refusedInitial;
+  if (initialFailure === "process") scope.createLifecycleProcessProof = refusedInitial;
+  if (initialFailure === "decode") scope.lifecycleSnapshot = async () => ({}) as never;
+  if (initialFailure === "workspace") scope.workspace.threadId = "foreign-workspace";
+  if (initialFailure === "project") project.workspaceRoot = root + "/foreign-project";
+  if (initialFailure === "grant") scope.owner.json = refusedInitial;
+  if (initialFailure === "token") scope.fixtureAccessToken = refusedInitial;
+  if (initialFailure === "api") scope.withProjectLifecycleApi = refusedInitial;
   let error: unknown;
   try {
     await NodeVM.runInNewContext(
@@ -619,6 +637,23 @@ it("executes the actual full caller with decoded current-source joins, public ac
   expect(result.actions).toContain("native-stop");
   expect(result.trusted).toBe(true);
   expect(result.scope.owner.failures).toEqual([]);
+  expect(
+    result.actions.filter((value) => value.startsWith("visual-project-lifecycle-bind-")),
+  ).toEqual(
+    [
+      "snapshot",
+      "descriptor",
+      "path",
+      "checkout",
+      "process",
+      "decode",
+      "workspace",
+      "project",
+      "grant",
+      "token",
+      "api",
+    ].map((boundary) => "visual-project-lifecycle-bind-" + boundary),
+  );
 });
 it("the actual caller preserves the original capture failure while reporting failed restoration and retaining the fixture", async () => {
   const result = await actualLifecycleCaller("cleanup-failure");
@@ -646,4 +681,28 @@ it("the actual two-theme caller closes the unchanged six-original lifecycle cont
       [...light.scope.assertions, ...dark.scope.assertions],
     ),
   ).toEqual({ existingRowsOnly: true, completeGroup: false, originalCount: 6 });
+});
+it.each([
+  "snapshot",
+  "descriptor",
+  "path",
+  "checkout",
+  "process",
+  "decode",
+  "workspace",
+  "project",
+  "grant",
+  "token",
+  "api",
+])("attributes the existing initial %s boundary without starting a row", async (boundary) => {
+  const result = await actualLifecycleCaller("valid", "light", boundary);
+  expect(result.error).toBeDefined();
+  expect(result.actions.filter((value) => value.startsWith("visual-")).at(-1)).toBe(
+    "visual-project-lifecycle-bind-" + boundary,
+  );
+  expect(result.scope.captures).toEqual([]);
+  expect(result.joins).toEqual([]);
+  expect(result.actions).not.toContain("native-start");
+  if (!["path", "decode", "workspace", "project"].includes(boundary))
+    expect(result.error).toBe(result.original);
 });

@@ -1711,15 +1711,18 @@ export async function runDeliveryRetryQualification() {
         step("visual-project-lifecycle-bind");
         if (!projectLifecycleFixture || !lifecycleSnapshot || server.child.pid === undefined)
           throw new Error("Owned lifecycle fixture unavailable.");
-        const fixture = projectLifecycleFixture,
-          initial = await lifecycleSnapshot(),
-          descriptor = await readOwnedGitProjectDescriptor();
+        const fixture = projectLifecycleFixture;
+        step("visual-project-lifecycle-bind-snapshot");
+        const initial = await lifecycleSnapshot();
+        step("visual-project-lifecycle-bind-descriptor");
+        const descriptor = await readOwnedGitProjectDescriptor();
         check(
           descriptor.environmentId === "local" &&
             !!descriptor.bootId &&
             !!descriptor.storageInstanceId &&
             descriptor.capabilities.vcsCloneReattach === true,
         );
+        step("visual-project-lifecycle-bind-path");
         check(
           workspace.path ===
             NodePath.join(
@@ -1728,6 +1731,7 @@ export async function runDeliveryRetryQualification() {
               "codex-delivery-retry-" + theme,
             ),
         );
+        step("visual-project-lifecycle-bind-checkout");
         const retained = NodeFS.lstatSync(workspace.path),
           gitPointer = NodeFS.readFileSync(NodePath.join(workspace.path, ".git"));
         const verifyCheckoutRetained = async () => {
@@ -1748,6 +1752,7 @@ export async function runDeliveryRetryQualification() {
               }),
           );
         };
+        step("visual-project-lifecycle-bind-process");
         const processProof = createLifecycleProcessProof({
           CI: childEnv.CI,
           uid: NodeFS.lstatSync(config.fixture).uid,
@@ -1779,8 +1784,10 @@ export async function runDeliveryRetryQualification() {
               current.capabilities.vcsCloneReattach === true,
           );
         };
+        step("visual-project-lifecycle-bind-decode");
         const models: OrchestrationReadModel =
           Schema.decodeUnknownSync(OrchestrationReadModel)(initial);
+        step("visual-project-lifecycle-bind-workspace");
         const hosts = models.threads.filter(
           (thread) =>
             thread.id === workspace.threadId &&
@@ -1791,13 +1798,14 @@ export async function runDeliveryRetryQualification() {
             thread.archivedAt === null,
         );
         check(hosts.length === 1);
-        const host = hosts[0]!,
-          projects = models.projects.filter(
-            (project) =>
-              project.id === host.projectId &&
-              project.deletedAt === null &&
-              project.workspaceRoot === context.projectPath,
-          );
+        const host = hosts[0]!;
+        step("visual-project-lifecycle-bind-project");
+        const projects = models.projects.filter(
+          (project) =>
+            project.id === host.projectId &&
+            project.deletedAt === null &&
+            project.workspaceRoot === context.projectPath,
+        );
         check(projects.length === 1);
         const primaryProject = projects[0]!;
         const bind = async (
@@ -1845,6 +1853,7 @@ export async function runDeliveryRetryQualification() {
           cloneUrl: fixture.cloneUrl,
           cloneParent: fixture.cloneParent,
         });
+        step("visual-project-lifecycle-bind-grant");
         const grant = await owner.json(
           config.binary,
           ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
@@ -1856,11 +1865,13 @@ export async function runDeliveryRetryQualification() {
             : null;
         if (typeof credential !== "string" || credential.length < 8 || credential.length > 16384)
           throw new Error("Owned lifecycle credential refused.");
+        step("visual-project-lifecycle-bind-token");
         const accessToken = await fixtureAccessToken(origin, credential),
           rows: object[] = [];
         const unsafe = () => {
           projectLifecycleFixtureSafeToDelete = false;
         };
+        step("visual-project-lifecycle-bind-api");
         await withProjectLifecycleApi(
           {
             CI: childEnv.CI,
