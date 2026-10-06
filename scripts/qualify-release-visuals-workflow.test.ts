@@ -209,6 +209,7 @@ describe("first visual batch workflow boundary", () => {
             "release-visual-project-lifecycle",
             "release-visual-settings-followups",
             "release-visual-pull-requests",
+            "release-visual-browser-followups",
           ],
         },
       },

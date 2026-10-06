@@ -299,7 +299,7 @@ it("retains the installer refusal when the actual PR pre-context preparation is 
     actualRequestTools(fixture);
     const source = qualifierSource(),
       begin = source.indexOf(
-        '      if (config.selection === "release-visual-pull-requests") {',
+        "      if (",
         source.indexOf("      const runRoot = NodePath.join(config.fixture, theme);"),
       ),
       end = source.indexOf("      const env = {", begin);
