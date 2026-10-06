@@ -47,6 +47,11 @@ owner. Never commit secrets, credentials, private user data, or unbounded logs.
 
 ## Operating rule
 
+Before repeating a costly agent-owned validation run, use the private checkpoint
+and checker described in [issue-delivery](../../.agents/skills/issue-delivery/SKILL.md).
+Run its behavioral checks with `node --test scripts/check-agent-delivery.node-test.mjs`.
+These checks validate the delivery decision, not application or native acceptance.
+
 Read [Shared cross-platform validation](./cross-platform-validation.md) in full
 before the native page. Source, manifests, scripts, tests, CI, and release
 workflows remain executable evidence; if a runbook disagrees with them, stop,
