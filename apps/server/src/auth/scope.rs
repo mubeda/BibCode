@@ -30,6 +30,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "gitManager.previewMerge"
         | "pullRequests.getContext"
         | "pullRequests.getVocabulary"
+        | "pullRequests.getCreateDefaults"
         | "pullRequests.list"
         | "pullRequests.get"
         | "pullRequests.getTimeline"
@@ -144,6 +145,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "terminal.open"
         | "terminal.resize"
         | "terminal.restart"
+        | "terminal.stageImagePaste"
         | "terminal.write"
         | "terminal.writeInput"
         | "subscribeTerminalEvents"
@@ -241,6 +243,7 @@ mod tests {
         for method in [
             "pullRequests.getContext",
             "pullRequests.getVocabulary",
+            "pullRequests.getCreateDefaults",
             "pullRequests.list",
             "pullRequests.get",
             "pullRequests.getTimeline",

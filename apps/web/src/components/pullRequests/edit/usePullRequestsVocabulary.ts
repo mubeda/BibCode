@@ -4,7 +4,7 @@ import { pullRequestsEnvironment } from "../../../state/pullRequests";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
 import type { PullRequestsScope } from "../usePullRequestsAction";
 
-/** Mounted only while a picker is open. Complete vocabularies never search the host. */
+/** Reads the first page on mount; only a truncated vocabulary searches the host. */
 export function usePullRequestsVocabulary(
   scope: PullRequestsScope,
   kind: PullRequestsVocabularyInput["kind"],

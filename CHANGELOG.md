@@ -1,5 +1,44 @@
 # Changelog
 
+## [v0.8.1] - 2026-10-06
+
+BiBCode v0.8.1 lets you set draft, people, labels, milestone, and merge options when creating a pull or merge request, pastes clipboard images into terminal programs on any host, and fixes terminal copy and browser discovery behind the UI proxy. This release includes the changes since v0.8.0.
+
+### Pull and merge request options
+
+- The create dialog now offers **Mark as draft**, assignees with **Assign to me**, reviewers, a milestone, and labels on GitHub and GitLab. GitLab merge requests also get **Delete source branch** and **Squash commits**, prefilled from the project's settings; a project that always or never squashes shows the box locked with a note. GitLab takes one assignee and one reviewer, GitHub several.
+- Pickers search the host as you type. A picker or settings read that fails offers **Retry** and never blocks creation; untouched merge boxes then leave the decision to the project.
+- When GitHub creates the pull request but cannot apply an option (for example a reviewer without access on github.com), the request is reported as created with a warning naming what was not applied, and it is never retried. When a request already exists for the branch, the dialog says your chosen options were not applied.
+- Provider failures show the provider's own message. GitLab request bodies travel in a private temporary file instead of on the command line.
+- The dialog brings the outcome into view when the request settles. Azure DevOps and Bitbucket keep the plain dialog, and older servers without `pullRequestCreateOptions` show no new fields.
+
+### Terminal
+
+- Pasting a screenshot or other clipboard image into a terminal running Codex or Claude Code now attaches it, including on remote, WSL, and SSH environments. The image is uploaded to the terminal's server, saved there, and its path is pasted. A status with **Cancel** shows during the upload, typed input waits behind the path, and older servers print a message instead of sending an empty paste.
+- Selections in terminals running Codex, opencode, or other mouse-tracking programs no longer disappear on the next hover or right-click, so keyboard and context-menu copy work. The desktop selection menu gains **Copy**.
+
+### Connection
+
+- A browser primary behind the loopback UI proxy now discovers and stores its server through the same authenticated HTTP routing it signs in with. The WebSocket endpoint, the desktop-managed bypass, and non-loopback access are unchanged.
+
+### Agent workflow
+
+- Added the `issue-delivery` skill and a CI-checked delivery checker for agent issue batches, and agents now confirm a delegated reviewer is running before waiting on it.
+
+### Known limitations and qualification still in progress
+
+- Create options have not yet been exercised against live GitHub and GitLab hosts, and terminal image paste is unverified in the macOS and Linux webviews and with Windows servers.
+- Native qualification for remote updates ([#16](https://github.com/mubeda/BibCode/issues/16)), the typography audit ([#27](https://github.com/mubeda/BibCode/issues/27)), the light/dark screenshot matrix ([#29](https://github.com/mubeda/BibCode/issues/29)), and the manual SSH check on a real Mac ([#38](https://github.com/mubeda/BibCode/issues/38)) remain open.
+- End-to-end-encrypted file transfers ([#18](https://github.com/mubeda/BibCode/issues/18)) remain deferred.
+
+### Downloads
+
+Desktop installers and standalone server distributions support macOS, Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are included for both architectures. Stable desktop updater payloads and signatures use the six-target `latest.json` manifest.
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it. macOS bundles remain ad-hoc signed and unnotarized; Windows installers remain without Authenticode.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.8.0...v0.8.1
+
 ## [v0.8.0] - 2026-10-05
 
 BiBCode v0.8.0 adds a Repositories view to the left panel, keeps remote chats from hanging in Working, and fixes terminal copy, project collapse, and the merge-request flow. This release includes the changes since v0.7.4.

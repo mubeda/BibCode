@@ -535,18 +535,39 @@ The authenticated environment advertises `gitPullRequestBranchSelection`
 checks it again on the same live session used for the mutation stream. Older
 servers therefore cannot silently ignore the reviewed branch fields.
 
-| Method                       | Required scope          | Responsibility                                                          |
-| ---------------------------- | ----------------------- | ----------------------------------------------------------------------- |
-| `pullRequests.getContext`    | `orchestration:read`    | Resolve origin, host/account, repository policy and availability.       |
-| `pullRequests.getVocabulary` | `orchestration:read`    | Load bounded searchable picker values on demand.                        |
-| `pullRequests.list`          | `orchestration:read`    | Page the repository list for explicit tabs/filters.                     |
-| `pullRequests.get`           | `orchestration:read`    | Read detail and compute permissions/readiness.                          |
-| `pullRequests.getTimeline`   | `orchestration:read`    | Read bounded comments, reviews, threads and events.                     |
-| `pullRequests.getCommits`    | `orchestration:read`    | Read the request's commit list.                                         |
-| `pullRequests.getChecks`     | `orchestration:read`    | Read GitHub checks or GitLab pipeline jobs.                             |
-| `pullRequests.getFiles`      | `orchestration:read`    | Read file metadata, bounded patches and diff refs.                      |
-| `pullRequests.runAction`     | `orchestration:operate` | Revalidate and serialize review/metadata/merge/state mutations.         |
-| `pullRequests.checkout`      | `orchestration:operate` | Guard current/other/new-worktree checkout and settle durable ownership. |
+The same action takes optional `pullRequestOptions` on request actions:
+`draft`, `assignees`, `reviewers` and `labels` (Pull Requests vocabulary entry
+ids; at most 20, 20 and 50), `milestone` (`{ id, title }`), and the GitLab-only
+`removeSourceBranch` and `squash`. Before any branch, commit or push, the server
+refuses options the resolved provider cannot honor: merge options outside
+GitLab, non-numeric GitLab person or milestone ids, and any option for Azure
+DevOps or Bitbucket. GitHub receives `gh pr create` flags (`--draft`,
+`--assignee`, `--reviewer`, CSV-quoted `--label`, `--milestone <title>`);
+GitLab receives one JSON body over stdin (`glab api … --input -`) with
+`assignee_ids`, `reviewer_ids`, `labels`, `milestone_id`,
+`remove_source_branch`, `squash`, and a `Draft: ` title prefix added unless the
+title already carries a draft marker. Requests without options keep the plain
+commands. When `gh` exits 1 after printing the request URL, the step reports
+`created` with `pr.warning` and is not retried; an existing open request reports
+that the options were not applied. Servers advertise `pullRequestCreateOptions`
+(default false for older servers); the dialog shows the fields and the client
+action sends them only when it is present. `pullRequests.getCreateDefaults`
+supplies the dialog's "Assign to me" viewer and GitLab's `squash_option` and
+`remove_source_branch_after_merge`; the dialog re-reads it on every open.
+
+| Method                           | Required scope          | Responsibility                                                          |
+| -------------------------------- | ----------------------- | ----------------------------------------------------------------------- |
+| `pullRequests.getContext`        | `orchestration:read`    | Resolve origin, host/account, repository policy and availability.       |
+| `pullRequests.getVocabulary`     | `orchestration:read`    | Load bounded searchable picker values on demand.                        |
+| `pullRequests.getCreateDefaults` | `orchestration:read`    | Viewer and GitLab merge defaults for the create dialog.                 |
+| `pullRequests.list`              | `orchestration:read`    | Page the repository list for explicit tabs/filters.                     |
+| `pullRequests.get`               | `orchestration:read`    | Read detail and compute permissions/readiness.                          |
+| `pullRequests.getTimeline`       | `orchestration:read`    | Read bounded comments, reviews, threads and events.                     |
+| `pullRequests.getCommits`        | `orchestration:read`    | Read the request's commit list.                                         |
+| `pullRequests.getChecks`         | `orchestration:read`    | Read GitHub checks or GitLab pipeline jobs.                             |
+| `pullRequests.getFiles`          | `orchestration:read`    | Read file metadata, bounded patches and diff refs.                      |
+| `pullRequests.runAction`         | `orchestration:operate` | Revalidate and serialize review/metadata/merge/state mutations.         |
+| `pullRequests.checkout`          | `orchestration:operate` | Guard current/other/new-worktree checkout and settle durable ownership. |
 
 Browser and desktop clients use these same typed unary RPCs; native actions such
 as opening a host URL retain the existing DesktopBridge/local API boundary.
@@ -1390,6 +1411,32 @@ releases it before acquiring the main registry, entry, or repository locks.
 Observation result publication takes the lifecycle mutex before repository
 state and skips publication after terminal transition. Later subscribe,
 refresh, invalidation, and release paths cannot restart the service.
+
+### Terminal image paste
+
+Servers with `capabilities.terminalImagePaste` accept
+`terminal.stageImagePaste { uploadId, name, mimeType, sizeBytes }`, which needs
+`terminal:operate`; the upload before it needs `orchestration:operate`, which
+every issued scope bundle that grants `terminal:operate` includes. A terminal program reads its own host's clipboard, never the
+client's, so the web terminal turns an image-only paste (no `text/plain`) into a
+staged upload and asks the server for a file the program can open. The upload
+uses the `chat-attachment` target with type `image`, so it shares the staging
+limits, ownership, and expiry above. The server binds the completed upload,
+accepts only PNG, JPEG, GIF, and WebP, copies it to
+`terminal-pastes/<uuid>.<ext>` under the state directory, retires the stage, and
+returns the absolute path. The client sends that path as terminal input,
+escaped for the server platform (backslashes on POSIX, quotes on Windows) when
+it contains other characters, and wrapped in bracketed-paste markers when the
+program enabled them. The paste
+reserves its place in the terminal's persistent input queue, so input typed
+during the upload waits behind the path within the 1 MiB pending limit, and a
+terminal restart drops both. The terminal shows the upload with a Cancel
+action, which releases the held input. A result for an earlier terminal process is dropped, a failed commit
+releases its stage, and closing the viewport aborts the upload. Codex and Claude Code
+attach an image from a pasted path. Copies are not tied to threads: each paste
+removes files in `terminal-pastes/` older than 24 hours. Against a server
+without the capability, the terminal reports that image paste needs a newer
+server instead of sending an empty paste.
 
 ### Missing-workspace runtime guard
 

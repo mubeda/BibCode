@@ -640,6 +640,10 @@ names no host keeps pull-request wording. Its
 create-pull-request review
 dialog groups repository, base, and head details separately from branch-publication status, then keeps the
 editable title and description in one padded form above the fixed action footer.
+Against servers that support it, the form also offers **Mark as draft**,
+**Assignee** (with **Assign to me**), **Reviewer**, **Milestone** and **Labels**
+for GitHub and GitLab, and GitLab's **Delete source branch** and **Squash
+commits**, which start from the project's settings.
 On GitLab it says **Create merge request** and uses `!N`. A self-hosted host
 that BiBCode has not identified yet shows "Not identified yet" with the next
 step (open Pull Requests for the project or Rescan in **Settings → Source

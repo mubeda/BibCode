@@ -155,7 +155,7 @@ pub struct UploadError {
     pub received_bytes: Option<u64>,
 }
 impl UploadError {
-    fn new(reason: UploadErrorReason, message: impl Into<String>) -> Self {
+    pub(crate) fn new(reason: UploadErrorReason, message: impl Into<String>) -> Self {
         Self {
             tag: "UploadError",
             reason,
@@ -177,7 +177,7 @@ impl UploadError {
         error.received_bytes = Some(received);
         error
     }
-    fn io(error: std::io::Error) -> Self {
+    pub(crate) fn io(error: std::io::Error) -> Self {
         Self::new(
             UploadErrorReason::Invalid,
             format!("Upload storage failed: {error}"),

@@ -66,6 +66,10 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   remoteUpdateProgress: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   terminalOrderedInput: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   terminalSizeOwnership: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `terminal.stageImagePaste` turns a pasted clipboard image into a server file path. */
+  terminalImagePaste: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `git.runStackedAction` accepts `pullRequestOptions` and reports `pr.warning`. */
+  pullRequestCreateOptions: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   vcsCloneReattach: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;

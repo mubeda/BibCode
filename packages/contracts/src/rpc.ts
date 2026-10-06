@@ -8,6 +8,8 @@ import {
   UploadCancelInput,
   UploadCancelResult,
   UploadError,
+  TerminalStageImagePasteInput,
+  TerminalStageImagePasteResult,
 } from "./uploads.ts";
 import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
@@ -31,6 +33,8 @@ import {
   PullRequestsTimeline,
   PullRequestsVocabulary,
   PullRequestsVocabularyInput,
+  PullRequestsCwdInput,
+  PullRequestsCreateDefaults,
 } from "./pullRequests.ts";
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
@@ -462,6 +466,7 @@ export const WS_METHODS = {
   // Pull Requests methods
   pullRequestsGetContext: "pullRequests.getContext",
   pullRequestsGetVocabulary: "pullRequests.getVocabulary",
+  pullRequestsGetCreateDefaults: "pullRequests.getCreateDefaults",
   pullRequestsList: "pullRequests.list",
   pullRequestsGet: "pullRequests.get",
   pullRequestsGetTimeline: "pullRequests.getTimeline",
@@ -497,6 +502,7 @@ export const WS_METHODS = {
   terminalClear: "terminal.clear",
   terminalRestart: "terminal.restart",
   terminalClose: "terminal.close",
+  terminalStageImagePaste: "terminal.stageImagePaste",
 
   // Preview methods
   previewOpen: "preview.open",
@@ -1280,6 +1286,15 @@ export const WsPullRequestsGetVocabularyRpc = Rpc.make(WS_METHODS.pullRequestsGe
   error: PullRequestsOperationError,
 });
 
+export const WsPullRequestsGetCreateDefaultsRpc = Rpc.make(
+  WS_METHODS.pullRequestsGetCreateDefaults,
+  {
+    payload: PullRequestsCwdInput,
+    success: PullRequestsCreateDefaults,
+    error: PullRequestsOperationError,
+  },
+);
+
 export const WsPullRequestsListRpc = Rpc.make(WS_METHODS.pullRequestsList, {
   payload: PullRequestsListInput,
   success: PullRequestsListPage,
@@ -1659,6 +1674,11 @@ export const WsUploadsCancelRpc = Rpc.make(WS_METHODS.uploadsCancel, {
   success: UploadCancelResult,
   error: Schema.Union([UploadError, EnvironmentRpcError]),
 });
+export const WsTerminalStageImagePasteRpc = Rpc.make(WS_METHODS.terminalStageImagePaste, {
+  payload: TerminalStageImagePasteInput,
+  success: TerminalStageImagePasteResult,
+  error: Schema.Union([UploadError, EnvironmentRpcError]),
+});
 
 export const WsRpcGroup = RpcGroup.make(
   WsUploadsBeginRpc,
@@ -1750,6 +1770,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeGitManagerSignalRpc,
   WsPullRequestsGetContextRpc,
   WsPullRequestsGetVocabularyRpc,
+  WsPullRequestsGetCreateDefaultsRpc,
   WsPullRequestsListRpc,
   WsPullRequestsGetRpc,
   WsPullRequestsGetTimelineRpc,
@@ -1769,6 +1790,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsTerminalClearRpc,
   WsTerminalRestartRpc,
   WsTerminalCloseRpc,
+  WsTerminalStageImagePasteRpc,
   WsSubscribeTerminalEventsRpc,
   WsSubscribeTerminalMetadataRpc,
   WsPreviewOpenRpc,

@@ -113,6 +113,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("pullRequests.getChecks"),
     read_unary("pullRequests.getCommits"),
     read_unary("pullRequests.getContext"),
+    read_unary("pullRequests.getCreateDefaults"),
     read_unary("pullRequests.getFiles"),
     read_unary("pullRequests.getTimeline"),
     read_unary("pullRequests.getVocabulary"),
@@ -160,6 +161,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("terminal.open"),
     mutation_unary("terminal.resize"),
     mutation_unary("terminal.restart"),
+    mutation_unary("terminal.stageImagePaste"),
     mutation_unary("terminal.write"),
     mutation_unary("terminal.writeInput"),
     read_unary("updater.activeWork"),
@@ -211,6 +213,7 @@ mod tests {
         for name in [
             "pullRequests.getContext",
             "pullRequests.getVocabulary",
+            "pullRequests.getCreateDefaults",
             "pullRequests.list",
             "pullRequests.get",
             "pullRequests.getTimeline",

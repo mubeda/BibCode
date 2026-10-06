@@ -3,6 +3,7 @@ import {
   type EnvironmentId as EnvironmentIdType,
   GitActionProgressPhase,
   type GitActionProgressEvent,
+  type GitPullRequestCreateOptions,
   type GitRunStackedActionInput,
   type GitRunStackedActionResult,
   GitStackedAction,
@@ -83,7 +84,17 @@ export interface RunVcsStackedActionInput {
   readonly pullRequestBody?: string;
   readonly pullRequestBaseBranch?: string;
   readonly pullRequestHeadBranch?: string;
+  readonly pullRequestOptions?: GitPullRequestCreateOptions;
   readonly onProgress?: (event: GitActionProgressEvent) => void;
+}
+
+export class VcsPullRequestCreateOptionsUnsupportedError extends Schema.TaggedError<VcsPullRequestCreateOptionsUnsupportedError>()(
+  "VcsPullRequestCreateOptionsUnsupportedError",
+  { environmentId: EnvironmentId },
+) {
+  override get message(): string {
+    return "Update this environment's BiBCode server to set draft, people, labels or merge options when creating a request.";
+  }
 }
 
 export class VcsActionUnavailableError extends Schema.TaggedError<VcsActionUnavailableError>()(
@@ -492,6 +503,9 @@ export function createVcsActionManager<R, E>(
           ...(input.pullRequestBody !== undefined
             ? { pullRequestBody: input.pullRequestBody }
             : {}),
+          ...(input.pullRequestOptions !== undefined
+            ? { pullRequestOptions: input.pullRequestOptions }
+            : {}),
         };
         return consumeVcsActionProgress(
           runStreamInEnvironment(
@@ -503,6 +517,14 @@ export function createVcsActionManager<R, E>(
                   const config = yield* session.initialConfig;
                   if (config.environment.capabilities.gitPullRequestBranchSelection !== true) {
                     return yield* new VcsPullRequestBranchSelectionUnsupportedError({
+                      environmentId: target.environmentId,
+                    });
+                  }
+                  if (
+                    rpcInput.pullRequestOptions !== undefined &&
+                    config.environment.capabilities.pullRequestCreateOptions !== true
+                  ) {
+                    return yield* new VcsPullRequestCreateOptionsUnsupportedError({
                       environmentId: target.environmentId,
                     });
                   }

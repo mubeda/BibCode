@@ -57,7 +57,9 @@ impl GitHubHost {
         // JSON lists use the 60 s / 1 MiB budget; Large is reserved for patches.
         let budget = if matches!(
             operation,
-            "pullRequests.getContext" | "pullRequests.getVocabulary"
+            "pullRequests.getContext"
+                | "pullRequests.getVocabulary"
+                | "pullRequests.getCreateDefaults"
         ) {
             Budget::Read
         } else {
@@ -176,6 +178,26 @@ impl GitHubHost {
 impl PullRequestHost for GitHubHost {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Github
+    }
+
+    fn create_defaults<'a>(
+        &'a self,
+        scope: &'a HostScope,
+        c: &'a CancellationToken,
+    ) -> HostFuture<'a, CreateDefaults> {
+        Box::pin(async move {
+            let operation = "pullRequests.getCreateDefaults";
+            let user = self.api(scope, "user", operation, c).await?;
+            let login = parse::string(&user, "login", operation)?;
+            Ok(CreateDefaults {
+                viewer: Some(ViewerRef {
+                    id: login.clone(),
+                    label: login,
+                }),
+                squash: None,
+                remove_source_branch: None,
+            })
+        })
     }
 
     fn capabilities(&self, _version: Option<&HostVersion>) -> HostCapabilities {

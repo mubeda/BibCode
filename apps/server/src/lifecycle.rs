@@ -65,6 +65,8 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "remoteUpdateProgress": true,
             "terminalOrderedInput": true,
             "terminalSizeOwnership": true,
+            "terminalImagePaste": true,
+            "pullRequestCreateOptions": true,
             "vcsCloneReattach": true,
             "attachmentStaging": true,
         },
@@ -1015,6 +1017,8 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["remoteUpdateProgress"], true);
         assert_eq!(descriptor["capabilities"]["terminalOrderedInput"], true);
         assert_eq!(descriptor["capabilities"]["terminalSizeOwnership"], true);
+        assert_eq!(descriptor["capabilities"]["terminalImagePaste"], true);
+        assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(
