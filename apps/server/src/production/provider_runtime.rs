@@ -2040,6 +2040,14 @@ pub async fn reconcile_abandoned_provider_sessions(
         .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
     for runtime in runtimes {
         let thread_id = runtime.thread_id.clone();
+        match discard_runtime_of_deleted_thread(&repositories, &thread_id).await {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(error) => {
+                tracing::warn!(thread_id, %error, "provider session remains eligible for startup reconciliation retry");
+                continue;
+            }
+        }
         let result = match runtime.status.as_str() {
             "starting" | "connecting" | "ready" | "running" => {
                 let session = SessionInput {
@@ -2090,6 +2098,9 @@ pub async fn reconcile_abandoned_provider_sessions(
     for session in sessions {
         let thread_id = session.thread_id.clone();
         let result = async {
+            if discard_runtime_of_deleted_thread(&repositories, &thread_id).await? {
+                return Ok(());
+            }
             let runtime = repositories
                 .get_provider_session_runtime(thread_id.clone())
                 .await
@@ -2130,6 +2141,27 @@ pub async fn reconcile_abandoned_provider_sessions(
         }
     }
     Ok(())
+}
+
+/// A deleted thread can never accept a session projection, so reconciling it would fail on every
+/// startup. Drops any runtime row left behind (a retried delivery can relaunch one after the delete
+/// projection removed it) and reports whether the thread is deleted.
+async fn discard_runtime_of_deleted_thread(
+    repositories: &Repositories,
+    thread_id: &str,
+) -> Result<bool, ProviderRuntimeError> {
+    let deleted = repositories
+        .get_thread(thread_id.to_owned())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+        .is_some_and(|thread| thread.deleted_at.is_some());
+    if deleted {
+        repositories
+            .delete_provider_session_runtime(thread_id.to_owned())
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+    }
+    Ok(deleted)
 }
 
 async fn reconcile_failed_provider_session_messages(

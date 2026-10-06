@@ -46,7 +46,10 @@ async fn session(engine: &OrchestrationEngine, status: &str, id: &str) {
     engine.dispatch(command(json!({"type":"thread.session.set", "commandId":id, "threadId":"t", "session":{"threadId":"t", "status":status, "providerName":"codex", "activeTurnId":if status == "running" {Some(id)} else {None}, "lastError":null, "updatedAt":TIME}, "createdAt":TIME}))).await.unwrap();
 }
 async fn enqueue(engine: &OrchestrationEngine, id: &str, queued: bool) {
-    let mut value = json!({"type":"thread.turn.start", "commandId":id, "threadId":"t", "message":{"messageId":id, "role":"user", "text":id, "attachments":[]}, "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":TIME});
+    enqueue_for(engine, "t", id, queued).await;
+}
+async fn enqueue_for(engine: &OrchestrationEngine, thread: &str, id: &str, queued: bool) {
+    let mut value = json!({"type":"thread.turn.start", "commandId":id, "threadId":thread, "message":{"messageId":id, "role":"user", "text":id, "attachments":[]}, "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":TIME});
     if queued {
         value["queued"] = json!(true);
     }
@@ -59,7 +62,7 @@ async fn enqueue(engine: &OrchestrationEngine, id: &str, queued: bool) {
                 attachment_refs: Vec::new(),
                 provider_turn: Some(NewProviderTurnDelivery {
                     command_id: id.into(),
-                    thread_id: "t".into(),
+                    thread_id: thread.into(),
                     message_id: id.into(),
                     provider_instance_id: "codex".into(),
                     provider_kind: "codex".into(),
@@ -395,5 +398,98 @@ async fn steer_target_lookup_failure_returns_to_pending_without_provider_io() {
         row(&engine, "steer-read-failure").await.state,
         TurnDeliveryState::Pending
     );
+    engine.shutdown().await;
+}
+
+async fn delete_thread(engine: &OrchestrationEngine, thread: &str) {
+    engine
+        .dispatch(command(json!({"type":"thread.delete", "commandId":format!("delete-{thread}"), "threadId":thread, "createdAt":TIME})))
+        .await
+        .unwrap();
+}
+async fn settled(engine: &OrchestrationEngine, id: &str) -> ProviderTurnDelivery {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let current = row(engine, id).await;
+            if current.state != TurnDeliveryState::Pending {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("delivery for a deleted thread settles")
+}
+
+#[tokio::test]
+async fn pending_delivery_for_a_deleted_thread_is_dismissed_and_never_routed() {
+    let engine = engine().await;
+    session(&engine, "ready", "ready").await;
+    enqueue(&engine, "first", false).await;
+    enqueue(&engine, "second", false).await;
+    delete_thread(&engine, "t").await;
+    let (service, mut routes) = service(&engine);
+    for id in ["first", "second"] {
+        let settled = settled(&engine, id).await;
+        assert_eq!(settled.state, TurnDeliveryState::Dismissed);
+        assert_eq!(settled.attempts, 0, "a deleted thread is never attempted");
+    }
+    quiet(&mut routes).await;
+    service.shutdown().await;
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn row_stuck_retrying_a_deleted_thread_settles_at_startup() {
+    let engine = engine().await;
+    session(&engine, "ready", "ready").await;
+    enqueue(&engine, "stuck", false).await;
+    engine
+        .repositories()
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "UPDATE provider_turn_outbox SET attempts = 36598, last_error = 'BiBCode could not update this thread: Thread is deleted.'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    delete_thread(&engine, "t").await;
+    let (service, mut routes) = service(&engine);
+    let settled = settled(&engine, "stuck").await;
+    assert_eq!(settled.state, TurnDeliveryState::Dismissed);
+    assert_eq!(settled.attempts, 36598);
+    quiet(&mut routes).await;
+    service.shutdown().await;
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn deleting_a_thread_settles_its_pending_delivery_while_live_threads_still_deliver() {
+    let engine = engine().await;
+    engine.dispatch(command(json!({"type":"thread.create", "commandId":"thread-live", "threadId":"live", "projectId":"p", "title":"Live", "runtimeMode":"full-access", "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":TIME}))).await.unwrap();
+    // A running session keeps the doomed thread's start row waiting rather than routed.
+    session(&engine, "running", "running").await;
+    enqueue(&engine, "doomed", false).await;
+    enqueue_for(&engine, "live", "survivor", false).await;
+    let (service, mut routes) = service(&engine);
+    received(&mut routes, "survivor").await;
+    quiet(&mut routes).await;
+    assert_eq!(
+        row(&engine, "doomed").await.state,
+        TurnDeliveryState::Pending
+    );
+    delete_thread(&engine, "t").await;
+    service.wake();
+    let settled = settled(&engine, "doomed").await;
+    assert_eq!(settled.state, TurnDeliveryState::Dismissed);
+    quiet(&mut routes).await;
+    assert_eq!(
+        row(&engine, "survivor").await.state,
+        TurnDeliveryState::Delivered
+    );
+    service.shutdown().await;
     engine.shutdown().await;
 }
