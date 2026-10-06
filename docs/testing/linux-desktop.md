@@ -1730,10 +1730,35 @@ submitting, submit once publicly, then require the typed public snapshot to
 report that exact newly started Cursor turn as completed with its completion
 timestamp. A missing question or working row alone does not prove success;
 failed, interrupted, foreign, or timestamp-free turns refuse qualification.
-Restore the original Claude/Opus identity through the existing cleanup owner and join every
-owned child on all exits. Failed restoration remains fatal; capture failures
-and their original errors are preserved. Never inject a canonical pending input
-or renderer state, force a click or replace the question with static markup.
+Restore the original imported primary/default public context through the
+existing cleanup owner and verify its existing Claude Opus selection without
+changing the completed Cursor thread's driver. Join every owned child on all
+exits. Failed restoration remains fatal; capture failures and their original
+errors are preserved. Never inject a canonical pending input or renderer state,
+force a click or replace the question with static markup.
+
+For the fixed Cursor question selection, keep its new managed workspace
+thread unstarted before selecting Cursor. Skip only this selection's unrelated
+Claude baseline; all other selections retain their ordinary baseline. Admit
+its empty workspace and the same project's original primary/default context
+from the current decoded public snapshot, with exact live identity, branch,
+path and project-root checks. Do not rewrite sessions or relax the public
+started-thread driver binding.
+
+The real Cursor turn establishes this conversation. Keep the actual original
+turn correlation, two ordered questions, selected-label proof, explicit Submit,
+original-turn completion and source/PNG checks. Afterward, restore the imported
+primary/default public context with supported navigation and verify its exact
+route/card identity and existing Claude Opus trigger. The original context's
+provider is restored; the completed Cursor workspace session stays Cursor.
+Keep the retained managed-worktree identity check and complete owner cleanup.
+A failed public context restoration remains a logical cleanup failure.
+
+Preserve the original failure's closed phase before cleanup can update phase
+markers, keyed by the exact original exception identity. Source and mounted
+probes establish the binding/setup contract, not the failed trial's native
+cause. New current-source CI receipts and independently reviewed original
+pixels remain necessary; this preparation does not close full82/164 coverage.
 
 The shared owned original-capture helper preserves the existing Git/project
 lifecycle: duplicate/file/alert refusal, identity before and after the original,
@@ -1767,6 +1792,13 @@ can otherwise overwrite the global phase, so an old recorded worktree model
 phase alone does not prove that the question producer was never entered.
 
 ### Existing workspace row substates
+
+The existing workspace preparation reports separate fixed phases for draft
+typing, descriptor read/identity, typed snapshot read, thread count/binding,
+project binding and batch entry. These markers add no action, read, retry or
+time budget, and identify only the attempted boundary. Preserve the original
+exception and cleanup; an earlier compound open phase alone does not establish
+which check failed or identify a native cause.
 
 The fixed manual `release-visual-workspace-substates` selection uses the same
 real-server controller, public pairing/import, selected managed Git worktree,

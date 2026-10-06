@@ -345,6 +345,7 @@ export interface CursorQuestionVisualDriver {
   verifyOwnedIdentity: () => Promise<void>;
   selectCursor: () => Promise<void>;
   restoreOriginal: () => Promise<void>;
+  verifyRestoredIdentity: () => Promise<void>;
   send: (prompt: string) => Promise<void>;
   capture: () => Promise<void>;
   waitOriginalTurnCompleted: () => Promise<void>;
@@ -403,7 +404,7 @@ export async function runCursorQuestionVisual(input: CursorQuestionVisualDriver)
   } finally {
     await input.owner.cleanup("cursor-question-model-restore", async () => {
       await input.restoreOriginal();
-      await input.verifyOwnedIdentity();
+      await input.verifyRestoredIdentity();
       restored = true;
     });
   }

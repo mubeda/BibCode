@@ -274,6 +274,9 @@ it("runs the public first/later/Submit sequence on actual components and origina
       } as never,
       owner: { cleanup: async (_role: string, run: () => Promise<void>) => run() } as never,
       verifyOwnedIdentity: async () => {},
+      verifyRestoredIdentity: async () => {
+        expect(restored).toBe(1);
+      },
       selectCursor: async () => {},
       restoreOriginal: async () => {
         restored++;

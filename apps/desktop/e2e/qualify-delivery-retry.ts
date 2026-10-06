@@ -32,6 +32,7 @@ import {
   projectGitProjectVisualAssertion,
   gitProjectVisualScenes,
   gitProjectDirectoryFailureFacts,
+  readGitProjectSelection,
   type GitProjectVisualSelection,
 } from "./support/release-visual-git-project.ts";
 import { gitProjectTabFailureFacts } from "./support/git-project-tab-observation.ts";
@@ -1449,22 +1450,27 @@ export async function runDeliveryRetryQualification() {
       const baseline = `delivery baseline ${theme}`;
       const prompt = `delivery held message ${theme}`;
       const draft = `delivery preserved draft ${theme}`;
-      step("baseline");
-      await send(baseline);
-      await owner.until(
-        async () =>
-          (await browser!.$(surface).getText()).includes(
-            "BiBCode deterministic streamed fixture response.",
-          ) &&
-          !(await browser!.$(`${form} button[aria-label="Stop generation"]`).isDisplayed()) &&
-          !(await browser!.$(`${surface} [data-timeline-row-kind="working"]`).isDisplayed()),
-      );
-      await browser.$(`${form} button[aria-label="Send message"]`).waitForDisplayed();
-      check(!(await browser.$(surface).getText()).includes(newConversationNotice));
+      if (config.selection !== "release-visual-cursor-question") {
+        step("baseline");
+        await send(baseline);
+        await owner.until(
+          async () =>
+            (await browser!.$(surface).getText()).includes(
+              "BiBCode deterministic streamed fixture response.",
+            ) &&
+            !(await browser!.$(`${form} button[aria-label="Stop generation"]`).isDisplayed()) &&
+            !(await browser!.$(`${surface} [data-timeline-row-kind="working"]`).isDisplayed()),
+        );
+        await browser.$(`${form} button[aria-label="Send message"]`).waitForDisplayed();
+        check(!(await browser.$(surface).getText()).includes(newConversationNotice));
+      }
       if (config.selection === "release-visual-workspace-substates") {
         step("visual-workspace-substates-open");
+        step("visual-workspace-substates-draft");
         await type("Owned visual review draft");
+        step("visual-workspace-substates-descriptor-read");
         const descriptor = await readOwnedGitProjectDescriptor();
+        step("visual-workspace-substates-descriptor-identity");
         check(
           descriptor.environmentId === "local" &&
             !!descriptor.bootId &&
@@ -1477,12 +1483,15 @@ export async function runDeliveryRetryQualification() {
             childEnv,
           ),
         );
+        step("visual-workspace-substates-snapshot-read");
         const initial = await readSnapshot();
         const threads = initial.threads.filter(
           (thread) => thread.id === workspace.threadId && thread.deletedAt === null,
         );
+        step("visual-workspace-substates-thread-count");
         check(threads.length === 1);
         const boundThread = threads[0]!;
+        step("visual-workspace-substates-thread-binding");
         check(
           boundThread.kind === "workspace" &&
             boundThread.branch === workspace.branch &&
@@ -1491,6 +1500,7 @@ export async function runDeliveryRetryQualification() {
         const projects = initial.projects.filter(
           (project) => project.id === boundThread.projectId && project.deletedAt === null,
         );
+        step("visual-workspace-substates-project-binding");
         check(projects.length === 1 && projects[0]!.workspaceRoot === context.projectPath);
         const binding = Object.freeze({
           origin,
@@ -1574,6 +1584,7 @@ export async function runDeliveryRetryQualification() {
             ),
           );
         };
+        step("visual-workspace-substates-batch-entry");
         const proof = await runWorkspaceSubstateBatch({
           ...binding,
           browser: b(),
@@ -1719,6 +1730,68 @@ export async function runDeliveryRetryQualification() {
           check(matching.length === 1);
           return matching[0]!;
         };
+        step("visual-cursor-question-bind-context");
+        const initial = await snapshot();
+        const questionThreads = initial.threads.filter(
+          (entry) =>
+            entry.id === workspace.threadId &&
+            entry.deletedAt === null &&
+            entry.archivedAt === null &&
+            entry.kind === "workspace" &&
+            entry.branch === workspace.branch &&
+            entry.worktreePath === workspace.path,
+        );
+        check(questionThreads.length === 1);
+        const questionThread = questionThreads[0]!;
+        check(
+          questionThread.session === null &&
+            questionThread.latestTurn === null &&
+            questionThread.messages.length === 0,
+        );
+        const projects = initial.projects.filter(
+          (entry) =>
+            entry.id === questionThread.projectId &&
+            entry.deletedAt === null &&
+            entry.workspaceRoot === context.projectPath,
+        );
+        check(projects.length === 1);
+        const primaryThreads = initial.threads.filter(
+          (entry) =>
+            entry.projectId === questionThread.projectId &&
+            entry.kind === "default" &&
+            entry.worktreePath === null &&
+            entry.archivedAt === null &&
+            entry.deletedAt === null,
+        );
+        check(primaryThreads.length === 1 && primaryThreads[0]!.id !== questionThread.id);
+        const originalContext: GitProjectVisualSelection = Object.freeze({
+          environmentId: "local",
+          projectId: questionThread.projectId,
+          threadId: primaryThreads[0]!.id,
+          cwd: context.projectPath,
+          branch: primaryThreads[0]!.branch,
+          title: projects[0]!.title,
+        });
+        const verifyRestoredIdentity = async () => {
+          check(
+            JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
+              JSON.stringify({
+                path: workspace.path,
+                branch: workspace.branch,
+                commonDirectory: workspace.commonDirectory,
+              }),
+          );
+          await owner.until(
+            async () =>
+              (await bounded(
+                b().execute(readGitProjectSelection, { origin, selection: originalContext }),
+                2_000,
+              )) &&
+              (await b()
+                .$(`${form} [data-chat-provider-model-picker="true"]`)
+                .getAttribute("aria-label")) === "Claude · Opus 5",
+          );
+        };
         let originalTurnId: string | null = null;
         const verifyOwnedIdentity = async () => {
           check(
@@ -1744,6 +1817,7 @@ export async function runDeliveryRetryQualification() {
           browser: b(),
           owner,
           verifyOwnedIdentity,
+          verifyRestoredIdentity,
           step,
           observeFailure: (error) => {
             if (cursorOriginalFailurePhases.has(phase)) cursorOriginalFailure = { error, phase };
@@ -1760,7 +1834,10 @@ export async function runDeliveryRetryQualification() {
                   .getAttribute("aria-label")) === "Cursor · Cursor Fixture",
             );
           },
-          restoreOriginal: () => selectClaudeModel("worktree"),
+          restoreOriginal: async () => {
+            await b().keys("Escape");
+            await click(`[data-testid="primary-card-button-${originalContext.projectId}"]`);
+          },
           send: async (text) => {
             const before = (await currentThread()).latestTurn?.turnId ?? null;
             await send(text);

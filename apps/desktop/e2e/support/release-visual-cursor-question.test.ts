@@ -3,6 +3,8 @@ import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeVM from "node:vm";
 import { QualificationOwner } from "./qualification-owner.ts";
+import { OrchestrationReadModel } from "../../../../packages/contracts/src/orchestration.ts";
+import * as NodeURL from "node:url";
 import { expect, it } from "vite-plus/test";
 import {
   cursorQuestionOptionSelector,
@@ -11,6 +13,12 @@ import {
   successfulCursorQuestionTurn,
 } from "./release-visual-cursor-question.ts";
 import { cursorQuestionFixturePrompt } from "./release-visual-cursor-question-fixture.ts";
+
+const contractsRequire = NodeModule.createRequire(
+  new NodeURL.URL("../../../../packages/contracts/package.json", import.meta.url),
+);
+const Schema: { decodeUnknownSync: <A>(schema: { readonly Type: A }) => (input: unknown) => A } =
+  contractsRequire("effect/Schema");
 
 it("refuses quiescent failed/cancelled/foreign turns without original public completion proof", () => {
   const completed = {
@@ -67,6 +75,9 @@ it("uses only genuine public choices and one explicit Submit, then restores the 
         },
       } as never,
       verifyOwnedIdentity: async () => {
+        actions.push("identity");
+      },
+      verifyRestoredIdentity: async () => {
         actions.push("identity");
       },
       selectCursor: async () => {
@@ -210,6 +221,9 @@ function cursorFailureDriver(
       verifyOwnedIdentity: async () => {
         calls.push("identity");
       },
+      verifyRestoredIdentity: async () => {
+        calls.push("identity");
+      },
       selectCursor: async () => {
         calls.push("select");
       },
@@ -285,3 +299,237 @@ it("resets the actual original Cursor record between entries when an exception o
   ).rejects.toBe(original);
   expect(attribution.recover(original)).toBe("worktree-select-claude-opus");
 });
+
+it.each([false, true])(
+  "verifies the original public context separately from the completed Cursor thread (restore failure=%s)",
+  async (failRestore) => {
+    const owner = new QualificationOwner("/owned-source", "/owned-fixture");
+    const calls: string[] = [];
+    const original = new Error("Inert original timeout.");
+    await expect(
+      runCursorQuestionVisual({
+        browser: {
+          $: () => ({
+            waitForDisplayed: async () => {
+              throw original;
+            },
+            waitForEnabled: async () => {},
+            click: async () => {},
+          }),
+          $$: async () => [{}],
+        } as never,
+        owner,
+        verifyOwnedIdentity: async () => {
+          calls.push("question-identity");
+        },
+        selectCursor: async () => {},
+        send: async () => {},
+        capture: async () => {},
+        waitOriginalTurnCompleted: async () => {},
+        restoreOriginal: async () => {
+          calls.push("navigate-primary");
+          if (failRestore) throw new Error("Inert restore timeout.");
+        },
+        verifyRestoredIdentity: async () => {
+          calls.push("original-primary-identity");
+        },
+        step: () => {},
+      }),
+    ).rejects.toBe(original);
+    expect(calls.filter((value) => value === "navigate-primary")).toHaveLength(1);
+    expect(calls.filter((value) => value === "question-identity")).toHaveLength(2);
+    expect(calls.includes("original-primary-identity")).toBe(!failRestore);
+    expect(owner.failures).toHaveLength(failRestore ? 1 : 0);
+    if (failRestore)
+      expect(owner.failures[0]).toMatchObject({
+        role: "cursor-question-model-restore",
+        failure: { kind: "timeout" },
+      });
+  },
+);
+
+it.each([
+  "delivery-retry-ui",
+  "release-visual-core",
+  "release-visual-settings",
+  "release-visual-workspace-substates",
+  "release-visual-cursor-question",
+])(
+  "keeps the original baseline operations for every selection except the dedicated Cursor row: %s",
+  async (selection) => {
+    const source = NodeFS.readFileSync(
+      new NodeURL.URL("../qualify-delivery-retry.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf("      const baseline = `delivery baseline ${theme}`;");
+    const end = source.indexOf(
+      '      if (config.selection === "release-visual-workspace-substates") {',
+      start,
+    );
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const calls: string[] = [];
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(){" + source.slice(start, end) + "}\nrun",
+      ),
+      {
+        config: { selection },
+        theme: "light",
+        surface: "owned-surface",
+        form: "owned-form",
+        newConversationNotice: "Owned new conversation",
+        step: () => {},
+        send: async (value: string) => {
+          expect(value).toBe("delivery baseline light");
+          calls.push("send");
+        },
+        owner: {
+          until: async (read: () => Promise<boolean>) => {
+            calls.push("response");
+            expect(await read()).toBe(true);
+          },
+        },
+        browser: {
+          $: (selector: string) => ({
+            getText: async () => "BiBCode deterministic streamed fixture response.",
+            isDisplayed: async () => false,
+            waitForDisplayed: async () => {
+              expect(selector).toContain("Send message");
+              calls.push("send-ready");
+            },
+          }),
+        },
+        check: (value: boolean) => {
+          expect(value).toBe(true);
+          calls.push("conversation-check");
+        },
+      },
+    );
+    await run();
+    expect(calls).toEqual(
+      selection === "release-visual-cursor-question"
+        ? []
+        : ["send", "response", "send-ready", "conversation-check"],
+    );
+  },
+);
+
+function freshCursorSnapshot(mode: string) {
+  const model = JSON.parse(
+    NodeFS.readFileSync(
+      new NodeURL.URL(
+        "../../../../packages/contracts/fixtures/http-orchestration/full-read-model.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const project = {
+    ...model.projects[0],
+    id: "owned-project",
+    title: "Owned project",
+    workspaceRoot: "/owned/project",
+    deletedAt: null,
+  };
+  const common = {
+    ...model.threads[0],
+    projectId: project.id,
+    deletedAt: null,
+    archivedAt: null,
+    messages: [],
+    activities: [],
+    checkpoints: [],
+    proposedPlans: [],
+    session: null,
+    latestTurn: null,
+  };
+  const primary = {
+    ...common,
+    id: "owned-primary",
+    kind: "default",
+    worktreePath: null,
+    branch: "main",
+  };
+  const question = {
+    ...common,
+    id: "owned-question",
+    kind: "workspace",
+    branch: "codex/delivery-retry-light",
+    worktreePath: "/owned/managed",
+  };
+  if (mode === "started")
+    question.latestTurn = model.threads[0].latestTurn ?? {
+      turnId: "owned-turn",
+      state: "running",
+      requestedAt: model.updatedAt,
+      startedAt: null,
+      completedAt: null,
+      assistantMessageId: null,
+    };
+  if (mode === "foreign-path") question.worktreePath = "/owned/foreign";
+  if (mode === "foreign-branch") question.branch = "foreign";
+  if (mode === "foreign-project") project.workspaceRoot = "/owned/foreign";
+  if (mode === "same-context-id") primary.id = question.id;
+  const threads =
+    mode === "missing-default"
+      ? [question]
+      : mode === "duplicate-default"
+        ? [primary, { ...primary, id: "owned-other-primary" }, question]
+        : [primary, question];
+  return Schema.decodeUnknownSync(OrchestrationReadModel)({
+    ...model,
+    projects: [project],
+    threads,
+  });
+}
+
+it.each([
+  "empty",
+  "started",
+  "foreign-path",
+  "foreign-branch",
+  "foreign-project",
+  "missing-default",
+  "duplicate-default",
+  "same-context-id",
+])(
+  "admits only the decoded empty managed Cursor thread and its owned original primary context: %s",
+  async (mode) => {
+    const source = NodeFS.readFileSync(
+      new NodeURL.URL("../qualify-delivery-retry.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf('        step("visual-cursor-question-bind-context");');
+    const end = source.indexOf("        let originalTurnId:", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function bind(){" + source.slice(start, end) + "return originalContext;}\nbind",
+      ),
+      {
+        step: () => {},
+        snapshot: async () => freshCursorSnapshot(mode),
+        workspace: {
+          threadId: "owned-question",
+          path: "/owned/managed",
+          branch: "codex/delivery-retry-light",
+        },
+        context: { projectPath: "/owned/project" },
+        check: (value: boolean) => {
+          if (!value) throw new Error("Inert owned binding refusal.");
+        },
+      },
+    );
+    if (mode === "empty")
+      await expect(run()).resolves.toMatchObject({
+        environmentId: "local",
+        projectId: "owned-project",
+        threadId: "owned-primary",
+        cwd: "/owned/project",
+        branch: "main",
+      });
+    else await expect(run()).rejects.toThrow("Inert owned binding refusal.");
+  },
+);
