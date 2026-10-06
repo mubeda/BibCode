@@ -2074,8 +2074,9 @@ starts.
     the choice, clearing it disables creation again, and reopening starts
     unselected. Repeat from the chat Git action; combined commit/push/request
     actions must also require target review before any mutation. No push,
-    provider process, or pull request may run just by opening the dialog from
-    these entry points. Cancel it and confirm the branch, its upstream, and the
+    provider mutation, or pull request may run just by opening the dialog from
+    these entry points; on servers with `pullRequestCreateOptions`, opening it
+    may run only the read-only defaults and picker reads. Cancel it and confirm the branch, its upstream, and the
     forge are unchanged. From Source Control, **Push & create PR/MR** and its
     Create menu action must push an unpublished branch first, then open the
     dialog with that branch selected as the source and listed among the origin
@@ -2103,6 +2104,15 @@ starts.
     Connect to an older server without `gitPullRequestBranchSelection`, or
     reconnect to one after opening the dialog: creation must be disabled with
     update guidance, and attempting the action must send no mutation.
+    Create options: on GitLab, create a merge request with **Mark as draft**,
+    **Assign to me**, a reviewer, a label, a milestone, **Delete source branch**
+    and **Squash commits**, and verify each on the GitLab page and that the title
+    has exactly one `Draft:` prefix. On a project that always squashes, the
+    Squash box must be locked with its note. On GitHub, create a draft pull
+    request with an assignee, a reviewer, a label and a milestone and verify
+    them on GitHub. With a reviewer who lacks access, the pull request must be
+    created once and the dialog must show the warning. Against a server without
+    `pullRequestCreateOptions`, the new fields must be absent.
     Record whether a failed attempt published the branch; native stacked actions
     currently report start/end outcomes without intermediate phase events.
     Retry a failed combined commit/push/request action: it must reread Git, reuse
