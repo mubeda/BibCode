@@ -6,6 +6,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { remote } from "webdriverio";
+import { bindOwnedBrowserAlertObservation } from "./owned-browser-alert.ts";
 import { classifyQualificationFailure, qualificationProcessRoles } from "./chat-upload-evidence.ts";
 import {
   prepareNetworkBeforeBrowser,
@@ -463,6 +464,7 @@ export async function openOwnedBrowser(
     /* Preserve the original session result or failure. */
   }
   const browser = await bounded(remote(ownedBrowserOptions(chrome, profile, webOrigin)), 45_000);
+  bindOwnedBrowserAlertObservation(browser);
   return { browser, driver: child };
 }
 

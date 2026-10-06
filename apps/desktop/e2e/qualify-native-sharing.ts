@@ -5,6 +5,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeNet from "node:net";
 import { remote } from "webdriverio";
+import { bindOwnedBrowserAlertObservation } from "./support/owned-browser-alert.ts";
 import {
   bounded,
   prepareOwnedNetwork,
@@ -311,6 +312,7 @@ export async function qualifyNativeSharing(
             }),
             45000,
           );
+          bindOwnedBrowserAlertObservation(attached);
           return attached;
         },
         disconnect: async (browser) => {

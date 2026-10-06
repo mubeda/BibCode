@@ -11,6 +11,7 @@ import {
   ownedBrowserOptions,
   projectOwnedDriverReadiness,
 } from "./qualification-owner.ts";
+import { bindOwnedBrowserAlertObservation } from "./owned-browser-alert.ts";
 import {
   prepareNetworkBeforeBrowser,
   verifyPreparedBrowserOnline,
@@ -340,7 +341,10 @@ describe("existing owned browser await boundaries", () => {
         bounds: number[] = [];
       const owner = {},
         child = {},
-        browser = {},
+        browser = {
+          getAlertText: vi.fn(async () => "Inert alert."),
+          addCommand: vi.fn(),
+        },
         readiness = vi.fn();
       const originalFailure = new Error("Inert original browser startup failure.");
       const startDriver = vi.fn(async (...args: unknown[]) => {
@@ -363,6 +367,7 @@ describe("existing owned browser await boundaries", () => {
           startOwnedBrowserDriver: startDriver,
           remote: createSession,
           ownedBrowserOptions,
+          bindOwnedBrowserAlertObservation,
           bounded: (promise: Promise<unknown>, ms: number) => {
             bounds.push(ms);
             return promise;
@@ -388,6 +393,8 @@ describe("existing owned browser await boundaries", () => {
           ? ["driver-readiness"]
           : ["driver-readiness", "session-create"],
       );
+      expect(browser.addCommand).toHaveBeenCalledTimes(outcome === "success" ? 1 : 0);
+      expect(browser.getAlertText).not.toHaveBeenCalled();
       expect(startDriver).toHaveBeenCalledTimes(1);
       expect(createSession).toHaveBeenCalledTimes(outcome === "driver-failure" ? 0 : 1);
       expect(bounds).toEqual(outcome === "driver-failure" ? [] : [45_000]);
