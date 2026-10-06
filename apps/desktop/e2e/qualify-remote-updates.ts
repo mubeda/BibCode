@@ -881,8 +881,8 @@ async function capture(scene: RemoteUiScene, host: Host, target: string, expecte
                         )
                       )
                         return false;
-                      const insetX = Math.min(2, box.width / 4);
-                      const insetY = Math.min(2, box.height / 4);
+                      const insetX = box.width / 4;
+                      const insetY = box.height / 4;
                       return [box.x + insetX, box.x + box.width / 2, box.right - insetX].every(
                         (x) =>
                           [box.y + insetY, box.y + box.height / 2, box.bottom - insetY].every(

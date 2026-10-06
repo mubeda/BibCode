@@ -1645,7 +1645,12 @@ function dismissedCaptureWitness(mode: string, theme: "light" | "dark", scene = 
           return toast;
         const button = buttons.find((candidate) => inside(candidate.rectangle, x, y));
         if (button && mode === "covered") return obstruction;
-        if (button && mode === "corner-covered" && x < button.rectangle.x + 3 && y < 222)
+        if (
+          button &&
+          mode === "interior-covered" &&
+          x < button.rectangle.x + button.rectangle.width / 3 &&
+          y < button.rectangle.y + button.rectangle.height / 3
+        )
           return obstruction;
         return button ?? target;
       },
@@ -1697,7 +1702,7 @@ it.each([
   "no-rects",
   "nonfinite",
   "covered",
-  "corner-covered",
+  "interior-covered",
   "right-toast",
   "pointer-transparent-toast",
 ])("refuses the actual dismissed capture's uninspectable action: %s", (mode) => {

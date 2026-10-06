@@ -901,8 +901,10 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Check button, one button with the expected update label and one Disconnect
   button inside the owned row. Each must be enabled and visible through its
   ancestors, with finite positive own rectangles fully inside the viewport. Test
-  an interior grid of points on every own rectangle and require the button or
-  its descendant to receive each hit. Reject any overlap with a visible fixed
+  an interior grid at one-quarter, one-half and three-quarters of each own
+  rectangle and require the button or its descendant to receive each hit. Those
+  points stay inside rounded controls; bounding-box corner points can fall outside
+  their painted hit area. Reject any overlap with a visible fixed
   toast root rectangle even when that toast is pointer-transparent. A clear row
   container alone cannot prove that its right-side actions are inspectable.
   Keep the original six-field witness and extend only `targetInView`; pass the
