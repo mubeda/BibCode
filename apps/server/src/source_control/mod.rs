@@ -14,6 +14,7 @@ pub use discovery::{
     VcsDiscoveryKind, WireOption,
 };
 pub(crate) use pull_request::GitLabCreateTransport;
+pub(crate) use pull_request::PrivateJsonBody;
 pub(crate) use pull_request::ProviderCommandFailure;
 #[allow(unused_imports)]
 pub(crate) use pull_request::ProviderCommandSpec;

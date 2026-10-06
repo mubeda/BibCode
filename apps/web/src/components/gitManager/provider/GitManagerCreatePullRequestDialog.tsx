@@ -10,7 +10,7 @@ import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime"
 import { useDebouncedValue } from "@tanstack/react-pacer";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { GitPullRequestIcon } from "lucide-react";
-import { memo, type ChangeEvent, useCallback, useMemo, useRef, useState } from "react";
+import { memo, type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
 import { Checkbox } from "~/components/ui/checkbox";
@@ -223,6 +223,13 @@ function CreatePullRequestReviewDialog({
   const body = editedBody ?? review?.defaultBody ?? "";
   const [progress, setProgress] = useState<CreatePullRequestProgress>(REVIEW_PROGRESS);
   const running = progress.kind === "running";
+  // The outcome, its link and any warning sit below the form; bring them into view on settle.
+  const statusRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (progress.kind === "created" || progress.kind === "existing" || progress.kind === "failed") {
+      statusRef.current?.scrollIntoView?.({ block: "nearest" });
+    }
+  }, [progress.kind]);
   const [previousHead, setPreviousHead] = useState(review?.head);
   if (previousHead !== review?.head) {
     setPreviousHead(review?.head);
@@ -578,6 +585,7 @@ function CreatePullRequestReviewDialog({
                   : "text-xs text-muted-foreground"
               }
               data-testid="create-pr-status"
+              ref={statusRef}
               role="status"
             >
               {statusText ?? review?.blockedReason}

@@ -820,6 +820,26 @@ describe("GitManagerCreatePullRequestDialog", () => {
       expect(button("Publish and create pull request").disabled).toBe(false);
     });
 
+    it("brings the outcome into view when the request settles", async () => {
+      const scrollIntoView = vi.fn();
+      const original = Element.prototype.scrollIntoView;
+      Element.prototype.scrollIntoView = scrollIntoView;
+      try {
+        h.script = [{ outcome: "success", events: [finished("created")] }];
+        await renderDialog();
+        await chooseTarget("main");
+        scrollIntoView.mockClear();
+        await act(async () => button("Publish and create pull request").click());
+        expect(
+          scrollIntoView.mock.contexts.some(
+            (element) => (element as Element).getAttribute("data-testid") === "create-pr-status",
+          ),
+        ).toBe(true);
+      } finally {
+        Element.prototype.scrollIntoView = original;
+      }
+    });
+
     it("shows the server's warning after a partial create", async () => {
       const event = finished("created");
       if (event.kind !== "action_finished") throw new Error("unexpected event");

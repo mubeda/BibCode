@@ -28,7 +28,6 @@ pub(crate) struct ProviderCommandInvocation<'a> {
     pub command: &'a ProviderCommandSpec,
     pub args: Vec<OsString>,
     pub allowed_non_zero_exit_codes: &'a [i32],
-    pub stdin: Option<Vec<u8>>,
 }
 
 impl ProviderCommandSpec {
@@ -121,6 +120,62 @@ impl CreatePullRequestOptions {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// A request body written to a private (0600, exclusively created) file and removed on drop.
+/// `glab api --input <file>` reads it, so the body has a known length.
+pub(crate) struct PrivateJsonBody(PathBuf);
+
+impl PrivateJsonBody {
+    pub(crate) async fn write(
+        directory: &std::path::Path,
+        body: &serde_json::Value,
+    ) -> std::io::Result<Self> {
+        std::fs::create_dir_all(directory)?;
+        let path = directory.join(format!("bibcode-body-{}.json", uuid::Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        let private = Self(path);
+        // No body is written until Windows has restricted the initially empty file.
+        #[cfg(windows)]
+        crate::auth::secure_windows_path(&private.0, false).await?;
+        serde_json::to_writer(&mut file, body).map_err(std::io::Error::other)?;
+        std::io::Write::flush(&mut file)?;
+        Ok(private)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateJsonBody {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The provider's own words for a failure: its last stderr line, else its last stdout line.
+fn provider_reason(stderr: &str, stdout: &str) -> String {
+    let last = |text: &str| {
+        text.lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .map(str::to_owned)
+    };
+    let reason = last(stderr)
+        .or_else(|| last(stdout))
+        .unwrap_or_else(|| "unknown error".to_owned());
+    crate::diagnostics::redact_sensitive_text(&reason)
+        .chars()
+        .take(300)
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -247,16 +302,10 @@ fn interpret_github_create(
 ) -> Result<CreatedPullRequest, Option<i32>> {
     let pull_request = parse_github_create_output(stdout, input).ok_or(Some(exit_code))?;
     let warning = (exit_code != 0).then(|| {
-        let reason = stderr
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("unknown error");
-        let reason: String = crate::diagnostics::redact_sensitive_text(reason)
-            .chars()
-            .take(300)
-            .collect();
-        format!("Created, but some options weren't applied: {reason}. Review them on GitHub.")
+        format!(
+            "Created, but some options weren't applied: {}. Review them on GitHub.",
+            provider_reason(stderr, "")
+        )
     });
     Ok(CreatedPullRequest {
         pull_request,
@@ -617,7 +666,8 @@ impl PullRequestService {
                 .await
                 .map(created);
         }
-        let mut stdin = None;
+        // Lives until the provider command has read it.
+        let mut body_file = None;
         let (command, args): (&ProviderCommandSpec, Vec<OsString>) = match input.provider {
             ProviderKind::Github => (&self.github_command, github_create_args(&input, options)),
             ProviderKind::Gitlab if options.is_empty() => (
@@ -639,26 +689,26 @@ impl PullRequestService {
             ),
             ProviderKind::Gitlab => {
                 let body = gitlab_create_body(&input, options).map_err(invalid_options)?;
-                stdin = Some(
-                    serde_json::to_vec(&body)
-                        .map_err(|error| invalid_options(error.to_string()))?,
-                );
-                (
-                    &self.gitlab_command,
-                    [
-                        "api",
-                        "--method",
-                        "POST",
-                        "projects/:fullpath/merge_requests",
-                        "-H",
-                        "Content-Type: application/json",
-                        "--input",
-                        "-",
-                    ]
-                    .into_iter()
-                    .map(OsString::from)
-                    .collect(),
-                )
+                let file = PrivateJsonBody::write(&std::env::temp_dir(), &body)
+                    .await
+                    .map_err(|error| {
+                        invalid_options(format!("Could not prepare the request body: {error}"))
+                    })?;
+                let mut args: Vec<OsString> = [
+                    "api",
+                    "--method",
+                    "POST",
+                    "projects/:fullpath/merge_requests",
+                    "-H",
+                    "Content-Type: application/json",
+                    "--input",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+                args.push(file.path().as_os_str().to_owned());
+                body_file = Some(file);
+                (&self.gitlab_command, args)
             }
             ProviderKind::AzureDevops => (
                 &self.azure_command,
@@ -695,9 +745,11 @@ impl PullRequestService {
                 ));
             }
         };
-        // `gh` applies reviewers, labels and the milestone after creating the request; a failure
-        // there exits 1 with the URL already printed.
-        let github_options = input.provider == ProviderKind::Github && !options.is_empty();
+        // Option failures exit 1; their provider message names what to change. `gh` applies
+        // reviewers, labels and the milestone after creating the request, so its failure there
+        // exits 1 with the URL already printed.
+        let with_options = !options.is_empty()
+            && matches!(input.provider, ProviderKind::Github | ProviderKind::Gitlab);
         let output = self
             .run_provider_os_with_allowed_exit_codes(
                 ProviderCommandInvocation {
@@ -706,8 +758,7 @@ impl PullRequestService {
                     operation: "createPullRequest",
                     command,
                     args,
-                    allowed_non_zero_exit_codes: if github_options { &[1] } else { &[] },
-                    stdin,
+                    allowed_non_zero_exit_codes: if with_options { &[1] } else { &[] },
                 },
                 cancellation,
             )
@@ -722,7 +773,27 @@ impl PullRequestService {
                 "Provider CLI returned an unrecognized pull-request payload.",
             )
         };
-        if github_options {
+        drop(body_file);
+        let refused = || {
+            let noun = if input.provider == ProviderKind::Gitlab {
+                "merge request"
+            } else {
+                "pull request"
+            };
+            operation_error(
+                input.provider,
+                &input.cwd,
+                "createPullRequest",
+                Some(command.label()),
+                Some(&input.head_branch),
+                &format!(
+                    "{} did not create the {noun}: {}",
+                    command.label(),
+                    provider_reason(&output.stderr, &output.stdout)
+                ),
+            )
+        };
+        if with_options && input.provider == ProviderKind::Github {
             return interpret_github_create(
                 output.exit_code,
                 &output.stdout,
@@ -730,15 +801,12 @@ impl PullRequestService {
                 &input,
             )
             .map_err(|exit| match exit {
-                Some(code) if code != 0 => process_error(
-                    input.provider,
-                    &input.cwd,
-                    "createPullRequest",
-                    command.label(),
-                    ProcessFailureFacts::exited(code),
-                ),
+                Some(code) if code != 0 => refused(),
                 _ => unrecognized(),
             });
+        }
+        if with_options && output.exit_code != 0 {
+            return Err(refused());
         }
         let parsed = match input.provider {
             ProviderKind::Github => parse_github_create_output(&output.stdout, &input),
@@ -1286,7 +1354,6 @@ impl PullRequestService {
                 command,
                 args,
                 allowed_non_zero_exit_codes: &[],
-                stdin: None,
             },
             cancellation,
         )
@@ -1305,7 +1372,6 @@ impl PullRequestService {
             command,
             args,
             allowed_non_zero_exit_codes,
-            stdin,
         } = invocation;
         let output = self
             .runner
@@ -1316,7 +1382,7 @@ impl PullRequestService {
                     args: command.args(args),
                     cwd: cwd.to_path_buf(),
                     env: vec![],
-                    stdin,
+                    stdin: None,
                     timeout: Duration::from_secs(60),
                     max_output_bytes: 128_000,
                     output_policy: OutputPolicy::Error,
@@ -3637,6 +3703,124 @@ esac
                 "--label",
                 "\"size \"\"small\"\"\""
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gitlab_options_travel_as_a_private_body_file() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+        let sandbox = TestSandbox::new("gitlab-options-body");
+        let argv = sandbox.root().join("glab-argv");
+        let body_copy = sandbox.root().join("glab-body");
+        let input_path = sandbox.root().join("glab-input-path");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" > '{argv}'
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--input' ]; then printf '%s' "$argument" > '{input}'; cat "$argument" > '{body}'; fi
+  previous="$argument"
+done
+printf '%s\n' '{{"iid":43,"title":"Draft: Add grid","web_url":"https://gitlab.test/43","target_branch":"main","source_branch":"feature","state":"opened"}}'
+"#,
+            argv = argv.display(),
+            input = input_path.display(),
+            body = body_copy.display(),
+        );
+        let glab = sandbox.executable_script("glab", &script, "");
+        let service = PullRequestService::with_provider_commands(
+            "unused-gh",
+            glab.to_string_lossy(),
+            "unused-az",
+        );
+        let mut gitlab = create_input("Add grid");
+        gitlab.cwd = sandbox.root().to_path_buf();
+        let created = service
+            .create_with_options(gitlab, &create_options(), &CancellationToken::new())
+            .await
+            .expect("GitLab request with options is created");
+        assert_eq!(created.pull_request.number, 43);
+        assert!(created.warning.is_none());
+        let argv = std::fs::read_to_string(&argv).unwrap();
+        assert!(argv.contains("--input\n"), "{argv}");
+        assert!(
+            !argv.contains("--input\n-\n"),
+            "the body is not streamed over stdin: {argv}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&body_copy).unwrap()).unwrap();
+        assert_eq!(body["assignee_ids"], serde_json::json!([7]));
+        assert_eq!(body["title"], "Draft: Add grid");
+        let input_path = std::fs::read_to_string(&input_path).unwrap();
+        assert!(
+            !Path::new(&input_path).exists(),
+            "the private body file is removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn option_failures_report_the_provider_message() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+        let sandbox = TestSandbox::new("option-failures");
+        let gh = sandbox.executable_script(
+            "gh",
+            "#!/bin/sh\nif [ -f \"$0.url\" ]; then printf '%s\\n' 'https://github.com/org/repo/pull/12'; fi\nprintf '%s\\n' 'Warning: 2 uncommitted changes' >&2\nprintf '%s\\n' \"could not add label: 'ghost' not found\" >&2\nexit 1\n",
+            "",
+        );
+        let glab = sandbox.executable_script(
+            "glab",
+            "#!/bin/sh\nprintf '%s\\n' 'glab: 422 Unprocessable Entity: reviewer_ids is invalid' >&2\nexit 1\n",
+            "",
+        );
+        let service = PullRequestService::with_provider_commands(
+            gh.to_string_lossy(),
+            glab.to_string_lossy(),
+            "unused-az",
+        );
+        let mut github = create_input("Add grid");
+        github.provider = ProviderKind::Github;
+        github.cwd = sandbox.root().to_path_buf();
+        let github_options = CreatePullRequestOptions {
+            labels: vec!["ghost".into()],
+            ..CreatePullRequestOptions::default()
+        };
+
+        let error = service
+            .create_with_options(github.clone(), &github_options, &CancellationToken::new())
+            .await
+            .expect_err("no request URL means nothing was created");
+        assert!(
+            error
+                .detail
+                .contains("could not add label: 'ghost' not found"),
+            "{error:?}"
+        );
+
+        std::fs::write(format!("{}.url", gh.display()), "").unwrap();
+        let created = service
+            .create_with_options(github, &github_options, &CancellationToken::new())
+            .await
+            .expect("a printed URL means the request exists");
+        assert_eq!(created.pull_request.number, 12);
+        assert!(
+            created
+                .warning
+                .unwrap()
+                .contains("could not add label: 'ghost' not found"),
+            "the warning names the real failure, not gh's unrelated warning"
+        );
+
+        let mut gitlab = create_input("Add grid");
+        gitlab.cwd = sandbox.root().to_path_buf();
+        let error = service
+            .create_with_options(gitlab, &create_options(), &CancellationToken::new())
+            .await
+            .expect_err("GitLab refused the request");
+        assert!(
+            error.detail.contains("reviewer_ids is invalid"),
+            "{error:?}"
         );
     }
 }
