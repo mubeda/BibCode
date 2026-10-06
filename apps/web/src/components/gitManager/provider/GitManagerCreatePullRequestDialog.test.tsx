@@ -711,9 +711,8 @@ describe("GitManagerCreatePullRequestDialog", () => {
       await chooseTarget("main");
       // The user's path: clicking the visible "Mark as draft" label.
       await act(async () =>
-        document
-          .querySelector<HTMLElement>('[aria-label="Mark as draft"]')!
-          .closest("label")!
+        [...document.querySelectorAll("label")]
+          .find((label) => label.textContent === "Mark as draft")!
           .click(),
       );
       await act(async () => button("Assign to me").click());
@@ -779,11 +778,17 @@ describe("GitManagerCreatePullRequestDialog", () => {
       h.script = [{ outcome: "success", events: [finished("created")] }];
       await renderDialog();
       await chooseTarget("main");
-      expect(document.body.textContent).toContain("Couldn't load the project's merge settings");
+      expect(document.body.textContent).toContain(
+        "Couldn't load your account and project settings.",
+      );
+      // The failure is reported once; the merge options only say what happens.
+      expect(document.body.textContent).not.toContain("Couldn't load the project's merge settings");
+      expect(document.body.textContent).toContain(
+        "Untouched options follow the project's settings.",
+      );
       await act(async () =>
-        document
-          .querySelector<HTMLElement>('[aria-label="Mark as draft"]')!
-          .closest("label")!
+        [...document.querySelectorAll("label")]
+          .find((label) => label.textContent === "Mark as draft")!
           .click(),
       );
       await act(async () => button("Publish and create merge request").click());
@@ -794,13 +799,12 @@ describe("GitManagerCreatePullRequestDialog", () => {
       });
     });
 
-    it("offers Retry when the account and project settings could not be read", async () => {
+    it("offers Retry when the account settings could not be read", async () => {
       h.createDefaultsError = "Request timed out";
       await renderDialog();
       await chooseTarget("main");
-      expect(document.body.textContent).toContain(
-        "Couldn't load your account and project settings.",
-      );
+      // GitHub reads only the account; the project's merge settings are GitLab's.
+      expect(document.body.textContent).toContain("Couldn't load your account settings.");
       await act(async () => button("Retry").click());
       expect(h.refreshDefaults).toHaveBeenCalledOnce();
       expect(input("git-manager-create-pr-base").value).toBe("main");
@@ -838,6 +842,56 @@ describe("GitManagerCreatePullRequestDialog", () => {
       } finally {
         Element.prototype.scrollIntoView = original;
       }
+    });
+
+    const existingWithWarning = () => {
+      const event = finished("opened_existing");
+      if (event.kind !== "action_finished") throw new Error("unexpected event");
+      return {
+        ...event,
+        result: {
+          ...event.result,
+          pr: { ...event.result.pr, warning: "The new options were not applied." },
+        },
+      };
+    };
+
+    it("keeps quiet about options the user never chose when the request already existed", async () => {
+      h.status = gitlab();
+      h.createDefaults = { viewer: null, squash: "default_on", removeSourceBranch: true };
+      h.script = [{ outcome: "success", events: [existingWithWarning()] }];
+      await renderDialog();
+      await chooseTarget("main");
+      await act(async () => button("Publish and create merge request").click());
+      // Only the project's defaults were sent, so nothing the user asked for was dropped.
+      expect(h.runs[0]?.pullRequestOptions).toMatchObject({ removeSourceBranch: true });
+      expect(document.body.textContent).not.toContain("The new options were not applied.");
+    });
+
+    it("reports chosen options an existing request did not take", async () => {
+      h.status = gitlab();
+      h.script = [{ outcome: "success", events: [existingWithWarning()] }];
+      await renderDialog();
+      await chooseTarget("main");
+      await act(async () =>
+        [...document.querySelectorAll("label")]
+          .find((label) => label.textContent === "Mark as draft")!
+          .click(),
+      );
+      await act(async () => button("Publish and create merge request").click());
+      expect(document.body.textContent).toContain("The new options were not applied.");
+    });
+
+    it("names the draft box without its hint", async () => {
+      await renderDialog();
+      const label = [...document.querySelectorAll("label")].find(
+        (candidate) => candidate.textContent === "Mark as draft",
+      )!;
+      const box = label.querySelector<HTMLElement>('[role="checkbox"]')!;
+      expect(box.getAttribute("aria-label")).toBeNull();
+      expect(document.getElementById(box.getAttribute("aria-describedby")!)?.textContent).toBe(
+        "Drafts can't be merged until marked ready.",
+      );
     });
 
     it("shows the server's warning after a partial create", async () => {

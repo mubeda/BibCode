@@ -1,5 +1,6 @@
 import type { EnvironmentId, PullRequestsCreateDefaults } from "@bibcode/contracts";
-import { type ReactNode, useId, useMemo } from "react";
+import { memo, type ReactNode, useId, useMemo } from "react";
+import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { Checkbox } from "~/components/ui/checkbox";
 import {
@@ -106,16 +107,22 @@ function OptionPicker(props: OptionPickerProps) {
       ) : null}
       {props.multiple && props.value.length > 0 ? (
         <div className="flex flex-wrap gap-1">
-          {props.value.map((choice) => (
-            <PullRequestsLabelChip
-              key={choice.id}
-              label={{
-                name: choice.label,
-                color: byId.get(choice.id)?.color ?? null,
-                description: null,
-              }}
-            />
-          ))}
+          {props.value.map((choice) =>
+            props.kind === "labels" ? (
+              <PullRequestsLabelChip
+                key={choice.id}
+                label={{
+                  name: choice.label,
+                  color: byId.get(choice.id)?.color ?? null,
+                  description: null,
+                }}
+              />
+            ) : (
+              <Badge key={choice.id} variant="outline" size="sm">
+                {choice.label}
+              </Badge>
+            ),
+          )}
         </div>
       ) : null}
     </div>
@@ -126,7 +133,7 @@ function OptionPicker(props: OptionPickerProps) {
  * Assignee, reviewer, milestone and labels for both providers, plus GitLab's merge options.
  * GitLab takes one assignee and one reviewer; GitHub takes several.
  */
-export function CreatePullRequestOptions(props: {
+export const CreatePullRequestOptions = memo(function CreatePullRequestOptions(props: {
   readonly scope: OptionScope;
   readonly providerKind: string | null;
   readonly defaults: PullRequestsCreateDefaults | null;
@@ -153,7 +160,9 @@ export function CreatePullRequestOptions(props: {
       {props.defaultsState === "error" ? (
         <div className="flex items-center gap-2 text-sm">
           <p role="alert" className="text-destructive">
-            Couldn't load your account and project settings.
+            {gitlab
+              ? "Couldn't load your account and project settings."
+              : "Couldn't load your account settings."}
           </p>
           <Button size="sm" variant="outline" onClick={props.onRetryDefaults}>
             Retry
@@ -235,12 +244,8 @@ export function CreatePullRequestOptions(props: {
             />
             Squash commits when merge request is accepted.
           </label>
-          {projectDecides ? (
-            <p className="text-xs text-muted-foreground">
-              {props.defaultsState === "loading"
-                ? "Loading the project's merge settings…"
-                : "Couldn't load the project's merge settings. Untouched options follow the project."}
-            </p>
+          {props.defaultsState === "loading" ? (
+            <p className="text-xs text-muted-foreground">Loading the project's merge settings…</p>
           ) : squash.note !== null ? (
             <p className="text-xs text-muted-foreground">{squash.note}</p>
           ) : removeUnknown || squashUnknown ? (
@@ -252,4 +257,4 @@ export function CreatePullRequestOptions(props: {
       ) : null}
     </div>
   );
-}
+});
