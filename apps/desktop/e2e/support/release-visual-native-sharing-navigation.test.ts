@@ -88,6 +88,7 @@ async function run(mode: "settles" | "never-settles" | "driver-fails") {
       step: () => {},
       observe: (facts: Record<string, boolean>) => Object.assign(observation, facts),
       browser,
+      viewport: { fit: async () => {} },
       owner,
       createNativeSharingBrowserPorts,
       evidence: "/inert/evidence",

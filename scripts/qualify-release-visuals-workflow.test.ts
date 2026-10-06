@@ -74,6 +74,15 @@ describe("first visual batch workflow boundary", () => {
     expect(run.run).toBe(
       "python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-pull-requests",
     );
+    expect(run.env).toEqual({
+      BIBCODE_UPLOAD_SERVER: "${{ runner.temp }}/issue29-visual-build/bibcode",
+      BIBCODE_DELIVERY_UI_WEB: "${{ runner.temp }}/issue29-visual-build/web",
+    });
+    const copyIndex = steps.findIndex(
+      (step: { name: string }) => step.name === "Copy immutable inputs outside Cargo output",
+    );
+    expect(copyIndex).toBeGreaterThanOrEqual(0);
+    expect(copyIndex).toBeLessThan(steps.indexOf(run));
     expect(
       evidence.with.path
         .trim()

@@ -37,7 +37,14 @@ import {
 } from "./support/chat-upload-evidence.ts";
 import { EnvironmentMetadataHttpApi } from "../../../packages/contracts/src/environmentHttp.ts";
 
-interface NativeSharingAdmissionFacts extends NativeSharingBrowserPreparationFacts {
+import {
+  createNativeSharingViewport,
+  type NativeSharingViewportFacts,
+} from "./support/release-visual-native-sharing-viewport.ts";
+import type { NativeSharingDomFacts } from "./support/release-visual-native-sharing-dom.ts";
+
+interface NativeSharingAdmissionFacts
+  extends NativeSharingBrowserPreparationFacts, NativeSharingViewportFacts, NativeSharingDomFacts {
   windowHandlesArray: boolean;
   windowMainOnly: boolean;
   windowCurrentMain: boolean;
@@ -265,7 +272,7 @@ export async function qualifyNativeSharing(
             throw refused();
           owner.spawn(
             xvfb,
-            [":99", "-screen", "0", "1280x960x24", "-nolisten", "tcp"],
+            [":99", "-screen", "0", "1920x1440x24", "-nolisten", "tcp"],
             { ...environment },
             "web",
           );
@@ -411,10 +418,10 @@ export async function qualifyNativeSharing(
         const original = await browser.getUrl();
         observe({ originalUrlReturned: true });
         step("native-original-size");
-        const originalSize = await browser.getWindowSize();
+        const originalRect = await browser.getWindowRect();
         observe({ originalSizeReturned: true });
         let route: "owned" | "absent" = "owned";
-        const verify = async () => {
+        const verifyIdentity = async () => {
           await guard();
           await verifyNativeSharingWindow(browser);
           validateNativeSharingIdentity(
@@ -423,6 +430,15 @@ export async function qualifyNativeSharing(
             route,
           );
         };
+        const viewport = createNativeSharingViewport({
+          browser,
+          owner,
+          original: originalRect,
+          identity: verifyIdentity,
+          unsafeCleanup: markUnsafe,
+          observe,
+        });
+        const verify = () => viewport.verify();
         step("native-initial-verification");
         await verify();
         observe({ initialIdentityVerified: true });
@@ -431,7 +447,7 @@ export async function qualifyNativeSharing(
           summary: object | undefined;
         try {
           step("native-ui-window-size");
-          await browser.setWindowSize(1280, 960);
+          await viewport.fit();
           observe({ uiWindowSizeSet: true });
           step("native-ui-navigation");
           await browser.url("tauri://localhost/#/settings/general");
@@ -451,6 +467,7 @@ export async function qualifyNativeSharing(
             unsafeCleanup: markUnsafe,
             onPreparationStage: step,
             onPreparationFacts: observe,
+            onDomFacts: observe,
             routeScope: (run) =>
               withNativeSharingRoute(routePorts, async (scope) => {
                 route = "absent";
@@ -477,17 +494,20 @@ export async function qualifyNativeSharing(
           visualFailed = true;
           visualFailure = error;
         }
-        try {
-          await browser.url(original);
-          await browser.setWindowSize(originalSize.width, originalSize.height);
-          await verify();
-        } catch (error) {
-          markUnsafe();
-          if (!visualFailed) {
-            visualFailed = true;
-            visualFailure = error;
+        const cleanup = async (run: () => Promise<unknown>) => {
+          try {
+            await run();
+          } catch (error) {
+            markUnsafe();
+            if (!visualFailed) {
+              visualFailed = true;
+              visualFailure = error;
+            }
           }
-        }
+        };
+        await cleanup(() => browser.url(original));
+        await cleanup(() => viewport.restore());
+        await cleanup(verify);
         if (visualFailed) throw visualFailure;
         if (captured.size !== 4 || captures.length !== 4 || unsafe) throw refused();
         return {

@@ -130,9 +130,9 @@ function admissionProbe(fault = "owned") {
       if (fault === "url") throw original;
       return "tauri://localhost/";
     },
-    getWindowSize: async () => {
+    getWindowRect: async () => {
       calls.push("size");
-      return { width: 1280, height: 960 };
+      return { x: 0, y: 0, width: 1280, height: 960 };
     },
   };
   const collect = async (input: { descriptor: () => Promise<unknown> }) => {
@@ -145,12 +145,16 @@ function admissionProbe(fault = "owned") {
       browser,
       step: (phase: string) => phases.push(phase),
       observe: (next: Record<string, boolean>) => Object.assign(facts, next),
+      markUnsafe: () => {},
       guard: async () => {},
       owner: {
         until: async (check: () => Promise<boolean>) => {
           expect(await check()).toBe(true);
         },
       },
+      createNativeSharingViewport: (input: { identity: () => Promise<void> }) => ({
+        verify: input.identity,
+      }),
       readNativeSharingBridge: () => {},
       collectNativeSharingIdentity: collect,
       verifyNativeSharingWindow: async () => {
@@ -247,11 +251,13 @@ it.each(["size", "navigation", "settlement", "ports"])(
       {
         step: (phase: string) => phases.push(phase),
         observe: () => {},
-        browser: {
-          setWindowSize: async () => {
+        viewport: {
+          fit: async () => {
             calls.push("size");
             if (fault === "size") throw original;
           },
+        },
+        browser: {
           url: async () => {
             calls.push("navigation");
             if (fault === "navigation") throw original;

@@ -2,6 +2,8 @@ import { captureOwnedVisualScene } from "./owned-visual-capture.ts";
 import {
   readNativeSharingDom,
   validateNativeSharingDom,
+  projectNativeSharingDomFacts,
+  type NativeSharingDomFacts,
 } from "./release-visual-native-sharing-dom.ts";
 import type { QualificationBrowser, QualificationOwner } from "./qualification-owner.ts";
 import type { NativeSharingRouteScope } from "./release-visual-native-sharing-route.ts";
@@ -48,6 +50,7 @@ export interface NativeSharingBrowserInput {
   readonly onCapture?: (receipt: Readonly<Record<string, unknown>>) => void;
   readonly onPreparationStage?: (stage: NativeSharingBrowserPreparationStage) => void;
   readonly onPreparationFacts?: (facts: Partial<NativeSharingBrowserPreparationFacts>) => void;
+  readonly onDomFacts?: (facts: NativeSharingDomFacts) => void;
   readonly onScene?: (
     scene: "native-share-no-route" | "native-share-refresh",
     theme: "light" | "dark",
@@ -206,9 +209,21 @@ export async function createNativeSharingBrowserPorts(
         file: scene + "-" + theme + ".png",
         captured: input.captured,
         observation: () => ({ scene, theme, origin }),
-        read: (value) => browser.execute(readNativeSharingDom, value),
+        read: async (value) => {
+          const result = await browser.execute(readNativeSharingDom, value);
+          try {
+            input.onDomFacts?.(projectNativeSharingDomFacts(result));
+          } catch {
+            observerFailure();
+          }
+          return result;
+        },
         verifyOwnedIdentity: verify,
-        validate: validateNativeSharingDom,
+        validate: (value) => {
+          const witness = validateNativeSharingDom(value);
+          if (observerFailed) throw refused();
+          return witness;
+        },
         project: ({ file, witness, ...image }) =>
           Object.freeze({ scene, theme, file, witness, ...image }),
         refused,

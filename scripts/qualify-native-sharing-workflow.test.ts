@@ -36,6 +36,20 @@ it("runs actual SDK navigation and native cleanup regressions before packaged ca
     "apps/desktop/e2e/support/release-visual-native-sharing-session.test.ts",
   );
 });
+it("runs the actual SDK client-viewport regression before packaged native sharing qualification", () => {
+  const steps = packagedWorkflow().jobs.native_sharing.steps;
+  const admission = steps.findIndex(
+    (step: { name: string }) => step.name === "Check native ownership and namespace admission",
+  );
+  const capture = steps.findIndex(
+    (step: { name: string }) => step.name === "Run contained native sharing scenes",
+  );
+  expect(admission).toBeGreaterThanOrEqual(0);
+  expect(capture).toBeGreaterThan(admission);
+  expect(steps[admission].run).toContain(
+    "apps/desktop/e2e/support/release-visual-native-sharing-viewport.test.ts",
+  );
+});
 it("admits a separate Linux packaged-app selection and skips the Chromium owner for it", () => {
   const value = workflow();
   expect(value.on.workflow_dispatch.inputs.scene_selection.options).toContain(

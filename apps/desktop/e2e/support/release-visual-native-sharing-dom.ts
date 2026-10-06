@@ -1,5 +1,64 @@
 // @effect-diagnostics nodeBuiltinImport:off - Closed Node witness validation refuses untrusted proxies before reflection.
 import * as NodeUtil from "node:util";
+export interface NativeSharingDomFacts {
+  domRouteMatched: boolean | null;
+  domThemeMatched: boolean | null;
+  domShareSelected: boolean | null;
+  domControlsMatched: boolean | null;
+  domExpectedState: boolean | null;
+  domCredentialAbsent: boolean | null;
+  domTargetInView: boolean | null;
+}
+/** Attribution only: this does not change DOM admission or create a second renderer read. */
+export function projectNativeSharingDomFacts(value: unknown): NativeSharingDomFacts {
+  const keys = [
+    "routeMatched",
+    "themeMatched",
+    "shareSelected",
+    "controlsMatched",
+    "expectedState",
+    "credentialAbsent",
+    "targetInView",
+  ];
+  const names = [
+    "domRouteMatched",
+    "domThemeMatched",
+    "domShareSelected",
+    "domControlsMatched",
+    "domExpectedState",
+    "domCredentialAbsent",
+    "domTargetInView",
+  ];
+  const absent = () =>
+    Object.freeze(
+      Object.fromEntries(names.map((key) => [key, null])),
+    ) as unknown as NativeSharingDomFacts;
+  try {
+    if (
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      NodeUtil.types.isProxy(value)
+    )
+      return absent();
+    const own = Reflect.ownKeys(value);
+    if (
+      own.length !== keys.length ||
+      !own.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      return absent();
+    const result: Record<string, boolean> = {};
+    for (let index = 0; index < keys.length; index++) {
+      const field = Object.getOwnPropertyDescriptor(value, keys[index]!);
+      if (!field?.enumerable || !Object.hasOwn(field, "value") || typeof field.value !== "boolean")
+        return absent();
+      result[names[index]!] = field.value;
+    }
+    return Object.freeze(result) as unknown as NativeSharingDomFacts;
+  } catch {
+    return absent();
+  }
+}
 export interface NativeSharingDomInput {
   readonly scene: "native-share-no-route" | "native-share-refresh";
   readonly theme: "light" | "dark";

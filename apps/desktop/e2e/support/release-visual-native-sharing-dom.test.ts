@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from "vite-plus/test";
 import {
   readNativeSharingDom,
   validateNativeSharingDom,
+  projectNativeSharingDomFacts,
 } from "./release-visual-native-sharing-dom.ts";
 afterEach(() => {
   vi.restoreAllMocks();
@@ -10,6 +11,60 @@ afterEach(() => {
   document.body.innerHTML = "";
   document.documentElement.className = "";
 });
+it("projects only the seven last DOM booleans, retaining false facts without values", () => {
+  const keys = [
+    "routeMatched",
+    "themeMatched",
+    "shareSelected",
+    "controlsMatched",
+    "expectedState",
+    "credentialAbsent",
+    "targetInView",
+  ];
+  const value = Object.fromEntries(keys.map((key) => [key, key !== "targetInView"]));
+  const facts = projectNativeSharingDomFacts(value);
+  expect(facts).toMatchObject({ domRouteMatched: true, domTargetInView: false });
+  expect(Object.keys(facts)).toHaveLength(7);
+  expect(JSON.stringify(facts)).not.toMatch(/tauri|http|Owned|#|</);
+});
+it.each(["missing", "extra", "getter", "proxy", "array"])(
+  "refuses unsafe last-DOM attribution packet without evaluating it: %s",
+  (mode) => {
+    const value: Record<string, unknown> = {
+      routeMatched: true,
+      themeMatched: true,
+      shareSelected: true,
+      controlsMatched: true,
+      expectedState: true,
+      credentialAbsent: true,
+      targetInView: false,
+    };
+    let reads = 0;
+    if (mode === "missing") delete value.routeMatched;
+    if (mode === "extra") value.privateValue = "inert sensitive text";
+    if (mode === "getter")
+      Object.defineProperty(value, "targetInView", {
+        enumerable: true,
+        get: () => {
+          reads++;
+          throw new Error("inert getter");
+        },
+      });
+    const input =
+      mode === "proxy"
+        ? new Proxy(value, {
+            ownKeys: () => {
+              reads++;
+              throw new Error("inert proxy");
+            },
+          })
+        : mode === "array"
+          ? [value]
+          : value;
+    expect(Object.values(projectNativeSharingDomFacts(input))).toEqual(Array(7).fill(null));
+    expect(reads).toBe(0);
+  },
+);
 function page(scene: "native-share-no-route" | "native-share-refresh", mode = "owned") {
   vi.stubGlobal("location", {
     origin: "null",

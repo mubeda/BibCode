@@ -2131,6 +2131,30 @@ errors propagate. The closed navigation phase and boolean distinguish an
 acknowledged assignment from an observed route without retaining URLs or window
 identities in the evidence.
 
+The owned Xvfb display is 1920 by 1440 at 24-bit color so the native window has
+room for its chrome. The pinned native Classic driver reports and sets the full
+outer rectangle, while its screenshot contains the visible WebKit client. The
+native-sharing-only viewport lease reads the actual client size and scale,
+requires devicePixelRatio 1 and the owned display dimensions, and uses stable
+outer/client measurements to account for bounded chrome. At most three owned
+main-window corrections run within the existing owner readiness deadline. The
+lease requires a 1280 by 960 client before capture and at the existing identity
+fences, retains unchanged original PNG bytes, and restores the exact original
+outer x, y, width and height before shutdown. It does not crop or rescale an
+image. URL restoration, rectangle restoration, and the final owned identity
+check are attempted independently within their existing bounds, including after
+an earlier cleanup failure. The original visual failure remains primary;
+otherwise the first cleanup failure is retained. Impossible or drifting geometry,
+failed correction or restoration, and
+unproven ownership fail qualification and preserve an unsafe fixture.
+
+The last seven closed DOM booleans are retained from the existing witness read
+in the existing phase/failure receipts. They admit no extra renderer read and
+retain no markup, text, URLs or private identity. These facts distinguish a
+remaining admission condition after geometry is established; they do not prove
+a native runtime cause or waive a failed original. The separate native
+follow-ups OS screenshot mode retains its own outer-window geometry contract.
+
 The native controller uses public Theme, Share this host and Refresh addresses
 controls. It removes and restores only the already-admitted private default
 route, checks the real native bridge and typed loopback descriptor, and never

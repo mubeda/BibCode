@@ -6,6 +6,72 @@ import * as NodeZlib from "node:zlib";
 import { expect, it } from "vite-plus/test";
 import { createNativeSharingBrowserPorts } from "./release-visual-native-sharing-browser.ts";
 import type { NativeSharingRouteScope } from "./release-visual-native-sharing-route.ts";
+it.each(["target-false", "observer-fails", "read-fails", "observer-then-read"])(
+  "retains closed last DOM facts from exactly the existing capture reads: %s",
+  async (mode) => {
+    const f = fixture(),
+      evidence = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-sharing-last-facts-")),
+      original = new Error("Inert exact DOM read fault."),
+      timeout = new Error("Inert exact DOM admission bound.");
+    let reads = 0,
+      shots = 0,
+      unsafe = 0;
+    const facts: object[] = [];
+    const input = {
+      ...f.input,
+      evidence,
+      owner: {
+        until: async (check: () => Promise<boolean>) => {
+          for (let i = 0; i < 3; i++) if (await check()) return;
+          throw timeout;
+        },
+      },
+      unsafeCleanup: () => unsafe++,
+      onDomFacts: (value: object) => {
+        facts.push(value);
+        if (mode.startsWith("observer")) throw new Error("Inert attribution fault.");
+      },
+      browser: {
+        ...f.browser,
+        takeScreenshot: async () => {
+          shots++;
+          return syntheticCaptureBytes().toString("base64");
+        },
+        execute: async () => {
+          reads++;
+          if (mode === "read-fails" || (mode === "observer-then-read" && reads > 1)) throw original;
+          return {
+            routeMatched: true,
+            themeMatched: true,
+            shareSelected: true,
+            controlsMatched: true,
+            expectedState: true,
+            credentialAbsent: true,
+            targetInView: mode !== "target-false",
+          };
+        },
+      } as never,
+    };
+    try {
+      const ports = await createNativeSharingBrowserPorts(input);
+      await expect(
+        ports.withMissingRoute(async (scope) => {
+          await ports.verifyRoute(scope, "absent");
+          await ports.capture("native-share-no-route", "light");
+        }),
+      ).rejects.toBe(mode.includes("read") ? original : timeout);
+      expect(shots).toBe(0);
+      expect(NodeFS.readdirSync(evidence)).toEqual([]);
+      expect(facts).toHaveLength(mode === "read-fails" ? 0 : mode === "observer-then-read" ? 1 : 3);
+      if (mode === "target-false")
+        expect(facts.at(-1)).toMatchObject({ domTargetInView: false, domRouteMatched: true });
+      if (mode.startsWith("observer")) expect(unsafe).toBeGreaterThan(0);
+      expect(reads).toBe(mode === "read-fails" ? 1 : mode === "observer-then-read" ? 2 : 3);
+    } finally {
+      NodeFS.rmSync(evidence, { recursive: true, force: true });
+    }
+  },
+);
 function fixture(mode = "owned") {
   const calls: string[] = [];
   let current = "tauri://localhost/#/local/owned",

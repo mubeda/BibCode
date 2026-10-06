@@ -366,7 +366,8 @@ jobs:
       - name: Run contained PR/MR visual batch
         if: ${{ inputs.scene_selection == 'release-visual-pull-requests' }}
         env:
-          BIBCODE_DELIVERY_UI_WEB: ${{ github.workspace }}/apps/web/dist
+          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-visual-build/bibcode
+          BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue29-visual-build/web
         run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-pull-requests
       - name: Retain explicit PR/MR evidence
         if: ${{ always() && inputs.scene_selection == 'release-visual-pull-requests' }}
