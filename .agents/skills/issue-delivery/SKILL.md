@@ -12,6 +12,9 @@ evidence, not an accepted screenshot, native result, or closed issue.
 - Choose one blocking acceptance criterion per issue. Give each delegate one
   concrete deliverable, an output path, a stopping condition, and the user's
   model setting. Stop overlapping implementation and duplicate reviews.
+- Confirm the delegate is running before waiting. Use `followup_task` to start a
+  new turn on a completed delegate; `send_message` only delivers a message and
+  does not wake it. A queued instruction is not evidence of live review work.
 - Keep analysis short. Choose the next evidence-producing action within about
   30 words. Do not repeat background reasoning between tool calls.
 - Test the complete caller before a costly run, including preparation, invocation,
