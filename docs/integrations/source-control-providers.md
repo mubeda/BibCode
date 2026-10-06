@@ -223,7 +223,9 @@ picker or settings read offers **Retry** and never blocks creation. GitHub
 applies some options after creating the request: if one of those steps fails,
 the request is reported as created with a warning naming what was not applied,
 and it is never retried. When an open request already exists for the branch,
-it opens as before and the dialog says the new options were not applied.
+it opens as before and, if the user chose any option, the dialog says the new
+options were not applied; merge boxes filled from the project's settings alone
+do not count.
 Azure DevOps and Bitbucket keep the plain dialog; the server refuses options
 for them before anything is published.
 An older environment that does not advertise branch-selection support disables

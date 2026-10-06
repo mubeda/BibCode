@@ -10,7 +10,16 @@ import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime"
 import { useDebouncedValue } from "@tanstack/react-pacer";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { GitPullRequestIcon } from "lucide-react";
-import { memo, type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  type ChangeEvent,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { Button } from "~/components/ui/button";
 import { Checkbox } from "~/components/ui/checkbox";
@@ -401,6 +410,12 @@ function CreatePullRequestReviewDialog({
         ? null
         : safeExternalUrl(review?.existingPullRequest?.url ?? null);
   const fieldsDisabled = busy || settled || review === null || blockedReason !== null;
+  const draftHintId = useId();
+  // An existing request's warning covers every option sent, including merge boxes filled from
+  // the project's defaults; it only matters when the user chose something. Fields lock once
+  // the request settles, so this still describes the attempt.
+  const choseOptions =
+    createOptionsSupported && createOptionsPayload(createOptions, providerKind) !== undefined;
   const branchFieldsDisabled =
     busy ||
     settled ||
@@ -535,22 +550,22 @@ function CreatePullRequestReviewDialog({
                 onChange={changeTitle}
               />
               {createOptionsSupported ? (
-                <label className="flex items-start gap-2 pt-1 text-sm">
-                  <Checkbox
-                    aria-label="Mark as draft"
-                    checked={createOptions.draft}
-                    disabled={fieldsDisabled}
-                    onCheckedChange={(draft) =>
-                      setCreateOptions((current) => ({ ...current, draft }))
-                    }
-                  />
-                  <span>
+                <div className="pt-1">
+                  <label className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      aria-describedby={draftHintId}
+                      checked={createOptions.draft}
+                      disabled={fieldsDisabled}
+                      onCheckedChange={(draft) =>
+                        setCreateOptions((current) => ({ ...current, draft }))
+                      }
+                    />
                     Mark as draft
-                    <span className="block text-xs text-muted-foreground">
-                      Drafts can't be merged until marked ready.
-                    </span>
-                  </span>
-                </label>
+                  </label>
+                  <p id={draftHintId} className="ps-6 text-xs text-muted-foreground">
+                    Drafts can't be merged until marked ready.
+                  </p>
+                </div>
               ) : null}
             </div>
             <div className="flex flex-col gap-1.5">
@@ -602,7 +617,7 @@ function CreatePullRequestReviewDialog({
                   </a>
                 </>
               ) : null}
-              {(progress.kind === "created" || progress.kind === "existing") &&
+              {(progress.kind === "created" || (progress.kind === "existing" && choseOptions)) &&
               progress.warning !== undefined ? (
                 <span className="mt-1 block font-medium text-foreground">{progress.warning}</span>
               ) : null}

@@ -126,7 +126,9 @@ merge request is accepted, ☐ Squash commits when merge request is accepted.
   applied; it is never retried, so no duplicate is made. Without a URL it is a
   failure as today.
 - Existing open request for the branch: `opened_existing` as today, with
-  `warning` saying the new options were not applied.
+  `warning` saying the new options were not applied. The dialog shows it only
+  when the user chose an option, not for merge boxes filled from the project's
+  defaults.
 - Defaults read failure: merge options show "project decides" (indeterminate,
   unlocked) with a Retry, and untouched boxes are not sent, so the project's
   settings apply; creation is unaffected.
