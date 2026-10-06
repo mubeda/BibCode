@@ -513,6 +513,16 @@ Include the shared [slow-link liveness scenario](./cross-platform-validation.md#
 when a browser client and a development or standalone server are available on
 this platform; otherwise record it as unavailable evidence.
 
+For a browser primary behind a configured loopback UI proxy, verify that
+descriptor discovery and the stored broker HTTP target use the same resolved
+UI HTTP route as authentication, from one topology snapshot. The registration
+cache identity includes that effective HTTP address; the WebSocket address
+stays at the backend endpoint. Cover changes to the development origin,
+desktop-managed bypass, non-loopback direct access and withheld-topology
+retention. A malformed development-origin hint must retain the cached
+registration through the existing failure path and recover on a later valid
+poll. Helper checks do not replace the real connection scenario.
+
 Use Codex Computer Use to operate the packaged executable. Capture the actual
 X11/Wayland and desktop environment in the report. At normal and minimum sizes
 verify:
