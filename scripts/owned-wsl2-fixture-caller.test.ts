@@ -179,3 +179,41 @@ it("keeps real GPG assertions and exposes only closed facts from its owned comma
   expect(tests).toContain("$corrupt)}|Should -Throw");
   expect(tests).toContain("Assert-PhysicalPin $gpgPin");
 });
+
+it("keeps GPG category projection test-only and based on the already-read stderr", () => {
+  const tests = NodeFS.readFileSync(
+    new URL("./owned-wsl2-fixture.Tests.ps1", import.meta.url),
+    "utf8",
+  );
+  const owner = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+  expect(tests).toContain("Get-PinnedGpgErrorCategory $command.stderr");
+  expect(tests).toContain("keybox ''[^''\\r\\n]+'': ");
+  expect(tests).not.toContain("keybox .+:|");
+  for (const category of [
+    "other",
+    "input-open-read",
+    "storage-open-create",
+    "storage-permission",
+  ]) {
+    expect(tests).toMatch(new RegExp(`C:/inert[^\\n]+Category='${category}'`));
+  }
+  expect(tests).toContain("Owned WSL2 pinned GPG closed error category (inert)");
+  expect(owner).not.toContain("Get-PinnedGpgErrorCategory");
+  const start = tests.indexOf("function Get-PinnedGpgErrorCategory");
+  const end = tests.indexOf("return 'other'", start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  expect(
+    [...tests.slice(start, end).matchAll(/return '([^']+)'/g)].map((match) => match[1]),
+  ).toEqual([
+    "storage-permission",
+    "storage-open-create",
+    "invalid-key-data",
+    "input-open-read",
+    "runtime-agent",
+  ]);
+  expect(tests.slice(start, end)).not.toMatch(/Invoke-|Get-Content|Start-Process|Write-/);
+  expect(tests).toContain("if($command.exitCode -ne 0){throw");
+  expect(tests).toContain("throw $originalFailure");
+  // Source consistency only; classifier and real GPG execution require Windows Pester.
+});

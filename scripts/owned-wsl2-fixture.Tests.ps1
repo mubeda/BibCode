@@ -1,4 +1,13 @@
-BeforeAll { . "$PSScriptRoot/owned-wsl2-fixture.ps1" }
+BeforeAll {
+  function Get-PinnedGpgErrorCategory([string]$Stderr) {
+    if($Stderr -match '(?im)^gpg: (?:keybox .+|error (?:opening|creating) .+|can''t create directory .+|Fatal: can''t (?:open|create) .+): (?:Permission denied|Access is denied|Access denied)\s*$'){return 'storage-permission'}
+    if($Stderr -match '(?im)^gpg: (?:keybox ''[^''\r\n]+'': |error (?:opening|creating) (?:keyring|keybox|trustdb).+:|can''t create directory .+|Fatal: can''t (?:open|create) .+)'){return 'storage-open-create'}
+    if($Stderr -match '(?im)^gpg: (?:no valid OpenPGP data found\.|invalid armor header:|invalid radix64 character|invalid packet)'){return 'invalid-key-data'}
+    if($Stderr -match '(?im)^gpg: (?:can''t open .+:|error reading .+:)'){return 'input-open-read'}
+    if($Stderr -match '(?im)^gpg: (?:error running .+:|failed to start agent|can''t connect to the agent:)'){return 'runtime-agent'}
+    return 'other'
+  }
+ . "$PSScriptRoot/owned-wsl2-fixture.ps1" }
 Describe 'Owned WSL2 command boundary' {
   BeforeEach {
     $script:record=@{name='BibCodeQA-0123456789abcdef0123456789abcdef';appState='joined';guid='inert-guid';importRoot=@{identity='inert-fileid'};wsl=@{pin=@{path='inert-wsl.exe'}};root=@{path='inert-owner'};phase='kernel-verified';kernelVerified=$true}
@@ -286,7 +295,7 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
           ($command.exitCode -ge 0 -and $command.exitCode -le 255)|Should -BeTrue
           ($command.stdout -is [string])|Should -BeTrue;($command.stderr -is [string])|Should -BeTrue
           $command.exitCode|Should -Be $script:OwnedWslSignedMetadata.commandExit
-          if($command.exitCode -ne 0){throw ('Pinned GPG '+$Operation+' refused; commandReceiptPresent=true; commandExit='+$command.exitCode+'; stdoutPresent='+($command.stdout.Length -gt 0)+'; stderrPresent='+($command.stderr.Length -gt 0))}
+          if($command.exitCode -ne 0){throw ('Pinned GPG '+$Operation+' refused; commandReceiptPresent=true; commandExit='+$command.exitCode+'; stdoutPresent='+($command.stdout.Length -gt 0)+'; stderrPresent='+($command.stderr.Length -gt 0)+'; category='+(Get-PinnedGpgErrorCategory $command.stderr))}
           throw $originalFailure
         }
       }
@@ -316,5 +325,36 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
         else{Remove-Variable -Name $contextName -Scope Script -ErrorAction SilentlyContinue}
       }
     }
+  }
+}
+
+
+Describe 'Owned WSL2 pinned GPG closed error category (inert)' {
+  It 'projects <Category> from already-read error text' -TestCases @(
+    @{Stderr="gpg: can't open 'inert-key': No such file or directory";Category='input-open-read'},
+    @{Stderr="gpg: error reading 'inert-key': Input/output error";Category='input-open-read'},
+    @{Stderr='gpg: no valid OpenPGP data found.';Category='invalid-key-data'},
+    @{Stderr='gpg: invalid armor header: inert-private';Category='invalid-key-data'},
+    @{Stderr="gpg: keybox 'inert-home/pubring.kbx': Permission denied";Category='storage-permission'},
+    @{Stderr="gpg: error creating 'inert-home/pubring.kbx': Permission denied";Category='storage-permission'},
+    @{Stderr="gpg: can't create directory 'inert-home': Permission denied";Category='storage-permission'},
+    @{Stderr="gpg: error opening keyring 'inert-home/pubring.kbx': No such file or directory";Category='storage-open-create'},
+    @{Stderr="gpg: can't create directory 'inert-home': No such file or directory";Category='storage-open-create'},
+    @{Stderr="gpg: error running 'inert-agent': exit status 2";Category='runtime-agent'},
+    @{Stderr="gpg: can't connect to the agent: IPC connect call failed";Category='runtime-agent'},
+    @{Stderr="gpg: WARNING: unsafe permissions on homedir 'inert-home'";Category='other'},
+    @{Stderr="gpg: keybox 'inert-home/pubring.kbx' created";Category='other'},
+    @{Stderr="gpg: keybox 'C:/inert-home/pubring.kbx' created";Category='other'},
+    @{Stderr="gpg: keybox 'C:/inert-home/pubring.kbx' created`ngpg: can't open 'C:/inert-key': No such file or directory";Category='input-open-read'},
+    @{Stderr="gpg: keybox 'C:/inert-home/pubring.kbx': No such file or directory";Category='storage-open-create'},
+    @{Stderr="gpg: keybox 'C:/inert-home/pubring.kbx': Permission denied";Category='storage-permission'},
+    @{Stderr="gpg: keybox 'inert-home/pubring.kbx' created`ngpg: can't open 'inert-key': No such file or directory";Category='input-open-read'},
+    @{Stderr='inert-private-path-and-credential';Category='other'},
+    @{Stderr='';Category='other'}
+  ) {
+    param($Stderr,$Category)
+    $actual=Get-PinnedGpgErrorCategory $Stderr
+    $actual|Should -BeExactly $Category
+    ($actual -cin @('input-open-read','invalid-key-data','storage-permission','storage-open-create','runtime-agent','other'))|Should -BeTrue
   }
 }
