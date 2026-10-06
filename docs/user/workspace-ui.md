@@ -29,6 +29,32 @@ the selected server is removed, the rail returns to Local. Saved servers show
 the name you gave them on this device (see
 [Remote access](./remote-access.md#name-a-saved-server)).
 
+The **Environments | Repositories** switch at the top of the left panel picks
+how projects are listed; the choice is remembered on this device.
+**Environments** is the per-environment view described above. **Repositories**
+hides the environment rail and lists one read-only card per Git repository,
+matched by its `origin` remote, across every connected environment. Each card
+holds one entry per checkout showing the environment, its connection state and
+the folder path; that entry is the project itself, with the same menu, actions,
+threads and worktrees. Projects without an `origin` get a card of their own
+named after their folder. Unavailable environments appear dimmed. In this view
+the sort menu's grouping choice is hidden, and each entry's menu is the normal
+project menu; its **Group into…** item affects the Environments view.
+Collapsing a repository card hides all its entries. Each entry keeps its own
+collapse state, so collapsing one environment's entry leaves the others open.
+Collapsing or expanding the project in Environments also updates its entries
+here, except other environments' entries you have already toggled in this
+view. With no projects, the view offers **Show Environments**, where projects
+are added. A changed `origin`
+moves its entry to the new card after the next refresh of that project: when
+the window regains focus, after a Git action, or when you reopen the project.
+An unsent message draft belongs to the repository's project rather than one
+checkout: starting a new thread from another environment's entry of the same
+repository continues that draft there, and its branch and worktree choice
+resets.
+Switching back to **Environments** restores the rail with its previous
+selection.
+
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
 unread-count badge covers agents across all connected environments and is hidden when nothing is unread. Selecting
 the row opens the full-screen Agents view; its top strip has a back arrow for
@@ -77,7 +103,9 @@ The glyph's shape carries the status: a hand (needs approval), a question mark
 (waiting for your answer), a spinner (working or connecting), a warning
 triangle (failed), a checklist (plan ready), a filled dot (finished, not opened
 yet) and a hollow ring (idle). A collapsed project and the **Show more** row
-show the most urgent glyph among the cards they hide.
+show the most urgent glyph among the cards they hide. A collapsed project keeps
+only the card you are viewing visible; its other cards and discovered worktrees
+appear again when you expand it.
 
 - The primary card represents the project's live checkout. Its title is the
   checkout's current branch, refreshed from Git rather than from a stored
@@ -884,7 +912,9 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
 
 - The primary action is adaptive. With staged files it defaults to Commit. With
   only unstaged or untracked files it becomes Stage All Changes. Clean-tree
-  states then move through pull, push, and PR actions when available. Publish is
+  states then move through pull, push, and PR actions when available. **Push &
+  create MR/PR** and **Create MR/PR** publish a branch that is not on the remote
+  yet, then open the shared review dialog with that branch as the source. Publish is
   currently shown disabled in this right-panel surface; the separate GitHub
   publish flow lives in the chat-header Git actions control.
 - The dropdown is always rendered and disables unavailable actions instead of

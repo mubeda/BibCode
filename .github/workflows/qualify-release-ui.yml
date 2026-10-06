@@ -1,3 +1,4 @@
+# Default branch registers dispatch; full capture jobs require a nominated QA ref.
 name: Issue 16 controlled remote update UI
 
 on:
@@ -17,6 +18,7 @@ permissions:
 
 jobs:
   remote_ui:
+    if: ${{ github.ref_name != github.event.repository.default_branch }}
     name: Linux Chromium remote update UI (${{ inputs.matrix || 'core' }})
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -137,3 +139,15 @@ jobs:
             ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/reload-complete-light.png
             ${{ runner.temp }}/issue16-ui-${{ github.run_id }}/reload-complete-dark.png
           if-no-files-found: warn
+
+  registration_only:
+    if: ${{ github.ref_name == github.event.repository.default_branch }}
+    name: Nominated QA ref required
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Refuse registration-only execution
+        shell: bash
+        run: |
+          printf '%s\n' 'QUALIFICATION_REQUIRES_NOMINATED_QA_REF'
+          exit 1

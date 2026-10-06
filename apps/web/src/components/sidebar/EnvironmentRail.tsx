@@ -19,6 +19,7 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
   buildEnvironmentRailModel,
+  ENVIRONMENT_RAIL_WIDTH_PX,
   resolveEnvironmentRailStatus,
   toEnvironmentRailCandidate,
   type EnvironmentRailEntry,
@@ -44,12 +45,19 @@ const RAIL_BUTTON_CLASS =
 const RAIL_BUTTON_SELECTED_CLASS =
   "bg-accent text-foreground ring-2 ring-primary before:absolute before:top-2 before:bottom-2 before:-left-2 before:w-[3px] before:rounded-full before:bg-primary";
 
-function StatusDot({ status }: { readonly status: EnvironmentRailStatus }) {
+export function EnvironmentStatusDot({
+  status,
+  className = "absolute right-0.5 bottom-0.5",
+}: {
+  readonly status: EnvironmentRailStatus;
+  readonly className?: string;
+}) {
   return (
     <span
       data-status={status}
       className={cn(
-        "absolute right-0.5 bottom-0.5 size-2 rounded-full border-2 border-sidebar",
+        "size-2 rounded-full border-2 border-sidebar",
+        className,
         STATUS_DOT_CLASS[status],
       )}
     />
@@ -90,7 +98,7 @@ function RemoteEntryButton({
         >
           {entry.avatar}
         </span>
-        <StatusDot status={entry.status} />
+        <EnvironmentStatusDot status={entry.status} />
       </TooltipTrigger>
       <TooltipPopup side="right">{entry.label}</TooltipPopup>
     </Tooltip>
@@ -211,7 +219,8 @@ export function EnvironmentRail() {
   return (
     <div
       data-testid="environment-rail"
-      className="flex h-full w-[52px] shrink-0 flex-col items-center gap-2 border-r border-panel-separator bg-sidebar pb-2"
+      style={{ width: ENVIRONMENT_RAIL_WIDTH_PX }}
+      className="flex h-full shrink-0 flex-col items-center gap-2 border-r border-panel-separator bg-sidebar pb-2"
     >
       {/* The fixed sidebar toggle is pinned over the rail's top strip; reserve
           the same topbar height the thread sidebar header reserves so the
@@ -231,7 +240,7 @@ export function EnvironmentRail() {
           <Menu>
             <MenuTrigger render={<button {...localButtonProps} />}>
               <MonitorIcon className="size-[18px]" />
-              <StatusDot status={model.localStatus} />
+              <EnvironmentStatusDot status={model.localStatus} />
             </MenuTrigger>
             <MenuPopup side="right" align="start">
               {model.localSubEntries.map((entry) => (
@@ -259,7 +268,7 @@ export function EnvironmentRail() {
               }
             >
               <MonitorIcon className="size-[18px]" />
-              <StatusDot status={model.localStatus} />
+              <EnvironmentStatusDot status={model.localStatus} />
             </TooltipTrigger>
             <TooltipPopup side="right">Local — this machine</TooltipPopup>
           </Tooltip>

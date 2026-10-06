@@ -1,5 +1,47 @@
 # Changelog
 
+## [v0.8.0] - 2026-10-05
+
+BiBCode v0.8.0 adds a Repositories view to the left panel, keeps remote chats from hanging in Working, and fixes terminal copy, project collapse, and the merge-request flow. This release includes the changes since v0.7.4.
+
+### Repositories view
+
+- The left panel has an Environments | Repositories toggle. The Repositories view groups projects from every connected environment under one read-only card per Git repository, with a card per environment that keeps all of the project's normal actions. The environment rail is hidden in this view, and an empty view links back to Environments.
+- Each card collapses independently and the primary local environment is listed first. The selected view and group expansion are remembered.
+- The server derives each project's repository identity from its `origin` remote and publishes it with the project. Credentials, query strings, and fragments are stripped from the stored remote URL. Identities are reconciled after project creation or a workspace move, at startup, and on catalog scans, when `.git/config` changes or at most every five minutes otherwise. The work runs off the catalog refresh lock, with bounded Git reads.
+- Composer drafts stay reachable when a project gains a repository identity.
+
+### Chat reliability
+
+- A Claude message that starts with a slash command or skill (for example `/superpowers:receiving-code-review …`) no longer hangs in Working. The Claude CLI echoes these messages in their expanded command form, which BiBCode now recognizes as the delivery acknowledgement.
+- A Claude message that is never acknowledged no longer holds its thread forever. After 60 seconds it is marked uncertain, so you can retry or dismiss it, and later messages can go through.
+- Stop now works when a provider stops responding. If a provider process BiBCode owns has not settled the turn within 10 seconds, BiBCode ends its session, marks the turn interrupted, and keeps the conversation so the next message resumes it in a new process. An OpenCode session on an external server is only asked to abort, since BiBCode can't end that server's work.
+- Messages queued for a deleted thread are dismissed instead of being retried forever, and server startup no longer retries sessions of deleted threads.
+
+### Git, terminal, and interface fixes
+
+- Push + MR and MR now both push first and then open the shared pull/merge-request review dialog. The source defaults to the pushed branch, and remote branches are listed as sources. The dialog asks you to publish when the branch is not on the remote yet.
+- Ctrl+C copies text selected in AI terminal chats even when the CLI enables mouse tracking. A plain drag selects text, and Shift+drag (Option+drag on macOS) sends the mouse to the CLI.
+- Collapsing a project now hides its discovered-worktree section and primary card.
+- Git branch footer labels stay inside their controls. Connection notices give guidance on server availability and network reachability instead of raw fetch errors.
+
+### Validation and CI
+
+- Registered manual dispatch for the visual and remote-UI release qualification workflows. These remain registration-only on `main`.
+
+### Known limitations and qualification still in progress
+
+- Native qualification for remote updates ([#16](https://github.com/mubeda/BibCode/issues/16)), the typography audit ([#27](https://github.com/mubeda/BibCode/issues/27)), the light/dark screenshot matrix ([#29](https://github.com/mubeda/BibCode/issues/29)), and the manual SSH check on a real Mac ([#38](https://github.com/mubeda/BibCode/issues/38)) remain open.
+- End-to-end-encrypted file transfers ([#18](https://github.com/mubeda/BibCode/issues/18)) remain deferred.
+
+### Downloads
+
+Desktop installers and standalone server distributions support macOS, Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are included for both architectures. Stable desktop updater payloads and signatures use the six-target `latest.json` manifest.
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it. macOS bundles remain ad-hoc signed and unnotarized; Windows installers remain without Authenticode.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.7.4...v0.8.0
+
 ## [v0.7.4] - 2026-10-05
 
 BiBCode v0.7.4 improves message recovery, attachment uploads, Git workflows, and remote-update feedback. This release includes the changes since v0.7.2.

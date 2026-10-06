@@ -144,11 +144,9 @@ function CreatePullRequestReviewDialog({
     [capabilityBlockedReason, cwd, environmentId],
   );
   const snapshot = useEnvironmentQuery(snapshotAtom).data;
-  const defaultSource =
-    commitInput !== undefined ||
-    snapshot?.remoteBranches.some((branch) => branch.name === `origin/${status?.refName}`)
-      ? (status?.refName ?? null)
-      : null;
+  // The checkout's branch is the source by default; the server publishes it
+  // first when origin does not have it yet.
+  const defaultSource = status?.refName ?? null;
   const sourceBranch = headBranch === undefined ? defaultSource : headBranch;
   const sourceTip =
     snapshot?.localBranches.find((branch) => branch.name === sourceBranch)?.tipSha ??
@@ -177,8 +175,15 @@ function CreatePullRequestReviewDialog({
             providerHint,
             commitBeforeCreate: commitInput !== undefined,
             headBranch: sourceBranch,
+            ...(snapshot == null
+              ? {}
+              : {
+                  headOnOrigin: snapshot.remoteBranches.some(
+                    (branch) => branch.name === `origin/${sourceBranch}`,
+                  ),
+                }),
           }),
-    [commitInput, sourceBranch, latestCommit, providerHint, status],
+    [commitInput, sourceBranch, latestCommit, providerHint, snapshot, status],
   );
   const provider = review === null ? hintedProvider(providerHint) : review.provider;
   // Until status answers, only a caller's hint names the host; without one stay neutral.
@@ -370,7 +375,7 @@ function CreatePullRequestReviewDialog({
         <DialogHeader className="pb-4">
           <DialogTitle>Create {noun}</DialogTitle>
           <DialogDescription>
-            {capabilityBlockedReason ?? `Review the ${noun} before anything is published.`}
+            {capabilityBlockedReason ?? `Review the ${noun} before it is created.`}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-5">
@@ -412,7 +417,7 @@ function CreatePullRequestReviewDialog({
                 ? `A new source branch will be created from ${review?.head ?? "the current branch"} for this commit.`
                 : commitInput !== undefined
                   ? "Committing uses the current branch. To select another source, create a request without committing."
-                  : "Choose a branch on origin. Push or fetch first if it is missing. Your checkout stays unchanged."}
+                  : "Defaults to the current branch, published first if origin does not have it. Other choices list branches on origin; your checkout stays unchanged."}
             </p>
           </div>
           <div className="flex flex-col gap-1.5">

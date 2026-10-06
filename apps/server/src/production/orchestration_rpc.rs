@@ -1258,6 +1258,7 @@ fn project_shell(project: &crate::persistence::ProjectionProject) -> Value {
         "defaultModelSelection": project.default_model_selection,
         "scripts": project.scripts,
         "worktreeDiscovery": project.worktree_discovery,
+        "repositoryIdentity": project.repository_identity,
         "createdAt": project.created_at,
         "updatedAt": project.updated_at,
     })
@@ -1960,6 +1961,7 @@ mod tests {
             created_at: CREATED_AT.to_owned(),
             updated_at: CREATED_AT.to_owned(),
             deleted_at: None,
+            repository_identity: None,
         };
         let mut deleted_project = project.clone();
         deleted_project.project_id = "project-deleted".to_owned();
@@ -2298,6 +2300,71 @@ mod tests {
         serde_json::to_vec(events)
             .expect("encode event array")
             .len()
+    }
+
+    /// Clients cannot set the server-authored identity: serde drops the unknown field, so the
+    /// command decodes, applies its other fields, and leaves the stored identity untouched.
+    #[tokio::test]
+    async fn a_client_project_meta_update_cannot_change_the_repository_identity() {
+        let engine = migrated_engine().await;
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"project.create","commandId":"create","projectId":"p","title":"P",
+                    "workspaceRoot":"/work/p","defaultModelSelection":null,"createdAt":CREATED_AT
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let identity = json!({"canonicalKey":"github.com/acme/repo","locator":{"source":"git-remote","remoteName":"origin","remoteUrl":"git@github.com:acme/repo.git"},"name":"repo"});
+        engine
+            .dispatch(OrchestrationCommand::ProjectRepositoryIdentitySet {
+                command_id: "identity".to_owned(),
+                project_id: "p".to_owned(),
+                repository_identity: Some(identity.clone()),
+            })
+            .await
+            .unwrap();
+        let before = engine.repositories().max_event_sequence().await.unwrap();
+
+        let command = decode_public_orchestration_command(
+            &engine,
+            json!({
+                "type":"project.meta.update","commandId":"client-meta","projectId":"p",
+                "title":"Renamed",
+                "repositoryIdentity":{"canonicalKey":"evil.example/x","locator":{"source":"git-remote","remoteName":"origin","remoteUrl":"https://evil.example/x.git"},"name":"x"}
+            }),
+        )
+        .await
+        .expect("the unknown field is ignored, not an error");
+        engine.dispatch(command).await.unwrap();
+
+        let project = engine
+            .repositories()
+            .get_project("p".to_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.title, "Renamed");
+        assert_eq!(project.repository_identity, Some(identity));
+        let page = read_replay(
+            &engine.repositories(),
+            before,
+            ReplayBudget::Page {
+                target_bytes: 100_000,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!page.events.is_empty());
+        for event in &page.events {
+            assert!(
+                event["payload"].get("repositoryIdentity").is_none(),
+                "{event}"
+            );
+        }
+        engine.shutdown().await;
     }
 
     #[tokio::test]

@@ -429,6 +429,77 @@ Xvfb alone does not provide a portal. Launch the AppImage with `GTK_THEME` and
 Record screenshots at launch and after changes, the portal/backend setup, and
 any unavailable native sessions. Restore settings only within the test session.
 
+## Manual visual workflow registration
+
+The default-branch `qualify-release-visuals.yml` is registration only. GitHub
+requires a manually dispatched workflow to exist on the default branch; the
+`--ref` option selects the workflow version on the nominated QA branch or tag.
+The default-branch version always fails with the closed
+`QUALIFICATION_REQUIRES_NOMINATED_QA_REF` classification before checkout,
+dependencies, runtime admission, or artifact retention. That refusal is not a
+native result. It does not install the QA owner or fixtures on `main`.
+
+Review and nominate the fully merged QA source before dispatch. Require that
+ref to contain the full workflow at the same path and its current owner,
+fixtures, helper tests, guarded CLI build, web build, static gates, and explicit
+evidence retention. Dispatch each existing selection separately:
+
+```sh
+qualification_ref="<nominated QA branch or tag>"
+gh workflow run qualify-release-visuals.yml --ref "$qualification_ref" -f scene_selection=release-visual-core
+gh workflow run qualify-release-visuals.yml --ref "$qualification_ref" -f scene_selection=release-visual-settings
+gh workflow run qualify-release-visuals.yml --ref "$qualification_ref" -f scene_selection=release-visual-git-project
+```
+
+Record the reviewed commit and require the actual run's head SHA to match it.
+The checkout, compiled inputs, and owner provenance must all name that same
+source; do not substitute a different checkout while retaining the dispatch
+SHA. Preserve the selected workflow's existing scene predicates, process and
+namespace ownership, bounds, cleanup proofs, and named light/dark originals.
+A completed preparation group does not prove the full 82-scene/164-original
+requirement, packaged Tauri scenarios, or other platforms. Keep execution refs,
+SHAs, counts, timings, and screenshot findings in the execution report.
+
+Verify registration policy without starting the qualification runtime:
+
+```sh
+vp test run scripts/qualify-release-visuals-registration.test.ts scripts/ci-platform-contract.test.ts
+```
+
+## Manual remote update UI registration
+
+The default-branch `qualify-release-ui.yml` also registers dispatch only. It
+has the existing `matrix` choices `core` and `full`, with `core` as the default,
+and refuses execution before checkout or runtime admission. Its historical
+presence in the Actions workflow list is insufficient: verify that the file
+exists on the current default branch before dispatching the nominated QA ref.
+
+Choose one matrix on the reviewed QA source. The full workflow on that ref
+retains its guarded server, maintained interactive fake host, source web build,
+private PID/network owners, static/helper gates, and explicit original-image
+and receipt retention. Its existing QA-branch push trigger stays in that
+version; the default registration stub has no automatic trigger.
+
+```sh
+qualification_ref="<nominated QA branch or tag>"
+qualification_matrix="full"
+gh workflow run qualify-release-ui.yml --ref "$qualification_ref" -f matrix="$qualification_matrix"
+```
+
+Require the actual run's head SHA, compiled inputs and owner provenance to
+match the reviewed nomination. Check joined controller/supervisor/namespace
+cleanup and unchanged build inputs before independently inspecting the
+originals. The controlled browser matrix does not qualify Tauri native dialogs,
+real remote installers, other platforms, or the full screenshot obligation.
+Record source and scope in the execution report; do not turn a registration
+refusal or a partial matrix into acceptance evidence.
+
+The static registration policy is safe to verify without starting its owner:
+
+```sh
+vp test run scripts/qualify-release-ui-registration.test.ts
+```
+
 ## Packaged UI scenarios
 
 Include the shared [Pull Requests smoke](./cross-platform-validation.md#pull-requests-web-shell-validation):
@@ -1448,6 +1519,14 @@ tests nor provisional source captures establish final-product pixels. If the
 canonical workflow is not registered on the default branch, report that
 registration limitation; do not repurpose another live manual workflow without
 root approval.
+
+Inspect the Git Manager branch popup footer with a long branch name in both
+themes. Its New branch and merge-instruction buttons and label spans must stay
+inside the bounded popup and use ellipsis while retaining complete accessible
+text and disabled explanations. Reject text clipped by the popup viewport; do
+not widen the window to hide a layout failure. Compiled CSS and component
+regressions establish the containment policy; fresh native originals establish
+pixel quality.
 
 ## Process-group cleanup
 
