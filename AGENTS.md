@@ -1,5 +1,20 @@
 # AGENTS.md
 
+## Delivery discipline
+
+For ongoing issue batches and repeated validation failures, use
+[issue-delivery](.agents/skills/issue-delivery/SKILL.md).
+
+| Rule                                                                                                  | Enforcement                                                                                                            |
+| ----------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Name the acceptance criterion and prove the complete caller before costly validation.                 | `scripts/check-agent-delivery.mjs` rejects missing requirements, component-only proof, failed proof, and stale source. |
+| Join a live scenario and explain the changed behavior before repeating a failed one.                  | The same checker rejects duplicate live runs and unchanged failed recipes.                                             |
+| Replan after two rounds without accepted evidence.                                                    | The same checker requires a revised premise and its evidence.                                                          |
+| Measure progress by accepted requirements and closed issues, preserve scope, and keep analysis brief. | The skill defines these judgment rules. Unit counts and commits are supporting evidence only.                          |
+
+The checker uses fresh observations supplied by the agent. It does not grant
+permissions, replace native validation, or waive the completion rules below.
+
 ## Required Pre-Work
 
 Before non-trivial diagnosis, design, or implementation:

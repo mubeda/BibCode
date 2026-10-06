@@ -55,6 +55,9 @@ jobs:
       - name: Check
         run: vp check
 
+      - name: Check agent delivery decisions
+        run: node --test scripts/check-agent-delivery.node-test.mjs
+
       - name: Typecheck
         run: vpr typecheck
 
