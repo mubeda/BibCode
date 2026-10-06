@@ -195,7 +195,16 @@ has not begun writing when the expected turn ends, changes, or is interrupted
 is rejected. Once written, its acknowledgement wait survives turn completion
 and subsequent turn starts. Process exit, output-stream failure, or session
 replacement makes an unacknowledged write ambiguous; input known not written
-remains definitely not sent. Dropping a delivery releases only its own waiter.
+remains definitely not sent. The wait is also bounded: a write without a
+matching replay 60 seconds after it was written (Claude replays within about
+two seconds of a cold start) becomes ambiguous, releasing the thread's delivery
+slot and showing the message as uncertain instead of keeping the chat working.
+A steer's 60 seconds start only once the steered turn stops taking input (its
+result or an interrupt), because Claude replays a steer when it consumes it,
+which can follow a long tool call. An expired write keeps its place in the
+acknowledgement order until its replay arrives or the session is retired, so a
+late replay is consumed by it and cannot confirm a later identical retry; that
+retry is acknowledged only by its own replay. Dropping a delivery releases only its own waiter.
 Rejected or unavailable steering returns to queued/start for normal promotion,
 with the reason in `delivery.detail`; transport
 ambiguity retains the existing uncertain-delivery behavior and never triggers
@@ -276,6 +285,25 @@ non-failed completion arms it. When a current deadline finds a busy session (an
 admitted delivery, a `running` or `starting` projection, or an active turn), it
 immediately re-arms for one idle timeout, and the next completion supersedes that
 re-arm.
+
+**Stop** has a deadline. When the projection shows a running turn and Stop
+names that turn (or no turn), the supervisor arms a 10-second interrupt deadline before asking the driver to
+interrupt, and bounds that driver call by the same 10 seconds because the single
+actor awaits it for every session. If that turn is still the running turn of the
+same live session when the deadline fires, the provider is treated as hung,
+whether it never answered the interrupt or answered and never settled the turn.
+The supervisor then retires the session through the idle-suspension path
+(detach, driver shutdown, runtime row `suspended` with its resume cursor),
+projects the session `interrupted` with class `session_stopped` and a plain
+detail, settles the turn's streaming assistant messages, and wakes the delivery
+worker. Claude's driver shutdown terminates the process before it takes the
+input writer, so a write blocked on a process that stopped reading cannot stall
+retirement. The next message launches a new provider process that resumes the same
+native conversation. A turn that settles in time, a different running turn, or
+a replaced session leaves the deadline with nothing to do. The supervisor
+checks the projection again after detachment has drained any terminal batch the
+event pump already admitted; if that batch settled the turn, its settlement
+stands and only the (resumable) retirement remains.
 
 Idle retention is deliberately conservative in three cases: a send that ends
 without a turn after invalidating an earlier deadline; a launched or restored

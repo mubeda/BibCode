@@ -391,6 +391,15 @@ the message to the runtime turn current at replay. A normal delivery must be
 accepted while a steer echo is still pending; correlate each echo to its own input. Turn completion must not
 retire a written acknowledgement, while process exit, stream failure, and
 session replacement still make an unacknowledged write ambiguous.
+A message starting with a known slash command or skill must be acknowledged by
+Claude's expanded replay, including multi-line arguments; an unknown command's
+raw replay must also acknowledge it, and another command's replay must not. A
+write with no recognisable replay must become uncertain at the acknowledgement
+deadline, while a steer's deadline starts only after its turn stops taking
+input. After Stop, a provider that never answers the interrupt, or answers and
+never settles the turn, must be retired at the interrupt deadline: the session
+is projected interrupted with its resume cursor retained, and the next message
+starts a new provider process.
 Interrupt/error during an in-flight steer must hold any subsequent requeue; a
 late acceptance must not restore a session that has already settled. Test local
 Claude settlement/interrupt during writer contention, late user echoes, and a
