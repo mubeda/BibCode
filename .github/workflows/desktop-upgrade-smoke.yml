@@ -247,7 +247,7 @@ jobs:
           "BIBCODE_NATIVE_WSL_FIXTURE_SELECTED=true" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Record native WSL prerequisite unavailable
-        if: inputs.native_followups == true && steps.native_wsl.outputs.available != 'true'
+        if: always() && inputs.native_followups == true && steps.native_wsl.outputs.available != 'true'
         shell: pwsh
         run: |
           $root = Join-Path $env:RUNNER_TEMP 'bibcode-native-followups-wsl/evidence'

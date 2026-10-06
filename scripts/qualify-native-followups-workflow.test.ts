@@ -269,7 +269,7 @@ it("uses only the original WSL reads and keeps default skip separate", () => {
     "inputs.native_followups != true && steps.wsl.outputs.available != 'true'",
   );
   expect(steps.find((step) => step.name === "Record native WSL prerequisite unavailable")!.if).toBe(
-    "inputs.native_followups == true && steps.native_wsl.outputs.available != 'true'",
+    "always() && inputs.native_followups == true && steps.native_wsl.outputs.available != 'true'",
   );
 });
 const args = [

@@ -772,10 +772,12 @@ relabel that metadata as Windows or use a native Windows substitute.
 The adapter changes and restores the real display mode and records original
 1280 by 960 desktop pixels for native-wsl-local in both themes. Missing WSL or
 display capability is unavailable/incomplete evidence. The native opt-in fails
-an unavailable WSL prerequisite and retains a closed status; the ordinary WSL
+an unavailable WSL prerequisite and retains a closed status, including after
+the fixture preparation step itself fails. The recorder uses `always()` so
+that earlier failure cannot skip the existing unavailable receipt. The ordinary WSL
 upgrade lane's documented skip remains unchanged. Native prerequisite failures
-retain one of three closed `reasonCode` values: `wsl-status-failed`,
-`wsl-list-failed`, or `wsl-no-distro`. The same status records
+retain one of four closed `reasonCode` values: `wsl-status-failed`,
+`wsl-list-failed`, `wsl-no-distro`, or `wsl-fixture-owner-refused`. The same status records
 `wslStatusSucceeded`, `wslListObserved`, and `wslListSucceeded`; the last is null
 when the existing status command failed and the list command did not run.
 Unknown flags or inconsistent reason/observation tuples are refused. The
