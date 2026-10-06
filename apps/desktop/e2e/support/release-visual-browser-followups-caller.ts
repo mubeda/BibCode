@@ -215,6 +215,7 @@ export function readBrowserFollowupBuildRecipe(input: {
       "sdkSourceSha256",
       "backendHttp",
       "backendWs",
+      "devServerUrl",
       "hostedOrigin",
       "probeEntry",
     ];
@@ -227,6 +228,7 @@ export function readBrowserFollowupBuildRecipe(input: {
       value.hostedOrigin !== "http://127.0.0.1:4893" ||
       value.backendHttp !== (mode === "primary" ? "http://127.0.0.1:4887" : "") ||
       value.backendWs !== (mode === "primary" ? "ws://127.0.0.1:4887" : "") ||
+      value.devServerUrl !== (mode === "primary" ? "http://127.0.0.1:4885" : "") ||
       value.probeEntry !== (mode === "hosted" ? "qualified-hosted-mode.js" : null)
     )
       throw refused();

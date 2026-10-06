@@ -2492,6 +2492,13 @@ Build the ordinary primary UI with the owned public backend at 4887 and the
 separate hosted UI at 4893 without backend/desktop configuration. Both builds
 use the same source and existing web build lock; the hosted SDK probe re-exports
 the actual public hosted-mode helper. Preserve both immutable input trees.
+The primary build's dev-origin hint must identify its actual UI origin at 4885,
+not backend 4887. The existing loopback HTTP proxy then keeps browser-session
+issuance, session reload and ticket creation on the same UI origin while the
+WebSocket endpoint remains 4887. Bind that hint in the immutable build recipe;
+missing or stale hints fail admission. Node bearer forwarding alone does not
+prove this browser cookie flow. Preserve hosted blank backend/dev configuration
+and the server's existing CORS, cookie and ticket authorization policies.
 
 The existing guarded Rust CLI binds raw4897. A zero-rate maintained bootstrap
 proxy at 4887 supports ordinary pairing, managed workspace selection and public

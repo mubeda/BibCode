@@ -34,7 +34,7 @@ export function browserFollowupBuildEnvironment(mode, inherited) {
     Object.assign(env, {
       VITE_HTTP_URL: "http://127.0.0.1:4887",
       VITE_WS_URL: "ws://127.0.0.1:4887",
-      VITE_DEV_SERVER_URL: "http://127.0.0.1:4887",
+      VITE_DEV_SERVER_URL: "http://127.0.0.1:4885",
     });
   return env;
 }
@@ -128,6 +128,7 @@ async function childBuild(mode, root, source) {
       sdkSourceSha256,
       backendHttp: mode === "primary" ? "http://127.0.0.1:4887" : "",
       backendWs: mode === "primary" ? "ws://127.0.0.1:4887" : "",
+      devServerUrl: mode === "primary" ? "http://127.0.0.1:4885" : "",
       hostedOrigin: "http://127.0.0.1:4893",
       probeEntry: mode === "hosted" ? "qualified-hosted-mode.js" : null,
     }),

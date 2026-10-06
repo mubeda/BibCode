@@ -275,6 +275,7 @@ it.each(["browser", "ordinary"])(
           sdkSourceSha256,
           backendHttp: mode === "primary" ? "http://127.0.0.1:4887" : "",
           backendWs: mode === "primary" ? "ws://127.0.0.1:4887" : "",
+          devServerUrl: mode === "primary" ? "http://127.0.0.1:4885" : "",
           hostedOrigin: "http://127.0.0.1:4893",
           probeEntry: mode === "hosted" ? "qualified-hosted-mode.js" : null,
         }),
