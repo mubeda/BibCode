@@ -48,6 +48,9 @@ it.each(["target-false", "observer-fails", "read-fails", "observer-then-read"])(
             expectedState: true,
             credentialAbsent: true,
             targetInView: mode !== "target-false",
+            viewportExact: true,
+            panelBoundsInView: mode !== "target-false",
+            panelCenterHit: mode === "target-false" ? null : true,
           };
         },
       } as never,
@@ -64,7 +67,13 @@ it.each(["target-false", "observer-fails", "read-fails", "observer-then-read"])(
       expect(NodeFS.readdirSync(evidence)).toEqual([]);
       expect(facts).toHaveLength(mode === "read-fails" ? 0 : mode === "observer-then-read" ? 1 : 3);
       if (mode === "target-false")
-        expect(facts.at(-1)).toMatchObject({ domTargetInView: false, domRouteMatched: true });
+        expect(facts.at(-1)).toMatchObject({
+          domTargetInView: false,
+          domRouteMatched: true,
+          domViewportExact: true,
+          domPanelBoundsInView: false,
+          domPanelCenterHit: null,
+        });
       if (mode.startsWith("observer")) expect(unsafe).toBeGreaterThan(0);
       expect(reads).toBe(mode === "read-fails" ? 1 : mode === "observer-then-read" ? 2 : 3);
     } finally {
@@ -393,6 +402,9 @@ it.each(["owned", "post-image-drift"])(
           expectedState: true,
           credentialAbsent: true,
           targetInView: true,
+          viewportExact: true,
+          panelBoundsInView: true,
+          panelCenterHit: true,
         }),
       } as never,
       identity: async () => {

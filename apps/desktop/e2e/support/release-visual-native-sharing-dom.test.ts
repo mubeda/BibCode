@@ -11,7 +11,7 @@ afterEach(() => {
   document.body.innerHTML = "";
   document.documentElement.className = "";
 });
-it("projects only the seven last DOM booleans, retaining false facts without values", () => {
+it("projects only closed DOM facts, retaining false facts without values", () => {
   const keys = [
     "routeMatched",
     "themeMatched",
@@ -20,11 +20,14 @@ it("projects only the seven last DOM booleans, retaining false facts without val
     "expectedState",
     "credentialAbsent",
     "targetInView",
+    "viewportExact",
+    "panelBoundsInView",
+    "panelCenterHit",
   ];
   const value = Object.fromEntries(keys.map((key) => [key, key !== "targetInView"]));
   const facts = projectNativeSharingDomFacts(value);
   expect(facts).toMatchObject({ domRouteMatched: true, domTargetInView: false });
-  expect(Object.keys(facts)).toHaveLength(7);
+  expect(Object.keys(facts)).toHaveLength(10);
   expect(JSON.stringify(facts)).not.toMatch(/tauri|http|Owned|#|</);
 });
 it.each(["missing", "extra", "getter", "proxy", "array"])(
@@ -38,6 +41,9 @@ it.each(["missing", "extra", "getter", "proxy", "array"])(
       expectedState: true,
       credentialAbsent: true,
       targetInView: false,
+      viewportExact: true,
+      panelBoundsInView: false,
+      panelCenterHit: null,
     };
     let reads = 0;
     if (mode === "missing") delete value.routeMatched;
@@ -61,7 +67,7 @@ it.each(["missing", "extra", "getter", "proxy", "array"])(
         : mode === "array"
           ? [value]
           : value;
-    expect(Object.values(projectNativeSharingDomFacts(input))).toEqual(Array(7).fill(null));
+    expect(Object.values(projectNativeSharingDomFacts(input))).toEqual(Array(10).fill(null));
     expect(reads).toBe(0);
   },
 );
@@ -131,5 +137,137 @@ it.each(["origin", "route", "credential", "duplicate"])(
   (mode) => {
     const value = readNativeSharingDom(page("native-share-no-route", mode));
     expect(() => validateNativeSharingDom(value)).toThrow();
+  },
+);
+
+it.each([
+  {
+    mode: "owned",
+    want: {
+      viewportExact: true,
+      panelBoundsInView: true,
+      panelCenterHit: true,
+      targetInView: true,
+    },
+    contains: 1,
+  },
+  {
+    mode: "viewport",
+    want: {
+      viewportExact: false,
+      panelBoundsInView: null,
+      panelCenterHit: null,
+      targetInView: false,
+    },
+    contains: 0,
+  },
+  {
+    mode: "long-panel",
+    want: {
+      viewportExact: true,
+      panelBoundsInView: false,
+      panelCenterHit: null,
+      targetInView: false,
+    },
+    contains: 0,
+  },
+  {
+    mode: "obstructed",
+    want: {
+      viewportExact: true,
+      panelBoundsInView: true,
+      panelCenterHit: false,
+      targetInView: false,
+    },
+    contains: 1,
+  },
+  {
+    mode: "no-hit",
+    want: {
+      viewportExact: true,
+      panelBoundsInView: true,
+      panelCenterHit: false,
+      targetInView: false,
+    },
+    contains: 0,
+  },
+])(
+  "attributes only reached visibility predicates without another DOM read: $mode",
+  ({ mode, want, contains }) => {
+    const input = page("native-share-no-route");
+    const panel = document.getElementById("sharing")!,
+      refresh = panel.querySelector("button")!;
+    const rectangle = Element.prototype.getBoundingClientRect as ReturnType<typeof vi.fn>;
+    const hit = document.elementFromPoint as ReturnType<typeof vi.fn>;
+    if (mode === "viewport") vi.stubGlobal("innerWidth", 1279);
+    if (mode === "long-panel")
+      panel.getBoundingClientRect = () => ({
+        x: 10,
+        y: 10,
+        left: 10,
+        top: 10,
+        right: 600,
+        bottom: 1200,
+        width: 590,
+        height: 1190,
+        toJSON: () => ({}),
+      });
+    hit.mockReturnValue(mode === "obstructed" ? document.body : mode === "no-hit" ? null : refresh);
+    const containment = vi.spyOn(panel, "contains");
+    const value = readNativeSharingDom(input);
+    expect(value).toMatchObject(want);
+    expect(hit).toHaveBeenCalledTimes(1);
+    expect(containment).toHaveBeenCalledTimes(contains);
+    expect(rectangle.mock.calls.length).toBe(mode === "long-panel" ? 8 : 10);
+    const facts = projectNativeSharingDomFacts(value);
+    expect(facts).toMatchObject({
+      domViewportExact: want.viewportExact,
+      domPanelBoundsInView: want.panelBoundsInView,
+      domPanelCenterHit: want.panelCenterHit,
+      domTargetInView: want.targetInView,
+    });
+    if (mode === "owned") expect(() => validateNativeSharingDom(value)).not.toThrow();
+    else expect(() => validateNativeSharingDom(value)).toThrow();
+  },
+);
+
+it.each(["getter", "proxy", "extra", "text"])(
+  "keeps new visibility attribution closed without admitting a failed original: %s",
+  (mode) => {
+    const value: Record<string, unknown> = {
+      routeMatched: true,
+      themeMatched: true,
+      shareSelected: true,
+      controlsMatched: true,
+      expectedState: true,
+      credentialAbsent: true,
+      targetInView: false,
+      viewportExact: true,
+      panelBoundsInView: false,
+      panelCenterHit: null,
+    };
+    let reads = 0;
+    if (mode === "getter")
+      Object.defineProperty(value, "panelCenterHit", {
+        enumerable: true,
+        get: () => {
+          reads++;
+          throw new Error("Inert private getter.");
+        },
+      });
+    if (mode === "extra") value.privateText = "inert private text";
+    if (mode === "text") value.panelCenterHit = "inert private text";
+    const input =
+      mode === "proxy"
+        ? new Proxy(value, {
+            ownKeys: () => {
+              reads++;
+              throw new Error("Inert private proxy.");
+            },
+          })
+        : value;
+    expect(Object.values(projectNativeSharingDomFacts(input))).toEqual(Array(10).fill(null));
+    expect(() => validateNativeSharingDom(input)).toThrow();
+    expect(reads).toBe(0);
   },
 );

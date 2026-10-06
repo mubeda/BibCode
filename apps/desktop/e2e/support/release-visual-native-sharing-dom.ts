@@ -8,6 +8,9 @@ export interface NativeSharingDomFacts {
   domExpectedState: boolean | null;
   domCredentialAbsent: boolean | null;
   domTargetInView: boolean | null;
+  domViewportExact: boolean | null;
+  domPanelBoundsInView: boolean | null;
+  domPanelCenterHit: boolean | null;
 }
 /** Attribution only: this does not change DOM admission or create a second renderer read. */
 export function projectNativeSharingDomFacts(value: unknown): NativeSharingDomFacts {
@@ -19,6 +22,9 @@ export function projectNativeSharingDomFacts(value: unknown): NativeSharingDomFa
     "expectedState",
     "credentialAbsent",
     "targetInView",
+    "viewportExact",
+    "panelBoundsInView",
+    "panelCenterHit",
   ];
   const names = [
     "domRouteMatched",
@@ -28,6 +34,9 @@ export function projectNativeSharingDomFacts(value: unknown): NativeSharingDomFa
     "domExpectedState",
     "domCredentialAbsent",
     "domTargetInView",
+    "domViewportExact",
+    "domPanelBoundsInView",
+    "domPanelCenterHit",
   ];
   const absent = () =>
     Object.freeze(
@@ -47,10 +56,14 @@ export function projectNativeSharingDomFacts(value: unknown): NativeSharingDomFa
       !own.every((key) => typeof key === "string" && keys.includes(key))
     )
       return absent();
-    const result: Record<string, boolean> = {};
+    const result: Record<string, boolean | null> = {};
     for (let index = 0; index < keys.length; index++) {
       const field = Object.getOwnPropertyDescriptor(value, keys[index]!);
-      if (!field?.enumerable || !Object.hasOwn(field, "value") || typeof field.value !== "boolean")
+      if (
+        !field?.enumerable ||
+        !Object.hasOwn(field, "value") ||
+        (typeof field.value !== "boolean" && !(index >= 7 && field.value === null))
+      )
         return absent();
       result[names[index]!] = field.value;
     }
@@ -139,6 +152,9 @@ export function readNativeSharingDom(input: NativeSharingDomInput): unknown {
       );
     const box = panel.getBoundingClientRect(),
       hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+    let viewportExact: boolean | null = null,
+      panelBoundsInView: boolean | null = null,
+      panelCenterHit: boolean | null = null;
     return {
       routeMatched: true,
       themeMatched:
@@ -167,14 +183,13 @@ export function readNativeSharingDom(input: NativeSharingDomInput): unknown {
         document.getElementById("boot-shell") === null &&
         document.querySelector("vite-error-overlay") === null,
       targetInView:
-        innerWidth === 1280 &&
-        innerHeight === 960 &&
-        box.left >= 0 &&
-        box.top >= 0 &&
-        box.right <= innerWidth &&
-        box.bottom <= innerHeight &&
-        hit !== null &&
-        (hit === panel || panel.contains(hit)),
+        (viewportExact = innerWidth === 1280 && innerHeight === 960) &&
+        (panelBoundsInView =
+          box.left >= 0 && box.top >= 0 && box.right <= innerWidth && box.bottom <= innerHeight) &&
+        (panelCenterHit = hit !== null && (hit === panel || panel.contains(hit))),
+      viewportExact,
+      panelBoundsInView,
+      panelCenterHit,
     };
   } catch {
     return null;
@@ -193,15 +208,27 @@ export function validateNativeSharingDom(value: unknown): Record<string, true> {
     "credentialAbsent",
     "targetInView",
   ];
+  const attribution = ["viewportExact", "panelBoundsInView", "panelCenterHit"];
   const own = Reflect.ownKeys(value);
   if (
-    own.length !== keys.length ||
-    !own.every((key) => typeof key === "string" && keys.includes(key))
+    own.length !== keys.length + attribution.length ||
+    !own.every(
+      (key) => typeof key === "string" && (keys.includes(key) || attribution.includes(key)),
+    )
   )
     throw refused();
   for (const key of keys) {
     const field = Object.getOwnPropertyDescriptor(value, key);
     if (!field?.enumerable || !Object.hasOwn(field, "value") || field.value !== true)
+      throw refused();
+  }
+  for (const key of attribution) {
+    const field = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      !field?.enumerable ||
+      !Object.hasOwn(field, "value") ||
+      (typeof field.value !== "boolean" && field.value !== null)
+    )
       throw refused();
   }
   return Object.freeze(Object.fromEntries(keys.map((key) => [key, true] as const)));

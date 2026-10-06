@@ -17,6 +17,9 @@ export interface NativeSharingViewportFacts {
   viewportRestoreAttempted: boolean;
   viewportOriginalRectRestored: boolean;
   viewportRestoreFailed: boolean;
+  viewportRestoreIdentityVerified: boolean;
+  viewportRestoreCommandReturned: boolean;
+  viewportRestoreOriginalFrameMatched: boolean | null;
 }
 export interface NativeSharingOriginalRectFacts {
   originalRectRecordMatched: boolean | null;
@@ -278,18 +281,33 @@ export function createNativeSharingViewport(input: {
       reject = bad;
     });
     active = false;
-    observe({ viewportLeaseActive: false, viewportRestoreAttempted: true });
+    observe({
+      viewportLeaseActive: false,
+      viewportRestoreAttempted: true,
+      viewportRestoreIdentityVerified: false,
+      viewportRestoreCommandReturned: false,
+      viewportRestoreOriginalFrameMatched: null,
+    });
     void (async () => {
       try {
         await input.identity();
+        observe({ viewportRestoreIdentityVerified: true });
         await input.geometry.restore();
+        observe({ viewportRestoreCommandReturned: true });
         await input.owner.until(async () => {
-          await input.identity();
+          try {
+            await input.identity();
+          } catch (error) {
+            observe({ viewportRestoreIdentityVerified: false });
+            throw error;
+          }
+          observe({ viewportRestoreIdentityVerified: true });
           await read();
-          return (
+          const originalFrameMatched =
             JSON.stringify(rect((await input.geometry.read()).rectangle)) ===
-            JSON.stringify(original)
-          );
+            JSON.stringify(original);
+          observe({ viewportRestoreOriginalFrameMatched: originalFrameMatched });
+          return originalFrameMatched;
         });
         observe({ viewportOriginalRectRestored: true });
         if (observerFailed) throw refused();

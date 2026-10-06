@@ -2236,11 +2236,27 @@ out-of-display rectangles still fail the existing guard. An opaque failure must
 remain unattributed until actual native evidence identifies its predicate;
 these facts do not establish readiness or waive a capture or cleanup fence.
 
-The last seven closed DOM booleans are retained from the existing witness read
-in the existing phase/failure receipts. They admit no extra renderer read and
-retain no markup, text, URLs or private identity. These facts distinguish a
-remaining admission condition after geometry is established; they do not prove
-a native runtime cause or waive a failed original. The separate native
+The seven existing DOM booleans remain the capture admission and witness.
+The same read also retains `domViewportExact`, `domPanelBoundsInView`, and
+`domPanelCenterHit` in the existing phase/failure receipts. These fixed facts
+follow the original short-circuit order; a later fact is null when its preceding
+predicate prevented inspection. They add no viewport, rectangle, hit-test or
+containment read. The target remains the complete selected tabpanel, with the
+same containment and center-hit requirements.
+
+The existing restore operations retain `viewportRestoreIdentityVerified`,
+`viewportRestoreCommandReturned`, and `viewportRestoreOriginalFrameMatched`.
+Identity records whether the latest attempted existing identity check succeeded;
+command returned records acknowledgement, not settlement. Original frame matched
+is null before a valid comparison, false for a differing native frame, and true
+only when the existing comparison matches the original. Client measurement still
+precedes native frame readback, so its last exact-client flag alone cannot prove
+restoration. Original errors, independent cleanup, unsafe refusal and deadlines
+remain unchanged. No new read, action, timer or artifact is added.
+
+These facts retain no geometry values, markup, text, URLs or private identity.
+They distinguish an unestablished admission or cleanup condition; they do not
+prove a native runtime cause or waive a failed original. The separate native
 follow-ups OS screenshot mode retains its own outer-window geometry contract.
 
 The native controller uses public Theme, Share this host and Refresh addresses

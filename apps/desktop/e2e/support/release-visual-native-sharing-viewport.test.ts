@@ -9,6 +9,7 @@ import { attach } from "webdriverio";
 import { afterEach, expect, it, vi } from "vite-plus/test";
 import { normalizeWebDriverRequest } from "./webdriver-request.ts";
 import { inspectScreenshot } from "./remote-ui-evidence.ts";
+import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
 import * as NativeViewport from "./release-visual-native-sharing-viewport.ts";
 import {
   createNativeSharingViewport,
@@ -61,10 +62,12 @@ async function fixture(mode = "owned") {
     unsafe = 0,
     scale = 1,
     changed = false,
+    restoring = false,
+    nativeRestoreReads = 0,
     currentUrl = "tauri://localhost/#/settings/general";
   const original = { ...rect },
     timeout = new Error("Inert owned viewport bound exhausted."),
-    facts: Record<string, boolean> = {};
+    facts: Record<string, boolean | null> = {};
   const initialRects: Record<string, unknown> = {
     "initial-zero": { x: 0, y: 0, width: 0, height: 0 },
     "initial-negative": { x: -1, y: 0, width: 1024, height: 768 },
@@ -130,7 +133,13 @@ async function fixture(mode = "owned") {
         }
         if (operation === "restore") {
           sets++;
-          rect = { ...original };
+          restoring = true;
+          if (mode !== "native-restore-delayed" && mode !== "native-restore-unsettled")
+            rect = { ...original };
+        }
+        if (operation === "read" && restoring) {
+          nativeRestoreReads++;
+          if (mode === "native-restore-delayed" && nativeRestoreReads === 3) rect = { ...original };
         }
         const snapshot = {
           rectangle: { ...rect },
@@ -144,6 +153,14 @@ async function fixture(mode = "owned") {
             : operation === "read"
               ? snapshot
               : { requested: true };
+        if (operation === "restore" && mode === "native-restore-refusal") {
+          response.statusCode = 500;
+          value = {
+            error: "unknown error",
+            message: "Inert native restoration refusal.",
+            stacktrace: "",
+          };
+        }
       } else {
         const chrome = mode === "changing-chrome" ? 40 + sets * 10 : 40;
         value = {
@@ -219,7 +236,7 @@ async function fixture(mode = "owned") {
       },
       identity,
       unsafeCleanup: () => unsafe++,
-      observe: (value: Record<string, boolean>) => Object.assign(facts, value),
+      observe: (value: Record<string, boolean | null>) => Object.assign(facts, value),
     },
     sets: () => sets,
     gets: () => gets,
@@ -841,7 +858,7 @@ it.each(["owned", "visual-fails", "restore-fails", "both-fail"])(
       ),
       viewport = createNativeSharingViewport(f.input),
       original = new Error("Inert exact visual failure."),
-      facts: Record<string, boolean> = {};
+      facts: Record<string, boolean | null> = {};
     const source = NodeFS.readFileSync(
         new URL("../qualify-native-sharing.ts", import.meta.url),
         "utf8",
@@ -859,7 +876,7 @@ it.each(["owned", "visual-fails", "restore-fails", "both-fail"])(
         original: "tauri://localhost/#/settings/general",
         verify: viewport.verify,
         step: () => {},
-        observe: (value: Record<string, boolean>) => Object.assign(facts, value),
+        observe: (value: Record<string, boolean | null>) => Object.assign(facts, value),
         markUnsafe: f.input.unsafeCleanup,
         evidence: "/inert/evidence",
         captured: new Set(),
@@ -883,5 +900,201 @@ it.each(["owned", "visual-fails", "restore-fails", "both-fail"])(
       expect(f.rect()).toEqual(f.original);
       await expect(viewport.verify()).resolves.toBeUndefined();
     } else expect(f.unsafe()).toBeGreaterThan(0);
+  },
+);
+
+it.each([
+  { mode: "owned", ack: true, frame: true },
+  { mode: "native-restore-delayed", ack: true, frame: true },
+  { mode: "native-restore-refusal", ack: false, frame: null },
+  { mode: "native-restore-unsettled", ack: true, frame: false },
+])(
+  "attributes actual SDK restoration stages without altering errors or calls: $mode",
+  async ({ mode, ack, frame }) => {
+    const f = await fixture(mode),
+      geometry = createNativeSharingGeometry({
+        browser: f.browser,
+        unsafeCleanup: f.input.unsafeCleanup,
+      });
+    const original = (await geometry.acquire()).rectangle;
+    const viewport = createNativeSharingViewport({ ...f.input, original, geometry });
+    await viewport.fit();
+    let failed = false,
+      error: unknown;
+    try {
+      await viewport.restore();
+    } catch (value) {
+      failed = true;
+      error = value;
+    }
+    expect(f.facts).toMatchObject({
+      viewportRestoreIdentityVerified: true,
+      viewportRestoreCommandReturned: ack,
+      viewportRestoreOriginalFrameMatched: frame,
+    });
+    expect(failed).toBe(!frame);
+    expect(f.sets()).toBe(2);
+    expect(f.gets()).toBe(0);
+    if (frame) {
+      expect(f.rect()).toEqual(f.original);
+      expect(f.unsafe()).toBe(0);
+      await expect(viewport.verify()).resolves.toBeUndefined();
+    } else {
+      expect(f.unsafe()).toBeGreaterThan(0);
+      if (ack) expect(error).toBe(f.timeout);
+      else
+        expect(error).toMatchObject({
+          name: "unknown error",
+          message: expect.stringContaining("Inert native restoration refusal."),
+        });
+    }
+  },
+);
+it.each(["error", "undefined"])(
+  "retains the exact restoration identity failure and unreached stages: %s",
+  async (mode) => {
+    const f = await fixture(),
+      original = mode === "undefined" ? undefined : new Error("Inert exact identity failure.");
+    const viewport = createNativeSharingViewport({
+      ...f.input,
+      identity: async () => {
+        throw original;
+      },
+    });
+    let failed = false,
+      failure: unknown;
+    try {
+      await viewport.restore();
+    } catch (error) {
+      failed = true;
+      failure = error;
+    }
+    expect(failed).toBe(true);
+    expect(failure).toBe(original);
+    expect(f.facts).toMatchObject({
+      viewportRestoreIdentityVerified: false,
+      viewportRestoreCommandReturned: false,
+      viewportRestoreOriginalFrameMatched: null,
+      viewportRestoreFailed: true,
+    });
+    expect(f.sets()).toBe(0);
+    expect(f.gets()).toBe(0);
+    expect(f.unsafe()).toBe(1);
+  },
+);
+
+it.each(["owned", "native-restore-refusal"])(
+  "keeps restore observers passive and genuine SDK refusal primary: %s",
+  async (mode) => {
+    const f = await fixture(mode),
+      geometry = createNativeSharingGeometry({
+        browser: f.browser,
+        unsafeCleanup: f.input.unsafeCleanup,
+      });
+    const original = (await geometry.acquire()).rectangle;
+    const viewport = createNativeSharingViewport({
+      ...f.input,
+      original,
+      geometry,
+      observe: (facts) => {
+        Object.assign(f.facts, facts);
+        if (facts.viewportRestoreIdentityVerified) throw new Error("Inert diagnostic failure.");
+      },
+    });
+    await viewport.fit();
+    if (mode === "owned")
+      await expect(viewport.restore()).rejects.toThrow("Owned native sharing viewport refused.");
+    else
+      await expect(viewport.restore()).rejects.toMatchObject({
+        name: "unknown error",
+        message: expect.stringContaining("Inert native restoration refusal."),
+      });
+    expect(f.unsafe()).toBeGreaterThan(0);
+    expect(f.sets()).toBe(2);
+    expect(f.gets()).toBe(0);
+  },
+);
+it.each(["owned", "native-restore-refusal", "native-restore-unsettled"])(
+  "the actual controller failure envelope retains original failure and restore stage facts: %s",
+  async (mode) => {
+    const f = await fixture(mode),
+      geometry = createNativeSharingGeometry({
+        browser: f.browser,
+        unsafeCleanup: f.input.unsafeCleanup,
+      });
+    const viewport = createNativeSharingViewport({
+      ...f.input,
+      original: (await geometry.acquire()).rectangle,
+      geometry,
+    });
+    const source = NodeFS.readFileSync(
+      new URL("../qualify-native-sharing.ts", import.meta.url),
+      "utf8",
+    );
+    const begin = source.indexOf("        let visualFailed"),
+      end = source.indexOf("        if (captured.size", begin);
+    const catchStart = source.indexOf(
+        "  } catch (error) {\n    failed = true;\n    failure = error;",
+      ),
+      catchEnd = source.indexOf("  } finally {", catchStart);
+    expect(begin).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(begin);
+    expect(catchStart).toBeGreaterThan(end);
+    const original = Object.freeze(
+        new Error("The required live observation did not arrive within its bound."),
+      ),
+      envelope: object[] = [];
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "(async()=>{let failed=false,failure;try{" +
+          source.slice(begin, end) +
+          source.slice(catchStart, catchEnd) +
+          "}return {failed,failure};})",
+      ),
+      {
+        browser: f.browser,
+        viewport,
+        owner: f.owner,
+        original: "tauri://localhost/#/settings/general",
+        verify: viewport.verify,
+        step: () => {},
+        observe: () => {},
+        markUnsafe: f.input.unsafeCleanup,
+        evidence: "/inert/evidence",
+        captured: new Set(),
+        captures: [],
+        write: (name: string, value: object) => {
+          expect(name).toBe("failure");
+          envelope.push(value);
+        },
+        withNativeSharingRoute: () => {},
+        readNativeSharingRoute: () => {},
+        routePorts: {},
+        createNativeSharingBrowserPorts: async () => ({}),
+        runNativeSharingVisual: async () => {
+          throw original;
+        },
+        phase: "native-share-no-route-light",
+        observation: f.facts,
+        classifyQualificationFailure,
+      },
+    );
+    const result = await run();
+    expect(result.failed).toBe(true);
+    expect(result.failure).toBe(original);
+    expect(envelope).toHaveLength(1);
+    expect(envelope[0]).toMatchObject({
+      phase: "native-share-no-route-light",
+      failure: { kind: "observation-timeout" },
+      observation: {
+        viewportRestoreIdentityVerified: true,
+        viewportRestoreCommandReturned: mode !== "native-restore-refusal",
+        viewportRestoreOriginalFrameMatched:
+          mode === "owned" ? true : mode === "native-restore-refusal" ? null : false,
+      },
+    });
+    expect(f.sets()).toBe(2);
+    expect(f.gets()).toBe(0);
+    expect(JSON.stringify(envelope)).not.toMatch(/Inert|tauri|private|\/inert/);
   },
 );
