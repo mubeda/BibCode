@@ -5006,7 +5006,9 @@ it.each([
           process: { env: {} },
           write: (name: string, value: Record<string, unknown>) => writes.set(name, value),
           window: {},
-          HTMLButtonElement: class {},
+          HTMLButtonElement: class {
+            disabled = false;
+          },
           location: {
             origin: refusal === "origin" ? "http://foreign.invalid" : "http://localhost:4901",
             pathname: refusal === "route" ? "/settings/providers" : "/settings/remote-servers",

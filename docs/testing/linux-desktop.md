@@ -1794,12 +1794,25 @@ capture count, wait bounds and owner cleanup remain unchanged. A restore failure
 can otherwise overwrite the global phase, so an old recorded worktree model
 phase alone does not prove that the question producer was never entered.
 
-The Cursor send callback separately
-attributes its original decoded-turn read, unchanged public composer send and
-correlated running-turn wait. These fixed phases preserve all predicates and
-original-error attribution; they add no snapshot reads, actions or timeout budget.
+The Cursor send callback separately attributes its original decoded-thread read,
+public composer send and native pending-question wait. The historical phase name
+`visual-cursor-question-turn-running` now locates that pending-request wait.
+Cursor delivery acknowledgement awaits the prompt response, which the question
+itself holds, so the current read model may have no `latestTurn` before Submit.
+Bind exactly one fresh fixed prompt and pending/sending Cursor delivery to the
+same Cursor session, one fresh native turn-start activity and one later native
+question activity with both exact questions and choices. Retain their private
+thread/message/turn/request identities and durable request sequence. After the
+unchanged public selections and explicit Submit, require that same prompt's
+delivered state and turn attribution, exact request-resolved answers, a later
+successful native turn-completed activity, ready/idle error-free Cursor session
+and the existing public quiescence witness. Do not fabricate a running turn,
+accept DOM silence as completion or bypass provider delivery acknowledgement.
+The two original images, public controls, restoration and wait bounds remain.
+These markers add no snapshot reads, actions or timeout budget.
 At only an original Cursor running-turn failure, `cursorTurnObservation` may retain
-nine booleans from the last already-required schema-decoded snapshot: selected
+nine booleans from the last already-required schema-decoded snapshot during that
+pending-request wait: selected
 Cursor model, latest-turn presence/newness/running state, session presence/Cursor
 provider, matching active turn, session error presence and the fixed prompt's
 public message presence. Reset the record at producer entry and emit it only for

@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - Only closed private qualification receipts are projected here.
 import * as NodeUtil from "node:util";
+import type { OrchestrationThread } from "../../../../packages/contracts/src/orchestration.ts";
 import type { QualificationBrowser, QualificationOwner } from "./qualification-owner.ts";
 import { cursorQuestionFixturePrompt } from "./release-visual-cursor-question-fixture.ts";
 import { captureOwnedVisualScene } from "./owned-visual-capture.ts";
@@ -417,4 +418,204 @@ export async function runCursorQuestionVisual(input: CursorQuestionVisualDriver)
     originalTurnCompleted: true,
     providerRestored: true,
   } as const;
+}
+
+export interface PendingCursorQuestionBinding {
+  readonly threadId: string;
+  readonly messageId: string;
+  readonly turnId: string;
+  readonly requestId: string;
+  readonly requestSequence: number;
+}
+function cursorData(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value) || NodeUtil.types.isProxy(value))
+    return undefined;
+  const field = Object.getOwnPropertyDescriptor(value, key);
+  return field?.enumerable && Object.hasOwn(field, "value") ? field.value : undefined;
+}
+function cursorQuestionArray(value: unknown): boolean {
+  if (!Array.isArray(value) || NodeUtil.types.isProxy(value) || value.length !== 2) return false;
+  const expected = [
+    {
+      id: "first",
+      question: "Choose the first scope.",
+      multiSelect: false,
+      labels: ["Workspace", "Project"],
+    },
+    {
+      id: "later",
+      question: "Choose the later checks.",
+      multiSelect: true,
+      labels: ["Tests", "Docs", "Types"],
+    },
+  ];
+  return expected.every((shape, index) => {
+    const item = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!item || !Object.hasOwn(item, "value")) return false;
+    const question = item.value;
+    if (
+      cursorData(question, "id") !== shape.id ||
+      cursorData(question, "question") !== shape.question ||
+      cursorData(question, "multiSelect") !== shape.multiSelect
+    )
+      return false;
+    const options = cursorData(question, "options");
+    if (
+      !Array.isArray(options) ||
+      NodeUtil.types.isProxy(options) ||
+      options.length !== shape.labels.length
+    )
+      return false;
+    return shape.labels.every((label, option) => {
+      const field = Object.getOwnPropertyDescriptor(options, String(option));
+      return field && Object.hasOwn(field, "value") && cursorData(field.value, "label") === label;
+    });
+  });
+}
+export function bindPendingCursorQuestion(
+  thread: OrchestrationThread,
+  before: { readonly messageIds: readonly string[]; readonly activityIds: readonly string[] },
+): PendingCursorQuestionBinding | null {
+  try {
+    if (
+      thread.modelSelection.instanceId !== "cursor" ||
+      thread.modelSelection.model !== "cursor-fixture" ||
+      thread.session?.providerName !== "cursor" ||
+      thread.session.threadId !== thread.id ||
+      thread.session.providerInstanceId !== "cursor" ||
+      thread.session.status === "error" ||
+      thread.session.lastError !== null
+    )
+      return null;
+    const messages = thread.messages.filter(
+      (message) =>
+        !before.messageIds.includes(message.id) &&
+        message.role === "user" &&
+        message.text === cursorQuestionFixturePrompt,
+    );
+    if (messages.length !== 1) return null;
+    const message = messages[0]!;
+    if (
+      message.delivery?.provider !== "cursor" ||
+      message.delivery.providerInstanceId !== "cursor" ||
+      !["pending", "sending"].includes(message.delivery.state)
+    )
+      return null;
+    const requests = thread.activities.filter(
+      (activity) =>
+        !before.activityIds.includes(activity.id) &&
+        activity.kind === "user-input.requested" &&
+        cursorData(activity.payload, "eventType") === "user-input.requested",
+    );
+    if (requests.length !== 1) return null;
+    const requested = requests[0]!,
+      requestId = cursorData(requested.payload, "requestId");
+    if (
+      requested.turnId === null ||
+      typeof requestId !== "string" ||
+      requestId.length < 1 ||
+      requestId.length > 256 ||
+      requested.sequence === undefined ||
+      !cursorQuestionArray(cursorData(requested.payload, "questions"))
+    )
+      return null;
+    const starts = thread.activities.filter(
+      (activity) =>
+        !before.activityIds.includes(activity.id) &&
+        activity.turnId === requested.turnId &&
+        activity.kind === "provider.turn" &&
+        cursorData(activity.payload, "eventType") === "turn.started" &&
+        activity.sequence !== undefined &&
+        activity.sequence < requested.sequence!,
+    );
+    if (
+      starts.length !== 1 ||
+      thread.activities.some(
+        (activity) =>
+          activity.turnId === requested.turnId &&
+          ["turn.completed", "user-input.resolved"].includes(
+            String(cursorData(activity.payload, "eventType")),
+          ),
+      )
+    )
+      return null;
+    return Object.freeze({
+      threadId: thread.id,
+      messageId: message.id,
+      turnId: requested.turnId,
+      requestId,
+      requestSequence: requested.sequence,
+    });
+  } catch {
+    return null;
+  }
+}
+export function completedPendingCursorQuestion(
+  thread: OrchestrationThread,
+  binding: PendingCursorQuestionBinding,
+): boolean {
+  try {
+    if (
+      thread.id !== binding.threadId ||
+      thread.modelSelection.instanceId !== "cursor" ||
+      thread.session?.providerName !== "cursor" ||
+      thread.session.threadId !== thread.id ||
+      thread.session.providerInstanceId !== "cursor" ||
+      !["ready", "idle"].includes(thread.session.status) ||
+      thread.session.activeTurnId !== null ||
+      thread.session.lastError !== null
+    )
+      return false;
+    const messages = thread.messages.filter(
+      (message) =>
+        message.id === binding.messageId &&
+        message.role === "user" &&
+        message.text === cursorQuestionFixturePrompt &&
+        message.turnId === binding.turnId &&
+        message.delivery?.state === "delivered" &&
+        message.delivery.provider === "cursor" &&
+        message.delivery.providerInstanceId === "cursor",
+    );
+    if (messages.length !== 1) return false;
+    const resolved = thread.activities.filter(
+      (activity) =>
+        activity.turnId === binding.turnId &&
+        activity.kind === "user-input.resolved" &&
+        cursorData(activity.payload, "eventType") === "user-input.resolved" &&
+        cursorData(activity.payload, "requestId") === binding.requestId &&
+        activity.sequence !== undefined &&
+        activity.sequence > binding.requestSequence,
+    );
+    const completed = thread.activities.filter(
+      (activity) =>
+        activity.turnId === binding.turnId &&
+        activity.kind === "provider.turn" &&
+        cursorData(activity.payload, "eventType") === "turn.completed" &&
+        cursorData(activity.payload, "state") === "completed" &&
+        cursorData(activity.payload, "stopReason") === "end_turn" &&
+        activity.sequence !== undefined &&
+        activity.sequence > binding.requestSequence,
+    );
+    if (resolved.length !== 1 || completed.length !== 1) return false;
+    const answers = cursorData(resolved[0]!.payload, "answers"),
+      later = cursorData(answers, "later");
+    if (
+      cursorData(answers, "first") !== "Workspace" ||
+      !Array.isArray(later) ||
+      NodeUtil.types.isProxy(later) ||
+      later.length !== 2 ||
+      !later.every((label) => label === "Tests" || label === "Docs") ||
+      new Set(later).size !== 2
+    )
+      return false;
+    return !thread.activities.some(
+      (activity) =>
+        activity.turnId === binding.turnId &&
+        (activity.kind === "provider.error" ||
+          (cursorData(activity.payload, "eventType") === "turn.completed" &&
+            cursorData(activity.payload, "state") !== "completed")),
+    );
+  } catch {
+    return false;
+  }
 }

@@ -4,6 +4,7 @@ import * as NodeModule from "node:module";
 import * as NodeVM from "node:vm";
 import { QualificationOwner } from "./qualification-owner.ts";
 import { OrchestrationReadModel } from "../../../../packages/contracts/src/orchestration.ts";
+import { EventId } from "../../../../packages/contracts/src/baseSchemas.ts";
 import * as NodeURL from "node:url";
 import { expect, it } from "vite-plus/test";
 import {
@@ -11,6 +12,8 @@ import {
   cursorQuestionSubmitSelector,
   runCursorQuestionVisual,
   successfulCursorQuestionTurn,
+  bindPendingCursorQuestion,
+  completedPendingCursorQuestion,
 } from "./release-visual-cursor-question.ts";
 import { cursorQuestionFixturePrompt } from "./release-visual-cursor-question-fixture.ts";
 
@@ -556,6 +559,8 @@ it.each(["before", "send", "running", "pass"])(
       NodeModule.stripTypeScriptTypes("({" + source.slice(start, end) + "}).send"),
       {
         originalTurnId: null,
+        pendingCursorBinding: null,
+        bindPendingCursorQuestion: () => ({ turnId: "owned-turn" }),
         cursorTurnObservation: null,
         cursorQuestionFixturePrompt,
         step: (phase: string) => phases.push(phase),
@@ -563,7 +568,7 @@ it.each(["before", "send", "running", "pass"])(
           calls.push("snapshot");
           if (++reads === 1) {
             if (boundary === "before") throw original;
-            return { latestTurn: null };
+            return { latestTurn: null, messages: [], activities: [] };
           }
           return {
             modelSelection: { instanceId: "cursor" },
@@ -627,13 +632,19 @@ it.each([
   const end = source.indexOf("          capture: async () => {", start);
   const scope = {
     originalTurnId: null,
+    pendingCursorBinding: null,
+    bindPendingCursorQuestion: () => null,
     cursorTurnObservation: null as unknown,
     cursorQuestionFixturePrompt,
     step: () => {},
     currentThread: async () => {
       if (!sampled) {
         sampled = true;
-        return { latestTurn: mode === "same-turn" ? { turnId: "owned-prior" } : null };
+        return {
+          latestTurn: mode === "same-turn" ? { turnId: "owned-prior" } : null,
+          messages: [],
+          activities: [],
+        };
       }
       return {
         modelSelection: { instanceId: mode === "foreign-model" ? "claudeAgent" : "cursor" },
@@ -749,4 +760,336 @@ it("clears the actual last Cursor predicate record before each producer entry", 
   NodeVM.runInNewContext(source.slice(start, end), scope);
   expect(scope.cursorTurnObservation).toBeNull();
   expect(scope.cursorOriginalFailure).toBeNull();
+});
+
+function pendingCursorModel(mode = "pending") {
+  const model = freshCursorSnapshot("empty");
+  const thread = model.threads.find((value) => value.id === "owned-question")!;
+  const time = model.updatedAt;
+  const requestId = "owned-request",
+    turnId = "owned-native-turn";
+  const started = {
+    id: "started",
+    tone: "info",
+    kind: "provider.turn",
+    summary: "Turn started",
+    payload: { eventType: "turn.started" },
+    turnId,
+    sequence: 1,
+    createdAt: time,
+  };
+  const requested = {
+    id: "requested",
+    tone: "approval",
+    kind: "user-input.requested",
+    summary: "Input requested",
+    payload: {
+      eventType: "user-input.requested",
+      requestId,
+      questions: [
+        {
+          id: "first",
+          header: "Question",
+          question: "Choose the first scope.",
+          multiSelect: false,
+          options: [
+            { label: "Workspace", description: "Workspace" },
+            { label: "Project", description: "Project" },
+          ],
+        },
+        {
+          id: "later",
+          header: "Question",
+          question: "Choose the later checks.",
+          multiSelect: true,
+          options: [
+            { label: "Tests", description: "Tests" },
+            { label: "Docs", description: "Docs" },
+            { label: "Types", description: "Types" },
+          ],
+        },
+      ],
+    },
+    turnId,
+    sequence: 2,
+    createdAt: time,
+  };
+  const message = {
+    id: "owned-prompt",
+    role: "user",
+    text: cursorQuestionFixturePrompt,
+    turnId: mode === "completed" ? turnId : null,
+    streaming: false,
+    delivery: {
+      state: mode === "completed" ? "delivered" : "sending",
+      provider: "cursor",
+      providerInstanceId: "cursor",
+    },
+    createdAt: time,
+    updatedAt: time,
+  };
+  const activities: unknown[] = [started, requested];
+  if (mode === "completed")
+    activities.push(
+      {
+        id: "resolved",
+        tone: "approval",
+        kind: "user-input.resolved",
+        summary: "Input received",
+        payload: {
+          eventType: "user-input.resolved",
+          requestId,
+          answers: { first: "Workspace", later: ["Tests", "Docs"] },
+        },
+        turnId,
+        sequence: 3,
+        createdAt: time,
+      },
+      {
+        id: "completed",
+        tone: "info",
+        kind: "provider.turn",
+        summary: "Turn completed",
+        payload: { eventType: "turn.completed", state: "completed", stopReason: "end_turn" },
+        turnId,
+        sequence: 4,
+        createdAt: time,
+      },
+    );
+  if (mode === "duplicate") activities.push({ ...requested, id: "duplicate", sequence: 3 });
+  if (mode === "foreign-turn") requested.turnId = "foreign";
+  if (mode === "wrong-questions") requested.payload.questions[1]!.multiSelect = false;
+  const candidate = {
+    ...thread,
+    modelSelection: { instanceId: "cursor", model: "cursor-fixture" },
+    session: {
+      threadId: thread.id,
+      status: mode === "completed" ? "ready" : "ready",
+      providerName: mode === "foreign-provider" ? "claudeAgent" : "cursor",
+      providerInstanceId: "cursor",
+      runtimeMode: "full-access",
+      activeTurnId: null,
+      lastError: null,
+      updatedAt: time,
+    },
+    messages: [message],
+    activities,
+  };
+  return Schema.decodeUnknownSync(OrchestrationReadModel)({
+    ...model,
+    threads: model.threads.map((value) => (value.id === thread.id ? candidate : value)),
+  }).threads.find((value) => value.id === thread.id)!;
+}
+it("binds the actual native question while Cursor delivery is awaiting its response and latestTurn is absent", () => {
+  const thread = pendingCursorModel();
+  expect(thread.latestTurn).toBeNull();
+  const bound = bindPendingCursorQuestion(thread, { messageIds: [], activityIds: [] });
+  expect(bound).toEqual({
+    threadId: "owned-question",
+    messageId: "owned-prompt",
+    turnId: "owned-native-turn",
+    requestId: "owned-request",
+    requestSequence: 2,
+  });
+  expect(completedPendingCursorQuestion(pendingCursorModel("completed"), bound!)).toBe(true);
+  expect(completedPendingCursorQuestion(thread, bound!)).toBe(false);
+});
+it.each(["duplicate", "foreign-turn", "wrong-questions", "foreign-provider"])(
+  "refuses a %s pending Cursor request instead of substituting a running turn",
+  (mode) => {
+    expect(
+      bindPendingCursorQuestion(pendingCursorModel(mode), { messageIds: [], activityIds: [] }),
+    ).toBeNull();
+  },
+);
+it("refuses stale pre-send requests and foreign completion joins", () => {
+  const thread = pendingCursorModel();
+  expect(
+    bindPendingCursorQuestion(thread, { messageIds: ["owned-prompt"], activityIds: [] }),
+  ).toBeNull();
+  expect(
+    bindPendingCursorQuestion(thread, { messageIds: [], activityIds: ["requested"] }),
+  ).toBeNull();
+  const bound = bindPendingCursorQuestion(thread, { messageIds: [], activityIds: [] })!;
+  expect(
+    completedPendingCursorQuestion(pendingCursorModel("completed"), {
+      ...bound,
+      turnId: "foreign",
+    }),
+  ).toBe(false);
+  expect(
+    completedPendingCursorQuestion(pendingCursorModel("completed"), {
+      ...bound,
+      requestId: "foreign",
+    }),
+  ).toBe(false);
+});
+
+it("the actual caller admits the native pending question before acknowledgement and preserves exact completion binding", async () => {
+  const source = NodeFS.readFileSync(
+    new NodeURL.URL("../qualify-delivery-retry.ts", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf(
+    "          send: async (text) => {",
+    source.indexOf("const proof = await runCursorQuestionVisual"),
+  );
+  const end = source.indexOf("          capture: async () => {", start);
+  let reads = 0;
+  const pending = pendingCursorModel();
+  const scope = {
+    originalTurnId: null as unknown,
+    pendingCursorBinding: null as unknown,
+    cursorTurnObservation: null,
+    cursorQuestionFixturePrompt,
+    bindPendingCursorQuestion,
+    step: () => {},
+    currentThread: async () =>
+      ++reads === 1 ? { ...pending, messages: [], activities: [] } : pending,
+    send: async () => {},
+    owner: { until: async (check: () => Promise<boolean>) => expect(await check()).toBe(true) },
+  };
+  const send = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes("({" + source.slice(start, end) + "}).send"),
+    scope,
+  );
+  await send(cursorQuestionFixturePrompt);
+  expect(scope.originalTurnId).toBe("owned-native-turn");
+  expect(scope.pendingCursorBinding).toEqual(
+    bindPendingCursorQuestion(pending, { messageIds: [], activityIds: [] }),
+  );
+  expect(reads).toBe(2);
+  const completionStart = source.indexOf("          waitOriginalTurnCompleted: () =>", end);
+  const completionEnd = source.indexOf("\n        });", completionStart);
+  const completed = pendingCursorModel("completed");
+  const completion = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      "({" + source.slice(completionStart, completionEnd) + "}).waitOriginalTurnCompleted",
+    ),
+    {
+      ...scope,
+      currentThread: async () => completed,
+      completedPendingCursorQuestion,
+      bounded: async (value: Promise<unknown>) => value,
+      b: () => ({ execute: async () => ({ valid: true }) }),
+      readCursorQuestionObservation: () => {},
+      validateCursorQuestionWitness: () => {},
+      theme: "light",
+      origin: "http://127.0.0.1:4885",
+      workspace: { threadId: completed.id, branch: completed.branch },
+    },
+  );
+  await completion();
+});
+
+it.each([
+  "wrong-turn",
+  "not-delivered",
+  "cancelled",
+  "wrong-answer",
+  "duplicate-resolved",
+  "session-error",
+])("refuses incomplete or foreign native Cursor completion: %s", (mode) => {
+  const pending = pendingCursorModel(),
+    binding = bindPendingCursorQuestion(pending, { messageIds: [], activityIds: [] })!;
+  const complete = pendingCursorModel("completed");
+  const altered = {
+    ...complete,
+    messages: complete.messages.map((message) =>
+      mode === "wrong-turn"
+        ? { ...message, turnId: "foreign" }
+        : mode === "not-delivered"
+          ? { ...message, delivery: { ...message.delivery!, state: "sending" } }
+          : message,
+    ),
+    activities: complete.activities.map((activity) =>
+      mode === "cancelled" && activity.id === "completed"
+        ? {
+            ...activity,
+            payload: { eventType: "turn.completed", state: "interrupted", stopReason: "cancelled" },
+          }
+        : mode === "wrong-answer" && activity.id === "resolved"
+          ? {
+              ...activity,
+              payload: {
+                eventType: "user-input.resolved",
+                requestId: binding.requestId,
+                answers: { first: "Workspace", later: ["Tests", "Types"] },
+              },
+            }
+          : activity,
+    ),
+    session:
+      mode === "session-error"
+        ? { ...complete.session!, status: "error", lastError: "private diagnostic" }
+        : complete.session,
+  };
+  if (mode === "duplicate-resolved")
+    altered.activities.push({
+      ...complete.activities.find((activity) => activity.id === "resolved")!,
+      id: EventId.make("duplicate"),
+      sequence: 5,
+    });
+  const model = freshCursorSnapshot("empty");
+  const decoded = Schema.decodeUnknownSync(OrchestrationReadModel)({
+    ...model,
+    threads: model.threads.map((thread) => (thread.id === complete.id ? altered : thread)),
+  }).threads.find((thread) => thread.id === complete.id)!;
+  expect(completedPendingCursorQuestion(decoded, binding)).toBe(false);
+});
+
+it.each(["resolved-first", "completed-first"])(
+  "joins both post-request native events without inventing an emission-order guarantee: %s",
+  (mode) => {
+    const pending = pendingCursorModel(),
+      binding = bindPendingCursorQuestion(pending, { messageIds: [], activityIds: [] })!,
+      completed = pendingCursorModel("completed");
+    const thread = {
+      ...completed,
+      activities: completed.activities.map((activity) =>
+        activity.id === "completed"
+          ? { ...activity, sequence: mode === "completed-first" ? 3 : 4 }
+          : activity.id === "resolved"
+            ? { ...activity, sequence: mode === "completed-first" ? 4 : 3 }
+            : activity,
+      ),
+    };
+    expect(completedPendingCursorQuestion(thread, binding)).toBe(true);
+  },
+);
+it.each(["resolved", "completed"])("refuses a %s event at or before the original request", (id) => {
+  const pending = pendingCursorModel(),
+    binding = bindPendingCursorQuestion(pending, { messageIds: [], activityIds: [] })!,
+    completed = pendingCursorModel("completed");
+  expect(
+    completedPendingCursorQuestion(
+      {
+        ...completed,
+        activities: completed.activities.map((activity) =>
+          activity.id === id ? { ...activity, sequence: 2 } : activity,
+        ),
+      },
+      binding,
+    ),
+  ).toBe(false);
+});
+
+it("refuses a schema-valid Cursor session belonging to another thread before question capture and completion", () => {
+  const pending = pendingCursorModel(),
+    binding = bindPendingCursorQuestion(pending, { messageIds: [], activityIds: [] })!,
+    complete = pendingCursorModel("completed"),
+    model = freshCursorSnapshot("empty");
+  const foreign = (thread: typeof pending) =>
+    Schema.decodeUnknownSync(OrchestrationReadModel)({
+      ...model,
+      threads: model.threads.map((value) =>
+        value.id === thread.id
+          ? { ...thread, session: { ...thread.session!, threadId: "foreign-thread" } }
+          : value,
+      ),
+    }).threads.find((value) => value.id === thread.id)!;
+  expect(
+    bindPendingCursorQuestion(foreign(pending), { messageIds: [], activityIds: [] }),
+  ).toBeNull();
+  expect(completedPendingCursorQuestion(foreign(complete), binding)).toBe(false);
 });

@@ -76,7 +76,9 @@ import {
   captureCursorQuestionVisual,
   readCursorQuestionObservation,
   validateCursorQuestionWitness,
-  successfulCursorQuestionTurn,
+  bindPendingCursorQuestion,
+  completedPendingCursorQuestion,
+  type PendingCursorQuestionBinding,
 } from "./support/release-visual-cursor-question.ts";
 import {
   classifyQualificationFailure,
@@ -1994,6 +1996,7 @@ export async function runDeliveryRetryQualification() {
           );
         };
         let originalTurnId: string | null = null;
+        let pendingCursorBinding: PendingCursorQuestionBinding | null = null;
         const verifyOwnedIdentity = async () => {
           check(
             JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
@@ -2042,7 +2045,12 @@ export async function runDeliveryRetryQualification() {
           },
           send: async (text) => {
             step("visual-cursor-question-turn-before");
-            const before = (await currentThread()).latestTurn?.turnId ?? null;
+            const beforeThread = await currentThread();
+            const before = beforeThread.latestTurn?.turnId ?? null;
+            const beforeCursor = {
+              messageIds: beforeThread.messages.map((message) => message.id),
+              activityIds: beforeThread.activities.map((activity) => activity.id),
+            };
             step("visual-cursor-question-send");
             await send(text);
             step("visual-cursor-question-turn-running");
@@ -2064,15 +2072,10 @@ export async function runDeliveryRetryQualification() {
                     message.role === "user" && message.text === cursorQuestionFixturePrompt,
                 ),
               });
-              if (
-                !turn ||
-                turn.turnId === before ||
-                turn.state !== "running" ||
-                thread.session?.activeTurnId !== turn.turnId ||
-                thread.session.providerName !== "cursor"
-              )
-                return false;
-              originalTurnId = turn.turnId;
+              const binding = bindPendingCursorQuestion(thread, beforeCursor);
+              if (binding === null) return false;
+              pendingCursorBinding = binding;
+              originalTurnId = binding.turnId;
               return true;
             });
           },
@@ -2096,7 +2099,9 @@ export async function runDeliveryRetryQualification() {
             owner.until(async () => {
               if (
                 originalTurnId === null ||
-                !successfulCursorQuestionTurn(await currentThread(), originalTurnId)
+                pendingCursorBinding === null ||
+                pendingCursorBinding.turnId !== originalTurnId ||
+                !completedPendingCursorQuestion(await currentThread(), pendingCursorBinding)
               )
                 return false;
               const observed = await bounded(
