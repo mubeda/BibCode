@@ -134,6 +134,7 @@ function inertOriginal() {
 }
 it.each([
   "ordinary",
+  "immediate-undo",
   "delayed-undo",
   "cancelled-undo",
   "late-undo",
@@ -279,6 +280,7 @@ it.each([
       let releaseUndo: () => void = () => {},
         undoCompletion: Promise<void> | null = null,
         undoIssued = false,
+        immediateUndoClosedBeforeVerification = false,
         hostingPendingObserved = false;
       const gate = new Promise<void>((resolve) => {
         releaseUndo = resolve;
@@ -303,10 +305,12 @@ it.each([
             if (selector.includes('normalize-space()="Done"')) await runLabel("--add-label");
             if (selector.includes('normalize-space()="Undo"')) {
               undoIssued = true;
-              if (mode !== "cancelled-undo")
-                undoCompletion = (
-                  mode === "delayed-undo" || mode === "late-undo" ? gate : Promise.resolve()
-                ).then(() => runLabel("--remove-label"));
+              if (mode === "immediate-undo") {
+                undoCompletion = runLabel("--remove-label");
+                await undoCompletion;
+                immediateUndoClosedBeforeVerification = true;
+              } else if (mode !== "cancelled-undo")
+                undoCompletion = gate.then(() => runLabel("--remove-label"));
             }
             if (selector.includes("primary-card-button-owned-project-original")) {
               selected = "original";
@@ -353,7 +357,13 @@ it.each([
         browser: browser as never,
         owner: {
           until: async (read: () => Promise<boolean>) => {
+            if (undoIssued && mode === "immediate-undo")
+              expect(immediateUndoClosedBeforeVerification).toBe(true);
             if (await read()) return;
+            if (undoIssued)
+              expect(JSON.parse(NodeFS.readFileSync(rawHosting.state, "utf8"))).toEqual({
+                labelApplied: true,
+              });
             hostingPendingObserved = true;
             if (undoIssued && (mode === "cancelled-undo" || mode === "late-undo"))
               throw originalError;
@@ -473,7 +483,7 @@ it.each([
           unsafe++;
         },
       };
-      if (mode === "ordinary" || mode === "delayed-undo") {
+      if (mode === "ordinary" || mode === "immediate-undo" || mode === "delayed-undo") {
         const result = await runOwnedPullRequestsSelection(input);
         expect(result.files).toHaveLength(24);
         expect(result.hostingBaselineRestored).toBe(true);
@@ -486,7 +496,8 @@ it.each([
         expect(JSON.parse(NodeFS.readFileSync(rawHosting.state, "utf8"))).toEqual({
           labelApplied: false,
         });
-        expect(hostingPendingObserved).toBe(true);
+        expect(immediateUndoClosedBeforeVerification).toBe(mode === "immediate-undo");
+        expect(hostingPendingObserved).toBe(mode !== "immediate-undo");
         expect(captures).toHaveLength(24);
         expect(NodeFS.readdirSync(evidence)).toHaveLength(24);
         expect(grants).toBe(1);
