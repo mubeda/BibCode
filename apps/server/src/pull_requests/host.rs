@@ -481,6 +481,14 @@ pub trait PullRequestHost: Send + Sync {
         query: Option<&'a str>,
         c: &'a CancellationToken,
     ) -> HostFuture<'a, Vocabulary>;
+    /// Hosts without per-request defaults return none.
+    fn create_defaults<'a>(
+        &'a self,
+        _scope: &'a HostScope,
+        _c: &'a CancellationToken,
+    ) -> HostFuture<'a, CreateDefaults> {
+        Box::pin(async { Ok(CreateDefaults::default()) })
+    }
     fn list<'a>(
         &'a self,
         scope: &'a HostScope,

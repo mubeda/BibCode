@@ -30,6 +30,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "gitManager.previewMerge"
         | "pullRequests.getContext"
         | "pullRequests.getVocabulary"
+        | "pullRequests.getCreateDefaults"
         | "pullRequests.list"
         | "pullRequests.get"
         | "pullRequests.getTimeline"
@@ -242,6 +243,7 @@ mod tests {
         for method in [
             "pullRequests.getContext",
             "pullRequests.getVocabulary",
+            "pullRequests.getCreateDefaults",
             "pullRequests.list",
             "pullRequests.get",
             "pullRequests.getTimeline",

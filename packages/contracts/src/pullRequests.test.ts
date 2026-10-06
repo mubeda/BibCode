@@ -39,7 +39,7 @@ const decodePullRequestsCheckoutResult = Schema.decodeUnknownSync(
 const permission = (allowed: boolean, reason: string | null = null) => ({ allowed, reason });
 
 describe("PullRequests contracts", () => {
-  it("registers the ten pullRequests methods in the RPC group", () => {
+  it("registers the eleven pullRequests methods in the RPC group", () => {
     const tags = [...WsRpcGroup.requests.keys()];
     for (const key of Object.keys(WS_METHODS).filter((key) => key.startsWith("pullRequests"))) {
       expect(tags).toContain(WS_METHODS[key as keyof typeof WS_METHODS]);
@@ -50,6 +50,7 @@ describe("PullRequests contracts", () => {
       "pullRequests.getChecks",
       "pullRequests.getCommits",
       "pullRequests.getContext",
+      "pullRequests.getCreateDefaults",
       "pullRequests.getFiles",
       "pullRequests.getTimeline",
       "pullRequests.getVocabulary",
@@ -659,5 +660,31 @@ describe("PullRequests actions and outcomes", () => {
     expect(encodePullRequestsCheckoutResult(decodePullRequestsCheckoutResult(value))).toEqual(
       value,
     );
+  });
+});
+
+describe("PullRequestsCreateDefaults", () => {
+  it("decodes GitLab defaults and GitHub's empty merge settings", () => {
+    const decode = Schema.decodeUnknownSync(PullRequests.PullRequestsCreateDefaults);
+    expect(
+      decode({
+        viewer: { id: "7", label: "alice" },
+        squash: "default_on",
+        removeSourceBranch: true,
+      }),
+    ).toEqual({
+      viewer: { id: "7", label: "alice" },
+      squash: "default_on",
+      removeSourceBranch: true,
+    });
+    expect(
+      decode({ viewer: { id: "octo", label: "octo" }, squash: null, removeSourceBranch: null }),
+    ).toEqual({ viewer: { id: "octo", label: "octo" }, squash: null, removeSourceBranch: null });
+    expect(() => decode({ viewer: null, squash: "sometimes", removeSourceBranch: null })).toThrow();
+  });
+
+  it("is served by pullRequests.getCreateDefaults", () => {
+    expect(WS_METHODS.pullRequestsGetCreateDefaults).toBe("pullRequests.getCreateDefaults");
+    expect(WsRpcGroup.requests.has("pullRequests.getCreateDefaults")).toBe(true);
   });
 });
