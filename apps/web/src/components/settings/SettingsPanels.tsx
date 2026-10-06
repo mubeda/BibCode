@@ -236,7 +236,7 @@ function ProviderLastChecked({ lastCheckedAt }: { lastCheckedAt: string | null }
   }
 
   return (
-    <span className="text-xs text-muted-foreground/60">
+    <span className="text-xs text-muted-foreground">
       {lastCheckedRelative.suffix ? (
         <>
           Checked <span className="font-mono tabular-nums">{lastCheckedRelative.value}</span>{" "}
