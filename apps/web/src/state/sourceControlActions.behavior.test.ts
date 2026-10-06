@@ -286,6 +286,15 @@ describe("command dispatch on a complete scope", () => {
 
   it("stacked action is managed externally (bypasses track) and forwards optional fields", async () => {
     const onProgress = () => undefined;
+    const createOptions = {
+      draft: true,
+      assignees: ["7"],
+      reviewers: [],
+      labels: ["bug"],
+      milestone: null,
+      removeSourceBranch: null,
+      squash: null,
+    };
     await useGitStackedAction(fullScope).run({
       actionId: "act-1",
       action: "commit_push_pr",
@@ -297,6 +306,7 @@ describe("command dispatch on a complete scope", () => {
       pullRequestHeadBranch: "feature/other",
       pullRequestTitle: "Reviewed title",
       pullRequestBody: "Reviewed body",
+      pullRequestOptions: createOptions,
       onProgress,
     });
     expect(h.trackCalls).toHaveLength(0);
@@ -311,6 +321,7 @@ describe("command dispatch on a complete scope", () => {
       pullRequestHeadBranch: "feature/other",
       pullRequestTitle: "Reviewed title",
       pullRequestBody: "Reviewed body",
+      pullRequestOptions: createOptions,
       onProgress,
     });
     // onSuccess still refreshes status even though tracking is external.

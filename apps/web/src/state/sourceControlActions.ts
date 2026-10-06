@@ -11,6 +11,7 @@ import {
 import type {
   EnvironmentId,
   GitActionProgressEvent,
+  GitPullRequestCreateOptions,
   GitResolvePullRequestResult,
   GitStackedAction,
   SourceControlCloneProtocol,
@@ -307,6 +308,7 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
       pullRequestBody?: string;
       pullRequestBaseBranch?: string;
       pullRequestHeadBranch?: string;
+      pullRequestOptions?: GitPullRequestCreateOptions;
       onProgress?: (event: GitActionProgressEvent) => void;
     }) => {
       if (resolveScope(scope) === null) {
@@ -335,6 +337,9 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
           ? { pullRequestHeadBranch: input.pullRequestHeadBranch }
           : {}),
         ...(input.pullRequestBody !== undefined ? { pullRequestBody: input.pullRequestBody } : {}),
+        ...(input.pullRequestOptions !== undefined
+          ? { pullRequestOptions: input.pullRequestOptions }
+          : {}),
         ...(input.onProgress ? { onProgress: input.onProgress } : {}),
       });
     },
