@@ -6,9 +6,10 @@ import * as NodeVM from "node:vm";
 import * as NodeZlib from "node:zlib";
 import * as NodeCrypto from "node:crypto";
 import { attach } from "webdriverio";
-import { afterEach, expect, it } from "vite-plus/test";
+import { afterEach, expect, it, vi } from "vite-plus/test";
 import { normalizeWebDriverRequest } from "./webdriver-request.ts";
 import { inspectScreenshot } from "./remote-ui-evidence.ts";
+import * as NativeViewport from "./release-visual-native-sharing-viewport.ts";
 import {
   createNativeSharingViewport,
   readNativeSharingViewport,
@@ -63,6 +64,15 @@ async function fixture(mode = "owned") {
   const original = { ...rect },
     timeout = new Error("Inert owned viewport bound exhausted."),
     facts: Record<string, boolean> = {};
+  const initialRects: Record<string, unknown> = {
+    "initial-zero": { x: 0, y: 0, width: 0, height: 0 },
+    "initial-negative": { x: -1, y: 0, width: 1024, height: 768 },
+    "initial-overflow-x": { x: 1000, y: 0, width: 1024, height: 768 },
+    "initial-overflow-y": { x: 0, y: 900, width: 1024, height: 768 },
+    "initial-fractional": { x: 0, y: 0, width: 1024.5, height: 768 },
+    "initial-missing": { x: 0, y: 0, height: 768 },
+    "initial-extra": { x: 0, y: 0, width: 1024, height: 768, privateValue: "inert value" },
+  };
   const server = NodeHttp.createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const value of request) chunks.push(Buffer.from(value));
@@ -82,10 +92,10 @@ async function fixture(mode = "owned") {
       } else value = currentUrl;
     } else if (request.url?.endsWith("/window/rect") && request.method === "GET") {
       gets++;
-      if (mode === "read-fault") {
+      if (mode === "read-fault" || mode === "initial-read-fault") {
         response.statusCode = 500;
         value = { error: "unknown error", message: "Inert rectangle failure.", stacktrace: "" };
-      } else value = rect;
+      } else value = Object.hasOwn(initialRects, mode) ? initialRects[mode] : rect;
     } else if (request.url?.endsWith("/window/rect") && request.method === "POST") {
       sets++;
       if (
@@ -175,6 +185,329 @@ async function fixture(mode = "owned") {
     },
   };
 }
+const unknownOriginalFacts = {
+  originalRectRecordMatched: null,
+  originalRectKeysMatched: null,
+  originalRectNumbersFinite: null,
+  originalRectNumbersInteger: null,
+  originalRectPositionNonnegative: null,
+  originalRectDimensionsPositive: null,
+  originalRectHorizontalWithinDisplay: null,
+  originalRectVerticalWithinDisplay: null,
+};
+const admittedOriginalFacts = {
+  originalRectRecordMatched: true,
+  originalRectKeysMatched: true,
+  originalRectNumbersFinite: true,
+  originalRectNumbersInteger: true,
+  originalRectPositionNonnegative: true,
+  originalRectDimensionsPositive: true,
+  originalRectHorizontalWithinDisplay: true,
+  originalRectVerticalWithinDisplay: true,
+};
+it.each([
+  { mode: "owned", want: admittedOriginalFacts },
+  {
+    mode: "initial-zero",
+    want: { ...admittedOriginalFacts, originalRectDimensionsPositive: false },
+  },
+  {
+    mode: "initial-negative",
+    want: {
+      ...admittedOriginalFacts,
+      originalRectPositionNonnegative: false,
+      originalRectHorizontalWithinDisplay: false,
+    },
+  },
+  {
+    mode: "initial-overflow-x",
+    want: { ...admittedOriginalFacts, originalRectHorizontalWithinDisplay: false },
+  },
+  {
+    mode: "initial-overflow-y",
+    want: { ...admittedOriginalFacts, originalRectVerticalWithinDisplay: false },
+  },
+  {
+    mode: "initial-fractional",
+    want: {
+      ...unknownOriginalFacts,
+      originalRectRecordMatched: true,
+      originalRectKeysMatched: true,
+      originalRectNumbersInteger: false,
+    },
+  },
+  {
+    mode: "initial-missing",
+    want: {
+      ...unknownOriginalFacts,
+      originalRectRecordMatched: true,
+      originalRectKeysMatched: false,
+    },
+  },
+  {
+    mode: "initial-extra",
+    want: {
+      ...unknownOriginalFacts,
+      originalRectRecordMatched: true,
+      originalRectKeysMatched: false,
+    },
+  },
+  { mode: "initial-read-fault", want: unknownOriginalFacts },
+])(
+  "attributes the same initial SDK rectangle admission without another read: $mode",
+  async ({ mode, want }) => {
+    const f = await fixture(mode),
+      source = NodeFS.readFileSync(
+        new URL("../qualify-native-sharing.ts", import.meta.url),
+        "utf8",
+      );
+    const init = source.indexOf("  const observation:"),
+      initEnd = source.indexOf("  const step =", init);
+    const facts = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(source.slice(init, initEnd)) + "\nobservation",
+      {
+        unknownNativeSharingOriginalRectFacts: Reflect.get(
+          NativeViewport,
+          "unknownNativeSharingOriginalRectFacts",
+        ),
+      },
+    ) as Record<string, unknown>;
+    const begin = source.indexOf('        step("native-original-size");'),
+      end = source.indexOf('        step("native-initial-verification");', begin);
+    const phases: string[] = [];
+    let sdkError: unknown,
+      failed = false,
+      failure: unknown;
+    const browser = Object.create(f.browser),
+      read = f.browser.getWindowRect.bind(f.browser);
+    Object.defineProperty(browser, "getWindowRect", {
+      value: async () => {
+        try {
+          return await read();
+        } catch (error) {
+          sdkError = error;
+          throw error;
+        }
+      },
+    });
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes("(async()=>{" + source.slice(begin, end) + "})"),
+      {
+        browser,
+        owner: f.owner,
+        guard: () => {
+          throw new Error("Unexpected additional identity read.");
+        },
+        verifyNativeSharingWindow: () => {},
+        validateNativeSharingIdentity: () => {},
+        collectNativeSharingIdentity: () => {},
+        endpoint: {},
+        descriptor: () => {},
+        identity: {},
+        createNativeSharingViewport,
+        markUnsafe: f.input.unsafeCleanup,
+        step: (phase: string) => phases.push(phase),
+        observe: (next: object) => Object.assign(facts, next),
+      },
+    );
+    try {
+      await run();
+    } catch (error) {
+      failed = true;
+      failure = error;
+    }
+    expect(failed).toBe(mode !== "owned");
+    if (mode === "initial-read-fault") expect(failure).toBe(sdkError);
+    else if (mode !== "owned")
+      expect(failure).toMatchObject({ message: "Owned native sharing viewport refused." });
+    expect(
+      Object.fromEntries(Object.keys(unknownOriginalFacts).map((key) => [key, facts[key]])),
+    ).toEqual(want);
+    expect(phases.at(-1)).toBe(
+      mode === "initial-read-fault" ? "native-original-size" : "native-original-rect-admission",
+    );
+    expect(f.gets()).toBe(1);
+    expect(f.sets()).toBe(0);
+    expect(f.unsafe()).toBe(0);
+    expect(JSON.stringify(facts)).not.toContain("inert value");
+  },
+);
+it.each(["proxy", "getter", "hidden", "extra-getter", "symbol", "missing", "array"])(
+  "keeps unsafe original rectangle metadata passive and private: %s",
+  async (mode) => {
+    const f = await fixture(),
+      original: Record<string, unknown> = { ...f.original };
+    let reads = 0;
+    const packets: unknown[] = [];
+    if (mode === "getter" || mode === "hidden")
+      Object.defineProperty(
+        original,
+        "width",
+        mode === "getter"
+          ? {
+              enumerable: true,
+              get: () => {
+                reads++;
+                throw new Error("Inert private getter.");
+              },
+            }
+          : { enumerable: false, value: 1024 },
+      );
+    if (mode === "extra-getter")
+      Object.defineProperty(original, "secret", {
+        enumerable: true,
+        get: () => {
+          reads++;
+          throw new Error("Inert extra getter.");
+        },
+      });
+    if (mode === "symbol") original[Symbol("inert secret") as unknown as string] = "inert secret";
+    if (mode === "missing") delete original.width;
+    const value =
+      mode === "proxy"
+        ? new Proxy(original, {
+            ownKeys: () => {
+              reads++;
+              throw new Error("Inert proxy trap.");
+            },
+            get: () => {
+              reads++;
+              throw new Error("Inert proxy trap.");
+            },
+          })
+        : mode === "array"
+          ? [original]
+          : original;
+    expect(() =>
+      createNativeSharingViewport({
+        ...f.input,
+        original: value,
+        onOriginalRectFacts: (facts: unknown) => packets.push(facts),
+      }),
+    ).toThrow("Owned native sharing viewport refused.");
+    expect(packets).toHaveLength(1);
+    expect(Object.keys(packets[0] as object).sort()).toEqual(
+      Object.keys(unknownOriginalFacts).sort(),
+    );
+    expect(
+      Object.values(packets[0] as object).every(
+        (value) => value === null || typeof value === "boolean",
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(packets)).not.toMatch(/secret|width|height|1024|768|\/|</);
+    expect(reads).toBe(0);
+    expect(f.gets()).toBe(0);
+    expect(f.sets()).toBe(0);
+  },
+);
+it("does not let diagnostic failure or mutation change original admission", async () => {
+  const f = await fixture(),
+    sentinel = new Error("Inert diagnostic failure."),
+    original = { x: 0, y: 0, width: 0, height: 0 };
+  let packet: unknown;
+  expect(() =>
+    createNativeSharingViewport({
+      ...f.input,
+      original,
+      onOriginalRectFacts: (facts: unknown) => {
+        packet = facts;
+        original.width = 1024;
+        original.height = 768;
+        throw sentinel;
+      },
+    }),
+  ).toThrow("Owned native sharing viewport refused.");
+  expect(packet).toMatchObject({ originalRectDimensionsPositive: false });
+  const admitted = createNativeSharingViewport({
+    ...f.input,
+    onOriginalRectFacts: () => {
+      throw sentinel;
+    },
+  });
+  await admitted.restore();
+  expect(f.rect()).toEqual(f.original);
+  expect(f.unsafe()).toBe(0);
+});
+it("leaves unvisited original predicates unknown without another property inspection", async () => {
+  const f = await fixture(),
+    original = { ...f.original, width: 1024.5 };
+  let packet: unknown,
+    laterReads = 0;
+  const descriptor = Object.getOwnPropertyDescriptor;
+  const reflection = vi
+    .spyOn(Object, "getOwnPropertyDescriptor")
+    .mockImplementation((value, key) => {
+      if (value === original && key === "height") laterReads++;
+      return descriptor(value, key);
+    });
+  try {
+    expect(() =>
+      createNativeSharingViewport({
+        ...f.input,
+        original,
+        onOriginalRectFacts: (facts: unknown) => {
+          packet = facts;
+        },
+      }),
+    ).toThrow("Owned native sharing viewport refused.");
+    expect(packet).toMatchObject({
+      originalRectNumbersFinite: null,
+      originalRectNumbersInteger: false,
+      originalRectDimensionsPositive: null,
+    });
+    expect(laterReads).toBe(0);
+  } finally {
+    reflection.mockRestore();
+  }
+});
+it.each(["nonfinite", "last-fractional"])(
+  "records only decidable original numeric predicates: %s",
+  async (mode) => {
+    const f = await fixture(),
+      original = { ...f.original, height: mode === "nonfinite" ? Number.POSITIVE_INFINITY : 768.5 };
+    let packet: unknown;
+    expect(() =>
+      createNativeSharingViewport({
+        ...f.input,
+        original,
+        onOriginalRectFacts: (facts: unknown) => {
+          packet = facts;
+        },
+      }),
+    ).toThrow("Owned native sharing viewport refused.");
+    expect(packet).toMatchObject(
+      mode === "nonfinite"
+        ? { originalRectNumbersFinite: false, originalRectNumbersInteger: null }
+        : { originalRectNumbersFinite: true, originalRectNumbersInteger: false },
+    );
+    expect(f.gets()).toBe(0);
+    expect(f.sets()).toBe(0);
+  },
+);
+it("publishes immutable original facts from the same admitted snapshot under callback reentry", async () => {
+  const f = await fixture(),
+    original = { ...f.original };
+  let packet: unknown,
+    reentered = false;
+  const viewport = createNativeSharingViewport({
+    ...f.input,
+    original,
+    onOriginalRectFacts: (facts: unknown) => {
+      packet = facts;
+      expect(Object.isFrozen(facts)).toBe(true);
+      original.width = -1;
+      createNativeSharingViewport({ ...f.input, original: { ...f.original } });
+      reentered = true;
+    },
+  });
+  expect(reentered).toBe(true);
+  expect(packet).toEqual(admittedOriginalFacts);
+  expect(f.gets()).toBe(0);
+  expect(f.sets()).toBe(0);
+  await viewport.restore();
+  expect(f.rect()).toEqual(f.original);
+  expect(f.sets()).toBe(1);
+});
 it("actual controller/Classic SDK establishes client1280x960 despite native chrome", async () => {
   const f = await fixture();
   const source = NodeFS.readFileSync(

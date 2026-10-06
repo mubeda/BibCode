@@ -2167,6 +2167,28 @@ otherwise the first cleanup failure is retained. Impossible or drifting geometry
 failed correction or restoration, and
 unproven ownership fail qualification and preserve an unsafe fixture.
 
+The initial outer-rectangle read records `native-original-rect-admission` before
+its strict validation. The same admission inspection projects eight fixed
+boolean-or-null fields: `originalRectRecordMatched`, `originalRectKeysMatched`,
+`originalRectNumbersFinite`, `originalRectNumbersInteger`,
+`originalRectPositionNonnegative`, `originalRectDimensionsPositive`,
+`originalRectHorizontalWithinDisplay`, and `originalRectVerticalWithinDisplay`.
+Null means that the predicate has not been established: before the existing read
+returns, after unsafe record/accessor metadata, or when an earlier refusal leaves
+later predicates uninspected. Missing or extra keys record only the closed key
+mismatch; their values are never inspected. Geometric facts are derived only
+from the already-admitted finite integer fields. Horizontal and vertical bounds
+include the nonnegative origin and the opposite edge within the owned display.
+
+The original admission snapshot and its projected packet are immutable. An
+optional diagnostic failure or callback reentry cannot change the admission or
+replace its original refusal. No numeric rectangle values, window identity,
+URL, body or error text enters these facts. They add no SDK/renderer/native read,
+poll, resize, launch option, request or deadline. Zero, negative, malformed or
+out-of-display rectangles still fail the existing guard. An opaque failure must
+remain unattributed until actual native evidence identifies its predicate;
+these facts do not establish readiness or waive a capture or cleanup fence.
+
 The last seven closed DOM booleans are retained from the existing witness read
 in the existing phase/failure receipts. They admit no extra renderer read and
 retain no markup, text, URLs or private identity. These facts distinguish a

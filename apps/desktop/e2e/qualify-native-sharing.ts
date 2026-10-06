@@ -39,12 +39,18 @@ import { EnvironmentMetadataHttpApi } from "../../../packages/contracts/src/envi
 
 import {
   createNativeSharingViewport,
+  unknownNativeSharingOriginalRectFacts,
   type NativeSharingViewportFacts,
+  type NativeSharingOriginalRectFacts,
 } from "./support/release-visual-native-sharing-viewport.ts";
 import type { NativeSharingDomFacts } from "./support/release-visual-native-sharing-dom.ts";
 
 interface NativeSharingAdmissionFacts
-  extends NativeSharingBrowserPreparationFacts, NativeSharingViewportFacts, NativeSharingDomFacts {
+  extends
+    NativeSharingBrowserPreparationFacts,
+    NativeSharingViewportFacts,
+    NativeSharingDomFacts,
+    NativeSharingOriginalRectFacts {
   windowHandlesArray: boolean;
   windowMainOnly: boolean;
   windowCurrentMain: boolean;
@@ -159,7 +165,9 @@ export async function qualifyNativeSharing(
     NodeFS.writeFileSync(NodePath.join(evidence, name + ".json"), JSON.stringify(value), {
       mode: 0o600,
     });
-  const observation: Partial<NativeSharingAdmissionFacts> = {};
+  const observation: Partial<NativeSharingAdmissionFacts> = {
+    ...unknownNativeSharingOriginalRectFacts,
+  };
   const step = (value: string) => {
     phase = value;
     write("phase", { phase, observation });
@@ -430,6 +438,7 @@ export async function qualifyNativeSharing(
             route,
           );
         };
+        step("native-original-rect-admission");
         const viewport = createNativeSharingViewport({
           browser,
           owner,
@@ -437,6 +446,7 @@ export async function qualifyNativeSharing(
           identity: verifyIdentity,
           unsafeCleanup: markUnsafe,
           observe,
+          onOriginalRectFacts: observe,
         });
         const verify = () => viewport.verify();
         step("native-initial-verification");
