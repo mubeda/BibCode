@@ -2468,6 +2468,14 @@ its original phase and exception through secondary cleanup failures; optional
 diagnostic errors cannot replace it. Raw errors, paths and identities stay
 private. A terminal phase identifies a boundary and does not establish a native
 cause or visual acceptance.
+At the existing Linux service-admission refusal only, the same status container
+can retain `linuxServiceAdmission`: the already-returned driver's zero, nonzero
+or unknown outcome and the six fixed owned service roles with their existing
+`done` and `overflow` flags, sampled before teardown. Optional sink failures
+cannot replace the original refusal or change cleanup. No raw log, process
+identity or command data is retained, and attribution does not change success
+admission, service liveness, reads, actions or budgets.
+
 The existing bounded driver rejection records `native-driver-command-timeout`
 only for its typed timeout outcome; other command rejections record
 `native-driver-command-rejected` without parsing raw errors. After the driver

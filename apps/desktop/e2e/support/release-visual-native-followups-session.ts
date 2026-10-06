@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 import * as NodeProcess from "node:process";
 import { bounded } from "./qualification-owner.ts";
 import { NativeFollowupCommandOwner } from "./release-visual-native-followups-process.ts";
+import type { NativeFollowupLinuxServiceAdmission } from "../../../../scripts/seeded-desktop-upgrade-smoke.ts";
 function createNativeFollowupsLinuxSessionRoot(workRoot: string, observe: (phase: string) => void) {
   const uid = typeof NodeProcess.getuid === "function" ? NodeProcess.getuid() : -1;
   const parent = NodeFS.lstatSync(workRoot);
@@ -42,6 +43,7 @@ export async function withNativeFollowupsLinuxSession<A>(
     workRoot: string;
     platform: string;
     onStage?: (phase: string) => void;
+    onServiceAdmission?: (services: NativeFollowupLinuxServiceAdmission["services"]) => void;
   },
   run: (environment: NodeJS.ProcessEnv) => Promise<A>,
 ): Promise<A> {
@@ -84,13 +86,18 @@ export async function withNativeFollowupsLinuxSession<A>(
     APPIMAGE_GTK_THEME: "",
   };
   const children: {
+    role: NativeFollowupLinuxServiceAdmission["services"][number]["role"];
     child: NodeChildProcess.ChildProcess;
     closed: Promise<void>;
     done: boolean;
     overflow: boolean;
     fd: number;
   }[] = [];
-  const start = (file: string, args: string[]) => {
+  const start = (
+    role: NativeFollowupLinuxServiceAdmission["services"][number]["role"],
+    file: string,
+    args: string[],
+  ) => {
     const executable = NodeFS.realpathSync(file),
       stat = NodeFS.statSync(executable);
     if (!stat.isFile() || (stat.mode & 0o022) !== 0)
@@ -107,7 +114,7 @@ export async function withNativeFollowupsLinuxSession<A>(
         stdio: ["ignore", "pipe", "pipe"],
       });
     let bytes = 0;
-    const entry = { child, closed: Promise.resolve(), done: false, overflow: false, fd };
+    const entry = { role, child, closed: Promise.resolve(), done: false, overflow: false, fd };
     children.push(entry);
     const read = (chunk: Buffer) => {
       bytes += chunk.length;
@@ -137,7 +144,7 @@ export async function withNativeFollowupsLinuxSession<A>(
     cleanupSafe = true;
   try {
     observe("native-linux-bus");
-    start("/usr/bin/dbus-daemon", [
+    start("dbus", "/usr/bin/dbus-daemon", [
       "--session",
       "--nofork",
       "--address=" + environment.DBUS_SESSION_BUS_ADDRESS,
@@ -165,7 +172,7 @@ export async function withNativeFollowupsLinuxSession<A>(
     ]);
     settings.assertClosed();
     observe("native-linux-services");
-    start("/usr/bin/openbox", ["--sm-disable"]);
+    start("openbox", "/usr/bin/openbox", ["--sm-disable"]);
     const xsettings = [
       "/usr/libexec/gsd-xsettings",
       "/usr/lib/gnome-settings-daemon/gsd-xsettings",
@@ -176,8 +183,8 @@ export async function withNativeFollowupsLinuxSession<A>(
     ].find(NodeFS.existsSync);
     if (!xsettings || !accessibility)
       throw new Error("Native follow-up real desktop services unavailable.");
-    start(xsettings, []);
-    start(accessibility, ["--launch-immediately"]);
+    start("xsettings", xsettings, []);
+    start("accessibility", accessibility, ["--launch-immediately"]);
     const backend = ["/usr/libexec/xdg-desktop-portal-gtk", "/usr/lib/xdg-desktop-portal-gtk"].find(
         NodeFS.existsSync,
       ),
@@ -185,13 +192,24 @@ export async function withNativeFollowupsLinuxSession<A>(
         NodeFS.existsSync,
       );
     if (!backend || !portal) throw new Error("Native follow-up real GTK portal unavailable.");
-    start(backend, []);
-    start(portal, []);
+    start("portal-gtk", backend, []);
+    start("portal", portal, []);
     observe("native-linux-driver");
     value = await run(environment);
     observe("native-linux-service-admission");
-    if (children.some((entry) => entry.done || entry.overflow))
-      throw new Error("Native follow-up private OS session exited early.");
+    if (children.some((entry) => entry.done || entry.overflow)) {
+      const original = new Error("Native follow-up private OS session exited early.");
+      try {
+        input.onServiceAdmission?.(
+          Object.freeze(
+            children.map(({ role, done, overflow }) => Object.freeze({ role, done, overflow })),
+          ),
+        );
+      } catch {
+        /* Optional attribution cannot replace this refusal or change owned teardown. */
+      }
+      throw original;
+    }
   } catch (error) {
     failed = true;
     original = error;

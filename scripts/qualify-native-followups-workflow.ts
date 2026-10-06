@@ -2,6 +2,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Development-only fixed CI native visual caller retains closed status, never a production transport.
 // @effect-diagnostics globalConsole:off - Emit only closed status/source metadata; raw errors remain private.
 import * as NodeFS from "node:fs";
+import * as NodeUtil from "node:util";
 import * as Effect from "effect/Effect";
 import { HostProcessPlatform } from "@bibcode/shared/hostProcess";
 import * as NodePath from "node:path";
@@ -13,6 +14,8 @@ import {
   type SeededDesktopUpgradeSmokeInput,
   nativeFollowupPhases,
   type NativeFollowupPhase,
+  nativeFollowupLinuxServiceRoles,
+  type NativeFollowupLinuxServiceAdmission,
 } from "./seeded-desktop-upgrade-smoke.ts";
 const refused = () => new Error("Native follow-up workflow admission refused.");
 export function nativeFollowupWorkflowPlan(
@@ -55,13 +58,73 @@ export function nativeFollowupWorkflowPlan(
     throw refused();
   return { partition: "windows-wsl" as const, expectedOriginals: 2 };
 }
+/** Closed failed-boundary metadata only; native process and command guards remain authoritative. */
+export function projectNativeFollowupLinuxServiceAdmission(
+  value: unknown,
+): Readonly<NativeFollowupLinuxServiceAdmission> | null {
+  if (value === null) return null;
+  const fields = (record: unknown, keys: readonly string[]): Record<string, unknown> => {
+    if (
+      !record ||
+      typeof record !== "object" ||
+      Array.isArray(record) ||
+      NodeUtil.types.isProxy(record)
+    )
+      throw refused();
+    const own = Reflect.ownKeys(record);
+    if (
+      own.length !== keys.length ||
+      !own.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      throw refused();
+    const result: Record<string, unknown> = {};
+    for (const key of keys) {
+      const field = Object.getOwnPropertyDescriptor(record, key);
+      if (!field?.enumerable || !Object.hasOwn(field, "value")) throw refused();
+      result[key] = field.value;
+    }
+    return result;
+  };
+  const record = fields(value, ["driverOutcome", "services"]),
+    driverOutcome = record.driverOutcome,
+    services = record.services;
+  if (driverOutcome !== "unknown" && driverOutcome !== "zero" && driverOutcome !== "nonzero")
+    throw refused();
+  if (
+    !services ||
+    typeof services !== "object" ||
+    NodeUtil.types.isProxy(services) ||
+    !Array.isArray(services)
+  )
+    throw refused();
+  if (services.length !== 6 || Reflect.ownKeys(services).length !== 7) throw refused();
+  const rows = nativeFollowupLinuxServiceRoles.map((role, index) => {
+    const field = Object.getOwnPropertyDescriptor(services, String(index));
+    if (!field?.enumerable || !Object.hasOwn(field, "value")) throw refused();
+    const row = fields(field.value, ["role", "done", "overflow"]);
+    if (row.role !== role || typeof row.done !== "boolean" || typeof row.overflow !== "boolean")
+      throw refused();
+    return Object.freeze({ role, done: row.done, overflow: row.overflow });
+  });
+  return Object.freeze({ driverOutcome, services: Object.freeze(rows) });
+}
+
 export function nativeFollowupWorkflowStatus(
   sourceSha: string,
   partition: "linux-menu-update" | "windows-wsl",
   status: "partition-complete" | "unavailable" | "failed",
   originalCount: number,
   phase: NativeFollowupPhase = "native-owner-start",
+  linuxServiceAdmission: unknown = null,
 ) {
+  const observation = projectNativeFollowupLinuxServiceAdmission(linuxServiceAdmission);
+  if (
+    observation !== null &&
+    (partition !== "linux-menu-update" ||
+      status !== "failed" ||
+      phase !== "native-linux-service-admission")
+  )
+    throw refused();
   const count = partition === "linux-menu-update" ? 6 : 2;
   if (
     !nativeFollowupPhases.includes(phase) ||
@@ -87,6 +150,7 @@ export function nativeFollowupWorkflowStatus(
     previewOriginalCount: 0,
     completeGroup: false,
     visualReview: "pending",
+    ...(observation === null ? {} : { linuxServiceAdmission: observation }),
   };
 }
 function privateWrite(root: string, name: string, value: object) {
@@ -124,15 +188,21 @@ async function main() {
   });
   let status: "partition-complete" | "failed" = "failed",
     count = 0;
-  let phase: NativeFollowupPhase = "native-owner-start";
+  const observation: {
+    phase: NativeFollowupPhase;
+    linuxServiceAdmission: Readonly<NativeFollowupLinuxServiceAdmission> | null;
+  } = { phase: "native-owner-start", linuxServiceAdmission: null };
   try {
     await runSeededDesktopUpgradeSmoke({
       ...input,
       observeNativeFollowupPhase: (value) => {
-        phase = value;
+        observation.phase = value;
+      },
+      observeNativeFollowupLinuxServiceAdmission: (value) => {
+        observation.linuxServiceAdmission = projectNativeFollowupLinuxServiceAdmission(value);
       },
     });
-    phase = "native-result-admission";
+    observation.phase = "native-result-admission";
     const retained = JSON.parse(
       NodeFS.readFileSync(
         NodePath.join(input.artifactDirectory, "native-followups-result.json"),
@@ -232,7 +302,16 @@ async function main() {
     privateWrite(
       input.artifactDirectory,
       "native-followups-workflow-status.json",
-      nativeFollowupWorkflowStatus(sourceSha, plan.partition, status, count, phase),
+      nativeFollowupWorkflowStatus(
+        sourceSha,
+        plan.partition,
+        status,
+        count,
+        observation.phase,
+        observation.phase === "native-linux-service-admission"
+          ? observation.linuxServiceAdmission
+          : null,
+      ),
     );
   }
 }

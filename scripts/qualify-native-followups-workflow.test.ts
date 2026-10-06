@@ -7,6 +7,7 @@ import { expect, it } from "vite-plus/test";
 import {
   nativeFollowupWorkflowPlan,
   nativeFollowupWorkflowStatus,
+  projectNativeFollowupLinuxServiceAdmission,
 } from "./qualify-native-followups-workflow.ts";
 import { parseSeededDesktopUpgradeSmokeArgs } from "./seeded-desktop-upgrade-smoke.ts";
 const root = NodePath.resolve(".");
@@ -430,8 +431,8 @@ it("retains only fixed owning terminal phases in the existing status packet", ()
   );
   expect(source).toContain("observeNativeFollowupPhase:");
   expect(source).toContain('phase = "native-result-admission";');
-  expect(source).toContain(
-    "nativeFollowupWorkflowStatus(sourceSha, plan.partition, status, count, phase)",
+  expect(source).toMatch(
+    /nativeFollowupWorkflowStatus\(\s*sourceSha,\s*plan\.partition,\s*status,\s*count,\s*observation\.phase,\s*observation\.phase === "native-linux-service-admission"\s*\? observation\.linuxServiceAdmission\s*: null,?\s*\)/,
   );
 });
 
@@ -443,4 +444,59 @@ it.each([
   expect(
     nativeFollowupWorkflowStatus("a".repeat(40), "linux-menu-update", "failed", 0, phase),
   ).toMatchObject({ phase, originalCount: 0, status: "failed", completeGroup: false });
+});
+
+it("refuses nonclosed Linux service metadata at the existing status boundary", () => {
+  const value = {
+    driverOutcome: "nonzero",
+    services: ["dbus", "openbox", "xsettings", "accessibility", "portal-gtk", "portal"].map(
+      (role) => ({ role, done: role === "portal", overflow: false }),
+    ),
+  };
+  expect(projectNativeFollowupLinuxServiceAdmission(value)).toEqual(value);
+  let traps = 0;
+  const accessor = { ...value };
+  Object.defineProperty(accessor, "services", {
+    enumerable: true,
+    get: () => {
+      traps++;
+      return value.services;
+    },
+  });
+  for (const invalid of [
+    { ...value, pid: 1 },
+    { ...value, driverOutcome: "success" },
+    { ...value, services: value.services.slice(1) },
+    { ...value, services: value.services.map((row) => ({ ...row, done: 1 })) },
+    { ...value, services: [...value.services.slice(0, 5), value.services[0]] },
+    accessor,
+    new Proxy(value, {
+      ownKeys: () => {
+        traps++;
+        return Reflect.ownKeys(value);
+      },
+    }),
+  ])
+    expect(() => projectNativeFollowupLinuxServiceAdmission(invalid)).toThrow();
+  expect(traps).toBe(0);
+  expect(() =>
+    nativeFollowupWorkflowStatus(
+      "a".repeat(40),
+      "linux-menu-update",
+      "partition-complete",
+      6,
+      "native-result-admission",
+      value,
+    ),
+  ).toThrow();
+  expect(() =>
+    nativeFollowupWorkflowStatus(
+      "a".repeat(40),
+      "windows-wsl",
+      "failed",
+      0,
+      "native-linux-service-admission",
+      value,
+    ),
+  ).toThrow();
 });

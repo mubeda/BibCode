@@ -57,6 +57,23 @@ export const nativeFollowupPhases = [
   "native-result-admission",
 ] as const;
 export type NativeFollowupPhase = (typeof nativeFollowupPhases)[number];
+export const nativeFollowupLinuxServiceRoles = [
+  "dbus",
+  "openbox",
+  "xsettings",
+  "accessibility",
+  "portal-gtk",
+  "portal",
+] as const;
+export interface NativeFollowupLinuxServiceAdmission {
+  readonly driverOutcome: "unknown" | "zero" | "nonzero";
+  readonly services: readonly {
+    readonly role: (typeof nativeFollowupLinuxServiceRoles)[number];
+    readonly done: boolean;
+    readonly overflow: boolean;
+  }[];
+}
+
 const MOCK_UPDATE_READY_TIMEOUT_MS = 60_000;
 // oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone CI owner snapshots its actual host once.
 const seededUpgradeNativeHostPlatform = process.platform;
@@ -79,6 +96,9 @@ export interface SeededDesktopUpgradeSmokeInput {
   readonly nativeFollowups?: boolean;
   readonly ownedWslManifest?: string;
   readonly observeNativeFollowupPhase?: (phase: NativeFollowupPhase) => void;
+  readonly observeNativeFollowupLinuxServiceAdmission?: (
+    value: NativeFollowupLinuxServiceAdmission,
+  ) => void;
 }
 
 interface SeededUpgradeLaneLayout {
@@ -1864,6 +1884,9 @@ const runWebDriverPhase = async (input: {
   readonly ownedWslDistro?: string;
   readonly ownedWslBackend?: string;
   readonly observeNativePhase?: (phase: string) => void;
+  readonly observeNativeLinuxServiceAdmission?: (
+    value: NativeFollowupLinuxServiceAdmission,
+  ) => void;
 }): Promise<void> => {
   const phaseRoot = NodePath.join(input.runRoot, `${input.phase}-driver`);
   await NodeFS.promises.mkdir(phaseRoot, { recursive: true });
@@ -1967,6 +1990,7 @@ const runWebDriverPhase = async (input: {
     );
     commands.assertClosed();
   }
+  let driverOutcome: NativeFollowupLinuxServiceAdmission["driverOutcome"] = "unknown";
   const runDriver = async (environment: NodeJS.ProcessEnv) => {
     const childEnvironment = { ...environment };
     if (input.lane === "native-followups") {
@@ -1980,7 +2004,7 @@ const runWebDriverPhase = async (input: {
         delete childEnvironment[key];
     }
     try {
-      return await runCommand({
+      const result = await runCommand({
         command: seededUpgradeVitePlusExecutable,
         args: ["exec", "wdio", "run", configPath],
         cwd: NodePath.join(input.repositoryRoot, "apps", "desktop"),
@@ -1999,6 +2023,8 @@ const runWebDriverPhase = async (input: {
         },
         timeoutMs: phaseTimeoutMs,
       });
+      driverOutcome = result.exitCode === 0 ? "zero" : "nonzero";
+      return result;
     } catch (error) {
       if (input.lane === "native-followups") {
         try {
@@ -2031,6 +2057,11 @@ const runWebDriverPhase = async (input: {
             workRoot: NodePath.dirname(NodePath.dirname(input.runRoot)),
             platform: seededUpgradeNativeHostPlatform,
             onStage: input.observeNativePhase,
+            onServiceAdmission: (services: NativeFollowupLinuxServiceAdmission["services"]) => {
+              input.observeNativeLinuxServiceAdmission?.(
+                Object.freeze({ driverOutcome, services }),
+              );
+            },
           },
           runDriver,
         )
@@ -2223,6 +2254,9 @@ const runUpgradeLane = async (input: {
   readonly ownedWslDistro?: string;
   readonly ownedWslBackend?: string;
   readonly observeNativePhase?: (phase: string) => void;
+  readonly observeNativeLinuxServiceAdmission?: (
+    value: NativeFollowupLinuxServiceAdmission,
+  ) => void;
 }): Promise<void> => {
   await NodeFS.promises.mkdir(input.layout.dataRoot, { recursive: true, mode: 0o700 });
   await NodeFS.promises.mkdir(input.layout.evidenceDirectory, { recursive: true, mode: 0o700 });
@@ -2252,6 +2286,9 @@ const runUpgradeLane = async (input: {
     ...(input.ownedWslDistro ? { ownedWslDistro: input.ownedWslDistro } : {}),
     ...(input.ownedWslBackend ? { ownedWslBackend: input.ownedWslBackend } : {}),
     ...(input.observeNativePhase ? { observeNativePhase: input.observeNativePhase } : {}),
+    ...(input.observeNativeLinuxServiceAdmission
+      ? { observeNativeLinuxServiceAdmission: input.observeNativeLinuxServiceAdmission }
+      : {}),
   } as const;
   await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
   if (input.platform === "win" && input.lane !== "native-followups") {
@@ -2819,6 +2856,9 @@ export async function runSeededDesktopUpgradeSmoke(
         ...(ownedWslDistro ? { ownedWslDistro } : {}),
         ...(ownedWslBackend ? { ownedWslBackend } : {}),
         observeNativePhase,
+        ...(input.observeNativeFollowupLinuxServiceAdmission
+          ? { observeNativeLinuxServiceAdmission: input.observeNativeFollowupLinuxServiceAdmission }
+          : {}),
       });
     }
     if (!input.nativeFollowups) {

@@ -14,6 +14,11 @@ import { it as effectIt } from "@effect/vitest";
 import { HostProcessPlatform } from "@bibcode/shared/hostProcess";
 import { AuthPairingLink } from "@bibcode/contracts";
 import { parse as parseToml, type TomlTable } from "smol-toml";
+import * as NodeEvents from "node:events";
+import {
+  nativeFollowupWorkflowStatus,
+  projectNativeFollowupLinuxServiceAdmission,
+} from "./qualify-native-followups-workflow.ts";
 import {
   releasePackageFiles,
   releaseRustPackageFiles,
@@ -1904,12 +1909,15 @@ describe("native follow-up owning setup stages", () => {
       );
     expect(actual >= 0 && open > actual && end > open && phaseLineStart >= 0).toBe(true);
     const phaseLine = source.slice(phaseLineStart, source.indexOf("\n", phaseLineStart));
-    const input = NodeVM.runInNewContext(phaseLine + "\n(" + source.slice(open, end) + ")", {
-      NodePath,
-      process: { env: {} },
-      seededUpgradeNativeHostPlatform: "linux",
-      input: { runRoot: nativeRoot, phase: "seed-and-install" },
-    }) as { root?: string; workRoot?: string };
+    const input = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(phaseLine + "\n(" + source.slice(open, end) + ")"),
+      {
+        NodePath,
+        process: { env: {} },
+        seededUpgradeNativeHostPlatform: "linux",
+        input: { runRoot: nativeRoot, phase: "seed-and-install" },
+      },
+    ) as { root?: string; workRoot?: string };
     expect(input.workRoot === "/owned/" + "x".repeat(52)).toBe(true);
     expect(input.root).toBeUndefined();
   });
@@ -2349,7 +2357,11 @@ it.each([
       NodeModule.stripTypeScriptTypes(
         workflow.slice(statusStart, statusEnd).replace("export ", ""),
       ) + "\nnativeFollowupWorkflowStatus;",
-      { nativeFollowupPhases: permitted, refused: () => new Error("Inert invalid status.") },
+      {
+        nativeFollowupPhases: permitted,
+        projectNativeFollowupLinuxServiceAdmission,
+        refused: () => new Error("Inert invalid status."),
+      },
     ) as (
       source: string,
       partition: string,
@@ -2366,5 +2378,238 @@ it.each([
         expected,
       ),
     ).toMatchObject({ phase: expected, originalCount: failed ? 0 : 6 });
+  },
+);
+
+it.each([
+  "zero-closed",
+  "nonzero-closed",
+  "overflow",
+  "observer-throw",
+  "normal",
+  "timeout",
+  "rejection",
+  "undefined",
+] as const)(
+  "preserves the actual Linux session/caller/status failed-boundary outcomes: %s",
+  async (mode) => {
+    const source = NodeFS.readFileSync(
+        new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+        "utf8",
+      ),
+      leaf = NodeFS.readFileSync(
+        new URL(
+          "../apps/desktop/e2e/support/release-visual-native-followups-session.ts",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+      leafStart = leaf.indexOf("function createNativeFollowupsLinuxSessionRoot("),
+      callerStart = source.indexOf("const runWebDriverPhase = async"),
+      callerEnd = source.indexOf("const startMockUpdateServer", callerStart);
+    expect(leafStart > 0 && callerStart > 0 && callerEnd > callerStart).toBe(true);
+    const phases: string[] = [],
+      cleanup: unknown[] = [],
+      children: Array<
+        NodeEvents.EventEmitter & {
+          pid: number;
+          stdout: NodeEvents.EventEmitter;
+          stderr: NodeEvents.EventEmitter;
+          kill: () => boolean;
+        }
+      > = [],
+      original =
+        mode === "undefined"
+          ? undefined
+          : mode === "timeout"
+            ? new SeededUpgradeCommandTimeoutError("Inert original timeout.")
+            : Object.freeze(new Error("Inert original command failure."));
+    let commands = 0,
+      admissions = 0,
+      failed = false,
+      caught: unknown,
+      observation: unknown = null;
+    const stat = {
+      mode: 0o40700,
+      uid: 1001,
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+      isFile: () => true,
+    };
+    const filesystem = {
+      lstatSync: () => stat,
+      statSync: () => ({
+        ...stat,
+        mode: 0o100755,
+        uid: 0,
+        isDirectory: () => false,
+        isFile: () => true,
+      }),
+      realpathSync: (path: string) => path,
+      mkdtempSync: (prefix: string) => prefix + "owned1",
+      existsSync: (path: string) =>
+        path.endsWith("/runtime/bus") ||
+        path === "/usr/libexec/gsd-xsettings" ||
+        path === "/usr/libexec/at-spi-bus-launcher" ||
+        path === "/usr/libexec/xdg-desktop-portal-gtk" ||
+        path === "/usr/libexec/xdg-desktop-portal",
+      mkdirSync: () => {},
+      openSync: () => 1,
+      writeSync: () => {},
+      closeSync: () => {},
+      writeFileSync: (_path: string, body: string) => cleanup.push(JSON.parse(body)),
+      promises: { mkdir: async () => {}, writeFile: async () => {} },
+    };
+    const session = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(leaf.slice(leafStart))
+        .replace(/^export /gm, "")
+        .replaceAll('await import("node:process")', "await loadProcess()") +
+        "\nwithNativeFollowupsLinuxSession;",
+      {
+        NodeFS: filesystem,
+        NodePath,
+        NodeProcess: { getuid: () => 1001 },
+        Buffer,
+        Error,
+        NativeFollowupCommandOwner: class {
+          async command() {
+            return Buffer.from("");
+          }
+          assertClosed() {}
+        },
+        bounded: async (value: Promise<unknown>) => value,
+        NodeChildProcess: {
+          spawn: () => {
+            const child = Object.assign(new NodeEvents.EventEmitter(), {
+              pid: 10000 + children.length,
+              stdout: new NodeEvents.EventEmitter(),
+              stderr: new NodeEvents.EventEmitter(),
+              kill: () => {
+                child.emit("close");
+                return true;
+              },
+            });
+            children.push(child);
+            return child;
+          },
+        },
+        loadProcess: async () => ({
+          kill: (pid: number) => {
+            const child = children.find((value) => value.pid === -pid);
+            if (!child) throw new Error("Inert foreign process.");
+            child.emit("close");
+          },
+        }),
+      },
+    ) as (
+      input: object,
+      run: (environment: NodeJS.ProcessEnv) => Promise<object>,
+    ) => Promise<object>;
+    let caller = source.slice(callerStart, callerEnd);
+    const importEnd = caller.indexOf(").withNativeFollowupsLinuxSession"),
+      importStart = caller.lastIndexOf("await import(", importEnd);
+    expect(importStart > 0 && importEnd > importStart).toBe(true);
+    caller =
+      caller.slice(0, importStart) + "await loadSession()\n        " + caller.slice(importEnd);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(caller) + "\nrunWebDriverPhase;",
+      {
+        NodeFS: filesystem,
+        NodePath,
+        NodeURL,
+        process: { env: { CI: "true", GITHUB_ACTIONS: "true", DISPLAY: ":inert" } },
+        seededUpgradeNativeHostPlatform: "linux",
+        seededUpgradeVitePlusExecutable,
+        SeededUpgradeCommandTimeoutError,
+        createSeededUpgradeDriverSpec: () => "inert",
+        createSeededUpgradeWdioConfig: () => "inert",
+        redactAndBoundUpgradeEvidence: () => "inert bounded output",
+        loadSession: async () => ({ withNativeFollowupsLinuxSession: session }),
+        runCommand: async () => {
+          commands++;
+          if (mode === "zero-closed" || mode === "nonzero-closed" || mode === "observer-throw")
+            children[3]!.emit("close");
+          if (mode === "overflow") children[4]!.stderr.emit("data", Buffer.alloc(65537));
+          if (mode === "timeout" || mode === "rejection" || mode === "undefined") throw original;
+          return { exitCode: mode === "nonzero-closed" ? 7 : 0, stdout: "", stderr: "" };
+        },
+        assertWebDriverPhaseExit: () => {
+          admissions++;
+        },
+      },
+    ) as (input: object) => Promise<void>;
+    try {
+      await run({
+        appBinaryPath: "inert",
+        backendPort: 1,
+        candidateVersion: "inert",
+        dataRoot: "/inert/data",
+        evidenceDirectory: "/inert/evidence",
+        expectedDataRoot: "/inert/data",
+        lane: "native-followups",
+        phase: "seed-and-install",
+        platform: "linux",
+        projectId: "inert",
+        repositoryRoot: "/inert/source",
+        restartTimeoutMs: 1,
+        resultPath: "/inert/before.json",
+        runRoot: "/inert/run/native",
+        workspaceRoot: "/inert/workspace",
+        webdriverPort: 1,
+        wsl: false,
+        sourceSha: "a".repeat(40),
+        observeNativePhase: (phase: string) => phases.push(phase),
+        observeNativeLinuxServiceAdmission: (value: unknown) => {
+          if (mode === "observer-throw") throw new Error("Inert diagnostic failure.");
+          observation = projectNativeFollowupLinuxServiceAdmission(value);
+        },
+      });
+    } catch (error) {
+      failed = true;
+      caught = error;
+    }
+    expect(commands).toBe(1);
+    expect(children).toHaveLength(6);
+    expect(admissions).toBe(mode === "normal" ? 1 : 0);
+    expect(failed).toBe(mode !== "normal");
+    expect(cleanup).toEqual([
+      {
+        childCount: 6,
+        childProcessesClosed: true,
+        boundedLogs: mode !== "overflow",
+        cleanupSafe: mode !== "overflow",
+      },
+    ]);
+    if (["timeout", "rejection", "undefined"].includes(mode)) expect(caught).toBe(original);
+    else if (failed)
+      expect(caught).toMatchObject({
+        message: "Native follow-up private OS session exited early.",
+      });
+    const attributed = ["zero-closed", "nonzero-closed", "overflow"].includes(mode);
+    if (attributed) {
+      expect(observation).toEqual({
+        driverOutcome: mode === "nonzero-closed" ? "nonzero" : "zero",
+        services: [
+          { role: "dbus", done: false, overflow: false },
+          { role: "openbox", done: false, overflow: false },
+          { role: "xsettings", done: false, overflow: false },
+          { role: "accessibility", done: mode !== "overflow", overflow: false },
+          { role: "portal-gtk", done: mode === "overflow", overflow: mode === "overflow" },
+          { role: "portal", done: false, overflow: false },
+        ],
+      });
+    } else expect(observation).toBeNull();
+    const phase = phases.at(-1)! as Parameters<typeof nativeFollowupWorkflowStatus>[4];
+    const status = nativeFollowupWorkflowStatus(
+      "a".repeat(40),
+      "linux-menu-update",
+      failed ? "failed" : "partition-complete",
+      failed ? 0 : 6,
+      phase,
+      observation,
+    );
+    expect(status.status).toBe(failed ? "failed" : "partition-complete");
+    if (attributed) expect(status).toHaveProperty("linuxServiceAdmission", observation);
+    else expect(status).not.toHaveProperty("linuxServiceAdmission");
   },
 );
