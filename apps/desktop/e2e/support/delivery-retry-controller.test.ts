@@ -23,6 +23,10 @@ import { gitProjectDirectoryFailureFacts } from "./release-visual-git-project.ts
 import { gitProjectTabFailureFacts } from "./git-project-tab-observation.ts";
 import { bounded, projectOwnedDriverReadiness } from "./qualification-owner.ts";
 import * as OwnerModule from "./qualification-owner.ts";
+import {
+  projectPrViewportObservation,
+  projectModelClickObservation,
+} from "./delivery-browser-observation.ts";
 import { correctDesktopUiOuterSize } from "./window-size.ts";
 import { readVisualViewport } from "./release-visual-observation.ts";
 import {
@@ -885,6 +889,9 @@ function createRefFailureBoundary(
     readiness?: unknown;
     readinessStage?: unknown;
     sessionObservation?: unknown;
+    viewportObservation?: unknown;
+    modelClickObservation?: unknown;
+    selection?: string;
     importObservation?: unknown;
   } = {},
 ) {
@@ -943,6 +950,11 @@ function createRefFailureBoundary(
       browserDriverReadiness: options.readiness ?? null,
       browserReadinessStage: options.readinessStage ?? null,
       browserSessionObservation: options.sessionObservation ?? null,
+      prViewportObservation: options.viewportObservation ?? null,
+      modelClickObservation: options.modelClickObservation ?? null,
+      config: { selection: options.selection ?? "delivery-retry-ui" },
+      projectPrViewportObservation,
+      projectModelClickObservation,
       error: new Error("The required live observation did not arrive within its bound."),
       bounded,
       projectOwnedDriverReadiness,
@@ -4152,3 +4164,53 @@ it.each([
     );
   },
 );
+
+it("actual failure writer retains fixed viewport/model facts only at their owned phase and selection", async () => {
+  const viewport = {
+    viewportReadReturned: true,
+    viewportNumbersFinite: true,
+    viewportDimensionsPositive: true,
+    viewportScaleOne: true,
+    outerReadReturned: true,
+    outerDimensionsPositive: true,
+    correctionFinitePositive: true,
+    resizeReturned: true,
+    lastViewportExact: false,
+  };
+  const model = {
+    modelRowCountOne: true,
+    modelRowRoleOption: true,
+    modelRowDisplayed: true,
+    modelRowCenterInViewport: true,
+    modelRowCenterHitsRow: false,
+    modelRowCenterHitsFavorite: false,
+    composerTriggerCountOne: true,
+    triggerLabelExpected: false,
+  };
+  const pr = createRefFailureBoundary({
+    phase: "visual-pull-requests-viewport-settle",
+    selection: "release-visual-pull-requests",
+    viewportObservation: viewport,
+  });
+  await pr.run();
+  expect(pr.writes[0]?.prViewportObservation).toEqual(viewport);
+  expect(pr.writes[0]?.modelClickObservation).toBeNull();
+  expect(pr.reads()).toBe(0);
+  const settings = createRefFailureBoundary({
+    phase: "import-verify-claude-opus",
+    selection: "release-visual-settings",
+    modelClickObservation: model,
+  });
+  await settings.run();
+  expect(settings.writes[0]?.modelClickObservation).toEqual(model);
+  expect(settings.writes[0]?.prViewportObservation).toBeNull();
+  const other = createRefFailureBoundary({
+    phase: "visual-pull-requests-viewport-settle",
+    selection: "delivery-retry-ui",
+    viewportObservation: viewport,
+    modelClickObservation: model,
+  });
+  await other.run();
+  expect(other.writes[0]?.prViewportObservation).toBeNull();
+  expect(other.writes[0]?.modelClickObservation).toBeNull();
+});

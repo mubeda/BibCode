@@ -11,6 +11,7 @@ import { ExecutionEnvironmentDescriptor } from "../../../../packages/contracts/s
 import { bindOwnedBrowserAlertObservation } from "./owned-browser-alert.ts";
 import { pullRequestsCaptureBindings } from "./release-visual-pull-requests.ts";
 import { expect, it } from "vite-plus/test";
+import { observePrViewportNumbers, observePrOuterNumbers } from "./delivery-browser-observation.ts";
 import { preparePullRequestsHostingFixture } from "./release-visual-pull-requests-installer.ts";
 import {
   createPullRequestsPhysicalJoins,
@@ -727,6 +728,9 @@ it.each(["ordinary", "producer-failure", "cleanup-failure"] as const)(
       context,
       theme: "light",
       origin: "http://127.0.0.1:4885",
+      prViewportObservation: null,
+      observePrViewportNumbers,
+      observePrOuterNumbers,
       pullRequestsFixture: fixture,
       pullRequestsFixtureSafeToDelete: true,
       browser,

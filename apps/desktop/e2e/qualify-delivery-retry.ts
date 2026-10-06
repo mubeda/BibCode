@@ -1,5 +1,14 @@
 import { observeOwnedBrowserAlert } from "./support/owned-browser-alert.ts";
 import {
+  projectPrViewportObservation,
+  projectModelClickObservation,
+  observePrViewportNumbers,
+  observePrOuterNumbers,
+  readDeliveryModelClickObservation,
+  type PrViewportObservation,
+  type ModelClickObservation,
+} from "./support/delivery-browser-observation.ts";
+import {
   selectLifecycleCodexWorkspace,
   runProjectLifecycleScene,
   captureProjectLifecycleScene,
@@ -721,6 +730,8 @@ export async function runDeliveryRetryQualification() {
   let browserDriverReadiness: OwnedDriverReadiness | null = null;
   let browserReadinessStage: "driver-readiness" | "session-create" | "online-proof" | null = null;
   let browserSessionObservation: OwnedBrowserSessionObservation | null = null;
+  let prViewportObservation: PrViewportObservation | null = null;
+  let modelClickObservation: ModelClickObservation | null = null;
   const networkProofs: object[] = [];
   const write = (name: string, value: unknown) =>
     NodeFS.writeFileSync(
@@ -1015,7 +1026,20 @@ export async function runDeliveryRetryQualification() {
     const model =
       '[data-model-picker-content="true"] [data-model-picker-instance-id="claudeAgent"][data-model-picker-model-slug="opus"]';
     step(`${scope}-select-claude-opus`);
-    await click(model);
+    if (config.selection === "release-visual-settings" && scope === "import") {
+      modelClickObservation = null;
+      const target = b().$(model);
+      await target.waitForDisplayed();
+      await target.waitForEnabled();
+      try {
+        modelClickObservation = projectModelClickObservation(
+          await bounded(b().execute(readDeliveryModelClickObservation, origin), 2000),
+        );
+      } catch {
+        /* Missing passive metadata cannot replace the original click result. */
+      }
+      await target.click();
+    } else await click(model);
     step(`${scope}-verify-claude-opus`);
     // The visible trigger text is model-only; its accessible label includes the
     // actual selected provider and full model name from the owned Claude fixture.
@@ -1719,18 +1743,57 @@ export async function runDeliveryRetryQualification() {
             childEnv,
           );
         step("visual-pull-requests-viewport");
-        const viewport = await bounded(browser.execute(readVisualViewport), 2000),
-          outer = await browser.getWindowSize(),
-          corrected = correctDesktopUiOuterSize(
-            outer,
-            { width: 1280, height: 960 },
-            viewport,
-            viewport.devicePixelRatio,
-          );
+        let attemptViewportObservation: PrViewportObservation = {
+          viewportReadReturned: null,
+          viewportNumbersFinite: null,
+          viewportDimensionsPositive: null,
+          viewportScaleOne: null,
+          outerReadReturned: null,
+          outerDimensionsPositive: null,
+          correctionFinitePositive: null,
+          resizeReturned: null,
+          lastViewportExact: null,
+        };
+        prViewportObservation = attemptViewportObservation;
+        step("visual-pull-requests-viewport-read");
+        const viewport = await bounded(browser.execute(readVisualViewport), 2000);
+        attemptViewportObservation = {
+          ...attemptViewportObservation,
+          viewportReadReturned: true,
+          ...observePrViewportNumbers(viewport),
+        };
+        prViewportObservation = attemptViewportObservation;
+        step("visual-pull-requests-viewport-outer-read");
+        const outer = await browser.getWindowSize();
+        attemptViewportObservation = {
+          ...attemptViewportObservation,
+          outerReadReturned: true,
+          outerDimensionsPositive: observePrOuterNumbers(outer),
+        };
+        prViewportObservation = attemptViewportObservation;
+        step("visual-pull-requests-viewport-correction");
+        const corrected = correctDesktopUiOuterSize(
+          outer,
+          { width: 1280, height: 960 },
+          viewport,
+          viewport.devicePixelRatio,
+        );
+        attemptViewportObservation = {
+          ...attemptViewportObservation,
+          correctionFinitePositive: observePrOuterNumbers(corrected),
+        };
+        prViewportObservation = attemptViewportObservation;
+        step("visual-pull-requests-viewport-resize");
         await browser.setWindowSize(corrected.width, corrected.height);
+        attemptViewportObservation = { ...attemptViewportObservation, resizeReturned: true };
+        prViewportObservation = attemptViewportObservation;
+        step("visual-pull-requests-viewport-settle");
         await owner.until(async () => {
           const current = await bounded(browser!.execute(readVisualViewport), 2000);
-          return current.width === 1280 && current.height === 960;
+          const exact = current.width === 1280 && current.height === 960;
+          attemptViewportObservation = { ...attemptViewportObservation, lastViewportExact: exact };
+          prViewportObservation = attemptViewportObservation;
+          return exact;
         });
         await runOwnedPullRequestsSelection({
           CI: childEnv.CI,
@@ -3285,6 +3348,16 @@ export async function runDeliveryRetryQualification() {
       browserSessionObservation:
         phase === "browser"
           ? projectOwnedBrowserSessionObservation(browserSessionObservation)
+          : null,
+      prViewportObservation:
+        config.selection === "release-visual-pull-requests" &&
+        phase.startsWith("visual-pull-requests-viewport")
+          ? projectPrViewportObservation(prViewportObservation)
+          : null,
+      modelClickObservation:
+        config.selection === "release-visual-settings" &&
+        ["import-select-claude-opus", "import-verify-claude-opus"].includes(phase)
+          ? projectModelClickObservation(modelClickObservation)
           : null,
     });
   } finally {

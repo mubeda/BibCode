@@ -14,7 +14,14 @@ export interface DeliveryImportModelFacts {
 }
 export interface DeliveryImportObservation {
   safeLocation: boolean | null;
-  route: "pair" | "root" | "workspace" | "settings" | "other" | null;
+  route:
+    | "pair"
+    | "root"
+    | "workspace"
+    | "settings-general"
+    | "settings-remote-servers"
+    | "other"
+    | null;
   modalPresent: boolean | null;
   modalDisplayed: boolean | null;
   pathPresent: boolean | null;
@@ -100,7 +107,14 @@ export function projectDeliveryImportObservation(input: unknown): DeliveryImport
     }
     if (
       !booleans.every((key) => value[key] === null || typeof value[key] === "boolean") ||
-      !choice("route", ["pair", "root", "workspace", "settings", "other"]) ||
+      !choice("route", [
+        "pair",
+        "root",
+        "workspace",
+        "settings-general",
+        "settings-remote-servers",
+        "other",
+      ]) ||
       !choice("primaryCardCount", ["none", "one", "multiple"]) ||
       !choice("errorCategory", [
         "host-loading",
@@ -173,9 +187,11 @@ export function readDeliveryImportObservation(
           ? "pair"
           : /^\/local\/[A-Za-z0-9._:-]{1,128}$/.test(location.pathname)
             ? "workspace"
-            : ["/settings/general", "/settings/remote-servers"].includes(location.pathname)
-              ? "settings"
-              : "other";
+            : location.pathname === "/settings/general"
+              ? "settings-general"
+              : location.pathname === "/settings/remote-servers"
+                ? "settings-remote-servers"
+                : "other";
     const displayed = (element: Element | null): boolean | null => {
       try {
         if (!element || typeof element.checkVisibility !== "function") return null;

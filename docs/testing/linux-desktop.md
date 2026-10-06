@@ -1069,6 +1069,22 @@ request URL, error text or driver log enters these receipts; preserve an unknown
 cause until the closed evidence identifies a boundary. Other failure phases
 retain null for both fields.
 
+For the PR selection, the existing viewport preparation records fixed subphases
+for its client read, outer read, correction calculation, resize and exact
+settlement. Its nine boolean-or-null facts use only those existing returned
+values. They retain no dimensions, response text or identity, and add no SDK
+request, retry, correction or changed deadline. Missing or unsafe metadata stays
+unknown. These facts identify an owning boundary, not a native geometry cause.
+
+The Settings import records one bounded passive model-option witness after its
+existing display/enabled waits and immediately before the unchanged click. The
+fixed eight predicates distinguish one visible option, its viewport center and
+whether that center hits the row or its real favorite child, plus the owned
+composer trigger count and expected-label predicate. No DOM, text, coordinates,
+URL or private identity leaves that read. An unavailable witness cannot gate,
+replace, retry or widen the original click. The existing failure-only route
+sample distinguishes its known General and Remote Servers routes by fixed enums.
+
 The same `browser` failure receipt also contains `browserSessionObservation`,
 an exact four-boolean packet: `protocolClientCreated`, `remoteReturned`,
 `alertBindingAttempted`, and `alertBindingCompleted`. The installed SDK's passive

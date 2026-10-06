@@ -325,7 +325,8 @@ describe("failure-only owned import DOM sample", () => {
   it.each([
     ["/", "root"],
     ["/pair", "pair"],
-    ["/settings/general", "settings"],
+    ["/settings/general", "settings-general"],
+    ["/settings/remote-servers", "settings-remote-servers"],
     ["/local/private-id", "workspace"],
     ["/local/private-id/nested", "other"],
   ])("retains only the route category", (pathname, route) => {
