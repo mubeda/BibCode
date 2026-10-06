@@ -357,18 +357,16 @@ it.each([
   "release-visual-settings",
   "release-visual-workspace-substates",
   "release-visual-cursor-question",
+  "release-visual-project-lifecycle",
 ])(
-  "keeps the original baseline operations for every selection except the dedicated Cursor row: %s",
+  "keeps baseline operations outside the dedicated Cursor and lifecycle selections: %s",
   async (selection) => {
     const source = NodeFS.readFileSync(
       new NodeURL.URL("../qualify-delivery-retry.ts", import.meta.url),
       "utf8",
     );
     const start = source.indexOf("      const baseline = `delivery baseline ${theme}`;");
-    const end = source.indexOf(
-      '      if (config.selection === "release-visual-workspace-substates") {',
-      start,
-    );
+    const end = source.indexOf("      if (config.selection === ", start);
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
     const calls: string[] = [];
@@ -411,7 +409,7 @@ it.each([
     );
     await run();
     expect(calls).toEqual(
-      selection === "release-visual-cursor-question"
+      ["release-visual-cursor-question", "release-visual-project-lifecycle"].includes(selection)
         ? []
         : ["send", "response", "send-ready", "conversation-check"],
     );

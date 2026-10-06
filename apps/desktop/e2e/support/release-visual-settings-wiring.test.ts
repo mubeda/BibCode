@@ -325,7 +325,7 @@ describe("actual separate settings callsite", () => {
   );
   it("runs the existing managed-worktree creator exactly once in the shared per-theme setup", async () => {
     const begin = source.indexOf(
-      "      const workspace = await createOwnedWorkspace(context, runRoot);",
+      "      const workspace = await createOwnedWorkspace(context, runRoot, lifecycleSnapshot);",
     );
     const end = source.indexOf("\n      if (", begin);
     expect(begin).toBeGreaterThan(0);
@@ -341,11 +341,13 @@ describe("actual separate settings callsite", () => {
       {
         context,
         runRoot: "/private/root",
+        lifecycleSnapshot: undefined,
         config: { fixture: "/private" },
         NodePath: { join: (...parts: string[]) => parts.join("/") },
-        createOwnedWorkspace: async (actual: unknown, root: string) => {
+        createOwnedWorkspace: async (actual: unknown, root: string, snapshot: unknown) => {
           expect(actual).toBe(context);
           expect(root).toBe("/private/root");
+          expect(snapshot).toBeUndefined();
           creates++;
           return { branch: "codex/delivery-retry-light", threadId: "owned-thread" };
         },

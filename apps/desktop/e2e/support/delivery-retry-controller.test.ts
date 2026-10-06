@@ -3779,7 +3779,7 @@ it.each([
   "binds the actual workspace-substate controller caller to its immutable public/source owner: %s",
   async (mode) => {
     const start = controller.indexOf(
-      '      if (config.selection === "release-visual-workspace-substates") {',
+      '      } else if (config.selection === "release-visual-workspace-substates") {',
     );
     const end = controller.indexOf(
       '      } else if (config.selection === "release-visual-core") {',
@@ -3819,7 +3819,9 @@ it.each([
     };
     const run = runControllerSource(
       NodeModule.stripTypeScriptTypes(
-        "async function run(){" + controller.slice(start, end) + "\n}}\nrun",
+        "async function run(){" +
+          controller.slice(start, end).replace(/^\s*\} else /, "") +
+          "\n}}\nrun",
       ),
       {
         config: { selection: "release-visual-workspace-substates", evidence: "/owned/evidence" },
