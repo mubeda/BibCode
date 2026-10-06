@@ -88,6 +88,27 @@ describe("original Git/project tab click attribution", () => {
     },
   );
 
+  it("retains only the original tab click's closed Chrome ellipsis header facts", () => {
+    const error = new Error(
+      'element click intercepted: Element <button>...</button> is not clickable at point (10, 20). Other element would receive the click: <div data-slot="toast-viewport" data-ending-style>...</div>',
+    );
+    const facts = project(
+      error,
+      "visual-git-project-tab-changes-click",
+      "release-visual-git-project",
+    );
+    expect(facts).toEqual({
+      tab: "changes",
+      receiverSlot: "toast-viewport",
+      receiverEndingStyle: true,
+    });
+    expect(
+      project(error, "visual-git-project-tab-history-completed", "release-visual-git-project"),
+    ).toBeNull();
+    expect(project(error, "visual-git-project-tab-changes-click", "other")).toBeNull();
+    expect(JSON.stringify(facts)).not.toMatch(/private|button|div|point|10|20|<|>/);
+  });
+
   it.each([
     "import-verify-claude-opus",
     "visual-git-project-tab-changes-displayed",

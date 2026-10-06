@@ -617,7 +617,9 @@ export async function runDeliveryRetryQualification() {
   } | null => cursorOriginalFailure;
   const cursorOriginalFailurePhases = new Set([
     "visual-cursor-question-select",
+    "visual-cursor-question-turn-before",
     "visual-cursor-question-send",
+    "visual-cursor-question-turn-running",
     "visual-cursor-question-first-choice",
     "visual-cursor-question-later-tests",
     "visual-cursor-question-later-docs",
@@ -1587,6 +1589,7 @@ export async function runDeliveryRetryQualification() {
         step("visual-workspace-substates-batch-entry");
         const proof = await runWorkspaceSubstateBatch({
           ...binding,
+          step,
           browser: b(),
           owner,
           verifyManaged,
@@ -1839,8 +1842,11 @@ export async function runDeliveryRetryQualification() {
             await click(`[data-testid="primary-card-button-${originalContext.projectId}"]`);
           },
           send: async (text) => {
+            step("visual-cursor-question-turn-before");
             const before = (await currentThread()).latestTurn?.turnId ?? null;
+            step("visual-cursor-question-send");
             await send(text);
+            step("visual-cursor-question-turn-running");
             await owner.until(async () => {
               const thread = await currentThread(),
                 turn = thread.latestTurn;

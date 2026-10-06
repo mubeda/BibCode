@@ -1038,3 +1038,83 @@ it("runs exactly the separate three-substate batch through genuine public prereq
   expect(calls).toContain("contained-scroll");
   expect(fake.result()).toEqual({ terminals: 0, chats: 0, running: false, active: "host" });
 });
+
+it("attributes workspace public prerequisites without changing their action or cleanup order", async () => {
+  const fake = publicWorkspacePorts();
+  const phases: string[] = [];
+  await runWorkspaceActivityLines({
+    ...fake.input,
+    step: (phase: string) => phases.push(phase),
+  } as WorkspaceSubstateFlowInput);
+  expect(phases).toEqual([
+    "visual-workspace-activity-context",
+    "visual-workspace-activity-managed",
+    "visual-workspace-activity-admission",
+    "visual-workspace-activity-panel-count",
+    "visual-workspace-activity-terminal-open",
+    "visual-workspace-activity-terminal-focus",
+    "visual-workspace-activity-terminal-command",
+    "visual-workspace-activity-terminal-running",
+    "visual-workspace-activity-host-return",
+    "visual-workspace-activity-chat-open",
+    "visual-workspace-activity-chat-compose",
+    "visual-workspace-activity-chat-send",
+    "visual-workspace-activity-chat-response",
+    "visual-workspace-activity-host-restore",
+    "visual-workspace-activity-terminal-hover",
+    "visual-workspace-activity-capture",
+  ]);
+  expect(fake.result()).toEqual({ terminals: 0, chats: 0, running: false, active: "host" });
+});
+
+it.each([
+  ["managed", "visual-workspace-activity-managed"],
+  ["admission", "visual-workspace-activity-admission"],
+  ["terminal-open", "visual-workspace-activity-terminal-open"],
+  ["chat-response", "visual-workspace-activity-chat-response"],
+  ["capture", "visual-workspace-activity-capture"],
+])(
+  "retains the workspace failure boundary and original exception through cleanup: %s",
+  async (boundary, expected) => {
+    const original = new Error("Inert workspace boundary failure.");
+    const fake = publicWorkspacePorts(boundary === "capture" ? original : undefined);
+    const phases: string[] = [];
+    const input = {
+      ...fake.input,
+      step: (phase: string) => phases.push(phase),
+      verifyManaged: async () => {
+        if (boundary === "managed") throw original;
+      },
+      browser: {
+        ...fake.input.browser,
+        execute: async (read: unknown, ...args: unknown[]) => {
+          if (boundary === "admission" && read === readWorkspaceSubstate) throw original;
+          return fake.input.browser.execute(read as never, ...args);
+        },
+        $: (selector: string) => {
+          const element = fake.input.browser.$(selector);
+          return {
+            ...element,
+            click: async (...args: unknown[]) => {
+              if (
+                boundary === "terminal-open" &&
+                selector.includes('normalize-space()="Open Terminal"')
+              )
+                throw original;
+              return element.click(...(args as []));
+            },
+            getText: async () => {
+              if (boundary === "chat-response") throw original;
+              return element.getText();
+            },
+          };
+        },
+      },
+    };
+    await expect(
+      runWorkspaceActivityLines(input as unknown as WorkspaceSubstateFlowInput),
+    ).rejects.toBe(original);
+    expect(phases.at(-1)).toBe(expected);
+    expect(fake.result()).toEqual({ terminals: 0, chats: 0, running: false, active: "host" });
+  },
+);

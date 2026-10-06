@@ -128,7 +128,7 @@ export function projectRemoteUiCheckAgainInterception(
     }
     if (!complete) return null;
     let remainder = fragment.slice(cursor).trimStart();
-    const closing = new RegExp("^</" + tag + "\\s*>", "i").exec(remainder);
+    const closing = new RegExp("^(?:\\.\\.\\.)?</" + tag + "\\s*>", "i").exec(remainder);
     if (closing) remainder = remainder.slice(closing[0].length);
     if (/[<>]/.test(remainder)) return null;
     const slot = attributes.get("data-slot");

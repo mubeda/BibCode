@@ -3797,6 +3797,7 @@ it.each([
     let descriptors = 0,
       snapshots = 0,
       capturesStarted = 0;
+    const recordStep = vi.fn();
     const captures: object[] = [],
       assertions: object[] = [];
     const document = {
@@ -3832,7 +3833,7 @@ it.each([
         assertions,
         capturedVisuals: new Set<string>(),
         success: false,
-        step: () => {},
+        step: recordStep,
         write: () => {},
         type: async (value: string) => expect(value).toBe("Owned visual review draft"),
         check: (value: boolean) => {
@@ -3886,9 +3887,13 @@ it.each([
           commonDirectory: workspace.commonDirectory,
         }),
         runWorkspaceSubstateBatch: async (input: {
+          step: (phase: string) => void;
           verifyManaged: () => Promise<void>;
           capture: (value: string) => Promise<void>;
         }) => {
+          expect(input.step).toBe(recordStep);
+          input.step("visual-workspace-activity-context");
+          expect(recordStep).toHaveBeenLastCalledWith("visual-workspace-activity-context");
           await input.verifyManaged();
           for (const substate of [
             "workspace-activity-lines",

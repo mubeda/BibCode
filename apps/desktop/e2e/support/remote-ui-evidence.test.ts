@@ -915,6 +915,51 @@ it.each([
   },
 );
 
+it.each([
+  ["toast-close", true],
+  ["dialog-popup", false],
+  ["private-unknown-slot", true],
+] as const)(
+  "projects only the header of a literal Chrome ellipsis receiver: %s",
+  (slot, ending) => {
+    const error = new Error(
+      'element click intercepted: Element <button>...</button> is not clickable at point (10, 20). Other element would receive the click: <div data-slot="' +
+        slot +
+        '"' +
+        (ending ? " data-ending-style" : "") +
+        ">...</div>",
+    );
+    const facts = projectRemoteUiCheckAgainInterception(error);
+    expect(facts).toEqual({
+      receiverSlot: slot === "private-unknown-slot" ? "other" : slot,
+      receiverEndingStyle: ending,
+    });
+    expect(Object.keys(facts!)).toEqual(["receiverSlot", "receiverEndingStyle"]);
+    expect(Object.isFrozen(facts)).toBe(true);
+    expect(JSON.stringify(facts)).not.toMatch(/private|button|div|point|10|20|<|>/);
+  },
+);
+
+it.each([
+  "....</div>",
+  "…</div>",
+  "... </div>",
+  "...</span>",
+  "...<span></span></div>",
+  "...</div><span>",
+  "..</div>",
+  "<span></span></div>",
+])(
+  "refuses malformed or nested ellipsis receiver contents without parsing arbitrary HTML: %s",
+  (body) => {
+    const error = new Error(
+      'element click intercepted: Other element would receive the click: <div data-slot="dialog-popup">' +
+        body,
+    );
+    expect(projectRemoteUiCheckAgainInterception(error)).toBeNull();
+  },
+);
+
 it("refuses inherited, accessor, live-proxy and revoked-proxy messages before reflection", () => {
   let reads = 0;
   const message =

@@ -3445,6 +3445,24 @@ it("projects only closed receiver facts from the pinned SDK's original click err
   );
 });
 
+it.each([false, true])(
+  "projects literal Chrome ellipsis header facts from the pinned SDK click error (ending=%s)",
+  (ending) => {
+    const error = sdkClickResponseError("element click intercepted", {
+      message:
+        'element click intercepted: Element <button>...</button> is not clickable at point (10, 20). Other element would receive the click: <div data-slot="dialog-popup"' +
+        (ending ? " data-ending-style" : "") +
+        ">...</div>",
+    });
+    const facts = projectRemoteUiCheckAgainInterception(error);
+    expect(facts).toEqual({ receiverSlot: "dialog-popup", receiverEndingStyle: ending });
+    expect(Object.keys(facts!)).toEqual(["receiverSlot", "receiverEndingStyle"]);
+    expect(JSON.stringify(facts)).not.toMatch(
+      /private|owned|element\/|https?:|button|div|10|20|<|>/,
+    );
+  },
+);
+
 // Execute the actual Classic click recovery, without importing a session or HTTP runtime.
 function sdkInternalMissingClick(
   sourceSelector = 'button[data-slot="toast-close"]',

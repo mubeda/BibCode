@@ -533,3 +533,65 @@ it.each([
     else await expect(run()).rejects.toThrow("Inert owned binding refusal.");
   },
 );
+
+it.each(["before", "send", "running", "pass"])(
+  "attributes the actual Cursor send and running-turn awaits separately: %s",
+  async (boundary) => {
+    const source = NodeFS.readFileSync(
+      new URL("../qualify-delivery-retry.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf(
+      "          send: async (text) => {",
+      source.indexOf("const proof = await runCursorQuestionVisual"),
+    );
+    const end = source.indexOf("          capture: async () => {", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const original = new Error("Inert Cursor await boundary failure.");
+    const phases: string[] = [],
+      calls: string[] = [];
+    let reads = 0;
+    const send = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes("({" + source.slice(start, end) + "}).send"),
+      {
+        originalTurnId: null,
+        step: (phase: string) => phases.push(phase),
+        currentThread: async () => {
+          calls.push("snapshot");
+          if (++reads === 1) {
+            if (boundary === "before") throw original;
+            return { latestTurn: null };
+          }
+          return {
+            latestTurn: { turnId: "owned-turn", state: "running" },
+            session: { activeTurnId: "owned-turn", providerName: "cursor" },
+          };
+        },
+        send: async (text: string) => {
+          expect(text).toBe(cursorQuestionFixturePrompt);
+          calls.push("public-send");
+          if (boundary === "send") throw original;
+        },
+        owner: {
+          until: async (check: () => Promise<boolean>) => {
+            calls.push("running-turn");
+            if (boundary === "running") throw original;
+            expect(await check()).toBe(true);
+          },
+        },
+      },
+    );
+    if (boundary === "pass") await send(cursorQuestionFixturePrompt);
+    else await expect(send(cursorQuestionFixturePrompt)).rejects.toBe(original);
+    expect(phases.at(-1)).toBe(
+      boundary === "before"
+        ? "visual-cursor-question-turn-before"
+        : boundary === "send"
+          ? "visual-cursor-question-send"
+          : "visual-cursor-question-turn-running",
+    );
+    if (boundary === "pass")
+      expect(calls).toEqual(["snapshot", "public-send", "running-turn", "snapshot"]);
+  },
+);

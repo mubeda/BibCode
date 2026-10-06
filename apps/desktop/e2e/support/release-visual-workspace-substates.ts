@@ -79,12 +79,39 @@ export interface WorkspaceSubstateContext {
 export interface WorkspaceSubstateObservation extends WorkspaceSubstateContext {
   readonly substate: WorkspaceSubstate;
 }
+export type WorkspaceActivityPhase =
+  | "context"
+  | "managed"
+  | "admission"
+  | "panel-count"
+  | "terminal-open"
+  | "terminal-focus"
+  | "terminal-command"
+  | "terminal-running"
+  | "host-return"
+  | "chat-open"
+  | "chat-compose"
+  | "chat-send"
+  | "chat-response"
+  | "host-restore"
+  | "terminal-hover"
+  | "capture";
+
+function activityStep(input: WorkspaceSubstateFlowInput, phase: WorkspaceActivityPhase): void {
+  try {
+    input.step?.(`visual-workspace-activity-${phase}`);
+  } catch {
+    // Optional closed attribution never changes the public operation or its failure.
+  }
+}
+
 export interface WorkspaceSubstateFlowInput extends WorkspaceSubstateContext {
   readonly browser: QualificationBrowser;
   readonly owner: Pick<QualificationOwner, "until">;
   /** Positive current managed Git/worktree/provider-source proof remains caller-owned. */
   readonly verifyManaged: () => Promise<void>;
   readonly capture: (substate: WorkspaceSubstate) => Promise<unknown>;
+  readonly step?: (phase: `visual-workspace-activity-${WorkspaceActivityPhase}`) => void;
   readonly observeCleanupFailure?: (phase: "stash" | "files-menu" | "workspace-panels") => void;
 }
 
@@ -360,8 +387,11 @@ export async function captureWorkspaceSubstate(
 }
 
 async function admit(input: WorkspaceSubstateFlowInput, selected: WorkspaceSubstate) {
+  if (selected === "workspace-activity-lines") activityStep(input, "context");
   const context = observation(input, selected);
+  if (selected === "workspace-activity-lines") activityStep(input, "managed");
   await input.verifyManaged();
+  if (selected === "workspace-activity-lines") activityStep(input, "admission");
   const value = await bounded(input.browser.execute(readWorkspaceSubstate, context), 2000);
   if (
     !value ||
@@ -475,6 +505,7 @@ export async function runFilesItemContextMenu(input: WorkspaceSubstateFlowInput)
 /** Public terminal subprocess and second provider chat, with owned resources closed on every exit. */
 export async function runWorkspaceActivityLines(input: WorkspaceSubstateFlowInput): Promise<void> {
   await admit(input, "workspace-activity-lines");
+  activityStep(input, "panel-count");
   const base = '[data-center-panel-tab-id="chat:host"]';
   if (
     (await input.browser.$$("[data-center-panel-tab-id]").length) !== 1 ||
@@ -496,8 +527,10 @@ export async function runWorkspaceActivityLines(input: WorkspaceSubstateFlowInpu
     input,
     "workspace-panels",
     async () => {
+      activityStep(input, "terminal-open");
       terminalAttempted = true;
       await panel("Open Terminal");
+      activityStep(input, "terminal-focus");
       const screen =
         '[data-center-surface-host][data-visible="true"] [data-terminal-owner="center"] .xterm-screen';
       await click(input, screen);
@@ -513,33 +546,43 @@ export async function runWorkspaceActivityLines(input: WorkspaceSubstateFlowInpu
         }),
       );
       // The contained fixture PATH deliberately excludes ambient command lookup.
+      activityStep(input, "terminal-command");
       await input.browser.keys("/bin/sleep 600");
       await input.browser.keys("Enter");
+      activityStep(input, "terminal-running");
       await input.owner.until(() =>
         input.browser
           .$(`[data-testid="thread-row-${input.threadId}"] [aria-label="Terminal process running"]`)
           .isDisplayed(),
       );
+      activityStep(input, "host-return");
       await click(input, `${base} [data-center-panel-tab-activation]`);
+      activityStep(input, "chat-open");
       chatAttempted = true;
       await panel("Claude");
+      activityStep(input, "chat-compose");
       const composer =
         '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]';
       await click(input, composer);
       await input.browser.keys("Owned workspace substate chat");
+      activityStep(input, "chat-send");
       await click(
         input,
         '[data-center-surface-host][data-visible="true"] button[aria-label="Send message"]',
       );
+      activityStep(input, "chat-response");
       await input.owner.until(async () =>
         (
           await input.browser.$('[data-center-surface-host][data-visible="true"]').getText()
         ).includes("BiBCode deterministic streamed fixture response."),
       );
+      activityStep(input, "host-restore");
       await click(input, `${base} [data-center-panel-tab-activation]`);
+      activityStep(input, "terminal-hover");
       await input.browser
         .$(`[data-testid="thread-row-${input.threadId}"] [aria-label="Terminal process running"]`)
         .moveTo();
+      activityStep(input, "capture");
       await input.capture("workspace-activity-lines");
     },
     async () => {

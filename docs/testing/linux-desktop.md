@@ -656,7 +656,10 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   primitive data value of at most 4096 units, with a recognized interception
   prefix and exactly one explicit receiving-element clause. Decode only its
   single bounded opening tag; quoted values are opaque, attribute names must
-  be unique, and self-closing, malformed or ambiguous markup remains null.
+  be unique, and self-closing, malformed or ambiguous markup remains null. The
+  matching closing tag may follow only the literal ASCII `...` emitted by
+  Chrome's serialized receiver. Nested markup, other ellipsis forms and trailing
+  tags remain refused; only the existing two header facts leave this decoder.
   The slot is one of the fixed toast slots, the toast-root attribute fingerprint,
   `dialog-popup`, `other`, or null. Ending means the receiving element's own
   `data-ending-style` attribute is present; it says nothing about an ancestor
@@ -1780,8 +1783,8 @@ geometry, scripted transport and static gates do not establish native pixels,
 Tauri behavior, a final product nomination or full-matrix acceptance.
 
 For the dedicated Cursor question producer, record an original failure only
-before restore cleanup, using the original exception and one of the seven
-existing closed Cursor phase names. On the same exception only, restore that
+before restore cleanup, using the original exception and one of the nine
+closed Cursor phase names. On the same exception only, restore that
 phase before existing failure observations and receipts. Clear the attribution
 record before each producer entry; a reused error cannot borrow an earlier
 phase. Optional attribution/reporting failure cannot replace the original
@@ -1790,6 +1793,11 @@ changes failure attribution only: model choices, native question actions,
 capture count, wait bounds and owner cleanup remain unchanged. A restore failure
 can otherwise overwrite the global phase, so an old recorded worktree model
 phase alone does not prove that the question producer was never entered.
+
+The Cursor send callback separately
+attributes its original decoded-turn read, unchanged public composer send and
+correlated running-turn wait. These fixed phases preserve all predicates and
+original-error attribution; they add no snapshot reads, actions or timeout budget.
 
 ### Existing workspace row substates
 
@@ -1823,7 +1831,13 @@ linked tooltip, provider/model/age session line, exactly `1 more chat`, original
 response and original unsent draft. Terminal activity means the existing
 indicator/tooltip; it does not invent a terminal text preview row. Interrupt and
 close only the created terminal, close the created chat and prove counts gone.
-Missing/disabled public controls, foreign identities or incomplete cleanup fail.
+Missing/disabled public controls, foreign identities or incomplete cleanup fail. The
+activity helper records only fixed phase enums before context and managed admission,
+the single-panel check, terminal open/focus/command/running, host return, chat
+open/compose/send/response, host restore, hover and capture. Cleanup preserves the
+original operation exception and its last phase; these markers add no page reads,
+actions or deadline changes. A marker locates the failing boundary and does not
+prove its native cause or qualify a missing screenshot.
 
 Every capture rechecks the actual local server boot/storage identity, schema-decoded
 public snapshot thread/project/worktree binding and filesystem Git identity,
