@@ -365,7 +365,7 @@ export async function prepareBrowserFollowupTerminal(input: {
         document.activeElement.closest("[data-preview-panel-mode]") !== null,
     ),
   );
-  await browser.keys("printf 'Owned shared terminal output\\n'; /bin/sleep 600");
+  await browser.keys("printf '\\nOwned shared terminal output\\n'; /bin/sleep 600");
   await browser.keys("Enter");
   let bound: ReturnType<typeof admitBrowserFollowupTerminal> | undefined;
   await input.owner.until(async () => {

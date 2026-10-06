@@ -2530,6 +2530,11 @@ Terminal creation. Before originals, join that proxy and rebind unchanged4887
 through the maintained throttle and original raw4894 observer to4897. Verify the
 same boot/storage/source, terminal PID and exact original history after the real
 renderer reconnect. Do not set renderer stores or synthetic protocol values.
+The single terminal marker command must emit an explicit leading newline before
+its exact output line, then keep the same long-running sleep process. This
+establishes a raw line boundary after shell control sequences. Preserve the
+original history bytes and exact marker-line predicate; do not strip ANSI or
+accept an echoed command as emitted output.
 The staged image is the maintained512KiB original fixture with a real slow
 transport and public Cancel. The second window attaches the same existing
 terminal and uses public Fit. Working-tree diff bytes come from actual Git.

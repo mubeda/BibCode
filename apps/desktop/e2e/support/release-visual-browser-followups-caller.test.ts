@@ -501,3 +501,103 @@ test.each(["owned", "main", "hosted", "proxy", "png", "cleanup"])(
     NodeAssert.equal(unsafe, mode === "cleanup" ? 1 : 0);
   },
 );
+
+test("actual public terminal bootstrap establishes its own raw marker line after Readline teardown", async () => {
+  const source = NodeFS.readFileSync(
+    new URL("./release-visual-browser-followups-caller.ts", import.meta.url),
+    "utf8",
+  );
+  const begin = source.indexOf("export async function prepareBrowserFollowupTerminal("),
+    end = source.indexOf("/** Own only the admitted main handle.", begin);
+  const snapshot = {
+    threadId: "inert-thread",
+    terminalId: "inert-terminal",
+    cwd: "/inert/worktree",
+    worktreePath: "/inert/worktree",
+    status: "running",
+    pid: 123,
+    exitCode: null,
+    exitSignal: null,
+    label: "sleep",
+    hasRunningSubprocess: true,
+    updatedAt: "2026-10-06T00:00:00.000Z",
+    history: "",
+  };
+  const keys: string[] = [],
+    order: string[] = [];
+  const element = {
+    isDisplayed: async () => true,
+    waitForDisplayed: async () => {},
+    getAttribute: async () => snapshot.terminalId,
+  };
+  const prepare = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(source.slice(begin, end)).replace(/^export /gm, "") +
+      "\nprepareBrowserFollowupTerminal",
+    {
+      click: async () => {
+        order.push("public-click");
+      },
+      refused: () => new Error("Inert terminal refused"),
+      admitBrowserFollowupTerminal,
+      readBrowserFollowupTerminalMetadata: async () => {
+        order.push("metadata");
+        return [snapshot];
+      },
+    },
+  );
+  const result = await prepare({
+    browser: {
+      $: () => element,
+      $$: () => [element],
+      execute: async () => true,
+      keys: async (value: string) => {
+        keys.push(value);
+        order.push(value === "Enter" ? "enter" : "command");
+      },
+    },
+    owner: {
+      until: async (check: () => Promise<boolean>) => NodeAssert.equal(await check(), true),
+    },
+    accessToken: "inert-access",
+    threadId: snapshot.threadId,
+    cwd: snapshot.cwd,
+    observeUnsafeCleanup: () => {
+      throw new Error("Unexpected cleanup refusal");
+    },
+  });
+  NodeAssert.deepEqual(keys, [
+    "printf '\\nOwned shared terminal output\\n'; /bin/sleep 600",
+    "Enter",
+  ]);
+  NodeAssert.equal(order.filter((value) => value === "command").length, 1);
+  NodeAssert.ok(
+    order.indexOf("command") < order.indexOf("enter") &&
+      order.indexOf("enter") < order.indexOf("metadata"),
+  );
+  NodeAssert.equal(result.pid, snapshot.pid);
+  const raw = {
+    ...snapshot,
+    history: "command echo\r\n\x1b[?2004l\r\r\nOwned shared terminal output\r\n",
+  };
+  const pinned = pinBrowserFollowupTerminalReplay(
+    raw as never,
+    snapshot.threadId,
+    snapshot.terminalId,
+    snapshot.cwd,
+  );
+  NodeAssert.equal(pinned.pid, result.pid);
+  NodeAssert.equal(pinned.history, raw.history);
+  for (const history of [
+    "",
+    "printf 'Owned shared terminal output\\n'; /bin/sleep 600\r\n",
+    "command echo\r\n\x1b[?2004l\rOwned shared terminal output\r\n",
+  ])
+    NodeAssert.throws(() =>
+      pinBrowserFollowupTerminalReplay(
+        { ...snapshot, history } as never,
+        snapshot.threadId,
+        snapshot.terminalId,
+        snapshot.cwd,
+      ),
+    );
+});
