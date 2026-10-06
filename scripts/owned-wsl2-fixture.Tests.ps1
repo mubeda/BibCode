@@ -92,7 +92,7 @@ Describe 'Owned WSL2 authenticated download arguments' {
     $start = $source.IndexOf($marker, [StringComparison]::Ordinal)
     if ($start -lt 0) { throw 'Owned download expression unavailable.' }
     $start += $marker.Length
-    $end = $source.IndexOf(') { Invoke-WebRequest', $start, [StringComparison]::Ordinal)
+    $end = $source.IndexOf(') {', $start, [StringComparison]::Ordinal)
     if ($end -lt $start) { throw 'Owned download expression boundary unavailable.' }
     $expression = $source.Substring($start, $end - $start)
     $ReleaseBase = 'https://releases.ubuntu.com/noble/'
@@ -149,7 +149,7 @@ function Get-FixtureInventory { Test-StageFault;@{distros=@();defaultGuid=$null}
 function Get-PhysicalPin([string]$Path) { Test-StageFault;@{path=$Path;identity='inert-file-id';directory=$true} }
 function Assert-PhysicalPin { Test-StageFault }
 function Get-FileHash([string]$LiteralPath) { Test-StageFault;@{Hash=if($LiteralPath.EndsWith('gpg.exe')){'INERTGPG'}else{$RootfsHash.ToUpperInvariant()}} }
-function Invoke-WebRequest { Test-StageFault;@{StatusCode=200} }
+function Invoke-WebRequest([switch]$PassThru) { Test-StageFault;if($PassThru){@{StatusCode=200}} }
 function Get-Item { Test-StageFault;@{Length=if($env:BIBCODE_INERT_SIGNED_FAILURE -ceq 'oversize'){3000000}else{1}} }
 function Get-Content { Test-StageFault;$RootfsHash+' *'+$RootfsName }
 function Save-FixtureManifest { Test-StageFault }
@@ -274,14 +274,30 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
       }
       foreach($name in $hashes.Keys){$file=Join-Path $fixtures $name;(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()|Should -BeExactly $hashes[$name];Copy-Item -LiteralPath $file -Destination (Join-Path $root $name);Set-OwnerAcl (Join-Path $root $name)}
       $key=Join-Path $root 'ubuntu-image-signing-key.asc';$sums=Join-Path $root 'noble-SHA256SUMS';$signature=Join-Path $root 'noble-SHA256SUMS.gpg'
-      Invoke-FixtureCommand $gpg @('--homedir',$taskGpgHome,'--batch','--import',$key)|Out-Null
+      function Invoke-PinnedMetadataCommand([string]$Operation,[string[]]$Arguments) {
+        $beforeCommands=@(Get-ChildItem -LiteralPath $root -File -Filter 'command-*.private.json'|ForEach-Object {$_.Name})
+        try { Invoke-FixtureCommand $gpg $Arguments } catch {
+          $originalFailure=$_
+          $newCommands=@(Get-ChildItem -LiteralPath $root -File -Filter 'command-*.private.json'|Where-Object {$_.Name -cnotin $beforeCommands})
+          if($newCommands.Count -ne 1){throw ('Pinned GPG '+$Operation+' refused; commandReceiptPresent=false; commandExit='+$script:OwnedWslSignedMetadata.commandExit)}
+          $command=Get-Content -LiteralPath $newCommands[0].FullName -Raw|ConvertFrom-Json
+          @($command.PSObject.Properties.Name|Sort-Object)|Should -Be @('exitCode','stderr','stdout')
+          ($command.exitCode -is [int])|Should -BeTrue
+          ($command.exitCode -ge 0 -and $command.exitCode -le 255)|Should -BeTrue
+          ($command.stdout -is [string])|Should -BeTrue;($command.stderr -is [string])|Should -BeTrue
+          $command.exitCode|Should -Be $script:OwnedWslSignedMetadata.commandExit
+          if($command.exitCode -ne 0){throw ('Pinned GPG '+$Operation+' refused; commandReceiptPresent=true; commandExit='+$command.exitCode+'; stdoutPresent='+($command.stdout.Length -gt 0)+'; stderrPresent='+($command.stderr.Length -gt 0))}
+          throw $originalFailure
+        }
+      }
+      Invoke-PinnedMetadataCommand 'gpg-import' @('--homedir',$taskGpgHome,'--batch','--import',$key)|Out-Null
       $script:OwnedWslSignedMetadata.commandExit|Should -Be 0
       $script:OwnedWslSignedMetadata.operation='fingerprint-admission';$script:OwnedWslSignedMetadata.commandExit=$null
-      $fingerprints=Invoke-FixtureCommand $gpg @('--homedir',$taskGpgHome,'--batch','--with-colons','--fingerprint','843938DF228D22F7B3742BC0D94AA3F0EFE21092')
+      $fingerprints=Invoke-PinnedMetadataCommand 'fingerprint-admission' @('--homedir',$taskGpgHome,'--batch','--with-colons','--fingerprint','843938DF228D22F7B3742BC0D94AA3F0EFE21092')
       $script:OwnedWslSignedMetadata.commandExit|Should -Be 0
       @($fingerprints -split "`n"|Where-Object {$_ -match '^fpr:' -and ($_ -split ':')[9] -ceq '843938DF228D22F7B3742BC0D94AA3F0EFE21092'}).Count|Should -Be 1
       $script:OwnedWslSignedMetadata.operation='signature-admission';$script:OwnedWslSignedMetadata.commandExit=$null
-      $verification=Invoke-FixtureCommand $gpg @('--homedir',$taskGpgHome,'--batch','--status-fd','1','--verify',$signature,$sums)
+      $verification=Invoke-PinnedMetadataCommand 'signature-admission' @('--homedir',$taskGpgHome,'--batch','--status-fd','1','--verify',$signature,$sums)
       $script:OwnedWslSignedMetadata.commandExit|Should -Be 0
       $valid=@($verification -split "`n"|Where-Object {$_ -match '^\[GNUPG:\] VALIDSIG '});$valid.Count|Should -Be 1
       ($valid[0] -split ' ')[2]|Should -BeExactly '843938DF228D22F7B3742BC0D94AA3F0EFE21092'

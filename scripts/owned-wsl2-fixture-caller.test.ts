@@ -140,3 +140,42 @@ it("keeps signed metadata schema confined to actual failed receipt/recorder sour
   expect(owner).toContain("$receipt.signedMetadata=[ordered]@{}");
   expect(owner).toContain("$child.ExitCode");
 });
+
+it("keeps Pester URI extraction and fake download output aligned with the actual owner", () => {
+  const owner = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+  const tests = NodeFS.readFileSync(
+    new URL("./owned-wsl2-fixture.Tests.ps1", import.meta.url),
+    "utf8",
+  );
+  const start = owner.indexOf("foreach($download in ");
+  const end = owner.indexOf(") {", start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  expect(owner.slice(start, end)).toContain("$ReleaseBase+'SHA256SUMS.gpg'");
+  expect(tests).toContain("$source.IndexOf(') {', $start, [StringComparison]::Ordinal)");
+  expect(tests).not.toContain(") { Invoke-WebRequest");
+  expect(tests).toContain(
+    "function Invoke-WebRequest([switch]$PassThru) { Test-StageFault;if($PassThru){@{StatusCode=200}} }",
+  );
+  expect(owner).toContain("-MaximumRedirection 0 -PassThru");
+  expect(owner).toContain("-TimeoutSec 300 -MaximumRedirection 0;Set-OwnerAcl $image");
+  // Source consistency only: execution of these PowerShell ports remains a Windows CI gate.
+});
+it("keeps real GPG assertions and exposes only closed facts from its owned command receipt", () => {
+  const tests = NodeFS.readFileSync(
+    new URL("./owned-wsl2-fixture.Tests.ps1", import.meta.url),
+    "utf8",
+  );
+  for (const operation of ["gpg-import", "fingerprint-admission", "signature-admission"]) {
+    expect(tests).toContain(`Invoke-PinnedMetadataCommand '${operation}'`);
+  }
+  expect(tests).toContain("commandReceiptPresent=true; commandExit=");
+  expect(tests).toContain("($command.stdout.Length -gt 0)");
+  expect(tests).toContain("($command.stderr.Length -gt 0)");
+  expect(tests).toContain(
+    "$command.exitCode|Should -Be $script:OwnedWslSignedMetadata.commandExit",
+  );
+  expect(tests).toContain("throw $originalFailure");
+  expect(tests).toContain("$corrupt)}|Should -Throw");
+  expect(tests).toContain("Assert-PhysicalPin $gpgPin");
+});
