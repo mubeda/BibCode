@@ -19,6 +19,7 @@ type RunInput = {
   pullRequestBody?: string;
   pullRequestBaseBranch?: string;
   pullRequestHeadBranch?: string;
+  pullRequestOptions?: unknown;
   onProgress?: (event: GitActionProgressEvent) => void;
 };
 
@@ -27,6 +28,12 @@ const h = vi.hoisted(() => ({
   latestCommit: null as unknown,
   otherCommit: null as unknown,
   branchSelectionSupported: true as boolean | undefined,
+  createOptionsSupported: true as boolean,
+  createDefaults: null as unknown,
+  createDefaultsError: null as string | null,
+  vocabularyError: null as string | null,
+  onSearch: vi.fn(),
+  refreshDefaults: vi.fn(),
   currentSourceRemote: true,
   refsError: null as string | null,
   refPages: null as Array<string[]> | null,
@@ -63,7 +70,10 @@ vi.mock("~/state/entities", () => ({
         id,
         {
           environment: {
-            capabilities: { gitPullRequestBranchSelection: h.branchSelectionSupported },
+            capabilities: {
+              gitPullRequestBranchSelection: h.branchSelectionSupported,
+              pullRequestCreateOptions: h.createOptionsSupported,
+            },
           },
         },
       ]),
@@ -83,66 +93,98 @@ vi.mock("~/state/gitManager", () => ({
 vi.mock("~/state/query", () => ({
   useEnvironmentQuery: (atom: { kind: string; cursor?: number; tip?: string } | null) => ({
     data:
-      atom?.kind === "status"
-        ? h.status
-        : atom?.kind === "commits"
-          ? {
-              commits:
-                atom.tip === "b".repeat(40)
-                  ? h.latestCommit === null
-                    ? []
-                    : [h.latestCommit]
-                  : atom.tip === "c".repeat(40)
-                    ? [h.otherCommit]
-                    : [commit("Wrong branch title", "Wrong branch description")],
-            }
-          : atom?.kind === "snapshot"
+      atom?.kind === "createDefaults"
+        ? // A new object per read, as a revalidated query delivers.
+          h.createDefaults === null
+          ? null
+          : { ...(h.createDefaults as object) }
+        : atom?.kind === "status"
+          ? h.status
+          : atom?.kind === "commits"
             ? {
-                localBranches: [
-                  { name: (h.status as VcsStatusResult | null)?.refName, tipSha: "b".repeat(40) },
-                  { name: "feature/other", tipSha: "c".repeat(40) },
-                ],
-                remoteBranches: [
-                  ...(h.currentSourceRemote
-                    ? [
-                        {
-                          name: `origin/${(h.status as VcsStatusResult | null)?.refName}`,
-                          tipSha: "b".repeat(40),
-                        },
-                      ]
-                    : []),
-                  { name: "origin/feature/other", tipSha: "c".repeat(40) },
-                ],
+                commits:
+                  atom.tip === "b".repeat(40)
+                    ? h.latestCommit === null
+                      ? []
+                      : [h.latestCommit]
+                    : atom.tip === "c".repeat(40)
+                      ? [h.otherCommit]
+                      : [commit("Wrong branch title", "Wrong branch description")],
               }
-            : atom?.kind === "refs"
+            : atom?.kind === "snapshot"
               ? {
-                  refs: (
-                    h.refPages?.[(atom.cursor ?? 0) / 100] ?? [
-                      "main",
-                      "release/next",
-                      "origin/main",
-                      "origin/release/next",
-                      "feature/reviewed",
-                      "feature/other",
-                      "origin/feature/reviewed",
-                      "origin/feature/other",
-                      "origin/remote-only",
-                      "other/hidden",
-                    ]
-                  ).map((name) => ({
-                    name,
-                    isRemote: name.startsWith("origin/") || name.startsWith("other/"),
-                    remoteName: name.startsWith("origin/") ? "origin" : "other",
-                  })),
-                  nextCursor:
-                    h.refPages && (atom.cursor ?? 0) / 100 < h.refPages.length - 1
-                      ? (atom.cursor ?? 0) + 100
-                      : null,
+                  localBranches: [
+                    { name: (h.status as VcsStatusResult | null)?.refName, tipSha: "b".repeat(40) },
+                    { name: "feature/other", tipSha: "c".repeat(40) },
+                  ],
+                  remoteBranches: [
+                    ...(h.currentSourceRemote
+                      ? [
+                          {
+                            name: `origin/${(h.status as VcsStatusResult | null)?.refName}`,
+                            tipSha: "b".repeat(40),
+                          },
+                        ]
+                      : []),
+                    { name: "origin/feature/other", tipSha: "c".repeat(40) },
+                  ],
                 }
-              : null,
+              : atom?.kind === "refs"
+                ? {
+                    refs: (
+                      h.refPages?.[(atom.cursor ?? 0) / 100] ?? [
+                        "main",
+                        "release/next",
+                        "origin/main",
+                        "origin/release/next",
+                        "feature/reviewed",
+                        "feature/other",
+                        "origin/feature/reviewed",
+                        "origin/feature/other",
+                        "origin/remote-only",
+                        "other/hidden",
+                      ]
+                    ).map((name) => ({
+                      name,
+                      isRemote: name.startsWith("origin/") || name.startsWith("other/"),
+                      remoteName: name.startsWith("origin/") ? "origin" : "other",
+                    })),
+                    nextCursor:
+                      h.refPages && (atom.cursor ?? 0) / 100 < h.refPages.length - 1
+                        ? (atom.cursor ?? 0) + 100
+                        : null,
+                  }
+                : null,
     emission: { _tag: "Initial", waiting: false },
-    error: atom?.kind === "refs" ? h.refsError : null,
+    error:
+      atom?.kind === "refs"
+        ? h.refsError
+        : atom?.kind === "createDefaults"
+          ? h.createDefaultsError
+          : null,
     isPending: false,
+    refresh: atom?.kind === "createDefaults" ? h.refreshDefaults : vi.fn(),
+    revalidate: vi.fn(),
+    requiresRetry: false,
+  }),
+}));
+
+vi.mock("~/state/pullRequests", () => ({
+  pullRequestsEnvironment: { getCreateDefaults: vi.fn(() => ({ kind: "createDefaults" })) },
+}));
+
+vi.mock("../../pullRequests/edit/usePullRequestsVocabulary", () => ({
+  usePullRequestsVocabulary: (_scope: unknown, kind: string) => ({
+    entries:
+      kind === "users"
+        ? [{ id: "7", label: "alice", color: null, description: null }]
+        : kind === "labels"
+          ? [{ id: "bug", label: "bug", color: "#f00", description: null }]
+          : [{ id: "3", label: "Sprint 9", color: null, description: null }],
+    search: "",
+    onSearch: h.onSearch,
+    searching: false,
+    error: h.vocabularyError,
     refresh: vi.fn(),
   }),
 }));
@@ -343,6 +385,12 @@ beforeEach(() => {
     sha: "c".repeat(40),
   };
   h.branchSelectionSupported = true;
+  h.createOptionsSupported = true;
+  h.createDefaults = null;
+  h.createDefaultsError = null;
+  h.vocabularyError = null;
+  h.onSearch.mockReset();
+  h.refreshDefaults.mockReset();
   h.currentSourceRemote = true;
   h.refsError = null;
   h.refPages = null;
@@ -632,6 +680,168 @@ describe("GitManagerCreatePullRequestDialog", () => {
     expect(input("git-manager-create-pr-title").value).toBe("feat: reviewed change");
     expect(input("git-manager-create-pr-body").value).toBe("Body from commit");
     expect(button("Publish and create pull request").disabled).toBe(true);
+  });
+
+  describe("create options", () => {
+    const gitlab = () =>
+      status({
+        sourceControlProvider: {
+          kind: "gitlab",
+          name: "GitLab",
+          baseUrl: "https://gitlab.example",
+        },
+      });
+
+    it("hides create options on servers without the capability", async () => {
+      h.createOptionsSupported = false;
+      await renderDialog();
+      expect(document.body.textContent).not.toContain("Mark as draft");
+      expect(document.body.textContent).not.toContain("Assignee");
+    });
+
+    it("sends draft and Assign to me with the create request", async () => {
+      h.status = gitlab();
+      h.createDefaults = {
+        viewer: { id: "7", label: "alice" },
+        squash: null,
+        removeSourceBranch: null,
+      };
+      h.script = [{ outcome: "success", events: [finished("created")] }];
+      await renderDialog();
+      await chooseTarget("main");
+      // The user's path: clicking the visible "Mark as draft" label.
+      await act(async () =>
+        document
+          .querySelector<HTMLElement>('[aria-label="Mark as draft"]')!
+          .closest("label")!
+          .click(),
+      );
+      await act(async () => button("Assign to me").click());
+      await act(async () => button("Publish and create merge request").click());
+      expect(h.runs[0]?.pullRequestOptions).toMatchObject({ draft: true, assignees: ["7"] });
+    });
+
+    it("sends the project's merge defaults the dialog showed", async () => {
+      h.status = gitlab();
+      h.createDefaults = { viewer: null, squash: "always", removeSourceBranch: true };
+      h.script = [{ outcome: "success", events: [finished("created")] }];
+      await renderDialog();
+      await chooseTarget("main");
+      expect(document.body.textContent).toContain("This project always squashes commits.");
+      await act(async () => button("Publish and create merge request").click());
+      expect(h.runs[0]?.pullRequestOptions).toMatchObject({
+        removeSourceBranch: true,
+        squash: true,
+      });
+    });
+
+    const fieldInput = (labelText: string) => {
+      const label = [...document.querySelectorAll("label")].find(
+        (candidate) => candidate.textContent === labelText,
+      );
+      return document.getElementById(label!.htmlFor) as HTMLInputElement;
+    };
+
+    it("shows the chosen person in a single-person picker", async () => {
+      h.status = gitlab();
+      h.createDefaults = {
+        viewer: { id: "7", label: "alice" },
+        squash: null,
+        removeSourceBranch: null,
+      };
+      await renderDialog();
+      await chooseTarget("main");
+      await act(async () => button("Assign to me").click());
+      expect(fieldInput("Assignee").value).toBe("alice");
+    });
+
+    it("clears a single picker's search when its choice is cleared", async () => {
+      h.status = gitlab();
+      h.createDefaults = {
+        viewer: { id: "7", label: "alice" },
+        squash: null,
+        removeSourceBranch: null,
+      };
+      await renderDialog();
+      await chooseTarget("main");
+      await act(async () => button("Assign to me").click());
+      h.onSearch.mockClear();
+      const clear = fieldInput("Assignee")
+        .closest(".grid")!
+        .querySelector<HTMLElement>('[data-slot="combobox-clear"]')!;
+      await act(async () => clear.click());
+      expect(h.onSearch).toHaveBeenCalledWith("");
+    });
+
+    it("leaves merge options to the project when its settings could not be read", async () => {
+      h.status = gitlab();
+      h.createDefaultsError = "Forbidden";
+      h.script = [{ outcome: "success", events: [finished("created")] }];
+      await renderDialog();
+      await chooseTarget("main");
+      expect(document.body.textContent).toContain("Couldn't load the project's merge settings");
+      await act(async () =>
+        document
+          .querySelector<HTMLElement>('[aria-label="Mark as draft"]')!
+          .closest("label")!
+          .click(),
+      );
+      await act(async () => button("Publish and create merge request").click());
+      expect(h.runs[0]?.pullRequestOptions).toMatchObject({
+        draft: true,
+        removeSourceBranch: null,
+        squash: null,
+      });
+    });
+
+    it("offers Retry when the account and project settings could not be read", async () => {
+      h.createDefaultsError = "Request timed out";
+      await renderDialog();
+      await chooseTarget("main");
+      expect(document.body.textContent).toContain(
+        "Couldn't load your account and project settings.",
+      );
+      await act(async () => button("Retry").click());
+      expect(h.refreshDefaults).toHaveBeenCalledOnce();
+      expect(input("git-manager-create-pr-base").value).toBe("main");
+    });
+
+    it("shows merge options only for GitLab", async () => {
+      await renderDialog();
+      expect(document.body.textContent).toContain("Assignee");
+      expect(document.body.textContent).not.toContain("Merge options");
+    });
+
+    it("a failed picker keeps creation available", async () => {
+      h.vocabularyError = "Forbidden";
+      await renderDialog();
+      await chooseTarget("main");
+      expect(document.body.textContent).toContain("Couldn't load reviewer.");
+      expect(button("Publish and create pull request").disabled).toBe(false);
+    });
+
+    it("shows the server's warning after a partial create", async () => {
+      const event = finished("created");
+      if (event.kind !== "action_finished") throw new Error("unexpected event");
+      h.script = [
+        {
+          outcome: "success",
+          events: [
+            {
+              ...event,
+              result: {
+                ...event.result,
+                pr: { ...event.result.pr, warning: "Created, but some options weren't applied." },
+              },
+            },
+          ],
+        },
+      ];
+      await renderDialog();
+      await chooseTarget("main");
+      await act(async () => button("Publish and create pull request").click());
+      expect(document.body.textContent).toContain("Created, but some options weren't applied.");
+    });
   });
 
   it("says merge request and shows the self-hosted GitLab address", async () => {
