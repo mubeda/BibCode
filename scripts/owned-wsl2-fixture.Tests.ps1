@@ -83,3 +83,33 @@ function Invoke-OwnedFixtureAction([string]$Name) {
     ($receipt | ConvertFrom-Json).completed | Should -BeFalse
   }
 }
+
+
+Describe 'Owned WSL2 authenticated download arguments' {
+  It 'uses the actual three two-element URI and output-path tuples' {
+    $source = Get-Content -LiteralPath "$PSScriptRoot/owned-wsl2-fixture.ps1" -Raw
+    $marker = 'foreach($download in '
+    $start = $source.IndexOf($marker, [StringComparison]::Ordinal)
+    if ($start -lt 0) { throw 'Owned download expression unavailable.' }
+    $start += $marker.Length
+    $end = $source.IndexOf(') { Invoke-WebRequest', $start, [StringComparison]::Ordinal)
+    if ($end -lt $start) { throw 'Owned download expression boundary unavailable.' }
+    $expression = $source.Substring($start, $end - $start)
+    $ReleaseBase = 'https://releases.ubuntu.com/noble/'
+    $SigningFingerprint = '843938DF228D22F7B3742BC0D94AA3F0EFE21092'
+    $key = 'inert key path'
+    $sums = 'inert checksum path'
+    $signature = 'inert signature path'
+    $downloads = & ([scriptblock]::Create('return ,(' + $expression + ')'))
+    $downloads.Count | Should -Be 3
+    @($downloads[0]).Count | Should -Be 2
+    @($downloads[1]).Count | Should -Be 2
+    @($downloads[2]).Count | Should -Be 2
+    $downloads[0][0] | Should -BeExactly 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x843938DF228D22F7B3742BC0D94AA3F0EFE21092'
+    $downloads[0][1] | Should -BeExactly 'inert key path'
+    $downloads[1][0] | Should -BeExactly 'https://releases.ubuntu.com/noble/SHA256SUMS'
+    $downloads[1][1] | Should -BeExactly 'inert checksum path'
+    $downloads[2][0] | Should -BeExactly 'https://releases.ubuntu.com/noble/SHA256SUMS.gpg'
+    $downloads[2][1] | Should -BeExactly 'inert signature path'
+  }
+}

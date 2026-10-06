@@ -117,7 +117,7 @@ function Prepare-Fixture {
   $gpg=Join-Path $env:ProgramFiles 'Git/usr/bin/gpg.exe';$gpgPin=Get-PhysicalPin $gpg;$gpgHash=(Get-FileHash -LiteralPath $gpg -Algorithm SHA256).Hash
   $gnupg=Join-Path $root 'gnupg';[IO.Directory]::CreateDirectory($gnupg)|Out-Null;Set-OwnerAcl $gnupg
   $key=Join-Path $root 'canonical.key';$sums=Join-Path $root 'SHA256SUMS';$signature=Join-Path $root 'SHA256SUMS.gpg';$image=Join-Path $root $RootfsName
-  foreach($download in @(@('https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x'+$SigningFingerprint,$key),@($ReleaseBase+'SHA256SUMS',$sums),@($ReleaseBase+'SHA256SUMS.gpg',$signature))) { Invoke-WebRequest -Uri $download[0] -OutFile $download[1] -TimeoutSec 120 -MaximumRedirection 0;Set-OwnerAcl $download[1] }
+  foreach($download in @(@(('https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x'+$SigningFingerprint),$key),@(($ReleaseBase+'SHA256SUMS'),$sums),@(($ReleaseBase+'SHA256SUMS.gpg'),$signature))) { Invoke-WebRequest -Uri $download[0] -OutFile $download[1] -TimeoutSec 120 -MaximumRedirection 0;Set-OwnerAcl $download[1] }
   if((Get-Item -LiteralPath $key).Length -gt 1048576 -or (Get-Item -LiteralPath $sums).Length -gt 2097152 -or (Get-Item -LiteralPath $signature).Length -gt 65536) {Refuse-OwnedWsl}
   Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--import',$key)|Out-Null
   $fingerprints=Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--with-colons','--fingerprint',$SigningFingerprint)
