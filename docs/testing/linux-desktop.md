@@ -1083,6 +1083,15 @@ failure phases retain null. The facts distinguish a boundary and do not name a
 runtime cause or admit a visual original. Optional observer errors preserve
 successful startup and the original failure and deadlines.
 
+Capture alert checks use the qualification-owned `ownedIsAlertOpen` command. It
+reads the standard `getAlertText` command once, discards the text, treats only the
+exact `no such alert` protocol error as absence, and propagates unexpected
+failures. The installed SDK can supply its own Chromium `isAlertOpen` command;
+binding preserves every existing SDK command. A pre-existing `ownedIsAlertOpen`
+or missing `getAlertText` still refuses binding before any alert read. Browser
+and native capture callers use the same owned command without changing capture,
+identity, original geometry, deadline or cleanup admission.
+
 In each theme, the driver pairs and imports through the public UI, then creates
 and selects a genuine managed worktree through **New worktree**. Its configured
 worktree base stays inside the private fixture. Bind the selected card's public

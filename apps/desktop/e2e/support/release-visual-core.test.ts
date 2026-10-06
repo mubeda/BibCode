@@ -1125,7 +1125,7 @@ function boundary() {
   const evidence = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "visual-evidence-test-"));
   const bytes = png();
   const browser = {
-    isAlertOpen: vi.fn(async () => false),
+    ownedIsAlertOpen: vi.fn(async () => false),
     execute: vi.fn(async (read: unknown): Promise<Record<string, boolean>> => {
       expect(read).toBe(readVisualWitness);
       return proof;
@@ -1220,7 +1220,7 @@ describe("original visual capture boundary", () => {
         if (mode === "observer-fault") throw new Error("Inert observer fault.");
       });
       Object.assign(f.input, { scene: "git-branch-menu", observeFailure: observed });
-      if (mode === "before-read") f.browser.isAlertOpen.mockRejectedValue(original);
+      if (mode === "before-read") f.browser.ownedIsAlertOpen.mockRejectedValue(original);
       else {
         f.browser.execute.mockResolvedValue(
           mode === "unsafe-latest"
@@ -1275,7 +1275,7 @@ describe("original visual capture boundary", () => {
       const f = boundary();
       try {
         if (failure === "invalid-scene") f.input.scene = "native-share-refresh" as never;
-        if (failure === "alert") f.browser.isAlertOpen.mockResolvedValue(true);
+        if (failure === "alert") f.browser.ownedIsAlertOpen.mockResolvedValue(true);
         if (failure === "before")
           f.browser.execute.mockResolvedValue({ ...proof, credentialAbsent: false });
         if (failure === "after")
@@ -1311,7 +1311,7 @@ it.each(["last-poll", "after-png", "before-read", "unsafe-latest", "observer-fau
       createCoreFailureObserver(records, ownership)(error, value);
     });
     f.input.observeFailure = observe;
-    if (mode === "before-read") f.browser.isAlertOpen.mockRejectedValue(original);
+    if (mode === "before-read") f.browser.ownedIsAlertOpen.mockRejectedValue(original);
     else if (mode === "after-png")
       f.browser.execute.mockResolvedValueOnce(proof).mockResolvedValueOnce(last);
     else if (mode !== "success") {

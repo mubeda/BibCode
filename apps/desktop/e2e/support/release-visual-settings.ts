@@ -1,3 +1,4 @@
+import { observeOwnedBrowserAlert } from "./owned-browser-alert.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Finite original PNG evidence in the owned qualification root.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -647,7 +648,11 @@ export async function captureSettingsVisualScene(
   try {
     const file = settingsVisualScreenshotName(input.scene, input.theme),
       path = NodePath.join(input.evidence, file);
-    if (input.captured.has(file) || NodeFS.existsSync(path) || (await input.browser.isAlertOpen()))
+    if (
+      input.captured.has(file) ||
+      NodeFS.existsSync(path) ||
+      (await observeOwnedBrowserAlert(input.browser))
+    )
       throw new Error("Visual settings capture refused.");
     const observation: SettingsVisualObservationInput = {
       scene: input.scene,

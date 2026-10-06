@@ -17,6 +17,7 @@ import {
 import { QualificationOwner, bounded } from "./qualification-owner.ts";
 import { readOwnedDeliveryWorktree } from "./delivery-retry-workspace.ts";
 import { inspectScreenshot } from "./remote-ui-evidence.ts";
+import { observeOwnedBrowserAlert } from "./owned-browser-alert.ts";
 
 const input: CoreImageObservation = {
   theme: "light",
@@ -796,6 +797,7 @@ it.each([
         Buffer,
         bounded,
         inspectScreenshot,
+        observeOwnedBrowserAlert,
         visualScreenshotName: (scene: string, theme: string) => {
           expect(scene).toBe("git-image-diff");
           return coreImageScreenshotName(theme);
@@ -822,7 +824,7 @@ it.each([
         verifyOwnedSource: async () => {},
         owner: { until: async (read: () => Promise<boolean>) => expect(await read()).toBe(true) },
         browser: {
-          isAlertOpen: async () => kind === "alert",
+          ownedIsAlertOpen: async () => kind === "alert",
           execute: async (
             reader: typeof readCoreImageDiffWitness,
             observation: CoreImageObservation,

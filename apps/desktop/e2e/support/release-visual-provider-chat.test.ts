@@ -8,6 +8,7 @@ import * as NodeURL from "node:url";
 import * as NodeVM from "node:vm";
 import { afterEach, expect, it, vi } from "vite-plus/test";
 import * as ProviderChat from "./release-visual-provider-chat.ts";
+import { observeOwnedBrowserAlert } from "./owned-browser-alert.ts";
 import {
   providerChatScenes,
   providerChatScreenshotName,
@@ -266,7 +267,7 @@ it("refuses duplicate captures, an open real-alert state, and unavailable multis
     captured: new Set<string>(),
     evidence: "/owned-evidence",
     browser: {
-      isAlertOpen: async () => {
+      ownedIsAlertOpen: async () => {
         calls.push("alert");
         return true;
       },
@@ -306,7 +307,7 @@ it("executes the imported shared capture and keeps pixels unretained after the p
           },
         },
         browser: {
-          isAlertOpen: async () => false,
+          ownedIsAlertOpen: async () => false,
           execute: async (read: typeof readProviderChatWitness, value: ProviderChatInput) => {
             calls.push("read");
             return read(value);
@@ -839,6 +840,7 @@ function actualCaptureWithSharedPorts(
       "\ncaptureOwnedVisualScene",
     {
       ...ports,
+      observeOwnedBrowserAlert,
       NodePath: { join: (root: string, file: string) => root + "/" + file },
       NodeFS: { ...(ports.NodeFS as object), existsSync: () => false },
     },
@@ -902,7 +904,7 @@ it.each(["execute", "bound"] as const)(
           },
         },
         browser: {
-          isAlertOpen: async () => false,
+          ownedIsAlertOpen: async () => false,
           execute: async () => {
             calls.push("execute");
             if (mode === "execute") throw original;
@@ -1043,7 +1045,7 @@ it("still polls successful unsatisfied witnesses without changing the post-image
         },
       },
       browser: {
-        isAlertOpen: async () => false,
+        ownedIsAlertOpen: async () => false,
         execute: async () => {
           calls.push("execute");
           return ++reads === 1 ? null : facts;

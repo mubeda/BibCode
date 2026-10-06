@@ -45,7 +45,7 @@ it("retains the exact existing identity/read/original/write capture order", asyn
   try {
     const receipt = await captureOwnedVisualScene({
       browser: {
-        isAlertOpen: async () => {
+        ownedIsAlertOpen: async () => {
           calls.push("alert");
           return false;
         },
@@ -132,7 +132,7 @@ it.each([
     const result = captureOwnedVisualScene({
       ...(row.viewport === undefined ? {} : { viewport: row.viewport }),
       browser: {
-        isAlertOpen: async () => {
+        ownedIsAlertOpen: async () => {
           calls.push("alert");
           return false;
         },
@@ -219,7 +219,7 @@ it.each(["arbitrary-size", null, 17, {}])(
       captureOwnedVisualScene({
         viewport,
         browser: {
-          isAlertOpen: async () => {
+          ownedIsAlertOpen: async () => {
             touched = true;
             return false;
           },
@@ -257,7 +257,7 @@ it.each([
     const run = () =>
       captureOwnedVisualScene({
         browser: {
-          isAlertOpen: async () => mode === "alert",
+          ownedIsAlertOpen: async () => mode === "alert",
           takeScreenshot: async () => {
             screenshots++;
             return originalPng(mode === "wrong-size" ? 1024 : 1280).toString("base64");

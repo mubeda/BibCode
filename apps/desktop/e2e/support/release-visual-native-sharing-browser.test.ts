@@ -106,7 +106,7 @@ function fixture(mode = "owned") {
         : true,
     getWindowSize: async () => ({ width: 1280, height: 960 }),
     setWindowSize: async () => {},
-    isAlertOpen: async () => false,
+    ownedIsAlertOpen: async () => false,
   };
   const input = {
     browser: browser as never,
@@ -379,7 +379,7 @@ it.each(["owned", "post-image-drift"])(
       },
       browser: {
         ...f.browser,
-        isAlertOpen: async () => false,
+        ownedIsAlertOpen: async () => false,
         takeScreenshot: async () => {
           shot = true;
           f.calls.push("screenshot");

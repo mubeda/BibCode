@@ -867,7 +867,7 @@ it.each(["owner-refused", "alert-open", "missing-fact"])(
           if (mode === "owner-refused") throw original;
         },
         browser: {
-          isAlertOpen: async () => mode === "alert-open",
+          ownedIsAlertOpen: async () => mode === "alert-open",
           execute: async () => ({ ...tagFacts, credentialAbsent: false }),
           takeScreenshot: async () => {
             screenshots++;

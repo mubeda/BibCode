@@ -194,14 +194,30 @@ jobs:
         run: |
           $output = wsl --status 2>&1 | Out-String
           $statusAvailable = $LASTEXITCODE -eq 0
+          $nativeSelected = '${{ inputs.native_followups }}' -eq 'true'
+          $listObserved = $false
+          $listSucceeded = $null
+          if ($nativeSelected) {
+            "status_succeeded=$($statusAvailable.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
           $distros = @()
           if ($statusAvailable) {
             $distros = @(wsl --list --quiet 2>$null | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ })
+            $listObserved = $true
+            $listSucceeded = $LASTEXITCODE -eq 0
           }
-          if ($statusAvailable -and $distros.Count -gt 0) {
+          if ($nativeSelected) {
+            "list_observed=$($listObserved.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "list_succeeded=$(($listSucceeded -eq $true).ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+          if ($statusAvailable -and $distros.Count -gt 0 -and (-not $nativeSelected -or $listSucceeded)) {
             "available=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             "capability_reason=WSL and an installed distribution are available" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           } else {
+            if ($nativeSelected) {
+              $reasonCode = if (-not $statusAvailable) { 'wsl-status-failed' } elseif (-not $listSucceeded) { 'wsl-list-failed' } else { 'wsl-no-distro' }
+              "reason_code=$reasonCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            }
             $reason = if (-not $statusAvailable) { "wsl --status is unavailable" } else { "WSL has no installed distribution" }
             "available=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             "capability_reason=$reason" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -220,7 +236,22 @@ jobs:
           foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleAll($rule) }
           foreach ($sid in @($me,$system)) { $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }
           Set-Acl -LiteralPath $root -AclObject $acl
-          @{schemaVersion=1;selection='release-visual-native-followups';sourceSha=$env:GITHUB_SHA;partition='windows-wsl';status='unavailable';originalCount=0;requiredPartitionOriginalCount=2;previewOriginalCount=0;completeGroup=$false;visualReview='pending'} | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $root 'native-followups-workflow-status.json') -Encoding utf8
+          $reasonCode = '${{ steps.wsl.outputs.reason_code }}'
+          if ($reasonCode -notin @('wsl-status-failed','wsl-list-failed','wsl-no-distro')) { throw 'Native WSL closed reason unavailable' }
+          $statusToken = '${{ steps.wsl.outputs.status_succeeded }}'
+          $observedToken = '${{ steps.wsl.outputs.list_observed }}'
+          $listToken = '${{ steps.wsl.outputs.list_succeeded }}'
+          if ($statusToken -notin @('true','false') -or $observedToken -notin @('true','false') -or $listToken -notin @('true','false')) { throw 'Native WSL closed flags unavailable' }
+          $statusSucceeded = $statusToken -eq 'true'
+          $listObserved = $observedToken -eq 'true'
+          $listSucceeded = if ($listObserved) { $listToken -eq 'true' } else { $null }
+          $reasonMatches = (
+            ($reasonCode -eq 'wsl-status-failed' -and -not $statusSucceeded -and -not $listObserved -and $null -eq $listSucceeded) -or
+            ($reasonCode -eq 'wsl-list-failed' -and $statusSucceeded -and $listObserved -and $listSucceeded -eq $false) -or
+            ($reasonCode -eq 'wsl-no-distro' -and $statusSucceeded -and $listObserved -and $listSucceeded -eq $true)
+          )
+          if (-not $reasonMatches) { throw 'Native WSL closed status mismatch' }
+          @{schemaVersion=1;selection='release-visual-native-followups';sourceSha=$env:GITHUB_SHA;partition='windows-wsl';status='unavailable';reasonCode=$reasonCode;wslStatusSucceeded=$statusSucceeded;wslListObserved=$listObserved;wslListSucceeded=$listSucceeded;originalCount=0;requiredPartitionOriginalCount=2;previewOriginalCount=0;completeGroup=$false;visualReview='pending'} | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $root 'native-followups-workflow-status.json') -Encoding utf8
           throw 'Native WSL partition remains unavailable'
 
       - name: Record unavailable WSL capability

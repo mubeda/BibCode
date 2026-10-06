@@ -771,9 +771,20 @@ relabel that metadata as Windows or use a native Windows substitute.
 
 The adapter changes and restores the real display mode and records original
 1280 by 960 desktop pixels for native-wsl-local in both themes. Missing WSL or
-display capability is unavailable/incomplete evidence. Native opt-in absence
-fails the partition and retains a closed unavailable status; the ordinary WSL
-upgrade lane's documented skip remains unchanged. Only two named PNGs, the three
+display capability is unavailable/incomplete evidence. The native opt-in fails
+an unavailable WSL prerequisite and retains a closed status; the ordinary WSL
+upgrade lane's documented skip remains unchanged. Native prerequisite failures
+retain one of three closed `reasonCode` values: `wsl-status-failed`,
+`wsl-list-failed`, or `wsl-no-distro`. The same status records
+`wslStatusSucceeded`, `wslListObserved`, and `wslListSucceeded`; the last is null
+when the existing status command failed and the list command did not run.
+Unknown flags or inconsistent reason/observation tuples are refused. The
+ACL-protected zero-original status is written before the native prerequisite
+step fails. No distro names, raw WSL output, host paths or exception text enter
+these fields. The existing status read and conditional quiet list remain the
+only capability commands; these diagnostics do not provision or change WSL,
+download a root filesystem, update the host, select a default distro or reboot.
+Only two named PNGs, the three
 retainer JSONs and the closed workflow status may be uploaded. Credentials,
 private paths, ACL output and raw OS/driver logs remain in protected private
 roots. Join exact owned processes and source/store/window identities before

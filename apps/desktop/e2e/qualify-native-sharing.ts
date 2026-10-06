@@ -328,8 +328,7 @@ export async function qualifyNativeSharing(
             }),
             45000,
           );
-          bindOwnedBrowserAlertObservation(attached);
-          return attached;
+          return bindOwnedBrowserAlertObservation(attached);
         },
         disconnect: async (browser) => {
           await closeNativeSharingSession(browser, observe);

@@ -1,3 +1,4 @@
+import { observeOwnedBrowserAlert } from "./owned-browser-alert.ts";
 import { readCoreImageDiffWitness } from "./release-visual-core-image.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Writes only finite original PNG evidence in the owned root.
 import * as NodeFS from "node:fs";
@@ -42,7 +43,7 @@ export async function captureVisualScene(input: VisualCaptureInput): Promise<obj
   let latestFailureFacts: Readonly<Record<string, boolean>> | null = null;
   try {
     const file = visualScreenshotName(input.scene, input.theme);
-    if (input.captured.has(file) || (await input.browser.isAlertOpen()))
+    if (input.captured.has(file) || (await observeOwnedBrowserAlert(input.browser)))
       throw new Error("Visual capture refused.");
     const verifyImageSource = input.scene === "git-image-diff" ? input.verifyOwnedSource : null;
     if (input.scene === "git-image-diff" && typeof verifyImageSource !== "function")

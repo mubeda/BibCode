@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Static workflow and inert fixed-input policy tests never launch an OS or application.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeVM from "node:vm";
 import * as YAML from "yaml";
 import { expect, it } from "vite-plus/test";
 import {
@@ -9,6 +10,244 @@ import {
 } from "./qualify-native-followups-workflow.ts";
 import { parseSeededDesktopUpgradeSmokeArgs } from "./seeded-desktop-upgrade-smoke.ts";
 const root = NodePath.resolve(".");
+function wslSteps() {
+  const source = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  return source.jobs.windows_wsl_upgrade_smoke.steps as Array<{
+    name: string;
+    id?: string;
+    if?: string;
+    run?: string;
+  }>;
+}
+// Evaluate only the workflow's closed boolean expressions, never a PowerShell/WSL command.
+function sourceBoolean(expression: string, values: Record<string, unknown>) {
+  const text = expression
+    .replace(/\$distros\.Count/g, "distroCount")
+    .replace(/\$true\b/g, "true")
+    .replace(/\$false\b/g, "false")
+    .replace(/\$null\b/g, "null")
+    .replace(
+      /\$(statusAvailable|nativeSelected|listSucceeded|listObserved|statusSucceeded|reasonCode)\b/g,
+      "$1",
+    )
+    .replace(/-eq\b/g, "===")
+    .replace(/-gt\b/g, ">")
+    .replace(/-and\b/g, "&&")
+    .replace(/-or\b/g, "||")
+    .replace(/-not\b/g, "!");
+  if (/\$|;|\{|\}|\bwsl\s+--|\b(?:Invoke|Out-File)\b/.test(text))
+    throw new Error("Unsupported closed workflow expression.");
+  return NodeVM.runInNewContext("(" + text + ")", values) as boolean;
+}
+function precedingSourceCondition(script: string, index: number) {
+  const line = script
+    .slice(0, index)
+    .split("\n")
+    .toReversed()
+    .find((value) => /^\s*if \(.+\) \{\s*$/.test(value));
+  if (!line) throw new Error("Closed workflow condition unavailable.");
+  return line.trim().slice(4, -3);
+}
+function closedWslDetection(
+  nativeSelected: boolean,
+  statusAvailable: boolean,
+  listSucceeded: boolean | null,
+  distroCount: number,
+) {
+  const script = wslSteps().find((step) => step.id === "wsl")!.run!;
+  const line = script
+    .split("\n")
+    .find((value) => value.trim().startsWith("if ($statusAvailable -and $distros.Count"))!;
+  const availability = line.trim().slice(4, -3);
+  const values = { nativeSelected, statusAvailable, listSucceeded, distroCount };
+  const available = sourceBoolean(availability, values);
+  const reason = script.match(
+    /\$reasonCode = if \(([^\n]+)\) \{ '([^']+)' \} elseif \(([^\n]+)\) \{ '([^']+)' \} else \{ '([^']+)' \}/,
+  );
+  expect(reason).not.toBeNull();
+  const reasonSelected = sourceBoolean(
+    precedingSourceCondition(script, script.indexOf("$reasonCode = if")),
+    values,
+  );
+  const reasonCode =
+    available || !reasonSelected
+      ? null
+      : sourceBoolean(reason![1]!, values)
+        ? reason![2]
+        : sourceBoolean(reason![3]!, values)
+          ? reason![4]
+          : reason![5];
+  return { available, reasonCode };
+}
+function closedWslUnavailable(
+  reasonCode: string,
+  statusSucceeded: boolean,
+  listObserved: boolean,
+  listSucceeded: boolean | null,
+) {
+  const script = wslSteps().find(
+    (step) => step.name === "Record native WSL prerequisite unavailable",
+  )!.run!;
+  const allowed = script.match(/\$reasonCode -notin @\(([^)]+)\)/);
+  const condition = script.match(
+    /\$reasonMatches = \(([\s\S]*?)\)\n\s*if \(-not \$reasonMatches\)/,
+  );
+  expect(allowed).not.toBeNull();
+  expect(condition).not.toBeNull();
+  if (
+    !allowed![1]!
+      .split(",")
+      .map((value) => value.trim().slice(1, -1))
+      .includes(reasonCode) ||
+    !sourceBoolean(condition![1]!, { reasonCode, statusSucceeded, listObserved, listSucceeded })
+  )
+    return null;
+  const literal = script.match(
+    /@\{schemaVersion=1;selection='release-visual-native-followups';[^}]+\}/,
+  );
+  expect(literal).not.toBeNull();
+  const values: Record<string, unknown> = {
+    $reasonCode: reasonCode,
+    $statusSucceeded: statusSucceeded,
+    $listObserved: listObserved,
+    $listSucceeded: listSucceeded,
+    "$env:GITHUB_SHA": "a".repeat(40),
+    $true: true,
+    $false: false,
+    $null: null,
+  };
+  return Object.fromEntries(
+    literal![0]
+      .slice(2, -1)
+      .split(";")
+      .map((field) => {
+        const [key, expression] = field.split("=");
+        const value = Object.hasOwn(values, expression!)
+          ? values[expression!]
+          : expression!.startsWith("'")
+            ? expression!.slice(1, -1)
+            : Number(expression);
+        return [key, value];
+      }),
+  );
+}
+it.each([
+  {
+    native: true,
+    status: false,
+    list: null,
+    count: 0,
+    available: false,
+    reason: "wsl-status-failed",
+  },
+  {
+    native: true,
+    status: true,
+    list: false,
+    count: 0,
+    available: false,
+    reason: "wsl-list-failed",
+  },
+  {
+    native: true,
+    status: true,
+    list: false,
+    count: 2,
+    available: false,
+    reason: "wsl-list-failed",
+  },
+  { native: true, status: true, list: true, count: 0, available: false, reason: "wsl-no-distro" },
+  { native: true, status: true, list: true, count: 2, available: true, reason: null },
+  { native: false, status: false, list: null, count: 0, available: false, reason: null },
+  { native: false, status: true, list: false, count: 2, available: true, reason: null },
+  { native: false, status: true, list: true, count: 0, available: false, reason: null },
+])(
+  "keeps actual native/default WSL decisions and closed reasons: $native/$status/$list/$count",
+  (value) => {
+    expect(closedWslDetection(value.native, value.status, value.list, value.count)).toEqual({
+      available: value.available,
+      reasonCode: value.reason,
+    });
+  },
+);
+it.each([
+  { reason: "wsl-status-failed", status: false, observed: false, list: null },
+  { reason: "wsl-list-failed", status: true, observed: true, list: false },
+  { reason: "wsl-no-distro", status: true, observed: true, list: true },
+])("retains a closed zero-original unavailable artifact before failure: $reason", (value) => {
+  expect(closedWslUnavailable(value.reason, value.status, value.observed, value.list)).toEqual({
+    schemaVersion: 1,
+    selection: "release-visual-native-followups",
+    sourceSha: "a".repeat(40),
+    partition: "windows-wsl",
+    status: "unavailable",
+    reasonCode: value.reason,
+    wslStatusSucceeded: value.status,
+    wslListObserved: value.observed,
+    wslListSucceeded: value.list,
+    originalCount: 0,
+    requiredPartitionOriginalCount: 2,
+    previewOriginalCount: 0,
+    completeGroup: false,
+    visualReview: "pending",
+  });
+  const script = wslSteps().find(
+    (step) => step.name === "Record native WSL prerequisite unavailable",
+  )!.run!;
+  expect(script.indexOf("Set-Acl -LiteralPath $root -AclObject $acl")).toBeLessThan(
+    script.indexOf("Set-Content -LiteralPath"),
+  );
+  expect(script.indexOf("Set-Content -LiteralPath")).toBeLessThan(
+    script.indexOf("throw 'Native WSL partition remains unavailable'"),
+  );
+});
+it.each([
+  { reason: "foreign", status: false, observed: false, list: null },
+  { reason: "wsl-status-failed", status: true, observed: false, list: null },
+  { reason: "wsl-status-failed", status: false, observed: true, list: false },
+  { reason: "wsl-list-failed", status: true, observed: false, list: null },
+  { reason: "wsl-list-failed", status: true, observed: true, list: true },
+  { reason: "wsl-no-distro", status: true, observed: true, list: false },
+  { reason: "wsl-no-distro", status: false, observed: false, list: null },
+])(
+  "refuses contradictory native unavailable metadata: $reason/$status/$observed/$list",
+  (value) => {
+    expect(closedWslUnavailable(value.reason, value.status, value.observed, value.list)).toBeNull();
+  },
+);
+it("uses only the original WSL reads and keeps default skip separate", () => {
+  const steps = wslSteps(),
+    script = steps.find((step) => step.id === "wsl")!.run!;
+  expect(script.match(/\$output = wsl --status\b/g)).toHaveLength(1);
+  expect(script.match(/\$distros = @\(wsl --list --quiet\b/g)).toHaveLength(1);
+  const list = script.indexOf("$distros = @(wsl --list --quiet");
+  expect(script.lastIndexOf("if ($statusAvailable) {", list)).toBeGreaterThan(0);
+  expect(sourceBoolean(precedingSourceCondition(script, list), { statusAvailable: false })).toBe(
+    false,
+  );
+  expect(sourceBoolean(precedingSourceCondition(script, list), { statusAvailable: true })).toBe(
+    true,
+  );
+  for (const field of ["status_succeeded", "list_observed", "list_succeeded", "reason_code"]) {
+    const condition = precedingSourceCondition(script, script.indexOf('"' + field + "="));
+    expect(sourceBoolean(condition, { nativeSelected: false })).toBe(false);
+    expect(sourceBoolean(condition, { nativeSelected: true })).toBe(true);
+  }
+  expect(script).not.toMatch(
+    /--(?:install|import|update|set-default|shutdown)|Invoke-WebRequest|Restart-Computer/,
+  );
+  expect(steps.find((step) => step.name === "Record unavailable WSL capability")!.if).toBe(
+    "steps.wsl.outputs.available != 'true'",
+  );
+  expect(steps.find((step) => step.name === "Record native WSL prerequisite unavailable")!.if).toBe(
+    "inputs.native_followups == true && steps.wsl.outputs.available != 'true'",
+  );
+});
 const args = [
   "--native-followups",
   "--platform",

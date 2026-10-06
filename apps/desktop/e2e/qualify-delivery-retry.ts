@@ -1,3 +1,4 @@
+import { observeOwnedBrowserAlert } from "./support/owned-browser-alert.ts";
 import {
   selectLifecycleCodexWorkspace,
   runProjectLifecycleScene,
@@ -1134,8 +1135,22 @@ export async function runDeliveryRetryQualification() {
     await owner.until(async () => (await b().$(composer).getText()).trim() === "");
   }
 
+  function retryDialogBrowser() {
+    const browser = b();
+    return {
+      isAlertOpen: () => observeOwnedBrowserAlert(browser),
+      getAlertText: () => browser.getAlertText(),
+      dismissAlert: () => browser.dismissAlert(),
+      acceptAlert: () => browser.acceptAlert(),
+      waitUntil: (
+        probe: () => Promise<boolean>,
+        options: { timeout: number; interval: number; timeoutMsg: string },
+      ) => browser.waitUntil(probe, options),
+    };
+  }
+
   async function capture(scene: DeliveryScene, id: string, prompt: string, draft: string) {
-    check(!(await b().isAlertOpen()));
+    check(!(await observeOwnedBrowserAlert(b())));
     const selector = row(id);
     const expected = scene === "new-conversation" ? newConversationNotice : "Delivery uncertain";
     await b().$(selector).scrollIntoView({ block: "center" });
@@ -2947,7 +2962,7 @@ export async function runDeliveryRetryQualification() {
         await capture("uncertain", id, prompt, draft);
         step("dismiss-prompt");
         const retry = () => click(`${row(id)} button[aria-label="Retry message delivery"]`);
-        const dismissed = await resolveActualRetryPrompt(browser, retry, "dismiss");
+        const dismissed = await resolveActualRetryPrompt(retryDialogBrowser(), retry, "dismiss");
         const cancelStarted = performance.now();
         while (performance.now() - cancelStarted < 1000) {
           unchanged(before, readDeliveryReceipts(control));
@@ -2961,7 +2976,7 @@ export async function runDeliveryRetryQualification() {
         );
         await capture("retry-cancelled", id, prompt, draft);
         step("accept-prompt");
-        const accepted = await resolveActualRetryPrompt(browser, retry, "accept");
+        const accepted = await resolveActualRetryPrompt(retryDialogBrowser(), retry, "accept");
         await owner.until(async () =>
           (await browser!.$(row(id)).getText()).includes(newConversationNotice),
         );

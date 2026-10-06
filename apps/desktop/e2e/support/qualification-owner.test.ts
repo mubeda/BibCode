@@ -176,7 +176,7 @@ it("distinguishes actual SDK handshake/context/binding boundaries without changi
               expect(same).toBe(client);
               return same;
             });
-            if (mode === "binding") sdkClient.addCommand("isAlertOpen", async () => false);
+            if (mode === "binding") sdkClient.addCommand("ownedIsAlertOpen", async () => false);
             return sdkClient;
           } catch (error) {
             original = error;
@@ -215,7 +215,7 @@ it("distinguishes actual SDK handshake/context/binding boundaries without changi
             sdkClient = await remote(
               ownedBrowserOptions("/inert/chrome", "/inert/profile", "http://127.0.0.1:4885"),
             );
-            if (mode === "binding") sdkClient.addCommand("isAlertOpen", async () => false);
+            if (mode === "binding") sdkClient.addCommand("ownedIsAlertOpen", async () => false);
             bindOwnedBrowserAlertObservation(sdkClient);
             returned = { browser: sdkClient };
           } else

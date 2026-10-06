@@ -535,10 +535,10 @@ export async function openOwnedBrowser(
   observe();
   observation.alertBindingAttempted = true;
   observe();
-  bindOwnedBrowserAlertObservation(browser);
+  const qualified = bindOwnedBrowserAlertObservation(browser);
   observation.alertBindingCompleted = true;
   observe();
-  return { browser, driver: child };
+  return { browser: qualified, driver: child };
 }
 
 export async function prepareOwnedNetwork(root: string) {

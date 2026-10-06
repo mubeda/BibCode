@@ -616,7 +616,7 @@ it("observes only the existing false capture facts while preserving the original
       calls.push("identity");
     },
     browser: {
-      isAlertOpen: async () => {
+      ownedIsAlertOpen: async () => {
         calls.push("alert");
         return false;
       },
@@ -766,7 +766,7 @@ it("reports the last actual poll result without adding a diagnostic execution", 
         captured: new Set(),
         verifyOwnedIdentity: async () => {},
         browser: {
-          isAlertOpen: async () => false,
+          ownedIsAlertOpen: async () => false,
           execute: async () => (++reads === 1 ? sourceControlFailureFacts : latest),
           takeScreenshot: async () => {
             throw new Error("No screenshot expected.");
@@ -819,7 +819,7 @@ it.each(["observer-fault", "pre-read", "read-reject", "after-read", "after-ident
         if (mode === "pre-read" || (mode === "after-identity" && identities === 2)) throw original;
       },
       browser: {
-        isAlertOpen: async () => false,
+        ownedIsAlertOpen: async () => false,
         execute: async () => {
           reads++;
           if (mode === "read-reject") throw original;
@@ -897,7 +897,7 @@ describe("original settings PNG boundary", () => {
             throw new Error("Identity changed.");
         },
         browser: {
-          isAlertOpen: async () => failure === "alert",
+          ownedIsAlertOpen: async () => failure === "alert",
           execute: async (
             read: typeof readSettingsVisualWitness,
             args: SettingsVisualObservationInput,

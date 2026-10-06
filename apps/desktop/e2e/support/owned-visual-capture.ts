@@ -1,3 +1,4 @@
+import { observeOwnedBrowserAlert } from "./owned-browser-alert.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Only the existing private original-capture lifecycle owns these writes.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -41,7 +42,7 @@ export async function captureOwnedVisualScene<Observation, Receipt extends objec
   if (
     input.captured.has(input.file) ||
     NodeFS.existsSync(path) ||
-    (await input.browser.isAlertOpen())
+    (await observeOwnedBrowserAlert(input.browser))
   )
     throw input.refused();
   const observation = input.observation();
