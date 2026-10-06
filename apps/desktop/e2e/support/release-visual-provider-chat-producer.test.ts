@@ -183,7 +183,7 @@ function caller(mode = "valid") {
             id,
             role: "user",
             text: prompt,
-            turnId: failed || queued ? null : turnId,
+            turnId: null,
             streaming: false,
             createdAt: time,
             updatedAt: time,

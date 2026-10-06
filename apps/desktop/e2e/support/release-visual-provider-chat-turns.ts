@@ -96,10 +96,11 @@ export function bindProviderChatMessage(input: {
   if (
     value.delivery?.provider !== input.provider ||
     value.delivery.providerInstanceId !== input.provider ||
-    (value.delivery.mode ?? "start") !== "start"
+    value.delivery.mode !== "start"
   )
     throw refused();
   const appended = input.inputs.slice(input.beforeInputCount);
+  let boundTurnId: string | null = null;
   if (input.state === "queued" || input.state === "refused") {
     if (
       appended.length !== 0 ||
@@ -111,21 +112,24 @@ export function bindProviderChatMessage(input: {
   } else {
     if (
       value.delivery.state !== "delivered" ||
-      value.turnId === null ||
-      after.latestTurn?.turnId !== value.turnId ||
+      value.turnId !== null ||
+      after.latestTurn?.turnId === null ||
+      after.latestTurn?.turnId === undefined ||
+      after.latestTurn.turnId === before.latestTurn?.turnId ||
       after.latestTurn.state !== input.state ||
-      (input.state === "running" && after.session?.activeTurnId !== value.turnId) ||
+      (input.state === "running" && after.session?.activeTurnId !== after.latestTurn.turnId) ||
       appended.length !== 1 ||
       appended[0]?.provider !== input.provider ||
       appended[0].kind !== "start" ||
       appended[0].prompt !== input.prompt ||
-      (input.provider === "codex" && appended[0].turnId !== value.turnId)
+      (input.provider === "codex" && appended[0].turnId !== after.latestTurn.turnId)
     )
       throw refused();
+    boundTurnId = after.latestTurn.turnId;
   }
   return Object.freeze({
     messageId: value.id,
-    turnId: value.turnId,
+    turnId: boundTurnId,
     threadId: after.id,
     provider: input.provider,
     prompt: input.prompt,
@@ -173,7 +177,8 @@ export function verifyProviderChatDelivery(input: {
   );
   if (
     original.turnId === null ||
-    first.turnId !== original.turnId ||
+    first.turnId !== null ||
+    first.delivery?.mode !== "start" ||
     first.delivery?.state !== "delivered" ||
     thread.latestTurn?.turnId !== original.turnId ||
     thread.latestTurn.state !== "error" ||
@@ -210,7 +215,9 @@ export function verifyProviderChatCheckpoint(
   );
   if (
     binding.turnId === null ||
-    user.turnId !== binding.turnId ||
+    user.turnId !== null ||
+    user.delivery?.mode !== "start" ||
+    user.delivery.state !== "delivered" ||
     thread.latestTurn?.turnId !== binding.turnId ||
     thread.latestTurn.state !== "completed" ||
     plans.length !== 1 ||

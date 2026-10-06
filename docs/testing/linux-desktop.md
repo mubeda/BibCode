@@ -1899,6 +1899,14 @@ explicit pair: same project, resolved managed path and branch, ordinary strict
 Git identity, exact visible panel surface and original host route/card. Recheck
 the public server's boot/storage identity throughout the source/capture joins.
 Do not change the product provider filter, persisted schema or canonical state.
+Normal START deliveries retain a null user-message `turnId` in the current
+server projection. Require exact delivered/start metadata and one fresh owned
+prompt; bind the native turn through the changed latest turn, running session
+where applicable and the single native input record (including Codex's real
+turn ID). Completed plan/checkpoint/assistant and held-loss FIFO checks use that
+native binding while preserving the START user's null attribution. Refused and
+queued messages remain null with no extra native dispatch; do not substitute
+steering attribution or a stale latest turn.
 
 On the Claude host, capture the `/comp` command suggestions, context popover,
 MCP popover, and actual markdown/plan/checkpoint row in that order. Seed the

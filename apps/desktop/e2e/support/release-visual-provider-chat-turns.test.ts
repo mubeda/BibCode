@@ -57,7 +57,7 @@ const user = {
   id: "owned-message",
   role: "user",
   text: "Owned visual partial reply [[slow]]",
-  turnId: "native-turn",
+  turnId: null,
   streaming: false,
   delivery: { state: "delivered", provider: "codex", providerInstanceId: "codex", mode: "start" },
   createdAt: time,
@@ -256,3 +256,73 @@ it("joins the completed plan to its real checkpoint file and assistant", () => {
     }),
   ).toThrow();
 });
+
+it("binds a normal delivered START with null user attribution to the actual latest/session/native input turn", () => {
+  const before = thread(),
+    after = thread([{ ...user, turnId: null }, assistant]);
+  expect(
+    api.bindProviderChatMessage({
+      before,
+      after,
+      prompt: user.text,
+      provider: "codex",
+      state: "running",
+      inputs: native,
+      beforeInputCount: 0,
+    }),
+  ).toMatchObject({ messageId: user.id, turnId: "native-turn" });
+});
+it("verifies held loss through native/assistant turn while the original START user remains unattributed", () => {
+  const original = {
+    messageId: user.id,
+    turnId: "native-turn",
+    threadId: "owned-panel",
+    provider: "codex",
+    prompt: user.text,
+    beforeInputCount: 0,
+  };
+  expect(
+    api.verifyProviderChatDelivery({
+      scene: "chat-held-workspace-loss",
+      thread: thread(
+        [{ ...user, turnId: null }, { ...assistant, streaming: false }, queued],
+        "error",
+      ),
+      original,
+      queuedMessageId: queued.id,
+      inputs: native,
+    }),
+  ).toMatchObject({ exactNativeTurn: true });
+});
+
+it.each(["nonnull-user", "steer", "missing-mode", "stale-turn"])(
+  "refuses unsupported START projection or stale native turn: %s",
+  (mode) => {
+    const before =
+      mode === "stale-turn"
+        ? thread([{ ...user, id: "owned-prior-message", text: "Owned prior turn" }, assistant])
+        : thread();
+    const after = thread([
+      {
+        ...user,
+        turnId: mode === "nonnull-user" ? "native-turn" : null,
+        delivery: {
+          ...user.delivery,
+          mode: mode === "steer" ? "steer" : mode === "missing-mode" ? undefined : "start",
+        },
+      },
+      assistant,
+    ]);
+    expect(() =>
+      api.bindProviderChatMessage({
+        before,
+        after,
+        prompt: user.text,
+        provider: "codex",
+        state: "running",
+        inputs: native,
+        beforeInputCount: 0,
+      }),
+    ).toThrow();
+  },
+);
