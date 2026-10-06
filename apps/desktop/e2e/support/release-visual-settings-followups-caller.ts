@@ -321,7 +321,7 @@ export async function runSettingsFollowupCaller(input: SettingsFollowupCallerInp
     if (found.length !== 1 || !remoteId) throw refused();
     await click(`[aria-label="More actions for ${found[0]}"]`);
     await click('//*[@role="menuitem" and normalize-space()="Remove server…"]');
-    await click('[role="alertdialog"] button=Remove server');
+    await click('//*[@role="alertdialog"]//button[normalize-space()="Remove server"]');
     await browser
       .$(`[data-testid="environment-rail-entry-${remoteId}"]`)
       .waitForExist({ reverse: true });
@@ -572,7 +572,9 @@ export async function runSettingsFollowupCaller(input: SettingsFollowupCallerInp
                   await acknowledgement.click();
                 }
                 registrationStarted = true;
-                await click(`${dialog} button=Add Server`);
+                await click(
+                  '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Add Server"]',
+                );
                 await browser.$(dialog).waitForDisplayed({ reverse: true });
                 registered = true;
                 await click(`[data-testid="environment-rail-entry-${remoteId}"]`);

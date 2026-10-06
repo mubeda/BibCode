@@ -41,7 +41,9 @@ export async function runSettingsFollowupRename(input: SettingsFollowupRenameInp
   const save = async (label: string) => {
     await input.browser.$(field).setValue(label);
     if ((await input.browser.$(field).getValue()) !== label) throw refused();
-    await click(popup + " button=Save");
+    await click(
+      '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Save"]',
+    );
     await input.owner.until(async () => (await input.readLabel()) === label);
     await input.owner.until(async () => !(await input.browser.$(popup).isDisplayed()));
   };
@@ -62,7 +64,10 @@ export async function runSettingsFollowupRename(input: SettingsFollowupRenameInp
   }
   let cleanupFailed = false;
   try {
-    if (await input.browser.$(popup).isDisplayed()) await click(popup + " button=Cancel");
+    if (await input.browser.$(popup).isDisplayed())
+      await click(
+        '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Cancel"]',
+      );
     const label = await input.readLabel();
     if (label === input.nextLabel) {
       await open(input.nextLabel);

@@ -62,6 +62,10 @@ def scenario_settings(name):
         return {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
                 'inner_timeout': 600, 'outer_timeout': 660,
                 'evidence_prefix': 'issue29-project-lifecycle-', 'fixture_prefix': 'bc-vl-'}
+    if name == 'release-visual-pull-requests':
+        return {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+                'inner_timeout': 600, 'outer_timeout': 660,
+                'evidence_prefix': 'issue29-pull-requests-', 'fixture_prefix': 'bc-vr-'}
     if name == 'release-visual-native-sharing':
         return {'controller': 'apps/desktop/e2e/qualify-native-sharing.ts',
                 'inner_timeout': 600, 'outer_timeout': 660,
@@ -103,10 +107,119 @@ def ui_input_hashes(server, fake_host, web_root):
             **({'fakeHostSha256': digest(fake_host)} if fake_host is not None else {}),
             'webSha256': result.hexdigest(), 'webFiles': count}
 
+def pull_requests_hosting_restored(fixture, result):
+    """Closed source/theme proof plus exact retained private bytes after both process owners join."""
+    try:
+        proof_keys = {'source', 'theme', 'baselineRestored', 'undoCompleted', 'inputsUnchanged',
+                      'ownedProcessesJoined', 'configSha256', 'hostingInputsSha256',
+                      'baselineStateSha256', 'completionLogSha256', 'mutableFilesIdentitySha256'}
+        proofs = result.get('pullRequestsHostingRestorationProofs')
+        if not isinstance(proofs, list) or len(proofs) != 2:
+            return False
+        uid = fixture.lstat().st_uid
+        def read_owned(path, size, mode):
+            metadata = path.lstat()
+            if (path.is_symlink() or not path.is_file() or path.resolve(strict=True) != path
+                    or metadata.st_nlink != 1 or metadata.st_uid != uid
+                    or metadata.st_mode & 0o777 != mode or metadata.st_size > size):
+                raise ValueError('Owned hosting bytes refused')
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                opened = os.fstat(descriptor)
+                with os.fdopen(descriptor, 'rb', closefd=False) as source:
+                    value = source.read(size + 1)
+                if (opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino
+                        or len(value) != metadata.st_size):
+                    raise ValueError('Owned hosting bytes changed')
+                return value
+            finally:
+                os.close(descriptor)
+        def exact_json(raw):
+            def fields(pairs):
+                value = {}
+                for key, item in pairs:
+                    if key in value: raise ValueError('Duplicate hosting field')
+                    value[key] = item
+                return value
+            return json.loads(raw, object_pairs_hook=fields)
+        seen = set()
+        for proof in proofs:
+            if (not isinstance(proof, dict) or set(proof) != proof_keys
+                    or proof.get('theme') not in ['light', 'dark'] or proof['theme'] in seen
+                    or proof.get('source') != result.get('source')
+                    or any(proof.get(key) is not True for key in ['baselineRestored', 'undoCompleted', 'inputsUnchanged', 'ownedProcessesJoined'])
+                    or any(not isinstance(proof.get(key), str) or len(proof[key]) != 64
+                           or any(char not in '0123456789abcdef' for char in proof[key])
+                           for key in ['configSha256', 'hostingInputsSha256', 'baselineStateSha256', 'completionLogSha256', 'mutableFilesIdentitySha256'])):
+                return False
+            seen.add(proof['theme'])
+            lexical = fixture / proof['theme']
+            if lexical.is_symlink(): return False
+            root = lexical.resolve(strict=True)
+            hosting = root / 'hosting'
+            for directory in [root, hosting, hosting / 'bin']:
+                metadata = directory.lstat()
+                if (directory.is_symlink() or not directory.is_dir() or metadata.st_uid != uid
+                        or metadata.st_mode & 0o777 != 0o700): return False
+            if set(path.name for path in hosting.iterdir()) != {'bin', 'origins.gitconfig', 'host-state.json', 'host-calls.jsonl', 'hosting-config.json'}:
+                return False
+            files = ['hosting/bin/gh', 'hosting/bin/glab', 'hosting/bin/release-visual-pull-requests-protocol.mjs', 'hosting/hosting-config.json', 'hosting/origins.gitconfig']
+            frozen = {name: read_owned(root / name, 1048576, 0o500 if '/bin/' in name else 0o600) for name in files}
+            config_bytes = frozen['hosting/hosting-config.json']
+            if hashlib.sha256(config_bytes).hexdigest() != proof['configSha256']: return False
+            input_bytes = ''.join(name + '\0' + hashlib.sha256(frozen[name]).hexdigest() + '\n' for name in sorted(files)).encode()
+            if hashlib.sha256(input_bytes).hexdigest() != proof['hostingInputsSha256']: return False
+            config = exact_json(config_bytes)
+            if (not isinstance(config, dict) or set(config) != {'root', 'sourceSha', 'uid', 'projects', 'exchanges', 'state', 'calls'}
+                    or config.get('root') != str(root) or config.get('sourceSha') != proof['source']
+                    or type(config.get('uid')) is not int or config['uid'] != uid
+                    or config.get('state') != str(hosting / 'host-state.json')
+                    or config.get('calls') != str(hosting / 'host-calls.jsonl')): return False
+            state = read_owned(hosting / 'host-state.json', 4096, 0o600)
+            state_value = exact_json(state)
+            if (not isinstance(state_value, dict) or set(state_value) != {'labelApplied'} or state_value['labelApplied'] is not False
+                    or hashlib.sha256(state).hexdigest() != proof['baselineStateSha256']): return False
+            identity = ''
+            for name in ['host-state.json', 'host-calls.jsonl']:
+                metadata = (hosting / name).lstat()
+                identity += name + '\0' + str(metadata.st_dev) + ':' + str(metadata.st_ino) + ':' + str(metadata.st_uid) + ':' + str(metadata.st_mode & 0o777) + '\n'
+            if hashlib.sha256(identity.encode()).hexdigest() != proof['mutableFilesIdentitySha256']: return False
+            calls = read_owned(hosting / 'host-calls.jsonl', 65536, 0o600)
+            if hashlib.sha256(calls).hexdigest() != proof['completionLogSha256'] or not calls.endswith(b'\n'): return False
+            records = [exact_json(line) for line in calls.splitlines()]
+            if len(records) > 200: return False
+            mutations = []
+            for record in records:
+                if (not isinstance(record, dict) or set(record) != {'kind', 'provider', 'number', 'success', 'bodySha256', 'mutation', 'stateSha256', 'stateIdentitySha256'}
+                        or record.get('provider') not in ['github', 'gitlab'] or type(record.get('success')) is not bool): return False
+                table = config.get('exchanges', {}).get(record['provider'])
+                if (not isinstance(table, list) or not any(isinstance(entry, dict) and entry.get('kind') == record.get('kind')
+                        and entry.get('number') == record.get('number') and (entry.get('exitCode') == 0) == record['success'] for entry in table)): return False
+                if record['kind'] == 'labels':
+                    if (record['provider'] != 'github' or record['number'] != 43 or record['success'] is not True
+                            or record['bodySha256'] is not None or record['mutation'] not in ['label-add', 'label-remove']
+                            or any(not isinstance(record[key], str) or len(record[key]) != 64 or any(char not in '0123456789abcdef' for char in record[key]) for key in ['stateSha256', 'stateIdentitySha256'])): return False
+                    expected_state = b'{"labelApplied":true}' if record['mutation'] == 'label-add' else state
+                    if record['stateSha256'] != hashlib.sha256(expected_state).hexdigest(): return False
+                    if record['mutation'] == 'label-remove':
+                        metadata = (hosting / 'host-state.json').lstat()
+                        state_identity = 'host-state.json\0' + str(metadata.st_dev) + ':' + str(metadata.st_ino) + ':' + str(metadata.st_uid) + ':' + str(metadata.st_mode & 0o777) + '\n'
+                        if record['stateIdentitySha256'] != hashlib.sha256(state_identity.encode()).hexdigest(): return False
+                    mutations.append(record['mutation'])
+                elif record['mutation'] is not None or record['stateSha256'] is not None or record['stateIdentitySha256'] is not None: return False
+            if mutations != ['label-add', 'label-remove']: return False
+        return seen == {'light', 'dark'}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
 def cleanup_ui_fixture(fixture, evidence, supervisor, scenario='remote-updates-ui'):
     """Delete only this allocated UI root after both owners prove joined cleanup."""
     if (supervisor.get('supervisorReaped') is not True or fixture.parent != Path('/tmp')
             or not fixture.name.startswith(scenario_settings(scenario)['fixture_prefix']) or fixture.is_symlink()):
+        return False
+    if (scenario == 'release-visual-pull-requests'
+            and (supervisor.get('hostNetworkNamespaceUnchanged') is not True
+                 or supervisor.get('buildInputsUnchanged') is not True)):
         return False
     try:
         receipt = evidence / 'namespace-cleanup.json'
@@ -115,7 +228,7 @@ def cleanup_ui_fixture(fixture, evidence, supervisor, scenario='remote-updates-u
         cleanup = json.loads(receipt.read_text())
         if cleanup.get('remaining') != [] or cleanup.get('controllerReaped') is not True:
             return False
-        if scenario in ['release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-native-sharing', 'release-visual-settings-followups']:
+        if scenario in ['release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-native-sharing', 'release-visual-settings-followups', 'release-visual-pull-requests']:
             result_path = evidence / 'result.json'
             metadata = result_path.lstat()
             if result_path.is_symlink() or not result_path.is_file() or metadata.st_nlink != 1 or metadata.st_size > 131072:
@@ -125,9 +238,12 @@ def cleanup_ui_fixture(fixture, evidence, supervisor, scenario='remote-updates-u
                     or result.get({'release-visual-provider-chat': 'providerChatFixtureSafeToDelete',
                                    'release-visual-project-lifecycle': 'projectLifecycleFixtureSafeToDelete',
                                    'release-visual-native-sharing': 'nativeSharingFixtureSafeToDelete',
+                                   'release-visual-pull-requests': 'pullRequestsFixtureSafeToDelete',
                                    'release-visual-settings-followups': 'settingsFollowupFixtureSafeToDelete'}[scenario]) is not True
                     or result.get('childProcessesClosed') is not True or result.get('cleanupFailures') != []):
                 return False
+        if scenario == 'release-visual-pull-requests' and not pull_requests_hosting_restored(fixture, result):
+            return False
         shutil.rmtree(fixture)
         return True
     except (OSError, ValueError, AttributeError):
@@ -341,7 +457,7 @@ def inner_resources(arguments):
     if (len(arguments) == 2 and arguments[0] == 'release-visual-native-sharing'
             and Path(arguments[1]).is_absolute() and arguments[1].endswith('.AppImage')):
         return arguments[0], None, arguments[1], 'core'
-    if len(arguments) == 2 and arguments[0] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups']:
+    if len(arguments) == 2 and arguments[0] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups', 'release-visual-pull-requests']:
         return arguments[0], None, arguments[1], 'core'
     raise RuntimeError('Unknown qualification owner payload')
 
@@ -397,13 +513,13 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
                                 'BIBCODE_NATIVE_SHARING_XVFB': str(xvfb.resolve(strict=True)),
                                 'GIT_CONFIG_NOSYSTEM': '1',
                                 'GIT_CONFIG_GLOBAL': str(fixture / 'empty-git-config')})
-        elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups']:
+        elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups', 'release-visual-pull-requests']:
             environment.update({'BIBCODE_DELIVERY_UI_WEB': str(Path(web_root).resolve(strict=True)),
                                 'BIBCODE_DELIVERY_UI_SELECTION': scenario,
                                 'GIT_CONFIG_NOSYSTEM': '1',
                                 'GIT_CONFIG_GLOBAL': str(fixture / 'empty-git-config')})
         with os.fdopen(os.open(fixture / 'private-controller.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
-            if scenario in ['release-visual-project-lifecycle', 'release-visual-settings-followups']:
+            if scenario in ['release-visual-project-lifecycle', 'release-visual-settings-followups', 'release-visual-pull-requests']:
                 previous_sigchld = signal.getsignal(signal.SIGCHLD)
                 lifecycle_reaper = lifecycle_adopted_reaper(lambda: process)
                 signal.signal(signal.SIGCHLD, lifecycle_reaper)
@@ -536,7 +652,7 @@ def outer(scenario='chat-upload', ui_matrix='core'):
         provenance.update({'scenario': scenario, 'selection': ui_matrix,
                            'inputs': ui_input_hashes(server, fake_host, web_root)})
         command.extend([scenario, fake_host, web_root, ui_matrix])
-    elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups']:
+    elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups', 'release-visual-pull-requests']:
         fake_host = None
         web_root = str(Path(os.environ['BIBCODE_DELIVERY_UI_WEB']).resolve(strict=True))
         provenance.update({'scenario': scenario, 'inputs': ui_input_hashes(server, None, web_root)})
@@ -551,14 +667,14 @@ def outer(scenario='chat-upload', ui_matrix='core'):
         result['privateFixtureDeleted'] = cleanup_ui_fixture(fixture, evidence, result, scenario)
         if not result['privateFixtureDeleted'] or not result['hostNetworkNamespaceUnchanged'] or not result['buildInputsUnchanged']:
             result['exitCode'] = result['exitCode'] or 1
-    elif scenario in ['remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups']:
+    elif scenario in ['remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups', 'release-visual-pull-requests']:
         result['buildInputsUnchanged'] = ui_input_hashes(server, fake_host, web_root) == provenance['inputs']
         result['privateFixtureDeleted'] = cleanup_ui_fixture(fixture, evidence, result, scenario)
         if not result['privateFixtureDeleted'] or not result['hostNetworkNamespaceUnchanged'] or not result['buildInputsUnchanged']:
             result['exitCode'] = result['exitCode'] or 1
     write_json(evidence / 'supervisor.json', result)
     print(json.dumps({'exitCode': result['exitCode'],
-                      **({'selection': scenario} if scenario == 'release-visual-settings-followups' else {'evidence': str(evidence)}),
+                      **({'selection': scenario} if scenario in ['release-visual-settings-followups', 'release-visual-pull-requests'] else {'evidence': str(evidence)}),
                       'supervisorReaped': result['supervisorReaped']}))
     return result['exitCode']
 

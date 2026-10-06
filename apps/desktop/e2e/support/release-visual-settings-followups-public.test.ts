@@ -63,11 +63,16 @@ async function mountedRename(mode = "success") {
     node.remove();
   });
   const select = (selector: string) => {
-    if (selector.endsWith("button=Save") || selector.endsWith("button=Cancel")) {
-      const label = selector.endsWith("button=Save") ? "Save" : "Cancel";
+    const scoped =
+      /^\/\/\*\[@data-slot="dialog-popup" and @role="dialog"\]\/\/button\[normalize-space\(\)="(Save|Cancel)"\]$/.exec(
+        selector,
+      );
+    if (scoped) {
       return Array.from(
-        document.querySelectorAll<HTMLButtonElement>('[data-slot="dialog-popup"] button'),
-      ).filter((value) => value.textContent?.trim() === label);
+        document.querySelectorAll<HTMLButtonElement>(
+          '[data-slot="dialog-popup"][role="dialog"] button',
+        ),
+      ).filter((value) => value.textContent?.trim() === scoped[1]);
     }
     return Array.from(document.querySelectorAll<HTMLElement>(selector));
   };

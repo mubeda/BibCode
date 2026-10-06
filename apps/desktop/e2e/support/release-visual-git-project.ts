@@ -1252,7 +1252,9 @@ export async function runGitProjectVisual(input: GitProjectVisualInput): Promise
   await tab("Changes", merge);
   await capture("git-merge-conflict", merge);
   await click('//*[@data-in-progress-kind="merge"]//button[normalize-space()="Abort"]');
-  await click(`${popup} button=Abort Merge`);
+  await click(
+    '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Abort Merge"]',
+  );
   await browser.$(popup).waitForDisplayed({ reverse: true });
   await input.owner.until(async () => {
     try {

@@ -1009,7 +1009,9 @@ export function createProjectLifecycleBrowserFlows(input: ProjectLifecycleBrowse
         await click(
           '//*[@role="menuitem" and not(@aria-disabled="true")][.//span[normalize-space()="Delete Worktree…"]]',
         );
-        const destructive = browser.$(popup + " button=Delete Git worktree and remove");
+        const destructive = browser.$(
+          '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Delete Git worktree and remove"]',
+        );
         await destructive.waitForDisplayed();
         await destructive.waitForEnabled();
         await input.source.verifyIdleRemovalContext();
@@ -1019,7 +1021,9 @@ export function createProjectLifecycleBrowserFlows(input: ProjectLifecycleBrowse
       closeRemovalDialog: async () => {
         row("worktree-remove-busy");
         if (!(await browser.$(popup).isExisting())) return;
-        await click(popup + " button=Cancel");
+        await click(
+          '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Cancel"]',
+        );
         await browser.$(popup).waitForDisplayed({ reverse: true });
       },
       stopAndJoinTurn: () => input.source.stopAndJoinTurn(),
@@ -1045,7 +1049,8 @@ export function createProjectLifecycleBrowserFlows(input: ProjectLifecycleBrowse
       verifySingleHeldTransfer: () => input.source.verifySingleHeldTransfer(),
       cancelPublicly: async () => {
         row("project-clone-progress");
-        const cancel = popup + " button=Cancel clone";
+        const cancel =
+          '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Cancel clone"]';
         if (await browser.$(cancel).isExisting()) await click(cancel);
       },
       verifyCancelledAndJoined: () => input.source.verifyCancelledAndJoined(),

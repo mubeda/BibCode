@@ -4,6 +4,7 @@ import ast
 import contextlib
 import io
 import json
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -610,6 +611,96 @@ class NetworkHandoffTests(unittest.TestCase):
         receipt = json.loads(capture.getvalue())
         self.assertEqual(receipt, {'refused': True, 'failure': {'stage': 'platform-check', 'attemptedMutations': 0, 'completedMutations': 0, 'netAdminEffective': None, 'lastCommand': None}})
         self.assertNotIn('secret', capture.getvalue())
+
+def owned_hosting_proofs(fixture, source):
+    proofs = []
+    for theme in ['light', 'dark']:
+        root = (fixture / theme).resolve(); hosting = root / 'hosting'; binary = hosting / 'bin'
+        for directory in [root, hosting, binary]: directory.mkdir(mode=0o700)
+        frozen = {}
+        for name in ['hosting/bin/gh', 'hosting/bin/glab', 'hosting/bin/release-visual-pull-requests-protocol.mjs', 'hosting/origins.gitconfig']:
+            path = root / name; value = ('Owned source fixture ' + name).encode(); path.write_bytes(value); path.chmod(0o500 if '/bin/' in name else 0o600); frozen[name] = value
+        state = b'{"labelApplied":false}'
+        (hosting / 'host-state.json').write_bytes(state); (hosting / 'host-state.json').chmod(0o600)
+        metadata = (hosting / 'host-state.json').stat()
+        state_identity = 'host-state.json\0' + str(metadata.st_dev) + ':' + str(metadata.st_ino) + ':' + str(metadata.st_uid) + ':' + str(metadata.st_mode & 0o777) + '\n'
+        records = [{'kind': 'labels', 'provider': 'github', 'number': 43, 'success': True, 'bodySha256': None, 'mutation': mutation, 'stateSha256': hashlib.sha256(b'{"labelApplied":true}' if mutation == 'label-add' else state).hexdigest(), 'stateIdentitySha256': hashlib.sha256(state_identity.encode()).hexdigest()} for mutation in ['label-add', 'label-remove']]
+        calls = ''.join(json.dumps(record) + '\n' for record in records).encode()
+        (hosting / 'host-calls.jsonl').write_bytes(calls); (hosting / 'host-calls.jsonl').chmod(0o600)
+        config = {'root': str(root), 'sourceSha': source, 'uid': os.getuid(), 'projects': {}, 'exchanges': {'github': [{'kind': 'labels', 'number': 43, 'exitCode': 0}], 'gitlab': []}, 'state': str(hosting / 'host-state.json'), 'calls': str(hosting / 'host-calls.jsonl')}
+        value = json.dumps(config).encode(); (hosting / 'hosting-config.json').write_bytes(value); (hosting / 'hosting-config.json').chmod(0o600); frozen['hosting/hosting-config.json'] = value
+        joined = ''.join(name + '\0' + hashlib.sha256(frozen[name]).hexdigest() + '\n' for name in sorted(frozen)).encode()
+        identity = ''.join(name + '\0' + str((hosting / name).stat().st_dev) + ':' + str((hosting / name).stat().st_ino) + ':' + str((hosting / name).stat().st_uid) + ':' + str((hosting / name).stat().st_mode & 0o777) + '\n' for name in ['host-state.json', 'host-calls.jsonl'])
+        proofs.append({'mutableFilesIdentitySha256': hashlib.sha256(identity.encode()).hexdigest(), 'source': source, 'theme': theme, 'baselineRestored': True, 'undoCompleted': True, 'inputsUnchanged': True, 'ownedProcessesJoined': True, 'configSha256': hashlib.sha256(value).hexdigest(), 'hostingInputsSha256': hashlib.sha256(joined).hexdigest(), 'baselineStateSha256': hashlib.sha256(state).hexdigest(), 'completionLogSha256': hashlib.sha256(calls).hexdigest()})
+    return proofs
+
+class PullRequestsContainment(unittest.TestCase):
+    def test_exact_selector_uses_original_controller_and_fixed_budgets(self):
+        selected = qualification.scenario_settings('release-visual-pull-requests')
+        self.assertEqual(selected, {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts', 'inner_timeout': 600, 'outer_timeout': 660, 'evidence_prefix': 'issue29-pull-requests-', 'fixture_prefix': 'bc-vr-'})
+        with self.assertRaises(RuntimeError):
+            qualification.scenario_settings('release-visual-pull-requests-other')
+
+    def test_cleanup_refuses_missing_false_or_mismatched_request_source_join(self):
+        for mode in ['missing', 'false', 'source', 'cleanup', 'closed', 'missing-host', 'false-host', 'malformed-host', 'missing-inputs', 'false-inputs', 'malformed-inputs', 'missing-host-restoration', 'false-host-restoration', 'safe']:
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as parent:
+                    root = Path(parent); fixture = Path(tempfile.mkdtemp(prefix='bc-vr-', dir='/tmp')); evidence = root / 'evidence'
+                    self.addCleanup(shutil.rmtree, fixture, ignore_errors=True); evidence.mkdir()
+                    (evidence / 'namespace-cleanup.json').write_text(json.dumps({'remaining': [], 'controllerReaped': True}))
+                    result = {'selection': 'release-visual-pull-requests', 'source': 'a' * 40, 'pullRequestsFixtureSafeToDelete': True, 'childProcessesClosed': True, 'cleanupFailures': [], 'pullRequestsHostingRestorationProofs': owned_hosting_proofs(fixture, 'a' * 40)}
+                    if mode == 'missing': result.pop('pullRequestsFixtureSafeToDelete')
+                    elif mode == 'false': result['pullRequestsFixtureSafeToDelete'] = False
+                    elif mode == 'source': result['source'] = 'b' * 40
+                    elif mode == 'cleanup': result['cleanupFailures'] = [{'role': 'owned', 'failure': 'refused'}]
+                    elif mode == 'closed': result['childProcessesClosed'] = False
+                    elif mode == 'missing-host-restoration': result.pop('pullRequestsHostingRestorationProofs', None)
+                    elif mode == 'false-host-restoration': result['pullRequestsHostingRestorationProofs'] = []
+                    (evidence / 'result.json').write_text(json.dumps(result))
+                    supervisor = {'supervisorReaped': True, 'hostNetworkNamespaceUnchanged': True, 'buildInputsUnchanged': True}
+                    if mode == 'missing-host': supervisor.pop('hostNetworkNamespaceUnchanged')
+                    elif mode == 'false-host': supervisor['hostNetworkNamespaceUnchanged'] = False
+                    elif mode == 'malformed-host': supervisor['hostNetworkNamespaceUnchanged'] = 1
+                    elif mode == 'missing-inputs': supervisor.pop('buildInputsUnchanged')
+                    elif mode == 'false-inputs': supervisor['buildInputsUnchanged'] = False
+                    elif mode == 'malformed-inputs': supervisor['buildInputsUnchanged'] = 'true'
+                    with mock.patch.dict(os.environ, {'GITHUB_SHA': 'a' * 40}):
+                        actual = qualification.cleanup_ui_fixture(fixture, evidence, supervisor, 'release-visual-pull-requests')
+                    self.assertEqual(actual, mode == 'safe'); self.assertEqual(fixture.exists(), mode != 'safe')
+
+    def test_hosting_restoration_refuses_applied_foreign_malformed_or_substituted_retained_bytes(self):
+        modes = ['applied', 'state-number', 'state-extra', 'state-symlink', 'state-hardlink', 'state-substitute', 'calls-substitute', 'calls-missing-undo', 'calls-failed-undo', 'calls-wrong-owner', 'calls-duplicate-field', 'source', 'theme', 'proof-extra', 'proof-false', 'config', 'input', 'pending-writer']
+        for mode in modes:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix='bc-vr-', dir='/tmp') as path:
+                fixture = Path(path); proofs = owned_hosting_proofs(fixture, 'a' * 40)
+                result = {'source': 'a' * 40, 'pullRequestsHostingRestorationProofs': proofs}
+                hosting = (fixture / 'light' / 'hosting').resolve(); state = hosting / 'host-state.json'; calls = hosting / 'host-calls.jsonl'
+                if mode == 'applied': state.write_text('{"labelApplied":true}')
+                elif mode == 'state-number': state.write_text('{"labelApplied":0}')
+                elif mode == 'state-extra': state.write_text('{"labelApplied":false,"foreign":false}')
+                elif mode == 'state-symlink':
+                    saved = hosting / 'saved'; state.rename(saved); state.symlink_to(saved)
+                elif mode == 'state-hardlink': os.link(state, hosting / 'saved')
+                elif mode in ['state-substitute', 'calls-substitute']:
+                    target = state if mode == 'state-substitute' else calls
+                    saved = target.with_name('substitute'); saved.write_bytes(target.read_bytes()); saved.chmod(0o600); saved.replace(target)
+                elif mode.startswith('calls-'):
+                    records = [json.loads(line) for line in calls.read_text().splitlines()]
+                    if mode == 'calls-missing-undo': records.pop()
+                    elif mode == 'calls-failed-undo': records[-1]['success'] = False
+                    elif mode == 'calls-wrong-owner': records[-1]['provider'] = 'gitlab'
+                    text = ''.join(json.dumps(record) + '\n' for record in records)
+                    if mode == 'calls-duplicate-field': text = text.replace('"success": true', '"success": true, "success": true')
+                    calls.write_text(text); proofs[0]['completionLogSha256'] = hashlib.sha256(text.encode()).hexdigest()
+                elif mode == 'source': proofs[0]['source'] = 'b' * 40
+                elif mode == 'theme': proofs[0]['theme'] = 'dark'
+                elif mode == 'proof-extra': proofs[0]['foreign'] = True
+                elif mode == 'proof-false': proofs[0]['undoCompleted'] = False
+                elif mode == 'config': (hosting / 'hosting-config.json').write_text('{}')
+                elif mode == 'input': (hosting / 'bin' / 'gh').chmod(0o600)
+                elif mode == 'pending-writer': (hosting / 'host-state.json.aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa').write_text('{"labelApplied":false}')
+                self.assertFalse(qualification.pull_requests_hosting_restored(fixture, result))
+                self.assertTrue(fixture.exists())
 
 if __name__ == '__main__':
     unittest.main()

@@ -608,7 +608,10 @@ it.each([
             selector.includes("composer-editor") ? "Owned visual review draft" : "Claude · Opus",
           click: async () => {
             events.push(selector);
-            if (selector.includes("button=Add Server") && selector.includes("dialog-popup"))
+            if (
+              selector ===
+              '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Add Server"]'
+            )
               registered = true;
             if (selector.includes("alertdialog")) registered = false;
             if (selector === "button=Open project") imported = true;

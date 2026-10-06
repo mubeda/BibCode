@@ -2,6 +2,20 @@
 import * as NodeFS from "node:fs";
 import * as YAML from "yaml";
 import { describe, expect, it } from "vite-plus/test";
+import * as NodeVM from "node:vm";
+import * as NodeModule from "node:module";
+const requestSource = NodeFS.readFileSync(
+  new URL("../apps/desktop/e2e/support/release-visual-pull-requests.ts", import.meta.url),
+  "utf8",
+);
+const pullRequestsCaptureBindings: Array<{ file: string }> = NodeVM.runInNewContext(
+  NodeModule.stripTypeScriptTypes(
+    requestSource.slice(
+      requestSource.indexOf("export const pullRequestsVisualRows"),
+      requestSource.indexOf("export interface PullRequestsExpectedHostContext"),
+    ),
+  ).replace(/^export /gm, "") + "\npullRequestsCaptureBindings",
+);
 const visualScenes = [
   "workspace-composite",
   "workspace-card-menu",
@@ -15,6 +29,68 @@ const visualScenes = [
 ];
 
 describe("first visual batch workflow boundary", () => {
+  it("executes the real Classic selector regression in the existing lifecycle helper gate", () => {
+    const workflow = NodeFS.readFileSync(
+      new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
+      "utf8",
+    );
+    const line = workflow
+      .split("\n")
+      .find(
+        (value) =>
+          value.trim().startsWith("vp test run ") &&
+          value.includes("release-visual-project-lifecycle-wiring.test.ts"),
+      );
+    expect(line).toContain("apps/desktop/e2e/support/release-visual-classic-selectors.test.ts");
+    const lifecycle = NodeFS.readFileSync(
+      new URL(
+        "../apps/desktop/e2e/support/release-visual-project-lifecycle.test.ts",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    expect(lifecycle).toContain("attachLifecycleSelectorPort");
+    expect(lifecycle).toContain('import { attach } from "webdriverio"');
+  });
+
+  it("dispatches the exact contained PR selector and finite source-bound originals", () => {
+    const value = YAML.parse(
+      NodeFS.readFileSync(
+        new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
+        "utf8",
+      ),
+    );
+    expect(value.on.workflow_dispatch.inputs.scene_selection.options).toContain(
+      "release-visual-pull-requests",
+    );
+    const steps = value.jobs.visual_core.steps;
+    const run = steps.find(
+        (step: { name: string }) => step.name === "Run contained PR/MR visual batch",
+      ),
+      evidence = steps.find(
+        (step: { name: string }) => step.name === "Retain explicit PR/MR evidence",
+      );
+    expect(run.if).toBe("${{ inputs.scene_selection == 'release-visual-pull-requests' }}");
+    expect(run.run).toBe(
+      "python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-pull-requests",
+    );
+    expect(
+      evidence.with.path
+        .trim()
+        .split("\n")
+        .map((line: string) => line.slice(line.lastIndexOf("/") + 1)),
+    ).toEqual([
+      "phase.json",
+      "failure.json",
+      "provenance.json",
+      "result.json",
+      "assertions.json",
+      "namespace-cleanup.json",
+      "supervisor.json",
+      ...pullRequestsCaptureBindings.map((binding) => binding.file),
+    ]);
+    expect(evidence.with.path).not.toMatch(/\*|private|profile|\.log/);
+  });
   it("checks supported descriptor capabilities on the real Linux server before dependent captures", () => {
     const value = YAML.parse(
       NodeFS.readFileSync(
@@ -29,7 +105,7 @@ describe("first visual batch workflow boundary", () => {
     }>;
     const gate = steps.find((step) => step.name === "Verify native server descriptor parity");
     expect(gate?.if).toBe(
-      "${{ inputs.scene_selection == 'release-visual-project-lifecycle' || inputs.scene_selection == 'release-visual-settings-followups' }}",
+      "${{ inputs.scene_selection == 'release-visual-project-lifecycle' || inputs.scene_selection == 'release-visual-settings-followups' || inputs.scene_selection == 'release-visual-pull-requests' }}",
     );
     expect(gate?.run?.trim().split("\n")).toEqual([
       "cargo fmt --all --check",
@@ -122,6 +198,7 @@ describe("first visual batch workflow boundary", () => {
             "release-visual-native-sharing",
             "release-visual-project-lifecycle",
             "release-visual-settings-followups",
+            "release-visual-pull-requests",
           ],
         },
       },

@@ -81,11 +81,18 @@ function fixture(mode = "owned") {
           popup = true;
           field = label;
         }
-        if (selector.endsWith("button=Save")) {
+        if (
+          selector ===
+          '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Save"]'
+        ) {
           label = field;
           popup = false;
         }
-        if (selector.endsWith("button=Cancel")) popup = false;
+        if (
+          selector ===
+          '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Cancel"]'
+        )
+          popup = false;
         if (selector.includes("Disconnect") && !selector.includes("More actions")) active = 0;
         if (selector.includes('normalize-space()="Connect"')) {
           if (mode.startsWith("delayed-")) delayedStage = 0;

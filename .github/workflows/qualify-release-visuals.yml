@@ -19,6 +19,7 @@ on:
           - release-visual-native-sharing
           - release-visual-project-lifecycle
           - release-visual-settings-followups
+          - release-visual-pull-requests
 
 permissions:
   contents: read
@@ -26,7 +27,7 @@ permissions:
 jobs:
   visual_core:
     if: ${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' }}
-    name: ${{ inputs.scene_selection == 'release-visual-settings-followups' && 'Linux Chromium four Settings rows in eighteen originals' || inputs.scene_selection == 'release-visual-project-lifecycle' && 'Linux Chromium three project lifecycle rows in both themes' || inputs.scene_selection == 'release-visual-provider-chat' && 'Linux Chromium seven provider chat rows in both themes' || inputs.scene_selection == 'release-visual-workspace-substates' && 'Linux Chromium three existing workspace substates in both themes' || inputs.scene_selection == 'release-visual-cursor-question' && 'Linux Chromium Cursor later-question pair' || inputs.scene_selection == 'release-visual-git-project' && 'Linux Chromium Git/project partial group in both themes' || inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
+    name: ${{ inputs.scene_selection == 'release-visual-pull-requests' && 'Linux Chromium five PR/MR rows in forty-eight originals' || inputs.scene_selection == 'release-visual-settings-followups' && 'Linux Chromium four Settings rows in eighteen originals' || inputs.scene_selection == 'release-visual-project-lifecycle' && 'Linux Chromium three project lifecycle rows in both themes' || inputs.scene_selection == 'release-visual-provider-chat' && 'Linux Chromium seven provider chat rows in both themes' || inputs.scene_selection == 'release-visual-workspace-substates' && 'Linux Chromium three existing workspace substates in both themes' || inputs.scene_selection == 'release-visual-cursor-question' && 'Linux Chromium Cursor later-question pair' || inputs.scene_selection == 'release-visual-git-project' && 'Linux Chromium Git/project partial group in both themes' || inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -58,7 +59,12 @@ jobs:
           vp test run apps/desktop/e2e/support/release-visual-git-project.test.ts apps/desktop/e2e/support/release-visual-git-project-fixture.test.ts apps/desktop/e2e/support/release-visual-git-project-directory-failure.test.ts apps/desktop/e2e/support/git-project-tab-observation.test.ts
           vp test run apps/desktop/e2e/support/release-visual-workspace-substates.test.ts
           vp test run apps/desktop/e2e/support/release-visual-provider-chat.test.ts apps/desktop/e2e/support/release-visual-provider-chat-fixture.test.ts apps/desktop/e2e/support/release-visual-provider-chat-installer.test.ts apps/desktop/e2e/support/release-visual-provider-chat-loss.test.ts apps/desktop/e2e/support/release-visual-provider-chat-api.test.ts apps/desktop/e2e/support/release-visual-provider-chat-media.test.ts apps/desktop/e2e/support/release-visual-provider-chat-turns.test.ts apps/desktop/e2e/support/release-visual-provider-chat-producer.test.ts apps/desktop/e2e/support/release-visual-provider-chat-public.test.ts apps/desktop/e2e/support/release-visual-provider-chat-wiring.test.ts
-          vp test run apps/desktop/e2e/support/release-visual-project-lifecycle.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle.public.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle-fixture.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle-api.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle-wiring.test.ts
+          vp test run apps/desktop/e2e/support/release-visual-project-lifecycle.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle.public.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle-fixture.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle-api.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle-wiring.test.ts apps/desktop/e2e/support/release-visual-classic-selectors.test.ts
+          vp test run apps/desktop/e2e/support/release-visual-pull-requests-protocol.test.ts apps/desktop/e2e/support/release-visual-pull-requests-fixture.test.ts apps/desktop/e2e/support/release-visual-pull-requests-installer.test.ts apps/desktop/e2e/support/release-visual-pull-requests-owner.test.ts apps/desktop/e2e/support/release-visual-pull-requests-api.test.ts apps/desktop/e2e/support/release-visual-pull-requests-producer.test.ts apps/desktop/e2e/support/release-visual-pull-requests.test.ts apps/desktop/e2e/support/release-visual-pull-requests-caller.test.ts
+      - name: Verify compiled PR public widgets
+        if: ${{ inputs.scene_selection == 'release-visual-pull-requests' }}
+        working-directory: apps/web
+        run: vp test run --project unit src/release-visual-pull-requests.public.test.tsx src/release-visual-pull-requests-create.public.test.tsx
       - name: Build the source UI once with owned loopback targets
         env:
           VITE_WS_URL: ws://127.0.0.1:4885
@@ -74,7 +80,7 @@ jobs:
         if: ${{ inputs.scene_selection == 'release-visual-cursor-question' }}
         run: cargo test -p bibcode-server --lib provider::cursor::runtime::tests::owned_later_question_keeps_multiple_labels_and_original_prompt_correlation -j 2 -- --exact
       - name: Verify native server descriptor parity
-        if: ${{ inputs.scene_selection == 'release-visual-project-lifecycle' || inputs.scene_selection == 'release-visual-settings-followups' }}
+        if: ${{ inputs.scene_selection == 'release-visual-project-lifecycle' || inputs.scene_selection == 'release-visual-settings-followups' || inputs.scene_selection == 'release-visual-pull-requests' }}
         run: |
           cargo fmt --all --check
           cargo test -p bibcode-server --test server_runtime -j 2
@@ -356,6 +362,74 @@ jobs:
             ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/project-clone-progress-dark.png
             ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/git-trust-refusal-light.png
             ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/git-trust-refusal-dark.png
+
+      - name: Run contained PR/MR visual batch
+        if: ${{ inputs.scene_selection == 'release-visual-pull-requests' }}
+        env:
+          BIBCODE_DELIVERY_UI_WEB: ${{ github.workspace }}/apps/web/dist
+        run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-pull-requests
+      - name: Retain explicit PR/MR evidence
+        if: ${{ always() && inputs.scene_selection == 'release-visual-pull-requests' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: issue29-pull-requests-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/assertions.json
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-github-detail-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-github-detail-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-github-detail-checks-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-github-detail-checks-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-github-detail-files-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-github-detail-files-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-github-detail-conversation-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-github-detail-conversation-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-github-detail-conversation-activity-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-github-detail-conversation-activity-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-checks-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-checks-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-files-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-files-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-conversation-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-conversation-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-conversation-activity-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-conversation-activity-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-secondary-confirmation-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-gitlab-detail-secondary-confirmation-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-create-github-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-create-github-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-create-gitlab-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-create-gitlab-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-editors-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-editors-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-comment-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-comment-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-confirmation-undo-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-confirmation-undo-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-inline-draft-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-inline-draft-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-pending-inline-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-pending-inline-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-base-chooser-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-base-chooser-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-base-confirmation-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-base-confirmation-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-dismiss-review-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-dismiss-review-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-merge-config-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-merge-config-dark.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-merge-confirmation-light.png
+            ${{ runner.temp }}/issue29-pull-requests-${{ github.run_id }}/request-review-edit-error-merge-confirmation-dark.png
 
   registration_only:
     if: ${{ github.ref_name == github.event.repository.default_branch }}

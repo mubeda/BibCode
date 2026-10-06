@@ -18,6 +18,9 @@ import {
 } from "./release-visual-project-lifecycle.ts";
 import * as NodeFS from "node:fs";
 import * as NodeURL from "node:url";
+import * as NodeHttp from "node:http";
+import { attach } from "webdriverio";
+import { classifyQualificationFailure } from "./chat-upload-evidence.ts";
 
 const common = {
   themeMatched: true,
@@ -951,5 +954,188 @@ it("refuses a missing or malformed held pack without sending any clone request",
     const source = createProjectLifecycleSourceJoins(f.input);
     await expect(source.verifySingleHeldTransfer()).rejects.toThrow();
     expect(f.raw.rpc.attachClone).not.toHaveBeenCalled();
+  }
+});
+
+/** Installed Classic SDK on an inert protocol port; no browser, provider or app is launched. */
+async function attachLifecycleSelectorPort() {
+  const selectors: Array<{ using: string; value: string }> = [];
+  let dialogOpen = true,
+    cancellationClicks = 0;
+  const server = NodeHttp.createServer((request, response) => {
+    let raw = "";
+    request.on("data", (chunk: Buffer) => {
+      raw += chunk.toString("utf8");
+    });
+    request.on("end", () => {
+      response.setHeader("content-type", "application/json");
+      const payload = raw ? JSON.parse(raw) : {};
+      const url = request.url ?? "";
+      if (url.endsWith("/window")) {
+        response.end(JSON.stringify({ value: "owned-inert-window" }));
+        return;
+      }
+      if (url.endsWith("/element") || url.endsWith("/elements")) {
+        selectors.push({ using: payload.using, value: payload.value });
+        if (payload.using === "css selector" && payload.value.includes(" button=")) {
+          response.statusCode = 400;
+          response.end(
+            JSON.stringify({
+              value: {
+                error: "invalid selector",
+                message: "Inert invalid CSS selector.",
+                stacktrace: "",
+              },
+            }),
+          );
+          return;
+        }
+        const element = { "element-6066-11e4-a52e-4f735466cecf": "owned-inert-control" };
+        response.end(
+          JSON.stringify({
+            value: url.endsWith("/elements") ? (dialogOpen ? [element] : []) : element,
+          }),
+        );
+        return;
+      }
+      if (url.endsWith("/click")) {
+        if (selectors.at(-1)?.value.includes('normalize-space()="Cancel')) {
+          dialogOpen = false;
+          cancellationClicks++;
+        }
+        response.end(JSON.stringify({ value: null }));
+        return;
+      }
+      if (["/displayed", "/enabled", "/execute/sync"].some((suffix) => url.endsWith(suffix))) {
+        response.end(JSON.stringify({ value: dialogOpen }));
+        return;
+      }
+      response.end(JSON.stringify({ value: null }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Inert protocol address refused.");
+  try {
+    const browser = await attach({
+      sessionId: "owned-inert-session",
+      capabilities: {
+        browserName: "chrome",
+        webSocketUrl: false,
+        "wdio:enforceWebDriverClassic": true,
+      },
+      hostname: "127.0.0.1",
+      port: address.port,
+      logLevel: "silent",
+      connectionRetryCount: 0,
+      transformRequest: (options: RequestInit) => {
+        const headers = new Headers(options.headers);
+        headers.delete("Content-Length");
+        return { ...options, headers };
+      },
+      options: { waitforTimeout: 20, waitforInterval: 1 },
+    });
+    return {
+      browser,
+      selectors,
+      cancellationClicks: () => cancellationClicks,
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  } catch (error) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw error;
+  }
+}
+it.each(["ordinary", "original-error"] as const)(
+  "uses real SDK scoped dialog buttons and preserves the original failure: %s",
+  async (mode) => {
+    const port = await attachLifecycleSelectorPort(),
+      f = browserFlow("worktree-remove-busy");
+    const original = new Error("Inert original running-source refusal."),
+      cleanup: string[] = [];
+    const running = vi.fn(async () => {
+      if (mode === "original-error") throw original;
+    });
+    const start = vi.fn(async () => {}),
+      stop = vi.fn(async () => {});
+    try {
+      const flows = createProjectLifecycleBrowserFlows({
+        ...f.input,
+        browser: port.browser,
+        source: {
+          ...f.input.source,
+          startHeldTurn: start,
+          stopAndJoinTurn: stop,
+          verifyRunningAndRefused: running,
+        },
+      });
+      const execute = runProjectLifecycleScene({
+        scene: "worktree-remove-busy",
+        theme: "light",
+        verifyOwnedIdentity: f.input.verifyOwnedIdentity,
+        step: () => {},
+        ...flows,
+        capture: async () => {},
+        observeCleanupFailure: (role) => cleanup.push(role),
+      });
+      if (mode === "ordinary")
+        await expect(execute).resolves.toMatchObject({ joinedCleanup: true });
+      else await expect(execute).rejects.toBe(original);
+      expect(start).toHaveBeenCalledOnce();
+      expect(stop).toHaveBeenCalledOnce();
+      expect(cleanup).toEqual([]);
+      expect(port.cancellationClicks()).toBe(1);
+      expect(
+        port.selectors.some(
+          (value) => value.using === "css selector" && value.value.includes(" button="),
+        ),
+      ).toBe(false);
+      for (const label of ["Delete Git worktree and remove", "Cancel"]) {
+        expect(
+          port.selectors.some(
+            (value) =>
+              value.using === "xpath" &&
+              value.value ===
+                '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="' +
+                  label +
+                  '"]',
+          ),
+        ).toBe(true);
+      }
+    } finally {
+      await port.close();
+    }
+  },
+);
+it("uses the actual SDK scoped clone cancellation and keeps invalid-selector attribution closed", async () => {
+  const port = await attachLifecycleSelectorPort(),
+    f = browserFlow("project-clone-progress");
+  try {
+    const flows = createProjectLifecycleBrowserFlows({ ...f.input, browser: port.browser });
+    await flows.clone.cancelPublicly();
+    expect(port.cancellationClicks()).toBe(1);
+    expect(
+      port.selectors.some(
+        (value) =>
+          value.using === "xpath" &&
+          value.value ===
+            '//*[@data-slot="dialog-popup" and @role="dialog"]//button[normalize-space()="Cancel clone"]',
+      ),
+    ).toBe(true);
+    await expect(
+      port.browser.findElement(
+        "css selector",
+        '[data-slot="dialog-popup"][role="dialog"] button=Cancel',
+      ),
+    ).rejects.toMatchObject({ name: "invalid selector" });
+    const error = await port.browser
+      .findElement("css selector", '[data-slot="dialog-popup"][role="dialog"] button=Cancel')
+      .catch((failure: unknown) => failure);
+    expect(classifyQualificationFailure(error)).toMatchObject({
+      kind: "unclassified",
+      errorClass: null,
+    });
+  } finally {
+    await port.close();
   }
 });

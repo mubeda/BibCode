@@ -1528,6 +1528,73 @@ not widen the window to hide a layout failure. Compiled CSS and component
 regressions establish the containment policy; fresh native originals establish
 pixel quality.
 
+## Contained PR/MR visual preparation
+
+Dispatch `qualify-release-visuals.yml` with the exact
+`release-visual-pull-requests` selection from the registered default branch.
+The existing visual owner runs the five approved request rows in both themes;
+its finite allowlist retains ten base originals and thirty-eight supplementary
+originals. Checks/Pipelines, Files changed/Changes, Conversation and activity,
+inline/pending drafts, base selection and confirmation, review dismissal,
+merge configuration and confirmation, secondary confirmation, retained errors
+and confirmation with Undo each require their own existing substate witness.
+Inspect every original independently; an intermediate receipt does not prove
+an unpictured tab or dialog.
+
+Run this producer only in the workflow's private user/network namespace. It
+prepares separate GitHub and GitLab repositories and private bare origins
+before the server starts. Their exact invalid host remotes resolve only to
+those owned local origins through the sealed fixture Git configuration. Owned
+`gh`/`glab` protocol executables provide raw source-bound replies to the normal
+hosting drivers; they refuse unmatched requests and never forward to a real
+hosting executable or account. Create, comment, review and other error scenes
+use the owned rejection responses; confirmation scenes cancel, and the one
+fixture metadata edit uses ordinary Undo. No real hosting message or request
+is sent, and no renderer/store/backend state is injected.
+
+The public import owner selects the original primary context before repository
+imports. Every request scene binds the decoded local descriptor, boot/storage
+identity and required capabilities, the reconciled `repositoryIdentity`, exact
+clean physical Git refs/origin/config and immutable fixture hashes. A separate
+Node grant opens one owned typed WebSocket for `pullRequests.getContext` only;
+normal UI request traffic stays with the authenticated application client.
+Before and after each original, require the current public route/project/host,
+all seven closed DOM facts and the unchanged source joins. The original primary
+is restored by public navigation and verified before the context socket closes.
+The capture owner requires the owned alert observation and original
+1280 by 960 nonblank PNG bytes; it does not accept hidden, clipped, obstructed,
+foreign or credential-bearing surfaces.
+
+The label edit's Undo runs asynchronously. Clicking its toast does not prove
+restoration. The read-only hosting owner pins the original false label state,
+sealed source/config/CLI/alias bytes and append-only call-log identity before
+public edits. It follows the existing bounded owner wait until the owned label
+add and reversal have completed normal process exits and the exact baseline
+bytes are restored. It never repeats a mutation or erases fixture state.
+Before publishing success and before Python deletion, recheck both themes after
+owned processes join: source/theme, private file ownership, unchanged hosting
+inputs, completed add/remove records and baseline state must all match their
+closed boolean/hash proofs. Missing, failed, cancelled, expired, substituted or
+unknown restoration retains the private evidence and permanently refuses
+deletion, even if later cleanup or a late Undo restores the bytes.
+
+The contained command is:
+
+```sh
+python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-pull-requests
+```
+
+The controller and outer supervisor retain the existing 600/660 second bounds
+and thirty-second owner waits. Evidence uses `issue29-pull-requests-<run-id>` and
+only the seven closed JSON receipts plus the forty-eight exact original names
+listed in the workflow. No logs, profiles, host replies, credentials or private
+fixture inputs enter the artifact. Any source, API-close, restoration or process
+cleanup failure monotonically refuses fixture deletion. Delete only after
+successful source joins, zero guard refusals, unchanged immutable inputs and
+joined controller/supervisor/namespace/browser/server cleanup. A preparation
+pass still requires independent original pixel review and does not establish
+native/Tauri or full-matrix acceptance.
+
 ## Process-group cleanup
 
 Capture PID, PPID, process group, start time, executable, and command line for
