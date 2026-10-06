@@ -2648,3 +2648,24 @@ current request explicitly authorizes it.
 Copy [the execution report template](./execution-report-template.md). Lead with
 one result classification and keep native, compatibility, and unavailable
 evidence separate. Do not claim completion from partial output or prior runs.
+
+### Existing native visual follow-up CI registration
+
+Use the registered manual `qualify-release-visuals.yml` selection
+`release-visual-native-followups` on the reviewed candidate ref. It calls
+`desktop-upgrade-smoke.yml` with the default-false native_followups input. The
+ordinary six-target matrix, 88 seeded controls and normal upgrade/remote-install
+lanes remain unchanged. The explicit native lane reuses the current-source
+protected baseline, a valid ephemeral-signed candidate and its existing
+source/package/store/process/window/cleanup owners. Production release signing
+material or hosting-account credentials are never used for this fixture.
+
+Require Linux six originals for native-menu-theme/native-update-protection/
+native-update-recovery and genuine Windows WSL two originals for native-wsl-local.
+Every partition passes whole check/type, the full current Native36 helper cohort
+including the ordinary seeded controls, and compiled public widget checks before
+execution. Retained originals keep byte/hash/source joins and require independent
+original-detail inspection. The workflow's closed status cannot make an
+unavailable/partial partition complete. Native Preview annotation prerequisites
+remain pending with zero annotation originals; preserve the 82-row/164-base
+manifest and do not accept substitute Preview pixels.

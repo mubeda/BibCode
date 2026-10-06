@@ -758,3 +758,24 @@ Complete [the execution report template](./execution-report-template.md), then
 perform the shared cleanup and final Git audit. Report whether WSL was usable,
 which distributions were exercised, Authenticode status, any native command
 that could not run, and whether anything was pushed.
+
+### Existing native Local/WSL visual follow-up partition
+
+The fixed `release-visual-native-followups` selection reuses the native Windows
+x64 WSL seeded owner with `--native-followups --wsl`. Require actual usable WSL
+plus an installed distribution, the exact current-source Linux server asset
+matching the protected desktop version, a real interactive display and private
+Windows ACLs. The native adapter verifies distro/hostname/wslpath and the mapped
+project-store root; a WSL primary may report Linux platform metadata. Never
+relabel that metadata as Windows or use a native Windows substitute.
+
+The adapter changes and restores the real display mode and records original
+1280 by 960 desktop pixels for native-wsl-local in both themes. Missing WSL or
+display capability is unavailable/incomplete evidence. Native opt-in absence
+fails the partition and retains a closed unavailable status; the ordinary WSL
+upgrade lane's documented skip remains unchanged. Only two named PNGs, the three
+retainer JSONs and the closed workflow status may be uploaded. Credentials,
+private paths, ACL output and raw OS/driver logs remain in protected private
+roots. Join exact owned processes and source/store/window identities before
+retention; no generic process-name cleanup is admitted. This partition does not
+qualify native Preview annotations or the full six-target release matrix.

@@ -2332,3 +2332,30 @@ inputs, interpreter files, logs, profiles, IDs, paths and process arguments are
 never artifact entries. Hermetic caller/producer/source/transport tests and
 workflow/Python boundary checks establish the source contract; only this CI
 lane and independent original-pixel review can establish visual qualification.
+
+### Existing native menu and update follow-up partition
+
+The fixed `release-visual-native-followups` manual selection calls the existing
+seeded owner with its default-false native opt-in. The selected Linux x64 lane
+uses a nonroot runner and real 1280 by 960 Xvfb display. Its private session owns
+D-Bus, Openbox, GNOME XSettings, AT-SPI and the GTK desktop portal; public
+gsettings actions change and restore that session's real appearance preference.
+Require the actual portal reply, native GTK menu grouping and original root
+pixels. Missing services or controls remain unavailable, never synthesized.
+
+The existing owner builds both a current-source protected baseline and a valid
+ephemeral-signed candidate in isolated checkouts. Its nonroot read-only install
+parent creates a genuine permission failure while retaining the original app.
+The public update coordinator must produce protection/recovery controls, verified
+pre-update backups and retained draft/store/boot/source/process joins. No invalid
+signature or fake update state substitutes for this failure. All original package
+and operation deadlines stay unchanged.
+
+The finite Linux originals are native-menu-theme, native-update-protection and
+native-update-recovery in light/dark. Keep only these six PNGs, the three
+retainer-owned native-followups JSON receipts and the closed workflow-status JSON.
+Raw native/OS/WDIO logs, signer files and source/store observations stay private;
+unsafe cleanup refuses retention. No crop, resize or alternate window is allowed.
+This is a six-original partition, not full-matrix or native Preview annotation
+acceptance. The normal six-platform seeded matrix and ordinary lanes remain the
+default; this explicit opt-in does not qualify omitted platforms.

@@ -205,6 +205,7 @@ describe("first visual batch workflow boundary", () => {
             "release-visual-workspace-substates",
             "release-visual-provider-chat",
             "release-visual-native-sharing",
+            "release-visual-native-followups",
             "release-visual-project-lifecycle",
             "release-visual-settings-followups",
             "release-visual-pull-requests",
@@ -277,7 +278,7 @@ it("binds the four Settings follow-up rows to exactly eighteen originals and sev
     with?: { name?: string; path?: string };
   }>;
   expect(value.jobs.visual_core.if).toBe(
-    "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' }}",
+    "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' && inputs.scene_selection != 'release-visual-native-followups' }}",
   );
   const run = steps.find((step) => step.name === "Run contained settings follow-up visual batch")!;
   expect(run.if).toBe("${{ inputs.scene_selection == 'release-visual-settings-followups' }}");
@@ -410,7 +411,14 @@ it("retains the fixed partial Git/project lane separately from native upgrade qu
     );
   const canonical = read("qualify-release-visuals.yml");
   const upgrade = read("desktop-upgrade-smoke.yml");
-  expect(Object.keys(upgrade.jobs)).toEqual(["seeded_upgrade_smoke", "windows_wsl_upgrade_smoke"]);
+  expect(Object.keys(upgrade.jobs)).toEqual([
+    "seeded_upgrade_smoke",
+    "windows_wsl_upgrade_smoke",
+    "native_followups_linux",
+  ]);
+  expect(upgrade.jobs.seeded_upgrade_smoke.if).toBe("${{ inputs.native_followups != true }}");
+  expect(upgrade.on.workflow_call.inputs.native_followups.default).toBe(false);
+  expect(upgrade.jobs.seeded_upgrade_smoke.strategy.matrix.include).toHaveLength(6);
   expect(upgrade.jobs.visual_core).toBeUndefined();
   expect(upgrade.jobs.seeded_upgrade_smoke.strategy.matrix.include).toHaveLength(6);
   expect(
@@ -628,11 +636,49 @@ it("retains only six lifecycle originals and seven closed receipts while keeping
   ])
     expect(gate).toContain("support/" + helper + ".test.ts");
   expect(value.jobs.visual_core.if).toBe(
-    "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' }}",
+    "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' && inputs.scene_selection != 'release-visual-native-followups' }}",
   );
   expect(value.jobs.native_sharing).toEqual({
     if: "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection == 'release-visual-native-sharing' }}",
     uses: "./.github/workflows/desktop-ui-smoke.yml",
     with: { native_sharing: true },
   });
+});
+
+it("keeps ordinary/default-branch ownership and separates only the explicit native follow-up mode", () => {
+  const value = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const admitted = (guard: string, selection: string, ref: string) =>
+    NodeVM.runInNewContext(guard.slice(3, -3), {
+      github: { ref_name: ref, event: { repository: { default_branch: "main" } } },
+      inputs: { scene_selection: selection },
+    });
+  for (const selection of [
+    "release-visual-core",
+    "release-visual-settings",
+    "release-visual-pull-requests",
+  ]) {
+    expect(admitted(value.jobs.visual_core.if, selection, "qa")).toBe(true);
+    expect(admitted(value.jobs.native_followups.if, selection, "qa")).toBe(false);
+  }
+  expect(admitted(value.jobs.visual_core.if, "release-visual-native-followups", "qa")).toBe(false);
+  expect(admitted(value.jobs.native_followups.if, "release-visual-native-followups", "qa")).toBe(
+    true,
+  );
+  expect(admitted(value.jobs.native_sharing.if, "release-visual-native-followups", "qa")).toBe(
+    false,
+  );
+  for (const selection of [
+    "release-visual-core",
+    "release-visual-native-sharing",
+    "release-visual-native-followups",
+  ]) {
+    expect(admitted(value.jobs.visual_core.if, selection, "main")).toBe(false);
+    expect(admitted(value.jobs.native_followups.if, selection, "main")).toBe(false);
+    expect(admitted(value.jobs.native_sharing.if, selection, "main")).toBe(false);
+  }
 });

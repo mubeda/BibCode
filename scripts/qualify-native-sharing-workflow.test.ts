@@ -60,7 +60,7 @@ it("admits a separate Linux packaged-app selection and skips the Chromium owner 
     "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection == 'release-visual-native-sharing' }}",
   );
   expect(value.jobs.visual_core.if).toBe(
-    "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' }}",
+    "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' && inputs.scene_selection != 'release-visual-native-followups' }}",
   );
   expect(value.jobs.native_sharing.uses).toBe("./.github/workflows/desktop-ui-smoke.yml");
   expect(value.jobs.native_sharing.with.native_sharing).toBe(true);

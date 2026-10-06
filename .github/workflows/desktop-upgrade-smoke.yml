@@ -3,12 +3,23 @@ name: Seeded Packaged Desktop Upgrade
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      native_followups:
+        description: Only the existing native visual follow-up partitions
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      native_followups:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   seeded_upgrade_smoke:
+    if: ${{ inputs.native_followups != true }}
     name: Seeded upgrade - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.jobTimeoutMinutes }}
@@ -196,6 +207,22 @@ jobs:
             "capability_reason=$reason" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
+      - name: Record native WSL prerequisite unavailable
+        if: inputs.native_followups == true && steps.wsl.outputs.available != 'true'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'bibcode-native-followups-wsl/evidence'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          $system = New-Object Security.Principal.SecurityIdentifier 'S-1-5-18'
+          $acl = Get-Acl -LiteralPath $root
+          $acl.SetOwner($me); $acl.SetAccessRuleProtection($true,$false)
+          foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleAll($rule) }
+          foreach ($sid in @($me,$system)) { $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }
+          Set-Acl -LiteralPath $root -AclObject $acl
+          @{schemaVersion=1;selection='release-visual-native-followups';sourceSha=$env:GITHUB_SHA;partition='windows-wsl';status='unavailable';originalCount=0;requiredPartitionOriginalCount=2;previewOriginalCount=0;completeGroup=$false;visualReview='pending'} | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $root 'native-followups-workflow-status.json') -Encoding utf8
+          throw 'Native WSL partition remains unavailable'
+
       - name: Record unavailable WSL capability
         if: steps.wsl.outputs.available != 'true'
         shell: pwsh
@@ -218,6 +245,17 @@ jobs:
       - name: Install frozen dependencies
         if: steps.wsl.outputs.available == 'true'
         run: vp install --frozen-lockfile
+
+      - name: Native WSL exact current-source gates
+        if: inputs.native_followups == true && steps.wsl.outputs.available == 'true'
+        run: |
+          vp check
+          vp run typecheck
+          vp test run scripts/qualify-native-followups-workflow.test.ts apps/desktop/e2e/support/release-visual-native-followups-backup.test.ts apps/desktop/e2e/support/release-visual-native-followups-capture.test.ts apps/desktop/e2e/support/release-visual-native-followups-cleanup.test.ts apps/desktop/e2e/support/release-visual-native-followups-controller.test.ts apps/desktop/e2e/support/release-visual-native-followups-endpoint.test.ts apps/desktop/e2e/support/release-visual-native-followups-evidence.test.ts apps/desktop/e2e/support/release-visual-native-followups-os.test.ts apps/desktop/e2e/support/release-visual-native-followups-preparation.test.ts apps/desktop/e2e/support/release-visual-native-followups-preview.test.ts apps/desktop/e2e/support/release-visual-native-followups-public.test.ts apps/desktop/e2e/support/release-visual-native-followups-session.test.ts apps/desktop/e2e/support/release-visual-native-followups-state.test.ts apps/desktop/e2e/support/release-visual-native-followups-update.test.ts apps/desktop/e2e/support/release-visual-native-followups-windows.test.ts apps/desktop/e2e/support/release-visual-native-followups.test.ts scripts/seeded-desktop-upgrade-smoke.test.ts
+      - name: Native WSL compiled public controls
+        if: inputs.native_followups == true && steps.wsl.outputs.available == 'true'
+        working-directory: apps/web
+        run: vp test run --project unit src/release-visual-native-followups.public.test.tsx src/reactCompiler.test.tsx
 
       - name: Build the WSL server used by the packaged desktop
         if: steps.wsl.outputs.available == 'true'
@@ -259,6 +297,18 @@ jobs:
             echo "previous_version=$previous_version"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Verify native WSL protected server version
+        if: inputs.native_followups == true && steps.wsl.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module - "${{ steps.wsl_versions.outputs.previous_version }}" <<'JS'
+          import * as fs from 'node:fs';
+          const source=fs.readFileSync('apps/server/Cargo.toml','utf8');
+          const version=/^version = "([^"]+)"$/m.exec(source)?.[1];
+          if(version!==process.argv[2])throw new Error('Native WSL protected asset version mismatch.');
+          JS
+
       - name: Generate WSL ephemeral updater signing key
         if: steps.wsl.outputs.available == 'true'
         shell: bash
@@ -275,7 +325,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Run protected WSL storage-identity upgrade
-        if: steps.wsl.outputs.available == 'true'
+        if: steps.wsl.outputs.available == 'true' && inputs.native_followups != true
         shell: bash
         run: |
           node scripts/seeded-desktop-upgrade-smoke.ts \
@@ -293,11 +343,136 @@ jobs:
             --updater-port 43220 \
             --restart-timeout-ms 240000
 
+      - name: Run existing native Local WSL originals
+        if: inputs.native_followups == true && steps.wsl.outputs.available == 'true'
+        shell: bash
+        run: |
+          node scripts/qualify-native-followups-workflow.ts \
+            --native-followups --wsl --platform win --arch x64 --bundle nsis \
+            --candidate-version "${{ steps.wsl_versions.outputs.candidate_version }}" \
+            --previous-tag "${{ steps.wsl_versions.outputs.previous_tag }}" \
+            --previous-version "${{ steps.wsl_versions.outputs.previous_version }}" \
+            --public-key-file "$BIBCODE_UPGRADE_PUBLIC_KEY_FILE" \
+            --run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-native-wsl" \
+            --work-root "$RUNNER_TEMP/bibcode-native-followups-wsl/work" \
+            --artifact-dir "$RUNNER_TEMP/bibcode-native-followups-wsl/evidence" \
+            --updater-port 43220 --restart-timeout-ms 240000
+
+      - name: Retain finite native WSL originals and closed status
+        if: always() && inputs.native_followups == true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue29-native-followups-windows-wsl-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bibcode-native-followups-wsl/evidence/native-followups-workflow-status.json
+            ${{ runner.temp }}/bibcode-native-followups-wsl/evidence/native-followups-result.json
+            ${{ runner.temp }}/bibcode-native-followups-wsl/evidence/native-followups-originals.json
+            ${{ runner.temp }}/bibcode-native-followups-wsl/evidence/native-followups-assertions.json
+            ${{ runner.temp }}/bibcode-native-followups-wsl/evidence/native-wsl-local-light.png
+            ${{ runner.temp }}/bibcode-native-followups-wsl/evidence/native-wsl-local-dark.png
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload bounded WSL seeded-upgrade evidence
-        if: always() && steps.wsl.outputs.available == 'true'
+        if: always() && steps.wsl.outputs.available == 'true' && inputs.native_followups != true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: seeded-upgrade-windows-wsl
           path: ${{ runner.temp }}/bibcode-seeded-wsl-upgrade/evidence/*
+          if-no-files-found: error
+          retention-days: 7
+
+  native_followups_linux:
+    if: ${{ inputs.native_followups == true }}
+    name: Existing native menu and update originals - Linux x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout exact current source and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+      - name: Install real private native desktop service dependencies
+        run: |
+          s''udo apt-get update
+          s''udo apt-get install -y build-essential curl wget file libxdo-dev libssl-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev xdg-utils patchelf xvfb xdotool imagemagick dbus xdg-desktop-portal xdg-desktop-portal-gtk gsettings-desktop-schemas dconf-gsettings-backend gnome-settings-daemon at-spi2-core python3-gi gir1.2-atspi-2.0 libatk-adaptor openbox
+      - name: Install frozen dependencies
+        run: vp install --frozen-lockfile
+      - name: Required exact current-source gates
+        run: |
+          vp check
+          vp run typecheck
+          vp test run scripts/qualify-native-followups-workflow.test.ts apps/desktop/e2e/support/release-visual-native-followups-backup.test.ts apps/desktop/e2e/support/release-visual-native-followups-capture.test.ts apps/desktop/e2e/support/release-visual-native-followups-cleanup.test.ts apps/desktop/e2e/support/release-visual-native-followups-controller.test.ts apps/desktop/e2e/support/release-visual-native-followups-endpoint.test.ts apps/desktop/e2e/support/release-visual-native-followups-evidence.test.ts apps/desktop/e2e/support/release-visual-native-followups-os.test.ts apps/desktop/e2e/support/release-visual-native-followups-preparation.test.ts apps/desktop/e2e/support/release-visual-native-followups-preview.test.ts apps/desktop/e2e/support/release-visual-native-followups-public.test.ts apps/desktop/e2e/support/release-visual-native-followups-session.test.ts apps/desktop/e2e/support/release-visual-native-followups-state.test.ts apps/desktop/e2e/support/release-visual-native-followups-update.test.ts apps/desktop/e2e/support/release-visual-native-followups-windows.test.ts apps/desktop/e2e/support/release-visual-native-followups.test.ts scripts/seeded-desktop-upgrade-smoke.test.ts
+      - name: Actual compiled native public controls
+        working-directory: apps/web
+        run: vp test run --project unit src/release-visual-native-followups.public.test.tsx src/reactCompiler.test.tsx
+      - id: versions
+        name: Resolve isolated protected and candidate versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_line="$(node scripts/resolve-previous-release-tag.ts --channel stable --current-tag v2147483647.0.0)"
+          previous_tag="${previous_line#previous_tag=}"
+          previous_version="${previous_tag#v}"
+          previous_core="${previous_version%%[-+]*}"
+          IFS=. read -r major minor patch <<< "$previous_core"
+          candidate_version="$major.$minor.$((patch + 1))-native.${GITHUB_RUN_NUMBER}"
+          { echo "previous_tag=$previous_tag"; echo "previous_version=$previous_version"; echo "candidate_version=$candidate_version"; } >> "$GITHUB_OUTPUT"
+      - name: Generate isolated ephemeral updater signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          key_path="$RUNNER_TEMP/bibcode-native-followups.key"
+          key_password="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"
+          echo "::add-mask::$key_password"
+          (cd apps/desktop && vp exec tauri signer generate --ci --password "$key_password" --write-keys "$key_path" >/dev/null)
+          test -s "$key_path"; test -s "$key_path.pub"
+          { echo "TAURI_SIGNING_PRIVATE_KEY=$key_path"; echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$key_password"; echo "BIBCODE_UPGRADE_PUBLIC_KEY_FILE=$key_path.pub"; } >> "$GITHUB_ENV"
+      - name: Run existing native menu protection and recovery originals as nonroot
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x960x24 -dpi 96' \
+            node scripts/qualify-native-followups-workflow.ts \
+              --native-followups --platform linux --arch x64 --bundle appimage \
+              --candidate-version "${{ steps.versions.outputs.candidate_version }}" \
+              --previous-tag "${{ steps.versions.outputs.previous_tag }}" \
+              --previous-version "${{ steps.versions.outputs.previous_version }}" \
+              --public-key-file "$BIBCODE_UPGRADE_PUBLIC_KEY_FILE" \
+              --run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-native-linux" \
+              --work-root "$RUNNER_TEMP/bibcode-native-followups-linux/work" \
+              --artifact-dir "$RUNNER_TEMP/bibcode-native-followups-linux/evidence" \
+              --updater-port 43120 --restart-timeout-ms 180000
+      - name: Retain finite native Linux originals and closed status
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue29-native-followups-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bibcode-native-followups-linux/evidence/native-followups-workflow-status.json
+            ${{ runner.temp }}/bibcode-native-followups-linux/evidence/native-followups-result.json
+            ${{ runner.temp }}/bibcode-native-followups-linux/evidence/native-followups-originals.json
+            ${{ runner.temp }}/bibcode-native-followups-linux/evidence/native-followups-assertions.json
+            ${{ runner.temp }}/bibcode-native-followups-linux/evidence/native-menu-theme-light.png
+            ${{ runner.temp }}/bibcode-native-followups-linux/evidence/native-menu-theme-dark.png
+            ${{ runner.temp }}/bibcode-native-followups-linux/evidence/native-update-protection-light.png
+            ${{ runner.temp }}/bibcode-native-followups-linux/evidence/native-update-protection-dark.png
+            ${{ runner.temp }}/bibcode-native-followups-linux/evidence/native-update-recovery-light.png
+            ${{ runner.temp }}/bibcode-native-followups-linux/evidence/native-update-recovery-dark.png
           if-no-files-found: error
           retention-days: 7

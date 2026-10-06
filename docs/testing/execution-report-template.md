@@ -348,3 +348,21 @@ Repeat the subsection for every non-native supported platform.
 - Branch merged: yes/no
 - Pull request opened: yes/no
 - Artifacts published: yes/no
+
+### Existing native follow-up partition evidence
+
+- Candidate/source SHA and protected-baseline/candidate versions; actual signed
+  payload verification and ephemeral public-key provenance.
+- Linux nonroot UID admission and real private D-Bus/XSettings/AT-SPI/portal/
+  Xvfb observations; actual GTK menu grouping and original root pixels.
+- Windows WSL declared and observed availability, exact source/version server
+  asset, distro/IP/wslpath/store mapping, interactive display and private ACL
+  admission; unavailable capability must remain incomplete.
+- Exact partition, scene/theme, original byte SHA and 1280 by 960 dimensions;
+  source/window/boot/storage/process/endpoint/backup/draft joins before/after.
+- Protection/recovery evidence from the normal public coordinator and genuine
+  nonroot permission failure; original app, backup and draft retained.
+- Exact actor/group cleanup and source/input immutability, bounded private logs,
+  no name sweep; closed retainer/status receipts and independent pixel verdict.
+- Six Linux/two WSL original scope and outstanding Preview annotation decision:
+  zero annotation originals; no full 82/164 acceptance from a partition pass.

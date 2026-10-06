@@ -17,6 +17,7 @@ on:
           - release-visual-workspace-substates
           - release-visual-provider-chat
           - release-visual-native-sharing
+          - release-visual-native-followups
           - release-visual-project-lifecycle
           - release-visual-settings-followups
           - release-visual-pull-requests
@@ -26,7 +27,7 @@ permissions:
 
 jobs:
   visual_core:
-    if: ${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' }}
+    if: ${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' && inputs.scene_selection != 'release-visual-native-followups' }}
     name: ${{ inputs.scene_selection == 'release-visual-pull-requests' && 'Linux Chromium five PR/MR rows in forty-eight originals' || inputs.scene_selection == 'release-visual-settings-followups' && 'Linux Chromium four Settings rows in eighteen originals' || inputs.scene_selection == 'release-visual-project-lifecycle' && 'Linux Chromium three project lifecycle rows in both themes' || inputs.scene_selection == 'release-visual-provider-chat' && 'Linux Chromium seven provider chat rows in both themes' || inputs.scene_selection == 'release-visual-workspace-substates' && 'Linux Chromium three existing workspace substates in both themes' || inputs.scene_selection == 'release-visual-cursor-question' && 'Linux Chromium Cursor later-question pair' || inputs.scene_selection == 'release-visual-git-project' && 'Linux Chromium Git/project partial group in both themes' || inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -371,7 +372,7 @@ jobs:
         run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-pull-requests
       - name: Retain explicit PR/MR evidence
         if: ${{ always() && inputs.scene_selection == 'release-visual-pull-requests' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: issue29-pull-requests-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
@@ -449,3 +450,9 @@ jobs:
     uses: ./.github/workflows/desktop-ui-smoke.yml
     with:
       native_sharing: true
+
+  native_followups:
+    if: ${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection == 'release-visual-native-followups' }}
+    uses: ./.github/workflows/desktop-upgrade-smoke.yml
+    with:
+      native_followups: true
