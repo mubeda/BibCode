@@ -49,6 +49,7 @@ export function nativeFollowupWorkflowPlan(
     input.platform !== "win" ||
     host.platform !== "win32" ||
     !input.wsl ||
+    !input.ownedWslManifest ||
     input.bundle !== "nsis"
   )
     throw refused();

@@ -59,6 +59,7 @@ export interface SeededNativeFollowupsInput {
   readonly candidateVersion: string;
   readonly projectId: string;
   readonly wsl: boolean;
+  readonly ownedWslDistro?: string;
 }
 export interface NativeFollowupRuntime {
   readonly environment: NodeJS.ProcessEnv;
@@ -161,6 +162,11 @@ export async function runSeededNativeFollowups(
     const bridge = await browser.execute(readNativeFollowupBridge),
       boot = bridge.bootstraps.find((entry) => entry.id === "primary");
     let descriptor: NativeFollowupState["descriptor"] = null;
+    if (
+      runtime.platform === "win32" &&
+      (!input.ownedWslDistro || boot?.runningDistro !== input.ownedWslDistro)
+    )
+      throw new Error("Native follow-up exact owned WSL distro refused.");
     if (boot?.httpBaseUrl) {
       if (runtime.platform === "win32" && boot.runningDistro) {
         const executable = NodePath.join(

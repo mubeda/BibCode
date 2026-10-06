@@ -1,0 +1,186 @@
+[CmdletBinding()]
+param(
+  [ValidateSet('Prepare','Build','Verify','VerifyOwner','AppAttempted','AppJoined','Terminate','Unregister','Restored','Delete')][string]$Action,
+  [string]$OwnerManifest,
+  [string]$SourceSha,
+  [string]$Checkout,
+  [string]$ExpectedVersion
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$RootfsName = 'ubuntu-24.04.5-wsl-amd64.wsl'
+$RootfsHash = 'bb415d824822c4b878125729af451a5d18fb13d1cf5cbed9a7393ad64ac6039e'
+$SigningFingerprint = '843938DF228D22F7B3742BC0D94AA3F0EFE21092'
+$ReleaseBase = 'https://releases.ubuntu.com/noble/'
+function Refuse-OwnedWsl { throw 'Owned WSL2 fixture refused.' }
+function Assert-FixtureRuntime {
+  if ($env:CI -ne 'true' -or $env:GITHUB_ACTIONS -ne 'true' -or $env:BIBCODE_NATIVE_WSL_FIXTURE_SELECTED -ne 'true' -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'X64' -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'X64' -or -not [OperatingSystem]::IsWindows() -or -not [Environment]::Is64BitProcess -or $SourceSha -cnotmatch '^[a-f0-9]{40}$' -or $SourceSha -cne $env:GITHUB_SHA) { Refuse-OwnedWsl }
+  if ([IO.Path]::GetFullPath($OwnerManifest) -cne (Join-Path $env:RUNNER_TEMP 'bibcode-owned-wsl2-owner/owner.secret.json')) { Refuse-OwnedWsl }
+}
+function Initialize-PhysicalReader {
+  if ('OwnedWslPhysical' -as [type]) { return }
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class OwnedWslPhysical {
+ [StructLayout(LayoutKind.Sequential)] struct Info { public uint Attributes; public System.Runtime.InteropServices.ComTypes.FILETIME Creation,Access,Write; public uint Volume,SizeHigh,SizeLow,Links,IndexHigh,IndexLow; }
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFile(string name,uint access,uint share,IntPtr security,uint disposition,uint flags,IntPtr template);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetFileInformationByHandle(SafeFileHandle handle,out Info info);
+ public static string Read(string path,bool directory) { using(var h=CreateFile(path,0,7,IntPtr.Zero,3,directory?0x02000000u:0u,IntPtr.Zero)) { Info i; if(h.IsInvalid||!GetFileInformationByHandle(h,out i)||(!directory&&i.Links!=1))throw new InvalidOperationException("Owned physical identity refused.");return i.Volume.ToString("X8")+":"+i.IndexHigh.ToString("X8")+i.IndexLow.ToString("X8"); } }
+}
+'@ | Out-Null
+}
+function Get-PhysicalPin([string]$Path) {
+  $item = Get-Item -LiteralPath $Path -Force
+  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.FullName -ine [IO.Path]::GetFullPath($Path)) { Refuse-OwnedWsl }
+  $parent = if ($item.PSIsContainer) { $item.Parent } else { $item.Directory }
+  while ($null -ne $parent) { if (($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Refuse-OwnedWsl }; $parent = $parent.Parent }
+  Initialize-PhysicalReader
+  return [ordered]@{path=$item.FullName;identity=[OwnedWslPhysical]::Read($item.FullName,$item.PSIsContainer);directory=[bool]$item.PSIsContainer}
+}
+function Assert-PhysicalPin($Pin) {
+  $now = Get-PhysicalPin $Pin.path
+  if ($now.identity -cne $Pin.identity -or $now.directory -ne $Pin.directory) { Refuse-OwnedWsl }
+}
+function Set-OwnerAcl([string]$Path) {
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+  $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+  $acl = Get-Acl -LiteralPath $Path
+  $acl.SetOwner($me); $acl.SetAccessRuleProtection($true,$false)
+  foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleAll($rule) }
+  $inherit = if ((Get-Item -LiteralPath $Path).PSIsContainer) { 'ContainerInherit,ObjectInherit' } else { 'None' }
+  foreach ($sid in @($me,$system)) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl',$inherit,'None','Allow')) }
+  Set-Acl -LiteralPath $Path -AclObject $acl
+}
+function Assert-OwnerAcl([string]$Path) {
+  $acl=Get-Acl -LiteralPath $Path; $me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  if (-not $acl.AreAccessRulesProtected -or $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $me -or @($acl.Access).Count -ne 2) { Refuse-OwnedWsl }
+  $sids=@();foreach($rule in $acl.Access) { $sid=$rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;if($rule.IsInherited -or $rule.AccessControlType -ne 'Allow' -or $rule.FileSystemRights -ne 'FullControl') { Refuse-OwnedWsl };$sids+=$sid }
+  if (@($sids | Sort-Object -Unique).Count -ne 2 -or $me -notin $sids -or 'S-1-5-18' -notin $sids) { Refuse-OwnedWsl }
+}
+function Invoke-FixtureCommand([string]$Exe,[string[]]$Arguments,[int]$Timeout=60000) {
+  $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Exe;$info.UseShellExecute=$false;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true;$info.CreateNoWindow=$true
+  foreach($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+  $child=[Diagnostics.Process]::new();$child.StartInfo=$info
+  try {
+    if(-not $child.Start()) { Refuse-OwnedWsl }
+    $out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadToEndAsync()
+    if(-not $child.WaitForExit($Timeout)) { $child.Kill($true);if(-not $child.WaitForExit(15000)) { Refuse-OwnedWsl };Refuse-OwnedWsl }
+    $stdout=$out.GetAwaiter().GetResult();$stderr=$err.GetAwaiter().GetResult()
+    if($stdout.Length -gt 2097152 -or $stderr.Length -gt 2097152) { Refuse-OwnedWsl }
+    $log=Join-Path ([IO.Path]::GetDirectoryName($OwnerManifest)) ('command-'+[guid]::NewGuid().ToString('N')+'.private.json')
+    [IO.File]::WriteAllText($log,(@{stdout=$stdout;stderr=$stderr;exitCode=$child.ExitCode}|ConvertTo-Json -Compress));Set-OwnerAcl $log
+    if($child.ExitCode -ne 0) { Refuse-OwnedWsl }
+    return $stdout.Replace([string][char]0,'').Trim()
+  } finally { $child.Dispose() }
+}
+function Get-FixtureInventory {
+  $key='HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+  if(-not (Test-Path -LiteralPath $key)) { return [ordered]@{defaultGuid=$null;distros=@()} }
+  $properties=Get-ItemProperty -LiteralPath $key
+  $default=$properties.PSObject.Properties['DefaultDistribution'];$value=if($null -eq $default -or -not $default.Value -or $default.Value -eq '{00000000-0000-0000-0000-000000000000}') {$null}else{[string]$default.Value}
+  $distros=@(Get-ChildItem -LiteralPath $key | ForEach-Object {$entry=Get-ItemProperty -LiteralPath $_.PSPath;[ordered]@{guid=$_.PSChildName;name=[string]$entry.DistributionName;basePath=[string]$entry.BasePath;version=[int]$entry.Version}})
+  return [ordered]@{defaultGuid=$value;distros=$distros}
+}
+function Save-FixtureManifest($Manifest) {
+  [IO.File]::WriteAllText($OwnerManifest,($Manifest|ConvertTo-Json -Depth 16 -Compress));Set-OwnerAcl $OwnerManifest
+}
+function Read-FixtureManifest {
+  Assert-FixtureRuntime;Assert-OwnerAcl $OwnerManifest
+  $m=Get-Content -LiteralPath $OwnerManifest -Raw|ConvertFrom-Json -AsHashtable
+  if($m.schema -ne 1 -or $m.sourceSha -cne $SourceSha -or $m.name -cnotmatch '^BibCodeQA-[a-f0-9]{32}$' -or $m.imageSha256 -cne $RootfsHash -or $m.before.distros.Count -ne 0 -or $null -ne $m.before.defaultGuid -or $m.appState -notin @('none','attempted','joined')) { Refuse-OwnedWsl }
+  Assert-PhysicalPin $m.root;Assert-OwnerAcl $m.root.path;Assert-PhysicalPin $m.manifestPin;Assert-PhysicalPin $m.wsl.pin;Assert-PhysicalPin $m.imagePin;Assert-PhysicalPin $m.gpg.pin;Assert-PhysicalPin $m.checkout
+  if(Test-Path -LiteralPath $m.importRoot.path) {Assert-PhysicalPin $m.importRoot} elseif($m.phase -ne 'unregistered') {Refuse-OwnedWsl}
+  if((Get-FileHash -LiteralPath $m.imagePin.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $RootfsHash -or (Get-FileHash -LiteralPath $m.gpg.pin.path -Algorithm SHA256).Hash -cne $m.gpg.sha256) {Refuse-OwnedWsl}
+  if((Get-FileHash -LiteralPath $m.wsl.pin.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $m.wsl.sha256) { Refuse-OwnedWsl }
+  return $m
+}
+function Assert-OwnedRegistration($Manifest,[bool]$AllowAbsent=$false) {
+  $inventory=Get-FixtureInventory
+  if($inventory.distros.Count -eq 0 -and $null -eq $inventory.defaultGuid -and $AllowAbsent) {return $null}
+  if($inventory.distros.Count -ne 1) { Refuse-OwnedWsl };$owned=$inventory.distros[0]
+  if($owned.name -cne $Manifest.name -or $owned.version -ne 2 -or ($null -ne $Manifest.guid -and $owned.guid -cne $Manifest.guid) -or ($null -ne $inventory.defaultGuid -and $inventory.defaultGuid -cne $owned.guid)) { Refuse-OwnedWsl }
+  $base=Get-PhysicalPin $owned.basePath
+  if($base.identity -cne $Manifest.importRoot.identity) { Refuse-OwnedWsl }
+  return $owned
+}
+function Prepare-Fixture {
+  Assert-FixtureRuntime
+  $root=[IO.Path]::GetDirectoryName($OwnerManifest)
+  if(Test-Path -LiteralPath $root) { Refuse-OwnedWsl };[IO.Directory]::CreateDirectory($root)|Out-Null;Set-OwnerAcl $root
+  $wsl=Join-Path $env:SystemRoot 'System32/wsl.exe';$certificate=Get-AuthenticodeSignature -LiteralPath $wsl
+  if($certificate.Status -ne 'Valid' -or $certificate.SignerCertificate.Subject -notmatch 'Microsoft') { Refuse-OwnedWsl }
+  $before=Get-FixtureInventory
+  if($before.distros.Count -ne 0 -or $null -ne $before.defaultGuid) { Refuse-OwnedWsl }
+  Invoke-FixtureCommand $wsl @('--status')|Out-Null;Invoke-FixtureCommand $wsl @('--list','--quiet')|Out-Null
+  $gpg=Join-Path $env:ProgramFiles 'Git/usr/bin/gpg.exe';$gpgPin=Get-PhysicalPin $gpg;$gpgHash=(Get-FileHash -LiteralPath $gpg -Algorithm SHA256).Hash
+  $gnupg=Join-Path $root 'gnupg';[IO.Directory]::CreateDirectory($gnupg)|Out-Null;Set-OwnerAcl $gnupg
+  $key=Join-Path $root 'canonical.key';$sums=Join-Path $root 'SHA256SUMS';$signature=Join-Path $root 'SHA256SUMS.gpg';$image=Join-Path $root $RootfsName
+  foreach($download in @(@('https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x'+$SigningFingerprint,$key),@($ReleaseBase+'SHA256SUMS',$sums),@($ReleaseBase+'SHA256SUMS.gpg',$signature))) { Invoke-WebRequest -Uri $download[0] -OutFile $download[1] -TimeoutSec 120 -MaximumRedirection 0;Set-OwnerAcl $download[1] }
+  if((Get-Item -LiteralPath $key).Length -gt 1048576 -or (Get-Item -LiteralPath $sums).Length -gt 2097152 -or (Get-Item -LiteralPath $signature).Length -gt 65536) {Refuse-OwnedWsl}
+  Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--import',$key)|Out-Null
+  $fingerprints=Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--with-colons','--fingerprint',$SigningFingerprint)
+  if(@($fingerprints -split "`n"|Where-Object {$_ -match '^fpr:' -and ($_ -split ':')[9] -ceq $SigningFingerprint}).Count -ne 1) { Refuse-OwnedWsl }
+  $verification=Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--status-fd','1','--verify',$signature,$sums)
+  $valid=@($verification -split "`n"|Where-Object {$_ -match '^\[GNUPG:\] VALIDSIG '})
+  if($valid.Count -ne 1 -or ($valid[0] -split ' ')[2] -cne $SigningFingerprint) { Refuse-OwnedWsl }
+  $line=@(Get-Content -LiteralPath $sums|Where-Object {$_ -cmatch ('^[a-f0-9]{64} [ *]'+[regex]::Escape($RootfsName)+'$')})
+  if($line.Count -ne 1 -or $line[0].Substring(0,64) -cne $RootfsHash) { Refuse-OwnedWsl }
+  Invoke-WebRequest -Uri ($ReleaseBase+$RootfsName) -OutFile $image -TimeoutSec 300 -MaximumRedirection 0;Set-OwnerAcl $image
+  if((Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant() -cne $RootfsHash) { Refuse-OwnedWsl };Assert-PhysicalPin $gpgPin
+  if((Get-FileHash -LiteralPath $gpg -Algorithm SHA256).Hash -cne $gpgHash) { Refuse-OwnedWsl }
+  $import=Join-Path $root 'distro';[IO.Directory]::CreateDirectory($import)|Out-Null;Set-OwnerAcl $import
+  $m=[ordered]@{schema=1;sourceSha=$SourceSha;name='BibCodeQA-'+[guid]::NewGuid().ToString('N');root=Get-PhysicalPin $root;importRoot=Get-PhysicalPin $import;wsl=@{pin=Get-PhysicalPin $wsl;sha256=(Get-FileHash -LiteralPath $wsl -Algorithm SHA256).Hash.ToLowerInvariant()};before=$before;imageSha256=$RootfsHash;imagePin=Get-PhysicalPin $image;gpg=@{pin=$gpgPin;sha256=$gpgHash};checkout=Get-PhysicalPin $env:GITHUB_WORKSPACE;manifestPin=$null;mappedCheckout=$null;backend=$null;guid=$null;phase='intent';appState='none';kernelVerified=$false}
+  Save-FixtureManifest $m
+  $m.manifestPin=Get-PhysicalPin $OwnerManifest;Save-FixtureManifest $m
+  $again=Get-FixtureInventory;if($again.distros.Count -ne 0 -or $null -ne $again.defaultGuid) {Refuse-OwnedWsl}
+  $m.phase='import-attempted';Save-FixtureManifest $m
+  Invoke-FixtureCommand $wsl @('--import',$m.name,$import,$image,'--version','2') 300000|Out-Null
+  $owned=Assert-OwnedRegistration $m;$m.guid=$owned.guid;$m.phase='registered';Save-FixtureManifest $m
+  $kernel=Invoke-FixtureCommand $wsl @('--distribution',$m.name,'--exec','uname','-r')
+  $architecture=Invoke-FixtureCommand $wsl @('--distribution',$m.name,'--exec','uname','-m')
+  $os=Invoke-FixtureCommand $wsl @('--distribution',$m.name,'--exec','cat','/etc/os-release')
+  if($kernel -cnotmatch '^[A-Za-z0-9.+-]*microsoft-standard-WSL2$' -or $architecture -cne 'x86_64' -or $os -notmatch '(?m)^ID=ubuntu\r?$' -or $os -notmatch '(?m)^VERSION_ID="24\.04"\r?$') { Refuse-OwnedWsl }
+  $mapped=Invoke-FixtureCommand $wsl @('--distribution',$m.name,'--exec','wslpath','-a',$m.checkout.path)
+  $canonical=Invoke-FixtureCommand $wsl @('--distribution',$m.name,'--exec','readlink','-e',$mapped)
+  if(-not $mapped.StartsWith('/') -or $mapped -cne $canonical) {Refuse-OwnedWsl}
+  Assert-PhysicalPin $m.checkout
+  $m.mappedCheckout=$mapped;$m.kernelVerified=$true;$m.phase='kernel-verified';Save-FixtureManifest $m
+}
+function Invoke-OwnedFixtureAction([string]$Action) {
+    if($Action -eq 'Prepare') { Prepare-Fixture } else {
+      $m=Read-FixtureManifest
+      switch($Action) {
+        'Build' {
+          Assert-OwnedRegistration $m|Out-Null
+          if(-not $m.kernelVerified -or $m.appState -ne 'none' -or $ExpectedVersion -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or -not [IO.Path]::GetFullPath($Checkout).StartsWith([IO.Path]::GetFullPath($env:RUNNER_TEMP)+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) {Refuse-OwnedWsl}
+          $checkoutPin=Get-PhysicalPin $Checkout
+          $cargo=Get-Content -LiteralPath (Join-Path $Checkout 'apps/server/Cargo.toml') -Raw
+          if($cargo -notmatch ('(?m)^version\s*=\s*"'+[regex]::Escape($ExpectedVersion)+'"\s*$')) {Refuse-OwnedWsl}
+          $mapped=Invoke-FixtureCommand $m.wsl.pin.path @('--distribution',$m.name,'--exec','wslpath','-a',$Checkout)
+          if($mapped -match "['`r`n]" -or $mapped -cne (Invoke-FixtureCommand $m.wsl.pin.path @('--distribution',$m.name,'--exec','readlink','-e',$mapped))) {Refuse-OwnedWsl}
+          Invoke-FixtureCommand $m.wsl.pin.path @('--distribution',$m.name,'--exec','bash','-lc','set -euo pipefail; apt-get update; apt-get install -y build-essential clang cmake curl pkg-config libssl-dev') 600000|Out-Null
+          Invoke-FixtureCommand $m.wsl.pin.path @('--distribution',$m.name,'--exec','bash','-lc','set -euo pipefail; if ! command -v cargo >/dev/null; then curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0; fi') 600000|Out-Null
+          $build="set -euo pipefail; cd '$mapped'; export PATH=`"`$HOME/.cargo/bin:`$PATH`"; CARGO_TARGET_DIR='$mapped/target/native-owned-wsl2' cargo +1.98.0 build --locked -p bibcode-server --bin bibcode --release"
+          Invoke-FixtureCommand $m.wsl.pin.path @('--distribution',$m.name,'--exec','bash','-lc',$build) 3600000|Out-Null
+          $binary=Join-Path $Checkout 'target/native-owned-wsl2/release/bibcode';$binaryPin=Get-PhysicalPin $binary
+          $version=Invoke-FixtureCommand $m.wsl.pin.path @('--distribution',$m.name,'--exec',($mapped+'/target/native-owned-wsl2/release/bibcode'),'--version')
+          if($version -notmatch ([regex]::Escape($ExpectedVersion)+'$')) {Refuse-OwnedWsl}
+          Assert-PhysicalPin $checkoutPin
+          $m.backend=@{pin=$binaryPin;sha256=(Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant();version=$ExpectedVersion};Save-FixtureManifest $m
+        }
+        'Verify' { Assert-OwnedRegistration $m|Out-Null;if($null -ne $m.backend) {Assert-PhysicalPin $m.backend.pin;if((Get-FileHash -LiteralPath $m.backend.pin.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $m.backend.sha256) {Refuse-OwnedWsl}};if(-not $m.kernelVerified -or $m.phase -ne 'kernel-verified') {Refuse-OwnedWsl} }
+        'VerifyOwner' {if($m.appState -eq 'attempted') {Refuse-OwnedWsl};Assert-OwnedRegistration $m $true|Out-Null}
+        'AppAttempted' { Assert-OwnedRegistration $m|Out-Null;if(-not $m.kernelVerified) {Refuse-OwnedWsl};$m.appState='attempted';Save-FixtureManifest $m }
+        'AppJoined' { Assert-OwnedRegistration $m|Out-Null;if($m.appState -ne 'attempted') {Refuse-OwnedWsl};$m.appState='joined';Save-FixtureManifest $m }
+        'Terminate' { if($m.appState -eq 'attempted') {Refuse-OwnedWsl};$owned=Assert-OwnedRegistration $m $true;if($null -ne $owned) {Invoke-FixtureCommand $m.wsl.pin.path @('--terminate',$m.name)|Out-Null} }
+        'Unregister' { if($m.appState -eq 'attempted') {Refuse-OwnedWsl};$owned=Assert-OwnedRegistration $m $true;if($null -ne $owned) {Invoke-FixtureCommand $m.wsl.pin.path @('--unregister',$m.name)|Out-Null};$m.phase='unregistered';Save-FixtureManifest $m }
+        'Restored' { $inventory=Get-FixtureInventory;if($inventory.distros.Count -ne 0 -or $null -ne $inventory.defaultGuid) {Refuse-OwnedWsl} }
+        'Delete' { $inventory=Get-FixtureInventory;if($inventory.distros.Count -ne 0 -or $null -ne $inventory.defaultGuid -or $m.appState -eq 'attempted') {Refuse-OwnedWsl};Get-ChildItem -LiteralPath $m.root.path -Force -Recurse|ForEach-Object {if(($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {Refuse-OwnedWsl}};Assert-PhysicalPin $m.root;Remove-Item -LiteralPath $m.root.path -Recurse -Force }
+      }
+    }
+}
+if($MyInvocation.InvocationName -ne '.') {
+  try { Invoke-OwnedFixtureAction $Action; Write-Output '{"completed":true}';exit 0 } catch { Write-Output '{"completed":false}';exit 1 }
+}

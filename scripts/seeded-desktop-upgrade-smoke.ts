@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { admitOwnedWslSeed, joinOwnedWslCleanup } from "./lib/owned-wsl2-fixture.ts";
 // @effect-diagnostics nodeBuiltinImport:off - This release harness owns host processes and paths.
 // @effect-diagnostics globalConsole:off - The standalone harness reports bounded progress.
 // @effect-diagnostics globalFetch:off - The standalone harness probes its loopback update server.
@@ -76,6 +77,7 @@ export interface SeededDesktopUpgradeSmokeInput {
   readonly wsl: boolean;
   readonly workRoot: string;
   readonly nativeFollowups?: boolean;
+  readonly ownedWslManifest?: string;
   readonly observeNativeFollowupPhase?: (phase: NativeFollowupPhase) => void;
 }
 
@@ -277,6 +279,7 @@ export function parseSeededDesktopUpgradeSmokeArgs(
         "work-root": { type: "string" },
         wsl: { type: "boolean", default: false },
         "native-followups": { type: "boolean", default: false },
+        "owned-wsl-manifest": { type: "string" },
       },
     }));
   } catch (cause) {
@@ -312,6 +315,15 @@ export function parseSeededDesktopUpgradeSmokeArgs(
       "Native follow-ups require a native Linux owner or a real Windows WSL owner.",
     );
   }
+  const ownedWslSelected = values["native-followups"] === true && values.wsl === true;
+  if (
+    ownedWslSelected
+      ? typeof values["owned-wsl-manifest"] !== "string"
+      : values["owned-wsl-manifest"] !== undefined
+  )
+    throw new SeededDesktopUpgradeSmokeError(
+      "Owned WSL2 manifest is required only for the native WSL fixture.",
+    );
   const updaterPort = parsePositiveInteger(values["updater-port"], "updater-port", 43_120);
   const highestPortOffset =
     values["native-followups"] === true ? 104 : values.wsl === true ? 102 : 103;
@@ -341,6 +353,14 @@ export function parseSeededDesktopUpgradeSmokeArgs(
     wsl: values.wsl === true,
     workRoot: requireAbsolute(requireString(values, "work-root"), "work-root"),
     ...(values["native-followups"] === true ? { nativeFollowups: true } : {}),
+    ...(ownedWslSelected
+      ? {
+          ownedWslManifest: requireAbsolute(
+            requireString(values, "owned-wsl-manifest"),
+            "owned-wsl-manifest",
+          ),
+        }
+      : {}),
   };
 }
 
@@ -479,6 +499,8 @@ export function createSeededUpgradeDriverSpec(input: {
   readonly platform?: SeededUpgradePlatform;
   readonly nativeFollowupsControllerPath?: string;
   readonly sourceSha?: string;
+  readonly ownedWslDistro?: string;
+  readonly ownedWslBackend?: string;
   readonly dataRoot?: string;
   readonly runRoot?: string;
   readonly evidenceDirectory?: string;
@@ -536,7 +558,7 @@ async function observe(seed) {
   return browser.execute(async (parameters, seed) => {
     const bridge = window.desktopBridge;
     if (!bridge) throw new Error("The packaged desktop bridge is unavailable.");
-    if (parameters.wsl && seed) {
+    if (parameters.wsl && seed && !parameters.ownedWslDistro) {
       if (
         typeof bridge.setWslOnly !== "function" ||
         typeof bridge.setWslBackendEnabled !== "function"
@@ -555,7 +577,7 @@ async function observe(seed) {
         const isReady =
           candidate?.httpBaseUrl &&
           candidate?.wsBaseUrl &&
-          (!parameters.wsl || typeof candidate.runningDistro === "string");
+          (!parameters.wsl || (typeof candidate.runningDistro === "string" && (!parameters.ownedWslDistro || candidate.runningDistro === parameters.ownedWslDistro)));
         if (isReady) return resolve(candidate);
         if (Date.now() - startedAt >= 60000) {
           return reject(new Error("The packaged primary bootstrap did not become ready."));
@@ -669,6 +691,7 @@ async function observe(seed) {
     projectId: input.projectId,
     workspaceRoot: input.workspaceRoot,
     wsl: input.wsl === true,
+    ownedWslDistro: input.ownedWslDistro,
   }, seed);
 }
 
@@ -1838,6 +1861,8 @@ const runWebDriverPhase = async (input: {
   readonly wsl: boolean;
   readonly onRemotePhaseStarted?: (() => void) | undefined;
   readonly sourceSha?: string;
+  readonly ownedWslDistro?: string;
+  readonly ownedWslBackend?: string;
   readonly observeNativePhase?: (phase: string) => void;
 }): Promise<void> => {
   const phaseRoot = NodePath.join(input.runRoot, `${input.phase}-driver`);
@@ -1877,6 +1902,7 @@ const runWebDriverPhase = async (input: {
               NodePath.join(input.repositoryRoot, "apps/desktop/e2e/qualify-native-followups.ts"),
             ).href,
             sourceSha: input.sourceSha,
+            ownedWslDistro: input.ownedWslDistro,
             dataRoot: input.dataRoot,
             runRoot: input.runRoot,
             evidenceDirectory: input.evidenceDirectory,
@@ -1962,6 +1988,7 @@ const runWebDriverPhase = async (input: {
           ...childEnvironment,
           BIBCODE_HOME: input.dataRoot,
           BIBCODE_PORT: String(input.backendPort),
+          ...(input.ownedWslBackend ? { BIBCODE_WSL_SERVER_BINARY: input.ownedWslBackend } : {}),
           BIBCODE_E2E_PLATFORM: input.platform,
           RUST_LOG: "bibcode=debug",
           ...(input.wsl
@@ -2193,6 +2220,8 @@ const runUpgradeLane = async (input: {
   readonly wsl: boolean;
   readonly onRemotePhaseStarted?: (() => void) | undefined;
   readonly sourceSha?: string;
+  readonly ownedWslDistro?: string;
+  readonly ownedWslBackend?: string;
   readonly observeNativePhase?: (phase: string) => void;
 }): Promise<void> => {
   await NodeFS.promises.mkdir(input.layout.dataRoot, { recursive: true, mode: 0o700 });
@@ -2220,6 +2249,8 @@ const runUpgradeLane = async (input: {
     wsl: input.wsl,
     onRemotePhaseStarted: input.onRemotePhaseStarted,
     ...(input.sourceSha ? { sourceSha: input.sourceSha } : {}),
+    ...(input.ownedWslDistro ? { ownedWslDistro: input.ownedWslDistro } : {}),
+    ...(input.ownedWslBackend ? { ownedWslBackend: input.ownedWslBackend } : {}),
     ...(input.observeNativePhase ? { observeNativePhase: input.observeNativePhase } : {}),
   } as const;
   await runWebDriverPhase({ ...shared, phase: "seed-and-install", resultPath: beforePath });
@@ -2379,6 +2410,10 @@ export async function runSeededDesktopUpgradeSmoke(
   if (process.env.CI !== "true")
     throw new SeededDesktopUpgradeSmokeError(
       "This packaged-upgrade harness is CI-only; it can terminate desktop applications.",
+    );
+  if (input.nativeFollowups && input.platform === "win" && (!input.wsl || !input.ownedWslManifest))
+    throw new SeededDesktopUpgradeSmokeError(
+      "Owned WSL2 manifest is required for native Windows capture.",
     );
   assertBaselineVersionIsOlder(input.previousVersion, input.candidateVersion);
   const runId = input.runId;
@@ -2628,6 +2663,118 @@ export async function runSeededDesktopUpgradeSmoke(
     );
     if (input.nativeFollowups) {
       const nativeLayout = layout.nativeFollowups!;
+      let ownedWslDistro: string | undefined, ownedWslBackend: string | undefined;
+      const invokeWslFixture = async (action: string, extra: string[] = []) => {
+        if (!input.ownedWslManifest) return;
+        if (
+          seededUpgradeNativeHostPlatform !== "win32" ||
+          input.platform !== "win" ||
+          !input.wsl ||
+          process.env.BIBCODE_NATIVE_WSL_FIXTURE_SELECTED !== "true"
+        )
+          throw new SeededDesktopUpgradeSmokeError("Owned native WSL2 handoff refused.");
+        const result = await runCommand({
+          command: NodePath.join(process.env.ProgramFiles ?? "", "PowerShell", "7", "pwsh.exe"),
+          args: [
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            NodePath.join(input.repositoryRoot, "scripts", "owned-wsl2-fixture.ps1"),
+            "-Action",
+            action,
+            "-OwnerManifest",
+            input.ownedWslManifest,
+            "-SourceSha",
+            currentCommit,
+            ...extra,
+          ],
+          cwd: input.repositoryRoot,
+          timeoutMs: action === "Build" ? 4_200_000 : 90_000,
+        });
+        if (result.exitCode !== 0 || JSON.parse(result.stdout.trim()).completed !== true)
+          throw new SeededDesktopUpgradeSmokeError("Owned native WSL2 command refused.");
+      };
+      if (input.ownedWslManifest) {
+        const close = joinOwnedWslCleanup({
+          verifyOwner: () => invokeWslFixture("VerifyOwner"),
+          terminate: () => invokeWslFixture("Terminate"),
+          unregister: () => invokeWslFixture("Unregister"),
+          verifyRestored: () => invokeWslFixture("Restored"),
+          deleteOwned: () => invokeWslFixture("Delete"),
+          unsafe: () => {},
+        });
+        cleanup.add("owned WSL2 test fixture", close);
+        await invokeWslFixture("Verify");
+        await invokeWslFixture("Build", [
+          "-Checkout",
+          layout.protectedBaseline.checkout,
+          "-ExpectedVersion",
+          input.previousVersion,
+        ]);
+        const manifest: unknown = JSON.parse(
+            await NodeFS.promises.readFile(input.ownedWslManifest, "utf8"),
+          ),
+          seed = admitOwnedWslSeed(manifest, currentCommit);
+        ownedWslDistro = seed.distro;
+        if (
+          manifest === null ||
+          typeof manifest !== "object" ||
+          !("backend" in manifest) ||
+          manifest.backend === null ||
+          typeof manifest.backend !== "object" ||
+          !("pin" in manifest.backend) ||
+          manifest.backend.pin === null ||
+          typeof manifest.backend.pin !== "object" ||
+          !("path" in manifest.backend.pin) ||
+          typeof manifest.backend.pin.path !== "string"
+        )
+          throw new SeededDesktopUpgradeSmokeError("Owned WSL2 backend input refused.");
+        ownedWslBackend = manifest.backend.pin.path;
+        await NodeFS.promises.mkdir(NodePath.join(nativeLayout.dataRoot, "userdata"), {
+          recursive: true,
+          mode: 0o700,
+        });
+        const { NativeFollowupCommandOwner } = await import(
+          NodeURL.pathToFileURL(
+            NodePath.join(
+              input.repositoryRoot,
+              "apps/desktop/e2e/support/release-visual-native-followups-process.ts",
+            ),
+          ).href
+        );
+        const { secureNativeFollowupWindowsRoot } = await import(
+          NodeURL.pathToFileURL(
+            NodePath.join(
+              input.repositoryRoot,
+              "apps/desktop/e2e/support/release-visual-native-followups-windows.ts",
+            ),
+          ).href
+        );
+        const commands = new NativeFollowupCommandOwner(
+          process.env,
+          NodePath.dirname(nativeLayout.dataRoot),
+          () => {},
+          seededUpgradeNativeHostPlatform,
+        );
+        await secureNativeFollowupWindowsRoot(
+          commands,
+          NodePath.join(
+            process.env.SystemRoot ?? "",
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
+          ),
+          nativeLayout.dataRoot,
+        );
+        commands.assertClosed();
+        await NodeFS.promises.writeFile(
+          NodePath.join(nativeLayout.dataRoot, "userdata", "desktop-settings.json"),
+          JSON.stringify(seed.settings),
+          { flag: "wx", mode: 0o600 },
+        );
+      }
+
       observeNativePhase("native-baseline-install");
       const nativeApp = await installBaselinePackage({
         laneRoot: NodePath.dirname(nativeLayout.dataRoot),
@@ -2652,7 +2799,9 @@ export async function runSeededDesktopUpgradeSmoke(
           platform: seededUpgradeNativeHostPlatform,
           environment: process.env,
         });
+        if (input.ownedWslManifest) await invokeWslFixture("AppJoined");
       });
+      if (input.ownedWslManifest) await invokeWslFixture("AppAttempted");
       observeNativePhase("native-driver");
       await runUpgradeLane({
         appBinaryPath: nativeApp,
@@ -2667,6 +2816,8 @@ export async function runSeededDesktopUpgradeSmoke(
         webdriverPort: assertRemoteInstallPort(input.updaterPort + 104),
         wsl: input.wsl,
         sourceSha: currentCommit,
+        ...(ownedWslDistro ? { ownedWslDistro } : {}),
+        ...(ownedWslBackend ? { ownedWslBackend } : {}),
         observeNativePhase,
       });
     }

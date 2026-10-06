@@ -10,6 +10,30 @@ import {
 } from "./qualify-native-followups-workflow.ts";
 import { parseSeededDesktopUpgradeSmokeArgs } from "./seeded-desktop-upgrade-smoke.ts";
 const root = NodePath.resolve(".");
+it("runs the owned WSL fixture caller and policy checks in both native partitions", () => {
+  const workflow = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const runs: string[] = [];
+  for (const job of Object.values(workflow.jobs)) {
+    if (!job || typeof job !== "object" || !("steps" in job) || !Array.isArray(job.steps)) continue;
+    for (const step of job.steps) {
+      if (
+        typeof step.run === "string" &&
+        step.run.includes("release-visual-native-followups-backup.test.ts")
+      )
+        runs.push(step.run);
+    }
+  }
+  expect(runs).toHaveLength(2);
+  for (const run of runs) {
+    expect(run).toContain("scripts/owned-wsl2-fixture-caller.test.ts");
+    expect(run).toContain("scripts/lib/owned-wsl2-fixture.test.ts");
+  }
+});
 function wslSteps() {
   const source = YAML.parse(
     NodeFS.readFileSync(
@@ -242,10 +266,10 @@ it("uses only the original WSL reads and keeps default skip separate", () => {
     /--(?:install|import|update|set-default|shutdown)|Invoke-WebRequest|Restart-Computer/,
   );
   expect(steps.find((step) => step.name === "Record unavailable WSL capability")!.if).toBe(
-    "steps.wsl.outputs.available != 'true'",
+    "inputs.native_followups != true && steps.wsl.outputs.available != 'true'",
   );
   expect(steps.find((step) => step.name === "Record native WSL prerequisite unavailable")!.if).toBe(
-    "inputs.native_followups == true && steps.wsl.outputs.available != 'true'",
+    "inputs.native_followups == true && steps.native_wsl.outputs.available != 'true'",
   );
 });
 const args = [
@@ -291,7 +315,13 @@ it("binds only the selected nonroot Linux or real Windows WSL owner and fixed sc
   expect(() => nativeFollowupWorkflowPlan({ ...input, nativeFollowups: false }, host)).toThrow();
   expect(
     nativeFollowupWorkflowPlan(
-      { ...input, platform: "win", bundle: "nsis", wsl: true },
+      {
+        ...input,
+        platform: "win",
+        bundle: "nsis",
+        wsl: true,
+        ownedWslManifest: NodePath.resolve("/owned/manifest.secret.json"),
+      },
       { ...host, platform: "win32", uid: null },
     ),
   ).toEqual({ partition: "windows-wsl", expectedOriginals: 2 });

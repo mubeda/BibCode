@@ -790,3 +790,40 @@ private paths, ACL output and raw OS/driver logs remain in protected private
 roots. Join exact owned processes and source/store/window identities before
 retention; no generic process-name cleanup is admitted. This partition does not
 qualify native Preview annotations or the full six-target release matrix.
+
+### Owned WSL2 fixture for the native Local row
+
+The selected native follow-up partition provisions one disposable WSL2 distro
+only when the Windows CI owner can read a clean empty distro/default inventory.
+It authenticates Canonical checksum metadata against the complete Ubuntu image
+signing fingerprint, then verifies the pinned Ubuntu24.04.5 image before explicit
+`--import --version 2`. It never runs a distribution installer, changes Windows
+features, updates WSL, reboots, switches host defaults or borrows an existing
+distro. Ordinary WSL upgrade capability/skip behavior remains unchanged.
+
+A successful import is insufficient. The fixture must run an actual Microsoft
+WSL2 kernel, x86_64 and Ubuntu24.04, join its physical Windows import path and
+registration, and resolve the real checkout through that exact distro. Failed
+kernel or ownership proof remains unavailable with zero originals. Hosted nested
+virtualization is not assumed.
+
+The native seeded lane takes the protected source/version overlay, builds its
+real Linux server in this owned distro with locked inputs, and seeds the existing
+isolated desktop settings to WSL-only, local-only exposure and the exact admitted
+distro before app launch. It verifies the actual native bridge/descriptor, mapped
+root and same running distro. No native Windows or WSL1 fallback is accepted.
+
+Cleanup authority exists before import. The existing seeded process owner joins
+native app/backend shutdown first. It then independently terminates and unregisters
+only the exact owned distro, checks the original empty/default-null state and
+physical private root, and removes only owned files. This completes before native
+evidence retention. Partial startup, cancellation, changed registration/root or
+unjoined app cleanup refuses deletion and acceptance; no global WSL shutdown or
+name-prefix sweep is permitted. The workflow fallback uses the same authority
+for setup failures and refuses an app that has not joined.
+
+Run the declared helper and Pester controls before the native job. Local source,
+TempFS or fake-command tests do not prove WSL, Windows ACLs or native originals.
+Keep command logs, names, registry IDs, paths and private manifests outside public
+evidence. The existing two original Local/WSL frames remain 1280 by 960; Preview
+and complete-group acceptance remain pending.
