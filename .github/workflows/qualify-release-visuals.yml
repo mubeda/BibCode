@@ -21,6 +21,7 @@ on:
           - release-visual-project-lifecycle
           - release-visual-settings-followups
           - release-visual-pull-requests
+          - release-visual-browser-followups
 
 permissions:
   contents: read
@@ -28,7 +29,7 @@ permissions:
 jobs:
   visual_core:
     if: ${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' && inputs.scene_selection != 'release-visual-native-followups' }}
-    name: ${{ inputs.scene_selection == 'release-visual-pull-requests' && 'Linux Chromium five PR/MR rows in forty-eight originals' || inputs.scene_selection == 'release-visual-settings-followups' && 'Linux Chromium four Settings rows in eighteen originals' || inputs.scene_selection == 'release-visual-project-lifecycle' && 'Linux Chromium three project lifecycle rows in both themes' || inputs.scene_selection == 'release-visual-provider-chat' && 'Linux Chromium seven provider chat rows in both themes' || inputs.scene_selection == 'release-visual-workspace-substates' && 'Linux Chromium three existing workspace substates in both themes' || inputs.scene_selection == 'release-visual-cursor-question' && 'Linux Chromium Cursor later-question pair' || inputs.scene_selection == 'release-visual-git-project' && 'Linux Chromium Git/project partial group in both themes' || inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
+    name: ${{ inputs.scene_selection == 'release-visual-browser-followups' && 'Linux Chromium six browser rows in fourteen originals' || inputs.scene_selection == 'release-visual-pull-requests' && 'Linux Chromium five PR/MR rows in forty-eight originals' || inputs.scene_selection == 'release-visual-settings-followups' && 'Linux Chromium four Settings rows in eighteen originals' || inputs.scene_selection == 'release-visual-project-lifecycle' && 'Linux Chromium three project lifecycle rows in both themes' || inputs.scene_selection == 'release-visual-provider-chat' && 'Linux Chromium seven provider chat rows in both themes' || inputs.scene_selection == 'release-visual-workspace-substates' && 'Linux Chromium three existing workspace substates in both themes' || inputs.scene_selection == 'release-visual-cursor-question' && 'Linux Chromium Cursor later-question pair' || inputs.scene_selection == 'release-visual-git-project' && 'Linux Chromium Git/project partial group in both themes' || inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -66,7 +67,26 @@ jobs:
         if: ${{ inputs.scene_selection == 'release-visual-pull-requests' }}
         working-directory: apps/web
         run: vp test run --project unit src/release-visual-pull-requests.public.test.tsx src/release-visual-pull-requests-create.public.test.tsx
+      - name: Verify browser follow-up composition and current public controls
+        if: ${{ inputs.scene_selection == 'release-visual-browser-followups' }}
+        run: |
+          vp test run apps/desktop/e2e/support/release-visual-browser-followups-caller.test.ts apps/desktop/e2e/support/release-visual-browser-followups-caller-resources.test.ts apps/desktop/e2e/support/release-visual-browser-followups-caller-protocol.test.ts apps/desktop/e2e/support/release-visual-browser-followups-owner.test.ts apps/desktop/e2e/support/release-visual-browser-followups-producer.test.ts apps/desktop/e2e/support/release-visual-browser-followups-protocol.test.ts apps/desktop/e2e/support/release-visual-browser-followups-transport.test.ts scripts/build-browser-followup-ui.test.mjs apps/desktop/e2e/support/release-visual-browser-followups-wiring.test.ts scripts/qualify-browser-followups-workflow.test.ts
+      - name: Verify compiled browser follow-up public controls
+        if: ${{ inputs.scene_selection == 'release-visual-browser-followups' }}
+        working-directory: apps/web
+        run: vp test run --project unit src/release-visual-browser-followups.public.test.tsx
+      - name: Build immutable primary and hosted follow-up UI separately
+        if: ${{ inputs.scene_selection == 'release-visual-browser-followups' }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          from pathlib import Path
+          (Path(os.environ['RUNNER_TEMP']) / 'issue29-browser-build').mkdir(mode=0o700)
+          PYTHON
+          node scripts/build-browser-followup-ui.mjs --build primary "$RUNNER_TEMP/issue29-browser-build" "$GITHUB_SHA"
+          node scripts/build-browser-followup-ui.mjs --build hosted "$RUNNER_TEMP/issue29-browser-build" "$GITHUB_SHA"
       - name: Build the source UI once with owned loopback targets
+        if: ${{ inputs.scene_selection != 'release-visual-browser-followups' }}
         env:
           VITE_WS_URL: ws://127.0.0.1:4885
           VITE_HTTP_URL: http://127.0.0.1:4885
@@ -89,6 +109,8 @@ jobs:
       - name: Build guarded production CLI
         run: cargo build -p bibcode-server --bin bibcode --features hermetic-test-guard -j 2
       - name: Copy immutable inputs outside Cargo output
+        env:
+          BIBCODE_SCENE_SELECTION: ${{ inputs.scene_selection }}
         run: |
           python3 - <<'PYTHON'
           import os, shutil
@@ -96,9 +118,49 @@ jobs:
           target = Path(os.environ['RUNNER_TEMP']) / 'issue29-visual-build'
           target.mkdir(mode=0o700)
           shutil.copy2('target/debug/bibcode', target / 'bibcode')
-          shutil.copytree('apps/web/dist', target / 'web')
+          if os.environ['BIBCODE_SCENE_SELECTION'] == 'release-visual-browser-followups':
+              build = Path(os.environ['RUNNER_TEMP']) / 'issue29-browser-build'
+              shutil.copytree(build / 'primary-assets', target / 'web')
+              shutil.copytree(build / 'hosted-assets', target / 'hosted-web')
+          else:
+              shutil.copytree('apps/web/dist', target / 'web')
           (target / 'bibcode').chmod(0o500)
           PYTHON
+      - name: Run contained browser follow-up original batch
+        if: ${{ inputs.scene_selection == 'release-visual-browser-followups' }}
+        env:
+          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-visual-build/bibcode
+          BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue29-visual-build/web
+        run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-browser-followups
+      - name: Retain finite browser follow-up original evidence
+        if: ${{ always() && inputs.scene_selection == 'release-visual-browser-followups' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: issue29-browser-followups-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/assertions.json
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/chat-staged-attachment-light.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/chat-staged-attachment-dark.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/terminal-shared-size-light.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/terminal-shared-size-dark.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/source-control-panel-light.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/source-control-panel-dark.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/slow-requests-light.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/slow-requests-dark.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/hosted-pair-confirm-light.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/hosted-pair-confirm-dark.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/hosted-pair-incomplete-light.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/hosted-pair-incomplete-dark.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/source-control-panel-overview-light.png
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/source-control-panel-overview-dark.png
       - name: Run contained first visual batch
         if: ${{ inputs.scene_selection == 'release-visual-core' || inputs.scene_selection == '' }}
         env:

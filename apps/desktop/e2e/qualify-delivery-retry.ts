@@ -180,6 +180,11 @@ import {
   type VisualTextRowObservationInput,
 } from "./support/release-visual-observation.ts";
 import { correctDesktopUiOuterSize } from "./support/window-size.ts";
+import {
+  prepareBrowserFollowupCaller,
+  runBrowserFollowupCaller,
+} from "./support/release-visual-browser-followups-caller.ts";
+import { validateBrowserFollowupJoins } from "./support/release-visual-browser-followups.ts";
 import { fixtureAccessToken } from "./support/remote-ui-rpc.ts";
 
 const root = NodePath.resolve(import.meta.dirname, "../../..");
@@ -522,6 +527,7 @@ export function deliveryConfiguration(
       "release-visual-provider-chat",
       "release-visual-project-lifecycle",
       "release-visual-pull-requests",
+      "release-visual-browser-followups",
     ].includes(selection) ||
     environment.CI !== "true" ||
     !/^[0-9a-f]{40}$/.test(environment.BIBCODE_UPLOAD_SOURCE ?? "") ||
@@ -545,7 +551,8 @@ export function deliveryConfiguration(
       | "release-visual-workspace-substates"
       | "release-visual-provider-chat"
       | "release-visual-project-lifecycle"
-      | "release-visual-pull-requests";
+      | "release-visual-pull-requests"
+      | "release-visual-browser-followups";
     fixture: string;
     evidence: string;
     binary: string;
@@ -677,6 +684,9 @@ export async function runDeliveryRetryQualification() {
   let projectLifecycleFixtureSafeToDelete = true;
   let settingsFollowupFixtureSafeToDelete = true;
   let pullRequestsFixtureSafeToDelete = true;
+  let browserFollowupFixtureSafeToDelete = true;
+  const browserFollowupResources: Array<Awaited<ReturnType<typeof prepareBrowserFollowupCaller>>> =
+    [];
   const pullRequestsHostingOwners: Array<() => PullRequestsHostingRestorationProof> = [];
   const pullRequestsHostingRestorationProofs: PullRequestsHostingRestorationProof[] = [];
   const settingsFollowupUsageFixtures: Array<
@@ -1256,7 +1266,10 @@ export async function runDeliveryRetryQualification() {
       theme = nextTheme;
       step("prepare-fixture");
       const runRoot = NodePath.join(config.fixture, theme);
-      if (config.selection === "release-visual-pull-requests") {
+      if (
+        config.selection === "release-visual-pull-requests" ||
+        config.selection === "release-visual-browser-followups"
+      ) {
         const outer = NodeFS.lstatSync(config.fixture);
         if (
           !outer.isDirectory() ||
@@ -1297,6 +1310,7 @@ export async function runDeliveryRetryQualification() {
       if (config.selection === "delivery-retry-ui") NodeFS.mkdirSync(control, { mode: 0o700 });
       if (
         config.selection === "release-visual-core" ||
+        config.selection === "release-visual-browser-followups" ||
         config.selection === "release-visual-workspace-substates" ||
         config.selection === "release-visual-provider-chat"
       ) {
@@ -1319,6 +1333,39 @@ export async function runDeliveryRetryQualification() {
         BIBCODE_LOG: "warn",
       };
       delete childEnv.BIBCODE_HERMETIC_GUARD;
+      let browserFollowup: Awaited<ReturnType<typeof prepareBrowserFollowupCaller>> | null = null;
+      if (config.selection === "release-visual-browser-followups") {
+        step("visual-browser-followups-resource-prepare");
+        browserFollowup = await prepareBrowserFollowupCaller({
+          CI: childEnv.CI,
+          root: runRoot,
+          primaryAssets: config.assets,
+          hostedAssets: NodePath.join(NodePath.dirname(config.assets), "hosted-web"),
+          source: config.source,
+          repository: root,
+          binary: config.binary,
+          admitOwner: async () => {
+            const admitted = deliveryConfiguration(process.env);
+            check(
+              admitted.selection === config.selection &&
+                admitted.fixture === config.fixture &&
+                admitted.source === config.source &&
+                admitted.assets === config.assets &&
+                admitted.binary === config.binary,
+            );
+          },
+          verifyInputs: async () => {
+            check(
+              NodeFS.realpathSync(config.binary) === config.binary &&
+                !NodeFS.lstatSync(config.binary).isSymbolicLink(),
+            );
+          },
+          observeUnsafeCleanup: () => {
+            browserFollowupFixtureSafeToDelete = false;
+          },
+        });
+        browserFollowupResources.push(browserFollowup);
+      }
       let settingsFollowupUsage: Awaited<
         ReturnType<typeof prepareSettingsFollowupCallerUsage>
       > | null = null;
@@ -1530,10 +1577,11 @@ export async function runDeliveryRetryQualification() {
         });
       }
       NodeFS.writeFileSync(settingsPath, JSON.stringify(settingsForWrite), { mode: 0o600 });
+      const primaryPort = config.selection === "release-visual-browser-followups" ? 4897 : 4885;
       await new Promise<void>((resolve, reject) => {
         const probe = NodeNet.createServer();
         probe.once("error", () => reject(new Error("Owned delivery port unavailable.")));
-        probe.listen(4885, "127.0.0.1", () =>
+        probe.listen(primaryPort, "127.0.0.1", () =>
           probe.close((error) => (error ? reject(error) : resolve())),
         );
       });
@@ -1546,7 +1594,7 @@ export async function runDeliveryRetryQualification() {
           "--host",
           "127.0.0.1",
           "--port",
-          "4885",
+          String(primaryPort),
           "--base-dir",
           context.stateRoot,
           "--static-dir",
@@ -1762,25 +1810,28 @@ export async function runDeliveryRetryQualification() {
       };
       if (
         config.selection === "release-visual-core" ||
+        config.selection === "release-visual-browser-followups" ||
         config.selection === "release-visual-workspace-substates" ||
         config.selection === "release-visual-provider-chat"
       ) {
         step("visual-fixture-managed");
         check(prepareVisualWorktree(visualInput).path === workspace.path);
-        step("visual-viewport");
-        const observed = await bounded(browser.execute(readVisualViewport), 2_000);
-        const outer = await browser.getWindowSize();
-        const corrected = correctDesktopUiOuterSize(
-          outer,
-          { width: 1280, height: 960 },
-          observed,
-          observed.devicePixelRatio,
-        );
-        await browser.setWindowSize(corrected.width, corrected.height);
-        await owner.until(async () => {
-          const viewport = await bounded(browser!.execute(readVisualViewport), 2_000);
-          return viewport.width === 1280 && viewport.height === 960;
-        });
+        if (config.selection !== "release-visual-browser-followups") {
+          step("visual-viewport");
+          const observed = await bounded(browser.execute(readVisualViewport), 2_000);
+          const outer = await browser.getWindowSize();
+          const corrected = correctDesktopUiOuterSize(
+            outer,
+            { width: 1280, height: 960 },
+            observed,
+            observed.devicePixelRatio,
+          );
+          await browser.setWindowSize(corrected.width, corrected.height);
+          await owner.until(async () => {
+            const viewport = await bounded(browser!.execute(readVisualViewport), 2_000);
+            return viewport.width === 1280 && viewport.height === 960;
+          });
+        }
       } else if (
         config.selection === "release-visual-settings" ||
         config.selection === "release-visual-settings-followups" ||
@@ -2738,6 +2789,88 @@ export async function runDeliveryRetryQualification() {
         });
         assertions.push({ theme, ...proof });
         write("assertions", { captures, assertions });
+      } else if (config.selection === "release-visual-browser-followups") {
+        if (!browserFollowup) throw new Error("Owned browser follow-up resources unavailable.");
+        await type("Owned visual review draft");
+        const grant = await owner.json(
+          config.binary,
+          ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
+          childEnv,
+        );
+        const credential =
+          typeof grant === "object" && grant !== null && "credential" in grant
+            ? grant.credential
+            : null;
+        if (typeof credential !== "string" || credential.length < 8)
+          throw new Error("Owned browser follow-up grant unavailable.");
+        const accessToken = await fixtureAccessToken("http://127.0.0.1:4887", credential);
+        await runBrowserFollowupCaller({
+          CI: childEnv.CI,
+          prepared: browserFollowup,
+          browser,
+          owner,
+          theme,
+          accessToken,
+          threadId: workspace.threadId,
+          cwd: workspace.path,
+          branch: workspace.branch,
+          projectPath: context.projectPath,
+          readDescriptor: readOwnedGitProjectDescriptor,
+          readSnapshot: () => readOwnedGitProjectSnapshot(accessToken),
+          verifyPhysical: async () => {
+            check(
+              JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
+                JSON.stringify({
+                  path: workspace.path,
+                  branch: workspace.branch,
+                  commonDirectory: workspace.commonDirectory,
+                }),
+            );
+          },
+          patch: () =>
+            runOwnedGitProjectCommand(
+              {
+                root: runRoot,
+                fixtureRoot: config.fixture,
+                home: context.fixtureUserHomePath,
+                git: NodePath.join(config.fixture, "bin", "git"),
+              },
+              workspace.path,
+              ["diff", "--no-ext-diff", "--patch", "--minimal", "HEAD", "--"],
+            ).stdout,
+          viewport: async (target, width, height) => {
+            const measured = await bounded(target.execute(readVisualViewport), 2000),
+              outer = await target.getWindowSize(),
+              corrected = correctDesktopUiOuterSize(
+                outer,
+                { width, height },
+                measured,
+                measured.devicePixelRatio,
+              );
+            await target.setWindowSize(corrected.width, corrected.height);
+            await owner.until(async () => {
+              const current = await bounded(target.execute(readVisualViewport), 2000);
+              return current.width === width && current.height === height;
+            });
+          },
+          evidence: config.evidence,
+          captured: capturedVisuals,
+          captures: captures as never,
+          publish: () => write("assertions", { captures, assertions }),
+          step,
+          observeUnsafeCleanup: () => {
+            browserFollowupFixtureSafeToDelete = false;
+          },
+        });
+        assertions.push({
+          theme,
+          rows: 6,
+          baseOriginals: 6,
+          supplements: 1,
+          producerSourceJoined: true,
+          bootstrapReplayJoined: true,
+          completeGroup: false,
+        });
       } else if (config.selection === "release-visual-settings-followups") {
         if (!settingsFollowupUsage || server.child.pid === undefined)
           throw new Error("Owned settings follow-up fixture unavailable.");
@@ -3011,6 +3144,7 @@ export async function runDeliveryRetryQualification() {
         ),
       );
       browser = undefined;
+      if (browserFollowup) await browserFollowup.close();
       await owner.stop(opened.driver);
       await owner.stop(server);
       if (settingsFollowupUsage && settingsFollowupFixtureSafeToDelete)
@@ -3027,30 +3161,34 @@ export async function runDeliveryRetryQualification() {
       validateProviderChatJoins(captures, assertions);
     if (config.selection === "release-visual-project-lifecycle")
       validateProjectLifecycleJoins(captures, assertions);
+    if (config.selection === "release-visual-browser-followups")
+      validateBrowserFollowupJoins(captures as never);
     if (config.selection === "release-visual-pull-requests")
       validatePullRequestsCallerJoins(captures, assertions);
     check(
       captures.length ===
         deliveryThemes.length *
-          (config.selection === "release-visual-pull-requests"
-            ? 24
-            : config.selection === "release-visual-core"
-              ? visualScenes.length
-              : config.selection === "release-visual-settings"
-                ? settingsVisualScenes.length
-                : config.selection === "release-visual-settings-followups"
-                  ? settingsFollowupScenes.length
-                  : config.selection === "release-visual-git-project"
-                    ? gitProjectVisualScenes.length
-                    : config.selection === "release-visual-cursor-question"
-                      ? 1
-                      : config.selection === "release-visual-workspace-substates"
-                        ? workspaceSubstates.length
-                        : config.selection === "release-visual-project-lifecycle"
-                          ? 3
-                          : config.selection === "release-visual-provider-chat"
-                            ? qualifiedProviderChatScenes.length
-                            : deliveryScenes.length) && assertions.length === 2,
+          (config.selection === "release-visual-browser-followups"
+            ? 7
+            : config.selection === "release-visual-pull-requests"
+              ? 24
+              : config.selection === "release-visual-core"
+                ? visualScenes.length
+                : config.selection === "release-visual-settings"
+                  ? settingsVisualScenes.length
+                  : config.selection === "release-visual-settings-followups"
+                    ? settingsFollowupScenes.length
+                    : config.selection === "release-visual-git-project"
+                      ? gitProjectVisualScenes.length
+                      : config.selection === "release-visual-cursor-question"
+                        ? 1
+                        : config.selection === "release-visual-workspace-substates"
+                          ? workspaceSubstates.length
+                          : config.selection === "release-visual-project-lifecycle"
+                            ? 3
+                            : config.selection === "release-visual-provider-chat"
+                              ? qualifiedProviderChatScenes.length
+                              : deliveryScenes.length) && assertions.length === 2,
     );
     success = true;
   } catch (error) {
@@ -3165,9 +3303,10 @@ export async function runDeliveryRetryQualification() {
       )
     )
       success = false;
-    await owner.close(
-      browser ? { browser: () => browser!.deleteSession().then(() => undefined) } : {},
-    );
+    await owner.close({
+      ...(browser ? { browser: () => browser!.deleteSession().then(() => undefined) } : {}),
+      proxies: browserFollowupResources.map((resource) => resource.close),
+    });
     for (const fixture of settingsFollowupUsageFixtures) {
       if (!settingsFollowupFixtureSafeToDelete) break;
       try {
@@ -3201,6 +3340,11 @@ export async function runDeliveryRetryQualification() {
       (!success || owner.failures.length > 0 || !owner.childrenClosed())
     )
       pullRequestsFixtureSafeToDelete = false;
+    if (
+      config.selection === "release-visual-browser-followups" &&
+      !browserFollowupFixtureSafeToDelete
+    )
+      success = false;
     if (config.selection === "release-visual-provider-chat" && !providerChatFixtureSafeToDelete)
       success = false;
     if (
@@ -3225,6 +3369,9 @@ export async function runDeliveryRetryQualification() {
       processes,
       cleanupFailures: owner.failures,
       childProcessesClosed: owner.childrenClosed(),
+      ...(config.selection === "release-visual-browser-followups"
+        ? { browserFollowupFixtureSafeToDelete }
+        : {}),
       ...(config.selection === "release-visual-provider-chat"
         ? { providerChatFixtureSafeToDelete }
         : {}),
@@ -3238,25 +3385,27 @@ export async function runDeliveryRetryQualification() {
         ? { pullRequestsFixtureSafeToDelete, pullRequestsHostingRestorationProofs }
         : {}),
       scope:
-        config.selection === "release-visual-pull-requests"
-          ? "Five existing PR/MR rows in forty-eight source-bound originals through real private Git, fake hosting protocol and public typed UI. Independent original pixel review and native/full82 acceptance remain unqualified."
-          : config.selection === "release-visual-core"
-            ? "First nine Linux Chromium scene pairs only. Original PNGs require independent review; unpictured surfaces and the remaining issue29 matrix are unqualified. No Playwright, Tauri or final-release acceptance claim."
-            : config.selection === "release-visual-settings"
-              ? "Four Linux Chromium settings scene pairs only. Add instance wizard and declared unpictured substates remain unqualified. Original light/dark PNGs require independent review; no native or full-matrix qualification claim."
-              : config.selection === "release-visual-settings-followups"
-                ? "Four existing Settings rows in eighteen Linux Chromium originals through native A/B APIs and public controls. completeGroup false; full82/164 scope, independent original pixel review and native/final acceptance remain required."
-                : config.selection === "release-visual-git-project"
-                  ? "Eleven fixed Git/project originals per theme; Tags groups/names remain partial. completeGroup remains false. Full82/164 originals and unpictured substates remain obligatory and unqualified; independent original-pixel review required."
-                  : config.selection === "release-visual-cursor-question"
-                    ? "One fixed Cursor later-multiselect question pair only through native ACP and public choices/Submit. completeGroup remains false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
-                    : config.selection === "release-visual-workspace-substates"
-                      ? "Three existing-row substates in six extra originals only: selected stash diff, owned Files item menu and public terminal/activity/more-chat lines. Core nine and full82/164 remain unchanged; completeGroup false, independent original pixel review and native/final acceptance remain required."
-                      : config.selection === "release-visual-project-lifecycle"
-                        ? "Three existing project lifecycle rows in six Linux Chromium originals only through maintained Codex, real owned Git transfer and server Git trust policy. completeGroup false; full82/164 and independent original pixel review remain required. No native or final-product acceptance claim."
-                        : config.selection === "release-visual-provider-chat"
-                          ? "Seven existing provider/chat rows in fourteen originals only through native Codex/Claude and public controls. Cursor owns the separate question pair. completeGroup false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
-                          : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
+        config.selection === "release-visual-browser-followups"
+          ? "Six existing browser rows in fourteen source-bound originals through genuine staging/cancellation, same-terminal reconnect/Fit, real Git diff, unchanged slow diagnostics and immutable hosted entry. completeGroup false; original82/164, independent original pixel review and native/final acceptance remain required."
+          : config.selection === "release-visual-pull-requests"
+            ? "Five existing PR/MR rows in forty-eight source-bound originals through real private Git, fake hosting protocol and public typed UI. Independent original pixel review and native/full82 acceptance remain unqualified."
+            : config.selection === "release-visual-core"
+              ? "First nine Linux Chromium scene pairs only. Original PNGs require independent review; unpictured surfaces and the remaining issue29 matrix are unqualified. No Playwright, Tauri or final-release acceptance claim."
+              : config.selection === "release-visual-settings"
+                ? "Four Linux Chromium settings scene pairs only. Add instance wizard and declared unpictured substates remain unqualified. Original light/dark PNGs require independent review; no native or full-matrix qualification claim."
+                : config.selection === "release-visual-settings-followups"
+                  ? "Four existing Settings rows in eighteen Linux Chromium originals through native A/B APIs and public controls. completeGroup false; full82/164 scope, independent original pixel review and native/final acceptance remain required."
+                  : config.selection === "release-visual-git-project"
+                    ? "Eleven fixed Git/project originals per theme; Tags groups/names remain partial. completeGroup remains false. Full82/164 originals and unpictured substates remain obligatory and unqualified; independent original-pixel review required."
+                    : config.selection === "release-visual-cursor-question"
+                      ? "One fixed Cursor later-multiselect question pair only through native ACP and public choices/Submit. completeGroup remains false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
+                      : config.selection === "release-visual-workspace-substates"
+                        ? "Three existing-row substates in six extra originals only: selected stash diff, owned Files item menu and public terminal/activity/more-chat lines. Core nine and full82/164 remain unchanged; completeGroup false, independent original pixel review and native/final acceptance remain required."
+                        : config.selection === "release-visual-project-lifecycle"
+                          ? "Three existing project lifecycle rows in six Linux Chromium originals only through maintained Codex, real owned Git transfer and server Git trust policy. completeGroup false; full82/164 and independent original pixel review remain required. No native or final-product acceptance claim."
+                          : config.selection === "release-visual-provider-chat"
+                            ? "Seven existing provider/chat rows in fourteen originals only through native Codex/Claude and public controls. Cursor owns the separate question pair. completeGroup false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
+                            : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
     });
   }
   return success ? 0 : 1;

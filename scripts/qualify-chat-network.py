@@ -97,7 +97,7 @@ def _setup(environment, run_owned, context, readlink, platform, clock, read_owne
             require(canonical.is_file() and str(canonical) == owner[15] == environment.get(native_key))
         elif len(owner) == 16:
             require(native_key not in environment)
-            require(owner[14] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups', 'release-visual-pull-requests'] and not any(key in environment for key in ui_keys))
+            require(owner[14] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat', 'release-visual-project-lifecycle', 'release-visual-settings-followups', 'release-visual-pull-requests', 'release-visual-browser-followups'] and not any(key in environment for key in ui_keys))
             require(environment.get(delivery_selection) == owner[14])
             web = Path(owner[15])
             require(web.is_absolute())

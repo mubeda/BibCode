@@ -75,6 +75,71 @@ class SettingsFollowupBoundariesTests(unittest.TestCase):
                 finally: shutil.rmtree(fixture, ignore_errors=True)
 
 
+class BrowserFollowupBoundariesTests(unittest.TestCase):
+    def test_actual_outer_initial_and_postrun_consumers_join_unchanged_inputs_and_refuse_either_ui_drift(self):
+        for scenario, drift in [('release-visual-browser-followups', None), ('release-visual-browser-followups', 'web'), ('release-visual-browser-followups', 'hosted-web'), ('release-visual-core', 'hosted-web'), ('remote-updates-ui', 'hosted-web')]:
+            with self.subTest(scenario=scenario, drift=drift), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory).resolve();server=root/'server';server.write_bytes(b'inert binary');web=root/'web';web.mkdir();(web/'index.html').write_bytes(b'inert primary');hosted=root/'hosted-web';hosted.mkdir();(hosted/'index.html').write_bytes(b'inert hosted');(hosted/'qualified-hosted-mode.js').write_bytes(b'inert SDK probe');fake=root/'fake';fake.write_bytes(b'inert fake host');owned=[];commands=[]
+                programs={name:str(server) for name in ['unshare','google-chrome','chromedriver','git','dirname','ip']}
+                def run(argv, **options):
+                    commands.append(argv);inner=argv.index('inner');owned.append(Path(argv[inner+2]));self.assertEqual(options,{'timeout':660 if scenario != 'remote-updates-ui' else 1860,'grace':15})
+                    if drift: (root/drift/'index.html').write_bytes(b'inert changed original')
+                    return {'exitCode':0,'supervisorReaped':True}, []
+                output=io.StringIO();original_readlink=qualification.os.readlink
+                def readlink(path):return 'net:[inert]' if str(path)=='/proc/self/ns/net' else original_readlink(path)
+                try:
+                    with mock.patch.dict(os.environ,{'GITHUB_RUN_ID':'inert-run','GITHUB_SHA':'a'*40,'RUNNER_TEMP':str(root),'BIBCODE_UPLOAD_SERVER':str(server),'BIBCODE_DELIVERY_UI_WEB':str(web),'BIBCODE_RELEASE_UI_WEB':str(web),'BIBCODE_RELEASE_UI_FAKE_HOST':str(fake)}), mock.patch.object(qualification,'host_programs',return_value=programs), mock.patch.object(qualification,'resolve_node_runtime',return_value=str(server)), mock.patch.object(qualification.os,'readlink',side_effect=readlink), mock.patch.object(qualification.subprocess,'check_output',return_value='inert version\n'), mock.patch.object(qualification,'run_owned_command',side_effect=run), mock.patch.object(qualification,'cleanup_ui_fixture',return_value=True), contextlib.redirect_stdout(output):
+                        status=qualification.outer(scenario)
+                    evidence=root/(qualification.scenario_settings(scenario)['evidence_prefix']+'inert-run');initial=json.loads((evidence/'provenance.json').read_text())['inputs'];result=json.loads((evidence/'supervisor.json').read_text());unchanged=scenario!='release-visual-browser-followups' or drift is None
+                    self.assertEqual(status,0 if unchanged else 1);self.assertEqual(result['buildInputsUnchanged'],unchanged);self.assertTrue(result['hostNetworkNamespaceUnchanged']);self.assertEqual(len(commands),1)
+                    self.assertEqual('hostedWebSha256' in initial,scenario=='release-visual-browser-followups');self.assertEqual('hostedWebFiles' in initial,scenario=='release-visual-browser-followups')
+                    if scenario=='release-visual-browser-followups':self.assertEqual(set(json.loads(output.getvalue())),{'exitCode','selection','supervisorReaped'})
+                finally:
+                    for fixture in owned:shutil.rmtree(fixture,ignore_errors=True)
+
+    def test_fixed_two_scalar_controller_and_original_bounds(self):
+        self.assertEqual(qualification.scenario_settings('release-visual-browser-followups'), {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts', 'inner_timeout': 600, 'outer_timeout': 660, 'evidence_prefix': 'issue29-browser-followups-', 'fixture_prefix': 'bc-vb-'})
+        self.assertEqual(qualification.inner_resources(['release-visual-browser-followups', '/owned/web']), ('release-visual-browser-followups', None, '/owned/web', 'core'))
+        for arguments in [['release-visual-browser-followups'], ['release-visual-browser-followups', '/owned/web', '/hosted'], ['release-visual-browser-followups/other', '/owned/web']]:
+            with self.assertRaises(RuntimeError): qualification.inner_resources(arguments)
+
+    def test_actual_entrypoint_refuses_with_only_closed_browser_fields(self):
+        entrypoint=ast.parse(SOURCE.read_text()).body[-1]; output=io.StringIO()
+        def stop(code): raise SystemExit(code)
+        namespace={'__name__':'__main__','sys':types.SimpleNamespace(argv=['qualifier','--scenario','release-visual-browser-followups'],exit=stop),'json':json,'outer':mock.Mock(side_effect=RuntimeError('inert private input'))}
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as ended:
+            exec(compile(ast.Module(body=[entrypoint],type_ignores=[]),'owned-browser-entrypoint','exec'),namespace)
+        self.assertEqual(ended.exception.code,1);self.assertEqual(json.loads(output.getvalue()),{'refused':True,'stage':'browser-controller'})
+
+    def test_actual_immutable_build_inputs_join_the_derived_hosted_tree_and_refuse_aliases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();server=root/'server';server.write_bytes(b'inert');web=root/'web';web.mkdir();(web/'index.html').write_bytes(b'inert primary');hosted=root/'hosted-web';hosted.mkdir();(hosted/'index.html').write_bytes(b'inert hosted');(hosted/'qualified-hosted-mode.js').write_bytes(b'inert SDK probe')
+            first=qualification.browser_input_hashes(str(server),str(web));(hosted/'qualified-hosted-mode.js').write_bytes(b'changed')
+            self.assertNotEqual(first,qualification.browser_input_hashes(str(server),str(web)))
+            alias=root/'alias';alias.symlink_to(hosted,target_is_directory=True)
+            with self.assertRaises(RuntimeError): qualification.browser_input_hashes(str(server),str(alias))
+            (hosted/'unsafe').symlink_to(server)
+            with self.assertRaises(RuntimeError): qualification.browser_input_hashes(str(server),str(web))
+
+    def test_cleanup_retains_fixture_until_all_browser_owners_and_source_join(self):
+        for mode in ['safe','missing','unsafe','source','selection','live','cleanup']:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                evidence=Path(directory);fixture=Path(tempfile.mkdtemp(prefix='bc-vb-',dir='/tmp'));(fixture/'retained').write_bytes(b'inert owned')
+                try:
+                    (evidence/'namespace-cleanup.json').write_text(json.dumps({'remaining':[],'controllerReaped':True}))
+                    result={'selection':'release-visual-browser-followups','source':'a'*40,'browserFollowupFixtureSafeToDelete':True,'childProcessesClosed':True,'cleanupFailures':[]}
+                    if mode=='missing':result.pop('browserFollowupFixtureSafeToDelete')
+                    if mode=='unsafe':result['browserFollowupFixtureSafeToDelete']=False
+                    if mode=='source':result['source']='b'*40
+                    if mode=='selection':result['selection']='release-visual-core'
+                    if mode=='live':result['childProcessesClosed']=False
+                    if mode=='cleanup':result['cleanupFailures']=[{}]
+                    (evidence/'result.json').write_text(json.dumps(result))
+                    with mock.patch.dict(os.environ,{'GITHUB_SHA':'a'*40}):deleted=qualification.cleanup_ui_fixture(fixture,evidence,{'supervisorReaped':True},'release-visual-browser-followups')
+                    self.assertEqual(deleted,mode=='safe');self.assertEqual(fixture.exists(),mode!='safe')
+                finally:shutil.rmtree(fixture,ignore_errors=True)
+
+
 class LifecycleAdoptedReaperTests(unittest.TestCase):
     def test_unassigned_controller_callbacks_cannot_reap_any_process(self):
         children = mock.Mock(return_value=[(42, 'Z'), (57, 'Z')]); waitpid = mock.Mock()

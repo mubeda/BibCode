@@ -50,6 +50,8 @@ def actual_owner_handoff(root, scenario, matrix='core'):
     selection = next(node for node in outer.body if isinstance(node, ast.If) and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) and call.func.value.id == 'command' and call.func.attr == 'extend' for call in ast.walk(node)))
     fake = root / 'fake-host'; fake.write_bytes(b'owned inert file')
     web = root / 'web'; web.mkdir(); (web / 'index.html').write_text('owned inert web')
+    if scenario == 'release-visual-browser-followups':
+        hosted = root / 'hosted-web'; hosted.mkdir(); (hosted / 'index.html').write_text('owned inert hosted web'); (hosted / 'qualified-hosted-mode.js').write_text('owned inert SDK probe')
     scope = {**qualifier.__dict__, 'scenario': scenario, 'ui_matrix': matrix,
              'programs': {key: sys.executable for key in ['google-chrome', 'chromedriver', 'git', 'dirname', 'ip']} | {'unshare': '/owned/unshare'},
              'evidence': root / 'evidence', 'fixture': root, 'node': sys.executable, 'server': sys.executable,
@@ -128,6 +130,24 @@ class NetworkTests(unittest.TestCase):
                 with self.assertRaises(network.NetworkRefused):
                     self.setup_network(fake, env={**env, key: value}, owner=owner)
                 self.assertEqual(fake.calls, [])
+
+
+    def test_actual_browser_producer_and_consumer_join_the_closed_sixteen_argument_owner(self):
+        with tempfile.TemporaryDirectory(prefix='browser-owner-inert-') as directory:
+            owner,env=actual_owner_handoff(Path(directory),'release-visual-browser-followups')
+            self.assertEqual(len(owner),16);self.assertEqual(owner[14],'release-visual-browser-followups');fake=FakeIp();proof=self.setup_network(fake,env=env,owner=owner)
+            self.assertEqual(fake.mutations,MUTATIONS);self.assertTrue(proof['pidOwnerMatches']);self.assertTrue(proof['privateNet'])
+
+    def test_browser_owner_refuses_foreign_selector_web_namespace_and_extra_fields_before_ip_calls(self):
+        with tempfile.TemporaryDirectory(prefix='browser-owner-inert-') as directory:
+            owner,env=actual_owner_handoff(Path(directory),'release-visual-browser-followups');other=Path(directory)/'foreign';other.mkdir();cases=[(owner+['extra'],env),(owner[:-1],env)]
+            for index,value in [(14,'release-visual-core'),(14,'../arbitrary'),(15,str(other.resolve()))]:
+                bad=list(owner);bad[index]=value;cases.append((bad,env))
+            for key,value in [('BIBCODE_DELIVERY_UI_SELECTION','release-visual-core'),('BIBCODE_UPLOAD_NETNS','net:[999]'),('BIBCODE_UPLOAD_USERNS','user:[999]'),('BIBCODE_RELEASE_UI_MATRIX','core')]:cases.append((owner,{**env,key:value}))
+            for bad,environment in cases:
+                fake=FakeIp()
+                with self.assertRaises(network.NetworkRefused):self.setup_network(fake,env=environment,owner=bad)
+                self.assertEqual(fake.calls,[])
 
     def test_actual_project_lifecycle_owner_keeps_exact_sixteen_argument_containment(self):
         with tempfile.TemporaryDirectory(prefix='lifecycle-owner-contract-') as directory:

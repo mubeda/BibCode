@@ -1,0 +1,187 @@
+import { expect, it } from "vite-plus/test";
+import { browserFollowupRows } from "./release-visual-browser-followups.ts";
+import {
+  runBrowserFollowupScene,
+  type BrowserFollowupProducerInput,
+} from "./release-visual-browser-followups-producer.ts";
+import { withBrowserFollowupResource } from "./release-visual-browser-followups-owner.ts";
+function fixture(failCapture = false) {
+  const actions: string[] = [],
+    captures: string[] = [];
+  let cleaned = 0,
+    identity = 0;
+  const original = new Error("Inert original capture failure");
+  const browser = {
+    $$: () => ({ length: 1 }),
+    $: (selector: string) => ({
+      elementId: "inert-element",
+      waitForDisplayed: async () => {},
+      waitForEnabled: async () => {},
+      isDisplayed: async () => true,
+      getText: async () => "Owned visual review draft",
+      getAttribute: async () => "false",
+      click: async () => {
+        actions.push(selector);
+      },
+      addValue: async () => {},
+    }),
+    keys: async () => {},
+    execute: async () => "workspace",
+    elementSendKeys: async () => {
+      actions.push("native-file-entry");
+    },
+  } as unknown as BrowserFollowupProducerInput["browser"];
+  const scope = async <A>(run: () => Promise<A>) =>
+    withBrowserFollowupResource({
+      run,
+      cleanup: async () => {
+        cleaned++;
+      },
+      observeUnsafeCleanup: () => {},
+    });
+  const input: BrowserFollowupProducerInput = {
+    browser,
+    owner: {
+      until: async (predicate) => {
+        if (!(await predicate())) throw new Error("Inert source did not become ready");
+      },
+    },
+    verifyOwnedIdentity: async () => {
+      identity++;
+    },
+    viewport: async () => {},
+    step: () => {},
+    observeUnsafeCleanup: () => {},
+    capture: async (scene, _, verify) => {
+      await verify();
+      if (failCapture) throw original;
+      await verify();
+      captures.push(scene);
+    },
+    upload: {
+      withSlowTransport: (run) =>
+        scope(() =>
+          run({
+            path: "/owned/upload-browser-followup.png",
+            verify: async () => ({
+              originalPngMatched: true,
+              stagedBeginObserved: true,
+              appendObserved: true,
+              unfinished: true,
+              actualSlowTransport: true,
+              bytes: 512 * 1024,
+              sha256: "a".repeat(64),
+            }),
+            verifyCancelled: async () => {
+              actions.push("cancel-joined");
+            },
+          }),
+        ),
+    },
+    terminal: {
+      withSecondWindow: (run) =>
+        scope(() =>
+          run({
+            browser,
+            label: "Terminal 1",
+            verify: async () => ({
+              sameTerminalMatched: true,
+              twoAttachmentsObserved: true,
+              distinctSizeClaims: true,
+              originalOutputMatched: true,
+              sizeOwnerMatched: true,
+            }),
+            verifyFit: async () => {
+              actions.push("fit-joined");
+            },
+          }),
+        ),
+    },
+    sourceControl: {
+      verify: async () => ({
+        ownedRepositoryMatched: true,
+        originalPatchMatched: true,
+        sourceHashMatched: true,
+        untruncated: true,
+      }),
+    },
+    slow: {
+      withHeldReply: (run) =>
+        scope(() =>
+          run({
+            arm: async () => {
+              actions.push("actual-reply-arm");
+            },
+            verify: async () => ({
+              requestObserved: true,
+              originalReplyHeld: true,
+              elapsedBeyondThreshold: true,
+              method: "server.getTraceDiagnostics",
+              thresholdMs: 15000,
+            }),
+            release: async () => {
+              actions.push("original-reply-release");
+            },
+          }),
+        ),
+    },
+    hosted: {
+      withOwnedEntry: (_, run) =>
+        scope(() =>
+          run({
+            browser,
+            verify: async () => ({
+              genuineHostedBuild: true,
+              backendConfigAbsent: true,
+              sameSourceMatched: true,
+              validOwnedEntry: true,
+              consentUnsubmitted: true,
+            }),
+          }),
+        ),
+    },
+  };
+  return { input, actions, captures, original, read: () => ({ cleaned, identity }) };
+}
+it.each(browserFollowupRows)(
+  "binds %s only to its actual public entry and two source joins",
+  async (row) => {
+    const value = fixture();
+    const receipt = await runBrowserFollowupScene(value.input, row);
+    expect(receipt.completeGroup).toBe(false);
+    expect(value.captures).toEqual(
+      row === "source-control-panel" ? ["source-control-panel-overview", row] : [row],
+    );
+    expect(value.read().identity).toBeGreaterThanOrEqual(4);
+    if (row.startsWith("hosted")) expect(value.actions).toEqual([]);
+    if (row === "terminal-shared-size") {
+      expect(value.actions).toContain("fit-joined");
+      expect(value.actions.some((value) => value.includes("Add Terminal"))).toBe(false);
+    }
+    if (row === "source-control-panel")
+      expect(value.actions.at(-1)).toBe('[aria-label="Restore panel size"]');
+    if (row === "slow-requests")
+      expect(value.actions.indexOf("actual-reply-arm")).toBeLessThan(
+        value.actions.indexOf('[aria-label="Refresh trace diagnostics"]'),
+      );
+  },
+);
+it.each(browserFollowupRows)(
+  "keeps an original %s capture failure and joins its owner cleanup",
+  async (row) => {
+    const value = fixture(true);
+    await expect(runBrowserFollowupScene(value.input, row)).rejects.toBe(value.original);
+    expect(value.captures).toEqual([]);
+    if (row === "source-control-panel")
+      expect(value.actions.at(-1)).toBe('[aria-label="Restore panel size"]');
+    else expect(value.read().cleaned).toBe(1);
+  },
+);
+it("refuses source-less or partially joined captures before issuing a success assertion", async () => {
+  const value = fixture();
+  value.input.capture = async (_, __, verify) => {
+    await verify();
+  };
+  await expect(runBrowserFollowupScene(value.input, "hosted-pair-confirm")).rejects.toThrow();
+  expect(value.read().cleaned).toBe(1);
+});

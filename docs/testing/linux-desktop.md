@@ -2428,3 +2428,36 @@ unsafe cleanup refuses retention. No crop, resize or alternate window is allowed
 This is a six-original partition, not full-matrix or native Preview annotation
 acceptance. The normal six-platform seeded matrix and ordinary lanes remain the
 default; this explicit opt-in does not qualify omitted platforms.
+
+### Contained browser follow-up visual qualification
+
+The selected `release-visual-browser-followups` batch retains the six existing
+browser rows in both themes plus the Source Control overview supplement. Its
+fourteen original PNGs remain 1280 by 960 and require independent review.
+Build the ordinary primary UI with the owned public backend at 4887 and the
+separate hosted UI at 4893 without backend/desktop configuration. Both builds
+use the same source and existing web build lock; the hosted SDK probe re-exports
+the actual public hosted-mode helper. Preserve both immutable input trees.
+
+The existing guarded Rust CLI binds raw4897. A zero-rate maintained bootstrap
+proxy at 4887 supports ordinary pairing, managed workspace selection and public
+Terminal creation. Before originals, join that proxy and rebind unchanged4887
+through the maintained throttle and original raw4894 observer to4897. Verify the
+same boot/storage/source, terminal PID and exact original history after the real
+renderer reconnect. Do not set renderer stores or synthetic protocol values.
+The staged image is the maintained512KiB original fixture with a real slow
+transport and public Cancel. The second window attaches the same existing
+terminal and uses public Fit. Working-tree diff bytes come from actual Git.
+The diagnostics scene holds one original server reply beyond the unchanged
+15-second threshold. Hosted entries use fresh unused loopback grants, actual
+SDK/product scrub readiness and exact grant revocation; never submit Pair.
+
+Retain exactly the fourteen named originals and finite phase/failure/provenance,
+result/assertions/namespace-cleanup/supervisor JSON files. No raw protocol,
+credential, client, history, PID, route or private logs enter public evidence.
+Close only owned windows, release held replies, unblock/join owned cancellation,
+restore proxy/viewport/UI leases and revoke owned grants before resource and
+child cleanup. Repeated cleanup joins the same retained promise. Any unsafe
+startup, drift, cancellation or teardown refuses fixture deletion and acceptance.
+Complete-group and full82/164 acceptance remain pending; this batch does not
+qualify native or Preview surfaces.
