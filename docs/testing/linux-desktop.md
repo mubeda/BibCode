@@ -2499,6 +2499,14 @@ WebSocket endpoint remains 4887. Bind that hint in the immutable build recipe;
 missing or stale hints fail admission. Node bearer forwarding alone does not
 prove this browser cookie flow. Preserve hosted blank backend/dev configuration
 and the server's existing CORS, cookie and ticket authorization policies.
+Verify that primary descriptor discovery and the stored broker HTTP target use
+the same resolved UI HTTP route as authentication, from one topology snapshot.
+Its registration cache identity must include that effective HTTP address, while
+the snapshot's WebSocket address remains unchanged. Cover a dev-origin change,
+desktop-managed bypass, non-loopback direct access and withheld-topology retention
+before native capture. A malformed dev-origin hint must enter the existing
+topology-read failure path, retain the cached registration and recover on a later
+valid poll. Helper success does not replace the real connection proof.
 
 The existing guarded Rust CLI binds raw4897. A zero-rate maintained bootstrap
 proxy at 4887 supports ordinary pairing, managed workspace selection and public

@@ -83,7 +83,10 @@ vi.mock("../environments/primary/httpLayer", async () => {
   return { primaryEnvironmentHttpLayer: Layer.empty };
 });
 
-vi.mock("../environments/primary/target", () => ({
+vi.mock("../environments/primary/target", async () => ({
+  ...(await vi.importActual<typeof import("../environments/primary/target")>(
+    "../environments/primary/target",
+  )),
   readPrimaryEnvironmentTarget: () => {
     if (pf.primaryTarget instanceof Error) {
       throw pf.primaryTarget;
@@ -1264,6 +1267,126 @@ describe("connectionPlatformLayer withheld desktop primary", () => {
     }).pipe(
       Effect.provide(Layer.mergeAll(connectionPlatformLayer, TestClock.layer())),
       Effect.scoped,
+    );
+  });
+});
+
+describe("connectionPlatformLayer resolved primary HTTP", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.effect("refreshes a primary registration when the effective HTTP proxy changes", () => {
+    stubBrowser();
+    Object.assign(window, { location: new URL("http://127.0.0.1:4885/") });
+    vi.stubEnv("VITE_DEV_SERVER_URL", "http://127.0.0.1:4885");
+    pf.primaryTarget = {
+      source: "configured",
+      target: { httpBaseUrl: "http://127.0.0.1:4887/", wsBaseUrl: "ws://127.0.0.1:4887/" },
+    };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const pull = yield* Stream.toPull(source.registrations);
+      const [proxied] = yield* pull;
+      expect(proxied).toHaveLength(1);
+      expect(proxied[0]?.target).toMatchObject({
+        httpBaseUrl: "http://127.0.0.1:4885",
+        wsBaseUrl: "ws://127.0.0.1:4887/",
+      });
+      vi.stubEnv("VITE_DEV_SERVER_URL", "");
+      const next = yield* Effect.forkChild(pull);
+      yield* TestClock.adjust("3 seconds");
+      const [direct] = yield* Fiber.join(next);
+      expect(direct[0]?.target).toMatchObject({
+        httpBaseUrl: "http://127.0.0.1:4887/",
+        wsBaseUrl: "ws://127.0.0.1:4887/",
+      });
+      expect(direct[0]).not.toBe(proxied[0]);
+      expect(pf.descriptorCalls).toEqual(["http://127.0.0.1:4885", "http://127.0.0.1:4887/"]);
+    }).pipe(
+      Effect.provide(Layer.mergeAll(connectionPlatformLayer, TestClock.layer())),
+      Effect.scoped,
+    );
+  });
+
+  it.effect("retains the cached primary through a malformed proxy hint and resumes polling", () => {
+    stubBrowser();
+    Object.assign(window, { location: new URL("http://127.0.0.1:4885/") });
+    vi.stubEnv("VITE_DEV_SERVER_URL", "http://127.0.0.1:4885");
+    pf.primaryTarget = {
+      source: "configured",
+      target: { httpBaseUrl: "http://127.0.0.1:4887/", wsBaseUrl: "ws://127.0.0.1:4887/" },
+    };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const pull = yield* Stream.toPull(source.registrations);
+      const [initial] = yield* pull;
+      expect(initial).toHaveLength(1);
+      vi.stubEnv("VITE_DEV_SERVER_URL", "http://[");
+      const malformedPoll = yield* Effect.forkChild(pull);
+      yield* TestClock.adjust("3 seconds");
+      const [retained] = yield* Fiber.join(malformedPoll);
+      expect(retained).toHaveLength(1);
+      expect(retained[0]).toBe(initial[0]);
+      expect(pf.descriptorCalls).toEqual(["http://127.0.0.1:4885"]);
+      vi.stubEnv("VITE_DEV_SERVER_URL", "http://127.0.0.1:4885");
+      const restoredPoll = yield* Effect.forkChild(pull);
+      yield* TestClock.adjust("3 seconds");
+      const [restored] = yield* Fiber.join(restoredPoll);
+      expect(restored).toHaveLength(1);
+      expect(restored[0]).toBe(initial[0]);
+      expect(restored[0]?.target).toMatchObject({
+        httpBaseUrl: "http://127.0.0.1:4885",
+        wsBaseUrl: "ws://127.0.0.1:4887/",
+      });
+      expect(pf.descriptorCalls).toEqual(["http://127.0.0.1:4885"]);
+    }).pipe(
+      Effect.provide(Layer.mergeAll(connectionPlatformLayer, TestClock.layer())),
+      Effect.scoped,
+    );
+  });
+
+  it.effect("uses one desktop topology snapshot for HTTP and WebSocket discovery", () => {
+    let topologyReads = 0;
+    const first = {
+      id: "primary",
+      label: "Local",
+      httpBaseUrl: "http://127.0.0.1:14373/",
+      wsBaseUrl: "ws://127.0.0.1:14373/",
+    };
+    const later = {
+      ...first,
+      httpBaseUrl: "http://127.0.0.1:14374/",
+      wsBaseUrl: "ws://127.0.0.1:14374/",
+    };
+    stubBrowser({
+      desktopBridge: {
+        ...makeBridge([]),
+        getLocalEnvironmentBootstraps: () => [++topologyReads === 1 ? first : later],
+      },
+    });
+    Object.assign(window, { location: new URL("http://127.0.0.1:4885/") });
+    vi.stubEnv("VITE_DEV_SERVER_URL", "http://127.0.0.1:4885");
+    return Effect.gen(function* () {
+      const targetModule = yield* Effect.promise(() => import("../environments/primary/target"));
+      const actualTargetModule = yield* Effect.promise(() =>
+        vi.importActual<typeof import("../environments/primary/target")>(
+          "../environments/primary/target",
+        ),
+      );
+      vi.spyOn(targetModule, "readPrimaryEnvironmentTarget").mockImplementation(
+        actualTargetModule.readPrimaryEnvironmentTarget,
+      );
+      const source = yield* PlatformConnectionSource;
+      const result = Option.getOrThrow(yield* Stream.runHead(source.registrations));
+      expect(result[0]?.target).toMatchObject({
+        httpBaseUrl: first.httpBaseUrl,
+        wsBaseUrl: first.wsBaseUrl,
+      });
+      expect(topologyReads).toBe(1);
+      expect(pf.descriptorCalls).toEqual([first.httpBaseUrl]);
+    }).pipe(
+      Effect.provide(connectionPlatformLayer),
+      Effect.scoped,
+      Effect.ensuring(Effect.sync(() => vi.restoreAllMocks())),
     );
   });
 });
