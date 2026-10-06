@@ -8,6 +8,8 @@ export function makeTestExecutionEnvironmentCapabilities(
     repositoryIdentity: false,
     terminalOrderedInput: false,
     terminalSizeOwnership: false,
+    terminalImagePaste: false,
+    pullRequestCreateOptions: false,
     worktreeCatalog: false,
     worktreeCatalogRefreshReason: false,
     vcsStatusSummary: false,

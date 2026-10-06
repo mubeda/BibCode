@@ -285,6 +285,21 @@ pub struct Vocabulary {
     pub truncated: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ViewerRef {
+    pub id: String,
+    pub label: String,
+}
+
+/// Prefill for the create dialog; GitHub has no per-request merge settings.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDefaults {
+    pub viewer: Option<ViewerRef>,
+    pub squash: Option<String>,
+    pub remove_source_branch: Option<bool>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ListState {

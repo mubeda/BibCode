@@ -3,7 +3,10 @@ import type {
   GitActionProgressPhase,
   GitManagerCommitEntry,
   GitManagerPullRequestsResult,
+  GitPullRequestCreateOptions,
   GitRunStackedActionResult,
+  PullRequestsCreateDefaults,
+  PullRequestsSquashOption,
   PullRequestsProviderKind,
   SourceControlProviderInfo,
   VcsStatusResult,
@@ -90,7 +93,11 @@ export interface ReviewedPullRequest {
  * The stacked `create_pr` action carrying the reviewed branches, title and body. The body
  * is sent only when the user wrote one so the server keeps its empty default.
  */
-export function createPullRequestAction(actionId: string, reviewed: ReviewedPullRequest) {
+export function createPullRequestAction(
+  actionId: string,
+  reviewed: ReviewedPullRequest,
+  options?: GitPullRequestCreateOptions,
+) {
   const title = reviewed.title.trim();
   const body = reviewed.body;
   return {
@@ -100,7 +107,102 @@ export function createPullRequestAction(actionId: string, reviewed: ReviewedPull
     ...(reviewed.headBranch === undefined ? {} : { pullRequestHeadBranch: reviewed.headBranch }),
     ...(title.length > 0 ? { pullRequestTitle: title } : {}),
     ...(body.trim().length > 0 ? { pullRequestBody: body } : {}),
+    ...(options === undefined ? {} : { pullRequestOptions: options }),
   };
+}
+
+export interface VocabularyChoice {
+  readonly id: string;
+  readonly label: string;
+}
+
+export interface CreateOptionsState {
+  readonly draft: boolean;
+  readonly assignees: readonly VocabularyChoice[];
+  readonly reviewers: readonly VocabularyChoice[];
+  readonly labels: readonly VocabularyChoice[];
+  readonly milestone: VocabularyChoice | null;
+  /** `null` until the user changes it; the dialog then shows the project's default. */
+  readonly removeSourceBranch: boolean | null;
+  readonly squash: boolean | null;
+}
+
+export const EMPTY_CREATE_OPTIONS: CreateOptionsState = {
+  draft: false,
+  assignees: [],
+  reviewers: [],
+  labels: [],
+  milestone: null,
+  removeSourceBranch: null,
+  squash: null,
+};
+
+/** Create options exist for GitHub and GitLab only; the server refuses them elsewhere. */
+export function supportsCreateOptions(providerKind: string | null): boolean {
+  return providerKind === "github" || providerKind === "gitlab";
+}
+
+/** The reviewed options, or `undefined` when nothing differs from the provider's defaults. */
+export function createOptionsPayload(
+  state: CreateOptionsState,
+  providerKind: string | null,
+): GitPullRequestCreateOptions | undefined {
+  if (!supportsCreateOptions(providerKind)) return undefined;
+  const gitlab = providerKind === "gitlab";
+  const payload: GitPullRequestCreateOptions = {
+    draft: state.draft,
+    assignees: state.assignees.map((choice) => choice.id),
+    reviewers: state.reviewers.map((choice) => choice.id),
+    labels: state.labels.map((choice) => choice.id),
+    milestone:
+      state.milestone === null ? null : { id: state.milestone.id, title: state.milestone.label },
+    removeSourceBranch: gitlab ? state.removeSourceBranch : null,
+    squash: gitlab ? state.squash : null,
+  };
+  const empty =
+    !payload.draft &&
+    payload.assignees.length === 0 &&
+    payload.reviewers.length === 0 &&
+    payload.labels.length === 0 &&
+    payload.milestone === null &&
+    payload.removeSourceBranch === null &&
+    payload.squash === null;
+  return empty ? undefined : payload;
+}
+
+/**
+ * The merge options exactly as the dialog displays them: once the project's defaults are known,
+ * untouched boxes send their shown value, and a project-forced squash always wins.
+ */
+export function shownCreateOptions(
+  state: CreateOptionsState,
+  defaults: PullRequestsCreateDefaults | null,
+): CreateOptionsState {
+  if (defaults === null) return state;
+  const squash = squashControl(defaults);
+  return {
+    ...state,
+    removeSourceBranch: state.removeSourceBranch ?? defaults.removeSourceBranch,
+    // An unreported project setting stays the project's decision until the user picks one.
+    squash: squash.locked
+      ? squash.checked
+      : (state.squash ?? (defaults.squash === null ? null : squash.checked)),
+  };
+}
+
+export function squashControl(
+  defaults: { readonly squash: PullRequestsSquashOption | null } | null,
+): { checked: boolean; locked: boolean; note: string | null } {
+  switch (defaults?.squash) {
+    case "always":
+      return { checked: true, locked: true, note: "This project always squashes commits." };
+    case "never":
+      return { checked: false, locked: true, note: "This project never squashes commits." };
+    case "default_on":
+      return { checked: true, locked: false, note: null };
+    default:
+      return { checked: false, locked: false, note: null };
+  }
 }
 
 export interface ExistingPullRequestSummary {
@@ -210,14 +312,29 @@ export type CreatePullRequestProgress =
       /** The branch was published in this attempt before the failure. */
       readonly branchPublished: boolean;
     }
-  | { readonly kind: "created"; readonly url: string | null; readonly number: number | null }
-  | { readonly kind: "existing"; readonly url: string | null; readonly number: number | null };
+  | {
+      readonly kind: "created";
+      readonly url: string | null;
+      readonly number: number | null;
+      readonly warning?: string;
+    }
+  | {
+      readonly kind: "existing";
+      readonly url: string | null;
+      readonly number: number | null;
+      readonly warning?: string;
+    };
 
 export const REVIEW_PROGRESS: CreatePullRequestProgress = { kind: "review" };
 
 function pullRequestOutcome(result: GitRunStackedActionResult): CreatePullRequestProgress {
   const kind = result.pr.status === "opened_existing" ? "existing" : "created";
-  return { kind, url: result.pr.url ?? null, number: result.pr.number ?? null };
+  return {
+    kind,
+    url: result.pr.url ?? null,
+    number: result.pr.number ?? null,
+    ...(result.pr.warning === undefined ? {} : { warning: result.pr.warning }),
+  };
 }
 
 /** Folds server progress events into the dialog's progress state. */

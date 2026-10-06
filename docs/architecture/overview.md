@@ -984,13 +984,23 @@ the departed renderer or its terminal buffers reachable.
 
 Terminal clipboard shortcuts use xterm's trusted native copy/paste events,
 including bracketed paste, without requiring the asynchronous Clipboard API.
+An image-only paste is uploaded to the terminal's environment, which returns
+the path of a server copy for the program to read
+([terminal image paste](rpc-and-orchestration.md#terminal-image-paste)).
 Shifted copy selects xterm's hidden textarea for the native copy command, then
 restores its pending input. Bare Ctrl+C remains terminal input when nothing is
-selected. Selecting output keeps keyboard focus in the terminal; **Add to chat**
-is available from the selected text's explicit context menu. While the running
-program has enabled mouse tracking (Codex, opencode and other TUIs), the viewport
-inverts xterm's force-selection modifier: a plain primary drag selects text for
-copying, and Shift+drag (Option+drag on macOS) is reported to the program.
+selected. Selecting output keeps keyboard focus in the terminal; **Copy** and
+**Add to chat** are available from the selected text's explicit context menu.
+Menu copy uses the Clipboard API and falls back to the textarea copy command,
+because the native menu can resolve after the click's user activation lapses.
+While the running program has enabled mouse tracking (Codex, opencode and other
+TUIs), the viewport inverts xterm's force-selection modifier: a plain primary
+drag selects text for copying, and Shift+drag (Option+drag on macOS) is
+reported to the program. xterm clears its selection on every report it sends,
+so while a selection exists a right-click is not reported and, under
+any-motion tracking (`?1003`), neither is pointer motion without a pressed
+button. xterm's link detection still sees that motion, so links stay
+clickable. A click or keystroke clears the selection and reporting resumes.
 
 ### Terminal attachment fidelity
 

@@ -40,6 +40,24 @@ export const UploadGetResult = Schema.Struct({
   complete: Schema.Boolean,
 });
 export type UploadGetResult = typeof UploadGetResult.Type;
+/** Image types a terminal paste can stage; the server picks the file extension from it. */
+export const TerminalImagePasteMimeType = Schema.Literals([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
+export type TerminalImagePasteMimeType = typeof TerminalImagePasteMimeType.Type;
+/** Commits a completed `chat-attachment` image upload to a server file whose path is pasted into a terminal. */
+export const TerminalStageImagePasteInput = Schema.Struct({
+  uploadId: UploadId,
+  name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+  mimeType: TerminalImagePasteMimeType,
+  sizeBytes: NonNegativeInt,
+});
+export type TerminalStageImagePasteInput = typeof TerminalStageImagePasteInput.Type;
+export const TerminalStageImagePasteResult = Schema.Struct({ path: TrimmedNonEmptyString });
+export type TerminalStageImagePasteResult = typeof TerminalStageImagePasteResult.Type;
 export const UploadCancelInput = Schema.Struct({ uploadId: UploadId });
 export type UploadCancelInput = typeof UploadCancelInput.Type;
 export const UploadCancelResult = Schema.Struct({});

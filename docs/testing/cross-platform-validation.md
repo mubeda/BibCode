@@ -257,11 +257,20 @@ once. Also check **Ctrl+Shift+C/V**, and multiline paste with an application
 that enables bracketed paste. Selecting text must leave keyboard focus in the
 terminal and must not open the **Add to chat** menu or overwrite the clipboard.
 Right-click the selected text and choose **Add to chat**; the selection must
-still attach to the composer. With no selection, **Ctrl+C** must interrupt the
-running terminal program. Start a CLI that enables mouse tracking (for example
-`codex`), drag across its output and copy with **Ctrl+C**; the selected text must
-reach the clipboard without interrupting the CLI. **Shift+drag** (**Option+drag**
-on macOS) must reach the CLI instead of selecting. Repeat copy/paste where asynchronous Clipboard API
+still attach to the composer. Right-click it again and choose **Copy**; the
+exact text must reach the clipboard and stay selected. With no selection,
+**Ctrl+C** must interrupt the running terminal program. Start a CLI that enables
+any-motion mouse tracking (for example `codex` or `opencode`), drag across its
+output, release, and move the pointer over the terminal for a few seconds; the
+selection must stay. Then copy with **Ctrl+C** (**Cmd+C** on macOS) and with
+right-click **Copy**; the selected text must reach the clipboard without
+interrupting the CLI. A plain click must clear the selection and hand pointer
+input back to the CLI. **Shift+drag** (**Option+drag** on macOS) must reach the
+CLI instead of selecting. Copy a screenshot to the client's clipboard and paste it
+into `codex` or `claude` running in a provider terminal, once against a local
+environment and once against a remote one: the terminal must paste a
+`terminal-pastes/` path and the CLI must attach the image. A text paste must
+still arrive as text. Repeat copy/paste where asynchronous Clipboard API
 access is unavailable; native clipboard events must still work. These packaged
 checks supplement the focused terminal and keybinding component tests.
 
@@ -2065,9 +2074,10 @@ starts.
     the choice, clearing it disables creation again, and reopening starts
     unselected. Repeat from the chat Git action; combined commit/push/request
     actions must also require target review before any mutation. No push,
-    provider process, or pull request may run just by opening the dialog from
-    these entry points. Cancel it and confirm the branch, its upstream, and the
-    forge are unchanged. From Source Control, **Push & create PR/MR** and its
+    provider mutation, or pull request may run just by opening the dialog from
+    these entry points; on servers with `pullRequestCreateOptions`, opening it
+    may run only the read-only defaults and picker reads. Cancel it and
+    confirm the branch, its upstream, and the forge are unchanged. From Source Control, **Push & create PR/MR** and its
     Create menu action must push an unpublished branch first, then open the
     dialog with that branch selected as the source and listed among the origin
     branches; a rejected push must show an error and leave the dialog closed, and
@@ -2094,6 +2104,17 @@ starts.
     Connect to an older server without `gitPullRequestBranchSelection`, or
     reconnect to one after opening the dialog: creation must be disabled with
     update guidance, and attempting the action must send no mutation.
+    Create options: on GitLab, create a merge request with **Mark as draft**,
+    **Assign to me**, a reviewer, a label, a milestone, **Delete source
+    branch** and **Squash commits**, and verify each on the GitLab page and
+    that the title has exactly one `Draft:` prefix. On a project that always
+    squashes, the Squash box must be locked with its note. On GitHub, create
+    a draft pull request with an assignee, a reviewer, a label and a milestone
+    and verify them on GitHub. On github.com, a reviewer who lacks access must
+    leave the pull request created once with the warning shown; GitHub
+    Enterprise Server may refuse such a request before creating it, which must
+    show the failure and create nothing. Against a server without
+    `pullRequestCreateOptions`, the new fields must be absent.
     Record whether a failed attempt published the branch; native stacked actions
     currently report start/end outcomes without intermediate phase events.
     Retry a failed combined commit/push/request action: it must reread Git, reuse

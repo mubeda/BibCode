@@ -209,6 +209,25 @@ before creating a branch, committing or pushing,
 so an unidentified host fails with "Nothing was published." and the same
 guidance. A request it creates makes the Pull Requests list read its GitLab
 totals again.
+On servers that advertise `pullRequestCreateOptions`, GitHub and GitLab
+requests also take create-time options. **Mark as draft** sits under the title;
+**Assignee** (with **Assign to me**), **Reviewer**, **Milestone** and
+**Labels** follow the description and search the repository's members,
+milestones and labels. GitLab takes one assignee and one reviewer; GitHub takes
+several. GitLab adds **Delete source branch** and **Squash commits**, which
+start from the project's settings; a project that always or never squashes
+locks that box and says why. While those settings load, fail to load or go
+unreported, untouched boxes show as indeterminate and leave the decision to the
+project, so the request never contradicts what the dialog showed. A failed
+picker or settings read offers **Retry** and never blocks creation. GitHub
+applies some options after creating the request: if one of those steps fails,
+the request is reported as created with a warning naming what was not applied,
+and it is never retried. When an open request already exists for the branch,
+it opens as before and, if the user chose any option, the dialog says the new
+options were not applied; merge boxes filled from the project's settings alone
+do not count.
+Azure DevOps and Bitbucket keep the plain dialog; the server refuses options
+for them before anything is published.
 An older environment that does not advertise branch-selection support disables
 creation with instructions to update its BiBCode server. The action also checks
 the live connection's support before mutation, including after reconnect.

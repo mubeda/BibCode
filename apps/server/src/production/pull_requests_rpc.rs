@@ -22,6 +22,7 @@ use crate::{
 pub const PULL_REQUESTS_UNARY_METHODS: &[&str] = &[
     "pullRequests.getContext",
     "pullRequests.getVocabulary",
+    "pullRequests.getCreateDefaults",
     "pullRequests.list",
     "pullRequests.get",
     "pullRequests.getTimeline",
@@ -137,6 +138,16 @@ impl ConfiguredPullRequestsRpcServices {
                             input.query.as_deref(),
                             &cancellation,
                         )
+                        .await,
+                    operation,
+                )
+            }
+            "pullRequests.getCreateDefaults" => {
+                let input: CwdOnlyInput = decode(request.payload, operation)?;
+                validate_cwd(&input.cwd, operation)?;
+                encode(
+                    self.service
+                        .create_defaults(&input.cwd, &cancellation)
                         .await,
                     operation,
                 )
@@ -305,6 +316,11 @@ struct ContextInput {
 }
 
 #[derive(Deserialize)]
+struct CwdOnlyInput {
+    cwd: PathBuf,
+}
+
+#[derive(Deserialize)]
 struct VocabularyInput {
     cwd: PathBuf,
     kind: VocabularyKind,
@@ -390,7 +406,7 @@ mod tests {
         assert!(registry.validate_complete().is_err());
         register_pull_requests_rpc(&mut registry, PullRequestsRpcServices);
         registry.validate_complete().unwrap();
-        assert_eq!(PULL_REQUESTS_UNARY_METHODS.len(), 10);
+        assert_eq!(PULL_REQUESTS_UNARY_METHODS.len(), 11);
     }
 
     #[tokio::test]

@@ -10,9 +10,19 @@ import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime"
 import { useDebouncedValue } from "@tanstack/react-pacer";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { GitPullRequestIcon } from "lucide-react";
-import { memo, type ChangeEvent, useCallback, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  type ChangeEvent,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { Button } from "~/components/ui/button";
+import { Checkbox } from "~/components/ui/checkbox";
 import {
   Combobox,
   ComboboxInput,
@@ -40,15 +50,23 @@ import {
 import { capitalize } from "effect/String";
 import { randomUUID } from "~/lib/utils";
 import { gitManagerEnvironment } from "~/state/gitManager";
+import { pullRequestsEnvironment } from "~/state/pullRequests";
 import { useServerConfigs } from "~/state/entities";
 import { useEnvironmentQuery } from "~/state/query";
 import { useGitStackedAction } from "~/state/sourceControlActions";
 import { vcsEnvironment } from "~/state/vcs";
 import { useAtomCommand } from "~/state/use-atom-command";
 
+import { usePullRequestsQuery } from "../../pullRequests/shared/usePullRequestsQuery";
+import { CreatePullRequestOptions } from "./CreatePullRequestOptions";
 import {
+  createOptionsPayload,
   createPullRequestAction,
+  EMPTY_CREATE_OPTIONS,
   failCreatePullRequestProgress,
+  shownCreateOptions,
+  supportsCreateOptions,
+  type CreateOptionsState,
   hintedProvider,
   presentCreatePullRequestProgress,
   reduceCreatePullRequestProgress,
@@ -189,6 +207,24 @@ function CreatePullRequestReviewDialog({
   // Until status answers, only a caller's hint names the host; without one stay neutral.
   const noun = resolveStatusChangeRequestPresentation(provider, review !== null).longName;
   const waitReason = `Wait for the ${noun} to finish.`;
+  const providerKind = provider?.kind ?? null;
+  const createOptionsSupported =
+    serverConfig?.environment.capabilities.pullRequestCreateOptions === true &&
+    supportsCreateOptions(providerKind);
+  const [createOptions, setCreateOptions] = useState<CreateOptionsState>(EMPTY_CREATE_OPTIONS);
+  const createDefaultsAtom = useMemo(
+    () =>
+      open && createOptionsSupported
+        ? pullRequestsEnvironment.getCreateDefaults({ environmentId, input: { cwd } })
+        : null,
+    [createOptionsSupported, cwd, environmentId, open],
+  );
+  // An open re-reads cached defaults and hides them meanwhile: account, origin or project
+  // settings can change at the same checkout path.
+  const createDefaultsQuery = usePullRequestsQuery(createDefaultsAtom);
+  const createDefaults = createDefaultsQuery.data ?? null;
+  const createDefaultsState =
+    createDefaults !== null ? "ready" : createDefaultsQuery.error ? "error" : "loading";
 
   const [editedTitle, setTitle] = useState<string>();
   const [editedBody, setBody] = useState<string>();
@@ -196,6 +232,13 @@ function CreatePullRequestReviewDialog({
   const body = editedBody ?? review?.defaultBody ?? "";
   const [progress, setProgress] = useState<CreatePullRequestProgress>(REVIEW_PROGRESS);
   const running = progress.kind === "running";
+  // The outcome, its link and any warning sit below the form; bring them into view on settle.
+  const statusRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (progress.kind === "created" || progress.kind === "existing" || progress.kind === "failed") {
+      statusRef.current?.scrollIntoView?.({ block: "nearest" });
+    }
+  }, [progress.kind]);
   const [previousHead, setPreviousHead] = useState(review?.head);
   if (previousHead !== review?.head) {
     setPreviousHead(review?.head);
@@ -284,13 +327,20 @@ function CreatePullRequestReviewDialog({
     } else {
       attemptedHead.current = sourceBranch;
     }
+    const options = createOptionsSupported
+      ? createOptionsPayload(shownCreateOptions(createOptions, createDefaults), providerKind)
+      : undefined;
     const result = await runStackedAction({
-      ...createPullRequestAction(randomUUID(), {
-        title: trimmedTitle,
-        body,
-        baseBranch,
-        ...(!remainingCommit?.featureBranch && sourceBranch ? { headBranch: sourceBranch } : {}),
-      }),
+      ...createPullRequestAction(
+        randomUUID(),
+        {
+          title: trimmedTitle,
+          body,
+          baseBranch,
+          ...(!remainingCommit?.featureBranch && sourceBranch ? { headBranch: sourceBranch } : {}),
+        },
+        options,
+      ),
       ...(remainingCommit?.commitMessage ? { commitMessage: remainingCommit.commitMessage } : {}),
       ...(remainingCommit?.featureBranch ? { featureBranch: true } : {}),
       ...(remainingCommit?.filePaths ? { filePaths: [...remainingCommit.filePaths] } : {}),
@@ -319,6 +369,10 @@ function CreatePullRequestReviewDialog({
     body,
     baseBranch,
     commitInput,
+    createDefaults,
+    createOptions,
+    createOptionsSupported,
+    providerKind,
     environmentId,
     progress.kind,
     refreshStatus,
@@ -356,6 +410,12 @@ function CreatePullRequestReviewDialog({
         ? null
         : safeExternalUrl(review?.existingPullRequest?.url ?? null);
   const fieldsDisabled = busy || settled || review === null || blockedReason !== null;
+  const draftHintId = useId();
+  // An existing request's warning covers every option sent, including merge boxes filled from
+  // the project's defaults; it only matters when the user chose something. Fields lock once
+  // the request settles, so this still describes the attempt.
+  const choseOptions =
+    createOptionsSupported && createOptionsPayload(createOptions, providerKind) !== undefined;
   const branchFieldsDisabled =
     busy ||
     settled ||
@@ -489,6 +549,24 @@ function CreatePullRequestReviewDialog({
                 value={title}
                 onChange={changeTitle}
               />
+              {createOptionsSupported ? (
+                <div className="pt-1">
+                  <label className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      aria-describedby={draftHintId}
+                      checked={createOptions.draft}
+                      disabled={fieldsDisabled}
+                      onCheckedChange={(draft) =>
+                        setCreateOptions((current) => ({ ...current, draft }))
+                      }
+                    />
+                    Mark as draft
+                  </label>
+                  <p id={draftHintId} className="ps-6 text-xs text-muted-foreground">
+                    Drafts can't be merged until marked ready.
+                  </p>
+                </div>
+              ) : null}
             </div>
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="git-manager-create-pr-body">Description</Label>
@@ -500,6 +578,18 @@ function CreatePullRequestReviewDialog({
                 onChange={changeBody}
               />
             </div>
+            {createOptionsSupported ? (
+              <CreatePullRequestOptions
+                scope={scope}
+                providerKind={providerKind}
+                defaults={createDefaults}
+                defaultsState={createDefaultsState}
+                onRetryDefaults={createDefaultsQuery.refresh}
+                value={createOptions}
+                onChange={setCreateOptions}
+                disabled={fieldsDisabled}
+              />
+            ) : null}
           </section>
           {statusText === null && review?.blockedReason == null ? null : (
             <p
@@ -510,6 +600,7 @@ function CreatePullRequestReviewDialog({
                   : "text-xs text-muted-foreground"
               }
               data-testid="create-pr-status"
+              ref={statusRef}
               role="status"
             >
               {statusText ?? review?.blockedReason}
@@ -525,6 +616,10 @@ function CreatePullRequestReviewDialog({
                     Open {noun}
                   </a>
                 </>
+              ) : null}
+              {(progress.kind === "created" || (progress.kind === "existing" && choseOptions)) &&
+              progress.warning !== undefined ? (
+                <span className="mt-1 block font-medium text-foreground">{progress.warning}</span>
               ) : null}
             </p>
           )}

@@ -460,6 +460,7 @@ impl ProductionRuntime {
         crate::production::uploads_rpc::register_uploads_rpc(
             &mut registry,
             attachment_uploads.clone(),
+            state_paths.terminal_pastes_dir.clone(),
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         let git_manager = GitManagerRpcServices::with_dependencies(
