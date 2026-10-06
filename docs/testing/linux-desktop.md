@@ -1804,9 +1804,13 @@ same Cursor session, one fresh native turn-start activity and one later native
 question activity with both exact questions and choices. Retain their private
 thread/message/turn/request identities and durable request sequence. After the
 unchanged public selections and explicit Submit, require that same prompt's
-delivered state and turn attribution, exact request-resolved answers, a later
+delivered start state, exact request-resolved answers, a later
 successful native turn-completed activity, ready/idle error-free Cursor session
-and the existing public quiescence witness. Do not fabricate a running turn,
+and the existing public quiescence witness. Normal start-delivery projection keeps
+its user message's `turnId` null; only delivered steering binds that field. The
+native started/question/resolved/completed activity chain owns the exact original
+turn correlation, joined to the one fresh fixed prompt and its delivered start.
+Do not invent message turn attribution or fabricate a running turn,
 accept DOM silence as completion or bypass provider delivery acknowledgement.
 The two original images, public controls, restoration and wait bounds remain.
 These markers add no snapshot reads, actions or timeout budget.

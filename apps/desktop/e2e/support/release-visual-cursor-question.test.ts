@@ -818,12 +818,13 @@ function pendingCursorModel(mode = "pending") {
     id: "owned-prompt",
     role: "user",
     text: cursorQuestionFixturePrompt,
-    turnId: mode === "completed" ? turnId : null,
+    turnId: null,
     streaming: false,
     delivery: {
       state: mode === "completed" ? "delivered" : "sending",
       provider: "cursor",
       providerInstanceId: "cursor",
+      mode: "start",
     },
     createdAt: time,
     updatedAt: time,
@@ -1092,4 +1093,64 @@ it("refuses a schema-valid Cursor session belonging to another thread before que
     bindPendingCursorQuestion(foreign(pending), { messageIds: [], activityIds: [] }),
   ).toBeNull();
   expect(completedPendingCursorQuestion(foreign(complete), binding)).toBe(false);
+});
+
+it("joins normal delivered-start messages whose current public projection intentionally has no native turnId", () => {
+  const pending = pendingCursorModel(),
+    binding = bindPendingCursorQuestion(pending, { messageIds: [], activityIds: [] })!,
+    completed = pendingCursorModel("completed"),
+    model = freshCursorSnapshot("empty");
+  const thread = Schema.decodeUnknownSync(OrchestrationReadModel)({
+    ...model,
+    threads: model.threads.map((value) =>
+      value.id === completed.id
+        ? {
+            ...completed,
+            messages: completed.messages.map((message) => ({
+              ...message,
+              turnId: null,
+              delivery: { ...message.delivery!, mode: "start" },
+            })),
+          }
+        : value,
+    ),
+  }).threads.find((value) => value.id === completed.id)!;
+  expect(completedPendingCursorQuestion(thread, binding)).toBe(true);
+});
+
+it("refuses a delivered steering record as proof of the original Cursor start", () => {
+  const pending = pendingCursorModel(),
+    binding = bindPendingCursorQuestion(pending, { messageIds: [], activityIds: [] })!,
+    complete = pendingCursorModel("completed");
+  expect(
+    completedPendingCursorQuestion(
+      {
+        ...complete,
+        messages: complete.messages.map((message) => ({
+          ...message,
+          delivery: { ...message.delivery!, mode: "steer" },
+        })),
+      },
+      binding,
+    ),
+  ).toBe(false);
+});
+
+it("requires the exact current delivered-start mode instead of accepting an absent mode", () => {
+  const pending = pendingCursorModel(),
+    binding = bindPendingCursorQuestion(pending, { messageIds: [], activityIds: [] })!,
+    complete = pendingCursorModel("completed"),
+    model = freshCursorSnapshot("empty");
+  const messages = complete.messages.map((message) => {
+    const { mode: ignored, ...delivery } = message.delivery!;
+    void ignored;
+    return { ...message, delivery };
+  });
+  const thread = Schema.decodeUnknownSync(OrchestrationReadModel)({
+    ...model,
+    threads: model.threads.map((value) =>
+      value.id === complete.id ? { ...complete, messages } : value,
+    ),
+  }).threads.find((value) => value.id === complete.id)!;
+  expect(completedPendingCursorQuestion(thread, binding)).toBe(false);
 });

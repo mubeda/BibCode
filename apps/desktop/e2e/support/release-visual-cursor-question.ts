@@ -571,7 +571,8 @@ export function completedPendingCursorQuestion(
         message.id === binding.messageId &&
         message.role === "user" &&
         message.text === cursorQuestionFixturePrompt &&
-        message.turnId === binding.turnId &&
+        message.turnId === null &&
+        message.delivery?.mode === "start" &&
         message.delivery?.state === "delivered" &&
         message.delivery.provider === "cursor" &&
         message.delivery.providerInstanceId === "cursor",
