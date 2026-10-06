@@ -235,14 +235,22 @@ jobs:
           if ($tests.FailedCount -ne 0) { throw 'Owned WSL fixture Pester controls failed' }
           $manifest = Join-Path $env:RUNNER_TEMP 'bibcode-owned-wsl2-owner/owner.secret.json'
           $available = $false
+          $prepareStage = $null
           $reason = '${{ steps.wsl.outputs.reason_code }}'
           if ('${{ steps.wsl.outputs.status_succeeded }}' -eq 'true' -and '${{ steps.wsl.outputs.list_succeeded }}' -eq 'true') {
             $result = & ./scripts/owned-wsl2-fixture.ps1 -Action Prepare -OwnerManifest $manifest -SourceSha $env:GITHUB_SHA
-            $available = $LASTEXITCODE -eq 0 -and ($result | ConvertFrom-Json).completed -eq $true
-            if (-not $available) { $reason = 'wsl-fixture-owner-refused' }
+            $receipt = $result | ConvertFrom-Json
+            $available = $LASTEXITCODE -eq 0 -and $receipt.completed -eq $true
+            if (-not $available) {
+              $reason = 'wsl-fixture-owner-refused'
+              $fields = @($receipt.PSObject.Properties.Name)
+              $prepareStage = $receipt.prepareStage
+              if ($fields.Count -ne 2 -or 'completed' -notin $fields -or 'prepareStage' -notin $fields -or (-not ($receipt.completed -is [bool])) -or $receipt.completed -ne $false -or (-not ($prepareStage -is [string])) -or $prepareStage -cnotin @('runtime-admission','private-root-acl','launcher-admission','empty-inventory','launcher-readiness','verifier-admission','signed-metadata','image-admission','intent-write','owned-import','kernel-admission','mapping-admission')) { throw 'Owned WSL Prepare metadata refused' }
+            }
           }
           "available=$($available.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "reason_code=$reason" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($reason -eq 'wsl-fixture-owner-refused') { "prepare_stage=$prepareStage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append }
           "BIBCODE_NATIVE_WSL_MANIFEST=$manifest" | Out-File -FilePath $env:GITHUB_ENV -Append
           "BIBCODE_NATIVE_WSL_FIXTURE_SELECTED=true" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -274,7 +282,13 @@ jobs:
             (($reasonCode -eq 'wsl-no-distro' -or $reasonCode -eq 'wsl-fixture-owner-refused') -and $statusSucceeded -and $listObserved -and $listSucceeded -eq $true)
           )
           if (-not $reasonMatches) { throw 'Native WSL closed status mismatch' }
-          @{schemaVersion=1;selection='release-visual-native-followups';sourceSha=$env:GITHUB_SHA;partition='windows-wsl';status='unavailable';reasonCode=$reasonCode;wslStatusSucceeded=$statusSucceeded;wslListObserved=$listObserved;wslListSucceeded=$listSucceeded;originalCount=0;requiredPartitionOriginalCount=2;previewOriginalCount=0;completeGroup=$false;visualReview='pending'} | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $root 'native-followups-workflow-status.json') -Encoding utf8
+          $status = @{schemaVersion=1;selection='release-visual-native-followups';sourceSha=$env:GITHUB_SHA;partition='windows-wsl';status='unavailable';reasonCode=$reasonCode;wslStatusSucceeded=$statusSucceeded;wslListObserved=$listObserved;wslListSucceeded=$listSucceeded;originalCount=0;requiredPartitionOriginalCount=2;previewOriginalCount=0;completeGroup=$false;visualReview='pending'}
+          if ($reasonCode -eq 'wsl-fixture-owner-refused') {
+            $prepareStage = '${{ steps.native_wsl.outputs.prepare_stage }}'
+            if ((-not ($prepareStage -is [string])) -or $prepareStage -cnotin @('runtime-admission','private-root-acl','launcher-admission','empty-inventory','launcher-readiness','verifier-admission','signed-metadata','image-admission','intent-write','owned-import','kernel-admission','mapping-admission')) { throw 'Native WSL Prepare stage refused' }
+            $status.prepareStage = $prepareStage
+          }
+          $status | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $root 'native-followups-workflow-status.json') -Encoding utf8
           throw 'Native WSL partition remains unavailable'
 
       - name: Record unavailable WSL capability

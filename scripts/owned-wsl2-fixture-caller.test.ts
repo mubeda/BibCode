@@ -81,3 +81,41 @@ it("the complete selected workflow gates a real kernel fixture and passes its ma
     "steps.wsl.outputs.available == 'true' && inputs.native_followups != true",
   );
 });
+
+const prepareStages = [
+  "runtime-admission",
+  "private-root-acl",
+  "launcher-admission",
+  "empty-inventory",
+  "launcher-readiness",
+  "verifier-admission",
+  "signed-metadata",
+  "image-admission",
+  "intent-write",
+  "owned-import",
+  "kernel-admission",
+  "mapping-admission",
+] as const;
+it("keeps Prepare stage labels and actual PowerShell recorder validations source-consistent", () => {
+  const source = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+  expect(
+    [...source.matchAll(/\$script:OwnedWslPrepareStage='([^']+)'/g)].map((match) => match[1]),
+  ).toEqual([...prepareStages]);
+  const steps = workflow.jobs.windows_wsl_upgrade_smoke.steps,
+    prepare = steps.find((step: { id?: string }) => step.id === "native_wsl"),
+    recorder = steps.find(
+      (step: { name?: string }) => step.name === "Record native WSL prerequisite unavailable",
+    );
+  expect(prepare.run).toContain("(-not ($receipt.completed -is [bool]))");
+  expect(prepare.run).toContain("$receipt.completed -ne $false");
+  for (const body of [prepare.run, recorder.run]) {
+    expect(body).toContain("(-not ($prepareStage -is [string]))");
+    const list = body.match(/\$prepareStage -cnotin @\(([^)]+)\)/)?.[1];
+    expect(list?.split(",").map((value: string) => value.trim().slice(1, -1))).toEqual([
+      ...prepareStages,
+    ]);
+  }
+  expect(recorder.run).toContain("if ($reasonCode -eq 'wsl-fixture-owner-refused')");
+  expect(recorder.run).toContain("$status.prepareStage = $prepareStage");
+  // These are source-consistency assertions, not execution of PowerShell admission or serialization.
+});

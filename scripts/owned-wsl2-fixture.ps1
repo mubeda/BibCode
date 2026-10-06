@@ -106,17 +106,24 @@ function Assert-OwnedRegistration($Manifest,[bool]$AllowAbsent=$false) {
   return $owned
 }
 function Prepare-Fixture {
+  $script:OwnedWslPrepareStage='runtime-admission'
   Assert-FixtureRuntime
+  $script:OwnedWslPrepareStage='private-root-acl'
   $root=[IO.Path]::GetDirectoryName($OwnerManifest)
   if(Test-Path -LiteralPath $root) { Refuse-OwnedWsl };[IO.Directory]::CreateDirectory($root)|Out-Null;Set-OwnerAcl $root
+  $script:OwnedWslPrepareStage='launcher-admission'
   $wsl=Join-Path $env:SystemRoot 'System32/wsl.exe';$certificate=Get-AuthenticodeSignature -LiteralPath $wsl
   if($certificate.Status -ne 'Valid' -or $certificate.SignerCertificate.Subject -notmatch 'Microsoft') { Refuse-OwnedWsl }
+  $script:OwnedWslPrepareStage='empty-inventory'
   $before=Get-FixtureInventory
   if($before.distros.Count -ne 0 -or $null -ne $before.defaultGuid) { Refuse-OwnedWsl }
+  $script:OwnedWslPrepareStage='launcher-readiness'
   Invoke-FixtureCommand $wsl @('--status')|Out-Null;Invoke-FixtureCommand $wsl @('--list','--quiet')|Out-Null
+  $script:OwnedWslPrepareStage='verifier-admission'
   $gpg=Join-Path $env:ProgramFiles 'Git/usr/bin/gpg.exe';$gpgPin=Get-PhysicalPin $gpg;$gpgHash=(Get-FileHash -LiteralPath $gpg -Algorithm SHA256).Hash
   $gnupg=Join-Path $root 'gnupg';[IO.Directory]::CreateDirectory($gnupg)|Out-Null;Set-OwnerAcl $gnupg
   $key=Join-Path $root 'canonical.key';$sums=Join-Path $root 'SHA256SUMS';$signature=Join-Path $root 'SHA256SUMS.gpg';$image=Join-Path $root $RootfsName
+  $script:OwnedWslPrepareStage='signed-metadata'
   foreach($download in @(@(('https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x'+$SigningFingerprint),$key),@(($ReleaseBase+'SHA256SUMS'),$sums),@(($ReleaseBase+'SHA256SUMS.gpg'),$signature))) { Invoke-WebRequest -Uri $download[0] -OutFile $download[1] -TimeoutSec 120 -MaximumRedirection 0;Set-OwnerAcl $download[1] }
   if((Get-Item -LiteralPath $key).Length -gt 1048576 -or (Get-Item -LiteralPath $sums).Length -gt 2097152 -or (Get-Item -LiteralPath $signature).Length -gt 65536) {Refuse-OwnedWsl}
   Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--import',$key)|Out-Null
@@ -127,21 +134,26 @@ function Prepare-Fixture {
   if($valid.Count -ne 1 -or ($valid[0] -split ' ')[2] -cne $SigningFingerprint) { Refuse-OwnedWsl }
   $line=@(Get-Content -LiteralPath $sums|Where-Object {$_ -cmatch ('^[a-f0-9]{64} [ *]'+[regex]::Escape($RootfsName)+'$')})
   if($line.Count -ne 1 -or $line[0].Substring(0,64) -cne $RootfsHash) { Refuse-OwnedWsl }
+  $script:OwnedWslPrepareStage='image-admission'
   Invoke-WebRequest -Uri ($ReleaseBase+$RootfsName) -OutFile $image -TimeoutSec 300 -MaximumRedirection 0;Set-OwnerAcl $image
   if((Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant() -cne $RootfsHash) { Refuse-OwnedWsl };Assert-PhysicalPin $gpgPin
   if((Get-FileHash -LiteralPath $gpg -Algorithm SHA256).Hash -cne $gpgHash) { Refuse-OwnedWsl }
+  $script:OwnedWslPrepareStage='intent-write'
   $import=Join-Path $root 'distro';[IO.Directory]::CreateDirectory($import)|Out-Null;Set-OwnerAcl $import
   $m=[ordered]@{schema=1;sourceSha=$SourceSha;name='BibCodeQA-'+[guid]::NewGuid().ToString('N');root=Get-PhysicalPin $root;importRoot=Get-PhysicalPin $import;wsl=@{pin=Get-PhysicalPin $wsl;sha256=(Get-FileHash -LiteralPath $wsl -Algorithm SHA256).Hash.ToLowerInvariant()};before=$before;imageSha256=$RootfsHash;imagePin=Get-PhysicalPin $image;gpg=@{pin=$gpgPin;sha256=$gpgHash};checkout=Get-PhysicalPin $env:GITHUB_WORKSPACE;manifestPin=$null;mappedCheckout=$null;backend=$null;guid=$null;phase='intent';appState='none';kernelVerified=$false}
   Save-FixtureManifest $m
   $m.manifestPin=Get-PhysicalPin $OwnerManifest;Save-FixtureManifest $m
+  $script:OwnedWslPrepareStage='owned-import'
   $again=Get-FixtureInventory;if($again.distros.Count -ne 0 -or $null -ne $again.defaultGuid) {Refuse-OwnedWsl}
   $m.phase='import-attempted';Save-FixtureManifest $m
   Invoke-FixtureCommand $wsl @('--import',$m.name,$import,$image,'--version','2') 300000|Out-Null
   $owned=Assert-OwnedRegistration $m;$m.guid=$owned.guid;$m.phase='registered';Save-FixtureManifest $m
+  $script:OwnedWslPrepareStage='kernel-admission'
   $kernel=Invoke-FixtureCommand $wsl @('--distribution',$m.name,'--exec','uname','-r')
   $architecture=Invoke-FixtureCommand $wsl @('--distribution',$m.name,'--exec','uname','-m')
   $os=Invoke-FixtureCommand $wsl @('--distribution',$m.name,'--exec','cat','/etc/os-release')
   if($kernel -cnotmatch '^[A-Za-z0-9.+-]*microsoft-standard-WSL2$' -or $architecture -cne 'x86_64' -or $os -notmatch '(?m)^ID=ubuntu\r?$' -or $os -notmatch '(?m)^VERSION_ID="24\.04"\r?$') { Refuse-OwnedWsl }
+  $script:OwnedWslPrepareStage='mapping-admission'
   $mapped=Invoke-FixtureCommand $wsl @('--distribution',$m.name,'--exec','wslpath','-a',$m.checkout.path)
   $canonical=Invoke-FixtureCommand $wsl @('--distribution',$m.name,'--exec','readlink','-e',$mapped)
   if(-not $mapped.StartsWith('/') -or $mapped -cne $canonical) {Refuse-OwnedWsl}
@@ -182,5 +194,9 @@ function Invoke-OwnedFixtureAction([string]$Action) {
     }
 }
 if($MyInvocation.InvocationName -ne '.') {
-  try { Invoke-OwnedFixtureAction $Action; Write-Output '{"completed":true}';exit 0 } catch { Write-Output '{"completed":false}';exit 1 }
+  try { Invoke-OwnedFixtureAction $Action; Write-Output '{"completed":true}';exit 0 } catch {
+    if($Action -eq 'Prepare') { [ordered]@{completed=$false;prepareStage=$script:OwnedWslPrepareStage}|ConvertTo-Json -Compress|Write-Output }
+    else { Write-Output '{"completed":false}' }
+    exit 1
+  }
 }

@@ -780,7 +780,17 @@ retain one of four closed `reasonCode` values: `wsl-status-failed`,
 `wsl-list-failed`, `wsl-no-distro`, or `wsl-fixture-owner-refused`. The same status records
 `wslStatusSucceeded`, `wslListObserved`, and `wslListSucceeded`; the last is null
 when the existing status command failed and the list command did not run.
-Unknown flags or inconsistent reason/observation tuples are refused. The
+Unknown flags or inconsistent reason/observation tuples are refused.
+Only `wsl-fixture-owner-refused` may additionally retain `prepareStage`, a fixed
+name for the last existing Prepare block entered before its refusal. The failed
+Prepare receipt and recorder validate the same finite stages. This identifies
+the boundary without retaining paths, exception text or command output; success
+and other actions retain their original receipts, and no new native action,
+read, timeout or authority fallback is added. The registered Pester tests must execute the actual Prepare/catch and workflow
+recorder bodies with inert ports before provisioning. Source consistency and
+Node-only checks do not establish this PowerShell proof; report it as unexecuted
+until the Windows CI gate passes.
+The
 ACL-protected zero-original status is written before the native prerequisite
 step fails. No distro names, raw WSL output, host paths or exception text enter
 these fields. The existing status read and conditional quiet list remain the

@@ -40,7 +40,11 @@ describe("visual qualification dispatch registration", () => {
           "release-visual-workspace-substates",
           "release-visual-provider-chat",
           "release-visual-native-sharing",
+          "release-visual-native-followups",
           "release-visual-project-lifecycle",
+          "release-visual-settings-followups",
+          "release-visual-pull-requests",
+          "release-visual-browser-followups",
         ]).toContain(choice);
     }
   });
@@ -53,10 +57,20 @@ describe("visual qualification dispatch registration", () => {
     else {
       expect(Object.keys(workflow.jobs)).toContain("visual_core");
       for (const key of Object.keys(workflow.jobs))
-        expect(["visual_core", "registration_only", "native_sharing"]).toContain(key);
+        expect([
+          "visual_core",
+          "registration_only",
+          "native_sharing",
+          "native_followups",
+        ]).toContain(key);
     }
     const job = registration ?? workflow.jobs.visual_core;
-    for (const candidate of [registration, owner, workflow.jobs.native_sharing].filter(Boolean)) {
+    for (const candidate of [
+      registration,
+      owner,
+      workflow.jobs.native_sharing,
+      workflow.jobs.native_followups,
+    ].filter(Boolean)) {
       expect(candidate.permissions).toBeUndefined();
       expect(candidate.strategy).toBeUndefined();
       expect(candidate["continue-on-error"]).toBeUndefined();
