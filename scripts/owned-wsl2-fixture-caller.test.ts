@@ -213,7 +213,40 @@ it("keeps GPG category projection test-only and based on the already-read stderr
     "runtime-agent",
   ]);
   expect(tests.slice(start, end)).not.toMatch(/Invoke-|Get-Content|Start-Process|Write-/);
-  expect(tests).toContain("if($command.exitCode -ne 0){throw");
+  expect(tests).toContain("if($command.exitCode -ne 0){");
   expect(tests).toContain("throw $originalFailure");
   // Source consistency only; classifier and real GPG execution require Windows Pester.
+});
+
+it("keeps complete import-input failure facts passive and test-only", () => {
+  const tests = NodeFS.readFileSync(
+    new URL("./owned-wsl2-fixture.Tests.ps1", import.meta.url),
+    "utf8",
+  );
+  const owner = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+  expect(owner).not.toContain("Get-PinnedGpgInputError");
+  expect(tests).toContain("Get-PinnedGpgInputError $command.stderr $ExpectedInput");
+  expect(tests).toContain("$lines.Count -ne 1");
+  expect(tests).toContain("[IO.Path]::IsPathFullyQualified($operand)");
+  expect(tests).toContain("[StringComparison]::OrdinalIgnoreCase");
+  expect(tests).toContain("$key) $key|Out-Null");
+  expect(tests).toContain("if($Operation -ceq 'gpg-import')");
+  const start = tests.indexOf("function Get-PinnedGpgInputError");
+  const end = tests.indexOf('. "$PSScriptRoot/owned-wsl2-fixture.ps1"', start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  const helper = tests.slice(start, end);
+  expect(helper).not.toMatch(/Invoke-|Get-Content|Start-Process|Write-|Test-Path/);
+  expect([...helper.matchAll(/result\.errno='([^']+)'/g)].map((match) => match[1])).toEqual([
+    "missing-input",
+    "permission-denied",
+    "invalid-argument",
+    "io-error",
+  ]);
+  expect(helper).toContain("errno='other';expectedInputMatched=$false");
+  expect(tests).toContain("throw $failureMessage");
+  expect(tests).toContain("throw $originalFailure");
+  expect(tests).toContain("$testsSource.Substring($start,$end-$start)+$call");
+  expect(tests).toContain("errno=permission-denied; expectedInputMatched=True");
+  // Source consistency only; complete Pester helper/real GPG execution remains CI-only.
 });

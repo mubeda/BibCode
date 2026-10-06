@@ -7,7 +7,27 @@ BeforeAll {
     if($Stderr -match '(?im)^gpg: (?:error running .+:|failed to start agent|can''t connect to the agent:)'){return 'runtime-agent'}
     return 'other'
   }
- . "$PSScriptRoot/owned-wsl2-fixture.ps1" }
+
+  function Get-PinnedGpgInputError([string]$Stderr,[string]$ExpectedInput) {
+    $result=[pscustomobject]@{errno='other';expectedInputMatched=$false}
+    $lines=[regex]::Matches($Stderr,'(?m)^gpg: (?:can''t open|error reading) ''([^\r\n]+)'': ([^\r\n]+)\r?$')
+    if($lines.Count -ne 1){return $result}
+    switch -CaseSensitive ($lines[0].Groups[2].Value) {
+      'No such file or directory' {$result.errno='missing-input';break}
+      'Permission denied' {$result.errno='permission-denied';break}
+      'Invalid argument' {$result.errno='invalid-argument';break}
+      'Input/output error' {$result.errno='io-error';break}
+    }
+    try {
+      $operand=$lines[0].Groups[1].Value.Replace('/','\')
+      $expected=$ExpectedInput.Replace('/','\')
+      if([IO.Path]::IsPathFullyQualified($operand) -and [IO.Path]::IsPathFullyQualified($expected)) {
+        $result.expectedInputMatched=[string]::Equals([IO.Path]::GetFullPath($operand),[IO.Path]::GetFullPath($expected),[StringComparison]::OrdinalIgnoreCase)
+      }
+    } catch { }
+    return $result
+  }
+. "$PSScriptRoot/owned-wsl2-fixture.ps1" }
 Describe 'Owned WSL2 command boundary' {
   BeforeEach {
     $script:record=@{name='BibCodeQA-0123456789abcdef0123456789abcdef';appState='joined';guid='inert-guid';importRoot=@{identity='inert-fileid'};wsl=@{pin=@{path='inert-wsl.exe'}};root=@{path='inert-owner'};phase='kernel-verified';kernelVerified=$true}
@@ -283,7 +303,7 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
       }
       foreach($name in $hashes.Keys){$file=Join-Path $fixtures $name;(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()|Should -BeExactly $hashes[$name];Copy-Item -LiteralPath $file -Destination (Join-Path $root $name);Set-OwnerAcl (Join-Path $root $name)}
       $key=Join-Path $root 'ubuntu-image-signing-key.asc';$sums=Join-Path $root 'noble-SHA256SUMS';$signature=Join-Path $root 'noble-SHA256SUMS.gpg'
-      function Invoke-PinnedMetadataCommand([string]$Operation,[string[]]$Arguments) {
+      function Invoke-PinnedMetadataCommand([string]$Operation,[string[]]$Arguments,[string]$ExpectedInput) {
         $beforeCommands=@(Get-ChildItem -LiteralPath $root -File -Filter 'command-*.private.json'|ForEach-Object {$_.Name})
         try { Invoke-FixtureCommand $gpg $Arguments } catch {
           $originalFailure=$_
@@ -295,11 +315,18 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
           ($command.exitCode -ge 0 -and $command.exitCode -le 255)|Should -BeTrue
           ($command.stdout -is [string])|Should -BeTrue;($command.stderr -is [string])|Should -BeTrue
           $command.exitCode|Should -Be $script:OwnedWslSignedMetadata.commandExit
-          if($command.exitCode -ne 0){throw ('Pinned GPG '+$Operation+' refused; commandReceiptPresent=true; commandExit='+$command.exitCode+'; stdoutPresent='+($command.stdout.Length -gt 0)+'; stderrPresent='+($command.stderr.Length -gt 0)+'; category='+(Get-PinnedGpgErrorCategory $command.stderr))}
+          if($command.exitCode -ne 0){
+            $failureMessage='Pinned GPG '+$Operation+' refused; commandReceiptPresent=true; commandExit='+$command.exitCode+'; stdoutPresent='+($command.stdout.Length -gt 0)+'; stderrPresent='+($command.stderr.Length -gt 0)+'; category='+(Get-PinnedGpgErrorCategory $command.stderr)
+            if($Operation -ceq 'gpg-import') {
+              $inputError=Get-PinnedGpgInputError $command.stderr $ExpectedInput
+              $failureMessage+='; errno='+$inputError.errno+'; expectedInputMatched='+$inputError.expectedInputMatched
+            }
+            throw $failureMessage
+          }
           throw $originalFailure
         }
       }
-      Invoke-PinnedMetadataCommand 'gpg-import' @('--homedir',$taskGpgHome,'--batch','--import',$key)|Out-Null
+      Invoke-PinnedMetadataCommand 'gpg-import' @('--homedir',$taskGpgHome,'--batch','--import',$key) $key|Out-Null
       $script:OwnedWslSignedMetadata.commandExit|Should -Be 0
       $script:OwnedWslSignedMetadata.operation='fingerprint-admission';$script:OwnedWslSignedMetadata.commandExit=$null
       $fingerprints=Invoke-PinnedMetadataCommand 'fingerprint-admission' @('--homedir',$taskGpgHome,'--batch','--with-colons','--fingerprint','843938DF228D22F7B3742BC0D94AA3F0EFE21092')
@@ -356,5 +383,58 @@ Describe 'Owned WSL2 pinned GPG closed error category (inert)' {
     $actual=Get-PinnedGpgErrorCategory $Stderr
     $actual|Should -BeExactly $Category
     ($actual -cin @('input-open-read','invalid-key-data','storage-permission','storage-open-create','runtime-agent','other'))|Should -BeTrue
+  }
+}
+
+
+Describe 'Owned WSL2 complete GPG input error projection (inert)' {
+  It 'returns only <Errno> and expected-operand <ExpectedMatch>' -TestCases @(
+    @{Stderr="gpg: can't open 'C:\inert-home\key.asc': No such file or directory";Expected='C:\inert-home\key.asc';Errno='missing-input';ExpectedMatch=$true},
+    @{Stderr="gpg: can't open 'C:/inert home/key.asc': No such file or directory";Expected='C:\inert home\key.asc';Errno='missing-input';ExpectedMatch=$true},
+    @{Stderr="gpg: can't open 'c:/INERT-HOME/key.asc': Permission denied";Expected='C:\inert-home\key.asc';Errno='permission-denied';ExpectedMatch=$true},
+    @{Stderr="gpg: can't open 'C:/foreign/key.asc': No such file or directory";Expected='C:\inert-home\key.asc';Errno='missing-input';ExpectedMatch=$false},
+    @{Stderr="gpg: keybox 'C:/inert-home/pubring.kbx' created`r`ngpg: can't open 'C:/inert-home/key.asc': Permission denied`r`n";Expected='C:\inert-home\key.asc';Errno='permission-denied';ExpectedMatch=$true},
+    @{Stderr="gpg: can't open 'C:/inert-home/key.asc': Invalid argument";Expected='C:\inert-home\key.asc';Errno='invalid-argument';ExpectedMatch=$true},
+    @{Stderr="gpg: error reading 'C:/inert-home/key.asc': Input/output error";Expected='C:\inert-home\key.asc';Errno='io-error';ExpectedMatch=$true},
+    @{Stderr="gpg: Zugriff auf 'C:/inert-home/key.asc' verweigert";Expected='C:\inert-home\key.asc';Errno='other';ExpectedMatch=$false},
+    @{Stderr="gpg: can't open 'C:/inert-home/key.asc': Unbekannter Fehler";Expected='C:\inert-home\key.asc';Errno='other';ExpectedMatch=$true},
+    @{Stderr="prefix gpg: can't open 'C:/inert-home/key.asc': No such file or directory";Expected='C:\inert-home\key.asc';Errno='other';ExpectedMatch=$false},
+    @{Stderr="gpg: can't open 'C:/inert-home/key.asc': No such file or directory`ngpg: can't open 'C:/foreign/key.asc': Permission denied";Expected='C:\inert-home\key.asc';Errno='other';ExpectedMatch=$false},
+    @{Stderr="gpg: can't open 'key.asc': No such file or directory";Expected='C:\inert-home\key.asc';Errno='missing-input';ExpectedMatch=$false},
+    @{Stderr="gpg: can't open 'C:/inert-home/sub/../key.asc': No such file or directory";Expected='C:\inert-home\key.asc';Errno='missing-input';ExpectedMatch=$true},
+    @{Stderr='';Expected='C:\inert-home\key.asc';Errno='other';ExpectedMatch=$false}
+  ) {
+    param($Stderr,$Expected,$Errno,$ExpectedMatch)
+    $projection=Get-PinnedGpgInputError $Stderr $Expected
+    @($projection.PSObject.Properties.Name|Sort-Object)|Should -Be @('errno','expectedInputMatched')
+    $projection.errno|Should -BeExactly $Errno
+    ($projection.expectedInputMatched -is [bool])|Should -BeTrue
+    $projection.expectedInputMatched|Should -Be $ExpectedMatch
+  }
+  It 'executes the actual failed-command wrapper and preserves fixed failure output' {
+    $testsSource=Get-Content -LiteralPath "$PSScriptRoot/owned-wsl2-fixture.Tests.ps1" -Raw
+    $start=$testsSource.IndexOf('function Invoke-PinnedMetadataCommand(',[StringComparison]::Ordinal)
+    $end=$testsSource.IndexOf("`n      Invoke-PinnedMetadataCommand 'gpg-import'",$start,[StringComparison]::Ordinal)
+    if($start -lt 0 -or $end -le $start){throw 'Actual pinned command wrapper unavailable.'}
+    $root=Join-Path $TestDrive 'inert-input-error';New-Item -ItemType Directory -Path $root|Out-Null
+    $gpg='inert-gpg';$expectedInput=Join-Path $root 'key.asc'
+    $previousMetadata=Get-Variable -Name OwnedWslSignedMetadata -Scope Script -ErrorAction SilentlyContinue
+    $previousMetadataValue=if($null -ne $previousMetadata){$previousMetadata.Value}else{$null}
+    try {
+    $script:OwnedWslSignedMetadata=[ordered]@{commandExit=2}
+    function Invoke-FixtureCommand([string]$Exe,[string[]]$Arguments) {
+      $record=[ordered]@{stdout='';stderr="gpg: can't open '"+$expectedInput+"': Permission denied";exitCode=2}
+      [IO.File]::WriteAllText((Join-Path $root 'command-inert.private.json'),($record|ConvertTo-Json -Compress))
+      throw 'Inert existing command refusal.'
+    }
+    $call="`nInvoke-PinnedMetadataCommand 'gpg-import' @('--import',`$expectedInput) `$expectedInput"
+    $caught=$null
+    try {& ([scriptblock]::Create($testsSource.Substring($start,$end-$start)+$call))}catch{$caught=$_}
+    $caught|Should -Not -BeNullOrEmpty
+    $caught.Exception.Message|Should -BeExactly 'Pinned GPG gpg-import refused; commandReceiptPresent=true; commandExit=2; stdoutPresent=False; stderrPresent=True; category=input-open-read; errno=permission-denied; expectedInputMatched=True'
+    } finally {
+      if($null -ne $previousMetadata){$script:OwnedWslSignedMetadata=$previousMetadataValue}
+      else{Remove-Variable -Name OwnedWslSignedMetadata -Scope Script -ErrorAction SilentlyContinue}
+    }
   }
 }
