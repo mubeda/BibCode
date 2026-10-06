@@ -1,2 +1,4 @@
 # git autocrlf=true converts LF to CRLF on Windows, causing issues with oxfmt
 * text=auto eol=lf
+# Retain the authenticated public-key fixture byte for byte, including armor-header spacing.
+scripts/fixtures/owned-wsl2/ubuntu-image-signing-key.asc -whitespace

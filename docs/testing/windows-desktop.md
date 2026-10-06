@@ -790,6 +790,15 @@ read, timeout or authority fallback is added. The registered Pester tests must e
 recorder bodies with inert ports before provisioning. Source consistency and
 Node-only checks do not establish this PowerShell proof; report it as unexecuted
 until the Windows CI gate passes.
+At a `signed-metadata` Prepare refusal only, `signedMetadata` may retain the fixed
+metadata item/operation, existing HTTP or GPG exit outcome and computed size,
+fingerprint, signature and checksum match facts. Unreached facts remain null.
+The failed receipt and recorder require exact keys, types, enum casing and
+bounded counts; raw output and paths remain private. The registered CI-only
+GPG test uses authenticated fixed metadata copies in an isolated test homedir.
+It adds no download or action to Prepare and does not establish the real refusal
+cause until the actual Windows command outcome is observed.
+
 The
 ACL-protected zero-original status is written before the native prerequisite
 step fails. No distro names, raw WSL output, host paths or exception text enter

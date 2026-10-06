@@ -119,3 +119,24 @@ it("keeps Prepare stage labels and actual PowerShell recorder validations source
   expect(recorder.run).toContain("$status.prepareStage = $prepareStage");
   // These are source-consistency assertions, not execution of PowerShell admission or serialization.
 });
+
+it("keeps signed metadata schema confined to actual failed receipt/recorder source", () => {
+  const steps = workflow.jobs.windows_wsl_upgrade_smoke.steps,
+    prepare = steps.find((step: { id?: string }) => step.id === "native_wsl"),
+    recorder = steps.find(
+      (step: { name?: string }) => step.name === "Record native WSL prerequisite unavailable",
+    );
+  for (const body of [prepare.run, recorder.run]) {
+    expect(body).toContain("function Assert-SignedMetadata($value)");
+    expect(body).toContain("(-not ($value.item -is [string]))");
+    expect(body).toContain("-cnotin @('key','checksums','signature')");
+    expect(body).toContain("(-not ($value.$key -is [bool]))");
+    expect(body).toContain("(-not ($number -is [int]))");
+    expect(body).toContain("$number -gt $high");
+  }
+  expect(prepare.run).toContain("if($prepareStage -ceq 'signed-metadata')");
+  expect(recorder.run).toContain("$status.signedMetadata=$signedMetadata");
+  const owner = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+  expect(owner).toContain("$receipt.signedMetadata=[ordered]@{}");
+  expect(owner).toContain("$child.ExitCode");
+});

@@ -143,19 +143,21 @@ $ReleaseBase='https://releases.ubuntu.com/noble/'
 function Test-StageFault { if($script:OwnedWslPrepareStage -eq $RequestedFailure) { throw 'Inert selected Prepare refusal.' } }
 function Assert-FixtureRuntime { Test-StageFault }
 function Test-Path { $false }
-function Set-OwnerAcl { Test-StageFault }
+function Set-OwnerAcl { Test-StageFault;if($env:BIBCODE_INERT_SIGNED_FAILURE -ceq 'acl' -and $script:OwnedWslPrepareStage -ceq 'signed-metadata'){throw 'Inert metadata ACL refusal.'} }
 function Get-AuthenticodeSignature { Test-StageFault;@{Status='Valid';SignerCertificate=@{Subject='Microsoft'}} }
 function Get-FixtureInventory { Test-StageFault;@{distros=@();defaultGuid=$null} }
 function Get-PhysicalPin([string]$Path) { Test-StageFault;@{path=$Path;identity='inert-file-id';directory=$true} }
 function Assert-PhysicalPin { Test-StageFault }
 function Get-FileHash([string]$LiteralPath) { Test-StageFault;@{Hash=if($LiteralPath.EndsWith('gpg.exe')){'INERTGPG'}else{$RootfsHash.ToUpperInvariant()}} }
-function Invoke-WebRequest { Test-StageFault }
-function Get-Item { Test-StageFault;@{Length=1} }
+function Invoke-WebRequest { Test-StageFault;@{StatusCode=200} }
+function Get-Item { Test-StageFault;@{Length=if($env:BIBCODE_INERT_SIGNED_FAILURE -ceq 'oversize'){3000000}else{1}} }
 function Get-Content { Test-StageFault;$RootfsHash+' *'+$RootfsName }
 function Save-FixtureManifest { Test-StageFault }
 function Assert-OwnedRegistration { Test-StageFault;@{guid='inert-guid'} }
 function Invoke-FixtureCommand([string]$Exe,[string[]]$Arguments) {
  Test-StageFault
+ if($script:OwnedWslPrepareStage -ceq 'signed-metadata'){$script:OwnedWslSignedMetadata.commandExit=0;if($env:BIBCODE_INERT_SIGNED_FAILURE -ceq 'gpg-exit'){$script:OwnedWslSignedMetadata.commandExit=2;throw 'Inert GPG refusal.'}}
+ if($env:BIBCODE_INERT_SIGNED_FAILURE -ceq 'fingerprint' -and '--fingerprint' -in $Arguments){return 'fpr:::::::::INERT-WRONG:'}
  if('--fingerprint' -in $Arguments){return 'fpr:::::::::'+$SigningFingerprint+':'}
  if('--verify' -in $Arguments){return '[GNUPG:] VALIDSIG '+$SigningFingerprint}
  if('uname' -in $Arguments){if('-r' -in $Arguments){return '6.6.87.2-microsoft-standard-WSL2'};return 'x86_64'}
@@ -180,18 +182,18 @@ function Set-Acl {}
       if($Body.Contains('${{')){throw 'Unresolved actual workflow expression.'}
       return $Body
     }
-    function Invoke-ActualPrepareRecorder([string]$Stage,[string]$Malformed,[string]$Reason='wsl-no-distro',[switch]$RecorderOnly,[string]$RecordedStage='',[switch]$ExpectSuccess) {
+    function Invoke-ActualPrepareRecorder([string]$Stage,[string]$Malformed,[string]$Reason='wsl-no-distro',[switch]$RecorderOnly,[string]$RecordedStage='',[switch]$ExpectSuccess,[string]$SignedCase='') {
       $caseRoot=Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
       $scripts=Join-Path $caseRoot 'scripts';New-Item -ItemType Directory -Path $scripts -Force|Out-Null
       $owner=Join-Path $scripts 'owned-wsl2-fixture.ps1'
       if($Malformed){Set-Content -LiteralPath $owner -Value ("param([string]`$Action,[string]`$OwnerManifest,[string]`$SourceSha)`nWrite-Output '"+$Malformed+"';exit 1") -Encoding utf8}
       else{Set-Content -LiteralPath $owner -Value ($ownerPrefix+"`n"+$ownerSource.Substring($ownerStart)) -Encoding utf8}
       $output=Join-Path $caseRoot 'github-output';$environment=Join-Path $caseRoot 'github-env';New-Item -ItemType File -Path $output,$environment|Out-Null
-      $saved=@{};foreach($key in @('RUNNER_TEMP','GITHUB_OUTPUT','GITHUB_ENV','GITHUB_SHA','BIBCODE_INERT_PREPARE_FAILURE')){$saved[$key]=[Environment]::GetEnvironmentVariable($key,'Process')}
+      $saved=@{};foreach($key in @('RUNNER_TEMP','GITHUB_OUTPUT','GITHUB_ENV','GITHUB_SHA','BIBCODE_INERT_PREPARE_FAILURE','BIBCODE_INERT_SIGNED_FAILURE')){$saved[$key]=[Environment]::GetEnvironmentVariable($key,'Process')}
       $prior=Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue;$had=$null -ne $prior;$exitValue=if($had){$prior.Value}else{$null}
       $statusSucceeded=$Reason -ne 'wsl-status-failed';$listObserved=$statusSucceeded;$listSucceeded=($Reason -ne 'wsl-list-failed' -and $statusSucceeded)
       try {
-        $env:RUNNER_TEMP=$caseRoot;$env:GITHUB_OUTPUT=$output;$env:GITHUB_ENV=$environment;$env:GITHUB_SHA='a'*40;$env:BIBCODE_INERT_PREPARE_FAILURE=$Stage
+        $env:RUNNER_TEMP=$caseRoot;$env:GITHUB_OUTPUT=$output;$env:GITHUB_ENV=$environment;$env:GITHUB_SHA='a'*40;$env:BIBCODE_INERT_PREPARE_FAILURE=$Stage;$env:BIBCODE_INERT_SIGNED_FAILURE=$SignedCase
         $flags=@{'steps.wsl.outputs.reason_code'=$Reason;'steps.wsl.outputs.status_succeeded'=$statusSucceeded.ToString().ToLowerInvariant();'steps.wsl.outputs.list_observed'=$listObserved.ToString().ToLowerInvariant();'steps.wsl.outputs.list_succeeded'=$listSucceeded.ToString().ToLowerInvariant()}
         $prepareFile=Join-Path $caseRoot 'prepare.ps1';Set-Content -LiteralPath $prepareFile -Value ($workflowPorts+"`n"+(Resolve-WorkflowTokens $prepareBody $flags)) -Encoding utf8
         Push-Location $caseRoot
@@ -201,7 +203,7 @@ function Set-Acl {}
           if($RecorderOnly){$outputs['reason_code']=$Reason;$outputs['prepare_stage']=$RecordedStage}
           else{& $prepareFile;foreach($line in Get-Content -LiteralPath $output){$parts=$line.Split('=',2);$outputs[$parts[0]]=$parts[1]}}
           if($ExpectSuccess){$LASTEXITCODE|Should -Be 0;$outputs['available']|Should -BeExactly 'true';$outputs.ContainsKey('prepare_stage')|Should -BeFalse;return}
-          $flags['steps.native_wsl.outputs.reason_code']=$outputs['reason_code'];$flags['steps.native_wsl.outputs.prepare_stage']=$outputs['prepare_stage']
+          $flags['steps.native_wsl.outputs.reason_code']=$outputs['reason_code'];$flags['steps.native_wsl.outputs.prepare_stage']=$outputs['prepare_stage'];$flags['steps.native_wsl.outputs.signed_metadata']=$outputs['signed_metadata']
           $recorderFile=Join-Path $caseRoot 'recorder.ps1';Set-Content -LiteralPath $recorderFile -Value ($workflowPorts+"`n"+(Resolve-WorkflowTokens $recorderBody $flags)) -Encoding utf8
           { & $recorderFile } | Should -Throw
           $file=Join-Path $caseRoot 'bibcode-native-followups-wsl/evidence/native-followups-workflow-status.json'
@@ -212,7 +214,7 @@ function Set-Acl {}
           $status.originalCount | Should -Be 0;$status.previewOriginalCount | Should -Be 0;$status.completeGroup | Should -BeFalse
           $status.wslStatusSucceeded | Should -Be $statusSucceeded;$status.wslListObserved | Should -Be $listObserved
           if($statusSucceeded){$status.wslListSucceeded | Should -Be $listSucceeded}else{$status.wslListSucceeded | Should -BeNullOrEmpty}
-          if($Stage){$status.reasonCode|Should -BeExactly 'wsl-fixture-owner-refused';$status.prepareStage|Should -BeExactly $Stage;@($status.PSObject.Properties.Name).Count|Should -Be 15}
+          if($Stage -or $SignedCase){$expectedStage=if($SignedCase){'signed-metadata'}else{$Stage};$status.reasonCode|Should -BeExactly 'wsl-fixture-owner-refused';$status.prepareStage|Should -BeExactly $expectedStage;if($expectedStage -ceq 'signed-metadata'){if(-not $SignedCase){$status.signedMetadata.operation|Should -BeExactly 'get';$status.signedMetadata.item|Should -BeExactly 'key';$status.signedMetadata.httpStatus|Should -BeNullOrEmpty};if($SignedCase -ceq 'acl'){$status.signedMetadata.operation|Should -BeExactly 'file-acl';$status.signedMetadata.httpStatus|Should -Be 200};if($SignedCase -ceq 'oversize'){$status.signedMetadata.sizeMatched|Should -BeFalse};if($SignedCase -ceq 'gpg-exit'){$status.signedMetadata.commandExit|Should -Be 2};if($SignedCase -ceq 'fingerprint'){$status.signedMetadata.fingerprintCount|Should -Be 0;$status.signedMetadata.fingerprintMatched|Should -BeFalse};@($status.PSObject.Properties.Name).Count|Should -Be 16}else{@($status.PSObject.Properties.Name).Count|Should -Be 15}}
           else{$status.reasonCode|Should -BeExactly $Reason;@($status.PSObject.Properties.Name)|Should -Not -Contain 'prepareStage'}
         } finally { Pop-Location }
       } finally {
@@ -224,13 +226,79 @@ function Set-Acl {}
   It 'runs actual Prepare catch, workflow receipt admission and recorder for <Stage>' -TestCases @(
     @{Stage='runtime-admission'},@{Stage='private-root-acl'},@{Stage='launcher-admission'},@{Stage='empty-inventory'},@{Stage='launcher-readiness'},@{Stage='verifier-admission'},@{Stage='signed-metadata'},@{Stage='image-admission'},@{Stage='intent-write'},@{Stage='owned-import'},@{Stage='kernel-admission'},@{Stage='mapping-admission'}
   ) { param($Stage) Invoke-ActualPrepareRecorder $Stage '' }
+  It 'retains already-computed signed failure outcome <Case>' -TestCases @(@{Case='acl'},@{Case='oversize'},@{Case='gpg-exit'},@{Case='fingerprint'}) {param($Case) Invoke-ActualPrepareRecorder '' '' -SignedCase $Case}
   It 'keeps the original actual Prepare success receipt and availability' { Invoke-ActualPrepareRecorder '' '' -ExpectSuccess }
   It 'rejects malformed failed receipt before stage publication: <Receipt>' -TestCases @(
+    @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":["key"],"operation":null,"httpStatus":null,"commandExit":null,"sizeMatched":null,"fingerprintCount":null,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null}}'},
+    @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":"KEY","operation":null,"httpStatus":null,"commandExit":null,"sizeMatched":null,"fingerprintCount":null,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null}}'},
+    @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":null,"operation":"unknown","httpStatus":null,"commandExit":null,"sizeMatched":null,"fingerprintCount":null,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null}}'},
+    @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":null,"operation":null,"httpStatus":200.5,"commandExit":null,"sizeMatched":null,"fingerprintCount":null,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null}}'},
+    @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":null,"operation":null,"httpStatus":600,"commandExit":null,"sizeMatched":null,"fingerprintCount":null,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null}}'},
+    @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":null,"operation":null,"httpStatus":null,"commandExit":"1","sizeMatched":null,"fingerprintCount":null,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null}}'},
+    @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":null,"operation":null,"httpStatus":null,"commandExit":null,"sizeMatched":null,"fingerprintCount":3,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null}}'},
+    @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":null,"operation":null,"httpStatus":null,"commandExit":null,"sizeMatched":"true","fingerprintCount":null,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null}}'},
+    @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":null,"operation":null,"httpStatus":null,"commandExit":null,"sizeMatched":null,"fingerprintCount":null,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null,"path":"inert-private"}}'},
     @{Receipt='{"completed":0,"prepareStage":"runtime-admission"}'},@{Receipt='{"completed":"False","prepareStage":"runtime-admission"}'},@{Receipt='{"completed":[false],"prepareStage":"runtime-admission"}'},@{Receipt='{"completed":false,"prepareStage":["runtime-admission"]}'},@{Receipt='{"completed":false,"prepareStage":"RUNTIME-ADMISSION"}'},@{Receipt='{"completed":false,"prepareStage":"inert private detail"}'},@{Receipt='{"completed":false,"prepareStage":"runtime-admission","path":"inert-private"}'},@{Receipt='{"completed":false}'},@{Receipt='{"prepareStage":"runtime-admission"}'}
   ) { param($Receipt) Invoke-ActualPrepareRecorder '' $Receipt }
   It 'rejects noncanonical recorder stage <Stage>' -TestCases @(@{Stage='RUNTIME-ADMISSION'},@{Stage='inert-private-detail'}) {param($Stage) Invoke-ActualPrepareRecorder '' '' 'wsl-fixture-owner-refused' -RecorderOnly -RecordedStage $Stage}
   It 'omits stage for existing prerequisite reason <Reason>' -TestCases @(@{Reason='wsl-status-failed'},@{Reason='wsl-list-failed'},@{Reason='wsl-no-distro'}) {
     param($Reason)
     Invoke-ActualPrepareRecorder '' '' $Reason -RecorderOnly
+  }
+}
+
+
+Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
+  It 'runs the existing bounded GPG caller against pinned metadata in an owned homedir' {
+    if(-not [OperatingSystem]::IsWindows() -or $env:CI -ne 'true' -or $env:GITHUB_ACTIONS -ne 'true'){throw 'Windows CI verifier required.'}
+    $root=Join-Path $TestDrive 'real-crypto';New-Item -ItemType Directory -Path $root|Out-Null
+    Set-OwnerAcl $root
+    $taskGpgHome=Join-Path $root 'gnupg';New-Item -ItemType Directory -Path $taskGpgHome|Out-Null;Set-OwnerAcl $taskGpgHome
+    $savedManifest=$OwnerManifest
+    $savedContext=@{}
+    foreach($contextName in @('Action','OwnedWslPrepareStage','OwnedWslSignedMetadata')) {
+      $previous=Get-Variable -Name $contextName -Scope Script -ErrorAction SilentlyContinue
+      $savedContext[$contextName]=@{exists=$null -ne $previous;value=if($null -ne $previous){$previous.Value}else{$null}}
+    }
+    try {
+      $Action='Prepare'
+      $script:Action='Prepare';$script:OwnedWslPrepareStage='signed-metadata'
+      $script:OwnedWslSignedMetadata=[ordered]@{operation='gpg-import';commandExit=$null}
+      $OwnerManifest=Join-Path $root 'owner.secret.json'
+      $gpg=Join-Path $env:ProgramFiles 'Git/usr/bin/gpg.exe';$gpgPin=Get-PhysicalPin $gpg
+      $fixtures=Join-Path $PSScriptRoot 'fixtures/owned-wsl2'
+      $hashes=@{
+        'ubuntu-image-signing-key.asc'='337fa0013bb263aebcef98fa7b7af18e186d89565a5019f7295beb42ebee5290'
+        'noble-SHA256SUMS'='728064ecf411f4ab702d9c3ca0a938ce672771424c028a1b52b2449f7eb5a068'
+        'noble-SHA256SUMS.gpg'='f9be4b4a527b63f14dde0387edcb7a02ba3ac43d537b1674a5aeae19c6f23827'
+      }
+      foreach($name in $hashes.Keys){$file=Join-Path $fixtures $name;(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()|Should -BeExactly $hashes[$name];Copy-Item -LiteralPath $file -Destination (Join-Path $root $name);Set-OwnerAcl (Join-Path $root $name)}
+      $key=Join-Path $root 'ubuntu-image-signing-key.asc';$sums=Join-Path $root 'noble-SHA256SUMS';$signature=Join-Path $root 'noble-SHA256SUMS.gpg'
+      Invoke-FixtureCommand $gpg @('--homedir',$taskGpgHome,'--batch','--import',$key)|Out-Null
+      $script:OwnedWslSignedMetadata.commandExit|Should -Be 0
+      $script:OwnedWslSignedMetadata.operation='fingerprint-admission';$script:OwnedWslSignedMetadata.commandExit=$null
+      $fingerprints=Invoke-FixtureCommand $gpg @('--homedir',$taskGpgHome,'--batch','--with-colons','--fingerprint','843938DF228D22F7B3742BC0D94AA3F0EFE21092')
+      $script:OwnedWslSignedMetadata.commandExit|Should -Be 0
+      @($fingerprints -split "`n"|Where-Object {$_ -match '^fpr:' -and ($_ -split ':')[9] -ceq '843938DF228D22F7B3742BC0D94AA3F0EFE21092'}).Count|Should -Be 1
+      $script:OwnedWslSignedMetadata.operation='signature-admission';$script:OwnedWslSignedMetadata.commandExit=$null
+      $verification=Invoke-FixtureCommand $gpg @('--homedir',$taskGpgHome,'--batch','--status-fd','1','--verify',$signature,$sums)
+      $script:OwnedWslSignedMetadata.commandExit|Should -Be 0
+      $valid=@($verification -split "`n"|Where-Object {$_ -match '^\[GNUPG:\] VALIDSIG '});$valid.Count|Should -Be 1
+      ($valid[0] -split ' ')[2]|Should -BeExactly '843938DF228D22F7B3742BC0D94AA3F0EFE21092'
+      $line=@(Get-Content -LiteralPath $sums|Where-Object {$_ -cmatch '^[a-f0-9]{64} [ *]ubuntu-24\.04\.5-wsl-amd64\.wsl$'});$line.Count|Should -Be 1
+      $line[0].Substring(0,64)|Should -BeExactly 'bb415d824822c4b878125729af451a5d18fb13d1cf5cbed9a7393ad64ac6039e'
+      $corrupt=Join-Path $root 'corrupt-SHA256SUMS';[IO.File]::WriteAllText($corrupt,([IO.File]::ReadAllText($sums)+'inert-corruption'));Set-OwnerAcl $corrupt
+      $script:OwnedWslSignedMetadata.commandExit=$null
+      {Invoke-FixtureCommand $gpg @('--homedir',$taskGpgHome,'--batch','--status-fd','1','--verify',$signature,$corrupt)}|Should -Throw
+      $script:OwnedWslSignedMetadata.commandExit|Should -BeGreaterThan 0
+      ($script:OwnedWslSignedMetadata.commandExit -le 255)|Should -BeTrue
+      Assert-PhysicalPin $gpgPin
+    } finally {
+      $OwnerManifest=$savedManifest
+      foreach($contextName in $savedContext.Keys) {
+        if($savedContext[$contextName].exists){Set-Variable -Name $contextName -Scope Script -Value $savedContext[$contextName].value}
+        else{Remove-Variable -Name $contextName -Scope Script -ErrorAction SilentlyContinue}
+      }
+    }
   }
 }

@@ -243,21 +243,41 @@ jobs:
           $manifest = Join-Path $env:RUNNER_TEMP 'bibcode-owned-wsl2-owner/owner.secret.json'
           $available = $false
           $prepareStage = $null
+          $signedMetadata = $null
           $reason = '${{ steps.wsl.outputs.reason_code }}'
           if ('${{ steps.wsl.outputs.status_succeeded }}' -eq 'true' -and '${{ steps.wsl.outputs.list_succeeded }}' -eq 'true') {
             $result = & ./scripts/owned-wsl2-fixture.ps1 -Action Prepare -OwnerManifest $manifest -SourceSha $env:GITHUB_SHA
+          function Assert-SignedMetadata($value) {
+            $keys=@('item','operation','httpStatus','commandExit','sizeMatched','fingerprintCount','fingerprintMatched','signatureCount','signerMatched','checksumCount','checksumMatched')
+            if($null -eq $value -or @($value.PSObject.Properties.Name).Count -ne $keys.Count) { throw 'Signed metadata shape refused' }
+            foreach($key in $keys){if($key -cnotin @($value.PSObject.Properties.Name)){throw 'Signed metadata key refused'}}
+            if($null -ne $value.item -and ((-not ($value.item -is [string])) -or $value.item -cnotin @('key','checksums','signature'))){throw 'Signed metadata item refused'}
+            if($null -ne $value.operation -and ((-not ($value.operation -is [string])) -or $value.operation -cnotin @('get','file-acl','size-admission','gpg-import','fingerprint-admission','signature-admission','checksum-admission'))){throw 'Signed metadata operation refused'}
+            foreach($key in @('sizeMatched','fingerprintMatched','signerMatched','checksumMatched')){if($null -ne $value.$key -and (-not ($value.$key -is [bool]))){throw 'Signed metadata bool refused'}}
+            foreach($key in @('httpStatus','commandExit','fingerprintCount','signatureCount','checksumCount')){
+              $number=$value.$key;if($null -eq $number){continue}
+              if((-not ($number -is [int])) -and (-not ($number -is [long]))){throw 'Signed metadata integer refused'}
+              $low=0;$high=2;if($key -ceq 'httpStatus'){$low=100;$high=599}elseif($key -ceq 'commandExit'){$high=255}
+              if($number -lt $low -or $number -gt $high){throw 'Signed metadata bound refused'}
+            }
+          }
             $receipt = $result | ConvertFrom-Json
             $available = $LASTEXITCODE -eq 0 -and $receipt.completed -eq $true
             if (-not $available) {
               $reason = 'wsl-fixture-owner-refused'
               $fields = @($receipt.PSObject.Properties.Name)
               $prepareStage = $receipt.prepareStage
-              if ($fields.Count -ne 2 -or 'completed' -notin $fields -or 'prepareStage' -notin $fields -or (-not ($receipt.completed -is [bool])) -or $receipt.completed -ne $false -or (-not ($prepareStage -is [string])) -or $prepareStage -cnotin @('runtime-admission','private-root-acl','launcher-admission','empty-inventory','launcher-readiness','verifier-admission','signed-metadata','image-admission','intent-write','owned-import','kernel-admission','mapping-admission')) { throw 'Owned WSL Prepare metadata refused' }
+              $expectedFields=if($prepareStage -ceq 'signed-metadata'){3}else{2}
+              if ($fields.Count -ne $expectedFields -or 'completed' -notin $fields -or 'prepareStage' -notin $fields -or (-not ($receipt.completed -is [bool])) -or $receipt.completed -ne $false -or (-not ($prepareStage -is [string])) -or $prepareStage -cnotin @('runtime-admission','private-root-acl','launcher-admission','empty-inventory','launcher-readiness','verifier-admission','signed-metadata','image-admission','intent-write','owned-import','kernel-admission','mapping-admission')) { throw 'Owned WSL Prepare metadata refused' }
             }
           }
           "available=$($available.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "reason_code=$reason" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          if ($reason -eq 'wsl-fixture-owner-refused') { "prepare_stage=$prepareStage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append }
+          if ($reason -eq 'wsl-fixture-owner-refused') {
+            if($prepareStage -ceq 'signed-metadata'){if('signedMetadata' -cnotin $fields){throw 'Signed metadata receipt refused'};Assert-SignedMetadata $receipt.signedMetadata;$signedMetadata=$receipt.signedMetadata}
+            "prepare_stage=$prepareStage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            if($null -ne $signedMetadata){"signed_metadata=$($signedMetadata|ConvertTo-Json -Compress)"|Out-File -FilePath $env:GITHUB_OUTPUT -Append}
+          }
           "BIBCODE_NATIVE_WSL_MANIFEST=$manifest" | Out-File -FilePath $env:GITHUB_ENV -Append
           "BIBCODE_NATIVE_WSL_FIXTURE_SELECTED=true" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -289,11 +309,26 @@ jobs:
             (($reasonCode -eq 'wsl-no-distro' -or $reasonCode -eq 'wsl-fixture-owner-refused') -and $statusSucceeded -and $listObserved -and $listSucceeded -eq $true)
           )
           if (-not $reasonMatches) { throw 'Native WSL closed status mismatch' }
+          function Assert-SignedMetadata($value) {
+            $keys=@('item','operation','httpStatus','commandExit','sizeMatched','fingerprintCount','fingerprintMatched','signatureCount','signerMatched','checksumCount','checksumMatched')
+            if($null -eq $value -or @($value.PSObject.Properties.Name).Count -ne $keys.Count) { throw 'Signed metadata shape refused' }
+            foreach($key in $keys){if($key -cnotin @($value.PSObject.Properties.Name)){throw 'Signed metadata key refused'}}
+            if($null -ne $value.item -and ((-not ($value.item -is [string])) -or $value.item -cnotin @('key','checksums','signature'))){throw 'Signed metadata item refused'}
+            if($null -ne $value.operation -and ((-not ($value.operation -is [string])) -or $value.operation -cnotin @('get','file-acl','size-admission','gpg-import','fingerprint-admission','signature-admission','checksum-admission'))){throw 'Signed metadata operation refused'}
+            foreach($key in @('sizeMatched','fingerprintMatched','signerMatched','checksumMatched')){if($null -ne $value.$key -and (-not ($value.$key -is [bool]))){throw 'Signed metadata bool refused'}}
+            foreach($key in @('httpStatus','commandExit','fingerprintCount','signatureCount','checksumCount')){
+              $number=$value.$key;if($null -eq $number){continue}
+              if((-not ($number -is [int])) -and (-not ($number -is [long]))){throw 'Signed metadata integer refused'}
+              $low=0;$high=2;if($key -ceq 'httpStatus'){$low=100;$high=599}elseif($key -ceq 'commandExit'){$high=255}
+              if($number -lt $low -or $number -gt $high){throw 'Signed metadata bound refused'}
+            }
+          }
           $status = @{schemaVersion=1;selection='release-visual-native-followups';sourceSha=$env:GITHUB_SHA;partition='windows-wsl';status='unavailable';reasonCode=$reasonCode;wslStatusSucceeded=$statusSucceeded;wslListObserved=$listObserved;wslListSucceeded=$listSucceeded;originalCount=0;requiredPartitionOriginalCount=2;previewOriginalCount=0;completeGroup=$false;visualReview='pending'}
           if ($reasonCode -eq 'wsl-fixture-owner-refused') {
             $prepareStage = '${{ steps.native_wsl.outputs.prepare_stage }}'
             if ((-not ($prepareStage -is [string])) -or $prepareStage -cnotin @('runtime-admission','private-root-acl','launcher-admission','empty-inventory','launcher-readiness','verifier-admission','signed-metadata','image-admission','intent-write','owned-import','kernel-admission','mapping-admission')) { throw 'Native WSL Prepare stage refused' }
             $status.prepareStage = $prepareStage
+            if($prepareStage -ceq 'signed-metadata'){$signedMetadata='${{ steps.native_wsl.outputs.signed_metadata }}'|ConvertFrom-Json;Assert-SignedMetadata $signedMetadata;$status.signedMetadata=$signedMetadata}
           }
           $status | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $root 'native-followups-workflow-status.json') -Encoding utf8
           throw 'Native WSL partition remains unavailable'

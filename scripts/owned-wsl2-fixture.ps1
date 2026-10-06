@@ -68,6 +68,7 @@ function Invoke-FixtureCommand([string]$Exe,[string[]]$Arguments,[int]$Timeout=6
     $out=$child.StandardOutput.ReadToEndAsync();$err=$child.StandardError.ReadToEndAsync()
     if(-not $child.WaitForExit($Timeout)) { $child.Kill($true);if(-not $child.WaitForExit(15000)) { Refuse-OwnedWsl };Refuse-OwnedWsl }
     $stdout=$out.GetAwaiter().GetResult();$stderr=$err.GetAwaiter().GetResult()
+    if($Action -eq 'Prepare' -and $script:OwnedWslPrepareStage -ceq 'signed-metadata' -and $script:OwnedWslSignedMetadata.operation -cin @('gpg-import','fingerprint-admission','signature-admission')) { $code=$child.ExitCode;if($code -ge 0 -and $code -le 255){$script:OwnedWslSignedMetadata.commandExit=[int]$code} }
     if($stdout.Length -gt 2097152 -or $stderr.Length -gt 2097152) { Refuse-OwnedWsl }
     $log=Join-Path ([IO.Path]::GetDirectoryName($OwnerManifest)) ('command-'+[guid]::NewGuid().ToString('N')+'.private.json')
     [IO.File]::WriteAllText($log,(@{stdout=$stdout;stderr=$stderr;exitCode=$child.ExitCode}|ConvertTo-Json -Compress));Set-OwnerAcl $log
@@ -124,16 +125,38 @@ function Prepare-Fixture {
   $gnupg=Join-Path $root 'gnupg';[IO.Directory]::CreateDirectory($gnupg)|Out-Null;Set-OwnerAcl $gnupg
   $key=Join-Path $root 'canonical.key';$sums=Join-Path $root 'SHA256SUMS';$signature=Join-Path $root 'SHA256SUMS.gpg';$image=Join-Path $root $RootfsName
   $script:OwnedWslPrepareStage='signed-metadata'
-  foreach($download in @(@(('https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x'+$SigningFingerprint),$key),@(($ReleaseBase+'SHA256SUMS'),$sums),@(($ReleaseBase+'SHA256SUMS.gpg'),$signature))) { Invoke-WebRequest -Uri $download[0] -OutFile $download[1] -TimeoutSec 120 -MaximumRedirection 0;Set-OwnerAcl $download[1] }
-  if((Get-Item -LiteralPath $key).Length -gt 1048576 -or (Get-Item -LiteralPath $sums).Length -gt 2097152 -or (Get-Item -LiteralPath $signature).Length -gt 65536) {Refuse-OwnedWsl}
+  $script:OwnedWslSignedMetadata=[ordered]@{item=$null;operation=$null;httpStatus=$null;commandExit=$null;sizeMatched=$null;fingerprintCount=$null;fingerprintMatched=$null;signatureCount=$null;signerMatched=$null;checksumCount=$null;checksumMatched=$null}
+  foreach($download in @(@(('https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x'+$SigningFingerprint),$key),@(($ReleaseBase+'SHA256SUMS'),$sums),@(($ReleaseBase+'SHA256SUMS.gpg'),$signature))) {
+    $script:OwnedWslSignedMetadata.item=if($download[1] -ceq $key){'key'}elseif($download[1] -ceq $sums){'checksums'}else{'signature'}
+    $script:OwnedWslSignedMetadata.operation='get';$script:OwnedWslSignedMetadata.httpStatus=$null
+    $response=Invoke-WebRequest -Uri $download[0] -OutFile $download[1] -TimeoutSec 120 -MaximumRedirection 0 -PassThru
+    $script:OwnedWslSignedMetadata.httpStatus=[int]$response.StatusCode
+    $script:OwnedWslSignedMetadata.operation='file-acl';Set-OwnerAcl $download[1]
+  }
+  $script:OwnedWslSignedMetadata.item=$null;$script:OwnedWslSignedMetadata.operation='size-admission'
+  $oversize=(Get-Item -LiteralPath $key).Length -gt 1048576 -or (Get-Item -LiteralPath $sums).Length -gt 2097152 -or (Get-Item -LiteralPath $signature).Length -gt 65536
+  $script:OwnedWslSignedMetadata.sizeMatched=-not $oversize
+  if($oversize) {Refuse-OwnedWsl}
+  $script:OwnedWslSignedMetadata.item='key';$script:OwnedWslSignedMetadata.operation='gpg-import';$script:OwnedWslSignedMetadata.commandExit=$null
   Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--import',$key)|Out-Null
+  $script:OwnedWslSignedMetadata.operation='fingerprint-admission';$script:OwnedWslSignedMetadata.commandExit=$null
   $fingerprints=Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--with-colons','--fingerprint',$SigningFingerprint)
-  if(@($fingerprints -split "`n"|Where-Object {$_ -match '^fpr:' -and ($_ -split ':')[9] -ceq $SigningFingerprint}).Count -ne 1) { Refuse-OwnedWsl }
+  $fingerprintCount=@($fingerprints -split "`n"|Where-Object {$_ -match '^fpr:' -and ($_ -split ':')[9] -ceq $SigningFingerprint}).Count
+  $script:OwnedWslSignedMetadata.fingerprintCount=[Math]::Min(2,$fingerprintCount);$script:OwnedWslSignedMetadata.fingerprintMatched=$fingerprintCount -eq 1
+  if($fingerprintCount -ne 1) { Refuse-OwnedWsl }
+  $script:OwnedWslSignedMetadata.item='signature';$script:OwnedWslSignedMetadata.operation='signature-admission';$script:OwnedWslSignedMetadata.commandExit=$null
   $verification=Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--status-fd','1','--verify',$signature,$sums)
   $valid=@($verification -split "`n"|Where-Object {$_ -match '^\[GNUPG:\] VALIDSIG '})
-  if($valid.Count -ne 1 -or ($valid[0] -split ' ')[2] -cne $SigningFingerprint) { Refuse-OwnedWsl }
+  $script:OwnedWslSignedMetadata.signatureCount=[Math]::Min(2,$valid.Count)
+  $signerMatched=$valid.Count -eq 1 -and ($valid[0] -split ' ')[2] -ceq $SigningFingerprint
+  $script:OwnedWslSignedMetadata.signerMatched=$signerMatched
+  if(-not $signerMatched) { Refuse-OwnedWsl }
+  $script:OwnedWslSignedMetadata.item='checksums';$script:OwnedWslSignedMetadata.operation='checksum-admission'
   $line=@(Get-Content -LiteralPath $sums|Where-Object {$_ -cmatch ('^[a-f0-9]{64} [ *]'+[regex]::Escape($RootfsName)+'$')})
-  if($line.Count -ne 1 -or $line[0].Substring(0,64) -cne $RootfsHash) { Refuse-OwnedWsl }
+  $script:OwnedWslSignedMetadata.checksumCount=[Math]::Min(2,$line.Count)
+  $checksumMatched=$line.Count -eq 1 -and $line[0].Substring(0,64) -ceq $RootfsHash
+  $script:OwnedWslSignedMetadata.checksumMatched=$checksumMatched
+  if(-not $checksumMatched) { Refuse-OwnedWsl }
   $script:OwnedWslPrepareStage='image-admission'
   Invoke-WebRequest -Uri ($ReleaseBase+$RootfsName) -OutFile $image -TimeoutSec 300 -MaximumRedirection 0;Set-OwnerAcl $image
   if((Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant() -cne $RootfsHash) { Refuse-OwnedWsl };Assert-PhysicalPin $gpgPin
@@ -195,7 +218,15 @@ function Invoke-OwnedFixtureAction([string]$Action) {
 }
 if($MyInvocation.InvocationName -ne '.') {
   try { Invoke-OwnedFixtureAction $Action; Write-Output '{"completed":true}';exit 0 } catch {
-    if($Action -eq 'Prepare') { [ordered]@{completed=$false;prepareStage=$script:OwnedWslPrepareStage}|ConvertTo-Json -Compress|Write-Output }
+    if($Action -eq 'Prepare') {
+      $receipt=[ordered]@{completed=$false;prepareStage=$script:OwnedWslPrepareStage}
+      if($script:OwnedWslPrepareStage -ceq 'signed-metadata') {
+        $originalFailure=$_
+        try { if($script:OwnedWslSignedMetadata.operation -ceq 'get' -and $null -ne $originalFailure.Exception.Response) { $code=[int]$originalFailure.Exception.Response.StatusCode;if($code -ge 100 -and $code -le 599){$script:OwnedWslSignedMetadata.httpStatus=$code} } } catch { }
+        $receipt.signedMetadata=[ordered]@{};foreach($name in $script:OwnedWslSignedMetadata.Keys){$receipt.signedMetadata[$name]=$script:OwnedWslSignedMetadata[$name]}
+      }
+      $receipt|ConvertTo-Json -Depth 4 -Compress|Write-Output
+    }
     else { Write-Output '{"completed":false}' }
     exit 1
   }
