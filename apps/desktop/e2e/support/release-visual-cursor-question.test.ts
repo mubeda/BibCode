@@ -556,6 +556,8 @@ it.each(["before", "send", "running", "pass"])(
       NodeModule.stripTypeScriptTypes("({" + source.slice(start, end) + "}).send"),
       {
         originalTurnId: null,
+        cursorTurnObservation: null,
+        cursorQuestionFixturePrompt,
         step: (phase: string) => phases.push(phase),
         currentThread: async () => {
           calls.push("snapshot");
@@ -564,8 +566,15 @@ it.each(["before", "send", "running", "pass"])(
             return { latestTurn: null };
           }
           return {
+            modelSelection: { instanceId: "cursor" },
+            messages: [{ role: "user", text: cursorQuestionFixturePrompt }],
             latestTurn: { turnId: "owned-turn", state: "running" },
-            session: { activeTurnId: "owned-turn", providerName: "cursor" },
+            session: {
+              activeTurnId: "owned-turn",
+              providerName: "cursor",
+              status: "running",
+              lastError: null,
+            },
           };
         },
         send: async (text: string) => {
@@ -595,3 +604,149 @@ it.each(["before", "send", "running", "pass"])(
       expect(calls).toEqual(["snapshot", "public-send", "running-turn", "snapshot"]);
   },
 );
+
+it.each([
+  "running",
+  "no-turn",
+  "same-turn",
+  "idle",
+  "foreign-active",
+  "foreign-provider",
+  "session-error",
+  "foreign-model",
+  "no-message",
+])("retains only closed facts from the existing actual running-turn snapshot: %s", async (mode) => {
+  const source = NodeFS.readFileSync(
+    new NodeURL.URL("../qualify-delivery-retry.ts", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf(
+    "          send: async (text) => {",
+    source.indexOf("const proof = await runCursorQuestionVisual"),
+  );
+  const end = source.indexOf("          capture: async () => {", start);
+  const scope = {
+    originalTurnId: null,
+    cursorTurnObservation: null as unknown,
+    cursorQuestionFixturePrompt,
+    step: () => {},
+    currentThread: async () => {
+      if (!sampled) {
+        sampled = true;
+        return { latestTurn: mode === "same-turn" ? { turnId: "owned-prior" } : null };
+      }
+      return {
+        modelSelection: { instanceId: mode === "foreign-model" ? "claudeAgent" : "cursor" },
+        messages:
+          mode === "no-message" ? [] : [{ role: "user", text: cursorQuestionFixturePrompt }],
+        latestTurn:
+          mode === "no-turn"
+            ? null
+            : {
+                turnId: mode === "same-turn" ? "owned-prior" : "owned-current",
+                state: mode === "idle" ? "completed" : "running",
+              },
+        session: {
+          providerName: mode === "foreign-provider" ? "claudeAgent" : "cursor",
+          activeTurnId: mode === "foreign-active" ? "foreign" : "owned-current",
+          status: mode === "session-error" ? "error" : "running",
+          lastError: mode === "session-error" ? "private fixture detail" : null,
+        },
+      };
+    },
+    send: async () => {},
+    owner: {
+      until: async (check: () => Promise<boolean>) => {
+        await check();
+      },
+    },
+  };
+  let sampled = false;
+  const send = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes("({" + source.slice(start, end) + "}).send"),
+    scope,
+  );
+  await send(cursorQuestionFixturePrompt);
+  expect(scope.cursorTurnObservation).toEqual({
+    modelCursor: mode !== "foreign-model",
+    turnPresent: mode !== "no-turn",
+    newTurn: mode !== "no-turn" && mode !== "same-turn",
+    turnRunning: mode !== "no-turn" && mode !== "idle",
+    sessionPresent: true,
+    sessionCursor: mode !== "foreign-provider",
+    activeTurnMatches: mode !== "no-turn" && mode !== "same-turn" && mode !== "foreign-active",
+    sessionError: mode === "session-error",
+    promptRecorded: mode !== "no-message",
+  });
+  expect(
+    Object.values(scope.cursorTurnObservation as object).every(
+      (value) => typeof value === "boolean",
+    ),
+  ).toBe(true);
+  expect(Object.isFrozen(scope.cursorTurnObservation)).toBe(true);
+  expect(JSON.stringify(scope.cursorTurnObservation)).not.toMatch(
+    /private|fixture|owned-|foreign|claudeAgent/,
+  );
+});
+
+it.each(["owned", "foreign-error", "foreign-phase", "foreign-selection"])(
+  "emits the last Cursor predicate facts only for the exact original failure: %s",
+  (mode) => {
+    const source = NodeFS.readFileSync(
+      new NodeURL.URL("../qualify-delivery-retry.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf(
+      "      cursorTurnObservation:",
+      source.indexOf('    write("failure", {'),
+    );
+    const end = source.indexOf("      startupObservation,", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const error = new Error("Inert original Cursor observation failure.");
+    const facts = Object.freeze({
+      modelCursor: true,
+      turnPresent: true,
+      newTurn: true,
+      turnRunning: false,
+      sessionPresent: true,
+      sessionCursor: true,
+      activeTurnMatches: false,
+      sessionError: true,
+      promptRecorded: true,
+    });
+    const result = NodeVM.runInNewContext("({" + source.slice(start, end) + "})", {
+      config: {
+        selection:
+          mode === "foreign-selection" ? "release-visual-core" : "release-visual-cursor-question",
+      },
+      phase:
+        mode === "foreign-phase"
+          ? "visual-cursor-question-send"
+          : "visual-cursor-question-turn-running",
+      originalCursorFailure: {
+        error: mode === "foreign-error" ? new Error("Inert other error.") : error,
+      },
+      error,
+      cursorTurnObservation: facts,
+    });
+    expect(result.cursorTurnObservation).toBe(mode === "owned" ? facts : null);
+  },
+);
+
+it("clears the actual last Cursor predicate record before each producer entry", () => {
+  const source = NodeFS.readFileSync(
+    new NodeURL.URL("../qualify-delivery-retry.ts", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf("        cursorTurnObservation = null;");
+  const end = source.indexOf("        const proof = await runCursorQuestionVisual({", start);
+  expect(start).toBeGreaterThan(0);
+  const scope = {
+    cursorTurnObservation: { sessionError: true } as unknown,
+    cursorOriginalFailure: {} as unknown,
+  };
+  NodeVM.runInNewContext(source.slice(start, end), scope);
+  expect(scope.cursorTurnObservation).toBeNull();
+  expect(scope.cursorOriginalFailure).toBeNull();
+});

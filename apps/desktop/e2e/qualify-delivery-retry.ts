@@ -67,7 +67,10 @@ import {
   type OwnedDriverReadiness,
 } from "./support/qualification-owner.ts";
 import { prepareDesktopUiTestContext } from "./support/test-project.ts";
-import { cursorQuestionFixtureSelection } from "./support/release-visual-cursor-question-fixture.ts";
+import {
+  cursorQuestionFixtureSelection,
+  cursorQuestionFixturePrompt,
+} from "./support/release-visual-cursor-question-fixture.ts";
 import {
   runCursorQuestionVisual,
   captureCursorQuestionVisual,
@@ -633,6 +636,7 @@ export async function runDeliveryRetryQualification() {
   let textRowObservationInput: VisualTextRowObservationInput | null = null;
   let importModelBinding: DeliveryImportModelBinding | null | undefined;
   let cursorOriginalFailure: { readonly error: unknown; readonly phase: string } | null = null;
+  let cursorTurnObservation: Readonly<Record<string, boolean>> | null = null;
   const readCursorOriginalFailure = (): {
     readonly error: unknown;
     readonly phase: string;
@@ -2009,6 +2013,7 @@ export async function runDeliveryRetryQualification() {
             )?.threadId === workspace.threadId,
           );
         };
+        cursorTurnObservation = null;
         cursorOriginalFailure = null;
         const proof = await runCursorQuestionVisual({
           browser: b(),
@@ -2044,6 +2049,21 @@ export async function runDeliveryRetryQualification() {
             await owner.until(async () => {
               const thread = await currentThread(),
                 turn = thread.latestTurn;
+              cursorTurnObservation = Object.freeze({
+                modelCursor: thread.modelSelection.instanceId === "cursor",
+                turnPresent: turn !== null,
+                newTurn: turn !== null && turn.turnId !== before,
+                turnRunning: turn?.state === "running",
+                sessionPresent: thread.session !== null,
+                sessionCursor: thread.session?.providerName === "cursor",
+                activeTurnMatches: turn !== null && thread.session?.activeTurnId === turn.turnId,
+                sessionError:
+                  thread.session?.status === "error" || thread.session?.lastError != null,
+                promptRecorded: thread.messages.some(
+                  (message) =>
+                    message.role === "user" && message.text === cursorQuestionFixturePrompt,
+                ),
+              });
               if (
                 !turn ||
                 turn.turnId === before ||
@@ -2384,6 +2404,12 @@ export async function runDeliveryRetryQualification() {
       phase,
       theme,
       failure: classifyQualificationFailure(error),
+      cursorTurnObservation:
+        config.selection === "release-visual-cursor-question" &&
+        phase === "visual-cursor-question-turn-running" &&
+        originalCursorFailure?.error === error
+          ? cursorTurnObservation
+          : null,
       startupObservation,
       importObservation,
       worktreeObservation,

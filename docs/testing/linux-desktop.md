@@ -1798,6 +1798,16 @@ The Cursor send callback separately
 attributes its original decoded-turn read, unchanged public composer send and
 correlated running-turn wait. These fixed phases preserve all predicates and
 original-error attribution; they add no snapshot reads, actions or timeout budget.
+At only an original Cursor running-turn failure, `cursorTurnObservation` may retain
+nine booleans from the last already-required schema-decoded snapshot: selected
+Cursor model, latest-turn presence/newness/running state, session presence/Cursor
+provider, matching active turn, session error presence and the fixed prompt's
+public message presence. Reset the record at producer entry and emit it only for
+the same original error and phase; otherwise it is null. No snapshot, message,
+ID, path or error text leaves this projection, and it adds no read or action.
+These are the last observed predicate facts, not a native cause or screenshot
+qualification. The existing failure JSON gains this nullable field; artifact
+filenames and all existing failure fields remain unchanged.
 
 ### Existing workspace row substates
 
