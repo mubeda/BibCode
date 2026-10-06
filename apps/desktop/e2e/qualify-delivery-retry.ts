@@ -1,4 +1,20 @@
 import {
+  selectLifecycleCodexWorkspace,
+  runProjectLifecycleScene,
+  captureProjectLifecycleScene,
+  createProjectLifecycleSourceJoins,
+  createProjectLifecycleBrowserFlows,
+  projectLifecycleAssertion,
+  validateProjectLifecycleJoins,
+  type ProjectLifecycleObservation,
+} from "./support/release-visual-project-lifecycle.ts";
+import {
+  prepareProjectLifecycleFixture,
+  createLifecycleProcessProof,
+  readLifecycleProcessRecord,
+} from "./support/release-visual-project-lifecycle-fixture.ts";
+import { withProjectLifecycleApi } from "./support/release-visual-project-lifecycle-api.ts";
+import {
   runWorkspaceSubstateBatch,
   captureWorkspaceSubstate,
   validateWorkspaceSubstateJoins,
@@ -30,6 +46,7 @@ import { withProviderChatPublicApi } from "./support/release-visual-provider-cha
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeNet from "node:net";
+import * as NodeCrypto from "node:crypto";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeModule from "node:module";
 import * as NodeUtil from "node:util";
@@ -151,6 +168,8 @@ const contractsRequire = NodeModule.createRequire(
 );
 const Schema: { decodeUnknownSync: <A>(schema: { readonly Type: A }) => (value: unknown) => A } =
   contractsRequire("effect/Schema");
+const DateTime: { nowUnsafe: () => unknown; formatIso: (value: unknown) => string } =
+  contractsRequire("effect/DateTime");
 const origin = "http://127.0.0.1:4885";
 const surface = '[data-center-surface-host][data-visible="true"]';
 const composer = `${surface} [data-testid="composer-editor"]`;
@@ -480,6 +499,7 @@ export function deliveryConfiguration(
       "release-visual-cursor-question",
       "release-visual-workspace-substates",
       "release-visual-provider-chat",
+      "release-visual-project-lifecycle",
     ].includes(selection) ||
     environment.CI !== "true" ||
     !/^[0-9a-f]{40}$/.test(environment.BIBCODE_UPLOAD_SOURCE ?? "") ||
@@ -500,7 +520,8 @@ export function deliveryConfiguration(
       | "release-visual-git-project"
       | "release-visual-cursor-question"
       | "release-visual-workspace-substates"
-      | "release-visual-provider-chat";
+      | "release-visual-provider-chat"
+      | "release-visual-project-lifecycle";
     fixture: string;
     evidence: string;
     binary: string;
@@ -629,6 +650,7 @@ export async function runDeliveryRetryQualification() {
   let theme: DeliveryTheme = "light";
   let success = false;
   let providerChatFixtureSafeToDelete = true;
+  let projectLifecycleFixtureSafeToDelete = true;
   const assertions: object[] = [];
   const captures: object[] = [];
   const capturedVisuals = new Set<string>();
@@ -988,6 +1010,7 @@ export async function runDeliveryRetryQualification() {
   async function createOwnedWorkspace(
     context: ReturnType<typeof prepareDesktopUiTestContext>,
     runRoot: string,
+    lifecycleSnapshot?: () => Promise<unknown>,
   ) {
     const branch = `codex/delivery-retry-${theme}`;
     const popup = '[data-slot="dialog-popup"][role="dialog"]';
@@ -1036,7 +1059,30 @@ export async function runDeliveryRetryQualification() {
         `Worktree: ${NodePath.basename(identity.path)} (${branch})`,
       ),
     );
-    await selectClaudeModel("worktree");
+    if (config.selection === "release-visual-project-lifecycle") {
+      if (!lifecycleSnapshot) throw new Error("Owned lifecycle snapshot unavailable.");
+      await selectLifecycleCodexWorkspace({
+        browser: b(),
+        owner,
+        readSnapshot: lifecycleSnapshot,
+        projectPath: context.projectPath,
+        threadId,
+        cwd: identity.path,
+        branch,
+        step,
+        verifyOwnedIdentity: async () => {
+          check(
+            (
+              await b().execute(readSelectedDeliveryWorktree, {
+                origin,
+                branch,
+                boundThreadId: threadId,
+              })
+            )?.threadId === threadId,
+          );
+        },
+      });
+    } else await selectClaudeModel("worktree");
     step("worktree-ready");
     check(
       (await b().execute(readSelectedDeliveryWorktree, { origin, branch, boundThreadId: threadId }))
@@ -1259,7 +1305,10 @@ export async function runDeliveryRetryQualification() {
         enabled: true,
         config: { binaryPath: claude },
       };
-      if (config.selection === "release-visual-provider-chat") {
+      if (
+        config.selection === "release-visual-provider-chat" ||
+        config.selection === "release-visual-project-lifecycle"
+      ) {
         const codex = NodePath.join(context.shimDirectory, "codex");
         configured.providers.codex = { enabled: true, binaryPath: codex };
         configured.providerInstances.codex = {
@@ -1290,6 +1339,63 @@ export async function runDeliveryRetryQualification() {
       configured.enableProviderUpdateChecks = false;
       configured.worktreeBaseDirectory = NodePath.join(runRoot, "managed-worktrees");
       NodeFS.mkdirSync(configured.worktreeBaseDirectory, { mode: 0o700 });
+      let projectLifecycleFixture: Awaited<
+        ReturnType<typeof prepareProjectLifecycleFixture>
+      > | null = null;
+      if (config.selection === "release-visual-project-lifecycle") {
+        step("visual-project-lifecycle-fixture");
+        const managedParent = NodePath.join(
+          configured.worktreeBaseDirectory,
+          NodePath.basename(context.projectPath),
+        );
+        NodeFS.mkdirSync(managedParent, { mode: 0o700 });
+        NodeFS.chmodSync(context.providerInputLogPath, 0o600);
+        projectLifecycleFixture = await prepareProjectLifecycleFixture({
+          root: runRoot,
+          home: context.fixtureUserHomePath,
+          primaryCheckout: context.projectPath,
+          anchorCheckouts: [context.projectPath],
+          plannedManagedCheckout: NodePath.join(managedParent, "codex-delivery-retry-" + theme),
+          source: config.source,
+          theme,
+          hostPlatform: "linux",
+          nodeExecutable: NodeFS.realpathSync(process.execPath),
+          gitExecutable: NodePath.join(config.fixture, "bin", "git"),
+          admitOwner: async () => {
+            const admitted = deliveryConfiguration(process.env);
+            check(
+              admitted.selection === config.selection &&
+                admitted.fixture === config.fixture &&
+                admitted.source === config.source,
+            );
+          },
+          git: async (cwd, args, environment) => {
+            let stderr = "";
+            const output = runOwnedGitProjectCommand(
+              {
+                root: runRoot,
+                fixtureRoot: config.fixture,
+                home: context.fixtureUserHomePath,
+                git: NodePath.join(config.fixture, "bin", "git"),
+              },
+              cwd,
+              args,
+              (command, argv, options) => {
+                const result = NodeChildProcess.spawnSync(command, argv, {
+                  ...options,
+                  env: { ...options.env, ...environment },
+                });
+                stderr = result.stderr;
+                return result;
+              },
+            );
+            return { ...output, stderr };
+          },
+        });
+      }
+      const serverEnvironment = projectLifecycleFixture
+        ? { ...childEnv, ...projectLifecycleFixture.serverGitEnvironment }
+        : childEnv;
       let settingsForWrite = configured;
       if (config.selection === "release-visual-settings") {
         step("visual-settings-provider-fixture");
@@ -1332,7 +1438,7 @@ export async function runDeliveryRetryQualification() {
           "--no-browser",
           "--no-startup-pairing-offer",
         ],
-        childEnv,
+        serverEnvironment,
         "primary",
       );
       await owner.until(async () => {
@@ -1438,7 +1544,17 @@ export async function runDeliveryRetryQualification() {
       }
       step("import");
       await importProject(context.projectPath);
-      const workspace = await createOwnedWorkspace(context, runRoot);
+      const lifecycleSnapshot =
+        config.selection === "release-visual-project-lifecycle"
+          ? createOwnedGitProjectSnapshotReader(() =>
+              owner.json(
+                config.binary,
+                ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
+                childEnv,
+              ),
+            )
+          : undefined;
+      const workspace = await createOwnedWorkspace(context, runRoot, lifecycleSnapshot);
       const visualInput = {
         root: runRoot,
         project: context.projectPath,
@@ -1469,12 +1585,15 @@ export async function runDeliveryRetryQualification() {
         });
       } else if (
         config.selection === "release-visual-settings" ||
-        config.selection === "release-visual-cursor-question"
+        config.selection === "release-visual-cursor-question" ||
+        config.selection === "release-visual-project-lifecycle"
       ) {
         step(
           config.selection === "release-visual-cursor-question"
             ? "visual-cursor-question-viewport"
-            : "visual-settings-viewport",
+            : config.selection === "release-visual-project-lifecycle"
+              ? "visual-project-lifecycle-viewport"
+              : "visual-settings-viewport",
         );
         const observed = await bounded(browser.execute(readVisualViewport), 2_000);
         const outer = await browser.getWindowSize();
@@ -1526,7 +1645,10 @@ export async function runDeliveryRetryQualification() {
       const baseline = `delivery baseline ${theme}`;
       const prompt = `delivery held message ${theme}`;
       const draft = `delivery preserved draft ${theme}`;
-      if (config.selection !== "release-visual-cursor-question") {
+      if (
+        config.selection !== "release-visual-cursor-question" &&
+        config.selection !== "release-visual-project-lifecycle"
+      ) {
         step("baseline");
         await send(baseline);
         await owner.until(
@@ -1540,7 +1662,289 @@ export async function runDeliveryRetryQualification() {
         await browser.$(`${form} button[aria-label="Send message"]`).waitForDisplayed();
         check(!(await browser.$(surface).getText()).includes(newConversationNotice));
       }
-      if (config.selection === "release-visual-workspace-substates") {
+      if (config.selection === "release-visual-project-lifecycle") {
+        step("visual-project-lifecycle-bind");
+        if (!projectLifecycleFixture || !lifecycleSnapshot || server.child.pid === undefined)
+          throw new Error("Owned lifecycle fixture unavailable.");
+        const fixture = projectLifecycleFixture,
+          initial = await lifecycleSnapshot(),
+          descriptor = await readOwnedGitProjectDescriptor();
+        check(
+          descriptor.environmentId === "local" &&
+            !!descriptor.bootId &&
+            !!descriptor.storageInstanceId &&
+            descriptor.capabilities.vcsCloneReattach === true,
+        );
+        check(
+          workspace.path ===
+            NodePath.join(
+              configured.worktreeBaseDirectory,
+              NodePath.basename(context.projectPath),
+              "codex-delivery-retry-" + theme,
+            ),
+        );
+        const retained = NodeFS.lstatSync(workspace.path),
+          gitPointer = NodeFS.readFileSync(NodePath.join(workspace.path, ".git"));
+        const verifyCheckoutRetained = async () => {
+          const current = NodeFS.lstatSync(workspace.path);
+          check(
+            current.isDirectory() &&
+              !current.isSymbolicLink() &&
+              current.dev === retained.dev &&
+              current.ino === retained.ino &&
+              NodeFS.readFileSync(NodePath.join(workspace.path, ".git")).equals(gitPointer),
+          );
+          check(
+            JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
+              JSON.stringify({
+                path: workspace.path,
+                branch: workspace.branch,
+                commonDirectory: workspace.commonDirectory,
+              }),
+          );
+        };
+        const processProof = createLifecycleProcessProof({
+          CI: childEnv.CI,
+          uid: NodeFS.lstatSync(config.fixture).uid,
+          serverPid: server.child.pid,
+          serverExecutable: config.binary,
+          serverArgs: server.child.spawnargs,
+          serverCwd: root,
+          namespace: {
+            net: childEnv.BIBCODE_UPLOAD_NETNS!,
+            pid: childEnv.BIBCODE_UPLOAD_PIDNS!,
+            user: childEnv.BIBCODE_UPLOAD_USERNS!,
+          },
+          providerNode: NodeFS.realpathSync(process.execPath),
+          providerScript: NodePath.join(context.shimDirectory, "codex-fixture.mjs"),
+          providerCwd: workspace.path,
+          read: readLifecycleProcessRecord,
+          pids: () =>
+            NodeFS.readdirSync("/proc")
+              .filter((name) => /^[0-9]+$/.test(name) && Number(name) > 1)
+              .map(Number),
+        });
+        const verifyTarget = async () => {
+          processProof.verifyServerOwned();
+          const current = await readOwnedGitProjectDescriptor();
+          check(
+            current.environmentId === descriptor.environmentId &&
+              current.bootId === descriptor.bootId &&
+              current.storageInstanceId === descriptor.storageInstanceId &&
+              current.capabilities.vcsCloneReattach === true,
+          );
+        };
+        const models: OrchestrationReadModel =
+          Schema.decodeUnknownSync(OrchestrationReadModel)(initial);
+        const hosts = models.threads.filter(
+          (thread) =>
+            thread.id === workspace.threadId &&
+            thread.kind === "workspace" &&
+            thread.worktreePath === workspace.path &&
+            thread.branch === workspace.branch &&
+            thread.deletedAt === null &&
+            thread.archivedAt === null,
+        );
+        check(hosts.length === 1);
+        const host = hosts[0]!,
+          projects = models.projects.filter(
+            (project) =>
+              project.id === host.projectId &&
+              project.deletedAt === null &&
+              project.workspaceRoot === context.projectPath,
+          );
+        check(projects.length === 1);
+        const primaryProject = projects[0]!;
+        const bind = async (
+          scene: ProjectLifecycleObservation["scene"],
+          cwd: string,
+        ): Promise<ProjectLifecycleObservation> => {
+          const model = await lifecycleSnapshot(),
+            projects = model.projects.filter(
+              (project) => project.workspaceRoot === cwd && project.deletedAt === null,
+            );
+          check(projects.length === 1);
+          const project = projects[0]!,
+            threads = model.threads.filter(
+              (thread) =>
+                thread.projectId === project.id &&
+                thread.kind === "default" &&
+                thread.worktreePath === null &&
+                thread.branch === null &&
+                thread.deletedAt === null &&
+                thread.archivedAt === null,
+            );
+          check(threads.length === 1);
+          return Object.freeze({
+            scene,
+            theme,
+            origin,
+            projectId: project.id,
+            threadId: threads[0]!.id,
+            cwd,
+            branch: "main",
+            title: project.title,
+            cloneUrl: fixture.cloneUrl,
+            cloneParent: fixture.cloneParent,
+          });
+        };
+        const busy: ProjectLifecycleObservation = Object.freeze({
+          scene: "worktree-remove-busy",
+          theme,
+          origin,
+          projectId: host.projectId,
+          threadId: host.id,
+          cwd: workspace.path,
+          branch: workspace.branch,
+          title: host.title,
+          cloneUrl: fixture.cloneUrl,
+          cloneParent: fixture.cloneParent,
+        });
+        const grant = await owner.json(
+          config.binary,
+          ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
+          childEnv,
+        );
+        const credential =
+          typeof grant === "object" && grant !== null && "credential" in grant
+            ? grant.credential
+            : null;
+        if (typeof credential !== "string" || credential.length < 8 || credential.length > 16384)
+          throw new Error("Owned lifecycle credential refused.");
+        const accessToken = await fixtureAccessToken(origin, credential),
+          rows: object[] = [];
+        const unsafe = () => {
+          projectLifecycleFixtureSafeToDelete = false;
+        };
+        await withProjectLifecycleApi(
+          {
+            CI: childEnv.CI,
+            ownedRoot: runRoot,
+            accessToken,
+            projectId: host.projectId,
+            threadId: host.id,
+            managedCheckout: workspace.path,
+            trustCheckout: fixture.trustCheckout,
+            cloneUrl: fixture.cloneUrl,
+            cloneParent: fixture.cloneParent,
+            verifyTarget,
+            observeUnsafeCleanup: unsafe,
+          },
+          async (api) => {
+            const execute = async (binding: ProjectLifecycleObservation) => {
+              const verifyOwnedIdentity = async () => {
+                await verifyTarget();
+                if (binding.scene === "worktree-remove-busy") {
+                  await verifyCheckoutRetained();
+                  check(
+                    (
+                      await b().execute(readSelectedDeliveryWorktree, {
+                        origin,
+                        branch: workspace.branch,
+                        boundThreadId: workspace.threadId,
+                      })
+                    )?.threadId === workspace.threadId,
+                  );
+                } else {
+                  check(
+                    await b().execute(readGitProjectSelection, {
+                      origin,
+                      selection: {
+                        environmentId: "local",
+                        projectId: binding.projectId,
+                        threadId: binding.threadId,
+                        cwd: binding.cwd,
+                        branch: binding.branch,
+                        title: binding.title,
+                      },
+                    }),
+                  );
+                }
+              };
+              const source = createProjectLifecycleSourceJoins({
+                owner,
+                binding,
+                fixture,
+                serverPid: server.child.pid!,
+                rpc: api,
+                newCommandId: () => NodeCrypto.randomUUID(),
+                nowIsoDate: () => DateTime.formatIso(DateTime.nowUnsafe()),
+                readNativeInputs: () => readProviderChatInputs(context.providerInputLogPath),
+                verifyProviderLive: async (turn) => processProof.verifyProviderLive(turn),
+                verifyProviderReaped: async () =>
+                  owner.until(async () => {
+                    try {
+                      processProof.verifyProviderReaped();
+                      return true;
+                    } catch {
+                      return false;
+                    }
+                  }),
+                verifyCheckoutRetained,
+                verifyFixtureInputsRetained: () => fixture.verifyInputsRetained(),
+                verifyServerOwned: verifyTarget,
+              });
+              const flows = createProjectLifecycleBrowserFlows({
+                browser: b(),
+                owner,
+                binding,
+                fixture,
+                source,
+                verifyOwnedIdentity,
+                selectTrustProject: async () => {
+                  check(binding.scene === "git-trust-refusal");
+                  await click('[data-testid="primary-card-button-' + binding.projectId + '"]');
+                },
+              });
+              const verifySource =
+                binding.scene === "worktree-remove-busy"
+                  ? () => source.verifyRunningAndRefused()
+                  : binding.scene === "project-clone-progress"
+                    ? () => source.verifySingleHeldTransfer()
+                    : () => source.refreshAndVerifyUntrusted();
+              rows.push(
+                await runProjectLifecycleScene({
+                  scene: binding.scene,
+                  theme,
+                  verifyOwnedIdentity,
+                  step,
+                  ...flows,
+                  capture: async () => {
+                    captures.push(
+                      await captureProjectLifecycleScene({
+                        ...binding,
+                        browser: b(),
+                        owner,
+                        evidence: config.evidence,
+                        captured: capturedVisuals,
+                        verifyOwnedIdentity,
+                        verifySource,
+                      }),
+                    );
+                    write("assertions", { captures, assertions });
+                  },
+                  observeCleanupFailure: (role, error) => {
+                    unsafe();
+                    owner.failures.push({ role, failure: classifyQualificationFailure(error) });
+                  },
+                }),
+              );
+            };
+            await execute(busy);
+            step("visual-project-lifecycle-trust-import");
+            await importProject(fixture.trustCheckout);
+            const trust = await bind("git-trust-refusal", fixture.trustCheckout);
+            await execute(trust);
+            step("visual-project-lifecycle-primary-restore");
+            await click('[data-testid="primary-card-button-' + primaryProject.id + '"]');
+            const clone = await bind("project-clone-progress", context.projectPath);
+            await execute(clone); // Clone is last: Cancel retains its visible form values until browser teardown.
+          },
+        );
+        await fixture.verifyInputsRetained();
+        assertions.push(projectLifecycleAssertion(theme, rows));
+        write("assertions", { captures, assertions });
+      } else if (config.selection === "release-visual-workspace-substates") {
         step("visual-workspace-substates-open");
         step("visual-workspace-substates-draft");
         await type("Owned visual review draft");
@@ -2351,6 +2755,8 @@ export async function runDeliveryRetryQualification() {
       validateWorkspaceSubstateJoins(captures, assertions);
     if (config.selection === "release-visual-provider-chat")
       validateProviderChatJoins(captures, assertions);
+    if (config.selection === "release-visual-project-lifecycle")
+      validateProjectLifecycleJoins(captures, assertions);
     check(
       captures.length ===
         deliveryThemes.length *
@@ -2364,9 +2770,11 @@ export async function runDeliveryRetryQualification() {
                   ? 1
                   : config.selection === "release-visual-workspace-substates"
                     ? workspaceSubstates.length
-                    : config.selection === "release-visual-provider-chat"
-                      ? qualifiedProviderChatScenes.length
-                      : deliveryScenes.length) && assertions.length === 2,
+                    : config.selection === "release-visual-project-lifecycle"
+                      ? 3
+                      : config.selection === "release-visual-provider-chat"
+                        ? qualifiedProviderChatScenes.length
+                        : deliveryScenes.length) && assertions.length === 2,
     );
     success = true;
   } catch (error) {
@@ -2481,6 +2889,11 @@ export async function runDeliveryRetryQualification() {
     if (owner.failures.length > 0 || !owner.childrenClosed()) success = false;
     if (config.selection === "release-visual-provider-chat" && !providerChatFixtureSafeToDelete)
       success = false;
+    if (
+      config.selection === "release-visual-project-lifecycle" &&
+      !projectLifecycleFixtureSafeToDelete
+    )
+      success = false;
     write("result", {
       success,
       phase,
@@ -2496,6 +2909,9 @@ export async function runDeliveryRetryQualification() {
       ...(config.selection === "release-visual-provider-chat"
         ? { providerChatFixtureSafeToDelete }
         : {}),
+      ...(config.selection === "release-visual-project-lifecycle"
+        ? { projectLifecycleFixtureSafeToDelete }
+        : {}),
       scope:
         config.selection === "release-visual-core"
           ? "First nine Linux Chromium scene pairs only. Original PNGs require independent review; unpictured surfaces and the remaining issue29 matrix are unqualified. No Playwright, Tauri or final-release acceptance claim."
@@ -2507,9 +2923,11 @@ export async function runDeliveryRetryQualification() {
                 ? "One fixed Cursor later-multiselect question pair only through native ACP and public choices/Submit. completeGroup remains false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
                 : config.selection === "release-visual-workspace-substates"
                   ? "Three existing-row substates in six extra originals only: selected stash diff, owned Files item menu and public terminal/activity/more-chat lines. Core nine and full82/164 remain unchanged; completeGroup false, independent original pixel review and native/final acceptance remain required."
-                  : config.selection === "release-visual-provider-chat"
-                    ? "Seven existing provider/chat rows in fourteen originals only through native Codex/Claude and public controls. Cursor owns the separate question pair. completeGroup false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
-                    : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
+                  : config.selection === "release-visual-project-lifecycle"
+                    ? "Three existing project lifecycle rows in six Linux Chromium originals only through maintained Codex, real owned Git transfer and server Git trust policy. completeGroup false; full82/164 and independent original pixel review remain required. No native or final-product acceptance claim."
+                    : config.selection === "release-visual-provider-chat"
+                      ? "Seven existing provider/chat rows in fourteen originals only through native Codex/Claude and public controls. Cursor owns the separate question pair. completeGroup false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
+                      : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
     });
   }
   return success ? 0 : 1;

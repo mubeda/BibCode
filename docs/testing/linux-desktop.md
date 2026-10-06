@@ -2074,3 +2074,72 @@ and child cleanup, unchanged host namespace and safe fixture deletion must be
 verified from the same CI run. Unsafe or unproven cleanup preserves the fixture
 and fails qualification. Record run-specific SHAs, timings and original hashes
 in the execution report, not this runbook.
+
+### Contained project lifecycle visual qualification
+
+The manual release visual workflow accepts `release-visual-project-lifecycle`
+from a reviewed, nominated QA ref. Default-branch execution remains registration
+only and fails closed; the separate native sharing selection retains its own
+packaged workflow and evidence boundary.
+
+```sh
+gh workflow run qualify-release-visuals.yml --ref '<qualified-ref>' -f scene_selection=release-visual-project-lifecycle
+```
+
+This fixed browser selection covers only the existing worktree-remove-busy,
+project-clone-progress and git-trust-refusal rows in light and dark at the
+standard 1280 by 960 bounds. It skips the unrelated common Claude baseline.
+Select Codex through the public model picker only while the decoded managed
+workspace has no session, turn, messages, activities, plans or checkpoints.
+Require the owned project/path/branch identity before and after selection.
+Normal START user messages retain null turn attribution; join their fresh
+message and delivered/start metadata to the real native input, latest turn and
+running session instead of inventing user-message turn IDs.
+
+Prepare the private fixture before starting the owned server. Its protected Git
+config explicitly exempts the primary, seed, origin and trust checkouts plus
+only the exact future destination derived from the caller's configured managed
+base and requested branch. Keep that destination absent for the server's
+exclusive reservation; validate its canonical private parent and re-admit the
+actual Git inventory, admin/backlink and decoded thread after public creation.
+Do not add wildcard exemptions or change host config or ownership. The
+ownership-test environment belongs to the owned server only during native
+qualification; direct forced-ownership Git commands are hermetic TempGit tests.
+
+Open the real idle removal dialog without clicking its destructive action,
+start one maintained Codex turn, and require a generation-bound typed removal
+refusal with session-running. Capture the actual disabled action and reason,
+then close the dialog, stop and reap that provider and retain the original
+checkout. Trust refusal uses the actual server's Git classification and typed
+untrusted status after removing only the owned target exemption. Restore the
+private config bytes, retry publicly and require readable status and retained
+inputs. The owned primary and other anchors must remain admitted.
+
+Clone progress must come from one real Git transport. Its exact owned URL is
+rewritten to a file transport by the protected config, and its admitted pack
+hook delegates unchanged real pack bytes before holding the remaining transfer.
+Wait boundedly for the valid owned marker; malformed or foreign marker data
+refuses admission. Use the advertised join-only attach request on that same
+active URL/destination without starting another clone. Capture only the
+Cloning/busy state the public form exposes. Cancel through its original public
+control, join the waiter, reap the Git/hook children and require removal of the
+partial destination with original form values and source inputs retained. Clone
+is last so its retained form can remain visible until browser teardown. The
+private PID1 lifecycle reaper handles adopted zombies without signalling or
+reaping the direct controller; Popen.wait remains its status owner.
+
+Retain only the six fixed original names, using the three row names with
+`-light.png` and `-dark.png`, and the seven phase/failure/provenance/result/
+assertions/namespace-cleanup/supervisor JSON receipts. Require closed witnesses,
+exact source/input hashes, byte-preserved originals, stable identity and zero
+guard refusals. Safe deletion additionally requires the lifecycle restoration
+flag, closed children, no cleanup failures and both controller/namespace and
+supervisor joins. Missing or unsafe proof retains the private fixture. Preserve
+the original error even when restoration fails.
+
+The workflow runs focused helper, current-contract, mounted public widget,
+actual caller VM and owner/namespace tests before the contained runtime. Those
+local results establish source behavior only. Real application/server/provider
+execution remains CI-only; independent inspection of all six original pixels
+is still required. completeGroup remains false, the 82-row/164-original scope
+is unchanged, and this batch provides no final native or release acceptance.

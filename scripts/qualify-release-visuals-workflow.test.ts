@@ -95,6 +95,7 @@ describe("first visual batch workflow boundary", () => {
             "release-visual-workspace-substates",
             "release-visual-provider-chat",
             "release-visual-native-sharing",
+            "release-visual-project-lifecycle",
           ],
         },
       },
@@ -390,4 +391,73 @@ it("keeps six workspace substate originals separate from the unchanged core nine
     ).run,
   ).toContain("support/release-visual-workspace-substates.test.ts");
   expect(visualScenes).toHaveLength(9);
+});
+
+it("retains only six lifecycle originals and seven closed receipts while keeping native ownership separate", () => {
+  const value = YAML.parse(
+      NodeFS.readFileSync(
+        new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
+        "utf8",
+      ),
+    ),
+    steps = value.jobs.visual_core.steps as Array<{
+      name: string;
+      if?: string;
+      run?: string;
+      uses?: string;
+      with?: { name?: string; path?: string; retentionDays?: number };
+    }>;
+  const run = steps.find((step) => step.name === "Run contained project lifecycle visual batch");
+  expect(run).toBeDefined();
+  expect(run!.if).toBe("${{ inputs.scene_selection == 'release-visual-project-lifecycle' }}");
+  expect(run!.run).toBe(
+    "python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-project-lifecycle",
+  );
+  const evidence = steps.find((step) => step.name === "Retain explicit project lifecycle evidence");
+  expect(evidence).toBeDefined();
+  expect(evidence!.uses).toBe("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a");
+  expect(evidence!.if).toBe(
+    "${{ always() && inputs.scene_selection == 'release-visual-project-lifecycle' }}",
+  );
+  expect(evidence!.with!.name).toBe(
+    "issue29-project-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}",
+  );
+  expect(
+    evidence!
+      .with!.path!.trim()
+      .split("\n")
+      .map((line) => line.slice(line.lastIndexOf("/") + 1)),
+  ).toEqual([
+    "phase.json",
+    "failure.json",
+    "provenance.json",
+    "result.json",
+    "assertions.json",
+    "namespace-cleanup.json",
+    "supervisor.json",
+    ...["worktree-remove-busy", "project-clone-progress", "git-trust-refusal"].flatMap((scene) => [
+      scene + "-light.png",
+      scene + "-dark.png",
+    ]),
+  ]);
+  expect(evidence!.with!.path).not.toMatch(/\*|private|profile|\.log/);
+  const gate = steps.find(
+    (step) => step.name === "Check owned helpers and namespace admission",
+  )!.run!;
+  for (const helper of [
+    "release-visual-project-lifecycle",
+    "release-visual-project-lifecycle.public",
+    "release-visual-project-lifecycle-fixture",
+    "release-visual-project-lifecycle-api",
+    "release-visual-project-lifecycle-wiring",
+  ])
+    expect(gate).toContain("support/" + helper + ".test.ts");
+  expect(value.jobs.visual_core.if).toBe(
+    "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' }}",
+  );
+  expect(value.jobs.native_sharing).toEqual({
+    if: "${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection == 'release-visual-native-sharing' }}",
+    uses: "./.github/workflows/desktop-ui-smoke.yml",
+    with: { native_sharing: true },
+  });
 });

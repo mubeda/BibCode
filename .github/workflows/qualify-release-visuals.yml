@@ -17,6 +17,7 @@ on:
           - release-visual-workspace-substates
           - release-visual-provider-chat
           - release-visual-native-sharing
+          - release-visual-project-lifecycle
 
 permissions:
   contents: read
@@ -24,7 +25,7 @@ permissions:
 jobs:
   visual_core:
     if: ${{ github.ref_name != github.event.repository.default_branch && inputs.scene_selection != 'release-visual-native-sharing' }}
-    name: ${{ inputs.scene_selection == 'release-visual-provider-chat' && 'Linux Chromium seven provider chat rows in both themes' || inputs.scene_selection == 'release-visual-workspace-substates' && 'Linux Chromium three existing workspace substates in both themes' || inputs.scene_selection == 'release-visual-cursor-question' && 'Linux Chromium Cursor later-question pair' || inputs.scene_selection == 'release-visual-git-project' && 'Linux Chromium Git/project partial group in both themes' || inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
+    name: ${{ inputs.scene_selection == 'release-visual-project-lifecycle' && 'Linux Chromium three project lifecycle rows in both themes' || inputs.scene_selection == 'release-visual-provider-chat' && 'Linux Chromium seven provider chat rows in both themes' || inputs.scene_selection == 'release-visual-workspace-substates' && 'Linux Chromium three existing workspace substates in both themes' || inputs.scene_selection == 'release-visual-cursor-question' && 'Linux Chromium Cursor later-question pair' || inputs.scene_selection == 'release-visual-git-project' && 'Linux Chromium Git/project partial group in both themes' || inputs.scene_selection == 'release-visual-settings' && 'Linux Chromium four settings pairs in both themes' || 'Linux Chromium eight scene pairs in both themes' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -55,6 +56,7 @@ jobs:
           vp test run apps/desktop/e2e/support/release-visual-git-project.test.ts apps/desktop/e2e/support/release-visual-git-project-fixture.test.ts apps/desktop/e2e/support/release-visual-git-project-directory-failure.test.ts apps/desktop/e2e/support/git-project-tab-observation.test.ts
           vp test run apps/desktop/e2e/support/release-visual-workspace-substates.test.ts
           vp test run apps/desktop/e2e/support/release-visual-provider-chat.test.ts apps/desktop/e2e/support/release-visual-provider-chat-fixture.test.ts apps/desktop/e2e/support/release-visual-provider-chat-installer.test.ts apps/desktop/e2e/support/release-visual-provider-chat-loss.test.ts apps/desktop/e2e/support/release-visual-provider-chat-api.test.ts apps/desktop/e2e/support/release-visual-provider-chat-media.test.ts apps/desktop/e2e/support/release-visual-provider-chat-turns.test.ts apps/desktop/e2e/support/release-visual-provider-chat-producer.test.ts apps/desktop/e2e/support/release-visual-provider-chat-public.test.ts apps/desktop/e2e/support/release-visual-provider-chat-wiring.test.ts
+          vp test run apps/desktop/e2e/support/release-visual-project-lifecycle.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle.public.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle-fixture.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle-api.test.ts apps/desktop/e2e/support/release-visual-project-lifecycle-wiring.test.ts
       - name: Build the source UI once with owned loopback targets
         env:
           VITE_WS_URL: ws://127.0.0.1:4885
@@ -278,6 +280,34 @@ jobs:
             ${{ runner.temp }}/issue29-provider-chat-${{ github.run_id }}/chat-refused-model-dark.png
             ${{ runner.temp }}/issue29-provider-chat-${{ github.run_id }}/chat-held-workspace-loss-light.png
             ${{ runner.temp }}/issue29-provider-chat-${{ github.run_id }}/chat-held-workspace-loss-dark.png
+
+      - name: Run contained project lifecycle visual batch
+        if: ${{ inputs.scene_selection == 'release-visual-project-lifecycle' }}
+        env:
+          BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-visual-build/bibcode
+          BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue29-visual-build/web
+        run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-project-lifecycle
+      - name: Retain explicit project lifecycle evidence
+        if: ${{ always() && inputs.scene_selection == 'release-visual-project-lifecycle' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue29-project-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/phase.json
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/failure.json
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/provenance.json
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/result.json
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/assertions.json
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/namespace-cleanup.json
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/supervisor.json
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/worktree-remove-busy-light.png
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/worktree-remove-busy-dark.png
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/project-clone-progress-light.png
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/project-clone-progress-dark.png
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/git-trust-refusal-light.png
+            ${{ runner.temp }}/issue29-project-lifecycle-${{ github.run_id }}/git-trust-refusal-dark.png
 
   registration_only:
     if: ${{ github.ref_name == github.event.repository.default_branch }}
