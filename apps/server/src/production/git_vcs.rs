@@ -28,8 +28,9 @@ use crate::{
     pull_requests::CreatedRequestObserver,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcSessionContext, RpcStreamChunk},
     source_control::{
-        ChangeRequestState, CreatePullRequestInput, ProviderHosts, ProviderKind,
-        PullRequestService, ResolvePullRequestInput, ResolvedPullRequest, SourceControlDiscovery,
+        ChangeRequestState, CreatePullRequestInput, CreatePullRequestOptions, ProviderHosts,
+        ProviderKind, PullRequestService, ResolvePullRequestInput, ResolvedPullRequest,
+        SourceControlDiscovery,
     },
     terminal::TerminalManager,
     workspace::{WorkspaceMutationFuture, WorkspaceMutationObserver},
@@ -2215,6 +2216,7 @@ struct StackedActionInput {
     pull_request_body: Option<String>,
     pull_request_base_branch: Option<String>,
     pull_request_head_branch: Option<String>,
+    pull_request_options: Option<CreatePullRequestOptions>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2243,6 +2245,8 @@ struct PullRequestStepDetails {
     base_branch: String,
     head_branch: String,
     title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 #[derive(Deserialize)]
 struct LookupRepositoryInput {
@@ -2276,6 +2280,42 @@ struct LaunchEditorInput {
     editor: String,
 }
 
+/// Options the provider cannot honor are refused before anything is committed or pushed.
+fn validate_options_for_provider(
+    options: &CreatePullRequestOptions,
+    provider: ProviderKind,
+) -> Result<(), &'static str> {
+    if options.is_empty() {
+        return Ok(());
+    }
+    match provider {
+        ProviderKind::Github
+            if options.remove_source_branch.is_some() || options.squash.is_some() =>
+        {
+            Err("Merge options apply only to GitLab merge requests.")
+        }
+        ProviderKind::Github => Ok(()),
+        ProviderKind::Gitlab => {
+            let numeric = |value: &String| value.parse::<u64>().is_ok();
+            if options
+                .assignees
+                .iter()
+                .chain(&options.reviewers)
+                .all(numeric)
+                && options
+                    .milestone
+                    .as_ref()
+                    .is_none_or(|milestone| numeric(&milestone.id))
+            {
+                Ok(())
+            } else {
+                Err("Choose GitLab people and milestones from the project's lists.")
+            }
+        }
+        _ => Err("Create options are available for GitHub and GitLab only."),
+    }
+}
+
 fn validate_stacked_action_input(input: &StackedActionInput) -> Result<(), Value> {
     if !matches!(
         input.action.as_str(),
@@ -2300,13 +2340,36 @@ fn validate_stacked_action_input(input: &StackedActionInput) -> Result<(), Value
     if (input.pull_request_title.is_some()
         || input.pull_request_body.is_some()
         || input.pull_request_base_branch.is_some()
-        || input.pull_request_head_branch.is_some())
+        || input.pull_request_head_branch.is_some()
+        || input.pull_request_options.is_some())
         && !matches!(input.action.as_str(), "create_pr" | "commit_push_pr")
     {
         return Err(request_error(
             "git.runStackedAction",
             "A pull request title, body, source or target branch applies only to pull request actions.",
         ));
+    }
+    if let Some(options) = &input.pull_request_options {
+        let valid = |value: &str| !value.trim().is_empty() && value.chars().count() <= 255;
+        if options.assignees.len() > 20
+            || options.reviewers.len() > 20
+            || options.labels.len() > 50
+            || !options
+                .assignees
+                .iter()
+                .chain(&options.reviewers)
+                .chain(&options.labels)
+                .all(|value| valid(value))
+            || options
+                .milestone
+                .as_ref()
+                .is_some_and(|milestone| !valid(&milestone.id) || !valid(&milestone.title))
+        {
+            return Err(request_error(
+                "git.runStackedAction",
+                "Pull request options exceed the supported limits.",
+            ));
+        }
     }
     if matches!(input.action.as_str(), "create_pr" | "commit_push_pr")
         && input
@@ -2514,6 +2577,12 @@ async fn run_stacked_action(
     } else {
         None
     };
+    let options = input.pull_request_options.clone().unwrap_or_default();
+    if let Some(provider) = pull_request_provider
+        && let Err(detail) = validate_options_for_provider(&options, provider)
+    {
+        return Err(request_error("git.runStackedAction", detail).into());
+    }
     let wants_push = if input.action == "create_pr" {
         if let Some(is_local) = selected_head_is_local {
             is_local
@@ -2669,7 +2738,18 @@ async fn run_stacked_action(
         )
         .await
         {
-            PullRequestStep::OpenedExisting(resolved_pull_request_step(&existing))
+            let mut step = resolved_pull_request_step(&existing);
+            if !options.is_empty() {
+                let noun = if provider == ProviderKind::Gitlab {
+                    "merge request"
+                } else {
+                    "pull request"
+                };
+                step.warning = Some(format!(
+                    "An open {noun} already existed for this branch; the new options were not applied."
+                ));
+            }
+            PullRequestStep::OpenedExisting(step)
         } else {
             let reviewed_title = input
                 .pull_request_title
@@ -2707,7 +2787,7 @@ async fn run_stacked_action(
                 })?
                 .to_owned();
             let created = pull_requests
-                .create(
+                .create_with_options(
                     CreatePullRequestInput {
                         cwd: input.cwd.clone(),
                         provider,
@@ -2716,11 +2796,14 @@ async fn run_stacked_action(
                         title,
                         body: input.pull_request_body.clone().unwrap_or_default(),
                     },
+                    &options,
                     cancellation,
                 )
                 .await
                 .map_err(StackedActionFailure::from)?;
-            PullRequestStep::Created(resolved_pull_request_step(&created))
+            let mut step = resolved_pull_request_step(&created.pull_request);
+            step.warning = created.warning;
+            PullRequestStep::Created(step)
         }
     } else {
         PullRequestStep::SkippedNotRequested
@@ -2825,6 +2908,7 @@ fn resolved_pull_request_step(pull_request: &ResolvedPullRequest) -> PullRequest
         base_branch: pull_request.base_branch.clone(),
         head_branch: pull_request.head_branch.clone(),
         title: pull_request.title.clone(),
+        warning: None,
     }
 }
 
@@ -5178,6 +5262,7 @@ esac
             pull_request_body: None,
             pull_request_base_branch: Some("main".to_owned()),
             pull_request_head_branch: None,
+            pull_request_options: None,
         };
         assert!(
             run_stacked_action(
@@ -5210,6 +5295,58 @@ esac
         assert!(request_error("method", "detail").is_object());
         assert!(vcs_error("operation", &repository, "detail").is_object());
         assert!(source_control_error("unknown", "lookup", "detail").is_object());
+    }
+
+    #[test]
+    fn options_must_fit_the_provider_before_anything_is_published() {
+        let gitlab_ids = CreatePullRequestOptions {
+            assignees: vec!["7".into()],
+            milestone: Some(crate::source_control::MilestoneRef {
+                id: "3".into(),
+                title: "Sprint 9".into(),
+            }),
+            squash: Some(true),
+            ..CreatePullRequestOptions::default()
+        };
+        assert!(validate_options_for_provider(&gitlab_ids, ProviderKind::Gitlab).is_ok());
+        assert!(validate_options_for_provider(&gitlab_ids, ProviderKind::Github).is_err());
+        let usernames = CreatePullRequestOptions {
+            reviewers: vec!["alice".into()],
+            ..CreatePullRequestOptions::default()
+        };
+        assert!(validate_options_for_provider(&usernames, ProviderKind::Gitlab).is_err());
+        assert!(validate_options_for_provider(&usernames, ProviderKind::Github).is_ok());
+        let draft = CreatePullRequestOptions {
+            draft: true,
+            ..CreatePullRequestOptions::default()
+        };
+        assert!(validate_options_for_provider(&draft, ProviderKind::AzureDevops).is_err());
+        assert!(validate_options_for_provider(&draft, ProviderKind::Bitbucket).is_err());
+        let none = CreatePullRequestOptions::default();
+        assert!(validate_options_for_provider(&none, ProviderKind::AzureDevops).is_ok());
+    }
+
+    #[test]
+    fn options_are_refused_on_non_request_actions() {
+        let input: StackedActionInput = serde_json::from_value(json!({
+            "actionId": "a", "cwd": "/repo", "action": "push",
+            "pullRequestOptions": {"draft": true, "assignees": [], "reviewers": [], "labels": [],
+                "milestone": null, "removeSourceBranch": null, "squash": null}
+        }))
+        .unwrap();
+        assert!(validate_stacked_action_input(&input).is_err());
+    }
+
+    #[test]
+    fn options_beyond_the_limits_are_refused() {
+        let assignees: Vec<String> = (0..21).map(|index| index.to_string()).collect();
+        let input: StackedActionInput = serde_json::from_value(json!({
+            "actionId": "a", "cwd": "/repo", "action": "create_pr", "pullRequestBaseBranch": "main",
+            "pullRequestOptions": {"draft": false, "assignees": assignees, "reviewers": [],
+                "labels": [], "milestone": null, "removeSourceBranch": null, "squash": null}
+        }))
+        .unwrap();
+        assert!(validate_stacked_action_input(&input).is_err());
     }
 
     /// A reviewed pull request: the fixture repository tracks a local bare
@@ -5359,6 +5496,35 @@ esac
             }
         }
 
+        // Merge options are GitLab-only and are refused before anything is published.
+        let github_merge_options: StackedActionInput = serde_json::from_value(json!({
+            "actionId":"merge-options", "cwd":repository, "action":"create_pr",
+            "pullRequestBaseBranch":"release/next",
+            "pullRequestOptions": {"draft": false, "assignees": [], "reviewers": [], "labels": [],
+                "milestone": null, "removeSourceBranch": null, "squash": true}
+        }))
+        .unwrap();
+        let error = run_stacked_action(
+            &git_repository,
+            &pull_requests,
+            &github_merge_options,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("GitLab-only merge options are refused for GitHub");
+        assert!(
+            error.wire["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Merge options apply only to GitLab"),
+            "{error:?}"
+        );
+        assert!(!calls.exists(), "no provider command before the refusal");
+        assert!(
+            !bare_remote.join("refs/heads/feature/reviewed").exists(),
+            "no branch published"
+        );
+
         let result = run_stacked_action(
             &git_repository,
             &pull_requests,
@@ -5422,6 +5588,35 @@ esac
         assert_eq!(retried["pr"]["number"], 9);
         let recorded = tokio::fs::read_to_string(&calls).await.expect("gh calls");
         assert!(!recorded.contains("create"), "{recorded}");
+        assert!(retried["pr"].get("warning").is_none(), "{retried}");
+
+        // Options chosen for a request that already exists are reported, not dropped silently.
+        let mut with_options = serde_json::to_value(json!({
+            "actionId":"action-reviewed-options", "cwd":repository, "action":"create_pr",
+            "pullRequestTitle":"Reviewed title", "pullRequestBaseBranch":"release/next",
+            "pullRequestOptions": {"draft": true, "assignees": [], "reviewers": [], "labels": [],
+                "milestone": null, "removeSourceBranch": null, "squash": null}
+        }))
+        .unwrap();
+        with_options["cwd"] = json!(repository);
+        let with_options: StackedActionInput = serde_json::from_value(with_options).unwrap();
+        let existing = run_stacked_action(
+            &git_repository,
+            &pull_requests,
+            &with_options,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("existing request resolves");
+        let existing = serde_json::to_value(existing).unwrap();
+        assert_eq!(existing["pr"]["status"], "opened_existing");
+        assert!(
+            existing["pr"]["warning"]
+                .as_str()
+                .unwrap()
+                .contains("the new options were not applied"),
+            "{existing}"
+        );
 
         // Explicit current-source publication keeps first-push upstream setup,
         // without replacing an upstream the user already chose.
@@ -6060,6 +6255,7 @@ esac
             pull_request_body: None,
             pull_request_base_branch: Some("main".to_owned()),
             pull_request_head_branch: None,
+            pull_request_options: None,
         };
 
         let error = run_stacked_action(

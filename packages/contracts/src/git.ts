@@ -128,6 +128,19 @@ export type VcsUnstageFilesInput = typeof VcsUnstageFilesInput.Type;
 export const VcsDiscardFilesInput = VcsStageFilesInput;
 export type VcsDiscardFilesInput = typeof VcsDiscardFilesInput.Type;
 
+const CreateOptionId = TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(255));
+/** Reviewed create-time options; merge options apply to GitLab only. */
+export const GitPullRequestCreateOptions = Schema.Struct({
+  draft: Schema.Boolean,
+  assignees: Schema.Array(CreateOptionId).check(Schema.isMaxLength(20)),
+  reviewers: Schema.Array(CreateOptionId).check(Schema.isMaxLength(20)),
+  labels: Schema.Array(CreateOptionId).check(Schema.isMaxLength(50)),
+  milestone: Schema.NullOr(Schema.Struct({ id: CreateOptionId, title: CreateOptionId })),
+  removeSourceBranch: Schema.NullOr(Schema.Boolean),
+  squash: Schema.NullOr(Schema.Boolean),
+});
+export type GitPullRequestCreateOptions = typeof GitPullRequestCreateOptions.Type;
+
 export const GitRunStackedActionInput = Schema.Struct({
   actionId: TrimmedNonEmptyStringSchema,
   cwd: TrimmedNonEmptyStringSchema,
@@ -146,6 +159,8 @@ export const GitRunStackedActionInput = Schema.Struct({
   pullRequestBaseBranch: Schema.optional(TrimmedNonEmptyStringSchema),
   /** Selected source branch; publication does not change the current checkout. */
   pullRequestHeadBranch: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Create-time options; requires capability `pullRequestCreateOptions`. */
+  pullRequestOptions: Schema.optional(GitPullRequestCreateOptions),
 });
 export type GitRunStackedActionInput = typeof GitRunStackedActionInput.Type;
 
@@ -371,6 +386,8 @@ export const GitRunStackedActionResult = Schema.Struct({
     baseBranch: Schema.optional(TrimmedNonEmptyStringSchema),
     headBranch: Schema.optional(TrimmedNonEmptyStringSchema),
     title: Schema.optional(TrimmedNonEmptyStringSchema),
+    /** The request exists, but some chosen options were not applied. */
+    warning: Schema.optional(Schema.String.check(Schema.isMaxLength(1_000))),
   }),
   toast: GitRunStackedActionToast,
 });

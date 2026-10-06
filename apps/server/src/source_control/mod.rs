@@ -20,9 +20,9 @@ pub(crate) use pull_request::ProviderCommandSpec;
 pub(crate) use pull_request::parse_github_create_url;
 #[allow(unused_imports)]
 pub use pull_request::{
-    ChangeRequestState, CreatePullRequestInput, PullRequestService, ResolvePullRequestInput,
-    ResolvedPullRequest, SourceControlProviderError, parse_github_pull_request,
-    parse_gitlab_merge_request,
+    ChangeRequestState, CreatePullRequestInput, CreatePullRequestOptions, CreatedPullRequest,
+    MilestoneRef, PullRequestService, ResolvePullRequestInput, ResolvedPullRequest,
+    SourceControlProviderError, parse_github_pull_request, parse_gitlab_merge_request,
 };
 
 use serde::{Deserialize, Serialize};

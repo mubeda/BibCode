@@ -63,6 +63,7 @@ impl PullRequestService {
                     .map(OsString::from)
                     .collect(),
                     allowed_non_zero_exit_codes: &[],
+                    stdin: None,
                 },
                 cancellation,
             )

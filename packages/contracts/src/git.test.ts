@@ -12,8 +12,8 @@ import {
   VcsRemoveWorktreeInput,
   GitPreparePullRequestThreadInput,
   GitPullRequestMaterializationError,
-  GitRunStackedActionResult,
   GitRunStackedActionInput,
+  GitRunStackedActionResult,
   GitResolvePullRequestResult,
   TextGenerationError,
   VcsStatusLocalResult,
@@ -460,5 +460,47 @@ describe("clone re-attach contracts", () => {
     expect(
       decodeCancelCloneInput({ url: "https://example.test/demo.git", parentDir: "~/code" }),
     ).toEqual({ url: "https://example.test/demo.git", parentDir: "~/code" });
+  });
+});
+
+describe("GitRunStackedActionInput pullRequestOptions", () => {
+  const decode = Schema.decodeUnknownSync(GitRunStackedActionInput);
+  const base = { actionId: "a", cwd: "/repo", action: "create_pr", pullRequestBaseBranch: "main" };
+  const options = {
+    draft: true,
+    assignees: ["7"],
+    reviewers: [],
+    labels: ["bug"],
+    milestone: { id: "3", title: "Sprint 9" },
+    removeSourceBranch: true,
+    squash: null,
+  };
+  it("accepts reviewed options", () => {
+    expect(decode({ ...base, pullRequestOptions: options }).pullRequestOptions).toEqual(options);
+  });
+  it("caps assignees at 20 and labels at 50", () => {
+    const ids = (n: number) => Array.from({ length: n }, (_, i) => `u${i}`);
+    expect(() =>
+      decode({ ...base, pullRequestOptions: { ...options, assignees: ids(21) } }),
+    ).toThrow();
+    expect(() =>
+      decode({ ...base, pullRequestOptions: { ...options, labels: ids(51) } }),
+    ).toThrow();
+  });
+  it("reports a partial-create warning on the pull request step", () => {
+    const decodeResult = Schema.decodeUnknownSync(GitRunStackedActionResult);
+    const result = decodeResult({
+      action: "create_pr",
+      branch: { status: "skipped_not_requested" },
+      commit: { status: "skipped_not_requested" },
+      push: { status: "skipped_not_requested" },
+      pr: {
+        status: "created",
+        url: "https://x/1",
+        warning: "Created, but some options weren't applied.",
+      },
+      toast: { title: "Done", cta: { kind: "none" } },
+    });
+    expect(result.pr.warning).toBe("Created, but some options weren't applied.");
   });
 });
