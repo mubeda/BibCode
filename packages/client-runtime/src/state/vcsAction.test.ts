@@ -192,6 +192,69 @@ describe("vcsActionState", () => {
     }
   }
 
+  const createOptions = {
+    draft: true,
+    assignees: ["7"],
+    reviewers: [],
+    labels: [],
+    milestone: null,
+    removeSourceBranch: null,
+    squash: null,
+  };
+  const withCreateOptions = (session: RpcSession, supported: boolean): RpcSession => ({
+    ...session,
+    initialConfig: Effect.succeed({
+      environment: {
+        capabilities: { gitPullRequestBranchSelection: true, pullRequestCreateOptions: supported },
+      },
+    } as never),
+  });
+
+  it.effect("rejects create options before mutation when the server lacks them", () =>
+    Effect.gen(function* () {
+      const sent: GitRunStackedActionInput[] = [];
+      const h = yield* makeStackedActionHarness(
+        withCreateOptions(stackedActionSession(true, sent), false),
+      );
+      const outcome = yield* Effect.promise(() =>
+        h.command.run(h.registry, {
+          actionId,
+          action: "create_pr",
+          pullRequestBaseBranch: "release/next",
+          pullRequestOptions: createOptions,
+        }),
+      );
+      expect(outcome._tag).toBe("Failure");
+      if (AsyncResult.isFailure(outcome)) {
+        expect(Cause.squash(outcome.cause)).toMatchObject({
+          _tag: "VcsPullRequestCreateOptionsUnsupportedError",
+          environmentId,
+        });
+      }
+      expect(sent).toEqual([]);
+      h.registry.dispose();
+    }),
+  );
+
+  it.effect("sends create options to servers that support them", () =>
+    Effect.gen(function* () {
+      const sent: GitRunStackedActionInput[] = [];
+      const h = yield* makeStackedActionHarness(
+        withCreateOptions(stackedActionSession(true, sent), true),
+      );
+      yield* Effect.promise(() =>
+        h.command.run(h.registry, {
+          actionId,
+          action: "create_pr",
+          pullRequestBaseBranch: "release/next",
+          pullRequestOptions: createOptions,
+        }),
+      );
+      expect(sent[0]?.pullRequestOptions).toEqual(createOptions);
+      h.registry.dispose();
+    }),
+  );
+
   it.effect("leaves commit and push actions available without branch-selection support", () =>
     Effect.gen(function* () {
       const sent: GitRunStackedActionInput[] = [];

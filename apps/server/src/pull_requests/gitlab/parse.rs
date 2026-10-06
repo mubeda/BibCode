@@ -12,6 +12,27 @@ pub(super) fn invalid(operation: &str) -> PullRequestsOperationError {
     PullRequestsOperationError::new(operation, "invalid_response")
 }
 
+pub(super) fn create_defaults(
+    user: &Value,
+    project: &Value,
+    operation: &str,
+) -> Result<CreateDefaults, PullRequestsOperationError> {
+    let id = user["id"]
+        .as_u64()
+        .ok_or_else(|| invalid(operation))?
+        .to_string();
+    let label = string(user, "username", operation)?;
+    let squash = project["squash_option"]
+        .as_str()
+        .filter(|option| matches!(*option, "never" | "always" | "default_on" | "default_off"))
+        .map(str::to_owned);
+    Ok(CreateDefaults {
+        viewer: Some(ViewerRef { id, label }),
+        squash,
+        remove_source_branch: project["remove_source_branch_after_merge"].as_bool(),
+    })
+}
+
 pub(super) fn string(
     value: &Value,
     key: &str,
@@ -1182,5 +1203,37 @@ mod mapping_tests {
         ] {
             assert_eq!(system_event(body), event, "{body}");
         }
+    }
+}
+
+#[cfg(test)]
+mod create_defaults_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gitlab_defaults_carry_the_numeric_viewer_and_project_merge_settings() {
+        let user = json!({"id": 7, "username": "alice"});
+        let project =
+            json!({"squash_option": "default_on", "remove_source_branch_after_merge": true});
+        let defaults = create_defaults(&user, &project, "pullRequests.getCreateDefaults").unwrap();
+        assert_eq!(
+            defaults.viewer,
+            Some(ViewerRef {
+                id: "7".into(),
+                label: "alice".into()
+            })
+        );
+        assert_eq!(defaults.squash.as_deref(), Some("default_on"));
+        assert_eq!(defaults.remove_source_branch, Some(true));
+    }
+
+    #[test]
+    fn unknown_squash_values_are_dropped() {
+        let user = json!({"id": 7, "username": "alice"});
+        let project = json!({"squash_option": "sometimes"});
+        let defaults = create_defaults(&user, &project, "pullRequests.getCreateDefaults").unwrap();
+        assert_eq!(defaults.squash, None);
+        assert_eq!(defaults.remove_source_branch, None);
     }
 }

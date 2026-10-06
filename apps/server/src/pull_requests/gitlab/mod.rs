@@ -95,7 +95,9 @@ impl GitLabHost {
                 &["api", path],
                 if matches!(
                     operation,
-                    "pullRequests.getContext" | "pullRequests.getVocabulary"
+                    "pullRequests.getContext"
+                        | "pullRequests.getVocabulary"
+                        | "pullRequests.getCreateDefaults"
                 ) {
                     Budget::Read
                 } else {
@@ -207,6 +209,22 @@ impl GitLabHost {
 }
 
 impl PullRequestHost for GitLabHost {
+    fn create_defaults<'a>(
+        &'a self,
+        scope: &'a HostScope,
+        c: &'a CancellationToken,
+    ) -> HostFuture<'a, CreateDefaults> {
+        Box::pin(async move {
+            let operation = "pullRequests.getCreateDefaults";
+            let project = project_path(scope);
+            let (user, project) = tokio::join!(
+                self.api(scope, "user", operation, c),
+                self.api(scope, &project, operation, c),
+            );
+            parse::create_defaults(&user?, &project?, operation)
+        })
+    }
+
     fn invalidate_context(&self) {
         self.contexts.clear();
         self.totals.clear();

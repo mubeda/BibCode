@@ -23,6 +23,11 @@ import {
   REVIEW_PROGRESS,
   UNIDENTIFIED_HOST_REASON,
   type CreatePullRequestProgress,
+  createOptionsPayload,
+  EMPTY_CREATE_OPTIONS,
+  squashControl,
+  shownCreateOptions,
+  type CreateOptionsState,
 } from "./GitManagerPullRequestPanel.logic";
 
 function status(overrides: Partial<VcsStatusResult> = {}): VcsStatusResult {
@@ -538,5 +543,117 @@ describe("resolveCreatePullRequestReview publication", () => {
     expect(resolveCreatePullRequestReview({ ...base, headOnOrigin: true }).publishRequired).toBe(
       false,
     );
+  });
+});
+
+describe("create options", () => {
+  const chosen: CreateOptionsState = {
+    ...EMPTY_CREATE_OPTIONS,
+    draft: true,
+    assignees: [{ id: "7", label: "alice" }],
+    labels: [{ id: "bug", label: "bug" }],
+    milestone: { id: "3", label: "Sprint 9" },
+    removeSourceBranch: true,
+    squash: false,
+  };
+
+  it("sends nothing when no option is set", () => {
+    expect(createOptionsPayload(EMPTY_CREATE_OPTIONS, "gitlab")).toBeUndefined();
+  });
+
+  it("sends GitLab ids and merge options", () => {
+    expect(createOptionsPayload(chosen, "gitlab")).toEqual({
+      draft: true,
+      assignees: ["7"],
+      reviewers: [],
+      labels: ["bug"],
+      milestone: { id: "3", title: "Sprint 9" },
+      removeSourceBranch: true,
+      squash: false,
+    });
+  });
+
+  it("never sends merge options for GitHub", () => {
+    expect(createOptionsPayload(chosen, "github")).toMatchObject({
+      removeSourceBranch: null,
+      squash: null,
+    });
+  });
+
+  it("sends nothing for providers without create options", () => {
+    expect(createOptionsPayload(chosen, "azure-devops")).toBeUndefined();
+    expect(createOptionsPayload(chosen, null)).toBeUndefined();
+  });
+
+  it("locks squash when the project forces it", () => {
+    expect(squashControl({ squash: "always" })).toEqual({
+      checked: true,
+      locked: true,
+      note: "This project always squashes commits.",
+    });
+    expect(squashControl({ squash: "never" })).toEqual({
+      checked: false,
+      locked: true,
+      note: "This project never squashes commits.",
+    });
+    expect(squashControl({ squash: "default_on" })).toEqual({
+      checked: true,
+      locked: false,
+      note: null,
+    });
+    expect(squashControl(null)).toEqual({ checked: false, locked: false, note: null });
+  });
+
+  it("adds options to the create action only when present", () => {
+    const reviewed = { baseBranch: "main", title: "T", body: "" };
+    expect(createPullRequestAction("a", reviewed)).not.toHaveProperty("pullRequestOptions");
+    expect(
+      createPullRequestAction("a", reviewed, createOptionsPayload(chosen, "gitlab")),
+    ).toHaveProperty("pullRequestOptions.draft", true);
+  });
+
+  it("carries the server's partial-create warning into the outcome", () => {
+    const event = finished("created");
+    if (event.kind !== "action_finished") throw new Error("unexpected event");
+    const warned = {
+      ...event,
+      result: { ...event.result, pr: { ...event.result.pr, warning: "Created, but…" } },
+    };
+    expect(reduceCreatePullRequestProgress(REVIEW_PROGRESS, warned)).toMatchObject({
+      kind: "created",
+      warning: "Created, but…",
+    });
+  });
+});
+
+describe("shownCreateOptions", () => {
+  it("sends the merge options the dialog shows once the project defaults are known", () => {
+    expect(
+      shownCreateOptions(EMPTY_CREATE_OPTIONS, {
+        viewer: null,
+        squash: "default_on",
+        removeSourceBranch: true,
+      }),
+    ).toMatchObject({ removeSourceBranch: true, squash: true });
+    expect(
+      shownCreateOptions(
+        { ...EMPTY_CREATE_OPTIONS, squash: true },
+        { viewer: null, squash: "never", removeSourceBranch: false },
+      ),
+    ).toMatchObject({ removeSourceBranch: false, squash: false });
+  });
+
+  it("leaves a merge option the project did not report to the project", () => {
+    expect(
+      shownCreateOptions(EMPTY_CREATE_OPTIONS, {
+        viewer: null,
+        squash: null,
+        removeSourceBranch: null,
+      }),
+    ).toMatchObject({ removeSourceBranch: null, squash: null });
+  });
+
+  it("leaves untouched merge options unset without defaults", () => {
+    expect(shownCreateOptions(EMPTY_CREATE_OPTIONS, null)).toEqual(EMPTY_CREATE_OPTIONS);
   });
 });

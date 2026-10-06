@@ -27,8 +27,8 @@ use context::{DiscoveredHosts, build_context, resolve_scope};
 use error::PullRequestsOperationError;
 use host::{HostCommandRunner, PullRequestHost};
 use model::{
-    ActionRequest, ActionResult, Checks, Commits, Context, Detail, Files, ListPage, ListQuery,
-    Permission, Permissions, ReviewEvent, Timeline, Vocabulary, VocabularyKind,
+    ActionRequest, ActionResult, Checks, Commits, Context, CreateDefaults, Detail, Files, ListPage,
+    ListQuery, Permission, Permissions, ReviewEvent, Timeline, Vocabulary, VocabularyKind,
 };
 
 type ActionGateKey = (bool, String, String, u64);
@@ -163,6 +163,26 @@ impl PullRequestsService {
                     .await
                     .map_err(|u| u.operation_error("pullRequests.getVocabulary"))?;
                 self.host(&scope).vocabulary(&scope, kind, query, &c).await
+            },
+        )
+        .await
+        .inspect_err(|error| self.invalidate_failed_context(error))
+    }
+
+    pub async fn create_defaults(
+        &self,
+        cwd: &Path,
+        c: &CancellationToken,
+    ) -> Result<CreateDefaults, PullRequestsOperationError> {
+        bounded_read(
+            "pullRequests.getCreateDefaults",
+            Duration::from_secs(30),
+            c,
+            |c| async move {
+                let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
+                    .await
+                    .map_err(|u| u.operation_error("pullRequests.getCreateDefaults"))?;
+                self.host(&scope).create_defaults(&scope, &c).await
             },
         )
         .await

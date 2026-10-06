@@ -25,14 +25,15 @@
         "pr": {
           "status": "created",
           "baseBranch": "AI",
-          "title": "constructor"
+          "title": "constructor",
+          "warning": "~,"
         },
         "toast": {
-          "title": "c",
+          "title": "G#o",
           "cta": {
             "kind": "open_pr",
-            "label": "G#o",
-            "url": ",}"
+            "label": "[",
+            "url": "5i#"
           }
         }
       }
