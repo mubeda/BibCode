@@ -257,11 +257,16 @@ once. Also check **Ctrl+Shift+C/V**, and multiline paste with an application
 that enables bracketed paste. Selecting text must leave keyboard focus in the
 terminal and must not open the **Add to chat** menu or overwrite the clipboard.
 Right-click the selected text and choose **Add to chat**; the selection must
-still attach to the composer. With no selection, **Ctrl+C** must interrupt the
-running terminal program. Start a CLI that enables mouse tracking (for example
-`codex`), drag across its output and copy with **Ctrl+C**; the selected text must
-reach the clipboard without interrupting the CLI. **Shift+drag** (**Option+drag**
-on macOS) must reach the CLI instead of selecting. Repeat copy/paste where asynchronous Clipboard API
+still attach to the composer. Right-click it again and choose **Copy**; the
+exact text must reach the clipboard and stay selected. With no selection,
+**Ctrl+C** must interrupt the running terminal program. Start a CLI that enables
+any-motion mouse tracking (for example `codex` or `opencode`), drag across its
+output, release, and move the pointer over the terminal for a few seconds; the
+selection must stay. Then copy with **Ctrl+C** (**Cmd+C** on macOS) and with
+right-click **Copy**; the selected text must reach the clipboard without
+interrupting the CLI. A plain click must clear the selection and hand pointer
+input back to the CLI. **Shift+drag** (**Option+drag** on macOS) must reach the
+CLI instead of selecting. Repeat copy/paste where asynchronous Clipboard API
 access is unavailable; native clipboard events must still work. These packaged
 checks supplement the focused terminal and keybinding component tests.
 

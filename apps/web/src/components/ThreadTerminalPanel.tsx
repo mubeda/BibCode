@@ -312,6 +312,27 @@ function writeSystemMessage(terminal: Terminal, message: string): void {
   terminal.write(`\r\n[terminal] ${message}\r\n`);
 }
 
+/**
+ * Copies with execCommand, which WebKit runs only on a DOM selection; xterm
+ * uses this same textarea for its native right-click copy handling. Pending
+ * textarea input is restored afterwards.
+ */
+function copyThroughTextarea(terminal: Terminal, text: string): boolean {
+  const textarea = terminal.textarea;
+  if (!textarea) return false;
+  const { value, selectionStart, selectionEnd, selectionDirection } = textarea;
+  try {
+    textarea.value = text;
+    textarea.select();
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    textarea.value = value;
+    textarea.setSelectionRange(selectionStart, selectionEnd, selectionDirection);
+  }
+}
+
 function acquireTerminalInputBinding(inputKey: string): {
   readonly binding: TerminalInputBinding;
   readonly scheduler: TerminalInputScheduler;
@@ -1347,6 +1368,21 @@ export function TerminalViewport({
       };
     };
 
+    // The native menu resolves after the click's user activation may have
+    // lapsed, so a rejected clipboard write falls back to execCommand.
+    const copySelectionText = async (text: string, isCurrent: () => boolean) => {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch {
+        if (!isCurrent() || copyThroughTextarea(terminal, text)) return;
+      }
+      writeSystemMessage(
+        terminal,
+        `Copy failed. Try ${isMacPlatform(navigator.platform) ? "Cmd" : "Ctrl"}+C.`,
+      );
+    };
+
     const showSelectionAction = async () => {
       if (!localApi) {
         clearSelectionAction();
@@ -1360,16 +1396,27 @@ export function TerminalViewport({
         clearSelectionAction();
         return;
       }
+      // Copy matches keyboard copy; only Add to chat trims the selection.
+      const copyText = terminalRef.current?.getSelection() ?? "";
       const requestId = ++selectionActionRequestIdRef.current;
       selectionActionOpenRef.current = true;
       try {
         const clicked = await localApi.contextMenu.show(
-          [{ id: "add-to-chat", label: "Add to chat" }],
+          [
+            { id: "copy", label: "Copy" },
+            { id: "add-to-chat", label: "Add to chat" },
+          ],
           nextAction.position,
         );
-        if (requestId !== selectionActionRequestIdRef.current || clicked !== "add-to-chat") {
+        if (requestId !== selectionActionRequestIdRef.current) return;
+        if (clicked === "copy") {
+          // A rebuilt or retargeted viewport supersedes the request mid-write.
+          const isCurrent = () => requestId === selectionActionRequestIdRef.current;
+          await copySelectionText(copyText, isCurrent);
+          if (isCurrent()) terminal.focus();
           return;
         }
+        if (clicked !== "add-to-chat") return;
         handleAddTerminalContext(nextAction.selection);
         terminalRef.current?.clearSelection();
         terminalRef.current?.focus();
@@ -1412,25 +1459,8 @@ export function TerminalViewport({
         if (clipboard.action === "copy" && event.shiftKey) {
           event.preventDefault();
           event.stopPropagation();
-          const textarea = terminal.textarea;
-          if (terminal.hasSelection() && textarea) {
-            // WebKit needs a DOM selection for execCommand; xterm uses this
-            // same textarea for its native right-click copy handling.
-            const { value, selectionStart, selectionEnd, selectionDirection } = textarea;
-            let copied = false;
-            try {
-              textarea.value = terminal.getSelection();
-              textarea.select();
-              copied = document.execCommand("copy");
-            } catch {
-              // Report a failed command after restoring pending input below.
-            } finally {
-              textarea.value = value;
-              textarea.setSelectionRange(selectionStart, selectionEnd, selectionDirection);
-            }
-            if (!copied) {
-              writeSystemMessage(terminal, `Copy failed. Try ${event.metaKey ? "Cmd" : "Ctrl"}+C.`);
-            }
+          if (terminal.hasSelection() && !copyThroughTextarea(terminal, terminal.getSelection())) {
+            writeSystemMessage(terminal, `Copy failed. Try ${event.metaKey ? "Cmd" : "Ctrl"}+C.`);
           }
         }
         // Let the browser dispatch trusted clipboard events to xterm's own
@@ -1589,17 +1619,36 @@ export function TerminalViewport({
     // and release, which xterm reports from document listeners. A selection
     // gesture inverts only its mousedown: a synthesized Option on release would
     // trigger xterm's Option-click cursor movement on macOS.
+    // xterm also clears its selection on every report it sends the app, so
+    // while a selection exists a right-click is kept from the app (the copy
+    // menu opens instead) and, under any-motion tracking, so is hover. Hover
+    // stops at `.xterm-screen` (xterm's stable screen element), after xterm's
+    // link detection there and before the report listener on `.xterm`.
     const forceSelectionKey = isMacPlatform(navigator.platform) ? "altKey" : "shiftKey";
     const invertForceSelectionKey = (event: MouseEvent) =>
       Object.defineProperty(event, forceSelectionKey, { value: !event[forceSelectionKey] });
     let invertingGesture = false;
     const handleMouseDown = (event: MouseEvent) => {
-      if (event.button !== 0 || terminal.modes.mouseTrackingMode === "none") {
+      const tracking = terminal.modes.mouseTrackingMode !== "none";
+      if (tracking && event.button === 2 && terminal.hasSelection()) {
+        Object.defineProperty(event, forceSelectionKey, { value: true });
+        return;
+      }
+      if (event.button !== 0 || !tracking) {
         invertingGesture = false;
         return;
       }
       invertingGesture = event[forceSelectionKey];
       invertForceSelectionKey(event);
+    };
+    const handleHover = (event: MouseEvent) => {
+      if (
+        event.buttons === 0 &&
+        terminal.modes.mouseTrackingMode === "any" &&
+        terminal.hasSelection()
+      ) {
+        event.stopPropagation();
+      }
     };
     const handleGestureMouse = (event: MouseEvent) => {
       if (!invertingGesture) return;
@@ -1608,6 +1657,8 @@ export function TerminalViewport({
     };
     const ownerDocument = mount.ownerDocument;
     mount.addEventListener("mousedown", handleMouseDown, true);
+    const screenElement = mount.querySelector<HTMLElement>(".xterm-screen");
+    screenElement?.addEventListener("mousemove", handleHover);
     ownerDocument.addEventListener("mousemove", handleGestureMouse, true);
     ownerDocument.addEventListener("mouseup", handleGestureMouse, true);
     mount.addEventListener("contextmenu", handleContextMenu);
@@ -1657,6 +1708,7 @@ export function TerminalViewport({
       terminalLinksDisposable.dispose();
       clearSelectionAction();
       mount.removeEventListener("mousedown", handleMouseDown, true);
+      screenElement?.removeEventListener("mousemove", handleHover);
       ownerDocument.removeEventListener("mousemove", handleGestureMouse, true);
       ownerDocument.removeEventListener("mouseup", handleGestureMouse, true);
       mount.removeEventListener("contextmenu", handleContextMenu);
