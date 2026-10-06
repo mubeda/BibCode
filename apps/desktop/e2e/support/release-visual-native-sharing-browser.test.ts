@@ -34,7 +34,7 @@ function fixture(mode = "owned") {
         if (selector.includes('normalize-space()="Light"')) dark = false;
       },
     }),
-    execute: async (read: unknown, input?: unknown) =>
+    execute: async (read: unknown, _input?: unknown) =>
       String(read).includes("location.origin")
         ? { origin: "tauri://localhost", hash: "#/local/owned", theme: "System" }
         : true,
@@ -98,6 +98,172 @@ it("restores the original route when construction's public preference read fails
   );
   expect(f.current()).toBe("tauri://localhost/#/local/owned");
 });
+
+function preparationProbe(fault = "owned", observer = "none") {
+  const calls: string[] = [],
+    phases: string[] = [],
+    facts: Record<string, boolean> = {},
+    original = new Error("Inert exact preparation failure."),
+    restoreError = new Error("Inert exact restore failure.");
+  let current = "tauri://localhost/#/settings/general",
+    unsafe = false,
+    navigations = 0;
+  const browser = {
+    getUrl: async () => {
+      calls.push("url");
+      if (fault === "url-read") throw original;
+      return fault === "url-admission" ? "tauri://localhost/#/" : current;
+    },
+    url: async (value: string) => {
+      calls.push("navigate");
+      navigations++;
+      if (fault === "navigation" && navigations === 1) throw original;
+      if ((fault === "restore" || fault === "text-and-restore") && navigations === 2)
+        throw restoreError;
+      current = value;
+    },
+    $: () => {
+      calls.push("query");
+      return {
+        waitForDisplayed: async () => {
+          calls.push("display");
+          if (fault === "display") throw original;
+        },
+        getText: async () => {
+          calls.push("text");
+          if (fault === "text" || fault === "text-and-restore") throw original;
+          return fault === "label" ? "Inert private label" : "System";
+        },
+      };
+    },
+  };
+  const input = {
+    browser: browser as never,
+    owner: {} as never,
+    evidence: "/owned/evidence",
+    captured: new Set<string>(),
+    routeScope: async () => {},
+    verifyRoute: async () => {},
+    identity: async () => {},
+    unsafeCleanup: () => {
+      unsafe = true;
+    },
+    onPreparationStage: (phase: string) => {
+      phases.push(phase);
+      if (observer === "stage") throw new Error("Inert observer failure.");
+    },
+    onPreparationFacts: (next: object) => {
+      Object.assign(facts, next);
+      if (observer === "facts") throw new Error("Inert observer failure.");
+    },
+  };
+  return {
+    input,
+    calls,
+    phases,
+    facts,
+    original,
+    restoreError,
+    unsafe: () => unsafe,
+    current: () => current,
+  };
+}
+it.each([
+  ["url-read", "native-ui-ports-url-read", ["url"]],
+  ["url-admission", "native-ui-ports-url-admission", ["url"]],
+  ["navigation", "native-ui-ports-general-navigate", ["url", "navigate", "navigate"]],
+  ["display", "native-ui-ports-theme-display", ["url", "navigate", "query", "display", "navigate"]],
+  [
+    "text",
+    "native-ui-ports-theme-text",
+    ["url", "navigate", "query", "display", "text", "navigate"],
+  ],
+  [
+    "label",
+    "native-ui-ports-theme-admission",
+    ["url", "navigate", "query", "display", "text", "navigate"],
+  ],
+  [
+    "restore",
+    "native-ui-ports-original-restore",
+    ["url", "navigate", "query", "display", "text", "navigate"],
+  ],
+])(
+  "attributes the actual preparation %s seam without adding an action",
+  async (fault, phase, calls) => {
+    const p = preparationProbe(fault as string);
+    const result = createNativeSharingBrowserPorts(p.input);
+    if (fault === "restore") await expect(result).rejects.toBe(p.restoreError);
+    else if (fault === "url-admission" || fault === "label") await expect(result).rejects.toThrow();
+    else await expect(result).rejects.toBe(p.original);
+    expect(p.phases.at(-1)).toBe(phase);
+    expect(p.calls).toEqual(calls);
+    expect(Object.values(p.facts).every((value) => typeof value === "boolean")).toBe(true);
+    expect(JSON.stringify(p.facts)).not.toMatch(/tauri|localhost|Inert private label/);
+  },
+);
+it("returns preparation facts from the existing reads and restores the same original", async () => {
+  const p = preparationProbe();
+  await createNativeSharingBrowserPorts(p.input);
+  expect(p.phases).toEqual([
+    "native-ui-ports-url-read",
+    "native-ui-ports-url-admission",
+    "native-ui-ports-general-navigate",
+    "native-ui-ports-theme-display",
+    "native-ui-ports-theme-text",
+    "native-ui-ports-theme-admission",
+    "native-ui-ports-original-restore",
+  ]);
+  expect(p.calls).toEqual(["url", "navigate", "query", "display", "text", "navigate"]);
+  expect(p.facts).toMatchObject({
+    uiPortsUrlReturned: true,
+    uiPortsUrlProtocolMatched: true,
+    uiPortsUrlHostMatched: true,
+    uiPortsUrlAuthorityClean: true,
+    uiPortsUrlRootPathMatched: true,
+    uiPortsUrlQueryClean: true,
+    uiPortsUrlRouteAllowed: true,
+    uiPortsGeneralNavigated: true,
+    uiPortsThemeDisplayed: true,
+    uiPortsThemeTextReturned: true,
+    uiPortsThemeLabelAllowed: true,
+    uiPortsThemeLabelSystem: true,
+    uiPortsThemeLabelLight: false,
+    uiPortsThemeLabelDark: false,
+    uiPortsOriginalRestoreAttempted: true,
+    uiPortsOriginalRestored: true,
+  });
+  expect(p.facts.uiPortsOriginalRestoreFailed).toBeUndefined();
+  expect(p.current()).toBe("tauri://localhost/#/settings/general");
+  expect(p.unsafe()).toBe(false);
+});
+it("preserves the earlier preference exception and its phase when original restoration also fails", async () => {
+  const p = preparationProbe("text-and-restore");
+  await expect(createNativeSharingBrowserPorts(p.input)).rejects.toBe(p.original);
+  expect(p.phases.at(-1)).toBe("native-ui-ports-theme-text");
+  expect(p.facts.uiPortsOriginalRestoreAttempted).toBe(true);
+  expect(p.facts.uiPortsOriginalRestoreFailed).toBe(true);
+  expect(p.unsafe()).toBe(true);
+});
+it.each(["stage", "facts"])(
+  "refuses false preparation success after a failed %s observer",
+  async (observer) => {
+    const p = preparationProbe("owned", observer);
+    await expect(createNativeSharingBrowserPorts(p.input)).rejects.toThrow();
+    expect(p.calls).toEqual(["url", "navigate", "query", "display", "text", "navigate"]);
+    expect(p.unsafe()).toBe(true);
+  },
+);
+it.each(["stage", "facts"])(
+  "preserves genuine preference/restore errors after a failed %s observer",
+  async (observer) => {
+    const p = preparationProbe("text-and-restore", observer);
+    await expect(createNativeSharingBrowserPorts(p.input)).rejects.toBe(p.original);
+    expect(p.phases.at(-1)).toBe("native-ui-ports-theme-text");
+    expect(p.facts.uiPortsOriginalRestoreFailed).toBe(true);
+    expect(p.unsafe()).toBe(true);
+  },
+);
 
 function syntheticCaptureBytes() {
   const chunk = (name: string, data: Buffer) => {

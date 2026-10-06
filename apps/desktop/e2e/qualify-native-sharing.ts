@@ -18,7 +18,10 @@ import {
   withNativeSharingRoute,
 } from "./support/release-visual-native-sharing-route.ts";
 import { withNativeSharingApplication } from "./support/release-visual-native-sharing-application.ts";
-import { createNativeSharingBrowserPorts } from "./support/release-visual-native-sharing-browser.ts";
+import {
+  createNativeSharingBrowserPorts,
+  type NativeSharingBrowserPreparationFacts,
+} from "./support/release-visual-native-sharing-browser.ts";
 import {
   collectNativeSharingIdentity,
   readNativeSharingBridge,
@@ -33,7 +36,7 @@ import {
 } from "./support/chat-upload-evidence.ts";
 import { EnvironmentMetadataHttpApi } from "../../../packages/contracts/src/environmentHttp.ts";
 
-interface NativeSharingAdmissionFacts {
+interface NativeSharingAdmissionFacts extends NativeSharingBrowserPreparationFacts {
   windowHandlesArray: boolean;
   windowMainOnly: boolean;
   windowCurrentMain: boolean;
@@ -438,6 +441,8 @@ export async function qualifyNativeSharing(
             captured,
             identity: verify,
             unsafeCleanup: markUnsafe,
+            onPreparationStage: step,
+            onPreparationFacts: observe,
             routeScope: (run) =>
               withNativeSharingRoute(routePorts, async (scope) => {
                 route = "absent";

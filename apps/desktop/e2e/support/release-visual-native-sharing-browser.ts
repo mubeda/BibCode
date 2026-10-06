@@ -6,6 +6,33 @@ import {
 import type { QualificationBrowser, QualificationOwner } from "./qualification-owner.ts";
 import type { NativeSharingRouteScope } from "./release-visual-native-sharing-route.ts";
 import type { NativeSharingVisualPorts } from "./release-visual-native-sharing.ts";
+export type NativeSharingBrowserPreparationStage =
+  | "native-ui-ports-url-read"
+  | "native-ui-ports-url-admission"
+  | "native-ui-ports-general-navigate"
+  | "native-ui-ports-theme-display"
+  | "native-ui-ports-theme-text"
+  | "native-ui-ports-theme-admission"
+  | "native-ui-ports-original-restore";
+export interface NativeSharingBrowserPreparationFacts {
+  uiPortsUrlReturned: boolean;
+  uiPortsUrlProtocolMatched: boolean;
+  uiPortsUrlHostMatched: boolean;
+  uiPortsUrlAuthorityClean: boolean;
+  uiPortsUrlRootPathMatched: boolean;
+  uiPortsUrlQueryClean: boolean;
+  uiPortsUrlRouteAllowed: boolean;
+  uiPortsGeneralNavigated: boolean;
+  uiPortsThemeDisplayed: boolean;
+  uiPortsThemeTextReturned: boolean;
+  uiPortsThemeLabelAllowed: boolean;
+  uiPortsThemeLabelSystem: boolean;
+  uiPortsThemeLabelLight: boolean;
+  uiPortsThemeLabelDark: boolean;
+  uiPortsOriginalRestoreAttempted: boolean;
+  uiPortsOriginalRestored: boolean;
+  uiPortsOriginalRestoreFailed: boolean;
+}
 export interface NativeSharingBrowserInput {
   readonly browser: QualificationBrowser;
   readonly owner: Pick<QualificationOwner, "until">;
@@ -19,6 +46,8 @@ export interface NativeSharingBrowserInput {
   readonly identity: () => Promise<void>;
   readonly unsafeCleanup: () => void;
   readonly onCapture?: (receipt: Readonly<Record<string, unknown>>) => void;
+  readonly onPreparationStage?: (stage: NativeSharingBrowserPreparationStage) => void;
+  readonly onPreparationFacts?: (facts: Partial<NativeSharingBrowserPreparationFacts>) => void;
   readonly onScene?: (
     scene: "native-share-no-route" | "native-share-refresh",
     theme: "light" | "dark",
@@ -29,10 +58,44 @@ export async function createNativeSharingBrowserPorts(
 ): Promise<NativeSharingVisualPorts> {
   const browser = input.browser,
     refused = () => new Error("Owned native sharing browser refused.");
+  let observerFailed = false;
+  const observerFailure = () => {
+    observerFailed = true;
+    try {
+      input.unsafeCleanup();
+    } catch {
+      /* Attribution cannot replace a genuine operation failure. */
+    }
+  };
+  const stage = (value: NativeSharingBrowserPreparationStage) => {
+    try {
+      input.onPreparationStage?.(value);
+    } catch {
+      observerFailure();
+    }
+  };
+  const observe = (facts: Partial<NativeSharingBrowserPreparationFacts>) => {
+    try {
+      input.onPreparationFacts?.(facts);
+    } catch {
+      observerFailure();
+    }
+  };
+  stage("native-ui-ports-url-read");
   const original = await browser.getUrl();
+  observe({ uiPortsUrlReturned: true });
+  stage("native-ui-ports-url-admission");
   const url = new URL(original);
   // Linux packaged assets use Tauri's custom scheme; URL.origin is opaque in Node.
   const origin = "tauri://localhost";
+  observe({
+    uiPortsUrlProtocolMatched: url.protocol === "tauri:",
+    uiPortsUrlHostMatched: url.hostname === "localhost",
+    uiPortsUrlAuthorityClean: url.port === "" && url.username === "" && url.password === "",
+    uiPortsUrlRootPathMatched: url.pathname === "/",
+    uiPortsUrlQueryClean: url.search === "",
+    uiPortsUrlRouteAllowed: /^#\/(local\/[A-Za-z0-9._:-]+|settings\/[a-z-]+)$/.test(url.hash),
+  });
   if (
     url.protocol !== "tauri:" ||
     url.hostname !== "localhost" ||
@@ -59,18 +122,35 @@ export async function createNativeSharingBrowserPorts(
   let preferenceFailed = false,
     preferenceFailure: unknown;
   try {
+    stage("native-ui-ports-general-navigate");
     await browser.url(general);
+    observe({ uiPortsGeneralNavigated: true });
+    stage("native-ui-ports-theme-display");
     const preference = browser.$('[aria-label="Theme preference"]');
     await preference.waitForDisplayed();
+    observe({ uiPortsThemeDisplayed: true });
+    stage("native-ui-ports-theme-text");
     prior = (await preference.getText()).trim();
+    observe({
+      uiPortsThemeTextReturned: true,
+      uiPortsThemeLabelAllowed: ["System", "Light", "Dark"].includes(prior),
+      uiPortsThemeLabelSystem: prior === "System",
+      uiPortsThemeLabelLight: prior === "Light",
+      uiPortsThemeLabelDark: prior === "Dark",
+    });
+    stage("native-ui-ports-theme-admission");
     if (!["System", "Light", "Dark"].includes(prior)) throw refused();
   } catch (error) {
     preferenceFailed = true;
     preferenceFailure = error;
   }
   try {
+    if (!preferenceFailed) stage("native-ui-ports-original-restore");
+    observe({ uiPortsOriginalRestoreAttempted: true });
     await browser.url(original);
+    observe({ uiPortsOriginalRestored: true });
   } catch (error) {
+    observe({ uiPortsOriginalRestoreFailed: true });
     try {
       input.unsafeCleanup();
     } catch {
@@ -79,6 +159,7 @@ export async function createNativeSharingBrowserPorts(
     if (!preferenceFailed) throw error;
   }
   if (preferenceFailed) throw preferenceFailure;
+  if (observerFailed) throw refused();
   let scope: NativeSharingRouteScope | null = null,
     expected: "absent" | "owned" = "owned";
   const selectTheme = async (label: "System" | "Light" | "Dark") => {
