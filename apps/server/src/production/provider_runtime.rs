@@ -397,6 +397,11 @@ pub trait ProviderDriver: Send + Sync {
     fn rollback(&self, turn_count: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
     fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>>;
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
+    /// Whether `shutdown` ends the provider's native work. An externally owned server keeps
+    /// running its turn after BiBCode detaches, so Stop must not settle it by retirement.
+    fn owns_native_work(&self) -> bool {
+        true
+    }
 }
 
 pub trait ProviderDriverFactory: Send + Sync {
@@ -6542,6 +6547,7 @@ async fn handle_command(
                 Ok(session) => {
                     // A late Stop for an earlier turn must not retire the turn running now.
                     if let Some(running_turn) = session
+                        .filter(|_| entry.driver.owns_native_work())
                         .filter(|session| session.status == "running")
                         .and_then(|session| session.active_turn_id)
                         .filter(|running| {
@@ -10243,6 +10249,9 @@ impl OpenCodeDriver {
 }
 
 impl ProviderDriver for OpenCodeDriver {
+    fn owns_native_work(&self) -> bool {
+        self.child.is_some()
+    }
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
         Box::pin(async move {
             let id = match &self.resume_session_id {
@@ -14184,6 +14193,7 @@ mod tests {
         interrupts: usize,
         interrupt_entered: Option<Arc<tokio::sync::Notify>>,
         interrupt_never_returns: bool,
+        externally_owned: bool,
         approvals: usize,
         answers: usize,
         modes: Vec<String>,
@@ -14447,6 +14457,9 @@ mod tests {
     }
 
     impl ProviderDriver for SupervisorDriver {
+        fn owns_native_work(&self) -> bool {
+            !self.state.lock().unwrap().externally_owned
+        }
         fn start(
             &self,
         ) -> super::BoxRuntimeFuture<'_, Result<super::StartedSession, super::ProviderRuntimeError>>
@@ -20931,6 +20944,8 @@ done
         StaleTurn,
         /// The turn's terminal projection is admitted but unfinished when the deadline fires.
         SettlesDuringRetirement,
+        /// An external server keeps working after detachment, so retiring it cannot stop it.
+        ExternallyOwned,
     }
 
     #[tokio::test]
@@ -20954,6 +20969,11 @@ done
     }
 
     #[tokio::test]
+    async fn interrupt_deadline_keeps_an_externally_owned_session_running() {
+        interrupt_deadline_case(InterruptResponse::ExternallyOwned).await;
+    }
+
+    #[tokio::test]
     async fn interrupt_deadline_does_not_overwrite_a_settlement_it_raced() {
         interrupt_deadline_case(InterruptResponse::SettlesDuringRetirement).await;
     }
@@ -20966,6 +20986,7 @@ done
             let first = Arc::new(StdMutex::new(SupervisorDriverState {
                 interrupt_entered: Some(entered.clone()),
                 interrupt_never_returns: matches!(response, InterruptResponse::NeverAnswers),
+                externally_owned: matches!(response, InterruptResponse::ExternallyOwned),
                 ..SupervisorDriverState::default()
             }));
             let second = Arc::new(StdMutex::new(SupervisorDriverState::default()));
@@ -21091,7 +21112,9 @@ done
                 let status = session().await.status;
                 let kept = matches!(
                     response,
-                    InterruptResponse::Settles | InterruptResponse::StaleTurn
+                    InterruptResponse::Settles
+                        | InterruptResponse::StaleTurn
+                        | InterruptResponse::ExternallyOwned
                 );
                 let raced = matches!(response, InterruptResponse::SettlesDuringRetirement);
                 if kept || raced && !live || !live && status != "running" {
@@ -21108,10 +21131,15 @@ done
 
             if matches!(
                 response,
-                InterruptResponse::Settles | InterruptResponse::StaleTurn
+                InterruptResponse::Settles
+                    | InterruptResponse::StaleTurn
+                    | InterruptResponse::ExternallyOwned
             ) {
                 assert!(!retired, "{response:?}: the session is kept");
                 assert_eq!(first.lock().unwrap().shutdowns, 0);
+                if matches!(response, InterruptResponse::ExternallyOwned) {
+                    assert_eq!(session().await.status, "running");
+                }
                 supervisor.shutdown().await.unwrap();
                 engine.shutdown().await;
                 return;
