@@ -1838,7 +1838,12 @@ steering emits no turn-start event and preserves the message's enqueue time.
 
 Interrupt requests and error/interrupted session updates atomically hold every
 queued row and emit a complete delivery update per message. A later ready event preserves
-those holds. Cancelling accepts only queued rows: the row becomes dismissed,
+those holds. A provider that has not settled the turn 10 seconds after Stop is
+retired by the provider supervisor and projected `interrupted`, so a hung
+provider cannot keep the session `running`
+([providers](./providers.md#failure-attribution)); a Claude write without a replay
+60 seconds after it was written settles as an uncertain delivery instead of
+holding its delivery slot. Cancelling accepts only queued rows: the row becomes dismissed,
 the delivery event carries `withdrawn: true`, and its projector deletes only
 the addressed message. The row and original payload remain durable, while
 same-command replay remains idempotent. Queued rows never enter crash
