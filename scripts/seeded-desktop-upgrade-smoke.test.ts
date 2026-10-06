@@ -2167,3 +2167,204 @@ it.each(["nonzero", "retention-failure", "observer-throw"] as const)(
     }
   },
 );
+
+it.each([
+  "timeout",
+  "command-rejection",
+  "undefined-rejection",
+  "service-exit",
+  "service-overflow",
+  "nonzero",
+  "success",
+  "observer-throw",
+  "ordinary-timeout",
+] as const)(
+  "retains exact native command/session outcomes in the actual caller and status: %s",
+  async (mode) => {
+    const source = NodeFS.readFileSync(
+        new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url),
+        "utf8",
+      ),
+      leaf = NodeFS.readFileSync(
+        new URL(
+          "../apps/desktop/e2e/support/release-visual-native-followups-session.ts",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+      workflow = NodeFS.readFileSync(
+        new URL("./qualify-native-followups-workflow.ts", import.meta.url),
+        "utf8",
+      ),
+      declaration = leaf.indexOf("  let failed = false"),
+      declarationEnd = leaf.indexOf("  try {", declaration),
+      action = leaf.indexOf('    observe("native-linux-driver");', declaration),
+      tail = leaf.indexOf("  } catch (error)", action),
+      callerStart = source.indexOf("const runWebDriverPhase = async"),
+      callerEnd = source.indexOf("const startMockUpdateServer", callerStart),
+      statusStart = workflow.indexOf("export function nativeFollowupWorkflowStatus("),
+      statusEnd = workflow.indexOf("\nasync function main", statusStart),
+      enumStart = source.indexOf("export const nativeFollowupPhases"),
+      enumEnd = source.indexOf("export type NativeFollowupPhase", enumStart);
+    expect(declaration > 0 && declarationEnd > declaration && tail > action).toBe(true);
+    expect(callerStart > 0 && callerEnd > callerStart && statusEnd > statusStart).toBe(true);
+    const phases: string[] = [],
+      cleanup: { childProcessesClosed: boolean; boundedLogs: boolean; cleanupSafe: boolean }[] = [];
+    const timedOut = mode === "timeout" || mode === "observer-throw" || mode === "ordinary-timeout",
+      original =
+        mode === "undefined-rejection"
+          ? undefined
+          : timedOut
+            ? new SeededUpgradeCommandTimeoutError("Inert original timeout.")
+            : Object.freeze(new Error("Inert original command refusal."));
+    let commands = 0,
+      admissions = 0,
+      failed = false,
+      caught: unknown,
+      preparedWrites = 0;
+    const filesystem = {
+      existsSync: () => false,
+      writeFileSync: (_file: string, value: string) => cleanup.push(JSON.parse(value)),
+      promises: {
+        mkdir: async () => {},
+        writeFile: async () => {
+          preparedWrites++;
+        },
+      },
+    };
+    const children =
+      mode === "service-exit" || mode === "service-overflow"
+        ? [{ done: true, overflow: mode === "service-overflow", child: {} }]
+        : [];
+    const session = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function effect(input, run) { const environment=input.environment, root=input.workRoot; const observe=(value)=>{try{input.onStage?.(value)}catch{}};" +
+          leaf.slice(declaration, declarationEnd) +
+          "try {" +
+          leaf.slice(action, tail) +
+          leaf.slice(tail) +
+          "\neffect;",
+      ),
+      { NodeFS: filesystem, NodePath, Error, children },
+    ) as (
+      input: object,
+      run: (environment: NodeJS.ProcessEnv) => Promise<object>,
+    ) => Promise<object>;
+    let caller = source.slice(callerStart, callerEnd);
+    const importEnd = caller.indexOf(").withNativeFollowupsLinuxSession"),
+      importStart = caller.lastIndexOf("await import(", importEnd);
+    expect(importStart > 0 && importEnd > importStart).toBe(true);
+    caller =
+      caller.slice(0, importStart) + "await loadSession()\n        " + caller.slice(importEnd);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(caller) + "\nrunWebDriverPhase;",
+      {
+        NodeFS: filesystem,
+        NodePath,
+        NodeURL,
+        process: { env: {} },
+        seededUpgradeNativeHostPlatform: "linux",
+        seededUpgradeVitePlusExecutable,
+        SeededUpgradeCommandTimeoutError,
+        createSeededUpgradeDriverSpec: () => "inert",
+        createSeededUpgradeWdioConfig: () => "inert",
+        redactAndBoundUpgradeEvidence: () => "inert bounded output",
+        loadSession: async () => ({ withNativeFollowupsLinuxSession: session }),
+        runCommand: async () => {
+          commands++;
+          if (timedOut || mode === "command-rejection" || mode === "undefined-rejection")
+            throw original;
+          return { exitCode: mode === "nonzero" ? 7 : 0, stdout: "", stderr: "" };
+        },
+        assertWebDriverPhaseExit: (value: { exitCode: number }) => {
+          admissions++;
+          if (value.exitCode !== 0) throw original;
+        },
+      },
+    ) as (input: object) => Promise<void>;
+    try {
+      await run({
+        appBinaryPath: "inert",
+        backendPort: 1,
+        candidateVersion: "inert",
+        dataRoot: "/inert/data",
+        evidenceDirectory: "/inert/evidence",
+        expectedDataRoot: "/inert/data",
+        lane: mode === "ordinary-timeout" ? "protected-baseline" : "native-followups",
+        phase: "seed-and-install",
+        platform: "linux",
+        projectId: "inert",
+        repositoryRoot: "/inert/source",
+        restartTimeoutMs: 1,
+        resultPath: "/inert/before.json",
+        runRoot: "/inert/run/native",
+        workspaceRoot: "/inert/workspace",
+        webdriverPort: 1,
+        wsl: false,
+        sourceSha: "a".repeat(40),
+        observeNativePhase: (phase: string) => {
+          phases.push(phase);
+          if (mode === "observer-throw") throw new Error("Inert diagnostic refusal.");
+        },
+      });
+    } catch (error) {
+      failed = true;
+      caught = error;
+    }
+    expect(failed).toBe(mode !== "success");
+    expect(commands).toBe(1);
+    expect(admissions).toBe(mode === "nonzero" || mode === "success" ? 1 : 0);
+    expect(preparedWrites).toBe(mode === "nonzero" || mode === "success" ? 3 : 2);
+    if (mode === "service-exit" || mode === "service-overflow")
+      expect(caught).toMatchObject({
+        message: "Native follow-up private OS session exited early.",
+      });
+    else if (failed) expect(caught).toBe(original);
+    if (mode === "ordinary-timeout") {
+      expect(phases).toEqual([]);
+      expect(cleanup).toEqual([]);
+      return;
+    }
+    expect(cleanup).toEqual([
+      {
+        childCount: children.length,
+        childProcessesClosed: true,
+        boundedLogs: mode !== "service-overflow",
+        cleanupSafe: mode !== "service-overflow",
+      },
+    ]);
+    const expected = timedOut
+      ? "native-driver-command-timeout"
+      : mode === "command-rejection" || mode === "undefined-rejection"
+        ? "native-driver-command-rejected"
+        : mode === "service-exit" || mode === "service-overflow"
+          ? "native-linux-service-admission"
+          : "native-driver-result-admission";
+    expect(phases.at(-1)).toBe(expected);
+    const permitted = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(source.slice(enumStart, enumEnd).replace("export ", "")) +
+        "\nnativeFollowupPhases;",
+    ) as readonly string[];
+    const status = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        workflow.slice(statusStart, statusEnd).replace("export ", ""),
+      ) + "\nnativeFollowupWorkflowStatus;",
+      { nativeFollowupPhases: permitted, refused: () => new Error("Inert invalid status.") },
+    ) as (
+      source: string,
+      partition: string,
+      result: string,
+      count: number,
+      phase: string,
+    ) => { phase: string; originalCount: number; status: string };
+    expect(
+      status(
+        "a".repeat(40),
+        "linux-menu-update",
+        failed ? "failed" : "partition-complete",
+        failed ? 0 : 6,
+        expected,
+      ),
+    ).toMatchObject({ phase: expected, originalCount: failed ? 0 : 6 });
+  },
+);

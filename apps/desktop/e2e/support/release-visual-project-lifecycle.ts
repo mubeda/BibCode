@@ -499,11 +499,14 @@ export async function runProjectLifecycleScene(input: ProjectLifecycleFlowInput)
     input.step(`visual-project-lifecycle-${selected}-prepare`);
     if (selected === "worktree-remove-busy") {
       cleanup.push(["lifecycle-busy-dialog", () => input.busy.closeRemovalDialog()]);
+      input.step("visual-project-lifecycle-worktree-remove-busy-open-idle-dialog");
       await input.busy.openIdleRemovalDialog();
       cleanup.push(["lifecycle-busy-turn", () => input.busy.stopAndJoinTurn()]);
       cleanup.push(["lifecycle-busy-retained", () => input.busy.verifyCheckoutRetained()]);
       admitted = true;
+      input.step("visual-project-lifecycle-worktree-remove-busy-start-held-turn");
       await input.busy.startHeldTurn();
+      input.step("visual-project-lifecycle-worktree-remove-busy-verify-retained-checkout");
       await input.busy.verifyCheckoutRetained();
     } else if (selected === "project-clone-progress") {
       cleanup.push(["lifecycle-clone-cancel", () => input.clone.cancelPublicly()]);

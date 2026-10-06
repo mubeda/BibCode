@@ -237,6 +237,23 @@ describe("genuine source/public action joins", () => {
     expect(calls).not.toContain("capture");
   });
 
+  it.each([
+    ["openIdleRemovalDialog", "open-idle-dialog"],
+    ["startHeldTurn", "start-held-turn"],
+    ["verifyCheckoutRetained", "verify-retained-checkout"],
+  ] as const)("retains the original failure phase at %s through cleanup", async (action, phase) => {
+    const { input, calls } = flow("worktree-remove-busy"),
+      original = new Error("Inert preparation failure.");
+    input.busy[action].mockRejectedValue(original);
+    await expect(runProjectLifecycleScene(input)).rejects.toBe(original);
+    expect(calls.filter((value) => value.startsWith("visual-project-lifecycle-")).at(-1)).toBe(
+      `visual-project-lifecycle-worktree-remove-busy-${phase}`,
+    );
+    expect(calls).not.toContain("capture");
+    expect(calls).toContain("busy-close-publicly");
+    if (action !== "openIdleRemovalDialog") expect(calls).toContain("busy-stop-and-join");
+  });
+
   it("does not return success after a cancellation/join or trust restoration failure", async () => {
     const clone = flow("project-clone-progress");
     clone.input.clone.verifyCancelledAndJoined.mockRejectedValue(new Error("Inert join failure."));

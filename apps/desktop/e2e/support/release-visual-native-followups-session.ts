@@ -189,6 +189,7 @@ export async function withNativeFollowupsLinuxSession<A>(
     start(portal, []);
     observe("native-linux-driver");
     value = await run(environment);
+    observe("native-linux-service-admission");
     if (children.some((entry) => entry.done || entry.overflow))
       throw new Error("Native follow-up private OS session exited early.");
   } catch (error) {

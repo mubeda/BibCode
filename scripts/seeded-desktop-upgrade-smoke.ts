@@ -47,6 +47,9 @@ export const nativeFollowupPhases = [
   "native-linux-settings",
   "native-linux-services",
   "native-linux-driver",
+  "native-driver-command-timeout",
+  "native-driver-command-rejected",
+  "native-linux-service-admission",
   "native-linux-cleanup",
   "native-cleanup",
   "native-retain",
@@ -1938,7 +1941,7 @@ const runWebDriverPhase = async (input: {
     );
     commands.assertClosed();
   }
-  const runDriver = (environment: NodeJS.ProcessEnv) => {
+  const runDriver = async (environment: NodeJS.ProcessEnv) => {
     const childEnvironment = { ...environment };
     if (input.lane === "native-followups") {
       for (const key of [
@@ -1950,24 +1953,39 @@ const runWebDriverPhase = async (input: {
       ])
         delete childEnvironment[key];
     }
-    return runCommand({
-      command: seededUpgradeVitePlusExecutable,
-      args: ["exec", "wdio", "run", configPath],
-      cwd: NodePath.join(input.repositoryRoot, "apps", "desktop"),
-      env: {
-        ...childEnvironment,
-        BIBCODE_HOME: input.dataRoot,
-        BIBCODE_PORT: String(input.backendPort),
-        BIBCODE_E2E_PLATFORM: input.platform,
-        RUST_LOG: "bibcode=debug",
-        ...(input.wsl
-          ? {
-              WSLENV: [process.env.WSLENV, "BIBCODE_HOME/p"].filter(Boolean).join(":"),
-            }
-          : {}),
-      },
-      timeoutMs: phaseTimeoutMs,
-    });
+    try {
+      return await runCommand({
+        command: seededUpgradeVitePlusExecutable,
+        args: ["exec", "wdio", "run", configPath],
+        cwd: NodePath.join(input.repositoryRoot, "apps", "desktop"),
+        env: {
+          ...childEnvironment,
+          BIBCODE_HOME: input.dataRoot,
+          BIBCODE_PORT: String(input.backendPort),
+          BIBCODE_E2E_PLATFORM: input.platform,
+          RUST_LOG: "bibcode=debug",
+          ...(input.wsl
+            ? {
+                WSLENV: [process.env.WSLENV, "BIBCODE_HOME/p"].filter(Boolean).join(":"),
+              }
+            : {}),
+        },
+        timeoutMs: phaseTimeoutMs,
+      });
+    } catch (error) {
+      if (input.lane === "native-followups") {
+        try {
+          input.observeNativePhase?.(
+            error instanceof SeededUpgradeCommandTimeoutError
+              ? "native-driver-command-timeout"
+              : "native-driver-command-rejected",
+          );
+        } catch {
+          /* Passive attribution cannot replace the original command rejection. */
+        }
+      }
+      throw error;
+    }
   };
   const result =
     input.lane === "native-followups" && input.platform === "linux"

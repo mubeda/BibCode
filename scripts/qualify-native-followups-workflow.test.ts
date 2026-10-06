@@ -404,3 +404,13 @@ it("retains only fixed owning terminal phases in the existing status packet", ()
     "nativeFollowupWorkflowStatus(sourceSha, plan.partition, status, count, phase)",
   );
 });
+
+it.each([
+  "native-driver-command-timeout",
+  "native-driver-command-rejected",
+  "native-linux-service-admission",
+] as const)("retains only the fixed native driver outcome phase: %s", (phase) => {
+  expect(
+    nativeFollowupWorkflowStatus("a".repeat(40), "linux-menu-update", "failed", 0, phase),
+  ).toMatchObject({ phase, originalCount: 0, status: "failed", completeGroup: false });
+});

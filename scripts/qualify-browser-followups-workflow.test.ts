@@ -81,3 +81,31 @@ it("publishes only seven closed receipts and the fourteen exact source-bound ori
   );
   expect(step.with.path).not.toMatch(/[?*]/);
 });
+
+it("runs every fixed-endpoint browser composition file with exclusive file ownership", () => {
+  const steps = workflow.jobs.visual_core.steps;
+  const browser = steps.find(
+    (step: { name?: string }) =>
+      step.name === "Verify browser follow-up composition and current public controls",
+  );
+  expect(browser.if).toBe("${{ inputs.scene_selection == 'release-visual-browser-followups' }}");
+  const command = browser.run.trim().split(/\s+/);
+  expect(command.slice(0, 4)).toEqual(["vp", "test", "run", "--no-file-parallelism"]);
+  expect(command.slice(4)).toEqual([
+    "apps/desktop/e2e/support/release-visual-browser-followups-caller.test.ts",
+    "apps/desktop/e2e/support/release-visual-browser-followups-caller-resources.test.ts",
+    "apps/desktop/e2e/support/release-visual-browser-followups-caller-protocol.test.ts",
+    "apps/desktop/e2e/support/release-visual-browser-followups-owner.test.ts",
+    "apps/desktop/e2e/support/release-visual-browser-followups-producer.test.ts",
+    "apps/desktop/e2e/support/release-visual-browser-followups-protocol.test.ts",
+    "apps/desktop/e2e/support/release-visual-browser-followups-transport.test.ts",
+    "scripts/build-browser-followup-ui.test.mjs",
+    "apps/desktop/e2e/support/release-visual-browser-followups-wiring.test.ts",
+    "scripts/qualify-browser-followups-workflow.test.ts",
+  ]);
+  expect(
+    steps
+      .filter((step: { run?: string }) => step.run?.includes("--no-file-parallelism"))
+      .map((step: { name: string }) => step.name),
+  ).toEqual(["Verify browser follow-up composition and current public controls"]);
+});

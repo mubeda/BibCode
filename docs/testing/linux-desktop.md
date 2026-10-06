@@ -2302,7 +2302,10 @@ Open the real idle removal dialog without clicking its destructive action,
 start one maintained Codex turn, and require a generation-bound typed removal
 refusal with session-running. Capture the actual disabled action and reason,
 then close the dialog, stop and reap that provider and retain the original
-checkout. Trust refusal uses the actual server's Git classification and typed
+checkout. Preparation records separate phases for opening the idle dialog,
+starting the held turn and verifying the retained checkout. Cleanup preserves
+the original failure phase; these markers add no action, retry or time budget.
+Trust refusal uses the actual server's Git classification and typed
 untrusted status after removing only the owned target exemption. Restore the
 private config bytes, retry publicly and require readable status and retained
 inputs. The owned primary and other anchors must remain admitted.
@@ -2445,6 +2448,13 @@ its original phase and exception through secondary cleanup failures; optional
 diagnostic errors cannot replace it. Raw errors, paths and identities stay
 private. A terminal phase identifies a boundary and does not establish a native
 cause or visual acceptance.
+The existing bounded driver rejection records `native-driver-command-timeout`
+only for its typed timeout outcome; other command rejections record
+`native-driver-command-rejected` without parsing raw errors. After the driver
+returns, `native-linux-service-admission` precedes the existing owned-service
+liveness/log-bound check. These fixed phases distinguish the command owner from
+the service check; original exception identity, cleanup order and all command
+bounds remain unchanged.
 
 The existing owner builds both a current-source protected baseline and a valid
 ephemeral-signed candidate in isolated checkouts. Its nonroot read-only install
@@ -2468,6 +2478,12 @@ default; this explicit opt-in does not qualify omitted platforms.
 The selected `release-visual-browser-followups` batch retains the six existing
 browser rows in both themes plus the Source Control overview supplement. Its
 fourteen original PNGs remain 1280 by 960 and require independent review.
+The browser-specific composition command runs with `--no-file-parallelism`.
+Its real loopback fixture files deliberately bind the same public endpoint, so
+each file must finish owned cleanup before another file acquires that endpoint.
+This keeps every selected case and fixed endpoint contract; it does not widen
+timeouts or serialize ordinary jobs.
+
 Build the ordinary primary UI with the owned public backend at 4887 and the
 separate hosted UI at 4893 without backend/desktop configuration. Both builds
 use the same source and existing web build lock; the hosted SDK probe re-exports
