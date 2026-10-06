@@ -303,7 +303,11 @@ native conversation. A turn that settles in time, a different running turn, or
 a replaced session leaves the deadline with nothing to do. The supervisor
 checks the projection again after detachment has drained any terminal batch the
 event pump already admitted; if that batch settled the turn, its settlement
-stands and only the (resumable) retirement remains.
+stands and only the (resumable) retirement remains. The deadline is not armed
+for a driver that does not own its native work: an OpenCode session on a
+configured external server keeps running its turn after BiBCode detaches, so
+Stop only asks it to abort (still bounded by the 10-second call limit) and the
+turn stays running until the server settles it.
 
 Idle retention is deliberately conservative in three cases: a send that ends
 without a turn after invalidating an earlier deadline; a launched or restored

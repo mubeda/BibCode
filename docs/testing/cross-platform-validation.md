@@ -396,10 +396,12 @@ Claude's expanded replay, including multi-line arguments; an unknown command's
 raw replay must also acknowledge it, and another command's replay must not. A
 write with no recognisable replay must become uncertain at the acknowledgement
 deadline, while a steer's deadline starts only after its turn stops taking
-input. After Stop, a provider that never answers the interrupt, or answers and
-never settles the turn, must be retired at the interrupt deadline: the session
-is projected interrupted with its resume cursor retained, and the next message
-starts a new provider process.
+input. After Stop, a provider process BiBCode owns that never answers the
+interrupt, or answers and never settles the turn, must be retired at the
+interrupt deadline: the session is projected interrupted with its resume cursor
+retained, and the next message starts a new provider process. An OpenCode
+session on a configured external server is not retired: Stop returns within the
+interrupt deadline and the turn stays running until that server settles it.
 Interrupt/error during an in-flight steer must hold any subsequent requeue; a
 late acceptance must not restore a session that has already settled. Test local
 Claude settlement/interrupt during writer contention, late user echoes, and a
