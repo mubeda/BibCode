@@ -535,18 +535,39 @@ The authenticated environment advertises `gitPullRequestBranchSelection`
 checks it again on the same live session used for the mutation stream. Older
 servers therefore cannot silently ignore the reviewed branch fields.
 
-| Method                       | Required scope          | Responsibility                                                          |
-| ---------------------------- | ----------------------- | ----------------------------------------------------------------------- |
-| `pullRequests.getContext`    | `orchestration:read`    | Resolve origin, host/account, repository policy and availability.       |
-| `pullRequests.getVocabulary` | `orchestration:read`    | Load bounded searchable picker values on demand.                        |
-| `pullRequests.list`          | `orchestration:read`    | Page the repository list for explicit tabs/filters.                     |
-| `pullRequests.get`           | `orchestration:read`    | Read detail and compute permissions/readiness.                          |
-| `pullRequests.getTimeline`   | `orchestration:read`    | Read bounded comments, reviews, threads and events.                     |
-| `pullRequests.getCommits`    | `orchestration:read`    | Read the request's commit list.                                         |
-| `pullRequests.getChecks`     | `orchestration:read`    | Read GitHub checks or GitLab pipeline jobs.                             |
-| `pullRequests.getFiles`      | `orchestration:read`    | Read file metadata, bounded patches and diff refs.                      |
-| `pullRequests.runAction`     | `orchestration:operate` | Revalidate and serialize review/metadata/merge/state mutations.         |
-| `pullRequests.checkout`      | `orchestration:operate` | Guard current/other/new-worktree checkout and settle durable ownership. |
+The same action takes optional `pullRequestOptions` on request actions:
+`draft`, `assignees`, `reviewers` and `labels` (Pull Requests vocabulary entry
+ids; at most 20, 20 and 50), `milestone` (`{ id, title }`), and the GitLab-only
+`removeSourceBranch` and `squash`. Before any branch, commit or push, the server
+refuses options the resolved provider cannot honor: merge options outside
+GitLab, non-numeric GitLab person or milestone ids, and any option for Azure
+DevOps or Bitbucket. GitHub receives `gh pr create` flags (`--draft`,
+`--assignee`, `--reviewer`, CSV-quoted `--label`, `--milestone <title>`);
+GitLab receives one JSON body over stdin (`glab api … --input -`) with
+`assignee_ids`, `reviewer_ids`, `labels`, `milestone_id`,
+`remove_source_branch`, `squash`, and a `Draft: ` title prefix added unless the
+title already carries a draft marker. Requests without options keep the plain
+commands. When `gh` exits 1 after printing the request URL, the step reports
+`created` with `pr.warning` and is not retried; an existing open request reports
+that the options were not applied. Servers advertise `pullRequestCreateOptions`
+(default false for older servers); the dialog shows the fields and the client
+action sends them only when it is present. `pullRequests.getCreateDefaults`
+supplies the dialog's "Assign to me" viewer and GitLab's `squash_option` and
+`remove_source_branch_after_merge`; the dialog re-reads it on every open.
+
+| Method                           | Required scope          | Responsibility                                                          |
+| -------------------------------- | ----------------------- | ----------------------------------------------------------------------- |
+| `pullRequests.getContext`        | `orchestration:read`    | Resolve origin, host/account, repository policy and availability.       |
+| `pullRequests.getVocabulary`     | `orchestration:read`    | Load bounded searchable picker values on demand.                        |
+| `pullRequests.getCreateDefaults` | `orchestration:read`    | Viewer and GitLab merge defaults for the create dialog.                 |
+| `pullRequests.list`              | `orchestration:read`    | Page the repository list for explicit tabs/filters.                     |
+| `pullRequests.get`               | `orchestration:read`    | Read detail and compute permissions/readiness.                          |
+| `pullRequests.getTimeline`       | `orchestration:read`    | Read bounded comments, reviews, threads and events.                     |
+| `pullRequests.getCommits`        | `orchestration:read`    | Read the request's commit list.                                         |
+| `pullRequests.getChecks`         | `orchestration:read`    | Read GitHub checks or GitLab pipeline jobs.                             |
+| `pullRequests.getFiles`          | `orchestration:read`    | Read file metadata, bounded patches and diff refs.                      |
+| `pullRequests.runAction`         | `orchestration:operate` | Revalidate and serialize review/metadata/merge/state mutations.         |
+| `pullRequests.checkout`          | `orchestration:operate` | Guard current/other/new-worktree checkout and settle durable ownership. |
 
 Browser and desktop clients use these same typed unary RPCs; native actions such
 as opening a host URL retain the existing DesktopBridge/local API boundary.
