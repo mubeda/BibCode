@@ -160,6 +160,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("terminal.open"),
     mutation_unary("terminal.resize"),
     mutation_unary("terminal.restart"),
+    mutation_unary("terminal.stageImagePaste"),
     mutation_unary("terminal.write"),
     mutation_unary("terminal.writeInput"),
     read_unary("updater.activeWork"),

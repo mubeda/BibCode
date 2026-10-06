@@ -23,6 +23,13 @@ export interface TerminalInputSchedulerOptions {
 export interface TerminalInputScheduler {
   /** Appends input in arrival order and schedules a drain. Empty strings are ignored. */
   enqueue(data: string): void;
+  /**
+   * Reserves the current end of the queue for input that is not ready yet. Later
+   * input waits behind the reservation, within the pending limit, until the returned
+   * function fills it (`null` leaves nothing). A reservation from before a reset or
+   * failure is ignored.
+   */
+  reserve(): (data: string | null) => void;
   /** Drops pending input and invalidates in-flight results for the old generation. */
   reset(): void;
   pendingLength(): number;
@@ -64,6 +71,13 @@ export function createTerminalInputScheduler(
   let stopped = false;
   let scheduled = false;
   let generation = 0;
+  interface Reservation {
+    data: string | null;
+    filled: boolean;
+  }
+  // Input waiting behind the first unfilled reservation, in arrival order.
+  let held: Array<string | Reservation> = [];
+  let reservationEpoch = 0;
 
   const takeFrame = (): string => {
     let end = 0;
@@ -99,6 +113,8 @@ export function createTerminalInputScheduler(
 
   const fail = (error: unknown): void => {
     pending = "";
+    held = [];
+    reservationEpoch += 1;
     if (typeof options.stopOnError === "function" ? options.stopOnError() : options.stopOnError) {
       stopped = true;
       notifyReset();
@@ -137,23 +153,59 @@ export function createTerminalInputScheduler(
     });
   };
 
+  const heldText = () =>
+    held.map((item) => (typeof item === "string" ? item : (item.data ?? ""))).join("");
+  const exceedsPending = (data: string) =>
+    encoder.encode(pending + heldText() + data).length > maxPendingBytes;
+  const failOverflow = () =>
+    fail(
+      new Error("Terminal input exceeded the 1 MiB pending limit. Reattach before typing again."),
+    );
+
+  const releaseFilled = () => {
+    while (held.length > 0) {
+      const head = held[0]!;
+      if (typeof head !== "string" && !head.filled) break;
+      held.shift();
+      pending += typeof head === "string" ? head : (head.data ?? "");
+    }
+    if (pending.length > 0) scheduleDrain();
+  };
+
   return {
     enqueue(data) {
       if (data.length === 0 || stopped) return;
-      if (encoder.encode(pending + data).length > maxPendingBytes) {
-        fail(
-          new Error(
-            "Terminal input exceeded the 1 MiB pending limit. Reattach before typing again.",
-          ),
-        );
+      if (exceedsPending(data)) {
+        failOverflow();
+        return;
+      }
+      if (held.length > 0) {
+        held.push(data);
         return;
       }
       pending += data;
       scheduleDrain();
     },
+    reserve() {
+      const reservation: Reservation = { data: null, filled: false };
+      const epoch = reservationEpoch;
+      held.push(reservation);
+      return (data) => {
+        if (reservation.filled || epoch !== reservationEpoch) return;
+        if (data !== null && exceedsPending(data)) {
+          failOverflow();
+          return;
+        }
+        reservation.data = data;
+        reservation.filled = true;
+        releaseFilled();
+      };
+    },
     reset() {
       generation += 1;
       pending = "";
+      held = [];
+      reservationEpoch += 1;
       stopped = false;
       if (maxInFlight() > 1) inFlight.clear();
       notifyReset();

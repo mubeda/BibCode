@@ -8,6 +8,8 @@ import {
   UploadCancelInput,
   UploadCancelResult,
   UploadError,
+  TerminalStageImagePasteInput,
+  TerminalStageImagePasteResult,
 } from "./uploads.ts";
 import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
@@ -497,6 +499,7 @@ export const WS_METHODS = {
   terminalClear: "terminal.clear",
   terminalRestart: "terminal.restart",
   terminalClose: "terminal.close",
+  terminalStageImagePaste: "terminal.stageImagePaste",
 
   // Preview methods
   previewOpen: "preview.open",
@@ -1659,6 +1662,11 @@ export const WsUploadsCancelRpc = Rpc.make(WS_METHODS.uploadsCancel, {
   success: UploadCancelResult,
   error: Schema.Union([UploadError, EnvironmentRpcError]),
 });
+export const WsTerminalStageImagePasteRpc = Rpc.make(WS_METHODS.terminalStageImagePaste, {
+  payload: TerminalStageImagePasteInput,
+  success: TerminalStageImagePasteResult,
+  error: Schema.Union([UploadError, EnvironmentRpcError]),
+});
 
 export const WsRpcGroup = RpcGroup.make(
   WsUploadsBeginRpc,
@@ -1769,6 +1777,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsTerminalClearRpc,
   WsTerminalRestartRpc,
   WsTerminalCloseRpc,
+  WsTerminalStageImagePasteRpc,
   WsSubscribeTerminalEventsRpc,
   WsSubscribeTerminalMetadataRpc,
   WsPreviewOpenRpc,

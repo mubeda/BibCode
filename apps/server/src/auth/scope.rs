@@ -144,6 +144,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "terminal.open"
         | "terminal.resize"
         | "terminal.restart"
+        | "terminal.stageImagePaste"
         | "terminal.write"
         | "terminal.writeInput"
         | "subscribeTerminalEvents"

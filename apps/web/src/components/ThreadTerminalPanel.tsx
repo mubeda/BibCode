@@ -23,6 +23,7 @@ import {
 import {
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
+  TerminalImagePasteMimeType,
   type TerminalLaunchCommand,
   type TerminalSize,
   type TerminalResizeInput,
@@ -30,6 +31,7 @@ import {
   type ProjectId,
 } from "@bibcode/contracts";
 import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
+import * as Schema from "effect/Schema";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import {
   type ReactNode,
@@ -308,6 +310,17 @@ export function enqueueTerminalInput<A, E>(input: {
   scheduler.enqueue(input.data);
 }
 
+const isTerminalImagePasteMimeType = Schema.is(TerminalImagePasteMimeType);
+
+/**
+ * Escapes a server path so a CLI that tokenizes pasted text (Codex, Claude Code)
+ * sees one path: backslash escapes on POSIX hosts, quotes on Windows.
+ */
+export function quoteTerminalPastePath(path: string, os: string | undefined): string {
+  if ((os === "windows" ? /^[\w./:\\-]+$/ : /^[\w./:-]+$/).test(path)) return path;
+  return os === "windows" ? `"${path}"` : path.replace(/[^\w./-]/g, "\\$&");
+}
+
 function writeSystemMessage(terminal: Terminal, message: string): void {
   terminal.write(`\r\n[terminal] ${message}\r\n`);
 }
@@ -444,6 +457,7 @@ function acquireTerminalInputBinding(inputKey: string): {
 
     return {
       enqueue: (data) => rawScheduler.enqueue(data),
+      reserve: () => rawScheduler.reserve(),
       reset: () => {
         keyedBinding.generation += 1;
         keyedBinding.error = null;
@@ -785,6 +799,8 @@ export function TerminalViewport({
   } | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
   const [inputReattaching, setInputReattaching] = useState(false);
+  const [imagePastesPending, setImagePastesPending] = useState(0);
+  const cancelImagePastesRef = useRef<() => void>(() => undefined);
   const openInPreferredEditor = useOpenInPreferredEditor(
     environmentId,
     serverConfig?.availableEditors ?? [],
@@ -807,6 +823,21 @@ export function TerminalViewport({
   const runTerminalRestart = useAtomCommand(terminalEnvironment.restart, {
     reportFailure: false,
   });
+  const runStageImagePaste = useAtomCommand(terminalEnvironment.stageImagePaste, {
+    reportFailure: false,
+  });
+  const stageImagePaste = useEffectEvent(
+    (image: File, mimeType: TerminalImagePasteMimeType, signal: AbortSignal) =>
+      serverConfig?.environment.capabilities?.terminalImagePaste === true
+        ? runStageImagePaste(
+            {
+              environmentId,
+              input: { file: image, name: image.name || "pasted-image", mimeType },
+            },
+            { signal },
+          )
+        : null,
+  );
   const hasHandledExitRef = useRef(false);
   const selectionPointerRef = useRef<{ x: number; y: number } | null>(null);
   const selectionActionRequestIdRef = useRef(0);
@@ -906,6 +937,8 @@ export function TerminalViewport({
   const terminalError = terminalSession.error;
   const terminalStatus = terminalSession.status;
   const terminalGeneration = terminalSession.generation;
+  const readTerminalGeneration = useEffectEvent(() => terminalGeneration);
+  const readServerOs = useEffectEvent(() => serverConfig?.environment.platform.os);
   const transcriptRuntime = terminalSession.transcriptRuntime;
   const themeRestartRequestIdRef = useRef(0);
   const themeRestartRequestRef = useRef<CodexThemeRestartRequest | null>(null);
@@ -1425,15 +1458,13 @@ export function TerminalViewport({
       }
     };
 
+    const inputBlocked = () =>
+      Boolean(readWorkspaceUnavailable()) ||
+      (inputBinding.ordered && inputBinding.error !== null) ||
+      inputBinding.renderer?.owner !== rendererOwner;
     const sendTerminalInput = (data: string, fallbackError: string) => {
       if (!replyGuard.acceptInput()) return;
-      if (
-        readWorkspaceUnavailable() ||
-        (inputBinding.ordered && inputBinding.error !== null) ||
-        inputBinding.renderer?.owner !== rendererOwner ||
-        data.length === 0
-      )
-        return;
+      if (inputBlocked() || data.length === 0) return;
       inputBinding.pendingFallbacks.push({ remaining: data.length, message: fallbackError });
       inputScheduler.enqueue(data);
     };
@@ -1655,7 +1686,72 @@ export function TerminalViewport({
       invertForceSelectionKey(event);
       if (event.type === "mouseup" && event.button === 0) invertingGesture = false;
     };
+    // The program reads its own host's clipboard, never this client's, so a
+    // pasted image is uploaded and the path of its server copy is pasted.
+    const pasteAborts = new Set<AbortController>();
+    cancelImagePastesRef.current = () => {
+      for (const abort of pasteAborts) abort.abort();
+    };
+    const handlePaste = (event: ClipboardEvent) => {
+      const data = event.clipboardData;
+      if (!data || data.getData("text/plain") !== "") return;
+      const image = Array.from(data.files).find((file) => file.type.startsWith("image/"));
+      if (!image) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (inputBlocked()) return;
+      if (!isTerminalImagePasteMimeType(image.type)) {
+        writeSystemMessage(terminal, "Image paste supports PNG, JPEG, GIF and WebP images.");
+        return;
+      }
+      const abort = new AbortController();
+      const staging = stageImagePaste(image, image.type, abort.signal);
+      if (staging === null) {
+        writeSystemMessage(
+          terminal,
+          "Image paste needs a newer BiBCode server on this environment.",
+        );
+        return;
+      }
+      // Input typed during the upload waits behind the path in the terminal's
+      // persistent input queue, so Enter cannot submit the prompt early.
+      const generation = readTerminalGeneration();
+      const bracketedAtPaste = terminal.modes.bracketedPasteMode;
+      const fallback = { remaining: 0, message: "Terminal write failed" };
+      inputBinding.pendingFallbacks.push(fallback);
+      const fill = inputScheduler.reserve();
+      pasteAborts.add(abort);
+      setImagePastesPending((count) => count + 1);
+      void staging.then((result) => {
+        pasteAborts.delete(abort);
+        setImagePastesPending((count) => count - 1);
+        let path: string | null = null;
+        if (result._tag === "Success") {
+          if (readTerminalGeneration() === generation) path = result.value;
+          else if (!disposed) {
+            writeSystemMessage(terminal, "Image paste dropped: the terminal restarted.");
+          }
+        } else if (!disposed && !isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          writeSystemMessage(
+            terminal,
+            `Image paste failed: ${error instanceof Error ? error.message : "upload error"}`,
+          );
+        }
+        if (inputBlocked()) path = null;
+        const quoted = path === null ? null : quoteTerminalPastePath(path, readServerOs());
+        // The program may toggle bracketed paste while the image uploads.
+        const bracketed = disposed ? bracketedAtPaste : terminal.modes.bracketedPasteMode;
+        const text = quoted === null ? null : bracketed ? `\x1b[200~${quoted}\x1b[201~` : quoted;
+        if (text !== null) {
+          fallback.remaining = text.length;
+          fallback.message = "Image paste failed";
+        }
+        fill(text);
+      });
+    };
     const ownerDocument = mount.ownerDocument;
+    mount.addEventListener("paste", handlePaste, true);
     mount.addEventListener("mousedown", handleMouseDown, true);
     const screenElement = mount.querySelector<HTMLElement>(".xterm-screen");
     screenElement?.addEventListener("mousemove", handleHover);
@@ -1707,6 +1803,9 @@ export function TerminalViewport({
       selectionDisposable.dispose();
       terminalLinksDisposable.dispose();
       clearSelectionAction();
+      cancelImagePastesRef.current();
+      cancelImagePastesRef.current = () => undefined;
+      mount.removeEventListener("paste", handlePaste, true);
       mount.removeEventListener("mousedown", handleMouseDown, true);
       screenElement?.removeEventListener("mousemove", handleHover);
       ownerDocument.removeEventListener("mousemove", handleGestureMouse, true);
@@ -2140,6 +2239,22 @@ export function TerminalViewport({
           className="absolute inset-0 flex items-center justify-center px-4 text-center text-xs text-destructive"
         >
           {terminalError}
+        </div>
+      ) : null}
+      {shouldRender && imagePastesPending > 0 ? (
+        <div
+          role="status"
+          className="absolute top-2 left-2 z-20 flex items-center gap-3 rounded-md border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md"
+        >
+          <span>Uploading pasted image… Typing continues after it.</span>
+          <Button
+            type="button"
+            size="xs"
+            variant="outline"
+            onClick={() => cancelImagePastesRef.current()}
+          >
+            Cancel
+          </Button>
         </div>
       ) : null}
       {shouldRender && orderedInput && inputError !== null ? (

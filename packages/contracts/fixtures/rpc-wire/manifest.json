@@ -426,6 +426,10 @@
       "mode": "unary"
     },
     {
+      "name": "terminal.stageImagePaste",
+      "mode": "unary"
+    },
+    {
       "name": "terminal.write",
       "mode": "unary"
     },
@@ -830,6 +834,8 @@
     "typed-failures/terminal__restart-01.json",
     "typed-failures/terminal__restart-02.json",
     "typed-failures/terminal__restart-03.json",
+    "typed-failures/terminal__stageImagePaste-00.json",
+    "typed-failures/terminal__stageImagePaste-01.json",
     "typed-failures/terminal__write-00.json",
     "typed-failures/terminal__write-01.json",
     "typed-failures/terminal__write-02.json",
@@ -1148,12 +1154,12 @@
     "stream-shapes/subscribePreviewEvents-03.json": "610d11c2c75756edfc18e224e5e91c6944162760c00c48c4d0de54fc4772acff",
     "stream-shapes/subscribePreviewEvents-04.json": "f501cfce13136cfa7ae7bad4febe03c8c2f251deb39b95d89a955a1c39b449aa",
     "stream-shapes/subscribeProjectEntries-00.json": "16f4733b371dc6218161dd4edea9bdd75720b67a9e18533b6bdf20d00e120db5",
-    "stream-shapes/subscribeServerConfig-00.json": "704fcf1f82b14ba62b8099983109215f5d4321ef33eaf7095f72d19c8b451bce",
+    "stream-shapes/subscribeServerConfig-00.json": "f0313e6a1ac9e4a5383445fd889c7c9c1300d254b4f611e911283037c8860bb0",
     "stream-shapes/subscribeServerConfig-01.json": "a1736b568373952030c3383ae56ebc777ff487d1732c6adfface416574e1dbf3",
     "stream-shapes/subscribeServerConfig-02.json": "ae146698c9d1a7fa8b20e6665efd2ef6300d7ecec411497f01271add5a3c32b4",
     "stream-shapes/subscribeServerConfig-03.json": "170831fd420c93bb7028261110e84a506b90762a469d9d9de9fed374b1856967",
-    "stream-shapes/subscribeServerLifecycle-00.json": "a266b965ae3c6d438332649ed65b5be5d1c1e6e9133f28d96d33d92efeabec48",
-    "stream-shapes/subscribeServerLifecycle-01.json": "4b438dddc2b9f75908ffdcf13413fa72d11610e8692cb935d4f3bd3af765b6bf",
+    "stream-shapes/subscribeServerLifecycle-00.json": "49f2b9d8923b499756a05a7019caa03591d44036369477716481840c7e08cfa0",
+    "stream-shapes/subscribeServerLifecycle-01.json": "1bfaf031ef42689e26bc5b50e85a279788ff50be139475c19d0feb5af39facd6",
     "stream-shapes/subscribeTerminalEvents-00.json": "cbd00577e4b1aee3d7026ea6efc0c135670a5af101a6ea0610ca7ecaa1385832",
     "stream-shapes/subscribeTerminalEvents-01.json": "8910c9265e5eb8ab0cdd98289a899d28b720c08decad2ec7d2967346570eaee6",
     "stream-shapes/subscribeTerminalEvents-02.json": "218d03fab79954845f38c1ed752082aab5340619a28c684920da1af6a7360fa8",
@@ -1207,6 +1213,8 @@
     "typed-failures/terminal__restart-01.json": "d30145df2096df3675ffde7a840acb67a4f2e26cb8d9a607b828688560d2ca82",
     "typed-failures/terminal__restart-02.json": "b2fbde91e8a8ad7b3e8fce9b4d378041efef24ffd25156a058c7cb69f6fd91e9",
     "typed-failures/terminal__restart-03.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
+    "typed-failures/terminal__stageImagePaste-00.json": "c0f19bace899404bbbcd76200dfe20db95bab5c07af171718b75b3a5dd11acbc",
+    "typed-failures/terminal__stageImagePaste-01.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
     "typed-failures/terminal__write-00.json": "e451472005788e3ddacb34413e5c45c63f8e729662c7f7ac8c967ee6f4e9d452",
     "typed-failures/terminal__write-01.json": "d30145df2096df3675ffde7a840acb67a4f2e26cb8d9a607b828688560d2ca82",
     "typed-failures/terminal__write-02.json": "b2fbde91e8a8ad7b3e8fce9b4d378041efef24ffd25156a058c7cb69f6fd91e9",
@@ -1621,6 +1629,8 @@
     "typed-failures/terminal__restart-01.json",
     "typed-failures/terminal__restart-02.json",
     "typed-failures/terminal__restart-03.json",
+    "typed-failures/terminal__stageImagePaste-00.json",
+    "typed-failures/terminal__stageImagePaste-01.json",
     "typed-failures/terminal__write-00.json",
     "typed-failures/terminal__write-01.json",
     "typed-failures/terminal__write-02.json",

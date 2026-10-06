@@ -266,7 +266,11 @@ selection must stay. Then copy with **Ctrl+C** (**Cmd+C** on macOS) and with
 right-click **Copy**; the selected text must reach the clipboard without
 interrupting the CLI. A plain click must clear the selection and hand pointer
 input back to the CLI. **Shift+drag** (**Option+drag** on macOS) must reach the
-CLI instead of selecting. Repeat copy/paste where asynchronous Clipboard API
+CLI instead of selecting. Copy a screenshot to the client's clipboard and paste it
+into `codex` or `claude` running in a provider terminal, once against a local
+environment and once against a remote one: the terminal must paste a
+`terminal-pastes/` path and the CLI must attach the image. A text paste must
+still arrive as text. Repeat copy/paste where asynchronous Clipboard API
 access is unavailable; native clipboard events must still work. These packaged
 checks supplement the focused terminal and keybinding component tests.
 

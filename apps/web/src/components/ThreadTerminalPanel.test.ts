@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   fitTerminalSafely,
+  quoteTerminalPastePath,
   getTerminalSelectionRect,
   normalizeComputedColor,
   resolveTerminalDocumentVisibility,
@@ -186,5 +187,30 @@ describe("resolveTerminalSelectionActionPosition", () => {
       x: 100,
       y: 50,
     });
+  });
+});
+
+describe("quoteTerminalPastePath", () => {
+  it.each([
+    [
+      "/home/me/.bibcode/userdata/terminal-pastes/a.png",
+      "linux",
+      "/home/me/.bibcode/userdata/terminal-pastes/a.png",
+    ],
+    [
+      "/Volumes/Work Disk/terminal-pastes/a.png",
+      "darwin",
+      "/Volumes/Work\\ Disk/terminal-pastes/a.png",
+    ],
+    ["/srv/it's (new)/a.png", "linux", "/srv/it\\'s\\ \\(new\\)/a.png"],
+    ["/tmp/work\\tree/a.png", "linux", "/tmp/work\\\\tree/a.png"],
+    ["C:\\Users\\me\\terminal-pastes\\a.png", "windows", "C:\\Users\\me\\terminal-pastes\\a.png"],
+    [
+      "C:\\Users\\Jane Doe\\terminal-pastes\\a.png",
+      "windows",
+      '"C:\\Users\\Jane Doe\\terminal-pastes\\a.png"',
+    ],
+  ])("pastes %s on %s as one token", (path, os, expected) => {
+    expect(quoteTerminalPastePath(path, os)).toBe(expected);
   });
 });
