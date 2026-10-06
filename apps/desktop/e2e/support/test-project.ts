@@ -9,6 +9,10 @@ import {
   cursorQuestionFixtureSelection,
   extendOwnedCursorQuestionFixture,
 } from "./release-visual-cursor-question-fixture.ts";
+import {
+  extendOwnedClaudeVisualFixture,
+  extendOwnedCodexVisualFixture,
+} from "./release-visual-provider-chat-fixture.ts";
 
 const FIXTURE_PROJECT_NAME = "BiBCode UI Fixture";
 const STREAMED_RESPONSE = "BiBCode deterministic streamed fixture response.";
@@ -994,10 +998,17 @@ function createProviderShims(
   shimDirectory: string,
   isWindows: boolean,
   cursorQuestion?: typeof cursorQuestionFixtureSelection,
+  providerChat?: "provider-chat-v1",
 ): void {
   const fixtureSources = {
-    codex: codexFixtureSource,
-    claude: claudeFixtureSource,
+    codex:
+      providerChat === undefined
+        ? codexFixtureSource
+        : extendOwnedCodexVisualFixture(codexFixtureSource, providerChat),
+    claude:
+      providerChat === undefined
+        ? claudeFixtureSource
+        : extendOwnedClaudeVisualFixture(claudeFixtureSource, providerChat),
     "cursor-agent": extendOwnedCursorQuestionFixture(cursorFixtureSource, cursorQuestion),
     grok: grokFixtureSource,
     opencode: opencodeFixtureSource,
@@ -1221,7 +1232,15 @@ export function prepareDesktopUiTestContext(
   environment: NodeJS.ProcessEnv = process.env,
   hostTemporaryDirectory: string = desktopUiHostTemporaryDirectory(),
   cursorQuestion?: typeof cursorQuestionFixtureSelection,
+  providerChat?: "provider-chat-v1",
 ): DesktopUiTestContext {
+  if (
+    providerChat !== undefined &&
+    (providerChat !== "provider-chat-v1" ||
+      environment.CI !== "true" ||
+      cursorQuestion !== undefined)
+  )
+    throw new Error("Owned provider chat fixture refused.");
   if (
     cursorQuestion !== undefined &&
     (cursorQuestion !== cursorQuestionFixtureSelection || environment.CI !== "true")
@@ -1266,7 +1285,7 @@ export function prepareDesktopUiTestContext(
   NodeFS.writeFileSync(providerInputLogPath, "");
   initializeGitProject(projectPath);
   writeFixtureFiles(fixtureUserHomePath, cursorInventoryFiles);
-  createProviderShims(shimDirectory, isWindows, cursorQuestion);
+  createProviderShims(shimDirectory, isWindows, cursorQuestion, providerChat);
   writeProviderSettings(stateRoot, shimDirectory, fixtureUserHomePath, isWindows, cursorQuestion);
 
   environment.BIBCODE_E2E_RUN_ROOT = runRoot;

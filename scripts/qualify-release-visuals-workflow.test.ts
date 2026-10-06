@@ -93,6 +93,7 @@ describe("first visual batch workflow boundary", () => {
             "release-visual-git-project",
             "release-visual-cursor-question",
             "release-visual-workspace-substates",
+            "release-visual-provider-chat",
           ],
         },
       },
@@ -145,6 +146,71 @@ describe("first visual batch workflow boundary", () => {
     ])
       expect(gate).toContain(`support/${name}.test.ts`);
   });
+});
+
+it("retains exactly fourteen provider originals and seven closed receipts in a separate manual lane", () => {
+  const value = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const steps = value.jobs.visual_core.steps as Array<{
+    name: string;
+    if?: string;
+    run?: string;
+    uses?: string;
+    with?: { path?: string; name?: string };
+  }>;
+  const run = steps.find((step) => step.name === "Run contained provider chat visual batch");
+  expect(run?.run).toBe(
+    "python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-provider-chat",
+  );
+  expect(run?.if).toBe("${{ inputs.scene_selection == 'release-visual-provider-chat' }}");
+  const retain = steps.find((step) => step.name === "Retain explicit provider chat evidence");
+  expect(retain?.uses).toBe("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a");
+  expect(retain?.with?.name).toBe(
+    "issue29-provider-chat-${{ github.run_id }}-${{ github.run_attempt }}",
+  );
+  expect(
+    retain?.with?.path
+      ?.trim()
+      .split("\n")
+      .map((line) => line.slice(line.lastIndexOf("/") + 1)),
+  ).toEqual([
+    "phase.json",
+    "failure.json",
+    "provenance.json",
+    "result.json",
+    "assertions.json",
+    "namespace-cleanup.json",
+    "supervisor.json",
+    ...[
+      "composer-command-menu",
+      "context-popover",
+      "mcp-popover",
+      "chat-markdown-plan",
+      "activity-narrow",
+      "chat-refused-model",
+      "chat-held-workspace-loss",
+    ].flatMap((scene) => [scene + "-light.png", scene + "-dark.png"]),
+  ]);
+  expect(retain?.with?.path).not.toMatch(/\*|private|profile|\.log|question-multiselect/);
+  const helper = steps.map((step) => step.run ?? "").join("\n");
+  for (const name of [
+    "provider-chat",
+    "provider-chat-fixture",
+    "provider-chat-installer",
+    "provider-chat-loss",
+    "provider-chat-api",
+    "provider-chat-media",
+    "provider-chat-turns",
+    "provider-chat-producer",
+    "provider-chat-public",
+    "provider-chat-wiring",
+  ]) {
+    expect(helper).toContain("release-visual-" + name + ".test.ts");
+  }
 });
 
 it("retains the fixed partial Git/project lane separately from native upgrade qualification", () => {

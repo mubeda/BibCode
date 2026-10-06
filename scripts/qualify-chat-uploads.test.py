@@ -37,7 +37,7 @@ class FixturePathBudgetTests(unittest.TestCase):
     def test_actual_roots_fit_branded_and_unbranded_chromium_unix_socket_paths(self):
         # Chromium branch 8037 FormatTemporaryFileName + SingletonSocket; Linux sun_path[108].
         # Portable SetupSockAddr requires byte length below 108, including room for NUL.
-        for scenario in ['remote-updates-ui', 'chat-upload', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates']:
+        for scenario in ['remote-updates-ui', 'chat-upload', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
             for run_id in ['37096649000', '9' * 20, '9' * 128]:
                 fixture, _ = self.actual_paths(scenario, run_id)
                 for brand in ['com.google.Chrome', 'org.chromium.Chromium']:
@@ -46,7 +46,7 @@ class FixturePathBudgetTests(unittest.TestCase):
                         self.assertLess(len(str(socket).encode('utf8')), 108)
 
     def test_only_private_root_omits_run_id_while_evidence_keeps_it(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
             selection = qualification.scenario_settings(scenario)
             roots = []
             for run_id in ['37096649000', '9' * 128]:
@@ -69,6 +69,40 @@ class FixturePathBudgetTests(unittest.TestCase):
 
 
 class ScenarioSelectionTests(unittest.TestCase):
+    def test_provider_chat_cleanup_requires_the_actual_safe_restoration_and_join_receipt(self):
+        for mode in ['missing', 'false', 'wrong-selection', 'wrong-source', 'live-child', 'cleanup-failure', 'malformed', 'safe']:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as evidence_dir:
+                evidence = Path(evidence_dir)
+                fixture = Path(tempfile.mkdtemp(prefix='bc-vp-unit-', dir='/tmp'))
+                try:
+                    (evidence / 'namespace-cleanup.json').write_text(json.dumps({'remaining': [], 'controllerReaped': True}))
+                    result = {'selection': 'release-visual-provider-chat', 'source': 'a' * 40,
+                              'providerChatFixtureSafeToDelete': True, 'childProcessesClosed': True,
+                              'cleanupFailures': []}
+                    if mode == 'missing': result.pop('providerChatFixtureSafeToDelete')
+                    if mode == 'false': result['providerChatFixtureSafeToDelete'] = False
+                    if mode == 'wrong-selection': result['selection'] = 'release-visual-core'
+                    if mode == 'wrong-source': result['source'] = 'b' * 40
+                    if mode == 'live-child': result['childProcessesClosed'] = False
+                    if mode == 'cleanup-failure': result['cleanupFailures'] = [{}]
+                    (evidence / 'result.json').write_text('invalid' if mode == 'malformed' else json.dumps(result))
+                    with mock.patch.dict(os.environ, {'GITHUB_SHA': 'a' * 40}):
+                        deleted = qualification.cleanup_ui_fixture(fixture, evidence, {'supervisorReaped': True}, 'release-visual-provider-chat')
+                    self.assertEqual(deleted, mode == 'safe')
+                    self.assertEqual(fixture.exists(), mode != 'safe')
+                finally:
+                    shutil.rmtree(fixture, ignore_errors=True)
+    def test_provider_chat_has_fixed_seven_row_owner_and_unchanged_bounds(self):
+        self.assertEqual(qualification.scenario_settings('release-visual-provider-chat'), {
+            'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+            'inner_timeout': 600, 'outer_timeout': 660,
+            'evidence_prefix': 'issue29-provider-chat-', 'fixture_prefix': 'bc-vp-',
+        })
+        self.assertEqual(qualification.inner_resources(['release-visual-provider-chat', '/owned/web']),
+                         ('release-visual-provider-chat', None, '/owned/web', 'core'))
+        for args in [['release-visual-provider-chat'], ['release-visual-provider-chat', '/owned/web', 'full']]:
+            with self.assertRaisesRegex(RuntimeError, 'Unknown qualification owner payload'):
+                qualification.inner_resources(args)
     def test_workspace_substates_have_fixed_bounds_and_exact_owner_payload(self):
         self.assertEqual(qualification.scenario_settings('release-visual-workspace-substates'), {
             'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',

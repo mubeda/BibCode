@@ -1850,3 +1850,78 @@ Compile inputs beforehand and execute only in the disposable Linux CI namespace;
 local source/HappyDOM/TempGit/fake-port tests prove compatibility, not pixels or
 native acceptance. Independently inspect both-theme original pixels, and keep
 completeGroup false; no full matrix, Tauri or final release acceptance follows.
+
+## Seven provider and chat visual rows
+
+The fixed manual `release-visual-provider-chat` selection of the visual preparation
+workflow runs the existing seven provider/chat rows in a separate disposable Linux
+PID/network namespace. Its 600-second controller and 660-second supervisor bounds
+retain the core, Settings, Git/project, Cursor and workspace selections and their
+defaults. This batch produces fourteen originals; `completeGroup` remains false
+and the original 82-row/164-original obligation remains unchanged. The later
+multiselect question stays exclusively in the separate Cursor selection.
+
+Use only the private CI opt-in `provider-chat-v1` fixture installation. The
+undefined installer selection preserves the existing provider source bytes;
+non-CI, unknown or simultaneous Cursor/provider opt-ins refuse before creating
+files. Enable only the owned Claude and Codex instances, retain the existing
+Claude Opus baseline on the selected managed workspace, and use the genuine
+New panel → Codex action once for the Codex rows. A started Claude conversation
+cannot change its driver. Admit the decoded host and newly created panel as an
+explicit pair: same project, resolved managed path and branch, ordinary strict
+Git identity, exact visible panel surface and original host route/card. Recheck
+the public server's boot/storage identity throughout the source/capture joins.
+Do not change the product provider filter, persisted schema or canonical state.
+
+On the Claude host, capture the `/comp` command suggestions, context popover,
+MCP popover, and actual markdown/plan/checkpoint row in that order. Seed the
+owned `visual-chat.ts` before the baseline checkpoint. Obtain its sibling
+`visual-swatch.png` through the typed public `assets.createUrl` RPC and require
+the signed same-origin route to serve the exact pinned PNG bytes. The opt-in
+native Claude protocol then changes only the pinned source file and emits its
+ordinary markdown/plan frames. Require the completed exact turn, matching plan,
+ready real checkpoint file and assistant before capture; require the actual
+64×64 image to finish loading. Never substitute static markup or a synthetic
+checkpoint or asset. Close popovers and the plan, and clear only owned drafts.
+
+On the owned Codex panel, capture Activity at the closed 960×800 viewport; all
+other rows remain 1280×960. Open the actual dock/Subagents/detail controls. Join
+sent messages to the bounded native input log and decoded delivery/session
+metadata. Publicly select GPT-5.4 and High before arming the owned catalog
+refusal marker. Capture the real `modelSelectionRefused` message and exact FIFO
+successor with no native dispatch. Cancel the successor through its own public
+row first, wait for its withdrawal and restore/clear only that owned draft,
+then dismiss the refused predecessor. This ordering prevents cleanup from
+sending the queued message. Restore only the original marker inode/bytes;
+an unsafe marker cleanup is fatal even when the capture already failed.
+
+For held workspace loss, send the genuine Codex slow turn, join its exact native
+turn ID, enqueue its separate FIFO successor, and retain the owned review draft.
+Before moving the disposable managed directory, pin its inode, `.git` pointer,
+admin/backlink, primary/common anchors and exact Git registration. During the
+intentional absence, use only the explicit opaque loss scope: original absent,
+exact renamed inode, unchanged anchors/registration and the same decoded
+host/panel ownership pair. Never relax the ordinary worktree reader or realpath
+the intentionally missing path. Require the real settled error, nonstreaming
+partial assistant, held FIFO and no automatic resend before and after the
+original screenshot. Restore that exact directory, prove ordinary identity,
+and cancel the owned queue. Close only the created Codex panel and publicly
+restore the original Claude host. Preserve both original and cleanup failures.
+
+The capture owner rechecks identity, typed turn/FIFO/file joins and strict closed
+DOM witnesses on both sides of each original screenshot. The artifact allowlist
+contains only `composer-command-menu`, `context-popover`, `mcp-popover`,
+`chat-markdown-plan`, `activity-narrow`, `chat-refused-model` and
+`chat-held-workspace-loss` with `-light.png` and `-dark.png`, plus the seven closed
+JSON receipts. Provider inputs, IDs, credentials, filesystem paths, profiles and
+raw logs remain private. Python deletes this batch's private root only after
+the controller's exact source/selection receipt reports safe restoration and
+closed children with no cleanup failures, and both supervisor/namespace owners
+join. Missing or unsafe restoration proof retains the fixture and fails the run.
+
+The workflow includes focused hermetic provider, installer, public context,
+turn, asset, file and loss-owner tests before compiling the real server/web
+inputs. Local HappyDOM, VM, fake-port and TempGit results prove those boundaries;
+the real provider/server/browser run remains CI-only. Independently inspect
+all fourteen paired original pixels before accepting these rows. No full-matrix,
+Tauri, native application or final release acceptance follows from this batch.

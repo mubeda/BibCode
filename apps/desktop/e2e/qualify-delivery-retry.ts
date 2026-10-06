@@ -5,6 +5,25 @@ import {
   workspaceSubstates,
 } from "./support/release-visual-workspace-substates.ts";
 import { runCoreImageDiffOriginal } from "./support/release-visual-core-image.ts";
+import {
+  runProviderChatVisual,
+  qualifiedProviderChatScenes,
+  validateProviderChatJoins,
+} from "./support/release-visual-provider-chat-producer.ts";
+import { captureProviderChatScene } from "./support/release-visual-provider-chat.ts";
+import { withOwnedCodexVisualOptionRefusal } from "./support/release-visual-provider-chat-fixture.ts";
+import {
+  withProviderChatWorkspaceLoss,
+  readProviderChatWorkspaceLoss,
+} from "./support/release-visual-provider-chat-loss.ts";
+import {
+  prepareProviderChatFiles,
+  configureProviderChatMedia,
+  verifyProviderChatMedia,
+  type ProviderChatMediaScope,
+} from "./support/release-visual-provider-chat-media.ts";
+import { readProviderChatInputs } from "./support/release-visual-provider-chat-turns.ts";
+import { withProviderChatPublicApi } from "./support/release-visual-provider-chat-api.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Disposable CI browser qualifier owns fixture paths.
 // @effect-diagnostics globalFetch:off - Only the owned loopback CLI is probed.
 // @effect-diagnostics globalTimers:off - Real bounded negative observation windows.
@@ -455,6 +474,7 @@ export function deliveryConfiguration(
       "release-visual-git-project",
       "release-visual-cursor-question",
       "release-visual-workspace-substates",
+      "release-visual-provider-chat",
     ].includes(selection) ||
     environment.CI !== "true" ||
     !/^[0-9a-f]{40}$/.test(environment.BIBCODE_UPLOAD_SOURCE ?? "") ||
@@ -474,7 +494,8 @@ export function deliveryConfiguration(
       | "release-visual-settings"
       | "release-visual-git-project"
       | "release-visual-cursor-question"
-      | "release-visual-workspace-substates";
+      | "release-visual-workspace-substates"
+      | "release-visual-provider-chat";
     fixture: string;
     evidence: string;
     binary: string;
@@ -602,6 +623,7 @@ export async function runDeliveryRetryQualification() {
   let phase = "prepare-network";
   let theme: DeliveryTheme = "light";
   let success = false;
+  let providerChatFixtureSafeToDelete = true;
   const assertions: object[] = [];
   const captures: object[] = [];
   const capturedVisuals = new Set<string>();
@@ -1145,12 +1167,15 @@ export async function runDeliveryRetryQualification() {
       const context =
         config.selection === "release-visual-cursor-question"
           ? prepareDesktopUiTestContext(env, undefined, cursorQuestionFixtureSelection)
-          : prepareDesktopUiTestContext(env);
+          : config.selection === "release-visual-provider-chat"
+            ? prepareDesktopUiTestContext(env, undefined, undefined, "provider-chat-v1")
+            : prepareDesktopUiTestContext(env);
       const control = NodePath.join(runRoot, "delivery-retry");
       if (config.selection === "delivery-retry-ui") NodeFS.mkdirSync(control, { mode: 0o700 });
       if (
         config.selection === "release-visual-core" ||
-        config.selection === "release-visual-workspace-substates"
+        config.selection === "release-visual-workspace-substates" ||
+        config.selection === "release-visual-provider-chat"
       ) {
         // This selector witnesses a genuine installation without an editor.
         // Cursor's editor launcher is distinct from the cursor-agent provider.
@@ -1228,6 +1253,15 @@ export async function runDeliveryRetryQualification() {
         enabled: true,
         config: { binaryPath: claude },
       };
+      if (config.selection === "release-visual-provider-chat") {
+        const codex = NodePath.join(context.shimDirectory, "codex");
+        configured.providers.codex = { enabled: true, binaryPath: codex };
+        configured.providerInstances.codex = {
+          driver: "codex",
+          enabled: true,
+          config: { binaryPath: codex },
+        };
+      }
       if (config.selection === "release-visual-cursor-question") {
         check(
           ownedCursorInstance !== null &&
@@ -1408,7 +1442,8 @@ export async function runDeliveryRetryQualification() {
       };
       if (
         config.selection === "release-visual-core" ||
-        config.selection === "release-visual-workspace-substates"
+        config.selection === "release-visual-workspace-substates" ||
+        config.selection === "release-visual-provider-chat"
       ) {
         step("visual-fixture-managed");
         check(prepareVisualWorktree(visualInput).path === workspace.path);
@@ -1448,6 +1483,39 @@ export async function runDeliveryRetryQualification() {
           const viewport = await bounded(browser!.execute(readVisualViewport), 2_000);
           return viewport.width === 1280 && viewport.height === 960;
         });
+      }
+      const providerSnapshot =
+        config.selection === "release-visual-provider-chat"
+          ? createOwnedGitProjectSnapshotReader(() =>
+              owner.json(
+                config.binary,
+                ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
+                childEnv,
+              ),
+            )
+          : null;
+      let providerMedia: ProviderChatMediaScope | null = null;
+      let providerDescriptor: Awaited<ReturnType<typeof readOwnedGitProjectDescriptor>> | null =
+        null;
+      if (providerSnapshot !== null) {
+        step("visual-provider-chat-media-seed");
+        providerDescriptor = await readOwnedGitProjectDescriptor();
+        check(
+          providerDescriptor.environmentId === "local" &&
+            !!providerDescriptor.bootId &&
+            !!providerDescriptor.storageInstanceId,
+        );
+        const initial = await providerSnapshot();
+        const hosts = initial.threads.filter(
+          (value) =>
+            value.id === workspace.threadId &&
+            value.deletedAt === null &&
+            value.kind === "workspace" &&
+            value.worktreePath === workspace.path &&
+            value.branch === workspace.branch,
+        );
+        check(hosts.length === 1);
+        providerMedia = prepareProviderChatFiles(visualInput, hosts[0]!);
       }
       const baseline = `delivery baseline ${theme}`;
       const prompt = `delivery held message ${theme}`;
@@ -1713,6 +1781,132 @@ export async function runDeliveryRetryQualification() {
           },
         });
         assertions.push({ theme, ...proof });
+      } else if (config.selection === "release-visual-provider-chat") {
+        if (providerSnapshot === null || providerMedia === null || providerDescriptor === null)
+          throw new Error("Owned provider context unavailable.");
+        const rawSnapshot = providerSnapshot,
+          media = providerMedia,
+          descriptor = providerDescriptor;
+        const snapshot = async () => {
+          const current = await readOwnedGitProjectDescriptor();
+          check(
+            current.environmentId === descriptor.environmentId &&
+              current.bootId === descriptor.bootId &&
+              current.storageInstanceId === descriptor.storageInstanceId,
+          );
+          return rawSnapshot();
+        };
+        const unsafe = () => {
+          providerChatFixtureSafeToDelete = false;
+        };
+        step("visual-provider-chat-baseline-checkpoint");
+        await owner.until(async () => {
+          const current = (await snapshot()).threads.filter(
+            (value) => value.id === workspace.threadId && value.deletedAt === null,
+          );
+          check(current.length === 1);
+          const host = current[0]!;
+          return (
+            host.latestTurn?.state === "completed" &&
+            host.checkpoints.some(
+              (value) => value.turnId === host.latestTurn?.turnId && value.status === "ready",
+            )
+          );
+        });
+        step("visual-provider-chat-public-asset");
+        const assetGrant = await owner.json(
+          config.binary,
+          ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
+          childEnv,
+        );
+        const assetCredential =
+          typeof assetGrant === "object" && assetGrant !== null && "credential" in assetGrant
+            ? assetGrant.credential
+            : null;
+        if (
+          typeof assetCredential !== "string" ||
+          assetCredential.length < 8 ||
+          assetCredential.length > 16384
+        )
+          throw new Error("Owned provider asset credential unavailable.");
+        const accessToken = await fixtureAccessToken(origin, assetCredential);
+        await withProviderChatPublicApi(
+          { CI: childEnv.CI, accessToken, observeCleanupFailure: unsafe },
+          async (api) => {
+            await configureProviderChatMedia(
+              media,
+              await api.createAssetUrl(workspace.threadId),
+              async (url) => {
+                const response = await fetch(url, { signal: AbortSignal.timeout(1000) });
+                if (!response.ok) throw new Error("Owned provider asset refused.");
+                const bytes = Buffer.from(await bounded(response.arrayBuffer(), 2000));
+                if (bytes.length > 8192) throw new Error("Owned provider asset refused.");
+                return bytes;
+              },
+            );
+          },
+        );
+        const proof = await runProviderChatVisual({
+          browser,
+          owner,
+          theme,
+          origin,
+          hostThreadId: workspace.threadId,
+          projectPath: context.projectPath,
+          workspace,
+          snapshot,
+          readInputs: () => readProviderChatInputs(context.providerInputLogPath),
+          verifyWorktree: () =>
+            check(
+              JSON.stringify(readOwnedDeliveryWorktree(visualInput)) ===
+                JSON.stringify({
+                  path: workspace.path,
+                  branch: workspace.branch,
+                  commonDirectory: workspace.commonDirectory,
+                }),
+            ),
+          verifyMedia: (changed) => verifyProviderChatMedia(media, changed),
+          withRefusedModel: (run) =>
+            withOwnedCodexVisualOptionRefusal(
+              {
+                selection: "provider-chat-v1",
+                fixtureRoot: config.fixture,
+                runRoot,
+                childEnv,
+                observeUnsafeCleanup: unsafe,
+              },
+              run,
+            ),
+          withManagedWorkspaceLoss: (readBinding, run) =>
+            withProviderChatWorkspaceLoss(
+              { worktree: visualInput, readBinding, observeUnsafeCleanup: unsafe },
+              run,
+            ),
+          verifyLoss: (scope, binding) => {
+            readProviderChatWorkspaceLoss(scope, binding);
+          },
+          capture: async (scene, verifyOwnedIdentity) => {
+            captures.push(
+              await captureProviderChatScene({
+                browser: b(),
+                owner,
+                theme,
+                origin,
+                threadId: workspace.threadId,
+                branch: workspace.branch,
+                scene,
+                evidence: config.evidence,
+                captured: capturedVisuals,
+                verifyOwnedIdentity,
+              }),
+            );
+            write("assertions", { captures, assertions });
+          },
+          observeUnsafeCleanup: unsafe,
+          step,
+        });
+        assertions.push(proof);
+        write("assertions", { captures, assertions });
       } else if (config.selection === "release-visual-cursor-question") {
         const snapshot = createOwnedGitProjectSnapshotReader(() =>
           owner.json(
@@ -2130,6 +2324,8 @@ export async function runDeliveryRetryQualification() {
       validateSettingsVisualJoins(captures, assertions);
     if (config.selection === "release-visual-workspace-substates")
       validateWorkspaceSubstateJoins(captures, assertions);
+    if (config.selection === "release-visual-provider-chat")
+      validateProviderChatJoins(captures, assertions);
     check(
       captures.length ===
         deliveryThemes.length *
@@ -2143,7 +2339,9 @@ export async function runDeliveryRetryQualification() {
                   ? 1
                   : config.selection === "release-visual-workspace-substates"
                     ? workspaceSubstates.length
-                    : deliveryScenes.length) && assertions.length === 2,
+                    : config.selection === "release-visual-provider-chat"
+                      ? qualifiedProviderChatScenes.length
+                      : deliveryScenes.length) && assertions.length === 2,
     );
     success = true;
   } catch (error) {
@@ -2250,6 +2448,8 @@ export async function runDeliveryRetryQualification() {
       browser ? { browser: () => browser!.deleteSession().then(() => undefined) } : {},
     );
     if (owner.failures.length > 0 || !owner.childrenClosed()) success = false;
+    if (config.selection === "release-visual-provider-chat" && !providerChatFixtureSafeToDelete)
+      success = false;
     write("result", {
       success,
       phase,
@@ -2262,6 +2462,9 @@ export async function runDeliveryRetryQualification() {
       processes,
       cleanupFailures: owner.failures,
       childProcessesClosed: owner.childrenClosed(),
+      ...(config.selection === "release-visual-provider-chat"
+        ? { providerChatFixtureSafeToDelete }
+        : {}),
       scope:
         config.selection === "release-visual-core"
           ? "First nine Linux Chromium scene pairs only. Original PNGs require independent review; unpictured surfaces and the remaining issue29 matrix are unqualified. No Playwright, Tauri or final-release acceptance claim."
@@ -2273,7 +2476,9 @@ export async function runDeliveryRetryQualification() {
                 ? "One fixed Cursor later-multiselect question pair only through native ACP and public choices/Submit. completeGroup remains false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
                 : config.selection === "release-visual-workspace-substates"
                   ? "Three existing-row substates in six extra originals only: selected stash diff, owned Files item menu and public terminal/activity/more-chat lines. Core nine and full82/164 remain unchanged; completeGroup false, independent original pixel review and native/final acceptance remain required."
-                  : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
+                  : config.selection === "release-visual-provider-chat"
+                    ? "Seven existing provider/chat rows in fourteen originals only through native Codex/Claude and public controls. Cursor owns the separate question pair. completeGroup false; full82/164 and independent original pixel review remain required. No Tauri or final-product acceptance claim."
+                    : "Real Linux Chromium Retry prompt and rendered notices only; not Tauri native-dialog or final issue29 qualification.",
     });
   }
   return success ? 0 : 1;

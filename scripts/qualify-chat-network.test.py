@@ -113,7 +113,7 @@ class NetworkTests(unittest.TestCase):
                 self.assertTrue(proof['linksContained'])
 
     def test_owner_argument_forms_refuse_extra_empty_and_truncated_arguments(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
             with tempfile.TemporaryDirectory(prefix='bibcode-owner-arity-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 for invalid in [owner + [''], owner + ['unexpected'], owner[:-1]]:
@@ -221,7 +221,7 @@ class NetworkTests(unittest.TestCase):
                 self.assertEqual(fake.calls, [])
 
     def test_original_owner_anchors_remain_required_for_both_forms(self):
-        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates']:
+        for scenario in ['chat-upload', 'remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
             with tempfile.TemporaryDirectory(prefix='bibcode-owner-anchor-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 for index, value in [(0, '/missing-python'), (1, '/missing-helper'), (2, 'outer'), (11, 'net:[99]'), (13, '/missing-ip')]:
@@ -230,7 +230,7 @@ class NetworkTests(unittest.TestCase):
                     self.assertEqual(fake.calls, [])
 
     def test_fixed_cursor_and_workspace_visual_producers_keep_the_containment_contract(self):
-        for scenario in ['release-visual-cursor-question', 'release-visual-workspace-substates']:
+        for scenario in ['release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory(prefix='visual-owner-contract-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 self.assertEqual(len(owner), 16)
@@ -248,7 +248,7 @@ class NetworkTests(unittest.TestCase):
                 self.assertEqual(proof['interfaceCount'], 3)
 
     def test_fixed_cursor_and_workspace_visual_owners_refuse_forged_selectors_assets_and_namespaces(self):
-        for scenario in ['release-visual-cursor-question', 'release-visual-workspace-substates']:
+        for scenario in ['release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory(prefix='visual-owner-identity-') as directory:
                 owner, env = actual_owner_handoff(Path(directory), scenario)
                 other = Path(directory) / 'other-web'; other.mkdir()

@@ -13,6 +13,8 @@ export interface OwnedVisualCaptureInput<Observation, Receipt extends object> {
   owner: Pick<QualificationOwner, "until">;
   evidence: string;
   file: string;
+  /** Closed approved original geometry; omitted retains Git/project and Cursor defaults. */
+  viewport?: "standard" | "activity-narrow";
   captured: Set<string>;
   observation: () => Observation;
   read: (observation: Observation) => Promise<unknown>;
@@ -31,6 +33,10 @@ export interface OwnedVisualCaptureInput<Observation, Receipt extends object> {
 export async function captureOwnedVisualScene<Observation, Receipt extends object>(
   input: OwnedVisualCaptureInput<Observation, Receipt>,
 ): Promise<Receipt> {
+  const viewport = input.viewport === undefined ? "standard" : input.viewport;
+  if (viewport !== "standard" && viewport !== "activity-narrow") throw input.refused();
+  const expected =
+    viewport === "activity-narrow" ? { width: 960, height: 800 } : { width: 1280, height: 960 };
   const path = NodePath.join(input.evidence, input.file);
   if (
     input.captured.has(input.file) ||
@@ -54,7 +60,7 @@ export async function captureOwnedVisualScene<Observation, Receipt extends objec
   await input.verifyOwnedIdentity();
   input.validate(await bounded(input.read(observation), 2000));
   const image = inspectScreenshot(bytes);
-  if (image.width !== 1280 || image.height !== 960) throw input.refused();
+  if (image.width !== expected.width || image.height !== expected.height) throw input.refused();
   const receipt = input.project({ file: input.file, witness, ...image });
   NodeFS.writeFileSync(path, bytes, { mode: 0o600, flag: "wx" });
   input.captured.add(input.file);

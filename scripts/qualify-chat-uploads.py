@@ -50,6 +50,10 @@ def scenario_settings(name):
         return {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
                 'inner_timeout': 600, 'outer_timeout': 660,
                 'evidence_prefix': 'issue29-workspace-substates-', 'fixture_prefix': 'bc-vw-'}
+    if name == 'release-visual-provider-chat':
+        return {'controller': 'apps/desktop/e2e/qualify-delivery-retry.ts',
+                'inner_timeout': 600, 'outer_timeout': 660,
+                'evidence_prefix': 'issue29-provider-chat-', 'fixture_prefix': 'bc-vp-'}
     raise RuntimeError('Unknown qualification scenario')
 
 def ui_input_hashes(server, fake_host, web_root):
@@ -85,6 +89,16 @@ def cleanup_ui_fixture(fixture, evidence, supervisor, scenario='remote-updates-u
         cleanup = json.loads(receipt.read_text())
         if cleanup.get('remaining') != [] or cleanup.get('controllerReaped') is not True:
             return False
+        if scenario == 'release-visual-provider-chat':
+            result_path = evidence / 'result.json'
+            metadata = result_path.lstat()
+            if result_path.is_symlink() or not result_path.is_file() or metadata.st_nlink != 1 or metadata.st_size > 131072:
+                return False
+            result = json.loads(result_path.read_text())
+            if (result.get('selection') != scenario or result.get('source') != os.environ.get('GITHUB_SHA')
+                    or result.get('providerChatFixtureSafeToDelete') is not True
+                    or result.get('childProcessesClosed') is not True or result.get('cleanupFailures') != []):
+                return False
         shutil.rmtree(fixture)
         return True
     except (OSError, ValueError, AttributeError):
@@ -251,7 +265,7 @@ def inner_resources(arguments):
         return 'chat-upload', None, None, 'core'
     if len(arguments) == 4 and arguments[0] == 'remote-updates-ui':
         return arguments[0], arguments[1], arguments[2], ui_matrix_selection(arguments[3])
-    if len(arguments) == 2 and arguments[0] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates']:
+    if len(arguments) == 2 and arguments[0] in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
         return arguments[0], None, arguments[1], 'core'
     raise RuntimeError('Unknown qualification owner payload')
 
@@ -292,7 +306,7 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
             environment.update({'BIBCODE_RELEASE_UI_FAKE_HOST': str(Path(fake_host).resolve(strict=True)),
                                 'BIBCODE_RELEASE_UI_WEB': str(Path(web_root).resolve(strict=True)),
                                 'BIBCODE_RELEASE_UI_MATRIX': ui_matrix})
-        elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates']:
+        elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
             environment.update({'BIBCODE_DELIVERY_UI_WEB': str(Path(web_root).resolve(strict=True)),
                                 'BIBCODE_DELIVERY_UI_SELECTION': scenario,
                                 'GIT_CONFIG_NOSYSTEM': '1',
@@ -418,7 +432,7 @@ def outer(scenario='chat-upload', ui_matrix='core'):
         provenance.update({'scenario': scenario, 'selection': ui_matrix,
                            'inputs': ui_input_hashes(server, fake_host, web_root)})
         command.extend([scenario, fake_host, web_root, ui_matrix])
-    elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates']:
+    elif scenario in ['delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
         fake_host = None
         web_root = str(Path(os.environ['BIBCODE_DELIVERY_UI_WEB']).resolve(strict=True))
         provenance.update({'scenario': scenario, 'inputs': ui_input_hashes(server, None, web_root)})
@@ -428,7 +442,7 @@ def outer(scenario='chat-upload', ui_matrix='core'):
     write_json(evidence / 'provenance.json', provenance)
     result, _ = run_owned_command(command, timeout=selection['outer_timeout'], grace=15)
     result['hostNetworkNamespaceUnchanged'] = os.readlink('/proc/self/ns/net') == namespace
-    if scenario in ['remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates']:
+    if scenario in ['remote-updates-ui', 'delivery-retry-ui', 'release-visual-core', 'release-visual-settings', 'release-visual-git-project', 'release-visual-cursor-question', 'release-visual-workspace-substates', 'release-visual-provider-chat']:
         result['buildInputsUnchanged'] = ui_input_hashes(server, fake_host, web_root) == provenance['inputs']
         result['privateFixtureDeleted'] = cleanup_ui_fixture(fixture, evidence, result, scenario)
         if not result['privateFixtureDeleted'] or not result['hostNetworkNamespaceUnchanged'] or not result['buildInputsUnchanged']:

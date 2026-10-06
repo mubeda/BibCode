@@ -115,6 +115,123 @@ it("retains the exact existing identity/read/original/write capture order", asyn
 });
 
 it.each([
+  { viewport: undefined, width: 1280, height: 960, accepted: true },
+  { viewport: "standard", width: 1280, height: 960, accepted: true },
+  { viewport: "activity-narrow", width: 960, height: 800, accepted: true },
+  { viewport: undefined, width: 960, height: 800, accepted: false },
+  { viewport: "standard", width: 960, height: 800, accepted: false },
+  { viewport: "activity-narrow", width: 1280, height: 960, accepted: false },
+  { viewport: "activity-narrow", width: 960, height: 799, accepted: false },
+] as const)("admits only the selected closed original viewport %#", async (row) => {
+  const evidence = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "owned-viewport-preset-"));
+  const calls: string[] = [],
+    captured = new Set<string>();
+  const bytes = originalPng(row.width, row.height);
+  const witness = { admitted: true } as const;
+  try {
+    const result = captureOwnedVisualScene({
+      ...(row.viewport === undefined ? {} : { viewport: row.viewport }),
+      browser: {
+        isAlertOpen: async () => {
+          calls.push("alert");
+          return false;
+        },
+        takeScreenshot: async () => {
+          calls.push("screenshot");
+          return bytes.toString("base64");
+        },
+      } as never,
+      owner: {
+        until: async (read: () => Promise<boolean>) => {
+          calls.push("until");
+          expect(await read()).toBe(true);
+        },
+      } as never,
+      evidence,
+      file: "owned-light.png",
+      captured,
+      observation: () => {
+        calls.push("observation");
+        return { admitted: true };
+      },
+      read: async () => {
+        calls.push("read");
+        return witness;
+      },
+      verifyOwnedIdentity: async () => {
+        calls.push("identity");
+      },
+      validate: () => {
+        calls.push("validate");
+        return witness;
+      },
+      project: (input) => {
+        calls.push("project");
+        return input;
+      },
+      refused: () => new Error("Owned capture refused."),
+    });
+    if (row.accepted) {
+      await expect(result).resolves.toMatchObject({ width: row.width, height: row.height });
+      expect(calls).toEqual([
+        "alert",
+        "observation",
+        "identity",
+        "until",
+        "read",
+        "validate",
+        "screenshot",
+        "identity",
+        "read",
+        "validate",
+        "project",
+      ]);
+      expect(NodeFS.readFileSync(NodePath.join(evidence, "owned-light.png"))).toEqual(bytes);
+      expect(NodeFS.statSync(NodePath.join(evidence, "owned-light.png")).mode & 0o777).toBe(0o600);
+      expect(captured.size).toBe(1);
+    } else {
+      await expect(result).rejects.toThrow("Owned capture refused.");
+      expect(calls).toEqual([
+        "alert",
+        "observation",
+        "identity",
+        "until",
+        "read",
+        "validate",
+        "screenshot",
+        "identity",
+        "read",
+        "validate",
+      ]);
+      expect(NodeFS.existsSync(NodePath.join(evidence, "owned-light.png"))).toBe(false);
+      expect(captured.size).toBe(0);
+    }
+  } finally {
+    NodeFS.rmSync(evidence, { recursive: true, force: true });
+  }
+});
+
+it.each(["arbitrary-size", null, 17, {}])(
+  "refuses an unknown viewport before all capture ports %#",
+  async (viewport) => {
+    let touched = false;
+    await expect(
+      captureOwnedVisualScene({
+        viewport,
+        browser: {
+          isAlertOpen: async () => {
+            touched = true;
+            return false;
+          },
+        },
+        refused: () => new Error("Owned capture refused."),
+      } as never),
+    ).rejects.toThrow("Owned capture refused.");
+    expect(touched).toBe(false);
+  },
+);
+
+it.each([
   "duplicate",
   "existing",
   "alert",
