@@ -40,6 +40,13 @@ environment identity.
 - Current servers expose the persistent store UUID as `storageInstanceId` on
   direct and BiBCode Connect descriptors. New clients decode an omitted field
   from an older or third-party server as `null`.
+- The public environment descriptor, authenticated config and lifecycle
+  descriptors, and BiBCode Connect descriptors consistently advertise
+  `vcsCloneReattach` and `attachmentStaging`. They identify join-only attachment
+  to an existing clone and staged chat uploads respectively. Clients decode
+  omitted capability flags from older or third-party servers as `false` and
+  retain their capability checks; these metadata flags do not grant access to
+  the authenticated operations.
 - Remote clients use the same HTTP and Effect RPC APIs as local clients.
 - Credentials are exchanged for bounded sessions; raw bootstrap credentials do
   not remain in WebSocket URLs.

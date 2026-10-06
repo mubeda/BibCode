@@ -2082,6 +2082,14 @@ from a reviewed, nominated QA ref. Default-branch execution remains registration
 only and fails closed; the separate native sharing selection retains its own
 packaged workflow and evidence boundary.
 
+Before lifecycle or Settings follow-up capture, the native Linux job runs
+`cargo fmt --all --check`, the complete `server_runtime` integration target,
+and server Clippy for all targets with warnings denied. Its descriptor tests
+compare the supported `vcsCloneReattach` and `attachmentStaging` flags across
+the public HTTP response, authenticated config, config snapshot and lifecycle
+events. Keep those capability checks active; missing flags from older servers
+decode as false. Record the native test and lint results with the capture report.
+
 ```sh
 gh workflow run qualify-release-visuals.yml --ref '<qualified-ref>' -f scene_selection=release-visual-project-lifecycle
 ```

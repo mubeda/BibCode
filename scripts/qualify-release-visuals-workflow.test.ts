@@ -15,6 +15,31 @@ const visualScenes = [
 ];
 
 describe("first visual batch workflow boundary", () => {
+  it("checks supported descriptor capabilities on the real Linux server before dependent captures", () => {
+    const value = YAML.parse(
+      NodeFS.readFileSync(
+        new URL("../.github/workflows/qualify-release-visuals.yml", import.meta.url),
+        "utf8",
+      ),
+    );
+    const steps = value.jobs.visual_core.steps as Array<{
+      name?: string;
+      if?: string;
+      run?: string;
+    }>;
+    const gate = steps.find((step) => step.name === "Verify native server descriptor parity");
+    expect(gate?.if).toBe(
+      "${{ inputs.scene_selection == 'release-visual-project-lifecycle' || inputs.scene_selection == 'release-visual-settings-followups' }}",
+    );
+    expect(gate?.run?.trim().split("\n")).toEqual([
+      "cargo fmt --all --check",
+      "cargo test -p bibcode-server --test server_runtime -j 2",
+      "cargo clippy -p bibcode-server --all-targets -j 2 -- -D warnings",
+    ]);
+    expect(steps.indexOf(gate!)).toBeLessThan(
+      steps.findIndex((step) => step.name === "Build guarded production CLI"),
+    );
+  });
   it("retains only the separate eight settings originals and the same seven closed receipts", () => {
     const value = YAML.parse(
       NodeFS.readFileSync(

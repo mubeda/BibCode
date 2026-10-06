@@ -366,6 +366,8 @@ struct EnvironmentCapabilities {
     remote_update_progress: bool,
     terminal_ordered_input: bool,
     terminal_size_ownership: bool,
+    vcs_clone_reattach: bool,
+    attachment_staging: bool,
 }
 
 async fn environment_descriptor(State(state): State<AppState>) -> Json<EnvironmentDescriptor> {
@@ -392,6 +394,8 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
             remote_update_progress: true,
             terminal_ordered_input: true,
             terminal_size_ownership: true,
+            vcs_clone_reattach: true,
+            attachment_staging: true,
         },
     })
 }

@@ -287,6 +287,8 @@ async fn binds_an_ephemeral_port_and_serves_the_environment_descriptor() {
     let descriptor: Value = response.json().await.expect("environment JSON");
     assert_eq!(descriptor["environmentId"], "local");
     assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
+    assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
+    assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
     assert_eq!(descriptor["remoteProtocolVersion"], 1);
     assert_eq!(descriptor["minCompatibleRemoteProtocol"], 1);
     assert!(descriptor["capabilities"].get("worktreeCatalog").is_none());
@@ -474,6 +476,14 @@ async fn authenticated_rpc_and_lifecycle_descriptors_match_the_well_known_storag
         get_config["exit"]["value"]["environment"]["storageInstanceId"],
         storage_instance_id
     );
+    for capability in ["vcsCloneReattach", "attachmentStaging"] {
+        assert_eq!(well_known["capabilities"][capability], true);
+        assert_eq!(
+            get_config["exit"]["value"]["environment"]["capabilities"][capability],
+            well_known["capabilities"][capability],
+            "HTTP and authenticated config capability {capability}"
+        );
+    }
 
     send_rpc_request(&mut socket, "11", "subscribeServerConfig").await;
     let config_snapshot = next_rpc_wire(&mut socket, "server config snapshot").await;
@@ -484,6 +494,13 @@ async fn authenticated_rpc_and_lifecycle_descriptors_match_the_well_known_storag
         config_snapshot["values"][0]["config"]["environment"]["storageInstanceId"],
         storage_instance_id
     );
+    for capability in ["vcsCloneReattach", "attachmentStaging"] {
+        assert_eq!(
+            config_snapshot["values"][0]["config"]["environment"]["capabilities"][capability],
+            well_known["capabilities"][capability],
+            "HTTP and config snapshot capability {capability}"
+        );
+    }
     acknowledge_rpc_chunk(&mut socket, "11").await;
 
     send_rpc_request(&mut socket, "12", "subscribeServerLifecycle").await;
@@ -496,6 +513,13 @@ async fn authenticated_rpc_and_lifecycle_descriptors_match_the_well_known_storag
             lifecycle["values"][0]["payload"]["environment"]["storageInstanceId"],
             storage_instance_id
         );
+        for capability in ["vcsCloneReattach", "attachmentStaging"] {
+            assert_eq!(
+                lifecycle["values"][0]["payload"]["environment"]["capabilities"][capability],
+                well_known["capabilities"][capability],
+                "HTTP and lifecycle {expected_type} capability {capability}"
+            );
+        }
         acknowledge_rpc_chunk(&mut socket, "12").await;
     }
 

@@ -73,6 +73,12 @@ jobs:
       - name: Verify inert Cursor runtime question protocol
         if: ${{ inputs.scene_selection == 'release-visual-cursor-question' }}
         run: cargo test -p bibcode-server --lib provider::cursor::runtime::tests::owned_later_question_keeps_multiple_labels_and_original_prompt_correlation -j 2 -- --exact
+      - name: Verify native server descriptor parity
+        if: ${{ inputs.scene_selection == 'release-visual-project-lifecycle' || inputs.scene_selection == 'release-visual-settings-followups' }}
+        run: |
+          cargo fmt --all --check
+          cargo test -p bibcode-server --test server_runtime -j 2
+          cargo clippy -p bibcode-server --all-targets -j 2 -- -D warnings
       - name: Build guarded production CLI
         run: cargo build -p bibcode-server --bin bibcode --features hermetic-test-guard -j 2
       - name: Copy immutable inputs outside Cargo output
