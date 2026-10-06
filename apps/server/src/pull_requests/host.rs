@@ -3,7 +3,6 @@
 use std::{
     ffi::{OsStr, OsString},
     future::Future,
-    io::Write,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -266,28 +265,12 @@ impl HostCommandRunner {
         body: &serde_json::Value,
         c: &CancellationToken,
     ) -> Result<CommandOutput, ProcessFailure> {
-        let directory = self.state_dir.join("pull-requests");
-        std::fs::create_dir_all(&directory).map_err(body_io_error)?;
-        let path_on_disk = directory.join(format!("body-{}.json", uuid::Uuid::new_v4()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path_on_disk).map_err(body_io_error)?;
-        let private_file = PrivateBodyFile(path_on_disk);
-        // No body is written until Windows has restricted the initially empty file.
-        #[cfg(windows)]
-        crate::auth::secure_windows_path(&private_file.0, false)
-            .await
-            .map_err(body_io_error)?;
-        serde_json::to_writer(&mut file, body)
-            .map_err(std::io::Error::other)
-            .map_err(body_io_error)?;
-        file.flush().map_err(body_io_error)?;
-        drop(file);
+        let private_file = crate::source_control::PrivateJsonBody::write(
+            &self.state_dir.join("pull-requests"),
+            body,
+        )
+        .await
+        .map_err(body_io_error)?;
         self.glab(
             scope,
             &[
@@ -298,7 +281,7 @@ impl HostCommandRunner {
                 OsStr::new("-H"),
                 OsStr::new("Content-Type: application/json"),
                 OsStr::new("--input"),
-                private_file.0.as_os_str(),
+                private_file.path().as_os_str(),
             ],
             Budget::Mutation,
             None,
@@ -402,13 +385,6 @@ fn body_io_error(source: std::io::Error) -> ProcessFailure {
             source,
         },
         stderr: String::new(),
-    }
-}
-
-struct PrivateBodyFile(PathBuf);
-impl Drop for PrivateBodyFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
     }
 }
 

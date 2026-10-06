@@ -127,8 +127,9 @@ merge request is accepted, ☐ Squash commits when merge request is accepted.
   failure as today.
 - Existing open request for the branch: `opened_existing` as today, with
   `warning` saying the new options were not applied.
-- Defaults read failure: merge options start unchecked and unlocked; creation
-  is unaffected.
+- Defaults read failure: merge options show "project decides" (indeterminate,
+  unlocked) with a Retry, and untouched boxes are not sent, so the project's
+  settings apply; creation is unaffected.
 - Push-first and commit-push-create flows are unchanged; options apply only at
   the create step.
 
