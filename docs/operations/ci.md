@@ -9,6 +9,9 @@ four job groups:
   `cargo check -p bibcode-server --lib --bins -j 2` also checks production
   feature wiring without dev units: all-targets Clippy enables the hermetic
   test guard, while ordinary server builds do not.
+  It also runs `node --test scripts/check-agent-delivery.node-test.mjs` to verify
+  rejection of stale or partial proof, duplicate runs, unchanged failed recipes,
+  and repeated rounds without a revised diagnosis.
 - **Test** runs every workspace package `test` script one task at a time with
   `vp run -r --concurrency-limit 1 test`, then runs `cargo test --workspace -j 2`
   explicitly on Ubuntu 24.04. Serial tasks keep `rustc` from competing with a
