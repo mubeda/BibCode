@@ -33,9 +33,41 @@ import {
 } from "./support/chat-upload-evidence.ts";
 import { EnvironmentMetadataHttpApi } from "../../../packages/contracts/src/environmentHttp.ts";
 
-export async function closeNativeSharingSession(browser: QualificationBrowser): Promise<void> {
+interface NativeSharingAdmissionFacts {
+  windowHandlesArray: boolean;
+  windowMainOnly: boolean;
+  windowCurrentMain: boolean;
+  bridgeReady: boolean;
+  initialBridgeReturned: boolean;
+  endpointHttp: boolean;
+  endpointLoopback: boolean;
+  endpointCleanAuthority: boolean;
+  endpointCleanQuery: boolean;
+  endpointRootPath: boolean;
+  descriptorResponseOk: boolean;
+  descriptorJsonReturned: boolean;
+  identityCollected: boolean;
+  descriptorBootPresent: boolean;
+  descriptorStoragePresent: boolean;
+  originalUrlReturned: boolean;
+  originalSizeReturned: boolean;
+  initialIdentityVerified: boolean;
+  uiWindowSizeSet: boolean;
+  uiNavigationCompleted: boolean;
+  uiPortsCreated: boolean;
+  cleanupPrepareSucceeded: boolean;
+  cleanupPrepareFailed: boolean;
+  cleanupSessionDeleted: boolean;
+  cleanupSessionDeleteFailed: boolean;
+  cleanupUnsafe: boolean;
+}
+export async function closeNativeSharingSession(
+  browser: QualificationBrowser,
+  observe?: (facts: Partial<NativeSharingAdmissionFacts>) => void,
+): Promise<void> {
   let failed = false,
     original: unknown;
+  const facts: Partial<NativeSharingAdmissionFacts> = {};
   try {
     const prepared = await bounded(
       browser.execute(async () => {
@@ -50,18 +82,27 @@ export async function closeNativeSharingSession(browser: QualificationBrowser): 
       }),
       15000,
     );
+    facts.cleanupPrepareSucceeded = prepared === true;
     if (prepared !== true) throw new Error("Owned native backend preparation refused.");
   } catch (error) {
+    facts.cleanupPrepareFailed = true;
     failed = true;
     original = error;
   }
   try {
     await bounded(browser.deleteSession(), 15000);
+    facts.cleanupSessionDeleted = true;
   } catch (error) {
+    facts.cleanupSessionDeleteFailed = true;
     if (!failed) {
       failed = true;
       original = error;
     }
+  }
+  try {
+    observe?.(facts);
+  } catch {
+    /* Optional attribution cannot replace preparation/deletion. */
   }
   if (failed) throw original;
 }
@@ -106,9 +147,18 @@ export async function qualifyNativeSharing(
     NodeFS.writeFileSync(NodePath.join(evidence, name + ".json"), JSON.stringify(value), {
       mode: 0o600,
     });
+  const observation: Partial<NativeSharingAdmissionFacts> = {};
   const step = (value: string) => {
     phase = value;
-    write("phase", { phase });
+    write("phase", { phase, observation });
+  };
+  const observe = (facts: Partial<NativeSharingAdmissionFacts>) => {
+    Object.assign(observation, facts);
+    try {
+      write("phase", { phase, observation });
+    } catch {
+      markUnsafe();
+    }
   };
   const inputs = new Map<string, { stat: string; sha256: string }>();
   let outcome: object | undefined;
@@ -261,31 +311,52 @@ export async function qualifyNativeSharing(
           return attached;
         },
         disconnect: async (browser) => {
-          await closeNativeSharingSession(browser);
+          await closeNativeSharingSession(browser, observe);
         },
         stop: async () => {
           await owner.close();
           if (owner.failures.length || !owner.childrenClosed()) throw refused();
         },
-        unsafeCleanup: markUnsafe,
+        unsafeCleanup: () => {
+          markUnsafe();
+          observe({ cleanupUnsafe: true });
+        },
       },
       async (browser) => {
         step("native-bridge-ready");
-        if (
-          JSON.stringify(await browser.getWindowHandles()) !== JSON.stringify(["main"]) ||
-          (await browser.getWindowHandle()) !== "main"
-        )
-          throw refused();
+        step("native-window-handles");
+        const handles = await browser.getWindowHandles(),
+          mainOnly = JSON.stringify(handles) === JSON.stringify(["main"]);
+        observe({ windowHandlesArray: Array.isArray(handles), windowMainOnly: mainOnly });
+        if (!mainOnly) throw refused();
+        step("native-window-current");
+        const current = await browser.getWindowHandle();
+        observe({ windowCurrentMain: current === "main" });
+        if (current !== "main") throw refused();
+        step("native-bridge-ready");
         await owner.until(async () => {
           try {
-            return (await browser.execute(readNativeSharingBridge)).metadata.host === "tauri";
+            const value = await browser.execute(readNativeSharingBridge),
+              ready = value.metadata.host === "tauri";
+            observe({ bridgeReady: ready });
+            return ready;
           } catch {
             return false;
           }
         });
+        step("native-bridge-initial");
         const initial = await browser.execute(readNativeSharingBridge),
           endpoint = initial.endpoint;
+        observe({ initialBridgeReturned: true });
+        step("native-endpoint-admission");
         const address = new URL(endpoint);
+        observe({
+          endpointHttp: address.protocol === "http:",
+          endpointLoopback: address.hostname === "127.0.0.1",
+          endpointCleanAuthority: !address.username && !address.password,
+          endpointCleanQuery: !address.search && !address.hash,
+          endpointRootPath: ["", "/"].includes(address.pathname),
+        });
         if (
           address.protocol !== "http:" ||
           address.hostname !== "127.0.0.1" ||
@@ -296,16 +367,29 @@ export async function qualifyNativeSharing(
           !["", "/"].includes(address.pathname)
         )
           throw refused();
+        let firstDescriptor = true;
         const descriptor = async () => {
           await guard();
+          if (firstDescriptor) step("native-initial-descriptor");
           const response = await fetch(
             address.origin + EnvironmentMetadataHttpApi.endpoints.descriptor.path,
             { signal: AbortSignal.timeout(1000) },
           );
+          if (firstDescriptor) observe({ descriptorResponseOk: response.ok });
           if (!response.ok) throw refused();
-          return response.json();
+          const value = await response.json();
+          if (firstDescriptor) observe({ descriptorJsonReturned: true });
+          return value;
         };
+        step("native-initial-identity-read");
         const first = await collectNativeSharingIdentity({ browser, endpoint, descriptor });
+        firstDescriptor = false;
+        step("native-initial-identity-admission");
+        observe({
+          identityCollected: true,
+          descriptorBootPresent: typeof first.descriptor.bootId === "string",
+          descriptorStoragePresent: typeof first.descriptor.storageInstanceId === "string",
+        });
         if (
           typeof first.descriptor.bootId !== "string" ||
           typeof first.descriptor.storageInstanceId !== "string"
@@ -317,8 +401,12 @@ export async function qualifyNativeSharing(
           serverVersion: first.descriptor.serverVersion,
           endpoint,
         };
-        const original = await browser.getUrl(),
-          originalSize = await browser.getWindowSize();
+        step("native-original-url");
+        const original = await browser.getUrl();
+        observe({ originalUrlReturned: true });
+        step("native-original-size");
+        const originalSize = await browser.getWindowSize();
+        observe({ originalSizeReturned: true });
         let route: "owned" | "absent" = "owned";
         const verify = async () => {
           await guard();
@@ -329,13 +417,20 @@ export async function qualifyNativeSharing(
             route,
           );
         };
+        step("native-initial-verification");
         await verify();
+        observe({ initialIdentityVerified: true });
         let visualFailed = false,
           visualFailure: unknown,
           summary: object | undefined;
         try {
+          step("native-ui-window-size");
           await browser.setWindowSize(1280, 960);
+          observe({ uiWindowSizeSet: true });
+          step("native-ui-navigation");
           await browser.url("tauri://localhost/#/settings/general");
+          observe({ uiNavigationCompleted: true });
+          step("native-ui-ports");
           const ports = await createNativeSharingBrowserPorts({
             browser,
             owner,
@@ -362,6 +457,7 @@ export async function qualifyNativeSharing(
             },
             onScene: (scene, theme) => step(scene + "-" + theme),
           });
+          observe({ uiPortsCreated: true });
           step("native-sharing-scenes");
           summary = await runNativeSharingVisual(ports);
         } catch (error) {
@@ -399,7 +495,7 @@ export async function qualifyNativeSharing(
     failed = true;
     failure = error;
     try {
-      write("failure", { phase, failure: classifyQualificationFailure(error) });
+      write("failure", { phase, failure: classifyQualificationFailure(error), observation });
     } catch {
       markUnsafe();
     }
