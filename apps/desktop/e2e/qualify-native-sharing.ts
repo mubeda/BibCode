@@ -43,6 +43,7 @@ import {
   type NativeSharingViewportFacts,
   type NativeSharingOriginalRectFacts,
 } from "./support/release-visual-native-sharing-viewport.ts";
+import { createNativeSharingGeometry } from "./support/release-visual-native-sharing-geometry.ts";
 import type { NativeSharingDomFacts } from "./support/release-visual-native-sharing-dom.ts";
 
 interface NativeSharingAdmissionFacts
@@ -425,7 +426,8 @@ export async function qualifyNativeSharing(
         const original = await browser.getUrl();
         observe({ originalUrlReturned: true });
         step("native-original-size");
-        const originalRect = await browser.getWindowRect();
+        const geometry = createNativeSharingGeometry({ browser, unsafeCleanup: markUnsafe });
+        const originalRect = (await geometry.acquire()).rectangle;
         observe({ originalSizeReturned: true });
         let route: "owned" | "absent" = "owned";
         const verifyIdentity = async () => {
@@ -442,6 +444,7 @@ export async function qualifyNativeSharing(
           browser,
           owner,
           original: originalRect,
+          geometry,
           identity: verifyIdentity,
           unsafeCleanup: markUnsafe,
           observe,

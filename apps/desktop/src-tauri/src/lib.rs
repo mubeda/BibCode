@@ -105,6 +105,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build());
     #[cfg(target_os = "linux")]
     let builder = builder.manage(linux_theme::LinuxThemeState::default());
+    #[cfg(all(feature = "desktop-e2e", target_os = "linux"))]
+    let builder = builder.manage(desktop_e2e_geometry::GeometryOwner::new());
     #[cfg(feature = "desktop-e2e")]
     let builder = builder
         .plugin(desktop_e2e_logging_plugin())
@@ -233,6 +235,8 @@ pub fn run() {
         preview::commands::desktop_preview_reveal_artifact,
         #[cfg(feature = "desktop-e2e")]
         desktop_e2e_prepare_for_exit,
+        #[cfg(all(feature = "desktop-e2e", target_os = "linux"))]
+        desktop_e2e_geometry::linux::desktop_e2e_main_window_geometry,
     ]);
     builder
         .build(desktop_context())
@@ -274,7 +278,21 @@ async fn prepare_desktop_runtime_for_exit<R: tauri::Runtime>(
 async fn desktop_e2e_prepare_for_exit(
     app_handle: tauri::AppHandle<bridge::DesktopRuntime>,
 ) -> Result<(), String> {
-    prepare_desktop_runtime_for_exit(&app_handle).await
+    #[cfg(target_os = "linux")]
+    let geometry = app_handle
+        .state::<std::sync::Arc<desktop_e2e_geometry::GeometryOwner>>()
+        .close()
+        .await;
+    let backend = prepare_desktop_runtime_for_exit(&app_handle).await;
+    #[cfg(target_os = "linux")]
+    if let Err(error) = geometry {
+        return Err(serde_json::to_value(error)
+            .map_err(|_| "Owned native geometry shutdown refused.")?
+            .as_str()
+            .unwrap_or("state-refused")
+            .to_string());
+    }
+    backend
 }
 
 fn desktop_context<R: tauri::Runtime>() -> tauri::Context<R> {
@@ -306,6 +324,8 @@ mod bridge;
 mod config;
 mod context_menu;
 mod data_safety;
+#[cfg(any(test, all(feature = "desktop-e2e", target_os = "linux")))]
+mod desktop_e2e_geometry;
 #[cfg(any(feature = "desktop-e2e", test))]
 mod desktop_e2e_page_load;
 mod firewall;
@@ -395,7 +415,8 @@ mod tests {
                 "allow-desktop-bridge",
                 "core:default",
                 "wdio:default",
-                "allow-desktop-e2e-lifecycle"
+                "allow-desktop-e2e-lifecycle",
+                "allow-desktop-e2e-main-geometry"
             ]))
         );
     }
@@ -416,6 +437,33 @@ mod tests {
             lifecycle_permission.commands.allow,
             ["desktop_e2e_prepare_for_exit"]
         );
+    }
+
+    #[test]
+    fn geometry_permission_is_test_only_and_does_not_authorize_preview_or_lifecycle() {
+        let permission: PermissionsFile = toml::from_str(include_str!(
+            "../permissions/desktop-e2e-main-geometry.toml"
+        ))
+        .expect("geometry permission should parse");
+        assert_eq!(permission.permission.len(), 1);
+        assert_eq!(
+            permission.permission[0].identifier,
+            "allow-desktop-e2e-main-geometry"
+        );
+        assert_eq!(
+            permission.permission[0].commands.allow,
+            ["desktop_e2e_main_window_geometry"]
+        );
+        let production: Value = serde_json::from_str(include_str!("../capabilities/default.json"))
+            .expect("production capability should parse");
+        assert!(
+            !production["permissions"]
+                .as_array()
+                .expect("permissions array")
+                .iter()
+                .any(|value| value == "allow-desktop-e2e-main-geometry")
+        );
+        assert_main_webview_only(&production);
     }
 
     #[test]

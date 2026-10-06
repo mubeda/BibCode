@@ -5,6 +5,7 @@ import {
   type QualificationBrowser,
   type QualificationOwner,
 } from "./qualification-owner.ts";
+import type { NativeSharingGeometryPort } from "./release-visual-native-sharing-geometry.ts";
 export interface NativeSharingViewportFacts {
   viewportMeasurementReturned: boolean;
   viewportDisplayMatched: boolean;
@@ -152,6 +153,7 @@ export function createNativeSharingViewport(input: {
   browser: QualificationBrowser;
   owner: Pick<QualificationOwner, "until">;
   original: unknown;
+  geometry: Pick<NativeSharingGeometryPort, "read" | "set" | "restore">;
   identity: () => Promise<void>;
   unsafeCleanup: () => void;
   observe?: (facts: Partial<NativeSharingViewportFacts>) => void;
@@ -215,13 +217,14 @@ export function createNativeSharingViewport(input: {
     try {
       await input.owner.until(async () => {
         await input.identity();
-        const current = rect(await bounded(input.browser.getWindowRect(), 2000)),
+        const native = await input.geometry.read(),
+          current = rect(native.rectangle),
           client = await read();
         if (requested && JSON.stringify(current) !== JSON.stringify(requested)) {
           previous = null;
           return false;
         }
-        const fingerprint = JSON.stringify({ current, client });
+        const fingerprint = JSON.stringify({ native, client });
         if (fingerprint !== previous) {
           previous = fingerprint;
           return false;
@@ -256,7 +259,7 @@ export function createNativeSharingViewport(input: {
         mutated = true;
         corrections++;
         observe({ viewportCorrectionAttempted: true });
-        await bounded(input.browser.setWindowRect(next.x, next.y, next.width, next.height), 2000);
+        await input.geometry.set(native, next);
         requested = next;
         previous = null;
         return false;
@@ -279,15 +282,12 @@ export function createNativeSharingViewport(input: {
     void (async () => {
       try {
         await input.identity();
-        await bounded(
-          input.browser.setWindowRect(original.x, original.y, original.width, original.height),
-          2000,
-        );
+        await input.geometry.restore();
         await input.owner.until(async () => {
           await input.identity();
           await read();
           return (
-            JSON.stringify(rect(await bounded(input.browser.getWindowRect(), 2000))) ===
+            JSON.stringify(rect((await input.geometry.read()).rectangle)) ===
             JSON.stringify(original)
           );
         });

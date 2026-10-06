@@ -155,6 +155,9 @@ function admissionProbe(fault = "owned") {
       createNativeSharingViewport: (input: { identity: () => Promise<void> }) => ({
         verify: input.identity,
       }),
+      createNativeSharingGeometry: () => ({
+        acquire: async () => ({ rectangle: await browser.getWindowRect() }),
+      }),
       readNativeSharingBridge: () => {},
       collectNativeSharingIdentity: collect,
       verifyNativeSharingWindow: async () => {

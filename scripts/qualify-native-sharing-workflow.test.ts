@@ -49,6 +49,28 @@ it("runs the actual SDK client-viewport regression before packaged native sharin
   expect(steps[admission].run).toContain(
     "apps/desktop/e2e/support/release-visual-native-sharing-viewport.test.ts",
   );
+  expect(steps[admission].run).toContain(
+    "apps/desktop/e2e/support/release-visual-native-sharing-geometry.test.ts",
+  );
+});
+it("validates native feature Rust contracts and warning-free targets before packaging", () => {
+  const steps = packagedWorkflow().jobs.native_sharing.steps;
+  const staticGate = steps.findIndex(
+    (step: { name: string }) => step.name === "Required native static gates",
+  );
+  const rust = steps.findIndex(
+    (step: { name: string }) => step.name === "Validate native desktop-e2e Rust geometry",
+  );
+  const build = steps.findIndex(
+    (step: { name: string }) => step.name === "Build guarded packaged native app",
+  );
+  expect(rust).toBeGreaterThan(staticGate);
+  expect(build).toBeGreaterThan(rust);
+  expect(steps[rust].run.trim().split("\n")).toEqual([
+    "cargo fmt --all --check",
+    "cargo test --locked -p bibcode-desktop --lib --features desktop-e2e,bibcode-server/hermetic-test-guard -j 2",
+    "cargo clippy --locked -p bibcode-desktop --all-targets --features desktop-e2e,bibcode-server/hermetic-test-guard -- -D warnings",
+  ]);
 });
 it("admits a separate Linux packaged-app selection and skips the Chromium owner for it", () => {
   const value = workflow();

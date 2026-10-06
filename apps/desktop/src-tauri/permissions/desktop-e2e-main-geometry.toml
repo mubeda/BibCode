@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-desktop-e2e-main-geometry"
+description = "Allows test-only main-WebView qualification to lease, read, request and restore its owned Linux native frame."
+commands.allow = ["desktop_e2e_main_window_geometry"]

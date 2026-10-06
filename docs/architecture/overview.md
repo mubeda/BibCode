@@ -20,6 +20,17 @@ flowchart TB
   Server -->|"provider-native protocols"| Providers
 ```
 
+Packaged Linux qualification has one additional native command under the
+`desktop-e2e` feature. `desktop_e2e_main_window_geometry` is authorized only for
+the main WebView by a separate test-only permission. Its transient native owner
+saves the actual mapped GTK frame and resize basis before mutation, performs
+bounded owned requests, and requires genuine frame readback for fitting and
+restoration. GTK objects stay on the main thread. Queued cancellation and
+shutdown close mutation admission, while started operations must join and
+unsafe cleanup remains latched. This command is absent from production builds,
+browser mode and the normal application RPC contract; it does not persist a
+second window-state source.
+
 ## Components
 
 - **Tauri host (`apps/desktop`)** owns native windows, menus, dialogs, updates,
@@ -41,6 +52,7 @@ flowchart TB
   `window.desktopBridge` only when Tauri globals are present. Tauri commands and
   events implement privileged operations; browser fallbacks are limited to
   explicitly safe capabilities.
+
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
   orchestration, providers, terminals, Git, files, diagnostics, relay access,

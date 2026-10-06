@@ -2160,21 +2160,39 @@ acknowledged assignment from an observed route without retaining URLs or window
 identities in the evidence.
 
 The owned Xvfb display is 1920 by 1440 at 24-bit color so the native window has
-room for its chrome. The pinned native Classic driver reports and sets the full
-outer rectangle, while its screenshot contains the visible WebKit client. The
-native-sharing-only viewport lease reads the actual client size and scale,
-requires devicePixelRatio 1 and the owned display dimensions, and uses stable
-outer/client measurements to account for bounded chrome. At most three owned
-main-window corrections run within the existing owner readiness deadline. The
-lease requires a 1280 by 960 client before capture and at the existing identity
-fences, retains unchanged original PNG bytes, and restores the exact original
-outer x, y, width and height before shutdown. It does not crop or rescale an
-image. URL restoration, rectangle restoration, and the final owned identity
-check are attempted independently within their existing bounds, including after
-an earlier cleanup failure. The original visual failure remains primary;
-otherwise the first cleanup failure is retained. Impossible or drifting geometry,
-failed correction or restoration, and
-unproven ownership fail qualification and preserve an unsafe fixture.
+room for its chrome. The test-only `desktop_e2e_main_window_geometry` command
+leases the exact main WebView's genuine GTK frame and resize basis before any
+mutation. Only Linux `desktop-e2e` builds register it, with a separate permission
+scoped to the main WebView. GTK reads and requests stay on the main thread;
+missing, unmapped, changed, non-X11 or unsupported-scale windows fail closed.
+No cached driver size, configured size or different window can supply a baseline.
+
+Before packaging, the native-sharing CI job runs `cargo fmt --all --check`,
+the desktop library tests with `desktop-e2e,bibcode-server/hermetic-test-guard`,
+and Clippy for all affected desktop targets with the same feature set and
+warnings denied. These Linux checks compile the GTK command and execute its
+contract/owner tests. Host compatibility compilation alone does not replace
+them or establish native geometry acceptance.
+
+The native-sharing-only viewport lease requires native scale and devicePixelRatio
+1 and the owned display dimensions. Stable native outer/basis and WebKit client
+measurements account for bounded chrome. At most three owned corrections run
+within the existing owner readiness deadline, with two-second native operations.
+GTK move/resize acknowledgements mean a request was issued; genuine frame
+readback must establish settlement. The lease requires a 1280 by 960 client
+before capture and at the existing identity fences, retains unchanged original
+PNG bytes, and restores the saved GTK resize basis and exact original outer x,
+y, width and height before shutdown. It does not crop or rescale an image.
+
+URL restoration, rectangle restoration, and the final owned identity check are
+attempted independently within their existing bounds, including after an earlier
+cleanup failure. The original visual failure remains primary; otherwise the
+first cleanup failure is retained. Repeated restoration joins its original
+operation. Shutdown closes mutation admission before backend preparation;
+expired queued callbacks cannot mutate and already-started work must join.
+Impossible or drifting geometry, failed correction or restoration, an unjoined
+operation, and unproven ownership fail qualification and preserve an unsafe
+fixture. A later successful cleanup cannot erase an earlier unsafe refusal.
 
 The initial outer-rectangle read records `native-original-rect-admission` before
 its strict validation. The same admission inspection projects eight fixed

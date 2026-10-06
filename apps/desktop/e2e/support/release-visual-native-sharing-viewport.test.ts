@@ -14,6 +14,7 @@ import {
   createNativeSharingViewport,
   readNativeSharingViewport,
 } from "./release-visual-native-sharing-viewport.ts";
+import { createNativeSharingGeometry } from "./release-visual-native-sharing-geometry.ts";
 const servers: NodeHttp.Server[] = [];
 afterEach(async () => {
   await Promise.all(
@@ -95,7 +96,13 @@ async function fixture(mode = "owned") {
       if (mode === "read-fault" || mode === "initial-read-fault") {
         response.statusCode = 500;
         value = { error: "unknown error", message: "Inert rectangle failure.", stacktrace: "" };
-      } else value = Object.hasOwn(initialRects, mode) ? initialRects[mode] : rect;
+      } else
+        value =
+          mode === "cached-size-defect"
+            ? { x: 0, y: 0, width: 0, height: 0 }
+            : Object.hasOwn(initialRects, mode)
+              ? initialRects[mode]
+              : rect;
     } else if (request.url?.endsWith("/window/rect") && request.method === "POST") {
       sets++;
       if (
@@ -115,14 +122,38 @@ async function fixture(mode = "owned") {
         value = rect;
       }
     } else if (request.url?.endsWith("/execute/sync")) {
-      const chrome = mode === "changing-chrome" ? 40 + sets * 10 : 40;
-      value = {
-        width: rect.width - 16,
-        height: rect.height - chrome,
-        scale: mode === "scale" ? 2 : scale,
-        screenWidth: mode === "display" ? 1280 : 1920,
-        screenHeight: mode === "display" ? 960 : 1440,
-      };
+      const operation = body.args?.[0]?.operation;
+      if (operation) {
+        if (operation === "set") {
+          sets++;
+          rect = { ...body.args[0].target };
+        }
+        if (operation === "restore") {
+          sets++;
+          rect = { ...original };
+        }
+        const snapshot = {
+          rectangle: { ...rect },
+          resizeWidth: rect.width - 16,
+          resizeHeight: rect.height - 40,
+          scaleFactor: scale,
+        };
+        value =
+          operation === "acquire"
+            ? { lease: "770f9c54-9e20-4c1c-9548-d04dba0f222a", snapshot }
+            : operation === "read"
+              ? snapshot
+              : { requested: true };
+      } else {
+        const chrome = mode === "changing-chrome" ? 40 + sets * 10 : 40;
+        value = {
+          width: rect.width - 16,
+          height: rect.height - chrome,
+          scale: mode === "scale" ? 2 : scale,
+          screenWidth: mode === "display" ? 1280 : 1920,
+          screenHeight: mode === "display" ? 960 : 1440,
+        };
+      }
     } else if (request.url?.endsWith("/window/handles"))
       value = changed ? ["main", "other"] : ["main"];
     else if (request.url?.endsWith("/window")) value = "main";
@@ -169,6 +200,23 @@ async function fixture(mode = "owned") {
       browser,
       owner,
       original,
+      geometry: {
+        read: async () => {
+          const rectangle = await browser.getWindowRect();
+          return {
+            rectangle,
+            resizeWidth: rectangle.width - 16,
+            resizeHeight: rectangle.height - 40,
+            scaleFactor: scale,
+          };
+        },
+        set: async (_expected: unknown, target: typeof rect) => {
+          await browser.setWindowRect(target.x, target.y, target.width, target.height);
+        },
+        restore: async () => {
+          await browser.setWindowRect(original.x, original.y, original.width, original.height);
+        },
+      },
       identity,
       unsafeCleanup: () => unsafe++,
       observe: (value: Record<string, boolean>) => Object.assign(facts, value),
@@ -183,8 +231,69 @@ async function fixture(mode = "owned") {
     changed: () => {
       changed = true;
     },
+    nativeGeometry: {
+      read: async () => ({
+        rectangle: { ...rect },
+        resizeWidth: rect.width - 16,
+        resizeHeight: rect.height - 40,
+        scaleFactor: scale,
+      }),
+      set: async (_expected: unknown, target: typeof rect) => {
+        sets++;
+        rect = { ...target };
+      },
+      restore: async () => {
+        sets++;
+        rect = { ...original };
+      },
+    },
   };
 }
+it("fits and restores a genuine native frame without the defective cached SDK geometry", async () => {
+  const f = await fixture("cached-size-defect");
+  const viewport = createNativeSharingViewport({ ...f.input, geometry: f.nativeGeometry });
+  await viewport.fit();
+  await viewport.verify();
+  await viewport.restore();
+  expect(f.rect()).toEqual(f.original);
+  expect(f.gets()).toBe(0);
+  expect(f.sets()).toBe(2);
+  expect(f.unsafe()).toBe(0);
+});
+it("the actual controller acquires the native original before fitting and exact restoration on the same SDK", async () => {
+  const f = await fixture("cached-size-defect"),
+    source = NodeFS.readFileSync(new URL("../qualify-native-sharing.ts", import.meta.url), "utf8");
+  const begin = source.indexOf('        step("native-original-size");'),
+    end = source.indexOf('        step("native-initial-verification");', begin);
+  const run = NodeVM.runInNewContext(
+    NodeModule.stripTypeScriptTypes(
+      "(async()=>{" + source.slice(begin, end) + "\nreturn viewport;})",
+    ),
+    {
+      browser: f.browser,
+      owner: f.owner,
+      createNativeSharingGeometry,
+      createNativeSharingViewport,
+      markUnsafe: f.input.unsafeCleanup,
+      step: () => {},
+      observe: () => {},
+      guard: async () => {},
+      verifyNativeSharingWindow: async () => {},
+      validateNativeSharingIdentity: () => {},
+      collectNativeSharingIdentity: async () => ({}),
+      identity: {},
+      endpoint: {},
+      descriptor: () => {},
+    },
+  );
+  const viewport = await run();
+  await viewport.fit();
+  await viewport.restore();
+  expect(f.rect()).toEqual(f.original);
+  expect(f.gets()).toBe(0);
+  expect(f.sets()).toBe(2);
+  expect(f.unsafe()).toBe(0);
+});
 const unknownOriginalFacts = {
   originalRectRecordMatched: null,
   originalRectKeysMatched: null,
@@ -305,6 +414,10 @@ it.each([
         descriptor: () => {},
         identity: {},
         createNativeSharingViewport,
+        createNativeSharingGeometry: () => ({
+          ...f.input.geometry,
+          acquire: async () => ({ rectangle: await browser.getWindowRect() }),
+        }),
         markUnsafe: f.input.unsafeCleanup,
         step: (phase: string) => phases.push(phase),
         observe: (next: object) => Object.assign(facts, next),

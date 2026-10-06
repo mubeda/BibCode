@@ -12,7 +12,8 @@
             "allow-desktop-bridge",
             "core:default",
             "wdio:default",
-            "allow-desktop-e2e-lifecycle"
+            "allow-desktop-e2e-lifecycle",
+            "allow-desktop-e2e-main-geometry"
           ]
         }
       ]
