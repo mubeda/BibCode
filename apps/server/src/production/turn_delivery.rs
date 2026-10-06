@@ -31,6 +31,8 @@ use crate::{
 
 use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
 
+const DELETED_THREAD_DETAIL: &str =
+    "This thread was deleted before the message could be delivered.";
 const MAX_CONCURRENT_THREADS: usize = 4;
 const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(50);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
@@ -812,6 +814,7 @@ async fn fill_available_slots(
         ])
         .await
         .map_err(|error| error.to_string())?;
+    let rows = dismiss_deliveries_for_deleted_threads(engine, rows).await?;
     let active_commands = rows
         .iter()
         .map(|row| row.command_id.as_str())
@@ -891,6 +894,54 @@ async fn fill_available_slots(
         });
     }
     Ok(FillResult { retry_delay })
+}
+
+/// A delivery whose thread was deleted can never be delivered: the provider would launch a
+/// session the orchestration engine then refuses to record. Settling it as `Dismissed` ends the
+/// retry loop, including for rows stranded before this rule existed. Returns the rows that remain.
+async fn dismiss_deliveries_for_deleted_threads(
+    engine: &OrchestrationEngine,
+    rows: Vec<ProviderTurnDelivery>,
+) -> Result<Vec<ProviderTurnDelivery>, String> {
+    let mut deleted = HashMap::new();
+    let mut remaining = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.state != TurnDeliveryState::Pending {
+            remaining.push(row);
+            continue;
+        }
+        let is_deleted = match deleted.get(&row.thread_id) {
+            Some(is_deleted) => *is_deleted,
+            None => {
+                let is_deleted = engine
+                    .repositories()
+                    .get_thread(row.thread_id.clone())
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .is_some_and(|thread| thread.deleted_at.is_some());
+                deleted.insert(row.thread_id.clone(), is_deleted);
+                is_deleted
+            }
+        };
+        if !is_deleted {
+            remaining.push(row);
+            continue;
+        }
+        // `false` means the row changed state concurrently; the next fill re-reads it.
+        engine
+            .transition_turn_delivery(TurnDeliveryTransition {
+                turn_id: None,
+                command_id: row.command_id,
+                expected_states: vec![TurnDeliveryState::Pending],
+                expected_attempt: row.attempts,
+                next_state: TurnDeliveryState::Dismissed,
+                detail: Some(DELETED_THREAD_DETAIL.to_owned()),
+                updated_at: now(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(remaining)
 }
 
 async fn promote_settled_threads(

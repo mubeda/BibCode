@@ -4689,6 +4689,7 @@ impl CatalogRpcFixture {
                 created_at: "2026-08-09T00:00:01Z".to_owned(),
                 updated_at: "2026-08-09T00:00:01Z".to_owned(),
                 deleted_at: None,
+                repository_identity: None,
             })
             .await
             .expect("project projection created");

@@ -258,7 +258,10 @@ that enables bracketed paste. Selecting text must leave keyboard focus in the
 terminal and must not open the **Add to chat** menu or overwrite the clipboard.
 Right-click the selected text and choose **Add to chat**; the selection must
 still attach to the composer. With no selection, **Ctrl+C** must interrupt the
-running terminal program. Repeat copy/paste where asynchronous Clipboard API
+running terminal program. Start a CLI that enables mouse tracking (for example
+`codex`), drag across its output and copy with **Ctrl+C**; the selected text must
+reach the clipboard without interrupting the CLI. **Shift+drag** (**Option+drag**
+on macOS) must reach the CLI instead of selecting. Repeat copy/paste where asynchronous Clipboard API
 access is unavailable; native clipboard events must still work. These packaged
 checks supplement the focused terminal and keybinding component tests.
 
@@ -388,6 +391,17 @@ the message to the runtime turn current at replay. A normal delivery must be
 accepted while a steer echo is still pending; correlate each echo to its own input. Turn completion must not
 retire a written acknowledgement, while process exit, stream failure, and
 session replacement still make an unacknowledged write ambiguous.
+A message starting with a known slash command or skill must be acknowledged by
+Claude's expanded replay, including multi-line arguments; an unknown command's
+raw replay must also acknowledge it, and another command's replay must not. A
+write with no recognisable replay must become uncertain at the acknowledgement
+deadline, while a steer's deadline starts only after its turn stops taking
+input. After Stop, a provider process BiBCode owns that never answers the
+interrupt, or answers and never settles the turn, must be retired at the
+interrupt deadline: the session is projected interrupted with its resume cursor
+retained, and the next message starts a new provider process. An OpenCode
+session on a configured external server is not retired: Stop returns within the
+interrupt deadline and the turn stays running until that server settles it.
 Interrupt/error during an in-flight steer must hold any subsequent requeue; a
 late acceptance must not restore a session that has already settled. Test local
 Claude settlement/interrupt during writer contention, late user echoes, and a
@@ -2049,18 +2063,26 @@ starts.
     option is selected; typing alone must not enable it. Choose a non-default
     target (for example `release/next`) and confirm a status refresh preserves
     the choice, clearing it disables creation again, and reopening starts
-    unselected. Repeat from Source Control's **Push & create PR/MR** and its
-    Create menu action, and from the chat Git action; combined commit/push/request
+    unselected. Repeat from the chat Git action; combined commit/push/request
     actions must also require target review before any mutation. No push,
-    provider process, or pull request may run just by opening the dialog.
-    Cancel it and confirm the branch, its upstream, and the forge are unchanged.
+    provider process, or pull request may run just by opening the dialog from
+    these entry points. Cancel it and confirm the branch, its upstream, and the
+    forge are unchanged. From Source Control, **Push & create PR/MR** and its
+    Create menu action must push an unpublished branch first, then open the
+    dialog with that branch selected as the source and listed among the origin
+    branches; a rejected push must show an error and leave the dialog closed, and
+    cancelling the dialog after the push must not create a request. A branch
+    created with `git checkout -b feature origin/main` (upstream `origin/main`)
+    must open the dialog without a push and publish `origin/feature` only when
+    the request is created.
     With a disposable configured forge, create once and verify the exact selected
     non-default target; plain **Push** must never create a request. Only the
     dialog's explicit primary action may publish or create.
     Both selectors must contain only origin branches, including those with a
     same-named local branch. Verify local-only branches, other remotes, and `HEAD`
-    are absent. A local-only checkout must leave the ordinary creation dialog's
-    source unselected and creation disabled, with push/fetch guidance.
+    are absent. A local-only checkout must still start with its branch as the
+    source, state that it will be published first, and publish it only when the
+    primary action runs.
     Change the source to another published branch and then an origin-only branch.
     Each change must clear the target, retain edited title/description, and seed
     untouched fields from that source's tip rather than another branch's newer
@@ -2373,6 +2395,18 @@ sizes. Cover relevant:
   session in the right pane, the back arrow returns to the normal view, and the
   per-row jump-to-workspace action returns to the normal view and re-points the
   rail to that row's environment;
+- the **Environments | Repositories** switch: open one repository as a project
+  on Local and on a remote environment. Switch the left panel to
+  **Repositories**: the environment rail disappears, the BiBCode brand stays where it was
+  beside the sidebar toggle (not under it), and one card named after the
+  repository lists both environments with their state and path; an offline
+  environment's entry is dimmed. Its `…` menu shows the normal project menu for
+  that environment. Change the remote checkout's `origin` with
+  `git remote set-url` and, after the next catalog refresh of that project
+  (window focus, a Git action, or reopening the project), confirm the entry
+  moves to its new card. Collapse one environment's entry and confirm the
+  other environment's entry stays open. Switch back to **Environments** and
+  confirm the rail returns with the same environment selected;
 - provider settings and provider/terminal action menus;
 - status-bar Claude/Codex usage with different accounts or usage values on local
   and remote servers: switching the environment rail changes the displayed

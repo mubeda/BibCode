@@ -64,7 +64,11 @@ import Sidebar, {
   SidebarThreadRow,
   handleSidebarNavigationKeyDown,
   handleSidebarSelectionMouseDown,
+  projectExpansionPreferenceKeys,
+  projectExpansionToggleKeys,
+  projectHeaderButtonClassName,
 } from "./Sidebar";
+import { resolveProjectExpanded, setProjectExpanded, type UiState } from "../uiStateStore";
 import { WORKSPACE_CARD_STATUS } from "./Sidebar.logic";
 
 const decodeStatusSummary = Schema.decodeUnknownSync(VcsStatusSummary);
@@ -108,6 +112,57 @@ staticDescribe("Sidebar global event helpers", () => {
       stopPropagation: vi.fn(),
     };
   }
+
+  it("writes a shared expansion key right after the project key", () => {
+    const project = {
+      projectKey: "project-key",
+      sharedExpansionKey: "github.com/acme/repo-a",
+      memberProjects: [{ physicalProjectKey: "member-key", workspaceRoot: "/work/repo" }],
+    } as unknown as Parameters<typeof projectExpansionPreferenceKeys>[0];
+    const keys = projectExpansionPreferenceKeys(project);
+    expect(keys.slice(0, 3)).toEqual(["project-key", "github.com/acme/repo-a", "member-key"]);
+    const { sharedExpansionKey: _omitted, ...withoutShared } = project;
+    expect(projectExpansionPreferenceKeys(withoutShared)).toEqual(
+      keys.filter((key) => key !== "github.com/acme/repo-a"),
+    );
+  });
+
+  it("collapses one environment card without collapsing its sibling", () => {
+    type Snapshot = Parameters<typeof projectExpansionPreferenceKeys>[0];
+    const card = (physical: string, workspaceRoot: string) =>
+      ({
+        projectKey: physical,
+        sharedExpansionKey: "github.com/acme/repo-a",
+        memberProjects: [{ physicalProjectKey: physical, workspaceRoot }],
+      }) as unknown as Snapshot;
+    // The same checkout path on both environments: the path-only legacy key must stay read-only.
+    const cardA = card("env-a:/work/repo", "/work/repo");
+    const cardB = card("env-b:/work/repo", "/work/repo");
+    const fresh = { projectExpandedById: {} } as unknown as UiState;
+    const expanded = (state: UiState, project: Snapshot) =>
+      resolveProjectExpanded(state.projectExpandedById, projectExpansionPreferenceKeys(project));
+
+    const collapsedA = setProjectExpanded(fresh, projectExpansionToggleKeys(cardA), false);
+    expect(expanded(collapsedA, cardA)).toBe(false);
+    expect(expanded(collapsedA, cardB)).toBe(true);
+    expect(new Set(projectExpansionToggleKeys(cardA))).toEqual(new Set(["env-a:/work/repo"]));
+
+    // An Environments-view row toggle writes the shared key, which a card without its own state reads.
+    const row = {
+      projectKey: "github.com/acme/repo-a",
+      memberProjects: [{ physicalProjectKey: "env-a:/work/repo", workspaceRoot: "/work/repo" }],
+    } as unknown as Snapshot;
+    const collapsedRow = setProjectExpanded(fresh, projectExpansionToggleKeys(row), false);
+    expect(expanded(collapsedRow, cardB)).toBe(false);
+  });
+
+  it("lets the project header button grow only for an environment card", () => {
+    const base = { showsSandboxBadge: false, isManualProjectSorting: false };
+    expect(projectHeaderButtonClassName({ ...base, isEnvironmentCard: true })).toContain("h-auto");
+    expect(projectHeaderButtonClassName({ ...base, isEnvironmentCard: false })).not.toContain(
+      "h-auto",
+    );
+  });
 
   it("handles traversal and numbered jump shortcuts across every guard", () => {
     const first = makeThread("first");
@@ -424,6 +479,27 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).toContain("No projects yet");
   });
 
+  it("points an empty Repositories view to Environments, where projects are added", () => {
+    h.state.shellSummary = {
+      ...h.state.shellSummary,
+      catalogReady: true,
+      desiredEnvironmentCount: 1,
+      statuses: [{ environmentId: ENV_MAIN, status: "live", hasSnapshot: true, error: null }],
+      canShowEmptyProjects: true,
+      hasSnapshot: true,
+      hasLiveShell: true,
+    };
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("No projects yet. Switch to Environments to add one.");
+    invoke(
+      mustFindProps((props) => props["children"] === "Show Environments", "show environments"),
+      "onClick",
+      mouseEvent(),
+    );
+    expect(h.uiStore.getState().setSidebarView).toHaveBeenCalledWith("environments");
+  });
+
   it("renders loading rather than claiming an empty catalog before catalog readiness", () => {
     const markup = render(<Sidebar />);
     expect(markup).toContain("Project data is still loading");
@@ -606,9 +682,97 @@ staticDescribe("Sidebar full render", () => {
       projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
     });
     const markup = render(<Sidebar />);
-    // Active thread peeks through even while collapsed.
+    // Active thread peeks through even while collapsed; the inactive primary card does not.
     expect(markup).toContain("thread-row-thread-active");
     expect(markup).not.toContain("thread-row-thread-idle");
+    expect(markup).not.toContain('data-testid="primary-card-project-a"');
+  });
+
+  it("writes only an environment card's own expansion keys, not the repository row's", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    // The header's test id sits on EnvironmentCardHeader's own output, which the harness does not capture.
+    expect(render(<Sidebar />)).toContain(`data-testid="environment-card-header-${ENV_REMOTE}"`);
+    const toggle = mustFindProps(
+      (props) =>
+        props["aria-expanded"] !== undefined &&
+        typeof props["onClick"] === "function" &&
+        String(props["className"] ?? "").includes("group-hover/project-header"),
+      "environment card toggle",
+    );
+    invoke(toggle, "onClick", mouseEvent());
+    expect(h.spies.setProjectExpanded).toHaveBeenCalledTimes(1);
+    expect(h.spies.setProjectExpanded).not.toHaveBeenCalledWith(
+      expect.arrayContaining(["github.com/acme/repo-a"]),
+      expect.anything(),
+    );
+  });
+
+  it("lets an environment card's header grow, but not a project row's", () => {
+    const projectHeaderClassNames = () =>
+      captured("SidebarMenuButton")
+        .map((entry) => String(entry.props["className"] ?? ""))
+        .filter((className) => className.includes("group-hover/project-header"));
+    groupedScenario();
+    render(<Sidebar />);
+    expect(projectHeaderClassNames().length).toBeGreaterThan(0);
+    expect(projectHeaderClassNames().some((className) => className.includes("h-auto"))).toBe(false);
+    h.uiStore.setState({ sidebarView: "repositories" });
+    render(<Sidebar />);
+    expect(projectHeaderClassNames()).toHaveLength(2);
+    expect(projectHeaderClassNames().every((className) => className.includes("h-auto"))).toBe(true);
+  });
+
+  it("groups every environment's checkout of a repository under one read-only card", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    expect(markup.match(/data-testid="repository-group-github\.com\/acme\/repo-a"/g)).toHaveLength(
+      1,
+    );
+    expect(markup).toContain(`data-testid="environment-card-header-${ENV_MAIN}"`);
+    expect(markup).toContain(`data-testid="environment-card-header-${ENV_REMOTE}"`);
+    expect(markup).toContain("2 environments");
+    expect(markup).toContain("Repositories · all environments");
+    expect(markup).not.toContain('data-testid="sidebar-add-project-trigger"');
+    expect(markup).not.toContain('data-testid="repository-group-actions"');
+    // The view always groups by repository, so the sort menu offers no grouping choice.
+    expect(markup).not.toContain("Group projects");
+  });
+
+  it("lists every environment's projects even when one environment is selected", () => {
+    groupedScenario();
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    expect(markup).toContain(`data-testid="environment-card-header-${ENV_MAIN}"`);
+  });
+
+  it("hides a collapsed repository group's environment cards", () => {
+    groupedScenario();
+    h.uiStore.setState({
+      sidebarView: "repositories",
+      repositoryGroupExpandedById: { "github.com/acme/repo-a": false },
+    });
+    const markup = render(<Sidebar />);
+    expect(markup).toContain('data-testid="repository-group-github.com/acme/repo-a"');
+    expect(markup).not.toContain("environment-card-header-");
+  });
+
+  it("reserves the environment rail's width at the header start only in the Repositories view", () => {
+    const reserve = "md:pl-[var(--environment-rail-width)]";
+    expect(render(<Sidebar />)).not.toContain(reserve);
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    expect(markup).toContain(reserve);
+  });
+
+  it("switches views from the toggle", () => {
+    baseScenario();
+    expect(render(<Sidebar />)).toContain("Group projects");
+    const repositories = mustFindProps(byAriaLabel("Repositories view"), "repositories toggle");
+    invoke(repositories, "onClick", mouseEvent());
+    expect(h.uiStore.getState().setSidebarView).toHaveBeenCalledWith("repositories");
   });
 
   it("shows the overflow 'Show more' affordance and expands on click", () => {
@@ -3141,7 +3305,12 @@ staticDescribe("new thread entry points", () => {
     expect(actions["aria-haspopup"]).toBe("menu");
     expect(markup).toContain("lucide-ellipsis");
     expect(markup).toContain("lucide-plus");
-    expect(markup).not.toContain("lucide-folder-git-2");
+    const hoverStrip = markup.slice(
+      markup.indexOf('data-testid="project-actions-button"'),
+      markup.indexOf('data-testid="pull-requests-button"'),
+    );
+    expect(hoverStrip).toContain("lucide-plus");
+    expect(hoverStrip).not.toContain("lucide-folder-git-2");
     expect(markup.indexOf("lucide-ellipsis")).toBeLessThan(markup.indexOf("lucide-plus"));
     expect(markup).toContain('data-testid="sidebar-projects-group"');
   });

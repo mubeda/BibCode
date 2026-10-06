@@ -16,6 +16,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::repository_identity::{
+    GitConfigStamp, RepositoryIdentityThrottle, git_config_stamp, reconcile_repository_identity,
+};
 use crate::{
     crypto::sha256_hex,
     git::{
@@ -342,6 +345,8 @@ pub struct WorktreeCatalogRpcServices {
 #[derive(Clone)]
 pub struct WorktreeCatalogOperationRuntime {
     state: Arc<Mutex<WorktreeCatalogOperationState>>,
+    /// Cancelled by `shutdown` so background work stops with the runtime.
+    cancellation: CancellationToken,
     admission: Arc<Semaphore>,
 }
 
@@ -384,8 +389,26 @@ impl WorktreeCatalogOperationRuntime {
                 accepting: true,
                 tasks: Vec::new(),
             })),
+            cancellation: CancellationToken::new(),
             admission: Arc::new(Semaphore::new(PRODUCTION_MAX_IN_FLIGHT_WORKTREE_OPERATIONS)),
         }
+    }
+
+    /// Runs best-effort follow-up work owned by the runtime, outside the caller's locks, and drops
+    /// it once shutdown has begun. `shutdown` cancels the token and waits for it.
+    async fn spawn_background<F, Fut>(&self, work: F)
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self.state.lock().await;
+        if !state.accepting {
+            return;
+        }
+        state.tasks.retain(|task| !task.is_finished());
+        state
+            .tasks
+            .push(tokio::spawn(work(self.cancellation.child_token())));
     }
 
     pub(crate) async fn run(
@@ -425,6 +448,7 @@ impl WorktreeCatalogOperationRuntime {
         let tasks = {
             let mut state = self.state.lock().await;
             state.accepting = false;
+            self.cancellation.cancel();
             self.admission.close();
             std::mem::take(&mut state.tasks)
         };
@@ -472,8 +496,15 @@ impl WorktreeOperationError {
 impl WorktreeCatalogRpcServices {
     #[must_use]
     pub fn new(catalog: WorktreeCatalogService, orchestration: OrchestrationEngine) -> Self {
+        let operations = WorktreeCatalogOperationRuntime::new();
         catalog.set_healthy_snapshot_observer(Arc::new(BranchReconciliationObserver {
             orchestration: orchestration.clone(),
+            git: catalog.git_repository(),
+            identity_throttle: RepositoryIdentityThrottle::default(),
+            config_stamp: read_git_config_stamp,
+            stamp_reads: Arc::default(),
+            stamp_timeout: CONFIG_STAMP_TIMEOUT,
+            operations: operations.clone(),
         }));
         let creation_git = catalog.git_repository();
         let removal_git = creation_git
@@ -486,7 +517,7 @@ impl WorktreeCatalogRpcServices {
             removal_quiescer: Arc::new(NoopWorktreeRemovalQuiescer),
             removal_git,
             status_broadcaster: None,
-            operations: WorktreeCatalogOperationRuntime::new(),
+            operations,
             #[cfg(test)]
             removal_admission_timeout: REMOVAL_ADMISSION_DRAIN_TIMEOUT,
             #[cfg(test)]
@@ -614,7 +645,57 @@ impl WorktreeCatalogRpcServices {
 #[derive(Clone)]
 struct BranchReconciliationObserver {
     orchestration: OrchestrationEngine,
+    git: Option<Arc<GitRepository>>,
+    identity_throttle: RepositoryIdentityThrottle,
+    /// Reads the primary checkout's `.git/config` stamp; a seam so tests can stall it.
+    config_stamp: ConfigStampSource,
+    /// Projects with a stamp read still running; see `StampReadGuard`.
+    stamp_reads: Arc<std::sync::Mutex<HashSet<String>>>,
+    stamp_timeout: Duration,
+    operations: WorktreeCatalogOperationRuntime,
 }
+
+type ConfigStampSource =
+    fn(PathBuf) -> Pin<Box<dyn Future<Output = Option<GitConfigStamp>> + Send>>;
+
+fn read_git_config_stamp(
+    checkout: PathBuf,
+) -> Pin<Box<dyn Future<Output = Option<GitConfigStamp>> + Send>> {
+    Box::pin(async move { git_config_stamp(&checkout).await })
+}
+
+/// Held by the tracked read task, so it lasts until the physical read ends or shutdown cancels it (a
+/// timeout only stops the waiter): a hung mount leaves at most one stuck read per project.
+struct StampReadGuard {
+    reads: Arc<std::sync::Mutex<HashSet<String>>>,
+    project_id: String,
+}
+
+impl StampReadGuard {
+    fn begin(reads: &Arc<std::sync::Mutex<HashSet<String>>>, project_id: &str) -> Option<Self> {
+        let inserted = reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(project_id.to_owned());
+        inserted.then(|| Self {
+            reads: reads.clone(),
+            project_id: project_id.to_owned(),
+        })
+    }
+}
+
+impl Drop for StampReadGuard {
+    fn drop(&mut self) {
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.project_id);
+    }
+}
+
+/// A slow or disconnected network mount must not hold the stamp read open; an unknown stamp falls
+/// back to the interval throttle.
+const CONFIG_STAMP_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl CatalogHealthySnapshotObserver for BranchReconciliationObserver {
     fn observe(
@@ -630,6 +711,73 @@ impl CatalogHealthySnapshotObserver for BranchReconciliationObserver {
 }
 
 impl BranchReconciliationObserver {
+    /// At most once per interval per project, or at once when the primary checkout's
+    /// `.git/config` changed, and off the catalog's refresh lock.
+    async fn refresh_repository_identity(
+        &self,
+        project_id: &str,
+        snapshot: &WorktreeCatalogSnapshot,
+    ) {
+        let Some(git) = self.git.clone() else {
+            return;
+        };
+        // The primary checkout's config is the one every worktree of the repository reads `origin`
+        // from, so this catches `git remote set-url` run in any of them. The stat can block on a
+        // network mount, so it runs in the tracked background task, never on the catalog's refresh.
+        let primary = snapshot
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.is_primary)
+            .map(|primary| PathBuf::from(&primary.path));
+        let orchestration = self.orchestration.clone();
+        let throttle = self.identity_throttle.clone();
+        let config_stamp = self.config_stamp;
+        let stamp_reads = self.stamp_reads.clone();
+        let stamp_timeout = self.stamp_timeout;
+        let operations = self.operations.clone();
+        let project_id = project_id.to_owned();
+        self.operations
+            .spawn_background(move |cancellation| async move {
+                let config = match primary {
+                    Some(path) => match StampReadGuard::begin(&stamp_reads, &project_id) {
+                        // A read from an earlier scan is still stuck: the stamp is unknown, and
+                        // the interval throttle decides without starting a second read.
+                        None => None,
+                        Some(guard) => {
+                            let (sender, receiver) = oneshot::channel();
+                            operations
+                                .spawn_background(move |cancellation| async move {
+                                    let _guard = guard;
+                                    tokio::select! {
+                                        biased;
+                                        () = cancellation.cancelled() => {}
+                                        stamp = config_stamp(path) => {
+                                            let _ = sender.send(stamp);
+                                        }
+                                    }
+                                })
+                                .await;
+                            tokio::select! {
+                                biased;
+                                () = cancellation.cancelled() => return,
+                                // A timeout stops only the wait: the read keeps its slot.
+                                stamp = tokio::time::timeout(stamp_timeout, receiver) => {
+                                    stamp.ok().and_then(Result::ok).flatten()
+                                }
+                            }
+                        }
+                    },
+                    None => None,
+                };
+                if !throttle.admit(&project_id, std::time::Instant::now(), config) {
+                    return;
+                }
+                reconcile_repository_identity(&orchestration, &git, &project_id, &cancellation)
+                    .await;
+            })
+            .await;
+    }
+
     async fn reconcile(&self, project_id: String, snapshot: Arc<WorktreeCatalogSnapshot>) {
         if !snapshot.authoritative
             || !matches!(
@@ -639,6 +787,8 @@ impl BranchReconciliationObserver {
         {
             return;
         }
+        self.refresh_repository_identity(&project_id, &snapshot)
+            .await;
         let threads = match self
             .orchestration
             .repositories()
@@ -4785,5 +4935,268 @@ mod mutation_invalidation_tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod repository_identity_refresh_tests {
+    use std::{process::Command, sync::Arc, time::Duration};
+
+    use tempfile::TempDir;
+
+    use super::{
+        BranchReconciliationObserver, CatalogHealthySnapshotObserver, RepositoryIdentityThrottle,
+        WorktreeCatalogOperationRuntime,
+    };
+    use crate::{
+        git::GitRepository,
+        orchestration::{EngineOptions, OrchestrationEngine},
+        persistence::{Database, run_migrations},
+        worktree_catalog::{
+            CatalogScanStatus, WorktreeAdoptionState, WorktreeCatalogSnapshot, WorktreeDescriptor,
+            WorktreeDirectoryState, WorktreeRegistrationState,
+        },
+    };
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    async fn stored_key(engine: &OrchestrationEngine) -> Option<String> {
+        engine
+            .repositories()
+            .get_project("p".to_owned())
+            .await
+            .unwrap()
+            .unwrap()
+            .repository_identity
+            .map(|identity| identity["canonicalKey"].as_str().unwrap().to_owned())
+    }
+
+    async fn engine_with_project(checkout: &TempDir) -> OrchestrationEngine {
+        let database = Database::open_in_memory().await.unwrap();
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .unwrap();
+        engine
+            .dispatch(
+                serde_json::from_value(serde_json::json!({
+                    "type":"project.create","commandId":"create","projectId":"p","title":"P",
+                    "workspaceRoot":checkout.path().to_string_lossy().replace('\\', "/"),
+                    "defaultModelSelection":null,"createdAt":"2026-10-05T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine
+    }
+
+    fn checkout_with_origin(origin: &str) -> TempDir {
+        let checkout = TempDir::new().unwrap();
+        git(checkout.path(), &["init", "-q"]);
+        git(checkout.path(), &["remote", "add", "origin", origin]);
+        checkout
+    }
+
+    async fn wait_for_key(engine: &OrchestrationEngine, key: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stored_key(engine).await.as_deref() != Some(key) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the identity becomes {key}"));
+    }
+
+    fn observer(engine: &OrchestrationEngine) -> BranchReconciliationObserver {
+        BranchReconciliationObserver {
+            orchestration: engine.clone(),
+            git: Some(Arc::new(GitRepository::default())),
+            identity_throttle: RepositoryIdentityThrottle::default(),
+            config_stamp: super::read_git_config_stamp,
+            stamp_reads: Arc::default(),
+            stamp_timeout: super::CONFIG_STAMP_TIMEOUT,
+            operations: WorktreeCatalogOperationRuntime::new(),
+        }
+    }
+
+    fn snapshot(worktrees: Vec<WorktreeDescriptor>) -> Arc<WorktreeCatalogSnapshot> {
+        Arc::new(WorktreeCatalogSnapshot {
+            repository_key: "repository".to_owned(),
+            generation: 1,
+            authoritative: true,
+            observed_at: "2026-10-05T00:00:00Z".to_owned(),
+            scan_status: CatalogScanStatus::Ready,
+            worktrees,
+            adopted_workspaces: Vec::new(),
+        })
+    }
+
+    fn primary(checkout: &TempDir) -> WorktreeDescriptor {
+        WorktreeDescriptor {
+            worktree_key: "primary".to_owned(),
+            path: checkout.path().to_string_lossy().into_owned(),
+            branch: None,
+            head: None,
+            is_primary: true,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            registration_state: WorktreeRegistrationState::Registered,
+            directory_state: WorktreeDirectoryState::Present,
+            adoption_state: WorktreeAdoptionState::None,
+            adopted_thread_id: None,
+            eligible_for_adoption: false,
+        }
+    }
+
+    /// A healthy scan refreshes the identity off the scan's own task, and a second scan inside the
+    /// throttle interval does not read `origin` again when no primary checkout config is known.
+    #[tokio::test]
+    async fn healthy_scans_refresh_the_identity_once_per_throttle_interval() {
+        let checkout = checkout_with_origin("git@github.com:acme/repo.git");
+        let engine = engine_with_project(&checkout).await;
+        let observer = observer(&engine);
+        let operations = observer.operations.clone();
+        let snapshot = snapshot(Vec::new());
+
+        observer.observe("p".to_owned(), snapshot.clone()).await;
+        wait_for_key(&engine, "github.com/acme/repo").await;
+
+        git(
+            checkout.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://gitlab.com/acme/other.git",
+            ],
+        );
+        observer.observe("p".to_owned(), snapshot).await;
+        operations.shutdown().await;
+        assert_eq!(
+            stored_key(&engine).await.as_deref(),
+            Some("github.com/acme/repo")
+        );
+        engine.shutdown().await;
+    }
+
+    /// `git remote set-url` rewrites the primary checkout's `.git/config`, so the next healthy scan
+    /// reconciles inside the throttle interval; a config with the same size and mtime does not.
+    #[tokio::test]
+    async fn a_changed_git_config_reconciles_on_the_next_healthy_scan() {
+        let checkout = checkout_with_origin("git@github.com:acme/repo.git");
+        let engine = engine_with_project(&checkout).await;
+        let observer = observer(&engine);
+        let operations = observer.operations.clone();
+        let snapshot = snapshot(vec![primary(&checkout)]);
+
+        observer.observe("p".to_owned(), snapshot.clone()).await;
+        wait_for_key(&engine, "github.com/acme/repo").await;
+
+        git(
+            checkout.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://gitlab.com/acme/other.git",
+            ],
+        );
+        observer.observe("p".to_owned(), snapshot.clone()).await;
+        wait_for_key(&engine, "gitlab.com/acme/other").await;
+
+        // Same length, and the previous mtime restored: the stamp is unchanged.
+        let config = checkout.path().join(".git").join("config");
+        let modified = std::fs::metadata(&config).unwrap().modified().unwrap();
+        git(
+            checkout.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://gitlab.com/acme/aaaaa.git",
+            ],
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&config)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        observer.observe("p".to_owned(), snapshot).await;
+        operations.shutdown().await;
+        assert_eq!(
+            stored_key(&engine).await.as_deref(),
+            Some("gitlab.com/acme/other")
+        );
+        engine.shutdown().await;
+    }
+
+    /// The stamp read can hang on a network mount: the observer still returns at once, the stalled
+    /// read is bounded by the runtime's shutdown, and nothing reconciles meanwhile.
+    #[tokio::test]
+    async fn a_stalled_git_config_stat_never_holds_the_observer() {
+        let checkout = checkout_with_origin("git@github.com:acme/repo.git");
+        let engine = engine_with_project(&checkout).await;
+        let mut observer = observer(&engine);
+        observer.config_stamp = |_| Box::pin(std::future::pending());
+        let operations = observer.operations.clone();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            observer.observe("p".to_owned(), snapshot(vec![primary(&checkout)])),
+        )
+        .await
+        .expect("the observer returns without awaiting the stamp read");
+        tokio::time::timeout(Duration::from_secs(1), operations.shutdown())
+            .await
+            .expect("shutdown cancels the stalled stamp read");
+        assert_eq!(stored_key(&engine).await, None);
+        engine.shutdown().await;
+    }
+
+    /// A stat that outlives its timeout keeps its project's slot, so further scans do not start
+    /// more blocking reads against the same stuck mount, yet still fall back to the interval.
+    #[tokio::test]
+    async fn a_stuck_git_config_stat_is_not_restarted_by_later_scans() {
+        static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let checkout = checkout_with_origin("git@github.com:acme/repo.git");
+        let engine = engine_with_project(&checkout).await;
+        let mut observer = observer(&engine);
+        observer.stamp_timeout = Duration::from_millis(50);
+        observer.config_stamp = |_| {
+            READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        };
+        let operations = observer.operations.clone();
+        let snapshot = snapshot(vec![primary(&checkout)]);
+
+        for _ in 0..3 {
+            observer.observe("p".to_owned(), snapshot.clone()).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The occupied slot reads as an unknown stamp, so the interval throttle still reconciles.
+        wait_for_key(&engine, "github.com/acme/repo").await;
+        operations.shutdown().await;
+        assert_eq!(READS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Shutdown cancels and joins the stuck read, which releases its slot.
+        assert!(observer.stamp_reads.lock().unwrap().is_empty());
+        engine.shutdown().await;
     }
 }

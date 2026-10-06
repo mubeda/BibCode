@@ -153,6 +153,8 @@ export function resolveCreatePullRequestReview(input: {
   readonly providerHint?: CreatePullRequestProviderHint | null;
   readonly commitBeforeCreate?: boolean;
   readonly headBranch?: string | null;
+  /** Whether origin already has a branch named like the source; undefined while unknown. */
+  readonly headOnOrigin?: boolean;
 }): CreatePullRequestReview {
   const { status, latestCommit } = input;
   // A cold or stale status may not name a host the caller already identified; the
@@ -180,7 +182,13 @@ export function resolveCreatePullRequestReview(input: {
   return {
     provider,
     head,
-    publishRequired: !isCurrentBranch || !status.hasUpstream || status.aheadCount > 0,
+    // An upstream with another name (`checkout -b feature origin/main`) does not
+    // publish the source, so a missing same-named origin branch decides.
+    publishRequired:
+      !isCurrentBranch ||
+      !status.hasUpstream ||
+      status.aheadCount > 0 ||
+      input.headOnOrigin === false,
     existingPullRequest,
     defaultTitle: defaultTitle.length > 0 ? defaultTitle : head === null ? "" : `Update ${head}`,
     defaultBody: latestCommit?.body.trim() ?? "",

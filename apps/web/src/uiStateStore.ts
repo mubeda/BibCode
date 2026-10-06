@@ -10,7 +10,11 @@ const LEGACY_PERSISTED_STATE_KEYS = [
   "codething:renderer-state:v1",
 ] as const;
 
+export type SidebarView = "environments" | "repositories";
+
 export interface PersistedUiState {
+  sidebarView?: SidebarView;
+  repositoryGroupExpandedById?: Record<string, boolean>;
   agentsSectionExpanded?: boolean;
   agentsGroupExpandedById?: Record<string, boolean>;
   projectExpandedById?: Record<string, boolean>;
@@ -24,6 +28,8 @@ export interface PersistedUiState {
 }
 
 export interface UiProjectState {
+  sidebarView: SidebarView;
+  repositoryGroupExpandedById: Record<string, boolean>;
   projectExpandedById: Record<string, boolean>;
   projectOrder: string[];
 }
@@ -43,6 +49,8 @@ export interface UiState extends UiProjectState, UiThreadState, UiEndpointState 
 }
 
 const initialState: UiState = {
+  sidebarView: "environments",
+  repositoryGroupExpandedById: {},
   agentsSectionExpanded: true,
   agentsGroupExpandedById: {},
   projectExpandedById: {},
@@ -122,6 +130,8 @@ export function parsePersistedState(parsed: PersistedUiState): UiState {
       : sanitizeStringArray(parsed.projectOrder);
 
   return {
+    sidebarView: parsed.sidebarView === "repositories" ? "repositories" : "environments",
+    repositoryGroupExpandedById: sanitizeBooleanRecord(parsed.repositoryGroupExpandedById),
     agentsSectionExpanded:
       typeof parsed.agentsSectionExpanded === "boolean" ? parsed.agentsSectionExpanded : true,
     agentsGroupExpandedById: sanitizeBooleanRecord(parsed.agentsGroupExpandedById),
@@ -210,6 +220,8 @@ export function persistState(state: UiState): void {
     window.localStorage.setItem(
       PERSISTED_STATE_KEY,
       JSON.stringify({
+        sidebarView: state.sidebarView,
+        repositoryGroupExpandedById: state.repositoryGroupExpandedById,
         agentsSectionExpanded: state.agentsSectionExpanded,
         agentsGroupExpandedById: state.agentsGroupExpandedById,
         projectExpandedById,
@@ -370,6 +382,22 @@ export function setAgentsSectionExpanded(state: UiState, expanded: boolean): UiS
   };
 }
 
+export function setSidebarView(state: UiState, sidebarView: SidebarView): UiState {
+  return state.sidebarView === sidebarView ? state : { ...state, sidebarView };
+}
+
+export function setRepositoryGroupExpanded(
+  state: UiState,
+  key: string,
+  expanded: boolean,
+): UiState {
+  if (state.repositoryGroupExpandedById[key] === expanded) return state;
+  return {
+    ...state,
+    repositoryGroupExpandedById: { ...state.repositoryGroupExpandedById, [key]: expanded },
+  };
+}
+
 export function setAgentsGroupExpanded(
   state: UiState,
   groupId: string,
@@ -456,6 +484,8 @@ interface UiStateStore extends UiState {
   markThreadUnread: (threadId: string, latestTurnCompletedAt: string | null | undefined) => void;
   setThreadChangedFilesExpanded: (threadId: string, turnId: string, expanded: boolean) => void;
   setDefaultAdvertisedEndpointKey: (key: string | null) => void;
+  setSidebarView: (view: SidebarView) => void;
+  setRepositoryGroupExpanded: (key: string, expanded: boolean) => void;
   setAgentsSectionExpanded: (expanded: boolean) => void;
   setAgentsGroupExpanded: (groupId: string, expanded: boolean) => void;
   setProjectExpanded: (projectIds: string | readonly string[], expanded: boolean) => void;
@@ -476,6 +506,9 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
     set((state) => setThreadChangedFilesExpanded(state, threadId, turnId, expanded)),
   setDefaultAdvertisedEndpointKey: (key) =>
     set((state) => setDefaultAdvertisedEndpointKey(state, key)),
+  setSidebarView: (view) => set((state) => setSidebarView(state, view)),
+  setRepositoryGroupExpanded: (key, expanded) =>
+    set((state) => setRepositoryGroupExpanded(state, key, expanded)),
   setAgentsSectionExpanded: (expanded) => set((state) => setAgentsSectionExpanded(state, expanded)),
   setAgentsGroupExpanded: (groupId, expanded) =>
     set((state) => setAgentsGroupExpanded(state, groupId, expanded)),

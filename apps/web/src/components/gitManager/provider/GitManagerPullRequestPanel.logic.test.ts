@@ -524,3 +524,19 @@ describe("create pull request progress", () => {
     expect(failCreatePullRequestProgress(reported, "transport lost")).toBe(reported);
   });
 });
+
+describe("resolveCreatePullRequestReview publication", () => {
+  it("requires publication when only a differently named upstream exists", () => {
+    const base = {
+      status: status({ refName: "feature", hasUpstream: true, aheadCount: 0 }),
+      latestCommit: null,
+    };
+    expect(resolveCreatePullRequestReview(base).publishRequired).toBe(false);
+    expect(resolveCreatePullRequestReview({ ...base, headOnOrigin: false }).publishRequired).toBe(
+      true,
+    );
+    expect(resolveCreatePullRequestReview({ ...base, headOnOrigin: true }).publishRequired).toBe(
+      false,
+    );
+  });
+});
