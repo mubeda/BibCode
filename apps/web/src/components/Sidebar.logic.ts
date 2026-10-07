@@ -752,6 +752,10 @@ export function isWorktreeSessionRunning<T extends WorktreeSessionThread>(
  * Idle cards use the standard border token, the active card a stronger neutral
  * border, and multi-selected cards a tinted one; the orange ring stays for focus.
  */
+/** The lifted surface of one project (or repository) in the left panel's list well. */
+export const SIDEBAR_CARD_CLASS =
+  "rounded-[10px] border border-sidebar-card-border bg-sidebar-card shadow-sidebar-card";
+
 export function resolveWorkspaceCardClassName(input: {
   isActive: boolean;
   isSelected: boolean;
@@ -769,10 +773,11 @@ export function resolveWorkspaceCardClassName(input: {
       "border-primary/40 bg-primary/15 hover:bg-primary/19 dark:bg-primary/22 dark:hover:bg-primary/28",
     );
   }
+  // Chats are rows on their project's card, so only selection draws an outline.
   if (input.isActive) {
-    return cn(base, "border-foreground/25 bg-accent");
+    return cn(base, "border-transparent bg-foreground/8 dark:bg-foreground/12");
   }
-  return cn(base, "border-border hover:bg-accent/60");
+  return cn(base, "border-transparent hover:bg-accent/60");
 }
 
 /** Shift+F10 or the Menu key: the platform shortcuts for a focused element's menu. */

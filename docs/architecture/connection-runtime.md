@@ -637,7 +637,9 @@ Local (the primary environment plus host-managed `local:` desktop backends,
 grouped per the `DESKTOP_LOCAL_CONNECTION_ID_PREFIX` convention) and one entry
 per saved remote environment. Selection writes `activeEnvironmentIdAtom` and
 scopes _presentation only_: the panel filters which environments' projects and
-threads it shows, and **Add project** targets the selected environment.
+threads it shows, and **Add project** starts on the selected environment. The
+Repositories view hides the rail, so Add Project's own host selector (shown
+whenever more than one host is available) is how a target is chosen there.
 The web entities module remembers the previous non-null primary identity in a
 keep-alive atom, so it survives an authentication-gate remount without being
 persisted across app reloads. The root reconciles that identity when its primary

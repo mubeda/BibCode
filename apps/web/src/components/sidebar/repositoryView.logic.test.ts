@@ -89,6 +89,7 @@ describe("groupProjectsByRepository", () => {
   it("groups by canonical key, keeps input order, and puts Local first", () => {
     const groups = groupProjectsByRepository({
       environments: identities,
+      sortOrder: "updated_at",
       projects: [
         card("a-ai", AI, "/work/a", "gitlab.example/team/a", "a"),
         card("b", LOCAL, "/home/b", "github.com/acme/b", "b"),
@@ -103,9 +104,30 @@ describe("groupProjectsByRepository", () => {
     expect(groups[0]).toMatchObject({ title: "a", environmentCount: 2, showHost: false });
   });
 
+  it("sorts repositories by name regardless of activity order", () => {
+    const groups = groupProjectsByRepository({
+      environments: identities,
+      sortOrder: "name",
+      projects: [
+        card("z", AI, "/work/zeta", "github.com/acme/zeta", "zeta"),
+        card("b2", AI, "/work/beta", "gitlab.example/other/Beta", "Beta"),
+        card("a", LOCAL, "/home/alpha", "github.com/acme/alpha", "alpha"),
+        card("b1", LOCAL, "/home/beta", "github.com/acme/beta", "beta"),
+      ],
+    });
+    // Case-insensitive by title; equal titles fall back to the repository key.
+    expect(groups.map((group) => group.key)).toEqual([
+      "github.com/acme/alpha",
+      "github.com/acme/beta",
+      "gitlab.example/other/Beta",
+      "github.com/acme/zeta",
+    ]);
+  });
+
   it("orders the primary Local first, then desktop-local environments, then remotes by label", () => {
     const [group] = groupProjectsByRepository({
       environments: identities,
+      sortOrder: "name",
       projects: [
         card("remote", AI, "/work/a", "github.com/acme/a"),
         card("wsl", WSL, "/home/a", "github.com/acme/a"),
@@ -124,6 +146,7 @@ describe("groupProjectsByRepository", () => {
   it("keeps two checkouts in one environment as two cards", () => {
     const [group] = groupProjectsByRepository({
       environments: identities,
+      sortOrder: "name",
       projects: [
         card("one", AI, "/work/a", "github.com/acme/a"),
         card("two", AI, "/work/a-copy", "github.com/acme/a"),
@@ -136,6 +159,7 @@ describe("groupProjectsByRepository", () => {
   it("titles identity-less projects by folder and shows hosts only on title clashes", () => {
     const groups = groupProjectsByRepository({
       environments: identities,
+      sortOrder: "updated_at",
       projects: [
         card("plain", LOCAL, "C:\\work\\scratch", null),
         card("api-gh", LOCAL, "/a", "github.com/acme/api", "api"),

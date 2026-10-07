@@ -297,7 +297,11 @@ minimum sizes verify:
 
 - when only the local Mac environment is configured, the rail shows Local and
   Add Project has no remote target; saved remote environments appear as separate
-  rail entries and become the Add Project target when selected;
+  rail entries and become the Add Project target when selected, and Add Project
+  then shows a **Host** selector offering this device and those servers;
+- in the **Repositories** view, the header's Add Project button opens the dialog
+  with the **Host** selector; choosing a remote server makes **Browse folder**
+  and the clone and create **Browse…** buttons list that server's folders;
 - Add a server by pairing code with a **Server alias**. Confirm the saved-server
   list and environment rail show that alias after reconnecting and restarting
   the app. Blank aliases use the pairing code's server name; failed pairing
