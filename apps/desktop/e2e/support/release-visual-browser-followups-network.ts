@@ -5,6 +5,21 @@ import type { createBrowserFollowupProtocolObserver } from "./release-visual-bro
 import { createBrowserFollowupProtocolObserver as createObserver } from "./release-visual-browser-followups-protocol.ts";
 import { startThrottleProxy, type ThrottleProxy } from "../../../../scripts/throttle-proxy.ts";
 const refused = () => new Error("Owned browser follow-up network refused.");
+function upgradeProtocols(header: Buffer): string[] {
+  const protocols: string[] = [];
+  for (const line of header.toString("latin1").split("\r\n")) {
+    const separator = line.indexOf(":");
+    if (separator < 0 || line.slice(0, separator).toLowerCase() !== "sec-websocket-protocol")
+      continue;
+    for (const value of line.slice(separator + 1).split(",")) {
+      const token = value.replace(/^[\t ]+|[\t ]+$/g, "");
+      if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(token)) throw refused();
+      protocols.push(token);
+    }
+  }
+  return protocols;
+}
+
 /** Publish one teardown result before starting it, including synchronous/reentrant fake-port callbacks. */
 function retainNetworkClose(run: () => Promise<void>): () => Promise<void> {
   let joined: Promise<void> | undefined;
@@ -159,6 +174,7 @@ export async function startBrowserFollowupTransport(input: {
       requestClassified = false,
       replyClassified = false,
       wantsUpgrade = false;
+    let offeredProtocols: string[] = [];
     const destroy = () => {
       gate.close();
       input.observer.connectionClosed(connection);
@@ -188,6 +204,7 @@ export async function startBrowserFollowupTransport(input: {
           if (end > 16380) throw refused();
           const header = requestPending.subarray(0, end + 4);
           wantsUpgrade = /^Upgrade:\s*websocket\s*\r?$/im.test(header.toString("ascii"));
+          if (wantsUpgrade) offeredProtocols = upgradeProtocols(header);
           requestClassified = true;
           write(client, upstream, header);
           bytes = requestPending.subarray(end + 4);
@@ -217,6 +234,9 @@ export async function startBrowserFollowupTransport(input: {
             )
           )
             throw refused();
+          const selectedProtocols = upgradeProtocols(replyPending.subarray(0, end + 4));
+          if (selectedProtocols.length > 1) throw refused();
+          gate.selectProtocol(offeredProtocols, selectedProtocols[0] ?? null);
           replyClassified = true;
           wire.upgraded = true;
           write(upstream, client, replyPending.subarray(0, end + 4));

@@ -2569,3 +2569,21 @@ child cleanup. Repeated cleanup joins the same retained promise. Any unsafe
 startup, drift, cancellation or teardown refuses fixture deletion and acceptance.
 Complete-group and full82/164 acceptance remain pending; this batch does not
 qualify native or Preview surfaces.
+
+The existing raw QA connection admits chunked RPC only when the buffered upgrade
+request offers and the 101 reply selects exactly `bibcode.rpc.chunked.v1`.
+Only HTTP SP and HTAB are trimmed around protocol tokens; high-bit bytes and
+other control whitespace are refused.
+Absent offer/selection retains bare whole-text WebSocket behavior; unsolicited,
+unsupported or multiple selections fail closed. HTTP, authentication headers,
+text frames and all forwarded frame bytes remain original. The QA gate reuses
+the maintained record assembler and RPC JSON serialization for binary logical
+messages, with the existing frame, per-message and pending-byte bounds.
+Independent control records leave partial data reassembly intact and forward in
+original control order. Only data records of the armed diagnostics reply are
+retained, in their original order and bytes, then released once after the existing
+strictly-greater-than-15-second proof and no later than 60 seconds. No record is
+re-encoded and no observer/replay identity rule, poll or deadline is weakened.
+Inert complete-caller checks bind the actual upgrade, assembler, original
+terminal snapshot/claim/PID/cwd/history owner, hold/release and joined cleanup;
+they do not establish the failed run's cause or native/pixel acceptance.
