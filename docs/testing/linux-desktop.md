@@ -2574,6 +2574,13 @@ Terminal creation. Before originals, join that proxy and rebind unchanged4887
 through the maintained throttle and original raw4894 observer to4897. Verify the
 same boot/storage/source, terminal PID and exact original history after the real
 renderer reconnect. Do not set renderer stores or synthetic protocol values.
+After publishing the observed endpoint, click the single pinned terminal's
+ordinary screen once in its owned main window. Require the DOM terminal ID to
+match the original terminal and its genuine active xterm textarea to belong to
+that same mount before the unchanged replay wait. This public focus action lets
+the supported size-owner policy claim a foreign snapshot, including matching
+geometry. Do not type keys, reset identities, reload, inject events or bypass
+PID, history, sequence, live-claim and cleanup checks.
 The single terminal marker command must emit an explicit leading newline before
 its exact output line, then keep the same long-running sleep process. This
 establishes a raw line boundary after shell control sequences. Preserve the

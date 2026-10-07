@@ -550,7 +550,42 @@ export async function runBrowserFollowupCaller(input: {
       });
       input.prepared.retain(transition);
       input.step("visual-browser-followups-observed-reconnect");
+      const terminalWindow = await input.browser.getWindowHandle();
       const network = await transition.activate();
+      network.transport.throwIfFailed();
+      network.observer.replay.throwIfFailed();
+      const terminalWindows = await input.browser.getWindowHandles();
+      if (
+        terminalWindows.length !== 1 ||
+        terminalWindows[0] !== terminalWindow ||
+        (await input.browser.getWindowHandle()) !== terminalWindow
+      )
+        throw refused();
+      const terminalMount = "[data-preview-panel-mode] [data-terminal-xterm-mount]";
+      const terminalMounts = input.browser.$$(terminalMount);
+      if (
+        (await terminalMounts.length) !== 1 ||
+        (await terminalMounts[0]!.getAttribute("data-terminal-xterm-mount")) !== terminal.terminalId
+      )
+        throw refused();
+      await click(input.browser, terminalMount + " .xterm-screen");
+      await input.owner.until(async () => {
+        network.transport.throwIfFailed();
+        network.observer.replay.throwIfFailed();
+        return input.browser.execute((terminalId: string) => {
+          const mounts = document.querySelectorAll<HTMLElement>(
+            "[data-preview-panel-mode] [data-terminal-xterm-mount]",
+          );
+          const active = document.activeElement;
+          return (
+            mounts.length === 1 &&
+            mounts[0]!.getAttribute("data-terminal-xterm-mount") === terminalId &&
+            active instanceof HTMLTextAreaElement &&
+            active.classList.contains("xterm-helper-textarea") &&
+            mounts[0]!.contains(active)
+          );
+        }, terminal.terminalId);
+      });
       await input.owner.until(async () => {
         network.transport.throwIfFailed();
         network.observer.replay.throwIfFailed();

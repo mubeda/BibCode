@@ -74,6 +74,15 @@ test.each(["owned", "bootstrap-close", "source-drift"])(
         "\nrunBrowserFollowupCaller",
       {
         withBrowserFollowupMainWindow,
+        click: NodeVM.runInNewContext(
+          NodeModule.stripTypeScriptTypes(
+            source.slice(
+              source.indexOf("async function click("),
+              source.indexOf("/** A real public Terminal"),
+            ),
+          ) + "\nclick;",
+          { refused: () => new Error("inert public control refused") },
+        ),
         bindBrowserFollowupTarget,
         prepareBrowserFollowupTerminal: async () => {
           events.push("public-terminal");
@@ -119,7 +128,14 @@ test.each(["owned", "bootstrap-close", "source-drift"])(
       CI: "true",
       prepared,
       browser: {
-        $: () => ({ isDisplayed: async () => false }),
+        $: () => ({
+          isDisplayed: async () => true,
+          waitForDisplayed: async () => {},
+          waitForEnabled: async () => {},
+          click: async () => {},
+        }),
+        $$: () => [{ getAttribute: async () => terminal.terminalId }],
+        execute: async () => true,
         getWindowHandles: async () => ["inert-main"],
         getWindowHandle: async () => "inert-main",
         getUrl: async () => "http://127.0.0.1:4885/local/inert-thread",
@@ -609,9 +625,9 @@ test.each(["pending", "transport-error", "replay-error", "undefined-error"])(
       new URL("./release-visual-browser-followups-caller.ts", import.meta.url),
       "utf8",
     );
-    const start = source.indexOf(
+    const start = source.lastIndexOf(
       "      await input.owner.until(async () => {",
-      source.indexOf('input.step("visual-browser-followups-observed-reconnect")'),
+      source.indexOf("          network.observer.terminalRestored();"),
     );
     const end = source.indexOf("      const verifyIdentity =", start);
     NodeAssert.equal(start > 0 && end > start, true);
@@ -664,5 +680,147 @@ test.each(["pending", "transport-error", "replay-error", "undefined-error"])(
       await NodeAssert.rejects(run(input, network), (value) => value === original);
       NodeAssert.equal(polls, 1);
     }
+  },
+);
+
+test.each([
+  "owned",
+  "foreign-same",
+  "foreign-different",
+  "wrong-mount",
+  "duplicate",
+  "no-focus",
+  "transport-error",
+  "replay-error",
+  "undefined-error",
+])(
+  "actual initial reconnect sequence focuses only its pinned public terminal: %s",
+  async (mode) => {
+    const source = NodeFS.readFileSync(
+      new URL("./release-visual-browser-followups-caller.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf(
+      "      const terminalWindow =",
+      source.indexOf('input.step("visual-browser-followups-observed-reconnect")'),
+    );
+    const oldStart = source.indexOf(
+      "      const network = await transition.activate();",
+      source.indexOf('input.step("visual-browser-followups-observed-reconnect")'),
+    );
+    const end = source.indexOf("      const verifyIdentity =", oldStart);
+    NodeAssert.equal(oldStart > 0 && end > oldStart, true);
+    const clickStart = source.indexOf("async function click("),
+      clickEnd = source.indexOf("/** A real public Terminal", clickStart);
+    const original =
+      mode === "undefined-error"
+        ? undefined
+        : Object.freeze(new Error("inert first owner failure"));
+    const deadline = new Error("inert unchanged observation bound");
+    let clicks = 0,
+      focused = false,
+      ready = !mode.startsWith("foreign"),
+      polls = 0;
+    class Textarea {
+      classList = { contains: (value: string) => value === "xterm-helper-textarea" };
+    }
+    const textarea = new Textarea();
+    const mount = {
+      getAttribute: async () => (mode === "wrong-mount" ? "other-terminal" : "inert-terminal"),
+      contains: (value: unknown) => value === textarea,
+    };
+    const domMount = {
+      getAttribute: () => (mode === "wrong-mount" ? "other-terminal" : "inert-terminal"),
+      contains: mount.contains,
+    };
+    const document = {
+      get activeElement() {
+        return focused ? textarea : null;
+      },
+      querySelectorAll: () => (mode === "duplicate" ? [domMount, domMount] : [domMount]),
+    };
+    const screen = {
+      waitForDisplayed: async () => {},
+      waitForEnabled: async () => {},
+      click: async () => {
+        clicks++;
+        if (mode !== "no-focus") focused = true;
+        ready = true;
+      },
+    };
+    const network = {
+      transport: {
+        throwIfFailed: () => {
+          if (mode === "transport-error" || mode === "undefined-error") throw original;
+        },
+      },
+      observer: {
+        replay: {
+          throwIfFailed: () => {
+            if (mode === "replay-error") throw original;
+          },
+        },
+        terminalRestored: () => {
+          if (!ready) throw deadline;
+        },
+      },
+    };
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        source.slice(clickStart, clickEnd) +
+          "\nasync function initial(input,terminal,transition){" +
+          source.slice(start >= 0 ? start : oldStart, end) +
+          "}\ninitial;",
+      ),
+      {
+        document,
+        HTMLTextAreaElement: Textarea,
+        refused: () => new Error("inert public mount refused"),
+      },
+    );
+    const input = {
+      browser: {
+        getWindowHandle: async () => "inert-main",
+        getWindowHandles: async () => ["inert-main"],
+        $$: (selector: string) =>
+          selector.endsWith(".xterm-screen")
+            ? [screen]
+            : mode === "duplicate"
+              ? [mount, mount]
+              : [mount],
+        $: () => screen,
+        execute: async (fn: (id: string) => boolean, id: string) => fn(id),
+      },
+      owner: {
+        until: async (check: () => Promise<boolean>) => {
+          for (let i = 0; i < 2; i++) {
+            polls++;
+            if (await check()) return;
+          }
+          throw deadline;
+        },
+      },
+    };
+    const pending = run(input, { terminalId: "inert-terminal" }, { activate: async () => network });
+    if (["owned", "foreign-same", "foreign-different"].includes(mode)) {
+      await pending;
+      NodeAssert.equal(clicks, 1);
+      NodeAssert.equal(focused, true);
+    } else {
+      let caught = false,
+        error: unknown;
+      try {
+        await pending;
+      } catch (value) {
+        caught = true;
+        error = value;
+      }
+      NodeAssert.equal(caught, true);
+      if (["transport-error", "replay-error", "undefined-error"].includes(mode)) {
+        NodeAssert.equal(error, original);
+        NodeAssert.equal(clicks, 0);
+      } else NodeAssert.equal(clicks, mode === "no-focus" ? 1 : 0);
+    }
+    NodeAssert.equal(polls <= 4, true);
   },
 );
