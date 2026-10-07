@@ -713,6 +713,7 @@ export function AddProjectCreateStep({
             <ParentDirectoryField
               busy={busy}
               canPick={canPickParent}
+              buttonLabel="Browse…"
               id="add-project-create-parent"
               invalid={parentDir.trim().length > 0 && parentError !== null}
               onChange={onParentDirChange}

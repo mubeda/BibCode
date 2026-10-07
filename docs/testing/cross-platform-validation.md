@@ -2437,7 +2437,9 @@ sizes. Cover relevant:
   selection's usage;
 - discovered and adopted external worktrees;
 - workspace cards and sidebar menus at the 422 px default width, in light and
-  dark: every status glyph (needs approval, waiting for your answer, working,
+  dark: each project (Environments) or repository (Repositories) reads as one
+  lifted card on the list background, environment bands are distinct inside a
+  repository card, and chat rows and secondary text stay legible in dark; every status glyph (needs approval, waiting for your answer, working,
   failed, plan ready, finished not opened, idle), the branch line with an open
   and a merged request, a dirty dot and a running terminal, the session line,
   **N more chats**, the hidden-worktree line, and the focus ring; **Shift+F10**

@@ -37,15 +37,19 @@ matched by its `origin` remote, across every connected environment. Each card
 holds one entry per checkout showing the environment, its connection state and
 the folder path; that entry is the project itself, with the same menu, actions,
 threads and worktrees. Projects without an `origin` get a card of their own
-named after their folder. Unavailable environments appear dimmed. In this view
-the sort menu's grouping choice is hidden, and each entry's menu is the normal
+named after their folder. Unavailable environments appear dimmed. Cards are
+sorted by repository name by default, so they keep their place as chats update;
+the sort menu's **Sort repositories** choice also offers **Last user message**
+and **Created at**, and is separate from the Environments view's project sort. In
+this view the sort menu's grouping choice is hidden, and each entry's menu is the normal
 project menu; its **Group into…** item affects the Environments view.
 Collapsing a repository card hides all its entries. Each entry keeps its own
 collapse state, so collapsing one environment's entry leaves the others open.
 Collapsing or expanding the project in Environments also updates its entries
 here, except other environments' entries you have already toggled in this
-view. With no projects, the view offers **Show Environments**, where projects
-are added. A changed `origin`
+view. The header's **Add project** button (also offered when the view is
+empty) opens Add Project with its **Host** selector, so the target environment
+is chosen in the dialog rather than on the hidden rail. A changed `origin`
 moves its entry to the new card after the next refresh of that project: when
 the window regains focus, after a Git action, or when you reopen the project.
 An unsent message draft belongs to the repository's project rather than one
@@ -79,10 +83,13 @@ pane while keeping the list visible. The per-row **Jump to workspace** action
 exits to the normal workspace view and re-points the environment rail to that
 row's environment.
 
-Projects are shown as groups of workspace cards. Each card is outlined, so it
-is clear which lines belong together; the open card has a light fill and a
-stronger outline, and selected cards a tinted one. A card has up to three
-lines:
+Projects are shown as cards lifted off a recessed list background, in both the
+Environments and Repositories views; in the Repositories view the repository is
+the card and each environment checkout is a shaded band inside it. A project's
+chats are workspace cards drawn as rows inside the project card, without their
+own outline: the open card has a fill and selected cards a tinted outline. Dark
+mode separates the layers more strongly and brightens secondary text on the
+cards so it stays readable. A workspace card has up to three lines:
 
 - **Line 1:** a status glyph, the title (bold while unread), a **primary**
   chip on the main checkout, and a pin when pinned. Hovering or focusing a
@@ -155,10 +162,12 @@ the server reuses it when free and still suffixes it when another worktree owns
 it.
 
 Use Add Project to open one existing project folder, clone a Git URL, or create
-a new Git repository. On macOS and Linux desktop, Add Project uses this device
-and omits a redundant location selector. On Windows, it shows **Location** when
-a mapped WSL backend is available, offering **This device** and the usable WSL
-locations. Browser clients retain connected-host selection. Local and mapped
+a new Git repository. It starts on the environment selected in the rail. On
+macOS and Linux desktop, it shows a **Host** selector when saved remote servers
+are available, offering **This device** and those servers, and omits it when
+this device is the only host. On Windows, the selector is labelled **Location**
+and also offers the usable WSL locations. Browser clients retain connected-host
+selection. Local and mapped
 WSL locations use the native folder picker. Remote hosts, and browser clients
 without a native dialog, open a folder browser that lists the selected host's
 directories; **Type a path instead** switches to manual entry of an absolute
@@ -176,6 +185,9 @@ server for remote hosts and browser clients. The browser names the server and
 starts at the entered parent folder. Choose a folder to return to the clone form;
 the repository is cloned beneath it on that same server. **Cancel** or **Back**
 keeps the Git URL and parent folder as entered. Manual path entry remains available.
+**Create new project** offers the same **Browse…** for its parent folder: the
+native picker locally, or the selected server's directory browser, returning to
+the form with the project name kept.
 If browsing fails or the connection drops, use **Refresh** in the browser or
 return to the form; its input is retained.
 
@@ -335,7 +347,9 @@ chat header `+` menu contains:
 Each extra chat panel is an isolated AI session. For contributors, this is
 implemented as a hidden sibling thread with `kind: "panel"` that shares the host
 thread's project, branch, and worktree. Panel threads are hidden from the left
-panel and are deleted when their tab closes.
+panel and are deleted when their tab closes. A new chat panel's tab shows
+**Opening chat…** until the server confirms the panel thread; if creation fails,
+the tab closes and a **Failed to open chat panel** toast gives the reason.
 
 Tabs persist across reloads. The host chat remains mounted while another center
 tab is active, so its transcript, scroll state, and composer state are preserved.

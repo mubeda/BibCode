@@ -1809,19 +1809,19 @@ describe("isWorktreeSessionRunning", () => {
 });
 
 describe("resolveWorkspaceCardClassName", () => {
-  it("outlines every card and keeps the hover wash on idle ones", () => {
+  // Chats are rows inside their project's card: the card draws the outline, not each chat.
+  it("draws idle chats as borderless rows with a hover wash", () => {
     const idle = resolveWorkspaceCardClassName({ isActive: false, isSelected: false });
-    expect(idle).toContain("border");
-    expect(idle).toContain("border-border");
-    expect(idle).not.toContain("border-transparent");
+    expect(idle).toContain("border-transparent");
+    expect(idle).not.toContain("border-border");
     expect(idle).toContain("hover:bg-accent/60");
   });
 
-  it("fills the active card and gives it a stronger border than its neighbours", () => {
+  it("fills the active chat strongly enough to read on the card in both themes", () => {
     const active = resolveWorkspaceCardClassName({ isActive: true, isSelected: false });
-    expect(active).toContain("bg-accent");
-    expect(active).toContain("border-foreground/25");
-    expect(active).not.toContain("border-border");
+    expect(active).toContain("border-transparent");
+    expect(active).toContain("bg-foreground/8");
+    expect(active).toContain("dark:bg-foreground/12");
     expect(active).not.toContain("font-medium");
   });
 

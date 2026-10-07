@@ -2,6 +2,8 @@ import { ChevronRightIcon, FolderGit2Icon } from "lucide-react";
 import { memo, useId, type ReactNode } from "react";
 
 import { useUiStateStore } from "../../uiStateStore";
+import { SIDEBAR_CARD_CLASS } from "../Sidebar.logic";
+import { cn } from "~/lib/utils";
 import { SidebarMenuItem } from "../ui/sidebar";
 import type { RepositoryGroup } from "./repositoryView.logic";
 
@@ -21,7 +23,7 @@ export const SidebarRepositoryGroup = memo(function SidebarRepositoryGroup({
     group.environmentCount === 1 ? "environment" : "environments"
   }`;
   return (
-    <SidebarMenuItem className="rounded-[10px] border border-border/75 bg-muted/30 p-1">
+    <SidebarMenuItem className={cn(SIDEBAR_CARD_CLASS, "p-1")} data-sidebar-card="true">
       <section
         aria-label={`Repository ${group.title}`}
         data-testid={`repository-group-${group.key}`}
@@ -31,7 +33,7 @@ export const SidebarRepositoryGroup = memo(function SidebarRepositoryGroup({
           aria-expanded={expanded}
           aria-controls={expanded ? listId : undefined}
           onClick={() => setRepositoryGroupExpanded(group.key, !expanded)}
-          className="flex h-7 w-full cursor-pointer items-center gap-2 rounded-md px-1.5 text-left outline-hidden hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex h-8 w-full cursor-pointer items-center gap-2 rounded-md px-1.5 text-left outline-hidden hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
         >
           <ChevronRightIcon
             aria-hidden
