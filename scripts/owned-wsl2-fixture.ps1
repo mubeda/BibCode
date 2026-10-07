@@ -59,6 +59,15 @@ function Assert-OwnerAcl([string]$Path) {
   $sids=@();foreach($rule in $acl.Access) { $sid=$rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;if($rule.IsInherited -or $rule.AccessControlType -ne 'Allow' -or $rule.FileSystemRights -ne 'FullControl') { Refuse-OwnedWsl };$sids+=$sid }
   if (@($sids | Sort-Object -Unique).Count -ne 2 -or $me -notin $sids -or 'S-1-5-18' -notin $sids) { Refuse-OwnedWsl }
 }
+# Git/usr/bin/gpg.exe uses MSYS POSIX absolute-home semantics.
+# Convert only its CLI argument; filesystem ownership and pins stay native.
+function Get-PinnedGitGpgHomeArgument([string]$NativeHome) {
+  try {
+    $native=$NativeHome.Replace('/','\')
+    if ($native -cnotmatch '\A[A-Za-z]:\\' -or [IO.Path]::GetFullPath($native) -cne $native) { Refuse-OwnedWsl }
+    return '/'+$native.Substring(0,1).ToLowerInvariant()+$native.Substring(2).Replace('\','/')
+  } catch { Refuse-OwnedWsl }
+}
 function Invoke-FixtureCommand([string]$Exe,[string[]]$Arguments,[int]$Timeout=60000) {
   $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Exe;$info.UseShellExecute=$false;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true;$info.CreateNoWindow=$true
   foreach($argument in $Arguments) { $info.ArgumentList.Add($argument) }
@@ -123,6 +132,7 @@ function Prepare-Fixture {
   $script:OwnedWslPrepareStage='verifier-admission'
   $gpg=Join-Path $env:ProgramFiles 'Git/usr/bin/gpg.exe';$gpgPin=Get-PhysicalPin $gpg;$gpgHash=(Get-FileHash -LiteralPath $gpg -Algorithm SHA256).Hash
   $gnupg=Join-Path $root 'gnupg';[IO.Directory]::CreateDirectory($gnupg)|Out-Null;Set-OwnerAcl $gnupg
+  $gpgHomeArgument=Get-PinnedGitGpgHomeArgument $gnupg
   $key=Join-Path $root 'canonical.key';$sums=Join-Path $root 'SHA256SUMS';$signature=Join-Path $root 'SHA256SUMS.gpg';$image=Join-Path $root $RootfsName
   $script:OwnedWslPrepareStage='signed-metadata'
   $script:OwnedWslSignedMetadata=[ordered]@{item=$null;operation=$null;httpStatus=$null;commandExit=$null;sizeMatched=$null;fingerprintCount=$null;fingerprintMatched=$null;signatureCount=$null;signerMatched=$null;checksumCount=$null;checksumMatched=$null}
@@ -138,14 +148,14 @@ function Prepare-Fixture {
   $script:OwnedWslSignedMetadata.sizeMatched=-not $oversize
   if($oversize) {Refuse-OwnedWsl}
   $script:OwnedWslSignedMetadata.item='key';$script:OwnedWslSignedMetadata.operation='gpg-import';$script:OwnedWslSignedMetadata.commandExit=$null
-  Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--import',$key)|Out-Null
+  Invoke-FixtureCommand $gpg @('--homedir',$gpgHomeArgument,'--batch','--import',$key)|Out-Null
   $script:OwnedWslSignedMetadata.operation='fingerprint-admission';$script:OwnedWslSignedMetadata.commandExit=$null
-  $fingerprints=Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--with-colons','--fingerprint',$SigningFingerprint)
+  $fingerprints=Invoke-FixtureCommand $gpg @('--homedir',$gpgHomeArgument,'--batch','--with-colons','--fingerprint',$SigningFingerprint)
   $fingerprintCount=@($fingerprints -split "`n"|Where-Object {$_ -match '^fpr:' -and ($_ -split ':')[9] -ceq $SigningFingerprint}).Count
   $script:OwnedWslSignedMetadata.fingerprintCount=[Math]::Min(2,$fingerprintCount);$script:OwnedWslSignedMetadata.fingerprintMatched=$fingerprintCount -eq 1
   if($fingerprintCount -ne 1) { Refuse-OwnedWsl }
   $script:OwnedWslSignedMetadata.item='signature';$script:OwnedWslSignedMetadata.operation='signature-admission';$script:OwnedWslSignedMetadata.commandExit=$null
-  $verification=Invoke-FixtureCommand $gpg @('--homedir',$gnupg,'--batch','--status-fd','1','--verify',$signature,$sums)
+  $verification=Invoke-FixtureCommand $gpg @('--homedir',$gpgHomeArgument,'--batch','--status-fd','1','--verify',$signature,$sums)
   $valid=@($verification -split "`n"|Where-Object {$_ -match '^\[GNUPG:\] VALIDSIG '})
   $script:OwnedWslSignedMetadata.signatureCount=[Math]::Min(2,$valid.Count)
   $signerMatched=$valid.Count -eq 1 -and ($valid[0] -split ' ')[2] -ceq $SigningFingerprint

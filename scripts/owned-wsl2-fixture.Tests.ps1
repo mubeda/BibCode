@@ -400,6 +400,7 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
     $root=Join-Path $TestDrive 'real-crypto';New-Item -ItemType Directory -Path $root|Out-Null
     Set-OwnerAcl $root
     $taskGpgHome=Join-Path $root 'gnupg';New-Item -ItemType Directory -Path $taskGpgHome|Out-Null;Set-OwnerAcl $taskGpgHome
+    $taskGpgHomeArgument=Get-PinnedGitGpgHomeArgument $taskGpgHome
     $savedManifest=$OwnerManifest
     $savedContext=@{}
     foreach($contextName in @('Action','OwnedWslPrepareStage','OwnedWslSignedMetadata','GpgPrivateEvidenceRealContext','GpgPrivateEvidenceAttempted')) {
@@ -445,14 +446,14 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
           throw $originalFailure
         }
       }
-      Invoke-PinnedMetadataCommand 'gpg-import' @('--homedir',$taskGpgHome,'--batch','--import',$key) $key|Out-Null
+      Invoke-PinnedMetadataCommand 'gpg-import' @('--homedir',$taskGpgHomeArgument,'--batch','--import',$key) $key|Out-Null
       $script:OwnedWslSignedMetadata.commandExit|Should -Be 0
       $script:OwnedWslSignedMetadata.operation='fingerprint-admission';$script:OwnedWslSignedMetadata.commandExit=$null
-      $fingerprints=Invoke-PinnedMetadataCommand 'fingerprint-admission' @('--homedir',$taskGpgHome,'--batch','--with-colons','--fingerprint','843938DF228D22F7B3742BC0D94AA3F0EFE21092')
+      $fingerprints=Invoke-PinnedMetadataCommand 'fingerprint-admission' @('--homedir',$taskGpgHomeArgument,'--batch','--with-colons','--fingerprint','843938DF228D22F7B3742BC0D94AA3F0EFE21092')
       $script:OwnedWslSignedMetadata.commandExit|Should -Be 0
       @($fingerprints -split "`n"|Where-Object {$_ -match '^fpr:' -and ($_ -split ':')[9] -ceq '843938DF228D22F7B3742BC0D94AA3F0EFE21092'}).Count|Should -Be 1
       $script:OwnedWslSignedMetadata.operation='signature-admission';$script:OwnedWslSignedMetadata.commandExit=$null
-      $verification=Invoke-PinnedMetadataCommand 'signature-admission' @('--homedir',$taskGpgHome,'--batch','--status-fd','1','--verify',$signature,$sums)
+      $verification=Invoke-PinnedMetadataCommand 'signature-admission' @('--homedir',$taskGpgHomeArgument,'--batch','--status-fd','1','--verify',$signature,$sums)
       $script:OwnedWslSignedMetadata.commandExit|Should -Be 0
       $valid=@($verification -split "`n"|Where-Object {$_ -match '^\[GNUPG:\] VALIDSIG '});$valid.Count|Should -Be 1
       ($valid[0] -split ' ')[2]|Should -BeExactly '843938DF228D22F7B3742BC0D94AA3F0EFE21092'
@@ -460,7 +461,7 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
       $line[0].Substring(0,64)|Should -BeExactly 'bb415d824822c4b878125729af451a5d18fb13d1cf5cbed9a7393ad64ac6039e'
       $corrupt=Join-Path $root 'corrupt-SHA256SUMS';[IO.File]::WriteAllText($corrupt,([IO.File]::ReadAllText($sums)+'inert-corruption'));Set-OwnerAcl $corrupt
       $script:OwnedWslSignedMetadata.commandExit=$null
-      {Invoke-FixtureCommand $gpg @('--homedir',$taskGpgHome,'--batch','--status-fd','1','--verify',$signature,$corrupt)}|Should -Throw
+      {Invoke-FixtureCommand $gpg @('--homedir',$taskGpgHomeArgument,'--batch','--status-fd','1','--verify',$signature,$corrupt)}|Should -Throw
       $script:OwnedWslSignedMetadata.commandExit|Should -BeGreaterThan 0
       ($script:OwnedWslSignedMetadata.commandExit -le 255)|Should -BeTrue
       Assert-PhysicalPin $gpgPin
@@ -759,4 +760,19 @@ Describe 'Owned WSL2 inactive operational evidence capability (inert)' {
       $script:GpgPrivateEvidenceRealContext=$savedReal;$script:GpgPrivateEvidenceAttempted=$savedAttempted;if($savedMetadataExists){$script:OwnedWslSignedMetadata=$savedMetadata}else{Remove-Variable -Name OwnedWslSignedMetadata -Scope Script -ErrorAction SilentlyContinue};$testKey.Dispose()
     }
   }
+}
+
+
+Describe 'Pinned Git GPG home argument boundary (inert)' {
+  It 'maps <Native> to the exact MSYS home argument' -TestCases @(
+    @{Native='C:\Owned\gnupg';Expected='/c/Owned/gnupg'},
+    @{Native='D:\Owned Space\gnupg';Expected='/d/Owned Space/gnupg'},
+    @{Native='c:/Owned/gnupg';Expected='/c/Owned/gnupg'},
+    @{Native='Z:\';Expected='/z/'}
+  ) { param($Native,$Expected) Get-PinnedGitGpgHomeArgument $Native|Should -BeExactly $Expected }
+  It 'refuses unsupported or noncanonical <Native>' -TestCases @(
+    @{Native='relative\gnupg'},@{Native='C:relative'},@{Native='\\host\share\gnupg'},
+    @{Native='\\?\C:\Owned\gnupg'},@{Native='/c/Owned/gnupg'},
+    @{Native='C:\Owned\..\gnupg'},@{Native='C:\Owned\.\gnupg'},@{Native=''}
+  ) { param($Native) {Get-PinnedGitGpgHomeArgument $Native}|Should -Throw }
 }

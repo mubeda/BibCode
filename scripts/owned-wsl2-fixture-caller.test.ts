@@ -1,5 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Actual workflow/harness source, inert command ports only.
 import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeAssert from "node:assert/strict";
 import * as NodeVM from "node:vm";
 import * as NodeModule from "node:module";
 import * as YAML from "yaml";
@@ -296,4 +298,59 @@ it("preserves absent script metadata in the actual optional/inactive Pester wrap
   expect(tests).toContain("$testsSource.Substring($start,$end-$start)");
   expect(tests).toContain("$script:GpgPrivateEvidenceAttempted|Should -BeFalse");
   // Source consistency only: actual strict-mode Pester setup/extracted-wrapper execution requires Windows CI.
+});
+
+it("uses the owning pinned-Git GPG home transform with absolute-path/refusal guards", () => {
+  const owner = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+  const start = owner.indexOf("function Get-PinnedGitGpgHomeArgument(");
+  const end = owner.indexOf("function Invoke-FixtureCommand(", start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const helper = owner.slice(start, end);
+  const regex = helper.match(/-cnotmatch '([^']+)'/)?.[1];
+  if (!regex) throw new Error("Owned home argument admission unavailable.");
+  const admitted = new RegExp(regex.replace(/\\A/g, "^"));
+  // Execute the exact source return expression with string-operation ports.
+  // Node win32.normalize is supporting validation evidence, not .NET interop.
+  const expression = helper.match(/return (.+)/)?.[1];
+  if (!expression) throw new Error("Owned home argument transform unavailable.");
+  const run = (value: string) => {
+    const native = value.replaceAll("/", "\\");
+    if (!admitted.test(native) || NodePath.win32.normalize(native) !== native)
+      throw new Error("Owned home argument refused.");
+    const port = {
+      Substring: (start: number, length?: number) => ({
+        ToLowerInvariant: () =>
+          native.slice(start, length === undefined ? undefined : start + length).toLowerCase(),
+        Replace: (from: string, to: string) =>
+          native
+            .slice(start, length === undefined ? undefined : start + length)
+            .replaceAll(from, to),
+      }),
+    };
+    return NodeVM.runInNewContext(
+      expression
+        .replace(/'([^']*)'/g, (_literal: string, value: string) => JSON.stringify(value))
+        .replace(/\$native/g, "native"),
+      { native: port },
+    );
+  };
+  for (const [value, expected] of [
+    ["C:\\Owned\\gnupg", "/c/Owned/gnupg"],
+    ["D:\\Owned Space\\gnupg", "/d/Owned Space/gnupg"],
+    ["c:/Owned/gnupg", "/c/Owned/gnupg"],
+    ["Z:\\", "/z/"],
+  ] as const)
+    expect(run(value)).toBe(expected);
+  for (const value of [
+    "relative\\gnupg",
+    "C:relative",
+    "\\\\host\\share",
+    "\\\\?\\C:\\Owned",
+    "/c/Owned",
+    "C:\\Owned\\..\\gnupg",
+    "C:\\Owned\\.\\gnupg",
+    "",
+  ])
+    expect(() => run(value)).toThrow();
+  NodeAssert.equal(regex, "\\A[A-Za-z]:\\\\");
 });

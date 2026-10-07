@@ -795,7 +795,15 @@ metadata item/operation, existing HTTP or GPG exit outcome and computed size,
 fingerprint, signature and checksum match facts. Unreached facts remain null.
 The failed receipt and recorder require exact keys, types, enum casing and
 bounded counts; raw output and paths remain private. The registered CI-only
-GPG test uses authenticated fixed metadata copies in an isolated test homedir.
+GPG test uses authenticated fixed metadata copies in an isolated test homedir. The pinned
+Git `usr/bin/gpg.exe` uses MSYS POSIX absolute-home semantics. The owning
+`Get-PinnedGitGpgHomeArgument` helper converts only the already-admitted local
+native drive homedir to its `/drive/...` CLI form for both Prepare and the real
+verifier. Drive-relative, UNC, extended namespace and noncanonical paths are
+refused. Filesystem admission, ownership/ACLs, executable pins and key/signature
+operands stay native; replacing separators with a drive-letter `C:/...` alone
+does not make a POSIX-absolute homedir. No `cygpath` process or extra GPG action
+is needed.
 It adds no download or action to Prepare and does not establish the real refusal
 cause until the actual Windows command outcome is observed.
 
