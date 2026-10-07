@@ -545,10 +545,14 @@ The toolbar has three segments:
    local name already exists, checkout stops and asks you to select or rename
    that local branch; existing work is never replaced. Remote rows offer
    checkout only. Use **Fetch** to discover branches added on the remote.
-   **New branch** always
-   forks from the checked-out branch (or the current HEAD commit when HEAD is
-   detached), never from the repository default, and the dialog names that base
-   in a highlighted chip before you confirm. The same segment exposes
+   **New branch** starts from the checked-out branch (or the current HEAD
+   commit when HEAD is detached), never from the repository default; its
+   **From** field shows that source and searches every local and remote branch
+   to start elsewhere. Creating a branch from a History commit starts at that
+   commit. A new branch never tracks its source, so one started from
+   `origin/main` publishes under its own name. **Check out after creating** is
+   on by default; turn it off to only create the branch, leaving the checked-out
+   branch and working tree as they were. The same segment exposes
    tag creation, deletion, and push actions. Symbolic remote default pointers
    such as `origin/HEAD` are not branch rows, while an actual local branch named
    `origin` remains available.
