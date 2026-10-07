@@ -294,7 +294,7 @@ const remoteRetentionFixture = async () => {
   );
   const ownerEnd = source.indexOf("\n      });", ownerStart) + "\n      });".length;
   const finallyStart = source.indexOf("    const secrets = [signingKey, signingPassword];");
-  const finallyEnd = source.indexOf("\n  }\n  if (failure !== undefined)", finallyStart);
+  const finallyEnd = source.indexOf("\n  }\n  if (failed || failure !== undefined)", finallyStart);
   if (
     [phaseStart, phaseEnd, laneStart, laneEnd, ownerStart, finallyStart, finallyEnd].some(
       (index) => index < 0,
@@ -390,7 +390,12 @@ const remoteRetentionFixture = async () => {
     copyBoundedEvidence,
     cleanup,
     runPhase,
-    finalize: () => evaluate(source.slice(finallyStart, finallyEnd) + "\n return failure;"),
+    finalize: () =>
+      evaluate(
+        "let failed = failure !== undefined;\n" +
+          source.slice(finallyStart, finallyEnd) +
+          "\n return failure;",
+      ),
     dispose: () => NodeFS.promises.rm(root, { recursive: true, force: true }),
   };
 };
@@ -1903,7 +1908,7 @@ describe("native follow-up owning setup stages", () => {
     const begin = source.indexOf(").withNativeFollowupsLinuxSession(");
     const actual = begin >= 0 ? begin : source.indexOf(".withNativeFollowupsLinuxSession(");
     const open = source.indexOf("{", actual),
-      end = source.indexOf(",\n          runDriver,", open),
+      end = source.indexOf(",\n            runDriver,", open),
       phaseLineStart = source.indexOf(
         "  const phaseRoot = NodePath.join(input.runRoot, `${input.phase}-driver`);",
       );

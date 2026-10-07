@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+import {
+  readOwnedNativeDriverResult,
+  type NativeDriverAttemptEvidence,
+  type NativeDriverEvidence,
+} from "./lib/native-driver-evidence.ts";
 import { admitOwnedWslSeed, joinOwnedWslCleanup } from "./lib/owned-wsl2-fixture.ts";
 // @effect-diagnostics nodeBuiltinImport:off - This release harness owns host processes and paths.
 // @effect-diagnostics globalConsole:off - The standalone harness reports bounded progress.
@@ -95,6 +100,7 @@ export interface SeededDesktopUpgradeSmokeInput {
   readonly workRoot: string;
   readonly nativeFollowups?: boolean;
   readonly ownedWslManifest?: string;
+  readonly observeNativeFollowupDriverEvidence?: (value: NativeDriverEvidence) => void;
   readonly observeNativeFollowupPhase?: (phase: NativeFollowupPhase) => void;
   readonly observeNativeFollowupLinuxServiceAdmission?: (
     value: NativeFollowupLinuxServiceAdmission,
@@ -718,14 +724,34 @@ async function observe(seed) {
 describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
   it("uses public desktop and authenticated RPC boundaries", async () => {
     const observation = await observe(${input.phase === "seed-and-install" ? "true" : "false"});
-    NodeFS.writeFileSync(input.resultPath, JSON.stringify(observation));
+    NodeFS.writeFileSync(input.resultPath, JSON.stringify(observation), ${input.lane === "native-followups" ? '{ mode: 0o600, flag: "wx" }' : "undefined"});
     ${
       input.lane === "native-followups"
         ? `
     if (input.phase === "seed-and-install") {
-      const { runSeededNativeFollowups } = await import(input.nativeFollowupsControllerPath);
-      const native = await runSeededNativeFollowups(browser, input, { environment: process.env, platform: process.platform, uid: typeof process.getuid === "function" ? process.getuid() : null });
-      NodeFS.writeFileSync(input.resultPath, JSON.stringify({ ...observation, nativeOriginalCount: native.originalCount, nativePartitionComplete: native.partitionComplete, installAttempted: false }), { mode: 0o600 });
+      const { runSeededNativeFollowups, projectNativeDriverHandoff } = await import(input.nativeFollowupsControllerPath);
+      let nativeDriverEvidence = null;
+      let native = null;
+      let innerFailed = false;
+      let innerError;
+      let publicationFailed = false;
+      let publicationError;
+      try {
+        native = await runSeededNativeFollowups(browser, {
+          ...input,
+          observeNativeDriverEvidence: (value) => { nativeDriverEvidence = projectNativeDriverHandoff(value,input.sourceSha); },
+        }, { environment: process.env, platform: process.platform, uid: typeof process.getuid === "function" ? process.getuid() : null });
+      } catch (error) {
+        innerFailed = true;
+        innerError = error;
+      } finally {
+        try { NodeFS.writeFileSync(input.resultPath, JSON.stringify({ ...observation, ...(native === null ? {} : { nativeOriginalCount: native.originalCount, nativePartitionComplete: native.partitionComplete }), installAttempted: false, ...(input.platform === "linux" ? { nativeDriverEvidence } : {}) }), { mode: 0o600 }); } catch (error) {
+          publicationFailed = true;
+          publicationError = error;
+        }
+      }
+      if (innerFailed) throw innerError;
+      if (publicationFailed) throw publicationError;
     }
     `
         : input.phase === "seed-and-install" && input.lane === "remote-install"
@@ -1884,6 +1910,7 @@ const runWebDriverPhase = async (input: {
   readonly ownedWslDistro?: string;
   readonly ownedWslBackend?: string;
   readonly observeNativePhase?: (phase: string) => void;
+  readonly observeNativeDriverEvidence?: (value: NativeDriverAttemptEvidence) => void;
   readonly observeNativeLinuxServiceAdmission?: (
     value: NativeFollowupLinuxServiceAdmission,
   ) => void;
@@ -1991,6 +2018,9 @@ const runWebDriverPhase = async (input: {
     commands.assertClosed();
   }
   let driverOutcome: NativeFollowupLinuxServiceAdmission["driverOutcome"] = "unknown";
+  let nativeDriverOutcome: NativeDriverEvidence["driverOutcome"] = "unknown";
+  let driverExitCode: number | null = null;
+  let linuxSessionCleanupJoined = false;
   const runDriver = async (environment: NodeJS.ProcessEnv) => {
     const childEnvironment = { ...environment };
     if (input.lane === "native-followups") {
@@ -2024,9 +2054,16 @@ const runWebDriverPhase = async (input: {
         timeoutMs: phaseTimeoutMs,
       });
       driverOutcome = result.exitCode === 0 ? "zero" : "nonzero";
+      nativeDriverOutcome = driverOutcome;
+      driverExitCode =
+        Number.isInteger(result.exitCode) && result.exitCode >= 0 && result.exitCode <= 255
+          ? result.exitCode
+          : null;
       return result;
     } catch (error) {
       if (input.lane === "native-followups") {
+        nativeDriverOutcome =
+          error instanceof SeededUpgradeCommandTimeoutError ? "timeout" : "rejected";
         try {
           input.observeNativePhase?.(
             error instanceof SeededUpgradeCommandTimeoutError
@@ -2040,32 +2077,64 @@ const runWebDriverPhase = async (input: {
       throw error;
     }
   };
-  const result =
-    input.lane === "native-followups" && input.platform === "linux"
-      ? await (
-          await import(
-            NodeURL.pathToFileURL(
-              NodePath.join(
-                input.repositoryRoot,
-                "apps/desktop/e2e/support/release-visual-native-followups-session.ts",
-              ),
-            ).href
-          )
-        ).withNativeFollowupsLinuxSession(
-          {
-            environment: process.env,
-            workRoot: NodePath.dirname(NodePath.dirname(input.runRoot)),
-            platform: seededUpgradeNativeHostPlatform,
-            onStage: input.observeNativePhase,
-            onServiceAdmission: (services: NativeFollowupLinuxServiceAdmission["services"]) => {
-              input.observeNativeLinuxServiceAdmission?.(
-                Object.freeze({ driverOutcome, services }),
-              );
+  let result;
+  try {
+    result =
+      input.lane === "native-followups" && input.platform === "linux"
+        ? await (
+            await import(
+              NodeURL.pathToFileURL(
+                NodePath.join(
+                  input.repositoryRoot,
+                  "apps/desktop/e2e/support/release-visual-native-followups-session.ts",
+                ),
+              ).href
+            )
+          ).withNativeFollowupsLinuxSession(
+            {
+              environment: process.env,
+              workRoot: NodePath.dirname(NodePath.dirname(input.runRoot)),
+              platform: seededUpgradeNativeHostPlatform,
+              onStage: input.observeNativePhase,
+              onCleanupJoined: (joined: boolean) => {
+                linuxSessionCleanupJoined = joined === true;
+              },
+              onServiceAdmission: (services: NativeFollowupLinuxServiceAdmission["services"]) => {
+                input.observeNativeLinuxServiceAdmission?.(
+                  Object.freeze({ driverOutcome, services }),
+                );
+              },
             },
-          },
-          runDriver,
-        )
-      : await runDriver(process.env);
+            runDriver,
+          )
+        : await runDriver(process.env);
+  } finally {
+    if (
+      input.lane === "native-followups" &&
+      input.platform === "linux" &&
+      input.phase === "seed-and-install" &&
+      input.observeNativeDriverEvidence
+    ) {
+      const inner = input.sourceSha
+        ? readOwnedNativeDriverResult({
+            runRoot: input.runRoot,
+            resultPath: input.resultPath,
+            sourceSha: input.sourceSha,
+          })
+        : null;
+      try {
+        input.observeNativeDriverEvidence({
+          driverOutcome: nativeDriverOutcome,
+          driverExitCode,
+          innerPhase: linuxSessionCleanupJoined ? (inner?.innerPhase ?? null) : null,
+          innerFailure: linuxSessionCleanupJoined ? (inner?.innerFailure ?? null) : null,
+          innerResult: linuxSessionCleanupJoined ? (inner?.innerResult ?? null) : null,
+        });
+      } catch {
+        /* Passive evidence cannot replace a joined command or session outcome. */
+      }
+    }
+  }
   if (input.lane === "native-followups") {
     try {
       input.observeNativePhase?.("native-driver-result-admission");
@@ -2075,7 +2144,11 @@ const runWebDriverPhase = async (input: {
   }
   const resultExists = NodeFS.existsSync(input.resultPath);
   let installAttempted = false;
-  if (input.phase === "seed-and-install" && resultExists) {
+  if (
+    input.phase === "seed-and-install" &&
+    resultExists &&
+    !(input.lane === "native-followups" && input.platform === "linux")
+  ) {
     try {
       const marker = JSON.parse(await NodeFS.promises.readFile(input.resultPath, "utf8")) as {
         readonly installAttempted?: unknown;
@@ -2254,6 +2327,7 @@ const runUpgradeLane = async (input: {
   readonly ownedWslDistro?: string;
   readonly ownedWslBackend?: string;
   readonly observeNativePhase?: (phase: string) => void;
+  readonly observeNativeDriverEvidence?: (value: NativeDriverAttemptEvidence) => void;
   readonly observeNativeLinuxServiceAdmission?: (
     value: NativeFollowupLinuxServiceAdmission,
   ) => void;
@@ -2286,6 +2360,9 @@ const runUpgradeLane = async (input: {
     ...(input.ownedWslDistro ? { ownedWslDistro: input.ownedWslDistro } : {}),
     ...(input.ownedWslBackend ? { ownedWslBackend: input.ownedWslBackend } : {}),
     ...(input.observeNativePhase ? { observeNativePhase: input.observeNativePhase } : {}),
+    ...(input.observeNativeDriverEvidence
+      ? { observeNativeDriverEvidence: input.observeNativeDriverEvidence }
+      : {}),
     ...(input.observeNativeLinuxServiceAdmission
       ? { observeNativeLinuxServiceAdmission: input.observeNativeLinuxServiceAdmission }
       : {}),
@@ -2549,6 +2626,9 @@ export async function runSeededDesktopUpgradeSmoke(
   };
   const requestLogPath = NodePath.join(runRoot, "updater-requests.jsonl");
   let failure: unknown;
+  let failed = false;
+  const nativeDriverEvidence: { value: NativeDriverAttemptEvidence | null } = { value: null };
+  let outerCleanupJoined = false;
   let remotePhaseStarted = false;
   try {
     if (!input.wsl && !input.nativeFollowups) {
@@ -2856,6 +2936,9 @@ export async function runSeededDesktopUpgradeSmoke(
         ...(ownedWslDistro ? { ownedWslDistro } : {}),
         ...(ownedWslBackend ? { ownedWslBackend } : {}),
         observeNativePhase,
+        observeNativeDriverEvidence: (value) => {
+          nativeDriverEvidence.value = value;
+        },
         ...(input.observeNativeFollowupLinuxServiceAdmission
           ? { observeNativeLinuxServiceAdmission: input.observeNativeFollowupLinuxServiceAdmission }
           : {}),
@@ -2923,6 +3006,7 @@ export async function runSeededDesktopUpgradeSmoke(
       });
     }
   } catch (cause) {
+    failed = true;
     failure = cause;
   } finally {
     const secrets = [signingKey, signingPassword];
@@ -2947,9 +3031,11 @@ export async function runSeededDesktopUpgradeSmoke(
         })),
       );
     } catch {
-      failure ??= new SeededDesktopUpgradeSmokeError(
-        "Private remote fixture receipts were invalid; evidence was not retained.",
-      );
+      if (!failed)
+        failure = new SeededDesktopUpgradeSmokeError(
+          "Private remote fixture receipts were invalid; evidence was not retained.",
+        );
+      failed = true;
       safeToRetainEvidence = false;
     }
     if (safeToRetainEvidence && !input.nativeFollowups)
@@ -2960,12 +3046,14 @@ export async function runSeededDesktopUpgradeSmoke(
         secrets,
       }).catch(() => undefined);
     try {
-      if (failure === undefined) observeNativePhase("native-cleanup");
+      if (!failed) observeNativePhase("native-cleanup");
       await cleanup.cleanup();
+      outerCleanupJoined = true;
     } catch (cleanupError) {
-      failure ??= cleanupError;
+      if (!failed) failure = cleanupError;
+      failed = true;
     }
-    if (input.nativeFollowups && failure === undefined) {
+    if (input.nativeFollowups && !failed) {
       try {
         if (input.platform === "win") {
           await NodeFS.promises.mkdir(input.artifactDirectory, { recursive: true, mode: 0o700 });
@@ -3023,11 +3111,28 @@ export async function runSeededDesktopUpgradeSmoke(
           platform: seededUpgradeNativeHostPlatform,
         });
       } catch (error) {
+        failed = true;
         failure = error;
       }
     }
+    if (input.nativeFollowups && input.platform === "linux") {
+      const driverEvidence = nativeDriverEvidence.value;
+      if (driverEvidence !== null) {
+        try {
+          input.observeNativeFollowupDriverEvidence?.({
+            ...driverEvidence,
+            ...(outerCleanupJoined
+              ? {}
+              : { innerPhase: null, innerFailure: null, innerResult: null }),
+            outerCleanupJoined,
+          });
+        } catch {
+          /* Closed status publication cannot replace the original owner failure. */
+        }
+      }
+    }
   }
-  if (failure !== undefined) throw failure;
+  if (failed || failure !== undefined) throw failure;
 }
 
 async function main(): Promise<void> {

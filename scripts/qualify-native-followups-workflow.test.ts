@@ -465,7 +465,7 @@ it("retains only fixed owning terminal phases in the existing status packet", ()
   expect(source).toContain("observeNativeFollowupPhase:");
   expect(source).toContain('phase = "native-result-admission";');
   expect(source).toMatch(
-    /nativeFollowupWorkflowStatus\(\s*sourceSha,\s*plan\.partition,\s*status,\s*count,\s*observation\.phase,\s*observation\.phase === "native-linux-service-admission"\s*\? observation\.linuxServiceAdmission\s*: null,?\s*\)/,
+    /nativeFollowupWorkflowStatus\(\s*sourceSha,\s*plan\.partition,\s*status,\s*count,\s*observation\.phase,\s*observation\.phase === "native-linux-service-admission"\s*\? observation\.linuxServiceAdmission\s*: null,?\s*status === "failed" \? observation\.nativeDriverEvidence : null,?\s*\)/,
   );
 });
 

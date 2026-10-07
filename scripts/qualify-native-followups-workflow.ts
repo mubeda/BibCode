@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 // @effect-diagnostics nodeBuiltinImport:off - Development-only fixed CI native visual caller retains closed status, never a production transport.
 // @effect-diagnostics globalConsole:off - Emit only closed status/source metadata; raw errors remain private.
+import {
+  projectNativeDriverEvidence,
+  type NativeDriverEvidence,
+} from "./lib/native-driver-evidence.ts";
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 import * as Effect from "effect/Effect";
@@ -116,8 +120,13 @@ export function nativeFollowupWorkflowStatus(
   originalCount: number,
   phase: NativeFollowupPhase = "native-owner-start",
   linuxServiceAdmission: unknown = null,
+  nativeDriverEvidence: unknown = null,
 ) {
   const observation = projectNativeFollowupLinuxServiceAdmission(linuxServiceAdmission);
+  const driver =
+    nativeDriverEvidence === null ? null : projectNativeDriverEvidence(nativeDriverEvidence);
+  if (driver !== null && (partition !== "linux-menu-update" || status !== "failed"))
+    throw refused();
   if (
     observation !== null &&
     (partition !== "linux-menu-update" ||
@@ -151,6 +160,7 @@ export function nativeFollowupWorkflowStatus(
     completeGroup: false,
     visualReview: "pending",
     ...(observation === null ? {} : { linuxServiceAdmission: observation }),
+    ...(driver === null ? {} : { nativeDriverEvidence: driver }),
   };
 }
 function privateWrite(root: string, name: string, value: object) {
@@ -191,10 +201,14 @@ async function main() {
   const observation: {
     phase: NativeFollowupPhase;
     linuxServiceAdmission: Readonly<NativeFollowupLinuxServiceAdmission> | null;
-  } = { phase: "native-owner-start", linuxServiceAdmission: null };
+    nativeDriverEvidence: NativeDriverEvidence | null;
+  } = { phase: "native-owner-start", linuxServiceAdmission: null, nativeDriverEvidence: null };
   try {
     await runSeededDesktopUpgradeSmoke({
       ...input,
+      observeNativeFollowupDriverEvidence: (value) => {
+        observation.nativeDriverEvidence = projectNativeDriverEvidence(value);
+      },
       observeNativeFollowupPhase: (value) => {
         observation.phase = value;
       },
@@ -311,6 +325,7 @@ async function main() {
         observation.phase === "native-linux-service-admission"
           ? observation.linuxServiceAdmission
           : null,
+        status === "failed" ? observation.nativeDriverEvidence : null,
       ),
     );
   }

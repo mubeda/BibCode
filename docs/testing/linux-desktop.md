@@ -2478,6 +2478,21 @@ its original phase and exception through secondary cleanup failures; optional
 diagnostic errors cannot replace it. Raw errors, paths and identities stay
 private. A terminal phase identifies a boundary and does not establish a native
 cause or visual acceptance.
+The same failed status can additionally contain `nativeDriverEvidence`. Its
+finite driver outcome and nullable returned exit code describe the existing
+command; inner phase, refusal and generated counts come only from the existing
+private result handoff. These counts are not accepted originals. The fixed
+result read runs after the joined driver/session attempt, including timeout and
+rejection, through an owned regular-file handle bounded to 1 MiB plus one
+overflow-detection byte before JSON parsing. Symlinks, aliases, escaped roots,
+replacement or multiple-link identities, wrong source/partition/selection,
+malformed fields and missing or partial handoffs leave inner evidence null.
+Inner metadata requires an independently witnessed safe Linux session cleanup
+and joined outer managed cleanup. Unsafe cleanup withholds it; observer or
+publication failures preserve the original failure, exit and outer phase.
+No additional artifact or PNG is retained on this path, and visual review stays
+pending. The successful-original retainer remains the success-only boundary.
+
 At the existing Linux service-admission refusal only, the same status container
 can retain `linuxServiceAdmission`: the already-returned driver's zero, nonzero
 or unknown outcome and the six fixed owned service roles with their existing

@@ -43,6 +43,7 @@ export async function withNativeFollowupsLinuxSession<A>(
     workRoot: string;
     platform: string;
     onStage?: (phase: string) => void;
+    onCleanupJoined?: (joined: boolean) => void;
     onServiceAdmission?: (services: NativeFollowupLinuxServiceAdmission["services"]) => void;
   },
   run: (environment: NodeJS.ProcessEnv) => Promise<A>,
@@ -243,16 +244,31 @@ export async function withNativeFollowupsLinuxSession<A>(
         cleanupSafe = false;
       }
     }
-    NodeFS.writeFileSync(
-      NodePath.join(root, "cleanup.json"),
-      JSON.stringify({
-        childCount: children.length,
-        childProcessesClosed: children.every((entry) => entry.done),
-        boundedLogs: children.every((entry) => !entry.overflow),
-        cleanupSafe,
-      }),
-      { mode: 0o600 },
-    );
+    try {
+      NodeFS.writeFileSync(
+        NodePath.join(root, "cleanup.json"),
+        JSON.stringify({
+          childCount: children.length,
+          childProcessesClosed: children.every((entry) => entry.done),
+          boundedLogs: children.every((entry) => !entry.overflow),
+          cleanupSafe,
+        }),
+        { mode: 0o600 },
+      );
+    } catch (error) {
+      cleanupSafe = false;
+      if (!failed) {
+        failed = true;
+        original = error;
+      }
+    }
+    try {
+      input.onCleanupJoined?.(
+        cleanupSafe && children.every((entry) => entry.done && !entry.overflow),
+      );
+    } catch {
+      /* Passive attribution cannot replace original error or cleanup. */
+    }
   }
   if (failed) throw original;
   if (!cleanupSafe) throw new Error("Native follow-up private OS cleanup unsafe.");

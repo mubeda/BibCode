@@ -2,6 +2,11 @@
 // @effect-diagnostics globalFetch:off - Only the actual native primary's admitted loopback descriptor is read.
 // @effect-diagnostics globalTimers:off - Joined qualification polling has an absolute bound.
 // @effect-diagnostics globalDate:off - Actual native operation deadlines are bounded.
+import {
+  projectNativeDriverHandoff,
+  type NativeDriverHandoff,
+} from "../../../scripts/lib/native-driver-evidence.ts";
+export { projectNativeDriverHandoff } from "../../../scripts/lib/native-driver-evidence.ts";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeCrypto from "node:crypto";
@@ -60,6 +65,7 @@ export interface SeededNativeFollowupsInput {
   readonly projectId: string;
   readonly wsl: boolean;
   readonly ownedWslDistro?: string;
+  readonly observeNativeDriverEvidence?: (value: NativeDriverHandoff) => void;
 }
 export interface NativeFollowupRuntime {
   readonly environment: NodeJS.ProcessEnv;
@@ -97,10 +103,56 @@ export async function runSeededNativeFollowups(
     captured = new Set<string>();
   const output = NodePath.join(input.evidenceDirectory, "native-followups");
   NodeFS.mkdirSync(output, { mode: 0o700 });
-  const write = (name: string, value: object) =>
+  let handoff: NativeDriverHandoff | null = null;
+  const write = (name: string, value: object) => {
     NodeFS.writeFileSync(NodePath.join(output, name + ".json"), JSON.stringify(value), {
       mode: 0o600,
     });
+    if (
+      input.platform !== "linux" ||
+      !input.observeNativeDriverEvidence ||
+      !["phase", "failure", "result"].includes(name)
+    )
+      return;
+    const field = (key: string): unknown => Object.getOwnPropertyDescriptor(value, key)?.value;
+    const next = projectNativeDriverHandoff(
+      {
+        schemaVersion: 1,
+        selection: "release-visual-native-followups",
+        sourceSha: input.sourceSha,
+        partition: "linux-menu-update",
+        innerPhase:
+          name === "phase" || name === "failure" ? field("phase") : (handoff?.innerPhase ?? null),
+        innerFailure:
+          name === "failure"
+            ? {
+                status: field("status"),
+                reason: field("reason"),
+                originalCount: field("originalCount"),
+              }
+            : (handoff?.innerFailure ?? null),
+        innerResult:
+          name === "result"
+            ? {
+                originalCount: field("originalCount"),
+                outstandingRowCount: field("outstandingRowCount"),
+                cleanup: field("cleanup"),
+                partitionComplete: field("partitionComplete"),
+                sourceMatches: field("sourceSha") === input.sourceSha,
+              }
+            : (handoff?.innerResult ?? null),
+      },
+      input.sourceSha,
+    );
+    handoff = next;
+    if (next !== null) {
+      try {
+        input.observeNativeDriverEvidence(next);
+      } catch {
+        /* Passive sink never replaces the controller's original outcome. */
+      }
+    }
+  };
   let unsafe = false,
     failed = false,
     originalError: unknown,
