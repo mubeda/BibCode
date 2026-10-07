@@ -369,7 +369,8 @@ describe("useAddProjectWorkflow public adapter", () => {
       "Relay server",
       "Remote server",
     ]);
-    expect(currentWorkflow).toHaveProperty("locationLabel", null);
+    // Without the rail (Repositories view) the picker is the only way to choose a server.
+    expect(currentWorkflow).toHaveProperty("locationLabel", "Host");
   });
 
   it("presents primary, WSL, and saved remote locations on Windows desktop", async () => {

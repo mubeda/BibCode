@@ -19,6 +19,7 @@ const h = vi.hoisted(() => ({
   snapshot: null as GitManagerRefsSnapshot | null,
   refreshRefs: vi.fn(),
   tagDialogProps: [] as Array<Record<string, unknown>>,
+  branchDialogProps: [] as Array<Record<string, unknown>>,
   menuItemProps: [] as Array<Record<string, unknown>>,
   refsAtom: vi.fn(() => ({ kind: "refs" })),
   signalAtom: vi.fn(() => ({ kind: "signal" })),
@@ -137,6 +138,13 @@ vi.mock("./tags/GitManagerTagDialog", () => ({
   },
 }));
 
+vi.mock("./dialogs/GitManagerBranchDialogs", () => ({
+  GitManagerBranchDialogs: (props: Record<string, unknown>) => {
+    h.branchDialogProps.push(props);
+    return null;
+  },
+}));
+
 import { GitManagerToolbar } from "./GitManagerToolbar";
 
 const currentProject = { environmentId: "env-a", projectId: "project-current" } as never;
@@ -205,6 +213,7 @@ beforeEach(() => {
   h.snapshot = null;
   h.refreshRefs.mockClear();
   h.tagDialogProps.length = 0;
+  h.branchDialogProps.length = 0;
   h.menuItemProps.length = 0;
   h.refsAtom.mockClear();
   h.signalAtom.mockClear();
@@ -418,6 +427,60 @@ describe("GitManagerToolbar", () => {
         remote: "origin",
         tag: "release/v1",
       });
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("offers remote sources to New Branch and creates without checking out when asked", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    h.snapshot = { ...refsSnapshot([]), remoteBranches: [ref("origin/release")] };
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () =>
+        root.render(
+          <GitManagerToolbar
+            projectRef={currentProject}
+            mainCheckoutCwd="/opaque/main"
+            selectedWorktreeCwd="/opaque/main"
+            worktrees={worktrees}
+            catalogPending={false}
+            catalogError={null}
+            repositoryUnavailable={null}
+            branchSyncDisabledReason={null}
+            stashMergeDisabledReason={null}
+            tagDisabledReason={null}
+            onSelectedWorktreeChange={() => undefined}
+          />,
+        ),
+      );
+      const props = h.branchDialogProps.at(-1)!;
+      expect(props.remoteRefs).toEqual([ref("origin/release")]);
+      await act(async () =>
+        (props.onSubmit as (submission: unknown) => Promise<void>)({
+          kind: "create",
+          name: "feature/later",
+          startPoint: "refs/remotes/origin/release",
+          checkout: false,
+        }),
+      );
+      expect(h.runOperation).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          input: expect.objectContaining({
+            _tag: "branch-create",
+            name: "feature/later",
+            startPoint: "refs/remotes/origin/release",
+            checkout: false,
+          }),
+        }),
+        expect.any(Function),
+      );
     } finally {
       await act(async () => root.unmount());
       container.remove();

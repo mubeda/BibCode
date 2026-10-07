@@ -19,7 +19,8 @@ export type AddProjectStep =
   | "remote-browse"
   | "clone"
   | "clone-parent-browse"
-  | "create";
+  | "create"
+  | "create-parent-browse";
 
 /**
  * `cloning` and `reconnecting` can be cancelled; `cancelling` waits for the server to confirm;

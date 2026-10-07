@@ -99,19 +99,25 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
               onCancel={workflow.cancelClone}
             />
           ) : null}
-          {workflow.step === "clone-parent-browse" ? (
+          {workflow.step === "clone-parent-browse" || workflow.step === "create-parent-browse" ? (
             <div className="space-y-5">
               <header className="space-y-1">
                 <h2 className="font-semibold text-2xl">
                   Choose parent folder on {workflow.selectedHost.label}
                 </h2>
                 <p className="text-muted-foreground text-sm">
-                  The repository will be cloned inside this folder.
+                  {workflow.step === "clone-parent-browse"
+                    ? "The repository will be cloned inside this folder."
+                    : "The new project folder will be created inside this folder."}
                 </p>
               </header>
               <RemoteDirectoryBrowser
                 environmentId={workflow.selectedHost.environmentId}
-                initialPath={workflow.cloneParent}
+                initialPath={
+                  workflow.step === "clone-parent-browse"
+                    ? workflow.cloneParent
+                    : workflow.createParent
+                }
                 resetKey={workflow.selectedHost.environmentId}
                 onSelect={(path) => void workflow.selectBrowsedFolder(path)}
                 onCancel={workflow.back}
@@ -126,7 +132,7 @@ export function AddProjectDialog({ open, onOpenChange }: AddProjectDialogProps) 
               platform={workflow.selectedHost.platform}
               error={workflow.error}
               busy={workflow.busy}
-              canPickParent={workflow.canPickParent}
+              canPickParent
               onNameChange={workflow.setCreateName}
               onParentDirChange={workflow.setCreateParent}
               onPickParent={() => void workflow.pickCreateParent()}

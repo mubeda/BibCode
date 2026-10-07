@@ -178,7 +178,9 @@ and excludes the source
 branch unless the action will create a new feature branch. Fetch updates the
 available remote branches. Status refreshes and retries preserve the selection;
 reopening the dialog, changing repositories, or changing source branch requires
-a new selection. Its wording follows the host: a
+a new selection. Choosing `main`, `master`, or the repository's default branch
+replaces the target hint with a red warning naming that branch; creation stays
+available. Its wording follows the host: a
 GitLab repository gets **Create merge request**, `!N` references and
 "merge request" throughout; a missing provider keeps "pull request", while an
 explicit unknown provider uses "change request". Until status has answered,

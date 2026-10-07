@@ -50,6 +50,20 @@ describe("ClientSettings Pull Requests", () => {
   });
 });
 
+describe("ClientSettings repository sort order", () => {
+  it("sorts repositories by name by default and keeps an explicit choice", () => {
+    expect(decodeClientSettings({}).sidebarRepositorySortOrder).toBe("name");
+    expect(DEFAULT_CLIENT_SETTINGS.sidebarRepositorySortOrder).toBe("name");
+    expect(
+      decodeClientSettings({ sidebarRepositorySortOrder: "updated_at" }).sidebarRepositorySortOrder,
+    ).toBe("updated_at");
+    expect(decodeClientSettingsPatch({ sidebarRepositorySortOrder: "created_at" })).toMatchObject({
+      sidebarRepositorySortOrder: "created_at",
+    });
+    expect(() => decodeClientSettingsPatch({ sidebarRepositorySortOrder: "manual" })).toThrow();
+  });
+});
+
 describe("ServerSettings Grok defaults", () => {
   it("defaults Grok to disabled for legacy and fresh settings", () => {
     expect(decodeServerSettings({}).providers.grok.enabled).toBe(false);

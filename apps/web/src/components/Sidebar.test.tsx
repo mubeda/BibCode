@@ -479,7 +479,7 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).toContain("No projects yet");
   });
 
-  it("points an empty Repositories view to Environments, where projects are added", () => {
+  it("offers Add project from an empty Repositories view", () => {
     h.state.shellSummary = {
       ...h.state.shellSummary,
       catalogReady: true,
@@ -491,13 +491,17 @@ staticDescribe("Sidebar full render", () => {
     };
     h.uiStore.setState({ sidebarView: "repositories" });
     const markup = render(<Sidebar />);
-    expect(markup).toContain("No projects yet. Switch to Environments to add one.");
+    expect(markup).toContain("No projects yet.");
+    expect(markup).not.toContain("Switch to Environments");
     invoke(
-      mustFindProps((props) => props["children"] === "Show Environments", "show environments"),
+      mustFindProps(
+        (props) => props["children"] === "Add project" && props["variant"] === "outline",
+        "empty-state add project",
+      ),
       "onClick",
       mouseEvent(),
     );
-    expect(h.uiStore.getState().setSidebarView).toHaveBeenCalledWith("environments");
+    expect(h.spies.openAddProject).toHaveBeenCalledTimes(1);
   });
 
   it("renders loading rather than claiming an empty catalog before catalog readiness", () => {
@@ -734,10 +738,64 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).toContain(`data-testid="environment-card-header-${ENV_REMOTE}"`);
     expect(markup).toContain("2 environments");
     expect(markup).toContain("Repositories · all environments");
-    expect(markup).not.toContain('data-testid="sidebar-add-project-trigger"');
     expect(markup).not.toContain('data-testid="repository-group-actions"');
     // The view always groups by repository, so the sort menu offers no grouping choice.
     expect(markup).not.toContain("Group projects");
+  });
+
+  it("lifts each Environments view project onto a card over the list well", () => {
+    baseScenario();
+    const markup = render(<Sidebar />);
+    expect(
+      String(mustFindProps(byTestId("sidebar-projects-group"), "projects group")["className"]),
+    ).toContain("bg-sidebar-well");
+    expect(markup.match(/data-sidebar-card="true"/g)).toHaveLength(1);
+  });
+
+  it("makes repositories the cards in the Repositories view, with environment rows on a band", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    // One repository card; its two environment checkouts are bands inside it, not nested cards.
+    expect(markup.match(/data-sidebar-card="true"/g)).toHaveLength(1);
+    expect(markup.match(/bg-sidebar-env-band/g)).toHaveLength(2);
+  });
+
+  it("orders Repositories view groups by name by default, not by recent activity", () => {
+    h.state.projects = [
+      makeProject("project-zeta", { title: "zeta", workspaceRoot: "C:/zeta", updatedAt: iso(1) }),
+      makeProject("project-alpha", {
+        title: "alpha",
+        workspaceRoot: "C:/alpha",
+        updatedAt: iso(500),
+      }),
+    ];
+    h.state.environments = [environmentFixture({ environmentId: ENV_MAIN, label: "Main" })];
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const alphaFirst = (markup: string) => markup.indexOf(">alpha<") < markup.indexOf(">zeta<");
+
+    expect(alphaFirst(render(<Sidebar />))).toBe(true);
+
+    h.state.clientSettings = {
+      ...DEFAULT_CLIENT_SETTINGS,
+      sidebarRepositorySortOrder: "updated_at",
+    };
+    expect(alphaFirst(render(<Sidebar />))).toBe(false);
+  });
+
+  it("offers repository sort orders in the Repositories view sort menu", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Sort repositories");
+    expect(markup).not.toContain("Sort projects");
+    const [repositorySort] = captured("MenuRadioGroup");
+    expect(repositorySort!.props["value"]).toBe("name");
+    (repositorySort!.props["onValueChange"] as (value: string) => void)("created_at");
+    expect(h.spies.updateSettings).toHaveBeenCalledWith({
+      sidebarRepositorySortOrder: "created_at",
+    });
+    expect(markup).not.toContain(">Manual<");
   });
 
   it("lists every environment's projects even when one environment is selected", () => {
@@ -1272,6 +1330,21 @@ staticDescribe("Sidebar environment scoping", () => {
       targetVersion: "0.7.3",
       progress: true,
     });
+  });
+
+  it("adds a project from the Repositories view without naming the hidden rail selection", () => {
+    seedTwoEnvironments();
+    h.state.activeEnvironmentId = ENV_REMOTE;
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    expect(markup).toContain('data-testid="sidebar-add-project-trigger"');
+    expect(markup).not.toContain("Add project on");
+    invoke(
+      mustFindProps(byTestId("sidebar-add-project-trigger"), "add project"),
+      "onClick",
+      mouseEvent(),
+    );
+    expect(h.spies.openAddProject).toHaveBeenCalledTimes(1);
   });
 
   it('labels the add-project trigger "Add project on <name>" only for a remote selection', () => {
@@ -3238,18 +3311,18 @@ staticDescribe("primary row", () => {
     baseScenario();
     const markup = render(<Sidebar />);
     expect(captured("SidebarMenuSub")).toHaveLength(1);
-    // 6 px between outlined cards, so neighbouring borders never merge.
-    expect(String(captured("SidebarMenuSub")[0]!.props["className"])).toContain("gap-1.5");
-    expect(String(captured("SidebarMenuSub")[0]!.props["className"])).not.toContain("gap-0.5");
+    // Chats are borderless rows on the project card, so 2 px separates them.
+    expect(String(captured("SidebarMenuSub")[0]!.props["className"])).toContain("gap-0.5");
+    expect(String(captured("SidebarMenuSub")[0]!.props["className"])).not.toContain("gap-1.5");
     // The list clips overflow, so it keeps the primitive's 2 px vertical padding:
     // the first and last card's 2 px focus ring reaches past the card border.
     expect(String(captured("SidebarMenuSub")[0]!.props["className"])).not.toMatch(
       /(^|\s)py-0(\s|$)/,
     );
-    // The primary card is outlined like the workspace cards.
+    // The primary card is a borderless row like the workspace cards.
     expect(
       String(mustFindProps(byTestId("primary-card-project-a"), "primary card")["className"]),
-    ).toContain("border-border");
+    ).toContain("border-transparent");
     expect(markup.indexOf('data-testid="primary-card-project-a"')).toBeLessThan(
       markup.indexOf('data-testid="thread-row-thread-active"'),
     );

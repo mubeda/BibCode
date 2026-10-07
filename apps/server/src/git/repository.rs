@@ -4146,9 +4146,9 @@ impl GitRepository {
         if let Some(start_point) = start_point {
             args.push(start_point.into());
         }
-        if !checkout {
-            args.push("--no-track".into());
-        }
+        // A new branch never tracks its start point: one created from `origin/main`
+        // would otherwise pull from and push to `main`.
+        args.push("--no-track".into());
         self.execute("GitManager.branchCreate", cwd, &args, true, cancellation)
             .await
     }
@@ -8780,6 +8780,45 @@ mod tests {
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn git_manager_branch_create_and_checkout_never_tracks_its_start_point() {
+        let runner = Arc::new(RecordingGitRunner {
+            outputs: HashMap::from([(
+                "GitManager.branchCreate".into(),
+                process_output("created\n"),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+
+        repository
+            .git_manager_create_branch(
+                Path::new("/repo"),
+                "feature/topic",
+                Some("refs/remotes/origin/main"),
+                true,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("branch creation succeeds");
+
+        // A remote start point must not become the new branch's upstream: pushing
+        // `feature/topic` would otherwise target `main`.
+        assert_eq!(
+            runner.requests()[0].args,
+            [
+                "switch",
+                "-c",
+                "feature/topic",
+                "refs/remotes/origin/main",
+                "--no-track"
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
         );
     }
 

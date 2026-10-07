@@ -92,6 +92,7 @@ import {
   MAX_SIDEBAR_THREAD_PREVIEW_COUNT,
   MIN_SIDEBAR_THREAD_PREVIEW_COUNT,
   type SidebarProjectSortOrder,
+  type SidebarRepositorySortOrder,
   type SidebarThreadPreviewCount,
   type SidebarThreadSortOrder,
 } from "@bibcode/contracts/settings";
@@ -275,6 +276,7 @@ import {
   isWorktreeSessionRunning,
   resolveWorkspaceCardAgeSource,
   resolveWorkspaceCardClassName,
+  SIDEBAR_CARD_CLASS,
   resolveWorkspaceCardStatus,
   resolveWorkspaceDirty,
   shouldShowWorkspaceBranchText,
@@ -452,6 +454,11 @@ const SIDEBAR_SORT_LABELS: Record<SidebarProjectSortOrder, string> = {
   updated_at: "Last user message",
   created_at: "Created at",
   manual: "Manual",
+};
+const SIDEBAR_REPOSITORY_SORT_LABELS: Record<SidebarRepositorySortOrder, string> = {
+  name: "Name",
+  updated_at: "Last user message",
+  created_at: "Created at",
 };
 const SIDEBAR_THREAD_SORT_LABELS: Record<SidebarThreadSortOrder, string> = {
   updated_at: "Last user message",
@@ -1600,7 +1607,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
   return (
     <SidebarMenuSub
       ref={attachThreadListAutoAnimateRef}
-      className="mx-0.5 my-0 w-full translate-x-0 gap-1.5 overflow-hidden px-1 sm:mx-1 sm:px-1.5"
+      className="mx-0.5 my-0 w-full translate-x-0 gap-0.5 overflow-hidden px-1 sm:mx-1 sm:px-1.5"
     >
       {projectExpanded && showDiscovery ? (
         <WorktreeDiscoverySection
@@ -3299,6 +3306,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       <div
         className={cn(
           "group/project-header relative",
+          environmentCard && "rounded-md bg-sidebar-env-band",
           environmentCard && !environmentCard.available && "opacity-60",
         )}
       >
@@ -3615,8 +3623,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
 });
 
 const SidebarProjectListRow = memo(function SidebarProjectListRow(props: SidebarProjectItemProps) {
+  // Inside a repository card an environment checkout is a band, not a nested card.
+  const isCard = !props.environmentCard;
   return (
-    <SidebarMenuItem className="rounded-md">
+    <SidebarMenuItem
+      className={isCard ? cn(SIDEBAR_CARD_CLASS, "p-1") : "rounded-md"}
+      data-sidebar-card={isCard ? "true" : undefined}
+    >
       <SidebarProjectItem {...props} />
     </SidebarMenuItem>
   );
@@ -3708,20 +3721,25 @@ type SortableProjectHandleProps = Pick<
 
 function ProjectSortMenu({
   projectSortOrder,
+  repositorySortOrder,
   threadSortOrder,
   projectGroupingMode,
   threadPreviewCount,
   onProjectSortOrderChange,
+  onRepositorySortOrderChange,
   onThreadSortOrderChange,
   onProjectGroupingModeChange,
   onThreadPreviewCountChange,
 }: {
   projectSortOrder: SidebarProjectSortOrder;
+  // Non-null in the Repositories view, which sorts repositories instead of projects.
+  repositorySortOrder: SidebarRepositorySortOrder | null;
   threadSortOrder: SidebarThreadSortOrder;
   // Null hides the grouping choice (the Repositories view always groups by repository).
   projectGroupingMode: SidebarProjectGroupingMode | null;
   threadPreviewCount: SidebarThreadPreviewCount;
   onProjectSortOrderChange: (sortOrder: SidebarProjectSortOrder) => void;
+  onRepositorySortOrderChange: (sortOrder: SidebarRepositorySortOrder) => void;
   onThreadSortOrderChange: (sortOrder: SidebarThreadSortOrder) => void;
   onProjectGroupingModeChange: (mode: SidebarProjectGroupingMode) => void;
   onThreadPreviewCountChange: (count: SidebarThreadPreviewCount) => void;
@@ -3753,25 +3771,49 @@ function ProjectSortMenu({
         <TooltipPopup side="right">Sidebar options</TooltipPopup>
       </Tooltip>
       <MenuPopup align="end" side="bottom" className="min-w-52">
-        <MenuGroup>
-          <div className="px-2 py-1 sm:text-xs font-medium text-muted-foreground">
-            Sort projects
-          </div>
-          <MenuRadioGroup
-            value={projectSortOrder}
-            onValueChange={(value) => {
-              onProjectSortOrderChange(value as SidebarProjectSortOrder);
-            }}
-          >
-            {(Object.entries(SIDEBAR_SORT_LABELS) as Array<[SidebarProjectSortOrder, string]>).map(
-              ([value, label]) => (
+        {repositorySortOrder === null ? (
+          <MenuGroup>
+            <div className="px-2 py-1 sm:text-xs font-medium text-muted-foreground">
+              Sort projects
+            </div>
+            <MenuRadioGroup
+              value={projectSortOrder}
+              onValueChange={(value) => {
+                onProjectSortOrderChange(value as SidebarProjectSortOrder);
+              }}
+            >
+              {(
+                Object.entries(SIDEBAR_SORT_LABELS) as Array<[SidebarProjectSortOrder, string]>
+              ).map(([value, label]) => (
                 <MenuRadioItem key={value} value={value} className="min-h-7 py-1 sm:text-xs">
                   {label}
                 </MenuRadioItem>
-              ),
-            )}
-          </MenuRadioGroup>
-        </MenuGroup>
+              ))}
+            </MenuRadioGroup>
+          </MenuGroup>
+        ) : (
+          <MenuGroup>
+            <div className="px-2 py-1 sm:text-xs font-medium text-muted-foreground">
+              Sort repositories
+            </div>
+            <MenuRadioGroup
+              value={repositorySortOrder}
+              onValueChange={(value) => {
+                onRepositorySortOrderChange(value as SidebarRepositorySortOrder);
+              }}
+            >
+              {(
+                Object.entries(SIDEBAR_REPOSITORY_SORT_LABELS) as Array<
+                  [SidebarRepositorySortOrder, string]
+                >
+              ).map(([value, label]) => (
+                <MenuRadioItem key={value} value={value} className="min-h-7 py-1 sm:text-xs">
+                  {label}
+                </MenuRadioItem>
+              ))}
+            </MenuRadioGroup>
+          </MenuGroup>
+        )}
         <MenuGroup>
           <div className="px-2 pt-2 pb-1 sm:text-xs font-medium text-muted-foreground">
             Sort threads
@@ -3890,9 +3932,13 @@ function SortableProjectItem({
         transform: CSS.Translate.toString(transform),
         transition,
       }}
-      className={`group/menu-item relative rounded-md ${
-        isDragging ? "z-20 opacity-80" : ""
-      } ${isOver && !isDragging ? "ring-1 ring-primary/40" : ""}`}
+      className={cn(
+        "group/menu-item relative p-1",
+        SIDEBAR_CARD_CLASS,
+        isDragging && "z-20 opacity-80",
+        isOver && !isDragging && "ring-1 ring-primary/40",
+      )}
+      data-sidebar-card="true"
       data-sidebar="menu-item"
       data-slot="sidebar-menu-item"
     >
@@ -4000,6 +4046,7 @@ interface SidebarProjectsContentProps {
   desktopUpdateButtonDisabled: boolean;
   handleDesktopUpdateButtonClick: () => void;
   projectSortOrder: SidebarProjectSortOrder;
+  repositorySortOrder: SidebarRepositorySortOrder;
   threadSortOrder: SidebarThreadSortOrder;
   projectGroupingMode: SidebarProjectGroupingMode;
   threadPreviewCount: SidebarThreadPreviewCount;
@@ -4057,6 +4104,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     desktopUpdateButtonDisabled,
     handleDesktopUpdateButtonClick,
     projectSortOrder,
+    repositorySortOrder,
     threadSortOrder,
     projectGroupingMode,
     threadPreviewCount,
@@ -4110,6 +4158,12 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     },
     [updateSettings],
   );
+  const handleRepositorySortOrderChange = useCallback(
+    (sortOrder: SidebarRepositorySortOrder) => {
+      updateSettings({ sidebarRepositorySortOrder: sortOrder });
+    },
+    [updateSettings],
+  );
   const handleThreadSortOrderChange = useCallback(
     (sortOrder: SidebarThreadSortOrder) => {
       updateSettings({ sidebarThreadSortOrder: sortOrder });
@@ -4130,7 +4184,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
   );
 
   return (
-    <SidebarContent className="gap-0">
+    <SidebarContent className="min-h-full gap-0">
       <SidebarGroup className="px-2 pt-2 pb-1">
         <SidebarMenu>
           <SidebarMenuItem>
@@ -4179,7 +4233,10 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
         </SidebarGroup>
       ) : null}
       <LocalSecondaryStatus />
-      <SidebarGroup className="px-2 py-2" data-testid="sidebar-projects-group">
+      <SidebarGroup
+        className="flex-1 bg-sidebar-well px-2 py-2"
+        data-testid="sidebar-projects-group"
+      >
         <div className="mb-1 flex items-center justify-between pl-2 pr-1.5">
           <span className="text-xs font-medium text-muted-foreground">
             {repositoriesView ? "Repositories · all environments" : "Projects"}
@@ -4187,33 +4244,32 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
           <div className="flex items-center gap-1">
             <ProjectSortMenu
               projectSortOrder={projectSortOrder}
+              repositorySortOrder={repositoriesView ? repositorySortOrder : null}
               threadSortOrder={threadSortOrder}
               projectGroupingMode={repositoriesView ? null : projectGroupingMode}
               threadPreviewCount={threadPreviewCount}
               onProjectSortOrderChange={handleProjectSortOrderChange}
+              onRepositorySortOrderChange={handleRepositorySortOrderChange}
               onThreadSortOrderChange={handleThreadSortOrderChange}
               onProjectGroupingModeChange={handleProjectGroupingModeChange}
               onThreadPreviewCountChange={handleThreadPreviewCountChange}
             />
-            {/* Adding a project needs a target environment, which this view does not pick. */}
-            {repositoriesView ? null : (
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <button
-                      type="button"
-                      aria-label={addProjectLabel}
-                      data-testid="sidebar-add-project-trigger"
-                      className="inline-flex h-6 min-w-6 cursor-pointer items-center justify-center rounded-md px-[calc(--spacing(1)-1px)] text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
-                      onClick={openAddProject}
-                    />
-                  }
-                >
-                  <FolderPlusIcon className="size-3.5" />
-                </TooltipTrigger>
-                <TooltipPopup side="right">{addProjectLabel}</TooltipPopup>
-              </Tooltip>
-            )}
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-label={addProjectLabel}
+                    data-testid="sidebar-add-project-trigger"
+                    className="inline-flex h-6 min-w-6 cursor-pointer items-center justify-center rounded-md px-[calc(--spacing(1)-1px)] text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
+                    onClick={openAddProject}
+                  />
+                }
+              >
+                <FolderPlusIcon className="size-3.5" />
+              </TooltipTrigger>
+              <TooltipPopup side="right">{addProjectLabel}</TooltipPopup>
+            </Tooltip>
           </div>
         </div>
 
@@ -4336,7 +4392,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
         )}
 
         {repositoriesView && projectAvailability.kind === "empty-confirmed" ? (
-          <RepositoriesViewEmptyState />
+          <RepositoriesViewEmptyState onAddProject={openAddProject} />
         ) : (
           <SidebarProjectAvailability
             view={projectAvailability}
@@ -4356,15 +4412,14 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
   );
 });
 
-/** Adding a project needs a target environment, which only the Environments view picks. */
-function RepositoriesViewEmptyState() {
-  const setSidebarView = useUiStateStore((store) => store.setSidebarView);
+/** The add-project dialog asks for the environment, so this view can start it directly. */
+function RepositoriesViewEmptyState({ onAddProject }: { onAddProject: () => void }) {
   return (
     <div className="px-2 pt-4 text-center text-xs text-muted-foreground">
-      <div>No projects yet. Switch to Environments to add one.</div>
+      <div>No projects yet.</div>
       <div className="mt-2 flex justify-center">
-        <Button size="xs" variant="ghost" onClick={() => setSidebarView("environments")}>
-          Show Environments
+        <Button size="xs" variant="outline" onClick={onAddProject}>
+          Add project
         </Button>
       </div>
     </div>
@@ -4397,6 +4452,9 @@ export default function Sidebar() {
       }),
     [activeEnvironmentId, environments],
   );
+  const sidebarView = useUiStateStore((store) => store.sidebarView);
+  const repositoriesView = sidebarView === "repositories";
+  // The Repositories view hides the rail, so naming its selection would point at nothing.
   const addProjectLabel = useMemo(() => {
     const remoteLabel = resolveAddProjectTargetLabel({
       activeEnvironmentId,
@@ -4408,10 +4466,10 @@ export default function Sidebar() {
           isDesktopLocalConnectionTarget(environment.entry.target),
       })),
     });
-    return remoteLabel === null ? "Add project" : `Add project on ${remoteLabel}`;
-  }, [activeEnvironmentId, environments]);
-  const sidebarView = useUiStateStore((store) => store.sidebarView);
-  const repositoriesView = sidebarView === "repositories";
+    return remoteLabel === null || repositoriesView
+      ? "Add project"
+      : `Add project on ${remoteLabel}`;
+  }, [activeEnvironmentId, environments, repositoriesView]);
   // The Repositories view lists every environment; the rail filter applies only to Environments.
   const projects = useMemo(
     () =>
@@ -4444,6 +4502,13 @@ export default function Sidebar() {
   const isOnSettings = pathname.startsWith("/settings");
   const sidebarThreadSortOrder = useClientSettings((s) => s.sidebarThreadSortOrder);
   const sidebarProjectSortOrder = useClientSettings((s) => s.sidebarProjectSortOrder);
+  const sidebarRepositorySortOrder = useClientSettings((s) => s.sidebarRepositorySortOrder);
+  // Repository groups take the order of their projects, so timestamp orders sort projects by it.
+  const effectiveProjectSortOrder: SidebarProjectSortOrder = repositoriesView
+    ? sidebarRepositorySortOrder === "name"
+      ? "updated_at"
+      : sidebarRepositorySortOrder
+    : sidebarProjectSortOrder;
   const sidebarProjectGroupingMode = useClientSettings((s) => s.sidebarProjectGroupingMode);
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
   // One project node per environment checkout; repositories are grouped at render time.
@@ -4878,13 +4943,13 @@ export default function Sidebar() {
     return sortProjectsForSidebar(
       sortableProjects,
       sortableThreads,
-      sidebarProjectSortOrder,
+      effectiveProjectSortOrder,
     ).flatMap((project) => {
       const resolvedProject = sidebarProjectByKey.get(project.id);
       return resolvedProject ? [resolvedProject] : [];
     });
   }, [
-    sidebarProjectSortOrder,
+    effectiveProjectSortOrder,
     physicalToLogicalKey,
     projectPhysicalKeyByScopedRef,
     sidebarProjectByKey,
@@ -4920,9 +4985,10 @@ export default function Sidebar() {
         ? groupProjectsByRepository({
             projects: sortedProjects,
             environments: environmentCardIdentities,
+            sortOrder: sidebarRepositorySortOrder,
           })
         : null,
-    [environmentCardIdentities, repositoriesView, sortedProjects],
+    [environmentCardIdentities, repositoriesView, sidebarRepositorySortOrder, sortedProjects],
   );
   // Projects in the order they appear on screen, so jump labels follow the current view.
   const visibleProjectsInOrder = useMemo(
@@ -5226,6 +5292,7 @@ export default function Sidebar() {
             desktopUpdateButtonDisabled={desktopUpdateButtonDisabled}
             handleDesktopUpdateButtonClick={handleDesktopUpdateButtonClick}
             projectSortOrder={sidebarProjectSortOrder}
+            repositorySortOrder={sidebarRepositorySortOrder}
             threadSortOrder={sidebarThreadSortOrder}
             projectGroupingMode={sidebarProjectGroupingMode}
             threadPreviewCount={sidebarThreadPreviewCount}

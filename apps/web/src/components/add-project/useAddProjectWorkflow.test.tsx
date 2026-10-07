@@ -792,6 +792,30 @@ describe("useAddProjectWorkflowState", () => {
     );
   });
 
+  it("browses a new project's parent on the selected server and creates beneath it", async () => {
+    const view = await mountWorkflow({ open: true });
+    act(() => view.current.selectHost(ENV_REMOTE));
+    act(() => view.current.openCreate());
+    act(() => view.current.setCreateName("demo"));
+    act(() => view.current.setCreateParent("/srv/existing"));
+    await act(async () => view.current.pickCreateParent());
+
+    expect(view.current.step).toBe("create-parent-browse");
+    expect(view.current.selectedHost.environmentId).toBe(ENV_REMOTE);
+    expect(testState.pickFolder).not.toHaveBeenCalled();
+
+    await act(async () => view.current.selectBrowsedFolder("/srv/chosen"));
+    expect(view.current.step).toBe("create");
+    expect(view.current.createName).toBe("demo");
+    expect(view.current.createParent).toBe("/srv/chosen");
+    expect(testState.operations.addFolder).not.toHaveBeenCalled();
+
+    await act(async () => view.current.pickCreateParent());
+    act(() => view.current.back());
+    expect(view.current.step).toBe("create");
+    expect(view.current.createParent).toBe("/srv/chosen");
+  });
+
   it("returns from parent browsing to the clone form without changing its input", async () => {
     const view = await mountWorkflow({ open: true });
     act(() => view.current.selectHost(ENV_REMOTE));
