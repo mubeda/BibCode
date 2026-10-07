@@ -8,6 +8,123 @@ BeforeAll {
     return 'other'
   }
 
+
+  $script:GpgPrivateEvidenceRealContext=$false
+  $script:GpgPrivateEvidenceAttempted=$false
+  function Initialize-GpgPrivateEvidenceSdk {
+    if('OwnedGpgEvidenceV1' -as [type]){return}
+    Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Security.Cryptography;
+public static class OwnedGpgEvidenceV1 {
+  public static byte[][] Seal(string publicSpki, string fingerprint, string stderr, byte[] context) {
+    byte[] plaintext = null;
+    byte[] key = null;
+    try {
+      if (publicSpki == null || publicSpki.Length == 0 || publicSpki.Length > 2048 || publicSpki.Length % 4 != 0 ||
+          !Regex.IsMatch(publicSpki, @"\A[A-Za-z0-9+/]+={0,2}\z") ||
+          fingerprint == null || !Regex.IsMatch(fingerprint, @"\A[a-f0-9]{64}\z")) throw new InvalidOperationException("Evidence omitted.");
+      int padding = publicSpki.EndsWith("==", StringComparison.Ordinal) ? 2 : publicSpki.EndsWith("=", StringComparison.Ordinal) ? 1 : 0;
+      int decodedLength = publicSpki.Length / 4 * 3 - padding;
+      if (decodedLength < 1 || decodedLength > 1024 || context == null || context.Length == 0 || context.Length > 4096) throw new InvalidOperationException("Evidence omitted.");
+      UTF8Encoding utf8 = new UTF8Encoding(false, true);
+      int length = utf8.GetByteCount(stderr);
+      if (length < 1 || length > 1048576) throw new InvalidOperationException("Evidence omitted.");
+      byte[] der = Convert.FromBase64String(publicSpki);
+      if (Convert.ToBase64String(der) != publicSpki || der.Length != decodedLength ||
+          Convert.ToHexString(SHA256.HashData(der)).ToLowerInvariant() != fingerprint) throw new InvalidOperationException("Evidence omitted.");
+      using (RSA rsa = RSA.Create()) {
+        int consumed;
+        rsa.ImportSubjectPublicKeyInfo(der, out consumed);
+        RSAParameters parameters = rsa.ExportParameters(false);
+        if (consumed != der.Length || rsa.KeySize != 3072 || parameters.Modulus == null || parameters.Modulus.Length != 384 ||
+            parameters.Exponent == null || parameters.Exponent.Length != 3 || parameters.Exponent[0] != 1 || parameters.Exponent[1] != 0 || parameters.Exponent[2] != 1) throw new InvalidOperationException("Evidence omitted.");
+        plaintext = utf8.GetBytes(stderr);
+        key = RandomNumberGenerator.GetBytes(32);
+        byte[] nonce = RandomNumberGenerator.GetBytes(12);
+        byte[] ciphertext = new byte[length];
+        byte[] tag = new byte[16];
+        using (AesGcm aes = new AesGcm(key, 16)) { aes.Encrypt(nonce, plaintext, ciphertext, tag, context); }
+        byte[] wrapped = rsa.Encrypt(key, RSAEncryptionPadding.OaepSHA256);
+        if (wrapped.Length != 384) throw new InvalidOperationException("Evidence omitted.");
+        return new byte[][] { context, ciphertext, wrapped, nonce, tag };
+      }
+    } finally {
+      if (plaintext != null) CryptographicOperations.ZeroMemory(plaintext);
+      if (key != null) CryptographicOperations.ZeroMemory(key);
+    }
+  }
+  public static void Publish(string root, byte[][] parts) {
+    if (parts == null || parts.Length != 5 || parts[0].Length < 1 || parts[0].Length > 4096 || parts[1].Length < 1 || parts[1].Length > 1048576 || parts[2].Length != 384 || parts[3].Length != 12 || parts[4].Length != 16) throw new InvalidOperationException("Evidence omitted.");
+    DirectoryInfo directory = new DirectoryInfo(root);
+    for (DirectoryInfo current = directory; current != null; current = current.Parent) {
+      if (!current.Exists || (current.Attributes & FileAttributes.ReparsePoint) != 0) throw new InvalidOperationException("Evidence omitted.");
+    }
+    if (directory.GetFileSystemInfos().Length != 0) throw new InvalidOperationException("Evidence omitted.");
+    string pending = Path.Combine(root, "pending");
+    string ready = Path.Combine(root, "ready");
+    if (Directory.Exists(pending) || File.Exists(pending) || Directory.Exists(ready) || File.Exists(ready)) throw new InvalidOperationException("Evidence omitted.");
+    Directory.CreateDirectory(pending);
+    string[] names = { "context.json", "stderr.aesgcm.bin", "key.rsa-oaep-sha256.bin", "nonce.bin", "tag.bin" };
+    for (int index = 0; index < names.Length; index++) {
+      using (FileStream file = new FileStream(Path.Combine(pending, names[index]), FileMode.CreateNew, FileAccess.Write, FileShare.None)) {
+        file.Write(parts[index], 0, parts[index].Length);
+        file.Flush(true);
+      }
+    }
+    if ((new DirectoryInfo(root).Attributes & FileAttributes.ReparsePoint) != 0 || (new DirectoryInfo(pending).Attributes & FileAttributes.ReparsePoint) != 0) throw new InvalidOperationException("Evidence omitted.");
+    Directory.Move(pending, ready);
+  }
+  public static string OpenInert(RSA testKey, byte[][] parts) {
+    byte[] key = null;
+    byte[] plaintext = null;
+    try {
+      key = testKey.Decrypt(parts[2], RSAEncryptionPadding.OaepSHA256);
+      if (key.Length != 32 || parts[3].Length != 12 || parts[4].Length != 16) throw new InvalidOperationException("Inert evidence refused.");
+      plaintext = new byte[parts[1].Length];
+      using (AesGcm aes = new AesGcm(key, 16)) { aes.Decrypt(parts[3], parts[1], parts[4], plaintext, parts[0]); }
+      return new UTF8Encoding(false, true).GetString(plaintext);
+    } finally {
+      if (key != null) CryptographicOperations.ZeroMemory(key);
+      if (plaintext != null) CryptographicOperations.ZeroMemory(plaintext);
+    }
+  }
+}
+'@ | Out-Null
+  }
+  function Get-GpgPrivateEvidenceAdmission([hashtable]$Environment,[bool]$Windows) {
+    if(-not $Windows -or $Environment.CI -cne 'true' -or $Environment.GITHUB_ACTIONS -cne 'true' -or $Environment.GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $Environment.GITHUB_JOB -cne 'windows_wsl_upgrade_smoke' -or $Environment.BIBCODE_GPG_EVIDENCE_SELECTED -cne 'true' -or $Environment.BIBCODE_GPG_EVIDENCE_ROOT_READY -cne 'true'){return $null}
+    $public=$Environment.BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI;$fingerprint=$Environment.BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256
+    if($public -isnot [string] -or $public.Length -lt 1 -or $public.Length -gt 2048 -or $public.Length % 4 -ne 0 -or $public -cnotmatch '\A[A-Za-z0-9+/]+={0,2}\z' -or $fingerprint -cnotmatch '\A[a-f0-9]{64}\z' -or $Environment.GITHUB_SHA -cnotmatch '\A[a-f0-9]{40}\z'){return $null}
+    $run=0L;$attempt=0L
+    if(-not [long]::TryParse($Environment.GITHUB_RUN_ID,[ref]$run) -or $run -lt 1 -or $run -gt 9007199254740991 -or -not [long]::TryParse($Environment.GITHUB_RUN_ATTEMPT,[ref]$attempt) -or $attempt -lt 1 -or $attempt -gt 9007199254740991){return $null}
+    return [pscustomobject]@{publicSpki=$public;context=[ordered]@{version=1;scope='wsl-real-gpg-import';alg='RSA-OAEP-SHA256';enc='AES-256-GCM';source=$Environment.GITHUB_SHA;run=$run;attempt=$attempt;jobRole='windows-native';fingerprint=$fingerprint}}
+  }
+  function New-GpgPrivateSealedParts($Admission,[string]$Stderr) {
+    Initialize-GpgPrivateEvidenceSdk
+    $context=[Text.UTF8Encoding]::new($false,$true).GetBytes(($Admission.context|ConvertTo-Json -Compress))
+    return ,([OwnedGpgEvidenceV1]::Seal($Admission.publicSpki,$Admission.context.fingerprint,$Stderr,$context))
+  }
+  function Publish-GpgPrivateSealedParts([string]$Root,[byte[][]]$Parts) { [OwnedGpgEvidenceV1]::Publish($Root,$Parts) }
+  function Save-GpgPrivateEvidence([string]$Stderr) {
+    try {
+      if($script:GpgPrivateEvidenceRealContext -ne $true -or $script:GpgPrivateEvidenceAttempted -eq $true){return 'omitted'}
+      $script:GpgPrivateEvidenceAttempted=$true
+      $facts=@{};foreach($name in @('CI','GITHUB_ACTIONS','GITHUB_EVENT_NAME','GITHUB_JOB','GITHUB_SHA','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','BIBCODE_GPG_EVIDENCE_SELECTED','BIBCODE_GPG_EVIDENCE_ROOT_READY','BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI','BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256')){$facts[$name]=[Environment]::GetEnvironmentVariable($name)}
+      $admission=Get-GpgPrivateEvidenceAdmission $facts ([OperatingSystem]::IsWindows())
+      if($null -eq $admission){return 'omitted'}
+      $root=Join-Path $env:RUNNER_TEMP 'bibcode-gpg-private-evidence'
+      $pin=Get-PhysicalPin $root;Assert-OwnerAcl $root
+      $parts=New-GpgPrivateSealedParts $admission $Stderr
+      Assert-PhysicalPin $pin;Assert-OwnerAcl $root
+      Publish-GpgPrivateSealedParts $root $parts
+      return 'completed'
+    } catch { return 'omitted' }
+  }
+
   function Get-PinnedGpgInputError([string]$Stderr,[string]$ExpectedInput) {
     $result=[pscustomobject]@{errno='other';expectedInputMatched=$false}
     $lines=[regex]::Matches($Stderr,'(?m)^gpg: (?:can''t open|error reading) ''([^\r\n]+)'': ([^\r\n]+)\r?$')
@@ -285,13 +402,14 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
     $taskGpgHome=Join-Path $root 'gnupg';New-Item -ItemType Directory -Path $taskGpgHome|Out-Null;Set-OwnerAcl $taskGpgHome
     $savedManifest=$OwnerManifest
     $savedContext=@{}
-    foreach($contextName in @('Action','OwnedWslPrepareStage','OwnedWslSignedMetadata')) {
+    foreach($contextName in @('Action','OwnedWslPrepareStage','OwnedWslSignedMetadata','GpgPrivateEvidenceRealContext','GpgPrivateEvidenceAttempted')) {
       $previous=Get-Variable -Name $contextName -Scope Script -ErrorAction SilentlyContinue
       $savedContext[$contextName]=@{exists=$null -ne $previous;value=if($null -ne $previous){$previous.Value}else{$null}}
     }
     try {
       $Action='Prepare'
       $script:Action='Prepare';$script:OwnedWslPrepareStage='signed-metadata'
+      $script:GpgPrivateEvidenceRealContext=$true;$script:GpgPrivateEvidenceAttempted=$false
       $script:OwnedWslSignedMetadata=[ordered]@{operation='gpg-import';commandExit=$null}
       $OwnerManifest=Join-Path $root 'owner.secret.json'
       $gpg=Join-Path $env:ProgramFiles 'Git/usr/bin/gpg.exe';$gpgPin=Get-PhysicalPin $gpg
@@ -321,6 +439,7 @@ Describe 'Owned WSL2 real authenticated metadata verifier (CI only)' {
               $inputError=Get-PinnedGpgInputError $command.stderr $ExpectedInput
               $failureMessage+='; errno='+$inputError.errno+'; expectedInputMatched='+$inputError.expectedInputMatched
             }
+            if($Operation -ceq 'gpg-import' -and $script:GpgPrivateEvidenceRealContext -eq $true){try {[void](Save-GpgPrivateEvidence $command.stderr)}catch { }}
             throw $failureMessage
           }
           throw $originalFailure
@@ -435,6 +554,201 @@ Describe 'Owned WSL2 complete GPG input error projection (inert)' {
     } finally {
       if($null -ne $previousMetadata){$script:OwnedWslSignedMetadata=$previousMetadataValue}
       else{Remove-Variable -Name OwnedWslSignedMetadata -Scope Script -ErrorAction SilentlyContinue}
+    }
+  }
+}
+
+
+Describe 'Owned WSL2 optional private GPG evidence (inert)' {
+  BeforeAll {
+    $script:InertGpgEnvironment=@{CI='true';GITHUB_ACTIONS='true';GITHUB_EVENT_NAME='workflow_dispatch';GITHUB_JOB='windows_wsl_upgrade_smoke';GITHUB_SHA=('1'*40);GITHUB_RUN_ID='1';GITHUB_RUN_ATTEMPT='1';BIBCODE_GPG_EVIDENCE_SELECTED='true';BIBCODE_GPG_EVIDENCE_ROOT_READY='true';BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI='AAAA';BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256=('0'*64)}
+  }
+  It 'omits evidence for inadmissible <Field>' -TestCases @(
+    @{Field='GITHUB_EVENT_NAME';Value='workflow_call'},@{Field='GITHUB_EVENT_NAME';Value='pull_request'},@{Field='GITHUB_JOB';Value='other'},@{Field='BIBCODE_GPG_EVIDENCE_SELECTED';Value='false'},@{Field='BIBCODE_GPG_EVIDENCE_ROOT_READY';Value='false'},@{Field='CI';Value='false'},@{Field='GITHUB_ACTIONS';Value='false'},@{Field='GITHUB_SHA';Value='invalid'},@{Field='GITHUB_RUN_ID';Value='0'},@{Field='GITHUB_RUN_ATTEMPT';Value='-1'},@{Field='BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI';Value=''},@{Field='BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI';Value=('A'*2052)},@{Field='BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256';Value=''},@{Field='BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256';Value=('A'*64)}
+  ) {
+    param($Field,$Value)
+    $facts=$script:InertGpgEnvironment.Clone();$facts[$Field]=$Value
+    Get-GpgPrivateEvidenceAdmission $facts $true|Should -BeNullOrEmpty
+  }
+  It 'omits evidence outside Windows and returns exact public context on admission' {
+    Get-GpgPrivateEvidenceAdmission $script:InertGpgEnvironment $false|Should -BeNullOrEmpty
+    $admission=Get-GpgPrivateEvidenceAdmission $script:InertGpgEnvironment $true
+    @($admission.context.Keys|Sort-Object)|Should -Be @('alg','attempt','enc','fingerprint','jobRole','run','scope','source','version')
+    $admission.context.run|Should -Be 1;$admission.context.attempt|Should -Be 1
+    $admission.context.scope|Should -BeExactly 'wsl-real-gpg-import';$admission.context.jobRole|Should -BeExactly 'windows-native'
+  }
+  It 'roundtrips SDK dummy bytes and rejects modified <Part>' -TestCases @(@{Part=-1},@{Part=0},@{Part=1},@{Part=2},@{Part=3},@{Part=4}) {
+    param($Part)
+    Initialize-GpgPrivateEvidenceSdk
+    $testKey=[Security.Cryptography.RSA]::Create(3072)
+    try {
+      $der=$testKey.ExportSubjectPublicKeyInfo();$public=[Convert]::ToBase64String($der);$fingerprint=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($der)).ToLowerInvariant()
+      $context=[Text.Encoding]::UTF8.GetBytes('{"version":1,"scope":"inert"}')
+      $parts=[OwnedGpgEvidenceV1]::Seal($public,$fingerprint,'inert-error',$context)
+      [OwnedGpgEvidenceV1]::OpenInert($testKey,$parts)|Should -BeExactly 'inert-error'
+      if($Part -ge 0){$parts[$Part][0]=$parts[$Part][0] -bxor 1;{[OwnedGpgEvidenceV1]::OpenInert($testKey,$parts)}|Should -Throw}
+      else {
+        $otherKey=[Security.Cryptography.RSA]::Create(3072)
+        try {{[OwnedGpgEvidenceV1]::OpenInert($otherKey,$parts)}|Should -Throw}finally{$otherKey.Dispose()}
+      }
+    } finally {$testKey.Dispose()}
+  }
+  It 'rejects empty/oversize/mismatched input and wrong RSA size' {
+    Initialize-GpgPrivateEvidenceSdk
+    $testKey=[Security.Cryptography.RSA]::Create(3072);$smallKey=[Security.Cryptography.RSA]::Create(2048)
+    try {
+      $der=$testKey.ExportSubjectPublicKeyInfo();$public=[Convert]::ToBase64String($der);$fingerprint=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($der)).ToLowerInvariant();$aad=[Text.Encoding]::UTF8.GetBytes('{}')
+      {[OwnedGpgEvidenceV1]::Seal($public,$fingerprint,'',$aad)}|Should -Throw
+      {[OwnedGpgEvidenceV1]::Seal($public,$fingerprint,('x'*1048577),$aad)}|Should -Throw
+      {[OwnedGpgEvidenceV1]::Seal($public,('0'*64),'inert',$aad)}|Should -Throw
+      $smallDer=$smallKey.ExportSubjectPublicKeyInfo();$smallPublic=[Convert]::ToBase64String($smallDer);$smallFingerprint=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($smallDer)).ToLowerInvariant()
+      {[OwnedGpgEvidenceV1]::Seal($smallPublic,$smallFingerprint,'inert',$aad)}|Should -Throw
+      $trailing=[byte[]]::new($der.Length+1);[Array]::Copy($der,$trailing,$der.Length);$trailingPublic=[Convert]::ToBase64String($trailing);$trailingFingerprint=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($trailing)).ToLowerInvariant()
+      {[OwnedGpgEvidenceV1]::Seal($trailingPublic,$trailingFingerprint,'inert',$aad)}|Should -Throw
+    } finally {$testKey.Dispose();$smallKey.Dispose()}
+  }
+  It 'publishes only a complete five-file set and refuses collisions' {
+    Initialize-GpgPrivateEvidenceSdk
+    $root=Join-Path $TestDrive 'inert-seal';New-Item -ItemType Directory -Path $root|Out-Null
+    $parts=[byte[][]]@([byte[]]@(1),[byte[]]@(2),[byte[]]::new(384),[byte[]]::new(12),[byte[]]::new(16))
+    [OwnedGpgEvidenceV1]::Publish($root,$parts)
+    @(Get-ChildItem -LiteralPath (Join-Path $root 'ready') -File|ForEach-Object {$_.Name}|Sort-Object)|Should -Be @('context.json','key.rsa-oaep-sha256.bin','nonce.bin','stderr.aesgcm.bin','tag.bin')
+    Test-Path -LiteralPath (Join-Path $root 'pending')|Should -BeFalse
+    {[OwnedGpgEvidenceV1]::Publish($root,$parts)}|Should -Throw
+    $bad=Join-Path $TestDrive 'inert-incomplete';New-Item -ItemType Directory -Path $bad|Out-Null
+    {[OwnedGpgEvidenceV1]::Publish($bad,([byte[][]]@([byte[]]@(1))))}|Should -Throw
+    Test-Path -LiteralPath (Join-Path $bad 'ready')|Should -BeFalse
+  }
+  It 'runs the actual failing wrapper while optional sink <Fault> preserves the original fixed failure' -TestCases @(@{Fault='encrypt'},@{Fault='wrap'},@{Fault='write'}) {
+    param($Fault)
+    $testsSource=Get-Content -LiteralPath "$PSScriptRoot/owned-wsl2-fixture.Tests.ps1" -Raw
+    $start=$testsSource.IndexOf('function Invoke-PinnedMetadataCommand(',[StringComparison]::Ordinal)
+    $end=$testsSource.IndexOf("`n      Invoke-PinnedMetadataCommand 'gpg-import'",$start,[StringComparison]::Ordinal)
+    if($start -lt 0 -or $end -le $start){throw 'Actual private-evidence caller unavailable.'}
+    $root=Join-Path $TestDrive ('inert-wrapper-'+$Fault);New-Item -ItemType Directory -Path $root|Out-Null
+    $gpg='inert-gpg';$expectedInput=Join-Path $root 'key.asc'
+    $savedMetadata=$script:OwnedWslSignedMetadata;$savedReal=$script:GpgPrivateEvidenceRealContext
+    try {
+      $script:GpgPrivateEvidenceRealContext=$true;$script:OwnedWslSignedMetadata=[ordered]@{commandExit=2}
+      function Invoke-FixtureCommand([string]$Exe,[string[]]$Arguments) {
+        [IO.File]::WriteAllText((Join-Path $root 'command-inert.private.json'),([ordered]@{stdout='';stderr="gpg: can't open '"+$expectedInput+"': Permission denied";exitCode=2}|ConvertTo-Json -Compress));throw 'Inert existing refusal.'
+      }
+      function Save-GpgPrivateEvidence([string]$Stderr) {throw ('Inert '+$Fault+' refusal.')}
+      $caught=$null
+      try {& ([scriptblock]::Create($testsSource.Substring($start,$end-$start)+"`nInvoke-PinnedMetadataCommand 'gpg-import' @('--import',`$expectedInput) `$expectedInput"))}catch{$caught=$_}
+      $caught.Exception.Message|Should -BeExactly 'Pinned GPG gpg-import refused; commandReceiptPresent=true; commandExit=2; stdoutPresent=False; stderrPresent=True; category=input-open-read; errno=permission-denied; expectedInputMatched=True'
+      @(Get-ChildItem -LiteralPath $root -File).Count|Should -Be 1
+    } finally {$script:OwnedWslSignedMetadata=$savedMetadata;$script:GpgPrivateEvidenceRealContext=$savedReal}
+  }
+  It 'keeps inert/success calls outside the operational sink and latches omission' {
+    $savedReal=$script:GpgPrivateEvidenceRealContext;$savedAttempted=$script:GpgPrivateEvidenceAttempted
+    try {
+      $script:GpgPrivateEvidenceRealContext=$false;$script:GpgPrivateEvidenceAttempted=$false
+      Save-GpgPrivateEvidence 'inert'|Should -BeExactly 'omitted'
+      $script:GpgPrivateEvidenceAttempted|Should -BeFalse
+      $script:GpgPrivateEvidenceRealContext=$true;$script:GpgPrivateEvidenceAttempted=$true
+      Save-GpgPrivateEvidence 'inert'|Should -BeExactly 'omitted'
+    } finally {$script:GpgPrivateEvidenceRealContext=$savedReal;$script:GpgPrivateEvidenceAttempted=$savedAttempted}
+  }
+}
+
+
+Describe 'Owned WSL2 complete private evidence sink (inert)' {
+  It 'executes actual environment admission, SDK seal and owned atomic publish' {
+    Initialize-GpgPrivateEvidenceSdk
+    $testKey=[Security.Cryptography.RSA]::Create(3072)
+    $names=@('RUNNER_TEMP','CI','GITHUB_ACTIONS','GITHUB_EVENT_NAME','GITHUB_JOB','GITHUB_SHA','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','BIBCODE_GPG_EVIDENCE_SELECTED','BIBCODE_GPG_EVIDENCE_ROOT_READY','BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI','BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256')
+    $saved=@{};foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name)}
+    $savedReal=$script:GpgPrivateEvidenceRealContext;$savedAttempted=$script:GpgPrivateEvidenceAttempted
+    try {
+      $temp=Join-Path $TestDrive 'inert-actual-sink';New-Item -ItemType Directory -Path $temp|Out-Null
+      $root=Join-Path $temp 'bibcode-gpg-private-evidence';New-Item -ItemType Directory -Path $root|Out-Null;Set-OwnerAcl $root
+      $der=$testKey.ExportSubjectPublicKeyInfo()
+      $facts=@{RUNNER_TEMP=$temp;CI='true';GITHUB_ACTIONS='true';GITHUB_EVENT_NAME='workflow_dispatch';GITHUB_JOB='windows_wsl_upgrade_smoke';GITHUB_SHA=('1'*40);GITHUB_RUN_ID='1';GITHUB_RUN_ATTEMPT='1';BIBCODE_GPG_EVIDENCE_SELECTED='true';BIBCODE_GPG_EVIDENCE_ROOT_READY='true';BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI=[Convert]::ToBase64String($der);BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($der)).ToLowerInvariant()}
+      foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$facts[$name])}
+      $script:GpgPrivateEvidenceRealContext=$true;$script:GpgPrivateEvidenceAttempted=$false
+      Save-GpgPrivateEvidence 'inert-error'|Should -BeExactly 'completed'
+      $ready=Join-Path $root 'ready';$parts=[byte[][]]::new(5);$filenames=@('context.json','stderr.aesgcm.bin','key.rsa-oaep-sha256.bin','nonce.bin','tag.bin')
+      for($index=0;$index -lt 5;$index++){$parts[$index]=[IO.File]::ReadAllBytes((Join-Path $ready $filenames[$index]))}
+      [OwnedGpgEvidenceV1]::OpenInert($testKey,$parts)|Should -BeExactly 'inert-error'
+      $context=[Text.Encoding]::UTF8.GetString($parts[0])|ConvertFrom-Json
+      @($context.PSObject.Properties.Name|Sort-Object)|Should -Be @('alg','attempt','enc','fingerprint','jobRole','run','scope','source','version')
+      $context.source|Should -BeExactly ('1'*40);$context.run|Should -Be 1;$context.attempt|Should -Be 1;$context.jobRole|Should -BeExactly 'windows-native'
+      Save-GpgPrivateEvidence 'inert-retry'|Should -BeExactly 'omitted'
+      @(Get-ChildItem -LiteralPath $ready -File).Count|Should -Be 5
+      Assert-OwnerAcl $root
+    } finally {
+      foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$saved[$name])}
+      $script:GpgPrivateEvidenceRealContext=$savedReal;$script:GpgPrivateEvidenceAttempted=$savedAttempted;$testKey.Dispose()
+    }
+  }
+  It 'omits an actual SDK refusal without output or a publishable set' {
+    $savedReal=$script:GpgPrivateEvidenceRealContext;$savedAttempted=$script:GpgPrivateEvidenceAttempted
+    $admission=[pscustomobject]@{publicSpki='AAAA';context=[ordered]@{fingerprint=('0'*64)}}
+    Mock Get-GpgPrivateEvidenceAdmission {$admission}
+    Mock Get-PhysicalPin {@{identity='inert';path='inert'}}
+    Mock Assert-OwnerAcl {}
+    Mock Assert-PhysicalPin {}
+    try {
+      $script:GpgPrivateEvidenceRealContext=$true;$script:GpgPrivateEvidenceAttempted=$false
+      $output=@(Save-GpgPrivateEvidence 'inert-private-error')
+      $output|Should -Be @('omitted')
+      $script:GpgPrivateEvidenceAttempted|Should -BeTrue
+    } finally {$script:GpgPrivateEvidenceRealContext=$savedReal;$script:GpgPrivateEvidenceAttempted=$savedAttempted}
+  }
+  It 'runs the actual workflow reservation body before Pester with inert temp ownership' {
+    $source=(Get-Content -LiteralPath "$PSScriptRoot/../.github/workflows/desktop-upgrade-smoke.yml" -Raw).Replace("`r`n","`n")
+    $begin=$source.IndexOf('      - id: gpg_private_root',[StringComparison]::Ordinal)
+    $finish=$source.IndexOf('      - id: native_wsl',$begin,[StringComparison]::Ordinal)
+    if($begin -lt 0 -or $finish -le $begin){throw 'Actual private reservation unavailable.'}
+    $block=$source.Substring($begin,$finish-$begin);$run=$block.IndexOf("        run: |`n",[StringComparison]::Ordinal)
+    if($run -lt 0){throw 'Actual private reservation body unavailable.'}
+    $body=($block.Substring($run+15) -split "`n"|ForEach-Object {if($_.StartsWith('          ')){ $_.Substring(10) }elseif($_.Trim().Length -gt 0){throw 'Reservation source indentation refused.'}}) -join "`n"
+    $savedTemp=$env:RUNNER_TEMP;$savedOutput=$env:GITHUB_OUTPUT
+    try {
+      $temp=Join-Path $TestDrive 'inert-reservation';New-Item -ItemType Directory -Path $temp|Out-Null
+      $output=Join-Path $TestDrive 'inert-reservation-output';[IO.File]::WriteAllText($output,'')
+      $env:RUNNER_TEMP=$temp;$env:GITHUB_OUTPUT=$output
+      & ([scriptblock]::Create($body))
+      [IO.File]::ReadAllText($output).Trim()|Should -BeExactly 'ready=true'
+      $root=Join-Path $temp 'bibcode-gpg-private-evidence';Assert-OwnerAcl $root
+      [IO.File]::WriteAllText($output,'');& ([scriptblock]::Create($body))
+      [IO.File]::ReadAllText($output).Trim()|Should -BeExactly 'ready=false'
+      @(Get-ChildItem -LiteralPath $root -Force).Count|Should -Be 0
+    } finally {$env:RUNNER_TEMP=$savedTemp;$env:GITHUB_OUTPUT=$savedOutput}
+  }
+}
+
+
+Describe 'Owned WSL2 inactive operational evidence capability (inert)' {
+  It 'preserves the actual failed wrapper with valid-looking public-key environment and inactive capability' {
+    $testsSource=Get-Content -LiteralPath "$PSScriptRoot/owned-wsl2-fixture.Tests.ps1" -Raw
+    $start=$testsSource.IndexOf('function Invoke-PinnedMetadataCommand(',[StringComparison]::Ordinal)
+    $end=$testsSource.IndexOf("`n      Invoke-PinnedMetadataCommand 'gpg-import'",$start,[StringComparison]::Ordinal)
+    if($start -lt 0 -or $end -le $start){throw 'Actual inactive-capability caller unavailable.'}
+    $testKey=[Security.Cryptography.RSA]::Create(3072)
+    $names=@('RUNNER_TEMP','CI','GITHUB_ACTIONS','GITHUB_EVENT_NAME','GITHUB_JOB','GITHUB_SHA','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','BIBCODE_GPG_EVIDENCE_SELECTED','BIBCODE_GPG_EVIDENCE_ROOT_READY','BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI','BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256')
+    $saved=@{};foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name)}
+    $savedReal=$script:GpgPrivateEvidenceRealContext;$savedAttempted=$script:GpgPrivateEvidenceAttempted;$savedMetadata=$script:OwnedWslSignedMetadata
+    try {
+      $root=Join-Path $TestDrive 'inert-inactive-wrapper';New-Item -ItemType Directory -Path $root|Out-Null
+      $gpg='inert-gpg';$expectedInput=Join-Path $root 'key.asc';$der=$testKey.ExportSubjectPublicKeyInfo()
+      $facts=@{RUNNER_TEMP=$root;CI='true';GITHUB_ACTIONS='true';GITHUB_EVENT_NAME='workflow_dispatch';GITHUB_JOB='windows_wsl_upgrade_smoke';GITHUB_SHA=('1'*40);GITHUB_RUN_ID='1';GITHUB_RUN_ATTEMPT='1';BIBCODE_GPG_EVIDENCE_SELECTED='true';BIBCODE_GPG_EVIDENCE_ROOT_READY='true';BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI=[Convert]::ToBase64String($der);BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($der)).ToLowerInvariant()}
+      foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$facts[$name])}
+      $script:GpgPrivateEvidenceRealContext=$false;$script:GpgPrivateEvidenceAttempted=$false;$script:OwnedWslSignedMetadata=[ordered]@{commandExit=2}
+      (Get-GpgPrivateEvidenceAdmission $facts $true).context.fingerprint|Should -BeExactly $facts.BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256
+      function Invoke-FixtureCommand([string]$Exe,[string[]]$Arguments) {
+        [IO.File]::WriteAllText((Join-Path $root 'command-inert.private.json'),([ordered]@{stdout='';stderr="gpg: can't open '"+$expectedInput+"': Permission denied";exitCode=2}|ConvertTo-Json -Compress));throw 'Inert existing refusal.'
+      }
+      $caught=$null
+      try {& ([scriptblock]::Create($testsSource.Substring($start,$end-$start)+"`nInvoke-PinnedMetadataCommand 'gpg-import' @('--import',`$expectedInput) `$expectedInput"))}catch{$caught=$_}
+      $caught.Exception.Message|Should -BeExactly 'Pinned GPG gpg-import refused; commandReceiptPresent=true; commandExit=2; stdoutPresent=False; stderrPresent=True; category=input-open-read; errno=permission-denied; expectedInputMatched=True'
+      $script:GpgPrivateEvidenceAttempted|Should -BeFalse
+      Test-Path -LiteralPath (Join-Path $root 'bibcode-gpg-private-evidence')|Should -BeFalse
+      @(Get-ChildItem -LiteralPath $root -File).Count|Should -Be 1
+    } finally {
+      foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$saved[$name])}
+      $script:GpgPrivateEvidenceRealContext=$savedReal;$script:GpgPrivateEvidenceAttempted=$savedAttempted;$script:OwnedWslSignedMetadata=$savedMetadata;$testKey.Dispose()
     }
   }
 }

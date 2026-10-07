@@ -533,3 +533,72 @@ it("refuses nonclosed Linux service metadata at the existing status boundary", (
     ),
   ).toThrow();
 });
+
+it("admits optional GPG evidence only in the selected manual Windows context", () => {
+  const workflow = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const steps = workflow.jobs.windows_wsl_upgrade_smoke.steps;
+  const reserve = steps.find((step: { id?: string }) => step.id === "gpg_private_root");
+  expect(reserve).toBeDefined();
+  const upload = steps.find((step: { id?: string }) => step.id === "gpg_private_upload");
+  expect(upload).toBeDefined();
+  const evaluate = (
+    expression: string,
+    event: string,
+    native: boolean,
+    windows: boolean,
+    key: string,
+    fingerprint: string,
+  ) =>
+    NodeVM.runInNewContext(expression.replace(/\$\{\{|\}\}/g, ""), {
+      github: { event_name: event },
+      inputs: {
+        native_followups: native,
+        native_windows_only: windows,
+        gpg_evidence_public_spki: key,
+        gpg_evidence_public_sha256: fingerprint,
+      },
+      always: () => true,
+      steps: { gpg_private_root: { outputs: { ready: "true" } } },
+    });
+  for (const [event, native, windows, key, fingerprint, want] of [
+    ["workflow_dispatch", true, true, "inert", "inert", true],
+    ["workflow_call", true, true, "inert", "inert", false],
+    ["pull_request", true, true, "inert", "inert", false],
+    ["workflow_dispatch", false, true, "inert", "inert", false],
+    ["workflow_dispatch", true, false, "inert", "inert", false],
+    ["workflow_dispatch", true, true, "", "inert", false],
+    ["workflow_dispatch", true, true, "inert", "", false],
+  ] satisfies Array<[string, boolean, boolean, string, string, boolean]>) {
+    expect(evaluate(reserve.if, event, native, windows, key, fingerprint)).toBe(want);
+    expect(evaluate(upload.if, event, native, windows, key, fingerprint)).toBe(want);
+  }
+  expect(workflow.on.workflow_dispatch.inputs.gpg_evidence_public_spki.default).toBe("");
+  expect(workflow.on.workflow_dispatch.inputs.gpg_evidence_public_sha256.default).toBe("");
+  expect(workflow.on.workflow_call.inputs.gpg_evidence_public_spki).toBeUndefined();
+  expect(workflow.on.workflow_call.inputs.gpg_evidence_public_sha256).toBeUndefined();
+  expect(steps.indexOf(reserve)).toBeLessThan(
+    steps.findIndex((step: { id?: string }) => step.id === "native_wsl"),
+  );
+  expect(reserve["continue-on-error"]).toBe(true);
+  expect(upload["continue-on-error"]).toBe(true);
+  expect(upload.with["retention-days"]).toBe(1);
+  expect(upload.with["if-no-files-found"]).toBe("ignore");
+  expect(
+    upload.with.path
+      .split("\n")
+      .filter(Boolean)
+      .map((path: string) => path.split("/").at(-1)),
+  ).toEqual([
+    "context.json",
+    "stderr.aesgcm.bin",
+    "key.rsa-oaep-sha256.bin",
+    "nonce.bin",
+    "tag.bin",
+  ]);
+  expect(upload.with.path).not.toMatch(/\*|TestDrive|command-/);
+});

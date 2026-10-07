@@ -805,12 +805,61 @@ step fails. No distro names, raw WSL output, host paths or exception text enter
 these fields. The existing status read and conditional quiet list remain the
 only capability commands; these diagnostics do not provision or change WSL,
 download a root filesystem, update the host, select a default distro or reboot.
-Only two named PNGs, the three
-retainer JSONs and the closed workflow status may be uploaded. Credentials,
+Native screenshot/status evidence uploads only two named PNGs, the three
+retainer JSONs and the closed workflow status. Credentials,
 private paths, ACL output and raw OS/driver logs remain in protected private
 roots. Join exact owned processes and source/store/window identities before
 retention; no generic process-name cleanup is admitted. This partition does not
 qualify native Preview annotations or the full six-target release matrix.
+
+### Optional encrypted real-GPG refusal evidence
+
+For an approved single diagnostic run, manual `workflow_dispatch` may pair
+`gpg_evidence_public_spki` (standard base64 public RSA SPKI DER) with
+`gpg_evidence_public_sha256` (64 lowercase hex SHA256 of those DER bytes).
+Both default empty. Require `native_followups=true` and
+`native_windows_only=true`; callable workflows, PRs, ordinary seeded lanes,
+and Linux selection do not receive the pair. Missing, malformed, mismatched,
+or unsupported input omits this optional evidence and preserves the original
+failed test. The operational private key stays only in the operator's private
+0700 task root with 0600 permissions, never CI, source, secrets, logs or inputs.
+
+The real failed import catch seals only the existing validated `command.stderr`
+with managed RSA-3072/OAEP-SHA256 and AES-256-GCM. It admits a complete DER key
+with exponent 65537, bounds public DER to 1024 bytes and UTF8 stderr to 1 MiB
+before allocation, and never truncates or newly persists plaintext. Original
+GPG arguments, mandatory exit/fingerprint/signature checks, and the native
+artifact allowlist remain unchanged. Pester controls execute the actual catch
+and SDK with inert keys; Node/source controls cannot establish Windows SDK
+interop and must be reported separately.
+
+The optional staging directory is separately admitted beneath `RUNNER_TEMP`
+before Pester, with exclusive reservation, no existing-directory reuse,
+reparse refusal, and protected current-user/SYSTEM ACLs. Five create-new files
+become publishable together by directory rename: `context.json`,
+`stderr.aesgcm.bin`, `key.rsa-oaep-sha256.bin`, `nonce.bin`, and `tag.bin`.
+The separate pinned optional upload uses exactly those paths, one-day
+retention, and omission on absent files. It cannot qualify a native row or
+replace mandatory failure. Partial staging is never uploaded.
+
+Before dispatch record exact source/ref, workflow/job role, recipient
+fingerprint and manual choices privately. After dispatch authenticate and
+uniquely bind the created run and current attempt; ambiguous joining stops
+retrieval. The receiver validates the authenticated artifact identity/digest,
+exact five bounded entries with no traversal/links/duplicates, and all nine
+public context keys: version=1, scope=`wsl-real-gpg-import`,
+alg=`RSA-OAEP-SHA256`, enc=`AES-256-GCM`, full source, positive-safe run and
+attempt, jobRole=`windows-native`, and the independently nominated recipient
+fingerprint. Authenticate the original context bytes as AES-GCM AAD, not a
+reserialization. Only after successful authentication may complete UTF8 stderr
+be written as 0600 under a fresh private root. No decrypted text enters tool
+output, repository, issues, PRs, CI logs, or native artifacts. Encryption does
+not authenticate the sender; authenticated GitHub provenance remains required.
+
+Dispatch once after reviewed gates. Missing, invalid, unsupported, or unjoined
+evidence requires stopping and replanning, not more labels or an unchanged
+GPG retry. A decrypted error guides a caller regression; it is not native
+acceptance or an established cause until inspected and reproduced.
 
 ### Owned WSL2 fixture for the native Local row
 

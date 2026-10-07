@@ -250,3 +250,28 @@ it("keeps complete import-input failure facts passive and test-only", () => {
   expect(tests).toContain("errno=permission-denied; expectedInputMatched=True");
   // Source consistency only; complete Pester helper/real GPG execution remains CI-only.
 });
+
+it("confines private GPG evidence to the existing failed import catch", () => {
+  const tests = NodeFS.readFileSync(
+    new URL("./owned-wsl2-fixture.Tests.ps1", import.meta.url),
+    "utf8",
+  );
+  const owner = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+  expect(owner).not.toMatch(/OwnedGpgEvidenceV1|Save-GpgPrivateEvidence/);
+  const start = tests.indexOf("function Invoke-PinnedMetadataCommand(");
+  const end = tests.indexOf("\n      Invoke-PinnedMetadataCommand 'gpg-import'", start);
+  const wrapper = tests.slice(start, end);
+  expect(wrapper).toContain("[void](Save-GpgPrivateEvidence $command.stderr)");
+  expect(wrapper).toContain(
+    "$Operation -ceq 'gpg-import' -and $script:GpgPrivateEvidenceRealContext -eq $true",
+  );
+  expect(wrapper).toContain("catch { }");
+  expect(wrapper).toContain("throw $failureMessage");
+  expect(wrapper).toContain("throw $originalFailure");
+  expect(tests).toContain("int length = utf8.GetByteCount(stderr);");
+  expect(tests).toContain("length > 1048576");
+  expect(tests).toContain("CryptographicOperations.ZeroMemory(plaintext)");
+  expect(tests).toContain("rsa.ImportSubjectPublicKeyInfo(der, out consumed)");
+  expect(tests).toContain("Directory.Move(pending, ready)");
+  // Source-consistency only. Actual Pester and managed SDK controls are Windows CI requirements.
+});

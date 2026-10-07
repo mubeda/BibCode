@@ -12,6 +12,14 @@ on:
         description: Run only the Windows WSL native follow-up partition
         type: boolean
         default: false
+      gpg_evidence_public_spki:
+        description: Optional public RSA SPKI for one encrypted Windows GPG refusal
+        type: string
+        default: ""
+      gpg_evidence_public_sha256:
+        description: Lowercase SHA256 of the paired decoded public SPKI DER
+        type: string
+        default: ""
   workflow_call:
     inputs:
       native_followups:
@@ -230,12 +238,49 @@ jobs:
             "capability_reason=$reason" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
+      - id: gpg_private_root
+        name: Reserve optional encrypted GPG evidence output
+        if: github.event_name == 'workflow_dispatch' && inputs.native_followups == true && inputs.native_windows_only == true && inputs.gpg_evidence_public_spki != '' && inputs.gpg_evidence_public_sha256 != ''
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ready = $false
+          $reservation = $null
+          try {
+            $temp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+            $parent = Get-Item -LiteralPath $temp -Force -ErrorAction Stop
+            if (-not $parent.PSIsContainer -or $parent.FullName -ine $temp) { throw 'Optional evidence omitted.' }
+            for ($cursor = $parent; $null -ne $cursor; $cursor = $cursor.Parent) {
+              if (($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Optional evidence omitted.' }
+            }
+            $root = Join-Path $temp 'bibcode-gpg-private-evidence'
+            $reservation = [IO.File]::Open((Join-Path $temp 'bibcode-gpg-private-evidence.reserve'),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+            if (Test-Path -LiteralPath $root) { throw 'Optional evidence omitted.' }
+            New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+            $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+            $acl = Get-Acl -LiteralPath $root -ErrorAction Stop
+            $acl.SetOwner($me)
+            $acl.SetAccessRuleProtection($true,$false)
+            foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleAll($rule) | Out-Null }
+            foreach ($sid in @($me,$system)) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')) }
+            Set-Acl -LiteralPath $root -AclObject $acl -ErrorAction Stop
+            $checked = Get-Acl -LiteralPath $root -ErrorAction Stop
+            if (-not $checked.AreAccessRulesProtected -or $checked.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $me.Value -or @($checked.Access).Count -ne 2) { throw 'Optional evidence omitted.' }
+            $ready = $true
+          } catch { $ready = $false } finally { if ($null -ne $reservation) { $reservation.Dispose() } }
+          "ready=$($ready.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
       - id: native_wsl
         name: Prepare one authenticated owned WSL2 native fixture
         if: inputs.native_followups == true
         shell: pwsh
         env:
           BIBCODE_NATIVE_WSL_FIXTURE_SELECTED: "true"
+          BIBCODE_GPG_EVIDENCE_SELECTED: "${{ github.event_name == 'workflow_dispatch' && inputs.native_followups == true && inputs.native_windows_only == true }}"
+          BIBCODE_GPG_EVIDENCE_ROOT_READY: "${{ steps.gpg_private_root.outputs.ready }}"
+          BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI: "${{ (github.event_name == 'workflow_dispatch' && inputs.native_followups == true && inputs.native_windows_only == true) && inputs.gpg_evidence_public_spki || '' }}"
+          BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256: "${{ (github.event_name == 'workflow_dispatch' && inputs.native_followups == true && inputs.native_windows_only == true) && inputs.gpg_evidence_public_sha256 || '' }}"
         run: |
           Import-Module Pester -MinimumVersion 5.0 -ErrorAction Stop
           $tests = Invoke-Pester -Path ./scripts/owned-wsl2-fixture.Tests.ps1 -PassThru
@@ -475,6 +520,22 @@ jobs:
             & ./scripts/owned-wsl2-fixture.ps1 -Action Delete -OwnerManifest $manifest -SourceSha $env:GITHUB_SHA | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Owned WSL fixture deletion refused' }
           }
+
+      - id: gpg_private_upload
+        name: Retain optional encrypted GPG refusal only
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.native_followups == true && inputs.native_windows_only == true && inputs.gpg_evidence_public_spki != '' && inputs.gpg_evidence_public_sha256 != '' && steps.gpg_private_root.outputs.ready == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue29-gpg-private-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bibcode-gpg-private-evidence/ready/context.json
+            ${{ runner.temp }}/bibcode-gpg-private-evidence/ready/stderr.aesgcm.bin
+            ${{ runner.temp }}/bibcode-gpg-private-evidence/ready/key.rsa-oaep-sha256.bin
+            ${{ runner.temp }}/bibcode-gpg-private-evidence/ready/nonce.bin
+            ${{ runner.temp }}/bibcode-gpg-private-evidence/ready/tag.bin
+          if-no-files-found: ignore
+          retention-days: 1
 
       - name: Retain finite native WSL originals and closed status
         if: always() && inputs.native_followups == true
