@@ -15,8 +15,9 @@ page and nothing goes nowhere.
 What the user decided:
 
 - Default target is the internal browser everywhere (chat already does this);
-  the terminal and OSC 8 links follow it. Ctrl/Cmd (or middle-click) inverts to
-  the system browser. A setting flips the default.
+  the terminal and OSC 8 links follow it. In chat, Ctrl/Cmd (or middle-click)
+  inverts to the system browser; in the terminal, where Ctrl/Cmd-click is the
+  activation gesture, Shift added to it inverts. A setting flips the default.
 - Terminal `.html`/`.htm`/`.pdf` paths open in the internal browser; every other
   path still goes to the editor.
 
@@ -94,8 +95,10 @@ Callers routed through it:
   menu with a direct `openLink`; file-path provider routes `.html`/`.htm`/`.pdf`
   through it; other paths unchanged.
 - OSC 8: set xterm `linkHandler` to `openLink` (no `confirm()`).
-- Git Manager PR anchors (`GitManagerPullRequestPanel.tsx`): `openLink` like
-  any other URL (internal by default, modifier for system).
+- Git Manager PR anchors and every other `target=_blank` anchor outside chat:
+  handled by the main window's `on_new_window` (below), which opens http(s) and
+  `mailto:` in the system browser. These links have no thread context, which
+  the router would also send to the system browser.
 
 ### Resolver
 
@@ -111,9 +114,9 @@ and never falls back to the raw URL for a remote environment.
 | SSH, relay | `unreachable` until Phase 1 |
 
 Notice copy (UI.md review required): "This address is on <environment name>,
-not this computer. Opening it here needs the preview gateway, which isn't
-available yet for <SSH | BiBCode Connect> environments." with "Open in system
-browser" as a secondary action only when the environment is local.
+not this computer. Opening server ports over <SSH | BiBCode Connect> isn't
+available yet." Disconnected and public-host environments get matching copy.
+No secondary action: a local environment is always reachable.
 
 All existing callers (port cards, URL bar, agent `environment-port`) move to the
 new function.
@@ -133,8 +136,9 @@ window builder:
 - Preview webview popup / `target=_blank` → new internal tab in the same thread
   (event to the web host through the existing preview event path), denied in the
   child itself.
-- Main-window `target=_blank` → deny in-webview and emit to the web app, which
-  calls `openLink` with `invert: false` (so it honors the setting).
+- Main-window `target=_blank` → deny in-webview and open http(s)/`mailto:` in
+  the system browser from Rust. The main window is built in `setup` from its
+  config entry (`"create": false`) so the handler can be attached.
 
 ### Agent `preview_open` on Tauri
 
@@ -172,7 +176,8 @@ pid sources.
 ## Failure and edge cases
 
 - Environment disconnected while resolving → `unreachable` notice, no open.
-- Thread closed between click and open → system browser fallback on desktop.
+- Thread closed between click and open → existing `openUrlInPreview` behavior
+  (unchanged by this phase).
 - `openExternal` failure → toast with the URL and a copy action.
 - Setting change applies to the next click; nothing is migrated.
 - macOS < 14 (preview unsupported) → `"app"` behaves as `"system"`.
