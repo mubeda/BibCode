@@ -1,4 +1,5 @@
 import { Empty, EmptyHeader, EmptyTitle } from "./ui/empty";
+import { Spinner } from "./ui/spinner";
 import { SidebarInset } from "./ui/sidebar";
 import { cn } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
@@ -30,5 +31,15 @@ export function NoActiveThreadState() {
         </Empty>
       </div>
     </SidebarInset>
+  );
+}
+
+/** A chat panel's tab exists before the server confirms its thread; show progress, not "no thread". */
+export function ChatPanelOpeningState() {
+  return (
+    <div className="flex min-h-0 flex-1 items-center justify-center gap-2 bg-background text-sm text-muted-foreground">
+      <Spinner className="size-4" aria-hidden />
+      Opening chat…
+    </div>
   );
 }
