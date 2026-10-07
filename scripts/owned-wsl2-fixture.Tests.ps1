@@ -627,18 +627,23 @@ Describe 'Owned WSL2 optional private GPG evidence (inert)' {
     if($start -lt 0 -or $end -le $start){throw 'Actual private-evidence caller unavailable.'}
     $root=Join-Path $TestDrive ('inert-wrapper-'+$Fault);New-Item -ItemType Directory -Path $root|Out-Null
     $gpg='inert-gpg';$expectedInput=Join-Path $root 'key.asc'
-    $savedMetadata=$script:OwnedWslSignedMetadata;$savedReal=$script:GpgPrivateEvidenceRealContext
+    $savedMetadataVariable=Get-Variable -Name OwnedWslSignedMetadata -Scope Script -ErrorAction SilentlyContinue
+    $savedMetadataExists=$null -ne $savedMetadataVariable
+    $savedMetadata=if($savedMetadataExists){$savedMetadataVariable.Value}else{$null}
+    $savedReal=$script:GpgPrivateEvidenceRealContext
+    $sinkCalls=[Collections.Generic.List[string]]::new()
     try {
       $script:GpgPrivateEvidenceRealContext=$true;$script:OwnedWslSignedMetadata=[ordered]@{commandExit=2}
       function Invoke-FixtureCommand([string]$Exe,[string[]]$Arguments) {
         [IO.File]::WriteAllText((Join-Path $root 'command-inert.private.json'),([ordered]@{stdout='';stderr="gpg: can't open '"+$expectedInput+"': Permission denied";exitCode=2}|ConvertTo-Json -Compress));throw 'Inert existing refusal.'
       }
-      function Save-GpgPrivateEvidence([string]$Stderr) {throw ('Inert '+$Fault+' refusal.')}
+      function Save-GpgPrivateEvidence([string]$Stderr) {$sinkCalls.Add($Fault);throw ('Inert '+$Fault+' refusal.')}
       $caught=$null
       try {& ([scriptblock]::Create($testsSource.Substring($start,$end-$start)+"`nInvoke-PinnedMetadataCommand 'gpg-import' @('--import',`$expectedInput) `$expectedInput"))}catch{$caught=$_}
       $caught.Exception.Message|Should -BeExactly 'Pinned GPG gpg-import refused; commandReceiptPresent=true; commandExit=2; stdoutPresent=False; stderrPresent=True; category=input-open-read; errno=permission-denied; expectedInputMatched=True'
+      $sinkCalls.Count|Should -Be 1;$sinkCalls[0]|Should -BeExactly $Fault
       @(Get-ChildItem -LiteralPath $root -File).Count|Should -Be 1
-    } finally {$script:OwnedWslSignedMetadata=$savedMetadata;$script:GpgPrivateEvidenceRealContext=$savedReal}
+    } finally {if($savedMetadataExists){$script:OwnedWslSignedMetadata=$savedMetadata}else{Remove-Variable -Name OwnedWslSignedMetadata -Scope Script -ErrorAction SilentlyContinue};$script:GpgPrivateEvidenceRealContext=$savedReal}
   }
   It 'keeps inert/success calls outside the operational sink and latches omission' {
     $savedReal=$script:GpgPrivateEvidenceRealContext;$savedAttempted=$script:GpgPrivateEvidenceAttempted
@@ -729,7 +734,10 @@ Describe 'Owned WSL2 inactive operational evidence capability (inert)' {
     $testKey=[Security.Cryptography.RSA]::Create(3072)
     $names=@('RUNNER_TEMP','CI','GITHUB_ACTIONS','GITHUB_EVENT_NAME','GITHUB_JOB','GITHUB_SHA','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','BIBCODE_GPG_EVIDENCE_SELECTED','BIBCODE_GPG_EVIDENCE_ROOT_READY','BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI','BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256')
     $saved=@{};foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name)}
-    $savedReal=$script:GpgPrivateEvidenceRealContext;$savedAttempted=$script:GpgPrivateEvidenceAttempted;$savedMetadata=$script:OwnedWslSignedMetadata
+    $savedReal=$script:GpgPrivateEvidenceRealContext;$savedAttempted=$script:GpgPrivateEvidenceAttempted
+    $savedMetadataVariable=Get-Variable -Name OwnedWslSignedMetadata -Scope Script -ErrorAction SilentlyContinue
+    $savedMetadataExists=$null -ne $savedMetadataVariable
+    $savedMetadata=if($savedMetadataExists){$savedMetadataVariable.Value}else{$null}
     try {
       $root=Join-Path $TestDrive 'inert-inactive-wrapper';New-Item -ItemType Directory -Path $root|Out-Null
       $gpg='inert-gpg';$expectedInput=Join-Path $root 'key.asc';$der=$testKey.ExportSubjectPublicKeyInfo()
@@ -748,7 +756,7 @@ Describe 'Owned WSL2 inactive operational evidence capability (inert)' {
       @(Get-ChildItem -LiteralPath $root -File).Count|Should -Be 1
     } finally {
       foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$saved[$name])}
-      $script:GpgPrivateEvidenceRealContext=$savedReal;$script:GpgPrivateEvidenceAttempted=$savedAttempted;$script:OwnedWslSignedMetadata=$savedMetadata;$testKey.Dispose()
+      $script:GpgPrivateEvidenceRealContext=$savedReal;$script:GpgPrivateEvidenceAttempted=$savedAttempted;if($savedMetadataExists){$script:OwnedWslSignedMetadata=$savedMetadata}else{Remove-Variable -Name OwnedWslSignedMetadata -Scope Script -ErrorAction SilentlyContinue};$testKey.Dispose()
     }
   }
 }

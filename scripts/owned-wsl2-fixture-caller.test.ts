@@ -275,3 +275,25 @@ it("confines private GPG evidence to the existing failed import catch", () => {
   expect(tests).toContain("Directory.Move(pending, ready)");
   // Source-consistency only. Actual Pester and managed SDK controls are Windows CI requirements.
 });
+
+it("preserves absent script metadata in the actual optional/inactive Pester wrapper controls", () => {
+  const tests = NodeFS.readFileSync(
+    new URL("./owned-wsl2-fixture.Tests.ps1", import.meta.url),
+    "utf8",
+  );
+  expect(
+    tests.match(
+      /\$savedMetadataVariable=Get-Variable -Name OwnedWslSignedMetadata -Scope Script -ErrorAction SilentlyContinue/g,
+    ),
+  ).toHaveLength(2);
+  expect(tests.match(/\$savedMetadataExists=\$null -ne \$savedMetadataVariable/g)).toHaveLength(2);
+  expect(
+    tests.match(
+      /if\(\$savedMetadataExists\)\{\$script:OwnedWslSignedMetadata=\$savedMetadata\}else\{Remove-Variable -Name OwnedWslSignedMetadata -Scope Script -ErrorAction SilentlyContinue\}/g,
+    ),
+  ).toHaveLength(2);
+  expect(tests).not.toContain("$savedMetadata=$script:OwnedWslSignedMetadata");
+  expect(tests).toContain("$testsSource.Substring($start,$end-$start)");
+  expect(tests).toContain("$script:GpgPrivateEvidenceAttempted|Should -BeFalse");
+  // Source consistency only: actual strict-mode Pester setup/extracted-wrapper execution requires Windows CI.
+});
