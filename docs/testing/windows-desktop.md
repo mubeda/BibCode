@@ -803,7 +803,12 @@ verifier. Drive-relative, UNC, extended namespace and noncanonical paths are
 refused. Filesystem admission, ownership/ACLs, executable pins and key/signature
 operands stay native; replacing separators with a drive-letter `C:/...` alone
 does not make a POSIX-absolute homedir. No `cygpath` process or extra GPG action
-is needed.
+is needed. The public-only import, fingerprint and detached-signature
+verifier operations use documented `--no-autostart`: no private-key signing,
+decryption or daemon lifecycle is part of this metadata boundary. The same
+pinned public key and exact signer fingerprint remain mandatory; signature
+mathematics, nonzero exit admission and corrupt-signature rejection are not
+relaxed. The isolated owned home and native file operands are unchanged.
 It adds no download or action to Prepare and does not establish the real refusal
 cause until the actual Windows command outcome is observed.
 

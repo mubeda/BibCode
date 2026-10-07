@@ -148,14 +148,14 @@ function Prepare-Fixture {
   $script:OwnedWslSignedMetadata.sizeMatched=-not $oversize
   if($oversize) {Refuse-OwnedWsl}
   $script:OwnedWslSignedMetadata.item='key';$script:OwnedWslSignedMetadata.operation='gpg-import';$script:OwnedWslSignedMetadata.commandExit=$null
-  Invoke-FixtureCommand $gpg @('--homedir',$gpgHomeArgument,'--batch','--import',$key)|Out-Null
+  Invoke-FixtureCommand $gpg @('--homedir',$gpgHomeArgument,'--batch','--no-autostart','--import',$key)|Out-Null
   $script:OwnedWslSignedMetadata.operation='fingerprint-admission';$script:OwnedWslSignedMetadata.commandExit=$null
-  $fingerprints=Invoke-FixtureCommand $gpg @('--homedir',$gpgHomeArgument,'--batch','--with-colons','--fingerprint',$SigningFingerprint)
+  $fingerprints=Invoke-FixtureCommand $gpg @('--homedir',$gpgHomeArgument,'--batch','--no-autostart','--with-colons','--fingerprint',$SigningFingerprint)
   $fingerprintCount=@($fingerprints -split "`n"|Where-Object {$_ -match '^fpr:' -and ($_ -split ':')[9] -ceq $SigningFingerprint}).Count
   $script:OwnedWslSignedMetadata.fingerprintCount=[Math]::Min(2,$fingerprintCount);$script:OwnedWslSignedMetadata.fingerprintMatched=$fingerprintCount -eq 1
   if($fingerprintCount -ne 1) { Refuse-OwnedWsl }
   $script:OwnedWslSignedMetadata.item='signature';$script:OwnedWslSignedMetadata.operation='signature-admission';$script:OwnedWslSignedMetadata.commandExit=$null
-  $verification=Invoke-FixtureCommand $gpg @('--homedir',$gpgHomeArgument,'--batch','--status-fd','1','--verify',$signature,$sums)
+  $verification=Invoke-FixtureCommand $gpg @('--homedir',$gpgHomeArgument,'--batch','--no-autostart','--status-fd','1','--verify',$signature,$sums)
   $valid=@($verification -split "`n"|Where-Object {$_ -match '^\[GNUPG:\] VALIDSIG '})
   $script:OwnedWslSignedMetadata.signatureCount=[Math]::Min(2,$valid.Count)
   $signerMatched=$valid.Count -eq 1 -and ($valid[0] -split ' ')[2] -ceq $SigningFingerprint

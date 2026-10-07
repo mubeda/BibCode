@@ -354,3 +354,46 @@ it("uses the owning pinned-Git GPG home transform with absolute-path/refusal gua
     expect(() => run(value)).toThrow();
   NodeAssert.equal(regex, "\\A[A-Za-z]:\\\\");
 });
+
+it("keeps every pinned public metadata operation agent-free without changing operands or crypto gates", () => {
+  for (const file of ["./owned-wsl2-fixture.ps1", "./owned-wsl2-fixture.Tests.ps1"]) {
+    const source = NodeFS.readFileSync(new URL(file, import.meta.url), "utf8");
+    const calls = source
+      .split("\n")
+      .filter(
+        (line) =>
+          line.includes("@('--homedir'") &&
+          (line.includes("Invoke-FixtureCommand $gpg ") ||
+            line.includes("Invoke-PinnedMetadataCommand ")),
+      );
+    expect(calls.length).toBe(file.endsWith("Tests.ps1") ? 4 : 3);
+    for (const call of calls) {
+      const array = call.match(/@\(([^)]+)\)/)?.[1];
+      if (!array) throw new Error("Actual public verifier arguments unavailable.");
+      const tokens = array.split(",").map((token) => token.trim());
+      const args = tokens.map((token) =>
+        token.startsWith("'") ? token.slice(1, -1) : "owned:" + token,
+      );
+      const received: string[] = [];
+      const invoke = NodeVM.runInNewContext(
+        "(args) => { for (const argument of args) port.Add(argument); }",
+        { port: { Add: (argument: string) => received.push(argument) } },
+      );
+      invoke(args);
+      expect(received).toEqual(args);
+      expect(received.filter((argument) => argument === "--no-autostart")).toHaveLength(1);
+      expect(received).not.toEqual(
+        expect.arrayContaining([
+          "--trust-model",
+          "--skip-verify",
+          "--ignore-time-conflict",
+          "--ignore-crc-error",
+        ]),
+      );
+      expect(
+        received.some((argument) => ["--import", "--fingerprint", "--verify"].includes(argument)),
+      ).toBe(true);
+    }
+  }
+  // Source/argument-port evidence only; real Windows crypto remains a mandatory CI counterfactual.
+});
