@@ -2,7 +2,7 @@
 
 ## [v0.8.2] - 2026-10-07
 
-BiBCode v0.8.2 makes the left panel easier to read with lifted project and repository cards, adds projects from the Repositories view on any environment, keeps repositories in name order, lets New Branch start from any local or remote branch without switching to it, and warns before targeting the main branch in a pull or merge request. This release includes the changes since v0.8.1.
+BiBCode v0.8.2 makes the left panel easier to read with lifted project and repository cards, adds projects from the Repositories view on any environment, keeps repositories in name order, lets New Branch start from any local or remote branch without switching to it, warns before targeting the main branch in a pull or merge request, and shows progress while a chat panel opens on a slow remote server. This release includes the changes since v0.8.1.
 
 ### Left panel
 
@@ -17,6 +17,10 @@ BiBCode v0.8.2 makes the left panel easier to read with lifted project and repos
 - **Check out after creating** is on by default. Turn it off to only create the branch: the checkout and working tree stay on the branch you were on.
 - A new branch never tracks its source, so a branch created from `origin/main` publishes under its own name instead of pulling from and pushing to `main`.
 - Choosing `main`, `master`, or the repository's default branch as the target of a pull or merge request shows a red warning naming the branch. Creation stays available.
+
+### Chat panels
+
+- Opening a chat panel on a remote server with latency no longer shows an empty tab while the server creates the chat. The panel shows **Opening chat…** until the chat arrives; a failed creation still closes the panel with an error.
 
 ### Known limitations and qualification still in progress
 
