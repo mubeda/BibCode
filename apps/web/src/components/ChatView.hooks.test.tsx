@@ -433,7 +433,8 @@ vi.mock("../hooks/useTurnDiffSummaries", () => ({
 
 // ── Child components ─────────────────────────────────────────────────
 
-vi.mock("./NoActiveThreadState", () => ({
+vi.mock("./NoActiveThreadState", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./NoActiveThreadState")>()),
   NoActiveThreadState: () => <div data-mock="no-active-thread" />,
 }));
 
