@@ -265,3 +265,35 @@ it.each(["owned", "send", "undefined", "close"])(
     ]);
   },
 );
+
+it("replay owner separates absent and retired ready proof from a permanently refused foreign replay", () => {
+  const value = observer();
+  expect(() => value.replay.throwIfFailed()).not.toThrow();
+  expect(() => value.terminalRestored()).toThrow();
+  attach(value, "first", "first-owner");
+  value.terminalRestored();
+  value.connectionClosed("first");
+  expect(() => value.replay.throwIfFailed()).not.toThrow();
+  expect(() => value.terminalRestored()).toThrow();
+  let original;
+  try {
+    attach(value, "foreign", "first-owner", { ...baseline, pid: 124 });
+  } catch (error) {
+    original = error;
+  }
+  expect(original).toBeDefined();
+  expect(() => value.replay.throwIfFailed()).toThrow();
+  let caught;
+  try {
+    value.replay.throwIfFailed();
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBe(original);
+  value.close();
+  try {
+    value.replay.throwIfFailed();
+  } catch (error) {
+    expect(error).toBe(original);
+  }
+});

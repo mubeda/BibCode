@@ -2526,6 +2526,13 @@ This is a six-original partition, not full-matrix or native Preview annotation
 acceptance. The normal six-platform seeded matrix and ordinary lanes remain the
 default; this explicit opt-in does not qualify omitted platforms.
 
+The browser reconnect wait retains the existing wire and replay owners' first
+permanent failure and propagates that same exception before polling again.
+Missing or retired connection proof remains pending while the owner is open;
+closed owners and latched failures refuse further use. Admission, the 30-second
+observation deadline and joined cleanup stay unchanged. This preserves failure
+information and does not by itself identify or repair a runtime reconnect cause.
+
 ### Contained browser follow-up visual qualification
 
 The selected `release-visual-browser-followups` batch retains the six existing

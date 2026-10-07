@@ -726,3 +726,47 @@ it("admits HTTP SP and HTAB around exactly selected protocol while forwarding th
     await transport.close();
   }
 });
+
+it.each(["observer", "socket", "undefined"])(
+  "actual transport preserves its first owned failure through retirement and close: %s",
+  async (mode) => {
+    const original =
+      mode === "undefined" ? undefined : Object.freeze(new Error("inert original wire failure"));
+    const observer = actualReplayObserver();
+    if (mode === "observer")
+      observer.observe = () => {
+        throw original;
+      };
+    const transport = await startBrowserFollowupTransport({
+      CI: "true",
+      listenPort: 4894,
+      targetPort: 4897,
+      observer,
+    });
+    const pair = admitSocket(null, null);
+    if (mode === "observer")
+      for (const bytes of rpcWire(
+        { _tag: "Request", id: "1", tag: "subscribeServerConfig", payload: {} },
+        false,
+        true,
+      ))
+        pair.client.socket.emit("data", bytes);
+    else pair.upstream.socket.emit("error", original);
+    expect(transport.observation().failed).toBe(true);
+    expect(() => transport.throwIfFailed()).toThrow();
+    let caught;
+    try {
+      transport.throwIfFailed();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBe(original);
+    await transport.close();
+    expect(transport.observation()).toMatchObject({ cleanupComplete: true, cleanupFailed: false });
+    try {
+      transport.throwIfFailed();
+    } catch (error) {
+      expect(error).toBe(original);
+    }
+  },
+);

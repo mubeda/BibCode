@@ -63,11 +63,11 @@ test.each(["owned", "bootstrap-close", "source-drift"])(
     const network = {
       observer: {
         terminalRestored: () => events.push("reconnect"),
-        replay: { verify: () => events.push("replay") },
+        replay: { verify: () => events.push("replay"), throwIfFailed: () => {} },
       },
       close: async () => {},
       proxy: {},
-      transport: {},
+      transport: { throwIfFailed: () => {} },
     };
     const run = NodeVM.runInNewContext(
       NodeModule.stripTypeScriptTypes(source.slice(begin)).replace(/^export /gm, "") +
@@ -601,3 +601,68 @@ test("actual public terminal bootstrap establishes its own raw marker line after
       ),
     );
 });
+
+test.each(["pending", "transport-error", "replay-error", "undefined-error"])(
+  "actual reconnect predicate preserves pending or owned permanent state: %s",
+  async (mode) => {
+    const source = NodeFS.readFileSync(
+      new URL("./release-visual-browser-followups-caller.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf(
+      "      await input.owner.until(async () => {",
+      source.indexOf('input.step("visual-browser-followups-observed-reconnect")'),
+    );
+    const end = source.indexOf("      const verifyIdentity =", start);
+    NodeAssert.equal(start > 0 && end > start, true);
+    const original =
+      mode === "undefined-error"
+        ? undefined
+        : Object.freeze(new Error("inert permanent owner error"));
+    let polls = 0,
+      healthyChecks = 0;
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        "async function run(input,network){" + source.slice(start, end) + "}run;",
+      ),
+      {},
+    );
+    const network = {
+      transport: {
+        throwIfFailed: () => {
+          healthyChecks++;
+          if (mode === "transport-error" || mode === "undefined-error") throw original;
+        },
+      },
+      observer: {
+        terminalRestored: () => {
+          throw original;
+        },
+        replay: {
+          throwIfFailed: () => {
+            healthyChecks++;
+            if (mode === "replay-error") throw original;
+          },
+        },
+      },
+    };
+    const input = {
+      owner: {
+        until: async (check: () => Promise<boolean>) => {
+          for (let i = 0; i < 2; i++) {
+            polls++;
+            NodeAssert.equal(await check(), false);
+          }
+        },
+      },
+    };
+    if (mode === "pending") {
+      await run(input, network);
+      NodeAssert.equal(polls, 2);
+      NodeAssert.equal(healthyChecks >= 4, true);
+    } else {
+      await NodeAssert.rejects(run(input, network), (value) => value === original);
+      NodeAssert.equal(polls, 1);
+    }
+  },
+);

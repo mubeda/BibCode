@@ -552,10 +552,14 @@ export async function runBrowserFollowupCaller(input: {
       input.step("visual-browser-followups-observed-reconnect");
       const network = await transition.activate();
       await input.owner.until(async () => {
+        network.transport.throwIfFailed();
+        network.observer.replay.throwIfFailed();
         try {
           network.observer.terminalRestored();
           return true;
         } catch {
+          network.transport.throwIfFailed();
+          network.observer.replay.throwIfFailed();
           return false;
         }
       });

@@ -155,6 +155,13 @@ export async function startBrowserFollowupTransport(input: {
     cleanupComplete = false,
     cleanupFailed = false,
     slowKey: string | null = null;
+  let originalFailure: unknown;
+  const markFailed = (error: unknown) => {
+    if (!failed) {
+      failed = true;
+      originalFailure = error;
+    }
+  };
   const server = NodeNet.createServer((client) => {
     if (closed || ++ordinal > 128) {
       client.destroy();
@@ -213,8 +220,8 @@ export async function startBrowserFollowupTransport(input: {
         }
         if (!wantsUpgrade) write(client, upstream, bytes);
         else for (const original of gate.client(bytes)) write(client, upstream, original);
-      } catch {
-        failed = true;
+      } catch (error) {
+        markFailed(error);
         destroy();
       }
     });
@@ -246,17 +253,17 @@ export async function startBrowserFollowupTransport(input: {
         }
         if (!wantsUpgrade) write(upstream, client, bytes);
         else for (const original of gate.server(bytes)) write(upstream, client, original);
-      } catch {
-        failed = true;
+      } catch (error) {
+        markFailed(error);
         destroy();
       }
     });
-    client.on("error", () => {
-      failed = true;
+    client.on("error", (error) => {
+      markFailed(error);
       destroy();
     });
-    upstream.on("error", () => {
-      failed = true;
+    upstream.on("error", (error) => {
+      markFailed(error);
       destroy();
     });
     client.on("close", destroy);
@@ -270,6 +277,10 @@ export async function startBrowserFollowupTransport(input: {
     });
   });
   return {
+    throwIfFailed: () => {
+      if (failed) throw originalFailure;
+      if (closed) throw refused();
+    },
     arm: () => {
       const admitted = [...wires.entries()].filter(
         ([connection, wire]) =>
@@ -327,7 +338,7 @@ export async function startBrowserFollowupTransport(input: {
       await attempt(() => input.observer.close());
       if (unsafe) {
         cleanupFailed = true;
-        failed = true;
+        markFailed(original);
         throw original;
       }
       cleanupComplete = true;

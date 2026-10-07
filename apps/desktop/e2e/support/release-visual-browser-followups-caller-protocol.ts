@@ -59,6 +59,11 @@ export function createBrowserFollowupReplayObserver(
   const uploadRequests = new Map<string, string>();
   let closed = false,
     failed = false;
+  let originalFailure: unknown;
+  const throwIfFailed = () => {
+    if (failed) throw originalFailure;
+    if (closed) throw refused();
+  };
   let uploadPending = false;
   const check = (value: TerminalSessionSnapshot) => {
     const pin = input.baseline;
@@ -145,7 +150,10 @@ export function createBrowserFollowupReplayObserver(
           }
         }
       } catch (error) {
-        failed = true;
+        if (!failed) {
+          failed = true;
+          originalFailure = error;
+        }
         throw error;
       }
     },
@@ -172,7 +180,7 @@ export function createBrowserFollowupReplayObserver(
       requests.clear();
       snapshots.clear();
     },
-    replay: { verify },
+    replay: { verify, throwIfFailed },
     stagePending: () => uploadPending,
   };
 }
