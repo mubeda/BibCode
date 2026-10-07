@@ -430,6 +430,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
           currentBranchName,
           defaultBranch: snapshot?.defaultBranch ?? null,
         }),
+        baseCommit: null,
       }),
     [currentBranchName, snapshot?.defaultBranch],
   );
@@ -476,7 +477,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
             projectId,
             name: submission.name,
             startPoint: submission.startPoint,
-            checkout: true,
+            checkout: submission.checkout,
           };
           break;
         case "rename":
@@ -792,6 +793,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         disabledReason={branchSyncDisabledReason}
         errorMessage={operationError}
         refs={localBranches}
+        remoteRefs={snapshot?.remoteBranches ?? EMPTY_BRANCHES}
         onClose={closeBranchDialog}
         onSubmit={submitBranchDialog}
       />

@@ -925,7 +925,11 @@ describe("GitManagerPanel", () => {
       );
 
       await act(async () => onAction({ _tag: "create-branch", sha }));
-      expect(h.branchDialogProps.at(-1)?.dialog).toEqual({ kind: "create", baseBranch: sha });
+      expect(h.branchDialogProps.at(-1)?.dialog).toEqual({
+        kind: "create",
+        baseBranch: null,
+        baseCommit: sha,
+      });
 
       await act(async () => onAction({ _tag: "create-tag", sha }));
       expect(h.historyTagDialogProps.at(-1)).toMatchObject({
@@ -933,6 +937,48 @@ describe("GitManagerPanel", () => {
         open: true,
         targetSha: sha,
       });
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("creates a branch from a History commit without checking it out when asked", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    useGitManagerStore.getState().setActiveTab(projectRef, "history");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const sha = "e".repeat(40);
+
+    try {
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      const onAction = h.historyProps.at(-1)?.onAction as (action: unknown) => void;
+      await act(async () => onAction({ _tag: "create-branch", sha }));
+      const props = h.branchDialogProps.at(-1)!;
+      expect(Array.isArray(props.remoteRefs)).toBe(true);
+      // The mocked operation never settles, so the submission is not awaited.
+      await act(async () => {
+        void (props.onSubmit as (submission: unknown) => Promise<void>)({
+          kind: "create",
+          name: "from-commit",
+          startPoint: sha,
+          checkout: false,
+        });
+      });
+      expect(h.runOperation).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          input: expect.objectContaining({
+            _tag: "branch-create",
+            name: "from-commit",
+            startPoint: sha,
+            checkout: false,
+          }),
+        }),
+        expect.any(Function),
+      );
     } finally {
       await act(async () => root.unmount());
       container.remove();

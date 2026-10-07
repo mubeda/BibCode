@@ -9,7 +9,7 @@ import type {
 import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
 import { useDebouncedValue } from "@tanstack/react-pacer";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { GitPullRequestIcon } from "lucide-react";
+import { GitPullRequestIcon, TriangleAlertIcon } from "lucide-react";
 import {
   memo,
   type ChangeEvent,
@@ -21,6 +21,7 @@ import {
   useState,
 } from "react";
 
+import { Alert, AlertDescription, AlertTitle } from "~/components/ui/alert";
 import { Button } from "~/components/ui/button";
 import { Checkbox } from "~/components/ui/checkbox";
 import {
@@ -162,6 +163,9 @@ function CreatePullRequestReviewDialog({
     [capabilityBlockedReason, cwd, environmentId],
   );
   const snapshot = useEnvironmentQuery(snapshotAtom).data;
+  const targetIsDefault = baseBranch !== null && baseBranch === snapshot?.defaultBranch;
+  const criticalTarget =
+    targetIsDefault || baseBranch === "main" || baseBranch === "master" ? baseBranch : null;
   // The checkout's branch is the source by default; the server publishes it
   // first when origin does not have it yet.
   const defaultSource = status?.refName ?? null;
@@ -485,7 +489,9 @@ function CreatePullRequestReviewDialog({
             <BranchPicker
               scope={scope}
               id="git-manager-create-pr-base"
-              helpId="create-pr-target-help"
+              helpId={
+                criticalTarget === null ? "create-pr-target-help" : "create-pr-target-warning"
+              }
               placeholder="Select a target branch…"
               value={baseBranch}
               onChange={(value) => {
@@ -497,9 +503,28 @@ function CreatePullRequestReviewDialog({
               excludedBranch={commitInput?.featureBranch ? null : (review?.head ?? null)}
               disabled={branchFieldsDisabled}
             />
-            <p id="create-pr-target-help" className="text-xs text-muted-foreground">
-              Choose the branch on origin that should receive these changes.
-            </p>
+            {criticalTarget === null ? (
+              <p id="create-pr-target-help" className="text-xs text-muted-foreground">
+                Choose the branch on origin that should receive these changes.
+              </p>
+            ) : (
+              <Alert
+                variant="error"
+                id="create-pr-target-warning"
+                className="mt-1"
+                data-testid="create-pr-critical-target"
+              >
+                <TriangleAlertIcon aria-hidden />
+                <AlertTitle>
+                  Targets <span className="font-mono">{criticalTarget}</span>,{" "}
+                  {targetIsDefault ? "the default branch" : "a mainline branch"}
+                </AlertTitle>
+                <AlertDescription className="text-xs">
+                  Merging this {noun} changes the code everyone builds from. Check this is the
+                  intended target.
+                </AlertDescription>
+              </Alert>
+            )}
           </div>
           <div
             className="rounded-lg border border-border/70 px-3 py-2.5 text-xs"
