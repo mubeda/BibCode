@@ -146,7 +146,6 @@ beforeEach(() => {
     createParent: "~/",
     error: null,
     notice: null,
-    canPickParent: true,
     selectHost: vi.fn(),
     back: vi.fn(),
     browse: vi.fn(async () => {}),
@@ -194,7 +193,6 @@ afterAll(() => {
 describe("AddProjectDialog mounted interactions", () => {
   it("offers Browse on a remote clone form without native picking", async () => {
     testState.workflow.step = "clone";
-    testState.workflow.canPickParent = false;
     testState.workflow.selectedHost = {
       ...testState.workflow.selectedHost,
       environmentId: EnvironmentId.make("remote-selected"),
@@ -206,6 +204,38 @@ describe("AddProjectDialog mounted interactions", () => {
     await click(buttonWithText("Browse…"));
     expect(testState.workflow.pickCloneParent).toHaveBeenCalledTimes(1);
     expect(document.querySelector<HTMLInputElement>("#add-project-clone-parent")).not.toBeNull();
+  });
+
+  it("offers Browse on a remote create form and browses that server", async () => {
+    testState.workflow.step = "create";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      environmentId: EnvironmentId.make("remote-selected"),
+      label: "Build server",
+      isPrimary: false,
+      nativePickerAvailable: false,
+    };
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+
+    await click(buttonWithText("Git repository in"));
+    await click(buttonWithText("Browse…"));
+    expect(testState.workflow.pickCreateParent).toHaveBeenCalledTimes(1);
+  });
+
+  it("identifies the server and starts the parent browser at the entered create path", async () => {
+    testState.workflow.step = "create-parent-browse";
+    testState.workflow.createParent = "/srv/projects";
+    testState.workflow.selectedHost = {
+      ...testState.workflow.selectedHost,
+      environmentId: EnvironmentId.make("remote-selected"),
+      label: "Build server",
+      isPrimary: false,
+    };
+    await mount(<AddProjectDialog open onOpenChange={vi.fn()} />);
+
+    expect(document.body.textContent).toContain("Choose parent folder on Build server");
+    expect(document.body.textContent).toContain("The new project folder will be created inside");
+    expect(document.body.textContent).toContain("Browsing remote-selected: /srv/projects");
   });
 
   it("identifies the server and starts the parent browser at the entered clone path", async () => {

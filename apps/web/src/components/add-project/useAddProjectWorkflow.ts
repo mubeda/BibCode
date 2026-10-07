@@ -97,7 +97,6 @@ export interface AddProjectWorkflow {
   readonly error: string | null;
   /** Informational feedback, such as a cancelled clone. Never an error. */
   readonly notice: string | null;
-  readonly canPickParent: boolean;
   readonly selectHost: (environmentId: EnvironmentId) => void;
   readonly back: () => void;
   readonly browse: () => Promise<void>;
@@ -446,7 +445,13 @@ export function useAddProjectWorkflowState(
     busyRef.current = false;
     setBusy(false);
     setCloneProgress("idle");
-    setStep((previous) => (previous === "clone-parent-browse" ? "clone" : "start"));
+    setStep((previous) =>
+      previous === "clone-parent-browse"
+        ? "clone"
+        : previous === "create-parent-browse"
+          ? "create"
+          : "start",
+    );
     setParentBrowseGeneration(null);
     setError(null);
     setNotice(null);
@@ -526,7 +531,7 @@ export function useAddProjectWorkflowState(
 
   const selectBrowsedFolder = useCallback(
     async (path: string) => {
-      if (step === "clone-parent-browse") {
+      if (step === "clone-parent-browse" || step === "create-parent-browse") {
         if (
           parentBrowseGeneration === null ||
           !isCurrent(parentBrowseGeneration) ||
@@ -536,8 +541,13 @@ export function useAddProjectWorkflowState(
         }
         generationRef.current += 1;
         setParentBrowseGeneration(null);
-        setCloneParentState(path);
-        setStep("clone");
+        if (step === "clone-parent-browse") {
+          setCloneParentState(path);
+          setStep("clone");
+        } else {
+          setCreateParentState(path);
+          setStep("create");
+        }
         setError(null);
         return;
       }
@@ -578,9 +588,9 @@ export function useAddProjectWorkflowState(
   const pickParent = useCallback(
     async (kind: "clone" | "create") => {
       if (!shouldUseNativePicker(selectedHost)) {
-        if (kind === "clone" && openRef.current && !busyRef.current) {
+        if (openRef.current && !busyRef.current) {
           setParentBrowseGeneration(generationRef.current);
-          setStep("clone-parent-browse");
+          setStep(kind === "clone" ? "clone-parent-browse" : "create-parent-browse");
           setError(null);
         }
         return;
@@ -841,7 +851,6 @@ export function useAddProjectWorkflowState(
     createParent,
     error,
     notice,
-    canPickParent: shouldUseNativePicker(selectedHost),
     selectHost,
     back,
     browse,
@@ -952,12 +961,15 @@ export function useAddProjectWorkflow(input: {
     primaryEnvironment?.environmentId,
     primaryEnvironmentId,
   ]);
+  // The Repositories view has no environment rail, so any choice of host must be offered here.
   const locationLabel: AddProjectLocationLabel =
     presentation.surface === "browser"
       ? "Host"
-      : presentation.platform === "windows" && hosts.length > 1
-        ? "Location"
-        : null;
+      : hosts.length <= 1
+        ? null
+        : presentation.platform === "windows"
+          ? "Location"
+          : "Host";
 
   const operations = useMemo(
     () =>

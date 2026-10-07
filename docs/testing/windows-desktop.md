@@ -500,6 +500,9 @@ minimum-size, and relevant Windows DPI states. Verify:
 - the environment rail groups **This device** and usable WSL locations under
   Local, shows saved remote servers separately, and Add Project targets the
   current rail selection;
+- in the **Repositories** view, the header's Add Project button opens the dialog
+  with the **Location** selector; choosing a remote server makes **Browse folder**
+  and the clone and create **Browse…** buttons list that server's folders;
 - **Local environment** is visible at `/settings/local-environment` and never
   empty;
 - Add a server by pairing code with a **Server alias**. Confirm the saved-server
