@@ -63,6 +63,10 @@ import { withProviderChatPublicApi } from "./support/release-visual-provider-cha
 // @effect-diagnostics globalFetch:off - Only the owned loopback CLI is probed.
 // @effect-diagnostics globalTimers:off - Real bounded negative observation windows.
 import * as NodeFS from "node:fs";
+import {
+  projectBrowserInitialJoin,
+  type BrowserInitialJoin,
+} from "./support/release-visual-browser-followups-protocol.ts";
 import * as NodePath from "node:path";
 import * as NodeNet from "node:net";
 import * as NodeCrypto from "node:crypto";
@@ -693,6 +697,16 @@ export async function runDeliveryRetryQualification() {
   let projectLifecycleFixtureSafeToDelete = true;
   let settingsFollowupFixtureSafeToDelete = true;
   let pullRequestsFixtureSafeToDelete = true;
+  let browserInitialFailure: {
+    error: unknown;
+    value: BrowserInitialJoin | null;
+    theme: string;
+  } | null = null;
+  const readBrowserInitialFailure = (): {
+    readonly error: unknown;
+    readonly value: BrowserInitialJoin | null;
+    readonly theme: string;
+  } | null => browserInitialFailure;
   let browserFollowupFixtureSafeToDelete = true;
   const browserFollowupResources: Array<Awaited<ReturnType<typeof prepareBrowserFollowupCaller>>> =
     [];
@@ -2867,9 +2881,17 @@ export async function runDeliveryRetryQualification() {
         if (typeof credential !== "string" || credential.length < 8)
           throw new Error("Owned browser follow-up grant unavailable.");
         const accessToken = await fixtureAccessToken("http://127.0.0.1:4887", credential);
+        browserInitialFailure = null;
         await runBrowserFollowupCaller({
           CI: childEnv.CI,
           prepared: browserFollowup,
+          observeInitialFailure: (error, value) => {
+            if (
+              phase === "visual-browser-followups-observed-reconnect" &&
+              browserInitialFailure === null
+            )
+              browserInitialFailure = { error, value: projectBrowserInitialJoin(value), theme };
+          },
           browser,
           owner,
           theme,
@@ -3256,6 +3278,7 @@ export async function runDeliveryRetryQualification() {
     success = true;
   } catch (error) {
     const originalCursorFailure = readCursorOriginalFailure();
+    const originalBrowserInitialFailure = readBrowserInitialFailure();
     if (originalCursorFailure !== null && originalCursorFailure.error === error) {
       phase = originalCursorFailure.phase;
       try {
@@ -3296,6 +3319,14 @@ export async function runDeliveryRetryQualification() {
       phase,
       theme,
       failure: classifyQualificationFailure(error),
+      browserInitialJoin:
+        config.selection === "release-visual-browser-followups" &&
+        phase === "visual-browser-followups-observed-reconnect" &&
+        originalBrowserInitialFailure !== null &&
+        Object.is(originalBrowserInitialFailure.error, error) &&
+        originalBrowserInitialFailure.theme === theme
+          ? projectBrowserInitialJoin(originalBrowserInitialFailure.value)
+          : null,
       cursorTurnObservation:
         config.selection === "release-visual-cursor-question" &&
         phase === "visual-cursor-question-turn-running" &&

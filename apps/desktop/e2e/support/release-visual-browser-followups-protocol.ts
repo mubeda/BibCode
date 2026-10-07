@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - The observer decodes actual public SDK envelopes at an external raw protocol boundary.
 import * as NodeModule from "node:module";
 import * as NodeCrypto from "node:crypto";
+import * as NodeUtil from "node:util";
 import {
   UploadBeginInput,
   UploadBeginResult,
@@ -34,15 +35,201 @@ const admitted = new Set([
   "terminal.resize",
   "review.getDiffPreview",
 ]);
+
+export type BrowserInitialCardinality = "none" | "one" | "multiple";
+export type BrowserInitialSizeOwner =
+  | "absent"
+  | "unclaimed"
+  | "current-attach"
+  | "foreign-claim"
+  | "ambiguous"
+  | "unknown";
+export interface BrowserInitialProtocol {
+  readonly closed: boolean;
+  readonly failed: boolean;
+  readonly attachRequests: BrowserInitialCardinality;
+  readonly snapshots: BrowserInitialCardinality;
+  readonly configAttachments: BrowserInitialCardinality;
+  readonly resizeRequests: BrowserInitialCardinality;
+  readonly sizeOwner: BrowserInitialSizeOwner;
+}
+export interface BrowserInitialReplay {
+  readonly closed: boolean;
+  readonly failed: boolean;
+  readonly snapshots: BrowserInitialCardinality;
+  readonly configSnapshots: BrowserInitialCardinality;
+}
+export interface BrowserInitialTransport {
+  readonly closed: boolean;
+  readonly failed: boolean;
+  readonly upgradedWires: BrowserInitialCardinality;
+  readonly configWires: BrowserInitialCardinality;
+}
+export interface BrowserInitialOwners {
+  protocol?: () => BrowserInitialProtocol;
+  replay?: () => BrowserInitialReplay;
+  transport?: () => BrowserInitialTransport;
+}
+export interface BrowserInitialHooks {
+  registerInitialOwners?: (owners: BrowserInitialOwners) => void;
+  observeInitialFailure?: (error: unknown) => void;
+}
+export interface BrowserInitialJoin {
+  readonly waitingOn: "before-focus" | "focus-predicate" | "receipt-predicate";
+  readonly ui: {
+    readonly windows: BrowserInitialCardinality | null;
+    readonly mounts: BrowserInitialCardinality | null;
+    readonly pinnedMountMatched: boolean | null;
+    readonly screenClickCompleted: boolean;
+    readonly activeTextareaOwned: boolean | null;
+  };
+  readonly transport: BrowserInitialTransport | null;
+  readonly protocol: BrowserInitialProtocol | null;
+  readonly replay: BrowserInitialReplay | null;
+  readonly sizeOwner: BrowserInitialSizeOwner;
+}
+export function browserInitialCardinality(count: number): BrowserInitialCardinality {
+  return count === 0 ? "none" : count === 1 ? "one" : "multiple";
+}
+/** Only this finite failure record crosses the existing private writer boundary. */
+export function projectBrowserInitialJoin(value: unknown): BrowserInitialJoin | null {
+  const fields = (input: unknown, keys: readonly string[]): Record<string, unknown> => {
+    if (
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      NodeUtil.types.isProxy(input)
+    )
+      throw refused();
+    const own = Reflect.ownKeys(input);
+    if (
+      own.length !== keys.length ||
+      !own.every((key) => typeof key === "string" && keys.includes(key))
+    )
+      throw refused();
+    const output: Record<string, unknown> = {};
+    for (const key of keys) {
+      const property = Object.getOwnPropertyDescriptor(input, key);
+      if (!property?.enumerable || !Object.hasOwn(property, "value")) throw refused();
+      output[key] = property.value;
+    }
+    return output;
+  };
+  const boolean = (input: unknown): boolean => {
+    if (typeof input !== "boolean") throw refused();
+    return input;
+  };
+  const nullableBoolean = (input: unknown): boolean | null =>
+    input === null ? null : boolean(input);
+  const cardinality = (input: unknown): BrowserInitialCardinality => {
+    if (input !== "none" && input !== "one" && input !== "multiple") throw refused();
+    return input;
+  };
+  const sizeOwner = (input: unknown): BrowserInitialSizeOwner => {
+    if (
+      input !== "absent" &&
+      input !== "unclaimed" &&
+      input !== "current-attach" &&
+      input !== "foreign-claim" &&
+      input !== "ambiguous" &&
+      input !== "unknown"
+    )
+      throw refused();
+    return input;
+  };
+  try {
+    const record = fields(value, [
+      "waitingOn",
+      "ui",
+      "transport",
+      "protocol",
+      "replay",
+      "sizeOwner",
+    ]);
+    if (
+      record.waitingOn !== "before-focus" &&
+      record.waitingOn !== "focus-predicate" &&
+      record.waitingOn !== "receipt-predicate"
+    )
+      return null;
+    const ui = fields(record.ui, [
+      "windows",
+      "mounts",
+      "pinnedMountMatched",
+      "screenClickCompleted",
+      "activeTextareaOwned",
+    ]);
+    let transport: BrowserInitialTransport | null = null,
+      protocol: BrowserInitialProtocol | null = null,
+      replay: BrowserInitialReplay | null = null;
+    if (record.transport !== null) {
+      const part = fields(record.transport, ["closed", "failed", "upgradedWires", "configWires"]);
+      transport = Object.freeze({
+        closed: boolean(part.closed),
+        failed: boolean(part.failed),
+        upgradedWires: cardinality(part.upgradedWires),
+        configWires: cardinality(part.configWires),
+      });
+    }
+    if (record.protocol !== null) {
+      const part = fields(record.protocol, [
+        "closed",
+        "failed",
+        "attachRequests",
+        "snapshots",
+        "configAttachments",
+        "resizeRequests",
+        "sizeOwner",
+      ]);
+      protocol = Object.freeze({
+        closed: boolean(part.closed),
+        failed: boolean(part.failed),
+        attachRequests: cardinality(part.attachRequests),
+        snapshots: cardinality(part.snapshots),
+        configAttachments: cardinality(part.configAttachments),
+        resizeRequests: cardinality(part.resizeRequests),
+        sizeOwner: sizeOwner(part.sizeOwner),
+      });
+    }
+    if (record.replay !== null) {
+      const part = fields(record.replay, ["closed", "failed", "snapshots", "configSnapshots"]);
+      replay = Object.freeze({
+        closed: boolean(part.closed),
+        failed: boolean(part.failed),
+        snapshots: cardinality(part.snapshots),
+        configSnapshots: cardinality(part.configSnapshots),
+      });
+    }
+    return Object.freeze({
+      waitingOn: record.waitingOn,
+      ui: Object.freeze({
+        windows: ui.windows === null ? null : cardinality(ui.windows),
+        mounts: ui.mounts === null ? null : cardinality(ui.mounts),
+        pinnedMountMatched: nullableBoolean(ui.pinnedMountMatched),
+        screenClickCompleted: boolean(ui.screenClickCompleted),
+        activeTextareaOwned: nullableBoolean(ui.activeTextareaOwned),
+      }),
+      transport,
+      protocol,
+      replay,
+      sizeOwner: sizeOwner(record.sizeOwner),
+    });
+  } catch {
+    return null;
+  }
+}
+
 /** Keeps private protocol values in memory only; returns finite public proofs, never raw envelopes or identifiers. */
-export function createBrowserFollowupProtocolObserver(input: {
-  png: Buffer;
-  cwd: string;
-  threadId: string;
-  terminalId: string;
-  patch: () => string;
-  slowTransport: () => boolean;
-}) {
+export function createBrowserFollowupProtocolObserver(
+  input: {
+    png: Buffer;
+    cwd: string;
+    threadId: string;
+    terminalId: string;
+    patch: () => string;
+    slowTransport: () => boolean;
+  } & BrowserInitialHooks,
+) {
   const requests = new Map<string, { tag: string; payload: unknown }>();
   const rendererConnections = new Set<string>();
   const attachments = new Map<
@@ -59,6 +246,50 @@ export function createBrowserFollowupProtocolObserver(input: {
   let preview: typeof ReviewDiffPreviewResult.Type | null = null;
   let closed = false;
   let terminalFailed = false;
+  const initialObservation = (): BrowserInitialProtocol => {
+    const values = [...attachments.values()];
+    const current = values.length === 1 ? values[0] : undefined;
+    const size = current?.snapshot.size;
+    return Object.freeze({
+      closed,
+      failed: terminalFailed,
+      attachRequests: browserInitialCardinality(
+        [...requests.values()].filter(
+          (request) =>
+            request.tag === "terminal.attach" &&
+            decode<TerminalAttachInput>(TerminalAttachInput, request.payload).sizeClaim != null,
+        ).length,
+      ),
+      snapshots: browserInitialCardinality(attachments.size),
+      configAttachments: browserInitialCardinality(
+        [...attachments.entries()].filter(
+          ([connection, value]) =>
+            rendererConnections.has(connection) &&
+            requests.get(value.entry)?.tag === "terminal.attach",
+        ).length,
+      ),
+      resizeRequests: browserInitialCardinality(
+        [...requests.values()].filter((request) => request.tag === "terminal.resize").length,
+      ),
+      sizeOwner:
+        values.length === 0
+          ? "absent"
+          : values.length > 1
+            ? "ambiguous"
+            : size == null
+              ? "unknown"
+              : size.sizeClaim === null
+                ? "unclaimed"
+                : size.sizeClaim === current?.claim
+                  ? "current-attach"
+                  : "foreign-claim",
+    });
+  };
+  try {
+    input.registerInitialOwners?.({ protocol: initialObservation });
+  } catch {
+    /* Optional evidence cannot affect protocol ownership. */
+  }
   const digest = NodeCrypto.createHash("sha256").update(input.png).digest("hex");
   const decode = <A>(schema: unknown, value: unknown): A =>
     Schema.decodeUnknownSync(Schema.toCodecJson(schema))(value) as A;
@@ -116,7 +347,9 @@ export function createBrowserFollowupProtocolObserver(input: {
         return;
       const entry = key(connection, value.id);
       if (requests.has(entry) || requests.size >= 128) throw refused();
-      requests.set(entry, { tag: value.tag, payload: value.payload });
+      if (value.tag !== "terminal.resize") {
+        requests.set(entry, { tag: value.tag, payload: value.payload });
+      }
       if (value.tag === "terminal.resize") {
         try {
           const payload = decode<typeof TerminalResizeInput.Type>(
@@ -147,10 +380,16 @@ export function createBrowserFollowupProtocolObserver(input: {
             throw refused();
         } catch (error) {
           terminalFailed = true;
+          try {
+            input.observeInitialFailure?.(error);
+          } catch {
+            /* Original refusal wins. */
+          }
           attachments.delete(connection);
           requests.delete(entry);
           throw error;
         }
+        requests.set(entry, { tag: value.tag, payload: value.payload });
       }
       if (value.tag === "uploads.append") {
         const payload = decode<typeof UploadAppendInput.Type>(UploadAppendInput, value.payload);
@@ -287,6 +526,11 @@ export function createBrowserFollowupProtocolObserver(input: {
         }
       } catch (error) {
         terminalFailed = true;
+        try {
+          input.observeInitialFailure?.(error);
+        } catch {
+          /* Original refusal wins. */
+        }
         attachments.delete(connection);
         requests.delete(entry);
         throw error;

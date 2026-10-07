@@ -2581,6 +2581,13 @@ that same mount before the unchanged replay wait. This public focus action lets
 the supported size-owner policy claim a foreign snapshot, including matching
 geometry. Do not type keys, reset identities, reload, inject events or bypass
 PID, history, sequence, live-claim and cleanup checks.
+An initial reconnect failure retains one nullable closed actor census before
+main-window restoration and observer cleanup. It distinguishes the existing
+focus and replay waits using their last observations, live configuration-request
+classification, attach/snapshot cardinalities and applied size ownership.
+Uncreated owners remain unknown. The record contains no raw identities, history,
+configuration, protocol or error values and adds no browser or network probe.
+Original failure, counts, cleanup and capture admission remain authoritative.
 The single terminal marker command must emit an explicit leading newline before
 its exact output line, then keep the same long-running sleep process. This
 establishes a raw line boundary after shell control sequences. Preserve the

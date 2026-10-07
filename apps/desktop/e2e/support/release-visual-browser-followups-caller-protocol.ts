@@ -10,7 +10,11 @@ import {
   type TerminalSummary,
 } from "../../../../packages/contracts/src/terminal.ts";
 import { AuthWebSocketTicketResult } from "../../../../packages/contracts/src/auth.ts";
-import { createBrowserFollowupProtocolObserver } from "./release-visual-browser-followups-protocol.ts";
+import {
+  browserInitialCardinality,
+  type BrowserInitialReplay,
+  createBrowserFollowupProtocolObserver,
+} from "./release-visual-browser-followups-protocol.ts";
 import { startBrowserFollowupTransport } from "./release-visual-browser-followups-network.ts";
 import { startThrottleProxy } from "../../../../scripts/throttle-proxy.ts";
 import { joinBrowserFollowupCleanup } from "./release-visual-browser-followups-caller-resources.ts";
@@ -53,13 +57,41 @@ export function createBrowserFollowupReplayObserver(
     baseline: ReturnType<typeof pinBrowserFollowupTerminalReplay>;
   },
 ) {
-  const base = createBrowserFollowupProtocolObserver(input),
-    requests = new Map<string, string>(),
+  let base: ReturnType<typeof createBrowserFollowupProtocolObserver> | undefined;
+  const requests = new Map<string, string>(),
     snapshots = new Map<string, TerminalSessionSnapshot>();
   const uploadRequests = new Map<string, string>();
   let closed = false,
     failed = false;
   let originalFailure: unknown;
+  const initialObservation = (): BrowserInitialReplay =>
+    Object.freeze({
+      closed,
+      failed,
+      snapshots: browserInitialCardinality(snapshots.size),
+      configSnapshots: browserInitialCardinality(
+        [...snapshots.keys()].filter((connection) => base?.rendererConnection(connection) === true)
+          .length,
+      ),
+    });
+  try {
+    input.registerInitialOwners?.({ replay: initialObservation });
+  } catch {
+    /* Optional evidence only. */
+  }
+  try {
+    base = createBrowserFollowupProtocolObserver(input);
+  } catch (error) {
+    failed = true;
+    originalFailure = error;
+    try {
+      input.observeInitialFailure?.(error);
+    } catch {
+      /* Original constructor error wins. */
+    }
+    throw error;
+  }
+
   const throwIfFailed = () => {
     if (failed) throw originalFailure;
     if (closed) throw refused();
@@ -83,7 +115,7 @@ export function createBrowserFollowupReplayObserver(
   const verify = () => {
     if (closed || failed || snapshots.size < 1 || snapshots.size > 2) throw refused();
     for (const [connection, value] of snapshots) {
-      if (!base.rendererConnection(connection)) throw refused();
+      if (!base!.rendererConnection(connection)) throw refused();
       check(value);
     }
   };
@@ -95,7 +127,7 @@ export function createBrowserFollowupReplayObserver(
       value: Readonly<Record<string, unknown>>,
     ) => {
       try {
-        base.observe(connection, direction, value);
+        base!.observe(connection, direction, value);
         if (
           direction === "request" &&
           value._tag === "Request" &&
@@ -153,30 +185,35 @@ export function createBrowserFollowupReplayObserver(
         if (!failed) {
           failed = true;
           originalFailure = error;
+          try {
+            input.observeInitialFailure?.(error);
+          } catch {
+            /* Original failure wins. */
+          }
         }
         throw error;
       }
     },
     terminal: () => {
       verify();
-      return base.terminal();
+      return base!.terminal();
     },
     fitted: () => {
       verify();
-      return base.fitted();
+      return base!.fitted();
     },
     terminalRestored: () => {
       verify();
-      return base.terminalRestored();
+      return base!.terminalRestored();
     },
     connectionClosed: (connection: string) => {
-      base.connectionClosed(connection);
+      base!.connectionClosed(connection);
       snapshots.delete(connection);
       for (const key of requests.keys()) if (key.startsWith(connection + ":")) requests.delete(key);
     },
     close: () => {
       closed = true;
-      base.close();
+      base!.close();
       requests.clear();
       snapshots.clear();
     },
@@ -350,6 +387,8 @@ export async function startBrowserFollowupReplayNetwork(
     listenPort: 4894,
     targetPort: 4897,
     observer,
+    ...(input.registerInitialOwners ? { registerInitialOwners: input.registerInitialOwners } : {}),
+    ...(input.observeInitialFailure ? { observeInitialFailure: input.observeInitialFailure } : {}),
   });
   try {
     proxy = await startThrottleProxy({
@@ -359,6 +398,11 @@ export async function startBrowserFollowupReplayNetwork(
       targetPort: 4894,
     });
   } catch (error) {
+    try {
+      input.observeInitialFailure?.(error);
+    } catch {
+      /* Original startup error wins. */
+    }
     try {
       await transport.close();
     } catch {

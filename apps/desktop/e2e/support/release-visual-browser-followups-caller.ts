@@ -39,6 +39,13 @@ import {
   ownBrowserFollowupLink,
   joinBrowserFollowupCleanup,
 } from "./release-visual-browser-followups-caller-resources.ts";
+import {
+  browserInitialCardinality,
+  projectBrowserInitialJoin,
+  type BrowserInitialJoin,
+  type BrowserInitialOwners,
+  type BrowserInitialCardinality,
+} from "./release-visual-browser-followups-protocol.ts";
 const refused = () => new Error("Owned browser follow-up caller refused.");
 /** The controller's physical worktree verifier remains authoritative; this closes the public descriptor/snapshot join. */
 export function bindBrowserFollowupTarget(input: {
@@ -478,6 +485,7 @@ export async function runBrowserFollowupCaller(input: {
   publish: () => void;
   step: (phase: string) => void;
   observeUnsafeCleanup: () => void;
+  observeInitialFailure?: (error: unknown, value: BrowserInitialJoin | null) => void;
 }) {
   if (input.CI !== "true") throw refused();
   let cleanupBinding: ReturnType<typeof bindBrowserFollowupTarget> | undefined;
@@ -532,72 +540,135 @@ export async function runBrowserFollowupCaller(input: {
         return true;
       });
       if (!baseline) throw refused();
-      const transition = createBrowserFollowupNetworkTransition({
-        bootstrap: input.prepared.bootstrap,
-        startObserved: () =>
-          startBrowserFollowupReplayNetwork({
-            CI: input.CI,
-            baseline: baseline!,
-            slowTransport: () => false,
-            png: NodeFS.readFileSync(input.prepared.png.path),
-            cwd: input.cwd,
-            threadId: input.threadId,
-            terminalId: terminal.terminalId,
-            patch: input.patch,
-            observeUnsafeCleanup: input.observeUnsafeCleanup,
-          }),
-        observeUnsafeCleanup: input.observeUnsafeCleanup,
-      });
-      input.prepared.retain(transition);
-      input.step("visual-browser-followups-observed-reconnect");
-      const terminalWindow = await input.browser.getWindowHandle();
-      const network = await transition.activate();
-      network.transport.throwIfFailed();
-      network.observer.replay.throwIfFailed();
-      const terminalWindows = await input.browser.getWindowHandles();
-      if (
-        terminalWindows.length !== 1 ||
-        terminalWindows[0] !== terminalWindow ||
-        (await input.browser.getWindowHandle()) !== terminalWindow
-      )
-        throw refused();
-      const terminalMount = "[data-preview-panel-mode] [data-terminal-xterm-mount]";
-      const terminalMounts = input.browser.$$(terminalMount);
-      if (
-        (await terminalMounts.length) !== 1 ||
-        (await terminalMounts[0]!.getAttribute("data-terminal-xterm-mount")) !== terminal.terminalId
-      )
-        throw refused();
-      await click(input.browser, terminalMount + " .xterm-screen");
-      await input.owner.until(async () => {
-        network.transport.throwIfFailed();
-        network.observer.replay.throwIfFailed();
-        return input.browser.execute((terminalId: string) => {
-          const mounts = document.querySelectorAll<HTMLElement>(
-            "[data-preview-panel-mode] [data-terminal-xterm-mount]",
-          );
-          const active = document.activeElement;
-          return (
-            mounts.length === 1 &&
-            mounts[0]!.getAttribute("data-terminal-xterm-mount") === terminalId &&
-            active instanceof HTMLTextAreaElement &&
-            active.classList.contains("xterm-helper-textarea") &&
-            mounts[0]!.contains(active)
-          );
-        }, terminal.terminalId);
-      });
-      await input.owner.until(async () => {
-        network.transport.throwIfFailed();
-        network.observer.replay.throwIfFailed();
+      const initialOwners: BrowserInitialOwners = {};
+      const initialUi: {
+        windows: BrowserInitialCardinality | null;
+        mounts: BrowserInitialCardinality | null;
+        pinnedMountMatched: boolean | null;
+        screenClickCompleted: boolean;
+        activeTextareaOwned: boolean | null;
+      } = {
+        windows: null,
+        mounts: null,
+        pinnedMountMatched: null,
+        screenClickCompleted: false,
+        activeTextareaOwned: null,
+      };
+      let waitingOn: BrowserInitialJoin["waitingOn"] = "before-focus",
+        initialActive = true,
+        initialCaptured = false;
+      const captureInitialFailure = (error: unknown) => {
+        if (!initialActive || initialCaptured) return;
+        initialCaptured = true;
+        const read = <A>(project: (() => A) | undefined): A | null => {
+          try {
+            return project?.() ?? null;
+          } catch {
+            return null;
+          }
+        };
+        const protocol = read(initialOwners.protocol);
+        const value = projectBrowserInitialJoin({
+          waitingOn,
+          ui: initialUi,
+          protocol,
+          replay: read(initialOwners.replay),
+          transport: read(initialOwners.transport),
+          sizeOwner: protocol?.sizeOwner ?? "unknown",
+        });
         try {
-          network.observer.terminalRestored();
-          return true;
+          input.observeInitialFailure?.(error, value);
         } catch {
+          /* Original initial failure wins, including undefined. */
+        }
+      };
+      let initialNetwork: Awaited<ReturnType<typeof startBrowserFollowupReplayNetwork>>;
+      try {
+        const transition = createBrowserFollowupNetworkTransition({
+          bootstrap: input.prepared.bootstrap,
+          startObserved: () =>
+            startBrowserFollowupReplayNetwork({
+              CI: input.CI,
+              baseline: baseline!,
+              slowTransport: () => false,
+              png: NodeFS.readFileSync(input.prepared.png.path),
+              cwd: input.cwd,
+              threadId: input.threadId,
+              terminalId: terminal.terminalId,
+              patch: input.patch,
+              observeUnsafeCleanup: input.observeUnsafeCleanup,
+              registerInitialOwners: (owners) => Object.assign(initialOwners, owners),
+              observeInitialFailure: captureInitialFailure,
+            }),
+          observeUnsafeCleanup: input.observeUnsafeCleanup,
+        });
+        input.prepared.retain(transition);
+        input.step("visual-browser-followups-observed-reconnect");
+        const terminalWindow = await input.browser.getWindowHandle();
+        const network = await transition.activate();
+        network.transport.throwIfFailed();
+        network.observer.replay.throwIfFailed();
+        const terminalWindows = await input.browser.getWindowHandles();
+        initialUi.windows = browserInitialCardinality(terminalWindows.length);
+        if (
+          terminalWindows.length !== 1 ||
+          terminalWindows[0] !== terminalWindow ||
+          (await input.browser.getWindowHandle()) !== terminalWindow
+        )
+          throw refused();
+        const terminalMount = "[data-preview-panel-mode] [data-terminal-xterm-mount]";
+        const terminalMounts = input.browser.$$(terminalMount);
+        const terminalMountCount = await terminalMounts.length;
+        initialUi.mounts = browserInitialCardinality(terminalMountCount);
+        if (terminalMountCount !== 1) throw refused();
+        initialUi.pinnedMountMatched =
+          (await terminalMounts[0]!.getAttribute("data-terminal-xterm-mount")) ===
+          terminal.terminalId;
+        if (!initialUi.pinnedMountMatched) throw refused();
+        await click(input.browser, terminalMount + " .xterm-screen");
+        initialUi.screenClickCompleted = true;
+        waitingOn = "focus-predicate";
+        await input.owner.until(async () => {
           network.transport.throwIfFailed();
           network.observer.replay.throwIfFailed();
-          return false;
-        }
-      });
+          const activeTextareaOwned = await input.browser.execute((terminalId: string) => {
+            const mounts = document.querySelectorAll<HTMLElement>(
+              "[data-preview-panel-mode] [data-terminal-xterm-mount]",
+            );
+            const active = document.activeElement;
+            return (
+              mounts.length === 1 &&
+              mounts[0]!.getAttribute("data-terminal-xterm-mount") === terminalId &&
+              active instanceof HTMLTextAreaElement &&
+              active.classList.contains("xterm-helper-textarea") &&
+              mounts[0]!.contains(active)
+            );
+          }, terminal.terminalId);
+          initialUi.activeTextareaOwned = activeTextareaOwned;
+          return activeTextareaOwned;
+        });
+        waitingOn = "receipt-predicate";
+        await input.owner.until(async () => {
+          network.transport.throwIfFailed();
+          network.observer.replay.throwIfFailed();
+          try {
+            network.observer.terminalRestored();
+            return true;
+          } catch {
+            network.transport.throwIfFailed();
+            network.observer.replay.throwIfFailed();
+            return false;
+          }
+        });
+        // Initial reconnect admission ends here.
+        initialNetwork = network;
+      } catch (error) {
+        captureInitialFailure(error);
+        initialActive = false;
+        throw error;
+      }
+      initialActive = false;
+      const network = initialNetwork;
       const verifyIdentity = async () => {
         await input.prepared.verify();
         await input.verifyPhysical();

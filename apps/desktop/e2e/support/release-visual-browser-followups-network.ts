@@ -1,6 +1,11 @@
 // @effect-diagnostics nodeBuiltinImport:off - CI-only owned loopback raw HTTP/WebSocket transport.
 import * as NodeNet from "node:net";
 import { createBrowserFollowupReplyGate } from "./release-visual-browser-followups-transport.ts";
+import {
+  browserInitialCardinality,
+  type BrowserInitialHooks,
+  type BrowserInitialTransport,
+} from "./release-visual-browser-followups-protocol.ts";
 import type { createBrowserFollowupProtocolObserver } from "./release-visual-browser-followups-protocol.ts";
 import { createBrowserFollowupProtocolObserver as createObserver } from "./release-visual-browser-followups-protocol.ts";
 import { startThrottleProxy, type ThrottleProxy } from "../../../../scripts/throttle-proxy.ts";
@@ -125,12 +130,14 @@ export async function startBrowserFollowupNetwork(input: {
   };
 }
 /** HTTP stays original. Only the original selected diagnostics reply is held after an actual WebSocket upgrade. */
-export async function startBrowserFollowupTransport(input: {
-  CI: string | undefined;
-  listenPort: number;
-  targetPort: number;
-  observer: ReturnType<typeof createBrowserFollowupProtocolObserver>;
-}) {
+export async function startBrowserFollowupTransport(
+  input: {
+    CI: string | undefined;
+    listenPort: number;
+    targetPort: number;
+    observer: ReturnType<typeof createBrowserFollowupProtocolObserver>;
+  } & BrowserInitialHooks,
+) {
   if (
     input.CI !== "true" ||
     ![input.listenPort, input.targetPort].every(
@@ -160,8 +167,31 @@ export async function startBrowserFollowupTransport(input: {
     if (!failed) {
       failed = true;
       originalFailure = error;
+      try {
+        input.observeInitialFailure?.(error);
+      } catch {
+        /* Original transport error wins. */
+      }
     }
   };
+  const initialObservation = (): BrowserInitialTransport =>
+    Object.freeze({
+      closed,
+      failed,
+      upgradedWires: browserInitialCardinality(
+        [...wires.values()].filter((wire) => wire.upgraded).length,
+      ),
+      configWires: browserInitialCardinality(
+        [...wires.entries()].filter(
+          ([connection, wire]) => wire.upgraded && input.observer.rendererConnection(connection),
+        ).length,
+      ),
+    });
+  try {
+    input.registerInitialOwners?.({ transport: initialObservation });
+  } catch {
+    /* Optional evidence only. */
+  }
   const server = NodeNet.createServer((client) => {
     if (closed || ++ordinal > 128) {
       client.destroy();
@@ -270,9 +300,13 @@ export async function startBrowserFollowupTransport(input: {
     upstream.on("close", destroy);
   });
   await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
+    const fail = (error: Error) => {
+      markFailed(error);
+      reject(error);
+    };
+    server.once("error", fail);
     server.listen(input.listenPort, "127.0.0.1", () => {
-      server.removeListener("error", reject);
+      server.removeListener("error", fail);
       resolve();
     });
   });

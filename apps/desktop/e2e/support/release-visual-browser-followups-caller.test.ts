@@ -1,3 +1,7 @@
+import {
+  browserInitialCardinality,
+  projectBrowserInitialJoin,
+} from "./release-visual-browser-followups-protocol.ts";
 import { it as test } from "vite-plus/test";
 import * as NodeAssert from "node:assert/strict";
 // @effect-diagnostics nodeBuiltinImport:off - Actual caller source executes only on inert ports.
@@ -73,6 +77,8 @@ test.each(["owned", "bootstrap-close", "source-drift"])(
       NodeModule.stripTypeScriptTypes(source.slice(begin)).replace(/^export /gm, "") +
         "\nrunBrowserFollowupCaller",
       {
+        browserInitialCardinality,
+        projectBrowserInitialJoin,
         withBrowserFollowupMainWindow,
         click: NodeVM.runInNewContext(
           NodeModule.stripTypeScriptTypes(
@@ -629,7 +635,7 @@ test.each(["pending", "transport-error", "replay-error", "undefined-error"])(
       "      await input.owner.until(async () => {",
       source.indexOf("          network.observer.terminalRestored();"),
     );
-    const end = source.indexOf("      const verifyIdentity =", start);
+    const end = source.indexOf("      // Initial reconnect admission ends here.", start);
     NodeAssert.equal(start > 0 && end > start, true);
     const original =
       mode === "undefined-error"
@@ -708,7 +714,7 @@ test.each([
       "      const network = await transition.activate();",
       source.indexOf('input.step("visual-browser-followups-observed-reconnect")'),
     );
-    const end = source.indexOf("      const verifyIdentity =", oldStart);
+    const end = source.indexOf("      // Initial reconnect admission ends here.", oldStart);
     NodeAssert.equal(oldStart > 0 && end > oldStart, true);
     const clickStart = source.indexOf("async function click("),
       clickEnd = source.indexOf("/** A real public Terminal", clickStart);
@@ -768,11 +774,12 @@ test.each([
     const run = NodeVM.runInNewContext(
       NodeModule.stripTypeScriptTypes(
         source.slice(clickStart, clickEnd) +
-          "\nasync function initial(input,terminal,transition){" +
+          "\nasync function initial(input,terminal,transition){let waitingOn; const initialUi = {};" +
           source.slice(start >= 0 ? start : oldStart, end) +
           "}\ninitial;",
       ),
       {
+        browserInitialCardinality,
         document,
         HTMLTextAreaElement: Textarea,
         refused: () => new Error("inert public mount refused"),
@@ -822,5 +829,216 @@ test.each([
       } else NodeAssert.equal(clicks, mode === "no-focus" ? 1 : 0);
     }
     NodeAssert.equal(polls <= 4, true);
+  },
+);
+
+test.each([
+  "bootstrap",
+  "focus",
+  "config",
+  "attach",
+  "snapshot",
+  "claim",
+  "partial",
+  "callback-undefined",
+  "original-undefined",
+])(
+  "complete initial caller captures one closed failure before joined retirement: %s",
+  async (mode) => {
+    const source = NodeFS.readFileSync(
+      new URL("./release-visual-browser-followups-caller.ts", import.meta.url),
+      "utf8",
+    );
+    const begin = source.indexOf("export async function runBrowserFollowupCaller(");
+    const events: string[] = [];
+    const snapshot = {
+      threadId: "inert-thread",
+      terminalId: "inert-terminal",
+      cwd: "/inert/worktree",
+      worktreePath: "/inert/worktree",
+      status: "running",
+      pid: 123,
+      sequence: 1,
+      history: "Owned shared terminal output\r\n",
+      size: { cols: 80, rows: 24, sizeClaim: "current-claim" },
+    };
+    const original =
+      mode === "original-undefined" ? undefined : new Error("inert exact initial failure");
+    let captured = false,
+      receipt: unknown,
+      callbacks = 0,
+      projectionClosed = false;
+    const prepared = {
+      png: { path: "inert" },
+      verify: async () => {},
+      bootstrap: {
+        close: async () => {
+          events.push("bootstrap");
+          if (["bootstrap", "original-undefined"].includes(mode)) throw original;
+        },
+      },
+      retain: () => {},
+      verifyHostedBuild: async () => ({}),
+    };
+    const clickStart = source.indexOf("async function click("),
+      clickEnd = source.indexOf("/** A real public Terminal", clickStart);
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(source.slice(begin)).replace(/^export /gm, "") +
+        "\nrunBrowserFollowupCaller",
+      {
+        browserInitialCardinality,
+        projectBrowserInitialJoin,
+        withBrowserFollowupMainWindow,
+        bindBrowserFollowupTarget,
+        admitBrowserFollowupTerminal,
+        pinBrowserFollowupTerminalReplay,
+        prepareBrowserFollowupTerminal: async () => ({
+          terminalId: snapshot.terminalId,
+          pid: 123,
+          label: "sleep",
+          hasRunningSubprocess: true,
+        }),
+        readBrowserFollowupTerminalBaseline: async () => snapshot,
+        createBrowserFollowupNetworkTransition,
+        NodeFS: { readFileSync: () => new Uint8Array([1]) },
+        click: NodeVM.runInNewContext(
+          NodeModule.stripTypeScriptTypes(source.slice(clickStart, clickEnd)) + "\nclick",
+          { refused: () => original },
+        ),
+        refused: () => original,
+        startBrowserFollowupReplayNetwork: async (input: {
+          registerInitialOwners?: (value: object) => void;
+          observeInitialFailure?: (error: unknown) => void;
+        }) => {
+          input.registerInitialOwners?.({
+            protocol: () => ({
+              closed: projectionClosed,
+              failed: false,
+              attachRequests: mode === "attach" ? "none" : "one",
+              snapshots: mode === "snapshot" ? "none" : "one",
+              configAttachments: mode === "config" ? "none" : "one",
+              resizeRequests: "none",
+              sizeOwner: mode === "claim" ? "foreign-claim" : "current-attach",
+            }),
+          });
+          if (mode === "partial") {
+            input.observeInitialFailure?.(original);
+            projectionClosed = true;
+            throw original;
+          }
+          input.registerInitialOwners?.({
+            replay: () => ({
+              closed: projectionClosed,
+              failed: false,
+              snapshots: "one",
+              configSnapshots: mode === "config" ? "none" : "one",
+            }),
+            transport: () => ({
+              closed: projectionClosed,
+              failed: false,
+              upgradedWires: "one",
+              configWires: mode === "config" ? "none" : "one",
+            }),
+          });
+          return {
+            transport: { throwIfFailed: () => {} },
+            observer: {
+              terminalRestored: () => {
+                throw original;
+              },
+              replay: { throwIfFailed: () => {}, verify: () => {} },
+            },
+            close: async () => {
+              projectionClosed = true;
+            },
+          };
+        },
+      },
+    );
+    const screen = {
+      isDisplayed: async () => true,
+      waitForDisplayed: async () => {},
+      waitForEnabled: async () => {},
+      click: async () => events.push("click"),
+    };
+    const input = {
+      CI: "true",
+      prepared,
+      browser: {
+        $: () => screen,
+        $$: () => [{ getAttribute: async () => snapshot.terminalId }],
+        execute: async () => mode !== "focus",
+        getWindowHandle: async () => "inert-main",
+        getWindowHandles: async () => ["inert-main"],
+        getUrl: async () => "http://127.0.0.1:4885/local/inert-thread",
+        getWindowRect: async () => ({ x: 0, y: 0, width: 900, height: 700 }),
+        url: async () => events.push("restore-url"),
+        setWindowRect: async () => events.push("restore-size"),
+      },
+      owner: {
+        until: async (check: () => Promise<boolean>) => {
+          if (!(await check())) throw original;
+        },
+      },
+      theme: "light",
+      accessToken: "inert",
+      threadId: snapshot.threadId,
+      cwd: snapshot.cwd,
+      branch: "inert-branch",
+      projectPath: "/inert/project",
+      readDescriptor: async () => descriptor,
+      readSnapshot: async () => snapshotModel,
+      verifyPhysical: async () => {},
+      patch: () => "",
+      viewport: async () => {},
+      evidence: "inert",
+      captured: new Set(),
+      captures: [],
+      publish: () => {},
+      step: () => {},
+      observeUnsafeCleanup: () => {},
+      observeInitialFailure: (error: unknown, value: unknown) => {
+        callbacks++;
+        captured = true;
+        receipt = value;
+        events.push("capture");
+        NodeAssert.equal(error, original);
+        if (mode === "callback-undefined") throw undefined;
+      },
+    };
+    let failed = false,
+      failure: unknown;
+    try {
+      await run(input);
+    } catch (error) {
+      failed = true;
+      failure = error;
+    }
+    NodeAssert.equal(failed, true);
+    NodeAssert.equal(failure, original);
+    NodeAssert.equal(captured, true);
+    NodeAssert.equal(callbacks, 1);
+    NodeAssert.ok(events.indexOf("capture") < events.indexOf("restore-url"));
+    const closed = receipt as {
+      waitingOn: string;
+      protocol: { closed: boolean } | null;
+      replay: unknown;
+      transport: unknown;
+    };
+    NodeAssert.equal(
+      closed.waitingOn,
+      ["bootstrap", "partial", "original-undefined"].includes(mode)
+        ? "before-focus"
+        : mode === "focus"
+          ? "focus-predicate"
+          : "receipt-predicate",
+    );
+    if (["bootstrap", "original-undefined"].includes(mode)) NodeAssert.equal(closed.protocol, null);
+    if (mode === "partial") {
+      NodeAssert.equal(closed.protocol?.closed, false);
+      NodeAssert.equal(closed.replay, null);
+      NodeAssert.equal(closed.transport, null);
+    }
+    NodeAssert.equal(JSON.stringify(receipt).includes("inert"), false);
   },
 );
