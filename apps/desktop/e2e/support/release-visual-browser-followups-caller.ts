@@ -644,7 +644,8 @@ export async function runBrowserFollowupCaller(input: {
               mounts[0]!.contains(active)
             );
           }, terminal.terminalId);
-          initialUi.activeTextareaOwned = activeTextareaOwned;
+          initialUi.activeTextareaOwned =
+            typeof activeTextareaOwned === "boolean" ? activeTextareaOwned : null;
           return activeTextareaOwned;
         });
         waitingOn = "receipt-predicate";

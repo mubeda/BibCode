@@ -1,10 +1,16 @@
+// @effect-diagnostics nodeBuiltinImport:off - Actual caller source executes only on inert ports.
+import * as NodePath from "node:path";
+import * as NodeOS from "node:os";
+import * as NodeEvents from "node:events";
+import { TerminalSessionSnapshot } from "../../../../packages/contracts/src/terminal.ts";
+import { createBrowserFollowupReplayObserver } from "./release-visual-browser-followups-caller-protocol.ts";
+import { createBrowserFollowupReplyGate } from "./release-visual-browser-followups-transport.ts";
 import {
   browserInitialCardinality,
   projectBrowserInitialJoin,
 } from "./release-visual-browser-followups-protocol.ts";
 import { it as test } from "vite-plus/test";
 import * as NodeAssert from "node:assert/strict";
-// @effect-diagnostics nodeBuiltinImport:off - Actual caller source executes only on inert ports.
 import * as NodeFS from "node:fs";
 import * as NodeVM from "node:vm";
 import * as NodeModule from "node:module";
@@ -1040,5 +1046,361 @@ test.each([
       NodeAssert.equal(closed.transport, null);
     }
     NodeAssert.equal(JSON.stringify(receipt).includes("inert"), false);
+  },
+);
+
+test.each([
+  ["undefined", undefined, false, false],
+  ["string", "driver-value", false, false],
+  ["empty-string", "", false, false],
+  ["number", 42, false, false],
+  ["zero", 0, false, false],
+  ["boolean-false", false, false, false],
+  ["boolean-true", true, false, false],
+  ["original-undefined", false, false, true],
+  ["success", true, true, false],
+  ["truthy-success", "driver-value", true, false],
+] as const)(
+  "actual focus return and real owners retain closed writer facts without coercion: %s",
+  async (_mode, rawFocus, success, undefinedError) => {
+    const caller = NodeFS.readFileSync(
+      new URL("./release-visual-browser-followups-caller.ts", import.meta.url),
+      "utf8",
+    );
+    const qualifier = NodeFS.readFileSync(
+      new URL("../qualify-delivery-retry.ts", import.meta.url),
+      "utf8",
+    );
+    const networkSource = NodeFS.readFileSync(
+      new URL("./release-visual-browser-followups-network.ts", import.meta.url),
+      "utf8",
+    );
+    const Schema = NodeModule.createRequire(
+      new URL("../../../../packages/contracts/package.json", import.meta.url),
+    )("effect/Schema");
+    const snapshot = Schema.decodeUnknownSync(Schema.toCodecJson(TerminalSessionSnapshot))({
+      threadId: "inert-thread",
+      terminalId: "inert-terminal",
+      cwd: "/inert/worktree",
+      worktreePath: "/inert/worktree",
+      status: "running",
+      pid: 123,
+      sequence: 1,
+      history: "Owned shared terminal output\r\n",
+      exitCode: null,
+      exitSignal: null,
+      label: "Terminal 1",
+      updatedAt: "2026-10-06T00:00:00.000Z",
+      size: { cols: 80, rows: 24, sizeClaim: "current-claim" },
+    });
+    const original = undefinedError
+      ? undefined
+      : Object.freeze(new Error("Inert original initial failure."));
+    const events: string[] = [],
+      readiness: unknown[] = [],
+      closes: Array<() => Promise<void>> = [];
+    let waits = 0,
+      callbacks = 0,
+      executes = 0;
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "initial-ui-facts-"));
+    NodeFS.chmodSync(root, 0o700);
+    try {
+      const writerContext = NodeVM.createContext({
+        NodeFS,
+        NodePath,
+        config: { evidence: root, selection: "release-visual-browser-followups" },
+        phase: "prepare",
+        theme: "light",
+        projectBrowserInitialJoin,
+        classifyQualificationFailure: () => ({ kind: "unclassified" }),
+        cursorTurnObservation: null,
+        startupObservation: null,
+        importObservation: null,
+        worktreeObservation: null,
+        createRefObservation: null,
+        textRowObservation: null,
+        gitProjectDirectoryFailureFacts: () => null,
+        gitProjectTabFailureFacts: () => null,
+        projectGitProjectTabInterception: () => null,
+        resolveSettingsVisualFailureScene: () => null,
+        createRefClearObservation: null,
+        browserDriverReadiness: null,
+        browserReadinessStage: null,
+        browserSessionObservation: null,
+        prViewportObservation: null,
+        modelClickObservation: null,
+      });
+      const declaration = qualifier.slice(
+        qualifier.indexOf("  let browserInitialFailure:"),
+        qualifier.indexOf("  let browserFollowupFixtureSafeToDelete = true;"),
+      );
+      const writeStart = qualifier.indexOf("  const write ="),
+        writeEnd = qualifier.indexOf("  const step =", writeStart);
+      const callbackStart = qualifier.indexOf("          observeInitialFailure: (error, value) =>");
+      const callbackEnd = qualifier.indexOf("          browser,", callbackStart);
+      const callback = qualifier
+        .slice(callbackStart, callbackEnd)
+        .trim()
+        .replace(/^observeInitialFailure: /, "")
+        .replace(/,$/, "");
+      const failureStart = qualifier.indexOf('    write("failure", {'),
+        failureEnd = qualifier.indexOf("\n  } finally {", failureStart);
+      NodeAssert.ok(writeStart > 0 && callbackStart > 0 && failureEnd > failureStart);
+      const writer = NodeVM.runInContext(
+        NodeModule.stripTypeScriptTypes(
+          declaration +
+            qualifier.slice(writeStart, writeEnd) +
+            "\nconst observe = " +
+            callback +
+            ";\nfunction publish(error){ const originalCursorFailure=null; const originalBrowserInitialFailure=readBrowserInitialFailure();" +
+            qualifier.slice(failureStart, failureEnd) +
+            "\n}\n({observe,publish,read:readBrowserInitialFailure});",
+        ),
+        writerContext,
+      );
+      const retainStart = networkSource.indexOf("function retainNetworkClose("),
+        retainEnd = networkSource.indexOf("/** One concrete", retainStart);
+      const transportStart = networkSource.indexOf(
+        "export async function startBrowserFollowupTransport(",
+      );
+      const startTransport = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(
+          networkSource.slice(retainStart, retainEnd) + networkSource.slice(transportStart),
+        ).replace(/^export /gm, "") + "\nstartBrowserFollowupTransport;",
+        {
+          browserInitialCardinality,
+          createBrowserFollowupReplyGate,
+          refused: () => original,
+          NodeNet: {
+            createServer: () => {
+              const server = new NodeEvents.EventEmitter();
+              return Object.assign(server, {
+                listen: (_port: number, _host: string, ready: () => void) => {
+                  ready();
+                  return server;
+                },
+                close: (done: (error?: Error) => void) => {
+                  done();
+                  return server;
+                },
+              });
+            },
+          },
+        },
+      );
+      const begin = caller.indexOf("export async function runBrowserFollowupCaller(");
+      const clickStart = caller.indexOf("async function click("),
+        clickEnd = caller.indexOf("/** A real public Terminal", clickStart);
+      const run = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(caller.slice(begin)).replace(/^export /gm, "") +
+          "\nrunBrowserFollowupCaller;",
+        {
+          browserInitialCardinality,
+          projectBrowserInitialJoin,
+          withBrowserFollowupMainWindow,
+          bindBrowserFollowupTarget,
+          admitBrowserFollowupTerminal,
+          pinBrowserFollowupTerminalReplay,
+          createBrowserFollowupNetworkTransition,
+          browserFollowupRows: [],
+          NodeFS: { readFileSync: () => new Uint8Array([1]) },
+          refused: () => original,
+          click: NodeVM.runInNewContext(
+            NodeModule.stripTypeScriptTypes(caller.slice(clickStart, clickEnd)) + "\nclick;",
+            { refused: () => original },
+          ),
+          prepareBrowserFollowupTerminal: async () => ({
+            terminalId: snapshot.terminalId,
+            pid: snapshot.pid,
+            label: "sleep",
+            hasRunningSubprocess: true,
+          }),
+          readBrowserFollowupTerminalBaseline: async () => snapshot,
+          startBrowserFollowupReplayNetwork: async (
+            input: Parameters<typeof createBrowserFollowupReplayObserver>[0],
+          ) => {
+            const observer = createBrowserFollowupReplayObserver(input);
+            const transport = await startTransport({
+              CI: "true",
+              listenPort: 4894,
+              targetPort: 4897,
+              observer,
+              registerInitialOwners: input.registerInitialOwners,
+              observeInitialFailure: input.observeInitialFailure,
+            });
+            observer.observe("connection-1", "request", {
+              _tag: "Request",
+              id: "1",
+              tag: "subscribeServerConfig",
+              payload: {},
+            });
+            observer.observe("connection-1", "request", {
+              _tag: "Request",
+              id: "2",
+              tag: "terminal.attach",
+              payload: {
+                threadId: snapshot.threadId,
+                terminalId: snapshot.terminalId,
+                cwd: snapshot.cwd,
+                worktreePath: snapshot.cwd,
+                sizeClaim: "current-claim",
+              },
+            });
+            observer.observe("connection-1", "reply", {
+              _tag: "Chunk",
+              requestId: "2",
+              values: [
+                {
+                  type: "snapshot",
+                  snapshot: {
+                    ...snapshot,
+                    size: {
+                      cols: 80,
+                      rows: 24,
+                      sizeClaim: success ? "current-claim" : "another-window-claim",
+                    },
+                  },
+                },
+              ],
+            });
+            return { observer, transport, close: transport.close };
+          },
+        },
+      );
+      const screen = {
+        waitForDisplayed: async () => {},
+        waitForEnabled: async () => {},
+        click: async () => events.push("click"),
+      };
+      const pending = run({
+        CI: "true",
+        prepared: {
+          png: { path: "inert" },
+          verify: async () => {},
+          bootstrap: { close: async () => {} },
+          retain: (resource: { close: () => Promise<void> }) => closes.push(resource.close),
+          verifyHostedBuild: async () => ({}),
+        },
+        browser: {
+          $: () => screen,
+          $$: () => [{ getAttribute: async () => snapshot.terminalId }],
+          execute: async () => {
+            executes++;
+            return rawFocus;
+          },
+          getWindowHandle: async () => "inert-main",
+          getWindowHandles: async () => ["inert-main"],
+          getUrl: async () => "http://127.0.0.1:4885/local/inert-thread",
+          getWindowRect: async () => ({ x: 0, y: 0, width: 900, height: 700 }),
+          url: async () => events.push("restore"),
+          setWindowRect: async () => events.push("cleanup"),
+        },
+        owner: {
+          until: async (check: () => Promise<unknown>) => {
+            waits++;
+            const value = await check();
+            if (waits === 2) readiness.push(value);
+            if (!value) throw original;
+          },
+        },
+        theme: "light",
+        accessToken: "inert",
+        threadId: snapshot.threadId,
+        cwd: snapshot.cwd,
+        branch: "inert-branch",
+        projectPath: "/inert/project",
+        readDescriptor: async () => descriptor,
+        readSnapshot: async () => snapshotModel,
+        verifyPhysical: async () => {},
+        patch: () => "",
+        viewport: async () => {},
+        evidence: root,
+        captured: new Set(),
+        captures: [],
+        publish: () => {
+          throw new Error("Unexpected scene publication.");
+        },
+        step: (phase: string) => {
+          writerContext.phase = phase;
+        },
+        observeUnsafeCleanup: () => {},
+        observeInitialFailure: (error: unknown, value: unknown) => {
+          callbacks++;
+          NodeAssert.equal(error, original);
+          events.push("capture");
+          writer.observe(error, value);
+          if (undefinedError) throw undefined;
+        },
+      });
+      let failed = false,
+        caught: unknown;
+      try {
+        await pending;
+      } catch (error) {
+        failed = true;
+        caught = error;
+      }
+      NodeAssert.equal(executes, 1);
+      NodeAssert.equal(readiness.length, 1);
+      NodeAssert.equal(readiness[0], rawFocus);
+      NodeAssert.equal(waits, rawFocus ? 3 : 2);
+      if (success) {
+        NodeAssert.equal(failed, false);
+        NodeAssert.equal(callbacks, 0);
+        NodeAssert.equal(writer.read(), null);
+        NodeAssert.equal(NodeFS.existsSync(NodePath.join(root, "failure.json")), false);
+      } else {
+        NodeAssert.equal(failed, true);
+        NodeAssert.equal(caught, original);
+        NodeAssert.equal(callbacks, 1);
+        NodeAssert.ok(events.indexOf("capture") < events.indexOf("cleanup"));
+        NodeAssert.equal(writer.read().error, original);
+        NodeAssert.notEqual(writer.read().value, null);
+        const first = writer.read().value;
+        writer.observe(new Error("Inert later error."), first);
+        NodeAssert.equal(writer.read().error, original);
+        writer.publish(caught);
+        const file = NodePath.join(root, "failure.json");
+        NodeAssert.equal(NodeFS.statSync(file).mode & 0o777, 0o600);
+        const bytes = NodeFS.readFileSync(file);
+        NodeAssert.ok(bytes.length <= 1024 * 1024);
+        const retained = JSON.parse(bytes.toString("utf8")).browserInitialJoin;
+        NodeAssert.deepEqual(retained, {
+          waitingOn: rawFocus ? "receipt-predicate" : "focus-predicate",
+          ui: {
+            windows: "one",
+            mounts: "one",
+            pinnedMountMatched: true,
+            screenClickCompleted: true,
+            activeTextareaOwned: typeof rawFocus === "boolean" ? rawFocus : null,
+          },
+          protocol: {
+            closed: false,
+            failed: false,
+            attachRequests: "one",
+            snapshots: "one",
+            configAttachments: "one",
+            resizeRequests: "none",
+            sizeOwner: "foreign-claim",
+          },
+          replay: { closed: false, failed: false, snapshots: "one", configSnapshots: "one" },
+          transport: { closed: false, failed: false, upgradedWires: "none", configWires: "none" },
+          sizeOwner: "foreign-claim",
+        });
+        NodeAssert.equal(
+          /inert-thread|another-window-claim|driver-value/.test(JSON.stringify(retained)),
+          false,
+        );
+        NodeAssert.ok(Object.isFrozen(first) && Object.isFrozen(first.ui));
+        for (const close of closes) await close();
+        NodeAssert.deepEqual(
+          JSON.parse(NodeFS.readFileSync(file, "utf8")).browserInitialJoin,
+          retained,
+        );
+      }
+    } finally {
+      for (const close of closes) await close();
+      NodeFS.rmSync(root, { recursive: true, force: true });
+    }
   },
 );
