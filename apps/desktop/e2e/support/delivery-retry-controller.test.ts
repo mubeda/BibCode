@@ -95,6 +95,7 @@ const runControllerSource = (
       gitProjectTabFailureFacts,
       cursorOriginalFailure: null,
       readCursorOriginalFailure: () => null,
+      readBrowserInitialFailure: () => null,
       config: { selection: "delivery-retry-ui" },
       settingsFollowupUsageFixtures: [],
       browserFollowupResources: [],
@@ -102,6 +103,23 @@ const runControllerSource = (
     },
     options,
   );
+
+it("the shared controller VM binds the same-source neutral browser failure read", () => {
+  const source = NodeFS.readFileSync(
+    NodePath.resolve("apps/desktop/e2e/qualify-delivery-retry.ts"),
+    "utf8",
+  );
+  const start = source.indexOf(
+    "    const originalBrowserInitialFailure = readBrowserInitialFailure();",
+  );
+  expect(start).toBeGreaterThan(0);
+  const end = source.indexOf("\n", start);
+  const result = runControllerSource(
+    source.slice(start, end) + "\noriginalBrowserInitialFailure;",
+    {},
+  );
+  expect(result).toBeNull();
+});
 
 it.each(["safe", "already-unsafe", "first-refused", "signal-during-join", "unjoined"])(
   "the actual final owner retries joins while preserving unsafe Settings inputs: %s",

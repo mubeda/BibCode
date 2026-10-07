@@ -165,6 +165,7 @@ function cursorFailureAttribution() {
     phase: "prepare",
     theme: "light",
     cursorOriginalFailure: null,
+    readBrowserInitialFailure: () => null,
     cursorOriginalFailurePhases: NodeVM.runInNewContext(
       source.slice(namesStart, namesEnd) + "\ncursorOriginalFailurePhases",
     ),
@@ -197,6 +198,13 @@ function cursorFailureAttribution() {
   ) as () => void;
   return { scope, observeFailure, recover, reset };
 }
+
+it("the same-source Cursor recovery starts with a neutral browser failure state", () => {
+  const attribution = cursorFailureAttribution();
+  const original = new Error("Inert unchanged Cursor recovery failure.");
+  expect(attribution.recover(original)).toBe("prepare");
+  expect(attribution.scope.cursorOriginalFailure).toBeNull();
+});
 
 function cursorFailureDriver(
   attribution: ReturnType<typeof cursorFailureAttribution>,
