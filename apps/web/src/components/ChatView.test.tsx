@@ -436,7 +436,8 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
 
 // ── Child components ─────────────────────────────────────────────────
 
-vi.mock("./NoActiveThreadState", () => ({
+vi.mock("./NoActiveThreadState", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./NoActiveThreadState")>()),
   NoActiveThreadState: () => <div data-mock="no-active-thread" />,
 }));
 
@@ -4684,6 +4685,18 @@ describe("ChatView", () => {
       expect(composer["routeKind"]).toBe("server");
       expect(composer["isServerThread"]).toBe(true);
       expect(composer["lockProviderPickerToActiveInstance"]).toBe(true);
+    });
+
+    it("shows an opening state instead of the global empty state before its thread arrives", () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+
+      const markup = renderToStaticMarkup(
+        <ChatView variant="panel" panelThreadRef={threadRef} workspaceUnavailable={null} />,
+      );
+
+      expect(markup).toContain("Opening chat…");
+      expect(markup).not.toContain('data-mock="no-active-thread"');
     });
   });
 

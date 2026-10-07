@@ -666,7 +666,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
             setHistoryActionMessage(branchSyncDisabledReason);
             return;
           }
-          setHistoryBranchDialog({ kind: "create", baseBranch: action.sha });
+          setHistoryBranchDialog({ kind: "create", baseBranch: null, baseCommit: action.sha });
           return;
         case "create-tag":
           if (tagDisabledReason !== null) {
@@ -864,7 +864,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           projectId,
           name: submission.name,
           startPoint: submission.startPoint,
-          checkout: true,
+          checkout: submission.checkout,
         })
       ) {
         setHistoryBranchDialog(null);
@@ -1212,6 +1212,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         disabledReason={branchSyncDisabledReason}
         errorMessage={historyOperationError}
         refs={localBranches}
+        remoteRefs={snapshot?.remoteBranches ?? EMPTY_REFS}
         onClose={closeHistoryBranchDialog}
         onSubmit={submitHistoryBranchDialog}
       />

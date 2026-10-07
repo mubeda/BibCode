@@ -1,4 +1,4 @@
-import type { EnvironmentId } from "@bibcode/contracts";
+import type { EnvironmentId, SidebarRepositorySortOrder } from "@bibcode/contracts";
 
 import {
   compareSidebarDisplayText,
@@ -72,9 +72,11 @@ function folderName(workspaceRoot: string): string {
 }
 
 // `projects` must be built with `separate` grouping: one node per physical checkout.
+// Timestamp orders keep the input order, so `projects` must already be sorted by that timestamp.
 export function groupProjectsByRepository(input: {
   readonly projects: readonly SidebarProjectSnapshot[];
   readonly environments: ReadonlyMap<EnvironmentId, EnvironmentCardIdentity>;
+  readonly sortOrder: SidebarRepositorySortOrder;
 }): RepositoryGroup[] {
   const buckets = new Map<string, SidebarProjectSnapshot[]>();
   for (const project of input.projects) {
@@ -111,7 +113,15 @@ export function groupProjectsByRepository(input: {
     const folded = group.title.toLowerCase();
     titleCounts.set(folded, (titleCounts.get(folded) ?? 0) + 1);
   }
-  return groups.map((group) => ({
+  const ordered =
+    input.sortOrder === "name"
+      ? groups.toSorted(
+          (left, right) =>
+            compareSidebarDisplayText(left.title.toLowerCase(), right.title.toLowerCase()) ||
+            compareSidebarDisplayText(left.key, right.key),
+        )
+      : groups;
+  return ordered.map((group) => ({
     ...group,
     showHost: group.host !== null && (titleCounts.get(group.title.toLowerCase()) ?? 0) > 1,
   }));

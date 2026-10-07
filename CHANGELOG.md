@@ -1,5 +1,41 @@
 # Changelog
 
+## [v0.8.2] - 2026-10-07
+
+BiBCode v0.8.2 makes the left panel easier to read with lifted project and repository cards, adds projects from the Repositories view on any environment, keeps repositories in name order, lets New Branch start from any local or remote branch without switching to it, warns before targeting the main branch in a pull or merge request, and shows progress while a chat panel opens on a slow remote server. This release includes the changes since v0.8.1.
+
+### Left panel
+
+- Projects (Environments view) and repositories (Repositories view) are now lifted cards on a recessed list background. Inside a repository card each environment checkout sits on its own shaded band, and chats are borderless rows with a clearer fill for the open one. Dark mode separates the layers much more strongly and brightens secondary text on the cards so paths and ages stay readable.
+- The Repositories view sorts repositories by name by default, so cards keep their place as chats update. Its sort menu offers **Sort repositories** (Name, Last user message, Created at), separate from the Environments view's project sort.
+- The Repositories view has an **Add project** button in its header and empty state. Because that view hides the environment rail, Add Project now shows its **Host** selector on macOS and Linux desktop whenever saved remote servers exist, so you pick the target environment in the dialog.
+- **Create new project** gains **Browse…** for its parent folder: the native picker on this device, or the selected remote server's directory browser, returning to the form with the project name kept.
+
+### Git
+
+- **New Branch** has a **From** field that searches every local and remote branch; it defaults to the checked-out branch, the current HEAD when detached, or the commit you opened it from in History.
+- **Check out after creating** is on by default. Turn it off to only create the branch: the checkout and working tree stay on the branch you were on.
+- A new branch never tracks its source, so a branch created from `origin/main` publishes under its own name instead of pulling from and pushing to `main`.
+- Choosing `main`, `master`, or the repository's default branch as the target of a pull or merge request shows a red warning naming the branch. Creation stays available.
+
+### Chat panels
+
+- Opening a chat panel on a remote server with latency no longer shows an empty tab while the server creates the chat. The panel shows **Opening chat…** until the chat arrives; a failed creation still closes the panel with an error.
+
+### Known limitations and qualification still in progress
+
+- The new panel layout and dialogs were verified in the web client in light and dark themes; native packaged visual validation on macOS, Windows, and Linux has not been run yet.
+- Native qualification for remote updates ([#16](https://github.com/mubeda/BibCode/issues/16)), the typography audit ([#27](https://github.com/mubeda/BibCode/issues/27)), the light/dark screenshot matrix ([#29](https://github.com/mubeda/BibCode/issues/29)), and the manual SSH check on a real Mac ([#38](https://github.com/mubeda/BibCode/issues/38)) remain open.
+- End-to-end-encrypted file transfers ([#18](https://github.com/mubeda/BibCode/issues/18)) remain deferred.
+
+### Downloads
+
+Desktop installers and standalone server distributions support macOS, Linux, and Windows on ARM64 and x64. Linux server `.deb` and `.rpm` packages are included for both architectures. Stable desktop updater payloads and signatures use the six-target `latest.json` manifest.
+
+On macOS, copy BiBCode.app from the DMG to Applications before launching it. macOS bundles remain ad-hoc signed and unnotarized; Windows installers remain without Authenticode.
+
+**Full Changelog**: https://github.com/mubeda/BibCode/compare/v0.8.1...v0.8.2
+
 ## [v0.8.1] - 2026-10-06
 
 BiBCode v0.8.1 lets you set draft, people, labels, milestone, and merge options when creating a pull or merge request, pastes clipboard images into terminal programs on any host, and fixes terminal copy and browser discovery behind the UI proxy. This release includes the changes since v0.8.0.

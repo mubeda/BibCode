@@ -37,6 +37,7 @@ const h = vi.hoisted(() => ({
   currentSourceRemote: true,
   refsError: null as string | null,
   refPages: null as Array<string[]> | null,
+  defaultBranch: null as string | null,
   refreshStatus: vi.fn(),
   runs: [] as Array<RunInput>,
   script: [] as Array<
@@ -113,6 +114,7 @@ vi.mock("~/state/query", () => ({
               }
             : atom?.kind === "snapshot"
               ? {
+                  defaultBranch: h.defaultBranch,
                   localBranches: [
                     { name: (h.status as VcsStatusResult | null)?.refName, tipSha: "b".repeat(40) },
                     { name: "feature/other", tipSha: "c".repeat(40) },
@@ -394,6 +396,7 @@ beforeEach(() => {
   h.currentSourceRemote = true;
   h.refsError = null;
   h.refPages = null;
+  h.defaultBranch = null;
   h.refreshStatus.mockReset().mockImplementation(async () => AsyncResult.success(h.status));
   h.runs = [];
   h.script = [];
@@ -616,6 +619,26 @@ describe("GitManagerCreatePullRequestDialog", () => {
     await setValue("git-manager-create-pr-base", "main");
     expect(primary().disabled).toBe(true);
     expect(h.runs).toEqual([]);
+  });
+
+  it("flags main, master, and the repository default branch as critical targets", async () => {
+    const warning = () => document.querySelector('[data-testid="create-pr-critical-target"]');
+    h.defaultBranch = "release/next";
+    await renderDialog();
+    expect(warning()).toBeNull();
+    await chooseTarget("main");
+    expect(warning()?.textContent).toContain("main");
+    expect(input("git-manager-create-pr-base").getAttribute("aria-describedby")).toContain(
+      warning()?.id ?? "missing",
+    );
+    await chooseTarget("release/next");
+    expect(warning()?.textContent).toContain("release/next");
+    expect(warning()?.textContent).toContain("default branch");
+    h.defaultBranch = null;
+    await renderDialog();
+    expect(warning()).toBeNull();
+    // A warning, not a block: creation stays available.
+    expect(button("Publish and create pull request").disabled).toBe(false);
   });
 
   it("requires a new selection after reopening or changing repositories", async () => {
