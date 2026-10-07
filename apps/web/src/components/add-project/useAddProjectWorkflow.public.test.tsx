@@ -442,6 +442,7 @@ describe("useAddProjectWorkflow public adapter", () => {
           actions.push("keys");
           // An inert native-input endpoint, not a QA DOM compensation action.
           await act(async () => {
+            path.focus();
             setter.call(path, path.value + value);
             path.dispatchEvent(new Event("input", { bubbles: true }));
           });
@@ -493,9 +494,13 @@ describe("useAddProjectWorkflow public adapter", () => {
             };
           },
           required: () => ({
+            $$: (selector: string) => Array.from(document.querySelectorAll(selector)),
             $: (selector: string) => ({
+              elementId: selector === "#add-project-host-path" ? path.id : undefined,
               isDisplayed: async () => true,
               isExisting: async () => true,
+              getValue: async () => path.value,
+              isFocused: async () => document.activeElement === path,
               setValue: (value: string) => sdk.setValue.call(endpoint, value),
               waitForDisplayed: async () => {
                 if (
