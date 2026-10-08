@@ -885,15 +885,19 @@ the next click. Without a thread, without desktop preview support (for example
 macOS before 14), or in a browser tab, web links open in the system browser.
 
 - **Chat:** Ctrl/Cmd-, Shift-, or Alt-click or middle-click opens the other
-  target. Right-click on an `http(s)` link offers both targets. Ctrl/Cmd-click on
-  an `.html`, `.htm`, or `.pdf` file chip opens it in the editor instead of the
-  browser.
+  target. Right-click on an `http(s)` link offers both targets. Any
+  modifier-click on an `.html`, `.htm`, or `.pdf` file chip opens
+  it in the editor instead of the browser.
 - **Terminal:** Ctrl/Cmd-click opens a link (Cmd on macOS); adding Shift opens
   the other target. `.html`, `.htm`, and `.pdf` paths, including a bare
   `index.html` and `file:///` URLs, open in the BiBCode browser; Ctrl/Cmd+Shift
-  opens them in the editor, and every other path opens in the editor.
-  Network (UNC) paths and `file://` URLs with a host are refused with "Network
-  paths can't be opened from the terminal." A hyperlink a program emits (OSC 8)
+  opens them in the editor, and every other path opens in the editor. Without a
+  thread or desktop preview support, they open in the editor too. A printed path
+  that starts with two separators (`\\server\share`, `//server/share`, `\\?\…`,
+  `\\.\…`) is refused with "Network paths can't be opened from the terminal."
+  A `file://` URL with a host shows "Unable to open this file link." Relative
+  links under a network working directory, such as a WSL `\\wsl.localhost\…`
+  folder, still open. A hyperlink a program emits (OSC 8)
   needs the same Ctrl/Cmd activation. When its visible text doesn't match its
   destination, a menu shows **Open …** with the destination and **Copy link**.
 - **Browser tabs:** popups and `target=_blank` links inside a preview tab open
@@ -906,7 +910,9 @@ this computer. From a thread on a LAN, tailnet (`100.64.0.0/10`), or WSL
 environment it opens on the server's address. From a thread on an SSH or BiBCode
 Connect environment, or a non-private host, BiBCode shows "Can't open this
 address here" and does not open this computer's `localhost`, whatever the
-target, modifier, or setting; reaching those ports is not available yet.
+target, modifier, or setting; reaching those ports is not available yet. If the
+thread's environment isn't connected, the notice says so and asks you to
+reconnect it.
 
 A file outside the thread's workspace can't be previewed; the notice offers
 **Open in editor**. If the system browser fails to open a link, the notice shows

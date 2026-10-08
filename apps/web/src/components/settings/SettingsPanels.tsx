@@ -610,7 +610,7 @@ export function GeneralSettingsPanel() {
 
         <SettingsRow
           title="Open links in"
-          description="Where web links from chat and the terminal open. Hold Ctrl or Cmd in chat, or Shift in the terminal, to use the other one."
+          description="Where web links from chat and the terminal open. Modifier-click a chat link, or Ctrl/Cmd+Shift-click a terminal link, to use the other one."
           resetAction={
             settings.browserLinkTarget !== DEFAULT_UNIFIED_SETTINGS.browserLinkTarget ? (
               <SettingResetButton

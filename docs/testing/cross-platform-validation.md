@@ -2601,7 +2601,7 @@ editor, or notice).
 - Chat `http(s)` link: plain click, Ctrl/Cmd-click, Shift-click, Alt-click, and
   middle-click. Right-click offers both targets; other link types show no custom
   menu. An `.html` or `.pdf` file chip opens in the BiBCode browser, and
-  Ctrl/Cmd-click opens the editor. A file outside the workspace shows the
+  any modifier-click opens the editor. A file outside the workspace shows the
   notice with **Open in editor**.
 - Terminal URL: plain click does nothing; Ctrl/Cmd-click opens the setting's
   target; Ctrl/Cmd+Shift-click opens the other.
@@ -2611,9 +2611,12 @@ editor, or notice).
   **Open …** and **Copy link**; plain click does nothing.
 - Terminal paths: `index.html`, an absolute `.html` path, a `file:///…/x.pdf`
   URL, and a `.txt` path. HTML and PDF open in the BiBCode browser and with
-  Ctrl/Cmd+Shift in the editor; `.txt` opens in the editor. On Windows,
-  `\\server\share\x.html` and `file://server/share/x.html` print "Network paths
-  can't be opened from the terminal." and open nothing.
+  Ctrl/Cmd+Shift in the editor; `.txt` opens in the editor. On any platform,
+  `\\server\share\x.html`, `//server/share/x.html`, and `\\.\C:\x.html` print
+  "Network paths can't be opened from the terminal." and open nothing;
+  `file://server/share/x.html` prints "Unable to open this file link." A
+  relative `x.html` under a UNC working directory (WSL `\\wsl.localhost\…`)
+  still opens.
 - Preview tab `target=_blank` link and `window.open` popup open a new tab in the
   same thread; `window.open('about:blank')` opens nothing. Git Manager pull
   request title opens in the system browser, not nowhere.
@@ -2633,13 +2636,14 @@ editor, or notice).
   image asset has none. In the BiBCode browser, a script
   in the HTML reads `localStorage` and `document.cookie` as unavailable.
 - Port attribution: start `python3 -m http.server 8123` in a thread's terminal;
-  the port appears in that thread's and terminal's discovered ports (port card), and not under another thread's terminal.
+  the port appears in that thread's and terminal's discovered ports (port
+  card), and not under another thread's terminal.
 
 Pending native checks (not covered by automated tests; mark each unavailable if
 the host cannot run it): Ctrl+Shift-click while a mouse-tracking TUI (Codex or
 opencode) runs must invert the target, not the TUI's selection; an OSC 8 link
-printed by a real CLI (a CLI that emits `https` hyperlinks) behaves as above; Linux/Wayland preview popups open as tabs; Windows
-UNC refusal as above.
+printed by a real CLI (a CLI that emits `https` hyperlinks) behaves as above;
+Linux/Wayland preview popups open as tabs; Windows UNC refusal as above.
 
 ## Non-native compatibility audit
 
