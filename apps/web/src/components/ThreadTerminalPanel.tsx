@@ -51,9 +51,11 @@ import {
   collectWrappedTerminalLinkLine,
   extractTerminalLinks,
   fileUrlToPath,
+  isNetworkPath,
   isTerminalLinkActivation,
   resolvePathLinkTarget,
   resolveWrappedTerminalLinkRange,
+  terminalLinkLabelShowsUri,
   terminalPreviewFilePath,
   wrappedTerminalLinkRangeIntersectsBufferLine,
 } from "../terminal-links";
@@ -329,6 +331,36 @@ export function quoteTerminalPastePath(path: string, os: string | undefined): st
   return os === "windows" ? `"${path}"` : path.replace(/[^\w./-]/g, "\\$&");
 }
 
+const LINK_TARGET_LABEL_LENGTH = 80;
+// The fallback context menu right-truncates near 24rem, so the host's owning domain (its end)
+// must land early in the label.
+const LINK_TARGET_HOST_LENGTH = 32;
+
+/**
+ * Origin and path of a link target for a confirmation label, about 80 characters. A long host
+ * keeps its end, which names the domain's owner; the path is shortened to fit.
+ */
+function describeLinkTarget(uri: string): string {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return uri.length > LINK_TARGET_LABEL_LENGTH
+      ? `${uri.slice(0, LINK_TARGET_LABEL_LENGTH - 1)}…`
+      : uri;
+  }
+  const host =
+    url.host.length > LINK_TARGET_HOST_LENGTH
+      ? `…${url.host.slice(-(LINK_TARGET_HOST_LENGTH - 1))}`
+      : url.host;
+  const origin = `${url.protocol}//${host}`;
+  const pathRoom = LINK_TARGET_LABEL_LENGTH - origin.length;
+  const path = url.pathname;
+  return path.length <= pathRoom
+    ? origin + path
+    : `${origin}${path.slice(0, Math.max(0, pathRoom - 1))}…`;
+}
+
 function writeSystemMessage(terminal: Terminal, message: string): void {
   terminal.write(`\r\n[terminal] ${message}\r\n`);
 }
@@ -351,6 +383,50 @@ function copyThroughTextarea(terminal: Terminal, text: string): boolean {
   } finally {
     textarea.value = value;
     textarea.setSelectionRange(selectionStart, selectionEnd, selectionDirection);
+  }
+}
+
+/**
+ * The native menu resolves after the click's user activation may have lapsed, so a missing or
+ * rejected clipboard write falls back to execCommand; a final failure prints the link to copy.
+ */
+async function copyLinkText(
+  terminal: Terminal,
+  uri: string,
+  isCurrent: () => boolean,
+): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(uri);
+    return;
+  } catch {
+    // A closed or retargeted viewport must not steal focus for a stale copy.
+    if (!isCurrent() || copyThroughDetachedTextarea(uri)) return;
+  }
+  writeSystemMessage(terminal, `Couldn't copy the link: ${uri}`);
+}
+
+/**
+ * execCommand copy from a textarea outside the terminal: xterm's own `copy` listener would
+ * replace the payload with its selection if the terminal's textarea were used.
+ */
+function copyThroughDetachedTextarea(text: string): boolean {
+  // Focus may have moved to another pane while the menu or clipboard was pending; give it back.
+  const previousFocus = document.activeElement;
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.readOnly = true;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  try {
+    textarea.focus();
+    textarea.select();
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    textarea.remove();
+    if (previousFocus instanceof HTMLElement) previousFocus.focus();
   }
 }
 
@@ -815,6 +891,7 @@ export function TerminalViewport({
   );
   const openTerminalPath = useEffectEvent((target: string) => openInPreferredEditor(target));
   const readWorkspaceUnavailable = useEffectEvent(() => workspaceUnavailable);
+  const readHasThread = useEffectEvent(() => threadRef.threadId.length > 0);
   const openPreview = useAtomCommand(previewEnvironment.open, {
     reportFailure: false,
   });
@@ -1189,9 +1266,46 @@ export function TerminalViewport({
       theme: terminalThemeFromApp(effectiveTerminalThemeRef.current, mount),
       // OSC 8 activations bypass the link provider, so apply the same activation guard here.
       linkHandler: {
-        activate: (event, uri) => {
+        activate: (event, uri, range) => {
           if (!isTerminalLinkActivation(event)) return;
-          routeTerminalUrl(uri, physicalShiftKey(event));
+          const activeTerminal = terminalRef.current;
+          if (!activeTerminal) return;
+          const invert = physicalShiftKey(event);
+          const getLine = (index: number) => activeTerminal.buffer.active.getLine(index);
+          if (terminalLinkLabelShowsUri(range, uri, getLine)) {
+            routeTerminalUrl(uri, invert);
+            return;
+          }
+          // OSC 8 text can disguise its target, so confirm it, as xterm's default handler did.
+          if (!localApi) {
+            writeSystemMessage(activeTerminal, "Opening links is unavailable in this browser.");
+            return;
+          }
+          void localApi.contextMenu
+            .show(
+              [
+                { id: "open", label: `Open ${describeLinkTarget(uri)}` },
+                { id: "copy", label: "Copy link" },
+              ],
+              { x: event.clientX, y: event.clientY },
+            )
+            .then((choice) => {
+              // A retargeted or closed viewport must not open this link against its new thread.
+              if (terminalRef.current !== activeTerminal) return;
+              if (choice === "open") routeTerminalUrl(uri, invert);
+              if (choice === "copy") {
+                void copyLinkText(
+                  activeTerminal,
+                  uri,
+                  () => terminalRef.current === activeTerminal,
+                );
+              }
+            })
+            .catch(() => {
+              if (terminalRef.current === activeTerminal) {
+                writeSystemMessage(activeTerminal, "Unable to open link");
+              }
+            });
         },
         allowNonHttpProtocols: false,
       },
@@ -1641,13 +1755,25 @@ export function TerminalViewport({
                 writeSystemMessage(latestTerminal, unavailableReason);
                 return;
               }
-              const editorTarget = resolvePathLinkTarget(
-                fileUrlToPath(match.text) ?? match.text,
-                cwd,
-              );
-              const previewFile = terminalPreviewFilePath(match.text, cwd);
+              const localPath = match.text.startsWith("file://")
+                ? fileUrlToPath(match.text)
+                : match.text;
+              if (localPath === null) {
+                writeSystemMessage(latestTerminal, "Unable to open this file link.");
+                return;
+              }
+              const editorTarget = resolvePathLinkTarget(localPath, cwd);
+              if (isNetworkPath(editorTarget)) {
+                writeSystemMessage(
+                  latestTerminal,
+                  "Network paths can't be opened from the terminal.",
+                );
+                return;
+              }
+              const previewFile = terminalPreviewFilePath(localPath, cwd);
               if (
                 previewFile !== null &&
+                readHasThread() &&
                 isPreviewSupportedInRuntime() &&
                 !physicalShiftKey(event)
               ) {

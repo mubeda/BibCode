@@ -21,7 +21,7 @@ export interface TerminalLinkBufferRange {
 
 export interface TerminalBufferLineLike {
   readonly isWrapped?: boolean;
-  translateToString(trimRight?: boolean): string;
+  translateToString(trimRight?: boolean, startColumn?: number, endColumn?: number): string;
 }
 
 export interface WrappedTerminalLinkLineSegment {
@@ -44,7 +44,7 @@ const FILE_URL_PATTERN = /file:\/\/[^\s"'`<>]+/g;
 // file. The leading delimiter is consumed (not a lookbehind, which older macOS WebKit rejects) and
 // the `link` group carries the match.
 const PREVIEW_FILENAME_PATTERN =
-  /(?:^|[\s"'`<>([{])(?<link>[A-Za-z0-9._-]+\.(?:html?|pdf)(?::\d+){0,2})(?=[.,;!?)\]}]*(?:[\s"'`<>]|$))/gi;
+  /(?:^|[\s"'`<>([{])(?<link>[A-Za-z0-9._-]+\.(?:html?|pdf)(?::\d+){0,2})(?=[.,;!?:)\]}]*(?:[\s"'`<>]|$))/gi;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;!?]+$/;
 
 // ConPTY full-screen repaints can mark an entire alt-screen TUI frame as one
@@ -196,12 +196,61 @@ export function fileUrlToPath(raw: string): string | null {
   } catch {
     return null;
   }
-  if (url.host.length > 0) {
-    return `\\\\${url.host}${pathname.replaceAll("/", "\\")}`;
-  }
+  // A host (after WHATWG normalisation drops `localhost`) means a network share: opening it
+  // makes the host connect over SMB, which can leak credentials to whoever printed the link.
+  if (url.host.length > 0) return null;
   const drive = /^\/([A-Za-z]:)(\/.*)?$/.exec(pathname);
   if (drive) return `${drive[1]}${(drive[2] ?? "\\").replaceAll("/", "\\")}`;
   return pathname;
+}
+
+/** UNC shares (`\\server\share`, `\\?\UNC\...`, `//server/share`), but not local `\\?\C:\` paths. */
+export function isNetworkPath(path: string): boolean {
+  if (/^[\\/]{2}[?.][\\/][A-Za-z]:(?:[\\/]|$)/.test(path)) return false;
+  // Windows reads any two leading separators, mixed or not, as a UNC prefix.
+  return /^[\\/]{2}/.test(path);
+}
+
+// A label must stand alone: `evil.test` linked inside `evil.test.trusted.example` must not pass.
+const LINK_LABEL_BOUNDARY = /^[\s"'`<>()[\]{},;]?$/;
+
+/**
+ * Whether an OSC 8 link's label (the clicked cells, read by xterm cell column so wide characters
+ * can't shift it) is its URI, with or without scheme and trailing slash, and stands alone, so the
+ * link can open without confirmation. xterm reports one range per row, so a label that continues
+ * onto another row is not trusted and gets confirmed instead.
+ */
+export function terminalLinkLabelShowsUri(
+  range: TerminalLinkBufferRange,
+  uri: string,
+  getLine: (bufferLineIndex: number) => TerminalBufferLineLike | null | undefined,
+): boolean {
+  if (range.start.y !== range.end.y) return false;
+  const y = range.start.y;
+  const line = getLine(y - 1);
+  if (!line) return false;
+  const label = line.translateToString(true, range.start.x - 1, range.end.x).trim();
+  const withoutScheme = uri.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  const shownForms = [uri, withoutScheme].flatMap((form) => [form, form.replace(/\/$/, "")]);
+  if (label.length === 0 || !shownForms.includes(label)) return false;
+
+  const before =
+    range.start.x > 1
+      ? line.translateToString(false, 0, range.start.x - 1).slice(-1)
+      : line.isWrapped
+        ? (getLine(y - 2)
+            ?.translateToString(false)
+            .slice(-1) ?? "")
+        : "";
+  const nextLine = getLine(y);
+  const rest = line.translateToString(false, range.end.x);
+  const after =
+    rest.length > 0
+      ? rest.charAt(0)
+      : nextLine?.isWrapped
+        ? nextLine.translateToString(false, 0, 1)
+        : "";
+  return LINK_LABEL_BOUNDARY.test(before) && LINK_LABEL_BOUNDARY.test(after);
 }
 
 export function terminalPreviewFilePath(rawPath: string, cwd: string): string | null {

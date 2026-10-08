@@ -4,8 +4,10 @@ import {
   collectWrappedTerminalLinkLine,
   extractTerminalLinks,
   fileUrlToPath,
+  isNetworkPath,
   isTerminalLinkActivation,
   resolvePathLinkTarget,
+  terminalLinkLabelShowsUri,
   splitPathAndPosition,
   resolveWrappedTerminalLinkRange,
   terminalPreviewFilePath,
@@ -369,17 +371,26 @@ describe("file links", () => {
       ["index.html", line.indexOf("(index.html") + 1],
     ]);
   });
+  it("links filenames followed by a colon", () => {
+    expect(extractTerminalLinks("index.html:12:3: error").map((m) => m.text)).toEqual([
+      "index.html:12:3",
+    ]);
+    expect(extractTerminalLinks("Wrote index.html: ok").map((m) => m.text)).toEqual(["index.html"]);
+  });
   it("extracts file URLs whole", () => {
     expect(extractTerminalLinks("see file:///tmp/report%20one.PDF").map((m) => m.text)).toEqual([
       "file:///tmp/report%20one.PDF",
     ]);
   });
-  it("converts POSIX, Windows-drive, and UNC file URLs", () => {
+  it("converts POSIX and Windows-drive file URLs", () => {
     expect(fileUrlToPath("file:///tmp/report%20one.PDF")).toBe("/tmp/report one.PDF");
     expect(fileUrlToPath("file:///C:/repo/report.pdf")).toBe("C:\\repo\\report.pdf");
-    expect(fileUrlToPath("file://server/share/report.pdf")).toBe("\\\\server\\share\\report.pdf");
+    expect(fileUrlToPath("file://localhost/tmp/a.html")).toBe("/tmp/a.html");
     expect(fileUrlToPath("/not/a/url")).toBeNull();
     expect(fileUrlToPath("file:///tmp/%E0.html")).toBeNull();
+  });
+  it("refuses file URLs that name a network host", () => {
+    expect(fileUrlToPath("file://server/share/r.pdf")).toBeNull();
   });
   it("classifies html path with line and column", () => {
     expect(terminalPreviewFilePath("dist/index.html:12:3", "/repo")).toBe("/repo/dist/index.html");
@@ -392,5 +403,79 @@ describe("file links", () => {
   });
   it("ignores other files", () => {
     expect(terminalPreviewFilePath("src/main.ts:4", "/repo")).toBeNull();
+  });
+});
+
+describe("OSC 8 link text", () => {
+  // A fake xterm row addressed by cell column: a wide character fills two cells, the second empty.
+  const row = (cells: readonly string[], isWrapped = false) => ({
+    isWrapped,
+    translateToString: (trimRight = false, start = 0, end = cells.length) => {
+      const text = cells.slice(start, end).join("");
+      return trimRight ? text.trimEnd() : text;
+    },
+  });
+  const ascii = (text: string, isWrapped = false) => row([...text], isWrapped);
+  const wide = (text: string) =>
+    row([..."界".repeat(10)].flatMap((c) => [c, ""]).concat([...text]));
+  const lines = [
+    ascii("see docs.example.com/guide here"),
+    ascii("https://evil.test.trusted.example/"),
+    wide(" safe.test https://evil.test/"),
+    wide(" https://ok.test/ "),
+    ascii("abc https://ok.test"),
+    ascii("/ more", true),
+  ];
+  const getLine = (index: number) => lines[index];
+  // xterm's 1-based, end-inclusive range of one row's link cells.
+  const cells = (y: number, x: number, endX: number) => ({ start: { x, y }, end: { x: endX, y } });
+
+  it("accepts labels that are the URI, with or without scheme and trailing slash", () => {
+    const guide = cells(1, 5, 26);
+    expect(terminalLinkLabelShowsUri(guide, "https://docs.example.com/guide", getLine)).toBe(true);
+    expect(terminalLinkLabelShowsUri(guide, "https://docs.example.com/guide/", getLine)).toBe(true);
+    expect(terminalLinkLabelShowsUri(guide, "http://docs.example.com/guide", getLine)).toBe(true);
+  });
+
+  it("rejects labels that name something else", () => {
+    expect(terminalLinkLabelShowsUri(cells(1, 5, 20), "https://evil.test/", getLine)).toBe(false);
+    expect(terminalLinkLabelShowsUri(cells(1, 5, 26), "https://docs.example.com/", getLine)).toBe(
+      false,
+    );
+    expect(terminalLinkLabelShowsUri(cells(9, 1, 3), "https://docs.example.com/", getLine)).toBe(
+      false,
+    );
+  });
+
+  it("rejects a label that is only part of a longer displayed address", () => {
+    // `evil.test` is linked inside the displayed `https://evil.test.trusted.example/`.
+    expect(terminalLinkLabelShowsUri(cells(2, 9, 17), "https://evil.test/", getLine)).toBe(false);
+  });
+
+  it("reads labels by cell column, so wide characters can't shift them", () => {
+    // Ten wide characters fill columns 1-20; ` safe.test` follows.
+    expect(terminalLinkLabelShowsUri(cells(3, 22, 30), "https://evil.test/", getLine)).toBe(false);
+    expect(terminalLinkLabelShowsUri(cells(4, 22, 37), "https://ok.test/", getLine)).toBe(true);
+  });
+
+  it("does not trust a label that continues onto the next wrapped row", () => {
+    expect(terminalLinkLabelShowsUri(cells(5, 5, 19), "https://ok.test", getLine)).toBe(false);
+  });
+});
+
+describe("isNetworkPath", () => {
+  it("flags UNC and protocol-relative paths", () => {
+    expect(isNetworkPath("\\\\server\\share\\a.html")).toBe(true);
+    expect(isNetworkPath("//server/share/a.html")).toBe(true);
+    expect(isNetworkPath("\\\\?\\UNC\\server\\share\\a.html")).toBe(true);
+    // Windows treats mixed leading separators as UNC too (`file:///%5cattacker/...` decodes so).
+    expect(isNetworkPath("/\\attacker.example/share/x.txt")).toBe(true);
+    expect(isNetworkPath("\\/attacker.example/share/x.txt")).toBe(true);
+  });
+  it("keeps local verbatim drive paths and ordinary paths", () => {
+    expect(isNetworkPath("\\\\?\\C:\\repo\\index.html")).toBe(false);
+    expect(isNetworkPath("\\\\.\\C:\\repo\\index.html")).toBe(false);
+    expect(isNetworkPath("C:\\repo\\index.html")).toBe(false);
+    expect(isNetworkPath("/repo/index.html")).toBe(false);
   });
 });
