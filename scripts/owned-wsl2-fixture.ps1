@@ -4,7 +4,8 @@ param(
   [string]$OwnerManifest,
   [string]$SourceSha,
   [string]$Checkout,
-  [string]$ExpectedVersion
+  [string]$ExpectedVersion,
+  [scriptblock]$PrepareRefusalObserver
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -27,17 +28,114 @@ public static class OwnedWslPhysical {
  [StructLayout(LayoutKind.Sequential)] struct Info { public uint Attributes; public System.Runtime.InteropServices.ComTypes.FILETIME Creation,Access,Write; public uint Volume,SizeHigh,SizeLow,Links,IndexHigh,IndexLow; }
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFile(string name,uint access,uint share,IntPtr security,uint disposition,uint flags,IntPtr template);
  [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetFileInformationByHandle(SafeFileHandle handle,out Info info);
- public static string Read(string path,bool directory) { using(var h=CreateFile(path,0,7,IntPtr.Zero,3,directory?0x02000000u:0u,IntPtr.Zero)) { Info i; if(h.IsInvalid||!GetFileInformationByHandle(h,out i)||(!directory&&i.Links!=1))throw new InvalidOperationException("Owned physical identity refused.");return i.Volume.ToString("X8")+":"+i.IndexHigh.ToString("X8")+i.IndexLow.ToString("X8"); } }
+ public static string Read(string path,bool directory) {
+  using(var h=CreateFile(path,0,7,IntPtr.Zero,3,directory?0x02000000u:0u,IntPtr.Zero)) {
+   if(h.IsInvalid) { int error=Marshal.GetLastWin32Error();throw OwnedWslPrepareFailure.Native("CreateFile",error,null); }
+   Info i;if(!GetFileInformationByHandle(h,out i)) { int error=Marshal.GetLastWin32Error();throw OwnedWslPrepareFailure.Native("GetFileInformationByHandle",error,null); }
+   if(!directory&&i.Links!=1)throw OwnedWslPrepareFailure.Native("SingleLinkPolicy",null,i.Links);
+   return i.Volume.ToString("X8")+":"+i.IndexHigh.ToString("X8")+i.IndexLow.ToString("X8");
+  }
+ }
+}
+
+public sealed class OwnedWslPrepareFailure {
+ public readonly string InputPath, AncestorPath, NativeBranch;
+ public readonly bool? IsDirectory;
+ public readonly uint? LeafAttributes, AncestorAttributes, NativeLinkCount;
+ public readonly int? NativeWin32Error;
+ public OwnedWslPrepareFailure(string input,string ancestor,bool? directory,uint? leaf,uint? parent,string branch,int? error,uint? links) { InputPath=input;AncestorPath=ancestor;IsDirectory=directory;LeafAttributes=leaf;AncestorAttributes=parent;NativeBranch=branch;NativeWin32Error=error;NativeLinkCount=links; }
+ public static bool Trusted(Exception error) {
+  Type t=error.GetType();return t==typeof(Exception)||t==typeof(InvalidOperationException)||t==typeof(ArgumentException)||t==typeof(ArgumentNullException)||t==typeof(ArgumentOutOfRangeException)||t==typeof(System.IO.IOException)||t==typeof(System.IO.FileNotFoundException)||t==typeof(System.IO.DirectoryNotFoundException)||t==typeof(UnauthorizedAccessException)||t==typeof(System.ComponentModel.Win32Exception)||t==typeof(System.Management.Automation.RuntimeException)||t==typeof(System.Management.Automation.MethodInvocationException)||t==typeof(System.Management.Automation.ActionPreferenceStopException)||t==typeof(System.Management.Automation.ParameterBindingException);
+ }
+ static readonly Type StockData=typeof(Exception).Assembly.GetType("System.Collections.ListDictionaryInternal");
+ const string Slot="BiBCode.OwnedPrepareFailure";
+ public static OwnedWslPrepareFailure Context(Exception error) {
+  if(!Trusted(error))return null;System.Collections.IDictionary data=error.Data;
+  if(data==null||data.GetType()!=StockData)return null;
+  object value=data[Slot];return value!=null&&value.GetType()==typeof(OwnedWslPrepareFailure)?(OwnedWslPrepareFailure)value:null;
+ }
+ public static void Attach(Exception error,string input,string ancestor,bool? directory,uint? leaf,uint? parent) {
+  if(error==null||!Trusted(error))return;
+  OwnedWslPrepareFailure original=null;Exception current=error;System.Collections.Generic.HashSet<Exception> seen=new System.Collections.Generic.HashSet<Exception>(System.Collections.Generic.ReferenceEqualityComparer.Instance);
+  for(int i=0;i<4&&current!=null;i++){if(!Trusted(current)||!seen.Add(current))return;OwnedWslPrepareFailure part=Context(current);if(part!=null){original=part;break;}current=current.InnerException;}
+  System.Collections.IDictionary data=error.Data;if(data==null||data.GetType()!=StockData)return;
+  if(Context(error)!=null&&Context(error).InputPath!=null)return;
+  data[Slot]=new OwnedWslPrepareFailure(input,ancestor,directory,leaf,parent,original==null?null:original.NativeBranch,original==null?null:original.NativeWin32Error,original==null?null:original.NativeLinkCount);
+ }
+ public static Exception Native(string branch,int? error,uint? links) {
+  InvalidOperationException refusal=new InvalidOperationException("Owned physical identity refused.");
+  refusal.Data[Slot]=new OwnedWslPrepareFailure(null,null,null,null,null,branch,error,links);return refusal;
+ }
+}
+public sealed class OwnedWslPrepareExceptionEntry {
+ public readonly string type,message,clrStack;public readonly int hResult;
+ public OwnedWslPrepareExceptionEntry(Exception error) {type=error.GetType().FullName;message=error.Message;hResult=error.HResult;clrStack=error.StackTrace;}
+}
+public sealed class OwnedWslPreparePayload {
+ public readonly int payloadVersion=1;
+ public readonly OwnedWslPrepareExceptionEntry[] exceptionChain;
+ public readonly string scriptStack,pinInputPath,pinAncestorPath,nativeBranch;
+ public readonly int? scriptLineNumber,nativeWin32Error;
+ public readonly bool? pinIsDirectory;
+ public readonly uint? pinLeafAttributes,pinAncestorAttributes,nativeLinkCount;
+ public OwnedWslPreparePayload(OwnedWslPrepareExceptionEntry[] chain,string stack,int? line,OwnedWslPrepareFailure pin) {exceptionChain=(OwnedWslPrepareExceptionEntry[])chain.Clone();scriptStack=stack;scriptLineNumber=line;pinInputPath=pin==null?null:pin.InputPath;pinAncestorPath=pin==null?null:pin.AncestorPath;pinIsDirectory=pin==null?null:pin.IsDirectory;pinLeafAttributes=pin==null?null:pin.LeafAttributes;pinAncestorAttributes=pin==null?null:pin.AncestorAttributes;nativeBranch=pin==null?null:pin.NativeBranch;nativeWin32Error=pin==null?null:pin.NativeWin32Error;nativeLinkCount=pin==null?null:pin.NativeLinkCount;}
+}
+public static class OwnedWslPrepareProjection {
+ static readonly System.Text.UTF8Encoding Utf8=new System.Text.UTF8Encoding(false,true);
+ static bool Bound(string text,int limit,ref int total){if(text==null)return true;if(text.Length>limit)return false;total+=Utf8.GetByteCount(text);return total<=262144;}
+ public static string Serialize(object value) {
+  try {
+   if(value==null)return null;Type t=value.GetType();Type recordType=typeof(System.Management.Automation.ErrorRecord);Type generic=recordType.Assembly.GetType("System.Management.Automation.ErrorRecord`1");
+   if(t!=recordType&&!(t.Assembly==recordType.Assembly&&t.IsGenericType&&generic!=null&&t.GetGenericTypeDefinition()==generic))return null;
+   System.Management.Automation.ErrorRecord record=(System.Management.Automation.ErrorRecord)value;
+   Exception error=record.Exception;if(error==null)return null;
+   System.Collections.Generic.List<OwnedWslPrepareExceptionEntry> entries=new System.Collections.Generic.List<OwnedWslPrepareExceptionEntry>();
+   System.Collections.Generic.HashSet<Exception> seen=new System.Collections.Generic.HashSet<Exception>(System.Collections.Generic.ReferenceEqualityComparer.Instance);
+   OwnedWslPrepareFailure pin=null;int bytes=0;
+   while(error!=null){if(entries.Count==4||!OwnedWslPrepareFailure.Trusted(error)||!seen.Add(error))return null;
+    OwnedWslPrepareExceptionEntry entry=new OwnedWslPrepareExceptionEntry(error);
+    if(entry.type==null||entry.message==null||!Bound(entry.type,512,ref bytes)||!Bound(entry.message,16384,ref bytes)||!Bound(entry.clrStack,65536,ref bytes))return null;
+    entries.Add(entry);if(pin==null)pin=OwnedWslPrepareFailure.Context(error);error=error.InnerException;
+   }
+   System.Management.Automation.InvocationInfo invocation=record.InvocationInfo;
+   if(invocation!=null&&invocation.GetType()!=typeof(System.Management.Automation.InvocationInfo))return null;
+   string stack=record.ScriptStackTrace;int? line=invocation==null?(int?)null:invocation.ScriptLineNumber;
+   if((line!=null&&line<0)||!Bound(stack,65536,ref bytes)||!Bound(pin==null?null:pin.InputPath,32768,ref bytes)||!Bound(pin==null?null:pin.AncestorPath,32768,ref bytes))return null;
+   if(pin!=null&&pin.NativeBranch!=null&&pin.NativeBranch!="CreateFile"&&pin.NativeBranch!="GetFileInformationByHandle"&&pin.NativeBranch!="SingleLinkPolicy")return null;
+   OwnedWslPreparePayload payload=new OwnedWslPreparePayload(entries.ToArray(),stack,line,pin);
+   return System.Text.Json.JsonSerializer.Serialize(payload,new System.Text.Json.JsonSerializerOptions{IncludeFields=true,MaxDepth=4});
+  } catch {return null;}
+ }
 }
 '@ | Out-Null
 }
 function Get-PhysicalPin([string]$Path) {
-  $item = Get-Item -LiteralPath $Path -Force
-  if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.FullName -ine [IO.Path]::GetFullPath($Path)) { Refuse-OwnedWsl }
-  $parent = if ($item.PSIsContainer) { $item.Parent } else { $item.Directory }
-  while ($null -ne $parent) { if (($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Refuse-OwnedWsl }; $parent = $parent.Parent }
-  Initialize-PhysicalReader
-  return [ordered]@{path=$item.FullName;identity=[OwnedWslPhysical]::Read($item.FullName,$item.PSIsContainer);directory=[bool]$item.PSIsContainer}
+  $leafAttributes=$null;$ancestorAttributes=$null;$ancestorPath=$null;$directory=$null
+  try {
+    $item = Get-Item -LiteralPath $Path -Force
+    $leafAttributes=[uint32]$item.Attributes
+    if (($leafAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Refuse-OwnedWsl }
+    $fullName=$item.FullName
+    if ($fullName -ine [IO.Path]::GetFullPath($Path)) { Refuse-OwnedWsl }
+    $directory=[bool]$item.PSIsContainer
+    $parent = if ($directory) { $item.Parent } else { $item.Directory }
+    $nextAncestorPath=[IO.Path]::GetDirectoryName($fullName)
+    while ($null -ne $parent) {
+      $attributes=[uint32]$parent.Attributes
+      if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        $ancestorAttributes=$attributes;$ancestorPath=$nextAncestorPath
+        Refuse-OwnedWsl
+      }
+      $parent = $parent.Parent
+      $nextAncestorPath=[IO.Path]::GetDirectoryName($nextAncestorPath)
+    }
+    Initialize-PhysicalReader
+    return [ordered]@{path=$fullName;identity=[OwnedWslPhysical]::Read($fullName,$directory);directory=$directory}
+  } catch {
+    $pinFailure=$_
+    try { if('OwnedWslPrepareFailure' -as [type]){[OwnedWslPrepareFailure]::Attach($pinFailure.Exception,$Path,$ancestorPath,$directory,$leafAttributes,$ancestorAttributes)} } catch { }
+    throw
+  }
 }
 function Assert-PhysicalPin($Pin) {
   $now = Get-PhysicalPin $Pin.path
@@ -47,10 +145,15 @@ function Set-OwnerAcl([string]$Path) {
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
   $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
   $acl = Get-Acl -LiteralPath $Path
-  $acl.SetOwner($me); $acl.SetAccessRuleProtection($true,$false)
-  foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleAll($rule) }
+  $acl.SetOwner($me)
+  $acl.SetAccessRuleProtection($true,$false)
+  foreach ($rule in @($acl.Access)) {
+    $acl.RemoveAccessRuleAll($rule)
+  }
   $inherit = if ((Get-Item -LiteralPath $Path).PSIsContainer) { 'ContainerInherit,ObjectInherit' } else { 'None' }
-  foreach ($sid in @($me,$system)) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl',$inherit,'None','Allow')) }
+  foreach ($sid in @($me,$system)) {
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl',$inherit,'None','Allow'))
+  }
   Set-Acl -LiteralPath $Path -AclObject $acl
 }
 function Assert-OwnerAcl([string]$Path) {
@@ -94,7 +197,9 @@ function Get-FixtureInventory {
   return [ordered]@{defaultGuid=$value;distros=$distros}
 }
 function Save-FixtureManifest($Manifest) {
-  [IO.File]::WriteAllText($OwnerManifest,($Manifest|ConvertTo-Json -Depth 16 -Compress));Set-OwnerAcl $OwnerManifest
+  $json=$Manifest|ConvertTo-Json -Depth 16 -Compress
+  [IO.File]::WriteAllText($OwnerManifest,$json)
+  Set-OwnerAcl $OwnerManifest
 }
 function Read-FixtureManifest {
   Assert-FixtureRuntime;Assert-OwnerAcl $OwnerManifest
@@ -172,10 +277,26 @@ function Prepare-Fixture {
   if((Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant() -cne $RootfsHash) { Refuse-OwnedWsl };Assert-PhysicalPin $gpgPin
   if((Get-FileHash -LiteralPath $gpg -Algorithm SHA256).Hash -cne $gpgHash) { Refuse-OwnedWsl }
   $script:OwnedWslPrepareStage='intent-write'
-  $import=Join-Path $root 'distro';[IO.Directory]::CreateDirectory($import)|Out-Null;Set-OwnerAcl $import
-  $m=[ordered]@{schema=1;sourceSha=$SourceSha;name='BibCodeQA-'+[guid]::NewGuid().ToString('N');root=Get-PhysicalPin $root;importRoot=Get-PhysicalPin $import;wsl=@{pin=Get-PhysicalPin $wsl;sha256=(Get-FileHash -LiteralPath $wsl -Algorithm SHA256).Hash.ToLowerInvariant()};before=$before;imageSha256=$RootfsHash;imagePin=Get-PhysicalPin $image;gpg=@{pin=$gpgPin;sha256=$gpgHash};checkout=Get-PhysicalPin $env:GITHUB_WORKSPACE;manifestPin=$null;mappedCheckout=$null;backend=$null;guid=$null;phase='intent';appState='none';kernelVerified=$false}
+  $import=Join-Path $root 'distro'
+  [IO.Directory]::CreateDirectory($import)|Out-Null
+  Set-OwnerAcl $import
+  $m=[ordered]@{
+    schema=1;sourceSha=$SourceSha;name='BibCodeQA-'+[guid]::NewGuid().ToString('N')
+    root=Get-PhysicalPin $root
+    importRoot=Get-PhysicalPin $import
+    wsl=@{
+      pin=Get-PhysicalPin $wsl
+      sha256=(Get-FileHash -LiteralPath $wsl -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    before=$before;imageSha256=$RootfsHash
+    imagePin=Get-PhysicalPin $image
+    gpg=@{pin=$gpgPin;sha256=$gpgHash}
+    checkout=Get-PhysicalPin $env:GITHUB_WORKSPACE
+    manifestPin=$null;mappedCheckout=$null;backend=$null;guid=$null;phase='intent';appState='none';kernelVerified=$false
+  }
   Save-FixtureManifest $m
-  $m.manifestPin=Get-PhysicalPin $OwnerManifest;Save-FixtureManifest $m
+  $m.manifestPin=Get-PhysicalPin $OwnerManifest
+  Save-FixtureManifest $m
   $script:OwnedWslPrepareStage='owned-import'
   $again=Get-FixtureInventory;if($again.distros.Count -ne 0 -or $null -ne $again.defaultGuid) {Refuse-OwnedWsl}
   $m.phase='import-attempted';Save-FixtureManifest $m
@@ -228,10 +349,13 @@ function Invoke-OwnedFixtureAction([string]$Action) {
 }
 if($MyInvocation.InvocationName -ne '.') {
   try { Invoke-OwnedFixtureAction $Action; Write-Output '{"completed":true}';exit 0 } catch {
+    $originalFailure=$_
+    if($Action -eq 'Prepare' -and $null -ne $PrepareRefusalObserver) {
+      try { & $PrepareRefusalObserver $originalFailure *> $null } catch { }
+    }
     if($Action -eq 'Prepare') {
       $receipt=[ordered]@{completed=$false;prepareStage=$script:OwnedWslPrepareStage}
       if($script:OwnedWslPrepareStage -ceq 'signed-metadata') {
-        $originalFailure=$_
         try { if($script:OwnedWslSignedMetadata.operation -ceq 'get' -and $null -ne $originalFailure.Exception.Response) { $code=[int]$originalFailure.Exception.Response.StatusCode;if($code -ge 100 -and $code -le 599){$script:OwnedWslSignedMetadata.httpStatus=$code} } } catch { }
         $receipt.signedMetadata=[ordered]@{};foreach($name in $script:OwnedWslSignedMetadata.Keys){$receipt.signedMetadata[$name]=$script:OwnedWslSignedMetadata[$name]}
       }

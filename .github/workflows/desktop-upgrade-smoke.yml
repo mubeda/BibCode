@@ -12,6 +12,10 @@ on:
         description: Run only the Windows WSL native follow-up partition
         type: boolean
         default: false
+      wsl_prepare_refusal_evidence:
+        description: Optional encrypted original Windows owned Prepare refusal
+        type: boolean
+        default: false
       gpg_evidence_public_spki:
         description: Optional public RSA SPKI for one encrypted Windows GPG refusal
         type: string
@@ -277,6 +281,7 @@ jobs:
         shell: pwsh
         env:
           BIBCODE_NATIVE_WSL_FIXTURE_SELECTED: "true"
+          BIBCODE_PREPARE_REFUSAL_SELECTED: "${{ github.event_name == 'workflow_dispatch' && inputs.native_followups == true && inputs.native_windows_only == true && inputs.wsl_prepare_refusal_evidence == true }}"
           BIBCODE_GPG_EVIDENCE_SELECTED: "${{ github.event_name == 'workflow_dispatch' && inputs.native_followups == true && inputs.native_windows_only == true }}"
           BIBCODE_GPG_EVIDENCE_ROOT_READY: "${{ steps.gpg_private_root.outputs.ready }}"
           BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI: "${{ (github.event_name == 'workflow_dispatch' && inputs.native_followups == true && inputs.native_windows_only == true) && inputs.gpg_evidence_public_spki || '' }}"
@@ -285,13 +290,43 @@ jobs:
           Import-Module Pester -MinimumVersion 5.0 -ErrorAction Stop
           $tests = Invoke-Pester -Path ./scripts/owned-wsl2-fixture.Tests.ps1 -PassThru
           if ($tests.FailedCount -ne 0) { throw 'Owned WSL fixture Pester controls failed' }
+          $prepareEvidenceState=@{active=$false;attempted=$false;public=$null;fingerprint=$null;context=$null;root=$null}
+          $prepareRefusalObserver=$null
+          try {
+            if($env:BIBCODE_PREPARE_REFUSAL_SELECTED -ceq 'true' -and $env:BIBCODE_GPG_EVIDENCE_ROOT_READY -ceq 'true' -and $env:CI -ceq 'true' -and $env:GITHUB_ACTIONS -ceq 'true' -and $env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch' -and $env:GITHUB_JOB -ceq 'windows_wsl_upgrade_smoke' -and [OperatingSystem]::IsWindows()) {
+              $run=0L;$attempt=0L
+              if($env:GITHUB_SHA -cnotmatch '\A[a-f0-9]{40}\z' -or -not [long]::TryParse($env:GITHUB_RUN_ID,[ref]$run) -or $run -lt 1 -or $run -gt 9007199254740991 -or -not [long]::TryParse($env:GITHUB_RUN_ATTEMPT,[ref]$attempt) -or $attempt -lt 1 -or $attempt -gt 9007199254740991){throw 'Optional evidence omitted.'}
+              if(-not ('OwnedGpgEvidenceV1' -as [type]) -or -not [OwnedGpgEvidenceV1]::RecipientAdmitted($env:BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI,$env:BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256)){throw 'Optional evidence omitted.'}
+              . ./scripts/owned-wsl2-fixture.ps1
+              Initialize-PhysicalReader
+              $prepareEvidenceState.public=$env:BIBCODE_GPG_EVIDENCE_PUBLIC_SPKI
+              $prepareEvidenceState.fingerprint=$env:BIBCODE_GPG_EVIDENCE_PUBLIC_SHA256
+              $context=[ordered]@{version=1;scope='wsl-owned-prepare-refusal';alg='RSA-OAEP-SHA256';enc='AES-256-GCM';source=$env:GITHUB_SHA;run=$run;attempt=$attempt;jobRole='windows-native';fingerprint=$prepareEvidenceState.fingerprint}
+              $prepareEvidenceState.context=[Text.UTF8Encoding]::new($false,$true).GetBytes(($context|ConvertTo-Json -Compress))
+              $prepareEvidenceState.root=Join-Path $env:RUNNER_TEMP 'bibcode-gpg-private-evidence'
+              $prepareRefusalObserver={
+                param($originalErrorRecord)
+                $payload=$null;$parts=$null
+                try {
+                  if($prepareEvidenceState.active -ne $true -or $prepareEvidenceState.attempted -eq $true){return}
+                  $prepareEvidenceState.attempted=$true
+                  $payload=[OwnedWslPrepareProjection]::Serialize($originalErrorRecord)
+                  if($null -eq $payload){return}
+                  $parts=[OwnedGpgEvidenceV1]::Seal($prepareEvidenceState.public,$prepareEvidenceState.fingerprint,$payload,$prepareEvidenceState.context)
+                  [OwnedGpgEvidenceV1]::Publish($prepareEvidenceState.root,$parts)
+                } catch { } finally { $payload=$null;$parts=$null }
+              }.GetNewClosure()
+            }
+          } catch { $prepareRefusalObserver=$null }
           $manifest = Join-Path $env:RUNNER_TEMP 'bibcode-owned-wsl2-owner/owner.secret.json'
           $available = $false
           $prepareStage = $null
           $signedMetadata = $null
           $reason = '${{ steps.wsl.outputs.reason_code }}'
           if ('${{ steps.wsl.outputs.status_succeeded }}' -eq 'true' -and '${{ steps.wsl.outputs.list_succeeded }}' -eq 'true') {
-            $result = & ./scripts/owned-wsl2-fixture.ps1 -Action Prepare -OwnerManifest $manifest -SourceSha $env:GITHUB_SHA
+            try {
+              $prepareEvidenceState.active=$null -ne $prepareRefusalObserver
+              $result = & ./scripts/owned-wsl2-fixture.ps1 -Action Prepare -OwnerManifest $manifest -SourceSha $env:GITHUB_SHA -PrepareRefusalObserver $prepareRefusalObserver
           function Assert-SignedMetadata($value) {
             $keys=@('item','operation','httpStatus','commandExit','sizeMatched','fingerprintCount','fingerprintMatched','signatureCount','signerMatched','checksumCount','checksumMatched')
             if($null -eq $value -or @($value.PSObject.Properties.Name).Count -ne $keys.Count) { throw 'Signed metadata shape refused' }
@@ -314,6 +349,12 @@ jobs:
               $prepareStage = $receipt.prepareStage
               $expectedFields=if($prepareStage -ceq 'signed-metadata'){3}else{2}
               if ($fields.Count -ne $expectedFields -or 'completed' -notin $fields -or 'prepareStage' -notin $fields -or (-not ($receipt.completed -is [bool])) -or $receipt.completed -ne $false -or (-not ($prepareStage -is [string])) -or $prepareStage -cnotin @('runtime-admission','private-root-acl','launcher-admission','empty-inventory','launcher-readiness','verifier-admission','signed-metadata','image-admission','intent-write','owned-import','kernel-admission','mapping-admission')) { throw 'Owned WSL Prepare metadata refused' }
+            }
+            } finally {
+              $prepareEvidenceState.active=$false
+              $prepareRefusalObserver=$null
+              $prepareEvidenceState.public=$null;$prepareEvidenceState.fingerprint=$null;$prepareEvidenceState.context=$null;$prepareEvidenceState.root=$null
+              $context=$null
             }
           }
           "available=$($available.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -522,7 +563,7 @@ jobs:
           }
 
       - id: gpg_private_upload
-        name: Retain optional encrypted GPG refusal only
+        name: Retain optional encrypted Windows refusal only
         if: always() && github.event_name == 'workflow_dispatch' && inputs.native_followups == true && inputs.native_windows_only == true && inputs.gpg_evidence_public_spki != '' && inputs.gpg_evidence_public_sha256 != '' && steps.gpg_private_root.outputs.ready == 'true'
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

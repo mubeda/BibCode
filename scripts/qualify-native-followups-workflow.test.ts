@@ -602,3 +602,58 @@ it("admits optional GPG evidence only in the selected manual Windows context", (
   ]);
   expect(upload.with.path).not.toMatch(/\*|TestDrive|command-/);
 });
+
+it("arms approved Prepare refusal evidence only after passing Pester and revokes inside invocation/receipt lifetime", () => {
+  const source = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  expect(source.on.workflow_dispatch.inputs.wsl_prepare_refusal_evidence).toEqual({
+    description: "Optional encrypted original Windows owned Prepare refusal",
+    type: "boolean",
+    default: false,
+  });
+  expect(source.on.workflow_call.inputs.wsl_prepare_refusal_evidence).toBeUndefined();
+  const step = source.jobs.windows_wsl_upgrade_smoke.steps.find(
+    (value: { id?: string }) => value.id === "native_wsl",
+  );
+  const condition = step.env.BIBCODE_PREPARE_REFUSAL_SELECTED.slice(3, -2).trim();
+  for (const event of ["workflow_dispatch", "pull_request", "workflow_call"]) {
+    for (const selected of [true, false]) {
+      const admitted = NodeVM.runInNewContext(condition, {
+        github: { event_name: event },
+        inputs: {
+          native_followups: true,
+          native_windows_only: true,
+          wsl_prepare_refusal_evidence: selected,
+        },
+      });
+      expect(admitted).toBe(event === "workflow_dispatch" && selected);
+    }
+  }
+  const body: string = step.run;
+  expect(body.indexOf("$tests.FailedCount -ne 0")).toBeLessThan(
+    body.indexOf("$prepareEvidenceState=@"),
+  );
+  expect(body.indexOf("RecipientAdmitted(")).toBeLessThan(
+    body.indexOf("$prepareEvidenceState.active=$null"),
+  );
+  expect(body).toContain("scope='wsl-owned-prepare-refusal'");
+  expect(body).toContain("-PrepareRefusalObserver $prepareRefusalObserver");
+  const invoke = body.indexOf("$result = & ./scripts/owned-wsl2-fixture.ps1 -Action Prepare");
+  const receipt = body.indexOf("$receipt = $result | ConvertFrom-Json", invoke);
+  const revoke = body.indexOf("$prepareEvidenceState.active=$false", receipt);
+  expect(invoke).toBeGreaterThan(0);
+  expect(receipt).toBeGreaterThan(invoke);
+  expect(revoke).toBeGreaterThan(receipt);
+  expect(body).toContain("} finally {");
+  const artifact = source.jobs.windows_wsl_upgrade_smoke.steps.find(
+    (value: { id?: string }) => value.id === "gpg_private_upload",
+  );
+  expect(artifact.with.path.trim().split("\n")).toHaveLength(5);
+  expect(artifact.with["retention-days"]).toBe(1);
+  expect(artifact["continue-on-error"]).toBe(true);
+  expect(artifact.with.path).not.toMatch(/\*|\.log|\.ps1/);
+});

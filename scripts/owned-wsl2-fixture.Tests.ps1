@@ -20,28 +20,39 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Security.Cryptography;
 public static class OwnedGpgEvidenceV1 {
-  public static byte[][] Seal(string publicSpki, string fingerprint, string stderr, byte[] context) {
-    byte[] plaintext = null;
-    byte[] key = null;
-    try {
+  private static RSA ImportRecipient(string publicSpki, string fingerprint) {
       if (publicSpki == null || publicSpki.Length == 0 || publicSpki.Length > 2048 || publicSpki.Length % 4 != 0 ||
           !Regex.IsMatch(publicSpki, @"\A[A-Za-z0-9+/]+={0,2}\z") ||
           fingerprint == null || !Regex.IsMatch(fingerprint, @"\A[a-f0-9]{64}\z")) throw new InvalidOperationException("Evidence omitted.");
       int padding = publicSpki.EndsWith("==", StringComparison.Ordinal) ? 2 : publicSpki.EndsWith("=", StringComparison.Ordinal) ? 1 : 0;
       int decodedLength = publicSpki.Length / 4 * 3 - padding;
-      if (decodedLength < 1 || decodedLength > 1024 || context == null || context.Length == 0 || context.Length > 4096) throw new InvalidOperationException("Evidence omitted.");
-      UTF8Encoding utf8 = new UTF8Encoding(false, true);
-      int length = utf8.GetByteCount(stderr);
-      if (length < 1 || length > 1048576) throw new InvalidOperationException("Evidence omitted.");
+      if (decodedLength < 1 || decodedLength > 1024) throw new InvalidOperationException("Evidence omitted.");
       byte[] der = Convert.FromBase64String(publicSpki);
       if (Convert.ToBase64String(der) != publicSpki || der.Length != decodedLength ||
           Convert.ToHexString(SHA256.HashData(der)).ToLowerInvariant() != fingerprint) throw new InvalidOperationException("Evidence omitted.");
-      using (RSA rsa = RSA.Create()) {
+      RSA rsa = RSA.Create();
+      try {
         int consumed;
         rsa.ImportSubjectPublicKeyInfo(der, out consumed);
         RSAParameters parameters = rsa.ExportParameters(false);
         if (consumed != der.Length || rsa.KeySize != 3072 || parameters.Modulus == null || parameters.Modulus.Length != 384 ||
             parameters.Exponent == null || parameters.Exponent.Length != 3 || parameters.Exponent[0] != 1 || parameters.Exponent[1] != 0 || parameters.Exponent[2] != 1) throw new InvalidOperationException("Evidence omitted.");
+        return rsa;
+      } catch { rsa.Dispose(); throw; }
+  }
+  public static bool RecipientAdmitted(string publicSpki, string fingerprint) {
+    using (RSA rsa = ImportRecipient(publicSpki, fingerprint)) { return true; }
+  }
+
+  public static byte[][] Seal(string publicSpki, string fingerprint, string stderr, byte[] context) {
+    byte[] plaintext = null;
+    byte[] key = null;
+    try {
+      if (context == null || context.Length == 0 || context.Length > 4096) throw new InvalidOperationException("Evidence omitted.");
+      UTF8Encoding utf8 = new UTF8Encoding(false, true);
+      int length = utf8.GetByteCount(stderr);
+      if (length < 1 || length > 1048576) throw new InvalidOperationException("Evidence omitted.");
+      using (RSA rsa = ImportRecipient(publicSpki, fingerprint)) {
         plaintext = utf8.GetBytes(stderr);
         key = RandomNumberGenerator.GetBytes(32);
         byte[] nonce = RandomNumberGenerator.GetBytes(12);
@@ -263,6 +274,12 @@ Describe 'Owned WSL2 authenticated download arguments' {
 
 
 Describe 'Owned WSL2 actual Prepare workflow and recorder boundary' {
+  BeforeEach {
+    $savedPrepareEvidenceSelection=$env:BIBCODE_PREPARE_REFUSAL_SELECTED
+    $env:BIBCODE_PREPARE_REFUSAL_SELECTED='false'
+  }
+  AfterEach { $env:BIBCODE_PREPARE_REFUSAL_SELECTED=$savedPrepareEvidenceSelection }
+
   BeforeAll {
     $ownerSource = Get-Content -LiteralPath "$PSScriptRoot/owned-wsl2-fixture.ps1" -Raw
     $workflowSource = Get-Content -LiteralPath "$PSScriptRoot/../.github/workflows/desktop-upgrade-smoke.yml" -Raw
@@ -279,7 +296,7 @@ Describe 'Owned WSL2 actual Prepare workflow and recorder boundary' {
     $ownerStart=$ownerSource.IndexOf('function Prepare-Fixture {',[StringComparison]::Ordinal)
     if($ownerStart -lt 0){throw 'Actual Prepare source unavailable.'}
     $ownerPrefix=@'
-param([string]$Action,[string]$OwnerManifest,[string]$RequestedFailure=$env:BIBCODE_INERT_PREPARE_FAILURE)
+param([string]$Action,[string]$OwnerManifest,[string]$RequestedFailure=$env:BIBCODE_INERT_PREPARE_FAILURE,[scriptblock]$PrepareRefusalObserver)
 $ErrorActionPreference='Stop'
 $SourceSha='a'*40
 $RootfsName='ubuntu-24.04.5-wsl-amd64.wsl'
@@ -775,4 +792,89 @@ Describe 'Pinned Git GPG home argument boundary (inert)' {
     @{Native='\\?\C:\Owned\gnupg'},@{Native='/c/Owned/gnupg'},
     @{Native='C:\Owned\..\gnupg'},@{Native='C:\Owned\.\gnupg'},@{Native=''}
   ) { param($Native) {Get-PinnedGitGpgHomeArgument $Native}|Should -Throw }
+}
+
+Describe 'Owned Prepare closed primitive refusal projection (Windows CI)' {
+  BeforeAll {
+    Initialize-PhysicalReader
+    Add-Type -TypeDefinition @'
+using System;
+public sealed class OwnedPrepareUnsafeException : Exception {
+ public static int Reads;
+ public override string Message { get { Reads++;throw new InvalidOperationException("unsafe getter"); } }
+}
+'@ | Out-Null
+  }
+  It 'refuses an unknown exception before its virtual message getter' {
+    $error=[OwnedPrepareUnsafeException]::new()
+    $record=[Management.Automation.ErrorRecord]::new($error,'inert',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+    [OwnedWslPrepareProjection]::Serialize($record)|Should -BeNullOrEmpty
+    [OwnedPrepareUnsafeException]::Reads|Should -Be 0
+  }
+  It 'serializes every closed null and uint32 maximum without touching TargetObject' {
+    $target=[pscustomobject]@{}
+    $target|Add-Member -MemberType ScriptProperty -Name Secret -Value {throw 'Untrusted target accessed.'}
+    $error=[InvalidOperationException]::new('inert original')
+    $native=[OwnedWslPrepareFailure]::Native('SingleLinkPolicy',$null,[uint32]::MaxValue)
+    [OwnedWslPrepareFailure]::Attach($native,'C:\inert\input','C:\inert',$false,[uint32]::MaxValue,[uint32]::MaxValue)
+    $record=[Management.Automation.ErrorRecord]::new($native,'inert',[Management.Automation.ErrorCategory]::NotSpecified,$target)
+    $value=[OwnedWslPrepareProjection]::Serialize($record)|ConvertFrom-Json -AsHashtable
+    @($value.Keys).Count|Should -Be 12
+    $value.payloadVersion|Should -Be 1
+    @($value.exceptionChain[0].Keys).Count|Should -Be 4
+    $value.exceptionChain[0].type|Should -BeExactly 'System.InvalidOperationException'
+    $value.exceptionChain[0].message|Should -BeExactly 'Owned physical identity refused.'
+    $value.exceptionChain[0].hResult|Should -Be $native.HResult
+    $value.exceptionChain[0].clrStack|Should -BeNullOrEmpty
+    $value.scriptStack|Should -BeNullOrEmpty
+    $value.pinInputPath|Should -BeExactly 'C:\inert\input'
+    $value.pinAncestorPath|Should -BeExactly 'C:\inert'
+    $value.pinIsDirectory|Should -BeFalse
+    $value.pinLeafAttributes|Should -Be ([long][uint32]::MaxValue)
+    $value.pinAncestorAttributes|Should -Be ([long][uint32]::MaxValue)
+    $value.nativeBranch|Should -BeExactly 'SingleLinkPolicy'
+    $value.nativeWin32Error|Should -BeNullOrEmpty
+    $value.nativeLinkCount|Should -Be ([long][uint32]::MaxValue)
+  }
+  It 'keeps native result nulls distinct for <Branch>' -TestCases @(@{Branch='CreateFile'},@{Branch='GetFileInformationByHandle'}) {
+    param($Branch)
+    $error=[OwnedWslPrepareFailure]::Native($Branch,5,$null)
+    [OwnedWslPrepareFailure]::Attach($error,'C:\inert\input',$null,$null,$null,$null)
+    $record=[Management.Automation.ErrorRecord]::new($error,'inert',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+    $value=[OwnedWslPrepareProjection]::Serialize($record)|ConvertFrom-Json
+    $value.nativeBranch|Should -BeExactly $Branch
+    $value.nativeWin32Error|Should -Be 5
+    $value.nativeLinkCount|Should -BeNullOrEmpty
+    $value.pinLeafAttributes|Should -BeNullOrEmpty
+    $value.pinIsDirectory|Should -BeNullOrEmpty
+  }
+  It 'preserves lower context while enriching the actual wrapper exception' {
+    $native=[OwnedWslPrepareFailure]::Native('CreateFile',5,$null)
+    $wrapper=[InvalidOperationException]::new('inert wrapper',$native)
+    [OwnedWslPrepareFailure]::Attach($wrapper,'C:\inert\input',$null,$true,16,$null)
+    $record=[Management.Automation.ErrorRecord]::new($wrapper,'inert',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+    $value=[OwnedWslPrepareProjection]::Serialize($record)|ConvertFrom-Json
+    $value.exceptionChain.Count|Should -Be 2
+    $value.nativeBranch|Should -BeExactly 'CreateFile'
+    $value.pinInputPath|Should -BeExactly 'C:\inert\input'
+  }
+  It 'omits a fifth exception or overbound message' {
+    $error=[InvalidOperationException]::new('leaf')
+    1..4|ForEach-Object {$error=[InvalidOperationException]::new('wrapper',$error)}
+    $record=[Management.Automation.ErrorRecord]::new($error,'inert',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+    [OwnedWslPrepareProjection]::Serialize($record)|Should -BeNullOrEmpty
+    $error=[InvalidOperationException]::new(('x'*16385))
+    $record=[Management.Automation.ErrorRecord]::new($error,'inert',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+    [OwnedWslPrepareProjection]::Serialize($record)|Should -BeNullOrEmpty
+  }
+  It 'keeps actual native missing-file refusal type/message and cached error' {
+    $failure=$null
+    try {[OwnedWslPhysical]::Read((Join-Path $TestDrive 'absent-owned-file'),$false)}catch {$failure=$_.Exception}
+    $record=[Management.Automation.ErrorRecord]::new($failure,'inert',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+    $value=[OwnedWslPrepareProjection]::Serialize($record)|ConvertFrom-Json
+    $value.nativeBranch|Should -BeExactly 'CreateFile'
+    $value.nativeWin32Error|Should -BeGreaterThan 0
+    $value.nativeLinkCount|Should -BeNullOrEmpty
+    $value.exceptionChain[-1].message|Should -BeExactly 'Owned physical identity refused.'
+  }
 }

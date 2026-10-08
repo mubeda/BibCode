@@ -397,3 +397,217 @@ it("keeps every pinned public metadata operation agent-free without changing ope
   }
   // Source/argument-port evidence only; real Windows crypto remains a mandatory CI counterfactual.
 });
+
+// Execute the actual optional callback statements with inert managed SDK ports.
+// Managed ErrorRecord admission, projection and PInvoke execution stay Windows CI-only.
+function actualPrepareRefusalObserver(script: string, ports: object) {
+  const begin = script.indexOf("$prepareRefusalObserver={");
+  const end = script.indexOf("}.GetNewClosure()", begin);
+  if (begin < 0 || end < begin) throw new Error("Prepare callback source unavailable.");
+  const body = script
+    .slice(begin + "$prepareRefusalObserver={".length, end)
+    .replace(/param\(\$originalErrorRecord\)/, "")
+    .replace(/\[OwnedWslPrepareProjection\]::Serialize/g, "projection.Serialize")
+    .replace(/\[OwnedGpgEvidenceV1\]::Seal/g, "sdk.Seal")
+    .replace(/\[OwnedGpgEvidenceV1\]::Publish/g, "sdk.Publish")
+    .replace(/\$true\b/g, "true")
+    .replace(/\$null\b/g, "null")
+    .replace(/-ne\b/g, "!==")
+    .replace(/-eq\b/g, "===")
+    .replace(/-or\b/g, "||")
+    .replace(/\$(prepareEvidenceState|originalErrorRecord|payload|parts)\b/g, "$1");
+  if (/\$|\[Owned|::|\bparam\(/.test(body)) throw new Error("Unexecuted callback expression.");
+  const callback = NodeVM.runInNewContext(
+    "(function(originalErrorRecord){let payload,parts;" + body + "})",
+    ports,
+  );
+  if (typeof callback !== "function") throw new Error("Prepare callback refused.");
+  return callback;
+}
+
+function actualPrepareRefusalCatch(owner: string, ports: object) {
+  const begin = owner.indexOf("if($MyInvocation.InvocationName -ne '.') {");
+  if (begin < 0) throw new Error("Actual owner catch unavailable.");
+  const body = owner
+    .slice(begin)
+    .replace("if($MyInvocation.InvocationName -ne '.')", "if(invocation !== '.')")
+    .replace("Invoke-OwnedFixtureAction $Action", "invoke(Action)")
+    .replace(/Write-Output ('[^\n]+?')/g, "write($1)")
+    .replace(/exit ([01])/g, "return finish($1)")
+    .replace("$originalFailure=$_", "originalFailure=caught")
+    .replace("} catch {\n    originalFailure", "} catch(caught) {\n    originalFailure")
+    .replace(
+      "& $PrepareRefusalObserver $originalFailure *> $null",
+      "PrepareRefusalObserver(originalFailure)",
+    )
+    .replace(
+      "[ordered]@{completed=$false;prepareStage=$script:OwnedWslPrepareStage}",
+      "{completed:false,prepareStage:stage}",
+    )
+    .replace("[ordered]@{}", "{}")
+    .replace(
+      "foreach($name in $script:OwnedWslSignedMetadata.Keys)",
+      "for(const name of Object.keys(metadata))",
+    )
+    .replace(
+      "$receipt|ConvertTo-Json -Depth 4 -Compress|Write-Output",
+      "write(JSON.stringify(receipt))",
+    )
+    .replace(/\[int\]/g, "")
+    .replace(/\$script:OwnedWslPrepareStage/g, "stage")
+    .replace(/\$script:OwnedWslSignedMetadata/g, "metadata")
+    .replace(/\$true\b/g, "true")
+    .replace(/\$false\b/g, "false")
+    .replace(/\$null\b/g, "null")
+    .replace(/-ceq\b|-eq\b/g, "===")
+    .replace(/-ne\b/g, "!==")
+    .replace(/-and\b/g, "&&")
+    .replace(/-ge\b/g, ">=")
+    .replace(/-le\b/g, "<=")
+    .replace(/\$(Action|originalFailure|PrepareRefusalObserver|receipt|code|name)\b/g, "$1");
+  if (/\$|::|\[ordered\]|\bWrite-Output|\bConvertTo-Json/.test(body))
+    throw new Error("Actual catch expression unexecuted.");
+  const run = NodeVM.runInNewContext(
+    "(function(){let originalFailure,receipt,code;" + body + "})",
+    ports,
+  );
+  if (typeof run !== "function") throw new Error("Actual catch refused.");
+  return run;
+}
+it.each(["success", "projection", "seal", "publication"])(
+  "actual Prepare optional callback keeps original identity and closed receipt through %s",
+  (fault) => {
+    const steps = workflow.jobs.windows_wsl_upgrade_smoke.steps;
+    const source = steps.find((step: { id?: string }) => step.id === "native_wsl").run;
+    const original = new Error("inert original refusal");
+    const events: string[] = [];
+    const state = {
+      active: true,
+      attempted: false,
+      public: "inert-public",
+      fingerprint: "a".repeat(64),
+      context: new Uint8Array([1]),
+      root: "inert-owned-root",
+    };
+    const callback = actualPrepareRefusalObserver(source, {
+      prepareEvidenceState: state,
+      projection: {
+        Serialize: (record: unknown) => {
+          NodeAssert.equal(record, original);
+          events.push("projection");
+          if (fault === "projection") throw undefined;
+          return JSON.stringify({ payloadVersion: 1 });
+        },
+      },
+      sdk: {
+        Seal: (_public: string, _fingerprint: string, payload: string, context: Uint8Array) => {
+          NodeAssert.equal(JSON.parse(payload).payloadVersion, 1);
+          NodeAssert.equal(context, state.context);
+          events.push("seal");
+          if (fault === "seal") throw new Error("inert seal refusal");
+          return [
+            context,
+            new Uint8Array([2]),
+            new Uint8Array(384),
+            new Uint8Array(12),
+            new Uint8Array(16),
+          ];
+        },
+        Publish: (_root: string, parts: Uint8Array[]) => {
+          NodeAssert.equal(parts.length, 5);
+          events.push("publication");
+          if (fault === "publication") throw new Error("inert publication refusal");
+        },
+      },
+    });
+    // Source catch owns this same record; callback errors are fully optional.
+    const output: string[] = [];
+    let exitCode = -1;
+    const owner = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+    const run = actualPrepareRefusalCatch(owner, {
+      invocation: "file",
+      Action: "Prepare",
+      stage: "intent-write",
+      metadata: {},
+      PrepareRefusalObserver: callback,
+      invoke: () => {
+        throw original;
+      },
+      write: (value: string) => output.push(value),
+      finish: (code: number) => {
+        exitCode = code;
+      },
+    });
+    run();
+    callback(original);
+    NodeAssert.equal(exitCode, 1);
+    NodeAssert.equal(output.length, 1);
+    NodeAssert.equal(state.attempted, true);
+    NodeAssert.equal(events.filter((event) => event === "projection").length, 1);
+    const retained = JSON.parse(output[0] ?? "null");
+    NodeAssert.deepEqual(retained, { completed: false, prepareStage: "intent-write" });
+    NodeAssert.equal(original.message, "inert original refusal");
+    state.active = false;
+    callback(original);
+    NodeAssert.equal(events.filter((event) => event === "projection").length, 1);
+  },
+);
+it("omits inactive callback despite operational-looking public environment", () => {
+  const source = workflow.jobs.windows_wsl_upgrade_smoke.steps.find(
+    (step: { id?: string }) => step.id === "native_wsl",
+  ).run;
+  let reads = 0;
+  const callback = actualPrepareRefusalObserver(source, {
+    prepareEvidenceState: { active: false, attempted: false },
+    projection: {
+      Serialize: () => {
+        reads++;
+        throw new Error("must remain inactive");
+      },
+    },
+    sdk: {},
+  });
+  callback(undefined);
+  expect(reads).toBe(0);
+});
+it("attributes named intent statements separately without extra filesystem reads", () => {
+  const owner = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+  const statements = [
+    "[IO.Directory]::CreateDirectory($import)|Out-Null",
+    "Set-OwnerAcl $import",
+    "root=Get-PhysicalPin $root",
+    "importRoot=Get-PhysicalPin $import",
+    "pin=Get-PhysicalPin $wsl",
+    "sha256=(Get-FileHash -LiteralPath $wsl",
+    "imagePin=Get-PhysicalPin $image",
+    "checkout=Get-PhysicalPin $env:GITHUB_WORKSPACE",
+    "$m.manifestPin=Get-PhysicalPin $OwnerManifest",
+    "$json=$Manifest|ConvertTo-Json",
+    "[IO.File]::WriteAllText($OwnerManifest,$json)",
+    "Set-OwnerAcl $OwnerManifest",
+    "$acl = Get-Acl -LiteralPath $Path",
+    "$acl.SetOwner($me)",
+    "$acl.SetAccessRuleProtection($true,$false)",
+    "$acl.RemoveAccessRuleAll($rule)",
+    "$acl.AddAccessRule(",
+    "Set-Acl -LiteralPath $Path -AclObject $acl",
+  ];
+  const lines = owner.split("\n");
+  const observed = statements.map((statement) =>
+    lines.findIndex((line) => line.includes(statement)),
+  );
+  expect(observed.every((line) => line >= 0)).toBe(true);
+  expect(new Set(observed).size).toBe(statements.length);
+  const intent = owner.slice(
+    owner.indexOf("$script:OwnedWslPrepareStage='intent-write'"),
+    owner.indexOf("$script:OwnedWslPrepareStage='owned-import'"),
+  );
+  expect(intent.match(/Save-FixtureManifest \$m/g)).toHaveLength(2);
+  const native = owner.slice(
+    owner.indexOf("public static string Read("),
+    owner.indexOf("public sealed class OwnedWslPrepareFailure"),
+  );
+  expect(native.match(/GetLastWin32Error\(\)/g)).toHaveLength(2);
+  expect(native).toContain("if(!directory&&i.Links!=1)");
+  expect(native).not.toMatch(/GetFileAttributes|GetFinalPathName|GetVolume/);
+});

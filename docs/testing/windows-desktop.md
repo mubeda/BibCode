@@ -828,6 +828,43 @@ roots. Join exact owned processes and source/store/window identities before
 retention; no generic process-name cleanup is admitted. This partition does not
 qualify native Preview annotations or the full six-target release matrix.
 
+### Optional encrypted original Prepare refusal
+
+An approved manual Windows-only native follow-up dispatch may additionally set
+`wsl_prepare_refusal_evidence=true` (default false). It reuses the existing
+paired public SPKI/fingerprint and admitted private staging output. It does
+not arm Pester controls, ordinary/callable workflows, Linux, or non-Prepare
+operations. After passing Pester, the workflow admits the recipient and installs
+one callback immediately around the real Prepare invocation; finally revokes
+that capability before clearing its references, including receipt failures.
+
+Only the original entire Prepare refusal is projected. Stock ErrorRecord and
+InvocationInfo types and an exact maintained exception allowlist are admitted
+before getters. No TargetObject, command/provider graph, arbitrary Data or
+PowerShell serializer crosses this boundary. The maintained JSON serializer
+receives only readonly owned primitive DTO fields: payloadVersion,
+exceptionChain (type/message/hResult/clrStack), scriptStack, scriptLineNumber,
+pinInputPath, pinAncestorPath, pinIsDirectory, pinLeafAttributes,
+pinAncestorAttributes, nativeBranch, nativeWin32Error and nativeLinkCount.
+Unknown results remain null. The at-most-four exception chain refuses cycles
+and unknown subclasses. Per-string bounds and cumulative strict UTF8 256 KiB
+omit rather than truncate. Original source lines identify existing ACL,
+serialization/write/hash statements; only pin failures retain actual supplied
+pin input/refusing ancestor and already-returned native results. Native branches
+are CreateFile, GetFileInformationByHandle and SingleLinkPolicy; the Win32 error
+is cached before disposal and the single-link guard is unchanged.
+
+The same managed string Seal API and exact five encrypted files carry this
+closed JSON under explicit AAD scope `wsl-owned-prepare-refusal`. Root must
+nominate that scope before dispatch and validate the twelve payload keys after
+authenticated decryption; it cannot interpret this ciphertext as GPG stderr.
+No private key/plaintext, sixth artifact, new public field, filesystem probe,
+provider/native command, guard waiver or acceptance claim is introduced.
+Optional projection/serialization/encryption/publication failures preserve the
+original closed Prepare receipt and exit. Strings cannot be promised erased.
+Node/source controls are supporting proof only; actual managed projection,
+Pester/callback/SDK interop and native identity remain Windows CI requirements.
+
 ### Optional encrypted real-GPG refusal evidence
 
 For an approved single diagnostic run, manual `workflow_dispatch` may pair
