@@ -307,6 +307,9 @@ cargo test -p bibcode-server migrations -j 2
 
 Deliver a queued message at completion and let its turn run past the idle timeout;
 the session must stay live until one idle timeout after that turn completes.
+Likewise, end a turn while a provider subagent keeps running: the session must stay
+live until about one idle timeout after the subagent finishes. After a clean server
+restart, the next message must resume the same native conversation.
 
 With a fake provider withholding acknowledgement, stop the session through
 workspace loss so its frozen delivery becomes uncertain, then restore the
