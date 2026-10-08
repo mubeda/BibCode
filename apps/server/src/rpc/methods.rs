@@ -118,7 +118,9 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("pullRequests.getTimeline"),
     read_unary("pullRequests.getVocabulary"),
     read_unary("pullRequests.list"),
+    read_unary("pullRequests.readSnapshot"),
     mutation_unary("pullRequests.runAction"),
+    read_stream("pullRequests.subscribe"),
     read_unary("review.getDiffPreview"),
     mutation_unary("server.consumeCodexRateLimitReset"),
     read_unary("server.discoverSourceControl"),
@@ -220,9 +222,11 @@ mod tests {
             "pullRequests.getCommits",
             "pullRequests.getChecks",
             "pullRequests.getFiles",
+            "pullRequests.readSnapshot",
         ] {
             assert!(ACTIVE_RPC_METHODS.contains(&read_unary(name)), "{name}");
         }
+        assert!(ACTIVE_RPC_METHODS.contains(&read_stream("pullRequests.subscribe")));
         for name in ["pullRequests.runAction", "pullRequests.checkout"] {
             assert!(ACTIVE_RPC_METHODS.contains(&mutation_unary(name)), "{name}");
         }

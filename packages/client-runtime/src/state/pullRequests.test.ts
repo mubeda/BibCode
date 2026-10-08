@@ -12,7 +12,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 
 describe("Pull Requests environment atoms", () => {
-  it("exports all ten factories through the public subpath and keys reads by environment and input", () => {
+  it("exports all twelve factories through the public subpath and keys reads by environment and input", () => {
     const runtime = Atom.runtime(
       Layer.effect(
         EnvironmentRegistry,
@@ -31,9 +31,11 @@ describe("Pull Requests environment atoms", () => {
       "getTimeline",
       "getVocabulary",
       "list",
+      "readSnapshot",
       "requestContextRescan",
       "requestListTotalsRefresh",
       "runAction",
+      "subscribe",
     ]);
 
     const environmentId = EnvironmentId.make("env-1");

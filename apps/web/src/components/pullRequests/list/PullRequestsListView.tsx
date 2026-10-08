@@ -25,12 +25,15 @@ import {
 } from "react";
 import { DEFAULT_PULL_REQUESTS_FILTERS, usePullRequestsStore } from "../../../pullRequestsStore";
 import { pullRequestsEnvironment } from "../../../state/pullRequests";
-import { type EnvironmentQueryView } from "../../../state/query";
+import { useEnvironmentQuery, type EnvironmentQueryView } from "../../../state/query";
 import { Button } from "../../ui/button";
 import { Skeleton } from "../../ui/skeleton";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
+import { useVisiblePullRequestRefresh } from "../useVisiblePullRequestRefresh";
+import { shownCopy, type ShownCopy } from "../detail/snapshotDisplay.logic";
+import { useDocumentVisible } from "../useDocumentVisible";
 import { PullRequestsFilters } from "./PullRequestsFilters";
 import { PullRequestsRow } from "./PullRequestsRow";
 import {
@@ -146,9 +149,9 @@ function PullRequestsPages({
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
   const renderRow = useCallback(
     ({ item }: { item: PullRequestsListRow }) => (
-      <PullRequestsRow row={item} projectRef={projectRef} context={context} />
+      <PullRequestsRow row={item} projectRef={projectRef} context={context} scope={scope} />
     ),
-    [context, projectRef],
+    [context, projectRef, scope],
   );
   const failure =
     query.emission._tag === "Failure" ? squashAtomCommandFailure(query.emission) : null;
@@ -308,6 +311,58 @@ export function PullRequestsListView({
   const firstQuery = usePullRequestsQuery(firstAtom, {
     freshOnOpen: freshPageKey === environmentRpcKey({ environmentId: scope.environmentId, input }),
   });
+  const isGitlab = context.provider === "gitlab";
+  const snapshotTarget = useMemo(
+    () => ({ environmentId: scope.environmentId, input: { ...input, number: null, tab: null } }),
+    [input, scope.environmentId],
+  );
+  const snapshotAtom = useMemo(
+    () => (isGitlab ? pullRequestsEnvironment.readSnapshot(snapshotTarget) : null),
+    [isGitlab, snapshotTarget],
+  );
+  const snapshotQuery = useEnvironmentQuery(snapshotAtom);
+  const visible = useDocumentVisible();
+  const subscribeAtom = useMemo(
+    () => (isGitlab && visible ? pullRequestsEnvironment.subscribe(snapshotTarget) : null),
+    [isGitlab, snapshotTarget, visible],
+  );
+  const subscribeQuery = useEnvironmentQuery(subscribeAtom);
+  // A success on the push stream, even the initial all-false connected event,
+  // stands the client's own refresh timer down until the stream fails or waits again.
+  const paused = isGitlab && subscribeQuery.emission._tag === "Success";
+  const [shownList, setShownList] = useState<ShownCopy<PullRequestsListPage> | null>(null);
+  const nextShownList = shownCopy(
+    shownList,
+    environmentRpcKey(snapshotTarget),
+    firstQuery.data,
+    isGitlab
+      ? { answered: snapshotQuery.data !== null, row: snapshotQuery.data?.list ?? null }
+      : null,
+  );
+  if (nextShownList !== shownList) setShownList(nextShownList);
+  const applySubscribedChange = useEffectEvent(
+    (changed: NonNullable<typeof subscribeQuery.data>) => {
+      if (changed.list) snapshotQuery.revalidate();
+    },
+  );
+  useEffect(() => {
+    if (subscribeQuery.data) applySubscribedChange(subscribeQuery.data);
+  }, [subscribeQuery.data]);
+  useVisiblePullRequestRefresh({
+    enabled: isGitlab,
+    succeeded: firstQuery.data !== null && firstQuery.error === null && !firstQuery.isPending,
+    paused,
+    revalidate: firstQuery.revalidate,
+  });
+  const displayedFirstPage = nextShownList?.payload ?? null;
+  const displayedFirstQuery: EnvironmentQueryView<PullRequestsListPage> =
+    displayedFirstPage === null
+      ? firstQuery
+      : {
+          ...firstQuery,
+          data: displayedFirstPage,
+          isPending: firstQuery.data === null ? false : firstQuery.isPending,
+        };
   useEffect(() => {
     if (freshPageKey != null) onFreshPageConsumed?.(freshPageKey);
   }, [freshPageKey, onFreshPageConsumed]);
@@ -335,7 +390,7 @@ export function PullRequestsListView({
           className="mx-4 mt-3 shrink-0"
         >
           {tabs.map((tab) => {
-            const counts = firstQuery.data?.counts;
+            const counts = displayedFirstPage?.counts;
             const count =
               tab === "all"
                 ? counts?.open !== null &&
@@ -373,7 +428,7 @@ export function PullRequestsListView({
             context={context}
             ref={ref}
             input={input}
-            firstQuery={firstQuery}
+            firstQuery={displayedFirstQuery}
             hasFilters={hasFilters}
             onClear={clear}
           />

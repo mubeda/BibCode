@@ -57,9 +57,16 @@ function MergeOption({
 
 export function PullRequestsUpdateBranch({
   detail,
+  live = detail,
   context,
 }: {
   detail: PullRequestsDetail;
+  /**
+   * Updating the branch only ever acts on a live detail, never a snapshot.
+   * Omitting this falls back to `detail`, so callers that have not adopted
+   * the split keep acting as before.
+   */
+  live?: PullRequestsDetail | null;
   context: Host;
 }) {
   const { run, pending } = usePullRequestsActions();
@@ -67,7 +74,9 @@ export function PullRequestsUpdateBranch({
   const disabledReason = useContext(MutationsDisabledContext);
   const permission = constrainPermission(
     detail.permissions.updateBranch,
-    disabledReason ?? (pending ? "Wait for the current action to finish" : null),
+    live === null
+      ? "Loading…"
+      : (disabledReason ?? (pending ? "Wait for the current action to finish" : null)),
   );
   const methods = detail.permissions.updateBranch.methods;
   const method = methods[0];
@@ -147,10 +156,17 @@ export function PullRequestsUpdateBranch({
 
 export function PullRequestsMergeControls({
   detail,
+  live = detail,
   context,
   projectRef,
 }: {
   detail: PullRequestsDetail;
+  /**
+   * Merging only ever acts on a live detail, never a snapshot. Omitting this
+   * falls back to `detail`, so callers that have not adopted the split keep
+   * acting as before.
+   */
+  live?: PullRequestsDetail | null;
   context: Host;
   projectRef: ScopedProjectRef;
 }) {
@@ -193,7 +209,10 @@ export function PullRequestsMergeControls({
     merge.allowed ||
     detail.permissions.mergeBypass.allowed ||
     detail.permissions.enableAutoMerge.allowed;
-  const busyReason = disabledReason ?? (pending ? "Wait for the current action to finish" : null);
+  const busyReason =
+    live === null
+      ? "Loading…"
+      : (disabledReason ?? (pending ? "Wait for the current action to finish" : null));
   const configuration = constrainPermission(
     { allowed: canConfigure, reason: canConfigure ? null : merge.reason },
     busyReason,

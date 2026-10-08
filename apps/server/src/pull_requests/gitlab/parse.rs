@@ -12,6 +12,19 @@ pub(super) fn invalid(operation: &str) -> PullRequestsOperationError {
     PullRequestsOperationError::new(operation, "invalid_response")
 }
 
+/// The four fields the poller reads from one `GET merge_requests/:iid` response.
+pub(super) fn probe_fingerprint(
+    value: &Value,
+    operation: &str,
+) -> Result<super::refresh::ProbeFingerprint, PullRequestsOperationError> {
+    Ok(super::refresh::ProbeFingerprint {
+        updated_at: string(value, "updated_at", operation)?,
+        user_notes_count: value["user_notes_count"].as_u64().unwrap_or(0),
+        pipeline_id: value["head_pipeline"]["id"].as_u64(),
+        pipeline_status: optional(&value["head_pipeline"], "status"),
+    })
+}
+
 pub(super) fn create_defaults(
     user: &Value,
     project: &Value,

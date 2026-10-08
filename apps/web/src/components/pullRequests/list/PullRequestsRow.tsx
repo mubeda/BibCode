@@ -1,4 +1,5 @@
 import type {
+  EnvironmentId,
   PullRequestsContext,
   PullRequestsListRow,
   ScopedProjectRef,
@@ -11,6 +12,7 @@ import { formatRelativeTimeLabel } from "../../../timestampFormat";
 import { PullRequestsActor } from "../shared/PullRequestsActor";
 import { PullRequestsLabelChip } from "../shared/PullRequestsLabelChip";
 import { PullRequestsStateIcon } from "../shared/PullRequestsStateIcon";
+import { useMergeRequestHoverPrefetch } from "../useMergeRequestHoverPrefetch";
 import { rowStateIcon, rowTimeLabel } from "./pullRequestsList.logic";
 const REVIEW_LABELS = {
   review_required: "Review required",
@@ -27,12 +29,20 @@ export interface PullRequestsRowProps {
   row: PullRequestsListRow;
   projectRef: ScopedProjectRef;
   context: Extract<PullRequestsContext, { status: "available" }>;
+  scope?: { environmentId: EnvironmentId; cwd: string };
 }
 export const PullRequestsRow = memo(function PullRequestsRow({
   row,
   projectRef,
   context,
+  scope,
 }: PullRequestsRowProps) {
+  const hoverPrefetch = useMergeRequestHoverPrefetch({
+    enabled: scope !== undefined && context.provider === "gitlab",
+    environmentId: scope?.environmentId ?? projectRef.environmentId,
+    cwd: scope?.cwd ?? "",
+    number: row.number,
+  });
   const combinedClosed = context.capabilities.closedTabIncludesMerged;
   const reference = formatChangeRequestNumber(context.provider, row.number);
   const check = row.checksSummary === null ? null : CHECKS[row.checksSummary];
@@ -41,6 +51,7 @@ export const PullRequestsRow = memo(function PullRequestsRow({
       role="listitem"
       data-text-surface="background"
       className="flex h-14 min-w-0 items-center gap-3 border-b border-border/60 px-4"
+      {...(scope !== undefined && context.provider === "gitlab" ? hoverPrefetch : {})}
     >
       <PullRequestsStateIcon state={rowStateIcon(row)} />
       <div className="min-w-0 flex-1">

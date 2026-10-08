@@ -1,5 +1,5 @@
 import { AsyncResult, type Atom } from "effect/unstable/reactivity";
-import { useEffect, useEffectEvent, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { useEnvironmentQuery, type EnvironmentQueryView } from "../../../state/query";
 
 export interface PullRequestsQueryOptions {
@@ -22,6 +22,7 @@ export function usePullRequestsQuery<A, E>(
   options?: PullRequestsQueryOptions,
 ): EnvironmentQueryView<A, E> {
   const query = useEnvironmentQuery(atom);
+  const shown = useRef<{ atom: typeof atom; data: A | null }>({ atom, data: null });
   const [opened, setOpened] = useState(() =>
     openedView(atom, query, options?.freshOnOpen === true),
   );
@@ -46,9 +47,15 @@ export function usePullRequestsQuery<A, E>(
       emission: AsyncResult.initial<A, E>(true),
       isPending: true,
     };
-  return opened.data !== null && query.data === opened.data
-    ? { ...query, data: null, isPending: query.isPending || query.error === null }
-    : query;
+  if (shown.current.atom !== atom) shown.current = { atom, data: null };
+  const view =
+    opened.data !== null && query.data === opened.data
+      ? { ...query, data: null, isPending: query.isPending || query.error === null }
+      : query;
+  if (view.data !== null) shown.current = { atom, data: view.data };
+  if (view.data === null && view.error !== null && shown.current.data !== null)
+    return { ...view, data: shown.current.data };
+  return view;
 }
 
 /** What an open must hide until re-read, including an already revalidating value or failure. */

@@ -18,6 +18,7 @@ import {
   createEnvironmentQueryAtomFamily,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
+  createEnvironmentRpcSubscriptionAtomFamily,
   environmentRpcKey,
 } from "./runtime.ts";
 import { vcsCommandConcurrency, vcsCommandScheduler } from "./vcsCommandScheduler.ts";
@@ -138,6 +139,20 @@ export function createPullRequestsEnvironmentAtoms<R, E>(
       label: "environment-data:pull-requests:get-files",
       tag: WS_METHODS.pullRequestsGetFiles,
       staleTimeMs: 30_000,
+    }),
+    // A stored payload is a point-in-time copy; every call re-reads it, so the
+    // caller's own `newerObservedAt` comparison decides whether to paint it.
+    readSnapshot: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:pull-requests:read-snapshot",
+      tag: WS_METHODS.pullRequestsReadSnapshot,
+      staleTimeMs: 0,
+      idleTtlMs: 0,
+    }),
+    /** The poller's change events for the mounted list key, number, and tab. */
+    subscribe: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:pull-requests:subscribe",
+      tag: WS_METHODS.pullRequestsSubscribe,
+      idleTtlMs: 0,
     }),
     runAction: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:pull-requests:run-action",

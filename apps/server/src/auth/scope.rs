@@ -37,6 +37,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "pullRequests.getCommits"
         | "pullRequests.getChecks"
         | "pullRequests.getFiles"
+        | "pullRequests.readSnapshot"
+        | "pullRequests.subscribe"
         | "orchestration.getArchivedShellSnapshot"
         | "orchestration.getFullThreadDiff"
         | "orchestration.getTurnDiff"
@@ -250,6 +252,8 @@ mod tests {
             "pullRequests.getCommits",
             "pullRequests.getChecks",
             "pullRequests.getFiles",
+            "pullRequests.readSnapshot",
+            "pullRequests.subscribe",
             "gitManager.getCommits",
             "gitManager.getDiff",
             "gitManager.getRefs",

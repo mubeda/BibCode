@@ -532,6 +532,60 @@ export const PullRequestsFiles = Schema.Struct({
 });
 export type PullRequestsFiles = typeof PullRequestsFiles.Type;
 
+export const PullRequestsSubscribeTab = Schema.Literals([
+  "conversation",
+  "commits",
+  "checks",
+  "files",
+]);
+export type PullRequestsSubscribeTab = typeof PullRequestsSubscribeTab.Type;
+
+export const PullRequestsSubscribeInput = Schema.Struct({
+  ...PullRequestsListInput.fields,
+  number: Schema.NullOr(Schema.Number),
+  tab: Schema.NullOr(PullRequestsSubscribeTab),
+});
+export type PullRequestsSubscribeInput = typeof PullRequestsSubscribeInput.Type;
+
+const PullRequestsSnapshotList = Schema.Struct({
+  payload: PullRequestsListPage,
+  observedAt: Schema.Number,
+});
+
+const PullRequestsSnapshotDetail = Schema.Struct({
+  payload: PullRequestsDetail,
+  observedAt: Schema.Number,
+});
+
+export const PullRequestsSnapshotTab = Schema.Struct({
+  kind: PullRequestsSubscribeTab,
+  payload: Schema.Union([
+    PullRequestsTimeline,
+    PullRequestsCommits,
+    PullRequestsChecks,
+    PullRequestsFiles,
+  ]),
+  observedAt: Schema.Number,
+});
+export type PullRequestsSnapshotTab = typeof PullRequestsSnapshotTab.Type;
+
+export const PullRequestsSnapshot = Schema.Struct({
+  list: Schema.NullOr(PullRequestsSnapshotList),
+  detail: Schema.NullOr(PullRequestsSnapshotDetail),
+  tab: Schema.NullOr(PullRequestsSnapshotTab),
+});
+export type PullRequestsSnapshot = typeof PullRequestsSnapshot.Type;
+
+export const PullRequestsChanged = Schema.Struct({
+  list: Schema.Boolean,
+  detail: Schema.Boolean,
+  timeline: Schema.Boolean,
+  commits: Schema.Boolean,
+  checks: Schema.Boolean,
+  files: Schema.Boolean,
+});
+export type PullRequestsChanged = typeof PullRequestsChanged.Type;
+
 export const PullRequestsActionRequest = Schema.Union([
   Schema.Struct({
     ...PullRequestsNumberInput.fields,

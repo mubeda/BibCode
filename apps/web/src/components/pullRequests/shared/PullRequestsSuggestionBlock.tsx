@@ -17,11 +17,18 @@ export function PullRequestsApplySuggestionsButton({
   permission,
   label,
   onApplied,
+  live = true,
 }: {
   suggestionIds: readonly string[];
   permission: PullRequestsPermission;
   label: string;
   onApplied?: (ids: readonly string[]) => void;
+  /**
+   * Applying a suggestion only ever acts on a live detail, never a
+   * snapshot. Defaults to `true` so callers that have not adopted the split
+   * keep acting as before.
+   */
+  live?: boolean;
 }) {
   const { run, pending } = usePullRequestsActions();
   const [open, setOpen] = useState(false);
@@ -31,11 +38,13 @@ export function PullRequestsApplySuggestionsButton({
   const busy = useRef(false);
   const available = constrainPermission(
     permission,
-    pending || applying
-      ? "Wait for the current action to finish"
-      : suggestionIds.length === 0
-        ? "This suggestion cannot be applied to the current head"
-        : null,
+    !live
+      ? "Loading…"
+      : pending || applying
+        ? "Wait for the current action to finish"
+        : suggestionIds.length === 0
+          ? "This suggestion cannot be applied to the current head"
+          : null,
   );
   async function apply() {
     if (!available.allowed || busy.current) return;
@@ -120,17 +129,26 @@ export function PullRequestsApplySuggestionsButton({
 export const PullRequestsSuggestionBlock = memo(function PullRequestsSuggestionBlock({
   suggestion,
   permission,
+  live = true,
 }: {
   suggestion: Suggestion;
   permission: PullRequestsPermission;
+  /**
+   * Applying a suggestion only ever acts on a live detail, never a
+   * snapshot. Defaults to `true` so callers that have not adopted the split
+   * keep acting as before.
+   */
+  live?: boolean;
 }) {
   const selection = useContext(PullRequestsSuggestionSelectionContext);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const available = constrainPermission(
     permission,
-    !suggestion.applicable || suggestion.id === null
-      ? "This suggestion cannot be applied to the current head"
-      : null,
+    !live
+      ? "Loading…"
+      : !suggestion.applicable || suggestion.id === null
+        ? "This suggestion cannot be applied to the current head"
+        : null,
   );
   return (
     <section
@@ -164,6 +182,7 @@ export const PullRequestsSuggestionBlock = memo(function PullRequestsSuggestionB
             suggestionIds={suggestion.id === null ? [] : [suggestion.id]}
             permission={available}
             label="Apply"
+            live={live}
           />
           <Button
             variant="outline"

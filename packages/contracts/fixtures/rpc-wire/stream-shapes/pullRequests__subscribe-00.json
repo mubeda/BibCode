@@ -1,0 +1,14 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "list": true,
+      "detail": true,
+      "timeline": false,
+      "commits": true,
+      "checks": true,
+      "files": true
+    }
+  ]
+}

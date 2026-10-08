@@ -15,10 +15,17 @@ export function PullRequestsDismissReview({
   review,
   permission,
   host,
+  live = true,
 }: {
   review: Extract<PullRequestsTimelineItem, { kind: "review" }>;
   permission: PullRequestsPermission;
   host: string;
+  /**
+   * Dismissing a review only ever acts on a live detail, never a snapshot.
+   * Defaults to `true` so callers that have not adopted the split keep
+   * acting as before.
+   */
+  live?: boolean;
 }) {
   const { run, pending } = usePullRequestsActions();
   const [open, setOpen] = useState(false);
@@ -29,11 +36,13 @@ export function PullRequestsDismissReview({
   const id = useId();
   const available = constrainPermission(
     permission,
-    !review.canDismiss
-      ? "This review cannot be dismissed"
-      : pending || dismissing
-        ? "Wait for the current action to finish"
-        : null,
+    !live
+      ? "Loading…"
+      : !review.canDismiss
+        ? "This review cannot be dismissed"
+        : pending || dismissing
+          ? "Wait for the current action to finish"
+          : null,
   );
   async function dismiss() {
     if (!available.allowed || !message.trim() || busy.current) return;
