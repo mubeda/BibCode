@@ -429,6 +429,33 @@ command in the current supervised-process implementation—and exactly one
 `finished` or `failed` event. Client interrupt and socket cancellation reach the
 supervised child process.
 
+`merge-into {source, target}` merges a full source ref into a local branch that
+is not checked out, without touching any worktree. It is advertised by the
+`gitManagerMergeIntoOperations` capability; an older server cannot decode the
+variant, so clients send it only when advertised. The server refuses a target
+that is checked out in the selected worktree (`target-is-current`), missing or
+written as a revision expression (`local-branch-not-found`), a symbolic ref
+(`invalid-request`), or checked out in another worktree (blocked
+`worktree-checked-out`); a dirty selected worktree does not block it. On Git
+older than 2.38 it fails with `git-too-old`. Otherwise it resolves
+`refs/heads/<target>` and the source once, reports "Already up to date." when
+the source is already contained, and computes the merge with
+`merge-tree --write-tree` (with `--attr-source=<target>` on Git 2.43 or
+later). A conflict fails with `conflicts` before any write, because no checkout
+holds the conflict; unrelated histories fail with `unrelated-histories`. The
+commit is created with `commit-tree -p <target> -p <source>`, passing `-S` when
+`commit.gpgSign` is true, and published with
+`git -c maintenance.auto=false -c fetch.writeCommitGraph=false -c fetch.bundleURI= fetch --no-tags --no-prune --no-recurse-submodules --no-write-fetch-head --quiet . <commit>:refs/heads/<target>`
+and `GIT_REFLOG_ACTION="merge-into <source>"`. Git's refusal for a branch in use
+by any worktree maps to blocked `worktree-checked-out`; any other publish failure
+re-reads the target and reports `non-fast-forward` if it moved, or Git's error
+otherwise. Commit and merge hooks do not run; a `reference-transaction` hook
+does and can reject the publish. `gitManager.previewMerge` accepts an optional
+`target` and then compares against `refs/heads/<target>`, returning
+`current = target`; it fails with `git-too-old` below Git 2.38 and with
+`merge-tree-failed` (carrying Git's first stderr line) for any merge-tree result
+other than clean, conflicted, or Git's unrelated-histories refusal.
+
 Branch selections send `branch-checkout.name` as a fully qualified
 `refs/heads/<branch>` or `refs/remotes/<remote>/<branch>` ref, keeping local
 names that resemble remote refs unambiguous. The server resolves that exact snapshot
@@ -470,12 +497,14 @@ Background failures preserve loaded commits and offer a Retry action.
 
 Every Git Manager mutation revalidates the selected checkout after admission;
 operations with server-authored blocked conditions recompute those reasons
-there as well. Branch and sync operations take the checkout's status-mutation
-guard before building that refs snapshot and hold it through execution, so
-`vcs.*` writes, which take the guard but not the project lock, cannot change the
-repository between validation and execution. Mutations then reuse
-`WorktreeCatalogService`'s existing project lock followed by its optional
-physical-repository lock. The non-waiting acquisition returns the structured
+there as well. Mutations reuse `WorktreeCatalogService`'s existing project lock followed by
+its optional physical-repository lock. Inside those locks, branch and sync
+operations then take the checkout's status-mutation guard before building that
+refs snapshot and hold it through execution, so `vcs.*` writes, which take the
+guard but not the project lock, cannot change the repository between validation
+and execution. Unlike `vcs.*` failures that reach no Git effect, a branch or
+sync operation that ends blocked still fences status reads, because it held the
+guard while validating. The non-waiting acquisition returns the structured
 `operation-in-flight` blocked reason when either lock is occupied; there is no
 second Git Manager lock and no silently queued competing operation. The client
 uses each returned `GitManagerBlockedReason.message` verbatim in disabled-state

@@ -307,6 +307,10 @@ The right-panel Source Control surface manages the active project or worktree:
 - Context menus can view a file, copy its path, open it externally, or add ignore
   rules for its name or parent folder when available.
 - Commit history and AI commit-message generation are available.
+- **Merge into current branch…** fetches and merges a local or remote branch
+  into the checked-out branch through Git Manager operations, and a merge in
+  progress shows Commit merge / Abort with per-file Ours, Theirs, and Mark
+  resolved.
 
 The panel intentionally has no stash or amend action. A staged row also does not
 yet open a true `git diff --cached` view.

@@ -1365,7 +1365,10 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - Git Manager force-push always uses `--force-with-lease`. Its execution paths
   forbid bare `--force`, `--ignore-other-worktrees`, forced
   `git worktree add -f`, and plumbing `update-ref` as ways to bypass the
-  server's worktree-aware guards.
+  server's worktree-aware guards. `merge-into` publishes its merge commit with
+  fast-forward-only `git fetch . <commit>:refs/heads/<target>`, which Git
+  refuses for a branch checked out, rebased, or bisected in any worktree; it
+  never uses `update-ref`.
 - Git worktree registration, directory availability, and path ownership are
   resolved by the server catalog. Clients do not infer recovery from directory
   existence or treat a degraded observation as an authoritative empty set.

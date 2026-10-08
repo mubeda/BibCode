@@ -207,7 +207,7 @@ non-interactive process test):
 7. Re-read the target tip; if it moved, fail `non-fast-forward` with "<target>
    changed while merging. Review the preview and try again."
 8. Publish: `git -c maintenance.auto=false -c fetch.writeCommitGraph=false
-   fetch --no-tags --no-prune --no-recurse-submodules --no-write-fetch-head
+   -c fetch.bundleURI= fetch --no-tags --no-prune --no-recurse-submodules --no-write-fetch-head
    --quiet . <merge>:refs/heads/<target>` with
    `GIT_REFLOG_ACTION="merge-into <source>"`. "refusing to fetch into branch"
    → blocked `worktree-checked-out` with Git's path; "(non-fast-forward)" or
@@ -245,8 +245,10 @@ blocked message. The toolbar tooltip becomes "Merge one branch into another".
 
 ## Failure codes
 
-New Rust `GitManagerFailureCode` values: `target-is-current`, `git-too-old`,
-`unrelated-histories`. Reused: `conflicts`, `already-up-to-date`,
+New wire codes, emitted as `operation_error` string codes (the existing
+`invalid-request` pattern) rather than new `GitManagerFailureCode` values:
+`target-is-current`, `git-too-old`, `unrelated-histories`, and
+`merge-tree-failed` for the preview. Reused: `conflicts`, `already-up-to-date`,
 `non-fast-forward`, `operation-in-flight`, `local-branch-not-found`, blocked
 `worktree-checked-out`. Every message names the next step.
 
@@ -339,3 +341,9 @@ New Rust `GitManagerFailureCode` values: `target-is-current`, `git-too-old`,
   re-read and fast-forward-only publish catch it for `merge-into`).
 - A repository `reference-transaction` hook can reject the publish; the
   operation then fails with Git's message and the target is unchanged.
+- A `vcs.switchRef` in another worktree can check the target out between Git's
+  own occupancy check and its ref commit inside the publish fetch. Closing that
+  needs `vcs.switchRef` to join the project lock; the reflog records the move.
+- `--quiet` hides Git's "(non-fast-forward)" line, so any publish failure other
+  than the in-use refusal re-reads the target to tell a moved target
+  (`non-fast-forward`) from a genuine failure.

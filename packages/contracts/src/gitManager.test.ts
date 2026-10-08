@@ -21,6 +21,7 @@ import {
 } from "./gitManager.ts";
 
 const decodeGitManagerBlockedReason = Schema.decodeUnknownSync(GitManagerBlockedReason);
+const decodeGitManagerPreviewMergeInput = Schema.decodeUnknownSync(GitManagerPreviewMergeInput);
 const decodeGitManagerWorktreeEntry = Schema.decodeUnknownSync(GitManagerWorktreeEntry);
 const decodeGitManagerRefEntry = Schema.decodeUnknownSync(GitManagerRefEntry);
 const decodeGitManagerRefsSnapshot = Schema.decodeUnknownSync(GitManagerRefsSnapshot);
@@ -224,7 +225,7 @@ describe("Git Manager wire schemas", () => {
   });
 
   it("decodes a merge preview input with and without a target", () => {
-    const decode = Schema.decodeUnknownSync(GitManagerPreviewMergeInput);
+    const decode = decodeGitManagerPreviewMergeInput;
     expect(decode({ cwd: "/repo", source: "topic" })).toEqual({ cwd: "/repo", source: "topic" });
     expect(decode({ cwd: "/repo", source: "topic", target: "release" })).toEqual({
       cwd: "/repo",

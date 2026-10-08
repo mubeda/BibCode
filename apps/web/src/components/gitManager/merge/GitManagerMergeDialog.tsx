@@ -167,7 +167,8 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
     [],
   );
 
-  const currentName = useMemo(() => refs.find((ref) => ref.current)?.name ?? null, [refs]);
+  // `entry`, not `ref`: the compiler's refs lint would read `ref.current` as a React ref.
+  const currentName = useMemo(() => refs.find((entry) => entry.current)?.name ?? null, [refs]);
   const targetNames = useMemo(() => refs.map((ref) => ref.name), [refs]);
   const showTargetPicker = mergeIntoAvailable && targetMode !== "current-branch";
   const target = (showTargetPicker ? targetName : null) ?? currentName;
