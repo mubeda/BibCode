@@ -3,8 +3,10 @@ import { environmentRpcKey } from "@bibcode/client-runtime/state/runtime";
 import {
   EnvironmentId,
   PullRequestsOperationError,
+  type PullRequestsChanged,
   type PullRequestsListInput,
   type PullRequestsListPage,
+  type PullRequestsSnapshot,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import { act, createRef, useReducer, type ReactNode } from "react";
@@ -28,6 +30,12 @@ const h = vi.hoisted(() => ({
   listProps: null as Record<string, unknown> | null,
   // One emission per failure, as an atom keeps it; a refresh answers with a new one.
   failures: new Map<object, unknown>(),
+  snapshot: null as PullRequestsSnapshot | null,
+  // What the next snapshot read answers with, as the poller stored it.
+  nextSnapshot: null as PullRequestsSnapshot | null,
+  changed: null as PullRequestsChanged | null,
+  snapshotReads: vi.fn(),
+  subscribe: vi.fn((args: { input: unknown }) => ({ kind: "subscribe", ...args })),
 }));
 vi.mock("../../../state/pullRequests", () => ({
   pullRequestsEnvironment: {
@@ -36,13 +44,30 @@ vi.mock("../../../state/pullRequests", () => ({
     getVocabulary: vi.fn(() => ({ kind: "vocabulary" })),
     get: vi.fn((args: unknown) => ({ kind: "get", args })),
     getTimeline: vi.fn((args: unknown) => ({ kind: "getTimeline", args })),
-    readSnapshot: vi.fn(() => ({ kind: "readSnapshot" })),
-    subscribe: vi.fn(() => ({ kind: "subscribe" })),
+    readSnapshot: vi.fn((args: { input: unknown }) => ({ kind: "readSnapshot", ...args })),
+    subscribe: h.subscribe,
   },
 }));
 vi.mock("../../../state/query", () => ({
   useEnvironmentQuery: (atom: { kind: string; input: PullRequestsListInput } | null) => {
     const [, publish] = useReducer((value: number) => value + 1, 0);
+    if (atom !== null && atom.kind !== "list") {
+      const value = atom.kind === "readSnapshot" ? h.snapshot : h.changed;
+      const read = () => {
+        h.snapshotReads(atom.kind);
+        if (atom.kind === "readSnapshot" && h.nextSnapshot) h.snapshot = h.nextSnapshot;
+        publish();
+      };
+      return {
+        data: value,
+        emission: value ? { _tag: "Success", value } : { _tag: "Initial" },
+        error: null,
+        isPending: false,
+        refresh: read,
+        revalidate: read,
+        requiresRetry: false,
+      };
+    }
     const data = atom?.kind === "list" ? (atom.input.cursor === null ? h.first : h.second) : null;
     const error = atom?.kind === "list" ? h.error : null;
     if (error && !h.failures.has(error))
@@ -91,6 +116,39 @@ vi.mock("@tanstack/react-router", () => ({
   ),
 }));
 import { PullRequestsListView, type PullRequestsListViewHandle } from "./PullRequestsListView";
+function setVisibility(state: DocumentVisibilityState) {
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+async function renderGitlab() {
+  await act(async () =>
+    root.render(
+      <PullRequestsListView
+        scope={{ environmentId: "env" as never, cwd: "/repo" }}
+        projectRef={projectRef}
+        context={gitlabContext}
+      />,
+    ),
+  );
+}
+function storedList(title: string, observedAt: number): PullRequestsSnapshot {
+  return {
+    list: {
+      payload: { rows: [{ ...row, title }], nextCursor: null, totalCount: 1, counts: null },
+      observedAt,
+    },
+    detail: null,
+    tab: null,
+  };
+}
+const LIST_EVENT: PullRequestsChanged = {
+  list: true,
+  detail: false,
+  timeline: false,
+  commits: false,
+  checks: false,
+  files: false,
+};
 let container: HTMLDivElement;
 let root: Root;
 const projectRef = { environmentId: "env", projectId: "p" } as never;
@@ -142,6 +200,12 @@ beforeEach(() => {
   h.requestTotals.mockClear();
   h.refresh.mockClear();
   h.listProps = null;
+  h.snapshot = null;
+  h.nextSnapshot = null;
+  h.changed = null;
+  h.snapshotReads.mockClear();
+  h.subscribe.mockClear();
+  setVisibility("visible");
 });
 afterEach(async () => {
   await act(async () => root.unmount());
@@ -503,4 +567,50 @@ it("shows an exhausted cached failure on remount without issuing another request
   await render();
   expect(container.textContent).toContain("The connection dropped.");
   expect(h.refresh).not.toHaveBeenCalled();
+});
+
+describe("PullRequestsListView GitLab snapshots", () => {
+  it("paints the stored list until the live first page answers", async () => {
+    h.snapshot = storedList("Stored copy", 1_000);
+    h.autoCompleteRefresh = false;
+    await renderGitlab();
+    expect(container.textContent).toContain("Stored copy");
+    h.first = { ...h.first!, rows: [{ ...row, title: "Live copy" }] };
+    await renderGitlab();
+    expect(container.textContent).toContain("Live copy");
+    expect(container.textContent).not.toContain("Stored copy");
+  });
+  it("a list event replaces a list that already shows live data with the newer stored copy", async () => {
+    h.snapshot = storedList("Stored copy", 1_000);
+    h.first = { ...h.first!, rows: [{ ...row, title: "Live copy" }] };
+    await renderGitlab();
+    expect(container.textContent).toContain("Live copy");
+    h.nextSnapshot = storedList("Poller copy", 2_000);
+    h.changed = { ...LIST_EVENT };
+    await renderGitlab();
+    expect(h.snapshotReads).toHaveBeenCalledWith("readSnapshot");
+    expect(container.textContent).toContain("Poller copy");
+    expect(container.textContent).not.toContain("Live copy");
+  });
+  it("keeps the live page when a re-read answers with a copy no newer than it", async () => {
+    h.snapshot = storedList("Stored copy", 1_000);
+    h.first = { ...h.first!, rows: [{ ...row, title: "Live copy" }] };
+    await renderGitlab();
+    h.nextSnapshot = storedList("Stored copy", 1_000);
+    h.changed = { ...LIST_EVENT };
+    await renderGitlab();
+    expect(h.snapshotReads).toHaveBeenCalledWith("readSnapshot");
+    expect(container.textContent).toContain("Live copy");
+    expect(container.textContent).not.toContain("Stored copy");
+  });
+  it("drops the subscription while the document is hidden and subscribes again when shown", async () => {
+    setVisibility("hidden");
+    await renderGitlab();
+    expect(h.subscribe).not.toHaveBeenCalled();
+    await act(async () => setVisibility("visible"));
+    expect(h.subscribe).toHaveBeenCalledWith({
+      environmentId: "env",
+      input: expect.objectContaining({ cwd: "/repo", state: "open", number: null, tab: null }),
+    });
+  });
 });

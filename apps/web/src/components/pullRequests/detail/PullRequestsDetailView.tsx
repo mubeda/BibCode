@@ -23,6 +23,8 @@ import { useEnvironmentQuery, type EnvironmentQueryView } from "../../../state/q
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { Button } from "../../ui/button";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
+import { prefetchedWithin } from "../hoverPrefetch.logic";
+import { useDocumentVisible } from "../useDocumentVisible";
 import { useVisiblePullRequestRefresh } from "../useVisiblePullRequestRefresh";
 import {
   buildListInput,
@@ -61,8 +63,14 @@ export function PullRequestsDetailView({
     () => ({ environmentId: scope.environmentId, input: { cwd: scope.cwd, number } }),
     [number, scope.cwd, scope.environmentId],
   );
+  // A hover prefetch that answered within FRESH_MS is shown as is on open.
+  const [prefetched] = useState(() => ({
+    detail: prefetchedWithin("get", request, Date.now()),
+    timeline: prefetchedWithin("getTimeline", request, Date.now()),
+  }));
   const detailQuery = usePullRequestsQuery(
     useMemo(() => pullRequestsEnvironment.get(request), [request]),
+    { freshOnOpen: prefetched.detail },
   );
   const timelineAtom = useMemo(() => pullRequestsEnvironment.getTimeline(request), [request]);
   const commitsAtom = useMemo(() => pullRequestsEnvironment.getCommits(request), [request]);
@@ -70,6 +78,7 @@ export function PullRequestsDetailView({
   const checksAtom = useMemo(() => pullRequestsEnvironment.getChecks(request), [request]);
   const timelineQuery = usePullRequestsQuery(
     tab === "conversation" || tab === "files" ? timelineAtom : null,
+    { freshOnOpen: prefetched.timeline },
   );
   const commitsQuery = usePullRequestsQuery(tab === "commits" ? commitsAtom : null);
   const checksQuery = usePullRequestsQuery(tab === "checks" ? checksAtom : null);
@@ -148,9 +157,10 @@ export function PullRequestsDetailView({
     [isGitlab, snapshotTarget],
   );
   const snapshotQuery = useEnvironmentQuery(snapshotAtom);
+  const visible = useDocumentVisible();
   const subscribeAtom = useMemo(
-    () => (isGitlab ? pullRequestsEnvironment.subscribe(snapshotTarget) : null),
-    [isGitlab, snapshotTarget],
+    () => (isGitlab && visible ? pullRequestsEnvironment.subscribe(snapshotTarget) : null),
+    [isGitlab, snapshotTarget, visible],
   );
   const subscribeQuery = useEnvironmentQuery(subscribeAtom);
   // A success on the push stream, even the initial all-false connected event,
@@ -170,7 +180,11 @@ export function PullRequestsDetailView({
   }, [snapshotQuery.data]);
   const [paintedTab, setPaintedTab] = useState<{
     tab: PullRequestsDetailTab;
-    payload: PullRequestsTimeline | PullRequestsCommitsData | PullRequestsChecksData | PullRequestsFilesData;
+    payload:
+      | PullRequestsTimeline
+      | PullRequestsCommitsData
+      | PullRequestsChecksData
+      | PullRequestsFilesData;
     observedAt: number;
   } | null>(null);
   useEffect(() => {
@@ -188,7 +202,9 @@ export function PullRequestsDetailView({
     (changed: NonNullable<typeof subscribeQuery.data>) => {
       if (changed.detail) detailQuery.revalidate();
       if (changed.timeline)
-        (tab === "conversation" || tab === "files" ? timelineQuery.revalidate : refreshTimelineAtom)();
+        (tab === "conversation" || tab === "files"
+          ? timelineQuery.revalidate
+          : refreshTimelineAtom)();
       if (changed.commits) (tab === "commits" ? commitsQuery.revalidate : refreshCommitsAtom)();
       if (changed.checks) (tab === "checks" ? checksQuery.revalidate : refreshChecksAtom)();
       if (changed.files) (tab === "files" ? filesQuery.revalidate : refreshFilesAtom)();
@@ -197,14 +213,6 @@ export function PullRequestsDetailView({
   useEffect(() => {
     if (subscribeQuery.data) applySubscribedChange(subscribeQuery.data);
   }, [subscribeQuery.data]);
-  // A fresh mount with no cached live detail kicks off the authoritative read
-  // alongside the painted snapshot; an already-fresh atom keeps its own 5s
-  // stale time instead of being forced to re-read here.
-  useEffect(() => {
-    if (isGitlab && detailQuery.data === null) detailQuery.revalidate();
-    // Deliberately once per mount: a later tab/number change remounts this view.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
   const detailSucceeded =
     detailQuery.data !== null && detailQuery.error === null && !detailQuery.isPending;
   // Action controls (merge, review, side column, header) act only on this live
@@ -231,10 +239,14 @@ export function PullRequestsDetailView({
       : null);
   const displayedChecks =
     checksQuery.data ??
-    (tab === "checks" && paintedActivePayload ? (paintedActivePayload as PullRequestsChecksData) : null);
+    (tab === "checks" && paintedActivePayload
+      ? (paintedActivePayload as PullRequestsChecksData)
+      : null);
   const displayedFiles =
     filesQuery.data ??
-    (tab === "files" && paintedActivePayload ? (paintedActivePayload as PullRequestsFilesData) : null);
+    (tab === "files" && paintedActivePayload
+      ? (paintedActivePayload as PullRequestsFilesData)
+      : null);
   const displayedActiveData = {
     conversation: displayedTimeline,
     commits: displayedCommits,
@@ -349,7 +361,11 @@ export function PullRequestsDetailView({
                 </TabsList>
                 <div className="flex min-h-0 flex-1">
                   <TabsPanel value={tab} className="min-h-0 flex-1 gap-0">
-                    <PullRequestsQueryState key={tab} query={displayedActiveQuery} label={labels[tab]}>
+                    <PullRequestsQueryState
+                      key={tab}
+                      query={displayedActiveQuery}
+                      label={labels[tab]}
+                    >
                       {tab === "conversation" && displayedTimeline ? (
                         <PullRequestsConversation
                           scope={scope}

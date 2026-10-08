@@ -1,8 +1,12 @@
 import type { EnvironmentId } from "@bibcode/contracts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { pullRequestsEnvironment } from "../../state/pullRequests";
-import { HOVER_PREFETCH_MS, prefetchGate } from "./hoverPrefetch.logic";
+import { HOVER_PREFETCH_MS, prefetchGate, recordPrefetch } from "./hoverPrefetch.logic";
 import { usePullRequestsQuery } from "./shared/usePullRequestsQuery";
+
+function answered(query: { data: unknown; error: string | null; isPending: boolean }): boolean {
+  return query.data !== null && query.error === null && !query.isPending;
+}
 
 export function useMergeRequestHoverPrefetch({
   enabled,
@@ -60,6 +64,16 @@ export function useMergeRequestHoverPrefetch({
     timelineQuery.error,
     timelineQuery.isPending,
   ]);
+
+  // An open within FRESH_MS of an answer shows it instead of reading again.
+  const detailAnswer = answered(detailQuery) ? detailQuery.data : null;
+  const timelineAnswer = answered(timelineQuery) ? timelineQuery.data : null;
+  useEffect(() => {
+    if (detailAnswer !== null) recordPrefetch("get", request, Date.now());
+  }, [detailAnswer, request]);
+  useEffect(() => {
+    if (timelineAnswer !== null) recordPrefetch("getTimeline", request, Date.now());
+  }, [request, timelineAnswer]);
 
   useEffect(
     () => () => {

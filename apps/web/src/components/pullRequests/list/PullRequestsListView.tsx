@@ -32,7 +32,8 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
 import { useVisiblePullRequestRefresh } from "../useVisiblePullRequestRefresh";
-import { newerObservedAt } from "../detail/snapshotDisplay.logic";
+import { shownCopy, type ShownCopy } from "../detail/snapshotDisplay.logic";
+import { useDocumentVisible } from "../useDocumentVisible";
 import { PullRequestsFilters } from "./PullRequestsFilters";
 import { PullRequestsRow } from "./PullRequestsRow";
 import {
@@ -320,49 +321,48 @@ export function PullRequestsListView({
     [isGitlab, snapshotTarget],
   );
   const snapshotQuery = useEnvironmentQuery(snapshotAtom);
+  const visible = useDocumentVisible();
   const subscribeAtom = useMemo(
-    () => (isGitlab ? pullRequestsEnvironment.subscribe(snapshotTarget) : null),
-    [isGitlab, snapshotTarget],
+    () => (isGitlab && visible ? pullRequestsEnvironment.subscribe(snapshotTarget) : null),
+    [isGitlab, snapshotTarget, visible],
   );
   const subscribeQuery = useEnvironmentQuery(subscribeAtom);
   // A success on the push stream, even the initial all-false connected event,
   // stands the client's own refresh timer down until the stream fails or waits again.
   const paused = isGitlab && subscribeQuery.emission._tag === "Success";
-  const [paintedList, setPaintedList] = useState<{
-    payload: PullRequestsListPage;
-    observedAt: number;
-  } | null>(null);
-  useEffect(() => {
-    const row = snapshotQuery.data?.list ?? null;
-    if (!row) return;
-    setPaintedList((previous) =>
-      newerObservedAt(previous?.observedAt ?? null, row.observedAt) ? row : previous,
-    );
-  }, [snapshotQuery.data]);
-  const applySubscribedChange = useEffectEvent((changed: NonNullable<typeof subscribeQuery.data>) => {
-    if (changed.list) snapshotQuery.revalidate();
-  });
+  const [shownList, setShownList] = useState<ShownCopy<PullRequestsListPage> | null>(null);
+  const nextShownList = shownCopy(
+    shownList,
+    environmentRpcKey(snapshotTarget),
+    firstQuery.data,
+    isGitlab
+      ? { answered: snapshotQuery.data !== null, row: snapshotQuery.data?.list ?? null }
+      : null,
+  );
+  if (nextShownList !== shownList) setShownList(nextShownList);
+  const applySubscribedChange = useEffectEvent(
+    (changed: NonNullable<typeof subscribeQuery.data>) => {
+      if (changed.list) snapshotQuery.revalidate();
+    },
+  );
   useEffect(() => {
     if (subscribeQuery.data) applySubscribedChange(subscribeQuery.data);
   }, [subscribeQuery.data]);
-  // A fresh mount with no cached live first page kicks off the authoritative read
-  // alongside the painted snapshot; an already-fresh atom keeps its own stale time.
-  useEffect(() => {
-    if (isGitlab && firstQuery.data === null) firstQuery.revalidate();
-    // Deliberately once per mount: a later input change remounts this view by key.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
   useVisiblePullRequestRefresh({
     enabled: isGitlab,
     succeeded: firstQuery.data !== null && firstQuery.error === null && !firstQuery.isPending,
     paused,
     revalidate: firstQuery.revalidate,
   });
-  const displayedFirstPage = firstQuery.data ?? paintedList?.payload ?? null;
+  const displayedFirstPage = nextShownList?.payload ?? null;
   const displayedFirstQuery: EnvironmentQueryView<PullRequestsListPage> =
-    firstQuery.data !== null || paintedList === null
+    displayedFirstPage === null
       ? firstQuery
-      : { ...firstQuery, data: paintedList.payload, isPending: false };
+      : {
+          ...firstQuery,
+          data: displayedFirstPage,
+          isPending: firstQuery.data === null ? false : firstQuery.isPending,
+        };
   useEffect(() => {
     if (freshPageKey != null) onFreshPageConsumed?.(freshPageKey);
   }, [freshPageKey, onFreshPageConsumed]);

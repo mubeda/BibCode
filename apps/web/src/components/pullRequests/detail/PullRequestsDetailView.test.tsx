@@ -9,6 +9,7 @@ import { act, useReducer } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { usePullRequestsStore, type PullRequestsDetailTab } from "../../../pullRequestsStore";
+import { recordPrefetch, resetPrefetchGates } from "../hoverPrefetch.logic";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { context, detail, gitlabContext } from "./testFixtures";
 import { click, allowed } from "../review/testHelpers";
@@ -91,6 +92,10 @@ vi.mock("@tanstack/react-router", () => ({
   Link: ({ children }: { children: React.ReactNode }) => <a>{children}</a>,
 }));
 import { PullRequestsDetailView } from "./PullRequestsDetailView";
+function setVisibility(state: DocumentVisibilityState) {
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
 let root: Root;
 let container: HTMLDivElement;
 const projectRef = { environmentId: "env", projectId: "project" } as ScopedProjectRef;
@@ -138,6 +143,8 @@ beforeEach(() => {
   h.pending = false;
   h.pendingQueries.clear();
   h.complete = true;
+  resetPrefetchGates();
+  setVisibility("visible");
   vi.clearAllMocks();
   h.command.mockResolvedValue({ _tag: "Success", value: { kind: "done" } });
   usePullRequestsStore.setState({ byProjectKey: {} });
@@ -418,6 +425,30 @@ describe("PullRequestsDetailView", () => {
     )!;
     expect(commentButton.disabled).toBe(true);
     expect(commentButton.title).toBe("Loading…");
+  });
+  it("shows a hover prefetch answered within 5 s on open without reading it again", async () => {
+    const request = { environmentId: scope.environmentId, input: { cwd: scope.cwd, number: 14 } };
+    recordPrefetch("get", request, Date.now());
+    recordPrefetch("getTimeline", request, Date.now());
+    await render("conversation", 14, null, gitlabContext);
+    expect(container.querySelector("h1")?.textContent).toContain(detail.title);
+    expect(h.refresh).not.toHaveBeenCalledWith("get");
+    expect(h.refresh).not.toHaveBeenCalledWith("getTimeline");
+  });
+  it("re-reads a hover prefetch older than 5 s on open", async () => {
+    const request = { environmentId: scope.environmentId, input: { cwd: scope.cwd, number: 14 } };
+    recordPrefetch("get", request, Date.now() - 6_000);
+    recordPrefetch("getTimeline", request, Date.now() - 6_000);
+    await render("conversation", 14, null, gitlabContext);
+    expect(h.refresh).toHaveBeenCalledWith("get");
+    expect(h.refresh).toHaveBeenCalledWith("getTimeline");
+  });
+  it("drops the subscription while the document is hidden and subscribes again when shown", async () => {
+    setVisibility("hidden");
+    await render("conversation", 14, null, gitlabContext);
+    expect(h.subscribed.has("subscribe")).toBe(false);
+    await act(async () => setVisibility("visible"));
+    expect(h.subscribed.has("subscribe")).toBe(true);
   });
   it("offers a direct path back to the request list", async () => {
     await render();

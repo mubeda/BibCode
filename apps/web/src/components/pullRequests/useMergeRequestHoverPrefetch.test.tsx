@@ -1,17 +1,15 @@
 // @vitest-environment happy-dom
+import type { EnvironmentId } from "@bibcode/contracts";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { HOVER_PREFETCH_MS, resetPrefetchGates } from "./hoverPrefetch.logic";
+import { HOVER_PREFETCH_MS, prefetchedWithin, resetPrefetchGates } from "./hoverPrefetch.logic";
 
 const h = vi.hoisted(() => ({
   settled: false,
   get: vi.fn((args: unknown) => ({ kind: "get", args })),
   getTimeline: vi.fn((args: unknown) => ({ kind: "getTimeline", args })),
-  handlers: new Map<
-    number,
-    { onPointerEnter(): void; onPointerLeave(): void }
-  >(),
+  handlers: new Map<number, { onPointerEnter(): void; onPointerLeave(): void }>(),
 }));
 
 vi.mock("../../state/pullRequests", () => ({
@@ -43,7 +41,12 @@ function Probe({
   cwd: string;
   number: number;
 }) {
-  const handlers = useMergeRequestHoverPrefetch({ enabled, environmentId, cwd, number });
+  const handlers = useMergeRequestHoverPrefetch({
+    enabled,
+    environmentId: environmentId as EnvironmentId,
+    cwd,
+    number,
+  });
   h.handlers.set(number, handlers);
   return createElement("div", { "data-number": String(number), ...handlers });
 }
@@ -88,12 +91,14 @@ describe("useMergeRequestHoverPrefetch", () => {
 
   function renderProbe(number: number) {
     act(() => {
-      root.render(createElement(Probe, { enabled: true, environmentId: "env", cwd: "/repo", number }));
+      root.render(
+        createElement(Probe, { enabled: true, environmentId: "env", cwd: "/repo", number }),
+      );
     });
     return number;
   }
 
-  function renderProbes(numbers: readonly number[]) {
+  function renderProbes<const T extends readonly number[]>(numbers: T): T {
     act(() => {
       root.render(createElement(MultiProbe, { numbers }));
     });
@@ -124,6 +129,18 @@ describe("useMergeRequestHoverPrefetch", () => {
       environmentId: "env",
       input: { cwd: "/repo", number: 14 },
     });
+  });
+
+  it("records answered prefetches so an open within 5 s shows them", () => {
+    const request = { environmentId: "env" as never, input: { cwd: "/repo", number: 14 } };
+    const number = renderProbe(14);
+    pointerEnter(number);
+    act(() => vi.advanceTimersByTime(HOVER_PREFETCH_MS));
+    expect(prefetchedWithin("get", request, Date.now())).toBe(false);
+    h.settled = true;
+    renderProbe(14);
+    expect(prefetchedWithin("get", request, Date.now())).toBe(true);
+    expect(prefetchedWithin("getTimeline", request, Date.now())).toBe(true);
   });
 
   it("does not prefetch when pointer leaves before 150ms", () => {
