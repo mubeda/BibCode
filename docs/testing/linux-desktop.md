@@ -404,6 +404,25 @@ without the override on an X11-only session (or Xvfb with `WAYLAND_DISPLAY`
 unset) to verify automatic X11 fallback. Report unavailable desktop sessions
 separately; Xvfb evidence alone does not validate native Wayland scaling.
 
+#### Preview child webview geometry
+
+The BiBCode browser is a child webview placed over the right panel. Run this
+check in both the native Wayland launch and the `BIBCODE_GDK_BACKEND=x11`
+launch above, at the fractional scale. In a thread, serve a page in its
+terminal (`python3 -m http.server 8123 --bind 127.0.0.1`), open
+`http://localhost:8123/` in the BiBCode browser, then:
+
+- resize the window, including to its minimum size and back;
+- drag the split between the conversation and the right panel both ways;
+- hide and show the right panel, and switch to another right-panel tab and
+  back.
+
+After each step, the preview must fill exactly the browser panel's content
+area: no offset, no gap, no overlap of the panel header or the conversation,
+and no stale area left behind. Record a screenshot per backend after the split
+drag. A preview that does not follow its panel is a product failure; record
+the backend, scale, and step that broke it.
+
 ### GTK light/dark theme
 
 Use an isolated test session with a working desktop portal settings backend.

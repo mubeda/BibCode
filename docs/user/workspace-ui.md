@@ -914,14 +914,10 @@ the setting is not shown.
 
 A link to `localhost`, a `*.localhost` name, any `127.x.x.x` address, `::1`, or a
 wildcard address (`0.0.0.0`, `[::]`) means the server's machine, not this
-computer. From a thread on a LAN, tailnet (`100.64.0.0/10`), or WSL environment,
-or one reached by a host name such as `devbox` or `box.lan`, it opens on the
-server's address. From a thread on an SSH or BiBCode Connect environment, or one
-reached by a public IP address, BiBCode shows "Can't open this address here"
-with the address and **Copy link**, and does not open this computer's
-`localhost`, whatever the target, modifier, or setting; reaching those ports is
-not supported yet. If the thread's environment isn't connected, the notice says
-so and asks you to reconnect it.
+computer. From a thread on this computer's own server it opens directly. From
+any other thread BiBCode never opens this computer's `localhost`, whatever the
+target, modifier, or setting; see
+[Previewing the server's dev servers](#previewing-the-servers-dev-servers).
 
 A file outside the thread's workspace can't be previewed; the notice offers
 **Open in editor**. If the system browser fails to open a link, the notice shows
@@ -932,9 +928,103 @@ sandbox with no origin of their own, so their scripts can't use `localStorage`
 or cookies. The agent's `preview_open` tool works on desktop for opening and
 navigating a tab; reading the page, clicking, and typing aren't supported yet.
 On desktop it always shows the tab it opens, and a request for a thread that
-isn't on screen times out.
+isn't on screen times out. In a browser tab, `preview_open` shows the open
+prompt (below) and tells the agent the open is waiting for you.
 A server a terminal starts is listed as a discovered port for that terminal and
 its thread.
+
+### Previewing the server's dev servers
+
+A dev server or tool listening on the server's loopback, such as
+`http://localhost:5173`, opens through the server's preview gateway when the
+thread's environment is:
+
+- on a LAN, tailnet (`100.64.0.0/10`), or WSL address, or reached by a host
+  name such as `devbox` or `box.lan`; the preview loads from
+  `http://<server address>:<gateway port>`;
+- desktop-managed SSH, on desktop only; the desktop forwards the gateway port
+  over the SSH connection, and the preview loads from
+  `http://127.0.0.1:<local port>`.
+
+The gateway opens one port per thread and dev-server port, so the client must
+be able to reach that host on ports other than BiBCode's own. The BiBCode
+browser's address bar and the thread's shared tab state keep showing the
+`localhost` address, and its **Reload** opens the address through the gateway
+again. A
+gateway port closes when its last BiBCode browser tab closes, after 10 minutes
+without connections, when its thread is deleted, or when the server stops.
+Closing a system-browser or browser tab doesn't close it; the idle timeout
+does.
+
+The previewed app runs on a new origin, not `localhost`. The gateway sends the
+app `Host: localhost:<port>`, but anything the browser checks against the page's
+own origin breaks if the app hard-codes `localhost`: OAuth redirect URLs, CORS
+allowlists, and links or scripts that name `http://localhost:<port>`.
+
+These cases show "Can't open this address here" with the address and **Copy
+link**:
+
+| Situation                                                     | Message                                                                                                               |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| BiBCode Connect, a public IP address, or SSH in a browser tab | "This address is on <environment>, not this computer. Opening its ports from here isn't supported yet."               |
+| The environment isn't connected                               | "<environment> isn't connected. Reconnect it, then open the link again."                                              |
+| An `https://` dev server                                      | "HTTPS dev servers can't be previewed through the gateway yet; serve over HTTP or open it on <environment> directly." |
+| Nothing listens on the port                                   | "Nothing is listening on port <port> on <environment>."                                                               |
+| The server refused the address                                | "Open this address from the thread's terminal or chat first, then try again."                                         |
+| The gateway or SSH forward failed                             | "Couldn't open a preview connection to <environment>. Try again, or reconnect <environment> if it keeps failing."     |
+| A terminal with no thread                                     | "Open this address from a thread's chat or terminal to reach it from here."                                           |
+
+Gateway traffic is plain HTTP on the server's address, outside BiBCode's
+encrypted transport. On a public IP address BiBCode does not use the gateway.
+
+**In a browser tab**, a gateway link opens a new browser tab. The tab opens
+blank at once and loads the preview after BiBCode resolves it; if resolution
+fails, the tab closes and the notice appears. If the browser blocks the new
+tab, a bar at the top of the window asks again:
+
+- "Agent wants to open <address>": the agent's `preview_open`.
+- "A command wants to open <address>": a `$BROWSER` request (below).
+- "Your browser blocked a new tab for <address>": a click whose tab was blocked.
+
+**Open** opens the address from your click; **Dismiss** drops the request. The
+bar shows one request at a time, with "(N more waiting)" when more are queued,
+and keeps a request whose open failed so you can try again. The gateway pages a
+preview tab can show:
+
+- "This preview link expired. Go back to BiBCode and open it again." The
+  preview's sign-in is gone: the link was already used or is older than 60
+  seconds, or your BiBCode session ended or was revoked. A live preview stops
+  within 30 seconds of its BiBCode session being revoked.
+- "Nothing is listening on port <port> on <environment>." The dev server
+  stopped.
+- "This request didn't come from the preview itself, so the gateway blocked
+  it." Another page, such as another preview, tried to send data or open a
+  live connection to this one.
+- "This preview has too many open connections. Try again in a moment."
+
+Reloading such a browser tab works while its gateway port is open. After the
+port closes, the tab shows a connection error or the expired page; open the
+link again from BiBCode, which starts a new gateway session.
+
+**Commands that open a browser.** Every agent and terminal session gets
+`BROWSER` and `BRAINSTORM_OPEN_CMD` set to `bibcode-open-url` (a
+`bibcode-open-url.exe` on Windows), so tools that launch a browser through
+either variable, such as the brainstorming companion, ask BiBCode instead of
+opening a browser on the server's machine. One BiBCode client showing that
+thread takes the request; a client whose window is hidden waits 2 seconds so a
+visible one goes first. On desktop the address opens like a clicked link, in
+the system browser when the thread is only shown in a side panel. In a browser
+tab it always waits for **Open** on the "A command wants to open" bar. A
+request no client takes within 60 seconds is dropped.
+
+`bibcode-open-url` prints the address instead when it has no BiBCode session
+(for example, run outside an agent or terminal session) or when BiBCode can't
+take the request. Its credential lasts 8 hours from the start of the agent or
+terminal session and is not renewed, so a longer session falls back to
+printing. Codex may withhold variables whose names contain `TOKEN` from the
+commands it runs, which would also make it print; this hasn't been verified.
+See
+[Provider architecture](../architecture/providers.md) for the mechanism.
 
 ### Activity and targeted Stop
 
