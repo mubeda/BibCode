@@ -18,13 +18,13 @@ use crate::process::locate_executable;
 use crate::{
     activity::{
         ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher,
-        ActivityCancellationService, ActivityCapabilities, ActivityDispatchError,
-        ActivityDispatchJob, ActivityHistoryRecovery, ActivityLifecycle, ActivityObservationState,
-        ActivityProjection, ActivityRepositoryError, ActivityRuntimeControlRegistration,
-        ActivityRuntimeGeneration, ActivityScopeRef, ActivityScopeSeed, ActivitySection,
-        ActivitySectionHealth, ActivitySummaryCounts, ActivityTargetDispatchDisposition,
-        AgentActivityController, ProviderActivityControlUpdate, ProviderActivityMutation,
-        ProviderActivityNativeTarget,
+        ActivityCancellationService, ActivityCapabilities, ActivityChange, ActivityDelta,
+        ActivityDispatchError, ActivityDispatchJob, ActivityHistoryRecovery, ActivityLifecycle,
+        ActivityObservationState, ActivityProjection, ActivityRepositoryError,
+        ActivityRuntimeControlRegistration, ActivityRuntimeGeneration, ActivityScopeRef,
+        ActivityScopeSeed, ActivitySection, ActivitySectionHealth, ActivitySummaryCounts,
+        ActivityTargetDispatchDisposition, AgentActivityController, ProviderActivityControlUpdate,
+        ProviderActivityMutation, ProviderActivityNativeTarget,
     },
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -850,29 +850,42 @@ impl ProviderActivityLifecycleState {
         self.capabilities.clone()
     }
 
-    fn observe_projected_batch(&mut self, mutations: &[ProviderActivityMutation]) {
+    fn observe_projected_batch(
+        &mut self,
+        mutations: &[ProviderActivityMutation],
+        deltas: &[ActivityDelta],
+    ) {
         for mutation in mutations {
             match mutation {
                 ProviderActivityMutation::SetScope { capabilities, .. } => {
                     self.capabilities = capabilities.clone();
                     self.runtime_observed_capabilities = true;
                 }
-                ProviderActivityMutation::UpsertActor(actor) => {
-                    self.retained.actors = true;
+                ProviderActivityMutation::UpsertActor(_) => self.retained.actors = true,
+                ProviderActivityMutation::UpsertWorkItem(_) => {
+                    self.retained.background_work = true;
+                }
+                _ => {}
+            }
+        }
+        // The projection can ignore a mutation (a late non-terminal report), so live activity
+        // follows the changes it accepted.
+        for change in deltas.iter().flat_map(|delta| &delta.changes) {
+            match change {
+                ActivityChange::ActorUpserted { actor } => {
                     track_live_activity(&mut self.live_actor_ids, &actor.id, actor.status);
                 }
-                ProviderActivityMutation::RemoveActor { actor_id } => {
+                ActivityChange::ActorRemoved { actor_id } => {
                     self.live_actor_ids.remove(actor_id);
                 }
-                ProviderActivityMutation::UpsertWorkItem(work_item) => {
-                    self.retained.background_work = true;
+                ActivityChange::WorkItemUpserted { work_item } => {
                     track_live_activity(
                         &mut self.live_work_item_ids,
                         &work_item.id,
                         work_item.status,
                     );
                 }
-                ProviderActivityMutation::RemoveWorkItem { work_item_id } => {
+                ActivityChange::WorkItemRemoved { work_item_id } => {
                     self.live_work_item_ids.remove(work_item_id);
                 }
                 _ => {}
@@ -7370,7 +7383,7 @@ fn spawn_event_pump(
                                     activity_lifecycle
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .observe_projected_batch(&lifecycle_mutations);
+                                        .observe_projected_batch(&lifecycle_mutations, &deltas);
                                     true
                                 }
                                 Ok(_) => true,
@@ -21435,8 +21448,17 @@ done
                 .unwrap();
         }
 
-        /// Sends an activity-only batch and waits until the pump has projected it.
         async fn emit_activity(&self, native_event_id: &str, mutation: ProviderActivityMutation) {
+            self.emit_activity_batch(native_event_id, vec![mutation])
+                .await;
+        }
+
+        /// Sends an activity-only batch and waits until the pump has projected it.
+        async fn emit_activity_batch(
+            &self,
+            native_event_id: &str,
+            mutations: Vec<ProviderActivityMutation>,
+        ) {
             // The pump records the batch before it yields after publishing this completion.
             let mut applied = self
                 .activity
@@ -21452,7 +21474,7 @@ done
                     item_id: None,
                     request_id: None,
                     payload: json!({}),
-                    activity: vec![mutation],
+                    activity: mutations,
                     activity_controls: Default::default(),
                 })
                 .await
@@ -21893,6 +21915,45 @@ done
             )
             .await;
         fixture.assert_suspended_after_timeout(3).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_ignores_a_late_running_report_the_projection_rejected() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        fixture
+            .emit_activity(
+                "subagent-stop",
+                ProviderActivityMutation::set_actor_status("actor:sub", "completed").unwrap(),
+            )
+            .await;
+        // A running report older than the completion is ignored by the projection, while
+        // another mutation in the same batch is accepted.
+        let ProviderActivityMutation::UpsertActor(mut late) =
+            ProviderActivityMutation::upsert_actor("actor:sub", None, "Sub", "running").unwrap()
+        else {
+            unreachable!("upsert_actor builds an actor upsert");
+        };
+        late.started_at = "2020-01-01T00:00:00.000Z".to_owned();
+        late.updated_at = "2020-01-01T00:00:00.000Z".to_owned();
+        fixture
+            .emit_activity_batch(
+                "late-subagent-report",
+                vec![
+                    ProviderActivityMutation::UpsertActor(late),
+                    ProviderActivityMutation::upsert_actor(
+                        "actor:other",
+                        None,
+                        "Other",
+                        "completed",
+                    )
+                    .unwrap(),
+                ],
+            )
+            .await;
+        fixture.assert_suspended_after_timeout(2).await;
         fixture.close().await;
     }
 
