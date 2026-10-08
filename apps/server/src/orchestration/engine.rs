@@ -426,6 +426,13 @@ pub enum OrchestrationCommand {
         title: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// Host thread of a `panel` thread; only `worktree.createPanel` sets it.
+        #[serde(
+            rename = "hostThreadId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        host_thread_id: Option<String>,
         #[serde(rename = "modelSelection")]
         model_selection: Value,
         #[serde(rename = "runtimeMode")]
@@ -3838,6 +3845,7 @@ async fn plan_command(
             project_id,
             title,
             kind,
+            host_thread_id,
             model_selection,
             runtime_mode,
             interaction_mode,
@@ -3866,6 +3874,11 @@ async fn plan_command(
             }
             let mut payload = json!({"threadId":thread_id,"projectId":project_id,"title":title,"modelSelection":model_selection,"runtimeMode":runtime_mode,"interactionMode":interaction_mode,"branch":branch,"worktreePath":worktree_path,"createdAt":created_at,"updatedAt":created_at});
             insert_optional(&mut payload, "kind", kind.as_ref().map(|v| json!(v)));
+            insert_optional(
+                &mut payload,
+                "hostThreadId",
+                host_thread_id.as_ref().map(|v| json!(v)),
+            );
             Ok(vec![make_event(
                 "thread.created",
                 "thread",
@@ -5591,10 +5604,10 @@ fn apply_threads_projector_tx(
     if event.event.event_type == "thread.created" {
         let payload = &event.event.payload;
         transaction.execute(
-            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL) \
+            "INSERT INTO projection_threads (thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at, host_thread_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, 0, 0, NULL, ?) \
              ON CONFLICT (thread_id) DO UPDATE SET \
-               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, \
+               project_id = excluded.project_id, title = excluded.title, kind = excluded.kind, host_thread_id = excluded.host_thread_id, \
                model_selection_json = excluded.model_selection_json, runtime_mode = excluded.runtime_mode, \
                interaction_mode = excluded.interaction_mode, branch = excluded.branch, worktree_path = excluded.worktree_path, \
                created_at = excluded.created_at, updated_at = excluded.updated_at, archived_at = excluded.archived_at, \
@@ -5618,6 +5631,7 @@ fn apply_threads_projector_tx(
                 optional_string(payload.get("worktreePath")),
                 required_str(payload, "createdAt")?,
                 required_str(payload, "updatedAt")?,
+                optional_string(payload.get("hostThreadId")),
             ],
         )?;
     } else {
@@ -6999,6 +7013,7 @@ mod tests {
                     project_id: PROJECT_ID.to_owned(),
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
+                    host_thread_id: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
                     interaction_mode: "default".to_owned(),
@@ -7486,6 +7501,7 @@ mod tests {
                     project_id: PROJECT_ID.to_owned(),
                     title: thread_id.to_owned(),
                     kind: Some(kind.to_owned()),
+                    host_thread_id: None,
                     model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
                     runtime_mode: "full-access".to_owned(),
                     interaction_mode: "default".to_owned(),
@@ -8338,6 +8354,66 @@ mod tests {
             .expect("default thread")
             .thread_id;
         (engine, thread_id)
+    }
+
+    #[tokio::test]
+    async fn panel_host_thread_survives_projection_rebuild() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(OrchestrationCommand::ThreadCreate {
+                command_id: "create-panel".to_owned(),
+                thread_id: "panel-thread".to_owned(),
+                project_id: "delivery-project".to_owned(),
+                title: "Panel".to_owned(),
+                kind: Some("panel".to_owned()),
+                host_thread_id: Some(host_id.clone()),
+                model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                branch: None,
+                worktree_path: None,
+                created_at: "2026-08-01T00:00:01Z".to_owned(),
+            })
+            .await
+            .expect("panel");
+        let host_of = |thread_id: &'static str| {
+            let repositories = engine.repositories();
+            async move {
+                repositories
+                    .get_thread(thread_id.to_owned())
+                    .await
+                    .expect("thread read")
+                    .expect("thread exists")
+                    .host_thread_id
+            }
+        };
+        assert_eq!(host_of("panel-thread").await, Some(host_id.clone()));
+
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute("UPDATE projection_threads SET host_thread_id = NULL", [])?;
+                connection.execute(
+                    "DELETE FROM projection_state WHERE projector = 'projection.threads'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("reset thread projection");
+        bootstrap_projectors(&engine.repositories(), &TestHooks::default())
+            .await
+            .expect("replay threads");
+
+        assert_eq!(host_of("panel-thread").await, Some(host_id.clone()));
+        let host = engine
+            .repositories()
+            .get_thread(host_id)
+            .await
+            .expect("host read")
+            .expect("host exists");
+        assert_eq!(host.host_thread_id, None);
     }
 
     fn delivery_turn_for_message(

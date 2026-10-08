@@ -2037,6 +2037,7 @@ async fn hardening_only_validated_opencode_preparation_receives_the_1s_budget() 
             driver_kind: "opencode".to_owned(),
             provider_instance_id: "opencode".to_owned(),
         }),
+        env: None,
     });
     let started = std::time::Instant::now();
     manager
@@ -8655,6 +8656,7 @@ async fn agent_activity_hung_factory_does_not_block_terminal_disable_or_later_se
             driver_kind: "codex".to_owned(),
             provider_instance_id: "codex".to_owned(),
         }),
+        env: None,
     });
     let opening = tokio::spawn({
         let manager = manager.clone();
@@ -8840,6 +8842,7 @@ async fn agent_activity_toggle_terminal_launched_disabled_stays_uninstrumented_a
             driver_kind: "codex".to_owned(),
             provider_instance_id: "codex".to_owned(),
         }),
+        env: None,
     });
     manager.open(input).await.expect("pass-through terminal");
     assert_eq!(backend.spawns()[0].executable, configured.to_string_lossy());
@@ -11495,6 +11498,7 @@ async fn opencode_cancelled_preparation_terminates_ready_helper_before_pass_thro
             driver_kind: "opencode".to_owned(),
             provider_instance_id: "opencode".to_owned(),
         }),
+        env: None,
     });
 
     manager.open(input).await.expect("OpenCode pass-through");
@@ -11622,6 +11626,7 @@ async fn opencode_spawn_failure_deletes_owned_root_before_terminating_helper() {
             driver_kind: "opencode".to_owned(),
             provider_instance_id: "opencode".to_owned(),
         }),
+        env: None,
     });
 
     manager
@@ -11743,6 +11748,7 @@ async fn opencode_root_correlation_timeout_keeps_attach_usable_until_terminal_cl
             driver_kind: "opencode".to_owned(),
             provider_instance_id: "opencode".to_owned(),
         }),
+        env: None,
     });
 
     manager.open(input).await.expect("OpenCode attach terminal");
@@ -11890,6 +11896,7 @@ async fn opencode_publication_failure_keeps_attach_usable_until_terminal_closes(
             driver_kind: "opencode".to_owned(),
             provider_instance_id: "opencode".to_owned(),
         }),
+        env: None,
     });
 
     manager.open(input).await.expect("OpenCode attach terminal");
@@ -12092,6 +12099,7 @@ impl OpenCodeToggleFixture {
                 driver_kind: "opencode".to_owned(),
                 provider_instance_id: "opencode".to_owned(),
             }),
+            env: None,
         });
         manager
             .open(input)
@@ -13068,6 +13076,7 @@ async fn opencode_parallel_terminals_have_unique_endpoints_credentials_roots_and
                 driver_kind: "opencode".to_owned(),
                 provider_instance_id: "opencode".to_owned(),
             }),
+            env: None,
         });
         manager.open(input).await.expect("parallel OpenCode attach");
     }
@@ -13325,6 +13334,7 @@ async fn opencode_helper_exit_in_manager_gap_falls_back_to_original_pty() {
             driver_kind: "opencode".to_owned(),
             provider_instance_id: "opencode".to_owned(),
         }),
+        env: None,
     });
 
     manager
@@ -13512,6 +13522,7 @@ async fn opencode_helper_failure_and_unsafe_args_are_exact_pass_through() {
                 driver_kind: "opencode".to_owned(),
                 provider_instance_id: "opencode".to_owned(),
             }),
+            env: None,
         });
         manager
             .open(input)
@@ -13626,6 +13637,7 @@ async fn installed_opencode_1184_cold_topology_reaps_owned_listener() {
             driver_kind: "opencode".to_owned(),
             provider_instance_id: "opencode".to_owned(),
         }),
+        env: None,
     });
     let started = std::time::Instant::now();
 
