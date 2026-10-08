@@ -185,3 +185,52 @@ it("refuses source-less or partially joined captures before issuing a success as
   await expect(runBrowserFollowupScene(value.input, "hosted-pair-confirm")).rejects.toThrow();
   expect(value.read().cleaned).toBe(1);
 });
+
+it.each(
+  browserFollowupRows.flatMap((row) =>
+    (["identity", "viewport"] as const).map((boundary) => [row, boundary] as const),
+  ),
+)("records admitted row %s before a %s preparation failure", async (row, boundary) => {
+  const value = fixture();
+  const original = Object.freeze(new Error("Inert exact preparation failure."));
+  const events: string[] = [];
+  const phases: string[] = [];
+  let admitted = 0;
+  value.input.step = (phase) => {
+    phases.push(phase);
+    events.push("phase");
+  };
+  value.input.verifyOwnedIdentity = async () => {
+    events.push("identity");
+    if (boundary === "identity") throw original;
+  };
+  value.input.viewport = async () => {
+    events.push("viewport");
+    throw original;
+  };
+  value.input.upload.withSlowTransport = async () => {
+    admitted++;
+    throw new Error("Unexpected upload admission.");
+  };
+  value.input.terminal.withSecondWindow = async () => {
+    admitted++;
+    throw new Error("Unexpected second-window admission.");
+  };
+  value.input.slow.withHeldReply = async () => {
+    admitted++;
+    throw new Error("Unexpected held-reply admission.");
+  };
+  value.input.hosted.withOwnedEntry = async () => {
+    admitted++;
+    throw new Error("Unexpected hosted admission.");
+  };
+  await expect(runBrowserFollowupScene(value.input, row)).rejects.toBe(original);
+  expect(phases).toEqual(["visual-browser-followups-" + row]);
+  expect(events).toEqual(
+    boundary === "identity" ? ["phase", "identity"] : ["phase", "identity", "viewport"],
+  );
+  expect(value.captures).toEqual([]);
+  expect(value.actions).toEqual([]);
+  expect(admitted).toBe(0);
+  expect(value.read().cleaned).toBe(0);
+});

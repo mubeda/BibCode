@@ -2588,6 +2588,9 @@ classification, attach/snapshot cardinalities and applied size ownership.
 Uncreated owners remain unknown. The record contains no raw identities, history,
 configuration, protocol or error values and adds no browser or network probe.
 Original failure, counts, cleanup and capture admission remain authoritative.
+Each admitted row sets its existing row phase before identity, viewport and public
+preparation; capture retains its existing subscene phase. The initial census
+remains limited to initial-join failures, so later row failures can retain null.
 The single terminal marker command must emit an explicit leading newline before
 its exact output line, then keep the same long-running sleep process. This
 establishes a raw line boundary after shell control sequences. Preserve the

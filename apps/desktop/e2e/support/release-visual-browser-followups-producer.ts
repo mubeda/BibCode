@@ -113,6 +113,7 @@ export async function runBrowserFollowupScene(
   row: BrowserFollowupRow,
 ) {
   if (!browserFollowupRows.includes(row)) throw refused();
+  input.step("visual-browser-followups-" + row);
   await input.verifyOwnedIdentity();
   await input.viewport(input.browser, 1280, 960);
   const capture = async (
