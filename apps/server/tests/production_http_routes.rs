@@ -258,7 +258,7 @@ async fn diagnostic_logs_route_is_bounded_authorized_and_returns_zip_headers() {
 }
 
 #[tokio::test]
-async fn html_and_svg_assets_are_sandboxed() {
+async fn script_capable_assets_are_sandboxed() {
     for (path, content_type, expected) in [
         (
             "page.html",
@@ -268,6 +268,26 @@ async fn html_and_svg_assets_are_sandboxed() {
         (
             "icon.svg",
             "image/svg+xml",
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+        ),
+        (
+            "upper.html",
+            "TEXT/HTML",
+            Some("sandbox allow-scripts allow-forms allow-popups"),
+        ),
+        (
+            "page.xhtml",
+            "application/xhtml+xml",
+            Some("sandbox allow-scripts allow-forms allow-popups"),
+        ),
+        (
+            "a.xml",
+            "text/xml",
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+        ),
+        (
+            "b.xml",
+            "application/xml",
             Some("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
         ),
         ("doc.pdf", "application/pdf", None),

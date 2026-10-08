@@ -466,8 +466,13 @@ fn asset_content_security_policy(content_type: &str) -> Option<&'static str> {
         .trim()
         .to_ascii_lowercase();
     match essence.as_str() {
-        "text/html" => Some("sandbox allow-scripts allow-forms allow-popups"),
-        "image/svg+xml" => Some("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+        "text/html" | "application/xhtml+xml" => {
+            Some("sandbox allow-scripts allow-forms allow-popups")
+        }
+        // XML documents can run scripts through XSLT, like SVG.
+        "image/svg+xml" | "text/xml" | "application/xml" => {
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox")
+        }
         _ => None,
     }
 }
