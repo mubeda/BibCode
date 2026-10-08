@@ -1,0 +1,710 @@
+//! Per-target preview gateway listener: a loopback/LAN HTTP/1.1 listener that bootstraps a
+//! gateway session from a single-use capability, then reverse-proxies authenticated
+//! requests and WebSocket upgrades to one upstream port. Bodies and tunnels stream through
+//! without buffering; every upstream exchange holds a per-target and a global permit for
+//! its whole lifetime.
+
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use futures_util::future::BoxFuture;
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
+use hyper::{
+    Method, Request, Response, StatusCode, Uri, Version,
+    body::{Body, Bytes, Incoming},
+    header::{
+        AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, COOKIE, HOST, HeaderMap,
+        HeaderName, HeaderValue, LOCATION, ORIGIN, RETRY_AFTER, SET_COOKIE, TRANSFER_ENCODING,
+        UPGRADE,
+    },
+    http::uri::Authority,
+    server::conn::http1 as server_http1,
+    service::service_fn,
+};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use percent_encoding::percent_decode_str;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    GatewaySession, GatewaySessions,
+    capability::CapabilityIssuer,
+    rewrite::{
+        HOP_BY_HOP, bootstrap_page, bootstrap_target, client_origin, filter_set_cookie,
+        gateway_cookie_name, gateway_origin_allowed, gateway_session_from_cookie, rewrite_location,
+        status_page, strip_request_cookies,
+    },
+};
+use crate::{auth::AuthService, signed_token::now_millis};
+
+#[path = "proxy_ws.rs"]
+mod ws;
+
+pub const PER_TARGET_CONNECTIONS: usize = 64;
+pub const GLOBAL_CONNECTIONS: usize = 256;
+pub const PRINCIPAL_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const COPY_BUFFER_BYTES: usize = 64 * 1024;
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PRINCIPAL_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const BOOTSTRAP_PATH: &str = "/__bibcode/bootstrap";
+const EXPIRED_COPY: &str = "This preview link expired. Go back to BiBCode and open it again.";
+
+/// Whether a BiBCode session is still active; `Some(expires_at_ms)` while it is.
+pub trait PrincipalCheck: Send + Sync {
+    fn session_expiry<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Option<i64>>;
+}
+
+impl PrincipalCheck for AuthService {
+    fn session_expiry<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Option<i64>> {
+        Box::pin(self.active_session_expiry(session_id))
+    }
+}
+
+/// Upstream connection limits. `global` is shared by every target of one server.
+#[derive(Clone)]
+pub struct GatewayLimits {
+    pub per_target: usize,
+    pub global: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+pub struct GatewayContext {
+    pub issuer: Arc<CapabilityIssuer>,
+    pub sessions: Arc<GatewaySessions>,
+    pub principal: Arc<dyn PrincipalCheck>,
+    pub limits: GatewayLimits,
+    /// The BiBCode session cookie name, never forwarded upstream or accepted back.
+    pub session_cookie_name: String,
+    /// How often an active principal is re-checked; [`PRINCIPAL_CHECK_INTERVAL`] in production.
+    pub principal_check_interval: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayTarget {
+    pub thread_id: String,
+    /// Where the gateway connects: the upstream itself or a local forward to it.
+    pub upstream: SocketAddr,
+    /// The port the previewed app listens on in its environment; used for `Host` and redirects.
+    pub upstream_port: u16,
+    pub environment_label: String,
+}
+
+pub struct RunningTarget {
+    pub gateway_port: u16,
+    pub shutdown: CancellationToken,
+    pub last_activity_ms: Arc<AtomicU64>,
+    /// Open client connections plus in-flight upstream exchanges and WebSocket tunnels;
+    /// zero means idle since `last_activity_ms`.
+    pub active: Arc<AtomicUsize>,
+}
+
+/// Binds `bind_host:0`, serves until `shutdown` is cancelled, and returns once listening.
+pub async fn start_target(
+    bind_host: &str,
+    target: GatewayTarget,
+    ctx: GatewayContext,
+    shutdown: CancellationToken,
+) -> std::io::Result<RunningTarget> {
+    let listener = TcpListener::bind((bind_host, 0)).await?;
+    let gateway_port = listener.local_addr()?.port();
+    let state = Arc::new(Listener {
+        per_target: Arc::new(Semaphore::new(ctx.limits.per_target)),
+        target,
+        ctx,
+        gateway_port,
+        shutdown: shutdown.clone(),
+        last_activity_ms: Arc::new(AtomicU64::new(now_millis())),
+        active: Arc::new(AtomicUsize::new(0)),
+        principal_checked_ms: Mutex::new(HashMap::new()),
+    });
+    let running = RunningTarget {
+        gateway_port,
+        shutdown,
+        last_activity_ms: state.last_activity_ms.clone(),
+        active: state.active.clone(),
+    };
+    tokio::spawn(accept_loop(listener, state));
+    Ok(running)
+}
+
+type ProxyBody = BoxBody<Bytes, hyper::Error>;
+
+struct Listener {
+    target: GatewayTarget,
+    ctx: GatewayContext,
+    gateway_port: u16,
+    per_target: Arc<Semaphore>,
+    shutdown: CancellationToken,
+    last_activity_ms: Arc<AtomicU64>,
+    active: Arc<AtomicUsize>,
+    /// Principal session id -> when it was last confirmed active.
+    principal_checked_ms: Mutex<HashMap<String, u64>>,
+}
+
+/// Counts one open connection or tunnel in `active` and stamps activity on both ends.
+struct Activity {
+    active: Arc<AtomicUsize>,
+    last_activity_ms: Arc<AtomicU64>,
+}
+
+impl Drop for Activity {
+    fn drop(&mut self) {
+        self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Permits for one upstream exchange; held until its connection or tunnel ends.
+struct Lease {
+    _target: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+    _activity: Activity,
+}
+
+impl Listener {
+    fn touch(&self) {
+        self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
+    fn activity(&self) -> Activity {
+        self.touch();
+        self.active.fetch_add(1, Ordering::Relaxed);
+        Activity {
+            active: self.active.clone(),
+            last_activity_ms: self.last_activity_ms.clone(),
+        }
+    }
+
+    fn lease(&self) -> Option<Lease> {
+        Some(Lease {
+            _target: self.per_target.clone().try_acquire_owned().ok()?,
+            _global: self.ctx.limits.global.clone().try_acquire_owned().ok()?,
+            _activity: self.activity(),
+        })
+    }
+
+    fn checked(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+        self.principal_checked_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn check_interval(&self) -> Duration {
+        self.ctx
+            .principal_check_interval
+            .max(Duration::from_millis(1))
+    }
+
+    /// Whether the principal is still active. Unless `force`, a confirmation younger than
+    /// the check interval is reused. An inactive principal loses every gateway session.
+    async fn principal_active(&self, session_id: &str, force: bool) -> bool {
+        let now = now_millis();
+        let interval = u64::try_from(self.check_interval().as_millis()).unwrap_or(u64::MAX);
+        if !force
+            && self
+                .checked()
+                .get(session_id)
+                .is_some_and(|at| now.saturating_sub(*at) < interval)
+        {
+            return true;
+        }
+        let active = self.principal_expiry(session_id).await.is_some();
+        let mut checked = self.checked();
+        if active {
+            checked.retain(|_, at| now.saturating_sub(*at) < interval);
+            checked.insert(session_id.to_owned(), now);
+        } else {
+            checked.remove(session_id);
+            drop(checked);
+            self.ctx.sessions.remove_for_principal(session_id);
+        }
+        active
+    }
+
+    /// The principal's unexpired expiry. A check that fails or misses its deadline counts as
+    /// inactive, so a stalled auth repository fails closed instead of hanging requests.
+    async fn principal_expiry(&self, session_id: &str) -> Option<u64> {
+        let deadline = self.check_interval().min(PRINCIPAL_CHECK_TIMEOUT);
+        let check = self.ctx.principal.session_expiry(session_id);
+        let expiry = tokio::time::timeout(deadline, check).await.ok().flatten()?;
+        u64::try_from(expiry)
+            .ok()
+            .filter(|expiry| *expiry > now_millis())
+    }
+
+    /// Resolves when the listener shuts down or the principal stops being active. Rechecks
+    /// are due one interval after the principal's last confirmation, so a connection admitted
+    /// on a cached confirmation does not extend the revocation window.
+    async fn until_revoked(&self, session_id: &str) {
+        let interval = self.check_interval();
+        let confirmed_ago = self.checked().get(session_id).map_or(interval, |at| {
+            Duration::from_millis(now_millis().saturating_sub(*at))
+        });
+        let first = tokio::time::Instant::now() + interval.saturating_sub(confirmed_ago);
+        let watch = async {
+            let mut ticks = tokio::time::interval_at(first, interval);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                if !self.principal_active(session_id, true).await {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = watch => {}
+        }
+    }
+
+    fn session_for(&self, headers: &HeaderMap) -> Option<GatewaySession> {
+        let id = gateway_session_from_cookie(&joined_cookies(headers), self.gateway_port)?;
+        let session = self.ctx.sessions.get(&id, now_millis())?;
+        (session.gateway_port == self.gateway_port
+            && session.upstream_port == self.target.upstream_port
+            && session.thread_id == self.target.thread_id)
+            .then_some(session)
+    }
+}
+
+async fn accept_loop(listener: TcpListener, state: Arc<Listener>) {
+    loop {
+        let accepted = tokio::select! {
+            () = state.shutdown.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((stream, _)) => {
+                tokio::spawn(serve_connection(stream, state.clone()));
+            }
+            Err(error) => {
+                // Usually descriptor exhaustion; back off instead of spinning.
+                tracing::debug!(%error, port = state.gateway_port, "preview gateway accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    drop(listener);
+    state.ctx.sessions.remove_for_port(state.gateway_port);
+}
+
+async fn serve_connection(stream: TcpStream, state: Arc<Listener>) {
+    let _activity = state.activity();
+    let service = service_fn({
+        let state = state.clone();
+        move |request| {
+            let state = state.clone();
+            async move { Ok::<_, Infallible>(handle(state, request).await) }
+        }
+    });
+    let connection = server_http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades();
+    tokio::select! {
+        _ = connection => {}
+        () = state.shutdown.cancelled() => {}
+    }
+}
+
+async fn handle(state: Arc<Listener>, request: Request<Incoming>) -> Response<ProxyBody> {
+    state.touch();
+    let Some(host) = request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| valid_host(host))
+        .map(str::to_owned)
+    else {
+        return bad_request();
+    };
+    if request.uri().path() == BOOTSTRAP_PATH {
+        return bootstrap(&state, request.uri().query().unwrap_or_default()).await;
+    }
+    let Some(session) = state.session_for(request.headers()) else {
+        return expired();
+    };
+    if !state
+        .principal_active(&session.principal_session_id, false)
+        .await
+    {
+        return expired();
+    }
+    let client_origin = client_origin("http", &host);
+    let websocket = ws::is_websocket(request.headers());
+    let safe_method = matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    let origin = request
+        .headers()
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    if (websocket || !safe_method) && !gateway_origin_allowed(origin, &client_origin) {
+        return page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "This request didn't come from the preview itself, so the gateway blocked it.",
+        );
+    }
+    let Some(lease) = state.lease() else {
+        let mut response = page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Preview is busy",
+            "This preview has too many open connections. Try again in a moment.",
+        );
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    };
+    forward(
+        state,
+        request,
+        session.principal_session_id,
+        &client_origin,
+        websocket,
+        lease,
+    )
+    .await
+}
+
+async fn bootstrap(state: &Listener, query: &str) -> Response<ProxyBody> {
+    let (mut cap, mut to) = (None, None);
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let decoded = percent_decode_str(value)
+            .decode_utf8()
+            .ok()
+            .map(|value| value.into_owned());
+        match name {
+            "cap" => cap = decoded,
+            "to" => to = decoded,
+            _ => {}
+        }
+    }
+    // Validate the target first so a malformed link does not burn its capability.
+    let Some(to) = to.as_deref().and_then(bootstrap_target) else {
+        return bad_request();
+    };
+    let Some(claims) = cap.and_then(|cap| {
+        state
+            .ctx
+            .issuer
+            .redeem(&cap, state.gateway_port, now_millis())
+            .ok()
+    }) else {
+        return expired();
+    };
+    if claims.upstream_port != state.target.upstream_port
+        || claims.thread_id != state.target.thread_id
+    {
+        return expired();
+    }
+    let Some(expiry) = state.principal_expiry(&claims.session_id).await else {
+        return expired();
+    };
+    let id = state.ctx.sessions.create(&claims, expiry);
+    state
+        .checked()
+        .insert(claims.session_id.clone(), now_millis());
+    let mut response = html(StatusCode::OK, bootstrap_page(&to));
+    let cookie = format!(
+        "{}={id}; HttpOnly; SameSite=Strict; Path=/",
+        gateway_cookie_name(state.gateway_port)
+    );
+    insert(response.headers_mut(), SET_COOKIE, &cookie);
+    response.headers_mut().insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+async fn forward(
+    state: Arc<Listener>,
+    mut request: Request<Incoming>,
+    principal: String,
+    client_origin: &str,
+    websocket: bool,
+    lease: Lease,
+) -> Response<ProxyBody> {
+    let downstream_upgrade = websocket.then(|| hyper::upgrade::on(&mut request));
+    let (mut parts, body) = request.into_parts();
+    parts.uri = parts
+        .uri
+        .path_and_query()
+        .cloned()
+        .map_or_else(|| Uri::from_static("/"), Uri::from);
+    parts.version = Version::HTTP_11;
+    upstream_request_headers(
+        &mut parts.headers,
+        state.target.upstream_port,
+        &state.ctx.session_cookie_name,
+        client_origin,
+        websocket,
+    );
+    if !body.is_end_stream() && body.size_hint().exact().is_none() {
+        // Hyper only chunks unknown-length bodies for methods that usually carry one, so a
+        // streamed GET body would otherwise be sent as empty.
+        parts
+            .headers
+            .insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+    }
+    let upstream_request = Request::from_parts(parts, body);
+
+    let connected = tokio::time::timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        TcpStream::connect(state.target.upstream),
+    )
+    .await;
+    let Ok(Ok(stream)) = connected else {
+        return unreachable(&state);
+    };
+    let _ = stream.set_nodelay(true);
+    let Ok((mut sender, connection)) =
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
+    else {
+        return unreachable(&state);
+    };
+    let lease = Arc::new(lease);
+    tokio::spawn({
+        let (state, principal, lease) = (state.clone(), principal.clone(), lease.clone());
+        async move {
+            let _lease = lease;
+            tokio::select! {
+                _ = connection.with_upgrades() => {}
+                () = state.until_revoked(&principal) => {}
+            }
+        }
+    });
+    let Ok(response) = sender.send_request(upstream_request).await else {
+        return unreachable(&state);
+    };
+    drop(sender);
+
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let Some(downstream_upgrade) = downstream_upgrade else {
+            return unreachable(&state);
+        };
+        return ws::switch_protocols(
+            state,
+            principal,
+            lease,
+            downstream_upgrade,
+            response,
+            client_origin,
+        );
+    }
+
+    let (mut parts, body) = response.into_parts();
+    rewrite_response_headers(&mut parts.headers, &state, client_origin);
+    Response::from_parts(parts, body.boxed())
+}
+
+fn upstream_request_headers(
+    headers: &mut HeaderMap,
+    upstream_port: u16,
+    session_cookie_name: &str,
+    client_origin: &str,
+    websocket: bool,
+) {
+    let cookies = joined_cookies(headers);
+    // Only an `Origin` the gateway already validated is rewritten; upstreams that compare
+    // it with `Host` (WebSocket servers, server actions) then see a same-origin request.
+    let validated_origin = headers
+        .get(ORIGIN)
+        .is_some_and(|origin| origin.as_bytes() == client_origin.as_bytes());
+    strip_hop_by_hop(headers);
+    for name in [COOKIE, AUTHORIZATION, HeaderName::from_static("dpop")] {
+        headers.remove(name);
+    }
+    if let Some(kept) = strip_request_cookies(&cookies, session_cookie_name) {
+        insert(headers, COOKIE, &kept);
+    }
+    let authority = format!("localhost:{upstream_port}");
+    insert(headers, HOST, &authority);
+    if validated_origin {
+        insert(headers, ORIGIN, &format!("http://{authority}"));
+    }
+    if websocket {
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+    }
+}
+
+fn rewrite_response_headers(headers: &mut HeaderMap, state: &Listener, client_origin: &str) {
+    strip_hop_by_hop(headers);
+    let cookies: Vec<HeaderValue> = headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| filter_set_cookie(value, &state.ctx.session_cookie_name))
+        .filter_map(|value| HeaderValue::from_str(&value).ok())
+        .collect();
+    headers.remove(SET_COOKIE);
+    for cookie in cookies {
+        headers.append(SET_COOKIE, cookie);
+    }
+    let location = headers
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| rewrite_location(value, state.target.upstream_port, client_origin));
+    if let Some(location) = location {
+        insert(headers, LOCATION, &location);
+    }
+}
+
+/// Removes the fixed hop-by-hop headers and any header the `Connection` header nominates.
+fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    let nominated: Vec<HeaderName> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .collect();
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in HOP_BY_HOP {
+        headers.remove(*name);
+    }
+}
+
+fn joined_cookies(headers: &HeaderMap) -> String {
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// `host[:port]` with nothing a browser would not send: no userinfo, path, whitespace, or
+/// control characters.
+fn valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !b"@/\\?#".contains(&byte))
+        && host.parse::<Authority>().is_ok()
+        // `Authority` accepts any port text; a port, when present, must be numeric.
+        && host[host.rfind(']').map_or(0, |end| end + 1)..]
+            .split_once(':')
+            .is_none_or(|(_, port)| port.parse::<u16>().is_ok())
+}
+
+/// Sets `name` to `value`, or removes it when `value` is not a valid header value.
+fn insert(headers: &mut HeaderMap, name: HeaderName, value: &str) {
+    match HeaderValue::from_str(value) {
+        Ok(value) => {
+            headers.insert(name, value);
+        }
+        Err(_) => {
+            headers.remove(name);
+        }
+    }
+}
+
+fn empty() -> ProxyBody {
+    Empty::new().map_err(|never| match never {}).boxed()
+}
+
+fn html(status: StatusCode, body: String) -> Response<ProxyBody> {
+    let mut response = Response::new(
+        Full::new(Bytes::from(body))
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn page(status: StatusCode, title: &str, body: &str) -> Response<ProxyBody> {
+    html(status, status_page(title, body))
+}
+
+fn expired() -> Response<ProxyBody> {
+    page(
+        StatusCode::UNAUTHORIZED,
+        "Preview link expired",
+        EXPIRED_COPY,
+    )
+}
+
+fn bad_request() -> Response<ProxyBody> {
+    page(
+        StatusCode::BAD_REQUEST,
+        "Invalid preview request",
+        "This preview address is malformed. Go back to BiBCode and open it again.",
+    )
+}
+
+fn unreachable(state: &Listener) -> Response<ProxyBody> {
+    page(
+        StatusCode::BAD_GATEWAY,
+        "Nothing is listening",
+        &format!(
+            "Nothing is listening on port {} on {}.",
+            state.target.upstream_port, state.target.environment_label
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_validation_accepts_only_host_and_port() {
+        for good in ["127.0.0.1:40001", "localhost", "[::1]:8080", "box.lan:3000"] {
+            assert!(valid_host(good), "{good}");
+        }
+        for bad in [
+            "",
+            "a b",
+            "user@host",
+            "host/path",
+            "host\t",
+            "host:port",
+            "host:",
+            "a:1:2",
+        ] {
+            assert!(!valid_host(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn connection_nominated_and_fixed_hop_by_hop_headers_are_stripped() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, x-secret"));
+        headers.insert("x-secret", HeaderValue::from_static("1"));
+        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert("x-kept", HeaderValue::from_static("1"));
+        strip_hop_by_hop(&mut headers);
+        assert_eq!(
+            headers.keys().map(HeaderName::as_str).collect::<Vec<_>>(),
+            ["x-kept"]
+        );
+    }
+}

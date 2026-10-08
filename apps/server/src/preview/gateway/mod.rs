@@ -2,6 +2,7 @@
 //! cookie, and `Location` rewriting the proxy applies in both directions.
 
 pub mod capability;
+pub mod proxy;
 pub mod rewrite;
 
 use std::collections::HashMap;

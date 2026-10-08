@@ -1034,6 +1034,19 @@ impl AuthService {
         }
     }
 
+    /// Expiry of `session_id` while it exists, is not revoked, and has not expired.
+    /// Repository failures count as inactive so callers fail closed.
+    pub(crate) async fn active_session_expiry(&self, session_id: &str) -> Option<i64> {
+        let observed_at = now_ms();
+        self.refresh_session_from_repository(session_id, observed_at)
+            .await
+            .ok()?;
+        let state = self.state.lock().await;
+        let session = state.sessions.get(session_id)?;
+        (session.revoked_at_ms.is_none() && session.expires_at_ms > observed_at)
+            .then_some(session.expires_at_ms)
+    }
+
     async fn refresh_session_from_repository(
         &self,
         session_id: &str,
@@ -3766,6 +3779,44 @@ mod tests {
             .with_desktop("desktop-test-seed")
             .expect("desktop config");
         AuthService::new(&config, vec![7_u8; 32])
+    }
+
+    #[tokio::test]
+    async fn active_session_expiry_requires_a_live_unrevoked_session() {
+        let auth = service();
+        let issue = || {
+            auth.exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+        };
+        let live = issue().await.expect("session should issue");
+        let live_id = live.principal.session_id;
+        let expected = auth.state.lock().await.sessions[&live_id].expires_at_ms;
+        assert_eq!(auth.active_session_expiry(&live_id).await, Some(expected));
+        assert_eq!(auth.active_session_expiry("missing").await, None);
+
+        auth.state
+            .lock()
+            .await
+            .sessions
+            .get_mut(&live_id)
+            .expect("session record")
+            .expires_at_ms = now_ms() - 1;
+        assert_eq!(auth.active_session_expiry(&live_id).await, None);
+
+        let revoked = issue().await.expect("session should issue");
+        auth.revoke_client("administrator", &revoked.principal.session_id)
+            .await
+            .expect("revoke session");
+        assert_eq!(
+            auth.active_session_expiry(&revoked.principal.session_id)
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
