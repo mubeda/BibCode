@@ -416,4 +416,19 @@ describe("center panel actions", () => {
       }),
     );
   });
+
+  it("keeps the tab when another client reopened the panel first", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    const panelId = ThreadId.make("panel-reopened-elsewhere");
+    const panelRef = { environmentId: hostRef.environmentId, threadId: panelId };
+    // The other client's unarchive already made the panel live here.
+    h.shells.set(panelId, { session: null, archivedAt: null });
+    h.unarchiveResult = { _tag: "Failure", cause: new Error("Thread is not archived.") };
+
+    await actions.reopenChatPanel(hostRef, panelId, "Claude");
+
+    expect(h.removeThread).not.toHaveBeenCalled();
+    expect(h.releaseChatPanelReservation).toHaveBeenCalledWith(panelRef);
+    expect(h.addToast).not.toHaveBeenCalled();
+  });
 });

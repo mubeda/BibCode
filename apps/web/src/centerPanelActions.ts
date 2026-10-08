@@ -151,7 +151,13 @@ export function useCenterPanelActions({
       useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, providerLabel);
       const result = await unarchiveThread({ environmentId, input: { threadId } });
       if (result._tag === "Success" || isAtomCommandInterrupted(result)) return;
-      useCenterPanelStore.getState().removeThread(scopeThreadRef(environmentId, threadId));
+      const panelRef = scopeThreadRef(environmentId, threadId);
+      // Another client reopened it first: the tab is valid and adoption already tracks it.
+      if (readThreadShell(panelRef)?.archivedAt === null) {
+        useCenterPanelStore.getState().releaseChatPanelReservation(panelRef);
+        return;
+      }
+      useCenterPanelStore.getState().removeThread(panelRef);
       const error = squashAtomCommandFailure(result);
       toastManager.add(
         stackedThreadToast({
