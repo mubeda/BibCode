@@ -683,3 +683,35 @@ it("keeps system launcher routing fixed and separate from generic owned pin cons
   expect(source).toContain("Environment.GetFolderPath(Environment.SpecialFolder.System)");
   // Static compatibility; actual complete Prepare/manifest/lifecycle tests are Pester CI-only.
 });
+
+it("binds CI manifest fixture inputs and restores SystemRoot before real trust admission", () => {
+  const tests = NodeFS.readFileSync(
+    new URL("./owned-wsl2-fixture.Tests.ps1", import.meta.url),
+    "utf8",
+  );
+  const group = tests.slice(
+    tests.indexOf("Describe 'Actual manifest reader and lifecycle trusted launcher consumer"),
+  );
+  const binding = group.indexOf(
+    "$script:OwnerManifest=Join-Path $TestDrive 'inert-owner.secret.json'",
+  );
+  const source = group.indexOf("$script:SourceSha='a'*40");
+  const manifest = group.indexOf("$script:launcherManifest=@");
+  expect(binding).toBeGreaterThan(0);
+  expect(source).toBeGreaterThan(binding);
+  expect(manifest).toBeGreaterThan(source);
+  const start = tests.indexOf(
+    "It 'uses the actual managed system launcher even when SystemRoot points elsewhere'",
+  );
+  const end = tests.indexOf("It 'refuses a saved alternate path", start);
+  const altered = tests.slice(start, end);
+  const nativeRead = altered.indexOf("[OwnedWslPhysical]::ReadSystemLauncher($actual)");
+  const restore = altered.indexOf("finally {$env:SystemRoot=$saved}");
+  const trust = altered.indexOf("$launcher=Get-TrustedWslLauncher $actual");
+  expect(nativeRead).toBeGreaterThan(0);
+  expect(restore).toBeGreaterThan(nativeRead);
+  expect(trust).toBeGreaterThan(restore);
+  expect(altered).toContain("Assert-TrustedWslLauncher $launcher");
+  expect(altered).not.toContain("Mock Get-AuthenticodeSignature");
+  // Static fixture compatibility only; actual Pester and WinTrust behavior are CI-only.
+});

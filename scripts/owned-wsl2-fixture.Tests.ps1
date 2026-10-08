@@ -911,11 +911,13 @@ Describe 'Trusted system launcher role and unchanged owned-file policy (Windows 
       $expected=[IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::System),'wsl.exe')
       $actual=Get-WslSystemLauncherPath
       ($actual -ceq $expected)|Should -BeTrue
-      $launcher=Get-TrustedWslLauncher $actual
-      $launcher.pin.directory|Should -BeFalse
-      ([bool]($launcher.pin.identity -cmatch '^[A-F0-9]{8}:[A-F0-9]{16}$'))|Should -BeTrue
-      Assert-TrustedWslLauncher $launcher
+      $identity=[OwnedWslPhysical]::ReadSystemLauncher($actual)
+      ([bool]($identity -cmatch '^[A-F0-9]{8}:[A-F0-9]{16}$'))|Should -BeTrue
     } finally {$env:SystemRoot=$saved}
+    $launcher=Get-TrustedWslLauncher $actual
+    $launcher.pin.directory|Should -BeFalse
+    ($launcher.pin.identity -ceq $identity)|Should -BeTrue
+    Assert-TrustedWslLauncher $launcher
   }
   It 'refuses a saved alternate path before physical read or signature checks' {
     Mock Get-PhysicalPinForRole {throw 'Unreachable physical read.'}
@@ -943,6 +945,8 @@ Describe 'Trusted system launcher role and unchanged owned-file policy (Windows 
 }
 Describe 'Actual manifest reader and lifecycle trusted launcher consumer (Windows CI)' {
   BeforeEach {
+    $script:OwnerManifest=Join-Path $TestDrive 'inert-owner.secret.json'
+    $script:SourceSha='a'*40
     $script:launcherReaderRefused=$false;$script:launcherReaderCalls=0;$script:launcherCommandCalls=0
     $script:launcherManifest=@{schema=1;sourceSha=$SourceSha;name='BibCodeQA-0123456789abcdef0123456789abcdef';imageSha256=$RootfsHash;before=@{distros=@();defaultGuid=$null};appState='joined';root=@{path='inert-root'};manifestPin=@{};wsl=@{pin=@{path='inert-system-wsl';identity='inert';directory=$false};sha256='inert'};imagePin=@{path='inert-image'};gpg=@{pin=@{path='inert-gpg'};sha256='INERTGPG'};checkout=@{};importRoot=@{path='inert-import'};phase='kernel-verified';kernelVerified=$true;backend=$null}
     Mock Assert-FixtureRuntime {};Mock Assert-OwnerAcl {};Mock Assert-PhysicalPin {};Mock Test-Path {$true}
