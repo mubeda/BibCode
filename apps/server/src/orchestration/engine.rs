@@ -4576,6 +4576,9 @@ async fn plan_command(
                     ),
                 );
             }
+            // Marks history so effects take no checkpoint baseline for a turn that never ran.
+            let mut metadata = metadata;
+            metadata["historyImport"] = json!(true);
             Ok(messages
                 .iter()
                 .map(|message| {

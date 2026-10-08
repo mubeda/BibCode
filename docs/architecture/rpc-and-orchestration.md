@@ -71,7 +71,9 @@ re-reads and re-validates the transcript, then:
 3. dispatches the server-internal `thread.history.import` with command ID
    `<threadId>:history`, which emits one `thread.message-sent` per message
    (`turnId: null`, `streaming: false`, no attachments) for at most 200
-   messages: the first user message and the latest ones. The engine rejects it
+   messages: the first user message and the latest ones. Its events carry
+   `metadata.historyImport: true`, so effects capture no checkpoint baseline
+   for them; the first real turn takes its own. The engine rejects it
    once the thread has a turn or a user message, so a turn another client
    started during the import keeps CLI history out of its conversation.
 
