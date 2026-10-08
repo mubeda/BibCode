@@ -19,8 +19,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         return Some(ACTIVITY_READ_SCOPE);
     }
     match method {
-        "agentSessions.scan"
-        | "assets.createUrl"
+        "assets.createUrl"
         | "filesystem.browse"
         | "gitManager.getCommits"
         | "gitManager.getDiff"
@@ -74,7 +73,10 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.refreshStatus"
         | "vcs.refreshWorktreeCatalog"
         | "worktree.getRemovalPlan" => Some(SCOPE_ORCHESTRATION_READ),
+        // Scan reads CLI transcripts (first prompts included) from the server host's home
+        // directory, outside BiBCode's data, so read-only credentials must not see them.
         "agentSessions.import"
+        | "agentSessions.scan"
         | "git.preparePullRequestThread"
         | "git.resolvePullRequest"
         | "git.runStackedAction"
@@ -205,7 +207,7 @@ mod tests {
         );
         assert_eq!(
             required_scope("agentSessions.scan"),
-            Some(SCOPE_ORCHESTRATION_READ)
+            Some(SCOPE_ORCHESTRATION_OPERATE)
         );
         assert_eq!(
             required_scope("agentSessions.import"),

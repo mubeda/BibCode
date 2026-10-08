@@ -1282,6 +1282,9 @@ async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
     for (id, tag) in [
         ("114", "activity.cancelSubtree"),
         ("115", "activity.retrySubtreeCancellation"),
+        // Scan reads CLI transcripts outside BiBCode's data on the server host.
+        ("116", "agentSessions.scan"),
+        ("117", "agentSessions.import"),
     ] {
         send_ws_json(
             &mut restricted_socket,
@@ -2657,6 +2660,8 @@ async fn start_desktop_server(temp: &TempDir) -> ServerHandle {
         "activity.listDetail",
         "activity.cancelSubtree",
         "activity.retrySubtreeCancellation",
+        "agentSessions.scan",
+        "agentSessions.import",
     ] {
         let response_tag = tag.to_owned();
         registry.register_unary(tag, move |_request, _cancellation| {

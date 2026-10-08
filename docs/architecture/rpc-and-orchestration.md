@@ -31,9 +31,11 @@ See [provider capability ownership and lifecycle](./providers.md#workspace-capab
 
 ## CLI session import
 
-`agentSessions.scan { projectId }` (`orchestration:read`) and
-`agentSessions.import { projectId, sessions: [{ provider, sessionId }] }`
-(`orchestration:operate`) are unary RPCs owned by
+`agentSessions.scan { projectId }` and
+`agentSessions.import { projectId, sessions: [{ provider, sessionId }] }` are
+unary RPCs that both require `orchestration:operate`, because scan returns
+transcript content (first prompts as titles) from the server host's home
+directory, outside BiBCode's own data. They are owned by
 [`agent_sessions_rpc`](../../apps/server/src/production/agent_sessions_rpc.rs);
 the bounded transcript reader is
 [`agent_sessions`](../../apps/server/src/agent_sessions/mod.rs). Both fail with
