@@ -14,13 +14,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 const h = vi.hoisted(() => {
   const commands = new Map<string, (input: unknown) => Promise<unknown>>();
-  const calls: Array<{ readonly label: string; readonly input: unknown }> = [];
+  const calls: Array<{
+    readonly label: string;
+    readonly input: unknown;
+    readonly signal: AbortSignal | undefined;
+  }> = [];
   // One runner per command, stable across renders like the real hook's callback.
   const runners = new Map(
     ["scan", "import"].map((label) => [
       label,
-      async (input: unknown): Promise<unknown> => {
-        calls.push({ label, input });
+      async (input: unknown, runOptions?: { signal?: AbortSignal }): Promise<unknown> => {
+        calls.push({ label, input, signal: runOptions?.signal });
         const run = commands.get(label);
         if (!run) throw new Error(`Missing ${label} command mock`);
         return run(input);
@@ -183,7 +187,7 @@ describe("ImportCliSessionsDialog", () => {
   it("lists sessions and explains why Import waits for a selection", async () => {
     await renderDialog();
 
-    expect(h.calls).toEqual([
+    expect(h.calls.map(({ label, input }) => ({ label, input }))).toEqual([
       {
         label: "scan",
         input: { environmentId: target.environmentId, input: { projectId: target.projectId } },
@@ -274,6 +278,53 @@ describe("ImportCliSessionsDialog", () => {
       "No Claude Code or Codex sessions found for /work/repo in the last 30 days.",
     );
     expect(container.textContent).not.toContain("Import 0");
+  });
+
+  it("stops a running scan when the dialog closes", async () => {
+    h.commands.set("scan", () => new Promise<never>(() => {}));
+    await renderDialog();
+    const signal = h.calls.find((call) => call.label === "scan")?.signal;
+    expect(signal?.aborted).toBe(false);
+
+    await act(async () => {
+      root.render(
+        <ImportCliSessionsDialog
+          open={false}
+          target={target}
+          onOpenChange={vi.fn()}
+          onImported={onImported}
+          onOpenThread={onOpenThread}
+        />,
+      );
+    });
+
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("stops a retried scan when the dialog closes", async () => {
+    h.commands.set("scan", async () => ({
+      _tag: "Failure",
+      cause: Cause.fail(new AgentSessionsError({ message: "The project no longer exists." })),
+    }));
+    await renderDialog();
+    h.commands.set("scan", () => new Promise<never>(() => {}));
+    await click(button("Try again"));
+    const retry = h.calls.findLast((call) => call.label === "scan")?.signal;
+    expect(retry?.aborted).toBe(false);
+
+    await act(async () => {
+      root.render(
+        <ImportCliSessionsDialog
+          open={false}
+          target={target}
+          onOpenChange={vi.fn()}
+          onImported={onImported}
+          onOpenThread={onOpenThread}
+        />,
+      );
+    });
+
+    expect(retry?.aborted).toBe(true);
   });
 
   it("reports a failed scan and scans again on request", async () => {

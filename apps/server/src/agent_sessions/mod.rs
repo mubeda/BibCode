@@ -157,7 +157,7 @@ pub(crate) fn scan(
                 break;
             }
             parse_budget -= file.size;
-            let Some(session) = read_session(source.provider, &file) else {
+            let Some(session) = read_session(source.provider, &file, Some(cancellation)) else {
                 continue;
             };
             if !is_resumable(source.provider, &session.session_id)
@@ -222,7 +222,7 @@ pub(crate) fn load(
     if !DirectoryMatcher::new(workspace_root).matches(&cwd) {
         return Err(LoadFailure::DifferentDirectory);
     }
-    let session = read_session(source.provider, &file).ok_or(LoadFailure::Unreadable)?;
+    let session = read_session(source.provider, &file, None).ok_or(LoadFailure::Unreadable)?;
     if session.session_id != session_id {
         return Err(LoadFailure::NotFound);
     }
@@ -384,14 +384,22 @@ fn read_cwd(path: &Path) -> Option<String> {
         })
 }
 
-fn read_session(provider: AgentSessionProvider, file: &SessionFile) -> Option<ParsedSession> {
+fn read_session(
+    provider: AgentSessionProvider,
+    file: &SessionFile,
+    cancellation: Option<&CancellationToken>,
+) -> Option<ParsedSession> {
     if file.size > MAX_TRANSCRIPT_BYTES {
         return None;
     }
     let open = || {
-        File::open(&file.path)
-            .ok()
-            .map(|file| file.take(MAX_TRANSCRIPT_BYTES))
+        File::open(&file.path).ok().map(|file| {
+            let records = RecordReader::new(file.take(MAX_TRANSCRIPT_BYTES));
+            match cancellation {
+                Some(cancellation) => records.with_cancellation(cancellation),
+                None => records,
+            }
+        })
     };
     let fallback_session_id = file
         .path
@@ -401,7 +409,7 @@ fn read_session(provider: AgentSessionProvider, file: &SessionFile) -> Option<Pa
     let canonical = match provider {
         AgentSessionProvider::ClaudeAgent => HashSet::new(),
         AgentSessionProvider::Codex => {
-            let mut records = RecordReader::new(open()?);
+            let mut records = open()?;
             let canonical = codex_canonical_response_users(&mut records);
             if records.failed {
                 return None;
@@ -409,7 +417,7 @@ fn read_session(provider: AgentSessionProvider, file: &SessionFile) -> Option<Pa
             canonical
         }
     };
-    let mut records = RecordReader::new(open()?);
+    let mut records = open()?;
     let session = build_session(
         provider,
         &mut records,
@@ -862,6 +870,7 @@ struct RecordReader<R> {
     buffer: Vec<u8>,
     lines: usize,
     failed: bool,
+    cancellation: Option<CancellationToken>,
 }
 
 impl<R: Read> RecordReader<R> {
@@ -871,7 +880,14 @@ impl<R: Read> RecordReader<R> {
             buffer: Vec::new(),
             lines: 0,
             failed: false,
+            cancellation: None,
         }
+    }
+
+    /// Stops between records once `cancellation` fires; the partial read counts as failed.
+    fn with_cancellation(mut self, cancellation: &CancellationToken) -> Self {
+        self.cancellation = Some(cancellation.clone());
+        self
     }
 }
 
@@ -879,6 +895,13 @@ impl<R: Read> Iterator for RecordReader<R> {
     type Item = Option<Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.failed = true;
+        }
         if self.failed {
             return None;
         }

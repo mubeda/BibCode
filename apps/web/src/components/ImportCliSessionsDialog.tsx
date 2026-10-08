@@ -10,7 +10,7 @@ import type {
   ProjectId,
   ThreadId,
 } from "@bibcode/contracts";
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { projectEnvironment } from "../state/projects";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -178,18 +178,34 @@ function ImportCliSessionsDialogContent({
     setTruncated(result.value.truncated);
   }, []);
 
+  // The server reads every matching transcript; a scan nobody will see is aborted.
+  const scanController = useRef<AbortController | null>(null);
   const scan = useCallback(
-    (requestTarget: ImportCliSessionsTarget) =>
-      scanSessions({
-        environmentId: requestTarget.environmentId,
-        input: { projectId: requestTarget.projectId },
-      }).then(applyScan),
+    (requestTarget: ImportCliSessionsTarget) => {
+      scanController.current?.abort();
+      const controller = new AbortController();
+      scanController.current = controller;
+      return scanSessions(
+        {
+          environmentId: requestTarget.environmentId,
+          input: { projectId: requestTarget.projectId },
+        },
+        { signal: controller.signal },
+      ).then((result) => {
+        if (!controller.signal.aborted) applyScan(result);
+      });
+    },
     [applyScan, scanSessions],
   );
 
+  // Aborts whichever scan is current, including one started by Try again.
+  const abortScan = useCallback(() => scanController.current?.abort(), []);
+
   useEffect(() => {
-    if (open && target) void scan(target);
-  }, [open, scan, target]);
+    if (!open || !target) return;
+    void scan(target);
+    return abortScan;
+  }, [abortScan, open, scan, target]);
 
   const retry = useCallback(() => {
     if (!target) return;

@@ -427,3 +427,17 @@ fn load_rechecks_the_folder_and_finds_codex_rollouts_by_id() {
         LoadFailure::NotResumable
     );
 }
+
+#[test]
+fn a_cancelled_scan_stops_reading_a_transcript_between_records() {
+    let text = lines(&[
+        json!({"type": "user", "sessionId": CLAUDE_ID, "message": {"content": "first"}}),
+        json!({"type": "assistant", "sessionId": CLAUDE_ID, "message": {"content": "second"}}),
+    ]);
+    let cancellation = CancellationToken::new();
+    let mut live = RecordReader::new(text.as_bytes()).with_cancellation(&cancellation);
+    assert!(live.next().is_some());
+    cancellation.cancel();
+    assert!(live.next().is_none());
+    assert!(live.failed, "a cancelled read is not a complete transcript");
+}
