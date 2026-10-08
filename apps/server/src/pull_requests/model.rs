@@ -760,6 +760,58 @@ pub struct Files {
     pub truncated: bool,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubscribeTab {
+    Conversation,
+    Commits,
+    Checks,
+    Files,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeInput {
+    #[serde(flatten)]
+    pub list: ListQuery,
+    pub number: Option<u64>,
+    pub tab: Option<SubscribeTab>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotPayload<T> {
+    pub payload: T,
+    pub observed_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotTab {
+    pub kind: SubscribeTab,
+    pub payload: serde_json::Value,
+    pub observed_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
+    pub list: Option<SnapshotPayload<ListPage>>,
+    pub detail: Option<SnapshotPayload<Detail>>,
+    pub tab: Option<SnapshotTab>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Changed {
+    pub list: bool,
+    pub detail: bool,
+    pub timeline: bool,
+    pub commits: bool,
+    pub checks: bool,
+    pub files: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionTarget {

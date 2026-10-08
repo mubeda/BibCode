@@ -7,6 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -14,10 +15,12 @@ use crate::{
     pull_requests::{
         ContextRead, PullRequestsService,
         error::PullRequestsOperationError,
-        model::{ActionRequest, ListQuery, VocabularyKind},
+        model::{ActionRequest, ListQuery, SubscribeInput, VocabularyKind},
     },
-    rpc::{RpcRegistry, RpcRequest, RpcResult},
+    rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
 };
+
+const SUBSCRIBE_STREAM_CAPACITY: usize = 8;
 
 pub const PULL_REQUESTS_UNARY_METHODS: &[&str] = &[
     "pullRequests.getContext",
@@ -31,7 +34,10 @@ pub const PULL_REQUESTS_UNARY_METHODS: &[&str] = &[
     "pullRequests.getFiles",
     "pullRequests.runAction",
     "pullRequests.checkout",
+    "pullRequests.readSnapshot",
 ];
+
+pub const PULL_REQUESTS_STREAM_METHODS: &[&str] = &["pullRequests.subscribe"];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PullRequestsRpcServices;
@@ -102,6 +108,14 @@ impl ConfiguredPullRequestsRpcServices {
         self.handle_mutation_unary(request, cancellation).await
     }
 
+    pub fn subscribe(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<RpcStreamChunk> {
+        self.handle_subscribe(request, cancellation)
+    }
+
     async fn handle_read_unary(
         &self,
         request: RpcRequest,
@@ -158,6 +172,14 @@ impl ConfiguredPullRequestsRpcServices {
                 validate_cwd(&cwd, operation)?;
                 encode(
                     self.service.list(&cwd, input, &cancellation).await,
+                    operation,
+                )
+            }
+            "pullRequests.readSnapshot" => {
+                let input: SubscribeInput = decode(request.payload, operation)?;
+                validate_cwd(Path::new(&input.list.cwd), operation)?;
+                encode(
+                    self.service.read_snapshot(input, &cancellation).await,
                     operation,
                 )
             }
@@ -299,6 +321,33 @@ impl ConfiguredPullRequestsRpcServices {
             "unavailable"
         )))
     }
+
+    fn handle_subscribe(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<RpcStreamChunk> {
+        let (sender, receiver) = mpsc::channel(SUBSCRIBE_STREAM_CAPACITY);
+        let service = self.service.clone();
+        let operation = request.tag.clone();
+        tokio::spawn(async move {
+            let input = match decode::<SubscribeInput>(request.payload, &operation) {
+                Ok(input) => input,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+            };
+            if let Err(error) = validate_cwd(Path::new(&input.list.cwd), &operation) {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            if let Err(error) = service.subscribe(input, &cancellation).await {
+                let _ = sender.send(Err(json!(error))).await;
+            }
+        });
+        receiver
+    }
 }
 
 #[derive(Deserialize)]
@@ -378,6 +427,12 @@ pub fn register_pull_requests_rpc(
             });
         }
     }
+    for method in PULL_REQUESTS_STREAM_METHODS {
+        let services = services.clone();
+        registry.register_stream(*method, move |request, cancellation| {
+            services.subscribe(request, cancellation)
+        });
+    }
 }
 
 #[cfg(test)]
@@ -406,7 +461,7 @@ mod tests {
         assert!(registry.validate_complete().is_err());
         register_pull_requests_rpc(&mut registry, PullRequestsRpcServices);
         registry.validate_complete().unwrap();
-        assert_eq!(PULL_REQUESTS_UNARY_METHODS.len(), 11);
+        assert_eq!(PULL_REQUESTS_UNARY_METHODS.len(), 12);
     }
 
     #[tokio::test]

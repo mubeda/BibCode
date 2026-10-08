@@ -29,7 +29,8 @@ use error::PullRequestsOperationError;
 use host::{HostCommandRunner, PullRequestHost};
 use model::{
     ActionRequest, ActionResult, Checks, Commits, Context, CreateDefaults, Detail, Files, ListPage,
-    ListQuery, Permission, Permissions, ReviewEvent, Timeline, Vocabulary, VocabularyKind,
+    ListQuery, Permission, Permissions, ReviewEvent, Snapshot, SubscribeInput, Timeline,
+    Vocabulary, VocabularyKind,
 };
 
 type ActionGateKey = (bool, String, String, u64);
@@ -188,6 +189,22 @@ impl PullRequestsService {
         )
         .await
         .inspect_err(|error| self.invalidate_failed_context(error))
+    }
+
+    pub async fn read_snapshot(
+        &self,
+        _input: SubscribeInput,
+        _c: &CancellationToken,
+    ) -> Result<Snapshot, PullRequestsOperationError> {
+        Err(snapshot_unavailable("pullRequests.readSnapshot"))
+    }
+
+    pub async fn subscribe(
+        &self,
+        _input: SubscribeInput,
+        _c: &CancellationToken,
+    ) -> Result<(), PullRequestsOperationError> {
+        Err(snapshot_unavailable("pullRequests.subscribe"))
     }
 
     pub async fn list(
@@ -547,6 +564,12 @@ fn action_permissions<'a>(action: &ActionRequest, p: &'a Permissions) -> Vec<&'a
         Delete { .. } => vec![&p.delete],
         Revert { .. } => vec![&p.revert],
     }
+}
+
+fn snapshot_unavailable(operation: &str) -> PullRequestsOperationError {
+    let mut error = PullRequestsOperationError::new(operation, "unavailable");
+    error.message = "Merge request snapshots are not available for this host.".into();
+    error
 }
 
 /// One deadline includes discovery, authentication, metadata, pages and mutations.
