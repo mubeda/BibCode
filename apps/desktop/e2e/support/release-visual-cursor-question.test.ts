@@ -166,6 +166,7 @@ function cursorFailureAttribution() {
     theme: "light",
     cursorOriginalFailure: null,
     readBrowserInitialFailure: () => null,
+    readBrowserTerminalReceiptFailure: () => null,
     cursorOriginalFailurePhases: NodeVM.runInNewContext(
       source.slice(namesStart, namesEnd) + "\ncursorOriginalFailurePhases",
     ),
