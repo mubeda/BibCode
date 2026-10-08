@@ -33,8 +33,14 @@ use crate::pull_requests::{
 pub(crate) use super::refresh::ActiveTab;
 
 const BASE_DELAY: Duration = Duration::from_secs(20);
-const BACKOFF_START: Duration = Duration::from_secs(60);
-const BACKOFF_CAP: Duration = Duration::from_secs(300);
+/// Fixed 429 backoff ladder: 60s, then 120s, then 300s, holding at 300s for
+/// any further consecutive 429. A success resets the ladder to its first
+/// step for the next 429.
+const BACKOFF_STEPS: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+];
 
 type Key = (String, String, String);
 
@@ -231,6 +237,7 @@ async fn run_tick(
     generation: i64,
     emit: &(dyn Fn(Changed) + Send + Sync),
     c: &CancellationToken,
+    shared_cancel: &CancellationToken,
 ) -> TickOutcome {
     let mut changed = Changed {
         list: false,
@@ -244,7 +251,6 @@ async fn run_tick(
     let page = match host.list(scope, list_query, c).await {
         Ok(page) => page,
         Err(error) => {
-            emit(changed);
             return classify(&error);
         }
     };
@@ -255,7 +261,7 @@ async fn run_tick(
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
     if list_changed(&previous_list_fp, &next_list_fp)
-        && !c.is_cancelled()
+        && !shared_cancel.is_cancelled()
         && let (Ok(fingerprint), Ok(payload)) = (
             serde_json::to_string(&next_list_fp),
             serde_json::to_vec(&page),
@@ -283,7 +289,6 @@ async fn run_tick(
     let next_probe = match host.probe(scope, number, c).await {
         Ok(probe) => probe,
         Err(error) => {
-            emit(changed);
             return classify(&error);
         }
     };
@@ -308,7 +313,7 @@ async fn run_tick(
     if names.detail {
         match full_detail(host, scope, number, c).await {
             Ok(detail) => {
-                if !c.is_cancelled()
+                if !shared_cancel.is_cancelled()
                     && let (Ok(fingerprint), Ok(payload)) = (
                         serde_json::to_string(&next_probe),
                         serde_json::to_vec(&detail),
@@ -329,7 +334,6 @@ async fn run_tick(
                 }
             }
             Err(error) => {
-                emit(changed);
                 return classify(&error);
             }
         }
@@ -337,7 +341,7 @@ async fn run_tick(
     if names.timeline {
         match host.timeline(scope, number, c).await {
             Ok(timeline) => {
-                if !c.is_cancelled()
+                if !shared_cancel.is_cancelled()
                     && let Ok(payload) = serde_json::to_vec(&timeline)
                 {
                     store(
@@ -355,7 +359,6 @@ async fn run_tick(
                 }
             }
             Err(error) => {
-                emit(changed);
                 return classify(&error);
             }
         }
@@ -363,7 +366,7 @@ async fn run_tick(
     if names.commits {
         match host.commits(scope, number, c).await {
             Ok(commits) => {
-                if !c.is_cancelled()
+                if !shared_cancel.is_cancelled()
                     && let Ok(payload) = serde_json::to_vec(&commits)
                 {
                     store(
@@ -381,7 +384,6 @@ async fn run_tick(
                 }
             }
             Err(error) => {
-                emit(changed);
                 return classify(&error);
             }
         }
@@ -389,7 +391,7 @@ async fn run_tick(
     if names.checks {
         match host.checks(scope, number, c).await {
             Ok(checks) => {
-                if !c.is_cancelled()
+                if !shared_cancel.is_cancelled()
                     && let Ok(payload) = serde_json::to_vec(&checks)
                 {
                     store(
@@ -407,7 +409,6 @@ async fn run_tick(
                 }
             }
             Err(error) => {
-                emit(changed);
                 return classify(&error);
             }
         }
@@ -415,7 +416,7 @@ async fn run_tick(
     if names.files {
         match host.files(scope, number, c).await {
             Ok(files) => {
-                if !c.is_cancelled()
+                if !shared_cancel.is_cancelled()
                     && let Ok(payload) = serde_json::to_vec(&files)
                 {
                     store(
@@ -433,7 +434,6 @@ async fn run_tick(
                 }
             }
             Err(error) => {
-                emit(changed);
                 return classify(&error);
             }
         }
@@ -478,7 +478,7 @@ pub(crate) async fn run_subscriber(
         permit = lease.shared.driver_lock.lock() => permit,
     };
     let mut delay = BASE_DELAY;
-    let mut backoff_step = BACKOFF_START;
+    let mut backoff_index: usize = 0;
     loop {
         tokio::select! {
             biased;
@@ -491,17 +491,27 @@ pub(crate) async fn run_subscriber(
         }
         let generation = lease.shared.next_tick();
         let outcome = run_tick(
-            host, database, scope, list_query, list_key, number, tab, generation, emit, c,
+            host,
+            database,
+            scope,
+            list_query,
+            list_key,
+            number,
+            tab,
+            generation,
+            emit,
+            c,
+            &lease.shared.cancellation,
         )
         .await;
         match outcome {
             TickOutcome::Success => {
                 delay = BASE_DELAY;
-                backoff_step = BACKOFF_START;
+                backoff_index = 0;
             }
             TickOutcome::RateLimited => {
-                delay = backoff_step.min(BACKOFF_CAP);
-                backoff_step = backoff_step.saturating_mul(2).min(BACKOFF_CAP);
+                delay = BACKOFF_STEPS[backoff_index];
+                backoff_index = (backoff_index + 1).min(BACKOFF_STEPS.len() - 1);
             }
             TickOutcome::Error => {
                 delay = BASE_DELAY;
@@ -610,6 +620,7 @@ case "$1 $2" in
       while [ ! -e release ]; do sleep 0.02; done
     fi
     if [ -e rate-limited ]; then echo 'HTTP 429' >&2; exit 1; fi
+    if [ -e list-error ]; then echo 'HTTP 404' >&2; exit 1; fi
     cat list.json ;;
   'api -i') printf 'HTTP/2 200 OK\r\nx-total: 0\r\n\r\n[]' ;;
   'api projects/gitlab-org%2Fcli/merge_requests/3941') cat detail.json ;;
@@ -710,9 +721,19 @@ esac
 
     /// Advances every subscriber as far as it can go without blocking, then
     /// yields so the timer/process reactor can make the next step ready.
+    ///
+    /// A subscriber mid-tick can be parked waiting on the database's own OS
+    /// worker thread, which is genuinely separate from this paused tokio
+    /// clock. `tokio::task::yield_now` only reschedules this task; it never
+    /// yields real wall-clock time, so a tight busy loop of nothing else can
+    /// starve that other thread of the real scheduling it needs to respond.
+    /// The tiny real sleep gives it that chance without slowing down the
+    /// common case, where the condition is already satisfied after the
+    /// first iteration or two.
     async fn drive(subscribers: &mut [Subscriber<'_>]) {
         for _ in 0..200 {
             poll_all(subscribers).await;
+            std::thread::sleep(Duration::from_millis(1));
             tokio::task::yield_now().await;
         }
     }
@@ -723,6 +744,7 @@ esac
             if condition() {
                 return;
             }
+            std::thread::sleep(Duration::from_millis(1));
             tokio::task::yield_now().await;
         }
         panic!("condition never became true");
@@ -788,6 +810,34 @@ esac
             })
             .await
             .unwrap()
+    }
+
+    /// Like `stored`, but safe to call while subscriber futures are still
+    /// alive and resting on a timer: a bare `.await` on the database's
+    /// cross-thread response can make the single paused-time test task
+    /// genuinely park, and tokio's paused clock then auto-advances straight
+    /// to the nearest pending subscriber sleep to unblock it, silently
+    /// firing an extra tick before the test ever calls `advance` itself.
+    /// Driving the subscribers on every iteration keeps the task always
+    /// runnable instead, so parking (and the auto-advance) never happens.
+    async fn stored_while_driving(
+        subscribers: &mut [Subscriber<'_>],
+        database: &Database,
+        host: &str,
+        project: &str,
+        kind: &str,
+        key: &str,
+    ) -> Option<StoredSnapshot> {
+        let mut future = Box::pin(stored(database, host, project, kind, key));
+        for _ in 0..200 {
+            poll_all(subscribers).await;
+            if let Some(result) = poll_immediate(future.as_mut()).await {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        panic!("stored() query never completed");
     }
 
     fn emitter(log: &Arc<Mutex<Vec<Changed>>>) -> impl Fn(Changed) + Send + Sync {
@@ -1069,7 +1119,7 @@ esac
     }
 
     #[tokio::test(start_paused = true)]
-    async fn gitlab_poller_rate_limited_backs_off_60s_then_120s() {
+    async fn gitlab_poller_rate_limited_backs_off_60s_then_120s_then_300s_then_resets_on_success() {
         let (s, host, scope) = fixture();
         fs::write(s.path("rate-limited"), "").unwrap();
         let database = new_database().await;
@@ -1108,6 +1158,119 @@ esac
         assert_eq!(count(&s, "mr list"), 2, "a second 429 backs off to 120s");
         tokio::time::advance(Duration::from_secs(1)).await;
         drive_until(&mut subs, || count(&s, "mr list") >= 3).await;
+        drive(&mut subs).await;
+        assert_eq!(count(&s, "mr list"), 3);
+        tokio::time::advance(Duration::from_secs(299)).await;
+        drive(&mut subs).await;
+        assert_eq!(
+            count(&s, "mr list"),
+            3,
+            "a third 429 backs off to 300s, not 240s"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a 429 tick must never call emit"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drive_until(&mut subs, || count(&s, "mr list") >= 4).await;
+        drive(&mut subs).await;
+        assert_eq!(count(&s, "mr list"), 4);
+        tokio::time::advance(Duration::from_secs(299)).await;
+        drive(&mut subs).await;
+        assert_eq!(
+            count(&s, "mr list"),
+            4,
+            "the delay stays at 300s for any further consecutive 429"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drive_until(&mut subs, || count(&s, "mr list") >= 5).await;
+        drive(&mut subs).await;
+        assert_eq!(count(&s, "mr list"), 5);
+
+        // Let the next tick succeed, then resume rate limiting: the next 429
+        // must back off to 60s again, not continue from 300s. The pending
+        // tick is still scheduled 300s out from the last 429, so it must
+        // wait out that full delay before it can succeed.
+        fs::remove_file(s.path("rate-limited")).unwrap();
+        tokio::time::advance(Duration::from_secs(299)).await;
+        drive(&mut subs).await;
+        assert_eq!(
+            count(&s, "mr list"),
+            5,
+            "the pending tick still waits out its 300s delay"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drive_until(&mut subs, || count(&s, "mr list") >= 6).await;
+        drive(&mut subs).await;
+        assert_eq!(count(&s, "mr list"), 6);
+        assert!(
+            !log.lock().unwrap().is_empty(),
+            "a successful tick must emit"
+        );
+        fs::write(s.path("rate-limited"), "").unwrap();
+        tokio::time::advance(Duration::from_secs(19)).await;
+        drive(&mut subs).await;
+        assert_eq!(
+            count(&s, "mr list"),
+            6,
+            "a success schedules its own next tick after 20s"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drive_until(&mut subs, || count(&s, "mr list") >= 7).await;
+        drive(&mut subs).await;
+        assert_eq!(count(&s, "mr list"), 7);
+        tokio::time::advance(Duration::from_secs(59)).await;
+        drive(&mut subs).await;
+        assert_eq!(
+            count(&s, "mr list"),
+            7,
+            "the 429 after a success backs off to 60s again, not 300s"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drive_until(&mut subs, || count(&s, "mr list") >= 8).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gitlab_poller_generic_host_error_does_not_emit() {
+        let (s, host, scope) = fixture();
+        fs::write(s.path("list-error"), "").unwrap();
+        let database = new_database().await;
+        let registry = Registry::default();
+        let list_query = default_list_query(s.root());
+        let list_key = list_query.snapshot_key();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let emit = emitter(&log);
+        let c = CancellationToken::new();
+        let mut subs = [pin_subscriber(
+            &registry,
+            &host,
+            &database,
+            &scope,
+            &list_query,
+            &list_key,
+            None,
+            tab_none(),
+            &emit,
+            &c,
+        )];
+        drive(&mut subs).await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drive_until(&mut subs, || count(&s, "mr list") >= 1).await;
+        drive(&mut subs).await;
+        assert_eq!(count(&s, "mr list"), 1);
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a non-429 host error must never call emit either"
+        );
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drive_until(&mut subs, || count(&s, "mr list") >= 2).await;
+        drive(&mut subs).await;
+        assert_eq!(
+            count(&s, "mr list"),
+            2,
+            "a generic error backs off at the base 20s delay, not the 429 ladder"
+        );
+        assert!(log.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1140,6 +1303,228 @@ esac
             .unwrap();
         assert_eq!(row.payload, b"second".to_vec());
         assert_eq!(row.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn gitlab_poller_run_tick_drops_the_list_write_once_the_shared_cancellation_has_fired() {
+        let (s, host, scope) = fixture();
+        fs::write(
+            s.path("list.json"),
+            json!([{
+                "iid": 1,
+                "title": "x",
+                "state": "opened",
+                "draft": false,
+                "author": {"username": "a"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "source_branch": "a",
+                "target_branch": "main",
+                "labels": [],
+                "user_notes_count": 0,
+                "web_url": "https://gitlab.com/x"
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let database = new_database().await;
+        let list_query = default_list_query(s.root());
+        let list_key = list_query.snapshot_key();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let emit = emitter(&log);
+        // The host-call token stays live, so `host.list` runs and succeeds
+        // normally; only the poller-wide (last-subscriber-left) token is
+        // already cancelled, simulating a tick that is still mid-flight
+        // after every subscriber has gone.
+        let c = CancellationToken::new();
+        let shared_cancel = CancellationToken::new();
+        shared_cancel.cancel();
+
+        let outcome = run_tick(
+            &host,
+            &database,
+            &scope,
+            &list_query,
+            &list_key,
+            None,
+            tab_none(),
+            1,
+            &emit,
+            &c,
+            &shared_cancel,
+        )
+        .await;
+
+        assert!(matches!(outcome, TickOutcome::Success));
+        assert_eq!(
+            count(&s, "mr list"),
+            1,
+            "the host call still ran to completion"
+        );
+        let row = stored(&database, &scope.host, &scope.repository, "list", &list_key).await;
+        assert!(
+            row.is_none(),
+            "the write must be dropped once the shared poller-wide cancellation has fired, \
+             even though the host call itself completed and the per-call token never cancelled"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gitlab_poller_a_second_subscriber_still_receives_the_write_when_only_the_drivers_own_token_cancels()
+     {
+        // Two subscribers share one poller; only one of them actually drives
+        // host reads at a time (see `run_subscriber`'s module doc comment).
+        // Cancelling *that* subscriber's own token must not cancel the
+        // shared, poller-wide cancellation the registry only fires once
+        // every subscriber has left: with a second subscriber still alive,
+        // the poller must hand driving off and keep writing snapshots, not
+        // freeze on the driver's last write.
+        let (s, host, scope) = fixture();
+        fs::write(
+            s.path("list.json"),
+            json!([{
+                "iid": 1,
+                "title": "x",
+                "state": "opened",
+                "draft": false,
+                "author": {"username": "a"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "source_branch": "a",
+                "target_branch": "main",
+                "labels": [],
+                "user_notes_count": 0,
+                "web_url": "https://gitlab.com/x"
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let database = new_database().await;
+        let registry = Registry::default();
+        let list_query = default_list_query(s.root());
+        let list_key = list_query.snapshot_key();
+        let log1 = Arc::new(Mutex::new(Vec::new()));
+        let log2 = Arc::new(Mutex::new(Vec::new()));
+        let emit1 = emitter(&log1);
+        let emit2 = emitter(&log2);
+        let c1 = CancellationToken::new();
+        let c2 = CancellationToken::new();
+
+        // Only the first subscriber exists for tick 1, so it is unambiguously
+        // the one that acquires the driver lock: no race to disambiguate
+        // which subscriber actually drove the tick.
+        let mut subs = vec![pin_subscriber(
+            &registry,
+            &host,
+            &database,
+            &scope,
+            &list_query,
+            &list_key,
+            None,
+            tab_none(),
+            &emit1,
+            &c1,
+        )];
+        drive(&mut subs).await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drive_until(&mut subs, || count(&s, "mr list") >= 1).await;
+        drive(&mut subs).await;
+        assert_eq!(count(&s, "mr list"), 1, "the first tick runs normally");
+        let row = stored_while_driving(
+            &mut subs,
+            &database,
+            &scope.host,
+            &scope.repository,
+            "list",
+            &list_key,
+        )
+        .await;
+        assert_eq!(
+            row.map(|row| row.generation),
+            Some(1),
+            "the first tick's own write must land before either token is cancelled"
+        );
+
+        // The second subscriber joins only now, after tick 1 has already
+        // landed: it shares the same poller key and bumps the registry's ref
+        // count, but it parks on the driver lock the first subscriber still
+        // holds instead of driving anything itself.
+        subs.push(pin_subscriber(
+            &registry,
+            &host,
+            &database,
+            &scope,
+            &list_query,
+            &list_key,
+            None,
+            tab_none(),
+            &emit2,
+            &c2,
+        ));
+        drive(&mut subs).await;
+
+        // The driving subscriber disconnects (cancels its own token) right
+        // after its first tick. Its loop only notices at the top of the next
+        // iteration, so this does not retroactively undo tick 1's write.
+        c1.cancel();
+        drive(&mut subs).await;
+
+        // Change the list content so the next tick's write is observable
+        // against a *different* fingerprint than tick 1's, and advance to
+        // let the surviving subscriber (never cancelled) pick up the driver
+        // lock the departing one just released and run the next tick itself.
+        fs::write(
+            s.path("list.json"),
+            json!([{
+                "iid": 1,
+                "title": "x",
+                "state": "opened",
+                "draft": false,
+                "author": {"username": "a"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-02T00:00:00Z",
+                "source_branch": "a",
+                "target_branch": "main",
+                "labels": [],
+                "user_notes_count": 0,
+                "web_url": "https://gitlab.com/x"
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drive_until(&mut subs, || count(&s, "mr list") >= 2).await;
+        drive(&mut subs).await;
+        assert_eq!(
+            count(&s, "mr list"),
+            2,
+            "the surviving subscriber must take over driving and run a second tick"
+        );
+        let row = stored_while_driving(
+            &mut subs,
+            &database,
+            &scope.host,
+            &scope.repository,
+            "list",
+            &list_key,
+        )
+        .await;
+        assert_eq!(
+            row.map(|row| row.generation),
+            Some(2),
+            "a second subscriber is still active, so the shared poller-wide cancellation never \
+             fired; the second tick's write must still land even though the driving \
+             subscriber's own token cancelled, instead of leaving tick 1's stale row in place"
+        );
+
+        // Confirms the surviving subscriber (never cancelled) is the one
+        // that actually took over driving, rather than some other path.
+        assert!(
+            !log2.lock().unwrap().is_empty(),
+            "the surviving subscriber must have emitted the second tick's result"
+        );
+
+        drop(subs);
     }
 
     #[tokio::test(start_paused = true)]
