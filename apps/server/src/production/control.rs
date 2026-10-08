@@ -23,7 +23,7 @@ use crate::{
     persistence::{read_json, write_bytes_atomically, write_json_atomically},
     production::{
         agent_activity::AgentActivitySettingsHandler,
-        keybindings, local_servers, provider_inventory,
+        keybindings, provider_inventory,
         provider_maintenance::{
             ProviderMaintenance, ProviderMaintenanceTarget, ProviderUpdateLifecycleToken,
             provider_version_advanced, provider_version_regressed,
@@ -1718,23 +1718,6 @@ impl ProductionServerControl for NativeServerControl {
                         }
                     }
                 }
-                "subscribeDiscoveredLocalServers" => loop {
-                    let servers = local_servers::discover(&cancellation).await;
-                    if cancellation.is_cancelled()
-                        || send_event(
-                            &sender,
-                            json!({ "servers": servers, "scannedAt": now_iso() }),
-                        )
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    tokio::select! {
-                        () = cancellation.cancelled() => return,
-                        () = tokio::time::sleep(local_servers::SCAN_INTERVAL) => {}
-                    }
-                },
                 "subscribeServerLifecycle" => {
                     let cwd = current_directory(&control.config);
                     let project_name = Path::new(&cwd)

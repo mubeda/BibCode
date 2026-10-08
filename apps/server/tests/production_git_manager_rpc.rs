@@ -202,6 +202,7 @@ impl Fixture {
                 unresolved_delivery_state: None,
                 unresolved_delivery_detail: None,
                 deleted_at: None,
+                host_thread_id: None,
             })
             .await
             .expect("thread owning the linked worktree");

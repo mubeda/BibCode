@@ -25,7 +25,7 @@ use bibcode_server::{
         Repositories, run_migrations,
     },
     production::git_vcs::{GitVcsRpcServices, register_git_vcs_rpc},
-    production::orchestration_rpc::register_orchestration_rpc,
+    production::orchestration_rpc::{register_orchestration_rpc, shell_snapshot},
     production::worktree_catalog_rpc::{
         WorktreeCatalogOperationRuntime, WorktreeCatalogRpcServices,
         WorktreeRemovalCleanupAdmission, WorktreeRemovalCleanupAdmissionError,
@@ -206,6 +206,24 @@ async fn dedicated_create_panel_and_retarget_resolve_workspace_authority_server_
     assert_eq!(panel.project_id, "project-1");
     assert_eq!(panel.worktree_path.as_deref(), Some(managed_path.as_str()));
     assert_eq!(panel.branch.as_deref(), Some("feature/managed-create"));
+    assert_eq!(panel.host_thread_id.as_deref(), Some("managed-thread"));
+    let shell = shell_snapshot(&fixture.engine, false)
+        .await
+        .expect("shell snapshot");
+    let shell_thread = |id: &str| {
+        shell["threads"]
+            .as_array()
+            .expect("shell threads")
+            .iter()
+            .find(|thread| thread["id"] == id)
+            .cloned()
+            .expect("shell thread")
+    };
+    assert_eq!(
+        shell_thread("managed-panel")["hostThreadId"],
+        "managed-thread"
+    );
+    assert!(shell_thread("managed-thread").get("hostThreadId").is_none());
 
     // The explicit refresh below is intentionally allowed to coalesce with an
     // in-flight catalog scan. Settle the managed-create invalidation first so
@@ -4724,6 +4742,7 @@ impl CatalogRpcFixture {
                 unresolved_delivery_state: None,
                 unresolved_delivery_detail: None,
                 deleted_at: None,
+                host_thread_id: None,
             })
             .await
             .expect("project thread projection created");

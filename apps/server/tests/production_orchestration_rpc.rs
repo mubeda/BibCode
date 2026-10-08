@@ -665,6 +665,23 @@ async fn public_dispatch_rejects_every_generic_worktree_authority_bypass() {
                     "force":true
                 }),
             ),
+            (
+                "71",
+                json!({
+                    "type":"thread.create",
+                    "commandId":"raw-host-create",
+                    "threadId":"raw-hosted",
+                    "projectId":"authority-project",
+                    "title":"Raw hosted",
+                    "hostThreadId":default_thread_id,
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":null,
+                    "worktreePath":null,
+                    "createdAt":CREATED_AT
+                }),
+            ),
         ];
         for (request_id, payload) in rejected {
             let command_id = payload["commandId"]

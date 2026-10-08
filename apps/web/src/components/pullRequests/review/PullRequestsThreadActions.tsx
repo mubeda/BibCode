@@ -13,11 +13,18 @@ export function PullRequestsThreadActions({
   permissions,
   projectRef,
   number,
+  live = true,
 }: {
   thread: Extract<PullRequestsTimelineItem, { kind: "thread" }>;
   permissions: PullRequestsPermissions;
   projectRef: ScopedProjectRef;
   number: number;
+  /**
+   * Resolving and replying only ever act on a live detail, never a
+   * snapshot. Defaults to `true` so callers that have not adopted the split
+   * keep acting as before.
+   */
+  live?: boolean;
 }) {
   const { run, pending } = usePullRequestsActions();
   const draft = usePullRequestsStore(
@@ -26,11 +33,13 @@ export function PullRequestsThreadActions({
   const [error, setError] = useState<string | null>(null);
   const resolvePermission = constrainPermission(
     permissions.resolveThreads,
-    !thread.canResolve
-      ? "This thread cannot be resolved by your account"
-      : pending
-        ? "Wait for the current action to finish"
-        : null,
+    !live
+      ? "Loading…"
+      : !thread.canResolve
+        ? "This thread cannot be resolved by your account"
+        : pending
+          ? "Wait for the current action to finish"
+          : null,
   );
   return (
     <div className="space-y-3 p-3">
@@ -60,7 +69,7 @@ export function PullRequestsThreadActions({
         </p>
       ) : null}
       <PullRequestsCommentBox
-        permission={permissions.comment}
+        permission={constrainPermission(permissions.comment, !live ? "Loading…" : null)}
         busy={pending}
         label="Reply to thread"
         submitLabel="Reply"

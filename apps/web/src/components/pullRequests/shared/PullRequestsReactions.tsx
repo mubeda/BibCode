@@ -18,11 +18,17 @@ export const PullRequestsReactions = memo(function PullRequestsReactions({
   permission,
   onToggle,
   busy = false,
+  live = true,
 }: {
   reactions: PullRequestsReactionSummary;
   permission?: PullRequestsPermission;
   onToggle?: (content: Content, on: boolean) => Promise<unknown>;
   busy?: boolean;
+  /**
+   * Reacting only ever acts on a live detail, never a snapshot. Defaults to
+   * `true` so callers that have not adopted the split keep acting as before.
+   */
+  live?: boolean;
 }) {
   const active = useRef(false);
   const [pending, setPending] = useState(false);
@@ -31,7 +37,7 @@ export const PullRequestsReactions = memo(function PullRequestsReactions({
   const currentPermission = permission
     ? constrainPermission(
         permission,
-        pending || busy ? "Wait for the current action to finish" : null,
+        !live ? "Loading…" : pending || busy ? "Wait for the current action to finish" : null,
       )
     : null;
   const toggle = (content: Content) => {

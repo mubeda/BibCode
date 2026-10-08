@@ -30,6 +30,13 @@ const READINESS_TONES = {
   closed: "neutral",
   unknown: "neutral",
 } as const;
+/** GitLab's approval line beside the overview Approve control. */
+export function approvalStatusNote(
+  required: { readonly approved: number; readonly required: number } | null,
+): string {
+  if (required === null || required.required <= 0) return "Approval is optional";
+  return `${required.approved} of ${required.required} approvals`;
+}
 export function readinessPresentation(
   readiness: PullRequestsMergeReadiness,
   _vocabulary: Vocabulary,

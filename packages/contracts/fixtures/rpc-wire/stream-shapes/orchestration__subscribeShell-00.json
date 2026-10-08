@@ -660,51 +660,35 @@
             "runtimeMode": "approval-required",
             "interactionMode": "plan",
             "branch": null,
-            "worktreePath": null,
+            "worktreePath": "(SB!8M*;",
             "latestTurn": null,
-            "createdAt": ".(SB!8M*;$",
-            "updatedAt": "jc<5",
-            "archivedAt": null,
-            "session": null,
-            "latestUserMessageAt": "#|J>k",
+            "createdAt": "jc<5",
+            "updatedAt": "%PD#|J>",
+            "archivedAt": "L]eQEF.8@>",
+            "session": {
+              "threadId": "u1UNNN]r",
+              "status": "starting",
+              "providerName": null,
+              "runtimeMode": "full-access",
+              "activeTurnId": "H3?!Tm]",
+              "lastError": ",M1<rJ'[?",
+              "updatedAt": "K?{)T\\asrL"
+            },
+            "latestUserMessageAt": "f8/r`MNWwp",
             "hasPendingApprovals": false,
             "hasPendingUserInput": true,
             "hasActionableProposedPlan": false
           },
           {
-            "id": "@>a",
-            "projectId": "u1UNNN]r",
-            "title": "96byTgH3?",
+            "id": "]L5.",
+            "projectId": "Df!|6ZXUo",
+            "title": "BLeLa",
             "modelSelection": {
-              "instanceId": "y853",
-              "model": "J'[?",
+              "instanceId": "u-",
+              "model": "K>#$F1zw",
               "options": [
                 {
-                  "id": "?{)T\\asr",
-                  "value": "4"
-                },
-                {
-                  "id": "8/r",
-                  "value": "NWwp$1Xg"
-                },
-                {
-                  "id": "d",
-                  "value": false
-                },
-                {
-                  "id": ".JD",
-                  "value": "|6ZXU"
-                },
-                {
-                  "id": "BLeLa",
-                  "value": "<QQUK>#$F"
-                },
-                {
-                  "id": "wm6AThE",
-                  "value": true
-                },
-                {
-                  "id": ")",
+                  "id": "hEJ^7%)",
                   "value": true
                 },
                 {
@@ -724,42 +708,22 @@
             "runtimeMode": "full-access",
             "interactionMode": "plan",
             "kind": "panel",
-            "branch": "CyIn@Rw7",
-            "worktreePath": "0/z5y%'&>A'q",
-            "latestTurn": {
-              "turnId": "tyNw|.?kyC",
-              "state": "interrupted",
-              "requestedAt": "bYoy",
-              "startedAt": "Wf@J+?m5XU",
-              "completedAt": null,
-              "assistantMessageId": null,
-              "sourceProposedPlan": {
-                "threadId": "BZP",
-                "planId": "N5z>#Yd"
-              }
-            },
-            "createdAt": "|",
-            "updatedAt": "}G03Xw",
+            "branch": null,
+            "worktreePath": null,
+            "latestTurn": null,
+            "createdAt": "n@Rw7^",
+            "updatedAt": "0/z5y",
             "archivedAt": null,
-            "session": {
-              "threadId": "zq",
-              "status": "stopped",
-              "providerName": "7\\A{J3?wD",
-              "providerInstanceId": "Y-9TG-5",
-              "runtimeMode": "full-access",
-              "activeTurnId": "c~4",
-              "lastError": null,
-              "lastErrorClass": null,
-              "updatedAt": "E\\e"
-            },
-            "latestUserMessageAt": "am{W*,",
+            "session": null,
+            "latestUserMessageAt": null,
             "hasPendingApprovals": true,
             "hasPendingUserInput": false,
-            "hasActionableProposedPlan": true,
+            "hasActionableProposedPlan": false,
+            "unresolvedDelivery": null,
             "conversationPreview": null
           }
         ],
-        "updatedAt": "_,V|vDZm"
+        "updatedAt": "0keyyca"
       }
     }
   ]
