@@ -28,11 +28,21 @@ public static class OwnedWslPhysical {
  [StructLayout(LayoutKind.Sequential)] struct Info { public uint Attributes; public System.Runtime.InteropServices.ComTypes.FILETIME Creation,Access,Write; public uint Volume,SizeHigh,SizeLow,Links,IndexHigh,IndexLow; }
  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFile(string name,uint access,uint share,IntPtr security,uint disposition,uint flags,IntPtr template);
  [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetFileInformationByHandle(SafeFileHandle handle,out Info info);
- public static string Read(string path,bool directory) {
+ enum PinRole { OwnedObject, SystemLauncher }
+ public static string Read(string path,bool directory) { return ReadIdentity(path,directory,PinRole.OwnedObject); }
+ public static string ReadSystemLauncher(string path) {
+  string system=Environment.GetFolderPath(Environment.SpecialFolder.System);
+  if(string.IsNullOrEmpty(system)||!System.IO.Path.IsPathFullyQualified(system))throw new InvalidOperationException("Owned physical identity refused.");
+  string expected=System.IO.Path.Combine(system,"wsl.exe");
+  if(!string.Equals(path,expected,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("Owned physical identity refused.");
+  return ReadIdentity(path,false,PinRole.SystemLauncher);
+ }
+ static string ReadIdentity(string path,bool directory,PinRole role) {
   using(var h=CreateFile(path,0,7,IntPtr.Zero,3,directory?0x02000000u:0u,IntPtr.Zero)) {
    if(h.IsInvalid) { int error=Marshal.GetLastWin32Error();throw OwnedWslPrepareFailure.Native("CreateFile",error,null); }
    Info i;if(!GetFileInformationByHandle(h,out i)) { int error=Marshal.GetLastWin32Error();throw OwnedWslPrepareFailure.Native("GetFileInformationByHandle",error,null); }
-   if(!directory&&i.Links!=1)throw OwnedWslPrepareFailure.Native("SingleLinkPolicy",null,i.Links);
+   if(role==PinRole.OwnedObject&&!directory&&i.Links!=1)throw OwnedWslPrepareFailure.Native("SingleLinkPolicy",null,i.Links);
+   if(role==PinRole.SystemLauncher&&((i.Attributes&0x10u)!=0||i.Links<1))throw OwnedWslPrepareFailure.Native("SingleLinkPolicy",null,i.Links);
    return i.Volume.ToString("X8")+":"+i.IndexHigh.ToString("X8")+i.IndexLow.ToString("X8");
   }
  }
@@ -109,15 +119,23 @@ public static class OwnedWslPrepareProjection {
 }
 '@ | Out-Null
 }
-function Get-PhysicalPin([string]$Path) {
+function Get-WslSystemLauncherPath {
+  $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+  if([string]::IsNullOrEmpty($system) -or -not [IO.Path]::IsPathFullyQualified($system)){Refuse-OwnedWsl}
+  return [IO.Path]::Combine($system,'wsl.exe')
+}
+function Get-PhysicalPin([string]$Path) { Get-PhysicalPinForRole $Path 'owned-object' }
+function Get-PhysicalPinForRole([string]$Path,[ValidateSet('owned-object','system-launcher')][string]$Role) {
   $leafAttributes=$null;$ancestorAttributes=$null;$ancestorPath=$null;$directory=$null
   try {
+    if($Role -ceq 'system-launcher' -and $Path -ine (Get-WslSystemLauncherPath)){Refuse-OwnedWsl}
     $item = Get-Item -LiteralPath $Path -Force
     $leafAttributes=[uint32]$item.Attributes
     if (($leafAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Refuse-OwnedWsl }
     $fullName=$item.FullName
     if ($fullName -ine [IO.Path]::GetFullPath($Path)) { Refuse-OwnedWsl }
     $directory=[bool]$item.PSIsContainer
+    if($Role -ceq 'system-launcher' -and $directory){Refuse-OwnedWsl}
     $parent = if ($directory) { $item.Parent } else { $item.Directory }
     $nextAncestorPath=[IO.Path]::GetDirectoryName($fullName)
     while ($null -ne $parent) {
@@ -130,7 +148,8 @@ function Get-PhysicalPin([string]$Path) {
       $nextAncestorPath=[IO.Path]::GetDirectoryName($nextAncestorPath)
     }
     Initialize-PhysicalReader
-    return [ordered]@{path=$fullName;identity=[OwnedWslPhysical]::Read($fullName,$directory);directory=$directory}
+    $identity=if($Role -ceq 'system-launcher'){[OwnedWslPhysical]::ReadSystemLauncher($fullName)}else{[OwnedWslPhysical]::Read($fullName,$directory)}
+    return [ordered]@{path=$fullName;identity=$identity;directory=$directory}
   } catch {
     $pinFailure=$_
     try { if('OwnedWslPrepareFailure' -as [type]){[OwnedWslPrepareFailure]::Attach($pinFailure.Exception,$Path,$ancestorPath,$directory,$leafAttributes,$ancestorAttributes)} } catch { }
@@ -140,6 +159,18 @@ function Get-PhysicalPin([string]$Path) {
 function Assert-PhysicalPin($Pin) {
   $now = Get-PhysicalPin $Pin.path
   if ($now.identity -cne $Pin.identity -or $now.directory -ne $Pin.directory) { Refuse-OwnedWsl }
+}
+function Get-TrustedWslLauncher([string]$Path) {
+  if($Path -ine (Get-WslSystemLauncherPath)){Refuse-OwnedWsl}
+  $pin=Get-PhysicalPinForRole $Path 'system-launcher'
+  $certificate=Get-AuthenticodeSignature -LiteralPath $Path
+  if($certificate.Status -ne 'Valid' -or $certificate.SignerCertificate.Subject -notmatch 'Microsoft'){Refuse-OwnedWsl}
+  $hash=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+  return [ordered]@{pin=$pin;sha256=$hash}
+}
+function Assert-TrustedWslLauncher($Launcher) {
+  $now=Get-TrustedWslLauncher $Launcher.pin.path
+  if($now.pin.identity -cne $Launcher.pin.identity -or $now.pin.directory -ne $Launcher.pin.directory -or $now.sha256 -cne $Launcher.sha256){Refuse-OwnedWsl}
 }
 function Set-OwnerAcl([string]$Path) {
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -205,10 +236,9 @@ function Read-FixtureManifest {
   Assert-FixtureRuntime;Assert-OwnerAcl $OwnerManifest
   $m=Get-Content -LiteralPath $OwnerManifest -Raw|ConvertFrom-Json -AsHashtable
   if($m.schema -ne 1 -or $m.sourceSha -cne $SourceSha -or $m.name -cnotmatch '^BibCodeQA-[a-f0-9]{32}$' -or $m.imageSha256 -cne $RootfsHash -or $m.before.distros.Count -ne 0 -or $null -ne $m.before.defaultGuid -or $m.appState -notin @('none','attempted','joined')) { Refuse-OwnedWsl }
-  Assert-PhysicalPin $m.root;Assert-OwnerAcl $m.root.path;Assert-PhysicalPin $m.manifestPin;Assert-PhysicalPin $m.wsl.pin;Assert-PhysicalPin $m.imagePin;Assert-PhysicalPin $m.gpg.pin;Assert-PhysicalPin $m.checkout
+  Assert-PhysicalPin $m.root;Assert-OwnerAcl $m.root.path;Assert-PhysicalPin $m.manifestPin;Assert-TrustedWslLauncher $m.wsl;Assert-PhysicalPin $m.imagePin;Assert-PhysicalPin $m.gpg.pin;Assert-PhysicalPin $m.checkout
   if(Test-Path -LiteralPath $m.importRoot.path) {Assert-PhysicalPin $m.importRoot} elseif($m.phase -ne 'unregistered') {Refuse-OwnedWsl}
   if((Get-FileHash -LiteralPath $m.imagePin.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $RootfsHash -or (Get-FileHash -LiteralPath $m.gpg.pin.path -Algorithm SHA256).Hash -cne $m.gpg.sha256) {Refuse-OwnedWsl}
-  if((Get-FileHash -LiteralPath $m.wsl.pin.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $m.wsl.sha256) { Refuse-OwnedWsl }
   return $m
 }
 function Assert-OwnedRegistration($Manifest,[bool]$AllowAbsent=$false) {
@@ -227,7 +257,7 @@ function Prepare-Fixture {
   $root=[IO.Path]::GetDirectoryName($OwnerManifest)
   if(Test-Path -LiteralPath $root) { Refuse-OwnedWsl };[IO.Directory]::CreateDirectory($root)|Out-Null;Set-OwnerAcl $root
   $script:OwnedWslPrepareStage='launcher-admission'
-  $wsl=Join-Path $env:SystemRoot 'System32/wsl.exe';$certificate=Get-AuthenticodeSignature -LiteralPath $wsl
+  $wsl=Get-WslSystemLauncherPath;$certificate=Get-AuthenticodeSignature -LiteralPath $wsl
   if($certificate.Status -ne 'Valid' -or $certificate.SignerCertificate.Subject -notmatch 'Microsoft') { Refuse-OwnedWsl }
   $script:OwnedWslPrepareStage='empty-inventory'
   $before=Get-FixtureInventory
@@ -284,10 +314,7 @@ function Prepare-Fixture {
     schema=1;sourceSha=$SourceSha;name='BibCodeQA-'+[guid]::NewGuid().ToString('N')
     root=Get-PhysicalPin $root
     importRoot=Get-PhysicalPin $import
-    wsl=@{
-      pin=Get-PhysicalPin $wsl
-      sha256=(Get-FileHash -LiteralPath $wsl -Algorithm SHA256).Hash.ToLowerInvariant()
-    }
+    wsl=Get-TrustedWslLauncher $wsl
     before=$before;imageSha256=$RootfsHash
     imagePin=Get-PhysicalPin $image
     gpg=@{pin=$gpgPin;sha256=$gpgHash}

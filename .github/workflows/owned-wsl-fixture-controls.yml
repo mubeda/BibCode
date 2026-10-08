@@ -1,0 +1,28 @@
+name: Owned WSL fixture caller controls
+
+on:
+  push:
+    branches: [codex/qualify-release-visuals]
+    paths:
+      - scripts/owned-wsl2-fixture.ps1
+      - scripts/owned-wsl2-fixture.Tests.ps1
+      - .github/workflows/owned-wsl-fixture-controls.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  caller_controls:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Execute actual owned fixture caller controls
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0 -ErrorAction Stop
+          $tests = Invoke-Pester -Path ./scripts/owned-wsl2-fixture.Tests.ps1 -PassThru
+          if ($tests.FailedCount -ne 0 -or $tests.PassedCount -eq 0) {
+            throw 'Owned WSL fixture caller controls failed.'
+          }

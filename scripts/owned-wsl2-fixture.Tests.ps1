@@ -310,6 +310,8 @@ function Set-OwnerAcl { Test-StageFault;if($env:BIBCODE_INERT_SIGNED_FAILURE -ce
 function Get-AuthenticodeSignature { Test-StageFault;@{Status='Valid';SignerCertificate=@{Subject='Microsoft'}} }
 function Get-FixtureInventory { Test-StageFault;@{distros=@();defaultGuid=$null} }
 function Get-PhysicalPin([string]$Path) { Test-StageFault;@{path=$Path;identity='inert-file-id';directory=$true} }
+function Get-WslSystemLauncherPath { Test-StageFault;[IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::System),'wsl.exe') }
+function Get-TrustedWslLauncher([string]$Path) { Test-StageFault;@{pin=@{path=$Path;identity='inert-launcher-id';directory=$false};sha256=$RootfsHash} }
 function Assert-PhysicalPin { Test-StageFault }
 function Get-FileHash([string]$LiteralPath) { Test-StageFault;@{Hash=if($LiteralPath.EndsWith('gpg.exe')){'INERTGPG'}else{$RootfsHash.ToUpperInvariant()}} }
 function Invoke-WebRequest([switch]$PassThru) { Test-StageFault;if($PassThru){@{StatusCode=200}} }
@@ -319,6 +321,7 @@ function Save-FixtureManifest { Test-StageFault }
 function Assert-OwnedRegistration { Test-StageFault;@{guid='inert-guid'} }
 function Invoke-FixtureCommand([string]$Exe,[string[]]$Arguments) {
  Test-StageFault
+ if(('--status' -in $Arguments -or '--list' -in $Arguments) -and $Exe -cne (Get-WslSystemLauncherPath)){throw 'Inert early launcher selection refused.'}
  if($script:OwnedWslPrepareStage -ceq 'signed-metadata'){$script:OwnedWslSignedMetadata.commandExit=0;if($env:BIBCODE_INERT_SIGNED_FAILURE -ceq 'gpg-exit'){$script:OwnedWslSignedMetadata.commandExit=2;throw 'Inert GPG refusal.'}}
  if($env:BIBCODE_INERT_SIGNED_FAILURE -ceq 'fingerprint' -and '--fingerprint' -in $Arguments){return 'fpr:::::::::INERT-WRONG:'}
  if('--fingerprint' -in $Arguments){return 'fpr:::::::::'+$SigningFingerprint+':'}
@@ -391,6 +394,17 @@ function Set-Acl {}
   ) { param($Stage) Invoke-ActualPrepareRecorder $Stage '' }
   It 'retains already-computed signed failure outcome <Case>' -TestCases @(@{Case='acl'},@{Case='oversize'},@{Case='gpg-exit'},@{Case='fingerprint'}) {param($Case) Invoke-ActualPrepareRecorder '' '' -SignedCase $Case}
   It 'keeps the original actual Prepare success receipt and availability' { Invoke-ActualPrepareRecorder '' '' -ExpectSuccess }
+  It 'runs actual Prepare with altered SystemRoot without invoking its signed-looking alternate' {
+    $saved=$env:SystemRoot
+    try {
+      $alternate=Join-Path $TestDrive 'alternate-system-root'
+      [IO.Directory]::CreateDirectory((Join-Path $alternate 'System32'))|Out-Null
+      [IO.File]::WriteAllText((Join-Path $alternate 'System32/wsl.exe'),'inert alternate launcher')
+      $env:SystemRoot=$alternate
+      Invoke-ActualPrepareRecorder '' '' -ExpectSuccess
+    } finally {$env:SystemRoot=$saved}
+  }
+
   It 'rejects malformed failed receipt before stage publication: <Receipt>' -TestCases @(
     @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":["key"],"operation":null,"httpStatus":null,"commandExit":null,"sizeMatched":null,"fingerprintCount":null,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null}}'},
     @{Receipt='{"completed":false,"prepareStage":"signed-metadata","signedMetadata":{"item":"KEY","operation":null,"httpStatus":null,"commandExit":null,"sizeMatched":null,"fingerprintCount":null,"fingerprintMatched":null,"signatureCount":null,"signerMatched":null,"checksumCount":null,"checksumMatched":null}}'},
@@ -876,5 +890,81 @@ public sealed class OwnedPrepareUnsafeException : Exception {
     $value.nativeWin32Error|Should -BeGreaterThan 0
     $value.nativeLinkCount|Should -BeNullOrEmpty
     $value.exceptionChain[-1].message|Should -BeExactly 'Owned physical identity refused.'
+  }
+}
+
+Describe 'Trusted system launcher role and unchanged owned-file policy (Windows CI)' {
+  BeforeAll { Initialize-PhysicalReader }
+  It 'keeps native one-link owned files valid and rejects a two-link owned file' {
+    $file=Join-Path $TestDrive 'owned-native.bin';$alias=Join-Path $TestDrive 'owned-native-alias.bin'
+    [IO.File]::WriteAllText($file,'inert owned data')
+    $one=[OwnedWslPhysical]::Read($file,$false)
+    ([bool]($one -cmatch '^[A-F0-9]{8}:[A-F0-9]{16}$'))|Should -BeTrue
+    New-Item -ItemType HardLink -Path $alias -Target $file -ErrorAction Stop|Out-Null
+    { [OwnedWslPhysical]::Read($file,$false) }|Should -Throw
+    { [OwnedWslPhysical]::ReadSystemLauncher($file) }|Should -Throw
+  }
+  It 'uses the actual managed system launcher even when SystemRoot points elsewhere' {
+    $saved=$env:SystemRoot
+    try {
+      $env:SystemRoot=Join-Path $TestDrive 'alternate-root'
+      $expected=[IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::System),'wsl.exe')
+      $actual=Get-WslSystemLauncherPath
+      ($actual -ceq $expected)|Should -BeTrue
+      $launcher=Get-TrustedWslLauncher $actual
+      $launcher.pin.directory|Should -BeFalse
+      ([bool]($launcher.pin.identity -cmatch '^[A-F0-9]{8}:[A-F0-9]{16}$'))|Should -BeTrue
+      Assert-TrustedWslLauncher $launcher
+    } finally {$env:SystemRoot=$saved}
+  }
+  It 'refuses a saved alternate path before physical read or signature checks' {
+    Mock Get-PhysicalPinForRole {throw 'Unreachable physical read.'}
+    Mock Get-AuthenticodeSignature {throw 'Unreachable signature.'}
+    {Assert-TrustedWslLauncher @{pin=@{path=(Join-Path $TestDrive 'wsl.exe');identity='inert';directory=$false};sha256=('a'*64)}}|Should -Throw
+    Should -Invoke Get-PhysicalPinForRole -Times 0 -Exactly
+    Should -Invoke Get-AuthenticodeSignature -Times 0 -Exactly
+  }
+  It 'repeats trusted launcher identity/hash/signature admission and refuses <Fault>' -TestCases @(
+    @{Fault='identity'},@{Fault='directory'},@{Fault='hash'},@{Fault='signature'},@{Fault='signer'}
+  ) {param($Fault)
+    $script:launcherFault=$Fault
+    $path=Get-WslSystemLauncherPath
+    Mock Get-PhysicalPinForRole {param($Path,$Role);if($Role -cne 'system-launcher'){throw 'Wrong role.'};@{path=$Path;identity=if($script:launcherFault -ceq 'identity'){'changed'}else{'inert-file-id'};directory=$script:launcherFault -ceq 'directory'}}
+    Mock Get-AuthenticodeSignature {@{Status=if($script:launcherFault -ceq 'signature'){'NotSigned'}else{'Valid'};SignerCertificate=@{Subject=if($script:launcherFault -ceq 'signer'){'Other publisher'}else{'Microsoft'}}}}
+    Mock Get-FileHash {@{Hash=if($script:launcherFault -ceq 'hash'){'B'*64}else{'A'*64}}}
+    {Assert-TrustedWslLauncher @{pin=@{path=$path;identity='inert-file-id';directory=$false};sha256=('a'*64)}}|Should -Throw
+  }
+  It 'refuses canonical or reparse mismatch before the native reader for <Actor>' -TestCases @(@{Actor='leaf'},@{Actor='ancestor'},@{Actor='canonical'}) {
+    param($Actor)
+    $script:launcherReparseActor=$Actor;$script:launcherReparsePath=Get-WslSystemLauncherPath
+    Mock Get-Item {param($LiteralPath);[pscustomobject]@{Attributes=if($script:launcherReparseActor -ceq 'leaf'){[IO.FileAttributes]::ReparsePoint}else{[IO.FileAttributes]::Normal};FullName=if($script:launcherReparseActor -ceq 'canonical'){Join-Path $TestDrive 'other-canonical-leaf'}else{$script:launcherReparsePath};PSIsContainer=$false;Directory=[pscustomobject]@{Attributes=if($script:launcherReparseActor -ceq 'ancestor'){[IO.FileAttributes]::ReparsePoint}else{[IO.FileAttributes]::Directory};Parent=$null}}}
+    {Get-TrustedWslLauncher $script:launcherReparsePath}|Should -Throw
+  }
+}
+Describe 'Actual manifest reader and lifecycle trusted launcher consumer (Windows CI)' {
+  BeforeEach {
+    $script:launcherReaderRefused=$false;$script:launcherReaderCalls=0;$script:launcherCommandCalls=0
+    $script:launcherManifest=@{schema=1;sourceSha=$SourceSha;name='BibCodeQA-0123456789abcdef0123456789abcdef';imageSha256=$RootfsHash;before=@{distros=@();defaultGuid=$null};appState='joined';root=@{path='inert-root'};manifestPin=@{};wsl=@{pin=@{path='inert-system-wsl';identity='inert';directory=$false};sha256='inert'};imagePin=@{path='inert-image'};gpg=@{pin=@{path='inert-gpg'};sha256='INERTGPG'};checkout=@{};importRoot=@{path='inert-import'};phase='kernel-verified';kernelVerified=$true;backend=$null}
+    Mock Assert-FixtureRuntime {};Mock Assert-OwnerAcl {};Mock Assert-PhysicalPin {};Mock Test-Path {$true}
+    Mock Get-Content {$script:launcherManifest|ConvertTo-Json -Depth 16 -Compress}
+    Mock Get-FileHash {param($LiteralPath);@{Hash=if($LiteralPath -ceq 'inert-gpg'){'INERTGPG'}else{$RootfsHash}}}
+    Mock Assert-TrustedWslLauncher {$script:launcherReaderCalls++;if($script:launcherReaderRefused){throw 'Inert trusted launcher refused.'}}
+    Mock Assert-OwnedRegistration {@{guid='inert-guid'}};Mock Get-FixtureInventory {@{distros=@();defaultGuid=$null}}
+    Mock Save-FixtureManifest {};Mock Get-ChildItem {@()};Mock Remove-Item {}
+    Mock Invoke-FixtureCommand {$script:launcherCommandCalls++;'inert'}
+  }
+  It 'routes actual <Action> through the trusted reader and refuses before commands' -TestCases @(
+    @{Action='Build'},@{Action='Verify'},@{Action='VerifyOwner'},@{Action='AppAttempted'},@{Action='AppJoined'},@{Action='Terminate'},@{Action='Unregister'},@{Action='Restored'},@{Action='Delete'}
+  ) {param($Action)
+    $script:launcherReaderRefused=$true
+    {Invoke-OwnedFixtureAction $Action}|Should -Throw
+    $script:launcherReaderCalls|Should -Be 1
+    $script:launcherCommandCalls|Should -Be 0
+  }
+  It 'runs actual manifest reader with the unchanged wsl shape and generic other pins' {
+    $value=Read-FixtureManifest
+    ((@($value.wsl.Keys|Sort-Object) -join ',') -ceq 'pin,sha256')|Should -BeTrue
+    $script:launcherReaderCalls|Should -Be 1
+    Should -Invoke Assert-PhysicalPin -Times 6 -Exactly
   }
 }

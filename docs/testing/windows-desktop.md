@@ -828,6 +828,25 @@ roots. Join exact owned processes and source/store/window identities before
 retention; no generic process-name cleanup is admitted. This partition does not
 qualify native Preview annotations or the full six-target release matrix.
 
+### Owned files and the trusted system WSL launcher
+
+The owned WSL fixture has two explicit pin roles. Generic owned non-directory
+files retain the single-link guard. The system launcher is derived from the
+maintained managed Windows System folder before the early signature/status/list
+calls, independently of `SystemRoot` or a saved manifest path. Its named boundary
+requires that exact location, a non-directory canonical leaf, no leaf/ancestor
+reparse, a positive native link count, stable physical identity and SHA256, and
+the existing Valid Microsoft Authenticode gate. The manifest retains the same
+`wsl` pin/hash shape; no binary is copied and no replacement is re-pinned.
+
+Every later fixture action enters through the manifest reader and repeats all
+launcher path/type/reparse/identity/hash/signature checks. A servicing or identity
+change refuses the lifecycle action; other owned-file/image/GPG/ACL/source and
+cleanup guards remain unchanged. Pester must execute actual Prepare and manifest
+consumers with inert faults and the native reader on owned one-/two-link files;
+Node source compatibility checks cannot establish PowerShell or native identity
+acceptance. Real launcher and kernel/lifecycle validation remains Windows CI.
+
 ### Optional encrypted original Prepare refusal
 
 An approved manual Windows-only native follow-up dispatch may additionally set
@@ -947,6 +966,12 @@ for setup failures and refuses an app that has not joined.
 
 Run the declared helper and Pester controls before the native job. Local source,
 TempFS or fake-command tests do not prove WSL, Windows ACLs or native originals.
+`owned-wsl-fixture-controls.yml` runs the actual Pester caller controls on Windows
+before packaging. It starts for fixture changes on the reviewed QA branch and
+can also be dispatched manually. Require its green result at the exact candidate
+commit before the expensive WSL partition; a source-only compatibility pass does
+not satisfy that caller gate. This controls-only lane does not import a distro,
+launch the product, build an installer or accept native screenshots.
 For a changed Windows recipe, dispatch `desktop-upgrade-smoke.yml` from its
 reviewed QA ref with both `native_followups=true` and `native_windows_only=true`.
 This selects the existing Windows partition without repeating Linux. The

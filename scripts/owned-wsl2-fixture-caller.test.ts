@@ -577,8 +577,8 @@ it("attributes named intent statements separately without extra filesystem reads
     "Set-OwnerAcl $import",
     "root=Get-PhysicalPin $root",
     "importRoot=Get-PhysicalPin $import",
-    "pin=Get-PhysicalPin $wsl",
-    "sha256=(Get-FileHash -LiteralPath $wsl",
+    "wsl=Get-TrustedWslLauncher $wsl",
+    "$hash=(Get-FileHash -LiteralPath $Path",
     "imagePin=Get-PhysicalPin $image",
     "checkout=Get-PhysicalPin $env:GITHUB_WORKSPACE",
     "$m.manifestPin=Get-PhysicalPin $OwnerManifest",
@@ -608,6 +608,78 @@ it("attributes named intent statements separately without extra filesystem reads
     owner.indexOf("public sealed class OwnedWslPrepareFailure"),
   );
   expect(native.match(/GetLastWin32Error\(\)/g)).toHaveLength(2);
-  expect(native).toContain("if(!directory&&i.Links!=1)");
+  expect(native).toContain("role==PinRole.OwnedObject&&!directory&&i.Links!=1");
   expect(native).not.toMatch(/GetFileAttributes|GetFinalPathName|GetVolume/);
+});
+
+it("executes source native role predicates while keeping owned-file single-link admission", () => {
+  const source = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+  const conditions = [
+    ...source.matchAll(
+      /if\((role==PinRole\.[^\n]+)\)throw OwnedWslPrepareFailure.Native\("SingleLinkPolicy"/g,
+    ),
+  ].map((match) => {
+    const condition = match[1];
+    if (condition === undefined) throw new Error("Native role predicate capture missing.");
+    return condition;
+  });
+  expect(conditions).toHaveLength(2);
+  const refuse = (
+    role: "OwnedObject" | "SystemLauncher",
+    directory: boolean,
+    links: number,
+    attributes: number,
+  ) =>
+    conditions.some((condition) =>
+      NodeVM.runInNewContext(
+        condition
+          .replace(/PinRole\.(OwnedObject|SystemLauncher)/g, '"$1"')
+          .replace(/0x10u/g, "0x10"),
+        { role, directory, i: { Links: links, Attributes: attributes } },
+      ),
+    );
+  expect(refuse("OwnedObject", false, 1, 0)).toBe(false);
+  expect(refuse("OwnedObject", false, 2, 0)).toBe(true);
+  expect(refuse("OwnedObject", false, 0, 0)).toBe(true);
+  expect(refuse("OwnedObject", true, 2, 16)).toBe(false);
+  expect(refuse("SystemLauncher", false, 2, 0)).toBe(false);
+  expect(refuse("SystemLauncher", false, 0, 0)).toBe(true);
+  expect(refuse("SystemLauncher", false, 2, 16)).toBe(true);
+  // Predicate compatibility only: no PowerShell/.NET/native filesystem execution.
+});
+it("keeps system launcher routing fixed and separate from generic owned pin consumers", () => {
+  const source = NodeFS.readFileSync(new URL("./owned-wsl2-fixture.ps1", import.meta.url), "utf8");
+  const prepare = source.slice(
+    source.indexOf("function Prepare-Fixture {"),
+    source.indexOf("function Invoke-OwnedFixtureAction("),
+  );
+  expect(prepare).toContain(
+    "$wsl=Get-WslSystemLauncherPath;$certificate=Get-AuthenticodeSignature -LiteralPath $wsl",
+  );
+  expect(prepare).not.toContain("$env:SystemRoot");
+  expect(prepare).toContain("wsl=Get-TrustedWslLauncher $wsl");
+  for (const path of ["$root", "$import", "$image", "$env:GITHUB_WORKSPACE"])
+    expect(prepare).toContain("Get-PhysicalPin " + path);
+  const reader = source.slice(
+    source.indexOf("function Read-FixtureManifest {"),
+    source.indexOf("function Assert-OwnedRegistration("),
+  );
+  expect(reader).toContain("Assert-TrustedWslLauncher $m.wsl");
+  expect(reader).not.toContain("Assert-PhysicalPin $m.wsl.pin");
+  const trusted = source.slice(
+    source.indexOf("function Get-TrustedWslLauncher("),
+    source.indexOf("function Set-OwnerAcl("),
+  );
+  expect(trusted).toContain("$Path -ine (Get-WslSystemLauncherPath)");
+  expect(trusted).toContain("Get-PhysicalPinForRole $Path 'system-launcher'");
+  expect(trusted).toContain("Get-AuthenticodeSignature -LiteralPath $Path");
+  expect(trusted).toContain("$certificate.Status -ne 'Valid'");
+  expect(trusted).toContain("Subject -notmatch 'Microsoft'");
+  expect(trusted).toContain("$now.pin.identity -cne $Launcher.pin.identity");
+  expect(trusted).toContain("$now.pin.directory -ne $Launcher.pin.directory");
+  expect(trusted).toContain("$now.sha256 -cne $Launcher.sha256");
+  expect(source).toContain("ReadIdentity(path,directory,PinRole.OwnedObject)");
+  expect(source).toContain("ReadIdentity(path,false,PinRole.SystemLauncher)");
+  expect(source).toContain("Environment.GetFolderPath(Environment.SpecialFolder.System)");
+  // Static compatibility; actual complete Prepare/manifest/lifecycle tests are Pester CI-only.
 });
