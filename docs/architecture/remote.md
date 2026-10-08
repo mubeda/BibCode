@@ -1098,8 +1098,14 @@ in `apps/server/src/preview/gateway/`.
     name or address, which is a reverse proxy or Tailscale Serve: "Previews
     aren't available through a proxied address." Their listeners would be
     unreachable. SSH tunnels and WSL arrive with a loopback `Host` and are
-    allowed. A machine name that resolves to loopback (`127.0.1.1` on Debian)
-    is refused the same way.
+    allowed. Loopback names are `localhost`, `*.localhost`, and loopback or
+    unspecified IP literals; names are never resolved, so a machine name that
+    resolves to loopback (`127.0.1.1` on Debian) is refused the same way.
+
+  When the connection's local address is unknown, the listener binds the
+  configured host only if it is `localhost` or a private address; otherwise
+  the call returns `unavailable`.
+
 - **Per-target listeners.** Each `(thread, upstream address and port, bound
 address)` gets its own listener on an ephemeral port, so two clients that
   reached the server on different addresses each get a listener they can
@@ -1146,9 +1152,10 @@ address)` gets its own listener on an ephemeral port, so two clients that
   `retry-after: 1`. When nothing listens, it returns `502` with "Nothing is
   listening on port <port> on <environment>."
 - **Teardown.** A target closes in four cases:
-  - The last preview tab of its thread on its port closes or navigates away.
-    The gateway follows `PreviewManager` events; after missed events it
-    re-checks every thread that has a target.
+  - Every preview tab of its thread that has shown its port has closed. A
+    tab that navigated away keeps it, so Back to its gateway origin still
+    loads. The gateway follows `PreviewManager` events; after
+    missed events it re-checks every thread that has a target.
   - It has had no connections for 10 minutes. The sweep runs every 60 s, and
     minting a capability counts as activity.
   - Its thread is deleted, which also closes the thread's preview tabs.
@@ -1180,9 +1187,12 @@ address)` gets its own listener on an ephemeral port, so two clients that
   holds for every client (`https-unsupported`, `not-admitted`, `no-upstream`)
   becomes the shared tab's `LoadFailed`. A failure of the client's own reach
   (SSH forward, missing bridge or profile, transport, `unavailable`,
-  `not-reachable` for the address it connected through, or a native load
-  failure on its gateway origin) stays a client-local failed state that
-  the tab and automation `status` report.
+  `not-reachable` for the address it connected through, or any other failure
+  resolving or forwarding the address) stays a client-local failed state that
+  the tab and automation `status` report. On such a failure, Reload resolves
+  the tab's URL again whatever its target kind. The desktop reports no native
+  load failures today, so after a page has loaded, a dropped forward shows the
+  webview's own error page instead of that state; Reload recovers.
 
 ### Open requests and automation hosts
 
@@ -1214,8 +1224,11 @@ itself. It announces the request, and exactly one client claims it.
   - Every other client waits 2 s and checks again. A hidden client then
     claims only a thread it shows, since nobody would see its prompt. A
     visible client claims anyway. If it doesn't show the thread, it shows a
-    prompt naming the thread ("A command in <thread title> wants to open …").
-    **Open** routes to that thread and then opens the URL.
+    prompt naming the thread ("A command in “<thread title>” wants to open
+    …"). **Show thread and open** routes to that thread and then opens the
+    URL. Whether the client shows the thread is checked again when the claim
+    returns, so a user who left or reached the thread meanwhile gets the
+    prompt or the direct open accordingly.
   - On desktop, a claim for a thread on screen opens like a clicked link: in
     the BiBCode browser for the routed thread, or in the system browser when
     the thread is only a panel and links open in the BiBCode browser. In

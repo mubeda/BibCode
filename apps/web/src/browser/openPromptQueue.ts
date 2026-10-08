@@ -15,7 +15,10 @@ export interface OpenPrompt {
   readonly environmentLabel: string;
   /** The browser blocked the new tab the last attempt opened. */
   readonly blocked: boolean;
-  /** Set when the asking thread isn't on screen; Open shows that thread first. */
+  /**
+   * How the prompt names the asking thread (its quoted title), set when that
+   * thread isn't on screen; Open shows that thread first.
+   */
   readonly threadTitle?: string;
 }
 

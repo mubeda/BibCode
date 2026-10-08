@@ -177,14 +177,14 @@ describe("OpenPromptBanner", () => {
         source: "command",
         url: "http://localhost:5173/",
         threadRef,
-        threadTitle: "Fix login",
+        threadTitle: "“Fix login”",
       }),
     );
     expect(container.textContent).toContain(
-      "A command in Fix login wants to open http://localhost:5173/ on Build box",
+      "A command in “Fix login” wants to open http://localhost:5173/ on Build box",
     );
 
-    await act(async () => button("Open").click());
+    await act(async () => button("Show thread and open").click());
     expect(order).toEqual(["navigate", "open"]);
     expect(h.navigate).toHaveBeenCalledWith({
       to: "/$environmentId/$threadId",

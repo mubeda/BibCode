@@ -980,16 +980,20 @@ link**:
 | The gateway or SSH forward failed, or this client's session expired | "Couldn't open a preview connection to <environment>. Try again, or reconnect <environment> if it keeps failing."     |
 | A terminal with no thread                                           | "Open this address from a thread's chat or terminal to reach it from here."                                           |
 
-When a BiBCode browser tab's address can't load, the tab shows "This site
-can't be reached" with the reason in place of the page, and **Reload** opens
-the address through the gateway again. A refusal about the address itself
-(HTTPS, nothing listening, a refused address) shows the same on every client.
-A failure on this computer's side (its SSH forward, its BiBCode session, the
-address it reached the server on, or its network route to the gateway) shows
-on this computer only, because another client may load the page fine. For
-BiBCode's own reasons the page shows the sentence alone, without network error
-codes or connection tips. An agent asking for the tab's status, or opening a
-new tab, gets the same reason as an error.
+When a BiBCode browser tab's address can't load, the tab shows the reason in
+place of the page, and **Reload** resolves the address again and reopens it.
+For BiBCode's own reasons (the messages above) the page reads "Can't show this
+page here" and shows the sentence alone, without network error codes or
+connection tips. A network error reads "This site can't be reached".
+
+A refusal about the address itself (HTTPS, nothing listening, an address the
+server won't preview) shows the same on every client. A failure on this
+computer's side shows on this computer only, because another client may load
+the page fine: its SSH forward, its BiBCode session, the public or proxied
+address it reached the server on, or a failure resolving or forwarding the
+address. After a page has loaded, a dropped forward shows the webview's own
+error page instead; **Reload** recovers. An agent asking for the tab's status,
+or opening a new tab, gets the same reason as an error.
 
 Gateway traffic is plain HTTP on the server's address, outside BiBCode's
 encrypted transport, so previews need a direct private route to the server: a
@@ -1006,13 +1010,14 @@ tab, a bar at the top of the window asks again:
 
 - "Agent wants to open <address>": the agent's `preview_open`.
 - "A command wants to open <address>": a `$BROWSER` request (below).
-- "A command in <thread title> wants to open <address>": a `$BROWSER` request
-  from a thread that isn't on screen, on desktop too.
+- "A command in “<thread title>” wants to open <address>": a `$BROWSER`
+  request from a thread that isn't on screen, on desktop too. Its button reads
+  **Show thread and open**.
 - "Your browser blocked a new tab for <address>": a click whose tab was
   blocked, followed by "Allow pop-ups for this site to open links directly."
 
-**Open** opens the address from your click, first showing the thread when the
-bar names one; **Copy link** copies the address and keeps the request;
+**Open** opens the address from your click (**Show thread and open** first
+shows the thread the bar names); **Copy link** copies the address and keeps the request;
 **Dismiss** drops the request. The bar shows one request at a time, with
 "(N more waiting)" when more are queued, and keeps a request whose open failed
 so you can try again. The gateway pages a preview tab can show:
@@ -1039,7 +1044,7 @@ either variable, such as the brainstorming companion, ask BiBCode instead of
 opening a browser on the server's machine. One BiBCode client takes the
 request. A visible client showing that thread takes it at once. Otherwise,
 after 2 seconds, a visible client takes it and asks with the "A command in
-<thread title> wants to open" bar; a client whose window is hidden takes it
+“<thread title>” wants to open" bar; a client whose window is hidden takes it
 only while showing the thread. On desktop, a request from a thread on screen
 opens like a clicked link, in the system browser when the thread is only shown
 in a side panel. In a browser tab it always waits for **Open** on the bar. A

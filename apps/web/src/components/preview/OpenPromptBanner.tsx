@@ -83,7 +83,7 @@ export function OpenPromptBanner(props: { readonly router: Pick<AppRouter, "navi
           else if (outcome === "app" || outcome === "system") removeOpenPrompt(prompt.id);
         }}
       >
-        Open
+        {prompt.threadTitle === undefined ? "Open" : "Show thread and open"}
       </Button>
       <Button size="xs" variant="outline" onClick={() => copyLink(prompt.url)}>
         Copy link

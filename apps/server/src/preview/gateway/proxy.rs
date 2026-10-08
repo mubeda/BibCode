@@ -303,6 +303,9 @@ async fn accept_loop(listener: TcpListener, state: Arc<Listener>) {
         }
     }
     drop(listener);
+    // Draining requests still need their sessions; they end once the drain wait or its
+    // deadline does (or at once, when only this target closes).
+    state.shutdown.cancelled().await;
     state.ctx.sessions.remove_for_port(state.gateway_port);
 }
 

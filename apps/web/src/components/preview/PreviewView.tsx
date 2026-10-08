@@ -123,9 +123,8 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   const canGoForward = desktopOverlay?.canGoForward ?? snapshot?.canGoForward ?? false;
   const refreshDisabled = navStatus._tag === "Idle";
   // This client's own failure wins: the shared tab may be fine for others.
-  const failure =
-    (tabId ? previewState.localFailures[tabId] : undefined) ??
-    (navStatus._tag === "LoadFailed" ? navStatus : null);
+  const localFailure = tabId ? previewState.localFailures[tabId] : undefined;
+  const failure = localFailure ?? (navStatus._tag === "LoadFailed" ? navStatus : null);
   const isUnreachable = failure !== null;
   const showEmptyState = shouldShowPreviewEmptyState(snapshot);
   const controller = desktopOverlay?.controller ?? "none";
@@ -240,8 +239,14 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   const handleRefresh = useCallback(() => {
     if (!previewBridge || !tabId) return;
     // A gateway capability is single use, so reloading a gateway tab
-    // re-bootstraps it (and re-establishes any SSH forward).
-    if (!url || resolvePreviewTarget(threadRef.environmentId, url).kind !== "gateway") {
+    // re-bootstraps it (and re-establishes any SSH forward). A tab this
+    // client failed resolves its failed URL again whatever the target: the
+    // native view may still hold the previous page, or nothing at all.
+    const reloadUrl = localFailure?.url ?? url;
+    if (
+      !reloadUrl ||
+      (!localFailure && resolvePreviewTarget(threadRef.environmentId, reloadUrl).kind !== "gateway")
+    ) {
       void previewBridge.refresh(tabId);
       return;
     }
@@ -251,7 +256,7 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
     void resolveForNavigation({
       environmentId: threadRef.environmentId,
       threadId: threadRef.threadId,
-      canonicalUrl: url,
+      canonicalUrl: reloadUrl,
       gatewayOpen,
       tabId,
     })
@@ -262,13 +267,13 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
         return failPreviewTabNavigation({
           threadRef,
           tabId,
-          url,
+          url: reloadUrl,
           failure: target,
           reportStatus,
         });
       })
       .catch(() => undefined);
-  }, [gatewayOpen, reportStatus, tabId, threadRef, url]);
+  }, [gatewayOpen, localFailure, reportStatus, tabId, threadRef, url]);
 
   const handleZoomIn = useCallback(() => {
     if (previewBridge && tabId) void previewBridge.zoomIn(tabId);

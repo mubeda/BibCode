@@ -171,7 +171,7 @@ describe("OpenRequestRouter", () => {
         source: "command",
         url: "http://localhost:5173/",
         threadRef,
-        threadTitle: "Fix login",
+        threadTitle: "“Fix login”",
       });
     } finally {
       vi.useRealTimers();
@@ -247,9 +247,10 @@ describe("OpenRequestRouter", () => {
     expect(h.openLink).toHaveBeenCalledWith(expect.objectContaining({ threadRef, invert: true }));
   });
 
-  it("uses the system browser when the user leaves the thread during the claim", async () => {
+  it("asks instead of opening when the user leaves the thread during the claim", async () => {
     let finish!: (value: unknown) => void;
     h.claim.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+    h.threadTitles = { "thread-1": "Fix login" };
     const registry = fakeRegistry();
     const router = { state: { matches: [{ params: { environmentId, threadId: "thread-1" } }] } };
     await mount(registry, router as never);
@@ -258,7 +259,33 @@ describe("OpenRequestRouter", () => {
     router.state.matches = [{ params: { environmentId, threadId: "thread-2" } }];
     await act(async () => finish(AsyncResult.success({ claimed: true })));
 
-    expect(h.openLink).toHaveBeenCalledWith(expect.objectContaining({ threadRef, invert: true }));
+    expect(h.openLink).not.toHaveBeenCalled();
+    expect(h.enqueueOpenPrompt).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "req-1", threadRef, threadTitle: "“Fix login”" }),
+    );
+  });
+
+  it("opens without asking when the user arrives at the thread during the claim", async () => {
+    vi.useFakeTimers();
+    try {
+      let finish!: (value: unknown) => void;
+      h.claim.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+      const registry = fakeRegistry();
+      const router = { state: { matches: [{ params: { environmentId, threadId: "thread-2" } }] } };
+      await mount(registry, router as never);
+
+      await act(async () => registry.emit(`events:${environmentId}`, openRequested("thread-1")));
+      await act(async () => vi.advanceTimersByTime(2_000));
+      router.state.matches = [{ params: { environmentId, threadId: "thread-1" } }];
+      await act(async () => finish(AsyncResult.success({ claimed: true })));
+
+      expect(h.enqueueOpenPrompt).not.toHaveBeenCalled();
+      expect(h.openLink).toHaveBeenCalledWith(
+        expect.objectContaining({ threadRef, invert: false }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("asks before opening in browser mode, where no click backs a new tab", async () => {

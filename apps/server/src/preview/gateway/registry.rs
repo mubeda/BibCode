@@ -2,8 +2,8 @@
 //!
 //! A target is one gateway listener for one `(thread, upstream port)`. Opening is idempotent:
 //! a second open reuses the running listener and mints a fresh capability. Targets close
-//! when the last preview tab of the thread on that port closes, after 10 minutes with no
-//! connections, when the thread is deleted, or on server shutdown.
+//! when every preview tab of the thread that has shown that port has closed, after 10
+//! minutes with no connections, when the thread is deleted, or on server shutdown.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -86,14 +86,26 @@ pub struct ClientReach {
 }
 
 /// The address a gateway listener for `reach` binds: the address the caller reached the
-/// server on, so the client reaches the listener the same way. `None` (a caller without a
-/// socket, as in tests) binds `fallback`, the server's configured host.
+/// server on, so the client reaches the listener the same way. `None` (the connection's
+/// local address is unknown, as in tests) binds `fallback`, the server's configured host,
+/// but only when it is `localhost` or a private address: a wildcard, public, or named host
+/// could expose plain-HTTP gateway traffic, and names are never resolved.
 pub fn gateway_bind_host(
     reach: Option<&ClientReach>,
     fallback: &str,
 ) -> Result<String, GatewayError> {
     let Some(reach) = reach else {
-        return Ok(fallback.to_owned());
+        let private = fallback.eq_ignore_ascii_case("localhost")
+            || fallback
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| is_private_reach(ip.to_canonical()));
+        return if private {
+            Ok(fallback.to_owned())
+        } else {
+            Err(GatewayError::Unavailable(
+                "the server can't tell which address this client reached".to_owned(),
+            ))
+        };
     };
     let ip = reach.local_ip.to_canonical();
     if !is_private_reach(ip) {
@@ -123,14 +135,16 @@ fn is_private_reach(ip: IpAddr) -> bool {
     }
 }
 
-/// `localhost`, a loopback address, or the unspecified address (which browsers connect to
-/// loopback), with or without a port.
+/// `localhost`, a `*.localhost` name (which browsers resolve to loopback themselves), a
+/// loopback address, or the unspecified address (which browsers connect to loopback), with
+/// or without a port. Names are never resolved.
 fn is_loopback_authority(host: &str) -> bool {
     let Ok(authority) = host.parse::<hyper::http::uri::Authority>() else {
         return false;
     };
-    let name = authority.host();
-    name.eq_ignore_ascii_case("localhost")
+    let name = authority.host().to_ascii_lowercase();
+    name == "localhost"
+        || name.ends_with(".localhost")
         || name
             .trim_start_matches('[')
             .trim_end_matches(']')
@@ -189,10 +203,10 @@ impl Drop for Inner {
 
 struct Target {
     running: RunningTarget,
-    /// A preview tab of the thread has pointed at this port, so the target closes with the
-    /// last such tab. A target no tab ever pointed at (a browser-mode tab) is left to the
-    /// idle sweep.
-    tabbed: bool,
+    /// Live preview tabs of the thread that have pointed at this port. A tab that navigated
+    /// away keeps the target for its Back, so the target closes once all of them have closed.
+    /// A target no tab ever pointed at (a browser-mode tab) is left to the idle sweep.
+    owners: HashSet<String>,
 }
 
 impl Target {
@@ -301,15 +315,17 @@ impl PreviewGateway {
                 key.clone(),
                 Target {
                     running,
-                    tabbed: false,
+                    owners: HashSet::new(),
                 },
             );
         }
-        let tabbed = tab_ports_of(&self.inner.preview, thread_id)
-            .await
-            .contains(&upstream_port);
+        let tabs = tab_ports_of(&self.inner.preview, thread_id).await;
         let target = targets.get_mut(&key).expect("target was just ensured");
-        target.tabbed |= tabbed;
+        target.owners.extend(
+            tabs.into_iter()
+                .filter(|(_, port)| *port == Some(upstream_port))
+                .map(|(tab_id, _)| tab_id),
+        );
         Ok(self.mint(&target.running, &key, session_id, session_expiry))
     }
 
@@ -416,12 +432,13 @@ impl PreviewGateway {
         }
     }
 
-    /// Reconciles the thread's targets with its live tabs: a target a live tab points at
-    /// becomes tabbed, and with `close_untabbed` a tabbed target no live tab points at any
-    /// more closes. Live tabs are read under the registry lock (the same order as `open`),
-    /// and event snapshots are never trusted, so a stale or replayed event cannot mark or
-    /// close a target against the current tab state. A thread without targets is skipped.
-    async fn sync_thread(&self, thread_id: &str, close_untabbed: bool) {
+    /// Reconciles the thread's targets with its live tabs: a live tab pointing at a target's
+    /// port becomes one of its owners. With `close_unowned`, closed tabs stop owning it, and
+    /// a target whose owners have all closed closes. Live tabs are read
+    /// under the registry lock (the same order as `open`), and event snapshots are never
+    /// trusted, so a stale or replayed event cannot mark or close a target against the
+    /// current tab state. A thread without targets is skipped.
+    async fn sync_thread(&self, thread_id: &str, close_unowned: bool) {
         let mut targets = self.inner.targets.lock().await;
         if !targets.keys().any(|(thread, ..)| thread == thread_id) {
             return;
@@ -431,11 +448,20 @@ impl PreviewGateway {
             if thread != thread_id {
                 return true;
             }
-            if live.contains(port) {
-                target.tabbed = true;
-                return true;
+            let tabbed = !target.owners.is_empty();
+            // Owners are dropped only on a pass that may close: a pass that only marks
+            // (a queued `resized` read after its tab closed) must leave the close to come.
+            if close_unowned {
+                target
+                    .owners
+                    .retain(|owner| live.iter().any(|(tab_id, _)| tab_id == owner));
             }
-            let close = close_untabbed && target.tabbed;
+            target.owners.extend(
+                live.iter()
+                    .filter(|(_, tab_port)| *tab_port == Some(*port))
+                    .map(|(tab_id, _)| tab_id.clone()),
+            );
+            let close = close_unowned && tabbed && target.owners.is_empty();
             if close {
                 target.close();
             }
@@ -443,10 +469,11 @@ impl PreviewGateway {
         });
     }
 
-    /// Follows preview tabs. Tab events mark targets tabbed, a closed tab closes its thread's
-    /// targets that lost their last tab, and missed events re-check every thread with a
-    /// target. A tab that opened and closed before the follower saw it live (both events
-    /// queued or missed) leaves its target untabbed, so the idle sweep closes it instead.
+    /// Follows preview tabs. Tab events record which live tabs have shown each target, a
+    /// closed tab closes its thread's targets whose last such tab it was, and missed events
+    /// re-check every thread with a target. A tab that opened and closed before the follower
+    /// saw it live (both events queued or missed) leaves its target unowned, so the idle
+    /// sweep closes it instead.
     /// That is the price of never trusting event snapshots, which would let a stale event
     /// close a fresh tabless target.
     async fn follow_tabs(
@@ -464,16 +491,16 @@ impl PreviewGateway {
             };
             let gateway = Self { inner };
             match event {
+                // Navigating away never closes the old target: the desktop reports no native
+                // load failures, so Back to its gateway origin would fail silently. Tab close,
+                // thread delete, and the idle sweep reap it.
                 Ok(
                     PreviewEvent::Opened { thread_id, .. }
+                    | PreviewEvent::Navigated { thread_id, .. }
                     | PreviewEvent::Resized { thread_id, .. }
                     | PreviewEvent::Failed { thread_id, .. },
                 ) => gateway.sync_thread(&thread_id, false).await,
-                // A tab that navigated away may have left its old port without a tab.
-                Ok(
-                    PreviewEvent::Closed { thread_id, .. }
-                    | PreviewEvent::Navigated { thread_id, .. },
-                ) => {
+                Ok(PreviewEvent::Closed { thread_id, .. }) => {
                     gateway.sync_thread(&thread_id, true).await;
                 }
                 Ok(PreviewEvent::OpenRequested { .. }) => {}
@@ -549,13 +576,17 @@ fn nav_port(status: &PreviewNavStatus) -> Option<u16> {
     }
 }
 
-async fn tab_ports_of(preview: &PreviewManager, thread_id: &str) -> Vec<u16> {
+/// The thread's live tabs and the admissible port each points at.
+async fn tab_ports_of(preview: &PreviewManager, thread_id: &str) -> Vec<(String, Option<u16>)> {
     preview
         .list(thread_id)
         .await
         .sessions
-        .iter()
-        .filter_map(|tab| nav_port(&tab.nav_status))
+        .into_iter()
+        .map(|tab| {
+            let port = nav_port(&tab.nav_status);
+            (tab.tab_id, port)
+        })
         .collect()
 }
 
@@ -689,6 +720,8 @@ mod tests {
             ("127.0.0.1", "127.0.0.1:45123", "127.0.0.1"),
             ("127.0.0.1", "localhost:3773", "127.0.0.1"),
             ("127.0.0.1", "0.0.0.0:3773", "127.0.0.1"),
+            ("127.0.0.1", "app.localhost:3773", "127.0.0.1"),
+            ("127.0.0.1", "App.Localhost", "127.0.0.1"),
             ("::1", "[::1]:3773", "::1"),
         ] {
             assert_eq!(
@@ -697,7 +730,30 @@ mod tests {
                 "{local} {host}"
             );
         }
-        assert_eq!(gateway_bind_host(None, "0.0.0.0").unwrap(), "0.0.0.0");
+    }
+
+    #[test]
+    fn an_unknown_local_address_binds_only_a_private_configured_host() {
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "192.168.1.5",
+            "100.101.102.103",
+        ] {
+            assert_eq!(gateway_bind_host(None, host).unwrap(), host);
+        }
+        // A wildcard or public bind would expose plain-HTTP gateway traffic on every
+        // interface, and a host name is never resolved.
+        for host in ["0.0.0.0", "::", "203.0.113.7", "box.example.com"] {
+            assert!(
+                matches!(
+                    gateway_bind_host(None, host),
+                    Err(GatewayError::Unavailable(_))
+                ),
+                "{host}"
+            );
+        }
     }
 
     #[test]
@@ -755,6 +811,80 @@ mod tests {
         gateway.close_idle(now + IDLE_TIMEOUT_MS + 1_000).await;
         assert!(gateway.inner.targets.lock().await.is_empty());
         gateway.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_marking_pass_after_the_tab_closed_leaves_the_close_to_come() {
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://localhost:{}/",
+            upstream.local_addr().unwrap().port()
+        );
+        let preview = PreviewManager::new();
+        let gateway = PreviewGateway::new(
+            "127.0.0.1",
+            "devbox",
+            gateway_context(Arc::new(Live), vec![1; 32], "session".into()),
+            preview.clone(),
+        );
+        let tab = preview.open("t", Some(&url)).await.unwrap();
+        gateway.open("t", &url, "s", i64::MAX, None).await.unwrap();
+
+        // A queued `resized` handled after its tab closed, then the `closed` event.
+        preview.close("t", Some(&tab.tab_id)).await.unwrap();
+        gateway.sync_thread("t", false).await;
+        gateway.sync_thread("t", true).await;
+
+        assert!(gateway.inner.targets.lock().await.is_empty());
+        gateway.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gateway_sessions_outlive_the_drain_and_end_with_shutdown() {
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://localhost:{}/",
+            upstream.local_addr().unwrap().port()
+        );
+        let gateway = PreviewGateway::new(
+            "127.0.0.1",
+            "devbox",
+            gateway_context(Arc::new(Live), vec![1; 32], "session".into()),
+            PreviewManager::new(),
+        );
+        let port = gateway
+            .open("t", &url, "s", i64::MAX, None)
+            .await
+            .unwrap()
+            .gateway_port;
+        let sessions = gateway.inner.ctx.sessions.clone();
+        let id = sessions.create(
+            &super::super::capability::GatewayCapabilityClaims {
+                gateway_port: port,
+                upstream_port: 1,
+                thread_id: "t".into(),
+                session_id: "s".into(),
+                expires_at: 0,
+                jti: "j".into(),
+            },
+            u64::MAX,
+        );
+
+        gateway.inner.draining.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            sessions.get(&id, now_millis()).is_some(),
+            "an exchange still draining keeps its session"
+        );
+
+        gateway.inner.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sessions.get(&id, now_millis()).is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown drops the listener's sessions");
     }
 
     #[tokio::test]

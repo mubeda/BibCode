@@ -265,6 +265,10 @@ async fn request_admission(
 fn cors_layer(config: &ServerConfig) -> CorsLayer {
     let layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        // Never allow `x-forwarded-host` (or `-proto`) here. A loopback peer's forwarded host
+        // becomes `Host` (`apply_forwarded_headers`), and the cookie Origin rule compares
+        // against that `Host`. A page could otherwise make the browser on this machine send a
+        // forwarded host equal to its own origin and pass the rule with the user's cookie.
         .allow_headers([
             axum::http::header::AUTHORIZATION,
             axum::http::header::CONTENT_TYPE,
@@ -278,14 +282,11 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
     let Some(dev_url) = &config.dev_url else {
         return layer.allow_origin(Any);
     };
+    // The desktop app's origins get no credentials: it sends a bearer token, and cookie
+    // requests from them are refused.
     let mut origins = Vec::new();
     if let Ok(origin) = dev_url.origin().ascii_serialization().parse() {
         origins.push(origin);
-    }
-    for origin in ["bibcode://app", "bibcode-dev://app"] {
-        if let Ok(origin) = origin.parse() {
-            origins.push(origin);
-        }
     }
     // Normal mode already allows every origin for header-authenticated clients.
     // Preserve that access in dev mode; only this allowlist gets credentialed CORS.
@@ -1061,6 +1062,9 @@ mod tests {
             "http://127.0.0.1:65000",
             "http://localhost:5734",
             "bibcode://other",
+            // The desktop app sends a bearer token, and cookies from its origins are refused.
+            "bibcode://app",
+            "bibcode-dev://app",
             "null",
         ] {
             assert_dev_cors_origin(Method::GET, origin, false).await;
@@ -1074,6 +1078,9 @@ mod tests {
             "http://127.0.0.1:65000",
             "http://localhost:5734",
             "bibcode://other",
+            // The desktop app sends a bearer token, and cookies from its origins are refused.
+            "bibcode://app",
+            "bibcode-dev://app",
             "null",
         ] {
             assert_dev_cors_origin(Method::OPTIONS, origin, false).await;
@@ -1081,15 +1088,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cors_dev_mode_preserves_credentials_for_dev_and_desktop_origins() {
-        for origin in [
-            "http://localhost:5733",
-            "bibcode://app",
-            "bibcode-dev://app",
-        ] {
-            for method in [Method::GET, Method::OPTIONS] {
-                assert_dev_cors_origin(method, origin, true).await;
-            }
+    async fn cors_dev_mode_preserves_credentials_for_the_dev_origin() {
+        for method in [Method::GET, Method::OPTIONS] {
+            assert_dev_cors_origin(method, "http://localhost:5733", true).await;
         }
     }
 

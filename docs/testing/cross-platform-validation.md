@@ -2720,8 +2720,8 @@ browser tab), the environment's address, and each gateway port.
   desktop the address opens like a clicked link, and in a browser tab the "A
   command wants to open <address>" bar appears. With two clients showing the thread, only one opens it; a client
   in a hidden window loses to a visible one. With every client on another
-  thread, after 2 seconds one visible client shows "A command in <thread title>
-  wants to open <address>", and **Open** switches to that thread and opens it. With the token unset
+  thread, after 2 seconds one visible client shows "A command in “<thread title>”
+  wants to open <address>", and **Show thread and open** switches to that thread and opens it. With the token unset
   (`env -u BIBCODE_OPEN_URL_AUTH "$BROWSER" http://localhost:8123/`), it prints
   the address and exits 0. With no BiBCode client connected to the server, it
   also prints the address and exits 0. `"$BROWSER" file:///etc/hosts` writes

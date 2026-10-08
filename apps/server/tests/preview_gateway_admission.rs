@@ -295,7 +295,7 @@ async fn shutdown_lets_an_in_flight_request_finish() {
 }
 
 #[tokio::test]
-async fn navigating_the_last_tab_away_closes_its_old_target() {
+async fn navigating_away_keeps_the_old_target_until_the_tab_closes() {
     let first = upstream_on("127.0.0.1:0").await.unwrap();
     let second = upstream_on("127.0.0.1:0").await.unwrap();
     let preview = PreviewManager::new();
@@ -313,7 +313,24 @@ async fn navigating_the_last_tab_away_closes_its_old_target() {
         )
         .await
         .unwrap();
+    // The desktop reports no native load failures, so Back to the old gateway origin must
+    // still find its listener.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        listening(target.gateway_port).await,
+        "navigating away keeps the old target"
+    );
 
+    // Closing another tab of the thread, or a lagged re-check, keeps it for that tab's Back.
+    let other = preview.open(THREAD, None).await.unwrap();
+    preview.close(THREAD, Some(&other.tab_id)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        listening(target.gateway_port).await,
+        "a live tab that once showed the port keeps it"
+    );
+
+    preview.close(THREAD, Some(&tab.tab_id)).await.unwrap();
     wait_until_closed(target.gateway_port).await;
 }
 

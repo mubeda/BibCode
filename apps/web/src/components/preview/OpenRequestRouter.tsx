@@ -102,14 +102,17 @@ function EnvironmentOpenRequestRouter(props: {
                 return;
               }
               if (!result.value.claimed) return;
-              if (!onScreen) {
-                // No client shows the thread: ask, naming it, and show it on Open.
+              // Checked again: the user may have moved on during the claim.
+              const where = shown();
+              if (where === null) {
+                // This client doesn't show the thread: ask, naming it, and show it on Open.
+                const title = readThreadShell(threadRef)?.title;
                 enqueueOpenPrompt({
                   id: event.requestId,
                   source: "command",
                   url: event.url,
                   threadRef,
-                  threadTitle: readThreadShell(threadRef)?.title ?? "another thread",
+                  threadTitle: title ? `“${title}”` : "another thread",
                 });
                 return;
               }
@@ -123,9 +126,9 @@ function EnvironmentOpenRequestRouter(props: {
                 });
                 return;
               }
-              // Only the routed thread has a browser panel here (checked again: the
-              // user may have moved on during the claim); otherwise use the system browser.
-              const invert = shown() !== "route" && getClientSettings().browserLinkTarget === "app";
+              // Only the routed thread has a browser panel here; a chat panel uses the
+              // system browser.
+              const invert = where !== "route" && getClientSettings().browserLinkTarget === "app";
               openLink({ url: event.url, threadRef, invert, openPreview });
             },
           );

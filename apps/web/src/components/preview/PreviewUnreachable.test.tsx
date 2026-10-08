@@ -21,6 +21,9 @@ describe("PreviewUnreachable", () => {
     const markup = render(0, reason);
 
     expect(occurrences(markup, reason)).toBe(1);
+    // The site may be fine; BiBCode can't show it here.
+    expect(markup).toContain("Can’t show this page here");
+    expect(markup).not.toContain("This site can");
     expect(markup).not.toContain("Details");
     expect(markup).not.toContain("ERR_");
     expect(markup).toContain("Reload");
@@ -29,6 +32,7 @@ describe("PreviewUnreachable", () => {
   it("explains a network error and keeps its code and tips", () => {
     const markup = render(-105, "ERR_NAME_NOT_RESOLVED");
 
+    expect(markup).toContain("This site can’t be reached");
     expect(markup).toContain("DNS address could not be found");
     expect(markup).toContain("ERR_NAME_NOT_RESOLVED");
     expect(markup).toContain("Details");

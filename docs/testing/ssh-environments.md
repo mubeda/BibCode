@@ -215,7 +215,7 @@ report's SSH environment evidence section.
   gateway's listener is still open, so the tab shows the gateway's own `502`
   page, titled "Nothing is listening", with "Nothing is listening on port 8123
   on <environment>." The address bar still shows `http://localhost:8123/`.
-  This is a page inside the tab, not BiBCode's "This site can't be reached"
+  This is a page inside the tab, not BiBCode's "Can't show this page here"
   overlay, which appears only when the listener has already closed and
   BiBCode opens the address again. Start the server again and press
   **Reload**: the page returns.

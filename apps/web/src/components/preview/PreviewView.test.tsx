@@ -1072,6 +1072,33 @@ describe("navigation handlers", () => {
     expect(bridgeMethodCalls("refresh")).toHaveLength(0);
   });
 
+  it("reloads a tab this client failed by resolving its failed URL again, whatever the target", async () => {
+    seedSession({
+      navStatus: { _tag: "Success", url: "http://localhost:5173/a", title: "A" },
+    });
+    h.previewState = {
+      ...h.previewState,
+      localFailures: {
+        "tab-1": {
+          url: "http://localhost:5173/b",
+          code: 0,
+          description: "Couldn't open a preview connection to Build box.",
+        },
+      },
+    };
+    h.previewBridge = makeBridge();
+    renderView();
+
+    (captured("unreachable").onReload as () => void)();
+    await flush();
+
+    expect(h.resolveForNavigationCalls).toMatchObject([
+      { canonicalUrl: "http://localhost:5173/b", tabId: "tab-1" },
+    ]);
+    expect(h.desktopNavigateCalls).toEqual([["tab-1", "http://localhost:5173/b"]]);
+    expect(bridgeMethodCalls("refresh")).toHaveLength(0);
+  });
+
   it("fails the tab on this client when a gateway reload can't reach it from here", async () => {
     seedSession({
       navStatus: { _tag: "Success", url: "http://localhost:5173/a", title: "A" },

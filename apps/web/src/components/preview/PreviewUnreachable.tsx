@@ -16,7 +16,11 @@ interface Props {
   onReload: () => void;
 }
 
-/** Theme-aware tailwind port of Chromium's "This site can't be reached" page. */
+/**
+ * Theme-aware tailwind port of Chromium's "This site can't be reached" page.
+ * For BiBCode's own reasons the site may be fine, so the heading says it
+ * can't be shown here instead.
+ */
 export function PreviewUnreachable({ url, code, description, onReload }: Props) {
   const [showDetails, setShowDetails] = useState(false);
   const host = safeHost(url) ?? url;
@@ -30,7 +34,7 @@ export function PreviewUnreachable({ url, code, description, onReload }: Props) 
       <div className="mx-auto flex w-full max-w-xl flex-1 flex-col px-8 py-12 sm:py-16">
         <ErrorIcon className="mb-6 size-12 text-muted-foreground/70" />
         <h1 className="mb-3 text-2xl font-semibold leading-tight text-foreground">
-          This site can&rsquo;t be reached
+          {ownReason ? <>Can&rsquo;t show this page here</> : <>This site can&rsquo;t be reached</>}
         </h1>
         <p className="text-sm leading-relaxed text-muted-foreground">
           <span className="font-semibold text-foreground">{host}</span>: {friendly}
