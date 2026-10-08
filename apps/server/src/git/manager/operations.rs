@@ -1969,13 +1969,12 @@ fn local_branch_not_found(operation: &str) -> GitManagerOperationError {
     )
 }
 
-fn first_stderr_line(output: &ProcessOutput) -> &str {
-    output
-        .stderr
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
+/// Git's first stderr line, or the exit code when it printed none (`--quiet`).
+fn failure_detail(output: &ProcessOutput) -> String {
+    merge::first_stderr_line(&output.stderr).map_or_else(
+        || format!("Git exited with {}.", output.exit_code),
+        str::to_owned,
+    )
 }
 
 fn merge_into_error(
@@ -2061,7 +2060,7 @@ fn merge_into_error(
             code: "unknown".to_owned(),
             message: format!(
                 "Git could not create the merge commit: {}",
-                first_stderr_line(&output)
+                failure_detail(&output)
             ),
             blocked: None,
             outputs: vec![output],
@@ -2071,7 +2070,7 @@ fn merge_into_error(
             code: "unknown".to_owned(),
             message: format!(
                 "Git could not update {target}: {}",
-                first_stderr_line(&output)
+                failure_detail(&output)
             ),
             blocked: None,
             outputs: vec![output],
@@ -2997,6 +2996,37 @@ mod tests {
         assert_eq!(in_use.code, "worktree-checked-out");
         assert!(in_use.blocked.is_some());
         assert!(in_use.message.contains("/w/release"));
+    }
+
+    #[test]
+    fn merge_into_failure_messages_never_end_in_an_empty_detail() {
+        use merge::MergeIntoError;
+
+        let silent = ProcessOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: " \n".into(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let publish = merge_into_error(
+            "merge-into",
+            "release",
+            MergeIntoError::PublishFailed(silent.clone()),
+        );
+        assert_eq!(
+            publish.message,
+            "Git could not update release: Git exited with 1."
+        );
+        let commit = merge_into_error(
+            "merge-into",
+            "release",
+            MergeIntoError::CommitFailed(silent),
+        );
+        assert_eq!(
+            commit.message,
+            "Git could not create the merge commit: Git exited with 1."
+        );
     }
 
     #[test]

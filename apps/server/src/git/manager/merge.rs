@@ -66,16 +66,17 @@ pub fn classify_merge_tree(
             Ok(GitManagerMergePreview::UnrelatedHistories)
         }
         _ => Err(GitManagerMergeError::MergeTreeFailed {
-            detail: stderr
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .map_or_else(
-                    || format!("merge-tree exited with {exit_code}"),
-                    str::to_owned,
-                ),
+            detail: first_stderr_line(stderr).map_or_else(
+                || format!("merge-tree exited with {exit_code}"),
+                str::to_owned,
+            ),
         }),
     }
+}
+
+/// The first non-empty stderr line; a `--quiet` command can fail without printing any.
+pub(super) fn first_stderr_line(stderr: &str) -> Option<&str> {
+    stderr.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 /// Fails with `GitTooOld` below 2.38; an unparseable version is allowed through and the
@@ -199,12 +200,14 @@ pub async fn squash_merge(
 #[derive(Debug, Eq, PartialEq)]
 pub enum PublishFailure {
     InUse { path: Option<String> },
-    Moved,
     Other,
 }
 
-/// Maps `git fetch . <commit>:refs/heads/<target>` refusals: Git owns the "branch in use
-/// by a worktree" check (checked out, mid-rebase, bisecting) and the fast-forward check.
+/// Recognises Git's own "branch in use by a worktree" refusal (checked out, mid-rebase,
+/// bisecting) in the stderr of a failed `git fetch . <commit>:refs/heads/<target>`. The
+/// publish runs with `--quiet`, which also hides the "[rejected] ... (non-fast-forward)"
+/// line, so a lost race exits 1 with empty stderr and arrives here as `Other`;
+/// `merge_into` re-reads the target to tell it apart from a genuine publish failure.
 #[must_use]
 pub fn classify_publish_failure(stderr: &str) -> PublishFailure {
     if let Some(rest) = stderr.split("checked out at '").nth(1) {
@@ -214,9 +217,6 @@ pub fn classify_publish_failure(stderr: &str) -> PublishFailure {
     }
     if stderr.contains("refusing to fetch into branch") {
         return PublishFailure::InUse { path: None };
-    }
-    if stderr.contains("non-fast-forward") || stderr.contains("[rejected]") {
-        return PublishFailure::Moved;
     }
     PublishFailure::Other
 }
@@ -369,10 +369,18 @@ pub async fn merge_into(
         .git_manager_publish_merge(cwd, &merge_commit, target, source, cancellation)
         .await?;
     if publish.exit_code != 0 {
-        return Err(match classify_publish_failure(&publish.stderr) {
-            PublishFailure::InUse { path } => MergeIntoError::InUse { path },
-            PublishFailure::Moved => MergeIntoError::TargetMoved,
-            PublishFailure::Other => MergeIntoError::PublishFailed(publish),
+        if let PublishFailure::InUse { path } = classify_publish_failure(&publish.stderr) {
+            return Err(MergeIntoError::InUse { path });
+        }
+        // A lost race (non-fast-forward, or "cannot lock ref ... expected") fails the
+        // `--quiet` fetch with little or no stderr; only the ref itself says whether it moved.
+        let current = repository
+            .git_manager_resolve_merge_tip(cwd, &target_ref, cancellation)
+            .await?;
+        return Err(if successful_tip(&current) == Some(target_tip.as_str()) {
+            MergeIntoError::PublishFailed(publish)
+        } else {
+            MergeIntoError::TargetMoved
         });
     }
     Ok(MergeIntoOutcome {
@@ -588,13 +596,90 @@ mod tests {
             }
         );
         assert_eq!(
-            classify_publish_failure(" ! [rejected]        abc -> t  (non-fast-forward)\n"),
-            PublishFailure::Moved
+            classify_publish_failure("fatal: refusing to fetch into branch 'refs/heads/t'\n"),
+            PublishFailure::InUse { path: None }
         );
+        // `--quiet` leaves a non-fast-forward rejection with no stderr at all.
+        assert_eq!(classify_publish_failure(""), PublishFailure::Other);
         assert_eq!(
-            classify_publish_failure("fatal: reference-transaction hook declined\n"),
+            classify_publish_failure(
+                "error: cannot lock ref 'refs/heads/t': is at abc but expected def\n"
+            ),
             PublishFailure::Other
         );
+        assert_eq!(
+            classify_publish_failure(
+                "fatal: in 'prepared' phase, update aborted by the reference-transaction hook\n"
+            ),
+            PublishFailure::Other
+        );
+    }
+
+    /// Fixture Git isolated from the developer's system and global configuration.
+    fn fixture_git(cwd: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_AUTHOR_NAME", "Git Manager Test")
+            .env("GIT_AUTHOR_EMAIL", "git-manager@example.test")
+            .env("GIT_COMMITTER_NAME", "Git Manager Test")
+            .env("GIT_COMMITTER_EMAIL", "git-manager@example.test")
+            .output()
+            .expect("git fixture starts")
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = fixture_git(cwd, args);
+        assert!(
+            output.status.success(),
+            "git fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Drives the real publish command with a commit that does not descend from the target.
+    #[tokio::test]
+    async fn a_real_non_fast_forward_publish_exits_one_quietly_and_leaves_the_target() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let cwd = directory.path();
+        git(cwd, &["init", "-q", "-b", "main"]);
+        git(cwd, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(cwd, &["switch", "-q", "-c", "release"]);
+        git(cwd, &["commit", "-q", "--allow-empty", "-m", "release"]);
+        git(cwd, &["switch", "-q", "-c", "rival", "main"]);
+        git(cwd, &["commit", "-q", "--allow-empty", "-m", "rival"]);
+        git(cwd, &["switch", "-q", "main"]);
+        let release_tip = rev_parse(cwd, "release");
+        let rival_tip = rev_parse(cwd, "rival");
+
+        let publish = GitRepository::default()
+            .git_manager_publish_merge(
+                cwd,
+                &rival_tip,
+                "release",
+                "refs/heads/rival",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("publish runs");
+
+        assert_eq!(publish.exit_code, 1, "{publish:?}");
+        assert_eq!(publish.stderr.trim(), "");
+        assert_eq!(
+            classify_publish_failure(&publish.stderr),
+            PublishFailure::Other
+        );
+        assert_eq!(rev_parse(cwd, "release"), release_tip);
+    }
+
+    fn rev_parse(cwd: &Path, revision: &str) -> String {
+        let output = fixture_git(cwd, &["rev-parse", revision]);
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
     #[tokio::test]
@@ -625,5 +710,96 @@ mod tests {
             );
         }
         assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    const TARGET_TIP: &str = "1111111111111111111111111111111111111111";
+    const SOURCE_TIP: &str = "2222222222222222222222222222222222222222";
+    const MERGE_COMMIT: &str = "3333333333333333333333333333333333333333";
+    const RIVAL_TIP: &str = "4444444444444444444444444444444444444444";
+
+    /// Answers every Git invocation `merge_into` makes with a fixed script. The target ref
+    /// reads return `TARGET_TIP` twice (the initial read and the re-read before the publish)
+    /// and `after_publish_tip` afterwards; the `--quiet` publish fails with empty stderr.
+    struct QuietPublishRunner {
+        target_reads: AtomicUsize,
+        after_publish_tip: &'static str,
+    }
+
+    impl GitProcessRunner for QuietPublishRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> BoxGitProcessFuture<'a> {
+            let args = request
+                .args
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let has = |value: &str| args.iter().any(|argument| argument == value);
+            let (exit_code, stdout) = if has("--version") {
+                (0, "git version 2.55.0\n".to_owned())
+            } else if has("refs/heads/release^{commit}") {
+                let tip = if self.target_reads.fetch_add(1, Ordering::SeqCst) < 2 {
+                    TARGET_TIP
+                } else {
+                    self.after_publish_tip
+                };
+                (0, format!("{tip}\n"))
+            } else if has("refs/heads/feature^{commit}") {
+                (0, format!("{SOURCE_TIP}\n"))
+            } else if has("symbolic-ref") || has("merge-base") || has("config") || has("fetch") {
+                (1, String::new())
+            } else if has("merge-tree") {
+                (0, format!("{TREE}\0"))
+            } else if has("commit-tree") {
+                (0, format!("{MERGE_COMMIT}\n"))
+            } else {
+                panic!("unexpected Git invocation: {args:?}");
+            };
+            Box::pin(async move {
+                Ok(ProcessOutput {
+                    exit_code,
+                    stdout,
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                })
+            })
+        }
+    }
+
+    async fn merge_into_with_a_quietly_failing_publish(
+        after_publish_tip: &'static str,
+    ) -> MergeIntoError {
+        let repository = GitRepository::with_runner_for_test(Arc::new(QuietPublishRunner {
+            target_reads: AtomicUsize::new(0),
+            after_publish_tip,
+        }));
+        merge_into(
+            &repository,
+            Path::new("."),
+            "refs/heads/feature",
+            "release",
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("the publish fails")
+    }
+
+    #[tokio::test]
+    async fn a_quiet_publish_failure_after_the_target_moved_is_a_moved_target() {
+        assert!(matches!(
+            merge_into_with_a_quietly_failing_publish(RIVAL_TIP).await,
+            MergeIntoError::TargetMoved
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_quiet_publish_failure_with_an_unmoved_target_is_a_publish_failure() {
+        assert!(matches!(
+            merge_into_with_a_quietly_failing_publish(TARGET_TIP).await,
+            MergeIntoError::PublishFailed(output) if output.exit_code == 1
+        ));
     }
 }

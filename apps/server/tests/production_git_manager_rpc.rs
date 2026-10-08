@@ -3135,12 +3135,69 @@ async fn a_rejecting_reference_transaction_hook_leaves_the_target_unchanged() {
     ))
     .await;
 
-    assert_eq!(
-        events.last().expect("terminal")["_tag"],
-        "failed",
-        "{events:?}"
+    let last = events.last().expect("terminal");
+    assert_eq!(last["_tag"], "failed", "{events:?}");
+    assert_eq!(last["code"], "unknown", "{events:?}");
+    assert!(
+        last["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("reference-transaction hook"),
+        "{last}"
     );
     assert_eq!(git_stdout(&main, &["rev-parse", "release"]), release_tip);
+}
+
+/// A competing writer moves the target after the in-lock re-read and before the publish
+/// updates the ref. The `preparing` hook state runs before Git locks the ref, so the
+/// hook can rewind the target with a real nested transaction (once, guarded by a marker).
+#[cfg(unix)]
+#[tokio::test]
+async fn merge_into_reports_non_fast_forward_when_the_target_moves_before_the_publish() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    git(&main, &["branch", "rival", "main"]);
+    git(&main, &["switch", "-q", "rival"]);
+    fs::write(main.join("rival.txt"), "rival\n").expect("rival change");
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-q", "-m", "rival"]);
+    git(&main, &["switch", "-q", "main"]);
+    let rival_tip = git_stdout(&main, &["rev-parse", "rival"]);
+    let git_dir = main.join(".git");
+    let hook = git_dir.join("hooks/reference-transaction");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = preparing ] && [ ! -e '{dir}/moved' ]; then\n  touch '{dir}/moved'\n  git update-ref refs/heads/release {rival_tip}\nfi\nexit 0\n",
+            dir = git_dir.display()
+        ),
+    )
+    .expect("hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("hook mode");
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "519",
+        &main,
+        "refs/heads/feature",
+        "release",
+    ))
+    .await;
+
+    if !git_dir.join("moved").exists() {
+        eprintln!("non-fast-forward publish coverage skipped: Git has no `preparing` hook state");
+        return;
+    }
+    let last = events.last().expect("terminal event");
+    assert_eq!(last["_tag"], "failed", "{events:?}");
+    assert_eq!(last["code"], "non-fast-forward", "{events:?}");
+    assert_eq!(
+        last["message"],
+        "release changed while merging. Review the preview and try again."
+    );
+    assert_eq!(git_stdout(&main, &["rev-parse", "release"]), rival_tip);
 }
 
 #[tokio::test]
