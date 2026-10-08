@@ -347,6 +347,38 @@ impl PullRequestsService {
         self.database.clone()
     }
 
+    /// Stores a successful unary read as the display copy the next
+    /// `readSnapshot` paints. The poller only names what changed; these reads
+    /// are what refill the rows. `generation` is taken before the host read,
+    /// so a slower read that started earlier never replaces a newer row.
+    async fn store_read<T: serde::Serialize>(
+        &self,
+        scope: &host::HostScope,
+        kind: &'static str,
+        key: &str,
+        fingerprint: String,
+        value: &T,
+        generation: i64,
+    ) {
+        let Some(database) = self.gitlab_snapshot_database(scope) else {
+            return;
+        };
+        let Ok(payload) = serde_json::to_vec(value) else {
+            return;
+        };
+        gitlab::poll::store(
+            &database,
+            &scope.host,
+            &scope.repository,
+            kind,
+            key,
+            fingerprint,
+            payload,
+            generation,
+        )
+        .await;
+    }
+
     pub async fn list(
         &self,
         cwd: &Path,
@@ -355,6 +387,9 @@ impl PullRequestsService {
     ) -> Result<ListPage, PullRequestsOperationError> {
         let host = HostCapture::default();
         let captured = host.clone();
+        let generation = snapshot_store::next_generation();
+        // Only first pages are painted from snapshots.
+        let snapshot_key = query.cursor.is_none().then(|| query.snapshot_key());
         let result = bounded_read(
             "pullRequests.list",
             Duration::from_secs(60),
@@ -371,12 +406,18 @@ impl PullRequestsService {
                 .map_err(|u| u.operation_error("pullRequests.list"))?;
                 let scope = &pending.scope;
                 captured.set(&scope.host);
-                pending
+                let page = pending
                     .read_authenticated(&self.runner, &c, |read_c| async move {
                         self.host(scope).list(scope, &query, &read_c).await
                     })
                     .await
-                    .map_err(|u| u.operation_error("pullRequests.list"))?
+                    .map_err(|u| u.operation_error("pullRequests.list"))??;
+                if let Some(key) = &snapshot_key {
+                    let fingerprint = gitlab::poll::list_fingerprint(&page);
+                    self.store_read(scope, "list", key, fingerprint, &page, generation)
+                        .await;
+                }
+                Ok(page)
             },
         )
         .await;
@@ -395,6 +436,7 @@ impl PullRequestsService {
         let operation = "pullRequests.get";
         let host = HostCapture::default();
         let captured = host.clone();
+        let generation = snapshot_store::next_generation();
         let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
@@ -413,6 +455,16 @@ impl PullRequestsService {
             }
             detail.permissions = permissions;
             detail.readiness = readiness;
+            // The poller's probe row, not this one, holds the change fingerprint.
+            self.store_read(
+                &scope,
+                "detail",
+                &number.to_string(),
+                String::new(),
+                &detail,
+                generation,
+            )
+            .await;
             Ok(detail)
         })
         .await;
@@ -432,12 +484,23 @@ impl PullRequestsService {
         let operation = "pullRequests.getTimeline";
         let host = HostCapture::default();
         let captured = host.clone();
+        let generation = snapshot_store::next_generation();
         let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
             captured.set(&scope.host);
-            self.host(&scope).timeline(&scope, number, &c).await
+            let value = self.host(&scope).timeline(&scope, number, &c).await?;
+            self.store_read(
+                &scope,
+                "timeline",
+                &number.to_string(),
+                String::new(),
+                &value,
+                generation,
+            )
+            .await;
+            Ok(value)
         })
         .await;
         if let Err(error) = &result {
@@ -456,12 +519,23 @@ impl PullRequestsService {
         let operation = "pullRequests.getCommits";
         let host = HostCapture::default();
         let captured = host.clone();
+        let generation = snapshot_store::next_generation();
         let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
             captured.set(&scope.host);
-            self.host(&scope).commits(&scope, number, &c).await
+            let value = self.host(&scope).commits(&scope, number, &c).await?;
+            self.store_read(
+                &scope,
+                "commits",
+                &number.to_string(),
+                String::new(),
+                &value,
+                generation,
+            )
+            .await;
+            Ok(value)
         })
         .await;
         if let Err(error) = &result {
@@ -480,12 +554,23 @@ impl PullRequestsService {
         let operation = "pullRequests.getChecks";
         let host = HostCapture::default();
         let captured = host.clone();
+        let generation = snapshot_store::next_generation();
         let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
             captured.set(&scope.host);
-            self.host(&scope).checks(&scope, number, &c).await
+            let value = self.host(&scope).checks(&scope, number, &c).await?;
+            self.store_read(
+                &scope,
+                "checks",
+                &number.to_string(),
+                String::new(),
+                &value,
+                generation,
+            )
+            .await;
+            Ok(value)
         })
         .await;
         if let Err(error) = &result {
@@ -504,12 +589,23 @@ impl PullRequestsService {
         let operation = "pullRequests.getFiles";
         let host = HostCapture::default();
         let captured = host.clone();
+        let generation = snapshot_store::next_generation();
         let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
             captured.set(&scope.host);
-            self.host(&scope).files(&scope, number, &c).await
+            let value = self.host(&scope).files(&scope, number, &c).await?;
+            self.store_read(
+                &scope,
+                "files",
+                &number.to_string(),
+                String::new(),
+                &value,
+                generation,
+            )
+            .await;
+            Ok(value)
         })
         .await;
         if let Err(error) = &result {
@@ -1758,6 +1854,80 @@ esac"#,
             .await
             .unwrap();
         assert!(other.is_some(), "other numbers remain");
+    }
+
+    #[tokio::test]
+    async fn gitlab_unary_get_stores_the_detail_snapshot_read_snapshot_paints() {
+        let s = crate::test_support::TestSandbox::new("pr-get-stores-snapshot");
+        let git = s.executable_script(
+            "git",
+            "printf '%s' 'git@gitlab.acme.example:team/repo.git'",
+            "",
+        );
+        let database = new_database().await;
+        let glab = s.executable_script(
+            "glab",
+            r#"case "$1 $2" in
+  '--version ') echo 'glab 1.114.0' ;;
+  'auth status') printf 'gitlab.acme.example\n  ✓ Logged in to gitlab.acme.example as alice\n' ;;
+  *) exit 64 ;;
+esac"#,
+            "",
+        );
+        let runner = Arc::new(HostCommandRunner::new(s.path("state")).with_commands(
+            "missing-gh",
+            &glab,
+            &git,
+        ));
+        runner.provider_hosts().record(
+            "gitlab.acme.example",
+            crate::source_control::ProviderKind::Gitlab,
+        );
+        let fake = Arc::new(ActionHost {
+            inputs: permissions::tests::gitlab_inputs(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            context_calls: None,
+            block_first: None,
+        });
+        let service = PullRequestsService {
+            runner,
+            github: fake.clone(),
+            gitlab: fake,
+            gitlab_host: Arc::new(gitlab::GitLabHost::new(Arc::new(HostCommandRunner::new(
+                PathBuf::new(),
+            )))),
+            action_gates: Arc::default(),
+            database: Some(database.clone()),
+            pollers: Arc::default(),
+        };
+        let detail = service
+            .get(s.root(), 14, &CancellationToken::new())
+            .await
+            .unwrap();
+        let row = database
+            .call(|connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).get(
+                    "gitlab.acme.example",
+                    "team/repo",
+                    "detail",
+                    "14",
+                )?)
+            })
+            .await
+            .unwrap()
+            .expect("a successful unary get stores the display copy");
+        assert_eq!(
+            serde_json::from_slice::<Detail>(&row.payload).unwrap(),
+            detail,
+            "the stored payload is exactly what the unary read answered"
+        );
+
+        let input: SubscribeInput = serde_json::from_value(serde_json::json!({"cwd":s.root(),"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null,"refreshTotals":false,"number":14,"tab":null})).unwrap();
+        let snapshot = service
+            .read_snapshot(input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.detail.map(|row| row.payload), Some(detail));
     }
 
     #[tokio::test]

@@ -4,17 +4,20 @@
 //! loop cooperatively inside that call instead of spawning a background task
 //! (forbidden everywhere else in `pull_requests`, see the `mod.rs` tripwires).
 //!
+//! A tick reads the list page and one merge-request probe, stores the list
+//! page and the probe fingerprint, and names what changed. It never runs the
+//! detail, timeline, commits, checks, or files reads: the client answers those
+//! names with the unary reads, which store their own snapshots.
+//!
 //! See `docs/superpowers/specs/2026-10-08-gitlab-merge-request-background-sync-design.md`.
 
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicI64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::persistence::Database;
@@ -25,9 +28,8 @@ use super::{
 };
 use crate::pull_requests::{
     host::{HostScope, PullRequestHost},
-    model::{Changed, Detail, ListQuery, ListRow},
-    permissions,
-    snapshot_store::{Snapshot as StoredSnapshot, SnapshotStore},
+    model::{Changed, ListPage, ListQuery, ListRow},
+    snapshot_store::{self, Snapshot as StoredSnapshot, SnapshotStore},
 };
 
 pub(crate) use super::refresh::ActiveTab;
@@ -41,6 +43,16 @@ const BACKOFF_STEPS: [Duration; 3] = [
     Duration::from_secs(120),
     Duration::from_secs(300),
 ];
+/// Ticks are 20 s apart, so a subscriber that falls this far behind has a
+/// stuck stream; it skips the lagged ticks instead of blocking the driver.
+const EVENT_CAPACITY: usize = 16;
+/// The probe row holds only the fingerprint the next tick compares against.
+const PROBE_KIND: &str = "probe";
+/// Every tab name a probe can raise; each subscriber keeps its own tab's.
+const ALL_TABS: ActiveTab = ActiveTab {
+    commits: true,
+    files: true,
+};
 
 type Key = (String, String, String);
 
@@ -65,11 +77,13 @@ impl Registry {
         });
         entry.ref_count += 1;
         let shared = entry.shared.clone();
+        let events = shared.events.subscribe();
         drop(entries);
         Lease {
             registry: self,
             key,
             shared,
+            events,
         }
     }
 
@@ -91,6 +105,7 @@ struct Lease<'a> {
     registry: &'a Registry,
     key: Key,
     shared: Arc<Shared>,
+    events: broadcast::Receiver<Tick>,
 }
 
 impl Drop for Lease<'_> {
@@ -101,21 +116,47 @@ impl Drop for Lease<'_> {
     }
 }
 
-#[derive(Default)]
 struct Shared {
     cancellation: CancellationToken,
     driver_lock: tokio::sync::Mutex<()>,
-    tick: AtomicI64,
+    events: broadcast::Sender<Tick>,
 }
 
-impl Shared {
-    fn next_tick(&self) -> i64 {
-        self.tick.fetch_add(1, Ordering::SeqCst) + 1
+impl Default for Shared {
+    fn default() -> Self {
+        let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        Self {
+            cancellation: CancellationToken::new(),
+            driver_lock: tokio::sync::Mutex::new(()),
+            events,
+        }
+    }
+}
+
+/// One successful tick, published to every subscriber of the key. Only the
+/// driving subscriber's number is probed.
+#[derive(Clone)]
+struct Tick {
+    number: Option<u64>,
+    changed: Changed,
+}
+
+impl Tick {
+    fn for_subscriber(&self, number: Option<u64>, tab: ActiveTab) -> Changed {
+        let probed = number.is_some() && number == self.number;
+        Changed {
+            list: self.changed.list,
+            detail: probed && self.changed.detail,
+            timeline: probed && self.changed.timeline,
+            commits: probed && tab.commits && self.changed.commits,
+            checks: probed && self.changed.checks,
+            files: probed && tab.files && self.changed.files,
+        }
     }
 }
 
 enum TickOutcome {
-    Success,
+    Success(Changed),
     RateLimited,
     Error,
 }
@@ -126,13 +167,6 @@ fn classify(error: &crate::pull_requests::error::PullRequestsOperationError) -> 
     } else {
         TickOutcome::Error
     }
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 fn enum_string<T: serde::Serialize>(value: &T) -> String {
@@ -154,8 +188,19 @@ fn list_row_fingerprint(row: &ListRow) -> ListFingerprint {
     }
 }
 
+fn list_fingerprints(page: &ListPage) -> Vec<ListFingerprint> {
+    page.rows.iter().map(list_row_fingerprint).collect()
+}
+
+/// The stored list fingerprint; the unary `list` read stores the same one, so
+/// the next tick does not report a page the client has just read as changed.
+pub(crate) fn list_fingerprint(page: &ListPage) -> String {
+    serde_json::to_string(&list_fingerprints(page)).unwrap_or_default()
+}
+
+/// Rows key on the lowercased host, matching `read_snapshot` and host deletes.
 #[allow(clippy::too_many_arguments)]
-async fn store(
+pub(crate) async fn store(
     database: &Database,
     host: &str,
     project: &str,
@@ -165,7 +210,7 @@ async fn store(
     payload: Vec<u8>,
     generation: i64,
 ) {
-    let host = host.to_owned();
+    let host = host.to_ascii_lowercase();
     let project = project.to_owned();
     let key = key.to_owned();
     let _ = database
@@ -177,7 +222,7 @@ async fn store(
                 key,
                 fingerprint,
                 payload,
-                observed_at_ms: now_ms(),
+                observed_at_ms: snapshot_store::now_ms(),
                 generation,
             })?;
             Ok(())
@@ -192,7 +237,7 @@ async fn load_fingerprint(
     kind: &'static str,
     key: &str,
 ) -> Option<String> {
-    let host = host.to_owned();
+    let host = host.to_ascii_lowercase();
     let project = project.to_owned();
     let key = key.to_owned();
     database
@@ -205,26 +250,6 @@ async fn load_fingerprint(
         .map(|snapshot| snapshot.fingerprint)
 }
 
-/// Mirrors `PullRequestsService::get`'s permission computation: the poller
-/// stores the same shape the unary `pullRequests.get` RPC answers.
-async fn full_detail(
-    host: &GitLabHost,
-    scope: &HostScope,
-    number: u64,
-    c: &CancellationToken,
-) -> Result<Detail, crate::pull_requests::error::PullRequestsOperationError> {
-    let context = host.context(scope, c).await?;
-    let raw = host.detail(scope, number, &context, c).await?;
-    let (permissions, readiness) = permissions::compute(&raw.inputs);
-    let mut detail = raw.detail_without_permissions;
-    for reviewer in &mut detail.reviewers {
-        reviewer.can_rerequest = permissions::can_rerequest(&permissions, reviewer.state);
-    }
-    detail.permissions = permissions;
-    detail.readiness = readiness;
-    Ok(detail)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_tick(
     host: &GitLabHost,
@@ -233,20 +258,11 @@ async fn run_tick(
     list_query: &ListQuery,
     list_key: &str,
     number: Option<u64>,
-    tab: ActiveTab,
     generation: i64,
-    emit: &(dyn Fn(Changed) + Send + Sync),
     c: &CancellationToken,
     shared_cancel: &CancellationToken,
 ) -> TickOutcome {
-    let mut changed = Changed {
-        list: false,
-        detail: false,
-        timeline: false,
-        commits: false,
-        checks: false,
-        files: false,
-    };
+    let mut changed = Changed::default();
 
     let page = match host.list(scope, list_query, c).await {
         Ok(page) => page,
@@ -254,7 +270,7 @@ async fn run_tick(
             return classify(&error);
         }
     };
-    let next_list_fp: Vec<ListFingerprint> = page.rows.iter().map(list_row_fingerprint).collect();
+    let next_list_fp = list_fingerprints(&page);
     let previous_list_fp: Vec<ListFingerprint> =
         load_fingerprint(database, &scope.host, &scope.repository, "list", list_key)
             .await
@@ -282,8 +298,7 @@ async fn run_tick(
     }
 
     let Some(number) = number else {
-        emit(changed);
-        return TickOutcome::Success;
+        return TickOutcome::Success(changed);
     };
 
     let next_probe = match host.probe(scope, number, c).await {
@@ -294,164 +309,78 @@ async fn run_tick(
     };
     let key = number.to_string();
     let previous_probe: Option<ProbeFingerprint> =
-        load_fingerprint(database, &scope.host, &scope.repository, "detail", &key)
+        load_fingerprint(database, &scope.host, &scope.repository, PROBE_KIND, &key)
             .await
             .and_then(|raw| serde_json::from_str(&raw).ok());
     let names = match &previous_probe {
-        Some(previous) => detail_refresh(previous, &next_probe, tab),
-        // Nothing has ever been read for this number: fetch everything the
-        // active tab needs instead of waiting for a second, differing probe.
+        Some(previous) => detail_refresh(previous, &next_probe, ALL_TABS),
+        // Nothing has been probed for this number yet: name everything so a
+        // change between the client's open and this first probe is re-read.
         None => RefreshNames {
             detail: true,
             timeline: true,
-            commits: tab.commits,
+            commits: true,
             checks: true,
-            files: tab.files,
+            files: true,
         },
     };
-
-    if names.detail {
-        match full_detail(host, scope, number, c).await {
-            Ok(detail) => {
-                if !shared_cancel.is_cancelled()
-                    && let (Ok(fingerprint), Ok(payload)) = (
-                        serde_json::to_string(&next_probe),
-                        serde_json::to_vec(&detail),
-                    )
-                {
-                    store(
-                        database,
-                        &scope.host,
-                        &scope.repository,
-                        "detail",
-                        &key,
-                        fingerprint,
-                        payload,
-                        generation,
-                    )
-                    .await;
-                    changed.detail = true;
-                }
-            }
-            Err(error) => {
-                return classify(&error);
-            }
-        }
-    }
-    if names.timeline {
-        match host.timeline(scope, number, c).await {
-            Ok(timeline) => {
-                if !shared_cancel.is_cancelled()
-                    && let Ok(payload) = serde_json::to_vec(&timeline)
-                {
-                    store(
-                        database,
-                        &scope.host,
-                        &scope.repository,
-                        "timeline",
-                        &key,
-                        probe_fingerprint_json(&next_probe),
-                        payload,
-                        generation,
-                    )
-                    .await;
-                    changed.timeline = true;
-                }
-            }
-            Err(error) => {
-                return classify(&error);
-            }
-        }
-    }
-    if names.commits {
-        match host.commits(scope, number, c).await {
-            Ok(commits) => {
-                if !shared_cancel.is_cancelled()
-                    && let Ok(payload) = serde_json::to_vec(&commits)
-                {
-                    store(
-                        database,
-                        &scope.host,
-                        &scope.repository,
-                        "commits",
-                        &key,
-                        probe_fingerprint_json(&next_probe),
-                        payload,
-                        generation,
-                    )
-                    .await;
-                    changed.commits = true;
-                }
-            }
-            Err(error) => {
-                return classify(&error);
-            }
-        }
-    }
-    if names.checks {
-        match host.checks(scope, number, c).await {
-            Ok(checks) => {
-                if !shared_cancel.is_cancelled()
-                    && let Ok(payload) = serde_json::to_vec(&checks)
-                {
-                    store(
-                        database,
-                        &scope.host,
-                        &scope.repository,
-                        "checks",
-                        &key,
-                        probe_fingerprint_json(&next_probe),
-                        payload,
-                        generation,
-                    )
-                    .await;
-                    changed.checks = true;
-                }
-            }
-            Err(error) => {
-                return classify(&error);
-            }
-        }
-    }
-    if names.files {
-        match host.files(scope, number, c).await {
-            Ok(files) => {
-                if !shared_cancel.is_cancelled()
-                    && let Ok(payload) = serde_json::to_vec(&files)
-                {
-                    store(
-                        database,
-                        &scope.host,
-                        &scope.repository,
-                        "files",
-                        &key,
-                        probe_fingerprint_json(&next_probe),
-                        payload,
-                        generation,
-                    )
-                    .await;
-                    changed.files = true;
-                }
-            }
-            Err(error) => {
-                return classify(&error);
-            }
-        }
+    let any = names.detail || names.timeline || names.commits || names.checks || names.files;
+    if any
+        && !shared_cancel.is_cancelled()
+        && let Ok(fingerprint) = serde_json::to_string(&next_probe)
+    {
+        store(
+            database,
+            &scope.host,
+            &scope.repository,
+            PROBE_KIND,
+            &key,
+            fingerprint,
+            Vec::new(),
+            generation,
+        )
+        .await;
+        changed.detail = names.detail;
+        changed.timeline = names.timeline;
+        changed.commits = names.commits;
+        changed.checks = names.checks;
+        changed.files = names.files;
     }
 
-    emit(changed);
-    TickOutcome::Success
+    TickOutcome::Success(changed)
 }
 
-fn probe_fingerprint_json(probe: &ProbeFingerprint) -> String {
-    serde_json::to_string(probe).unwrap_or_default()
+/// Forwards every published tick until `wait` resolves; `None` means the
+/// subscriber or the whole poller was cancelled first.
+async fn forward_until<T>(
+    events: &mut broadcast::Receiver<Tick>,
+    wait: impl std::future::Future<Output = T>,
+    forward: &impl Fn(&Tick),
+    c: &CancellationToken,
+    shared_cancel: &CancellationToken,
+) -> Option<T> {
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            biased;
+            () = c.cancelled() => return None,
+            () = shared_cancel.cancelled() => return None,
+            value = &mut wait => return Some(value),
+            received = events.recv() => match received {
+                Ok(tick) => forward(&tick),
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return None,
+            },
+        }
+    }
 }
 
 /// Runs one subscriber's share of the poll loop until `c` is cancelled or
 /// every other subscriber for this key has already left. At most one
 /// subscriber per key drives host reads at a time: the rest wait for the
 /// driver lock, so a dropped driver hands the loop to another live subscriber
-/// instead of stopping it.
+/// instead of stopping it. Every subscriber, driving or waiting, receives each
+/// tick's list name; detail names reach only subscribers of the probed number.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_subscriber(
     registry: &Registry,
@@ -470,26 +399,41 @@ pub(crate) async fn run_subscriber(
         scope.repository.clone(),
         list_key.to_owned(),
     );
-    let lease = registry.join(key);
-    let _permit = tokio::select! {
-        biased;
-        () = c.cancelled() => return,
-        () = lease.shared.cancellation.cancelled() => return,
-        permit = lease.shared.driver_lock.lock() => permit,
+    let mut lease = registry.join(key);
+    let shared = lease.shared.clone();
+    // The client stands its own refresh timer down on this first success.
+    emit(Changed::default());
+    let forward = |tick: &Tick| emit(tick.for_subscriber(number, tab));
+    let Some(_permit) = forward_until(
+        &mut lease.events,
+        shared.driver_lock.lock(),
+        &forward,
+        c,
+        &shared.cancellation,
+    )
+    .await
+    else {
+        return;
     };
     let mut delay = BASE_DELAY;
     let mut backoff_index: usize = 0;
     loop {
-        tokio::select! {
-            biased;
-            () = c.cancelled() => return,
-            () = lease.shared.cancellation.cancelled() => return,
-            () = tokio::time::sleep(delay) => {}
-        }
-        if c.is_cancelled() || lease.shared.cancellation.is_cancelled() {
+        if forward_until(
+            &mut lease.events,
+            tokio::time::sleep(delay),
+            &forward,
+            c,
+            &shared.cancellation,
+        )
+        .await
+        .is_none()
+        {
             return;
         }
-        let generation = lease.shared.next_tick();
+        if c.is_cancelled() || shared.cancellation.is_cancelled() {
+            return;
+        }
+        let generation = snapshot_store::next_generation();
         let outcome = run_tick(
             host,
             database,
@@ -497,15 +441,14 @@ pub(crate) async fn run_subscriber(
             list_query,
             list_key,
             number,
-            tab,
             generation,
-            emit,
             c,
-            &lease.shared.cancellation,
+            &shared.cancellation,
         )
         .await;
         match outcome {
-            TickOutcome::Success => {
+            TickOutcome::Success(changed) => {
+                let _ = shared.events.send(Tick { number, changed });
                 delay = BASE_DELAY;
                 backoff_index = 0;
             }
@@ -781,10 +724,10 @@ esac
                 Ok(SnapshotStore::new(connection).put(StoredSnapshot {
                     host,
                     project,
-                    kind: "detail".into(),
+                    kind: PROBE_KIND.into(),
                     key: number.to_string(),
                     fingerprint,
-                    payload: b"{}".to_vec(),
+                    payload: Vec::new(),
                     observed_at_ms: 0,
                     generation: 0,
                 })?)
@@ -845,6 +788,35 @@ esac
         move |changed: Changed| {
             log.lock().unwrap_or_else(|p| p.into_inner()).push(changed);
         }
+    }
+
+    /// The events after the connected one every subscriber receives on join.
+    fn ticks(log: &Arc<Mutex<Vec<Changed>>>) -> Vec<Changed> {
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.first(),
+            Some(&Changed::default()),
+            "the first event is the all-false connected event"
+        );
+        log[1..].to_vec()
+    }
+
+    fn list_json(updated_at: &str) -> String {
+        json!([{
+            "iid": 1,
+            "title": "x",
+            "state": "opened",
+            "draft": false,
+            "author": {"username": "a"},
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": updated_at,
+            "source_branch": "a",
+            "target_branch": "main",
+            "labels": [],
+            "user_notes_count": 0,
+            "web_url": "https://gitlab.com/x"
+        }])
+        .to_string()
     }
 
     #[tokio::test(start_paused = true)]
@@ -1004,13 +976,20 @@ esac
         .await;
         drive(&mut subs).await;
         assert!(log.lock().unwrap().iter().all(|changed| !changed.detail));
-        let row = stored(&database, &scope.host, &scope.repository, "detail", "3941")
-            .await
-            .unwrap();
-        assert_eq!(
-            row.payload,
-            b"{}".to_vec(),
-            "the seeded placeholder payload must remain untouched"
+        let row = stored(
+            &database,
+            &scope.host,
+            &scope.repository,
+            PROBE_KIND,
+            "3941",
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.generation, 0, "an unchanged probe rewrites nothing");
+        assert!(
+            stored(&database, &scope.host, &scope.repository, "detail", "3941")
+                .await
+                .is_none()
         );
         assert_eq!(
             count(
@@ -1023,8 +1002,7 @@ esac
     }
 
     #[tokio::test(start_paused = true)]
-    async fn gitlab_poller_changed_updated_at_emits_detail_and_timeline_and_stores_the_detail_payload()
-     {
+    async fn gitlab_poller_changed_updated_at_emits_detail_and_timeline_without_the_detail_join() {
         let (s, host, scope) = fixture();
         let database = new_database().await;
         let detail: Value =
@@ -1052,25 +1030,43 @@ esac
         )];
         drive(&mut subs).await;
         tokio::time::advance(Duration::from_secs(20)).await;
-        drive_until(&mut subs, || !log.lock().unwrap().is_empty()).await;
+        drive_until(&mut subs, || log.lock().unwrap().len() >= 2).await;
         drive(&mut subs).await;
-        let changed = log.lock().unwrap()[0].clone();
+        let changed = ticks(&log)[0].clone();
         assert!(changed.detail && changed.timeline);
         assert!(!changed.commits && !changed.checks && !changed.files);
-        assert!(
+        assert_eq!(
             count(
                 &s,
                 "api projects/gitlab-org%2Fcli/merge_requests/3941/approvals"
-            ) >= 1,
-            "the unary detail method ran"
+            ),
+            0,
+            "the client answers `detail` with the unary read; the poller never joins"
         );
-        let row = stored(&database, &scope.host, &scope.repository, "detail", "3941")
-            .await
-            .unwrap();
-        let payload: Value = serde_json::from_slice(&row.payload).unwrap();
+        assert_eq!(
+            count(&s, "api --method"),
+            0,
+            "no GraphQL timeline read either"
+        );
         assert!(
-            payload.get("permissions").is_some() && payload.get("readiness").is_some(),
-            "the stored payload is the detail response, not the probe JSON"
+            stored(&database, &scope.host, &scope.repository, "detail", "3941")
+                .await
+                .is_none(),
+            "the probe body is never stored as detail"
+        );
+        let probe = stored(
+            &database,
+            &scope.host,
+            &scope.repository,
+            PROBE_KIND,
+            "3941",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&probe.fingerprint).unwrap()["updated_at"],
+            detail["updated_at"],
+            "the next tick compares against the new probe"
         );
     }
 
@@ -1104,9 +1100,9 @@ esac
         )];
         drive(&mut subs).await;
         tokio::time::advance(Duration::from_secs(20)).await;
-        drive_until(&mut subs, || !log.lock().unwrap().is_empty()).await;
+        drive_until(&mut subs, || log.lock().unwrap().len() >= 2).await;
         drive(&mut subs).await;
-        let changed = log.lock().unwrap()[0].clone();
+        let changed = ticks(&log)[0].clone();
         assert!(changed.detail && changed.checks);
         assert!(!changed.timeline && !changed.commits && !changed.files);
         assert_eq!(
@@ -1114,7 +1110,8 @@ esac
                 &s,
                 "api projects/gitlab-org%2Fcli/merge_requests/3941/pipelines?per_page=1"
             ),
-            1
+            0,
+            "the client answers `checks` with the unary read"
         );
     }
 
@@ -1168,8 +1165,8 @@ esac
             "a third 429 backs off to 300s, not 240s"
         );
         assert!(
-            log.lock().unwrap().is_empty(),
-            "a 429 tick must never call emit"
+            ticks(&log).is_empty(),
+            "a 429 tick must never call emit beyond the connected event"
         );
         tokio::time::advance(Duration::from_secs(1)).await;
         drive_until(&mut subs, || count(&s, "mr list") >= 4).await;
@@ -1203,10 +1200,8 @@ esac
         drive_until(&mut subs, || count(&s, "mr list") >= 6).await;
         drive(&mut subs).await;
         assert_eq!(count(&s, "mr list"), 6);
-        assert!(
-            !log.lock().unwrap().is_empty(),
-            "a successful tick must emit"
-        );
+        drive_until(&mut subs, || log.lock().unwrap().len() >= 2).await;
+        assert_eq!(ticks(&log).len(), 1, "a successful tick must emit");
         fs::write(s.path("rate-limited"), "").unwrap();
         tokio::time::advance(Duration::from_secs(19)).await;
         drive(&mut subs).await;
@@ -1259,8 +1254,8 @@ esac
         drive(&mut subs).await;
         assert_eq!(count(&s, "mr list"), 1);
         assert!(
-            log.lock().unwrap().is_empty(),
-            "a non-429 host error must never call emit either"
+            ticks(&log).is_empty(),
+            "a non-429 host error must never call emit beyond the connected event"
         );
         tokio::time::advance(Duration::from_secs(20)).await;
         drive_until(&mut subs, || count(&s, "mr list") >= 2).await;
@@ -1270,7 +1265,7 @@ esac
             2,
             "a generic error backs off at the base 20s delay, not the 429 ladder"
         );
-        assert!(log.lock().unwrap().is_empty());
+        assert!(ticks(&log).is_empty());
     }
 
     #[tokio::test]
@@ -1330,8 +1325,6 @@ esac
         let database = new_database().await;
         let list_query = default_list_query(s.root());
         let list_key = list_query.snapshot_key();
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let emit = emitter(&log);
         // The host-call token stays live, so `host.list` runs and succeeds
         // normally; only the poller-wide (last-subscriber-left) token is
         // already cancelled, simulating a tick that is still mid-flight
@@ -1347,15 +1340,13 @@ esac
             &list_query,
             &list_key,
             None,
-            tab_none(),
             1,
-            &emit,
             &c,
             &shared_cancel,
         )
         .await;
 
-        assert!(matches!(outcome, TickOutcome::Success));
+        assert!(matches!(outcome, TickOutcome::Success(_)));
         assert_eq!(
             count(&s, "mr list"),
             1,
@@ -1430,7 +1421,7 @@ esac
         drive_until(&mut subs, || count(&s, "mr list") >= 1).await;
         drive(&mut subs).await;
         assert_eq!(count(&s, "mr list"), 1, "the first tick runs normally");
-        let row = stored_while_driving(
+        let first_generation = stored_while_driving(
             &mut subs,
             &database,
             &scope.host,
@@ -1438,12 +1429,9 @@ esac
             "list",
             &list_key,
         )
-        .await;
-        assert_eq!(
-            row.map(|row| row.generation),
-            Some(1),
-            "the first tick's own write must land before either token is cancelled"
-        );
+        .await
+        .map(|row| row.generation)
+        .expect("the first tick's own write must land before either token is cancelled");
 
         // The second subscriber joins only now, after tick 1 has already
         // landed: it shares the same poller key and bumps the registry's ref
@@ -1509,9 +1497,8 @@ esac
             &list_key,
         )
         .await;
-        assert_eq!(
-            row.map(|row| row.generation),
-            Some(2),
+        assert!(
+            row.is_some_and(|row| row.generation > first_generation),
             "a second subscriber is still active, so the shared poller-wide cancellation never \
              fired; the second tick's write must still land even though the driving \
              subscriber's own token cancelled, instead of leaving tick 1's stale row in place"
@@ -1520,7 +1507,7 @@ esac
         // Confirms the surviving subscriber (never cancelled) is the one
         // that actually took over driving, rather than some other path.
         assert!(
-            !log2.lock().unwrap().is_empty(),
+            log2.lock().unwrap().iter().any(|changed| changed.list),
             "the surviving subscriber must have emitted the second tick's result"
         );
 
@@ -1560,5 +1547,214 @@ esac
         drop(subs);
         let row = stored(&database, &scope.host, &scope.repository, "list", &list_key).await;
         assert!(row.is_none(), "cancelling mid-flight drops the pending put");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gitlab_poller_emits_one_all_false_event_when_a_lease_is_acquired() {
+        let (s, host, scope) = fixture();
+        let database = new_database().await;
+        let registry = Registry::default();
+        let list_query = default_list_query(s.root());
+        let list_key = list_query.snapshot_key();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let emit = emitter(&log);
+        let c = CancellationToken::new();
+        let mut subs = [pin_subscriber(
+            &registry,
+            &host,
+            &database,
+            &scope,
+            &list_query,
+            &list_key,
+            Some(3941),
+            tab_none(),
+            &emit,
+            &c,
+        )];
+        drive(&mut subs).await;
+        assert_eq!(*log.lock().unwrap(), vec![Changed::default()]);
+        assert!(
+            calls(&s).is_empty(),
+            "the connected event needs no host read"
+        );
+        c.cancel();
+        drive(&mut subs).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gitlab_poller_a_later_poller_stores_a_change_over_rows_an_earlier_poller_left() {
+        let (s, host, scope) = fixture();
+        fs::write(s.path("list.json"), list_json("2024-01-01T00:00:00Z")).unwrap();
+        let database = new_database().await;
+        let registry = Registry::default();
+        let list_query = default_list_query(s.root());
+        let list_key = list_query.snapshot_key();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let emit = emitter(&log);
+
+        let first_c = CancellationToken::new();
+        let mut first = [pin_subscriber(
+            &registry,
+            &host,
+            &database,
+            &scope,
+            &list_query,
+            &list_key,
+            None,
+            tab_none(),
+            &emit,
+            &first_c,
+        )];
+        drive(&mut first).await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drive_until(&mut first, || log.lock().unwrap().len() >= 2).await;
+        let earlier = stored_while_driving(
+            &mut first,
+            &database,
+            &scope.host,
+            &scope.repository,
+            "list",
+            &list_key,
+        )
+        .await
+        .expect("the first poller stores its page");
+        drop(first);
+
+        fs::write(s.path("list.json"), list_json("2024-01-02T00:00:00Z")).unwrap();
+        let second_c = CancellationToken::new();
+        let mut second = [pin_subscriber(
+            &registry,
+            &host,
+            &database,
+            &scope,
+            &list_query,
+            &list_key,
+            None,
+            tab_none(),
+            &emit,
+            &second_c,
+        )];
+        drive(&mut second).await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drive_until(&mut second, || log.lock().unwrap().len() >= 4).await;
+        assert_eq!(count(&s, "mr list"), 2);
+        let later = stored_while_driving(
+            &mut second,
+            &database,
+            &scope.host,
+            &scope.repository,
+            "list",
+            &list_key,
+        )
+        .await
+        .unwrap();
+        assert!(later.generation > earlier.generation);
+        assert!(
+            String::from_utf8(later.payload)
+                .unwrap()
+                .contains("2024-01-02T00:00:00Z"),
+            "a new poller's tick counter must not lose to the rows an earlier one left"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gitlab_poller_every_subscriber_of_the_key_receives_list_events_and_only_the_probed_number_gets_detail_names()
+     {
+        let (s, host, scope) = fixture();
+        fs::write(s.path("list.json"), list_json("2024-01-01T00:00:00Z")).unwrap();
+        let database = new_database().await;
+        let registry = Registry::default();
+        let list_query = default_list_query(s.root());
+        let list_key = list_query.snapshot_key();
+        let driver_log = Arc::new(Mutex::new(Vec::new()));
+        let list_log = Arc::new(Mutex::new(Vec::new()));
+        let files_log = Arc::new(Mutex::new(Vec::new()));
+        let driver_emit = emitter(&driver_log);
+        let list_emit = emitter(&list_log);
+        let files_emit = emitter(&files_log);
+        let c = CancellationToken::new();
+        let mut subs = [
+            pin_subscriber(
+                &registry,
+                &host,
+                &database,
+                &scope,
+                &list_query,
+                &list_key,
+                Some(3941),
+                tab_none(),
+                &driver_emit,
+                &c,
+            ),
+            pin_subscriber(
+                &registry,
+                &host,
+                &database,
+                &scope,
+                &list_query,
+                &list_key,
+                None,
+                tab_none(),
+                &list_emit,
+                &c,
+            ),
+            pin_subscriber(
+                &registry,
+                &host,
+                &database,
+                &scope,
+                &list_query,
+                &list_key,
+                Some(3941),
+                ActiveTab {
+                    commits: false,
+                    files: true,
+                },
+                &files_emit,
+                &c,
+            ),
+        ];
+        drive(&mut subs).await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        drive_until(&mut subs, || {
+            [&driver_log, &list_log, &files_log]
+                .iter()
+                .all(|log| log.lock().unwrap().len() >= 2)
+        })
+        .await;
+        drive(&mut subs).await;
+        assert_eq!(count(&s, "mr list"), 1, "one poller drives the key");
+        assert_eq!(
+            count(&s, "api projects/gitlab-org%2Fcli/merge_requests/3941"),
+            1,
+            "one probe for the driver's number"
+        );
+        let first_probe = Changed {
+            list: true,
+            detail: true,
+            timeline: true,
+            commits: false,
+            checks: true,
+            files: false,
+        };
+        assert_eq!(ticks(&driver_log), vec![first_probe.clone()]);
+        assert_eq!(
+            ticks(&list_log),
+            vec![Changed {
+                list: true,
+                ..Changed::default()
+            }],
+            "a waiting subscriber with no open number still hears the list change"
+        );
+        assert_eq!(
+            ticks(&files_log),
+            vec![Changed {
+                files: true,
+                ..first_probe
+            }],
+            "a waiting subscriber of the probed number keeps its own tab's names"
+        );
+        c.cancel();
+        drive(&mut subs).await;
     }
 }

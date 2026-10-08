@@ -2,10 +2,36 @@
 
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
 pub(crate) const BYTE_CAP: i64 = 33_554_432;
 pub(crate) const FILES_PAYLOAD_CAP: usize = 1_048_576;
+
+static LAST_GENERATION: AtomicI64 = AtomicI64::new(0);
+
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Write order for `put`, taken before the host read starts: epoch
+/// milliseconds, bumped past the previous stamp in this process. Rows left by
+/// an earlier poller or an earlier server process carry older stamps, so a
+/// later read can always replace them; a wall clock moved backwards across a
+/// restart holds writes off only until it passes the stored stamps again.
+pub(crate) fn next_generation() -> i64 {
+    let now = now_ms();
+    let previous = LAST_GENERATION
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+            Some(now.max(last + 1))
+        })
+        .unwrap_or_else(|last| last);
+    now.max(previous + 1)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
@@ -68,12 +94,7 @@ impl<'a> SnapshotStore<'a> {
                 "SELECT generation
                  FROM pull_request_snapshots
                  WHERE host = ?1 AND project = ?2 AND kind = ?3 AND key = ?4",
-                params![
-                    snapshot.host,
-                    snapshot.project,
-                    snapshot.kind,
-                    snapshot.key
-                ],
+                params![snapshot.host, snapshot.project, snapshot.kind, snapshot.key],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?
@@ -145,5 +166,25 @@ impl<'a> SnapshotStore<'a> {
             [],
             |row| row.get(0),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pull_request_snapshots_generation_is_wall_clock_based_and_strictly_increasing() {
+        let before = now_ms();
+        let first = next_generation();
+        let second = next_generation();
+        assert!(
+            first >= before,
+            "a stamp is never older than the clock it read"
+        );
+        assert!(
+            second > first,
+            "two stamps in the same millisecond still order"
+        );
     }
 }

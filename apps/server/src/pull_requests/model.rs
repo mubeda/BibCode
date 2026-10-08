@@ -809,7 +809,7 @@ pub struct Snapshot {
     pub tab: Option<SnapshotTab>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Changed {
     pub list: bool,

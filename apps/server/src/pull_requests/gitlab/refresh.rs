@@ -130,6 +130,54 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_reordered_or_resized_list_page_is_a_list_change() {
+        let row = sample_row();
+        let commented = ListFingerprint {
+            comment_count: 4,
+            ..sample_row()
+        };
+        assert!(list_changed(
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&commented)
+        ));
+        assert!(list_changed(
+            &[row.clone(), commented.clone()],
+            &[commented, row.clone()]
+        ));
+        assert!(list_changed(
+            std::slice::from_ref(&row),
+            &[row.clone(), row.clone()]
+        ));
+        assert!(list_changed(&[], std::slice::from_ref(&row)));
+    }
+
+    #[test]
+    fn a_pipeline_appearing_or_going_away_refreshes_detail_and_checks_only() {
+        let without = ProbeFingerprint {
+            updated_at: "2026-10-08T00:00:00Z".into(),
+            user_notes_count: 3,
+            pipeline_id: None,
+            pipeline_status: None,
+        };
+        let with = ProbeFingerprint {
+            pipeline_id: Some(7),
+            pipeline_status: Some("running".into()),
+            ..without.clone()
+        };
+        let tab = ActiveTab {
+            commits: true,
+            files: true,
+        };
+        let expected = RefreshNames {
+            detail: true,
+            checks: true,
+            ..RefreshNames::none()
+        };
+        assert_eq!(detail_refresh(&without, &with, tab), expected);
+        assert_eq!(detail_refresh(&with, &without, tab), expected);
+    }
+
+    #[test]
     fn pipeline_change_with_the_same_updated_at_refreshes_detail_and_checks_only() {
         let previous = ProbeFingerprint {
             updated_at: "2026-10-08T00:00:00Z".into(),
