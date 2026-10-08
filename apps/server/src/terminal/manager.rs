@@ -7480,7 +7480,7 @@ mod tests {
         assert_eq!(spawns.len(), 2, "open and restart each spawn once");
         let separator = if cfg!(windows) { ';' } else { ':' };
         for (spawn, token) in spawns.iter().zip(issued.lock().unwrap().iter()) {
-            assert_eq!(spawn.env["BIBCODE_OPEN_URL_TOKEN"], *token);
+            assert_eq!(spawn.env["BIBCODE_OPEN_URL_AUTH"], *token);
             assert_eq!(
                 spawn.env["BIBCODE_OPEN_URL_ENDPOINT"],
                 "http://127.0.0.1:3773/api/preview/open-url"

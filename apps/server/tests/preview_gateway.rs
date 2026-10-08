@@ -178,12 +178,29 @@ impl Gateway {
         let target = GatewayTarget {
             thread_id: THREAD.to_owned(),
             upstream,
+            fallback: None,
             upstream_port: upstream.port(),
             environment_label: "devbox".to_owned(),
         };
-        let running = start_target("127.0.0.1", target, ctx, CancellationToken::new())
-            .await
-            .expect("gateway listens");
+        Self::start_target(target, ctx, issuer, principal).await
+    }
+
+    async fn start_target(
+        target: GatewayTarget,
+        ctx: GatewayContext,
+        issuer: Arc<CapabilityIssuer>,
+        principal: Arc<FakePrincipal>,
+    ) -> Self {
+        let upstream_port = target.upstream_port;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let running = start_target(
+            listener,
+            target,
+            ctx,
+            CancellationToken::new(),
+            CancellationToken::new(),
+        )
+        .expect("gateway listens");
         let base = format!("http://127.0.0.1:{}", running.gateway_port);
         let http = reqwest::Client::builder()
             .no_proxy()
@@ -194,7 +211,7 @@ impl Gateway {
             running,
             issuer,
             principal,
-            upstream_port: upstream.port(),
+            upstream_port,
             base,
             http,
         }
@@ -527,6 +544,60 @@ async fn rewrites_set_cookie_domain_and_location() {
         .map(|value| value.to_str().unwrap())
         .collect();
     assert_eq!(cookies, ["app=1; Path=/"]);
+}
+
+#[tokio::test]
+async fn a_refused_upstream_is_retried_once_on_the_other_loopback_family() {
+    // The dev server restarted on IPv6 after the target was probed on IPv4.
+    let listener = match TcpListener::bind("[::1]:0").await {
+        Ok(listener) => listener,
+        Err(error) => {
+            println!("skipping: IPv6 loopback is unavailable ({error})");
+            return;
+        }
+    };
+    let ipv6 = listener.local_addr().unwrap();
+    let app = Router::new().route("/", get(|| async { "from ipv6" }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let refused: SocketAddr = format!("127.0.0.1:{}", ipv6.port()).parse().unwrap();
+    if TcpStream::connect(refused).await.is_ok() {
+        println!("skipping: something listens on {refused}");
+        return;
+    }
+    let issuer = Arc::new(CapabilityIssuer::new(vec![9; 32]));
+    let principal = Arc::new(FakePrincipal(
+        Mutex::new(Some(i64::try_from(now_millis()).unwrap() + 3_600_000)),
+        AtomicBool::new(false),
+    ));
+    let target = GatewayTarget {
+        thread_id: THREAD.to_owned(),
+        upstream: refused,
+        fallback: Some(ipv6),
+        upstream_port: ipv6.port(),
+        environment_label: "devbox".to_owned(),
+    };
+    let ctx = GatewayContext {
+        issuer: issuer.clone(),
+        sessions: Arc::new(GatewaySessions::new()),
+        principal: principal.clone(),
+        limits: GatewayLimits {
+            per_target: 64,
+            global: Arc::new(Semaphore::new(256)),
+        },
+        session_cookie_name: SESSION_COOKIE.to_owned(),
+        principal_check_interval: Duration::from_secs(30),
+    };
+    let gateway = Gateway::start_target(target, ctx, issuer, principal).await;
+    let cookie = gateway.session_cookie().await;
+    let response = gateway
+        .http
+        .get(format!("{}/", gateway.base))
+        .header(header::COOKIE, cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "from ipv6");
 }
 
 #[tokio::test]

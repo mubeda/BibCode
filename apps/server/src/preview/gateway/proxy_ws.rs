@@ -1,6 +1,6 @@
 //! WebSocket half of the preview gateway proxy: answers the client's upgrade once the
 //! upstream accepted it, then tunnels bytes both ways until either side closes, the
-//! listener shuts down, or the principal stops being active.
+//! listener starts draining or shuts down, or the principal stops being active.
 
 use std::sync::Arc;
 
@@ -69,5 +69,7 @@ async fn tunnel(
     tokio::select! {
         () = copy => {}
         () = state.until_revoked(&principal) => {}
+        // A tunnel is never idle, so it would always hold shutdown to its deadline.
+        () = state.draining.cancelled() => {}
     }
 }

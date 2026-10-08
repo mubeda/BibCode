@@ -8,7 +8,13 @@ use axum::{
 };
 use bibcode_server::{
     RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime, mcp,
-    preview::PreviewManager,
+    preview::{
+        MAX_PENDING_OPEN_REQUESTS, PreviewManager,
+        gateway::{
+            proxy::PrincipalCheck,
+            registry::{PreviewGateway, gateway_context},
+        },
+    },
     production::{
         connect_mcp::{
             ConnectMcpConfig, ConnectMcpService, DecodedCloudProof, EndpointRuntime, JwtCodec,
@@ -19,7 +25,7 @@ use bibcode_server::{
     },
     workspace::{WorkspaceRpc, WorkspaceService},
 };
-use futures_util::SinkExt;
+use futures_util::{SinkExt, future::BoxFuture};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -156,6 +162,7 @@ async fn open_url_route_accepts_bearer_token_and_emits_open_request() {
     .await;
 
     assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["delivered"], true);
     let request_id = body["requestId"].as_str().expect("request id").to_owned();
     let event = serde_json::to_value(events.recv().await.expect("event")).unwrap();
     assert_eq!(event["type"], "openRequested");
@@ -163,6 +170,64 @@ async fn open_url_route_accepts_bearer_token_and_emits_open_request() {
     assert_eq!(event["requestId"], request_id.as_str());
     assert_eq!(event["url"], "http://localhost:5173/");
     assert!(preview.claim_open_request(&request_id).await);
+}
+
+struct LivePrincipal;
+
+impl PrincipalCheck for LivePrincipal {
+    fn session_expiry<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, Option<i64>> {
+        Box::pin(async { Some(i64::MAX) })
+    }
+}
+
+#[tokio::test]
+async fn open_url_route_reports_whether_a_client_could_see_the_request() {
+    let temp = TempDir::new().unwrap();
+    let connect = Arc::new(setup_service(&temp).await);
+    let preview = PreviewManager::new();
+    // The production gateway follows preview events itself; it is not a client.
+    let gateway = PreviewGateway::new(
+        "127.0.0.1",
+        "devbox",
+        gateway_context(Arc::new(LivePrincipal), vec![1; 32], "session".into()),
+        preview.clone(),
+    );
+    let app = router(Arc::clone(&connect), preview.clone());
+    let credential = connect.issue_open_url_credential("thread-1").await.unwrap();
+    let post = || {
+        post_open_url(
+            &app,
+            bearer(&credential.token),
+            json!({"url": "http://localhost:5173/"}),
+        )
+    };
+
+    let (status, body) = post().await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["delivered"], false);
+    assert!(body["requestId"].is_string());
+
+    let _client = preview.subscribe_events();
+    let (status, body) = post().await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["delivered"], true);
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_url_route_answers_429_past_the_pending_request_cap() {
+    let temp = TempDir::new().unwrap();
+    let connect = Arc::new(setup_service(&temp).await);
+    let app = router(Arc::clone(&connect), PreviewManager::new());
+    let credential = connect.issue_open_url_credential("thread-1").await.unwrap();
+    let body = json!({"url": "http://localhost:5173/"});
+    for _ in 0..MAX_PENDING_OPEN_REQUESTS {
+        let (status, _) = post_open_url(&app, bearer(&credential.token), body.clone()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+    let (status, response) = post_open_url(&app, bearer(&credential.token), body).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response["error"], "too_many_open_requests");
 }
 
 #[tokio::test]
@@ -231,7 +296,7 @@ async fn open_url_token_does_not_authorize_mcp() {
         Err(error) => error,
     };
     assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
-    assert!(format!("{error:?}").contains("invalid_mcp_credential"));
+    assert_eq!(error.body()["error"], "invalid_mcp_credential");
 }
 
 #[tokio::test]
@@ -293,7 +358,8 @@ async fn claim_open_request_rpc_is_single_use() {
     let request_id = preview
         .request_open("thread-1", "http://localhost:5173")
         .await
-        .unwrap();
+        .unwrap()
+        .request_id;
 
     for (id, expected) in [("1", true), ("2", false)] {
         socket
@@ -341,7 +407,7 @@ async fn run_open_url_cli(url: &str, env: &[(&str, &str)]) -> std::process::Outp
     command
         .args(["open-url", url])
         .env_remove("BIBCODE_OPEN_URL_ENDPOINT")
-        .env_remove("BIBCODE_OPEN_URL_TOKEN");
+        .env_remove("BIBCODE_OPEN_URL_AUTH");
     for (key, value) in env {
         command.env(key, value);
     }
@@ -371,7 +437,7 @@ async fn open_url_cli_posts_to_the_route_and_emits_open_request() {
         url,
         &[
             ("BIBCODE_OPEN_URL_ENDPOINT", &endpoint),
-            ("BIBCODE_OPEN_URL_TOKEN", &credential.token),
+            ("BIBCODE_OPEN_URL_AUTH", &credential.token),
         ],
     )
     .await;
@@ -382,12 +448,26 @@ async fn open_url_cli_posts_to_the_route_and_emits_open_request() {
     assert_eq!(event["threadId"], "thread-1");
     assert_eq!(event["url"], url);
 
+    // With no client subscribed nobody will open it, so the URL is printed for a human.
+    drop(events);
+    let output = run_open_url_cli(
+        url,
+        &[
+            ("BIBCODE_OPEN_URL_ENDPOINT", &endpoint),
+            ("BIBCODE_OPEN_URL_AUTH", &credential.token),
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{url}\n"));
+    assert!(output.stderr.is_empty(), "{output:?}");
+
     // A refused token still succeeds for the caller: the URL is printed for a human.
     let output = run_open_url_cli(
         url,
         &[
             ("BIBCODE_OPEN_URL_ENDPOINT", &endpoint),
-            ("BIBCODE_OPEN_URL_TOKEN", "not-a-token"),
+            ("BIBCODE_OPEN_URL_AUTH", "not-a-token"),
         ],
     )
     .await;
@@ -423,7 +503,7 @@ async fn open_url_alias_posts_the_url_and_rejects_a_missing_one() {
         command
             .args(args)
             .env("BIBCODE_OPEN_URL_ENDPOINT", &endpoint)
-            .env("BIBCODE_OPEN_URL_TOKEN", &credential.token);
+            .env("BIBCODE_OPEN_URL_AUTH", &credential.token);
         async move {
             timeout(Duration::from_secs(20), command.output())
                 .await

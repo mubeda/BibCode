@@ -2678,6 +2678,11 @@ browser tab), the environment's address, and each gateway port.
   `http://<server address>:<gateway port>/`. `https://localhost:8123/` shows
   the HTTPS notice, and a port with nothing listening shows "Nothing is
   listening on port <port> on <environment>."
+- **Bind and reach.** With the server started on `--host 0.0.0.0`, the gateway
+  port listens only on the address the client used (`ss -ltn` on Linux,
+  `netstat -an` elsewhere), not on `0.0.0.0`. Reach the same server through a
+  reverse proxy on its host, or through Tailscale Serve, and click the link
+  again: the preview is refused as a proxied address and no gateway port opens.
 - **Browser-mode cross-site bootstrap.** Open the BiBCode UI in a browser from
   a different host than the environment's address, so the UI and the gateway
   are different sites (for example, the UI served by this computer and the
@@ -2717,8 +2722,9 @@ browser tab), the environment's address, and each gateway port.
   in a hidden window loses to a visible one. With every client on another
   thread, after 2 seconds one visible client shows "A command in <thread title>
   wants to open <address>", and **Open** switches to that thread and opens it. With the token unset
-  (`env -u BIBCODE_OPEN_URL_TOKEN "$BROWSER" http://localhost:8123/`), it prints
-  the address and exits 0. `"$BROWSER" file:///etc/hosts` writes
+  (`env -u BIBCODE_OPEN_URL_AUTH "$BROWSER" http://localhost:8123/`), it prints
+  the address and exits 0. With no BiBCode client connected to the server, it
+  also prints the address and exits 0. `"$BROWSER" file:///etc/hosts` writes
   `bibcode open-url: expected an http(s) URL` and exits 2.
 - **Agent open in a browser tab.** With only a browser-mode client on the
   thread, ask the agent to call `preview_open` for `http://localhost:8123/`:
@@ -2728,9 +2734,11 @@ browser tab), the environment's address, and each gateway port.
 Pending native checks: Windows `bibcode-open-url.exe` started from `cmd` and
 PowerShell (the desktop build attaches to the parent console; record whether
 the prompt waits and the exit code is visible); whether a Codex agent's
-commands receive `BIBCODE_OPEN_URL_TOKEN` (from a Codex tool call,
-`[ -n "$BIBCODE_OPEN_URL_TOKEN" ] && echo present || echo missing`; never print
-the value); a session older than 8 hours falls back to printing.
+commands receive `BIBCODE_OPEN_URL_AUTH` (from a Codex tool call,
+`[ -n "$BIBCODE_OPEN_URL_AUTH" ] && echo present || echo missing`; never print
+the value); whether Codex's `workspace-write` sandbox makes `"$BROWSER"` print
+the address instead of opening it; a session older than 8 hours falls back to
+printing.
 
 ## Non-native compatibility audit
 

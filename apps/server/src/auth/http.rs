@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn cookie_origin_matches_host_or_trusted_app_origins() {
+    fn cookie_origin_matches_host_or_the_dev_origin() {
         use axum::http::{HeaderMap, HeaderValue, header};
 
         let config = crate::config::ServerConfig::new(std::env::temp_dir())
@@ -1055,12 +1055,11 @@ mod tests {
             super::cookie_request_origin_allowed(&headers, trusted)
         };
 
-        for origin in [
-            "bibcode://app",
-            "bibcode-dev://app",
-            "http://localhost:5733",
-        ] {
-            assert!(allowed(None, Some(origin)), "{origin}");
+        assert_eq!(trusted, ["http://localhost:5733"]);
+        assert!(allowed(None, Some("http://localhost:5733")));
+        // The desktop app never authenticates with the cookie, so its origins get no pass.
+        for origin in ["bibcode://app", "bibcode-dev://app"] {
+            assert!(!allowed(Some("127.0.0.1:3773"), Some(origin)), "{origin}");
         }
         assert!(allowed(
             Some("127.0.0.1:3773"),
@@ -1073,10 +1072,7 @@ mod tests {
         let opaque_dev = crate::config::ServerConfig::new(std::env::temp_dir())
             .with_dev_url("file:///tmp/app".parse().expect("opaque dev URL"));
         let opaque_auth = crate::auth::AuthService::new(&opaque_dev, vec![7_u8; 32]);
-        assert_eq!(
-            opaque_auth.trusted_cookie_origins(),
-            ["bibcode://app", "bibcode-dev://app"]
-        );
+        assert!(opaque_auth.trusted_cookie_origins().is_empty());
         assert!(!allowed(
             Some("127.0.0.1:3773"),
             Some("http://127.0.0.1:3774")

@@ -1079,15 +1079,36 @@ in `apps/server/src/preview/gateway/`.
   `::1`. `https` fails with `PreviewGatewayError` reason `https-unsupported`,
   and any other host or scheme fails with `not-admitted`. Every call is an
   explicit user or agent action by an operate caller, so there is no per-port
-  allowlist. The upstream is probed at `127.0.0.1:<port>`, then
-  `[::1]:<port>`, for 500 ms each. The first address that accepts wins; if
-  neither does, the call fails with `no-upstream`. A server without
-  authentication returns `unavailable`, because a capability binds a session.
-- **Per-target listeners.** Each `(thread, upstream port)` gets its own
-  listener on an ephemeral port of the main server's bind host. The separate
-  port gives each target its own origin. Opening is idempotent under one lock:
-  a second call reuses the listener and mints a fresh capability. The result
-  is `{ gatewayPort, capability, expiresAtMs }`.
+  allowlist. A literal address is probed only at that address, so
+  `127.0.0.2` is never served by `127.0.0.1`. `localhost` is probed at
+  `127.0.0.1:<port>`, then `[::1]:<port>`. Each probe waits 500 ms. The first
+  address that accepts wins; if none does, the call fails with `no-upstream`.
+  When a `localhost` upstream later refuses a connection, the gateway tries the
+  other loopback family once, so a dev server that restarted on IPv6 stays
+  reachable. A server without authentication returns `unavailable`, because a
+  capability binds a session.
+- **Bind and reachability.** The listener binds the local address the caller's
+  RPC connection was accepted on, not the configured bind host. On a `0.0.0.0`
+  bind, a LAN client gets a listener on the LAN address and an SSH tunnel gets
+  one on loopback. The call fails with reason `not-reachable` in two cases:
+  - The caller reached the server on a public address: "Previews aren't
+    available on a public address." Private reach is loopback, RFC 1918,
+    CGNAT `100.64.0.0/10` (tailnets), link-local, and IPv6 ULA `fc00::/7`.
+  - The caller reached a loopback socket under a `Host` that is not a loopback
+    name or address, which is a reverse proxy or Tailscale Serve: "Previews
+    aren't available through a proxied address." Their listeners would be
+    unreachable. SSH tunnels and WSL arrive with a loopback `Host` and are
+    allowed. A machine name that resolves to loopback (`127.0.1.1` on Debian)
+    is refused the same way.
+- **Per-target listeners.** Each `(thread, upstream address and port, bound
+address)` gets its own listener on an ephemeral port, so two clients that
+  reached the server on different addresses each get a listener they can
+  reach. The separate port gives each target its own origin. Ports stay unique
+  across addresses, because capabilities and gateway sessions name a listener
+  by its port. Opening is idempotent under one lock: a second call reuses the
+  listener and mints a fresh capability. At most 64 targets run at once;
+  another open returns `unavailable`. The result is
+  `{ gatewayPort, capability, expiresAtMs }`.
 - **Auth bootstrap.** The capability is a `signed_token` with purpose
   `preview-gateway`. It is bound to the gateway port, upstream port, thread,
   and caller's session, lasts 60 s, and works once. The client navigates to
@@ -1113,8 +1134,10 @@ in `apps/server/src/preview/gateway/`.
   compare `Origin` with `Host` accept them.
 - **Forwarding.** `Host` becomes `localhost:<port>`. The gateway strips
   BiBCode's session cookie, every `bibcode-gw-*` cookie, `authorization`,
-  `dpop`, and hop-by-hop headers. In responses it drops `Domain=` from
-  `Set-Cookie` and drops cookies with reserved names. It also rewrites a
+  `dpop`, and hop-by-hop headers, including `proxy-connection`. In responses
+  it drops `Domain=` from `Set-Cookie` and drops cookies with reserved names.
+  Cookie headers are filtered as bytes, so a non-ASCII cookie passes through
+  unchanged and never costs a request its gateway cookie. It also rewrites a
   `Location` that points at `localhost`, `127.0.0.1`, or `[::1]` on the
   upstream port to the client-facing origin.
 - **Limits.** Each target allows 64 concurrent upstream connections, and all
@@ -1123,21 +1146,25 @@ in `apps/server/src/preview/gateway/`.
   `retry-after: 1`. When nothing listens, it returns `502` with "Nothing is
   listening on port <port> on <environment>."
 - **Teardown.** A target closes in four cases:
-  - The last preview tab of its thread on its port closes. The gateway follows
-    `PreviewManager` events; after missed events it re-checks every thread
-    that has a target.
+  - The last preview tab of its thread on its port closes or navigates away.
+    The gateway follows `PreviewManager` events; after missed events it
+    re-checks every thread that has a target.
   - It has had no connections for 10 minutes. The sweep runs every 60 s, and
     minting a capability counts as activity.
   - Its thread is deleted, which also closes the thread's preview tabs.
-  - The server shuts down.
+  - The server shuts down. Shutdown stops accepting, closes idle connections
+    and WebSocket tunnels at once, and lets in-flight requests finish for up to
+    2 s before cutting what is left. The server has no shutdown deadline of its
+    own, and the desktop gives the whole backend 5 s to stop.
 
   The first case applies only once a tab of the thread has pointed at the
   target's port. A target no tab ever pointed at, such as one opened for a
   browser-mode tab, closes only in the other three cases.
 
-- **E2EE caveat.** Gateway traffic is plain HTTP on the server's bind, outside
-  Noise, like `/api/assets`. Clients keep the Phase 0 `public-host` notice
-  instead of using the gateway on public-IP binds.
+- **E2EE caveat.** Gateway traffic is plain HTTP, outside Noise, like
+  `/api/assets`. Clients keep the Phase 0 `public-host` notice instead of using
+  the gateway on public-IP binds, and the server refuses such callers with
+  `not-reachable`.
 - **Relay limitation.** A relay (BiBCode Connect) client cannot reach gateway
   listeners. It shows "This address is on <label>, not this computer. Opening
   its ports from here isn't supported yet."
@@ -1168,11 +1195,20 @@ in `apps/server/src/preview/gateway/`.
   five-minute ticket window.
 - When the browser-session cookie is the credential, any method other than
   `GET`, `HEAD`, or `OPTIONS`, and any WebSocket upgrade, must carry an `Origin`
-  equal to the request's own `http(s)://<Host>` origin or one of
-  `bibcode://app`, `bibcode-dev://app`, or the `--dev-url` origin. A missing or
-  different `Origin` returns `403` `EnvironmentOperationForbiddenError` with
-  reason `origin_not_allowed`. Bearer, DPoP, and `wsTicket` authentication do
-  not check `Origin`.
+  equal to the request's own `http(s)://<Host>` origin or the `--dev-url`
+  origin. A missing or different `Origin` returns `403`
+  `EnvironmentOperationForbiddenError` with reason `origin_not_allowed`.
+  Bearer, DPoP, and `wsTicket` authentication do not check `Origin`. The
+  desktop app's `bibcode://app` origin gets no exception: it sends a bearer
+  token with `credentials: "omit"` and never uses the cookie.
+- `X-Forwarded-Host` and `X-Forwarded-Proto` are honored only from a loopback
+  socket peer, the same trust as `X-Forwarded-For`. From such a peer the first
+  `X-Forwarded-Host` entry replaces `Host` before any handler runs, so the
+  Origin rule, DPoP request URLs, and the preview gateway see the address the
+  browser used. Every other peer has both headers removed. A reverse proxy
+  must therefore run on the server's host and send `X-Forwarded-Host`. With
+  nginx's default `proxy_set_header Host $proxy_host`, a proxy that omits it
+  gets `403` on every cookie mutation and WebSocket.
 - DPoP binds Connect-issued relay and environment tokens to the client's proof
   key and the target HTTP request.
 - Relay request proofs and environment health/mint responses are independently

@@ -1,6 +1,9 @@
 use bibcode_server::preview;
 
-use preview::{PreviewManager, PreviewNavStatus, PreviewViewportSetting};
+use preview::{
+    MAX_PENDING_OPEN_REQUESTS, OpenRequestError, PreviewManager, PreviewNavStatus,
+    PreviewViewportSetting,
+};
 
 #[tokio::test]
 async fn opens_a_preview_session_with_normalized_localhost_url_and_emits_opened() {
@@ -96,10 +99,12 @@ async fn request_open_emits_event_and_first_claim_wins() {
     let manager = PreviewManager::new();
     let mut events = manager.subscribe_events();
 
-    let request_id = manager
+    let receipt = manager
         .request_open("thread-1", "localhost:5173/docs")
         .await
         .expect("request open");
+    assert!(receipt.delivered, "a client is subscribed");
+    let request_id = receipt.request_id;
 
     let event = events.recv().await.expect("openRequested event");
     assert_eq!(event.event_type(), "openRequested");
@@ -155,18 +160,70 @@ async fn request_open_rejects_non_http_and_oversized_urls() {
 #[tokio::test(start_paused = true)]
 async fn open_requests_expire_after_sixty_seconds() {
     let manager = PreviewManager::new();
-    let fresh = manager
+    let claimed_in_time = manager
         .request_open("thread-1", "http://localhost:5173")
         .await
-        .expect("request open");
-    let stale = manager
+        .expect("request open")
+        .request_id;
+    let claimed_too_late = manager
         .request_open("thread-1", "http://localhost:5173")
         .await
-        .expect("request open");
+        .expect("request open")
+        .request_id;
 
     tokio::time::advance(std::time::Duration::from_secs(59)).await;
-    assert!(manager.claim_open_request(&fresh).await);
+    assert!(manager.claim_open_request(&claimed_in_time).await);
 
     tokio::time::advance(std::time::Duration::from_secs(2)).await;
-    assert!(!manager.claim_open_request(&stale).await);
+    assert!(!manager.claim_open_request(&claimed_too_late).await);
+}
+
+#[tokio::test]
+async fn internal_subscribers_do_not_count_as_delivery() {
+    let manager = PreviewManager::new();
+    let internal = manager.subscribe_internal_events();
+    let request = |manager: PreviewManager| async move {
+        manager
+            .request_open("thread-1", "http://localhost:5173")
+            .await
+            .expect("request open")
+            .delivered
+    };
+    assert!(!request(manager.clone()).await, "only the server listens");
+    let client = manager.subscribe_events();
+    assert!(request(manager.clone()).await, "a client listens");
+    drop(client);
+    assert!(!request(manager.clone()).await);
+    drop(internal);
+    assert!(!request(manager.clone()).await, "nobody listens");
+}
+
+#[tokio::test]
+async fn pending_open_requests_are_capped_per_thread() {
+    let manager = PreviewManager::new();
+    let mut first = None;
+    for _ in 0..MAX_PENDING_OPEN_REQUESTS {
+        let id = manager
+            .request_open("thread-1", "http://localhost:5173")
+            .await
+            .expect("under the cap")
+            .request_id;
+        first.get_or_insert(id);
+    }
+    assert!(matches!(
+        manager
+            .request_open("thread-1", "http://localhost:5173")
+            .await,
+        Err(OpenRequestError::TooManyPending)
+    ));
+    manager
+        .request_open("thread-2", "http://localhost:5173")
+        .await
+        .expect("another thread has its own cap");
+    // Claiming one frees a slot.
+    assert!(manager.claim_open_request(&first.unwrap()).await);
+    manager
+        .request_open("thread-1", "http://localhost:5173")
+        .await
+        .expect("a slot was freed");
 }

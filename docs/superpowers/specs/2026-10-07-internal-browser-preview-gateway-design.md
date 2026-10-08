@@ -241,7 +241,7 @@ non-local environments:
 - The server mints a per-session token scoped to one thread and one
   capability: requesting an open for that thread. Lifetime: the provider or
   terminal session.
-- Injected as `BIBCODE_OPEN_URL_TOKEN` and `BIBCODE_OPEN_URL_ENDPOINT` into
+- Injected as `BIBCODE_OPEN_URL_AUTH` and `BIBCODE_OPEN_URL_ENDPOINT` into
   provider launches (`production/provider_runtime.rs`, alongside the MCP
   credential) and terminal spawns (`terminal/pty.rs` env assembly).
 

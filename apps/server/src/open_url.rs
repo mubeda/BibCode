@@ -14,7 +14,9 @@ use std::{
 use crate::production::connect_mcp::ConnectMcpService;
 
 pub const SHIM_NAME: &str = "bibcode-open-url";
-pub const TOKEN_ENV: &str = "BIBCODE_OPEN_URL_TOKEN";
+/// Not `*_TOKEN`: Codex's default `shell_environment_policy` drops variables whose names
+/// contain `KEY`, `SECRET`, or `TOKEN` from the commands it runs.
+pub const TOKEN_ENV: &str = "BIBCODE_OPEN_URL_AUTH";
 pub const ENDPOINT_ENV: &str = "BIBCODE_OPEN_URL_ENDPOINT";
 const POST_TIMEOUT: Duration = Duration::from_secs(5);
 const PATH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
@@ -280,7 +282,8 @@ impl OpenUrlEnvironment {
 
 /// `bibcode open-url <url>`: asks the BiBCode client showing this session's thread to open
 /// `url`. Returns the process exit code. A tool calling `$BROWSER` must never fail because
-/// BiBCode is unreachable, so every failure after validation prints the URL and exits 0.
+/// BiBCode is unreachable, so every failure after validation prints the URL and exits 0, and
+/// so does a request no client could see (or one refused because too many are pending).
 pub async fn run_open_url(url: &str) -> i32 {
     let endpoint = std::env::var(ENDPOINT_ENV).ok();
     let token = std::env::var(TOKEN_ENV).ok();
@@ -299,14 +302,19 @@ async fn open_url(url: &str, endpoint: Option<&str>, token: Option<&str>) -> i32
         println!("{url}");
         return 0;
     };
-    if let Err(error) = post_open_request(url, endpoint, token).await {
-        println!("{url}");
-        eprintln!("bibcode open-url: {error}");
+    match post_open_request(url, endpoint, token).await {
+        Ok(true) => {}
+        Ok(false) => println!("{url}"),
+        Err(error) => {
+            println!("{url}");
+            eprintln!("bibcode open-url: {error}");
+        }
     }
     0
 }
 
-async fn post_open_request(url: &str, endpoint: &str, token: &str) -> Result<(), String> {
+/// Whether a BiBCode client received the request.
+async fn post_open_request(url: &str, endpoint: &str, token: &str) -> Result<bool, String> {
     // The endpoint is this machine's own server; a user's HTTP proxy must not intercept it.
     let client = reqwest::Client::builder()
         .timeout(POST_TIMEOUT)
@@ -320,11 +328,11 @@ async fn post_open_request(url: &str, endpoint: &str, token: &str) -> Result<(),
         .send()
         .await
         .map_err(|error| error.to_string())?;
-    if response.status() == reqwest::StatusCode::ACCEPTED {
-        Ok(())
-    } else {
-        Err(format!("BiBCode answered {}", response.status()))
+    if response.status() != reqwest::StatusCode::ACCEPTED {
+        return Err(format!("BiBCode answered {}", response.status()));
     }
+    let body: serde_json::Value = response.json().await.map_err(|error| error.to_string())?;
+    Ok(body["delivered"].as_bool().unwrap_or(false))
 }
 
 #[cfg(test)]
@@ -550,7 +558,7 @@ mod tests {
         assert_eq!(
             env,
             BTreeMap::from([
-                ("BIBCODE_OPEN_URL_TOKEN".to_owned(), "token-1".to_owned()),
+                ("BIBCODE_OPEN_URL_AUTH".to_owned(), "token-1".to_owned()),
                 (
                     "BIBCODE_OPEN_URL_ENDPOINT".to_owned(),
                     "http://127.0.0.1:3773/api/preview/open-url".to_owned()

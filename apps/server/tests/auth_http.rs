@@ -2759,13 +2759,14 @@ async fn cookie_authenticated_websocket_upgrade_requires_same_origin() {
 }
 
 #[tokio::test]
-async fn trusted_desktop_origins_pass_cookie_checks() {
+async fn desktop_app_origins_do_not_pass_cookie_checks() {
     let temp = TempDir::new().expect("temporary base directory");
     let handle = start_desktop_server(&temp).await;
     let client = Client::new();
     let cookie = browser_session_cookie(&client, &handle).await;
 
-    for origin in ["bibcode://app", "bibcode-dev://app"] {
+    // The desktop app authenticates with a bearer token, never the cookie.
+    for origin in ["bibcode://app", "bibcode-dev://app", "bibcode-other://app"] {
         let response = client
             .post(http_url(&handle, "/api/orchestration/dispatch"))
             .header(header::COOKIE, &cookie)
@@ -2773,18 +2774,44 @@ async fn trusted_desktop_origins_pass_cookie_checks() {
             .json(&json!({}))
             .send()
             .await
-            .expect("trusted-origin dispatch");
-        assert_ne!(response.status(), StatusCode::FORBIDDEN, "{origin}");
+            .expect("app-origin dispatch");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origin}");
     }
-    let untrusted = client
-        .post(http_url(&handle, "/api/orchestration/dispatch"))
-        .header(header::COOKIE, &cookie)
-        .header(header::ORIGIN, "bibcode-other://app")
-        .json(&json!({}))
-        .send()
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
+async fn a_loopback_proxy_forwarded_host_is_the_cookie_origin() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let cookie = browser_session_cookie(&client, &handle).await;
+    let dispatch = |origin: String| {
+        client
+            .post(http_url(&handle, "/api/orchestration/dispatch"))
+            .header(header::COOKIE, &cookie)
+            // nginx's default `proxy_set_header Host $proxy_host`.
+            .header("x-forwarded-host", "bibcode.example.test")
+            .header("x-forwarded-proto", "https")
+            .header(header::ORIGIN, origin)
+            .json(&json!({}))
+            .send()
+    };
+
+    // The test client is a loopback peer, like a reverse proxy on this machine.
+    let proxied = dispatch("https://bibcode.example.test".to_owned())
         .await
-        .expect("untrusted app-origin dispatch");
-    assert_eq!(untrusted.status(), StatusCode::FORBIDDEN);
+        .expect("proxied dispatch");
+    assert_ne!(proxied.status(), StatusCode::FORBIDDEN);
+    let socket_origin = dispatch(format!("http://{}", handle.local_addr()))
+        .await
+        .expect("socket-origin dispatch");
+    assert_eq!(
+        socket_origin.status(),
+        StatusCode::FORBIDDEN,
+        "the forwarded host replaces the proxy's own Host"
+    );
 
     shutdown(handle).await;
 }

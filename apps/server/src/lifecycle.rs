@@ -438,7 +438,7 @@ impl ServerRuntime {
             let _log_sink = task_log_sink;
             let result = axum::serve(
                 listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
+                app.into_make_service_with_connect_info::<http::ConnectionAddrs>(),
             )
             .with_graceful_shutdown(server_shutdown.cancelled_owned())
             .await;

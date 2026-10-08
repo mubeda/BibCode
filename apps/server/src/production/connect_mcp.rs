@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::http_routes::{
     HttpRouteError, JsonOperation, JsonRouteResponse, McpHttpResponse, RouteContext,
 };
-use crate::preview::PreviewManager;
+use crate::preview::{OpenRequestError, PreviewManager};
 
 const RELAY_LINK_PROOF_TYP: &str = "bibcode-env-link+jwt";
 const RELAY_MINT_REQUEST_TYP: &str = "bibcode-cloud-mint+jwt";
@@ -194,6 +194,11 @@ impl ConnectMcpError {
     }
 
     #[must_use]
+    pub const fn body(&self) -> &Value {
+        &self.body
+    }
+
+    #[must_use]
     pub fn into_http(self) -> HttpRouteError {
         let mut error = HttpRouteError::new(self.status, self.body);
         for (name, value) in self.headers {
@@ -271,6 +276,14 @@ impl ConnectMcpError {
                 header::WWW_AUTHENTICATE.as_str().to_owned(),
                 "Bearer".to_owned(),
             )]),
+        }
+    }
+
+    fn too_many_open_requests(message: String) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: json!({ "error": "too_many_open_requests", "message": message }),
+            headers: BTreeMap::new(),
         }
     }
 }
@@ -485,7 +498,10 @@ impl ConnectMcpService {
             .map(|record| record.thread_id.clone())
     }
 
-    /// `POST /api/preview/open-url`: bearer open-url token only, body `{ "url": … }`.
+    /// `POST /api/preview/open-url`: bearer open-url token only, body `{ "url": … }`. Answers
+    /// `202 { requestId, delivered }`; `delivered` is false when no client could see the
+    /// request, so the caller should show the URL itself. A thread with too many unclaimed
+    /// requests gets `429`.
     pub async fn open_url(
         &self,
         preview: &PreviewManager,
@@ -502,14 +518,22 @@ impl ConnectMcpService {
             .ok()
             .and_then(|payload| payload.get("url")?.as_str().map(str::to_owned))
             .ok_or_else(|| ConnectMcpError::bad_request("A string \"url\" is required."))?;
-        let request_id = preview
-            .request_open(&thread_id, &url)
-            .await
-            .map_err(|error| ConnectMcpError::bad_request(error.to_string()))?;
+        let receipt =
+            preview
+                .request_open(&thread_id, &url)
+                .await
+                .map_err(|error| match error {
+                    OpenRequestError::InvalidUrl(error) => {
+                        ConnectMcpError::bad_request(error.to_string())
+                    }
+                    OpenRequestError::TooManyPending => {
+                        ConnectMcpError::too_many_open_requests(error.to_string())
+                    }
+                })?;
         Ok(JsonRouteResponse {
             status: StatusCode::ACCEPTED,
             headers: BTreeMap::new(),
-            body: json!({ "requestId": request_id }),
+            body: json!({ "requestId": receipt.request_id, "delivered": receipt.delivered }),
         })
     }
 

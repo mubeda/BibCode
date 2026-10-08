@@ -34,6 +34,7 @@ use crate::{
     diagnostics::TraceDiagnosticsStore,
     json_size::encoded_json_len,
     maintenance::{RpcAdmissionGate, RpcPermit, rpc_mutability},
+    preview::gateway::registry::ClientReach,
 };
 
 const OUTBOUND_CAPACITY: usize = 64;
@@ -262,6 +263,8 @@ pub(crate) struct RpcSessionContext {
     admission: Option<RpcPermit>,
     pairing_confirmation: Option<PairingConfirmationLatch>,
     connection: Arc<RpcConnectionLifetime>,
+    /// How this connection reached the server; `None` without a socket (tests).
+    reach: Option<ClientReach>,
 }
 
 struct RpcConnectionLifetime {
@@ -306,6 +309,7 @@ impl RpcSessionContext {
             admission: None,
             pairing_confirmation: None,
             connection: Arc::default(),
+            reach: None,
         }
     }
 
@@ -321,7 +325,20 @@ impl RpcSessionContext {
             admission: None,
             pairing_confirmation: Some(pairing_confirmation),
             connection: Arc::default(),
+            reach: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_reach(mut self, reach: Option<ClientReach>) -> Self {
+        self.reach = reach;
+        self
+    }
+
+    /// How this connection reached the server: its socket's local address and `Host`.
+    #[must_use]
+    pub(crate) fn reach(&self) -> Option<&ClientReach> {
+        self.reach.as_ref()
     }
 
     #[must_use]

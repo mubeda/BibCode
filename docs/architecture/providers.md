@@ -481,7 +481,7 @@ platform-specific handling.
 
 Every provider launch and every terminal process start also receives the
 open-URL hook: `BROWSER` and `BRAINSTORM_OPEN_CMD` set to `bibcode-open-url`,
-`BIBCODE_OPEN_URL_TOKEN` and `BIBCODE_OPEN_URL_ENDPOINT`, and `PATH` with
+`BIBCODE_OPEN_URL_AUTH` and `BIBCODE_OPEN_URL_ENDPOINT`, and `PATH` with
 `<state dir>/runtime/open-url` prepended to the effective `PATH` above. These
 server values replace any the instance or terminal caller supplied. At startup
 the server puts `bibcode-open-url` there:
@@ -497,6 +497,19 @@ Either form posts the URL to `POST /api/preview/open-url` with the token. The
 `bibcode` and desktop executables recognize an open-url invocation before
 anything else starts: before clap, data-root resolution, or Tauri. They match
 either the `open-url` argument or an executable named `bibcode-open-url`.
+
+The route answers `202 { requestId, delivered }`. `delivered` is false when no
+client was subscribed to preview events, since nobody would open the request;
+the server's own subscribers do not count. A thread may hold 64 unclaimed
+requests; past that the route answers `429`. When the request is not
+delivered, is refused, or BiBCode cannot be reached, `bibcode open-url` prints
+the URL to stdout and exits 0, so the calling tool still shows it.
+
+The token variable is not named `*_TOKEN` because Codex's default
+`shell_environment_policy` drops variables whose names contain `KEY`, `SECRET`,
+or `TOKEN` from the commands it runs. Codex's `workspace-write` sandbox also
+blocks network access, so inside it the post fails and the shim prints the URL.
+Neither behavior has been verified live with Codex yet.
 
 The token is issued per launch or terminal start, is scoped to the thread, and
 authorizes only that route. The provider credential stays outside the instance

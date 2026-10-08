@@ -763,7 +763,8 @@ struct PreviewGatewayOpenInput {
     url: String,
 }
 
-/// Opens a gateway target for the caller's own session, which the capability is bound to.
+/// Opens a gateway target for the caller's own session, which the capability is bound to,
+/// on the address the caller's connection reached the server on.
 async fn gateway_open(
     gateway: PreviewGateway,
     request: RpcRequest,
@@ -781,6 +782,7 @@ async fn gateway_open(
             &input.url,
             &principal.session_id,
             principal.expires_at_ms,
+            context.reach(),
         )
         .await
         .map_err(|error| gateway_error(&error))?;
@@ -796,6 +798,7 @@ fn gateway_error(error: &GatewayError) -> Value {
         GatewayError::NotAdmitted => "not-admitted",
         GatewayError::HttpsUnsupported => "https-unsupported",
         GatewayError::NoUpstream => "no-upstream",
+        GatewayError::NotReachable(_) => "not-reachable",
         GatewayError::Unavailable(_) => "unavailable",
     };
     json!({

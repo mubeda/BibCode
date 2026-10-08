@@ -20803,7 +20803,7 @@ done
                 &temp,
                 "env-provider",
                 &format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$BIBCODE_OPEN_URL_TOKEN\" \"$BIBCODE_OPEN_URL_ENDPOINT\" \"$BROWSER\" \"$BRAINSTORM_OPEN_CMD\" \"$PATH\" > '{}'\nprintf ready > '{}'\nread -r line\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$BIBCODE_OPEN_URL_AUTH\" \"$BIBCODE_OPEN_URL_ENDPOINT\" \"$BROWSER\" \"$BRAINSTORM_OPEN_CMD\" \"$PATH\" > '{}'\nprintf ready > '{}'\nread -r line\n",
                     dump.display(),
                     ready.display()
                 ),

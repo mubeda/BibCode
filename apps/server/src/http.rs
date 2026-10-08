@@ -8,9 +8,12 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, FromRef, Request, State, WebSocketUpgrade},
+    extract::{
+        ConnectInfo, FromRef, Request, State, WebSocketUpgrade, connect_info::Connected,
+        rejection::ExtensionRejection,
+    },
     http::{
-        HeaderMap, Method, StatusCode, Uri,
+        HeaderMap, HeaderValue, Method, StatusCode, Uri,
         header::{
             CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH, LOCATION,
         },
@@ -18,6 +21,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
+    serve::IncomingStream,
 };
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
@@ -36,6 +40,7 @@ use crate::{
         MAINTENANCE_UPDATE_STATUS_PATH, MaintenanceError, RpcAdmissionGate, UpdateMaintenance,
         http_mutability,
     },
+    preview::gateway::registry::ClientReach,
     production::http_routes::{self, HttpRoutesState},
     remote_update::RemoteUpdateSupport,
     rpc::{
@@ -128,6 +133,74 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Get, "*"),
 ];
 
+/// Both ends of an accepted connection. `local` is the address the client reached, which on a
+/// wildcard bind tells which interface, and so which network, it came in on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConnectionAddrs {
+    pub(crate) peer: SocketAddr,
+    pub(crate) local: Option<SocketAddr>,
+}
+
+impl Connected<IncomingStream<'_, tokio::net::TcpListener>> for ConnectionAddrs {
+    fn connect_info(stream: IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        Self {
+            peer: *stream.remote_addr(),
+            local: stream.io().local_addr().ok(),
+        }
+    }
+}
+
+type ConnectionInfo = Result<ConnectInfo<ConnectionAddrs>, ExtensionRejection>;
+
+/// How a WebSocket client reached this server, for `preview.gatewayOpen`.
+fn client_reach(connection: ConnectionInfo, headers: &HeaderMap) -> Option<ClientReach> {
+    let ConnectInfo(addrs) = connection.ok()?;
+    Some(ClientReach {
+        local_ip: addrs.local?.ip(),
+        host: headers
+            .get(HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+    })
+}
+
+const X_FORWARDED_HOST: &str = "x-forwarded-host";
+const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
+
+/// `X-Forwarded-Host` and `X-Forwarded-Proto` are trusted only from a loopback peer (a
+/// reverse proxy on this machine), like `X-Forwarded-For`. From such a peer the forwarded
+/// host becomes `Host`, so the Origin rule and the preview gateway see the address the
+/// browser used (nginx sends `Host: $proxy_host` by default). From any other peer, or an
+/// unknown one, both headers are dropped.
+async fn trust_forwarded_headers(
+    connection: ConnectionInfo,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let peer = connection.ok().map(|ConnectInfo(addrs)| addrs.peer.ip());
+    apply_forwarded_headers(request.headers_mut(), peer);
+    next.run(request).await
+}
+
+fn apply_forwarded_headers(headers: &mut HeaderMap, peer: Option<IpAddr>) {
+    if !peer.is_some_and(|peer| peer.to_canonical().is_loopback()) {
+        headers.remove(X_FORWARDED_HOST);
+        headers.remove(X_FORWARDED_PROTO);
+        return;
+    }
+    // A proxy chain appends; the first entry is the host the browser asked for.
+    let forwarded = headers
+        .get(X_FORWARDED_HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .and_then(|host| HeaderValue::from_str(host).ok());
+    if let Some(host) = forwarded {
+        headers.insert(HOST, host);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub config: Arc<ServerConfig>,
@@ -163,6 +236,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             state.admission_gate.clone(),
             request_admission,
         ))
+        .layer(middleware::from_fn(trust_forwarded_headers))
         .layer(cors)
         .with_state(state)
 }
@@ -224,11 +298,13 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
 
 async fn websocket(
     State(state): State<AppState>,
+    connection: ConnectionInfo,
     headers: HeaderMap,
     uri: Uri,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let session_shutdown = state.shutdown.child_token();
+    let reach = client_reach(connection, &headers);
     if state.config.unsafe_no_auth {
         return upgrade
             .protocols([CHUNKED_RPC_SUBPROTOCOL])
@@ -238,7 +314,7 @@ async fn websocket(
                 run_session(
                     socket,
                     state.rpc_registry,
-                    RpcSessionContext::unauthenticated(),
+                    RpcSessionContext::unauthenticated().with_reach(reach),
                     session_shutdown,
                 )
             })
@@ -249,7 +325,8 @@ async fn websocket(
             let auth = state.auth.clone();
             let session_id = principal.session_id.clone();
             let expires_at_ms = principal.expires_at_ms;
-            let rpc_context = RpcSessionContext::authenticated(principal, auth.clone());
+            let rpc_context =
+                RpcSessionContext::authenticated(principal, auth.clone()).with_reach(reach);
             upgrade
                 .protocols([CHUNKED_RPC_SUBPROTOCOL])
                 .max_frame_size(MAX_PLAIN_WEBSOCKET_FRAME_BYTES)
@@ -284,15 +361,17 @@ async fn websocket(
 
 async fn websocket_e2ee(
     State(state): State<AppState>,
-    peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
+    connection: ConnectionInfo,
     headers: axum::http::HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let session_shutdown = state.shutdown.child_token();
-    let socket_peer_ip = peer
+    let socket_peer_ip = connection
+        .as_ref()
         .ok()
-        .map(|ConnectInfo(address)| address.ip())
+        .map(|ConnectInfo(addrs)| addrs.peer.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let reach = client_reach(connection, &headers);
     let peer_ip = crate::rpc::effective_preauth_peer(
         socket_peer_ip,
         headers
@@ -307,6 +386,7 @@ async fn websocket_e2ee(
             crate::rpc::run_e2ee_session(
                 socket,
                 peer_ip,
+                reach,
                 preauth_admission,
                 state.auth,
                 state.rpc_registry,
@@ -814,6 +894,33 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn forwarded_host_is_trusted_only_from_a_loopback_peer() {
+        let forwarded = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(HOST, HeaderValue::from_static("127.0.0.1:3773"));
+            headers.insert(
+                X_FORWARDED_HOST,
+                HeaderValue::from_static("bibcode.example.test, inner.proxy"),
+            );
+            headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("https"));
+            headers
+        };
+        for loopback in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            let mut headers = forwarded();
+            apply_forwarded_headers(&mut headers, Some(loopback.parse().unwrap()));
+            assert_eq!(headers[HOST], "bibcode.example.test", "{loopback}");
+            assert_eq!(headers[X_FORWARDED_PROTO], "https", "{loopback}");
+        }
+        for untrusted in [Some("192.168.1.9".parse().unwrap()), None] {
+            let mut headers = forwarded();
+            apply_forwarded_headers(&mut headers, untrusted);
+            assert_eq!(headers[HOST], "127.0.0.1:3773", "{untrusted:?}");
+            assert!(!headers.contains_key(X_FORWARDED_HOST), "{untrusted:?}");
+            assert!(!headers.contains_key(X_FORWARDED_PROTO), "{untrusted:?}");
+        }
+    }
 
     #[test]
     fn content_hashed_assets_follow_the_vite_output_convention() {

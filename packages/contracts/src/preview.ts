@@ -337,12 +337,20 @@ export class PreviewInvalidUrlError extends Schema.TaggedError<PreviewInvalidUrl
 
 /**
  * Why `preview.gatewayOpen` refused: `not-admitted` (not a plain-HTTP loopback URL),
- * `https-unsupported`, `no-upstream` (nothing listens on the port), or `unavailable`.
+ * `https-unsupported`, `no-upstream` (nothing listens on the port), `not-reachable` (the
+ * caller reached the server on a public address or through a reverse proxy), or
+ * `unavailable`.
  */
 export class PreviewGatewayError extends Schema.TaggedError<PreviewGatewayError>()(
   "PreviewGatewayError",
   {
-    reason: Schema.Literals(["not-admitted", "https-unsupported", "no-upstream", "unavailable"]),
+    reason: Schema.Literals([
+      "not-admitted",
+      "https-unsupported",
+      "no-upstream",
+      "not-reachable",
+      "unavailable",
+    ]),
     message: Schema.String,
   },
 ) {}

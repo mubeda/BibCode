@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "PreviewGatewayError",
-          "reason": "https-unsupported",
+          "reason": "no-upstream",
           "message": "ica"
         }
       }

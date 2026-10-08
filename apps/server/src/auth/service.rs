@@ -98,7 +98,7 @@ pub struct AuthService {
     /// Redeemed single-use websocket ticket ids, pruned by expiry.
     redeemed_websocket_tickets: Arc<std::sync::Mutex<HashMap<String, i64>>>,
     dpop: DpopVerifier,
-    /// Non-request origins that may use the session cookie for mutations.
+    /// Non-request origins that may use the session cookie for mutations: the dev UI only.
     trusted_cookie_origins: Arc<[String]>,
 }
 
@@ -489,18 +489,17 @@ impl AuthService {
                     expires_at_ms: now_ms().saturating_add(DESKTOP_BOOTSTRAP_TTL_MS),
                 });
         let (access_events, _) = broadcast::channel(ACCESS_EVENT_CAPACITY);
-        let trusted_cookie_origins = ["bibcode://app", "bibcode-dev://app"]
+        // Only a dev UI served from another origin uses the cookie cross-origin. The desktop
+        // app (`bibcode://app`) never sends it: its requests carry a bearer token with
+        // `credentials: "omit"`, and its WebSockets authenticate with a ticket.
+        let trusted_cookie_origins = config
+            .dev_url
+            .as_ref()
+            .map(|dev_url| dev_url.origin())
+            // An opaque origin serializes as `null`, which sandboxed frames send.
+            .filter(url::Origin::is_tuple)
+            .map(|origin| origin.ascii_serialization())
             .into_iter()
-            .map(str::to_owned)
-            .chain(
-                config
-                    .dev_url
-                    .as_ref()
-                    .map(|dev_url| dev_url.origin())
-                    // An opaque origin serializes as `null`, which sandboxed frames send.
-                    .filter(url::Origin::is_tuple)
-                    .map(|origin| origin.ascii_serialization()),
-            )
             .collect();
         Self {
             descriptor: AuthDescriptor {

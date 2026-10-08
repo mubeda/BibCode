@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -18,6 +21,9 @@ pub mod gateway;
 
 /// How long an `openRequested` event stays claimable.
 const OPEN_REQUEST_TTL: Duration = Duration::from_secs(60);
+/// Unclaimed open requests one thread may hold; a command looping on `$BROWSER` cannot
+/// flood the event channel past this.
+pub const MAX_PENDING_OPEN_REQUESTS: usize = 64;
 /// The contract's preview URL cap.
 const MAX_URL_LENGTH: usize = 2048;
 
@@ -164,16 +170,33 @@ pub enum PreviewError {
     },
 }
 
+#[derive(Debug, Error)]
+pub enum OpenRequestError {
+    #[error(transparent)]
+    InvalidUrl(#[from] PreviewError),
+    #[error("This thread already has {MAX_PENDING_OPEN_REQUESTS} unclaimed open requests.")]
+    TooManyPending,
+}
+
+/// An announced open request. `delivered` is whether any client was subscribed to preview
+/// events when it was announced; when none was, nobody will claim it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenRequestReceipt {
+    pub request_id: String,
+    pub delivered: bool,
+}
+
 #[derive(Default)]
 struct PreviewState {
     sessions: BTreeMap<String, PreviewSessionSnapshot>,
-    /// Unclaimed open requests by id, with their expiry.
-    open_requests: HashMap<String, Instant>,
+    /// Unclaimed open requests by id: their thread and expiry.
+    open_requests: HashMap<String, (String, Instant)>,
 }
 
 impl PreviewState {
     fn prune_open_requests(&mut self, now: Instant) {
-        self.open_requests.retain(|_, expires_at| *expires_at > now);
+        self.open_requests
+            .retain(|_, (_, expires_at)| *expires_at > now);
     }
 }
 
@@ -181,6 +204,21 @@ impl PreviewState {
 pub struct PreviewManager {
     state: Arc<Mutex<PreviewState>>,
     events: broadcast::Sender<PreviewEvent>,
+    /// Receivers of `events` held by the server itself, which never claim open requests.
+    internal_subscribers: Arc<AtomicUsize>,
+}
+
+/// A preview event subscription held by the server itself (the gateway's tab follower). It
+/// does not count as a client when an open request's delivery is decided.
+pub struct InternalPreviewEvents {
+    pub receiver: broadcast::Receiver<PreviewEvent>,
+    count: Arc<AtomicUsize>,
+}
+
+impl Drop for InternalPreviewEvents {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Default for PreviewManager {
@@ -196,12 +234,24 @@ impl PreviewManager {
         Self {
             state: Arc::new(Mutex::new(PreviewState::default())),
             events,
+            internal_subscribers: Arc::default(),
         }
     }
 
+    /// A client subscription: it counts toward open-request delivery.
     #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<PreviewEvent> {
         self.events.subscribe()
+    }
+
+    /// A subscription for the server's own observers; see [`InternalPreviewEvents`].
+    #[must_use]
+    pub fn subscribe_internal_events(&self) -> InternalPreviewEvents {
+        self.internal_subscribers.fetch_add(1, Ordering::Relaxed);
+        InternalPreviewEvents {
+            receiver: self.events.subscribe(),
+            count: self.internal_subscribers.clone(),
+        }
     }
 
     pub async fn open(
@@ -426,8 +476,13 @@ impl PreviewManager {
     }
 
     /// Announces that a command in `thread_id` wants `url` opened. Returns the request id that
-    /// clients race to claim with [`Self::claim_open_request`].
-    pub async fn request_open(&self, thread_id: &str, url: &str) -> Result<String, PreviewError> {
+    /// clients race to claim with [`Self::claim_open_request`], and whether any client could
+    /// see it.
+    pub async fn request_open(
+        &self,
+        thread_id: &str,
+        url: &str,
+    ) -> Result<OpenRequestReceipt, OpenRequestError> {
         let input_length = url.len();
         let url = normalize_url(url)?;
         // The caller is a command, not a validated client, so enforce the contract's URL cap
@@ -437,24 +492,39 @@ impl PreviewManager {
                 input_length,
                 reason: "too-long",
                 protocol: None,
-            });
+            }
+            .into());
         }
         let request_id = format!("open_{}", Uuid::new_v4().simple());
         let now = Instant::now();
         {
             let mut state = self.state.lock().await;
             state.prune_open_requests(now);
-            state
+            let pending = state
                 .open_requests
-                .insert(request_id.clone(), now + OPEN_REQUEST_TTL);
+                .values()
+                .filter(|(thread, _)| thread == thread_id)
+                .count();
+            if pending >= MAX_PENDING_OPEN_REQUESTS {
+                return Err(OpenRequestError::TooManyPending);
+            }
+            state.open_requests.insert(
+                request_id.clone(),
+                (thread_id.to_owned(), now + OPEN_REQUEST_TTL),
+            );
         }
+        let delivered =
+            self.events.receiver_count() > self.internal_subscribers.load(Ordering::Relaxed);
         let _ = self.events.send(PreviewEvent::OpenRequested {
             thread_id: thread_id.to_owned(),
             request_id: request_id.clone(),
             url,
             created_at: now_iso(),
         });
-        Ok(request_id)
+        Ok(OpenRequestReceipt {
+            request_id,
+            delivered,
+        })
     }
 
     /// Claims an open request. Only the first claim of a live request returns `true`.
@@ -472,7 +542,10 @@ impl PreviewManager {
             .filter(|snapshot| snapshot.thread_id == thread_id)
             .cloned()
             .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| left.updated_at.cmp(&right.updated_at));
+        // RFC 3339 strings with different fractional digits do not sort as text.
+        sessions.sort_by_cached_key(|snapshot| {
+            OffsetDateTime::parse(&snapshot.updated_at, &Rfc3339).ok()
+        });
         PreviewListResult { sessions }
     }
 }
@@ -548,6 +621,29 @@ mod normalization_tests {
         assert_eq!(
             normalize_url("0.0.0.0:8080/path").expect("wildcard loopback URL"),
             "http://0.0.0.0:8080/path"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sorts_by_instant_not_text() {
+        let manager = PreviewManager::new();
+        let earlier = manager.open("t", None).await.unwrap();
+        let later = manager.open("t", None).await.unwrap();
+        {
+            let mut state = manager.state.lock().await;
+            // As text `.5Z` sorts before `Z`, though it is half a second later.
+            for (tab, stamp) in [
+                (&earlier, "2026-10-08T00:00:01Z"),
+                (&later, "2026-10-08T00:00:01.5Z"),
+            ] {
+                let key = composite_key("t", &tab.tab_id);
+                state.sessions.get_mut(&key).unwrap().updated_at = stamp.to_owned();
+            }
+        }
+        let listed = manager.list("t").await.sessions;
+        assert_eq!(
+            listed.iter().map(|tab| &tab.tab_id).collect::<Vec<_>>(),
+            [&earlier.tab_id, &later.tab_id]
         );
     }
 

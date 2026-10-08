@@ -8,6 +8,7 @@ pub const HOP_BY_HOP: &[&str] = &[
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
+    "proxy-connection",
     "te",
     "trailer",
     "transfer-encoding",
@@ -23,52 +24,73 @@ pub fn gateway_cookie_name(gateway_port: u16) -> String {
     format!("{GATEWAY_COOKIE_PREFIX}{gateway_port}")
 }
 
+// Cookie headers are handled as bytes: browsers send non-ASCII cookie values as raw UTF-8
+// (or worse), and one such cookie must not cost the request its gateway cookie or drop an
+// upstream `Set-Cookie`. Every byte that is not a separator passes through unchanged.
+
 /// Value of this listener's own gateway cookie; cookies for other gateway ports are ignored.
-pub fn gateway_session_from_cookie(cookie_header: &str, gateway_port: u16) -> Option<String> {
+pub fn gateway_session_from_cookie(cookie_header: &[u8], gateway_port: u16) -> Option<String> {
     let wanted = gateway_cookie_name(gateway_port);
-    cookie_header.split(';').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        (name.trim() == wanted).then(|| value.trim().to_owned())
+    cookie_pairs(cookie_header).find_map(|pair| {
+        let (name, value) = split_pair(pair)?;
+        (name == wanted.as_bytes())
+            .then(|| String::from_utf8(value.trim_ascii().to_vec()).ok())
+            .flatten()
     })
 }
 
-fn is_reserved_cookie(name: &str, session_cookie_name: &str) -> bool {
-    name == session_cookie_name
-        || name.starts_with(SESSION_COOKIE_PREFIX)
-        || name.starts_with(GATEWAY_COOKIE_PREFIX)
+fn is_reserved_cookie(name: &[u8], session_cookie_name: &str) -> bool {
+    name == session_cookie_name.as_bytes()
+        || name.starts_with(SESSION_COOKIE_PREFIX.as_bytes())
+        || name.starts_with(GATEWAY_COOKIE_PREFIX.as_bytes())
 }
 
-fn cookie_name(pair: &str) -> &str {
-    pair.split_once('=').map_or(pair, |(name, _)| name).trim()
+fn cookie_pairs(header: &[u8]) -> impl Iterator<Item = &[u8]> {
+    header.split(|byte| *byte == b';').map(<[u8]>::trim_ascii)
+}
+
+fn split_pair(pair: &[u8]) -> Option<(&[u8], &[u8])> {
+    let at = pair.iter().position(|byte| *byte == b'=')?;
+    Some((pair[..at].trim_ascii(), &pair[at + 1..]))
+}
+
+fn cookie_name(pair: &[u8]) -> &[u8] {
+    split_pair(pair).map_or(pair, |(name, _)| name)
+}
+
+fn join_pairs<'a>(pairs: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut joined = Vec::new();
+    for pair in pairs {
+        if !joined.is_empty() {
+            joined.extend_from_slice(b"; ");
+        }
+        joined.extend_from_slice(pair);
+    }
+    joined
 }
 
 /// Request `Cookie` header without the BiBCode session cookie and any gateway cookie;
 /// `None` when nothing is left to forward.
-pub fn strip_request_cookies(cookie_header: &str, session_cookie_name: &str) -> Option<String> {
-    let kept: Vec<&str> = cookie_header
-        .split(';')
-        .map(str::trim)
-        .filter(|pair| {
-            !pair.is_empty() && !is_reserved_cookie(cookie_name(pair), session_cookie_name)
-        })
-        .collect();
-    (!kept.is_empty()).then(|| kept.join("; "))
+pub fn strip_request_cookies(cookie_header: &[u8], session_cookie_name: &str) -> Option<Vec<u8>> {
+    let kept = join_pairs(cookie_pairs(cookie_header).filter(|pair| {
+        !pair.is_empty() && !is_reserved_cookie(cookie_name(pair), session_cookie_name)
+    }));
+    (!kept.is_empty()).then_some(kept)
 }
 
 /// Upstream `Set-Cookie` without its `Domain` attribute; `None` when it would overwrite a
 /// BiBCode session or gateway cookie, or when it is nameless. Browsers store a nameless
 /// cookie and send its bare value, so `=bibcode_session=x` would arrive as a reserved cookie.
-pub fn filter_set_cookie(value: &str, session_cookie_name: &str) -> Option<String> {
-    let mut parts = value.split(';').map(str::trim);
+pub fn filter_set_cookie(value: &[u8], session_cookie_name: &str) -> Option<Vec<u8>> {
+    let mut parts = cookie_pairs(value);
     let first = parts.next()?;
-    let name = cookie_name(first);
-    if !first.contains('=') || name.is_empty() || is_reserved_cookie(name, session_cookie_name) {
+    let (name, _) = split_pair(first)?;
+    if name.is_empty() || is_reserved_cookie(name, session_cookie_name) {
         return None;
     }
-    let kept: Vec<&str> = std::iter::once(first)
-        .chain(parts.filter(|attribute| !cookie_name(attribute).eq_ignore_ascii_case("domain")))
-        .collect();
-    Some(kept.join("; "))
+    Some(join_pairs(std::iter::once(first).chain(parts.filter(
+        |attribute| !cookie_name(attribute).eq_ignore_ascii_case(b"domain"),
+    ))))
 }
 
 /// Points an upstream redirect at the client-facing gateway origin when it targets the
@@ -196,38 +218,68 @@ mod tests {
         assert!(page.contains("location.replace(\"/\")"));
     }
 
+    fn strip(header: &str, session: &str) -> Option<String> {
+        strip_request_cookies(header.as_bytes(), session)
+            .map(|kept| String::from_utf8(kept).unwrap())
+    }
+
+    fn filter(value: &str, session: &str) -> Option<String> {
+        filter_set_cookie(value.as_bytes(), session).map(|kept| String::from_utf8(kept).unwrap())
+    }
+
     #[test]
     fn cookies_are_stripped_and_filtered() {
         assert_eq!(
-            strip_request_cookies(
+            strip(
                 "bibcode_session=x; app=1; bibcode-gw-40001=y",
                 "bibcode_session"
             )
             .as_deref(),
             Some("app=1")
         );
+        assert_eq!(strip("bibcode-gw-1=a", "bibcode_session"), None);
         assert_eq!(
-            strip_request_cookies("bibcode-gw-1=a", "bibcode_session"),
-            None
-        );
-        assert_eq!(
-            filter_set_cookie("sid=1; Domain=evil.test; Path=/", "bibcode_session").as_deref(),
+            filter("sid=1; Domain=evil.test; Path=/", "bibcode_session").as_deref(),
             Some("sid=1; Path=/")
         );
         assert_eq!(
-            filter_set_cookie("bibcode_session=evil; Path=/", "bibcode_session"),
+            filter("bibcode_session=evil; Path=/", "bibcode_session"),
             None
         );
+        assert_eq!(filter("bibcode-gw-40001=evil", "bibcode_session"), None);
         assert_eq!(
-            filter_set_cookie("bibcode-gw-40001=evil", "bibcode_session"),
-            None
-        );
-        assert_eq!(
-            gateway_session_from_cookie("a=1; bibcode-gw-40001=sess; bibcode-gw-40002=o", 40001)
+            gateway_session_from_cookie(b"a=1; bibcode-gw-40001=sess; bibcode-gw-40002=o", 40001)
                 .as_deref(),
             Some("sess")
         );
         assert_eq!(gateway_cookie_name(40001), "bibcode-gw-40001");
+    }
+
+    #[test]
+    fn non_ascii_cookies_pass_through_byte_for_byte() {
+        // Raw UTF-8 and a lone Latin-1 byte, as some apps and browsers send them.
+        let header =
+            b"name=Jos\xc3\xa9; bibcode-gw-40001=sess; legacy=\xe9t\xe9; bibcode_session=x";
+        assert_eq!(
+            gateway_session_from_cookie(header, 40001).as_deref(),
+            Some("sess")
+        );
+        assert_eq!(
+            strip_request_cookies(header, "bibcode_session").as_deref(),
+            Some(&b"name=Jos\xc3\xa9; legacy=\xe9t\xe9"[..])
+        );
+        assert_eq!(
+            filter_set_cookie(
+                b"pref=\xe9t\xe9; Domain=evil.test; Path=/",
+                "bibcode_session"
+            )
+            .as_deref(),
+            Some(&b"pref=\xe9t\xe9; Path=/"[..])
+        );
+        assert_eq!(
+            filter_set_cookie(b"bibcode-gw-1=\xe9", "bibcode_session"),
+            None
+        );
     }
 
     #[test]
@@ -240,22 +292,18 @@ mod tests {
             "; Path=/",
             "",
         ] {
-            assert_eq!(
-                filter_set_cookie(nameless, "bibcode_session"),
-                None,
-                "{nameless:?}"
-            );
+            assert_eq!(filter(nameless, "bibcode_session"), None, "{nameless:?}");
         }
     }
 
     #[test]
     fn instance_scoped_session_cookies_are_reserved() {
         assert_eq!(
-            filter_set_cookie("bibcode_session_3773=evil; Path=/", "bibcode_session_4000"),
+            filter("bibcode_session_3773=evil; Path=/", "bibcode_session_4000"),
             None
         );
         assert_eq!(
-            strip_request_cookies(
+            strip(
                 "bibcode_session_3773=a; app=1; bibcode_session_4000=b",
                 "bibcode_session_4000"
             )

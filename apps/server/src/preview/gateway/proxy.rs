@@ -96,6 +96,8 @@ pub struct GatewayTarget {
     pub thread_id: String,
     /// Where the gateway connects: the upstream itself or a local forward to it.
     pub upstream: SocketAddr,
+    /// Tried once when `upstream` refuses: the other loopback family of a `localhost` target.
+    pub fallback: Option<SocketAddr>,
     /// The port the previewed app listens on in its environment; used for `Host` and redirects.
     pub upstream_port: u16,
     pub environment_label: String,
@@ -110,14 +112,15 @@ pub struct RunningTarget {
     pub active: Arc<AtomicUsize>,
 }
 
-/// Binds `bind_host:0`, serves until `shutdown` is cancelled, and returns once listening.
-pub async fn start_target(
-    bind_host: &str,
+/// Serves `target` on `listener`. `draining` stops accepting and closes idle connections and
+/// WebSocket tunnels while in-flight requests finish; `shutdown` cuts everything.
+pub fn start_target(
+    listener: TcpListener,
     target: GatewayTarget,
     ctx: GatewayContext,
     shutdown: CancellationToken,
+    draining: CancellationToken,
 ) -> std::io::Result<RunningTarget> {
-    let listener = TcpListener::bind((bind_host, 0)).await?;
     let gateway_port = listener.local_addr()?.port();
     let state = Arc::new(Listener {
         per_target: Arc::new(Semaphore::new(ctx.limits.per_target)),
@@ -125,6 +128,7 @@ pub async fn start_target(
         ctx,
         gateway_port,
         shutdown: shutdown.clone(),
+        draining,
         last_activity_ms: Arc::new(AtomicU64::new(now_millis())),
         active: Arc::new(AtomicUsize::new(0)),
         principal_checked_ms: Mutex::new(HashMap::new()),
@@ -147,6 +151,7 @@ struct Listener {
     gateway_port: u16,
     per_target: Arc<Semaphore>,
     shutdown: CancellationToken,
+    draining: CancellationToken,
     last_activity_ms: Arc<AtomicU64>,
     active: Arc<AtomicUsize>,
     /// Principal session id -> when it was last confirmed active.
@@ -283,6 +288,7 @@ async fn accept_loop(listener: TcpListener, state: Arc<Listener>) {
     loop {
         let accepted = tokio::select! {
             () = state.shutdown.cancelled() => break,
+            () = state.draining.cancelled() => break,
             accepted = listener.accept() => accepted,
         };
         match accepted {
@@ -314,6 +320,14 @@ async fn serve_connection(stream: TcpStream, state: Arc<Listener>) {
         .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades();
+    let mut connection = std::pin::pin!(connection);
+    tokio::select! {
+        _ = connection.as_mut() => return,
+        () = state.shutdown.cancelled() => return,
+        () = state.draining.cancelled() => {}
+    }
+    // Draining: an idle connection closes now, an in-flight request finishes first.
+    connection.as_mut().graceful_shutdown();
     tokio::select! {
         _ = connection => {}
         () = state.shutdown.cancelled() => {}
@@ -466,12 +480,7 @@ async fn forward(
     }
     let upstream_request = Request::from_parts(parts, body);
 
-    let connected = tokio::time::timeout(
-        UPSTREAM_CONNECT_TIMEOUT,
-        TcpStream::connect(state.target.upstream),
-    )
-    .await;
-    let Ok(Ok(stream)) = connected else {
+    let Some(stream) = connect_upstream(&state.target).await else {
         return unreachable(&state);
     };
     let _ = stream.set_nodelay(true);
@@ -515,6 +524,19 @@ async fn forward(
     Response::from_parts(parts, body.boxed())
 }
 
+/// Connects to the target's upstream; a refused `localhost` upstream is retried once on the
+/// other loopback family, where a restarted dev server may now listen.
+async fn connect_upstream(target: &GatewayTarget) -> Option<TcpStream> {
+    let connect = |addr| tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr));
+    match connect(target.upstream).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            connect(target.fallback?).await.ok()?.ok()
+        }
+        _ => None,
+    }
+}
+
 fn upstream_request_headers(
     headers: &mut HeaderMap,
     upstream_port: u16,
@@ -532,8 +554,10 @@ fn upstream_request_headers(
     for name in [COOKIE, AUTHORIZATION, HeaderName::from_static("dpop")] {
         headers.remove(name);
     }
-    if let Some(kept) = strip_request_cookies(&cookies, session_cookie_name) {
-        insert(headers, COOKIE, &kept);
+    if let Some(kept) = strip_request_cookies(&cookies, session_cookie_name)
+        && let Ok(kept) = HeaderValue::from_bytes(&kept)
+    {
+        headers.insert(COOKIE, kept);
     }
     let authority = format!("localhost:{upstream_port}");
     insert(headers, HOST, &authority);
@@ -551,9 +575,8 @@ fn rewrite_response_headers(headers: &mut HeaderMap, state: &Listener, client_or
     let cookies: Vec<HeaderValue> = headers
         .get_all(SET_COOKIE)
         .iter()
-        .filter_map(|value| value.to_str().ok())
-        .filter_map(|value| filter_set_cookie(value, &state.ctx.session_cookie_name))
-        .filter_map(|value| HeaderValue::from_str(&value).ok())
+        .filter_map(|value| filter_set_cookie(value.as_bytes(), &state.ctx.session_cookie_name))
+        .filter_map(|value| HeaderValue::from_bytes(&value).ok())
         .collect();
     headers.remove(SET_COOKIE);
     for cookie in cookies {
@@ -585,13 +608,13 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-fn joined_cookies(headers: &HeaderMap) -> String {
+fn joined_cookies(headers: &HeaderMap) -> Vec<u8> {
     headers
         .get_all(COOKIE)
         .iter()
-        .filter_map(|value| value.to_str().ok())
+        .map(HeaderValue::as_bytes)
         .collect::<Vec<_>>()
-        .join("; ")
+        .join(&b"; "[..])
 }
 
 /// `host[:port]` with nothing a browser would not send: no userinfo, path, whitespace, or

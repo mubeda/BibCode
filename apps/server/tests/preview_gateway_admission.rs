@@ -15,7 +15,10 @@ use bibcode_server::{
         PreviewManager,
         gateway::{
             proxy::PrincipalCheck,
-            registry::{GatewayError, GatewayOpenResult, PreviewGateway, gateway_context},
+            registry::{
+                GatewayError, GatewayOpenResult, MAX_TARGETS, PreviewGateway,
+                SHUTDOWN_DRAIN_TIMEOUT, gateway_context,
+            },
         },
     },
     signed_token::now_millis,
@@ -24,7 +27,10 @@ use futures_util::{SinkExt, future::BoxFuture};
 use reqwest::{Client, StatusCode, header};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, time::timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 use websocket_frames::next_frame_past_heartbeat;
 
 const THREAD: &str = "thread-1";
@@ -69,7 +75,7 @@ async fn upstream_on(addr: &str) -> std::io::Result<SocketAddr> {
 }
 
 async fn open(gateway: &PreviewGateway, url: &str) -> Result<GatewayOpenResult, GatewayError> {
-    gateway.open(THREAD, url, SESSION, far_expiry()).await
+    gateway.open(THREAD, url, SESSION, far_expiry(), None).await
 }
 
 fn http() -> Client {
@@ -186,6 +192,132 @@ async fn reaches_an_ipv6_only_upstream() {
 }
 
 #[tokio::test]
+async fn a_literal_loopback_upstream_is_probed_at_that_address() {
+    // Only 127.0.0.1 listens on this port: 127.0.0.2 must not be served by it.
+    let upstream = upstream_on("127.0.0.1:0").await.unwrap();
+    let gateway = gateway(&PreviewManager::new());
+    // Not even by reusing the running `localhost` target on that port.
+    open(&gateway, &format!("http://localhost:{}/", upstream.port()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        open(&gateway, &format!("http://127.0.0.2:{}/", upstream.port())).await,
+        Err(GatewayError::NoUpstream)
+    ));
+    // Linux routes all of 127.0.0.0/8 to loopback; other platforms only 127.0.0.1.
+    if cfg!(target_os = "linux") {
+        let second = upstream_on("127.0.0.2:0").await.unwrap();
+        let opened = open(&gateway, &format!("http://127.0.0.2:{}/", second.port()))
+            .await
+            .expect("an upstream on 127.0.0.2 is admitted");
+        let cookie = bootstrap(opened.gateway_port, &opened.capability)
+            .await
+            .unwrap();
+        let body = http()
+            .get(format!("http://127.0.0.1:{}/", opened.gateway_port))
+            .header(header::COOKIE, cookie)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "hello from upstream");
+    }
+}
+
+#[tokio::test]
+async fn opens_past_the_global_target_cap_are_unavailable() {
+    let upstream = upstream_on("127.0.0.1:0").await.unwrap();
+    let gateway = gateway(&PreviewManager::new());
+    let url = format!("http://localhost:{}/", upstream.port());
+    for thread in 0..MAX_TARGETS {
+        gateway
+            .open(&format!("t{thread}"), &url, SESSION, far_expiry(), None)
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        gateway
+            .open("one-more", &url, SESSION, far_expiry(), None)
+            .await,
+        Err(GatewayError::Unavailable(_))
+    ));
+    // A running target still mints capabilities at the cap.
+    gateway
+        .open("t0", &url, SESSION, far_expiry(), None)
+        .await
+        .expect("reopen at the cap");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_lets_an_in_flight_request_finish() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/slow",
+        get(|| async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            "slow done"
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let gateway = gateway(&PreviewManager::new());
+    let opened = open(&gateway, &format!("http://localhost:{}/", upstream.port()))
+        .await
+        .unwrap();
+    let cookie = bootstrap(opened.gateway_port, &opened.capability)
+        .await
+        .unwrap();
+    let request = tokio::spawn(
+        http()
+            .get(format!("http://127.0.0.1:{}/slow", opened.gateway_port))
+            .header(header::COOKIE, cookie)
+            .send(),
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let started = std::time::Instant::now();
+    gateway.shutdown().await;
+
+    let response = request
+        .await
+        .unwrap()
+        .expect("the in-flight request completes");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "slow done");
+    assert!(
+        started.elapsed() < SHUTDOWN_DRAIN_TIMEOUT,
+        "shutdown ended with the request, not at the deadline"
+    );
+    assert!(!listening(opened.gateway_port).await);
+}
+
+#[tokio::test]
+async fn navigating_the_last_tab_away_closes_its_old_target() {
+    let first = upstream_on("127.0.0.1:0").await.unwrap();
+    let second = upstream_on("127.0.0.1:0").await.unwrap();
+    let preview = PreviewManager::new();
+    let gateway = gateway(&preview);
+    let first_url = format!("http://localhost:{}/", first.port());
+    let tab = preview.open(THREAD, Some(&first_url)).await.unwrap();
+    let target = open(&gateway, &first_url).await.unwrap();
+
+    preview
+        .navigate(
+            THREAD,
+            &tab.tab_id,
+            &format!("http://localhost:{}/", second.port()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_until_closed(target.gateway_port).await;
+}
+
+#[tokio::test]
 async fn second_open_reuses_listener_with_fresh_capability() {
     let upstream = upstream_on("127.0.0.1:0").await.unwrap();
     let gateway = gateway(&PreviewManager::new());
@@ -207,7 +339,7 @@ async fn second_open_reuses_listener_with_fresh_capability() {
 
     // Another thread on the same port gets its own listener.
     let other = gateway
-        .open("thread-2", &url, SESSION, far_expiry())
+        .open("thread-2", &url, SESSION, far_expiry(), None)
         .await
         .unwrap();
     assert_ne!(other.gateway_port, first.gateway_port);
@@ -311,7 +443,7 @@ async fn close_thread_and_shutdown_close_every_target() {
     let url = format!("http://localhost:{}/", upstream.port());
     let first = open(&gateway, &url).await.unwrap();
     let other = gateway
-        .open("thread-2", &url, SESSION, far_expiry())
+        .open("thread-2", &url, SESSION, far_expiry(), None)
         .await
         .unwrap();
     gateway.close_thread(THREAD).await;
@@ -337,6 +469,10 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_on("127.0.0.1").await
+    }
+
+    async fn start_on(host: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let providers = hermetic_providers::BUILTIN_PROVIDER_DRIVERS
             .iter()
@@ -347,7 +483,7 @@ impl Server {
             json!({"providers": providers}),
         );
         let config = ServerConfig::new(root.path())
-            .with_bind("127.0.0.1", 0)
+            .with_bind(host, 0)
             .with_desktop(DESKTOP_BOOTSTRAP)
             .unwrap();
         let handle = ServerRuntime::start(config).await.expect("server starts");
@@ -363,7 +499,11 @@ impl Server {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("http://{}{}", self.handle.local_addr(), path)
+        format!(
+            "http://127.0.0.1:{}{}",
+            self.handle.local_addr().port(),
+            path
+        )
     }
 
     async fn read_only_token(&self) -> String {
@@ -388,6 +528,12 @@ impl Server {
     }
 
     async fn socket(&self, token: &str) -> Socket {
+        let authority = format!("127.0.0.1:{}", self.handle.local_addr().port());
+        self.socket_at(token, &authority, &[]).await
+    }
+
+    /// An RPC socket to `authority` (an address of this server) with extra upgrade headers.
+    async fn socket_at(&self, token: &str, authority: &str, headers: &[(&str, &str)]) -> Socket {
         let ticket = json_ok(
             self.client
                 .post(self.url("/api/auth/websocket-ticket"))
@@ -400,13 +546,16 @@ impl Server {
             .as_str()
             .unwrap()
             .to_owned();
-        connect_async(format!(
-            "ws://{}/ws?wsTicket={ticket}",
-            self.handle.local_addr()
-        ))
-        .await
-        .expect("WebSocket connects")
-        .0
+        let mut request = format!("ws://{authority}/ws?wsTicket={ticket}")
+            .into_client_request()
+            .unwrap();
+        for (name, value) in headers {
+            request.headers_mut().insert(
+                header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        connect_async(request).await.expect("WebSocket connects").0
     }
 }
 
@@ -518,6 +667,83 @@ async fn gateway_open_requires_operate_scope() {
 
     server.handle.shutdown();
     wait_until_closed(gateway_port).await;
+}
+
+#[tokio::test]
+async fn gateway_open_refuses_a_proxied_caller() {
+    let upstream = upstream_on("127.0.0.1:0").await.unwrap();
+    let server = Server::start().await;
+    let payload =
+        json!({"threadId": THREAD, "url": format!("http://localhost:{}/", upstream.port())});
+    let authority = format!("127.0.0.1:{}", server.handle.local_addr().port());
+    // A reverse proxy on this machine names the public host in `X-Forwarded-Host`; Tailscale
+    // Serve and proxies that pass `Host` through send it directly.
+    for header in [
+        ("x-forwarded-host", "bibcode.example.test"),
+        ("host", "bibcode.example.test"),
+    ] {
+        let mut socket = server
+            .socket_at(&server.admin_token, &authority, &[header])
+            .await;
+        let exit = call(&mut socket, "1", "preview.gatewayOpen", payload.clone()).await;
+        let error = failure(&exit);
+        assert_eq!(error["_tag"], "PreviewGatewayError", "{header:?}");
+        assert_eq!(error["reason"], "not-reachable", "{header:?}");
+        assert_eq!(
+            error["message"],
+            "Previews aren't available through a proxied address."
+        );
+    }
+    server.handle.shutdown();
+}
+
+/// On a wildcard bind the gateway listens only on the address the client reached, not on
+/// every interface. Linux routes all of `127.0.0.0/8` to loopback, so `127.0.0.2` stands in
+/// for a LAN address.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_gateway_binds_the_address_the_client_reached() {
+    let upstream = upstream_on("127.0.0.1:0").await.unwrap();
+    let server = Server::start_on("0.0.0.0").await;
+    let port = server.handle.local_addr().port();
+    let mut socket = server
+        .socket_at(&server.admin_token, &format!("127.0.0.2:{port}"), &[])
+        .await;
+    let exit = call(
+        &mut socket,
+        "1",
+        "preview.gatewayOpen",
+        json!({"threadId": THREAD, "url": format!("http://localhost:{}/", upstream.port())}),
+    )
+    .await;
+    let gateway_port = u16::try_from(success(&exit)["gatewayPort"].as_u64().unwrap()).unwrap();
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.2", gateway_port))
+            .await
+            .is_ok()
+    );
+    assert!(
+        !listening(gateway_port).await,
+        "the listener is not on the server's wildcard bind"
+    );
+    server.handle.shutdown();
+}
+
+#[tokio::test]
+async fn the_open_url_route_is_wired_in_a_real_server() {
+    let server = Server::start().await;
+    let response = server
+        .client
+        .post(server.url("/api/preview/open-url"))
+        .bearer_auth("not-a-token")
+        .json(&json!({"url": "http://localhost:5173/"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_open_url_credential");
+    server.handle.shutdown();
 }
 
 #[tokio::test]
