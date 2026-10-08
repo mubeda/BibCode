@@ -3357,7 +3357,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=52).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=53).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3407,7 +3407,8 @@ mod tests {
                 (49, "AuthPairingDeliveryState"),
                 (50, "QueuedTurnDeliveries"),
                 (51, "TurnDeliveryFailureReason"),
-                (52, "ProjectRepositoryIdentity")
+                (52, "ProjectRepositoryIdentity"),
+                (53, "PullRequestSnapshots"),
             ],
         );
         assert_eq!(
@@ -3504,9 +3505,10 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 36);
+        assert_eq!(second.len(), 37);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
+        assert_eq!(second[36].id, 53);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3518,7 +3520,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 28);
+        assert_eq!(application_table_count, 29);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -3613,7 +3615,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52]
+            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3650,7 +3652,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52]
+            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3678,7 +3680,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52]
+            [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3818,7 +3820,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48, 49, 50, 51, 52]
+            [48, 49, 50, 51, 52, 53]
         );
         assert_eq!(
             connection.query_row(
@@ -3847,7 +3849,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 19);
+        assert_eq!(applied.len(), 20);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3867,6 +3869,7 @@ mod tests {
         assert_eq!(applied[16].id, 50);
         assert_eq!(applied[17].id, 51);
         assert_eq!(applied[18].id, 52);
+        assert_eq!(applied[19].id, 53);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;
