@@ -611,14 +611,19 @@ export function projectDeliveryStartupObservation(input: unknown) {
     typeof input === "object" && input !== null && !Array.isArray(input)
       ? (input as Record<string, unknown>)
       : {};
-  const safeLocation = typeof value.safeLocation === "boolean" ? value.safeLocation : null;
+  const locationFact = value.safeLocation;
+  const safeLocation = typeof locationFact === "boolean" ? locationFact : null;
   const source = safeLocation === true ? value : {};
-  const boolean = (key: string): boolean | null =>
-    typeof source[key] === "boolean" ? source[key] : null;
+  const route = source.route;
+  const readyState = source.readyState;
+  const boolean = (key: string): boolean | null => {
+    const fact = source[key];
+    return typeof fact === "boolean" ? fact : null;
+  };
   return {
     safeLocation,
     route:
-      typeof source.route === "string" &&
+      typeof route === "string" &&
       [
         "pair",
         "root",
@@ -626,15 +631,17 @@ export function projectDeliveryStartupObservation(input: unknown) {
         "settings-general",
         "settings-remote-servers",
         "other",
-      ].includes(source.route)
-        ? source.route
+      ].includes(route)
+        ? route
         : null,
     readyState:
-      typeof source.readyState === "string" &&
-      ["loading", "interactive", "complete"].includes(source.readyState)
-        ? source.readyState
+      typeof readyState === "string" && ["loading", "interactive", "complete"].includes(readyState)
+        ? readyState
         : null,
     online: boolean("online"),
+    rootElementPresent: boolean("rootElementPresent"),
+    rootHasChildren: boolean("rootHasChildren"),
+    rootErrorPresent: boolean("rootErrorPresent"),
     tokenInputPresent: boolean("tokenInputPresent"),
     tokenInputDisabled: boolean("tokenInputDisabled"),
     submitPresent: boolean("submitPresent"),
@@ -806,6 +813,16 @@ export async function runDeliveryRetryQualification() {
               location.hash !== ""
             )
               return { safeLocation: false };
+            const root = document.querySelector("#root");
+            const rootElement = root instanceof HTMLElement ? root : null;
+            const heading = rootElement?.querySelector("h1");
+            const errorSection =
+              heading?.textContent?.trim() === "Something went wrong."
+                ? heading.closest("section")
+                : null;
+            const errorButtons = errorSection
+              ? Array.from(errorSection.querySelectorAll("button")).slice(0, 16)
+              : [];
             const token = document.querySelector("#pairing-token");
             const pairingForm = token instanceof HTMLInputElement ? token.form : null;
             const submit = pairingForm?.querySelector('button[type="submit"]');
@@ -825,6 +842,12 @@ export async function runDeliveryRetryQualification() {
                           : "other",
               readyState: document.readyState,
               online: navigator.onLine,
+              rootElementPresent: rootElement !== null,
+              rootHasChildren: rootElement !== null && rootElement.childElementCount > 0,
+              rootErrorPresent:
+                errorSection !== null &&
+                errorButtons.some((button) => button.textContent?.trim() === "Try again") &&
+                errorButtons.some((button) => button.textContent?.trim() === "Reload app"),
               tokenInputPresent: token instanceof HTMLInputElement,
               tokenInputDisabled: token instanceof HTMLInputElement ? token.disabled : null,
               submitPresent: submit instanceof HTMLButtonElement,

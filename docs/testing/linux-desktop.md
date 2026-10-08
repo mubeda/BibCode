@@ -2690,3 +2690,12 @@ uses the existing public-control cardinality, displayed and enabled checks; it
 does not type, send, change the draft or weaken receipt/capture/cleanup checks.
 Two-document source controls with the real composer and editor do not prove the
 failed native run's activation cause or native screenshot acceptance.
+
+The existing bounded pair/theme failure observation retains `rootElementPresent`,
+`rootHasChildren` and `rootErrorPresent` as booleans or unknown. These distinguish
+a missing or empty application root from the current root error surface using
+only its fixed public heading and Try again/Reload app controls. Error details,
+page text, credentials, console and HTTP data remain excluded. The same safe
+location check, two-second observation bound, original failure and joined cleanup
+remain authoritative; these facts never admit a capture or identify a native
+cause by themselves.

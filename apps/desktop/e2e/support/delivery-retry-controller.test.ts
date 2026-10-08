@@ -2884,6 +2884,7 @@ function startupFailureBoundary(
       navigator: { onLine: true },
       HTMLInputElement: Input,
       HTMLButtonElement: Button,
+      HTMLElement: class {},
       document: {
         readyState: "complete",
         documentElement: { classList: { contains: () => options.dark === true } },
@@ -2921,6 +2922,9 @@ describe("closed failure-only startup observation", () => {
       route: "pair",
       readyState: "complete",
       online: true,
+      rootElementPresent: false,
+      rootHasChildren: false,
+      rootErrorPresent: false,
       tokenInputPresent: true,
       tokenInputDisabled: false,
       submitPresent: true,
@@ -2986,6 +2990,9 @@ describe("closed failure-only startup observation", () => {
           safeLocation,
           readyState: "private-ready",
           extra: "private-body",
+          rootElementPresent: "private-root",
+          rootHasChildren: 1,
+          rootErrorPresent: {},
         },
       });
       await f.run();
@@ -3011,6 +3018,45 @@ describe("closed failure-only startup observation", () => {
       expect(JSON.stringify(f.writes)).not.toContain("private");
     },
   );
+
+  it("refuses a getter-backed root fact without replacing failure publication", async () => {
+    const response = { safeLocation: true };
+    Object.defineProperty(response, "rootErrorPresent", {
+      enumerable: true,
+      get() {
+        throw new Error("private-root-getter");
+      },
+    });
+    const f = startupFailureBoundary({ response });
+    await f.run();
+    expect(f.writes).toHaveLength(1);
+    expect(f.writes[0]?.startupObservation).toBeNull();
+    expect(JSON.stringify(f.writes)).not.toContain("private");
+  });
+
+  it.each([
+    ["safeLocation", true],
+    ["route", "pair"],
+    ["readyState", "complete"],
+    ["rootElementPresent", true],
+    ["rootHasChildren", false],
+    ["rootErrorPresent", true],
+  ] as const)("projects each %s fact from one read", async (key, known) => {
+    const response = { safeLocation: true };
+    let reads = 0;
+    Object.defineProperty(response, key, {
+      enumerable: true,
+      get() {
+        reads++;
+        return reads === 1 ? known : "private-changing-value";
+      },
+    });
+    const f = startupFailureBoundary({ response });
+    await f.run();
+    expect(reads).toBe(1);
+    expect(f.writes[0]?.startupObservation).toEqual(expect.objectContaining({ [key]: known }));
+    expect(JSON.stringify(f.writes)).not.toContain("private");
+  });
 
   it("bounds the read at two seconds and never publishes its late result", async () => {
     vi.useFakeTimers();
