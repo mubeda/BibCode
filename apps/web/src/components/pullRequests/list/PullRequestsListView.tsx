@@ -31,6 +31,7 @@ import { Skeleton } from "../../ui/skeleton";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
+import { useVisiblePullRequestRefresh } from "../useVisiblePullRequestRefresh";
 import { PullRequestsFilters } from "./PullRequestsFilters";
 import { PullRequestsRow } from "./PullRequestsRow";
 import {
@@ -307,6 +308,11 @@ export function PullRequestsListView({
   );
   const firstQuery = usePullRequestsQuery(firstAtom, {
     freshOnOpen: freshPageKey === environmentRpcKey({ environmentId: scope.environmentId, input }),
+  });
+  useVisiblePullRequestRefresh({
+    enabled: context.provider === "gitlab",
+    succeeded: firstQuery.data !== null && firstQuery.error === null && !firstQuery.isPending,
+    revalidate: firstQuery.revalidate,
   });
   useEffect(() => {
     if (freshPageKey != null) onFreshPageConsumed?.(freshPageKey);

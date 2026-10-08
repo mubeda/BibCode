@@ -12,6 +12,7 @@ import { pullRequestsEnvironment } from "../../../state/pullRequests";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { Button } from "../../ui/button";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
+import { useVisiblePullRequestRefresh } from "../useVisiblePullRequestRefresh";
 import { PullRequestsQueryState } from "./PullRequestsQueryState";
 import { PullRequestsHeader } from "./PullRequestsHeader";
 import { PullRequestsConversation } from "./PullRequestsConversation";
@@ -109,6 +110,16 @@ export function PullRequestsDetailView({
     checks: checksQuery,
     files: filesQuery,
   }[tab];
+  useVisiblePullRequestRefresh({
+    enabled: context.provider === "gitlab",
+    succeeded: detailQuery.data !== null && detailQuery.error === null && !detailQuery.isPending,
+    revalidate: detailQuery.revalidate,
+  });
+  useVisiblePullRequestRefresh({
+    enabled: context.provider === "gitlab" && activeQuery.data !== null,
+    succeeded: activeQuery.data !== null && activeQuery.error === null && !activeQuery.isPending,
+    revalidate: activeQuery.revalidate,
+  });
   useEffect(() => {
     usePullRequestsStore.getState().setLastNumber(projectRef, number);
   }, [number, projectRef]);
