@@ -8,7 +8,7 @@ use std::{
     fmt, io,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use crate::production::connect_mcp::ConnectMcpService;
@@ -19,18 +19,31 @@ pub const ENDPOINT_ENV: &str = "BIBCODE_OPEN_URL_ENDPOINT";
 const POST_TIMEOUT: Duration = Duration::from_secs(5);
 const PATH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
 
-/// Writes `bibcode-open-url` (POSIX sh, mode 0755) and `bibcode-open-url.cmd` into `dir`, each
-/// pointing at `exe`. A shim whose content is already current is left alone.
+/// Puts `bibcode-open-url` into `dir`, running `exe`. POSIX gets a sh shim (mode 0755)
+/// that runs `exe open-url "$1"`. Windows gets `bibcode-open-url.exe`, an alias of `exe`
+/// that [`open_url_invocation`] recognizes by name: a batch shim would hand the URL to the
+/// `cmd.exe` parser, and callers that skip the shell never find a `.cmd` anyway. Shims that
+/// are already current are left alone.
 pub fn write_shims(dir: &Path, exe: &Path) -> io::Result<()> {
-    let exe = exe.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("executable path is not UTF-8: {}", exe.display()),
-        )
-    })?;
     std::fs::create_dir_all(dir)?;
-    write_if_changed(&dir.join(SHIM_NAME), &posix_shim(exe))?;
-    write_if_changed(&dir.join(format!("{SHIM_NAME}.cmd")), &windows_shim(exe))
+    let written = if cfg!(windows) {
+        write_alias(&dir.join(format!("{SHIM_NAME}.exe")), exe)
+    } else {
+        exe.to_str()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("executable path is not UTF-8: {}", exe.display()),
+                )
+            })
+            .and_then(|exe| write_if_changed(&dir.join(SHIM_NAME), &posix_shim(exe)))
+    };
+    // An earlier build wrote a batch shim; never leave it on `PATH`.
+    let removed = match std::fs::remove_file(dir.join(format!("{SHIM_NAME}.cmd"))) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    };
+    written.and(removed)
 }
 
 fn posix_shim(exe: &str) -> String {
@@ -41,16 +54,64 @@ fn posix_shim(exe: &str) -> String {
     )
 }
 
-fn windows_shim(exe: &str) -> String {
-    // A batch file expands `%…%` even inside quotes; Windows paths cannot contain `"`.
-    // `"%~1"` drops the caller's quotes and quotes the URL itself, so an `&` or `|` that
-    // reached the batch parser escaped (`^&`) stays inside the argument.
-    // ponytail: a raw `"` in the argument still ends the quoting (the batch-file argument
-    // problem every `.cmd` has); valid URLs percent-encode it. A `bibcode-open-url.exe` alias
-    // would remove batch parsing entirely if Windows callers need that guarantee.
-    format!(
-        "@echo off\r\n\"{}\" open-url \"%~1\"\r\n",
-        exe.replace('%', "%%")
+/// Makes `alias` a hard link to `exe`, or a copy when linking fails (another volume), via a
+/// temporary file and a rename. A current alias is kept without reading the large binary.
+fn write_alias(alias: &Path, exe: &Path) -> io::Result<()> {
+    let source = std::fs::metadata(exe)?;
+    if let Ok(existing) = std::fs::metadata(alias)
+        && let (Ok(source_modified), Ok(alias_modified)) = (source.modified(), existing.modified())
+        && alias_is_current(
+            (source.len(), source_modified),
+            (existing.len(), alias_modified),
+        )
+    {
+        return Ok(());
+    }
+    let name = alias.file_name().unwrap_or_default().to_string_lossy();
+    let temporary = alias.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = std::fs::hard_link(exe, &temporary)
+        .or_else(|_| {
+            std::fs::copy(exe, &temporary)?;
+            // A copy carries the source's modified time, so freshness stays an equality.
+            std::fs::File::options()
+                .write(true)
+                .open(&temporary)?
+                .set_modified(source.modified()?)
+        })
+        .and_then(|()| std::fs::rename(&temporary, alias));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// An alias with its source's length and modified time is that source: a hard link shares the
+/// source's metadata, and a copy is stamped with it. Equality, not "no older", so rolling back
+/// to an older build of the same size still replaces the alias.
+fn alias_is_current(source: (u64, SystemTime), alias: (u64, SystemTime)) -> bool {
+    source == alias
+}
+
+/// The URL to open when this process is an open-url invocation, checked before anything
+/// else starts: `<exe> open-url <url>` (the POSIX shim), or the Windows alias
+/// `bibcode-open-url[.exe] <url>`. A missing URL yields `""`, which [`run_open_url`]
+/// rejects with exit 2.
+#[must_use]
+pub fn open_url_invocation(args: &[OsString]) -> Option<String> {
+    let invoked_as_alias = args
+        .first()
+        .and_then(|program| Path::new(program).file_stem())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case(SHIM_NAME));
+    let url = if invoked_as_alias {
+        args.get(1)
+    } else if args.get(1).is_some_and(|command| command == "open-url") {
+        args.get(2)
+    } else {
+        return None;
+    };
+    Some(
+        url.map(|url| url.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     )
 }
 
@@ -297,9 +358,12 @@ mod tests {
         assert_eq!(args, vec!["open-url".to_owned(), url.to_owned()]);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn shims_are_rewritten_only_when_their_content_changes() {
+    fn posix_shim_is_rewritten_only_when_its_content_changes() {
         let temp = tempfile::tempdir().unwrap();
+        // A batch shim left by an earlier build is removed.
+        std::fs::write(temp.path().join(format!("{SHIM_NAME}.cmd")), "@echo off").unwrap();
         write_shims(temp.path(), Path::new("/opt/bibcode/bibcode")).unwrap();
         let shim = temp.path().join(SHIM_NAME);
         let first = std::fs::metadata(&shim).unwrap().modified().unwrap();
@@ -308,17 +372,130 @@ mod tests {
         assert_eq!(std::fs::metadata(&shim).unwrap().modified().unwrap(), first);
 
         write_shims(temp.path(), Path::new("/opt/100%/bibcode")).unwrap();
-        assert!(
-            std::fs::read_to_string(&shim)
-                .unwrap()
-                .contains("exec '/opt/100%/bibcode' open-url \"$1\"")
+        assert_eq!(
+            std::fs::read_to_string(&shim).unwrap(),
+            "#!/bin/sh\n# BiBCode open-url shim: hands one URL to the BiBCode client showing this thread.\nexec '/opt/100%/bibcode' open-url \"$1\"\n"
+        );
+        // Only the shim remains: no batch shim, no temporary file.
+        let names = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![OsString::from(SHIM_NAME)]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_gets_an_exe_alias_and_no_batch_shim() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe = temp.path().join("bibcode.exe");
+        std::fs::write(&exe, b"not really an executable").unwrap();
+        let shims = temp.path().join("shims");
+        std::fs::create_dir(&shims).unwrap();
+        std::fs::write(shims.join(format!("{SHIM_NAME}.cmd")), "@echo off").unwrap();
+
+        write_shims(&shims, &exe).unwrap();
+
+        assert_eq!(
+            std::fs::read(shims.join(format!("{SHIM_NAME}.exe"))).unwrap(),
+            b"not really an executable"
+        );
+        assert!(!shims.join(format!("{SHIM_NAME}.cmd")).exists());
+        assert!(!shims.join(SHIM_NAME).exists());
+    }
+
+    #[test]
+    fn alias_is_written_atomically_and_replaced_only_when_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe = temp.path().join("bibcode");
+        std::fs::write(&exe, b"version one").unwrap();
+        let shims = temp.path().join("shims");
+        std::fs::create_dir(&shims).unwrap();
+        let alias = shims.join(format!("{SHIM_NAME}.exe"));
+
+        write_alias(&alias, &exe).unwrap();
+        assert_eq!(std::fs::read(&alias).unwrap(), b"version one");
+        // A current alias is kept without a byte compare. Rewriting the hard link would
+        // change the source too, so a separate file with the source's length and modified
+        // time stands in for it.
+        let source_modified = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        stand_in_with_time(&alias, source_modified);
+        write_alias(&alias, &exe).unwrap();
+        assert_eq!(std::fs::read(&alias).unwrap(), b"version 1!!");
+
+        // A same-size source with another modified time (a rollback) replaces it.
+        stand_in_with_time(&alias, source_modified + Duration::from_secs(60));
+        write_alias(&alias, &exe).unwrap();
+        assert_eq!(std::fs::read(&alias).unwrap(), b"version one");
+
+        // A new source of another length replaces it; no temporary file survives.
+        std::fs::remove_file(&exe).unwrap();
+        std::fs::write(&exe, b"version two, longer").unwrap();
+        write_alias(&alias, &exe).unwrap();
+        assert_eq!(std::fs::read(&alias).unwrap(), b"version two, longer");
+        assert_eq!(std::fs::read_dir(&shims).unwrap().count(), 1);
+    }
+
+    /// Replaces `alias` with an unrelated file of the same length, stamped `modified`.
+    fn stand_in_with_time(alias: &Path, modified: SystemTime) {
+        std::fs::remove_file(alias).unwrap();
+        std::fs::write(alias, b"version 1!!").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(alias)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    #[test]
+    fn alias_freshness_compares_length_and_modified_time() {
+        let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let later = earlier + Duration::from_secs(1);
+        // A hard link shares the source's metadata; a copy is stamped with it.
+        assert!(alias_is_current((10, earlier), (10, earlier)));
+        // A rebuilt source, or a rollback to an older build of the same size.
+        assert!(!alias_is_current((10, later), (10, earlier)));
+        assert!(!alias_is_current((10, earlier), (10, later)));
+        assert!(!alias_is_current((10, earlier), (11, earlier)));
+    }
+
+    #[test]
+    fn open_url_invocation_recognizes_the_subcommand_and_the_alias() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        let url = "http://h/?a=$(x)&b=\"c\"";
+        assert_eq!(
+            open_url_invocation(&args(&["/opt/bibcode/bibcode", "open-url", url])),
+            Some(url.to_owned())
+        );
+        for alias in [
+            "bibcode-open-url",
+            "/state/runtime/open-url/bibcode-open-url.exe",
+            "/state/runtime/open-url/BIBCODE-OPEN-URL.EXE",
+        ] {
+            assert_eq!(
+                open_url_invocation(&args(&[alias, url])),
+                Some(url.to_owned()),
+                "{alias}"
+            );
+        }
+        // A missing URL still runs open-url, which exits 2 with its usage message.
+        assert_eq!(
+            open_url_invocation(&args(&["bibcode-open-url.exe"])),
+            Some(String::new())
         );
         assert_eq!(
-            std::fs::read_to_string(temp.path().join(format!("{SHIM_NAME}.cmd"))).unwrap(),
-            "@echo off\r\n\"/opt/100%%/bibcode\" open-url \"%~1\"\r\n"
+            open_url_invocation(&args(&["bibcode", "open-url"])),
+            Some(String::new())
         );
-        // No temporary file survives.
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+        // Anything else starts the program normally.
+        assert_eq!(open_url_invocation(&args(&["bibcode", "serve"])), None);
+        assert_eq!(open_url_invocation(&args(&["bibcode-desktop"])), None);
+        assert_eq!(
+            open_url_invocation(&args(&["bibcode-desktop", "bibcode://pair?code=x"])),
+            None
+        );
+        assert_eq!(open_url_invocation(&[]), None);
     }
 
     #[test]

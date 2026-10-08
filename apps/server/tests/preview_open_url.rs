@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -26,6 +26,9 @@ use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
+
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
 
 #[path = "support/websocket_frames.rs"]
 mod websocket_frames;
@@ -391,6 +394,58 @@ async fn open_url_cli_posts_to_the_route_and_emits_open_request() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{url}\n"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("401"));
+    server.abort();
+}
+
+/// The Windows `bibcode-open-url.exe` alias is the server binary under another name; it takes
+/// the URL as its only argument. Dispatch is by name, so it is exercised on every platform.
+#[tokio::test]
+async fn open_url_alias_posts_the_url_and_rejects_a_missing_one() {
+    let temp = TempDir::new().unwrap();
+    let alias = temp
+        .path()
+        .join(format!("bibcode-open-url{}", std::env::consts::EXE_SUFFIX));
+    executable_fixture::copy_executable(Path::new(env!("CARGO_BIN_EXE_bibcode")), &alias);
+    let connect = Arc::new(setup_service(&temp).await);
+    let preview = PreviewManager::new();
+    let mut events = preview.subscribe_events();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/api/preview/open-url",
+        listener.local_addr().unwrap()
+    );
+    let app = router(Arc::clone(&connect), preview.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let credential = connect.issue_open_url_credential("thread-1").await.unwrap();
+    let url = "http://localhost:5173/?a=\"b\"&c";
+    let run = |args: Vec<&str>| {
+        let mut command = tokio::process::Command::new(&alias);
+        command
+            .args(args)
+            .env("BIBCODE_OPEN_URL_ENDPOINT", &endpoint)
+            .env("BIBCODE_OPEN_URL_TOKEN", &credential.token);
+        async move {
+            timeout(Duration::from_secs(20), command.output())
+                .await
+                .expect("alias exits")
+                .expect("alias runs")
+        }
+    };
+
+    let output = run(vec![url]).await;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let event = serde_json::to_value(events.recv().await.expect("event")).unwrap();
+    assert_eq!(event["type"], "openRequested");
+    // The raw quote arrived as data; the server stores the URL normalized.
+    assert_eq!(event["url"], "http://localhost:5173/?a=%22b%22&c");
+
+    let output = run(Vec::new()).await;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "bibcode open-url: expected an http(s) URL\n"
+    );
     server.abort();
 }
 

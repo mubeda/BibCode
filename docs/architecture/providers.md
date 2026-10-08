@@ -483,14 +483,24 @@ Every provider launch and every terminal process start also receives the
 open-URL hook: `BROWSER` and `BRAINSTORM_OPEN_CMD` set to `bibcode-open-url`,
 `BIBCODE_OPEN_URL_TOKEN` and `BIBCODE_OPEN_URL_ENDPOINT`, and `PATH` with
 `<state dir>/runtime/open-url` prepended to the effective `PATH` above. These
-server values replace any the instance or terminal caller supplied. The server
-writes the `bibcode-open-url` shims (POSIX sh and `.cmd`) there at startup;
-each runs `<server executable> open-url "<url>"`, which posts the URL to
-`POST /api/preview/open-url` with the token. The token is issued per launch or
-terminal start, is scoped to the thread, and authorizes only that route. The
-provider credential stays outside the instance environment, so durable
-delivery route fingerprints do not change with it. A desktop executable handles
-`open-url` before Tauri starts; inside an AppImage the shim runs the image.
+server values replace any the instance or terminal caller supplied. At startup
+the server puts `bibcode-open-url` there:
+
+- On POSIX hosts, a sh shim that runs `<server executable> open-url "$1"`.
+  Inside an AppImage, the shim runs the image itself.
+- On Windows, `bibcode-open-url.exe`: a hard link to the server executable, or
+  a copy when linking fails. It is not a batch file, because a batch file would
+  pass the URL through the `cmd.exe` parser (command injection). Callers that
+  start processes without a shell also find only `.exe` files.
+
+Either form posts the URL to `POST /api/preview/open-url` with the token. The
+`bibcode` and desktop executables recognize an open-url invocation before
+anything else starts: before clap, data-root resolution, or Tauri. They match
+either the `open-url` argument or an executable named `bibcode-open-url`.
+
+The token is issued per launch or terminal start, is scoped to the thread, and
+authorizes only that route. The provider credential stays outside the instance
+environment, so durable delivery route fingerprints do not change with it.
 
 ## Provider maintenance
 
