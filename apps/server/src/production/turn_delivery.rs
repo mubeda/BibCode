@@ -842,6 +842,17 @@ async fn fill_available_slots(
         {
             continue;
         }
+        // A closed (archived) chat panel starts nothing until it is reopened; unarchive wakes
+        // delivery. The claim repeats this check.
+        if engine
+            .repositories()
+            .get_thread(row.thread_id.clone())
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some_and(|thread| thread.kind == "panel" && thread.archived_at.is_some())
+        {
+            continue;
+        }
         candidates.push(row);
     }
     let retry_delay = candidates

@@ -541,3 +541,34 @@ async fn a_closed_chat_panel_never_promotes_its_queue_until_reopened() {
     service.shutdown().await;
     engine.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_closed_chat_panel_does_not_start_a_prompt_sent_before_it_closed() {
+    let engine = engine().await;
+    engine.dispatch(command(json!({"type":"thread.create", "commandId":"panel", "threadId":"panel", "projectId":"p", "title":"Panel — Codex", "kind":"panel", "hostThreadId":"t", "runtimeMode":"full-access", "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":TIME}))).await.unwrap();
+    // The prompt was admitted, but the panel closed before delivery claimed it.
+    enqueue_for(&engine, "panel", "pending-panel", false).await;
+    engine
+        .dispatch(command(
+            json!({"type":"thread.archive", "commandId":"close", "threadId":"panel"}),
+        ))
+        .await
+        .unwrap();
+    let (service, mut routes) = service(&engine);
+    quiet(&mut routes).await;
+    assert_eq!(
+        row(&engine, "pending-panel").await.state,
+        TurnDeliveryState::Pending
+    );
+    // Delivery skips the closed panel instead of retrying its claim in a loop.
+    assert_eq!(engine.repositories().provider_turn_claims_for_test(), 0);
+    engine
+        .dispatch(command(
+            json!({"type":"thread.unarchive", "commandId":"reopen", "threadId":"panel"}),
+        ))
+        .await
+        .unwrap();
+    received(&mut routes, "pending-panel").await;
+    service.shutdown().await;
+    engine.shutdown().await;
+}

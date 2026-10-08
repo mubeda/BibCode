@@ -1868,8 +1868,9 @@ so a rejected head can be dismissed without stranding its tail. Dismissal of
 sending or uncertain work does not prove the provider received nothing, so
 those placeholders and bound running turns continue to block automatic
 promotion. An archived `panel` thread (a closed chat panel) never promotes
-automatically, so its queue cannot start work after its tab closed; unarchiving
-it resumes the queue. Explicit Send now remains available under its client gate.
+automatically, and delivery neither selects nor claims its pending rows, so
+neither its queue nor a prompt sent just before closing starts work after its
+tab closed; unarchiving it resumes both. Explicit Send now remains available under its client gate.
 
 Pending start deliveries from older clients also wait while the session is
 running or starting; the SQLite claim repeats this check so a stale worker read
