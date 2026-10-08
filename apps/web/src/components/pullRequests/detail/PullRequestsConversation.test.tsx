@@ -105,4 +105,45 @@ describe("PullRequestsConversation", () => {
     expect(container.textContent).toContain("Older activity is on the host page");
     expect(container.querySelector(`a[href="${detail.url}"]`)).not.toBeNull();
   });
+  it("leaves the comment action and a timeline action inactive with a null live detail", () => {
+    const permissiveDetail = {
+      ...detail,
+      permissions: {
+        ...detail.permissions,
+        comment: allowed,
+        react: allowed,
+      },
+    };
+    const timelineComment = {
+      ...comment,
+      viewerIsAuthor: true,
+      reactions: [{ content: "+1" as const, count: 1, viewerReacted: false }],
+    };
+    const container = document.createElement("div");
+    container.innerHTML = renderToStaticMarkup(
+      <PullRequestsConversation
+        scope={{ environmentId: projectRef.environmentId, cwd: "/repo" }}
+        detail={permissiveDetail}
+        liveDetail={null}
+        context={context}
+        projectRef={{ environmentId: "env", projectId: "project" } as never}
+        timeline={{ items: [timelineComment], truncated: false }}
+      />,
+    );
+    // The comment action: the main comment box's submit control.
+    const commentButton = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Comment",
+    )!;
+    expect(commentButton.disabled).toBe(true);
+    expect(commentButton.title).toBe("Loading…");
+    // A timeline action: the "Add reaction" trigger on the rendered comment.
+    const addReactionButtons = [...container.querySelectorAll("button")].filter(
+      (button) => button.textContent === "Add reaction",
+    );
+    expect(addReactionButtons.length).toBeGreaterThan(0);
+    for (const button of addReactionButtons) {
+      expect(button.disabled).toBe(true);
+      expect(button.title).toBe("Loading…");
+    }
+  });
 });

@@ -31,6 +31,7 @@ export function PullRequestsCommentActions({
   number,
   host,
   url,
+  live = true,
 }: {
   comment: Comment;
   permissions: PullRequestsPermissions;
@@ -38,6 +39,12 @@ export function PullRequestsCommentActions({
   number: number;
   host: string;
   url: string;
+  /**
+   * Editing, deleting, and minimizing a comment only ever act on a live
+   * detail, never a snapshot. Defaults to `true` so callers that have not
+   * adopted the split keep acting as before.
+   */
+  live?: boolean;
 }) {
   const { run, pending } = usePullRequestsActions();
   const edit = usePullRequestsStore(
@@ -52,7 +59,11 @@ export function PullRequestsCommentActions({
   const permission = (key: "editOwnComment" | "deleteOwnComment" | "minimizeComment") =>
     constrainPermission(
       permissions[key],
-      pending || deleting ? "Wait for the current action to finish" : null,
+      !live
+        ? "Loading…"
+        : pending || deleting
+          ? "Wait for the current action to finish"
+          : null,
     );
   const minimized = comment.minimized;
   return (
@@ -147,7 +158,7 @@ export function PullRequestsCommentActions({
       {edit !== undefined && comment.viewerIsAuthor ? (
         <div className="space-y-2">
           <PullRequestsCommentBox
-            permission={permissions.editOwnComment}
+            permission={permission("editOwnComment")}
             busy={pending}
             label="Edit comment"
             submitLabel="Save"

@@ -25,6 +25,13 @@ export interface PullRequestsTimelineItemProps {
   number: number;
   context: Extract<PullRequestsContext, { status: "available" }>;
   url: string;
+  /**
+   * React, comment, reply, resolve, dismiss, edit, delete, minimize, and
+   * apply-suggestions all only ever act on a live detail, never a snapshot.
+   * Defaults to `true` so callers that have not adopted the split keep
+   * acting as before.
+   */
+  live?: boolean;
 }
 const REVIEW_LABELS = {
   approved: "approved these changes",
@@ -42,9 +49,10 @@ function CommentBody({
   number,
   context,
   url,
+  live = true,
 }: Pick<
   PullRequestsTimelineItemProps,
-  "permissions" | "projectRef" | "number" | "context" | "url"
+  "permissions" | "projectRef" | "number" | "context" | "url" | "live"
 > & {
   comment:
     | Extract<TimelineItem, { kind: "comment" }>
@@ -80,12 +88,14 @@ function CommentBody({
             <PullRequestsSuggestionBlock
               suggestion={comment.suggestion}
               permission={permissions.applySuggestion}
+              live={live}
             />
           ) : null}
           <PullRequestsReactions
             reactions={comment.reactions}
             permission={permissions.react}
             busy={pending}
+            live={live}
             onToggle={(content, on) => run({ action: "react", targetId: comment.id, content, on })}
           />
         </>
@@ -97,6 +107,7 @@ function CommentBody({
         number={number}
         host={context.host}
         url={url}
+        live={live}
       />
     </article>
   );
@@ -108,6 +119,7 @@ export const PullRequestsTimelineItem = memo(function PullRequestsTimelineItem({
   number,
   context,
   url,
+  live = true,
 }: PullRequestsTimelineItemProps) {
   if (item.kind === "event")
     return (
@@ -170,6 +182,7 @@ export const PullRequestsTimelineItem = memo(function PullRequestsTimelineItem({
           review={item}
           permission={permissions.dismissReview}
           host={context.host}
+          live={live}
         />
       </article>
     );
@@ -191,6 +204,7 @@ export const PullRequestsTimelineItem = memo(function PullRequestsTimelineItem({
           number={number}
           context={context}
           url={url}
+          live={live}
         />
       </div>
     );
@@ -237,6 +251,7 @@ export const PullRequestsTimelineItem = memo(function PullRequestsTimelineItem({
             number={number}
             context={context}
             url={url}
+            live={live}
           />
         </div>
       ))}
@@ -245,6 +260,7 @@ export const PullRequestsTimelineItem = memo(function PullRequestsTimelineItem({
         permissions={permissions}
         projectRef={projectRef}
         number={number}
+        live={live}
       />
     </article>
   );

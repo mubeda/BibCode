@@ -121,16 +121,23 @@ export function PullRequestsConversationComment({
   permission,
   projectRef,
   number,
+  live = true,
 }: {
   permission: PullRequestsPermission;
   projectRef: ScopedProjectRef;
   number: number;
+  /**
+   * Commenting only ever acts on a live detail, never a snapshot. Defaults
+   * to `true` so callers that have not adopted the split keep acting as
+   * before.
+   */
+  live?: boolean;
 }) {
   const draft = usePullRequestsStore((s) => s.selectDraft(projectRef, number).comment);
   const { run, pending } = usePullRequestsActions();
   return (
     <PullRequestsCommentBox
-      permission={permission}
+      permission={constrainPermission(permission, !live ? "Loading…" : null)}
       draft={draft}
       busy={pending}
       onDraftChange={(value) =>

@@ -381,6 +381,7 @@ describe("PullRequestsDetailView", () => {
         merge: { ...detail.permissions.merge, ...allowed },
         editPullRequest: allowed,
         editReviewers: allowed,
+        comment: allowed,
       },
     };
     h.data.readSnapshot = {
@@ -411,6 +412,12 @@ describe("PullRequestsDetailView", () => {
     )!;
     expect(reviewerPicker.disabled).toBe(true);
     expect(reviewerPicker.title).toBe("Loading…");
+    // The main comment box's submit control stays inactive too.
+    const commentButton = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Comment",
+    )!;
+    expect(commentButton.disabled).toBe(true);
+    expect(commentButton.title).toBe("Loading…");
   });
   it("offers a direct path back to the request list", async () => {
     await render();

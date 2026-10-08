@@ -27,11 +27,12 @@ export interface PullRequestsConversationProps {
   timeline: PullRequestsTimeline;
   detailsRefreshing?: boolean;
   /**
-   * Action controls (review, merge, side column pickers) only act on a live
-   * detail that succeeded on this mount, never on a painted snapshot. Those
-   * controls still render from `detail` but stay inactive with a "Loading…"
-   * reason until this exists. Omitting this falls back to `detail`, so
-   * callers that have not adopted the split keep acting as before.
+   * Action controls (review, merge, side column pickers, timeline items,
+   * reactions, comment box) only act on a live detail that succeeded on
+   * this mount, never on a painted snapshot. Those controls still render
+   * from `detail` but stay inactive with a "Loading…" reason until this
+   * exists. Omitting this falls back to `detail`, so callers that have not
+   * adopted the split keep acting as before.
    */
   liveDetail?: PullRequestsDetail | null;
 }
@@ -47,6 +48,9 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
 }: PullRequestsConversationProps) {
   const { run, pending } = usePullRequestsActions();
   const items = useMemo(() => groupTimeline(timeline.items), [timeline.items]);
+  // React, comment, reply, resolve, dismiss, edit, delete, minimize, and
+  // apply-suggestions all only ever act on a live detail, never a snapshot.
+  const live = liveDetail !== null;
   const renderItem = useCallback(
     ({ item }: { item: PullRequestsTimeline["items"][number] }) => (
       <PullRequestsTimelineItem
@@ -56,9 +60,10 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
         number={detail.number}
         context={context}
         url={detail.url}
+        live={live}
       />
     ),
-    [context, detail.number, detail.permissions, detail.url, projectRef],
+    [context, detail.number, detail.permissions, detail.url, projectRef, live],
   );
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -102,6 +107,7 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
               reactions={detail.reactions}
               permission={detail.permissions.react}
               busy={pending}
+              live={live}
               onToggle={(content, on) => run({ action: "react", targetId: null, content, on })}
             />
           </article>
@@ -119,6 +125,7 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
               permission={detail.permissions.comment}
               projectRef={projectRef}
               number={detail.number}
+              live={live}
             />
             <div className="lg:hidden">
               <PullRequestsSideColumn
