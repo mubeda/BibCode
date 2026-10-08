@@ -19,10 +19,25 @@ struct Listener {
     host: String,
     port: u16,
     pid: Option<u32>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    inode: Option<u64>,
 }
 
-pub(crate) async fn discover(cancellation: &CancellationToken) -> Vec<Value> {
-    let listeners = platform_listeners(cancellation).await;
+/// One live terminal session and the pids of its process tree (root first).
+pub(crate) struct TerminalProcessSet {
+    pub thread_id: String,
+    pub terminal_id: String,
+    pub pids: Vec<u32>,
+}
+
+pub(crate) async fn discover(
+    cancellation: &CancellationToken,
+    terminals: &[TerminalProcessSet],
+) -> Vec<Value> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut listeners = platform_listeners(cancellation).await;
+    #[cfg(target_os = "linux")]
+    attribute_socket_owners(cancellation, &mut listeners, terminals).await;
     let names = process_names(listeners.iter().filter_map(|listener| listener.pid));
     listeners
         .into_iter()
@@ -35,10 +50,76 @@ pub(crate) async fn discover(cancellation: &CancellationToken) -> Vec<Value> {
                 "url": format!("http://{}:{}/", listener.host, listener.port),
                 "processName": process_name,
                 "pid": listener.pid,
-                "terminal": null,
+                "terminal": terminal_for_pid(terminals, listener.pid),
             })
         })
         .collect()
+}
+
+fn terminal_for_pid(terminals: &[TerminalProcessSet], pid: Option<u32>) -> Option<Value> {
+    let pid = pid?;
+    terminals
+        .iter()
+        .find(|terminal| terminal.pids.contains(&pid))
+        .map(|terminal| {
+            json!({ "threadId": terminal.thread_id, "terminalId": terminal.terminal_id })
+        })
+}
+
+/// `/proc/net/tcp` carries no pid, so resolve listener socket inodes through the
+/// fd tables of terminal descendants only; the rest of the host is never scanned.
+#[cfg(target_os = "linux")]
+async fn attribute_socket_owners(
+    cancellation: &CancellationToken,
+    listeners: &mut [Listener],
+    terminals: &[TerminalProcessSet],
+) {
+    if terminals.is_empty() || listeners.iter().all(|listener| listener.pid.is_some()) {
+        return;
+    }
+    let pids = terminals
+        .iter()
+        .flat_map(|terminal| terminal.pids.iter().copied())
+        .collect::<Vec<_>>();
+    let owners = tokio::select! {
+        () = cancellation.cancelled() => return,
+        owners = tokio::task::spawn_blocking(move || {
+            socket_inode_pids(std::path::Path::new("/proc"), &pids)
+        }) => owners.unwrap_or_default(),
+    };
+    for listener in listeners {
+        if listener.pid.is_none() {
+            listener.pid = listener.inode.and_then(|inode| owners.get(&inode).copied());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn socket_inode_pids(
+    proc_root: &std::path::Path,
+    pids: &[u32],
+) -> std::collections::HashMap<u64, u32> {
+    let mut map = std::collections::HashMap::new();
+    for &pid in pids {
+        // Processes exit and fd dirs can be unreadable; skip both.
+        let Ok(entries) = std::fs::read_dir(proc_root.join(pid.to_string()).join("fd")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            let target = target.to_string_lossy();
+            if let Some(inode) = target
+                .strip_prefix("socket:[")
+                .and_then(|inode| inode.strip_suffix(']'))
+                && let Ok(inode) = inode.parse()
+            {
+                map.insert(inode, pid);
+            }
+        }
+    }
+    map
 }
 
 fn normalize(mut listeners: Vec<Listener>) -> Vec<Listener> {
@@ -56,6 +137,9 @@ fn normalize(mut listeners: Vec<Listener>) -> Vec<Listener> {
                 .and_modify(|existing: &mut Listener| {
                     if existing.pid.is_none() {
                         existing.pid = listener.pid;
+                    }
+                    if existing.inode.is_none() {
+                        existing.inode = listener.inode;
                     }
                 })
                 .or_insert(listener);
@@ -97,6 +181,7 @@ fn parse_netstat(output: &str) -> Vec<Listener> {
                 host,
                 port,
                 pid: fields[4].parse().ok().filter(|pid| *pid > 0),
+                inode: None,
             })
         })
         .collect()
@@ -127,7 +212,7 @@ fn parse_proc_tcp(input: &str) -> Vec<Listener> {
         .skip(1)
         .filter_map(|line| {
             let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() < 4 || fields[3] != "0A" {
+            if fields.len() < 10 || fields[3] != "0A" {
                 return None;
             }
             let (address, port) = fields[1].split_once(':')?;
@@ -137,6 +222,7 @@ fn parse_proc_tcp(input: &str) -> Vec<Listener> {
                 host,
                 port: u16::from_str_radix(port, 16).ok()?,
                 pid: None,
+                inode: fields[9].parse().ok().filter(|inode| *inode != 0),
             })
         })
         .collect()
@@ -149,7 +235,7 @@ fn parse_proc_tcp6(input: &str) -> Vec<Listener> {
         .skip(1)
         .filter_map(|line| {
             let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() < 4 || fields[3] != "0A" {
+            if fields.len() < 10 || fields[3] != "0A" {
                 return None;
             }
             let (address, port) = fields[1].split_once(':')?;
@@ -164,6 +250,7 @@ fn parse_proc_tcp6(input: &str) -> Vec<Listener> {
                 host: host.to_owned(),
                 port: u16::from_str_radix(port, 16).ok()?,
                 pid: None,
+                inode: fields[9].parse().ok().filter(|inode| *inode != 0),
             })
         })
         .collect()
@@ -195,7 +282,12 @@ fn parse_lsof(output: &str) -> Vec<Listener> {
         } else if let Some(value) = line.strip_prefix('n') {
             let address = value.split(" (LISTEN)").next().unwrap_or(value);
             if let Some((host, port)) = split_address(address) {
-                listeners.push(Listener { host, port, pid });
+                listeners.push(Listener {
+                    host,
+                    port,
+                    pid,
+                    inode: None,
+                });
             }
         }
     }
@@ -248,11 +340,13 @@ mod tests {
                 host: "*".to_owned(),
                 port: 3000,
                 pid: Some(1),
+                inode: None,
             },
             Listener {
                 host: "::1".to_owned(),
                 port: 4000,
                 pid: Some(2),
+                inode: None,
             },
         ]);
 
@@ -262,5 +356,72 @@ mod tests {
                 .iter()
                 .all(|listener| listener.host == "127.0.0.1")
         );
+    }
+
+    #[test]
+    fn listeners_are_attributed_to_the_terminal_owning_their_pid() {
+        let terminals = vec![TerminalProcessSet {
+            thread_id: "thread-1".into(),
+            terminal_id: "term-1".into(),
+            pids: vec![100, 101],
+        }];
+        assert_eq!(
+            terminal_for_pid(&terminals, Some(101)),
+            Some(json!({ "threadId": "thread-1", "terminalId": "term-1" }))
+        );
+        assert_eq!(terminal_for_pid(&terminals, Some(7)), None);
+        assert_eq!(terminal_for_pid(&terminals, None), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_tcp_rows_keep_the_socket_inode() {
+        let input = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1435 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 424242 1 0000000000000000 100 0 0 10 0\n";
+        let listeners = parse_proc_tcp(input);
+        assert_eq!(listeners[0].port, 5173);
+        assert_eq!(listeners[0].inode, Some(424242));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_inodes_map_to_pids_from_fd_links_and_skip_unreadable_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("100/fd")).unwrap();
+        std::os::unix::fs::symlink("socket:[424242]", root.path().join("100/fd/3")).unwrap();
+        // pid 101 has no fd dir (vanished process)
+        let map = socket_inode_pids(root.path(), &[100, 101]);
+        assert_eq!(map.get(&424242), Some(&100));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn discover_attributes_a_real_listener_to_the_terminal_owning_its_pid() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let terminals = vec![TerminalProcessSet {
+            thread_id: "thread-1".into(),
+            terminal_id: "term-1".into(),
+            pids: vec![std::process::id()],
+        }];
+
+        let servers = discover(&CancellationToken::new(), &terminals).await;
+        let server = servers
+            .iter()
+            .find(|server| server["port"] == port)
+            .expect("listener is discovered");
+        assert_eq!(server["pid"], std::process::id());
+        assert!(server["processName"].is_string());
+        assert_eq!(
+            server["terminal"],
+            json!({ "threadId": "thread-1", "terminalId": "term-1" })
+        );
+
+        let unattributed = discover(&CancellationToken::new(), &[]).await;
+        let server = unattributed
+            .iter()
+            .find(|server| server["port"] == port)
+            .expect("listener is discovered without terminals");
+        assert_eq!(server["terminal"], Value::Null);
+        assert_eq!(server["pid"], Value::Null);
     }
 }
