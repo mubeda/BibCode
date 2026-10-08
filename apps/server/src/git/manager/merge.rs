@@ -196,6 +196,191 @@ pub async fn squash_merge(
     Ok(vec![merge, commit])
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum PublishFailure {
+    InUse { path: Option<String> },
+    Moved,
+    Other,
+}
+
+/// Maps `git fetch . <commit>:refs/heads/<target>` refusals: Git owns the "branch in use
+/// by a worktree" check (checked out, mid-rebase, bisecting) and the fast-forward check.
+#[must_use]
+pub fn classify_publish_failure(stderr: &str) -> PublishFailure {
+    if let Some(rest) = stderr.split("checked out at '").nth(1) {
+        return PublishFailure::InUse {
+            path: rest.split('\'').next().map(str::to_owned),
+        };
+    }
+    if stderr.contains("refusing to fetch into branch") {
+        return PublishFailure::InUse { path: None };
+    }
+    if stderr.contains("non-fast-forward") || stderr.contains("[rejected]") {
+        return PublishFailure::Moved;
+    }
+    PublishFailure::Other
+}
+
+#[must_use]
+pub fn merge_into_message(source: &str, target: &str) -> String {
+    match source.strip_prefix("refs/remotes/") {
+        Some(remote) => format!("Merge remote-tracking branch '{remote}' into {target}"),
+        None => format!(
+            "Merge branch '{}' into {target}",
+            source.strip_prefix("refs/heads/").unwrap_or(source)
+        ),
+    }
+}
+
+#[derive(Debug)]
+pub enum MergeIntoError {
+    Merge(GitManagerMergeError),
+    TargetMissing,
+    /// `fetch .` checks occupancy against the alias but writes through it, so a symbolic
+    /// target could move a branch that a worktree has checked out.
+    TargetIsSymbolic {
+        destination: String,
+    },
+    Conflicts {
+        file_count: u64,
+    },
+    UnrelatedHistories,
+    CommitFailed(ProcessOutput),
+    TargetMoved,
+    InUse {
+        path: Option<String>,
+    },
+    PublishFailed(ProcessOutput),
+}
+
+impl From<GitCommandError> for MergeIntoError {
+    fn from(error: GitCommandError) -> Self {
+        Self::Merge(GitManagerMergeError::Git(error))
+    }
+}
+
+#[derive(Debug)]
+pub struct MergeIntoOutcome {
+    pub outputs: Vec<ProcessOutput>,
+    pub up_to_date: bool,
+}
+
+/// Merges `source` into the local branch `target` without touching any worktree: both
+/// tips are resolved once, the merge is computed with `merge-tree`, committed with
+/// `commit-tree`, and published by a fast-forward-only `fetch .` so Git itself refuses a
+/// branch that any worktree holds. Before the publish only an unreachable commit object
+/// exists; no ref, index, or file changes.
+pub async fn merge_into(
+    repository: &GitRepository,
+    cwd: &Path,
+    source: &str,
+    target: &str,
+    cancellation: &CancellationToken,
+) -> Result<MergeIntoOutcome, MergeIntoError> {
+    // `refs/heads/<target>` below is evaluated by `rev-parse`, so revision syntax such as
+    // `main~1` must never reach it.
+    if !valid_target_branch(target) {
+        return Err(MergeIntoError::Merge(GitManagerMergeError::InvalidTarget));
+    }
+    let version = ensure_merge_tree_supported(repository, cwd, cancellation)
+        .await
+        .map_err(MergeIntoError::Merge)?;
+    let target_ref = format!("refs/heads/{target}");
+    let (target_tip, source_tip, symbolic) = tokio::try_join!(
+        repository.git_manager_resolve_merge_tip(cwd, &target_ref, cancellation),
+        repository.git_manager_resolve_merge_tip(cwd, source, cancellation),
+        repository.git_manager_symbolic_ref(cwd, &target_ref, cancellation),
+    )?;
+    let target_tip = successful_tip(&target_tip)
+        .ok_or(MergeIntoError::TargetMissing)?
+        .to_owned();
+    if symbolic.exit_code == 0 {
+        return Err(MergeIntoError::TargetIsSymbolic {
+            destination: symbolic.stdout.trim().to_owned(),
+        });
+    }
+    let source_tip = successful_tip(&source_tip)
+        .ok_or(MergeIntoError::Merge(GitManagerMergeError::InvalidSource))?
+        .to_owned();
+    if repository
+        .git_manager_is_ancestor(cwd, &source_tip, &target_tip, cancellation)
+        .await?
+        .exit_code
+        == 0
+    {
+        return Ok(MergeIntoOutcome {
+            outputs: Vec::new(),
+            up_to_date: true,
+        });
+    }
+    let attr_source = version
+        .is_some_and(|version| version >= GitVersion::MERGE_TREE_ATTR_SOURCE)
+        .then_some(target_tip.as_str());
+    let merge_tree = repository
+        .git_manager_merge_tree(cwd, &target_tip, &source_tip, attr_source, cancellation)
+        .await?;
+    let tree =
+        match classify_merge_tree(merge_tree.exit_code, &merge_tree.stdout, &merge_tree.stderr)
+            .map_err(MergeIntoError::Merge)?
+        {
+            GitManagerMergePreview::Clean => merge_tree_tree_oid(&merge_tree.stdout)
+                .ok_or_else(|| {
+                    MergeIntoError::Merge(GitManagerMergeError::MergeTreeFailed {
+                        detail: "merge-tree printed no tree".to_owned(),
+                    })
+                })?
+                .to_owned(),
+            GitManagerMergePreview::Conflicted { file_count } => {
+                return Err(MergeIntoError::Conflicts { file_count });
+            }
+            GitManagerMergePreview::UnrelatedHistories => {
+                return Err(MergeIntoError::UnrelatedHistories);
+            }
+        };
+    let signing = repository
+        .git_manager_commit_gpg_sign(cwd, cancellation)
+        .await?;
+    let sign = match signing.exit_code {
+        0 => signing.stdout.trim() == "true",
+        1 => false,
+        _ => return Err(MergeIntoError::CommitFailed(signing)),
+    };
+    let commit = repository
+        .git_manager_commit_tree(
+            cwd,
+            &tree,
+            [&target_tip, &source_tip],
+            &merge_into_message(source, target),
+            sign,
+            cancellation,
+        )
+        .await?;
+    if commit.exit_code != 0 {
+        return Err(MergeIntoError::CommitFailed(commit));
+    }
+    let merge_commit = commit.stdout.trim().to_owned();
+    let reread = repository
+        .git_manager_resolve_merge_tip(cwd, &target_ref, cancellation)
+        .await?;
+    if successful_tip(&reread) != Some(target_tip.as_str()) {
+        return Err(MergeIntoError::TargetMoved);
+    }
+    let publish = repository
+        .git_manager_publish_merge(cwd, &merge_commit, target, source, cancellation)
+        .await?;
+    if publish.exit_code != 0 {
+        return Err(match classify_publish_failure(&publish.stderr) {
+            PublishFailure::InUse { path } => MergeIntoError::InUse { path },
+            PublishFailure::Moved => MergeIntoError::TargetMoved,
+            PublishFailure::Other => MergeIntoError::PublishFailed(publish),
+        });
+    }
+    Ok(MergeIntoOutcome {
+        outputs: vec![commit, publish],
+        up_to_date: false,
+    })
+}
+
 #[must_use]
 pub fn is_already_up_to_date(output: &ProcessOutput) -> bool {
     output.stdout.trim() == "Already up to date."
@@ -378,5 +563,67 @@ mod tests {
             classify_merge_tree(129, "", "usage: git merge-tree [--write-tree]"),
             Err(GitManagerMergeError::MergeTreeFailed { .. })
         ));
+    }
+
+    #[test]
+    fn merge_into_message_names_local_and_remote_sources() {
+        assert_eq!(
+            merge_into_message("refs/heads/feature", "release"),
+            "Merge branch 'feature' into release"
+        );
+        assert_eq!(
+            merge_into_message("refs/remotes/origin/feature", "release"),
+            "Merge remote-tracking branch 'origin/feature' into release"
+        );
+    }
+
+    #[test]
+    fn classifies_publish_refusals() {
+        assert_eq!(
+            classify_publish_failure(
+                "fatal: refusing to fetch into branch 'refs/heads/t' checked out at '/w/t'\n"
+            ),
+            PublishFailure::InUse {
+                path: Some("/w/t".into())
+            }
+        );
+        assert_eq!(
+            classify_publish_failure(" ! [rejected]        abc -> t  (non-fast-forward)\n"),
+            PublishFailure::Moved
+        );
+        assert_eq!(
+            classify_publish_failure("fatal: reference-transaction hook declined\n"),
+            PublishFailure::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_into_refuses_a_revision_expression_target_before_running_git() {
+        let (runner, repository) = version_runner("git version 2.55.0\n");
+        for target in [
+            "release~1",
+            "release^",
+            "release@{1}",
+            "a..b",
+            "release^{tree}",
+        ] {
+            let error = merge_into(
+                &repository,
+                Path::new("."),
+                "refs/heads/feature",
+                target,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a revision expression is not a branch name");
+            assert!(
+                matches!(
+                    error,
+                    MergeIntoError::Merge(GitManagerMergeError::InvalidTarget)
+                ),
+                "{target}: {error:?}"
+            );
+        }
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
     }
 }

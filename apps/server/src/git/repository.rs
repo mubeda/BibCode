@@ -4574,6 +4574,145 @@ impl GitRepository {
             .await
     }
 
+    pub(crate) async fn git_manager_is_ancestor(
+        &self,
+        cwd: &Path,
+        ancestor: &str,
+        descendant: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.mergeInto.isAncestor",
+            cwd,
+            &[
+                "merge-base".into(),
+                "--is-ancestor".into(),
+                ancestor.into(),
+                descendant.into(),
+            ],
+            true,
+            4 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    /// `commit.gpgSign`; commit-tree ignores it, so callers pass `-S` themselves. Exit 1
+    /// means the key is unset; any other non-zero exit (an invalid boolean) is not "off".
+    pub(crate) async fn git_manager_commit_gpg_sign(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.mergeInto.gpgSign",
+            cwd,
+            &strings(&["config", "--bool", "--get", "commit.gpgSign"]),
+            true,
+            4 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Exit 0 prints the branch a symbolic ref points at; exit 1 means a regular ref.
+    pub(crate) async fn git_manager_symbolic_ref(
+        &self,
+        cwd: &Path,
+        reference: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.mergeInto.symbolicRef",
+            cwd,
+            &["symbolic-ref".into(), "-q".into(), reference.into()],
+            true,
+            4 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_commit_tree(
+        &self,
+        cwd: &Path,
+        tree: &str,
+        parents: [&str; 2],
+        message: &str,
+        sign: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["commit-tree".to_owned()];
+        if sign {
+            args.push("-S".to_owned());
+        }
+        args.extend([
+            tree.to_owned(),
+            "-p".to_owned(),
+            parents[0].to_owned(),
+            "-p".to_owned(),
+            parents[1].to_owned(),
+            "-F".to_owned(),
+            "-".to_owned(),
+        ]);
+        self.execute_with_stdin(
+            "GitManager.mergeInto.commitTree",
+            cwd,
+            &args,
+            message.as_bytes().to_vec(),
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Fast-forward-only publish: Git refuses a branch checked out, rebased, or bisected
+    /// in any worktree, which `update-ref` would not (docs/architecture/overview.md).
+    pub(crate) async fn git_manager_publish_merge(
+        &self,
+        cwd: &Path,
+        commit: &str,
+        target: &str,
+        source: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut environment = git_environment();
+        environment.push((
+            "GIT_REFLOG_ACTION".into(),
+            format!("merge-into {source}").into(),
+        ));
+        self.execute_with_environment(
+            "GitManager.mergeInto.publish",
+            cwd,
+            &[
+                "-c".into(),
+                "maintenance.auto=false".into(),
+                "-c".into(),
+                "fetch.writeCommitGraph=false".into(),
+                // A configured bundle URI would otherwise be downloaded and imported
+                // into refs/bundles/ by this local self-fetch.
+                "-c".into(),
+                "fetch.bundleURI=".into(),
+                "fetch".into(),
+                "--no-tags".into(),
+                "--no-prune".into(),
+                "--no-recurse-submodules".into(),
+                "--no-write-fetch-head".into(),
+                "--quiet".into(),
+                ".".into(),
+                format!("{commit}:refs/heads/{target}"),
+            ],
+            GitExecutionOptions {
+                allow_non_zero_exit: true,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            environment,
+            cancellation,
+        )
+        .await
+    }
+
     pub(crate) async fn git_manager_squash_merge_commit(
         &self,
         cwd: &Path,

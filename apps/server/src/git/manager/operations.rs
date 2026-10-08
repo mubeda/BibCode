@@ -374,6 +374,12 @@ pub enum GitManagerOperationRequest {
         source: String,
         no_verify: bool,
     },
+    MergeInto {
+        cwd: PathBuf,
+        project_id: String,
+        source: String,
+        target: String,
+    },
     Rebase {
         cwd: PathBuf,
         project_id: String,
@@ -464,6 +470,7 @@ impl GitManagerOperationRequest {
             Self::StashDrop { .. } => "stash-drop",
             Self::Merge { .. } => "merge",
             Self::SquashMerge { .. } => "squash-merge",
+            Self::MergeInto { .. } => "merge-into",
             Self::Rebase { .. } => "rebase",
             Self::CherryPick { .. } => "cherry-pick",
             Self::Squash { .. } => "squash",
@@ -497,6 +504,7 @@ impl GitManagerOperationRequest {
             | Self::StashDrop { cwd, .. }
             | Self::Merge { cwd, .. }
             | Self::SquashMerge { cwd, .. }
+            | Self::MergeInto { cwd, .. }
             | Self::Rebase { cwd, .. }
             | Self::CherryPick { cwd, .. }
             | Self::Squash { cwd, .. }
@@ -547,6 +555,7 @@ impl GitManagerOperationRequest {
             | Self::StashDrop { project_id, .. }
             | Self::Merge { project_id, .. }
             | Self::SquashMerge { project_id, .. }
+            | Self::MergeInto { project_id, .. }
             | Self::Rebase { project_id, .. }
             | Self::CherryPick { project_id, .. }
             | Self::Squash { project_id, .. }
@@ -584,6 +593,7 @@ impl GitManagerOperationRequest {
                 | Self::StashDrop { .. }
                 | Self::Merge { .. }
                 | Self::SquashMerge { .. }
+                | Self::MergeInto { .. }
                 | Self::Rebase { .. }
                 | Self::CherryPick { .. }
                 | Self::Squash { .. }
@@ -1048,6 +1058,9 @@ fn blocked_reason_for_operation(
         | GitManagerOperationRequest::SquashMerge { source, .. } => {
             (Some(source.as_str()), "merge")
         }
+        GitManagerOperationRequest::MergeInto { target, .. } => {
+            (Some(target.as_str()), "merge-into")
+        }
         GitManagerOperationRequest::StashPush { .. } => {
             (snapshot.head_ref.as_deref(), "stash-push")
         }
@@ -1350,6 +1363,45 @@ async fn execute_branch_or_sync_operation(
                 .await
                 .map_err(|error| git_command_error(operation, error, Vec::new()))?;
             require_last_success(operation, outputs)?
+        }
+        GitManagerOperationRequest::MergeInto {
+            cwd,
+            source,
+            target,
+            ..
+        } => {
+            validate_merge_source(operation, source)?;
+            validate_revision(operation, target)?;
+            if snapshot.head_ref.as_deref() == Some(target.as_str()) {
+                return Err(operation_error(
+                    operation,
+                    "target-is-current",
+                    "This branch is checked out here; use Merge into the current branch instead.",
+                ));
+            }
+            if !snapshot
+                .local_branches
+                .iter()
+                .any(|branch| branch.name == *target)
+            {
+                return Err(local_branch_not_found(operation));
+            }
+            let outcome = merge::merge_into(repository, cwd, source, target, cancellation)
+                .await
+                .map_err(|error| merge_into_error(operation, target, error))?;
+            let label = source
+                .strip_prefix("refs/heads/")
+                .or_else(|| source.strip_prefix("refs/remotes/"))
+                .unwrap_or(source);
+            return Ok(GitManagerOperationOutcome {
+                operation: operation.to_owned(),
+                message: if outcome.up_to_date {
+                    "Already up to date.".to_owned()
+                } else {
+                    format!("Merged {label} into {target}.")
+                },
+                outputs: outcome.outputs,
+            });
         }
         GitManagerOperationRequest::Rebase {
             cwd, base, target, ..
@@ -1907,6 +1959,124 @@ fn cancelled_error(operation: &str) -> GitManagerOperationError {
         GitManagerFailureCode::Cancelled.as_str(),
         failure_message(GitManagerFailureCode::Cancelled),
     )
+}
+
+fn local_branch_not_found(operation: &str) -> GitManagerOperationError {
+    operation_error(
+        operation,
+        "local-branch-not-found",
+        "The target branch no longer exists; refresh the repository refs.",
+    )
+}
+
+fn first_stderr_line(output: &ProcessOutput) -> &str {
+    output
+        .stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+}
+
+fn merge_into_error(
+    operation: &str,
+    target: &str,
+    error: merge::MergeIntoError,
+) -> GitManagerOperationError {
+    use merge::{GitManagerMergeError, MergeIntoError};
+    match error {
+        MergeIntoError::Merge(GitManagerMergeError::GitTooOld { found }) => operation_error(
+            operation,
+            "git-too-old",
+            &format!(
+                "Merging into another branch needs Git 2.38 or later on this environment (found {found})."
+            ),
+        ),
+        MergeIntoError::Merge(GitManagerMergeError::Git(error)) => {
+            git_command_error(operation, error, Vec::new())
+        }
+        MergeIntoError::Merge(GitManagerMergeError::InvalidSource) => operation_error(
+            operation,
+            "invalid-merge-source",
+            "The requested merge source could not be resolved.",
+        ),
+        // The preview reports an invalid target the same way.
+        MergeIntoError::Merge(GitManagerMergeError::InvalidTarget)
+        | MergeIntoError::TargetMissing => local_branch_not_found(operation),
+        MergeIntoError::Merge(GitManagerMergeError::MergeTreeFailed { detail }) => {
+            operation_error(
+                operation,
+                "unknown",
+                &format!("Git could not compute the merge: {detail}"),
+            )
+        }
+        MergeIntoError::Merge(_) => {
+            operation_error(operation, "unknown", "Git could not compute the merge.")
+        }
+        MergeIntoError::TargetIsSymbolic { destination } => operation_error(
+            operation,
+            "invalid-request",
+            &format!(
+                "{target} is an alias for {}. Merge into that branch instead.",
+                destination.strip_prefix("refs/heads/").unwrap_or(&destination)
+            ),
+        ),
+        MergeIntoError::Conflicts { file_count } => operation_error(
+            operation,
+            "conflicts",
+            &format!(
+                "{file_count} files would conflict. Check out {target} and merge there to resolve them."
+            ),
+        ),
+        MergeIntoError::UnrelatedHistories => operation_error(
+            operation,
+            "unrelated-histories",
+            "These branches have unrelated histories and cannot be merged.",
+        ),
+        MergeIntoError::TargetMoved => operation_error(
+            operation,
+            "non-fast-forward",
+            &format!("{target} changed while merging. Review the preview and try again."),
+        ),
+        MergeIntoError::InUse { path } => blocked_operation_error(
+            operation,
+            GitManagerBlockedReason {
+                operation: operation.to_owned(),
+                code: "worktree-checked-out".to_owned(),
+                message: path.map_or_else(
+                    || {
+                        "Cannot update this branch: Git reports it is in use by another worktree."
+                            .to_owned()
+                    },
+                    |path| {
+                        format!(
+                            "Cannot update this branch: it is checked out in the worktree at {path}."
+                        )
+                    },
+                ),
+            },
+        ),
+        MergeIntoError::CommitFailed(output) => GitManagerOperationError {
+            operation: operation.to_owned(),
+            code: "unknown".to_owned(),
+            message: format!(
+                "Git could not create the merge commit: {}",
+                first_stderr_line(&output)
+            ),
+            blocked: None,
+            outputs: vec![output],
+        },
+        MergeIntoError::PublishFailed(output) => GitManagerOperationError {
+            operation: operation.to_owned(),
+            code: "unknown".to_owned(),
+            message: format!(
+                "Git could not update {target}: {}",
+                first_stderr_line(&output)
+            ),
+            blocked: None,
+            outputs: vec![output],
+        },
+    }
 }
 
 fn operation_error(operation: &str, code: &str, message: &str) -> GitManagerOperationError {
@@ -2727,6 +2897,106 @@ mod tests {
         assert_eq!(reason.operation, "rebase");
         assert_eq!(reason.code, "worktree-checked-out");
         assert!(reason.message.contains(worktree_path));
+    }
+
+    fn merge_into_snapshot(
+        worktree_path: Option<&str>,
+        dirty: bool,
+    ) -> crate::git::GitManagerRefsSnapshot {
+        crate::git::GitManagerRefsSnapshot {
+            generation: 1,
+            head_ref: Some("main".into()),
+            detached_sha: None,
+            is_dirty: dirty,
+            default_branch: Some("main".into()),
+            remotes: Vec::new(),
+            local_branches: vec![crate::git::GitManagerRefEntry {
+                name: "release".into(),
+                tip_sha: "0123456789012345678901234567890123456789".into(),
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+                current: false,
+                is_default: false,
+                worktree_path: worktree_path.map(Into::into),
+                blocked: Vec::new(),
+            }],
+            remote_branches: Vec::new(),
+            tags: Vec::new(),
+            worktrees: Vec::new(),
+            in_progress_operation: None,
+            conflicted_paths: Vec::new(),
+        }
+    }
+
+    fn merge_into_request() -> GitManagerOperationRequest {
+        GitManagerOperationRequest::MergeInto {
+            cwd: PathBuf::from("/repo"),
+            project_id: "project-1".into(),
+            source: "refs/heads/feature".into(),
+            target: "release".into(),
+        }
+    }
+
+    #[test]
+    fn merge_into_blocks_a_target_held_by_another_worktree() {
+        let reason = blocked_reason_for_operation(
+            &merge_into_snapshot(Some("/repo/release-worktree"), false),
+            &merge_into_request(),
+        )
+        .expect("occupied merge-into target is blocked");
+
+        assert_eq!(reason.operation, "merge-into");
+        assert_eq!(reason.code, "worktree-checked-out");
+        assert!(reason.message.contains("/repo/release-worktree"));
+    }
+
+    #[test]
+    fn merge_into_ignores_a_dirty_selected_worktree() {
+        assert_eq!(
+            blocked_reason_for_operation(&merge_into_snapshot(None, true), &merge_into_request()),
+            None
+        );
+    }
+
+    #[test]
+    fn merge_into_failures_map_to_the_wire_codes() {
+        use merge::{GitManagerMergeError, MergeIntoError};
+
+        let too_old = merge_into_error(
+            "merge-into",
+            "release",
+            MergeIntoError::Merge(GitManagerMergeError::GitTooOld {
+                found: crate::git::GitVersion {
+                    major: 2,
+                    minor: 34,
+                    patch: 1,
+                },
+            }),
+        );
+        assert_eq!(too_old.code, "git-too-old");
+        assert_eq!(
+            too_old.message,
+            "Merging into another branch needs Git 2.38 or later on this environment (found 2.34.1)."
+        );
+
+        let invalid_target = merge_into_error(
+            "merge-into",
+            "release~1",
+            MergeIntoError::Merge(GitManagerMergeError::InvalidTarget),
+        );
+        assert_eq!(invalid_target.code, "local-branch-not-found");
+
+        let in_use = merge_into_error(
+            "merge-into",
+            "release",
+            MergeIntoError::InUse {
+                path: Some("/w/release".into()),
+            },
+        );
+        assert_eq!(in_use.code, "worktree-checked-out");
+        assert!(in_use.blocked.is_some());
+        assert!(in_use.message.contains("/w/release"));
     }
 
     #[test]

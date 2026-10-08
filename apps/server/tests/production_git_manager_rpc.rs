@@ -14,7 +14,7 @@ use bibcode_server::{
     CauseItem, RequestId, RpcExit, RpcRegistry, RpcRequest, ServerConfig, ServerHandle,
     ServerMessage, ServerRuntime,
     git::{GitRepository, MAX_DIFF_BUFFER_SIZE, NativeFileTrash, StatusBroadcaster},
-    persistence::{Database, ProjectionProject, Repositories, run_migrations},
+    persistence::{Database, ProjectionProject, ProjectionThread, Repositories, run_migrations},
     production::git_manager_rpc::{
         ConfiguredGitManagerRpcServices, GitManagerRpcServices, register_git_manager_rpc,
     },
@@ -42,6 +42,7 @@ struct Fixture {
     remote_path: PathBuf,
     services: ConfiguredGitManagerRpcServices,
     broadcaster: StatusBroadcaster,
+    repositories: Repositories,
 }
 
 #[test]
@@ -163,7 +164,7 @@ impl Fixture {
             repository,
             broadcaster.clone(),
             catalog,
-            repositories,
+            repositories.clone(),
             availability,
             Arc::new(NativeFileTrash::default()),
         );
@@ -173,7 +174,37 @@ impl Fixture {
             remote_path,
             services,
             broadcaster,
+            repositories,
         })
+    }
+
+    /// Operations resolve a linked worktree to its project through a thread that owns it.
+    async fn own_worktree(&self, worktree: &Path) {
+        self.repositories
+            .upsert_thread(ProjectionThread {
+                thread_id: "thread-linked".to_owned(),
+                project_id: "project-1".to_owned(),
+                title: "Linked worktree".to_owned(),
+                kind: "default".to_owned(),
+                model_selection: json!({"instanceId": "codex", "model": "gpt-5.4"}),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                branch: Some("linked".to_owned()),
+                worktree_path: Some(worktree.to_string_lossy().into_owned()),
+                latest_turn_id: None,
+                created_at: "2026-09-01T00:00:01Z".to_owned(),
+                updated_at: "2026-09-01T00:00:01Z".to_owned(),
+                archived_at: None,
+                latest_user_message_at: None,
+                pending_approval_count: 0,
+                pending_user_input_count: 0,
+                has_actionable_proposed_plan: 0,
+                unresolved_delivery_state: None,
+                unresolved_delivery_detail: None,
+                deleted_at: None,
+            })
+            .await
+            .expect("thread owning the linked worktree");
     }
 
     fn operation(&self, id: &str, payload: Value) -> mpsc::Receiver<Result<Vec<Value>, Value>> {
@@ -2558,6 +2589,558 @@ async fn branch_operations_validate_after_taking_the_worktree_mutation_guard() {
     assert_eq!(last["_tag"], "failed", "{events:?}");
     assert_eq!(last["code"], "dirty-working-tree", "{events:?}");
     assert_eq!(git_stdout(&cwd, &["rev-parse", "main"]), main_tip);
+}
+
+/// main checkout on `main`; `release` and `feature` branch from it with one commit each.
+fn merge_into_fixture(cwd: &Path, feature_file: &str, feature_text: &str, release_text: &str) {
+    git(cwd, &["switch", "-q", "-c", "release"]);
+    fs::write(cwd.join("tracked.txt"), release_text).expect("release change");
+    git(cwd, &["commit", "-qam", "release"]);
+    git(cwd, &["switch", "-q", "-c", "feature", "main"]);
+    fs::write(cwd.join(feature_file), feature_text).expect("feature change");
+    git(cwd, &["add", "."]);
+    git(cwd, &["commit", "-q", "-m", "feature"]);
+    git(cwd, &["switch", "-q", "main"]);
+}
+
+fn merge_into(
+    fixture: &Fixture,
+    id: &str,
+    cwd: &Path,
+    source: &str,
+    target: &str,
+) -> mpsc::Receiver<Result<Vec<Value>, Value>> {
+    fixture.operation(
+        id,
+        json!({ "_tag": "merge-into", "cwd": cwd, "projectId": "project-1",
+                "source": source, "target": target }),
+    )
+}
+
+fn merge_head_exists(cwd: &Path) -> bool {
+    git_output(cwd, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .status
+        .success()
+}
+
+#[tokio::test]
+async fn merge_into_from_a_linked_worktree_leaves_that_checkout_untouched() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    let linked = fixture._root.path().join("linked");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            path(&linked),
+            "main",
+        ],
+    );
+    configure_identity(&linked);
+    fixture.own_worktree(&linked).await;
+    fs::write(linked.join("scratch.txt"), "uncommitted\n").expect("dirty linked checkout");
+    let before = (
+        git_stdout(&linked, &["rev-parse", "HEAD"]),
+        git_stdout(&linked, &["ls-files", "-s"]),
+        git_stdout(&linked, &["status", "--porcelain"]),
+    );
+    let release_tip = git_stdout(&main, &["rev-parse", "release"]);
+    let feature_tip = git_stdout(&main, &["rev-parse", "feature"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "501",
+        &linked,
+        "refs/heads/feature",
+        "release",
+    ))
+    .await;
+
+    assert_eq!(
+        events.last().and_then(|event| event["_tag"].as_str()),
+        Some("finished"),
+        "{events:?}"
+    );
+    let parents = git_stdout(&main, &["rev-list", "--parents", "-n", "1", "release"]);
+    let parents: Vec<_> = parents
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(parents, [release_tip, feature_tip]);
+    assert_eq!(
+        git_stdout(&main, &["log", "-1", "--format=%s", "release"]),
+        "Merge branch 'feature' into release"
+    );
+    let after = (
+        git_stdout(&linked, &["rev-parse", "HEAD"]),
+        git_stdout(&linked, &["ls-files", "-s"]),
+        git_stdout(&linked, &["status", "--porcelain"]),
+    );
+    assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn conflicting_merge_into_is_refused_before_any_write() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "tracked.txt", "feature\n", "release\n");
+    let release_tip = git_stdout(&main, &["rev-parse", "release"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "502",
+        &main,
+        "refs/heads/feature",
+        "release",
+    ))
+    .await;
+
+    let last = events.last().expect("terminal event");
+    assert_eq!(last["_tag"], "failed");
+    assert_eq!(last["code"], "conflicts");
+    assert!(
+        last["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Check out release")
+    );
+    assert_eq!(git_stdout(&main, &["rev-parse", "release"]), release_tip);
+    assert!(!merge_head_exists(&main));
+}
+
+#[tokio::test]
+async fn merge_into_blocks_a_target_checked_out_in_another_worktree() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    let holder = fixture._root.path().join("holder");
+    git(&main, &["worktree", "add", "-q", path(&holder), "release"]);
+    let release_tip = git_stdout(&main, &["rev-parse", "release"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "503",
+        &main,
+        "refs/heads/feature",
+        "release",
+    ))
+    .await;
+
+    let last = events.last().expect("terminal event");
+    assert_eq!(last["code"], "worktree-checked-out", "{events:?}");
+    assert!(!last["blocked"].is_null());
+    assert_eq!(git_stdout(&main, &["rev-parse", "release"]), release_tip);
+}
+
+#[tokio::test]
+async fn merge_into_maps_gits_refusal_for_a_target_mid_rebase_elsewhere() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    git(&main, &["switch", "-q", "-c", "other", "main"]);
+    fs::write(main.join("tracked.txt"), "other\n").expect("other change");
+    git(&main, &["commit", "-qam", "other"]);
+    git(&main, &["switch", "-q", "main"]);
+    let holder = fixture._root.path().join("holder");
+    git(&main, &["worktree", "add", "-q", path(&holder), "release"]);
+    configure_identity(&holder);
+    // The rebase stops on a conflict, leaving `release` detached but in use.
+    assert!(!git_output(&holder, &["rebase", "other"]).status.success());
+    let release_tip = git_stdout(&main, &["rev-parse", "release"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "504",
+        &main,
+        "refs/heads/feature",
+        "release",
+    ))
+    .await;
+
+    let last = events.last().expect("terminal event");
+    assert_eq!(last["code"], "worktree-checked-out", "{events:?}");
+    assert_eq!(git_stdout(&main, &["rev-parse", "release"]), release_tip);
+}
+
+#[tokio::test]
+async fn merge_into_fails_without_moving_the_target_when_signing_fails() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    git(&main, &["config", "commit.gpgSign", "true"]);
+    git(&main, &["config", "gpg.program", "false"]);
+    let release_tip = git_stdout(&main, &["rev-parse", "release"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "505",
+        &main,
+        "refs/heads/feature",
+        "release",
+    ))
+    .await;
+
+    assert_eq!(
+        events.last().expect("terminal event")["_tag"],
+        "failed",
+        "{events:?}"
+    );
+    assert_eq!(git_stdout(&main, &["rev-parse", "release"]), release_tip);
+}
+
+#[tokio::test]
+async fn merge_into_fails_when_the_signing_setting_is_unreadable() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    // commit-tree ignores the setting, so an unreadable value must not read as "unsigned".
+    git(&main, &["config", "commit.gpgSign", "maybe"]);
+    let release_tip = git_stdout(&main, &["rev-parse", "release"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "516",
+        &main,
+        "refs/heads/feature",
+        "release",
+    ))
+    .await;
+
+    let last = events.last().expect("terminal event");
+    assert_eq!(last["_tag"], "failed", "{events:?}");
+    assert!(
+        last["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("bad boolean"),
+        "{last}"
+    );
+    assert_eq!(git_stdout(&main, &["rev-parse", "release"]), release_tip);
+}
+
+/// `fetch .` checks occupancy against the alias but writes through it, which would move a
+/// checked-out branch under its worktree without touching that worktree's index or files.
+#[tokio::test]
+async fn merge_into_refuses_a_symbolic_target_that_aliases_a_checked_out_branch() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    git(
+        &main,
+        &["symbolic-ref", "refs/heads/trunk", "refs/heads/main"],
+    );
+    let main_tip = git_stdout(&main, &["rev-parse", "main"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "517",
+        &main,
+        "refs/heads/feature",
+        "trunk",
+    ))
+    .await;
+
+    let last = events.last().expect("terminal event");
+    assert_eq!(last["_tag"], "failed", "{events:?}");
+    assert_eq!(last["code"], "invalid-request", "{events:?}");
+    assert!(
+        last["message"].as_str().unwrap_or("").contains("main"),
+        "{last}"
+    );
+    assert_eq!(git_stdout(&main, &["rev-parse", "main"]), main_tip);
+    assert_eq!(git_stdout(&main, &["status", "--porcelain"]), "");
+}
+
+/// The publish is a self-fetch; a configured bundle URI must not be downloaded and imported.
+#[tokio::test]
+async fn merge_into_publish_does_not_import_a_configured_fetch_bundle() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    let bundle = fixture._root.path().join("configured.bundle");
+    git(&main, &["bundle", "create", path(&bundle), "--all"]);
+    git(
+        &main,
+        &[
+            "config",
+            "fetch.bundleURI",
+            &format!("file://{}", path(&bundle)),
+        ],
+    );
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "518",
+        &main,
+        "refs/heads/feature",
+        "release",
+    ))
+    .await;
+
+    assert_eq!(
+        events.last().expect("terminal event")["_tag"],
+        "finished",
+        "{events:?}"
+    );
+    assert_eq!(
+        git_stdout(&main, &["for-each-ref", "refs/bundles"]),
+        "",
+        "publishing must write only the target branch"
+    );
+}
+
+#[tokio::test]
+async fn merge_into_updates_the_branch_not_a_same_named_tag() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    git(&main, &["tag", "release", "feature"]);
+    let release_tip = git_stdout(&main, &["rev-parse", "refs/heads/release"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "506",
+        &main,
+        "refs/heads/feature",
+        "release",
+    ))
+    .await;
+
+    let last = events.last().expect("terminal event");
+    assert_eq!(last["_tag"], "finished", "{events:?}");
+    assert_ne!(last["message"], "Already up to date.");
+    assert_ne!(
+        git_stdout(&main, &["rev-parse", "refs/heads/release"]),
+        release_tip
+    );
+}
+
+#[tokio::test]
+async fn merge_into_reports_already_up_to_date_without_writing() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    git(&main, &["branch", "behind", "release~1"]);
+    let release_tip = git_stdout(&main, &["rev-parse", "release"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "507",
+        &main,
+        "refs/heads/behind",
+        "release",
+    ))
+    .await;
+
+    assert_eq!(
+        events.last().expect("terminal")["message"],
+        "Already up to date."
+    );
+    assert_eq!(git_stdout(&main, &["rev-parse", "release"]), release_tip);
+}
+
+#[tokio::test]
+async fn merge_into_rejects_the_current_and_a_deleted_target() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+
+    let current = collect_events(merge_into(
+        &fixture,
+        "508",
+        &main,
+        "refs/heads/feature",
+        "main",
+    ))
+    .await;
+    assert_eq!(
+        current.last().expect("terminal")["code"],
+        "target-is-current"
+    );
+
+    let missing = collect_events(merge_into(
+        &fixture,
+        "509",
+        &main,
+        "refs/heads/feature",
+        "gone",
+    ))
+    .await;
+    assert_eq!(
+        missing.last().expect("terminal")["code"],
+        "local-branch-not-found"
+    );
+    assert!(
+        !git_output(&main, &["rev-parse", "-q", "--verify", "refs/heads/gone"])
+            .status
+            .success()
+    );
+}
+
+/// `release~1` is not a branch, but `rev-parse refs/heads/release~1` evaluates it as
+/// release's parent; the target must be refused as a literal name, writing nothing.
+#[tokio::test]
+async fn merge_into_target_is_a_literal_branch_name_not_a_revision_expression() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    let refs_before = git_stdout(
+        &main,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
+
+    for (index, target) in ["release~1", "release^", "release@{1}", "release^{commit}"]
+        .into_iter()
+        .enumerate()
+    {
+        let events = collect_events(merge_into(
+            &fixture,
+            &format!("52{index}"),
+            &main,
+            "refs/heads/feature",
+            target,
+        ))
+        .await;
+
+        let last = events.last().expect("terminal event");
+        assert_eq!(last["_tag"], "failed", "{target}: {events:?}");
+        assert_eq!(last["code"], "local-branch-not-found", "{target}");
+    }
+
+    assert_eq!(
+        git_stdout(
+            &main,
+            &["for-each-ref", "--format=%(refname) %(objectname)"]
+        ),
+        refs_before
+    );
+}
+
+#[tokio::test]
+async fn merge_into_records_a_remote_tracking_source() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    git(&main, &["push", "-q", "origin", "feature"]);
+    git(&main, &["fetch", "-q", "origin"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "510",
+        &main,
+        "refs/remotes/origin/feature",
+        "release",
+    ))
+    .await;
+
+    assert_eq!(
+        events.last().expect("terminal")["_tag"],
+        "finished",
+        "{events:?}"
+    );
+    assert_eq!(
+        git_stdout(&main, &["log", "-1", "--format=%s", "release"]),
+        "Merge remote-tracking branch 'origin/feature' into release"
+    );
+}
+
+/// The Source Control path (spec criterion 3): fetch, merge a remote-tracking ref into the
+/// current branch, resolve the conflict, and finish through `continue` with two parents.
+#[tokio::test]
+async fn remote_tracking_merge_conflict_finishes_through_continue_with_two_parents() {
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "tracked.txt", "feature\n", "release\n");
+    git(&main, &["push", "-q", "origin", "feature"]);
+    fs::write(main.join("tracked.txt"), "main\n").expect("main change");
+    git(&main, &["commit", "-qam", "main"]);
+    let fetched = collect_events(fixture.operation(
+        "512",
+        json!({ "_tag": "fetch", "cwd": main, "projectId": "project-1", "remote": "origin" }),
+    ))
+    .await;
+    assert_eq!(
+        fetched.last().expect("terminal")["_tag"],
+        "finished",
+        "{fetched:?}"
+    );
+    let main_tip = git_stdout(&main, &["rev-parse", "main"]);
+    let source_tip = git_stdout(&main, &["rev-parse", "refs/remotes/origin/feature"]);
+
+    let merged = collect_events(fixture.operation(
+        "513",
+        json!({ "_tag": "merge", "cwd": main, "projectId": "project-1",
+                "source": "refs/remotes/origin/feature", "noVerify": false }),
+    ))
+    .await;
+    assert_eq!(
+        merged.last().expect("terminal")["code"],
+        "conflicts",
+        "{merged:?}"
+    );
+    assert!(merge_in_progress(&main));
+
+    let resolved = collect_events(fixture.operation(
+        "514",
+        json!({ "_tag": "resolve-conflict", "cwd": main, "projectId": "project-1",
+                "path": "tracked.txt", "side": "theirs" }),
+    ))
+    .await;
+    assert_eq!(
+        resolved.last().expect("terminal")["_tag"],
+        "finished",
+        "{resolved:?}"
+    );
+    let finished = collect_events(fixture.operation(
+        "515",
+        json!({ "_tag": "continue", "cwd": main, "projectId": "project-1", "operation": "merge" }),
+    ))
+    .await;
+    assert_eq!(
+        finished.last().expect("terminal")["_tag"],
+        "finished",
+        "{finished:?}"
+    );
+    assert_eq!(head_parents(&main), [main_tip, source_tip]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_rejecting_reference_transaction_hook_leaves_the_target_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new().await;
+    let main = fixture.repository_path.clone();
+    merge_into_fixture(&main, "feature.txt", "feature\n", "release\n");
+    let hook = main.join(".git/hooks/reference-transaction");
+    fs::write(
+        &hook,
+        "#!/bin/sh\n[ \"$1\" = prepared ] && exit 1\nexit 0\n",
+    )
+    .expect("hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("hook mode");
+    let release_tip = git_stdout(&main, &["rev-parse", "release"]);
+
+    let events = collect_events(merge_into(
+        &fixture,
+        "511",
+        &main,
+        "refs/heads/feature",
+        "release",
+    ))
+    .await;
+
+    assert_eq!(
+        events.last().expect("terminal")["_tag"],
+        "failed",
+        "{events:?}"
+    );
+    assert_eq!(git_stdout(&main, &["rev-parse", "release"]), release_tip);
 }
 
 #[tokio::test]

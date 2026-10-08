@@ -226,6 +226,18 @@ mod telemetry {
             .git_manager_git_version(cwd, &cancellation)
             .await
             .expect("git version read");
+        repository
+            .git_manager_is_ancestor(cwd, SHA, PARENT_SHA, &cancellation)
+            .await
+            .expect("ancestor read");
+        repository
+            .git_manager_commit_gpg_sign(cwd, &cancellation)
+            .await
+            .expect("signing setting read");
+        repository
+            .git_manager_symbolic_ref(cwd, "refs/heads/release", &cancellation)
+            .await
+            .expect("symbolic ref read");
         tags::list_tags(&repository, cwd, &cancellation)
             .await
             .expect("tag read");
@@ -382,6 +394,14 @@ mod telemetry {
             .git_manager_squash_merge_commit(cwd, false, &cancellation)
             .await
             .expect("squash merge commit operation");
+        repository
+            .git_manager_commit_tree(cwd, SHA, [SHA, PARENT_SHA], "Merge", false, &cancellation)
+            .await
+            .expect("merge commit-tree operation");
+        repository
+            .git_manager_publish_merge(cwd, SHA, "release", "refs/heads/topic", &cancellation)
+            .await
+            .expect("merge publish operation");
         repository
             .git_manager_rebase(cwd, "main", "topic", &cancellation)
             .await
