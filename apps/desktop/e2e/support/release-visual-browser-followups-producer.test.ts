@@ -330,7 +330,10 @@ it("prepares original size owner once after second tab selection and before its 
         ...scope,
         prepareOriginalSizeOwner: async () => {
           events.push("pointer");
-          expect(value.actions.at(-1)).toContain("data-right-panel-tab-list");
+          expect(value.actions.slice(-2)).toEqual([
+            '//*[@data-right-panel-tab-list]//button[normalize-space()="Terminal 1"]',
+            '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]',
+          ]);
         },
       }),
     );
@@ -413,3 +416,73 @@ it("clears terminal receipt phase on success before its unchanged capture", asyn
   ]);
   expect(value.captures).toEqual(["terminal-shared-size"]);
 });
+
+const terminalComposerSelector =
+  '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]';
+it("focuses the unique visible second composer once between tab selection and original ownership", async () => {
+  const value = fixture();
+  await runBrowserFollowupScene(value.input, "terminal-shared-size");
+  expect(value.actions).toEqual([
+    '//*[@data-right-panel-tab-list]//button[normalize-space()="Terminal 1"]',
+    terminalComposerSelector,
+    "original-size-owner",
+    "button=Fit to this window",
+    "fit-joined",
+  ]);
+  expect(value.captures).toEqual(["terminal-shared-size"]);
+  expect(value.read().cleaned).toBe(1);
+});
+it.each([0, 2])(
+  "refuses %s visible second composer editors before original ownership",
+  async (count) => {
+    const value = fixture();
+    const controls = value.input.browser.$$;
+    value.input.browser.$$ = ((selector: string) =>
+      selector === terminalComposerSelector
+        ? { length: count }
+        : controls(selector)) as typeof controls;
+    await expect(runBrowserFollowupScene(value.input, "terminal-shared-size")).rejects.toThrow();
+    expect(value.actions).not.toContain(terminalComposerSelector);
+    expect(value.actions).not.toContain("original-size-owner");
+    expect(value.captures).toEqual([]);
+    expect(value.read().cleaned).toBe(1);
+  },
+);
+it.each(["display", "enabled", "click"] as const)(
+  "preserves exact second composer %s failure through cleanup",
+  async (boundary) => {
+    for (const original of [new Error("Inert composer public control failure."), undefined]) {
+      const value = fixture();
+      const control = value.input.browser.$;
+      value.input.browser.$ = ((selector: string) => {
+        const element = control(selector);
+        if (selector !== terminalComposerSelector) return element;
+        return {
+          ...element,
+          waitForDisplayed: async () => {
+            if (boundary === "display") throw original;
+          },
+          waitForEnabled: async () => {
+            if (boundary === "enabled") throw original;
+          },
+          click: async () => {
+            throw original;
+          },
+        };
+      }) as typeof control;
+      let failed = false,
+        caught: unknown;
+      try {
+        await runBrowserFollowupScene(value.input, "terminal-shared-size");
+      } catch (error) {
+        failed = true;
+        caught = error;
+      }
+      expect(failed).toBe(true);
+      expect(caught).toBe(original);
+      expect(value.actions).not.toContain("original-size-owner");
+      expect(value.captures).toEqual([]);
+      expect(value.read().cleaned).toBe(1);
+    }
+  },
+);

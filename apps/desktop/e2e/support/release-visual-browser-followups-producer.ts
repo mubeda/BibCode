@@ -208,6 +208,9 @@ export async function runBrowserFollowupScene(
           scope.browser,
           `//*[@data-right-panel-tab-list]//button[normalize-space()="${scope.label}"]`,
         );
+        const editor =
+          '[data-center-surface-host][data-visible="true"] [data-testid="composer-editor"]';
+        await click(scope.browser, editor);
         const verify = async () => {
           requireReceipt(await scope.verify(), [
             "sameTerminalMatched",

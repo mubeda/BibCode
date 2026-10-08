@@ -2680,3 +2680,13 @@ the same frozen helper registration before WSL builds, without replacing this
 Linux backend gate or changing the native original-image scope.
 The cheap caller workflow also runs that helper set on Ubuntu, so the real Linux
 filesystem cases execute before a costly native partition is repeated.
+
+For the terminal shared-size browser row, select the existing second-window
+terminal tab, then click its single visible composer editor before returning to
+the original pinned terminal screen. This ordinary focus action leaves the second
+document's active element outside its terminal, so a later window activation does
+not request its size claim before the existing strict receipt. The editor click
+uses the existing public-control cardinality, displayed and enabled checks; it
+does not type, send, change the draft or weaken receipt/capture/cleanup checks.
+Two-document source controls with the real composer and editor do not prove the
+failed native run's activation cause or native screenshot acceptance.
