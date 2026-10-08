@@ -1750,8 +1750,11 @@ describe("seeded packaged desktop upgrade harness", () => {
       });
       expect(NodeFS.existsSync(readyPath)).toBe(true);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toBe("early|late-tail");
-      expect(NodeFS.existsSync(finishedPath)).toBe(true);
+      // POSIX inherited pipes outlive the parent; Windows reports its own closed pipe.
+      if (HostProcessPlatform.defaultValue() === "win32") expect(result.stdout).toBe("early|");
+      else expect(result.stdout).toBe("early|late-tail");
+      if (HostProcessPlatform.defaultValue() !== "win32")
+        expect(NodeFS.existsSync(finishedPath)).toBe(true);
     } catch (error) {
       failed = true;
       original = error;
@@ -2240,7 +2243,7 @@ it.each([
       callerStart = source.indexOf("const runWebDriverPhase = async"),
       callerEnd = source.indexOf("const startMockUpdateServer", callerStart),
       statusStart = workflow.indexOf("export function nativeFollowupWorkflowStatus("),
-      statusEnd = workflow.indexOf("\nasync function main", statusStart),
+      statusEnd = workflow.indexOf("\nfunction privateWrite", statusStart),
       enumStart = source.indexOf("export const nativeFollowupPhases"),
       enumEnd = source.indexOf("export type NativeFollowupPhase", enumStart);
     expect(declaration > 0 && declarationEnd > declaration && tail > action).toBe(true);
@@ -2282,7 +2285,7 @@ it.each([
           leaf.slice(tail) +
           "\neffect;",
       ),
-      { NodeFS: filesystem, NodePath, Error, children },
+      { NodeFS: filesystem, NodePath: NodePath.posix, Error, children },
     ) as (
       input: object,
       run: (environment: NodeJS.ProcessEnv) => Promise<object>,
@@ -2297,7 +2300,7 @@ it.each([
       NodeModule.stripTypeScriptTypes(caller) + "\nrunWebDriverPhase;",
       {
         NodeFS: filesystem,
-        NodePath,
+        NodePath: NodePath.posix,
         NodeURL,
         process: { env: {} },
         seededUpgradeNativeHostPlatform: "linux",
@@ -2496,7 +2499,7 @@ it.each([
         "\nwithNativeFollowupsLinuxSession;",
       {
         NodeFS: filesystem,
-        NodePath,
+        NodePath: NodePath.posix,
         NodeProcess: { getuid: () => 1001 },
         Buffer,
         Error,
@@ -2544,7 +2547,7 @@ it.each([
       NodeModule.stripTypeScriptTypes(caller) + "\nrunWebDriverPhase;",
       {
         NodeFS: filesystem,
-        NodePath,
+        NodePath: NodePath.posix,
         NodeURL,
         process: { env: { CI: "true", GITHUB_ACTIONS: "true", DISPLAY: ":inert" } },
         seededUpgradeNativeHostPlatform: "linux",

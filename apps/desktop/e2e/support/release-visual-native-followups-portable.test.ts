@@ -3,6 +3,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeCrypto from "node:crypto";
 import * as NodeModule from "node:module";
+import * as NodeEvents from "node:events";
 import * as NodeVM from "node:vm";
 import { expect, it } from "vite-plus/test";
 const read = (name: string) => NodeFS.readFileSync(new URL(name, import.meta.url), "utf8");
@@ -187,5 +188,54 @@ it.each(["owned", "public", "changed"])(
       expect(mode & 0o777).toBe(0o700);
       expect(unsafe).toBe(fault === "changed");
     }
+  },
+);
+
+it.each(["exit-tail-close", "exit-close-tail"])(
+  "actual command owner settles only on close under controlled all-host stdio: %s",
+  async (order) => {
+    const source = NodeFS.readFileSync(
+      new URL("../../../../scripts/seeded-desktop-upgrade-smoke.ts", import.meta.url),
+      "utf8",
+    );
+    const begin = source.indexOf("export const runBoundedCommand ="),
+      end = source.indexOf("const runCommand = runBoundedCommand", begin);
+    expect(begin).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(begin);
+    const child = Object.assign(new NodeEvents.EventEmitter(), {
+      stdout: new NodeEvents.EventEmitter(),
+      stderr: new NodeEvents.EventEmitter(),
+    });
+    const run = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(source.slice(begin, end)).replace(/^export /gm, "") +
+        "\nrunBoundedCommand",
+      {
+        NodeChildProcess: { spawn: () => child },
+        observeOwnedChildClose: () => {},
+        process: { env: {} },
+        NodePath: NodePath.posix,
+      },
+    );
+    let settled = false;
+    const pending = run({ command: "inert", args: [], cwd: "/inert" }).then(
+      (value: { stdout: string; exitCode: number }) => {
+        settled = true;
+        return value;
+      },
+    );
+    child.stdout.emit("data", Buffer.from("early|"));
+    child.emit("exit", 0);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    if (order === "exit-tail-close") {
+      child.stdout.emit("data", Buffer.from("late-tail"));
+      child.emit("close", 0);
+    } else {
+      child.emit("close", 0);
+      child.stdout.emit("data", Buffer.from("late-tail"));
+    }
+    const result = await pending;
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe(order === "exit-tail-close" ? "early|late-tail" : "early|");
   },
 );

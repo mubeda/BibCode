@@ -775,6 +775,9 @@ it("workflow retains failure-only status with the original six-item artifact pol
   expect(fallback).toBeDefined();
   expect(fallback.run).toContain("--failed-windows-prerequisite-status");
   expect(fallback.if).toContain("!cancelled()");
+  expect(fallback.env.BIBCODE_NATIVE_STATUS_CANCELLED).toBe("false");
+  for (const value of Object.values(fallback.env))
+    expect(value).not.toMatch(/\b(?:always|cancelled|failure|success)\(\)/);
   expect(fallback.if).toContain("steps.wsl_dependencies.outcome == 'success'");
   expect(fallback.if).toContain("steps.native_wsl_visuals.outcome == 'skipped'");
   const expression = fallback.if.replace(/\$\{\{|\}\}/g, "");

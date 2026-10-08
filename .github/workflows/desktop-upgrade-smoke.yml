@@ -593,7 +593,7 @@ jobs:
           BIBCODE_NATIVE_STATUS_DEPENDENCIES: "${{ steps.wsl_dependencies.outcome }}"
           BIBCODE_NATIVE_STATUS_PREREQUISITE: "${{ (steps.native_wsl_source_gates.outcome == 'failure' || steps.native_wsl_public_controls.outcome == 'failure' || steps.wsl_versions.outcome == 'failure' || steps.native_wsl_signing.outcome == 'failure') && 'failure' || 'skipped' }}"
           BIBCODE_NATIVE_STATUS_WRAPPER: "${{ steps.native_wsl_visuals.outcome }}"
-          BIBCODE_NATIVE_STATUS_CANCELLED: "${{ cancelled() }}"
+          BIBCODE_NATIVE_STATUS_CANCELLED: "false"
         run: node scripts/qualify-native-followups-workflow.ts --failed-windows-prerequisite-status
 
       - name: Retain finite native WSL originals and closed status
