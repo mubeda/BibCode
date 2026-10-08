@@ -22,6 +22,14 @@ import {
 
 import { Button } from "~/components/ui/button";
 import {
+  Combobox,
+  ComboboxEmpty,
+  ComboboxInput,
+  ComboboxItem,
+  ComboboxList,
+  ComboboxPopup,
+} from "~/components/ui/combobox";
+import {
   Dialog,
   DialogDescription,
   DialogFooter,
@@ -39,7 +47,11 @@ import { useEnvironmentQuery } from "~/state/query";
 
 import { GitManagerOperationBanner } from "../toolbar/GitManagerOperationBanner";
 import { groupBranches } from "../toolbar/branchGrouping";
-import { resolveMergeConfirmCopy, summarizeMergePreview } from "./GitManagerMergeDialog.logic";
+import {
+  MERGE_PREVIEW_GIT_TOO_OLD_PREFIX,
+  resolveMergeConfirmCopy,
+  summarizeMergePreview,
+} from "./GitManagerMergeDialog.logic";
 
 // The mode buttons carry `aria-pressed`, which the shared Button styles do not
 // read (they key on Base UI's `data-pressed`), so the selected mode needs its
@@ -73,6 +85,10 @@ export interface GitManagerMergeDialogProps {
   readonly remoteRefs?: ReadonlyArray<GitManagerRefEntry>;
   readonly recentNames?: ReadonlyArray<string>;
   readonly disabledReason?: string | null;
+  /** The server can merge into a branch that is not checked out (`merge-into`). */
+  readonly mergeIntoAvailable?: boolean;
+  /** "current-branch" merges only into the checked-out branch and hides the Into picker. */
+  readonly targetMode?: "any-target" | "current-branch";
   readonly onOpenChange: (open: boolean) => void;
   readonly onFinished?: () => void;
 }
@@ -107,6 +123,8 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   remoteRefs = NO_REFS,
   recentNames = NO_RECENT_BRANCHES,
   disabledReason: capabilityDisabledReason = null,
+  mergeIntoAvailable = false,
+  targetMode = "any-target",
   onOpenChange,
   onFinished = noop,
 }: GitManagerMergeDialogProps) {
@@ -115,6 +133,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   const [mode, setMode] = useState<"merge" | "squash">("merge");
   const [filter, setFilter] = useState("");
   const [selectedSourceRef, setSelectedSourceRef] = useState<string | null>(null);
+  const [targetName, setTargetName] = useState<string | null>(null);
   const [operationEvent, setOperationEvent] = useState<GitManagerOperationEvent | null>(null);
   const [failureCode, setFailureCode] = useState<string | null>(null);
   const [failureMessage, setFailureMessage] = useState<string | null>(null);
@@ -127,6 +146,12 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
     [],
   );
 
+  const currentName = useMemo(() => refs.find((ref) => ref.current)?.name ?? null, [refs]);
+  const targetNames = useMemo(() => refs.map((ref) => ref.name), [refs]);
+  const showTargetPicker = mergeIntoAvailable && targetMode !== "current-branch";
+  const target = (showTargetPicker ? targetName : null) ?? currentName;
+  const intoOtherBranch = showTargetPicker && target !== null && target !== currentName;
+
   const deferredFilter = useDeferredValue(filter);
   const grouped = useMemo(
     () => groupBranches({ refs, remoteRefs, recentNames, filter: deferredFilter }),
@@ -134,15 +159,17 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   );
   const localSourceOptions = useMemo(
     (): ReadonlyArray<MergeSourceOption> =>
+      // The target cannot be its own source; the checked-out branch is a source for
+      // another target.
       [...grouped.default, ...grouped.recent, ...grouped.other]
-        .filter((branch) => !branch.current)
+        .filter((branch) => branch.name !== target)
         .map((entry) => ({
           ref: `refs/heads/${entry.name}`,
           label: entry.name,
           entry,
           remote: false,
         })),
-    [grouped.default, grouped.other, grouped.recent],
+    [grouped.default, grouped.other, grouped.recent, target],
   );
   const remoteSourceOptions = useMemo(
     (): ReadonlyArray<MergeSourceOption> =>
@@ -161,7 +188,12 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
     remoteSourceOptions[0] ??
     null;
   const selectedSource = selectedOption?.ref ?? null;
-  const operationTag = mode === "merge" ? "merge" : "squash-merge";
+  const effectiveMode = intoOtherBranch ? "merge" : mode;
+  const operationTag = intoOtherBranch
+    ? "merge-into"
+    : effectiveMode === "merge"
+      ? "merge"
+      : "squash-merge";
   const repositoryBlockedReason = useMemo(
     () =>
       refs
@@ -171,8 +203,11 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
         ) ?? null,
     [operationTag, refs],
   );
-  const blockedReason =
-    selectedOption === null
+  const blockedReason = intoOtherBranch
+    ? (refs
+        .find((ref) => ref.name === target)
+        ?.blocked.find((reason) => reason.operation === "merge-into") ?? null)
+    : selectedOption === null
       ? null
       : selectedOption.remote
         ? repositoryBlockedReason
@@ -185,14 +220,27 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
         ? null
         : gitManagerEnvironment.previewMerge({
             environmentId,
-            input: { cwd, source: selectedSource },
+            input: {
+              cwd,
+              source: selectedSource,
+              ...(intoOtherBranch && target !== null ? { target } : {}),
+            },
           }),
-    [capabilityDisabledReason, cwd, environmentId, open, selectedSource],
+    [capabilityDisabledReason, cwd, environmentId, intoOtherBranch, open, selectedSource, target],
   );
   const previewQuery = useEnvironmentQuery(previewAtom);
-  const preview = previewQuery.data?.source === selectedSource ? previewQuery.data : null;
-  const summary = preview === null ? null : summarizeMergePreview(preview);
-  const copy = resolveMergeConfirmCopy(mode);
+  // A cached preview for another source or target must not enable Merge.
+  const preview =
+    previewQuery.data !== null &&
+    previewQuery.data.source === selectedSource &&
+    (!intoOtherBranch || previewQuery.data.current === target)
+      ? previewQuery.data
+      : null;
+  const summary = preview === null ? null : summarizeMergePreview(preview, { intoOtherBranch });
+  const copy = resolveMergeConfirmCopy(effectiveMode, intoOtherBranch ? target : null);
+  // Below Git 2.38 there is no preview, but merging into the checked-out branch still works.
+  const previewUnsupported =
+    !intoOtherBranch && previewQuery.error?.startsWith(MERGE_PREVIEW_GIT_TOO_OLD_PREFIX) === true;
   const disabledReason =
     capabilityDisabledReason ??
     blockedReason?.message ??
@@ -200,11 +248,13 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
       ? "The selected Git operation is running."
       : selectedSource === null
         ? "Choose a source branch."
-        : previewQuery.isPending || preview === null
-          ? "Loading merge preview."
-          : summary?.mergeEnabled === false
-            ? summary.message
-            : null);
+        : previewUnsupported
+          ? null
+          : previewQuery.isPending || preview === null
+            ? "Loading merge preview."
+            : summary?.mergeEnabled === false
+              ? summary.message
+              : null);
   const confirmDisabled = disabledReason !== null;
   const disabledReasonId =
     disabledReason === null ? undefined : "git-manager-merge-disabled-reason";
@@ -213,6 +263,11 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
     (event: ChangeEvent<HTMLInputElement>) => setFilter(event.currentTarget.value),
     [],
   );
+  const chooseTarget = useCallback((name: string | null) => {
+    if (name === null) return;
+    setTargetName(name);
+    setSelectedSourceRef((current) => (current === `refs/heads/${name}` ? null : current));
+  }, []);
   const chooseMerge = useCallback(() => setMode("merge"), []);
   const chooseSquash = useCallback(() => setMode("squash"), []);
   const close = useCallback(() => {
@@ -225,13 +280,22 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   }, []);
   const confirm = useCallback(() => {
     if (confirmDisabled || selectedSource === null || activeOperationRef.current !== null) return;
-    const input: GitManagerOperationRequest = {
-      _tag: operationTag,
-      cwd,
-      projectId: projectRef.projectId,
-      source: selectedSource,
-      noVerify: false,
-    };
+    const input: GitManagerOperationRequest =
+      operationTag === "merge-into" && target !== null
+        ? {
+            _tag: "merge-into",
+            cwd,
+            projectId: projectRef.projectId,
+            source: selectedSource,
+            target,
+          }
+        : {
+            _tag: operationTag === "squash-merge" ? "squash-merge" : "merge",
+            cwd,
+            projectId: projectRef.projectId,
+            source: selectedSource,
+            noVerify: false,
+          };
     setFailureCode(null);
     setFailureMessage(null);
     setOperationRunning(true);
@@ -275,6 +339,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
     projectRef.projectId,
     registry,
     selectedSource,
+    target,
   ]);
 
   return (
@@ -287,9 +352,44 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="min-h-0 space-y-3 px-6 pb-4">
+          {showTargetPicker ? (
+            <div className="space-y-1.5">
+              <label className="block text-sm" htmlFor="git-manager-merge-target">
+                Into
+              </label>
+              <Combobox
+                items={targetNames}
+                value={target}
+                onValueChange={chooseTarget}
+                disabled={operationRunning}
+              >
+                <ComboboxInput
+                  className="font-mono"
+                  id="git-manager-merge-target"
+                  placeholder="Search branches…"
+                />
+                <ComboboxPopup data-text-surface="popover">
+                  <ComboboxEmpty>No matching branches.</ComboboxEmpty>
+                  <ComboboxList>
+                    {(name: string) => (
+                      <ComboboxItem className="font-mono" key={name} value={name}>
+                        {name}
+                      </ComboboxItem>
+                    )}
+                  </ComboboxList>
+                </ComboboxPopup>
+              </Combobox>
+              {intoOtherBranch ? (
+                <p className="text-xs text-muted-foreground">
+                  `{target}` is updated without checking it out. Your files don't change and commit
+                  hooks don't run.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
           <div className="flex gap-2" role="group" aria-label="Merge mode">
             <Button
-              aria-pressed={mode === "merge"}
+              aria-pressed={effectiveMode === "merge"}
               className={MERGE_MODE_BUTTON_CLASS}
               size="sm"
               variant="outline"
@@ -297,15 +397,17 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
             >
               Merge commit
             </Button>
-            <Button
-              aria-pressed={mode === "squash"}
-              className={MERGE_MODE_BUTTON_CLASS}
-              size="sm"
-              variant="outline"
-              onClick={chooseSquash}
-            >
-              Squash merge
-            </Button>
+            {intoOtherBranch ? null : (
+              <Button
+                aria-pressed={effectiveMode === "squash"}
+                className={MERGE_MODE_BUTTON_CLASS}
+                size="sm"
+                variant="outline"
+                onClick={chooseSquash}
+              >
+                Squash merge
+              </Button>
+            )}
           </div>
           <label className="relative block">
             <SearchIcon

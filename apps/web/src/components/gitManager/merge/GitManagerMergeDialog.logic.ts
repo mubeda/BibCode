@@ -13,6 +13,12 @@ export function hasMergeSource(
   return remoteBranches.length > 0 || localBranches.some((branch) => !branch.current);
 }
 
+/**
+ * Prefix of the server's `git-too-old` preview message, which reaches the client only as
+ * text. A merge into the checked-out branch still works on that Git, without a preview.
+ */
+export const MERGE_PREVIEW_GIT_TOO_OLD_PREFIX = "Merge preview needs Git";
+
 export interface MergePreviewSummary {
   readonly kind: GitManagerMergePreview["_tag"];
   readonly message: string;
@@ -21,7 +27,10 @@ export interface MergePreviewSummary {
   readonly behind: number;
 }
 
-export function summarizeMergePreview(preview: GitManagerMergePreview): MergePreviewSummary {
+export function summarizeMergePreview(
+  preview: GitManagerMergePreview,
+  options: { readonly intoOtherBranch?: boolean } = {},
+): MergePreviewSummary {
   const base = { ahead: preview.ahead, behind: preview.behind };
   const source = shortRefName(preview.source);
   const current = shortRefName(preview.current);
@@ -42,6 +51,15 @@ export function summarizeMergePreview(preview: GitManagerMergePreview): MergePre
         ...base,
       };
     case "conflicted":
+      // No checkout holds a merge into another branch, so its conflicts cannot be resolved.
+      if (options.intoOtherBranch) {
+        return {
+          kind: preview._tag,
+          message: `${preview.fileCount} files would conflict. Check out \`${current}\` to merge and resolve them.`,
+          mergeEnabled: false,
+          ...base,
+        };
+      }
       return {
         kind: preview._tag,
         message: `There will be ${preview.fileCount} conflicted files.`,
@@ -58,10 +76,14 @@ export function summarizeMergePreview(preview: GitManagerMergePreview): MergePre
   }
 }
 
-export function resolveMergeConfirmCopy(mode: "merge" | "squash"): {
+export function resolveMergeConfirmCopy(
+  mode: "merge" | "squash",
+  target: string | null = null,
+): {
   readonly title: string;
   readonly confirmLabel: string;
 } {
+  if (target !== null) return { title: `Merge into ${target}`, confirmLabel: "Merge" };
   return mode === "merge"
     ? { title: "Merge into current branch", confirmLabel: "Merge" }
     : { title: "Squash and merge into current branch", confirmLabel: "Squash and Merge" };

@@ -50,7 +50,7 @@ vi.mock("../toolbar/GitManagerOperationBanner", () => ({
     operation === null ? null : <div data-operation-event={operation._tag} />,
 }));
 
-import { GitManagerMergeDialog } from "./GitManagerMergeDialog";
+import { GitManagerMergeDialog, type GitManagerMergeDialogProps } from "./GitManagerMergeDialog";
 
 const cleanPreview: GitManagerMergePreview = {
   _tag: "clean",
@@ -82,6 +82,7 @@ async function renderDialog(
   onOpenChange = vi.fn(),
   disabledReason: string | null = null,
   remoteRefs: ReadonlyArray<GitManagerRefEntry> = [],
+  extra: Partial<GitManagerMergeDialogProps> = {},
 ) {
   await act(async () =>
     root?.render(
@@ -94,18 +95,50 @@ async function renderDialog(
         remoteRefs={remoteRefs}
         recentNames={["feature"]}
         onOpenChange={onOpenChange}
+        {...extra}
       />,
     ),
   );
   return onOpenChange;
 }
 
-function buttonWithText(text: string): HTMLButtonElement {
+function buttonWithText(text: string): HTMLButtonElement;
+function buttonWithText(text: string, options: { optional: true }): HTMLButtonElement | null;
+function buttonWithText(text: string, options?: { optional: true }): HTMLButtonElement | null {
   const button = [...container.querySelectorAll("button")].find(
     (candidate) => candidate.textContent === text,
   );
-  if (!(button instanceof HTMLButtonElement)) throw new Error(`Missing button: ${text}`);
-  return button;
+  if (button instanceof HTMLButtonElement) return button;
+  if (options?.optional) return null;
+  throw new Error(`Missing button: ${text}`);
+}
+
+function targetInput(): HTMLInputElement {
+  const input = document.querySelector<HTMLInputElement>("#git-manager-merge-target");
+  if (!input) throw new Error("Missing Into input");
+  return input;
+}
+
+async function chooseTarget(label: string) {
+  await act(async () => {
+    targetInput().focus();
+    targetInput()
+      .closest('[data-slot="input-control"]')
+      ?.parentElement?.querySelector<HTMLButtonElement>('[data-slot="combobox-trigger"]')
+      ?.click();
+  });
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(
+      targetInput(),
+      label,
+    );
+    targetInput().dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(
+    (item) => item.textContent?.trim() === label,
+  );
+  if (!option) throw new Error(`Missing Into option: ${label}`);
+  await act(async () => option.click());
 }
 
 beforeEach(() => {
@@ -203,6 +236,68 @@ describe("GitManagerMergeDialog", () => {
       expect.objectContaining({ input: { cwd: "/repo", source: "refs/remotes/origin/topic" } }),
     );
     expect(buttonWithText("Merge")).toMatchObject({ disabled: true, title: message });
+  });
+
+  it("merges the checked-out branch into another branch with merge-into", async () => {
+    h.preview = { ...cleanPreview, source: "refs/heads/main", current: "release" };
+    await renderDialog([branch("main", true), branch("release")], vi.fn(), null, [], {
+      mergeIntoAvailable: true,
+    });
+    await chooseTarget("release");
+    expect(container.textContent).toContain("`release` is updated without checking it out.");
+    expect(buttonWithText("Squash merge", { optional: true })).toBeNull();
+    await act(async () => buttonWithText("main").click());
+    await act(async () => buttonWithText("Merge").click());
+    expect(h.runOperation).toHaveBeenLastCalledWith(
+      expect.anything(),
+      {
+        environmentId: "env-a",
+        input: {
+          _tag: "merge-into",
+          cwd: "/repo",
+          projectId: "project-a",
+          source: "refs/heads/main",
+          target: "release",
+        },
+      },
+      expect.any(Function),
+    );
+  });
+
+  it("keeps Merge disabled until the preview matches the chosen target", async () => {
+    h.preview = { ...cleanPreview, current: "main" };
+    await renderDialog(
+      [branch("main", true), branch("release"), branch("feature")],
+      vi.fn(),
+      null,
+      [],
+      { mergeIntoAvailable: true },
+    );
+    await chooseTarget("release");
+    expect(buttonWithText("Merge").disabled).toBe(true);
+  });
+
+  it("hides the Into picker without the capability", async () => {
+    await renderDialog([branch("main", true), branch("feature")]);
+    expect(document.querySelector("#git-manager-merge-target")).toBeNull();
+  });
+
+  it("allows merging into the current branch when Git is too old to preview", async () => {
+    h.preview = null;
+    h.error = "Merge preview needs Git 2.38 or later on this environment (found 2.34.1).";
+    await renderDialog([branch("main", true), branch("feature")]);
+    expect(buttonWithText("Merge").disabled).toBe(false);
+    expect(container.textContent).toContain("found 2.34.1");
+  });
+
+  it("keeps merge-into disabled when Git is too old to preview", async () => {
+    h.preview = null;
+    h.error = "Merge preview needs Git 2.38 or later on this environment (found 2.34.1).";
+    await renderDialog([branch("main", true), branch("release")], vi.fn(), null, [], {
+      mergeIntoAvailable: true,
+    });
+    await chooseTarget("release");
+    expect(buttonWithText("Merge").disabled).toBe(true);
   });
 
   it("closes on finished and stays open with the failure code on failed", async () => {

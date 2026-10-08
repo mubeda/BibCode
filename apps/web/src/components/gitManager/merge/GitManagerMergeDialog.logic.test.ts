@@ -61,6 +61,24 @@ describe("summarizeMergePreview", () => {
     ).toBe("This will merge 7 commits from `origin/topic` into `main`.");
   });
 
+  it("disables a conflicted merge into another branch with the check-out hint", () => {
+    const summary = summarizeMergePreview(
+      preview({
+        _tag: "conflicted",
+        source: "refs/heads/feature",
+        current: "release",
+        ahead: 1,
+        behind: 0,
+        fileCount: 2,
+      }),
+      { intoOtherBranch: true },
+    );
+    expect(summary.mergeEnabled).toBe(false);
+    expect(summary.message).toBe(
+      "2 files would conflict. Check out `release` to merge and resolve them.",
+    );
+  });
+
   it("disables a server-classified unrelated-histories merge", () => {
     expect(summarizeMergePreview(preview({ _tag: "unrelated-histories" }))).toEqual({
       kind: "unrelated-histories",
@@ -81,6 +99,13 @@ describe("resolveMergeConfirmCopy", () => {
     expect(resolveMergeConfirmCopy("squash")).toEqual({
       title: "Squash and merge into current branch",
       confirmLabel: "Squash and Merge",
+    });
+  });
+
+  it("names the target branch when merging into another branch", () => {
+    expect(resolveMergeConfirmCopy("merge", "release")).toEqual({
+      title: "Merge into release",
+      confirmLabel: "Merge",
     });
   });
 });

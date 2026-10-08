@@ -206,6 +206,8 @@ interface GitManagerRepositorySurfacesProps {
   readonly signalPending: boolean;
   readonly branchSyncDisabledReason: string | null;
   readonly stashMergeDisabledReason: string | null;
+  /** The environment can merge into a branch that is not checked out. */
+  readonly mergeIntoAvailable: boolean;
   readonly rewriteDisabledReason: string | null;
   readonly tagDisabledReason: string | null;
   readonly pullRequestsDisabledReason: string | null;
@@ -223,6 +225,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   signalPending,
   branchSyncDisabledReason,
   stashMergeDisabledReason,
+  mergeIntoAvailable,
   rewriteDisabledReason,
   tagDisabledReason,
   pullRequestsDisabledReason,
@@ -1023,7 +1026,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           }
           disabled={mergeDisabledReason !== null}
           size="xs"
-          title={mergeDisabledReason ?? "Merge a branch into the current branch"}
+          title={mergeDisabledReason ?? "Merge one branch into another"}
           variant="ghost"
           onClick={openMergeDialog}
         >
@@ -1238,6 +1241,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       />
       <GitManagerMergeDialog
         disabledReason={stashMergeDisabledReason}
+        mergeIntoAvailable={mergeIntoAvailable}
         open={mergeDialogOpen}
         projectRef={projectRef}
         recentNames={recentNames}
@@ -1405,6 +1409,7 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
           signalGeneration={signalGeneration}
           signalPending={signalPending}
           stashMergeDisabledReason={effectiveDisabledReasons.stashMerge}
+          mergeIntoAvailable={capabilityDisabledReasons.mergeInto === null}
           tagDisabledReason={effectiveDisabledReasons.tag}
           tabTransitionBaselineRef={tabTransitionBaselineRef}
           onTabChange={handleTabChange}
