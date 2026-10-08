@@ -48,6 +48,21 @@ const MERGE_MODE_BUTTON_CLASS =
   "aria-pressed:border-primary aria-pressed:bg-primary/15 aria-pressed:text-foreground";
 
 const NO_RECENT_BRANCHES: ReadonlyArray<string> = Object.freeze([]);
+const NO_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
+// Repository-wide blocks that apply whatever the source is, so a remote source (which has
+// no per-branch guards) still shows them before the click.
+const REPOSITORY_BLOCK_CODES: ReadonlySet<string> = new Set([
+  "dirty-working-tree",
+  "merge-in-progress",
+]);
+
+interface MergeSourceOption {
+  /** Full ref sent to the server, so a local branch named like a remote one stays distinct. */
+  readonly ref: string;
+  readonly label: string;
+  readonly entry: GitManagerRefEntry;
+  readonly remote: boolean;
+}
 const noop = () => undefined;
 
 export interface GitManagerMergeDialogProps {
@@ -55,10 +70,33 @@ export interface GitManagerMergeDialogProps {
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly projectRef: ScopedProjectRef;
   readonly refs: ReadonlyArray<GitManagerRefEntry>;
+  readonly remoteRefs?: ReadonlyArray<GitManagerRefEntry>;
   readonly recentNames?: ReadonlyArray<string>;
   readonly disabledReason?: string | null;
   readonly onOpenChange: (open: boolean) => void;
   readonly onFinished?: () => void;
+}
+
+function MergeSourceButton({
+  option,
+  selected,
+  onSelect,
+}: {
+  readonly option: MergeSourceOption;
+  readonly selected: boolean;
+  readonly onSelect: (ref: string) => void;
+}) {
+  return (
+    <button
+      aria-pressed={selected}
+      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring aria-pressed:bg-accent"
+      type="button"
+      onClick={() => onSelect(option.ref)}
+    >
+      <GitMergeIcon aria-hidden="true" className="size-3.5" />
+      <span className="truncate font-mono">{option.label}</span>
+    </button>
+  );
 }
 
 export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
@@ -66,6 +104,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   scope,
   projectRef,
   refs,
+  remoteRefs = NO_REFS,
   recentNames = NO_RECENT_BRANCHES,
   disabledReason: capabilityDisabledReason = null,
   onOpenChange,
@@ -75,7 +114,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   const { environmentId, cwd } = scope;
   const [mode, setMode] = useState<"merge" | "squash">("merge");
   const [filter, setFilter] = useState("");
-  const [selectedSourceName, setSelectedSourceName] = useState<string | null>(null);
+  const [selectedSourceRef, setSelectedSourceRef] = useState<string | null>(null);
   const [operationEvent, setOperationEvent] = useState<GitManagerOperationEvent | null>(null);
   const [failureCode, setFailureCode] = useState<string | null>(null);
   const [failureMessage, setFailureMessage] = useState<string | null>(null);
@@ -90,22 +129,55 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
 
   const deferredFilter = useDeferredValue(filter);
   const grouped = useMemo(
-    () => groupBranches({ refs, recentNames, filter: deferredFilter }),
-    [deferredFilter, recentNames, refs],
+    () => groupBranches({ refs, remoteRefs, recentNames, filter: deferredFilter }),
+    [deferredFilter, recentNames, refs, remoteRefs],
   );
-  const sourceBranches = useMemo(
-    () =>
-      [...grouped.default, ...grouped.recent, ...grouped.other].filter((branch) => !branch.current),
+  const localSourceOptions = useMemo(
+    (): ReadonlyArray<MergeSourceOption> =>
+      [...grouped.default, ...grouped.recent, ...grouped.other]
+        .filter((branch) => !branch.current)
+        .map((entry) => ({
+          ref: `refs/heads/${entry.name}`,
+          label: entry.name,
+          entry,
+          remote: false,
+        })),
     [grouped.default, grouped.other, grouped.recent],
   );
-  const selectedBranch =
-    sourceBranches.find((branch) => branch.name === selectedSourceName) ??
-    sourceBranches[0] ??
+  const remoteSourceOptions = useMemo(
+    (): ReadonlyArray<MergeSourceOption> =>
+      grouped.remote.map((entry) => ({
+        ref: `refs/remotes/${entry.name}`,
+        label: entry.name,
+        entry,
+        remote: true,
+      })),
+    [grouped.remote],
+  );
+  const selectedOption =
+    localSourceOptions.find((option) => option.ref === selectedSourceRef) ??
+    remoteSourceOptions.find((option) => option.ref === selectedSourceRef) ??
+    localSourceOptions[0] ??
+    remoteSourceOptions[0] ??
     null;
-  const selectedSource = selectedBranch?.name ?? null;
+  const selectedSource = selectedOption?.ref ?? null;
   const operationTag = mode === "merge" ? "merge" : "squash-merge";
+  const repositoryBlockedReason = useMemo(
+    () =>
+      refs
+        .flatMap((ref) => ref.blocked)
+        .find(
+          (reason) => reason.operation === operationTag && REPOSITORY_BLOCK_CODES.has(reason.code),
+        ) ?? null,
+    [operationTag, refs],
+  );
   const blockedReason =
-    selectedBranch?.blocked.find((reason) => reason.operation === operationTag) ?? null;
+    selectedOption === null
+      ? null
+      : selectedOption.remote
+        ? repositoryBlockedReason
+        : (selectedOption.entry.blocked.find((reason) => reason.operation === operationTag) ??
+          null);
 
   const previewAtom = useMemo(
     () =>
@@ -211,7 +283,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
         <DialogHeader>
           <DialogTitle>{copy.title}</DialogTitle>
           <DialogDescription>
-            Select a local source branch and review the server-computed merge preview.
+            Select a source branch and review the server-computed merge preview.
           </DialogDescription>
         </DialogHeader>
         <div className="min-h-0 space-y-3 px-6 pb-4">
@@ -255,21 +327,34 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
             aria-label="Source branches"
             className="max-h-44 overflow-auto rounded-md border border-border"
           >
-            {sourceBranches.length === 0 ? (
+            {localSourceOptions.length === 0 && remoteSourceOptions.length === 0 ? (
               <p className="p-3 text-xs text-muted-foreground">No source branches found.</p>
             ) : (
-              sourceBranches.map((branch) => (
-                <button
-                  aria-pressed={branch.name === selectedSource}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring aria-pressed:bg-accent"
-                  key={branch.name}
-                  type="button"
-                  onClick={() => setSelectedSourceName(branch.name)}
-                >
-                  <GitMergeIcon aria-hidden="true" className="size-3.5" />
-                  <span className="truncate font-mono">{branch.name}</span>
-                </button>
-              ))
+              <>
+                {localSourceOptions.map((option) => (
+                  <MergeSourceButton
+                    key={option.ref}
+                    option={option}
+                    selected={option.ref === selectedSource}
+                    onSelect={setSelectedSourceRef}
+                  />
+                ))}
+                {remoteSourceOptions.length === 0 ? null : (
+                  <>
+                    <p className="px-3 pt-2 pb-1 text-xs font-medium text-muted-foreground uppercase">
+                      Remote
+                    </p>
+                    {remoteSourceOptions.map((option) => (
+                      <MergeSourceButton
+                        key={option.ref}
+                        option={option}
+                        selected={option.ref === selectedSource}
+                        onSelect={setSelectedSourceRef}
+                      />
+                    ))}
+                  </>
+                )}
+              </>
             )}
           </div>
           <div aria-live="polite" className="min-h-10 rounded-md bg-muted/35 p-3 text-xs">

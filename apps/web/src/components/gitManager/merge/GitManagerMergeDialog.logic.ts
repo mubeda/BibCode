@@ -1,4 +1,17 @@
-import type { GitManagerMergePreview } from "@bibcode/contracts";
+import type { GitManagerMergePreview, GitManagerRefEntry } from "@bibcode/contracts";
+
+/** Display name for a merge ref: drops `refs/heads/` and `refs/remotes/`. */
+export function shortRefName(ref: string): string {
+  return ref.replace(/^refs\/(heads|remotes)\//, "");
+}
+
+/** A merge needs a local branch other than the checked-out one, or any remote branch. */
+export function hasMergeSource(
+  localBranches: ReadonlyArray<GitManagerRefEntry>,
+  remoteBranches: ReadonlyArray<GitManagerRefEntry>,
+): boolean {
+  return remoteBranches.length > 0 || localBranches.some((branch) => !branch.current);
+}
 
 export interface MergePreviewSummary {
   readonly kind: GitManagerMergePreview["_tag"];
@@ -10,19 +23,21 @@ export interface MergePreviewSummary {
 
 export function summarizeMergePreview(preview: GitManagerMergePreview): MergePreviewSummary {
   const base = { ahead: preview.ahead, behind: preview.behind };
+  const source = shortRefName(preview.source);
+  const current = shortRefName(preview.current);
   switch (preview._tag) {
     case "clean":
       if (preview.ahead === 0) {
         return {
           kind: preview._tag,
-          message: `Nothing to merge: \`${preview.source}\` has no commits that \`${preview.current}\` lacks.`,
+          message: `Nothing to merge: \`${source}\` has no commits that \`${current}\` lacks.`,
           mergeEnabled: false,
           ...base,
         };
       }
       return {
         kind: preview._tag,
-        message: `This will merge ${preview.ahead} commits from \`${preview.source}\` into \`${preview.current}\`.`,
+        message: `This will merge ${preview.ahead} commits from \`${source}\` into \`${current}\`.`,
         mergeEnabled: true,
         ...base,
       };

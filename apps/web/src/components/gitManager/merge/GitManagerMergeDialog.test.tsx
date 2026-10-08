@@ -54,7 +54,7 @@ import { GitManagerMergeDialog } from "./GitManagerMergeDialog";
 
 const cleanPreview: GitManagerMergePreview = {
   _tag: "clean",
-  source: "feature",
+  source: "refs/heads/feature",
   current: "main",
   ahead: 2,
   behind: 0,
@@ -81,6 +81,7 @@ async function renderDialog(
   refs: ReadonlyArray<GitManagerRefEntry>,
   onOpenChange = vi.fn(),
   disabledReason: string | null = null,
+  remoteRefs: ReadonlyArray<GitManagerRefEntry> = [],
 ) {
   await act(async () =>
     root?.render(
@@ -90,6 +91,7 @@ async function renderDialog(
         scope={{ environmentId: "env-a" as never, cwd: "/repo" }}
         projectRef={{ environmentId: "env-a", projectId: "project-a" } as never}
         refs={refs}
+        remoteRefs={remoteRefs}
         recentNames={["feature"]}
         onOpenChange={onOpenChange}
       />,
@@ -187,6 +189,22 @@ describe("GitManagerMergeDialog", () => {
     expect(container.textContent).toContain("feature");
   });
 
+  it("lists remote branches and sends their full ref with the repository-level block", async () => {
+    const message = "Merge is blocked: the working tree has uncommitted changes.";
+    const main = {
+      ...branch("main", true),
+      blocked: [{ operation: "merge", code: "dirty-working-tree", message }],
+    } as GitManagerRefEntry;
+    h.preview = { ...cleanPreview, source: "refs/remotes/origin/topic" };
+    await renderDialog([main, branch("feature")], vi.fn(), null, [branch("origin/topic")]);
+    expect(container.textContent).toContain("origin/topic");
+    await act(async () => buttonWithText("origin/topic").click());
+    expect(h.previewMerge).toHaveBeenLastCalledWith(
+      expect.objectContaining({ input: { cwd: "/repo", source: "refs/remotes/origin/topic" } }),
+    );
+    expect(buttonWithText("Merge")).toMatchObject({ disabled: true, title: message });
+  });
+
   it("closes on finished and stays open with the failure code on failed", async () => {
     const onOpenChange = await renderDialog([branch("main", true), branch("feature")]);
     await act(async () => buttonWithText("Merge").click());
@@ -198,7 +216,7 @@ describe("GitManagerMergeDialog", () => {
           _tag: "merge",
           cwd: "/repo",
           projectId: "project-a",
-          source: "feature",
+          source: "refs/heads/feature",
           noVerify: false,
         },
       },

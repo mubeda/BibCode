@@ -1,7 +1,12 @@
-import type { GitManagerMergePreview } from "@bibcode/contracts";
+import type { GitManagerMergePreview, GitManagerRefEntry } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolveMergeConfirmCopy, summarizeMergePreview } from "./GitManagerMergeDialog.logic";
+import {
+  hasMergeSource,
+  resolveMergeConfirmCopy,
+  shortRefName,
+  summarizeMergePreview,
+} from "./GitManagerMergeDialog.logic";
 
 function preview(
   value: Partial<GitManagerMergePreview> & Pick<GitManagerMergePreview, "_tag">,
@@ -46,6 +51,16 @@ describe("summarizeMergePreview", () => {
     });
   });
 
+  it("names full-ref sources by their short branch name", () => {
+    expect(
+      summarizeMergePreview(preview({ _tag: "clean", source: "refs/heads/feature" })).message,
+    ).toBe("This will merge 7 commits from `feature` into `main`.");
+    expect(
+      summarizeMergePreview(preview({ _tag: "clean", source: "refs/remotes/origin/topic" }))
+        .message,
+    ).toBe("This will merge 7 commits from `origin/topic` into `main`.");
+  });
+
   it("disables a server-classified unrelated-histories merge", () => {
     expect(summarizeMergePreview(preview({ _tag: "unrelated-histories" }))).toEqual({
       kind: "unrelated-histories",
@@ -67,5 +82,36 @@ describe("resolveMergeConfirmCopy", () => {
       title: "Squash and merge into current branch",
       confirmLabel: "Squash and Merge",
     });
+  });
+});
+
+describe("shortRefName", () => {
+  it("strips local and remote-tracking ref prefixes only", () => {
+    expect(shortRefName("refs/heads/feature")).toBe("feature");
+    expect(shortRefName("refs/remotes/origin/x")).toBe("origin/x");
+    expect(shortRefName("main")).toBe("main");
+    expect(shortRefName("refs/tags/v1")).toBe("refs/tags/v1");
+  });
+});
+
+describe("hasMergeSource", () => {
+  function ref(name: string, current = false): GitManagerRefEntry {
+    return {
+      name,
+      tipSha: `${name}-sha`,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      current,
+      isDefault: false,
+      worktreePath: null,
+      blocked: [],
+    };
+  }
+
+  it("needs a local branch other than the current one, or any remote branch", () => {
+    expect(hasMergeSource([ref("main", true)], [])).toBe(false);
+    expect(hasMergeSource([ref("main", true)], [ref("origin/topic")])).toBe(true);
+    expect(hasMergeSource([ref("main", true), ref("feature")], [])).toBe(true);
   });
 });

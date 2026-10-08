@@ -61,6 +61,7 @@ import {
   type GitManagerBranchDialogSubmission,
 } from "./dialogs/GitManagerBranchDialogs";
 import { GitManagerMergeDialog } from "./merge/GitManagerMergeDialog";
+import { hasMergeSource } from "./merge/GitManagerMergeDialog.logic";
 import { GitManagerStashDiff } from "./stash/GitManagerStashDiff";
 import { GitManagerStashList } from "./stash/GitManagerStashList";
 import { resolveStashIndex } from "./stash/GitManagerStashList.logic";
@@ -929,7 +930,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     stashMergeDisabledReason ??
     (refsQuery.isPending || snapshot === null
       ? "Loading branches."
-      : localBranches.every((branch) => branch.current)
+      : !hasMergeSource(localBranches, snapshot?.remoteBranches ?? EMPTY_REFS)
         ? "No source branch is available."
         : null);
   const rebaseBlockedReason =
@@ -1241,6 +1242,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         projectRef={projectRef}
         recentNames={recentNames}
         refs={localBranches}
+        remoteRefs={snapshot?.remoteBranches ?? EMPTY_REFS}
         scope={scope}
         onFinished={handleMergeFinished}
         onOpenChange={setMergeDialogOpen}
