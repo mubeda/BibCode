@@ -31,7 +31,10 @@ use crate::{
     mcp::preview_automation::PreviewAutomationBroker,
     orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine, load_snapshot},
     persistence::{Database, Repositories, StatePaths},
-    preview::PreviewManager,
+    preview::{
+        PreviewManager,
+        gateway::registry::{PreviewGateway, gateway_context},
+    },
     process::configure_background_command,
     production::{
         agent_activity::ProductionAgentActivity,
@@ -96,6 +99,7 @@ pub struct ProductionRuntime {
     pub activity_projections: ActivityProjections,
     pub preview_automation: PreviewAutomationBroker,
     pub preview: PreviewManager,
+    preview_gateway: PreviewGateway,
     asset_access: AssetAccess,
     transfer_access: TransferAccess,
     terminal_services: ServerTerminalServices,
@@ -321,6 +325,7 @@ impl ProductionRuntime {
         provider_runtime
             .attach_activity_cancellation(activity_cancellation.clone())
             .await;
+        let preview_gateway_secret = asset_secret.clone();
         let transfer_access = TransferAccess::new(asset_secret.clone());
         let asset_access = AssetAccess::new(asset_secret, state_paths.attachments_dir.clone());
         // One host observation: Pull Requests scope resolution and Settings discovery
@@ -382,11 +387,23 @@ impl ProductionRuntime {
         let workspace_for_effects = workspace.clone();
         let preview = PreviewManager::new();
         let preview_automation = PreviewAutomationBroker::new();
+        // Gateway listeners bind the same interface as the main server.
+        let preview_gateway = PreviewGateway::new(
+            config.host.clone(),
+            config.environment_label.clone(),
+            gateway_context(
+                Arc::new(auth.clone()),
+                preview_gateway_secret,
+                auth.cookie_name().to_owned(),
+            ),
+            preview.clone(),
+        );
         let workspace_preview = WorkspacePreviewRpcServices::new(
             workspace.clone(),
             preview.clone(),
             preview_automation.clone(),
-        );
+        )
+        .with_gateway(preview_gateway.clone());
 
         let process_monitor = Arc::new(DiagnosticsMonitor::new(
             resource_sampler.clone(),
@@ -430,6 +447,8 @@ impl ProductionRuntime {
                 provider: provider_runtime.clone(),
                 terminals: terminal_services.clone(),
                 workspace: workspace_for_effects,
+                preview: preview.clone(),
+                preview_gateway: preview_gateway.clone(),
             }),
             EffectsOptions::default(),
         )
@@ -507,6 +526,7 @@ impl ProductionRuntime {
             activity_projections,
             preview_automation,
             preview,
+            preview_gateway,
             asset_access,
             transfer_access,
             terminal_services,
@@ -650,6 +670,7 @@ impl ProductionRuntime {
             return Ok(());
         }
         self.server_control.shutdown_capability_discovery().await;
+        self.preview_gateway.shutdown().await;
         let process_ownership = self.terminal_services.freeze_process_ownership().await;
         self.managed_endpoint.shutdown().await;
         self.workspace.shutdown().await;
@@ -700,6 +721,8 @@ struct RuntimeEffectCallbacks {
     provider: Arc<ProviderRuntimeSupervisor>,
     terminals: ServerTerminalServices,
     workspace: WorkspaceRpc,
+    preview: PreviewManager,
+    preview_gateway: PreviewGateway,
 }
 
 impl OrchestrationEffectCallbacks for RuntimeEffectCallbacks {
@@ -775,6 +798,16 @@ impl OrchestrationEffectCallbacks for RuntimeEffectCallbacks {
         Box::pin(async move {
             self.workspace.refresh_index(cwd).await;
             Ok(())
+        })
+    }
+
+    fn close_previews<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, ()> {
+        Box::pin(async move {
+            self.preview_gateway.close_thread(thread_id).await;
+            self.preview
+                .close(thread_id, None)
+                .await
+                .map_err(|error| error.to_string())
         })
     }
 
@@ -2503,6 +2536,8 @@ mod tests {
             provider: runtime.provider_runtime.clone(),
             terminals: runtime.terminal_services.clone(),
             workspace: WorkspaceRpc::new(WorkspaceService::default()),
+            preview: runtime.preview.clone(),
+            preview_gateway: runtime.preview_gateway.clone(),
         };
         let canonical_callback_workspace =
             std::fs::canonicalize(&callback_workspace).expect("callback workspace canonical path");

@@ -1,0 +1,499 @@
+//! Gateway admission and the per-thread target registry behind `preview.gatewayOpen`.
+//!
+//! A target is one gateway listener for one `(thread, upstream port)`. Opening is idempotent:
+//! a second open reuses the running listener and mints a fresh capability. Targets close
+//! when the last preview tab of the thread on that port closes, after 10 minutes with no
+//! connections, when the thread is deleted, or on server shutdown.
+
+use std::{
+    collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Weak, atomic::Ordering},
+    time::Duration,
+};
+
+use tokio::{
+    net::TcpStream,
+    sync::{
+        Mutex, Semaphore,
+        broadcast::{self, error::RecvError},
+    },
+};
+use tokio_util::sync::CancellationToken;
+use url::{Host, Url};
+
+use super::{
+    GatewaySessions,
+    capability::CapabilityIssuer,
+    proxy::{
+        GLOBAL_CONNECTIONS, GatewayContext, GatewayLimits, GatewayTarget, PER_TARGET_CONNECTIONS,
+        PRINCIPAL_CHECK_INTERVAL, PrincipalCheck, RunningTarget, start_target,
+    },
+};
+use crate::{
+    preview::{PreviewEvent, PreviewManager, PreviewNavStatus},
+    signed_token::now_millis,
+};
+
+const UPSTREAM_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const IDLE_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayOpenResult {
+    pub gateway_port: u16,
+    pub capability: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayError {
+    #[error("not admitted")]
+    NotAdmitted,
+    #[error("https unsupported")]
+    HttpsUnsupported,
+    #[error("no upstream")]
+    NoUpstream,
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+}
+
+/// The production gateway context: one capability issuer, one session table, and one
+/// global connection semaphore shared by every target.
+#[must_use]
+pub fn gateway_context(
+    principal: Arc<dyn PrincipalCheck>,
+    secret: Vec<u8>,
+    session_cookie_name: String,
+) -> GatewayContext {
+    GatewayContext {
+        issuer: Arc::new(CapabilityIssuer::new(secret)),
+        sessions: Arc::new(GatewaySessions::new()),
+        principal,
+        limits: GatewayLimits {
+            per_target: PER_TARGET_CONNECTIONS,
+            global: Arc::new(Semaphore::new(GLOBAL_CONNECTIONS)),
+        },
+        session_cookie_name,
+        principal_check_interval: PRINCIPAL_CHECK_INTERVAL,
+    }
+}
+
+type TargetKey = (String, u16);
+
+#[derive(Clone)]
+pub struct PreviewGateway {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    bind_host: String,
+    environment_label: String,
+    ctx: GatewayContext,
+    preview: PreviewManager,
+    targets: Mutex<HashMap<TargetKey, Target>>,
+    shutdown: CancellationToken,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+struct Target {
+    running: RunningTarget,
+    /// A preview tab of the thread has pointed at this port, so the target closes with the
+    /// last such tab. A target no tab ever pointed at (a browser-mode tab) is left to the
+    /// idle sweep.
+    tabbed: bool,
+}
+
+impl Target {
+    fn close(&self) {
+        self.running.shutdown.cancel();
+    }
+}
+
+impl PreviewGateway {
+    /// Starts the idle sweeper and the preview-tab follower; both stop on [`Self::shutdown`].
+    #[must_use]
+    pub fn new(
+        bind_host: impl Into<String>,
+        environment_label: impl Into<String>,
+        ctx: GatewayContext,
+        preview: PreviewManager,
+    ) -> Self {
+        let gateway = Self {
+            inner: Arc::new(Inner {
+                bind_host: bind_host.into(),
+                environment_label: environment_label.into(),
+                ctx,
+                preview: preview.clone(),
+                targets: Mutex::new(HashMap::new()),
+                shutdown: CancellationToken::new(),
+            }),
+        };
+        // The tasks hold the gateway weakly: dropping its last owner (a runtime that failed to
+        // start) cancels them and every listener through `Inner`'s drop.
+        let weak = Arc::downgrade(&gateway.inner);
+        let shutdown = gateway.inner.shutdown.clone();
+        tokio::spawn(Self::sweep_idle(weak.clone(), shutdown.clone()));
+        // Subscribe before returning so no tab opened after construction is missed.
+        let events = preview.subscribe_events();
+        tokio::spawn(Self::follow_tabs(weak, shutdown, events));
+        gateway
+    }
+
+    /// Admits `url` for `thread_id` and mints a capability bound to the caller's session.
+    pub async fn open(
+        &self,
+        thread_id: &str,
+        url: &str,
+        session_id: &str,
+        session_expires_at_ms: i64,
+    ) -> Result<GatewayOpenResult, GatewayError> {
+        let upstream_port = admit(url)?;
+        let session_expiry = u64::try_from(session_expires_at_ms)
+            .ok()
+            .filter(|expiry| *expiry > now_millis())
+            .ok_or_else(|| GatewayError::Unavailable("the session has expired".to_owned()))?;
+        let key = (thread_id.to_owned(), upstream_port);
+        // The probe runs under the lock so a concurrent `close_thread` or `shutdown` cannot
+        // slip between it and the insert and leave a listener for a closed thread.
+        // ponytail: one global lock; a loopback probe is refused at once, but a dropped SYN
+        // stalls other opens for up to 1 s. Use per-thread fences if that shows up.
+        let mut targets = self.inner.targets.lock().await;
+        if self.inner.shutdown.is_cancelled() {
+            return Err(GatewayError::Unavailable(
+                "the preview gateway is shut down".to_owned(),
+            ));
+        }
+        if !targets.contains_key(&key) {
+            let upstream = probe_upstream(upstream_port)
+                .await
+                .ok_or(GatewayError::NoUpstream)?;
+            let target = GatewayTarget {
+                thread_id: thread_id.to_owned(),
+                upstream,
+                upstream_port,
+                environment_label: self.inner.environment_label.clone(),
+            };
+            let running = start_target(
+                &self.inner.bind_host,
+                target,
+                self.inner.ctx.clone(),
+                self.inner.shutdown.child_token(),
+            )
+            .await
+            .map_err(|error| GatewayError::Unavailable(error.to_string()))?;
+            targets.insert(
+                key.clone(),
+                Target {
+                    running,
+                    tabbed: false,
+                },
+            );
+        }
+        let tabbed = tab_ports_of(&self.inner.preview, thread_id)
+            .await
+            .contains(&upstream_port);
+        let target = targets.get_mut(&key).expect("target was just ensured");
+        target.tabbed |= tabbed;
+        Ok(self.mint(&target.running, &key, session_id, session_expiry))
+    }
+
+    pub async fn close_thread(&self, thread_id: &str) {
+        self.inner
+            .targets
+            .lock()
+            .await
+            .retain(|(thread, _), target| {
+                let keep = thread != thread_id;
+                if !keep {
+                    target.close();
+                }
+                keep
+            });
+    }
+
+    pub async fn close_target(&self, thread_id: &str, upstream_port: u16) {
+        let key = (thread_id.to_owned(), upstream_port);
+        if let Some(target) = self.inner.targets.lock().await.remove(&key) {
+            target.close();
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let mut targets = self.inner.targets.lock().await;
+        self.inner.shutdown.cancel();
+        targets.clear();
+    }
+
+    /// A fresh capability for `target`. Minting counts as activity, so a capability is
+    /// never handed out for a target the idle sweep is about to close.
+    fn mint(
+        &self,
+        target: &RunningTarget,
+        (thread_id, upstream_port): &TargetKey,
+        session_id: &str,
+        session_expiry: u64,
+    ) -> GatewayOpenResult {
+        let now = now_millis();
+        target.last_activity_ms.store(now, Ordering::Relaxed);
+        let (capability, expires_at_ms) = self.inner.ctx.issuer.issue(
+            target.gateway_port,
+            *upstream_port,
+            thread_id,
+            session_id,
+            now,
+        );
+        GatewayOpenResult {
+            gateway_port: target.gateway_port,
+            capability,
+            expires_at_ms: expires_at_ms.min(session_expiry),
+        }
+    }
+
+    /// Closes targets with no connections and no activity for [`IDLE_TIMEOUT_MS`].
+    async fn close_idle(&self, now_ms: u64) {
+        self.inner.targets.lock().await.retain(|_, target| {
+            let running = &target.running;
+            let idle = running.active.load(Ordering::Relaxed) == 0
+                && now_ms.saturating_sub(running.last_activity_ms.load(Ordering::Relaxed))
+                    >= IDLE_TIMEOUT_MS;
+            if idle {
+                target.close();
+            }
+            !idle
+        });
+    }
+
+    async fn sweep_idle(gateway: Weak<Inner>, shutdown: CancellationToken) {
+        let mut ticks = tokio::time::interval(IDLE_SWEEP_INTERVAL);
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                _ = ticks.tick() => {}
+            }
+            let Some(inner) = gateway.upgrade() else {
+                return;
+            };
+            Self { inner }.close_idle(now_millis()).await;
+        }
+    }
+
+    /// Reconciles the thread's targets with its live tabs: a target a live tab points at
+    /// becomes tabbed, and with `close_untabbed` a tabbed target no live tab points at any
+    /// more closes. Live tabs are read under the registry lock (the same order as `open`),
+    /// and event snapshots are never trusted, so a stale or replayed event cannot mark or
+    /// close a target against the current tab state.
+    async fn sync_thread(&self, thread_id: &str, close_untabbed: bool) {
+        let mut targets = self.inner.targets.lock().await;
+        let live = tab_ports_of(&self.inner.preview, thread_id).await;
+        targets.retain(|(thread, port), target| {
+            if thread != thread_id {
+                return true;
+            }
+            if live.contains(port) {
+                target.tabbed = true;
+                return true;
+            }
+            let close = close_untabbed && target.tabbed;
+            if close {
+                target.close();
+            }
+            !close
+        });
+    }
+
+    /// Follows preview tabs. Tab events mark targets tabbed, a closed tab closes its thread's
+    /// targets that lost their last tab, and missed events re-check every thread with a
+    /// target. A tab that opened and closed before the follower saw it live (both events
+    /// queued or missed) leaves its target untabbed, so the idle sweep closes it instead.
+    /// That is the price of never trusting event snapshots, which would let a stale event
+    /// close a fresh tabless target.
+    async fn follow_tabs(
+        gateway: Weak<Inner>,
+        shutdown: CancellationToken,
+        mut events: broadcast::Receiver<PreviewEvent>,
+    ) {
+        loop {
+            let event = tokio::select! {
+                () = shutdown.cancelled() => return,
+                event = events.recv() => event,
+            };
+            let Some(inner) = gateway.upgrade() else {
+                return;
+            };
+            let gateway = Self { inner };
+            match event {
+                Ok(
+                    PreviewEvent::Opened { thread_id, .. }
+                    | PreviewEvent::Navigated { thread_id, .. }
+                    | PreviewEvent::Resized { thread_id, .. }
+                    | PreviewEvent::Failed { thread_id, .. },
+                ) => gateway.sync_thread(&thread_id, false).await,
+                Ok(PreviewEvent::Closed { thread_id, .. }) => {
+                    gateway.sync_thread(&thread_id, true).await;
+                }
+                Ok(PreviewEvent::OpenRequested { .. }) => {}
+                Err(RecvError::Lagged(_)) => {
+                    let threads: HashSet<String> = gateway
+                        .inner
+                        .targets
+                        .lock()
+                        .await
+                        .keys()
+                        .map(|(thread, _)| thread.clone())
+                        .collect();
+                    for thread_id in threads {
+                        gateway.sync_thread(&thread_id, true).await;
+                    }
+                }
+                Err(RecvError::Closed) => return,
+            }
+        }
+    }
+}
+
+/// The upstream port of an admissible target: a plain-HTTP URL on `localhost`,
+/// `127.0.0.0/8`, or `::1`.
+fn admit(url: &str) -> Result<u16, GatewayError> {
+    let url = Url::parse(url).map_err(|_| GatewayError::NotAdmitted)?;
+    let loopback = match url.host() {
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if !loopback {
+        return Err(GatewayError::NotAdmitted);
+    }
+    match url.scheme() {
+        "http" => {}
+        "https" => return Err(GatewayError::HttpsUnsupported),
+        _ => return Err(GatewayError::NotAdmitted),
+    }
+    url.port_or_known_default()
+        .filter(|port| *port != 0)
+        .ok_or(GatewayError::NotAdmitted)
+}
+
+fn nav_port(status: &PreviewNavStatus) -> Option<u16> {
+    match status {
+        PreviewNavStatus::Idle => None,
+        PreviewNavStatus::Loading { url, .. }
+        | PreviewNavStatus::Success { url, .. }
+        | PreviewNavStatus::LoadFailed { url, .. } => admit(url).ok(),
+    }
+}
+
+async fn tab_ports_of(preview: &PreviewManager, thread_id: &str) -> Vec<u16> {
+    preview
+        .list(thread_id)
+        .await
+        .sessions
+        .iter()
+        .filter_map(|tab| nav_port(&tab.nav_status))
+        .collect()
+}
+
+/// The first loopback address on `port` that accepts a connection: IPv4, then IPv6.
+async fn probe_upstream(port: u16) -> Option<SocketAddr> {
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let addr = SocketAddr::new(ip, port);
+        if let Ok(Ok(_)) =
+            tokio::time::timeout(UPSTREAM_PROBE_TIMEOUT, TcpStream::connect(addr)).await
+        {
+            return Some(addr);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::future::BoxFuture;
+
+    use super::*;
+
+    struct Live;
+
+    impl PrincipalCheck for Live {
+        fn session_expiry<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Option<i64>> {
+            Box::pin(async { Some(i64::MAX) })
+        }
+    }
+
+    #[test]
+    fn admits_only_plain_http_loopback_urls() {
+        assert_eq!(admit("http://localhost/").unwrap(), 80);
+        assert_eq!(admit("http://LOCALHOST:5173/x").unwrap(), 5173);
+        assert_eq!(admit("http://127.1.2.3:8080").unwrap(), 8080);
+        assert_eq!(admit("http://[::1]:3000/").unwrap(), 3000);
+        assert!(matches!(
+            admit("https://localhost:5173/"),
+            Err(GatewayError::HttpsUnsupported)
+        ));
+        assert!(matches!(
+            admit("https://example.com/"),
+            Err(GatewayError::NotAdmitted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_sweep_closes_only_targets_idle_for_ten_minutes() {
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://localhost:{}/",
+            upstream.local_addr().unwrap().port()
+        );
+        let gateway = PreviewGateway::new(
+            "127.0.0.1",
+            "devbox",
+            gateway_context(Arc::new(Live), vec![1; 32], "session".into()),
+            PreviewManager::new(),
+        );
+        gateway.open("t", &url, "s", i64::MAX).await.unwrap();
+        let now = now_millis();
+        gateway.close_idle(now + IDLE_TIMEOUT_MS - 1_000).await;
+        assert_eq!(gateway.inner.targets.lock().await.len(), 1);
+        gateway.close_idle(now + IDLE_TIMEOUT_MS + 1_000).await;
+        assert!(gateway.inner.targets.lock().await.is_empty());
+        gateway.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_handle_closes_listeners() {
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://localhost:{}/",
+            upstream.local_addr().unwrap().port()
+        );
+        let gateway = PreviewGateway::new(
+            "127.0.0.1",
+            "devbox",
+            gateway_context(Arc::new(Live), vec![1; 32], "session".into()),
+            PreviewManager::new(),
+        );
+        let port = gateway
+            .open("t", &url, "s", i64::MAX)
+            .await
+            .unwrap()
+            .gateway_port;
+        let inner = Arc::downgrade(&gateway.inner);
+        drop(gateway);
+        assert!(inner.upgrade().is_none(), "background tasks hold no handle");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the listener stops");
+    }
+}

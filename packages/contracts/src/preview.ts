@@ -10,7 +10,7 @@
  * @module Preview
  */
 import { Schema } from "effect";
-import { ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { PortSchema, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 const Url = TrimmedNonEmptyString.check(Schema.isMaxLength(2048));
 const Title = Schema.String.check(Schema.isMaxLength(512));
@@ -202,6 +202,21 @@ export const PreviewClaimOpenRequestResult = Schema.Struct({
 });
 export type PreviewClaimOpenRequestResult = typeof PreviewClaimOpenRequestResult.Type;
 
+/** `url` is the canonical loopback URL; the server admits only plain-HTTP loopback targets. */
+export const PreviewGatewayOpenInput = Schema.Struct({
+  threadId: ThreadId,
+  url: Url,
+});
+export type PreviewGatewayOpenInput = typeof PreviewGatewayOpenInput.Type;
+
+/** `capability` bootstraps one gateway session on `gatewayPort` before `expiresAtMs`. */
+export const PreviewGatewayOpenResult = Schema.Struct({
+  gatewayPort: PortSchema,
+  capability: TrimmedNonEmptyString,
+  expiresAtMs: Schema.Finite,
+});
+export type PreviewGatewayOpenResult = typeof PreviewGatewayOpenResult.Type;
+
 export const PreviewListResult = Schema.Struct({
   sessions: Schema.Array(PreviewSessionSnapshot),
 });
@@ -319,6 +334,18 @@ export class PreviewInvalidUrlError extends Schema.TaggedError<PreviewInvalidUrl
     return `Invalid preview URL (${this.reason}${protocol}; input length ${this.inputLength}).`;
   }
 }
+
+/**
+ * Why `preview.gatewayOpen` refused: `not-admitted` (not a plain-HTTP loopback URL),
+ * `https-unsupported`, `no-upstream` (nothing listens on the port), or `unavailable`.
+ */
+export class PreviewGatewayError extends Schema.TaggedError<PreviewGatewayError>()(
+  "PreviewGatewayError",
+  {
+    reason: Schema.Literals(["not-admitted", "https-unsupported", "no-upstream", "unavailable"]),
+    message: Schema.String,
+  },
+) {}
 
 export const PreviewError = Schema.Union([PreviewSessionLookupError, PreviewInvalidUrlError]);
 export type PreviewError = typeof PreviewError.Type;

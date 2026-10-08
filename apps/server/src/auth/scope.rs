@@ -96,6 +96,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "orchestration.dispatchCommand"
         | "preview.claimOpenRequest"
         | "preview.close"
+        | "preview.gatewayOpen"
         | "preview.navigate"
         | "preview.open"
         | "preview.refresh"
@@ -312,6 +313,11 @@ mod tests {
                 "wrong activity mutation scope for {method}"
             );
         }
+        assert_eq!(
+            required_scope("preview.gatewayOpen"),
+            Some(SCOPE_ORCHESTRATION_OPERATE),
+            "a gateway gives read/write access to the upstream, so reading is not enough"
+        );
         assert_eq!(
             required_scope("vcs.cancelClone"),
             Some(SCOPE_ORCHESTRATION_OPERATE),

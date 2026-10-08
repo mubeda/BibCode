@@ -90,6 +90,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_stream("orchestration.subscribeThread"),
     mutation_unary("preview.claimOpenRequest"),
     mutation_unary("preview.close"),
+    mutation_unary("preview.gatewayOpen"),
     read_unary("preview.list"),
     mutation_unary("preview.navigate"),
     mutation_unary("preview.open"),

@@ -1061,6 +1061,80 @@ flowchart LR
 Keeping launch separate prevents connection code from assuming that every
 endpoint can install software, start a process, or use SSH.
 
+## Preview gateway
+
+A client that is not on the server's host cannot load a dev server that listens
+on the server's loopback. `preview.gatewayOpen({ threadId, url })`, which needs
+`orchestration:operate`, opens a reverse-proxy listener for it. The code lives
+in `apps/server/src/preview/gateway/`.
+
+- **Admission.** The URL must be plain `http` on `localhost`, `127.0.0.0/8`, or
+  `::1`. `https` fails with `PreviewGatewayError` reason `https-unsupported`,
+  and any other host or scheme fails with `not-admitted`. Every call is an
+  explicit user or agent action by an operate caller, so there is no per-port
+  allowlist. The upstream is probed at `127.0.0.1:<port>`, then
+  `[::1]:<port>`, for 500 ms each. The first address that accepts wins; if
+  neither does, the call fails with `no-upstream`. A server without
+  authentication returns `unavailable`, because a capability binds a session.
+- **Per-target listeners.** Each `(thread, upstream port)` gets its own
+  listener on an ephemeral port of the main server's bind host. The separate
+  port gives each target its own origin. Opening is idempotent under one lock:
+  a second call reuses the listener and mints a fresh capability. The result
+  is `{ gatewayPort, capability, expiresAtMs }`.
+- **Auth bootstrap.** The capability is a `signed_token` with purpose
+  `preview-gateway`. It is bound to the gateway port, upstream port, thread,
+  and caller's session, lasts 60 s, and works once. The client navigates to
+  `/__bibcode/bootstrap?cap=<token>&to=<path>`, where `to` is a path with no
+  scheme or host. The gateway sets
+  `bibcode-gw-<gatewayPort>=<id>; HttpOnly; SameSite=Strict; Path=/` and
+  returns a `200` page that calls `location.replace(to)`. The follow-up
+  navigation then comes from the gateway's own site, so the browser sends the
+  `Strict` cookie even when the BiBCode UI is on another site. Every later
+  request needs that cookie; without it the gateway returns `401` with "This
+  preview link expired. Go back to BiBCode and open it again."
+- **Principal binding.** A gateway session lives no longer than its BiBCode
+  session. The gateway rechecks the session through the auth service at least
+  every 30 s. Revocation or expiry ends the gateway session and closes its live
+  connections within that window.
+- **Origin rule.** Cookies ignore ports, so another previewed app on the same
+  host also carries the gateway cookie. Before any rewrite, a WebSocket upgrade
+  or a request other than `GET`, `HEAD`, or `OPTIONS` must carry an `Origin`
+  equal to the gateway's client-facing origin (`http://` plus the request
+  `Host`). A missing or different `Origin` returns `403` before the request
+  reaches the upstream. Only after that exact match does the gateway rewrite
+  `Origin` to `http://localhost:<port>` on these requests, so upstreams that
+  compare `Origin` with `Host` accept them.
+- **Forwarding.** `Host` becomes `localhost:<port>`. The gateway strips
+  BiBCode's session cookie, every `bibcode-gw-*` cookie, `authorization`,
+  `dpop`, and hop-by-hop headers. In responses it drops `Domain=` from
+  `Set-Cookie` and drops cookies with reserved names. It also rewrites a
+  `Location` that points at `localhost`, `127.0.0.1`, or `[::1]` on the
+  upstream port to the client-facing origin.
+- **Limits.** Each target allows 64 concurrent upstream connections, and all
+  targets share one limit of 256. Bodies stream through 64 KiB buffers and are
+  never buffered whole. Over the limit, the gateway returns `503` with
+  `retry-after: 1`. When nothing listens, it returns `502` with "Nothing is
+  listening on port <port> on <environment>."
+- **Teardown.** A target closes in four cases:
+  - The last preview tab of its thread on its port closes. The gateway follows
+    `PreviewManager` events; after missed events it re-checks every thread
+    that has a target.
+  - It has had no connections for 10 minutes. The sweep runs every 60 s, and
+    minting a capability counts as activity.
+  - Its thread is deleted, which also closes the thread's preview tabs.
+  - The server shuts down.
+
+  The first case applies only once a tab of the thread has pointed at the
+  target's port. A target no tab ever pointed at, such as one opened for a
+  browser-mode tab, closes only in the other three cases.
+
+- **E2EE caveat.** Gateway traffic is plain HTTP on the server's bind, outside
+  Noise, like `/api/assets`. Clients keep the Phase 0 `public-host` notice
+  instead of using the gateway on public-IP binds.
+- **Relay limitation.** A relay (BiBCode Connect) client cannot reach gateway
+  listeners. It shows "This address is on <label>, not this computer. Opening
+  its ports from here isn't supported yet."
+
 ## Security boundaries
 
 - Pairing credentials and access tokens are secrets; connection catalog labels

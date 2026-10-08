@@ -335,6 +335,12 @@ impl RpcSessionContext {
         self.admission.clone()
     }
 
+    /// The authenticated principal of this connection; `None` on an unauthenticated server.
+    #[must_use]
+    pub(crate) fn principal(&self) -> Option<&Principal> {
+        self.principal.as_ref()
+    }
+
     #[must_use]
     pub(crate) fn current_session_id(&self) -> Option<&str> {
         self.principal

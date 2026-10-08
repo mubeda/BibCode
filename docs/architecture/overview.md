@@ -705,6 +705,13 @@ environment shares the host process. SSH forwarding is owned by the Tauri host;
 provider, terminal, and managed relay processes are supervised by the server.
 Neither path introduces a production Node server or packaged helper sidecar.
 
+The server can also open preview gateway listeners. Each one reverse-proxies
+one loopback dev server for one thread to a client that is not on the server's
+host. A listener binds an ephemeral port on the main server's bind host. It is
+opened through `preview.gatewayOpen` and closed when its tabs close, after
+10 idle minutes, when its thread is deleted, or at shutdown. See
+[Preview gateway](remote.md#preview-gateway).
+
 When WSL-only mode is selected, that intent is authoritative even if an older
 persisted document has a stale disabled-backend flag. WSL planning and primary
 startup fail closed as a tagged `wsl-primary-unavailable` desktop state. The
