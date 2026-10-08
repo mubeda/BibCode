@@ -1,6 +1,7 @@
 import type { PullRequestsMergeReadiness } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import {
+  approvalStatusNote,
   checksSummaryLabel,
   fileTree,
   groupTimeline,
@@ -31,6 +32,15 @@ describe("headerSentence", () => {
     expect(headerSentence({ ...detail, commitCount: 1 }, context.provider)).toContain(
       "1 commit into",
     ));
+});
+describe("approvalStatusNote", () => {
+  it("says approval is optional when the host requires none", () => {
+    expect(approvalStatusNote(null)).toBe("Approval is optional");
+    expect(approvalStatusNote({ approved: 0, required: 0 })).toBe("Approval is optional");
+  });
+  it("counts the approvals the host already has against the number it requires", () => {
+    expect(approvalStatusNote({ approved: 1, required: 2 })).toBe("1 of 2 approvals");
+  });
 });
 describe("readinessPresentation", () => {
   it.each(["1 approving review required.", "  1 approving review required.\n"])(

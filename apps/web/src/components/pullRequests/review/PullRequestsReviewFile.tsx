@@ -26,12 +26,20 @@ export const PullRequestsReviewFile = memo(function PullRequestsReviewFile({
   context,
   projectRef,
   threads = EMPTY_THREADS,
+  live = true,
   ...diff
 }: PullRequestsFileDiffProps & {
   detail: PullRequestsDetail;
   context: Extract<PullRequestsContext, { status: "available" }>;
   projectRef: ScopedProjectRef;
   threads?: readonly Thread[] | undefined;
+  /**
+   * Every review action rendered for this file (thread actions, pending
+   * comments, the inline composer) only ever acts on a live detail, never
+   * a snapshot. Defaults to `true` so callers that have not adopted the
+   * split keep acting as before.
+   */
+  live?: boolean;
 }) {
   const pending = usePullRequestsStore(
     useShallow((s) =>
@@ -105,6 +113,7 @@ export const PullRequestsReviewFile = memo(function PullRequestsReviewFile({
           number={detail.number}
           context={context}
           url={detail.url}
+          live={live}
         />,
       );
     for (const comment of pending)
@@ -118,6 +127,7 @@ export const PullRequestsReviewFile = memo(function PullRequestsReviewFile({
             projectRef={projectRef}
             number={detail.number}
             permission={detail.permissions.review}
+            live={live}
           />,
         );
     for (const draft of drafts)
@@ -133,6 +143,7 @@ export const PullRequestsReviewFile = memo(function PullRequestsReviewFile({
             permission={detail.permissions.review}
             headSha={detail.headSha}
             patch={diff.file.patch ?? ""}
+            live={live}
           />,
         );
     return [...groups.values()].map(
@@ -154,6 +165,7 @@ export const PullRequestsReviewFile = memo(function PullRequestsReviewFile({
     detail.url,
     projectRef,
     context,
+    live,
   ]);
   return (
     <PullRequestsFileDiff
