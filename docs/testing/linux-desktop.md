@@ -2618,6 +2618,13 @@ The diagnostics scene holds one original server reply beyond the unchanged
 15-second threshold. Hosted entries use fresh unused loopback grants, actual
 SDK/product scrub readiness and exact grant revocation; never submit Pair.
 
+The common witness ignores a retained dialog only when the node or an ancestor
+is explicitly hidden, inert or aria-hidden. Closed popover portals can remain
+mounted under that ancestry. An active dialog still refuses capture even when
+clipped, offscreen, occluded or transparent; a closed-state marker alone does
+not admit it. Preserve the original target visibility/hit checks and all source,
+route, selection, draft, progress and cancellation checks.
+
 Retain exactly the fourteen named originals and finite phase/failure/provenance,
 result/assertions/namespace-cleanup/supervisor JSON files. No raw protocol,
 credential, client, history, PID, route or private logs enter public evidence.

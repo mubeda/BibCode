@@ -440,7 +440,9 @@ export function readBrowserFollowupWitness(
     bootShellAbsent:
       document.getElementById("boot-shell") === null &&
       document.querySelector("vite-error-overlay") === null,
-    unrelatedModalAbsent: document.querySelector('[role="dialog"],[role="alertdialog"]') === null,
+    unrelatedModalAbsent: all('[role="dialog"],[role="alertdialog"]').every(
+      (node) => node.closest('[hidden],[inert],[aria-hidden="true"]') !== null,
+    ),
     targetInView: targets.length > 0 && targets.every(visible),
     ...facts,
   };

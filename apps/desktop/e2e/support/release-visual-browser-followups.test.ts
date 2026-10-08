@@ -1,6 +1,8 @@
+// @vitest-environment happy-dom
 // @effect-diagnostics nodeBuiltinImport:off - Only closed capture receipts are used here.
-import { expect, it } from "vite-plus/test";
+import { afterEach, expect, it, vi } from "vite-plus/test";
 import {
+  readBrowserFollowupWitness,
   browserFollowupRows,
   browserFollowupScenes,
   browserFollowupFacts,
@@ -8,6 +10,7 @@ import {
   projectBrowserFollowupCapture,
   validateBrowserFollowupJoins,
   admitBrowserFollowupObservation,
+  type BrowserFollowupObservation,
 } from "./release-visual-browser-followups.ts";
 const witness = (scene: (typeof browserFollowupScenes)[number]) =>
   Object.fromEntries(browserFollowupFacts(scene).map((key) => [key, true]));
@@ -101,3 +104,50 @@ it.each([
     ).toThrow();
   }
 });
+
+afterEach(() => {
+  document.body.replaceChildren();
+  vi.unstubAllGlobals();
+});
+it.each(["dialog", "alertdialog"])(
+  "refuses active %s while ignoring only explicitly unavailable ancestry",
+  (role) => {
+    vi.stubGlobal("location", {
+      origin: "http://127.0.0.1:4885",
+      pathname: "/local/owned-thread",
+      search: "",
+      hash: "",
+    });
+    const input: BrowserFollowupObservation = {
+      scene: "chat-staged-attachment" as const,
+      theme: "light" as const,
+      origin: "http://127.0.0.1:4885",
+      environmentId: "local",
+      threadId: "owned-thread",
+      projectId: "owned-project",
+      terminalId: "owned-terminal",
+      environmentLabel: "Local",
+      terminalLabel: "Terminal 1",
+      hostedHost: "127.0.0.1:4887",
+    };
+    const parent = document.createElement("div"),
+      modal = document.createElement("div");
+    modal.setAttribute("role", role);
+    parent.append(modal);
+    document.body.append(parent);
+    expect(readBrowserFollowupWitness(input)?.unrelatedModalAbsent).toBe(false);
+    for (const node of [parent, modal])
+      for (const attribute of ["hidden", "inert", "aria-hidden"]) {
+        node.setAttribute(attribute, attribute === "aria-hidden" ? "true" : "");
+        expect(readBrowserFollowupWitness(input)?.unrelatedModalAbsent).toBe(true);
+        node.removeAttribute(attribute);
+        expect(readBrowserFollowupWitness(input)?.unrelatedModalAbsent).toBe(false);
+      }
+    modal.setAttribute("data-closed", "");
+    expect(readBrowserFollowupWitness(input)?.unrelatedModalAbsent).toBe(false);
+    modal.removeAttribute("data-closed");
+    modal.style.cssText = "position:absolute;left:-100px;top:-100px;opacity:0";
+    parent.style.overflow = "hidden";
+    expect(readBrowserFollowupWitness(input)?.unrelatedModalAbsent).toBe(false);
+  },
+);
