@@ -48,7 +48,7 @@ describe("AppRoot", () => {
     expect(isValidElement(children[8]) && children[8].type).toBe(PreviewNewWindowRouter);
   });
 
-  it("omits preview automation hosts when the runtime does not support automation", () => {
+  it("mounts preview automation hosts for a preview bridge without full automation", () => {
     const bridge = {} as DesktopPreviewBridge;
     registerPreviewRuntimeCapabilities(bridge, {
       picker: false,
@@ -63,11 +63,20 @@ describe("AppRoot", () => {
       (root as ReactElement<{ readonly children: ReactNode }>).props.children,
     );
 
+    expect(children).toHaveLength(9);
+    expect(isValidElement(children[7]) && children[7].type).toBe(PreviewAutomationHosts);
+  });
+
+  it("omits preview automation hosts without a preview bridge", () => {
+    h.previewBridge = null;
+
+    const root = AppRoot({ router: {} as AppRouter });
+    const children = Children.toArray(
+      (root as ReactElement<{ readonly children: ReactNode }>).props.children,
+    );
+
     expect(children).toHaveLength(8);
     expect(isValidElement(children[0]) && children[0].type).toBe(ConnectionDatabaseRecoveryDialog);
-    expect(isValidElement(children[1]) && children[1].type).toBe(ShareExposureReconciler);
-    expect(isValidElement(children[2]) && children[2].type).toBe(ThreadLifecycleReconciler);
-    expect(isValidElement(children[3]) && children[3].type).toBe(ProjectDataRecoveryCoordinator);
     expect(isValidElement(children[4]) && children[4].type).toBe(RouterProvider);
     expect(isValidElement(children[7]) && children[7].type).toBe(PreviewNewWindowRouter);
   });

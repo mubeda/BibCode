@@ -207,7 +207,7 @@ describe("tauriPreviewBridge", () => {
 
     emit("preview://state", statePayload("logical-a", 1, "https://b.test/"));
 
-    expect(received).toEqual([
+    expect(received.filter(([, state]) => state.navStatus.kind !== "Idle")).toEqual([
       [
         "logical-b",
         { ...statePayload("logical-a", 1, "https://b.test/").state, tabId: "logical-b" },
@@ -591,6 +591,73 @@ describe("tauriPreviewBridge", () => {
       loading: false,
     });
     await expect(bridge.automation.click("tab_1", {} as never)).rejects.toThrow(/not supported/);
+  });
+
+  it("reports a navigated tab as loading the new URL before the native event arrives", async () => {
+    const { bridge, emit, invoke } = makeBridge();
+    bridge.onStateChange(() => {});
+    await bridge.createTab("tab_1");
+    emit("preview://state", statePayload("tab_1", 1, "http://old.test/"));
+
+    let finishNavigate: () => void = () => {};
+    invoke.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (finishNavigate = () => resolve())),
+    );
+    const navigation = bridge.navigate("tab_1", "http://new.test/");
+
+    await expect(bridge.automation.status("tab_1")).resolves.toMatchObject({
+      url: "http://new.test/",
+      loading: true,
+    });
+    finishNavigate();
+    await navigation;
+  });
+
+  it("does not report a same-document fragment navigation as loading", async () => {
+    const { bridge, emit } = makeBridge();
+    bridge.onStateChange(() => {});
+    await bridge.createTab("tab_1");
+    emit("preview://state", statePayload("tab_1", 1, "http://old.test/page"));
+
+    await bridge.navigate("tab_1", "http://old.test/page#section");
+
+    await expect(bridge.automation.status("tab_1")).resolves.toMatchObject({
+      url: "http://old.test/page",
+      loading: false,
+    });
+  });
+
+  it("reports a freshly created blank tab as available before any page loads", async () => {
+    const { bridge } = makeBridge();
+    const states: Array<[string, DesktopPreviewTabState]> = [];
+    bridge.onStateChange((tabId, state) => states.push([tabId, state]));
+
+    await bridge.createTab("tab_1");
+    await bridge.createTab("tab_2");
+
+    await expect(bridge.automation.status("tab_2")).resolves.toMatchObject({
+      available: true,
+      url: null,
+      loading: false,
+    });
+    expect(states.map(([tabId, state]) => [tabId, state.navStatus.kind])).toEqual([
+      ["tab_1", "Idle"],
+      ["tab_2", "Idle"],
+    ]);
+  });
+
+  it("restores the previous state when native navigation fails", async () => {
+    const { bridge, emit, invoke } = makeBridge();
+    bridge.onStateChange(() => {});
+    await bridge.createTab("tab_1");
+    emit("preview://state", statePayload("tab_1", 1, "http://old.test/"));
+    invoke.mockRejectedValueOnce(new Error("navigate failed"));
+
+    await expect(bridge.navigate("tab_1", "http://new.test/")).rejects.toThrow("navigate failed");
+    await expect(bridge.automation.status("tab_1")).resolves.toMatchObject({
+      url: "http://old.test/",
+      loading: false,
+    });
   });
 
   it("rejects every unsupported Promise surface with the stable Tauri capability error", async () => {

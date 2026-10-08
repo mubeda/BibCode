@@ -916,6 +916,7 @@ export function TerminalViewport({
     const outcome = openLink({
       url,
       threadRef: threadRef.threadId.length > 0 ? threadRef : null,
+      environmentId,
       invert,
       openPreview,
       onError: (cause) => {

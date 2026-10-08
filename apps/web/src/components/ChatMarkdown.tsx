@@ -1368,6 +1368,7 @@ function ChatMarkdown({
             const outcome = openLink({
               url: href,
               threadRef: threadRef ?? null,
+              environmentId,
               invert,
               openPreview,
               onError: (cause) =>
@@ -1414,6 +1415,7 @@ function ChatMarkdown({
                       const outcome = openLink({
                         url: href,
                         threadRef: threadRef ?? null,
+                        environmentId,
                         invert: wantApp ? setting === "system" : setting === "app",
                         openPreview,
                         onError: (cause) =>

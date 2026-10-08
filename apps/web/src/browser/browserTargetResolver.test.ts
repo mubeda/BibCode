@@ -50,7 +50,7 @@ describe("browser target resolver", () => {
   });
 
   it("refuses public hosts until the authenticated gateway exists", async () => {
-    readPreparedConnection.mockReturnValue(bearer("https://relay.example.com"));
+    readPreparedConnection.mockReturnValue(bearer("https://203.0.113.10"));
     const { resolveBrowserNavigationTarget, UNREACHABLE_MESSAGES } =
       await import("./browserTargetResolver");
     expect(() =>
@@ -165,8 +165,8 @@ describe("browser target resolver", () => {
     });
   });
 
-  it("refuses bearer environments on public hosts", async () => {
-    readPreparedConnection.mockReturnValue(bearer("https://dev.example.com"));
+  it("refuses bearer environments on public IP addresses", async () => {
+    readPreparedConnection.mockReturnValue(bearer("https://203.0.113.10"));
     const { resolvePreviewTarget } = await import("./browserTargetResolver");
     expect(resolvePreviewTarget(env, "http://localhost:5173/")).toMatchObject({
       kind: "unreachable",
@@ -269,6 +269,10 @@ describe("browser target resolver", () => {
     "http://169.254.2.3:4321",
     "http://[fd00::1]:4321",
     "http://[fe80::1]:4321",
+    "http://devbox:4321",
+    "http://build.lan:4321",
+    "http://box.home.arpa:4321",
+    "http://1.example.test:4321",
   ])("accepts private environment host %s", async (httpBaseUrl) => {
     readPreparedConnection.mockReturnValue(bearer(httpBaseUrl));
     const { resolveBrowserNavigationTarget } = await import("./browserTargetResolver");
@@ -290,7 +294,7 @@ describe("browser target resolver", () => {
     "http://100.128.0.1:4321",
     "http://[2001:db8::1]:4321",
     "http://1.2.3:4321",
-    "http://1.example.test:4321",
+    "http://8.8.8.8:4321",
   ])("rejects non-private environment host %s", async (httpBaseUrl) => {
     readPreparedConnection.mockReturnValue(bearer(httpBaseUrl));
     const { resolveBrowserNavigationTarget, UNREACHABLE_MESSAGES } =
@@ -307,5 +311,88 @@ describe("browser target resolver", () => {
       kind: "reachable",
       url: "https://10.0.0.2/path",
     });
+  });
+
+  it("rewrites loopback onto a non-IP environment host name", async () => {
+    readPreparedConnection.mockReturnValue(bearer("http://devbox:3773"));
+    const { resolvePreviewTarget } = await import("./browserTargetResolver");
+    expect(resolvePreviewTarget(env, "http://localhost:5173")).toEqual({
+      kind: "reachable",
+      url: "http://devbox:5173/",
+    });
+  });
+
+  const loopbackForms = [
+    ["http://[::]:8000/x", "http://localhost:8000/x"],
+    ["http://0.0.0.0:8000/x", "http://localhost:8000/x"],
+    ["http://[::1]:8000/x", "http://[::1]:8000/x"],
+    ["http://127.0.0.2:8000/x", "http://127.0.0.2:8000/x"],
+    ["http://127.1.2.3:8000/x", "http://127.1.2.3:8000/x"],
+    ["http://app.localhost:8000/x", "http://app.localhost:8000/x"],
+    ["http://LOCALHOST:8000/x", "http://localhost:8000/x"],
+  ] as const;
+
+  it.each(loopbackForms)(
+    "keeps %s on this machine for a same-host environment",
+    async (raw, want) => {
+      readPreparedConnection.mockReturnValue(
+        conn({ _tag: "PrimaryConnectionTarget" }, "http://127.0.0.1:3773"),
+      );
+      const { resolvePreviewTarget } = await import("./browserTargetResolver");
+      expect(resolvePreviewTarget(env, raw)).toEqual({ kind: "reachable", url: want });
+    },
+  );
+
+  it.each(loopbackForms)("rewrites %s onto a LAN environment host", async (raw) => {
+    readPreparedConnection.mockReturnValue(bearer("http://192.168.1.25:3773"));
+    const { resolvePreviewTarget } = await import("./browserTargetResolver");
+    expect(resolvePreviewTarget(env, raw)).toEqual({
+      kind: "reachable",
+      url: "http://192.168.1.25:8000/x",
+    });
+  });
+
+  it.each(loopbackForms)("refuses %s over SSH", async (raw) => {
+    readPreparedConnection.mockReturnValue(
+      conn({ _tag: "SshConnectionTarget", connectionId: "ssh:1" }, "http://127.0.0.1:45123/"),
+    );
+    const { resolvePreviewTarget } = await import("./browserTargetResolver");
+    expect(resolvePreviewTarget(env, raw)).toMatchObject({ kind: "unreachable", reason: "ssh" });
+  });
+
+  it("treats a malformed connection base URL as disconnected instead of throwing", async () => {
+    readPreparedConnection.mockReturnValue(bearer("not a url"));
+    const { resolvePreviewTarget, resolveBrowserNavigationTarget } =
+      await import("./browserTargetResolver");
+    expect(resolvePreviewTarget(env, "http://localhost:5173/")).toMatchObject({
+      kind: "unreachable",
+      reason: "disconnected",
+    });
+    expect(() =>
+      resolveBrowserNavigationTarget(env, { kind: "environment-port", port: 5173 }),
+    ).toThrow("isn't connected");
+  });
+
+  it("resolves agent url targets through the environment topology", async () => {
+    const { resolveBrowserNavigationTarget } = await import("./browserTargetResolver");
+    readPreparedConnection.mockReturnValue(
+      conn({ _tag: "SshConnectionTarget", connectionId: "ssh:1" }, "http://127.0.0.1:45123/"),
+    );
+    expect(() =>
+      resolveBrowserNavigationTarget(env, { kind: "url", url: "http://localhost:3000" }),
+    ).toThrow(/SSH/);
+
+    readPreparedConnection.mockReturnValue(bearer("http://192.168.1.25:3773"));
+    expect(
+      resolveBrowserNavigationTarget(env, { kind: "url", url: "http://localhost:3000/app" }),
+    ).toEqual({
+      requestedUrl: "http://localhost:3000/app",
+      resolvedUrl: "http://192.168.1.25:3000/app",
+      resolutionKind: "direct-private-network",
+      environmentId: "environment-1",
+    });
+    expect(
+      resolveBrowserNavigationTarget(env, { kind: "url", url: "https://example.test/docs" }),
+    ).toMatchObject({ resolvedUrl: "https://example.test/docs", resolutionKind: "direct" });
   });
 });

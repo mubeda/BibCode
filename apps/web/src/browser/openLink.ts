@@ -1,4 +1,4 @@
-import type { ScopedThreadRef } from "@bibcode/contracts";
+import type { EnvironmentId, ScopedThreadRef } from "@bibcode/contracts";
 import { isAtomCommandInterrupted } from "@bibcode/client-runtime/state/runtime";
 
 import { getClientSettings } from "~/hooks/useSettings";
@@ -25,13 +25,17 @@ export function chooseLinkDestination(input: {
 export function openLink(input: {
   readonly url: string;
   readonly threadRef: ScopedThreadRef | null;
+  /** Resolves server-loopback URLs when there is no thread (e.g. a thread-less terminal). */
+  readonly environmentId?: EnvironmentId | null;
   readonly invert: boolean;
   readonly openPreview: OpenPreviewMutation<unknown>;
+  /** Called for internal-browser failures only; a system-browser failure shows its own notice. */
   readonly onError?: (cause: unknown) => void;
 }): OpenLinkOutcome {
   let url = input.url;
-  if (input.threadRef) {
-    const resolution = resolvePreviewTarget(input.threadRef.environmentId, url);
+  const environmentId = input.threadRef?.environmentId ?? input.environmentId ?? null;
+  if (environmentId !== null) {
+    const resolution = resolvePreviewTarget(environmentId, url);
     if (resolution.kind === "unreachable") {
       showPreviewUnreachableNotice(resolution);
       return "unreachable";
@@ -47,10 +51,7 @@ export function openLink(input: {
     const api = readLocalApi();
     if (!api) return "unavailable";
     // Called synchronously so browser-mode window.open keeps the click's activation.
-    api.shell.openExternal(url).catch((cause: unknown) => {
-      showLinkOpenFailedNotice(url);
-      input.onError?.(cause);
-    });
+    api.shell.openExternal(url).catch(() => showLinkOpenFailedNotice(url));
     return "system";
   }
   openUrlInPreview({ threadRef: input.threadRef, url, openPreview: input.openPreview })

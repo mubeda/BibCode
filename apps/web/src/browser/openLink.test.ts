@@ -99,15 +99,48 @@ describe("openLink", () => {
     );
   });
 
-  it("shows a copyable notice when the system browser fails", async () => {
+  it("shows a copyable notice when the system browser fails, without reporting it twice", async () => {
     resolvePreviewTarget.mockReturnValue({ kind: "reachable", url: "https://example.com/" });
     setting = "system";
     openExternal.mockRejectedValue(new Error("no handler"));
+    const onError = vi.fn();
     const { openLink } = await import("./openLink");
-    openLink({ url: "https://example.com/", threadRef, invert: false, openPreview });
+    openLink({ url: "https://example.com/", threadRef, invert: false, openPreview, onError });
     await vi.waitFor(() =>
       expect(showLinkOpenFailedNotice).toHaveBeenCalledWith("https://example.com/"),
     );
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("resolves through the environment when there is no thread", async () => {
+    const unreachable = { kind: "unreachable", reason: "ssh", environmentLabel: "Box" };
+    resolvePreviewTarget.mockReturnValue(unreachable);
+    const { openLink } = await import("./openLink");
+    const environmentId = EnvironmentId.make("env-2");
+    expect(
+      openLink({
+        url: "http://localhost:5173/",
+        threadRef: null,
+        environmentId,
+        invert: false,
+        openPreview,
+      }),
+    ).toBe("unreachable");
+    expect(resolvePreviewTarget).toHaveBeenCalledWith(environmentId, "http://localhost:5173/");
+    expect(showPreviewUnreachableNotice).toHaveBeenCalledWith(unreachable);
+    expect(openExternal).not.toHaveBeenCalled();
+
+    resolvePreviewTarget.mockReturnValue({ kind: "reachable", url: "http://10.0.0.2:5173/" });
+    expect(
+      openLink({
+        url: "http://localhost:5173/",
+        threadRef: null,
+        environmentId,
+        invert: false,
+        openPreview,
+      }),
+    ).toBe("system");
+    expect(openExternal).toHaveBeenCalledWith("http://10.0.0.2:5173/");
   });
 
   it("reports async preview failures through onError", async () => {

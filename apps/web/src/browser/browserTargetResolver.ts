@@ -3,7 +3,7 @@ import type {
   EnvironmentId,
   PreviewUrlResolution,
 } from "@bibcode/contracts";
-import { isLoopbackHost, normalizePreviewUrl } from "@bibcode/shared/preview";
+import { normalizePreviewUrl } from "@bibcode/shared/preview";
 
 import { readPreparedConnection } from "~/state/session";
 
@@ -27,9 +27,42 @@ const isPrivateNetworkHost = (host: string): boolean => {
   );
 };
 
-const isLocalLoopbackHost = (host: string): boolean => {
-  const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+const unbracket = (host: string) => host.toLowerCase().replace(/^\[|\]$/g, "");
+
+/** Any address that names the machine it is resolved on, including wildcard binds. */
+const isLoopbackHost = (hostname: string): boolean => {
+  const host = unbracket(hostname);
+  return (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    /^127\.\d+\.\d+\.\d+$/.test(host) ||
+    host === "0.0.0.0" ||
+    host === "::1" ||
+    host === "::"
+  );
+};
+
+const isWildcardHost = (hostname: string) => {
+  const host = unbracket(hostname);
+  return host === "0.0.0.0" || host === "::";
+};
+
+const isIpLiteral = (host: string) => host.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(host);
+
+const parseUrl = (raw: string): URL | null => {
+  try {
+    return new URL(raw);
+  } catch {
+    return null;
+  }
+};
+
+const parsePreviewUrl = (raw: string): URL | null => {
+  try {
+    return new URL(normalizePreviewUrl(raw));
+  } catch {
+    return null;
+  }
 };
 
 export type PreviewUnreachableReason = "disconnected" | "ssh" | "relay" | "public-host";
@@ -69,15 +102,19 @@ function classifyEnvironmentReach(environmentId: EnvironmentId): EnvironmentReac
     return { kind: "unreachable", reason: "disconnected", label: "This environment" };
   }
   const label = connection.label;
+  const baseUrl = parseUrl(connection.httpBaseUrl);
+  if (!baseUrl) return { kind: "unreachable", reason: "disconnected", label };
   if (connection.target._tag === "SshConnectionTarget") {
     return { kind: "unreachable", reason: "ssh", label };
   }
   if (connection.target._tag === "RelayConnectionTarget") {
     return { kind: "unreachable", reason: "relay", label };
   }
-  const host = new URL(connection.httpBaseUrl).hostname.replace(/^\[|\]$/g, "");
-  if (isLocalLoopbackHost(host)) return { kind: "same-host" };
-  if (isPrivateNetworkHost(host)) return { kind: "host", host };
+  const host = unbracket(baseUrl.hostname);
+  if (isLoopbackHost(host)) return { kind: "same-host" };
+  // A host name (devbox, *.lan, *.internal) is the user's own name for the
+  // machine; only a public IP literal is known to be off the private network.
+  if (!isIpLiteral(host) || isPrivateNetworkHost(host)) return { kind: "host", host };
   return { kind: "unreachable", reason: "public-host", label };
 }
 
@@ -88,10 +125,21 @@ export function resolveBrowserNavigationTarget(
   target: BrowserNavigationTarget,
 ): PreviewUrlResolution {
   if (target.kind === "url") {
+    const resolution = resolvePreviewTarget(environmentId, target.url);
+    if (resolution.kind === "unreachable") {
+      throw new Error(UNREACHABLE_MESSAGES[resolution.reason](resolution.environmentLabel));
+    }
+    const requestedHost = parsePreviewUrl(target.url)?.hostname;
+    const resolvedHost = parseUrl(resolution.url)?.hostname;
+    const rewritten =
+      requestedHost !== undefined &&
+      resolvedHost !== undefined &&
+      isLoopbackHost(requestedHost) &&
+      !isLoopbackHost(resolvedHost);
     return {
       requestedUrl: target.url,
-      resolvedUrl: target.url,
-      resolutionKind: "direct",
+      resolvedUrl: resolution.url,
+      resolutionKind: rewritten ? "direct-private-network" : "direct",
       environmentId,
     };
   }
@@ -118,17 +166,13 @@ export function resolvePreviewTarget(
   environmentId: EnvironmentId,
   rawUrl: string,
 ): PreviewTargetResolution {
-  let parsed: URL;
-  try {
-    parsed = new URL(normalizePreviewUrl(rawUrl));
-  } catch {
-    // Malformed input keeps the normal navigation error path.
-    return { kind: "reachable", url: rawUrl };
-  }
+  const parsed = parsePreviewUrl(rawUrl);
+  // Malformed input keeps the normal navigation error path.
+  if (!parsed) return { kind: "reachable", url: rawUrl };
   if (!isLoopbackHost(parsed.hostname)) return { kind: "reachable", url: parsed.toString() };
   // The server's own origin (e.g. an SSH-forwarded asset URL) is already reachable.
   const serverUrl = readPreparedConnection(environmentId)?.httpBaseUrl;
-  if (serverUrl !== undefined && new URL(serverUrl).origin === parsed.origin) {
+  if (serverUrl !== undefined && parseUrl(serverUrl)?.origin === parsed.origin) {
     return { kind: "reachable", url: parsed.toString() };
   }
   const reach = classifyEnvironmentReach(environmentId);
@@ -137,7 +181,7 @@ export function resolvePreviewTarget(
   }
   if (reach.kind === "host") {
     parsed.hostname = formatHost(reach.host);
-  } else if (parsed.hostname === "0.0.0.0") {
+  } else if (isWildcardHost(parsed.hostname)) {
     // A wildcard bind is not a navigable address; loopback is.
     parsed.hostname = "localhost";
   }

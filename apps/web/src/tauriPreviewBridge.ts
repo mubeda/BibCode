@@ -50,6 +50,22 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
     for (const listener of stateListeners) listener(tabId, state);
   };
 
+  // The native host emits no event for its initial about:blank page, so a new
+  // blank tab would otherwise never report itself as present.
+  const publishIdleIfUnknown = (tabId: string) => {
+    if (stateByTab.has(tabId)) return;
+    publishState(tabId, {
+      tabId,
+      webContentsId: null,
+      navStatus: { kind: "Idle" },
+      canGoBack: false,
+      canGoForward: false,
+      zoomFactor: zoomByTab.get(tabId) ?? 1,
+      controller: "human",
+      updatedAt: new Date().toISOString(),
+    });
+  };
+
   const startStateEvents = () => {
     if (stopStateEvents) return;
     stopStateEvents = listen<PreviewStateEventPayload>("preview://state", (payload) => {
@@ -114,6 +130,7 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
               visible: presentation.visible,
             });
           }
+          publishIdleIfUnknown(tabId);
           return;
         }
         try {
@@ -123,6 +140,7 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
           if (activeTabId === tabId) activeTabId = null;
           throw error;
         }
+        publishIdleIfUnknown(tabId);
       }),
     closeTab: (tabId) =>
       enqueueTabOperation(tabId, async () => {
@@ -152,7 +170,25 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
         visible,
       });
     },
-    navigate: (tabId, url) => invokeForTab("desktop_preview_navigate", tabId, { url }),
+    navigate: async (tabId, url) => {
+      // Until the native load event arrives, status would report the old page as
+      // loaded and readiness waits would return early; report the target as loading.
+      // A fragment change on the same document fires no page-load event, so it stays as is.
+      const previous = stateByTab.get(tabId);
+      const currentUrl = previous?.navStatus.kind === "Idle" ? null : previous?.navStatus.url;
+      const sameDocument = url.includes("#") && currentUrl?.split("#")[0] === url.split("#")[0];
+      const loading: DesktopPreviewTabState | undefined =
+        previous && !sameDocument
+          ? { ...previous, navStatus: { kind: "Loading", url, title: "" } }
+          : undefined;
+      if (loading) publishState(tabId, loading);
+      try {
+        await invokeForTab("desktop_preview_navigate", tabId, { url });
+      } catch (error) {
+        if (previous && stateByTab.get(tabId) === loading) publishState(tabId, previous);
+        throw error;
+      }
+    },
     goBack: (tabId) => invokeForTab("desktop_preview_go_back", tabId),
     goForward: (tabId) => invokeForTab("desktop_preview_go_forward", tabId),
     refresh: (tabId) => invokeForTab("desktop_preview_refresh", tabId),
