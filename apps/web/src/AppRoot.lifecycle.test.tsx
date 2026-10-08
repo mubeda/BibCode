@@ -534,4 +534,59 @@ describe("AppRoot thread lifecycle reconciliation", () => {
       expect.objectContaining({ kind: "chat", threadId: PANEL_ID }),
     );
   });
+  it("drops a persisted tab whose chat panel was closed while this client was away", async () => {
+    const PANEL_ID = ThreadId.make("panel-closed-elsewhere");
+    const RESERVED_ID = ThreadId.make("panel-being-reopened");
+    const shellThread = (id: ThreadId, extra: Record<string, unknown> = {}) =>
+      ({
+        id,
+        archivedAt: null,
+        title: "Host",
+        ...extra,
+      }) as OrchestrationShellSnapshot["threads"][number];
+    const archivedPanel = (id: ThreadId) =>
+      shellThread(id, {
+        kind: "panel",
+        hostThreadId: HOST_ID,
+        title: "Panel — Codex",
+        archivedAt: "2026-10-08T00:00:00.000Z",
+      });
+    // The layout persisted before another client closed (archived) the panel.
+    useCenterPanelStore.getState().openChatPanel(HOST_REF, PANEL_ID, "Codex");
+    // A reopen in flight keeps its reserved tab until the panel is live again.
+    useCenterPanelStore.getState().reserveChatPanel(HOST_REF, RESERVED_ID, "Codex");
+    publishShellState(
+      ENVIRONMENT_ID,
+      shellState("live", {
+        ...snapshot(70, []),
+        threads: [shellThread(HOST_ID, { kind: "workspace" })],
+      }),
+    );
+    h.archivedStates.set(ENVIRONMENT_ID, {
+      snapshots: [
+        {
+          environmentId: ENVIRONMENT_ID,
+          snapshot: {
+            ...snapshot(70, []),
+            threads: [archivedPanel(PANEL_ID), archivedPanel(RESERVED_ID)],
+          },
+        },
+      ],
+      error: null,
+      isLoading: false,
+    });
+
+    await act(async () => root.render(<AppRoot router={{} as AppRouter} />));
+
+    const surfaces = selectThreadCenterPanelState(
+      useCenterPanelStore.getState().byThreadKey,
+      HOST_REF,
+    ).surfaces;
+    expect(surfaces).not.toContainEqual(
+      expect.objectContaining({ kind: "chat", threadId: PANEL_ID }),
+    );
+    expect(surfaces).toContainEqual(
+      expect.objectContaining({ kind: "chat", threadId: RESERVED_ID }),
+    );
+  });
 });

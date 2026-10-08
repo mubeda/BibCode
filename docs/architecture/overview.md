@@ -976,7 +976,9 @@ by an in-flight local open and chat panels still pending locally. Adoption only
 on first sight keeps a local close from being undone by later status updates.
 Closing a chat panel archives its thread; a tracked panel thread that leaves the
 live list (archived or deleted) loses its tab on every client unless it is
-still pending locally, and is adopted again if it is unarchived.
+still pending locally, and is adopted again if it is unarchived. Lifecycle
+reconciliation does not retain archived panel threads, so a tab persisted by a
+client that was away when the panel closed is dropped too.
 The reconciler reads the raw `subscribeTerminalMetadata` stream as whole
 delivered batches (an atom alone keeps only a batch's last event). Metadata
 `remove` events carry a `reason`: only `closed` (an explicit close) drops the
