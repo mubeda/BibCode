@@ -713,6 +713,8 @@ interface TerminalViewportProps {
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
   command?: TerminalLaunchCommand;
+  /** Marks the session as a host thread's center panel so other clients adopt it. */
+  centerPanel?: boolean;
   visible: boolean;
   onSessionExited: () => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
@@ -752,6 +754,7 @@ export function TerminalViewport({
   worktreePath,
   runtimeEnv,
   command,
+  centerPanel = false,
   visible,
   onSessionExited,
   onAddTerminalContext,
@@ -931,6 +934,7 @@ export function TerminalViewport({
       ...(worktreePath !== undefined ? { worktreePath } : {}),
       ...(spawnEnv ? { env: spawnEnv } : {}),
       ...(command ? { command } : {}),
+      ...(centerPanel ? { centerPanel } : {}),
     },
     attach: shouldRender && canAttachTerminal && readyRenderer !== null,
   });
@@ -2731,6 +2735,7 @@ export default function ThreadTerminalPanel({
                           {...(terminalCommandsById?.get(terminalId)
                             ? { command: terminalCommandsById.get(terminalId)! }
                             : {})}
+                          centerPanel={owner === "center-panel"}
                           visible
                           onSessionExited={() => onCloseTerminal(terminalId)}
                           onAddTerminalContext={onAddTerminalContext}
@@ -2764,6 +2769,7 @@ export default function ThreadTerminalPanel({
                   {...(terminalCommandsById?.get(resolvedActiveTerminalId)
                     ? { command: terminalCommandsById.get(resolvedActiveTerminalId)! }
                     : {})}
+                  centerPanel={owner === "center-panel"}
                   visible
                   onSessionExited={() => onCloseTerminal(resolvedActiveTerminalId)}
                   onAddTerminalContext={onAddTerminalContext}

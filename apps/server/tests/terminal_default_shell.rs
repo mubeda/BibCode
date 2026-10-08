@@ -127,6 +127,7 @@ async fn attaching_a_missing_terminal_opens_it_without_deadlocking() {
     let attachment = tokio::time::timeout(
         Duration::from_secs(3),
         manager.attach(TerminalAttachInput {
+            center_panel: false,
             size_claim: None,
             thread_id: "thread-attach".to_string(),
             terminal_id: "terminal-attach".to_string(),
@@ -160,6 +161,7 @@ async fn concurrent_open_and_attach_share_one_native_process() {
         30,
     );
     let input = TerminalAttachInput {
+        center_panel: false,
         size_claim: None,
         thread_id: "thread-concurrent".to_string(),
         terminal_id: "terminal-concurrent".to_string(),
@@ -213,7 +215,7 @@ async fn closing_a_terminal_does_not_resurrect_its_metadata() {
         loop {
             if matches!(
                 metadata.recv().await,
-                Some(TerminalMetadataEvent::Remove { ref thread_id, ref terminal_id })
+                Some(TerminalMetadataEvent::Remove { ref thread_id, ref terminal_id, .. })
                     if thread_id == "thread-close" && terminal_id == "terminal-close"
             ) {
                 break;

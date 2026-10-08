@@ -62,6 +62,7 @@ pub struct ProviderTerminalActivityLaunch {
 pub struct TerminalLaunchCommand {
     pub executable: String,
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(
         default,
@@ -69,6 +70,10 @@ pub struct TerminalLaunchCommand {
         skip_serializing_if = "Option::is_none"
     )]
     pub activity: Option<ProviderTerminalActivityLaunch>,
+    /// Provider defaults the client merges into the spawn env; kept so other
+    /// clients that adopt the terminal relaunch it the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
 }
 
 fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -89,6 +94,8 @@ pub struct TerminalOpenInput {
     pub rows: u16,
     pub env: BTreeMap<String, String>,
     pub command: Option<TerminalLaunchCommand>,
+    /// Marks a host thread's center panel; sticky on the session once set.
+    pub center_panel: bool,
 }
 
 impl TerminalOpenInput {
@@ -108,6 +115,7 @@ impl TerminalOpenInput {
             rows,
             env: BTreeMap::new(),
             command: None,
+            center_panel: false,
         }
     }
 }
@@ -124,6 +132,7 @@ pub struct TerminalAttachInput {
     pub restart_if_not_running: bool,
     pub command: Option<TerminalLaunchCommand>,
     pub size_claim: Option<String>,
+    pub center_panel: bool,
 }
 
 impl TerminalAttachInput {
@@ -139,6 +148,7 @@ impl TerminalAttachInput {
             restart_if_not_running: false,
             command: None,
             size_claim: None,
+            center_panel: false,
         }
     }
 }
@@ -194,6 +204,10 @@ pub struct TerminalSummary {
     pub has_running_subprocess: bool,
     pub label: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub center_panel: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<TerminalLaunchCommand>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -364,12 +378,23 @@ pub enum TerminalMetadataEvent {
         terminals: Vec<TerminalSummary>,
     },
     Upsert {
-        terminal: TerminalSummary,
+        terminal: Box<TerminalSummary>,
     },
     Remove {
         #[serde(rename = "threadId")]
         thread_id: String,
         #[serde(rename = "terminalId")]
         terminal_id: String,
+        reason: TerminalRemovalReason,
     },
+}
+
+/// Why a session left the metadata list. Only `Closed` means a client closed
+/// it; clients keep center-panel tabs for the others.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalRemovalReason {
+    Closed,
+    Restarted,
+    Shutdown,
 }

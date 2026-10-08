@@ -43,6 +43,7 @@ vi.mock("@tanstack/react-router", () => ({
 vi.mock("@effect/atom-react", async () => {
   const { useSyncExternalStore } = await import("react");
   return {
+    useAtomSubscribe: () => undefined,
     useAtomValue: (atom: { readonly environmentId: EnvironmentId }) =>
       useSyncExternalStore(
         (listener) => {
@@ -92,6 +93,10 @@ vi.mock("./state/shell", () => ({
   },
   environmentAvailabilityCommands: { retry: {}, adoptStorage: {} },
   useEnvironmentShellSummary: () => ({ statuses: [] }),
+}));
+
+vi.mock("./state/terminal", () => ({
+  terminalEnvironment: { metadataEvents: () => ({}) },
 }));
 
 vi.mock("./state/use-atom-command", () => ({
