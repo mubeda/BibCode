@@ -10,9 +10,11 @@ import {
   type GitManagerOperationEvent,
   type GitManagerOperationRequest,
 } from "@bibcode/contracts";
+import { RegistryContext } from "@effect/atom-react";
 import * as Cause from "effect/Cause";
 import { type AtomRegistry } from "effect/unstable/reactivity";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
+import { useCallback, useContext } from "react";
 
 import { connectionAtomRuntime } from "../connection/runtime";
 
@@ -88,4 +90,19 @@ export function runGitManagerOperation(
     result,
     cancel: () => settle(AsyncResult.failure(Cause.interrupt())),
   };
+}
+
+/** `runGitManagerOperation` bound to the current atom registry. */
+export function useRunGitManagerOperation() {
+  const registry = useContext(RegistryContext);
+  return useCallback(
+    (
+      target: {
+        readonly environmentId: EnvironmentId;
+        readonly input: GitManagerOperationRequest;
+      },
+      onEvent: (event: GitManagerOperationEvent) => void,
+    ) => runGitManagerOperation(registry, target, onEvent),
+    [registry],
+  );
 }

@@ -1,5 +1,7 @@
 import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import type {
+  GitManagerOperationEvent,
+  GitManagerOperationRequest,
   GitManagerRefEntry,
   GitStackedAction,
   ScopedProjectRef,
@@ -12,6 +14,7 @@ import {
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
 import { useAtomValue } from "@effect/atom-react";
+import * as Cause from "effect/Cause";
 import {
   ChevronDownIcon,
   CloudUploadIcon,
@@ -60,7 +63,11 @@ import { getSourceControlPresentation } from "~/sourceControlPresentation";
 import { useSourceControlDraft } from "~/sourceControlDraft";
 import { useServerConfigs } from "~/state/entities";
 import { usePrimaryEnvironmentId } from "~/state/environments";
-import { gitManagerEnvironment } from "~/state/gitManager";
+import {
+  gitManagerEnvironment,
+  type GitManagerOperationHandle,
+  useRunGitManagerOperation,
+} from "~/state/gitManager";
 import { useEnvironmentQuery } from "~/state/query";
 import { primaryServerAvailableEditorsAtom } from "~/state/server";
 import { shellEnvironment } from "~/state/shell";
@@ -80,6 +87,7 @@ import {
 } from "./GitActionsControl.logic";
 import { SourceControlCommits } from "./SourceControlCommits";
 import {
+  BUSY_REASON,
   buildSourceControlMenuItems,
   resolveSourceControlPrimaryAction,
   type SourceControlMenuItem,
@@ -100,7 +108,11 @@ import {
   workingTreeFiles,
 } from "./SourceControlPanel.logic";
 import { SourceControlSection } from "./SourceControlSection";
+import { GIT_MANAGER_STASH_MERGE_DISABLED_REASON } from "./gitManager/gitManagerAvailability";
+import { GitManagerInProgressStrip } from "./gitManager/GitManagerInProgressStrip";
 import { GitManagerMergeDialog } from "./gitManager/merge/GitManagerMergeDialog";
+import { GitManagerOperationBanner } from "./gitManager/toolbar/GitManagerOperationBanner";
+import { SourceControlMergeChanges } from "./SourceControlMergeChanges";
 import {
   GitManagerCreatePullRequestDialog,
   type GitManagerCreatePullRequestDialogProps,
@@ -116,6 +128,7 @@ interface SourceControlPanelProps {
 }
 
 const EMPTY_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
+const MERGE_IN_PROGRESS = { kind: "merge", current: null, total: null } as const;
 const EMPTY_REMOTES: ReadonlyArray<string> = Object.freeze([]);
 
 const RUNNING_ACTIONS = [
@@ -202,6 +215,10 @@ export default function SourceControlPanel({
   // Fetch and merge run as Git Manager operations, outside the vcs action manager.
   const [mergeOperationRunning, setMergeOperationRunning] = useState(false);
   const isBusy = vcsBusy || mergeOperationRunning;
+  const runOperation = useRunGitManagerOperation();
+  const recoveryHandleRef = useRef<GitManagerOperationHandle | null>(null);
+  const [recoveryEvent, setRecoveryEvent] = useState<GitManagerOperationEvent | null>(null);
+  useEffect(() => () => recoveryHandleRef.current?.cancel(), []);
   const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
   // Refs (with remotes) load only while the merge dialog is open.
   const refsQuery = useEnvironmentQuery(
@@ -231,7 +248,56 @@ export default function SourceControlPanel({
   const [ignorePending, setIgnorePending] = useState(false);
 
   const files = useMemo(() => workingTreeFiles(status), [status]);
-  const groups = useMemo(() => groupFilesByArea(files), [files]);
+  const mergeInProgress = status?.operationInProgress === "merge";
+  // A complete scope is required to build any merge recovery request.
+  const recoveryScope =
+    projectRef !== null && gitCwd !== null
+      ? { cwd: gitCwd, projectId: projectRef.projectId }
+      : null;
+  const mergeRecoveryShown = mergeInProgress && recoveryScope !== null;
+  const groups = useMemo(
+    () => groupFilesByArea(files, { separateConflicts: mergeRecoveryShown }),
+    [files, mergeRecoveryShown],
+  );
+  const runRecovery = useCallback(
+    (input: GitManagerOperationRequest) => {
+      if (recoveryHandleRef.current !== null) return;
+      setMergeOperationRunning(true);
+      setRecoveryEvent({ _tag: "started", operation: input._tag });
+      const handle = runOperation({ environmentId, input }, (event) => {
+        setRecoveryEvent(event);
+        // The merge commit now exists; the commit history reloads on this token.
+        if (event._tag === "finished" && input._tag === "continue") {
+          setCommitSignal((value) => value + 1);
+        }
+      });
+      recoveryHandleRef.current = handle;
+      void handle.result.then((result) => {
+        if (recoveryHandleRef.current === handle) recoveryHandleRef.current = null;
+        setMergeOperationRunning(false);
+        if (result._tag !== "Failure") return;
+        if (Cause.hasInterruptsOnly(result.cause)) {
+          setRecoveryEvent(null);
+          return;
+        }
+        const error = Cause.squash(result.cause);
+        setRecoveryEvent({
+          _tag: "failed",
+          operation: input._tag,
+          code: "transport-error",
+          message: error instanceof Error ? error.message : "The Git operation failed.",
+          blocked: null,
+        });
+      });
+    },
+    [environmentId, runOperation],
+  );
+  const cancelRecovery = useCallback(() => {
+    recoveryHandleRef.current?.cancel();
+  }, []);
+  const stripDisabledReason =
+    (mergeAvailable ? null : GIT_MANAGER_STASH_MERGE_DISABLED_REASON) ??
+    (mergeOperationRunning ? "A merge is running." : vcsBusy ? BUSY_REASON : null);
   const selectedFiles = useMemo(
     () => files.filter((file) => selectedFilePaths.has(file.path)),
     [files, selectedFilePaths],
@@ -1032,7 +1098,7 @@ export default function SourceControlPanel({
                 <Undo2Icon className="size-3.5" aria-hidden />
                 Discard All
               </Button>
-              {hasAreas ? (
+              {hasAreas && mergeInProgress ? null : hasAreas ? (
                 <>
                   <Button
                     className="flex-1"
@@ -1161,6 +1227,37 @@ export default function SourceControlPanel({
           ) : null}
         </div>
 
+        {mergeRecoveryShown && recoveryScope !== null ? (
+          <div className="overflow-hidden rounded-md border border-border/60">
+            <GitManagerOperationBanner operation={recoveryEvent} onCancel={cancelRecovery} />
+            <GitManagerInProgressStrip
+              blocked={null}
+              continueDisabledReason={
+                groups.conflicted.length > 0
+                  ? "Resolve and stage every conflicted file first."
+                  : null
+              }
+              continueLabel="Commit merge"
+              disabledReason={stripDisabledReason}
+              operation={MERGE_IN_PROGRESS}
+              onAbort={() => runRecovery({ _tag: "abort", ...recoveryScope, operation: "merge" })}
+              onContinue={() =>
+                runRecovery({ _tag: "continue", ...recoveryScope, operation: "merge" })
+              }
+            />
+            {groups.conflicted.length > 0 ? (
+              <SourceControlMergeChanges
+                disabled={isBusy || !mergeAvailable}
+                files={groups.conflicted}
+                onMarkResolved={(path) => void runStage([path])}
+                onOpenInEditor={onOpenExternalEditor}
+                onResolve={(path, side) =>
+                  runRecovery({ _tag: "resolve-conflict", ...recoveryScope, path, side })
+                }
+              />
+            ) : null}
+          </div>
+        ) : null}
         <ScrollArea className="min-h-0 flex-1 rounded-md border border-border/60">
           {statusQuery.isPending && !status ? (
             <p className="flex items-center gap-2 px-3 py-6 text-xs text-muted-foreground">

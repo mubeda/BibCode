@@ -282,7 +282,7 @@ function resolvePrimaryActionForStatus(
   };
 }
 
-const BUSY_REASON = "Git action in progress.";
+export const BUSY_REASON = "Git action in progress.";
 
 /**
  * Build the primary-action dropdown for the Source Control panel.
