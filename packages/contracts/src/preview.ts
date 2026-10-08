@@ -1,10 +1,11 @@
 /**
  * Preview - Schemas for the in-app browser preview surface.
  *
- * The preview is desktop-only (Chromium <webview>); the server tracks per-thread
- * tab metadata so it survives client reconnects and multi-window. The desktop
- * renderer mediates: it owns the actual <webview> and reports navigation back to
- * the server via these RPCs, the server fans events to all subscribers.
+ * The preview is desktop-only: each tab is a Tauri child webview owned by the
+ * Rust desktop host (not a renderer-owned Chromium <webview>). The server tracks
+ * per-thread tab metadata so it survives client reconnects and multi-window. The
+ * desktop renderer mediates: it drives the host's webviews and reports navigation
+ * back to the server via these RPCs, the server fans events to all subscribers.
  *
  * @module Preview
  */

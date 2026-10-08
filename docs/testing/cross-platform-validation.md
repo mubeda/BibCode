@@ -2589,6 +2589,58 @@ diagnostic frames separate from acceptance evidence.
 Authentication-dependent scenarios must be reported as unavailable when the
 native host has no suitable credentials. Never copy secrets into evidence.
 
+### Integrated browser link routing
+
+Run on the packaged desktop app (macOS 14+, Windows, Linux) with a disposable
+thread whose workspace contains `index.html`, a `.pdf`, and a `.txt`. Repeat
+each row with **Settings → General → Open links in** set to **BiBCode browser**
+and **System browser**; the modifier must always select the other target.
+Record, per row, where the link landed (BiBCode browser tab, system browser,
+editor, or notice).
+
+- Chat `http(s)` link: plain click, Ctrl/Cmd-click, Shift-click, Alt-click, and
+  middle-click. Right-click offers both targets; other link types show no custom
+  menu. An `.html` or `.pdf` file chip opens in the BiBCode browser, and
+  Ctrl/Cmd-click opens the editor. A file outside the workspace shows the
+  notice with **Open in editor**.
+- Terminal URL: plain click does nothing; Ctrl/Cmd-click opens the setting's
+  target; Ctrl/Cmd+Shift-click opens the other.
+- OSC 8: `printf '\e]8;;https://example.com\e\\example.com\e]8;;\e\\\n'` opens
+  on Ctrl/Cmd-click with no menu (text matches destination). With
+  `printf '\e]8;;https://example.com\e\\docs\e]8;;\e\\\n'` a menu shows
+  **Open …** and **Copy link**; plain click does nothing.
+- Terminal paths: `index.html`, an absolute `.html` path, a `file:///…/x.pdf`
+  URL, and a `.txt` path. HTML and PDF open in the BiBCode browser and with
+  Ctrl/Cmd+Shift in the editor; `.txt` opens in the editor. On Windows,
+  `\\server\share\x.html` and `file://server/share/x.html` print "Network paths
+  can't be opened from the terminal." and open nothing.
+- Preview tab `target=_blank` link and `window.open` popup open a new tab in the
+  same thread; `window.open('about:blank')` opens nothing. Git Manager pull
+  request title opens in the system browser, not nowhere.
+- Agent `preview_open` opens a tab and reports success. Snapshot, click, and
+  type are still unsupported and report so.
+- Loopback links (`http://localhost:3000`, `127.0.0.1`, `0.0.0.0`): from a
+  local thread they open locally; from an SSH or BiBCode Connect thread they
+  show "Can't open this address here" for both targets, never this computer's
+  localhost; from a LAN, tailnet, or WSL thread they open on the server's
+  address.
+- A failed system-browser open (no handler registered) shows the link with
+  **Copy link**.
+- Agent-written asset response: `curl -sI '<signed /api/assets URL>'` for an
+  HTML file shows a `content-security-policy` header of
+  `sandbox allow-scripts allow-forms allow-popups`; for SVG, of
+  `default-src 'none'; style-src 'unsafe-inline'; sandbox`; a `.txt` or raster
+  image asset has none. In the BiBCode browser, a script
+  in the HTML reads `localStorage` and `document.cookie` as unavailable.
+- Port attribution: start `python3 -m http.server 8123` in a thread's terminal;
+  the port appears in that thread's and terminal's discovered ports (port card), and not under another thread's terminal.
+
+Pending native checks (not covered by automated tests; mark each unavailable if
+the host cannot run it): Ctrl+Shift-click while a mouse-tracking TUI (Codex or
+opencode) runs must invert the target, not the TUI's selection; an OSC 8 link
+printed by a real CLI (a CLI that emits `https` hyperlinks) behaves as above; Linux/Wayland preview popups open as tabs; Windows
+UNC refusal as above.
+
 ## Non-native compatibility audit
 
 Review shared and platform-gated code for every supported non-native host. Run
