@@ -219,13 +219,6 @@ impl ServerRuntime {
             logging::initialize_owned(&state_paths.server_log)
                 .map_err(|error| ServerError::Logging(error.to_string()))?,
         );
-        // Without the shim, `$BROWSER` in agents and terminals fails to resolve; the server
-        // itself is unaffected, so this never stops startup.
-        if let Err(error) = open_url_shim_target()
-            .and_then(|exe| crate::open_url::write_shims(&state_paths.open_url_shim_dir, &exe))
-        {
-            tracing::warn!(%error, "could not write the open-url shim");
-        }
         if let (Some(static_dir), Some(source)) = (&config.static_dir, config.static_dir_source) {
             tracing::info!(
                 static_dir = %static_dir.display(),
@@ -236,6 +229,14 @@ impl ServerRuntime {
         let store_runtime_guard = StoreRuntimeGuard::acquire(&config.base_dir)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
+        // Only the runtime-guard owner repoints the shim; a second server for this data root
+        // fails the guard first. Without the shim, `$BROWSER` in agents and terminals fails to
+        // resolve; the server itself is unaffected, so this never stops startup.
+        if let Err(error) = open_url_shim_target()
+            .and_then(|exe| crate::open_url::write_shims(&state_paths.open_url_shim_dir, &exe))
+        {
+            tracing::warn!(%error, "could not write the open-url shim");
+        }
         let prepared_store = prepare_store(&config)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;

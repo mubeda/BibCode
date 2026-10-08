@@ -38,12 +38,20 @@ pub fn write_shims(dir: &Path, exe: &Path) -> io::Result<()> {
             })
             .and_then(|exe| write_if_changed(&dir.join(SHIM_NAME), &posix_shim(exe)))
     };
-    // An earlier build wrote a batch shim; never leave it on `PATH`.
-    let removed = match std::fs::remove_file(dir.join(format!("{SHIM_NAME}.cmd"))) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
+    // An earlier build wrote a batch shim everywhere, and the sh shim on Windows too, where
+    // MSYS/Git Bash would find it before the alias. Never leave either on `PATH`.
+    let stale: &[String] = if cfg!(windows) {
+        &[format!("{SHIM_NAME}.cmd"), SHIM_NAME.to_owned()]
+    } else {
+        &[format!("{SHIM_NAME}.cmd")]
     };
-    written.and(removed)
+    stale.iter().fold(written, |result, name| {
+        let removed = match std::fs::remove_file(dir.join(name)) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+        result.and(removed)
+    })
 }
 
 fn posix_shim(exe: &str) -> String {
@@ -92,16 +100,27 @@ fn alias_is_current(source: (u64, SystemTime), alias: (u64, SystemTime)) -> bool
     source == alias
 }
 
+/// [`open_url_invocation`] for this process: its arguments and its executable's name.
+#[must_use]
+pub fn current_open_url_invocation() -> Option<String> {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let exe = std::env::current_exe().ok();
+    open_url_invocation(&args, exe.as_deref().and_then(Path::file_stem))
+}
+
 /// The URL to open when this process is an open-url invocation, checked before anything
 /// else starts: `<exe> open-url <url>` (the POSIX shim), or the Windows alias
-/// `bibcode-open-url[.exe] <url>`. A missing URL yields `""`, which [`run_open_url`]
-/// rejects with exit 2.
+/// `bibcode-open-url[.exe] <url>`, recognized by `argv[0]` or by `exe_stem`, the running
+/// executable's file stem (argv[0] is whatever the caller chose). A missing URL yields `""`,
+/// which [`run_open_url`] rejects with exit 2.
 #[must_use]
-pub fn open_url_invocation(args: &[OsString]) -> Option<String> {
+pub fn open_url_invocation(args: &[OsString], exe_stem: Option<&OsStr>) -> Option<String> {
+    let is_alias = |stem: &OsStr| stem.eq_ignore_ascii_case(SHIM_NAME);
     let invoked_as_alias = args
         .first()
         .and_then(|program| Path::new(program).file_stem())
-        .is_some_and(|stem| stem.eq_ignore_ascii_case(SHIM_NAME));
+        .is_some_and(is_alias)
+        || exe_stem.is_some_and(is_alias);
     let url = if invoked_as_alias {
         args.get(1)
     } else if args.get(1).is_some_and(|command| command == "open-url") {
@@ -393,6 +412,8 @@ mod tests {
         let shims = temp.path().join("shims");
         std::fs::create_dir(&shims).unwrap();
         std::fs::write(shims.join(format!("{SHIM_NAME}.cmd")), "@echo off").unwrap();
+        // The sh shim an earlier build wrote here too; Git Bash would prefer it.
+        std::fs::write(shims.join(SHIM_NAME), "#!/bin/sh\n").unwrap();
 
         write_shims(&shims, &exe).unwrap();
 
@@ -465,7 +486,7 @@ mod tests {
         let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
         let url = "http://h/?a=$(x)&b=\"c\"";
         assert_eq!(
-            open_url_invocation(&args(&["/opt/bibcode/bibcode", "open-url", url])),
+            open_url_invocation(&args(&["/opt/bibcode/bibcode", "open-url", url]), None),
             Some(url.to_owned())
         );
         for alias in [
@@ -474,28 +495,46 @@ mod tests {
             "/state/runtime/open-url/BIBCODE-OPEN-URL.EXE",
         ] {
             assert_eq!(
-                open_url_invocation(&args(&[alias, url])),
+                open_url_invocation(&args(&[alias, url]), None),
                 Some(url.to_owned()),
                 "{alias}"
             );
         }
         // A missing URL still runs open-url, which exits 2 with its usage message.
         assert_eq!(
-            open_url_invocation(&args(&["bibcode-open-url.exe"])),
+            open_url_invocation(&args(&["bibcode-open-url.exe"]), None),
             Some(String::new())
         );
         assert_eq!(
-            open_url_invocation(&args(&["bibcode", "open-url"])),
+            open_url_invocation(&args(&["bibcode", "open-url"]), None),
             Some(String::new())
         );
         // Anything else starts the program normally.
-        assert_eq!(open_url_invocation(&args(&["bibcode", "serve"])), None);
-        assert_eq!(open_url_invocation(&args(&["bibcode-desktop"])), None);
         assert_eq!(
-            open_url_invocation(&args(&["bibcode-desktop", "bibcode://pair?code=x"])),
+            open_url_invocation(&args(&["bibcode", "serve"]), None),
             None
         );
-        assert_eq!(open_url_invocation(&[]), None);
+        assert_eq!(open_url_invocation(&args(&["bibcode-desktop"]), None), None);
+        assert_eq!(
+            open_url_invocation(&args(&["bibcode-desktop", "bibcode://pair?code=x"]), None),
+            None
+        );
+        assert_eq!(open_url_invocation(&[], None), None);
+
+        // The running executable's name counts too: a caller may pass any argv[0].
+        let alias_stem = Some(OsStr::new("Bibcode-Open-Url"));
+        assert_eq!(
+            open_url_invocation(&args(&["browser", url]), alias_stem),
+            Some(url.to_owned())
+        );
+        assert_eq!(
+            open_url_invocation(&args(&["browser"]), alias_stem),
+            Some(String::new())
+        );
+        assert_eq!(
+            open_url_invocation(&args(&["bibcode", "serve"]), Some(OsStr::new("bibcode"))),
+            None
+        );
     }
 
     #[test]

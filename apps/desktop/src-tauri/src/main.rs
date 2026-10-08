@@ -3,8 +3,8 @@
 fn main() {
     // The open-url shim, or the Windows `bibcode-open-url.exe` alias: no Tauri, no window,
     // and the single-instance plugin never sees it.
-    let args = std::env::args_os().collect::<Vec<_>>();
-    if let Some(url) = bibcode_server::open_url::open_url_invocation(&args) {
+    if let Some(url) = bibcode_server::open_url::current_open_url_invocation() {
+        attach_parent_console();
         let code = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -14,3 +14,18 @@ fn main() {
     }
     bibcode_desktop_lib::run();
 }
+
+/// A release build is a GUI-subsystem executable with no console of its own, so open-url's
+/// printed fallback and errors would go nowhere. Borrow the calling shell's console when
+/// there is one; a debug build already has its own, and then this fails harmlessly.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: AttachConsole takes a process id by value and touches no caller memory.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
