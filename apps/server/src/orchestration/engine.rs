@@ -4541,6 +4541,21 @@ async fn plan_command(
             messages,
         } => {
             require_thread(model, command, thread_id)?;
+            // Checked by the engine worker, so a turn admitted after the importer's own check
+            // still keeps CLI history out of the thread's new conversation.
+            if repositories
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(wrap_persistence)?
+                .is_some_and(|thread| {
+                    thread.latest_turn_id.is_some() || thread.latest_user_message_at.is_some()
+                })
+            {
+                return invariant(
+                    command,
+                    "This thread was used before its history import.".to_owned(),
+                );
+            }
             if messages.is_empty() || messages.len() > MAX_IMPORTED_THREAD_MESSAGES {
                 return invariant(
                     command,
@@ -11298,6 +11313,53 @@ mod tests {
             ["activity-other-turn"]
         );
         reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn history_import_refuses_a_thread_that_already_started_a_turn() {
+        const CREATED_AT: &str = "2026-10-08T10:00:00.000Z";
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine");
+        for value in [
+            json!({"type":"project.create","commandId":"project","projectId":"p1","title":"P","workspaceRoot":"C:/repo","createdAt":CREATED_AT}),
+            json!({"type":"thread.create","commandId":"used","threadId":"used","projectId":"p1","title":"Used","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+            json!({"type":"thread.create","commandId":"fresh","threadId":"fresh","projectId":"p1","title":"Fresh","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+            // Another client starts a turn before the import's history lands.
+            json!({"type":"thread.turn.start","commandId":"turn","threadId":"used","message":{"messageId":"m-user","role":"user","text":"hello","attachments":[]},"createdAt":CREATED_AT}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(value).unwrap())
+                .await
+                .expect("setup command");
+        }
+        let import = |thread_id: &str| OrchestrationCommand::ThreadHistoryImport {
+            command_id: format!("{thread_id}:history"),
+            thread_id: thread_id.to_owned(),
+            messages: vec![ImportedThreadMessage {
+                message_id: format!("{thread_id}:000000"),
+                role: "user".to_owned(),
+                text: "from the CLI".to_owned(),
+                created_at: CREATED_AT.to_owned(),
+            }],
+        };
+        assert!(matches!(
+            engine.dispatch(import("used")).await,
+            Err(OrchestrationError::Invariant { .. })
+        ));
+        engine
+            .dispatch(import("fresh"))
+            .await
+            .expect("an unused thread accepts its history");
+        engine.shutdown().await;
     }
 
     #[tokio::test]

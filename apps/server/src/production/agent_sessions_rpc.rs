@@ -525,7 +525,11 @@ async fn dispatch(
         )
         .await
         .map(|_| ())
-        .map_err(|failure| failure.to_string())
+        .map_err(|failure| match failure {
+            // Invariant details explain themselves; the wrapper names internal command types.
+            crate::orchestration::OrchestrationError::Invariant { detail, .. } => detail,
+            failure => failure.to_string(),
+        })
 }
 
 /// The row a suspended session of this provider leaves, with the CLI session as its cursor,

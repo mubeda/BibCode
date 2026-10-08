@@ -70,7 +70,9 @@ re-reads and re-validates the transcript, then:
 3. dispatches the server-internal `thread.history.import` with command ID
    `<threadId>:history`, which emits one `thread.message-sent` per message
    (`turnId: null`, `streaming: false`, no attachments) for at most 200
-   messages: the first user message and the latest ones.
+   messages: the first user message and the latest ones. The engine rejects it
+   once the thread has a turn or a user message, so a turn another client
+   started during the import keeps CLI history out of its conversation.
 
 Both commands use a digest of the step and thread ID, so a retry after a
 partial failure replays the committed steps; an accepted history command marks
