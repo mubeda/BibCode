@@ -467,7 +467,10 @@ Background failures preserve loaded commits and offer a Retry action.
 
 Every Git Manager mutation revalidates the selected checkout after admission;
 operations with server-authored blocked conditions recompute those reasons
-there as well. Mutations then reuse
+there as well. Branch and sync operations take the checkout's status-mutation
+guard before building that refs snapshot and hold it through execution, so
+`vcs.*` writes, which take the guard but not the project lock, cannot change the
+repository between validation and execution. Mutations then reuse
 `WorktreeCatalogService`'s existing project lock followed by its optional
 physical-repository lock. The non-waiting acquisition returns the structured
 `operation-in-flight` blocked reason when either lock is occupied; there is no

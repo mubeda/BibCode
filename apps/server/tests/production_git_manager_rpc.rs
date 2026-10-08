@@ -41,6 +41,7 @@ struct Fixture {
     repository_path: PathBuf,
     remote_path: PathBuf,
     services: ConfiguredGitManagerRpcServices,
+    broadcaster: StatusBroadcaster,
 }
 
 #[test]
@@ -171,6 +172,7 @@ impl Fixture {
             repository_path,
             remote_path,
             services,
+            broadcaster,
         })
     }
 
@@ -2463,6 +2465,35 @@ async fn conflicting_merge_reports_conflicts_and_leaves_the_operation_in_progres
         String::from_utf8(git_output(&cwd, &["rev-parse", "--git-path", "MERGE_HEAD"]).stdout)
             .expect("UTF-8 merge path");
     assert!(cwd.join(merge_head.trim()).exists() || Path::new(merge_head.trim()).exists());
+}
+
+#[tokio::test]
+async fn branch_operations_validate_after_taking_the_worktree_mutation_guard() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    git(&cwd, &["switch", "-q", "-c", "feature"]);
+    fs::write(cwd.join("feature.txt"), "feature\n").expect("feature file");
+    git(&cwd, &["add", "feature.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "feature"]);
+    git(&cwd, &["switch", "-q", "main"]);
+    let main_tip = git_stdout(&cwd, &["rev-parse", "main"]);
+
+    let guard = fixture.broadcaster.begin_mutation(&cwd).await;
+    let receiver = fixture.operation(
+        "490",
+        json!({ "_tag": "merge", "cwd": cwd, "projectId": "project-1",
+                "source": "feature", "noVerify": false }),
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // A vcs.* writer holding the guard dirties the tree before the merge may validate.
+    fs::write(cwd.join("tracked.txt"), "dirty while waiting\n").expect("dirty tracked file");
+    guard.finish().await;
+
+    let events = collect_events(receiver).await;
+    let last = events.last().expect("terminal event");
+    assert_eq!(last["_tag"], "failed", "{events:?}");
+    assert_eq!(last["code"], "dirty-working-tree", "{events:?}");
+    assert_eq!(git_stdout(&cwd, &["rev-parse", "main"]), main_tip);
 }
 
 #[tokio::test]

@@ -942,32 +942,8 @@ pub async fn run_branch_or_sync_operation(
     let operation_cancellation = cancellation.clone();
     let result = match catalog
         .try_with_project_mutation_lock_cancellation(&project_id, &cancellation, || async move {
-            let mut snapshot = build_refs_snapshot(
-                &locked_repository,
-                locked_request.cwd(),
-                &operation_cancellation,
-            )
-            .await
-            .map_err(|error| refs_snapshot_error(operation, error))?;
-            snapshot.in_progress_operation = detect_in_progress_operation(
-                &locked_repository,
-                locked_request.cwd(),
-                &operation_cancellation,
-            )
-            .await
-            .map_err(|_| {
-                operation_error(
-                    operation,
-                    "repository-state-unavailable",
-                    "Git repository operation state could not be revalidated.",
-                )
-            })?;
-            if let Some(reason) = blocked_reason_for_operation(&snapshot, &locked_request) {
-                return Err(blocked_operation_error(operation, reason));
-            }
-            if operation_cancellation.is_cancelled() {
-                return Err(cancelled_error(operation));
-            }
+            // vcs.* writes take this per-worktree guard but not the project lock, so it is
+            // held from the snapshot onward: validation and execution see the same HEAD.
             let mutation = tokio::select! {
                 biased;
                 () = operation_cancellation.cancelled() => {
@@ -975,12 +951,41 @@ pub async fn run_branch_or_sync_operation(
                 }
                 mutation = locked_broadcaster.begin_mutation(locked_request.cwd()) => mutation,
             };
-            let result = execute_branch_or_sync_operation(
-                &locked_repository,
-                &snapshot,
-                &locked_request,
-                &operation_cancellation,
-            )
+            let result = async {
+                let mut snapshot = build_refs_snapshot(
+                    &locked_repository,
+                    locked_request.cwd(),
+                    &operation_cancellation,
+                )
+                .await
+                .map_err(|error| refs_snapshot_error(operation, error))?;
+                snapshot.in_progress_operation = detect_in_progress_operation(
+                    &locked_repository,
+                    locked_request.cwd(),
+                    &operation_cancellation,
+                )
+                .await
+                .map_err(|_| {
+                    operation_error(
+                        operation,
+                        "repository-state-unavailable",
+                        "Git repository operation state could not be revalidated.",
+                    )
+                })?;
+                if let Some(reason) = blocked_reason_for_operation(&snapshot, &locked_request) {
+                    return Err(blocked_operation_error(operation, reason));
+                }
+                if operation_cancellation.is_cancelled() {
+                    return Err(cancelled_error(operation));
+                }
+                execute_branch_or_sync_operation(
+                    &locked_repository,
+                    &snapshot,
+                    &locked_request,
+                    &operation_cancellation,
+                )
+                .await
+            }
             .await;
             mutation.finish().await;
             result
