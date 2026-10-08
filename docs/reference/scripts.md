@@ -216,6 +216,10 @@ performing a production install.
   The default round trip is 200 ms and the default sample count is 5. The
   command prints `HARNESS_JSON` and writes the same document to
   `BIBCODE_GITLAB_HARNESS_REPORT` (`/tmp/bibcode-gitlab-mr-load.json` when unset).
+  It also runs the ignored
+  `gitlab_subscribed_merge_request_polling_records_host_requests` scenario,
+  which waits through several real 20 s poll ticks and prints
+  `HARNESS_SUBSCRIBE_JSON`; the default `cargo test` suite skips it.
 - `bash scripts/test-linux-git-compatibility.sh TEST_BINARY [IMAGE ...]`: run the
   compiled Linux Git-runner regression in disposable Debian, Ubuntu, Fedora,
   and Arch containers. Build the executable on the Ubuntu 22.04 glibc baseline;

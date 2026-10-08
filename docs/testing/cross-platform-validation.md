@@ -2291,9 +2291,15 @@ never count a sandbox-denied listener test as passed or skipped.
     the request URL; the comment model has no host permalink.
 13. Add single-line and reverse-drag multi-line inline comments; insert a
     suggestion with the selected new source lines. Verify amber pending cards,
-    Edit/Remove, the sticky counter in both tabs, and review submission. Reload
-    while comment, reply, edit, inline, and review-summary drafts exist and
-    verify they survive. Unrenderable lines must retain draft cards below the diff.
+    Edit/Remove, the sticky counter in both tabs, and review submission. On
+    GitLab, Overview shows **Approve** under the description, with **Approval
+    is optional** when the host requires none, otherwise the approved/required
+    count. It stays inactive with **Loading…** until the live detail succeeds,
+    and choosing it approves the current head without opening **Review** and
+    without posting pending inline comments. After approval the same control
+    is **Revoke approval**. A denied account still sees **Approve** with the
+    server reason. Reload while comment, reply, edit, inline, and review-summary
+    drafts exist and verify they survive. Unrenderable lines must retain draft cards below the diff.
 14. Exercise full-success, zero-landed, and partial-landed review receipts with
     controlled fixtures or an authorized test host. Only failed comments stay
     pending by path, line, and body; identical duplicate drafts retain their

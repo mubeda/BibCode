@@ -54,6 +54,7 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (39, "provider_turn_outbox"),
     (39, "orchestration_attachment_refs"),
     (43, "worktree_removal_receipts"),
+    (53, "pull_request_snapshots"),
 ];
 
 #[derive(Debug, Error)]
@@ -681,6 +682,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(50, "QueuedTurnDeliveries", migration_050),
     Migration::new(51, "TurnDeliveryFailureReason", migration_051),
     Migration::new(52, "ProjectRepositoryIdentity", migration_052),
+    Migration::new(53, "PullRequestSnapshots", migration_053),
 ];
 
 impl Migration {
@@ -2538,6 +2540,24 @@ fn migration_052(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_053(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE pull_request_snapshots (
+          host TEXT NOT NULL,
+          project TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          key TEXT NOT NULL,
+          fingerprint TEXT NOT NULL,
+          payload BLOB NOT NULL,
+          observed_at_ms INTEGER NOT NULL,
+          generation INTEGER NOT NULL,
+          PRIMARY KEY (host, project, kind, key)
+        );
+        "#,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2550,6 +2570,114 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     type DeliveryColumn = (String, String, i64, Option<String>, i64);
+
+    #[test]
+    fn pull_request_snapshots_migration_and_store_enforce_caps_and_generations() {
+        use crate::pull_requests::snapshot_store::{Snapshot, SnapshotStore};
+
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&mut connection, None).unwrap();
+        let table_name: String = connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE name = 'pull_request_snapshots'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_name, "pull_request_snapshots");
+
+        let store = SnapshotStore::new(&connection);
+        let host = "gitlab.example";
+        let project = "team/repo";
+
+        let first = Snapshot {
+            host: host.into(),
+            project: project.into(),
+            kind: "detail".into(),
+            key: "1".into(),
+            fingerprint: "fp-1".into(),
+            payload: vec![1; 16_000_000],
+            observed_at_ms: 100,
+            generation: 1,
+        };
+        let second = Snapshot {
+            host: host.into(),
+            project: project.into(),
+            kind: "detail".into(),
+            key: "2".into(),
+            fingerprint: "fp-2".into(),
+            payload: vec![2; 16_000_000],
+            observed_at_ms: 200,
+            generation: 1,
+        };
+        store.put(first).unwrap();
+        store.put(second).unwrap();
+        assert_eq!(store.byte_total().unwrap(), 32_000_000);
+
+        let third = Snapshot {
+            host: host.into(),
+            project: project.into(),
+            kind: "detail".into(),
+            key: "3".into(),
+            fingerprint: "fp-3".into(),
+            payload: vec![3; 2_000_000],
+            observed_at_ms: 300,
+            generation: 1,
+        };
+        store.put(third).unwrap();
+        assert!(
+            store.get(host, project, "detail", "1").unwrap().is_none(),
+            "oldest observed_at_ms row must be evicted"
+        );
+        assert!(store.get(host, project, "detail", "2").unwrap().is_some());
+        assert!(store.get(host, project, "detail", "3").unwrap().is_some());
+        assert!(store.byte_total().unwrap() <= 33_554_432);
+
+        let oversized_files = Snapshot {
+            host: host.into(),
+            project: project.into(),
+            kind: "files".into(),
+            key: "4".into(),
+            fingerprint: "fp-files".into(),
+            payload: vec![4; 1_048_577],
+            observed_at_ms: 400,
+            generation: 1,
+        };
+        store.put(oversized_files).unwrap();
+        assert!(
+            store.get(host, project, "files", "4").unwrap().is_none(),
+            "files payloads over 1 MiB must not be stored"
+        );
+
+        let newer = Snapshot {
+            host: host.into(),
+            project: project.into(),
+            kind: "timeline".into(),
+            key: "5".into(),
+            fingerprint: "fp-new".into(),
+            payload: b"generation-2".to_vec(),
+            observed_at_ms: 500,
+            generation: 2,
+        };
+        store.put(newer).unwrap();
+        let stale = Snapshot {
+            host: host.into(),
+            project: project.into(),
+            kind: "timeline".into(),
+            key: "5".into(),
+            fingerprint: "fp-old".into(),
+            payload: b"generation-1".to_vec(),
+            observed_at_ms: 600,
+            generation: 1,
+        };
+        store.put(stale).unwrap();
+        let stored = store
+            .get(host, project, "timeline", "5")
+            .unwrap()
+            .expect("generation 2 snapshot remains");
+        assert_eq!(stored.payload, b"generation-2");
+        assert_eq!(stored.generation, 2);
+    }
 
     #[test]
     fn migration_052_adds_nullable_repository_identity_column() {
@@ -3229,7 +3357,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=52).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=53).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3279,7 +3407,8 @@ mod tests {
                 (49, "AuthPairingDeliveryState"),
                 (50, "QueuedTurnDeliveries"),
                 (51, "TurnDeliveryFailureReason"),
-                (52, "ProjectRepositoryIdentity")
+                (52, "ProjectRepositoryIdentity"),
+                (53, "PullRequestSnapshots"),
             ],
         );
         assert_eq!(
@@ -3376,9 +3505,10 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 36);
+        assert_eq!(second.len(), 37);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
+        assert_eq!(second[36].id, 53);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3390,7 +3520,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 28);
+        assert_eq!(application_table_count, 29);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -3485,7 +3615,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52]
+            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3522,7 +3652,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52]
+            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3550,7 +3680,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52]
+            [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3690,7 +3820,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48, 49, 50, 51, 52]
+            [48, 49, 50, 51, 52, 53]
         );
         assert_eq!(
             connection.query_row(
@@ -3719,7 +3849,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 19);
+        assert_eq!(applied.len(), 20);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3739,6 +3869,7 @@ mod tests {
         assert_eq!(applied[16].id, 50);
         assert_eq!(applied[17].id, 51);
         assert_eq!(applied[18].id, 52);
+        assert_eq!(applied[19].id, 53);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

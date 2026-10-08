@@ -55,7 +55,9 @@ describe("PullRequests contracts", () => {
       "pullRequests.getTimeline",
       "pullRequests.getVocabulary",
       "pullRequests.list",
+      "pullRequests.readSnapshot",
       "pullRequests.runAction",
+      "pullRequests.subscribe",
     ]);
   });
   it("decodes an unavailable context with an actionable auth command", () => {
@@ -660,6 +662,36 @@ describe("PullRequests actions and outcomes", () => {
     expect(encodePullRequestsCheckoutResult(decodePullRequestsCheckoutResult(value))).toEqual(
       value,
     );
+  });
+});
+
+describe("PullRequests snapshots and change events", () => {
+  it("decodes a snapshot with a null list and a detail observedAt of 1", () => {
+    const decode = Schema.decodeUnknownSync(PullRequests.PullRequestsSnapshot);
+    expect(
+      decode({
+        list: null,
+        detail: { payload: detail, observedAt: 1 },
+        tab: null,
+      }),
+    ).toEqual({
+      list: null,
+      detail: { payload: detail, observedAt: 1 },
+      tab: null,
+    });
+  });
+
+  it("rejects a changed event that omits checks", () => {
+    const decode = Schema.decodeUnknownSync(PullRequests.PullRequestsChanged);
+    expect(() =>
+      decode({
+        list: false,
+        detail: false,
+        timeline: false,
+        commits: false,
+        files: false,
+      }),
+    ).toThrow();
   });
 });
 

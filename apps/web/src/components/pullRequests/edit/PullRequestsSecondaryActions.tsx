@@ -70,7 +70,18 @@ function StateConfirmation({
     </PullRequestsConfirmAction>
   );
 }
-export function PullRequestsRevertButton(props: Props) {
+export function PullRequestsRevertButton({
+  detail,
+  live = detail,
+  context,
+}: Props & {
+  /**
+   * Reverting only ever acts on a live detail, never a snapshot. Omitting
+   * this falls back to `detail`, so callers that have not adopted the split
+   * keep acting as before.
+   */
+  live?: PullRequestsDetail | null;
+}) {
   const { pending } = usePullRequestsActions();
   const [open, setOpen] = useState(false);
   return (
@@ -78,12 +89,14 @@ export function PullRequestsRevertButton(props: Props) {
       <PermissionButton
         mutation
         permission={constrainPermission(
-          props.detail.permissions.revert,
-          props.detail.state !== "merged"
-            ? "Only merged requests can be reverted"
-            : pending
-              ? "Wait for the current action to finish"
-              : null,
+          detail.permissions.revert,
+          live === null
+            ? "Loading…"
+            : detail.state !== "merged"
+              ? "Only merged requests can be reverted"
+              : pending
+                ? "Wait for the current action to finish"
+                : null,
         )}
         variant="outline"
         size="sm"
@@ -92,7 +105,12 @@ export function PullRequestsRevertButton(props: Props) {
         Revert
       </PermissionButton>
       {open ? (
-        <StateConfirmation {...props} action="revert" onClose={() => setOpen(false)} />
+        <StateConfirmation
+          detail={detail}
+          context={context}
+          action="revert"
+          onClose={() => setOpen(false)}
+        />
       ) : null}
     </>
   );
@@ -130,7 +148,18 @@ function ActionItem({
     </div>
   );
 }
-export function PullRequestsSecondaryActions({ detail, context }: Props) {
+export function PullRequestsSecondaryActions({
+  detail,
+  live = detail,
+  context,
+}: Props & {
+  /**
+   * Every action here only ever acts on a live detail, never a snapshot.
+   * Omitting this falls back to `detail`, so callers that have not adopted
+   * the split keep acting as before.
+   */
+  live?: PullRequestsDetail | null;
+}) {
   const { run, pending } = usePullRequestsActions();
   const [confirmation, setConfirmation] = useState<"delete" | "revert" | null>(null);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
@@ -139,7 +168,9 @@ export function PullRequestsSecondaryActions({ detail, context }: Props) {
   const available = (permission: PullRequestsPermission) =>
     constrainPermission(
       permission,
-      disabledReason ?? (pending ? "Wait for the current action to finish" : null),
+      live === null
+        ? "Loading…"
+        : (disabledReason ?? (pending ? "Wait for the current action to finish" : null)),
     );
   function apply(action: PullRequestsAction, title: string) {
     const inverse = inverseOf(action, { lockReason: detail.lockReason });

@@ -14,10 +14,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bibcode_server::persistence::{Database, run_migrations};
 use bibcode_server::pull_requests::{
     ContextRead, PullRequestsService,
     host::HostCommandRunner,
-    model::{Context, ListQuery},
+    model::{Changed, Context, ListQuery, SubscribeInput},
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -36,6 +37,7 @@ const SUGGESTION_NOTES: usize = 12;
 const PLAIN_NOTES: usize = 8;
 const MR_NUMBER: u64 = 42;
 
+#[derive(Clone)]
 struct Hit {
     method: String,
     path: String,
@@ -216,6 +218,431 @@ async fn gitlab_list_and_merge_request_loads_record_requests_and_wall_time() {
             "merge request host reads ran apart: max in flight {mr_inflight}"
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "waits through real 20 s poll ticks; run via scripts/measure-gitlab-merge-request-load.sh"]
+async fn gitlab_subscribed_merge_request_polling_records_host_requests() {
+    const RTT_MS: u64 = 200;
+    let root = TempDir::new().expect("tempdir");
+    let cwd = root.path().join("checkout");
+    fs::create_dir(&cwd).expect("checkout dir");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("local addr");
+    let api = Arc::new(Api {
+        started: Instant::now(),
+        rtt_ms: AtomicU64::new(RTT_MS),
+        hits: Mutex::new(Vec::new()),
+        inflight: AtomicUsize::new(0),
+        max_inflight: AtomicUsize::new(0),
+        list_page: list_page(),
+        detail: detail_body(),
+        timeline: timeline_body(),
+        metadata: metadata_body(),
+    });
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve(listener, Arc::clone(&api), shutdown_rx));
+    let log_path = root.path().join("glab-calls.jsonl");
+    let glab = write_glab(root.path(), &format!("http://{address}"), &log_path);
+    let gh = write_gh(root.path());
+    let runner = HostCommandRunner::new(root.path().join("state")).with_commands(gh, glab, "git");
+    let token = CancellationToken::new();
+    runner
+        .git(&cwd, &["init", "-q", "-b", "main"], &token)
+        .await
+        .expect("git init");
+    runner
+        .git(
+            &cwd,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@git.acme.example/team/sub/repo.git",
+            ],
+            &token,
+        )
+        .await
+        .expect("git remote");
+    let database = open_database().await;
+    let service = PullRequestsService::with_runner(runner.clone()).with_database(database);
+
+    let detail_band = measure_detail_band(&service, &cwd).await;
+
+    let _ = fs::write(&log_path, "");
+    api.snapshot_and_clear();
+    let empty_snapshot = service
+        .read_snapshot(subscribe_input(&cwd, None), &CancellationToken::new())
+        .await
+        .expect("empty read snapshot");
+    assert!(empty_snapshot.list.is_none());
+    assert!(empty_snapshot.detail.is_none());
+    assert_eq!(host_requests(&api, &log_path), 0, "empty read_snapshot");
+
+    // The detail join belongs to the unary reads measured in the band; a
+    // number the poller has never probed only names every family once.
+    let cold_probe = subscribe_until(
+        &service,
+        &cwd,
+        &api,
+        &log_path,
+        subscribe_input(&cwd, Some(MR_NUMBER)),
+        Duration::from_secs(45),
+        |sample| {
+            count_glab_mr_list(sample) >= 1 && probe_hits(sample) >= 1 && sample.events.len() >= 2
+        },
+    )
+    .await;
+    assert_eq!(
+        probe_hits(&cold_probe),
+        1,
+        "cold probe: {}",
+        format_tick_sample(&cold_probe)
+    );
+    assert_eq!(
+        detail_join_hits(&cold_probe),
+        0,
+        "the poller never runs the detail join: {}",
+        format_tick_sample(&cold_probe)
+    );
+    assert!(
+        cold_probe
+            .events
+            .iter()
+            .any(|changed| changed.detail && changed.timeline && changed.checks),
+        "an unprobed number names detail, timeline, and checks for the client to re-read"
+    );
+
+    let _ = fs::write(&log_path, "");
+    api.snapshot_and_clear();
+    let stored_snapshot = service
+        .read_snapshot(
+            subscribe_input(&cwd, Some(MR_NUMBER)),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("stored read snapshot");
+    assert!(stored_snapshot.detail.is_some());
+    assert_eq!(host_requests(&api, &log_path), 0, "stored read_snapshot");
+
+    let seeded_list = subscribe_until(
+        &service,
+        &cwd,
+        &api,
+        &log_path,
+        subscribe_input(&cwd, None),
+        Duration::from_secs(45),
+        |sample| count_glab_mr_list(sample) >= 1,
+    )
+    .await;
+    assert_eq!(
+        count_glab_mr_list(&seeded_list),
+        1,
+        "seed list tick: {}",
+        format_tick_sample(&seeded_list)
+    );
+    assert_eq!(
+        detail_join_hits(&seeded_list),
+        0,
+        "seed list tick detail join: {}",
+        format_tick_sample(&seeded_list)
+    );
+
+    let unchanged_list = subscribe_until(
+        &service,
+        &cwd,
+        &api,
+        &log_path,
+        subscribe_input(&cwd, None),
+        Duration::from_secs(45),
+        |sample| count_glab_mr_list(sample) >= 1,
+    )
+    .await;
+    assert_eq!(
+        count_glab_mr_list(&unchanged_list),
+        1,
+        "unchanged list tick: {}",
+        format_tick_sample(&unchanged_list)
+    );
+    assert_eq!(
+        detail_join_hits(&unchanged_list),
+        0,
+        "unchanged list tick detail join: {}",
+        format_tick_sample(&unchanged_list)
+    );
+
+    let unchanged_detail = subscribe_until(
+        &service,
+        &cwd,
+        &api,
+        &log_path,
+        subscribe_input(&cwd, Some(MR_NUMBER)),
+        Duration::from_secs(45),
+        |sample| count_glab_mr_list(sample) >= 1 && probe_hits(sample) >= 1,
+    )
+    .await;
+    assert_eq!(
+        count_glab_mr_list(&unchanged_detail),
+        1,
+        "unchanged detail tick list: {}",
+        format_tick_sample(&unchanged_detail)
+    );
+    assert_eq!(
+        probe_hits(&unchanged_detail),
+        1,
+        "unchanged detail tick probe: {}",
+        format_tick_sample(&unchanged_detail)
+    );
+    assert_eq!(
+        detail_join_hits(&unchanged_detail),
+        0,
+        "unchanged detail tick detail join: {}",
+        format_tick_sample(&unchanged_detail)
+    );
+
+    let report = json!({
+        "rttMs": RTT_MS,
+        "detailBandMs": {
+            "minWallMs": detail_band.min_wall_ms,
+            "medianWallMs": detail_band.median_wall_ms,
+            "maxWallMs": detail_band.max_wall_ms,
+        },
+        "coldProbeTick": {
+            "tickWallMs": cold_probe.wall_ms,
+            "listClassRequests": count_glab_mr_list(&cold_probe),
+            "probeHits": probe_hits(&cold_probe),
+            "detailJoinHits": detail_join_hits(&cold_probe),
+        },
+        "unchangedListTick": {
+            "listClassRequests": count_glab_mr_list(&unchanged_list),
+            "detailJoinHits": detail_join_hits(&unchanged_list),
+        },
+        "unchangedDetailTick": {
+            "listClassRequests": count_glab_mr_list(&unchanged_detail),
+            "probeHits": probe_hits(&unchanged_detail),
+            "detailJoinHits": detail_join_hits(&unchanged_detail),
+        },
+    });
+    println!(
+        "HARNESS_SUBSCRIBE_JSON {}",
+        serde_json::to_string(&report).unwrap()
+    );
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("server task");
+}
+
+struct DetailBand {
+    min_wall_ms: u128,
+    max_wall_ms: u128,
+    median_wall_ms: u128,
+}
+
+struct TickSample {
+    wall_ms: u128,
+    hits: Vec<Hit>,
+    glab_args: Vec<Vec<String>>,
+    events: Vec<Changed>,
+}
+
+async fn open_database() -> Database {
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| Ok(run_migrations(connection, None)?))
+        .await
+        .expect("migrations");
+    database
+}
+
+fn subscribe_input(cwd: &Path, number: Option<u64>) -> SubscribeInput {
+    let mut value = serde_json::to_value(list_query(cwd)).expect("list query value");
+    if let Some(object) = value.as_object_mut() {
+        object.insert("number".into(), json!(number));
+        object.insert("tab".into(), Value::Null);
+    }
+    serde_json::from_value(value).expect("subscribe input")
+}
+
+async fn measure_detail_band(service: &PullRequestsService, cwd: &Path) -> DetailBand {
+    let mut walls = Vec::new();
+    for _ in 0..3 {
+        let started = Instant::now();
+        let detail_service = service.clone();
+        let detail_token = CancellationToken::new();
+        let timeline_token = CancellationToken::new();
+        let (detail, timeline) = tokio::join!(
+            service.get(cwd, MR_NUMBER, &detail_token),
+            detail_service.timeline(cwd, MR_NUMBER, &timeline_token),
+        );
+        detail.expect("detail rpc");
+        timeline.expect("timeline rpc");
+        walls.push(started.elapsed().as_millis());
+    }
+    walls.sort_unstable();
+    DetailBand {
+        min_wall_ms: walls[0],
+        max_wall_ms: walls[walls.len() - 1],
+        median_wall_ms: walls[walls.len() / 2],
+    }
+}
+
+async fn subscribe_until(
+    service: &PullRequestsService,
+    _cwd: &Path,
+    api: &Api,
+    log_path: &Path,
+    input: SubscribeInput,
+    timeout: Duration,
+    done: impl Fn(&TickSample) -> bool,
+) -> TickSample {
+    let _ = fs::write(log_path, "");
+    api.snapshot_and_clear();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    let emit_changed = move |event: Changed| recorded.lock().expect("events").push(event);
+    let subscribe_token = CancellationToken::new();
+    let subscribe_cancel = subscribe_token.clone();
+    let subscribe_service = service.clone();
+    let subscribe_input = input;
+    let subscribe_handle = tokio::spawn(async move {
+        subscribe_service
+            .subscribe(subscribe_input, &emit_changed, &subscribe_token)
+            .await
+    });
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut tick_started = None;
+    let mut idle_polls = 0_u32;
+    while Instant::now() < deadline {
+        let hits = api.hits.lock().expect("hit log").clone();
+        let glab_args = read_glab_args(log_path);
+        if !hits.is_empty() && tick_started.is_none() {
+            tick_started = Some(Instant::now());
+        }
+        let sample = TickSample {
+            wall_ms: tick_started
+                .map(|tick| tick.elapsed().as_millis())
+                .unwrap_or(0),
+            hits,
+            glab_args,
+            events: events.lock().expect("events").clone(),
+        };
+        if api.inflight.load(Ordering::Acquire) == 0 {
+            idle_polls += 1;
+        } else {
+            idle_polls = 0;
+        }
+        if done(&sample) && idle_polls >= 4 {
+            subscribe_cancel.cancel();
+            let _ = subscribe_handle.await;
+            return sample;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    subscribe_cancel.cancel();
+    let _ = subscribe_handle.await;
+    panic!(
+        "subscribe tick timed out after {} ms; hits={}",
+        timeout.as_millis(),
+        format_hits(&api.hits.lock().expect("hit log"))
+    );
+}
+
+fn host_requests(api: &Api, log_path: &Path) -> usize {
+    let hits = api.hits.lock().expect("hit log").len();
+    let cli = read_glab_args(log_path).len();
+    assert_eq!(hits, cli, "http hits and glab calls diverged");
+    hits
+}
+
+fn read_glab_args(log_path: &Path) -> Vec<Vec<String>> {
+    fs::read_to_string(log_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line).expect("glab log line")["args"]
+                .as_array()
+                .expect("glab args")
+                .iter()
+                .map(|value| value.as_str().expect("glab arg").to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+fn count_glab_mr_list(sample: &TickSample) -> usize {
+    sample
+        .glab_args
+        .iter()
+        .filter(|args| args.len() >= 2 && args[0] == "mr" && args[1] == "list")
+        .count()
+}
+
+fn probe_hits(sample: &TickSample) -> usize {
+    probe_hits_in(&sample.hits)
+}
+
+fn detail_join_hits(sample: &TickSample) -> usize {
+    detail_join_hits_in(&sample.hits)
+}
+
+const PROJECT_PATH: &str = "/api/v4/projects/team%2Fsub%2Frepo";
+
+fn merge_request_path(number: u64) -> String {
+    format!("{PROJECT_PATH}/merge_requests/{number}")
+}
+
+fn is_probe_path(path: &str, number: u64) -> bool {
+    path == merge_request_path(number)
+}
+
+fn is_detail_join_path(path: &str, number: u64) -> bool {
+    let prefix = merge_request_path(number);
+    path.starts_with(&prefix)
+        && path != prefix
+        && (path.contains("/approvals")
+            || path.contains("/reviewers")
+            || path.contains("/approval_state")
+            || path.contains("/award_emoji")
+            || path.contains("/closes_issues")
+            || path.contains("/notes/")
+            || path.contains("/pipelines")
+            || path.contains("/resource_")
+            || path.contains("/versions"))
+        || path == "/api/v4/graphql"
+}
+
+fn probe_hits_in(hits: &[Hit]) -> usize {
+    hits.iter()
+        .filter(|hit| hit.method == "GET" && is_probe_path(&hit.path, MR_NUMBER))
+        .count()
+}
+
+fn detail_join_hits_in(hits: &[Hit]) -> usize {
+    hits.iter()
+        .filter(|hit| is_detail_join_path(&hit.path, MR_NUMBER))
+        .count()
+}
+
+fn format_hits(hits: &[Hit]) -> String {
+    hits.iter()
+        .map(|hit| format!("{} {}", hit.method, hit.path))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_tick_sample(sample: &TickSample) -> String {
+    format!(
+        "http=[{}] glab={}",
+        format_hits(&sample.hits),
+        sample
+            .glab_args
+            .iter()
+            .map(|args| args.join(" "))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
 }
 
 struct Sample {
