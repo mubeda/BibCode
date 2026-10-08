@@ -2600,8 +2600,10 @@ rejection identity, including undefined. No runtime claims, PIDs, geometry value
 credentials, paths, messages, stacks, or causes enter this field.
 The same code allowlist covers the actual replay wrapper before the inner receipt.
 Replay pin or config-classification refusals use current-attachment-invalid; an
-unavailable replay owner uses observer-unavailable. The codes describe the last
-normal guard outcome and do not identify an earlier native event or its cause.
+unavailable replay owner preserves the authenticated code of its first stored
+failure when present, otherwise uses observer-unavailable. This projects only
+the existing private marker without inspecting the error or re-evaluating a
+guard. The code does not establish the earlier native event or its cause.
 The single terminal marker command must emit an explicit leading newline before
 its exact output line, then keep the same long-running sleep process. This
 establishes a raw line boundary after shell control sequences. Preserve the

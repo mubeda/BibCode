@@ -412,5 +412,9 @@ it("marks replay pin refusal without replacing the stored original failure", () 
   } catch (error) {
     terminalError = error;
   }
-  expect(projectBrowserTerminalGuard(terminalError)).toBe("observer-unavailable");
+  expect(terminalError).not.toBe(original);
+  if (!(terminalError instanceof Error)) throw new Error("Inert replay error unavailable");
+  expect(terminalError.message).toBe("Owned browser follow-up replay refused.");
+  expect(projectBrowserTerminalGuard(terminalError)).toBe("current-attachment-invalid");
+  expect(() => value.replay.throwIfFailed()).toThrow(original);
 });

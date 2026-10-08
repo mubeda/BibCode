@@ -1,7 +1,10 @@
 // @effect-diagnostics nodeBuiltinImport:off - Original public terminal envelopes remain private at the owned raw-wire boundary.
 // @effect-diagnostics globalFetch:off - One fixed authenticated loopback endpoint.
 // @effect-diagnostics globalTimers:off - Joined, bounded fixture-only public stream.
-import { markBrowserTerminalGuard } from "./release-visual-browser-followups-source.ts";
+import {
+  markBrowserTerminalGuard,
+  projectBrowserTerminalGuard,
+} from "./release-visual-browser-followups-source.ts";
 import * as NodeModule from "node:module";
 import {
   TerminalAttachInput,
@@ -114,7 +117,13 @@ export function createBrowserFollowupReplayObserver(
       throw markBrowserTerminalGuard(refused(), "current-attachment-invalid");
   };
   const verify = () => {
-    if (closed || failed) throw markBrowserTerminalGuard(refused(), "observer-unavailable");
+    if (closed || failed) {
+      const reason = failed ? projectBrowserTerminalGuard(originalFailure) : "private-unknown";
+      throw markBrowserTerminalGuard(
+        refused(),
+        reason === "private-unknown" ? "observer-unavailable" : reason,
+      );
+    }
     if (snapshots.size < 1) throw markBrowserTerminalGuard(refused(), "attachment-count-none");
     if (snapshots.size > 2) throw markBrowserTerminalGuard(refused(), "attachment-count-many");
     for (const [connection, value] of snapshots) {

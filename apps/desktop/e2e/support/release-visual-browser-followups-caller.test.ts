@@ -425,11 +425,9 @@ test.each([
           NodeAssert.equal(
             JSON.parse(NodeFS.readFileSync(NodePath.join(root, "failure.json"), "utf8"))
               .browserTerminalReceiptGuard,
-            mode === "guard-unclassified"
+            mode === "guard-unclassified" || mode === "guard-pinbad"
               ? "current-attachment-invalid"
-              : mode === "guard-pinbad"
-                ? "observer-unavailable"
-                : "second-owner-mismatch",
+              : "second-owner-mismatch",
           );
           NodeAssert.equal(
             NodeFS.statSync(NodePath.join(root, "failure.json")).mode & 0o777,
