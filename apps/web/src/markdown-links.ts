@@ -1,5 +1,5 @@
 import { formatWorkspaceRelativePath } from "./filePathDisplay";
-import { resolvePathLinkTarget, splitPathAndPosition } from "./terminal-links";
+import { isNetworkPath, resolvePathLinkTarget, splitPathAndPosition } from "./terminal-links";
 
 const WINDOWS_DRIVE_PATH_PATTERN = /^[A-Za-z]:[\\/]/;
 const WINDOWS_UNC_PATH_PATTERN = /^\\\\/;
@@ -57,6 +57,24 @@ function stripSearchAndHash(value: string): { path: string; hash: string } {
   return { path, hash: rawHash };
 }
 
+/**
+ * True for a link to a network or device path (`\\host`, `//host`, `\\?\`, `\\.\`) or
+ * a `file:` URL naming a host. Opening one on a Windows host connects over SMB and
+ * can leak credentials, and chat text is agent-influenced, so chat never resolves it.
+ */
+export function isNetworkLinkHref(href: string): boolean {
+  const value = normalizeMarkdownLinkDestination(href);
+  if (value.toLowerCase().startsWith("file:")) {
+    try {
+      const parsed = new URL(value);
+      return parsed.host.length > 0 || isNetworkPath(safeDecode(parsed.pathname));
+    } catch {
+      return false;
+    }
+  }
+  return isNetworkPath(safeDecode(stripSearchAndHash(value).path));
+}
+
 function normalizeWindowsDrivePath(path: string): string {
   return /^\/[A-Za-z]:[\\/]/.test(path) ? path.slice(1) : path;
 }
@@ -87,6 +105,7 @@ function parseFileUrlHref(
 export function rewriteMarkdownFileUriHref(href: string | undefined): string | null {
   if (!href) return null;
   const normalizedHref = normalizeMarkdownLinkDestination(href);
+  if (isNetworkLinkHref(normalizedHref)) return null;
   const target = parseFileUrlHref(normalizedHref, { decodePath: false });
   if (!target) return null;
   return `${target.path}${target.hash}`;
@@ -140,6 +159,7 @@ export function resolveMarkdownFileLinkTarget(
   if (!href) return null;
   const rawHref = normalizeMarkdownLinkDestination(href);
   if (rawHref.length === 0 || rawHref.startsWith("#")) return null;
+  if (isNetworkLinkHref(rawHref)) return null;
 
   const fileUrlTarget = rawHref.toLowerCase().startsWith("file:")
     ? parseFileUrlHref(rawHref)

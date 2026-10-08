@@ -889,7 +889,10 @@ the setting is not shown.
   target. Right-click on an `http(s)` link offers **Open in BiBCode browser**,
   **Open in system browser**, and **Copy link**. Any
   modifier-click on an `.html`, `.htm`, or `.pdf` file chip opens
-  it in the editor instead of the browser.
+  it in the editor instead of the browser. Links to network or device paths
+  (`file://server/…`, `file:////server/…`, `\\server\share`, `\\?\…`, `\\.\…`)
+  never become file chips, so they can't open in the editor or the browser; a
+  `//host/…` link stays an ordinary web link.
 - **Terminal:** Ctrl/Cmd-click opens a link (Cmd on macOS); adding Shift opens
   the other target. `.html`, `.htm`, and `.pdf` paths, including a bare
   `index.html` and `file:///` URLs, open in the BiBCode browser; Ctrl/Cmd+Shift
