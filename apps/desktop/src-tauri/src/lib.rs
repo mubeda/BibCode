@@ -88,6 +88,20 @@ macro_rules! bridge_command_names {
     };
 }
 
+/// The URL of `<exe> open-url <url>`, the command the server's open-url shim runs. `main`
+/// handles it before Tauri starts: no window, and the single-instance plugin never sees it.
+pub fn open_url_argument(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<String> {
+    let mut args = args.into_iter().skip(1);
+    if args.next()? != "open-url" {
+        return None;
+    }
+    Some(
+        args.next()
+            .map(|url| url.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shell_path_hydration = shell_environment::hydrate_process_path();
@@ -359,6 +373,30 @@ mod tests {
     use serde_json::Value;
 
     use super::{DESKTOP_BRIDGE_COMMAND_NAMES, DESKTOP_PREVIEW_COMMAND_NAMES};
+
+    #[test]
+    fn open_url_argv_is_recognized_before_tauri_starts() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            super::open_url_argument(args(&["bibcode-desktop", "open-url", "http://h/?a=$(x)"])),
+            Some("http://h/?a=$(x)".to_owned())
+        );
+        // A missing URL still runs open-url, which rejects it with exit code 2.
+        assert_eq!(
+            super::open_url_argument(args(&["bibcode-desktop", "open-url"])),
+            Some(String::new())
+        );
+        assert_eq!(super::open_url_argument(args(&["bibcode-desktop"])), None);
+        assert_eq!(
+            super::open_url_argument(args(&["bibcode-desktop", "bibcode://pair?code=x"])),
+            None
+        );
+    }
 
     #[test]
     fn main_window_is_created_by_setup_so_it_can_handle_new_windows() {

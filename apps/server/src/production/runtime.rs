@@ -289,10 +289,24 @@ impl ProductionRuntime {
             process_attribution.clone(),
             ui_process_observer,
         ));
+        // Bound to the credential store when lifecycle attaches it to the provider runtime.
+        let open_url =
+            crate::open_url::OpenUrlEnvironment::new(state_paths.open_url_shim_dir.clone());
+        let terminal_open_url = open_url.clone();
         let terminal_manager = TerminalManager::with_process_attribution(
             Arc::new(PortablePtyBackend),
             TerminalManagerOptions {
                 launch_preparer: provider_terminal_preparer,
+                session_env: Some(TerminalManagerOptions::session_env_hook(
+                    move |thread_id, env| {
+                        let open_url = terminal_open_url.clone();
+                        Box::pin(async move {
+                            if let Some(session) = open_url.issue(thread_id).await {
+                                session.apply(env);
+                            }
+                        })
+                    },
+                )),
                 ..TerminalManagerOptions::default()
             },
             process_attribution.clone(),
@@ -315,7 +329,7 @@ impl ProductionRuntime {
                 .with_published_inventory(control.published_provider_inventory()),
             ),
             activity_projections.chat(),
-            SupervisorOptions::default(),
+            SupervisorOptions::default().with_open_url(open_url),
             operational_logs.provider(),
         ));
         let activity_cancellation = ActivityCancellationService::new(

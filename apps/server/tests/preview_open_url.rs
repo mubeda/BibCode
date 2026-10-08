@@ -50,6 +50,7 @@ async fn setup_service(temp: &TempDir) -> ConnectMcpService {
             environment_id: "env-1".into(),
             descriptor: json!({"environmentId":"env-1"}),
             mcp_endpoint: "http://127.0.0.1:43123/mcp".into(),
+            open_url_endpoint: "http://127.0.0.1:43123/api/preview/open-url".into(),
             now_epoch_seconds: Arc::new(|| 1_700_000_000),
             max_mcp_credentials: 4,
             max_mcp_sessions: 4,
@@ -329,4 +330,83 @@ async fn claim_open_request_rpc_is_single_use() {
             "unexpected claim response: {message:?}"
         );
     }
+}
+
+/// Runs the real `bibcode open-url` the shim runs, with `env` as its only open-url settings.
+async fn run_open_url_cli(url: &str, env: &[(&str, &str)]) -> std::process::Output {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_bibcode"));
+    command
+        .args(["open-url", url])
+        .env_remove("BIBCODE_OPEN_URL_ENDPOINT")
+        .env_remove("BIBCODE_OPEN_URL_TOKEN");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    timeout(Duration::from_secs(20), command.output())
+        .await
+        .expect("open-url exits")
+        .expect("open-url runs")
+}
+
+#[tokio::test]
+async fn open_url_cli_posts_to_the_route_and_emits_open_request() {
+    let temp = TempDir::new().unwrap();
+    let connect = Arc::new(setup_service(&temp).await);
+    let preview = PreviewManager::new();
+    let mut events = preview.subscribe_events();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/api/preview/open-url",
+        listener.local_addr().unwrap()
+    );
+    let app = router(Arc::clone(&connect), preview.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let credential = connect.issue_open_url_credential("thread-1").await.unwrap();
+    let url = "http://localhost:5173/?key=abc";
+
+    let output = run_open_url_cli(
+        url,
+        &[
+            ("BIBCODE_OPEN_URL_ENDPOINT", &endpoint),
+            ("BIBCODE_OPEN_URL_TOKEN", &credential.token),
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let event = serde_json::to_value(events.recv().await.expect("event")).unwrap();
+    assert_eq!(event["type"], "openRequested");
+    assert_eq!(event["threadId"], "thread-1");
+    assert_eq!(event["url"], url);
+
+    // A refused token still succeeds for the caller: the URL is printed for a human.
+    let output = run_open_url_cli(
+        url,
+        &[
+            ("BIBCODE_OPEN_URL_ENDPOINT", &endpoint),
+            ("BIBCODE_OPEN_URL_TOKEN", "not-a-token"),
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{url}\n"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("401"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn open_url_cli_without_a_session_prints_the_url_and_rejects_non_http() {
+    let output = run_open_url_cli("https://example.com/a?b=$(c)", &[]).await;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "https://example.com/a?b=$(c)\n"
+    );
+
+    let output = run_open_url_cli("file:///etc/passwd", &[]).await;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "bibcode open-url: expected an http(s) URL\n"
+    );
 }

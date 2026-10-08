@@ -836,6 +836,7 @@ fn launch() -> ProviderLaunchRequest {
                 .as_deref()
                 .unwrap_or_else(|| Path::new(".")),
         )),
+        open_url: None,
     }
 }
 

@@ -37,6 +37,8 @@ pub struct ConnectMcpConfig {
     pub environment_id: String,
     pub descriptor: Value,
     pub mcp_endpoint: String,
+    /// This server's `POST /api/preview/open-url` URL, as a process on this host reaches it.
+    pub open_url_endpoint: String,
     pub now_epoch_seconds: Arc<dyn Fn() -> i64 + Send + Sync>,
     pub max_mcp_credentials: usize,
     pub max_mcp_sessions: usize,
@@ -465,6 +467,11 @@ impl ConnectMcpService {
             },
         );
         Ok(OpenUrlCredential { token, expires_at })
+    }
+
+    #[must_use]
+    pub fn open_url_endpoint(&self) -> &str {
+        &self.config.open_url_endpoint
     }
 
     /// Returns the thread an open-url token was issued for, if it is live.

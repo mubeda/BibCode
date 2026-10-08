@@ -219,6 +219,13 @@ impl ServerRuntime {
             logging::initialize_owned(&state_paths.server_log)
                 .map_err(|error| ServerError::Logging(error.to_string()))?,
         );
+        // Without the shim, `$BROWSER` in agents and terminals fails to resolve; the server
+        // itself is unaffected, so this never stops startup.
+        if let Err(error) = open_url_shim_target()
+            .and_then(|exe| crate::open_url::write_shims(&state_paths.open_url_shim_dir, &exe))
+        {
+            tracing::warn!(%error, "could not write the open-url shim");
+        }
         if let (Some(static_dir), Some(source)) = (&config.static_dir, config.static_dir_source) {
             tracing::info!(
                 static_dir = %static_dir.display(),
@@ -360,6 +367,10 @@ impl ServerRuntime {
                             environment_id: config.environment_id.clone(),
                             descriptor,
                             mcp_endpoint: format!("http://{local_addr}/mcp"),
+                            open_url_endpoint: format!(
+                                "{}/api/preview/open-url",
+                                local_http_base(local_addr)
+                            ),
                             now_epoch_seconds: Arc::new(|| {
                                 time::OffsetDateTime::now_utc().unix_timestamp()
                             }),
@@ -747,6 +758,45 @@ fn build_startup_access(
     })
 }
 
+/// What the open-url shim runs. An AppImage's mounted executable depends on the environment
+/// AppRun sets, which agents and terminals do not inherit, so the image itself is the entry.
+fn open_url_shim_target() -> std::io::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(appimage_entry(
+        &exe,
+        std::env::var_os("APPIMAGE"),
+        std::env::var_os("APPDIR"),
+    )
+    .unwrap_or(exe))
+}
+
+/// The AppImage that `exe` runs from. `APPIMAGE` alone may be inherited from an unrelated
+/// AppImage, so `exe` must lie inside the mounted `APPDIR` too.
+fn appimage_entry(
+    exe: &std::path::Path,
+    appimage: Option<std::ffi::OsString>,
+    appdir: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let image = std::path::PathBuf::from(appimage?);
+    let appdir = std::path::PathBuf::from(appdir?);
+    (image.is_absolute() && appdir.is_absolute() && exe.starts_with(&appdir) && image.is_file())
+        .then_some(image)
+}
+
+/// How a process on this host reaches the server; a wildcard bind answers on loopback.
+fn local_http_base(local_addr: SocketAddr) -> String {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let ip = match local_addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    format!("http://{}", SocketAddr::new(ip, local_addr.port()))
+}
+
 /// Endpoint other devices can reach, derived from the bound socket address.
 /// Loopback and unspecified binds have no usable advertised endpoint.
 pub(crate) fn startup_offer_endpoint(local_addr: SocketAddr) -> Option<String> {
@@ -805,6 +855,52 @@ mod tests {
     use crate::test_support::hermetic_providers;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_url_shim_runs_the_appimage_only_from_inside_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("BiBCode.AppImage");
+        std::fs::write(&image, b"image").unwrap();
+        let appdir = temp.path().join(".mount_BiBCod");
+        let inside = appdir.join("usr/bin/bibcode-desktop");
+        let os = |path: &std::path::Path| Some(path.as_os_str().to_owned());
+
+        assert_eq!(
+            appimage_entry(&inside, os(&image), os(&appdir)),
+            Some(image.clone())
+        );
+        // A standalone server that inherited another AppImage's variables keeps its own exe.
+        assert_eq!(
+            appimage_entry(
+                std::path::Path::new("/usr/bin/bibcode"),
+                os(&image),
+                os(&appdir)
+            ),
+            None
+        );
+        assert_eq!(appimage_entry(&inside, os(&image), None), None);
+        assert_eq!(
+            appimage_entry(&inside, os(&temp.path().join("missing")), os(&appdir)),
+            None
+        );
+    }
+
+    #[test]
+    fn local_http_base_reaches_wildcard_binds_on_loopback() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        for (ip, expected) in [
+            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), "http://127.0.0.1:3773"),
+            (IpAddr::V6(Ipv6Addr::UNSPECIFIED), "http://[::1]:3773"),
+            (
+                IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+                "http://100.64.0.10:3773",
+            ),
+            (IpAddr::V6(Ipv6Addr::LOCALHOST), "http://[::1]:3773"),
+        ] {
+            assert_eq!(local_http_base(SocketAddr::new(ip, 3773)), expected);
+        }
+    }
 
     #[test]
     fn startup_offer_endpoint_requires_a_routable_bind() {

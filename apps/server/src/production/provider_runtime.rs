@@ -104,6 +104,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::open_url::{OpenUrlEnvironment, OpenUrlSession};
+
 pub type BoxRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const MAX_PARALLEL_PROVIDER_SESSION_SHUTDOWNS: usize = 8;
@@ -149,6 +151,9 @@ pub struct ProviderLaunchRequest {
     pub server_password: Option<String>,
     pub mcp: Option<ProviderMcpConfig>,
     pub codex_home: Option<CodexHomeLayout>,
+    /// Merged into the child environment at spawn. Kept out of `environment`, which the
+    /// durable delivery route fingerprints.
+    pub open_url: Option<OpenUrlSession>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -415,6 +420,8 @@ pub trait ProviderDriverFactory: Send + Sync {
 pub struct SupervisorOptions {
     pub queue_capacity: usize,
     pub session_idle_timeout: Duration,
+    /// Gives each launched provider an open-url credential once a credential store is attached.
+    pub open_url: Option<OpenUrlEnvironment>,
     #[cfg(test)]
     idle_deadline_test_observer: Option<mpsc::UnboundedSender<IdleDeadlineTestEvent>>,
     #[cfg(test)]
@@ -426,11 +433,20 @@ impl Default for SupervisorOptions {
         Self {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+            open_url: None,
             #[cfg(test)]
             idle_deadline_test_observer: None,
             #[cfg(test)]
             accepted_publication_test_hook: None,
         }
+    }
+}
+
+impl SupervisorOptions {
+    #[must_use]
+    pub fn with_open_url(mut self, open_url: OpenUrlEnvironment) -> Self {
+        self.open_url = Some(open_url);
+        self
     }
 }
 
@@ -499,6 +515,7 @@ pub struct ProviderRuntimeSupervisor {
     stopped: CancellationToken,
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     connect_mcp: Arc<RwLock<Option<Arc<ConnectMcpService>>>>,
+    open_url: Option<OpenUrlEnvironment>,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
 }
 
@@ -907,6 +924,7 @@ impl ProviderRuntimeSupervisor {
         #[cfg(test)] activity_dispatch_completion_hook: Option<ActivityDispatchCompletionTestHook>,
     ) -> Self {
         let queue_capacity = options.queue_capacity.max(1);
+        let open_url = options.open_url.clone();
         let session_idle_timeout = options.session_idle_timeout;
         #[cfg(test)]
         let idle_deadline_test_observer = options.idle_deadline_test_observer.clone();
@@ -950,6 +968,7 @@ impl ProviderRuntimeSupervisor {
             stopped,
             worker: Arc::new(Mutex::new(Some(worker))),
             connect_mcp: Arc::new(RwLock::new(None)),
+            open_url,
             activity_cancellation,
         }
     }
@@ -959,6 +978,9 @@ impl ProviderRuntimeSupervisor {
     }
 
     pub async fn attach_connect_mcp(&self, service: Arc<ConnectMcpService>) {
+        if let Some(open_url) = self.open_url.as_ref() {
+            open_url.bind(service.clone());
+        }
         *self.connect_mcp.write().await = Some(service);
     }
 
@@ -985,6 +1007,11 @@ impl ProviderRuntimeSupervisor {
                 authorization_header: issued.authorization_header,
                 provider_session_id: issued.provider_session_id,
             });
+        }
+        if request.open_url.is_none()
+            && let Some(open_url) = self.open_url.as_ref()
+        {
+            request.open_url = open_url.issue(&request.thread_id).await;
         }
         self.request(|response| SupervisorMessage::Launch {
             request: Box::new(request),
@@ -4486,6 +4513,7 @@ async fn build_launch_request_for_command(
             .then(|| route.binary.server_password.clone()),
         mcp: None,
         codex_home,
+        open_url: None,
     })
 }
 
@@ -8979,9 +9007,12 @@ where
     Fut: Future<Output = ()>,
 {
     let provider = request.provider.clone();
+    let mut request_environment = Cow::Borrowed(&request.environment);
+    if let Some(open_url) = request.open_url.as_ref() {
+        open_url.apply(request_environment.to_mut());
+    }
     let environment = normalize_provider_environment(
-        request
-            .environment
+        request_environment
             .iter()
             .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
     );
@@ -14187,6 +14218,7 @@ mod tests {
     #[derive(Default)]
     struct SupervisorDriverState {
         launches: usize,
+        launch_requests: Vec<super::ProviderLaunchRequest>,
         starts: usize,
         sends: Vec<String>,
         send_turn_ids: std::collections::VecDeque<String>,
@@ -14713,11 +14745,12 @@ mod tests {
     impl ProviderDriverFactory for SupervisorFactory {
         fn create(
             &self,
-            _: super::ProviderLaunchRequest,
+            request: super::ProviderLaunchRequest,
         ) -> super::BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, super::ProviderRuntimeError>>
         {
             Box::pin(async move {
                 self.state.lock().unwrap().launches += 1;
+                self.state.lock().unwrap().launch_requests.push(request);
                 Ok(Arc::new(SupervisorDriver {
                     state: self.state.clone(),
                     events: tokio::sync::Mutex::new(
@@ -14807,6 +14840,7 @@ mod tests {
             server_password: None,
             mcp: None,
             codex_home: None,
+            open_url: None,
         }
     }
 
@@ -18888,6 +18922,7 @@ done
             stopped: tokio_util::sync::CancellationToken::new(),
             worker: Arc::new(tokio::sync::Mutex::new(None)),
             connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
+            open_url: None,
             activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
         };
         assert_eq!(
@@ -18907,6 +18942,7 @@ done
             stopped: tokio_util::sync::CancellationToken::new(),
             worker: Arc::new(tokio::sync::Mutex::new(None)),
             connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
+            open_url: None,
             activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
         };
         let drop_response = tokio::spawn(async move {
@@ -20667,6 +20703,145 @@ done
         engine.shutdown().await;
     }
 
+    async fn open_url_connect_service(
+        temp: &TempDir,
+    ) -> Arc<crate::production::connect_mcp::ConnectMcpService> {
+        use crate::production::connect_mcp::{
+            ConnectMcpConfig, ConnectMcpService, DecodedCloudProof, EndpointRuntime, JwtCodec,
+            PairingIssuer, PreviewInvoker,
+        };
+        let jwt = JwtCodec::new(
+            |_typ, _payload| async move { Err("unused".to_owned()) },
+            |_key, _typ, _token, _issuer, _audience, _now| async move {
+                Err::<DecodedCloudProof, _>("unused".to_owned())
+            },
+            || async { Err("unused".to_owned()) },
+        );
+        Arc::new(
+            ConnectMcpService::open(
+                temp.path().join("connect.sqlite3"),
+                ConnectMcpConfig {
+                    environment_id: "env-1".into(),
+                    descriptor: json!({"environmentId":"env-1"}),
+                    mcp_endpoint: "http://127.0.0.1:43123/mcp".into(),
+                    open_url_endpoint: "http://127.0.0.1:43123/api/preview/open-url".into(),
+                    now_epoch_seconds: Arc::new(|| 1_700_000_000),
+                    max_mcp_credentials: 4,
+                    max_mcp_sessions: 4,
+                },
+                jwt,
+                EndpointRuntime::new(|_config| async move { Ok(json!({"status":"disabled"})) }),
+                PairingIssuer::new(|_thumbprint| async move { Err("unused".to_owned()) }),
+                PreviewInvoker::new(|_scope, _operation, _input, _tab, _cancellation| async {
+                    Ok(json!({}))
+                }),
+            )
+            .await
+            .expect("connect service"),
+        )
+    }
+
+    #[tokio::test]
+    async fn provider_launch_env_contains_open_url_vars() {
+        let engine = supervisor_engine().await;
+        let state = Arc::new(StdMutex::new(SupervisorDriverState::default()));
+        let (_events_tx, events) = mpsc::channel(1);
+        let temp = TempDir::new().unwrap();
+        let shim_dir = temp.path().join("shims");
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events)),
+            }),
+            super::ActivityProjection::new(crate::activity::ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions {
+                open_url: Some(crate::open_url::OpenUrlEnvironment::new(shim_dir.clone())),
+                ..super::SupervisorOptions::default()
+            },
+        );
+        let connect = open_url_connect_service(&temp).await;
+        supervisor.attach_connect_mcp(connect.clone()).await;
+        let mut request = native_launch(&temp, "codex");
+        request.thread_id = "t1".to_owned();
+        let route_fingerprint = super::delivery_route_fingerprint(&request).unwrap();
+
+        supervisor.launch(request).await.unwrap();
+
+        let launched = state
+            .lock()
+            .unwrap()
+            .launch_requests
+            .pop()
+            .expect("launched request");
+        // The per-launch credential stays out of the durable route fingerprint.
+        assert_eq!(
+            super::delivery_route_fingerprint(&launched).unwrap(),
+            route_fingerprint
+        );
+        let session = launched.open_url.clone().expect("open-url session");
+        assert_eq!(
+            connect.verify_open_url_credential(&session.token).await,
+            Some("t1".to_owned())
+        );
+        assert_eq!(
+            session.endpoint,
+            "http://127.0.0.1:43123/api/preview/open-url"
+        );
+        assert_eq!(session.shim_dir, shim_dir);
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+
+        // The provider process itself sees the variables.
+        #[cfg(unix)]
+        {
+            let dump = temp.path().join("env-dump");
+            let ready = temp.path().join("env-ready");
+            let fixture = executable_fixture(
+                &temp,
+                "env-provider",
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$BIBCODE_OPEN_URL_TOKEN\" \"$BIBCODE_OPEN_URL_ENDPOINT\" \"$BROWSER\" \"$BRAINSTORM_OPEN_CMD\" \"$PATH\" > '{}'\nprintf ready > '{}'\nread -r line\n",
+                    dump.display(),
+                    ready.display()
+                ),
+            );
+            let mut launched = launched;
+            launched.binary_path = fixture.to_string_lossy().into_owned();
+            launched
+                .environment
+                .insert("BROWSER".to_owned(), "firefox".to_owned());
+            let child =
+                super::spawn_child(&launched, &[], false, ProcessAttributionRegistry::new())
+                    .await
+                    .expect("provider child should spawn");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("provider fixture records its environment");
+            let mut inner = child.into_inner();
+            let _ = inner.start_kill();
+            let _ = inner.wait().await;
+
+            let recorded = std::fs::read_to_string(&dump).unwrap();
+            let lines = recorded.lines().collect::<Vec<_>>();
+            assert_eq!(lines[0], session.token);
+            assert_eq!(lines[1], "http://127.0.0.1:43123/api/preview/open-url");
+            assert_eq!(lines[2], "bibcode-open-url");
+            assert_eq!(lines[3], "bibcode-open-url");
+            assert!(
+                lines[4].starts_with(&format!("{}:", shim_dir.display())),
+                "PATH {} must start with the shim directory",
+                lines[4]
+            );
+        }
+    }
+
     #[tokio::test]
     async fn delivery_send_does_not_block_supervisor_control_messages() {
         let engine = supervisor_engine().await;
@@ -20751,6 +20926,7 @@ done
             super::SupervisorOptions {
                 queue_capacity: 2,
                 session_idle_timeout: IDLE_TIMEOUT,
+                open_url: None,
                 idle_deadline_test_observer: Some(idle_deadline_tx),
                 accepted_publication_test_hook: None,
             },
@@ -21231,6 +21407,7 @@ done
                 super::SupervisorOptions {
                     queue_capacity: 2,
                     session_idle_timeout: idle_timeout,
+                    open_url: None,
                     idle_deadline_test_observer: Some(idle_deadline_tx),
                     accepted_publication_test_hook: Some(super::AcceptedPublicationTestHook {
                         admission_waiting: Some(admission_waiting.clone()),

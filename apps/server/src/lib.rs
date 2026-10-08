@@ -20,6 +20,7 @@ mod lifecycle;
 pub mod logging;
 mod maintenance;
 pub mod mcp;
+pub mod open_url;
 pub mod orchestration;
 pub mod persistence;
 pub mod preview;
@@ -117,6 +118,10 @@ pub async fn run_cli() -> Result<(), RunError> {
         CliAction::Storage(command) => run_storage_command(command).await,
         CliAction::Pairing(command) => run_pairing_command(command).await,
         CliAction::Service(command) => run_service_command(command),
+        CliAction::OpenUrl { url } => match open_url::run_open_url(&url).await {
+            0 => Ok(()),
+            code => std::process::exit(code),
+        },
     }
 }
 

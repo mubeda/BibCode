@@ -3693,6 +3693,7 @@ mod tests {
                 server_password: None,
                 mcp: None,
                 codex_home: None,
+                open_url: None,
             })
             .await
             .expect("provider launches");

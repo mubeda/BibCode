@@ -479,6 +479,19 @@ effective executable-search policy. A provider instance's case-insensitive
 the ambient value is used. Explicit executable paths retain their normal
 platform-specific handling.
 
+Every provider launch and every terminal process start also receives the
+open-URL hook: `BROWSER` and `BRAINSTORM_OPEN_CMD` set to `bibcode-open-url`,
+`BIBCODE_OPEN_URL_TOKEN` and `BIBCODE_OPEN_URL_ENDPOINT`, and `PATH` with
+`<state dir>/runtime/open-url` prepended to the effective `PATH` above. These
+server values replace any the instance or terminal caller supplied. The server
+writes the `bibcode-open-url` shims (POSIX sh and `.cmd`) there at startup;
+each runs `<server executable> open-url "<url>"`, which posts the URL to
+`POST /api/preview/open-url` with the token. The token is issued per launch or
+terminal start, is scoped to the thread, and authorizes only that route. The
+provider credential stays outside the instance environment, so durable
+delivery route fingerprints do not change with it. A desktop executable handles
+`open-url` before Tauri starts; inside an AppImage the shim runs the image.
+
 ## Provider maintenance
 
 The Rust server owns installed-version probes, latest-version registry checks,

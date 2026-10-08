@@ -44,6 +44,9 @@ pub struct StatePaths {
     pub environment_id: PathBuf,
     pub server_runtime_state: PathBuf,
     pub secrets_dir: PathBuf,
+    /// Holds the `bibcode-open-url` shims that agents and terminals find on `PATH`. Created by
+    /// `open_url::write_shims`, not by startup: the hook is optional and must not stop the server.
+    pub open_url_shim_dir: PathBuf,
 }
 
 impl StatePaths {
@@ -78,6 +81,7 @@ impl StatePaths {
             environment_id: state_dir.join("environment-id"),
             server_runtime_state: state_dir.join("server-runtime.json"),
             secrets_dir: state_dir.join("secrets"),
+            open_url_shim_dir: state_dir.join("runtime/open-url"),
             state_dir,
             logs_dir,
             provider_logs_dir,
