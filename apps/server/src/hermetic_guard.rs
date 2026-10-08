@@ -31,6 +31,31 @@ const GUARDED_PROGRAMS: &[&str] = &[
     "winget",
 ];
 
+fn abort_guard_process() -> ! {
+    #[cfg(unix)]
+    {
+        // SAFETY: `limit` is a valid rlimit for this call, which only changes
+        // this process's core-file limit.
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        unsafe {
+            let _ = libc::setrlimit(libc::RLIMIT_CORE, &limit);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl has no pointer arguments and changes only this process.
+        // Pipe core_pattern handlers such as systemd-coredump still dump when
+        // RLIMIT_CORE is 0 unless the process is not dumpable.
+        unsafe {
+            let _ = libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
+    }
+    std::process::abort()
+}
+
 fn abort_mode() -> bool {
     match std::env::var_os(MODE_ENV) {
         None => DEFAULT_MODE == "abort",
@@ -41,7 +66,7 @@ fn abort_mode() -> bool {
                 "hermetic-test-guard: invalid {MODE_ENV} value {value:?} (thread {})",
                 std::thread::current().name().unwrap_or("unnamed")
             );
-            std::process::abort();
+            abort_guard_process();
         }
     }
 }
@@ -55,7 +80,7 @@ pub(crate) fn refuse_access(name: &str, path: &Path) -> bool {
         std::thread::current().name().unwrap_or("unnamed")
     );
     if abort {
-        std::process::abort();
+        abort_guard_process();
     }
     false
 }
