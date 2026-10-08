@@ -1,7 +1,8 @@
 # Resume continuity — design
 
-Status: approved for implementation by the user on 2026-10-08 ("do the
-idle-suspension fix and implement t3 code gaps"). T3 Code
+Status: approved by the user on 2026-10-08, first as the direction ("do the
+idle-suspension fix and implement t3 code gaps") and then explicitly as written
+here, including the decisions below. T3 Code
 (`/work/github/t3code`) is the reference implementation for parts 3–5.
 
 ## Problems
