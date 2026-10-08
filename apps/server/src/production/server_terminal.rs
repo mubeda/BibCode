@@ -14,7 +14,7 @@ use crate::{
         ProcessAttributionRegistry, ProcessAttributionTotals, ProcessIdentity,
         ProcessResourceHistory, ProcessResourceTotals, ProcessRow, ProcessSignal,
         RuntimeProcessOwnership, SplitMetric, UiCoverage, UiCoverageStatus,
-        bound_diagnostic_string, build_descendant_entries, process_tree_metadata,
+        bound_diagnostic_string, process_tree_metadata,
     },
     persistence::Repositories,
     production::orchestration_effects::SetupScriptLaunch,
@@ -32,7 +32,7 @@ use crate::{
 };
 
 use super::{
-    local_servers::{self, TerminalProcessSet},
+    local_servers,
     workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError},
 };
 
@@ -369,11 +369,10 @@ fn register_control_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalSe
     }
     {
         let terminal = services.terminal.clone();
-        let sampler = services.process_sampler.clone();
         registry.register_stream(
             "subscribeDiscoveredLocalServers",
             move |_request, cancellation| {
-                discovered_local_servers_stream(terminal.clone(), sampler.clone(), cancellation)
+                discovered_local_servers_stream(terminal.clone(), cancellation)
             },
         );
     }
@@ -381,13 +380,13 @@ fn register_control_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalSe
 
 fn discovered_local_servers_stream(
     terminal: TerminalManager,
-    sampler: Arc<NativeProcessSampler>,
     cancellation: CancellationToken,
 ) -> JsonStream {
     spawn_stream(cancellation, move |sender, cancellation| async move {
+        let mut discovery = local_servers::Discovery::default();
         loop {
-            let terminals = live_terminal_process_sets(&terminal, &sampler).await;
-            let servers = local_servers::discover(&cancellation, &terminals).await;
+            let terminals = terminal.live_session_pids().await;
+            let servers = discovery.scan(&cancellation, terminals).await;
             if cancellation.is_cancelled()
                 || sender
                     .send(Ok(vec![json!({
@@ -405,39 +404,6 @@ fn discovered_local_servers_stream(
             }
         }
     })
-}
-
-/// Process trees of live terminals, sampled only when at least one terminal is live.
-// ponytail: one full process sample per scan tick while terminals are live; switch to an
-// inspector cache if diagnostics show the 1 s scan cost.
-async fn live_terminal_process_sets(
-    terminal: &TerminalManager,
-    sampler: &NativeProcessSampler,
-) -> Vec<TerminalProcessSet> {
-    let live = terminal.live_session_pids().await;
-    if live.is_empty() {
-        return Vec::new();
-    }
-    let rows = match sampler.collect_rows().await {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::debug!(%error, "local server discovery could not sample terminal processes");
-            return Vec::new();
-        }
-    };
-    live.into_iter()
-        .map(|(thread_id, terminal_id, root)| TerminalProcessSet {
-            thread_id,
-            terminal_id,
-            pids: std::iter::once(root)
-                .chain(
-                    build_descendant_entries(&rows, root)
-                        .into_iter()
-                        .map(|entry| entry.pid),
-                )
-                .collect(),
-        })
-        .collect()
 }
 
 fn register_diagnostics_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
@@ -2002,11 +1968,8 @@ mod tests {
             .expect("bind local listener");
         let port = listener.local_addr().expect("listener address").port();
         let cancellation = CancellationToken::new();
-        let mut discovery = discovered_local_servers_stream(
-            services.terminal.clone(),
-            services.process_sampler.clone(),
-            cancellation.clone(),
-        );
+        let mut discovery =
+            discovered_local_servers_stream(services.terminal.clone(), cancellation.clone());
 
         let discovered = next_snapshot(&mut discovery).await;
         assert!(discovered["scannedAt"].is_string());

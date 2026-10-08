@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 #[cfg(target_os = "linux")]
 use std::net::Ipv4Addr;
@@ -13,6 +16,9 @@ pub(crate) const SCAN_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(any(windows, target_os = "macos"))]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_SERVERS: usize = 256;
+/// Cached attributions are redone at least this often, so a sample that missed an
+/// owner (or an owner that exited while its socket lives on) is corrected.
+const ATTRIBUTION_REFRESH: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Listener {
@@ -24,34 +30,178 @@ struct Listener {
 }
 
 /// One live terminal session and the pids of its process tree (root first).
-pub(crate) struct TerminalProcessSet {
-    pub thread_id: String,
-    pub terminal_id: String,
-    pub pids: Vec<u32>,
+struct TerminalProcessSet {
+    thread_id: String,
+    terminal_id: String,
+    pids: Vec<u32>,
 }
 
-pub(crate) async fn discover(
-    cancellation: &CancellationToken,
-    terminals: &[TerminalProcessSet],
-) -> Vec<Value> {
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut listeners = platform_listeners(cancellation).await;
-    #[cfg(target_os = "linux")]
-    attribute_socket_owners(cancellation, &mut listeners, terminals).await;
-    let names = process_names(listeners.iter().filter_map(|listener| listener.pid));
-    listeners
-        .into_iter()
-        .take(MAX_SERVERS)
-        .map(|listener| {
-            let process_name = listener.pid.and_then(|pid| names.get(&pid)).cloned();
-            json!({
-                "host": listener.host,
-                "port": listener.port,
-                "url": format!("http://{}:{}/", listener.host, listener.port),
-                "processName": process_name,
-                "pid": listener.pid,
-                "terminal": terminal_for_pid(terminals, listener.pid),
+/// `(thread_id, terminal_id, root pid)` of each live terminal session.
+pub(crate) type LiveTerminal = (String, String, u32);
+
+/// A listener's platform identity: port, reported pid, and socket inode.
+type ListenerKey = (u16, Option<u32>, Option<u64>);
+
+struct Attribution {
+    pid: Option<u32>,
+    terminal: Option<Value>,
+}
+
+/// One subscriber's discovery state. Listener attribution is reused until a new
+/// listener appears or the live terminals change, so the host process table is
+/// sampled only when something new needs attributing.
+// ponytail: each subscriber still runs its own 1 s listener scan and its own
+// process-table sample (parent pids only) per change or every 10 s; share one scan
+// task across subscribers if several clients make that measurable.
+#[derive(Default)]
+pub(crate) struct Discovery {
+    terminals: Vec<LiveTerminal>,
+    attributions: HashMap<ListenerKey, Attribution>,
+    sampled_at: Option<Instant>,
+}
+
+impl Discovery {
+    pub(crate) async fn scan(
+        &mut self,
+        cancellation: &CancellationToken,
+        terminals: Vec<LiveTerminal>,
+    ) -> Vec<Value> {
+        let listeners = platform_listeners(cancellation).await;
+        self.attribute(
+            cancellation,
+            listeners,
+            terminals,
+            process_parents,
+            Instant::now(),
+        )
+        .await
+    }
+
+    async fn attribute(
+        &mut self,
+        cancellation: &CancellationToken,
+        mut listeners: Vec<Listener>,
+        terminals: Vec<LiveTerminal>,
+        sample_parents: fn() -> HashMap<u32, u32>,
+        now: Instant,
+    ) -> Vec<Value> {
+        listeners.truncate(MAX_SERVERS);
+        if terminals != self.terminals {
+            self.terminals = terminals;
+            self.attributions.clear();
+        }
+        let keys = listeners
+            .iter()
+            .map(|listener| (listener.port, listener.pid, listener.inode))
+            .collect::<Vec<ListenerKey>>();
+        let expired = self
+            .sampled_at
+            .is_none_or(|sampled_at| now.duration_since(sampled_at) >= ATTRIBUTION_REFRESH);
+        if !self.terminals.is_empty()
+            && (expired || keys.iter().any(|key| !self.attributions.contains_key(key)))
+        {
+            self.sampled_at = Some(now);
+            let parents = tokio::select! {
+                () = cancellation.cancelled() => return Vec::new(),
+                parents = tokio::task::spawn_blocking(sample_parents) => parents.unwrap_or_default(),
+            };
+            let sets = terminal_process_sets(&self.terminals, &parents);
+            #[cfg(target_os = "linux")]
+            attribute_socket_owners(cancellation, &mut listeners, &sets).await;
+            self.attributions = keys
+                .iter()
+                .zip(&listeners)
+                .map(|(key, listener)| {
+                    let terminal = terminal_for_pid(&sets, listener.pid);
+                    (
+                        *key,
+                        Attribution {
+                            pid: listener.pid,
+                            terminal,
+                        },
+                    )
+                })
+                .collect();
+        } else {
+            let current = keys.iter().collect::<HashSet<_>>();
+            self.attributions.retain(|key, _| current.contains(key));
+        }
+        let attributions = keys
+            .iter()
+            .map(|key| self.attributions.get(key))
+            .collect::<Vec<_>>();
+        for (listener, attribution) in listeners.iter_mut().zip(&attributions) {
+            if let Some(attribution) = attribution {
+                listener.pid = attribution.pid;
+            }
+        }
+        let pids = listeners
+            .iter()
+            .filter_map(|listener| listener.pid)
+            .collect::<Vec<_>>();
+        let names = tokio::task::spawn_blocking(move || process_names(pids.into_iter()))
+            .await
+            .unwrap_or_default();
+        listeners
+            .into_iter()
+            .zip(attributions)
+            .map(|(listener, attribution)| {
+                let process_name = listener.pid.and_then(|pid| names.get(&pid)).cloned();
+                json!({
+                    "host": listener.host,
+                    "port": listener.port,
+                    "url": format!("http://{}:{}/", listener.host, listener.port),
+                    "processName": process_name,
+                    "pid": listener.pid,
+                    "terminal": attribution.and_then(|attribution| attribution.terminal.clone()),
+                })
             })
+            .collect()
+    }
+}
+
+/// Parent pid of every host process. Refreshes nothing beyond the process list,
+/// and uses its own `System`, so diagnostics' CPU baselines are untouched.
+fn process_parents() -> HashMap<u32, u32> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    system
+        .processes()
+        .iter()
+        .filter(|(_, process)| process.thread_kind().is_none())
+        .filter_map(|(pid, process)| Some((pid.as_u32(), process.parent()?.as_u32())))
+        .collect()
+}
+
+fn terminal_process_sets(
+    terminals: &[LiveTerminal],
+    parents: &HashMap<u32, u32>,
+) -> Vec<TerminalProcessSet> {
+    let mut children = HashMap::<u32, Vec<u32>>::new();
+    for (&pid, &parent) in parents {
+        children.entry(parent).or_default().push(pid);
+    }
+    terminals
+        .iter()
+        .map(|(thread_id, terminal_id, root)| {
+            let mut pids = vec![*root];
+            let mut seen = HashSet::from([*root]);
+            let mut next = 0;
+            while let Some(&pid) = pids.get(next) {
+                next += 1;
+                for &child in children.get(&pid).into_iter().flatten() {
+                    if seen.insert(child) {
+                        pids.push(child);
+                    }
+                }
+            }
+            TerminalProcessSet {
+                thread_id: thread_id.clone(),
+                terminal_id: terminal_id.clone(),
+                pids,
+            }
         })
         .collect()
 }
@@ -393,18 +543,148 @@ mod tests {
         assert_eq!(map.get(&424242), Some(&100));
     }
 
+    fn live(root: u32) -> Vec<(String, String, u32)> {
+        vec![("thread-1".into(), "term-1".into(), root)]
+    }
+
+    fn listener(port: u16, pid: u32) -> Listener {
+        Listener {
+            host: "127.0.0.1".into(),
+            port,
+            pid: Some(pid),
+            inode: None,
+        }
+    }
+
+    static SAMPLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counting_parents() -> HashMap<u32, u32> {
+        SAMPLES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        HashMap::from([(101, 100), (102, 101)])
+    }
+
+    #[tokio::test]
+    async fn discovery_samples_the_process_table_only_for_unattributed_listeners() {
+        let samples = || SAMPLES.load(std::sync::atomic::Ordering::SeqCst);
+        let cancellation = CancellationToken::new();
+        let mut discovery = Discovery::default();
+        let start = std::time::Instant::now();
+
+        // No live terminals: nothing can be attributed, so nothing is sampled.
+        let servers = discovery
+            .attribute(
+                &cancellation,
+                vec![listener(3000, 102)],
+                Vec::new(),
+                counting_parents,
+                start,
+            )
+            .await;
+        assert_eq!(samples(), 0);
+        assert_eq!(servers[0]["terminal"], Value::Null);
+
+        // A new listener under a live terminal is sampled once and attributed.
+        let servers = discovery
+            .attribute(
+                &cancellation,
+                vec![listener(3000, 102)],
+                live(100),
+                counting_parents,
+                start,
+            )
+            .await;
+        assert_eq!(samples(), 1);
+        assert_eq!(
+            servers[0]["terminal"],
+            json!({ "threadId": "thread-1", "terminalId": "term-1" })
+        );
+
+        // Every listener already attributed: no sampling, same answer.
+        let servers = discovery
+            .attribute(
+                &cancellation,
+                vec![listener(3000, 102)],
+                live(100),
+                counting_parents,
+                start,
+            )
+            .await;
+        assert_eq!(samples(), 1);
+        assert_eq!(
+            servers[0]["terminal"],
+            json!({ "threadId": "thread-1", "terminalId": "term-1" })
+        );
+
+        // A new listener or a changed terminal set samples again.
+        discovery
+            .attribute(
+                &cancellation,
+                vec![listener(3000, 102), listener(4000, 7)],
+                live(100),
+                counting_parents,
+                start,
+            )
+            .await;
+        assert_eq!(samples(), 2);
+        let servers = discovery
+            .attribute(
+                &cancellation,
+                vec![listener(3000, 102)],
+                live(101),
+                counting_parents,
+                start,
+            )
+            .await;
+        assert_eq!(samples(), 3);
+        assert_eq!(
+            servers[0]["terminal"],
+            json!({ "threadId": "thread-1", "terminalId": "term-1" })
+        );
+
+        // Cached answers expire, so a missed or stale owner is retried.
+        discovery
+            .attribute(
+                &cancellation,
+                vec![listener(3000, 102)],
+                live(101),
+                counting_parents,
+                start + ATTRIBUTION_REFRESH,
+            )
+            .await;
+        assert_eq!(samples(), 4);
+    }
+
+    #[test]
+    fn terminal_process_sets_follow_parent_links_from_each_root() {
+        let parents = HashMap::from([(101, 100), (102, 101), (200, 1)]);
+        let sets = terminal_process_sets(&live(100), &parents);
+        let mut pids = sets[0].pids.clone();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![100, 101, 102]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_parents_sees_a_spawned_child_under_this_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        let parents = process_parents();
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(parents.get(&child.id()), Some(&std::process::id()));
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn discover_attributes_a_real_listener_to_the_terminal_owning_its_pid() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let terminals = vec![TerminalProcessSet {
-            thread_id: "thread-1".into(),
-            terminal_id: "term-1".into(),
-            pids: vec![std::process::id()],
-        }];
 
-        let servers = discover(&CancellationToken::new(), &terminals).await;
+        let servers = Discovery::default()
+            .scan(&CancellationToken::new(), live(std::process::id()))
+            .await;
         let server = servers
             .iter()
             .find(|server| server["port"] == port)
@@ -416,7 +696,9 @@ mod tests {
             json!({ "threadId": "thread-1", "terminalId": "term-1" })
         );
 
-        let unattributed = discover(&CancellationToken::new(), &[]).await;
+        let unattributed = Discovery::default()
+            .scan(&CancellationToken::new(), Vec::new())
+            .await;
         let server = unattributed
             .iter()
             .find(|server| server["port"] == port)
