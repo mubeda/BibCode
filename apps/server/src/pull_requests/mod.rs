@@ -11,6 +11,7 @@ pub mod host;
 pub mod model;
 pub mod permissions;
 mod read;
+pub(crate) mod snapshot_store;
 
 use std::{
     collections::HashMap,
