@@ -100,6 +100,7 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
             </header>
             <PullRequestsBodyEditor
               detail={detail}
+              live={liveDetail}
               projectRef={projectRef}
               baseUrl={`${context.webUrl}/`}
             />

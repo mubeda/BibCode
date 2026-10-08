@@ -4,7 +4,10 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { createJSONStorage } from "zustand/middleware";
 import { usePullRequestsStore } from "../../../pullRequestsStore";
-import { context, detail, file } from "./testFixtures";
+import type { PullRequestsDetail, PullRequestsTimeline } from "@bibcode/contracts";
+import { PullRequestsActionsContext } from "../usePullRequestsAction";
+import { allowed, mockRun } from "../review/testHelpers";
+import { context, detail, file, thread } from "./testFixtures";
 const h = vi.hoisted(() => ({
   hash: "",
   navigate: vi.fn(),
@@ -14,6 +17,7 @@ const h = vi.hoisted(() => ({
 vi.mock("@tanstack/react-router", () => ({
   useLocation: () => ({ hash: h.hash }),
   useNavigate: () => h.navigate,
+  Link: ({ children }: { children: ReactNode }) => <a>{children}</a>,
 }));
 vi.mock("../../../hooks/useSettings", () => ({
   useClientSettings: (select: (settings: { diffIgnoreWhitespace: boolean }) => unknown) =>
@@ -60,10 +64,25 @@ const files = {
   diffRefs: { baseSha: "base", startSha: "start", headSha: "head" },
   truncated: false,
 };
-async function render() {
+async function render(
+  overrideDetail: PullRequestsDetail = detail,
+  timeline?: PullRequestsTimeline,
+  live?: PullRequestsDetail | null,
+) {
   await act(async () =>
     root.render(
-      <PullRequestsFiles files={files} detail={detail} projectRef={projectRef} context={context} />,
+      <PullRequestsActionsContext
+        value={{ run: mockRun(), pending: false, error: null, requestKind: "pull request" }}
+      >
+        <PullRequestsFiles
+          files={files}
+          {...(timeline ? { timeline } : {})}
+          detail={overrideDetail}
+          {...(live === undefined ? {} : { live })}
+          projectRef={projectRef}
+          context={context}
+        />
+      </PullRequestsActionsContext>,
     ),
   );
 }
@@ -132,5 +151,47 @@ describe("PullRequestsFiles", () => {
     expect(
       container.querySelector('[data-file-path="docs/read me#é.md"]')?.getAttribute("aria-current"),
     ).toBe("true");
+  });
+  it("leaves the bulk apply-suggestions control inactive with title Loading… when live is null", async () => {
+    const suggestible: PullRequestsDetail = {
+      ...detail,
+      permissions: { ...detail.permissions, applySuggestion: allowed },
+    };
+    const threadAt = (id: string, suggestionId: string, fromLine: number, toLine: number) => ({
+      ...thread,
+      id,
+      path: file.path,
+      comments: [
+        {
+          ...thread.comments[0]!,
+          id: `${id}:comment`,
+          suggestion: { ...thread.comments[0]!.suggestion!, id: suggestionId, fromLine, toLine },
+        },
+      ],
+    });
+    const timeline: PullRequestsTimeline = {
+      items: [threadAt("th:1", "sg:1", 3, 4), threadAt("th:2", "sg:2", 6, 7)],
+      truncated: false,
+    };
+    await render(suggestible, timeline);
+    await act(async () => container.querySelector<HTMLElement>("#file\\=src\\/a\\.ts button")!.click());
+    await act(async () =>
+      container
+        .querySelector<HTMLInputElement>('input[aria-label="Select suggestion for lines 3–4"]')!
+        .click(),
+    );
+    await act(async () =>
+      container
+        .querySelector<HTMLInputElement>('input[aria-label="Select suggestion for lines 6–7"]')!
+        .click(),
+    );
+    const bulkButton = () =>
+      [...container.querySelectorAll("button")].find((b) => b.textContent === "Apply 2 selected")!;
+    expect(bulkButton().disabled).toBe(false);
+    // Re-render with a null live detail; the selection state carries over on the
+    // same mounted instance, isolating the live gate as the only variable.
+    await render(suggestible, timeline, null);
+    expect(bulkButton().disabled).toBe(true);
+    expect(bulkButton().title).toBe("Loading…");
   });
 });

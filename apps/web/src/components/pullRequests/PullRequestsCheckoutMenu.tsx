@@ -24,12 +24,19 @@ export function PullRequestsCheckoutMenu({
   number,
   headBranch,
   permission,
+  live = true,
 }: {
   scope: PullRequestsScope;
   projectRef: ScopedProjectRef;
   number: number;
   headBranch: string;
   permission: PullRequestsPermission;
+  /**
+   * Checking out only ever acts on a live detail, never a snapshot.
+   * Defaults to `true` so callers that have not adopted the split keep
+   * acting as before.
+   */
+  live?: boolean;
 }) {
   const reasonId = useId();
   const { requestKind } = usePullRequestsActions();
@@ -52,7 +59,7 @@ export function PullRequestsCheckoutMenu({
     worktrees,
     onSuccess: catalog.revalidate,
   });
-  const available = constrainPermission(permission, disabledReason);
+  const available = constrainPermission(permission, !live ? "Loading…" : disabledReason);
   const reason = available.allowed ? undefined : (available.reason ?? undefined);
   const targets = checkoutTargets(worktrees, scope.cwd);
   const others = targets.filter((target) => target.kind === "checkout" && target.cwd !== scope.cwd);

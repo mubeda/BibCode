@@ -378,6 +378,7 @@ export function PullRequestsDetailView({
                                 timeline={displayedTimeline}
                                 files={displayedFiles}
                                 detail={detail}
+                                live={liveDetail}
                                 projectRef={projectRef}
                                 context={context}
                               />

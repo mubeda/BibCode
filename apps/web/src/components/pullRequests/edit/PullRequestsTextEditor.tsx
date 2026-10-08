@@ -13,9 +13,16 @@ export interface PullRequestsEditorProps {
   detail: PullRequestsDetail;
   projectRef: ScopedProjectRef;
   baseUrl?: string;
+  /**
+   * Editing the title or body only ever acts on a live detail, never a
+   * snapshot. Omitting this falls back to `detail`, so callers that have
+   * not adopted the split keep acting as before.
+   */
+  live?: PullRequestsDetail | null;
 }
 export function PullRequestsTextEditor({
   detail,
+  live = detail,
   projectRef,
   field,
   baseUrl,
@@ -33,7 +40,11 @@ export function PullRequestsTextEditor({
   const label = field === "title" ? "Title" : "Description";
   const permission = constrainPermission(
     detail.permissions.editPullRequest,
-    pending || saving ? "Wait for the current action to finish" : null,
+    live === null
+      ? "Loading…"
+      : pending || saving
+        ? "Wait for the current action to finish"
+        : null,
   );
   const savePermission = constrainPermission(
     permission,

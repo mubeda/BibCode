@@ -51,6 +51,7 @@ export const PullRequestsHeader = memo(function PullRequestsHeader({
     <header className="shrink-0 space-y-3 p-4">
       <PullRequestsTitleEditor
         detail={detail}
+        live={live}
         projectRef={projectRef}
         provider={context.provider}
       />
@@ -125,6 +126,7 @@ export const PullRequestsHeader = memo(function PullRequestsHeader({
           number={detail.number}
           headBranch={detail.headBranch}
           permission={detail.permissions.checkout}
+          live={live !== null}
         />
         <PermissionButton
           permission={{ allowed: !refreshing, reason: refreshing ? "Refreshing…" : null }}

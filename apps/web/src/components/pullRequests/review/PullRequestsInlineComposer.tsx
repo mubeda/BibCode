@@ -14,6 +14,7 @@ export function PullRequestsInlineComposer({
   permission,
   headSha,
   patch,
+  live = true,
 }: {
   projectRef: ScopedProjectRef;
   number: number;
@@ -21,6 +22,12 @@ export function PullRequestsInlineComposer({
   permission: PullRequestsPermission;
   headSha: string;
   patch: string;
+  /**
+   * Adding or submitting a review comment only ever acts on a live detail,
+   * never a snapshot. Defaults to `true` so callers that have not adopted
+   * the split keep acting as before.
+   */
+  live?: boolean;
 }) {
   const draft = usePullRequestsStore((s) =>
     s.selectDraft(projectRef, number).inlineDrafts.find((c) => c.id === draftId),
@@ -43,11 +50,13 @@ export function PullRequestsInlineComposer({
   if (!draft) return null;
   const available = constrainPermission(
     permission,
-    pending || sending
-      ? "Wait for the current action to finish"
-      : !draft.body.trim()
-        ? "Write a review comment first"
-        : null,
+    !live
+      ? "Loading…"
+      : pending || sending
+        ? "Wait for the current action to finish"
+        : !draft.body.trim()
+          ? "Write a review comment first"
+          : null,
   );
   const discard = () =>
     usePullRequestsStore.getState().removeInlineDraft(projectRef, number, draft.id);
@@ -150,13 +159,15 @@ export function PullRequestsInlineComposer({
         <PermissionButton
           permission={constrainPermission(
             permission,
-            pending || sending
-              ? "Wait for the current action to finish"
-              : source === null
-                ? "Source lines are not available in this patch"
-                : draft.side === "left"
-                  ? "Suggestions apply to the new version of the file"
-                  : null,
+            !live
+              ? "Loading…"
+              : pending || sending
+                ? "Wait for the current action to finish"
+                : source === null
+                  ? "Source lines are not available in this patch"
+                  : draft.side === "left"
+                    ? "Suggestions apply to the new version of the file"
+                    : null,
           )}
           variant="outline"
           size="sm"
@@ -194,11 +205,18 @@ export function PullRequestsPendingComment({
   projectRef,
   number,
   permission,
+  live = true,
 }: {
   comment: PendingInlineComment;
   projectRef: ScopedProjectRef;
   number: number;
   permission: PullRequestsPermission;
+  /**
+   * Editing a pending review comment only ever acts on a live detail, never
+   * a snapshot. Defaults to `true` so callers that have not adopted the
+   * split keep acting as before.
+   */
+  live?: boolean;
 }) {
   const { pending } = usePullRequestsActions();
   return (
@@ -212,7 +230,7 @@ export function PullRequestsPendingComment({
         <PermissionButton
           permission={constrainPermission(
             permission,
-            pending ? "Wait for the current action to finish" : null,
+            !live ? "Loading…" : pending ? "Wait for the current action to finish" : null,
           )}
           variant="outline"
           size="sm"
