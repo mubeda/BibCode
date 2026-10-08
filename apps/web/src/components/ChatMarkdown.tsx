@@ -81,9 +81,10 @@ import { isPreviewSupportedInRuntime } from "../previewStateStore";
 import {
   isBrowserPreviewFile,
   openFileInPreview,
-  openUrlInPreview,
   BrowserPreviewUnavailableError,
 } from "../browser/openFileInPreview";
+import { showFileOutsideWorkspaceNotice } from "../browser/linkNotices";
+import { openLink } from "../browser/openLink";
 
 class CodeHighlightErrorBoundary extends React.Component<
   { fallback: ReactNode; children: ReactNode },
@@ -135,6 +136,13 @@ interface MarkdownActionFailureContext {
 
 function reportMarkdownActionFailure(context: MarkdownActionFailureContext, cause: unknown): void {
   console.error("[chat-markdown] action failed", context, cause);
+}
+
+function reportLinkUnavailable(target: string): void {
+  reportMarkdownActionFailure(
+    { operation: "open-link", target },
+    new Error("Local API is unavailable in this runtime."),
+  );
 }
 
 const highlightedCodeCache = new LRUCache<string>(
@@ -1048,7 +1056,11 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
           { operation: "open-file-in-browser", target: targetPath },
           result.cause,
         );
-        const error = squashAtomCommandFailure(result);
+        const error = squashAtomCommandFailure(result) as { readonly _tag?: string } | undefined;
+        if (error?._tag === "AssetWorkspacePathValidationError") {
+          showFileOutsideWorkspaceNotice({ onOpenInEditor: handleOpenInEditor });
+          return;
+        }
         toastManager.add(
           stackedThreadToast({
             type: "error",
@@ -1070,7 +1082,7 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
         );
       }
     })();
-  }, [onOpenInBrowser, targetPath]);
+  }, [handleOpenInEditor, onOpenInBrowser, targetPath]);
 
   const handleCopy = useCallback(
     (value: string, title: string) => {
@@ -1168,6 +1180,10 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
+              if (onOpenInBrowser && isModifiedOrNonPrimaryMarkdownClick(event)) {
+                handleOpenInEditor();
+                return;
+              }
               if (onOpenInBrowser) {
                 handleOpenInBrowser();
                 return;
@@ -1271,23 +1287,6 @@ function ChatMarkdown({
     event.clipboardData.setData("text/plain", payload.text);
     event.clipboardData.setData("text/html", payload.html);
   }, []);
-  const openExternalLinkInPreview = useCallback(
-    (url: string) => {
-      if (!threadRef) {
-        return Promise.resolve(
-          AsyncResult.failure<void, BrowserPreviewUnavailableError>(
-            Cause.fail(
-              new BrowserPreviewUnavailableError({
-                message: "Thread context is unavailable.",
-              }),
-            ),
-          ),
-        );
-      }
-      return openUrlInPreview({ threadRef, url, openPreview });
-    },
-    [openPreview, threadRef],
-  );
   const openMarkdownFileInPreview = useCallback(
     (path: string) => {
       if (!threadRef || preparedConnection._tag === "None") {
@@ -1361,10 +1360,21 @@ function ChatMarkdown({
         if (!fileLinkMeta) {
           const faviconHost = resolveExternalLinkHost(href);
           const isSameDocumentLink = href?.startsWith("#") ?? false;
-          const opensInPreview =
-            isHttpUrl(href) && Boolean(threadRef) && isPreviewSupportedInRuntime();
           const onClick = props.onClick;
           const canOpenInPreview = Boolean(threadRef) && isPreviewSupportedInRuntime();
+          const routeLink = (event: ReactMouseEvent<HTMLAnchorElement>, invert: boolean) => {
+            if (!href || !isHttpUrl(href)) return;
+            event.preventDefault();
+            const outcome = openLink({
+              url: href,
+              threadRef: threadRef ?? null,
+              invert,
+              openPreview,
+              onError: (cause) =>
+                reportMarkdownActionFailure({ operation: "open-link", target: href }, cause),
+            });
+            if (outcome === "unavailable") reportLinkUnavailable(href);
+          };
           const link = (
             <a
               {...props}
@@ -1378,32 +1388,18 @@ function ChatMarkdown({
                   handleMarkdownFragmentClick(event, href);
                   return;
                 }
-                if (!opensInPreview || !href || isModifiedOrNonPrimaryMarkdownClick(event)) return;
-                event.preventDefault();
-                void openExternalLinkInPreview(href)
-                  .then((result) => {
-                    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-                      reportMarkdownActionFailure(
-                        { operation: "open-link-in-preview", target: href },
-                        result.cause,
-                      );
-                    }
-                  })
-                  .catch((cause: unknown) => {
-                    reportMarkdownActionFailure(
-                      { operation: "open-link-in-preview", target: href },
-                      cause,
-                    );
-                  });
+                routeLink(event, isModifiedOrNonPrimaryMarkdownClick(event));
+              }}
+              onAuxClick={(event) => {
+                if (event.button === 1) routeLink(event, true);
               }}
               onContextMenu={(event) => {
-                if (!canOpenInPreview || !href) return;
+                if (!canOpenInPreview || !href || !isHttpUrl(href)) return;
                 event.preventDefault();
                 event.stopPropagation();
                 const api = readLocalApi();
                 if (!api) return;
                 void (async () => {
-                  let operation = "show-link-context-menu";
                   try {
                     const clicked = await api.contextMenu.show(
                       [
@@ -1412,20 +1408,27 @@ function ChatMarkdown({
                       ] as const,
                       { x: event.clientX, y: event.clientY },
                     );
-                    if (clicked === "open-in-browser") {
-                      operation = "open-link-in-preview";
-                      const result = await openExternalLinkInPreview(href);
-                      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-                        reportMarkdownActionFailure({ operation, target: href }, result.cause);
-                      }
-                      return;
-                    }
-                    if (clicked === "open-external") {
-                      operation = "open-link-external";
-                      await api.shell.openExternal(href);
+                    if (clicked === "open-in-browser" || clicked === "open-external") {
+                      const wantApp = clicked === "open-in-browser";
+                      const setting = getClientSettings().browserLinkTarget;
+                      const outcome = openLink({
+                        url: href,
+                        threadRef: threadRef ?? null,
+                        invert: wantApp ? setting === "system" : setting === "app",
+                        openPreview,
+                        onError: (cause) =>
+                          reportMarkdownActionFailure(
+                            { operation: "open-link", target: href },
+                            cause,
+                          ),
+                      });
+                      if (outcome === "unavailable") reportLinkUnavailable(href);
                     }
                   } catch (cause) {
-                    reportMarkdownActionFailure({ operation, target: href }, cause);
+                    reportMarkdownActionFailure(
+                      { operation: "show-link-context-menu", target: href },
+                      cause,
+                    );
                   }
                 })();
               }}
@@ -1532,7 +1535,7 @@ function ChatMarkdown({
       markdownFileLinkMetaByHref,
       onTaskListChange,
       openInPreferredEditor,
-      openExternalLinkInPreview,
+      openPreview,
       openMarkdownFileInPreview,
       resolvedTheme,
       skills,

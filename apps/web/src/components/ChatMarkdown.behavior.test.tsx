@@ -16,6 +16,9 @@ const mocks = vi.hoisted(() => ({
   contextMenuShow: vi.fn(),
   openExternal: vi.fn(),
   toastAdd: vi.fn(),
+  openLink: vi.fn(),
+  showFileOutsideWorkspaceNotice: vi.fn(),
+  browserLinkTarget: "app" as "app" | "system",
   previewSupported: true,
   localApiAvailable: true,
 }));
@@ -49,6 +52,13 @@ vi.mock("../browser/openFileInPreview", () => ({
   isBrowserPreviewFile: () => true,
   openFileInPreview: mocks.openFileInPreview,
   openUrlInPreview: mocks.openUrlInPreview,
+}));
+vi.mock("../browser/openLink", () => ({ openLink: mocks.openLink }));
+vi.mock("../browser/linkNotices", () => ({
+  showFileOutsideWorkspaceNotice: mocks.showFileOutsideWorkspaceNotice,
+}));
+vi.mock("../hooks/useSettings", () => ({
+  getClientSettings: () => ({ wordWrap: false, browserLinkTarget: mocks.browserLinkTarget }),
 }));
 vi.mock("../localApi", () => ({
   readLocalApi: () =>
@@ -101,6 +111,9 @@ beforeEach(() => {
   });
   mocks.previewSupported = true;
   mocks.localApiAvailable = true;
+  mocks.browserLinkTarget = "app";
+  mocks.openLink.mockReset().mockReturnValue("app");
+  mocks.showFileOutsideWorkspaceNotice.mockReset();
   mocks.openEditor.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   mocks.openFileInPreview.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   mocks.openUrlInPreview.mockReset().mockResolvedValue(AsyncResult.success(undefined));
@@ -358,10 +371,41 @@ describe("ChatMarkdown file-link behavior", () => {
       }),
     );
   });
+
+  it("opens the editor instead of the browser for a modified click on a previewable file", async () => {
+    const link = await mountFileLink();
+    await act(async () =>
+      link.dispatchEvent(
+        new MouseEvent("click", { bubbles: true, cancelable: true, button: 0, ctrlKey: true }),
+      ),
+    );
+    await flush();
+    expect(mocks.openEditor).toHaveBeenCalledWith("/workspace/src/index.ts:12");
+    expect(mocks.openFileInPreview).not.toHaveBeenCalled();
+  });
+
+  it("explains files outside the workspace and offers the editor", async () => {
+    const link = await mountFileLink();
+    mocks.openFileInPreview.mockResolvedValueOnce(
+      AsyncResult.failure(Cause.fail({ _tag: "AssetWorkspacePathValidationError" })),
+    );
+    await act(async () => link.click());
+    await flush();
+
+    expect(mocks.showFileOutsideWorkspaceNotice).toHaveBeenCalledOnce();
+    expect(mocks.toastAdd).not.toHaveBeenCalled();
+
+    expect(mocks.openEditor).not.toHaveBeenCalled();
+    mocks.showFileOutsideWorkspaceNotice.mock.calls[0]![0].onOpenInEditor();
+    await flush();
+    expect(mocks.openEditor).toHaveBeenCalledWith("/workspace/src/index.ts:12");
+  });
 });
 
 describe("ChatMarkdown external-link behavior", () => {
-  it("opens normal HTTP(S) link activation in the integrated browser", async () => {
+  const url = "https://example.test/docs";
+
+  it("routes a primary click through the link router without inverting", async () => {
     const link = await mountExternalLink();
     const click = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
 
@@ -369,17 +413,15 @@ describe("ChatMarkdown external-link behavior", () => {
     expect(link.rel).toBe("noopener noreferrer");
 
     await act(async () => link.dispatchEvent(click));
-    await flush();
 
     expect(click.defaultPrevented).toBe(true);
-    expect(mocks.openUrlInPreview).toHaveBeenCalledOnce();
-    expect(mocks.openUrlInPreview).toHaveBeenCalledWith(
-      expect.objectContaining({ threadRef, url: "https://example.test/docs" }),
+    expect(mocks.openLink).toHaveBeenCalledOnce();
+    expect(mocks.openLink).toHaveBeenCalledWith(
+      expect.objectContaining({ url, threadRef, invert: false, onError: expect.any(Function) }),
     );
-    expect(mocks.openExternal).not.toHaveBeenCalled();
   });
 
-  it("preserves native browser behavior for modified HTTP(S) link clicks", async () => {
+  it("inverts the destination for modified clicks", async () => {
     const link = await mountExternalLink();
 
     for (const init of [
@@ -388,6 +430,7 @@ describe("ChatMarkdown external-link behavior", () => {
       { shiftKey: true },
       { altKey: true },
     ]) {
+      mocks.openLink.mockClear();
       const click = new MouseEvent("click", {
         bubbles: true,
         cancelable: true,
@@ -395,38 +438,91 @@ describe("ChatMarkdown external-link behavior", () => {
         ...init,
       });
       await act(async () => link.dispatchEvent(click));
-      await flush();
-      expect(click.defaultPrevented).toBe(false);
+      expect(click.defaultPrevented).toBe(true);
+      expect(mocks.openLink).toHaveBeenCalledWith(expect.objectContaining({ url, invert: true }));
     }
-
-    expect(mocks.openUrlInPreview).not.toHaveBeenCalled();
   });
 
-  it("reports a failed normal HTTP(S) preview open without falling back externally", async () => {
+  it("inverts the destination for a middle click", async () => {
+    const link = await mountExternalLink();
+    const auxclick = new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 });
+
+    await act(async () => link.dispatchEvent(auxclick));
+
+    expect(auxclick.defaultPrevented).toBe(true);
+    expect(mocks.openLink).toHaveBeenCalledWith(expect.objectContaining({ url, invert: true }));
+
+    mocks.openLink.mockClear();
+    await act(async () =>
+      link.dispatchEvent(
+        new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 2 }),
+      ),
+    );
+    expect(mocks.openLink).not.toHaveBeenCalled();
+  });
+
+  it("routes links without a thread so the router can use the system browser", async () => {
+    const link = await mountExternalLink(false);
+    await act(async () => link.click());
+    expect(mocks.openLink).toHaveBeenCalledWith(
+      expect.objectContaining({ url, threadRef: null, invert: false }),
+    );
+  });
+
+  it("keeps same-document fragment links out of the router", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () =>
+      root?.render(
+        <ChatMarkdown
+          text={"[jump](#target)\n\n<a id='target'></a>"}
+          cwd="/workspace"
+          threadRef={threadRef}
+        />,
+      ),
+    );
+    const link = container.querySelector<HTMLAnchorElement>('a[href="#target"]')!;
+    await act(async () => link.click());
+    expect(mocks.openLink).not.toHaveBeenCalled();
+  });
+
+  it("reports router errors and an unavailable local API with operation context", async () => {
     const link = await mountExternalLink();
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    const cause = Cause.fail(new Error("preview rejected"));
-    mocks.openUrlInPreview.mockResolvedValueOnce(AsyncResult.failure(cause));
 
+    const cause = new Error("preview rejected");
     await act(async () => link.click());
-    await flush();
-
+    const onError = mocks.openLink.mock.calls[0]![0].onError as (cause: unknown) => void;
+    onError(cause);
     expect(consoleError).toHaveBeenCalledWith(
       "[chat-markdown] action failed",
-      { operation: "open-link-in-preview", target: "https://example.test/docs" },
+      { operation: "open-link", target: url },
       cause,
     );
-    expect(mocks.openExternal).not.toHaveBeenCalled();
-  });
 
-  it("does not route non-HTTP schemes into the integrated browser", async () => {
-    const link = await mountMailtoLink();
+    consoleError.mockClear();
+    mocks.openLink.mockReturnValueOnce("unavailable");
     await act(async () => link.click());
-    await flush();
-    expect(mocks.openUrlInPreview).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledWith(
+      "[chat-markdown] action failed",
+      { operation: "open-link", target: url },
+      expect.any(Error),
+    );
   });
 
-  it("opens external links in the integrated or system browser from the native menu", async () => {
+  it("does not route non-HTTP schemes", async () => {
+    const link = await mountMailtoLink();
+    const click = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+    await act(async () => link.dispatchEvent(click));
+    expect(click.defaultPrevented).toBe(false);
+    expect(mocks.openLink).not.toHaveBeenCalled();
+
+    await openContextMenu(link);
+    expect(mocks.contextMenuShow).not.toHaveBeenCalled();
+  });
+
+  it("maps the native menu items through the browserLinkTarget setting", async () => {
     const link = await mountExternalLink();
 
     mocks.contextMenuShow.mockResolvedValueOnce("open-in-browser");
@@ -438,57 +534,50 @@ describe("ChatMarkdown external-link behavior", () => {
       ],
       { x: 14, y: 28 },
     );
-    expect(mocks.openUrlInPreview).toHaveBeenCalledWith(
-      expect.objectContaining({ threadRef, url: "https://example.test/docs" }),
+    expect(mocks.openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url, threadRef, invert: false }),
     );
 
     mocks.contextMenuShow.mockResolvedValueOnce("open-external");
     await openContextMenu(link);
-    expect(mocks.openExternal).toHaveBeenCalledWith("https://example.test/docs");
+    expect(mocks.openLink).toHaveBeenLastCalledWith(expect.objectContaining({ url, invert: true }));
 
+    mocks.browserLinkTarget = "system";
+    mocks.contextMenuShow.mockResolvedValueOnce("open-in-browser");
+    await openContextMenu(link);
+    expect(mocks.openLink).toHaveBeenLastCalledWith(expect.objectContaining({ url, invert: true }));
+
+    mocks.contextMenuShow.mockResolvedValueOnce("open-external");
+    await openContextMenu(link);
+    expect(mocks.openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url, invert: false }),
+    );
+
+    const calls = mocks.openLink.mock.calls.length;
     mocks.contextMenuShow.mockResolvedValueOnce(undefined);
     await openContextMenu(link);
-    expect(mocks.openUrlInPreview).toHaveBeenCalledOnce();
-    expect(mocks.openExternal).toHaveBeenCalledOnce();
+    expect(mocks.openLink).toHaveBeenCalledTimes(calls);
   });
 
-  it("reports integrated and system browser failures with operation context", async () => {
+  it("reports context-menu failures with operation context", async () => {
     const link = await mountExternalLink();
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    const previewCause = Cause.fail(new Error("preview rejected"));
-    mocks.openUrlInPreview.mockResolvedValueOnce(AsyncResult.failure(previewCause));
-    mocks.contextMenuShow.mockResolvedValueOnce("open-in-browser");
-    await openContextMenu(link);
-    expect(consoleError).toHaveBeenCalledWith(
-      "[chat-markdown] action failed",
-      { operation: "open-link-in-preview", target: "https://example.test/docs" },
-      previewCause,
-    );
-
-    mocks.openUrlInPreview.mockRejectedValueOnce(new Error("preview threw"));
-    mocks.contextMenuShow.mockResolvedValueOnce("open-in-browser");
-    await openContextMenu(link);
-    expect(consoleError).toHaveBeenCalledWith(
-      "[chat-markdown] action failed",
-      { operation: "open-link-in-preview", target: "https://example.test/docs" },
-      expect.any(Error),
-    );
-
-    mocks.openExternal.mockRejectedValueOnce(new Error("shell denied"));
-    mocks.contextMenuShow.mockResolvedValueOnce("open-external");
-    await openContextMenu(link);
-    expect(consoleError).toHaveBeenCalledWith(
-      "[chat-markdown] action failed",
-      { operation: "open-link-external", target: "https://example.test/docs" },
-      expect.any(Error),
-    );
 
     mocks.contextMenuShow.mockRejectedValueOnce(new Error("menu unavailable"));
     await openContextMenu(link);
     expect(consoleError).toHaveBeenCalledWith(
       "[chat-markdown] action failed",
-      { operation: "show-link-context-menu", target: "https://example.test/docs" },
+      { operation: "show-link-context-menu", target: url },
+      expect.any(Error),
+    );
+
+    consoleError.mockClear();
+    mocks.openLink.mockReturnValueOnce("unavailable");
+    mocks.contextMenuShow.mockResolvedValueOnce("open-external");
+    await openContextMenu(link);
+    expect(consoleError).toHaveBeenCalledWith(
+      "[chat-markdown] action failed",
+      { operation: "open-link", target: url },
       expect.any(Error),
     );
   });
