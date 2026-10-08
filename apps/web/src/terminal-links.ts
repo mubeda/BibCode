@@ -204,10 +204,13 @@ export function fileUrlToPath(raw: string): string | null {
   return pathname;
 }
 
-/** UNC shares (`\\server\share`, `\\?\UNC\...`, `//server/share`), but not local `\\?\C:\` paths. */
+/**
+ * Network or device paths: any two leading separators, mixed or not. That covers UNC shares
+ * (`\\server\share`, `//server/share`) and also `\\?\` and `\\.\` paths, where Win32 resolves
+ * `..` (`\\.\C:\..\UNC\host\share`) into an SMB target. Check the path as printed, not one
+ * resolved against the cwd: relative paths under a UNC cwd (e.g. WSL) can't name a new host.
+ */
 export function isNetworkPath(path: string): boolean {
-  if (/^[\\/]{2}[?.][\\/][A-Za-z]:(?:[\\/]|$)/.test(path)) return false;
-  // Windows reads any two leading separators, mixed or not, as a UNC prefix.
   return /^[\\/]{2}/.test(path);
 }
 
@@ -254,7 +257,9 @@ export function terminalLinkLabelShowsUri(
 }
 
 export function terminalPreviewFilePath(rawPath: string, cwd: string): string | null {
-  const { path } = splitPathAndPosition(fileUrlToPath(rawPath) ?? rawPath);
+  const localPath = rawPath.startsWith("file://") ? fileUrlToPath(rawPath) : rawPath;
+  if (localPath === null) return null;
+  const { path } = splitPathAndPosition(localPath);
   if (!/\.(?:html?|pdf)$/i.test(path)) return null;
   return resolvePathLinkTarget(path, cwd);
 }

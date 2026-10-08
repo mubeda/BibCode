@@ -1254,6 +1254,7 @@ export function TerminalViewport({
     // events xterm later activates links with; Shift-click routing needs the physical key.
     const physicalShiftKeys = new WeakMap<MouseEvent, boolean>();
     const physicalShiftKey = (event: MouseEvent) => physicalShiftKeys.get(event) ?? event.shiftKey;
+    let linkConfirmOpen = false;
 
     const fitAddon = new FitAddon();
     const terminal = new Terminal({
@@ -1281,6 +1282,9 @@ export function TerminalViewport({
             writeSystemMessage(activeTerminal, "Opening links is unavailable in this browser.");
             return;
           }
+          // Rapid Ctrl-clicks must not stack confirmation menus.
+          if (linkConfirmOpen) return;
+          linkConfirmOpen = true;
           void localApi.contextMenu
             .show(
               [
@@ -1305,6 +1309,9 @@ export function TerminalViewport({
               if (terminalRef.current === activeTerminal) {
                 writeSystemMessage(activeTerminal, "Unable to open link");
               }
+            })
+            .finally(() => {
+              linkConfirmOpen = false;
             });
         },
         allowNonHttpProtocols: false,
@@ -1762,14 +1769,14 @@ export function TerminalViewport({
                 writeSystemMessage(latestTerminal, "Unable to open this file link.");
                 return;
               }
-              const editorTarget = resolvePathLinkTarget(localPath, cwd);
-              if (isNetworkPath(editorTarget)) {
+              if (isNetworkPath(localPath)) {
                 writeSystemMessage(
                   latestTerminal,
                   "Network paths can't be opened from the terminal.",
                 );
                 return;
               }
+              const editorTarget = resolvePathLinkTarget(localPath, cwd);
               const previewFile = terminalPreviewFilePath(localPath, cwd);
               if (
                 previewFile !== null &&

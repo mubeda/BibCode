@@ -5836,15 +5836,24 @@ describe("TerminalViewport mounted lifecycle", () => {
     await mount(<TerminalViewport {...viewportProps()} />);
     const terminal = xtermState.terminals[0]!;
     terminal.bufferLines.push(
-      terminalBufferLine("\\\\server\\share\\a.html //server/share/b.html"),
+      terminalBufferLine(
+        "\\\\server\\share\\a.html //server/share/b.html \\\\.\\C:\\..\\UNC\\a\\s\\x.html //./C:/../UNC/a/s/x.html \\\\?\\C:\\x.html",
+      ),
     );
     const links = provideTerminalLinks(terminal) ?? [];
     expect(links.map((link) => link.text)).toEqual([
       "\\\\server\\share\\a.html",
       "//server/share/b.html",
+      "\\\\.\\C:\\..\\UNC\\a\\s\\x.html",
+      "//./C:/../UNC/a/s/x.html",
+      "\\\\?\\C:\\x.html",
     ]);
 
-    for (const link of links) link.activate(new MouseEvent("click", { ctrlKey: true }));
+    // Plain clicks would preview; Ctrl+Shift clicks would open the editor. Both are refused.
+    for (const link of links) {
+      link.activate(new MouseEvent("click", { ctrlKey: true }));
+      link.activate(new MouseEvent("click", { ctrlKey: true, shiftKey: true }));
+    }
     await act(async () => Promise.resolve());
     expect(openFileInPreview).not.toHaveBeenCalled();
     expect(testState.openPath).not.toHaveBeenCalled();
@@ -5852,7 +5861,46 @@ describe("TerminalViewport mounted lifecycle", () => {
       terminal.writes.filter(
         (write) => write === "\r\n[terminal] Network paths can't be opened from the terminal.\r\n",
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(10);
+  });
+
+  it("opens relative links under a UNC working directory such as WSL", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    const cwd = "\\\\wsl.localhost\\Ubuntu\\home\\u\\proj";
+    await mount(<TerminalViewport {...viewportProps({ cwd })} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("index.html src/main.ts:4"));
+    const [htmlLink, sourceLink] = provideTerminalLinks(terminal) ?? [];
+    terminal.writes.length = 0;
+
+    htmlLink!.activate(new MouseEvent("click", { ctrlKey: true }));
+    sourceLink!.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).toHaveBeenCalledWith(
+      expect.objectContaining({ filePath: `${cwd}\\index.html` }),
+    );
+    expect(testState.openPath).toHaveBeenCalledWith(`${cwd}\\src\\main.ts:4`);
+    expect(terminal.writes).toEqual([]);
+  });
+
+  it("keeps one OSC 8 confirmation menu open at a time", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    testState.localApiAvailable = true;
+    let choose: (choice: string | null) => void = () => undefined;
+    testState.contextMenuShow.mockImplementation(
+      () => new Promise<string | null>((resolve) => (choose = resolve)),
+    );
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const click = osc8Link(terminal, "docs.example.com", "https://evil.test/");
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    click(new MouseEvent("click", { ctrlKey: true }));
+    expect(testState.contextMenuShow).toHaveBeenCalledOnce();
+
+    await act(async () => choose(null));
+    click(new MouseEvent("click", { ctrlKey: true }));
+    expect(testState.contextMenuShow).toHaveBeenCalledTimes(2);
   });
 
   it("refuses file URLs it cannot convert instead of treating them as relative paths", async () => {

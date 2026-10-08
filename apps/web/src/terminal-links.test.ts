@@ -404,6 +404,10 @@ describe("file links", () => {
   it("ignores other files", () => {
     expect(terminalPreviewFilePath("src/main.ts:4", "/repo")).toBeNull();
   });
+  it("rejects file URLs it cannot convert instead of resolving them as relative paths", () => {
+    expect(terminalPreviewFilePath("file://server/share/r.html", "/repo")).toBeNull();
+    expect(terminalPreviewFilePath("file:///tmp/%E0.html", "/repo")).toBeNull();
+  });
 });
 
 describe("OSC 8 link text", () => {
@@ -472,9 +476,12 @@ describe("isNetworkPath", () => {
     expect(isNetworkPath("/\\attacker.example/share/x.txt")).toBe(true);
     expect(isNetworkPath("\\/attacker.example/share/x.txt")).toBe(true);
   });
-  it("keeps local verbatim drive paths and ordinary paths", () => {
-    expect(isNetworkPath("\\\\?\\C:\\repo\\index.html")).toBe(false);
-    expect(isNetworkPath("\\\\.\\C:\\repo\\index.html")).toBe(false);
+  it("flags device and verbatim paths, which `..` can turn into UNC targets", () => {
+    expect(isNetworkPath("\\\\.\\C:\\..\\UNC\\a\\s\\x.html")).toBe(true);
+    expect(isNetworkPath("//./C:/../UNC/a/s/x.html")).toBe(true);
+    expect(isNetworkPath("\\\\?\\C:\\x.html")).toBe(true);
+  });
+  it("keeps ordinary paths", () => {
     expect(isNetworkPath("C:\\repo\\index.html")).toBe(false);
     expect(isNetworkPath("/repo/index.html")).toBe(false);
   });
