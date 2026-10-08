@@ -4322,7 +4322,7 @@ mod workspace_loss_tests {
     }
 }
 
-async fn launch_request_for_command(
+pub(crate) async fn launch_request_for_command(
     engine: &OrchestrationEngine,
     settings_root: &PathBuf,
     command: &OrchestrationCommand,
@@ -4490,17 +4490,17 @@ async fn build_launch_request_for_command(
 }
 
 /// Settings carried only by Codex provider routes.
-struct CodexRouteSettings {
-    home: CodexHomeLayout,
+pub(crate) struct CodexRouteSettings {
+    pub(crate) home: CodexHomeLayout,
 }
 
-struct ResolvedProviderRouteSettings {
-    provider: String,
+pub(crate) struct ResolvedProviderRouteSettings {
+    pub(crate) provider: String,
     provider_instance_id: String,
     provider_label: String,
     binary: ProviderBinarySettingsState,
-    environment: BTreeMap<String, String>,
-    codex: Option<CodexRouteSettings>,
+    pub(crate) environment: BTreeMap<String, String>,
+    pub(crate) codex: Option<CodexRouteSettings>,
 }
 
 impl ResolvedProviderRouteSettings {
@@ -4536,7 +4536,7 @@ impl ResolvedProviderRouteSettings {
     }
 }
 
-async fn resolve_provider_route_settings(
+pub(crate) async fn resolve_provider_route_settings(
     settings_root: &PathBuf,
     instance_id: &str,
     frozen_delivery: Option<&ProviderTurnDelivery>,
@@ -8211,7 +8211,7 @@ async fn persist_runtime(
     result.map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))
 }
 
-fn native_adapter_key(provider: &str) -> &'static str {
+pub(crate) fn native_adapter_key(provider: &str) -> &'static str {
     match provider {
         "codex" => "codex-app-server",
         "claude" | "claudeAgent" => "claude-stream-json",

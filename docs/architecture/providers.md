@@ -424,6 +424,40 @@ queries are ignored; identical snapshots are suppressed and the last valid
 snapshot remains visible. Control responses retain the same request routing,
 cleanup, and nonfatal shutdown behavior as context queries.
 
+## Imported CLI sessions
+
+[CLI session import](./rpc-and-orchestration.md#cli-session-import) turns a
+Claude Code or Codex session recorded on the server host into a thread whose
+next turn resumes it. Homes resolve as the launch would:
+
+- Claude: `CLAUDE_CONFIG_DIR` from the `claudeAgent` instance environment
+  (non-redacted values only), then the server environment, then `.claude` in
+  the home directory; transcripts are `<config dir>/projects/*/*.jsonl`.
+- Codex: the `codex` instance's configured home (its shared home when a shadow
+  home is set), else `CODEX_HOME` from the instance and then the server
+  environment, else `~/.codex`; transcripts are
+  `<home>/sessions/YYYY/MM/DD/rollout-*.jsonl`.
+
+Parsing and skip rules follow T3 Code's `AgentSessionScanner`: Claude records
+marked `isSidechain`, `isMeta` or `isCompactSummary` are skipped, `aiTitle`
+names the thread, and only UUID session IDs (resumable with `--resume`) are
+offered; Codex takes its ID from `session_meta`, its model from `turn_context`,
+and keeps one copy of a prompt written both as a `user_message` event and a
+response item. Discovery stats at most 20,000 files per source, a session's
+directory comes from its first 1 MiB, records over 16 MiB are skipped, and an
+imported message over 100 KiB keeps its start and a truncation note.
+
+The import inserts (never replaces) the row a suspended session of that provider leaves:
+`provider_name` and `provider_instance_id` match the thread's model selection
+(so `launch_request_for_command` accepts it), `adapter_key` follows
+`native_adapter_key`, and the cursor is `{"sessionId": <id>}` for Claude (only
+`sessionId`, because `resume_string` reads `threadId` first) or
+`{"threadId": <id>}` for Codex, with Codex `runtime_payload` `{model, cwd}` and
+Claude `{"transport": "stream-json"}`. The thread's model is the transcript's
+model when the instance offers it (Claude's dated IDs match their undated
+catalog slug; Codex reports a model it accepts), else the project's default for
+that instance, the driver's session default, or the built-in default.
+
 ## Provider usage and local credential ownership
 
 `ProviderUsageService` owns only bounded quota snapshots, refresh admission,

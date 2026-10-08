@@ -130,6 +130,20 @@ pub struct ThreadMessageInput {
     pub attachments: Vec<Value>,
 }
 
+/// One historical message appended by `thread.history.import`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImportedThreadMessage {
+    #[serde(rename = "messageId")]
+    pub message_id: String,
+    pub role: String,
+    pub text: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
+/// The most messages one `thread.history.import` command appends.
+pub const MAX_IMPORTED_THREAD_MESSAGES: usize = 200;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInput {
     #[serde(rename = "threadId")]
@@ -437,6 +451,15 @@ pub enum OrchestrationCommand {
         worktree_path: Option<String>,
         #[serde(rename = "createdAt")]
         created_at: String,
+    },
+    /// Server-internal: appends an imported CLI session's transcript without starting a turn.
+    #[serde(rename = "thread.history.import")]
+    ThreadHistoryImport {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        messages: Vec<ImportedThreadMessage>,
     },
     #[serde(rename = "thread.delete")]
     ThreadDelete {
@@ -4512,6 +4535,47 @@ async fn plan_command(
             metadata,
             json!({"threadId":thread_id,"turnCount":turn_count}),
         ),
+        OrchestrationCommand::ThreadHistoryImport {
+            command_id,
+            thread_id,
+            messages,
+        } => {
+            require_thread(model, command, thread_id)?;
+            if messages.is_empty() || messages.len() > MAX_IMPORTED_THREAD_MESSAGES {
+                return invariant(
+                    command,
+                    format!(
+                        "A history import carries 1 to {MAX_IMPORTED_THREAD_MESSAGES} messages."
+                    ),
+                );
+            }
+            if let Some(message) = messages
+                .iter()
+                .find(|message| !matches!(message.role.as_str(), "user" | "assistant"))
+            {
+                return invariant(
+                    command,
+                    format!(
+                        "Imported message '{}' has unsupported role '{}'.",
+                        message.message_id, message.role
+                    ),
+                );
+            }
+            Ok(messages
+                .iter()
+                .map(|message| {
+                    make_event(
+                        "thread.message-sent",
+                        "thread",
+                        thread_id,
+                        &message.created_at,
+                        command_id,
+                        metadata.clone(),
+                        json!({"threadId":thread_id,"messageId":message.message_id,"role":message.role,"text":message.text,"attachments":[],"turnId":null,"streaming":false,"createdAt":message.created_at,"updatedAt":message.created_at}),
+                    )
+                })
+                .collect())
+        }
     }
 }
 
@@ -6578,6 +6642,7 @@ impl OrchestrationCommand {
             Self::WorktreeDetachResolved { .. } => "worktree.detach-resolved",
             Self::WorktreeBranchReconcileResolved { .. } => "worktree.branch-reconcile-resolved",
             Self::ThreadCreate { .. } => "thread.create",
+            Self::ThreadHistoryImport { .. } => "thread.history.import",
             Self::ThreadDelete { .. } => "thread.delete",
             Self::ThreadArchive { .. } => "thread.archive",
             Self::ThreadUnarchive { .. } => "thread.unarchive",
@@ -6613,6 +6678,7 @@ impl OrchestrationCommand {
             | Self::WorktreeDetachResolved { command_id, .. }
             | Self::WorktreeBranchReconcileResolved { command_id, .. }
             | Self::ThreadCreate { command_id, .. }
+            | Self::ThreadHistoryImport { command_id, .. }
             | Self::ThreadDelete { command_id, .. }
             | Self::ThreadArchive { command_id, .. }
             | Self::ThreadUnarchive { command_id, .. }
@@ -6646,6 +6712,7 @@ impl OrchestrationCommand {
             | Self::WorktreeAdoptResolved { .. }
             | Self::WorktreeDetachResolved { .. }
             | Self::WorktreeBranchReconcileResolved { .. }
+            | Self::ThreadHistoryImport { .. }
             | Self::ThreadDelete { .. }
             | Self::ThreadArchive { .. }
             | Self::ThreadUnarchive { .. }
@@ -6683,6 +6750,7 @@ impl OrchestrationCommand {
             Self::WorktreeDetachResolved { project_id, .. } => ("project", project_id),
             Self::WorktreeBranchReconcileResolved { thread_id, .. } => ("thread", thread_id),
             Self::ThreadCreate { thread_id, .. }
+            | Self::ThreadHistoryImport { thread_id, .. }
             | Self::ThreadDelete { thread_id, .. }
             | Self::ThreadArchive { thread_id, .. }
             | Self::ThreadUnarchive { thread_id, .. }
@@ -6716,6 +6784,7 @@ impl OrchestrationCommand {
                 | Self::WorktreeAdoptResolved { .. }
                 | Self::WorktreeDetachResolved { .. }
                 | Self::WorktreeBranchReconcileResolved { .. }
+                | Self::ThreadHistoryImport { .. }
         )
     }
 }

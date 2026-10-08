@@ -19,7 +19,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         return Some(ACTIVITY_READ_SCOPE);
     }
     match method {
-        "assets.createUrl"
+        "agentSessions.scan"
+        | "assets.createUrl"
         | "filesystem.browse"
         | "gitManager.getCommits"
         | "gitManager.getDiff"
@@ -73,7 +74,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.refreshStatus"
         | "vcs.refreshWorktreeCatalog"
         | "worktree.getRemovalPlan" => Some(SCOPE_ORCHESTRATION_READ),
-        "git.preparePullRequestThread"
+        "agentSessions.import"
+        | "git.preparePullRequestThread"
         | "git.resolvePullRequest"
         | "git.runStackedAction"
         | "gitManager.commit"
@@ -199,6 +201,14 @@ mod tests {
         );
         assert_eq!(
             required_scope("server.updateSettings"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
+        assert_eq!(
+            required_scope("agentSessions.scan"),
+            Some(SCOPE_ORCHESTRATION_READ)
+        );
+        assert_eq!(
+            required_scope("agentSessions.import"),
             Some(SCOPE_ORCHESTRATION_OPERATE)
         );
         assert_eq!(

@@ -22,6 +22,14 @@
       "mode": "unary"
     },
     {
+      "name": "agentSessions.import",
+      "mode": "unary"
+    },
+    {
+      "name": "agentSessions.scan",
+      "mode": "unary"
+    },
+    {
       "name": "assets.createUrl",
       "mode": "unary"
     },
@@ -649,6 +657,10 @@
     "typed-failures/activity__listRoster-01.json",
     "typed-failures/activity__retrySubtreeCancellation-00.json",
     "typed-failures/activity__retrySubtreeCancellation-01.json",
+    "typed-failures/agentSessions__import-00.json",
+    "typed-failures/agentSessions__import-01.json",
+    "typed-failures/agentSessions__scan-00.json",
+    "typed-failures/agentSessions__scan-01.json",
     "typed-failures/assets__createUrl-00.json",
     "typed-failures/assets__createUrl-01.json",
     "typed-failures/assets__createUrl-02.json",
@@ -958,6 +970,10 @@
     "typed-failures/activity__listRoster-01.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
     "typed-failures/activity__retrySubtreeCancellation-00.json": "be0ad835d8f6d073e0bf4d85ca56e382a9eb0fe2eeb336125438016aac46f2cd",
     "typed-failures/activity__retrySubtreeCancellation-01.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
+    "typed-failures/agentSessions__import-00.json": "10a4c98585fc40d3e1b314b028346da7435c443f9b32cd585961ebb6a1b4709a",
+    "typed-failures/agentSessions__import-01.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
+    "typed-failures/agentSessions__scan-00.json": "10a4c98585fc40d3e1b314b028346da7435c443f9b32cd585961ebb6a1b4709a",
+    "typed-failures/agentSessions__scan-01.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
     "typed-failures/assets__createUrl-00.json": "42ad92327837d410e8404513014c9e4302dcf309a1f35dc63475ebc6d6e83e74",
     "typed-failures/assets__createUrl-01.json": "d30145df2096df3675ffde7a840acb67a4f2e26cb8d9a607b828688560d2ca82",
     "typed-failures/assets__createUrl-02.json": "b2fbde91e8a8ad7b3e8fce9b4d378041efef24ffd25156a058c7cb69f6fd91e9",
@@ -1446,6 +1462,10 @@
     "typed-failures/activity__listRoster-01.json",
     "typed-failures/activity__retrySubtreeCancellation-00.json",
     "typed-failures/activity__retrySubtreeCancellation-01.json",
+    "typed-failures/agentSessions__import-00.json",
+    "typed-failures/agentSessions__import-01.json",
+    "typed-failures/agentSessions__scan-00.json",
+    "typed-failures/agentSessions__scan-01.json",
     "typed-failures/assets__createUrl-00.json",
     "typed-failures/assets__createUrl-01.json",
     "typed-failures/assets__createUrl-02.json",

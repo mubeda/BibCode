@@ -356,6 +356,11 @@ import { worktreeEnvironment } from "../state/worktrees";
 import { getBulkThreadDeletionConfirmation } from "../worktreeCleanup";
 import { WorktreeAvailabilityWarning } from "./WorktreeAvailabilityWarning";
 import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "./WorktreeRemovalDialog";
+import {
+  ImportCliSessionsDialog,
+  type ImportCliSessionsSummary,
+  type ImportCliSessionsTarget,
+} from "./ImportCliSessionsDialog";
 import { SidebarProjectAvailability } from "./sidebar/SidebarProjectAvailability";
 import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
 import { environmentConnectionActions } from "../connection/environmentPresentationPolicy";
@@ -1958,6 +1963,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     null,
   );
   const [projectRenameTitle, setProjectRenameTitle] = useState("");
+  const [importSessionsTarget, setImportSessionsTarget] = useState<ImportCliSessionsTarget | null>(
+    null,
+  );
   const [projectGroupingTarget, setProjectGroupingTarget] =
     useState<SidebarProjectGroupMember | null>(null);
   const [projectGroupingSelection, setProjectGroupingSelection] = useState<
@@ -2663,6 +2671,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         case "new-worktree":
           openWorktreeForProjectMember(member);
           return;
+        case "import-sessions":
+          setImportSessionsTarget({
+            environmentId: member.environmentId,
+            projectId: member.id,
+            workspaceRoot: member.workspaceRoot,
+          });
+          return;
         case "rename":
           openProjectRenameDialog(member);
           return;
@@ -2828,6 +2843,34 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     setProjectRenameTarget(null);
     setProjectRenameTitle("");
   }, []);
+
+  const handleImportSessionsOpenChange = useCallback((open: boolean) => {
+    if (!open) setImportSessionsTarget(null);
+  }, []);
+
+  const openImportedThread = useCallback(
+    (target: ImportCliSessionsTarget, threadId: ThreadId) => {
+      setImportSessionsTarget(null);
+      navigateToThread(scopeThreadRef(target.environmentId, threadId));
+    },
+    [navigateToThread],
+  );
+
+  const handleSessionsImported = useCallback(
+    (target: ImportCliSessionsTarget, summary: ImportCliSessionsSummary) => {
+      setImportSessionsTarget(null);
+      toastManager.add(
+        stackedThreadToast({
+          type: summary.type,
+          title: summary.title,
+          ...(summary.description === undefined ? {} : { description: summary.description }),
+        }),
+      );
+      if (summary.newestThreadId === null) return;
+      openImportedThread(target, summary.newestThreadId);
+    },
+    [openImportedThread],
+  );
 
   const submitProjectRename = useCallback(async () => {
     if (!projectRenameTarget) {
@@ -3499,6 +3542,14 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         showDiscovery={supportedWorktreeDiscoveryMembers.length > 0}
         primaryEnvironmentId={primaryEnvironmentId}
         onDiscoveryHiddenCountChange={handleDiscoveryHiddenCountChange}
+      />
+
+      <ImportCliSessionsDialog
+        open={importSessionsTarget !== null}
+        target={importSessionsTarget}
+        onOpenChange={handleImportSessionsOpenChange}
+        onImported={handleSessionsImported}
+        onOpenThread={openImportedThread}
       />
 
       <Dialog

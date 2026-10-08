@@ -29,6 +29,53 @@ The request cannot override server-owned provider settings or credentials. It
 uses the same authenticated environment RPC path in browser and desktop clients.
 See [provider capability ownership and lifecycle](./providers.md#workspace-capability-discovery).
 
+## CLI session import
+
+`agentSessions.scan { projectId }` (`orchestration:read`) and
+`agentSessions.import { projectId, sessions: [{ provider, sessionId }] }`
+(`orchestration:operate`) are unary RPCs owned by
+[`agent_sessions_rpc`](../../apps/server/src/production/agent_sessions_rpc.rs);
+the bounded transcript reader is
+[`agent_sessions`](../../apps/server/src/agent_sessions/mod.rs). Both fail with
+`AgentSessionsError { message }`.
+
+Scan reads Claude Code and Codex transcripts on the **server host** for the
+built-in `claudeAgent` and `codex` instances (a disabled driver is not
+scanned). It lists sessions whose first recorded working directory is the
+project's workspace root after canonicalization, whose file changed in the last
+30 days, newest first, at most 200 (`truncated` reports more). Each candidate
+carries title, last activity and visible message count. `alreadyImported` is set
+once thread `import:<instanceId>:<sessionId>` was deleted or its history command
+was accepted, and `threadId` names that thread while it is live; an import
+interrupted before its history committed stays selectable. Sessions another
+BiBCode thread already runs (a `provider_turn_outbox.provider_session_id` or a
+`provider_session_runtime` cursor owned by a thread other than their import)
+are left out, because BiBCode's own conversations write into the same homes;
+import skips them too. The scan keeps only metadata; import reads the
+transcript again.
+
+Import handles each requested session independently and reports it as
+`imported { sessionId, threadId }` or `skipped { sessionId, reason }`. It
+re-reads and re-validates the transcript, then:
+
+1. dispatches `thread.create` with command ID `<threadId>:create`, unless an
+   interrupted import already created the thread;
+2. inserts a `suspended` `provider_session_runtime` row with the CLI session as
+   its resume cursor only when the thread has no row yet (see
+   [imported CLI sessions](./providers.md#imported-cli-sessions)); a thread that
+   started its own conversation before an interrupted import finished keeps it
+   and the session is skipped;
+3. dispatches the server-internal `thread.history.import` with command ID
+   `<threadId>:history`, which emits one `thread.message-sent` per message
+   (`turnId: null`, `streaming: false`, no attachments) for at most 200
+   messages: the first user message and the latest ones.
+
+Both commands use a digest of the step and thread ID, so a retry after a
+partial failure replays the committed steps; an accepted history command marks
+the session imported. A deleted import keeps its thread ID and is skipped
+rather than recreated. `thread.history.import` is rejected by public
+`orchestration.dispatchCommand` like every other server-internal command.
+
 ## Session establishment
 
 `ConnectionResolver` first produces a `PreparedConnection`. Remote bearer and

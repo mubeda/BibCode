@@ -122,6 +122,17 @@ export function createProjectEnvironmentAtoms<R, E>(
         key: ({ environmentId, input }) => JSON.stringify([environmentId, input.cwd]),
       },
     }),
+    /** Lists the CLI sessions recorded in the project's folder on the server host. */
+    scanAgentSessions: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:scan-agent-sessions",
+      tag: WS_METHODS.agentSessionsScan,
+    }),
+    importAgentSessions: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:project:import-agent-sessions",
+      tag: WS_METHODS.agentSessionsImport,
+      scheduler: projectScheduler,
+      concurrency: projectConcurrency,
+    }),
     createDownloadUrl: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:projects:create-download-url",
       tag: WS_METHODS.projectsCreateDownloadUrl,
