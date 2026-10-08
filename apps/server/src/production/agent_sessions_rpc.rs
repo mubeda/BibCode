@@ -588,7 +588,17 @@ async fn write_suspended_runtime(
             Ok(())
         }
         Some(_) => Err(USED_BEFORE_IMPORT.to_owned()),
-        None => Err(UNLINKED.to_owned()),
+        None => {
+            // A turn another client admitted during the import may not have launched yet.
+            let used = repositories
+                .get_thread(thread_id.to_owned())
+                .await
+                .map_err(unlinked)?
+                .is_some_and(|thread| {
+                    thread.latest_turn_id.is_some() || thread.latest_user_message_at.is_some()
+                });
+            Err(if used { USED_BEFORE_IMPORT } else { UNLINKED }.to_owned())
+        }
     }
 }
 
@@ -774,6 +784,81 @@ mod tests {
             assert_eq!(launch.provider, provider.kind());
             assert_eq!(launch.resume_cursor, Some(json!({ cursor: session_id })));
         }
+        engine.shutdown().await;
+    }
+
+    /// A turn another client admitted while the transcript was read keeps its own conversation.
+    #[tokio::test]
+    async fn linking_refuses_a_thread_that_started_its_own_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = Database::open_in_memory().await.unwrap();
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .unwrap();
+        let services = Services {
+            orchestration: engine.clone(),
+            settings_root: temp.path().to_path_buf(),
+        };
+        let session_id = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let thread_id = thread_id("codex", session_id);
+        let selection = import_model_selection(
+            AgentSessionProvider::Codex,
+            "codex",
+            None,
+            &Value::Null,
+            None,
+        );
+        for value in [
+            json!({"type":"project.create","commandId":"project","projectId":"p","title":"P","workspaceRoot":temp.path(),"createdAt":"2026-10-01T00:00:00Z"}),
+            json!({"type":"thread.create","commandId":format!("{thread_id}:create"),"threadId":thread_id,"projectId":"p","title":"Imported","modelSelection":selection,"runtimeMode":IMPORTED_RUNTIME_MODE,"createdAt":"2026-10-01T00:00:00Z"}),
+            json!({"type":"thread.turn.start","commandId":"other-client-turn","threadId":thread_id,"message":{"messageId":"m","role":"user","text":"hello","attachments":[]},"createdAt":"2026-10-02T00:00:00Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(value).unwrap())
+                .await
+                .unwrap();
+        }
+        let resolved = ResolvedSource {
+            source: SessionSource {
+                provider: AgentSessionProvider::Codex,
+                home: temp.path().to_path_buf(),
+            },
+            instance_id: "codex",
+        };
+        let session = ParsedSession {
+            session_id: session_id.to_owned(),
+            title: "Imported".to_owned(),
+            model: None,
+            message_count: 0,
+            messages: Vec::new(),
+        };
+        assert_eq!(
+            write_suspended_runtime(
+                &services,
+                &thread_id,
+                &resolved,
+                &session,
+                &selection,
+                temp.path(),
+            )
+            .await,
+            Err(USED_BEFORE_IMPORT.to_owned())
+        );
+        assert!(
+            engine
+                .repositories()
+                .get_provider_session_runtime(thread_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         engine.shutdown().await;
     }
 

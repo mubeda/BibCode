@@ -350,8 +350,8 @@ impl Repositories {
         }).await
     }
 
-    /// Links resumable state to a live thread only when the thread has none yet, so a session
-    /// the thread already started is never replaced.
+    /// Links resumable state to a live thread only when the thread has none yet and has not
+    /// admitted a turn or user message, so a conversation the thread started is never replaced.
     pub(crate) async fn insert_provider_session_runtime_if_absent_for_live_thread(
         &self,
         row: ProviderSessionRuntime,
@@ -362,7 +362,8 @@ impl Repositories {
                    thread_id, provider_name, provider_instance_id, adapter_key, runtime_mode, status, \
                    last_seen_at, resume_cursor_json, runtime_payload_json \
                  ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
-                   WHERE EXISTS (SELECT 1 FROM projection_threads WHERE thread_id = ?1 AND deleted_at IS NULL) \
+                   WHERE EXISTS (SELECT 1 FROM projection_threads WHERE thread_id = ?1 AND deleted_at IS NULL \
+                   AND latest_turn_id IS NULL AND latest_user_message_at IS NULL) \
                  ON CONFLICT (thread_id) DO NOTHING",
                 params![row.thread_id, row.provider_name, row.provider_instance_id, row.adapter_key, row.runtime_mode, row.status, row.last_seen_at, optional_json(&row.resume_cursor)?, optional_json(&row.runtime_payload)?],
             )?;

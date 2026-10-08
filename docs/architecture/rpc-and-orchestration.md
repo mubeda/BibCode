@@ -63,7 +63,8 @@ re-reads and re-validates the transcript, then:
 1. dispatches `thread.create` with command ID `<threadId>:create`, unless an
    interrupted import already created the thread;
 2. inserts a `suspended` `provider_session_runtime` row with the CLI session as
-   its resume cursor only when the thread has no row yet (see
+   its resume cursor only when the thread has no row, turn, or user message yet
+   (see
    [imported CLI sessions](./providers.md#imported-cli-sessions)); a thread that
    started its own conversation before an interrupted import finished keeps it
    and the session is skipped;
