@@ -440,7 +440,7 @@ next turn resumes it. Homes resolve as the launch would:
   resolves it; transcripts are
   `<home>/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 
-Parsing and skip rules follow T3 Code's `AgentSessionScanner`: Claude records
+Parsing and skip rules follow the upstream reference scanner: Claude records
 marked `isSidechain`, `isMeta` or `isCompactSummary` are skipped, `aiTitle`
 names the thread, and only UUID session IDs (resumable with `--resume`) are
 offered; Codex takes its ID from `session_meta`, its model from `turn_context`,

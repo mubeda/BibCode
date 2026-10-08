@@ -1,5 +1,5 @@
 //! Claude Code and Codex CLI sessions recorded on the server host, read for import into a
-//! project's threads. Parsing and its skip rules follow T3 Code's `AgentSessionScanner`.
+//! project's threads. Parsing and its skip rules follow the upstream reference scanner.
 //!
 //! Every read is bounded: discovery stats at most [`MAX_FILES_PER_SOURCE`] files, a session's
 //! working directory comes from its first [`CWD_PREFIX_BYTES`], a transcript is read line by
@@ -229,7 +229,7 @@ pub(crate) fn load(
     Ok(session)
 }
 
-/// Claude resumes only UUID sessions (T3 Code's pattern: hyphenated, version 1-8, RFC variant);
+/// Claude resumes only UUID sessions (hyphenated, version 1-8, RFC variant);
 /// Codex IDs come from the transcript's own metadata.
 pub(crate) fn is_resumable(provider: AgentSessionProvider, session_id: &str) -> bool {
     match provider {
