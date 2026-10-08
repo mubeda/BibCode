@@ -353,7 +353,8 @@ thread's project, branch, and worktree. Panel threads are hidden from the left
 panel and from Settings → Archived. Closing a chat panel's tab stops its running
 turn, keeps its queued messages waiting, and archives the panel thread, so its
 history is kept and it can resume;
-**Reopen closed chat** brings it back as the active tab, and a
+**Reopen closed chat** brings it back as the active tab (messages queued
+behind a stopped turn then offer **Send now**), and a
 **Failed to reopen chat panel** toast gives the reason if that fails. Deleting
 the host thread deletes its chat panels, open or closed. A new chat panel's tab shows
 **Opening chat…** until the server confirms the panel thread; if creation fails,
