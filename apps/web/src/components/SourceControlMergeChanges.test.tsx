@@ -68,6 +68,43 @@ describe("SourceControlMergeChanges", () => {
     expect(onMarkResolved).toHaveBeenCalledWith("src/a.txt");
   });
 
+  it("scrolls a long conflict list instead of clipping it", async () => {
+    await act(async () =>
+      root?.render(
+        <SourceControlMergeChanges
+          disabled={false}
+          files={[CONFLICTED]}
+          onMarkResolved={vi.fn()}
+          onOpenInEditor={vi.fn()}
+          onResolve={vi.fn()}
+        />,
+      ),
+    );
+    expect(container.querySelector("ul")?.className).toMatch(/overflow-y-auto/);
+    expect(container.querySelector("ul")?.className).toMatch(/max-h-/);
+  });
+
+  it("explains why a file cannot be opened without an external editor", async () => {
+    await act(async () =>
+      root?.render(
+        <SourceControlMergeChanges
+          disabled={false}
+          files={[CONFLICTED]}
+          openInEditorDisabledReason="No external editor is available."
+          onMarkResolved={vi.fn()}
+          onOpenInEditor={vi.fn()}
+          onResolve={vi.fn()}
+        />,
+      ),
+    );
+    expect(buttonLabelled("Open src/a.txt in editor")).toMatchObject({
+      disabled: true,
+      title: "No external editor is available.",
+    });
+    // A disabled button shows no tooltip, so the reason is also visible text.
+    expect(container.textContent).toContain("No external editor is available.");
+  });
+
   it("disables resolving while busy but keeps the file openable", async () => {
     await act(async () =>
       root?.render(

@@ -1250,6 +1250,11 @@ export default function SourceControlPanel({
                 disabled={isBusy || !mergeAvailable}
                 files={groups.conflicted}
                 onMarkResolved={(path) => void runStage([path])}
+                openInEditorDisabledReason={
+                  preferredEditor
+                    ? null
+                    : "No external editor is available. Install one, or open the file from Files."
+                }
                 onOpenInEditor={onOpenExternalEditor}
                 onResolve={(path, side) =>
                   runRecovery({ _tag: "resolve-conflict", ...recoveryScope, path, side })

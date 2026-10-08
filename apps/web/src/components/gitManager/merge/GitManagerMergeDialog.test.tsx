@@ -434,6 +434,35 @@ describe("GitManagerMergeDialog", () => {
     expect(onRefsStale).toHaveBeenCalledTimes(1);
   });
 
+  it("locks the source choice while a fetch runs so the preview stays the fetched one", async () => {
+    await renderDialog(
+      [branch("main", true), branch("feature")],
+      vi.fn(),
+      null,
+      [branch("origin/topic")],
+      {
+        remotes: ["origin"],
+      },
+    );
+    await act(async () => buttonWithText("Fetch").click());
+    expect(buttonWithText("origin/topic").disabled).toBe(true);
+    expect(buttonWithText("feature").disabled).toBe(true);
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    expect(buttonWithText("origin/topic").disabled).toBe(false);
+  });
+
+  it("explains a failed preview on the disabled Merge button", async () => {
+    h.preview = null;
+    h.error = "The current HEAD could not be resolved for merge preview.";
+    await renderDialog([branch("main", true), branch("feature")]);
+    expect(buttonWithText("Merge")).toMatchObject({
+      disabled: true,
+      title: "The current HEAD could not be resolved for merge preview.",
+    });
+  });
+
   it("closes on a conflicted current-branch merge so the panel strip shows", async () => {
     const onOpenChange = await renderDialog(
       [branch("main", true), branch("feature")],

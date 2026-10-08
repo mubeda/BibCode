@@ -106,15 +106,18 @@ export interface GitManagerMergeDialogProps {
 function MergeSourceButton({
   option,
   selected,
+  disabled,
   onSelect,
 }: {
   readonly option: MergeSourceOption;
   readonly selected: boolean;
+  readonly disabled: boolean;
   readonly onSelect: (ref: string) => void;
 }) {
   return (
     <button
       aria-pressed={selected}
+      disabled={disabled}
       className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring aria-pressed:bg-accent"
       type="button"
       onClick={() => onSelect(option.ref)}
@@ -275,11 +278,13 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
         ? "Choose a source branch."
         : previewUnsupported
           ? null
-          : previewQuery.isPending || preview === null
-            ? "Loading merge preview."
-            : summary?.mergeEnabled === false
-              ? summary.message
-              : null);
+          : preview === null && previewQuery.error !== null
+            ? previewQuery.error
+            : previewQuery.isPending || preview === null
+              ? "Loading merge preview."
+              : summary?.mergeEnabled === false
+                ? summary.message
+                : null);
   const confirmDisabled = disabledReason !== null;
   const disabledReasonId =
     disabledReason === null ? undefined : "git-manager-merge-disabled-reason";
@@ -512,6 +517,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
                 aria-label="Filter source branches"
                 className="[&_input]:pl-7"
                 placeholder="Filter branches…"
+                disabled={operationRunning}
                 size="sm"
                 type="search"
                 value={filter}
@@ -552,6 +558,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
                     key={option.ref}
                     option={option}
                     selected={option.ref === selectedSource}
+                    disabled={operationRunning}
                     onSelect={setSelectedSourceRef}
                   />
                 ))}
@@ -565,6 +572,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
                         key={option.ref}
                         option={option}
                         selected={option.ref === selectedSource}
+                        disabled={operationRunning}
                         onSelect={setSelectedSourceRef}
                       />
                     ))}

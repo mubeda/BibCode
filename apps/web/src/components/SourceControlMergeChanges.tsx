@@ -13,6 +13,8 @@ export interface SourceControlMergeChangesProps {
   /** Stages the file as edited, for a conflict resolved by hand. */
   readonly onMarkResolved: (path: string) => void;
   readonly onOpenInEditor: (path: string) => void;
+  /** Why files cannot open in an external editor here (e.g. none is installed). */
+  readonly openInEditorDisabledReason?: string | null;
 }
 
 /** Conflicted paths of a merge in progress, each resolvable with one side or in an editor. */
@@ -22,11 +24,16 @@ export const SourceControlMergeChanges = memo(function SourceControlMergeChanges
   onResolve,
   onMarkResolved,
   onOpenInEditor,
+  openInEditorDisabledReason = null,
 }: SourceControlMergeChangesProps) {
   return (
     <section aria-label="Merge Changes" className="border-b border-border/60 px-2 py-2">
       <h3 className="px-1 pb-1 text-xs font-medium text-muted-foreground">Merge Changes</h3>
-      <ul className="space-y-0.5">
+      {openInEditorDisabledReason === null ? null : (
+        <p className="px-1 pb-1 text-xs text-muted-foreground">{openInEditorDisabledReason}</p>
+      )}
+      {/* Bounded so the strip above stays visible and every row stays reachable. */}
+      <ul className="max-h-48 space-y-0.5 overflow-y-auto">
         {files.map((file) => (
           <li className="flex min-w-0 items-center gap-1 px-1 text-xs" key={file.path}>
             <span className="min-w-0 flex-1 truncate font-mono" title={file.path}>
@@ -34,8 +41,9 @@ export const SourceControlMergeChanges = memo(function SourceControlMergeChanges
             </span>
             <Button
               aria-label={`Open ${file.path} in editor`}
+              disabled={openInEditorDisabledReason !== null}
               size="icon-xs"
-              title="Open in editor"
+              title={openInEditorDisabledReason ?? "Open in editor"}
               variant="ghost"
               onClick={() => onOpenInEditor(file.path)}
             >

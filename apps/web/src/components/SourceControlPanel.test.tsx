@@ -1952,6 +1952,19 @@ describe("SourceControlPanel — merge recovery follow-through", () => {
     expect(testState.runStage).toHaveBeenCalledWith(["a.txt"]);
   });
 
+  it("explains that conflicted files cannot open without an external editor", () => {
+    testState.preferredEditor = null as never;
+    testState.availableEditors = [];
+    testState.statusQuery = { ...testState.statusQuery, data: inProgress("merge", [CONFLICTED]) };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(captured.mergeChanges?.openInEditorDisabledReason).toBeTruthy();
+
+    testState.preferredEditor = "vscode";
+    testState.availableEditors = ["vscode"];
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(captured.mergeChanges?.openInEditorDisabledReason).toBeNull();
+  });
+
   it("keeps conflicts in the ordinary sections outside a merge", () => {
     testState.statusQuery = { ...testState.statusQuery, data: inProgress("rebase", [CONFLICTED]) };
     render(buildProps({ projectRef: PROJECT_REF }));
