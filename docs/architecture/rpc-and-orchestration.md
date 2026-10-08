@@ -281,8 +281,11 @@ A physical observation starts with one
 `git -c core.quotePath=false status --porcelain=2 --branch --untracked-files=all`.
 Its headers supply branch, upstream, and ahead/behind state. Staged and
 unstaged numstat commands run concurrently only when the porcelain records show
-those areas. Default-ref, remote-provider, and pull-request enrichment remain
-separate when the requested result needs them. If porcelain fails, only a
+those areas. Each unmerged record yields one `conflicted` entry in the unstaged
+area, and the Git Manager in-progress detector runs alongside the remote-name
+read to fill optional `operationInProgress`; a failed probe omits the field and
+never fails status. Default-ref, remote-provider, and pull-request enrichment
+remain separate when the requested result needs them. If porcelain fails, only a
 successful existing repository probe returning false maps to the compatible
 non-repository result; otherwise the original structured Git error is returned.
 Status and background-observation Git reads use `GIT_OPTIONAL_LOCKS=0`. Fetch

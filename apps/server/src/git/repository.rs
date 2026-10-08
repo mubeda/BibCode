@@ -19,6 +19,7 @@ use crate::diagnostics::redact_sensitive_text;
 use crate::source_control::{self, ProviderHosts};
 
 use super::manager::graph::MAX_DIFF_BUFFER_SIZE;
+use super::manager::in_progress::detect_in_progress_operation;
 use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
 use super::{
     ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError,
@@ -2335,15 +2336,22 @@ impl GitRepository {
             }
             (false, false) => (HashMap::new(), HashMap::new()),
         };
-        let remotes = self
-            .execute_read(
+        let remote_args = strings(&["remote"]);
+        let (remotes, in_progress) = tokio::join!(
+            self.execute_read(
                 "GitVcsDriver.statusDetailsLocal.remotes",
                 cwd,
-                &strings(&["remote"]),
+                &remote_args,
                 true,
                 cancellation,
-            )
-            .await?;
+            ),
+            // ponytail: one `rev-parse --git-path` per status read; cache the resolved
+            // paths per worktree if status reads become a measured hot spot.
+            detect_in_progress_operation(self, cwd, cancellation),
+        );
+        let remotes = remotes?;
+        // A failed probe degrades to no field; status must not fail because of it.
+        let operation_in_progress = in_progress.ok().flatten().map(|operation| operation.kind);
         let remote_names: Vec<&str> = remotes.stdout.lines().map(str::trim).collect();
         let has_primary_remote = remote_names.contains(&"origin");
         let (ref_name, upstream_ref, ahead_count, behind_count) =
@@ -2366,6 +2374,19 @@ impl GitRepository {
                     deletions: 0,
                     status: Some(VcsWorkingTreeFileStatus::Untracked),
                     area: Some(VcsStagingArea::Untracked),
+                });
+                continue;
+            }
+            if record.unmerged {
+                // One entry per conflicted path: staging it is how the user marks it resolved.
+                let (insertions, deletions) =
+                    unstaged_stats.get(&record.path).copied().unwrap_or((0, 0));
+                files.push(VcsWorkingTreeFile {
+                    path: record.path,
+                    insertions,
+                    deletions,
+                    status: Some(VcsWorkingTreeFileStatus::Conflicted),
+                    area: Some(VcsStagingArea::Unstaged),
                 });
                 continue;
             }
@@ -2415,6 +2436,7 @@ impl GitRepository {
                 default_ref_name,
                 has_working_tree_changes: !working_tree.files.is_empty(),
                 working_tree,
+                operation_in_progress,
             },
             remote: StatusRemoteObservation {
                 upstream_ref,
@@ -7647,9 +7669,10 @@ mod tests {
     };
     use crate::test_support::TestSandbox;
 
-    const EXPECTED_FUSED_OPERATIONS: [&str; 4] = [
+    const EXPECTED_FUSED_OPERATIONS: [&str; 5] = [
         "GitVcsDriver.statusDetailsLocal.status",
         "GitVcsDriver.statusDetailsLocal.remotes",
+        "GitManager.getRefs.inProgressPaths",
         "GitVcsDriver.defaultRef.originHead",
         "GitVcsDriver.remoteProvider",
     ];
@@ -7728,6 +7751,10 @@ mod tests {
                         process_output("origin\n"),
                     ),
                     (
+                        "GitManager.getRefs.inProgressPaths".into(),
+                        no_in_progress_paths(),
+                    ),
+                    (
                         "GitVcsDriver.defaultRef.originHead".into(),
                         process_output("refs/remotes/origin/main\n"),
                     ),
@@ -7766,6 +7793,10 @@ mod tests {
                     (
                         "GitVcsDriver.statusDetailsLocal.remotes".into(),
                         process_output("origin\n"),
+                    ),
+                    (
+                        "GitManager.getRefs.inProgressPaths".into(),
+                        no_in_progress_paths(),
                     ),
                     (
                         "GitVcsDriver.defaultRef.originHead".into(),
@@ -7880,6 +7911,16 @@ mod tests {
             "{} has no stall guard",
             request.operation
         );
+    }
+
+    /// Eleven `--git-path` answers that name no existing file, so the probe reports no operation.
+    fn no_in_progress_paths() -> ProcessOutput {
+        process_output(
+            &(0..11)
+                .map(|index| format!(".git/bibcode-none-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 
     impl GitProcessRunner for RecordingGitRunner {

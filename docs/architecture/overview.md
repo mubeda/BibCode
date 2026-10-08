@@ -135,7 +135,10 @@ flowchart TB
   safety convergence.
 
   One status observation reads porcelain-v2 branch and file state once and runs
-  staged or unstaged numstat only for areas that are present. A failed porcelain
+  staged or unstaged numstat only for areas that are present. Each unmerged path
+  appears once, as an unstaged `conflicted` entry, and the Git Manager detector
+  reports any merge, rebase, cherry-pick, revert, or squash left in progress as
+  optional `operationInProgress` (omitted when the probe fails). A failed porcelain
   read whose repository probe also refuses the folder becomes the non-repository
   result, which says, when the server can tell, whether no repository exists, Git
   cannot read one, or Git refuses to trust it. A readable non-work-tree result
