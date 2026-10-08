@@ -573,7 +573,12 @@ Browser and desktop clients use these same typed unary RPCs; native actions such
 as opening a host URL retain the existing DesktopBridge/local API boundary.
 Reads begin on route/tab/picker open, user filters/pagination, Refresh, Rescan,
 or successful-action invalidation. No timer, window focus, constructor, or idle
-worker initiates provider traffic. `pullRequests.getContext` accepts an optional
+worker initiates provider traffic. A visible, mounted GitLab merge request list
+or detail route refreshes its mounted queries 20 s after the last success and
+prefetches `get` plus `getTimeline` for a row hovered 150 ms, at most two per
+environment. Hiding the document or leaving the route stops that timer. GitHub
+routes do not. The explicit Refresh action is unchanged. `pullRequests.getContext`
+accepts an optional
 `rescan`: without it the server reuses its bounded 30 s probe and host-context
 answers (the origin is still read); with it the server clears those caches and
 forgets the origin host's recorded provider before resolving. Only Rescan and
