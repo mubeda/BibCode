@@ -230,26 +230,34 @@ impl CursorSessionRuntime {
         connection
             .request("authenticate", json!({ "methodId": "cursor_login" }))
             .await?;
-        let response = if let Some(session_id) = self.inner.options.resume_session_id.clone() {
-            connection
-                .request("session/load", json!({ "sessionId": session_id }))
-                .await?
-        } else {
-            connection
-                .request(
-                    "session/new",
-                    json!({
-                        "cwd": self.inner.options.cwd,
-                        "mcpServers": self.inner.options.mcp_servers,
-                    }),
-                )
-                .await?
+        let new_session = json!({
+            "cwd": self.inner.options.cwd,
+            "mcpServers": self.inner.options.mcp_servers,
+        });
+        let mut loaded_session_id = self.inner.options.resume_session_id.clone();
+        let response = match loaded_session_id.clone() {
+            Some(session_id) => {
+                match connection
+                    .request("session/load", json!({ "sessionId": session_id }))
+                    .await
+                {
+                    Ok(response) => response,
+                    // Cursor refused to load the saved session, so retrying it cannot succeed;
+                    // continue in a new session on the same connection, as Codex does.
+                    Err(AcpProtocolError::RemoteRequest { .. }) => {
+                        loaded_session_id = None;
+                        connection.request("session/new", new_session).await?
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            None => connection.request("session/new", new_session).await?,
         };
         let session_id = response
             .get("sessionId")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .or_else(|| self.inner.options.resume_session_id.clone());
+            .or(loaded_session_id);
         let session_id = session_id.ok_or(CursorRuntimeError::MissingProviderSessionId)?;
         *self.inner.provider_session_id.lock().await = Some(session_id.clone());
         let config_options = response

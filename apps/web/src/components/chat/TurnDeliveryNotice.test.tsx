@@ -52,9 +52,7 @@ describe("TurnDeliveryNotice", () => {
       ...delivery("delivered", "claudeAgent", null),
       reason: "startedNewConversation",
     });
-    expect(markup).toContain(
-      "Sent in a new conversation. The agent won&#x27;t remember earlier messages in this thread.",
-    );
+    expect(markup).toContain("Sent in a new conversation with a summary of earlier messages.");
     expect(markup).toContain('role="status"');
     expect(markup).toContain("text-muted-foreground");
     expect(markup).not.toMatch(/text-destructive|text-warning|<button/u);
@@ -69,7 +67,7 @@ describe("TurnDeliveryNotice", () => {
           ...delivery(state),
           reason: "startedNewConversation",
         }),
-      ).not.toContain("Sent in a new conversation.");
+      ).not.toContain("Sent in a new conversation");
     },
   );
 

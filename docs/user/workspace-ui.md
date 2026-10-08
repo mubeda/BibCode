@@ -505,6 +505,17 @@ remains in the timeline with its copy button so you can prepare the corrected
 message. Other failed deliveries still offer Retry and Dismiss; uncertain
 deliveries still warn that Retry could send a duplicate.
 
+When BiBCode cannot resume a thread's provider conversation (the provider no
+longer has it, for example after its history was cleared), it starts a new one
+and the thread shows **Couldn't resume the previous <provider> conversation.
+Started a new one with a summary of this thread.** Your next message reaches the
+provider together with the thread's earlier messages (up to the last 40, about
+24,000 characters, oldest left out first), so the agent can pick up where it left
+off; the thread still shows only what you typed. A provider command starting with
+`/` is sent as written, and the summary goes with the next ordinary message. A
+retried message that had to start a new conversation shows **Sent in a new
+conversation with a summary of earlier messages.**
+
 ### Composer context window
 
 In the normal composer footer, controls remain visible in this order: MCP
