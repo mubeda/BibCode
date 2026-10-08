@@ -945,8 +945,8 @@ Describe 'Trusted system launcher role and unchanged owned-file policy (Windows 
 }
 Describe 'Actual manifest reader and lifecycle trusted launcher consumer (Windows CI)' {
   BeforeEach {
-    $script:OwnerManifest=Join-Path $TestDrive 'inert-owner.secret.json'
-    $script:SourceSha='a'*40
+    $OwnerManifest=Join-Path $TestDrive 'inert-owner.secret.json'
+    $SourceSha='a'*40
     $script:launcherReaderRefused=$false;$script:launcherReaderCalls=0;$script:launcherCommandCalls=0
     $script:launcherManifest=@{schema=1;sourceSha=$SourceSha;name='BibCodeQA-0123456789abcdef0123456789abcdef';imageSha256=$RootfsHash;before=@{distros=@();defaultGuid=$null};appState='joined';root=@{path='inert-root'};manifestPin=@{};wsl=@{pin=@{path='inert-system-wsl';identity='inert';directory=$false};sha256='inert'};imagePin=@{path='inert-image'};gpg=@{pin=@{path='inert-gpg'};sha256='INERTGPG'};checkout=@{};importRoot=@{path='inert-import'};phase='kernel-verified';kernelVerified=$true;backend=$null}
     Mock Assert-FixtureRuntime {};Mock Assert-OwnerAcl {};Mock Assert-PhysicalPin {};Mock Test-Path {$true}
@@ -960,12 +960,18 @@ Describe 'Actual manifest reader and lifecycle trusted launcher consumer (Window
   It 'routes actual <Action> through the trusted reader and refuses before commands' -TestCases @(
     @{Action='Build'},@{Action='Verify'},@{Action='VerifyOwner'},@{Action='AppAttempted'},@{Action='AppJoined'},@{Action='Terminate'},@{Action='Unregister'},@{Action='Restored'},@{Action='Delete'}
   ) {param($Action)
+    ([bool]($OwnerManifest -is [string] -and $OwnerManifest.Length -gt 0))|Should -BeTrue
+    ([bool]($SourceSha -ceq ('a'*40)))|Should -BeTrue
+    ([bool]($script:launcherManifest.sourceSha -ceq $SourceSha))|Should -BeTrue
     $script:launcherReaderRefused=$true
     {Invoke-OwnedFixtureAction $Action}|Should -Throw
     $script:launcherReaderCalls|Should -Be 1
     $script:launcherCommandCalls|Should -Be 0
   }
   It 'runs actual manifest reader with the unchanged wsl shape and generic other pins' {
+    ([bool]($OwnerManifest -is [string] -and $OwnerManifest.Length -gt 0))|Should -BeTrue
+    ([bool]($SourceSha -ceq ('a'*40)))|Should -BeTrue
+    ([bool]($script:launcherManifest.sourceSha -ceq $SourceSha))|Should -BeTrue
     $value=Read-FixtureManifest
     ((@($value.wsl.Keys|Sort-Object) -join ',') -ceq 'pin,sha256')|Should -BeTrue
     $script:launcherReaderCalls|Should -Be 1

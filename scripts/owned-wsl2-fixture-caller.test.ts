@@ -692,14 +692,17 @@ it("binds CI manifest fixture inputs and restores SystemRoot before real trust a
   const group = tests.slice(
     tests.indexOf("Describe 'Actual manifest reader and lifecycle trusted launcher consumer"),
   );
-  const binding = group.indexOf(
-    "$script:OwnerManifest=Join-Path $TestDrive 'inert-owner.secret.json'",
-  );
-  const source = group.indexOf("$script:SourceSha='a'*40");
+  const binding = group.indexOf("$OwnerManifest=Join-Path $TestDrive 'inert-owner.secret.json'");
+  const source = group.indexOf("$SourceSha='a'*40");
   const manifest = group.indexOf("$script:launcherManifest=@");
   expect(binding).toBeGreaterThan(0);
   expect(source).toBeGreaterThan(binding);
   expect(manifest).toBeGreaterThan(source);
+  expect(group).not.toContain("$script:OwnerManifest=");
+  expect(group).not.toContain("$script:SourceSha=");
+  expect(group).toContain("$script:launcherReaderCalls");
+  expect(group.match(/\$OwnerManifest -is \[string\]/g)).toHaveLength(2);
+  expect(group.match(/\$script:launcherManifest.sourceSha -ceq \$SourceSha/g)).toHaveLength(2);
   const start = tests.indexOf(
     "It 'uses the actual managed system launcher even when SystemRoot points elsewhere'",
   );
