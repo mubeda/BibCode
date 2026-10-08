@@ -2627,6 +2627,15 @@ click the single pinned original terminal screen once in the original owned
 window, then return to the selected second handle before the unchanged two-lease
 receipt wait. This restores the original renderer's size claim through its
 ordinary pointer/focus policy; it does not assert OS focus on a handle switch.
+During the existing validated single-renderer restoration admission, the fixture
+binds that renderer's original size claim. Its distinct live second claim is
+bound when the two-stream receipt is checked. Wire retirement/reinsertion keeps
+those roles; connection-map arrival order cannot swap them. Missing, extra,
+ambiguous or changed/unbound claims refuse rather than select any applied owner.
+A wire reconnect preserves a mounted renderer's UUID; renderer teardown creates
+a different claim and is not silently rebound by this fixture. All existing
+PID/history/sequence/cwd, live cardinality, distinct claims, geometry and owner
+checks remain required.
 The second window captures the genuine foreign-size notice and uses public Fit.
 After that window closes and original geometry is restored, click the original
 pinned screen once again before the unchanged one-lease restoration wait, even

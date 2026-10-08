@@ -75,6 +75,7 @@ function terminalFixture() {
       sizeClaim: claim,
     });
     value.chunk(connection, "1", { type: "snapshot", snapshot });
+    if (connection === "first") value.observer.terminalRestored();
   }
   const fit = () => {
     for (const connection of ["first", "second"])
@@ -262,6 +263,7 @@ it("joins two actual terminal attachments and requires a real resize event befor
       sizeClaim: claim,
     });
     value.chunk(connection!, "1", { type: "snapshot", snapshot });
+    if (connection === "first") value.observer.terminalRestored();
   }
   expect(value.observer.terminal().sameTerminalMatched).toBe(true);
   expect(() => value.observer.fitted()).toThrow();

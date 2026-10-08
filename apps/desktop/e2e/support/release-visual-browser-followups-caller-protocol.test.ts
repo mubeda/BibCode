@@ -297,3 +297,91 @@ it("replay owner separates absent and retired ready proof from a permanently ref
     expect(error).toBe(original);
   }
 });
+
+it("preserves original/second roles when the original wire is retired and reinserted", () => {
+  const value = observer();
+  attach(value, "first", "first-owner");
+  value.terminalRestored();
+  attach(value, "second", "second-owner");
+  expect(value.terminal().sizeOwnerMatched).toBe(true);
+  value.connectionClosed("first");
+  attach(value, "replacement", "first-owner");
+  expect(value.terminal().sizeOwnerMatched).toBe(true);
+  value.replay.throwIfFailed();
+  value.connectionClosed("second");
+  value.terminalRestored();
+  value.close();
+});
+it.each([
+  "unbound",
+  "missing-original",
+  "new-original",
+  "new-second",
+  "wrong-owner",
+  "wrong-geometry",
+] as const)("refuses role ambiguity or drift without accepting %s", (mode) => {
+  const value = observer();
+  attach(value, "first", "first-owner");
+  if (mode !== "unbound") value.terminalRestored();
+  attach(value, "second", "second-owner");
+  if (mode !== "unbound") value.terminal();
+  if (mode === "missing-original") value.connectionClosed("first");
+  if (mode === "new-original") {
+    value.connectionClosed("first");
+    attach(value, "replacement", "foreign-original");
+  }
+  if (mode === "new-second") {
+    value.connectionClosed("second");
+    attach(value, "replacement", "foreign-second");
+  }
+  if (mode === "wrong-owner" || mode === "wrong-geometry")
+    value.observe("second", "reply", {
+      _tag: "Chunk",
+      requestId: "2",
+      values: [
+        {
+          type: "resized",
+          threadId: baseline.threadId,
+          terminalId: baseline.terminalId,
+          size: {
+            cols: mode === "wrong-geometry" ? 92 : 91,
+            rows: 24,
+            sizeClaim: mode === "wrong-owner" ? "second-owner" : "first-owner",
+          },
+        },
+      ],
+    });
+  expect(() => value.terminal()).toThrow();
+  value.close();
+});
+
+it("refuses extra or stale resize actors after role binding", () => {
+  for (const mode of ["extra", "stale"]) {
+    const value = observer();
+    attach(value, "first", "first-owner");
+    value.terminalRestored();
+    attach(value, "second", "second-owner");
+    value.terminal();
+    if (mode === "extra") expect(() => attach(value, "third", "third-owner")).toThrow();
+    else {
+      value.connectionClosed("first");
+      attach(value, "replacement", "first-owner");
+      expect(() =>
+        value.observe("first", "request", {
+          _tag: "Request",
+          id: "3",
+          tag: "terminal.resize",
+          payload: {
+            threadId: baseline.threadId,
+            terminalId: baseline.terminalId,
+            cols: 91,
+            rows: 24,
+            sizeClaim: "first-owner",
+          },
+        }),
+      ).toThrow();
+    }
+    expect(() => value.terminal()).toThrow();
+    value.close();
+  }
+});

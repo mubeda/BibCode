@@ -484,6 +484,7 @@ it.each(["owned", "foreign-pid", "foreign-cwd", "foreign-claim"])(
             ...(index === 1 && mode === "foreign-cwd" ? records.slice(0, -1) : records),
           ]),
         );
+        if (index === 0) observer.terminalRestored();
       }
       if (mode === "owned" || mode === "foreign-claim")
         expect(() => observer.terminal()).not.toThrow();

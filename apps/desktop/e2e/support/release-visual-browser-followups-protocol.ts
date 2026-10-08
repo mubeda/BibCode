@@ -305,6 +305,8 @@ export function createBrowserFollowupProtocolObserver(
       throw refused();
     return connection + ":" + id;
   };
+  let originalClaim: string | null = null;
+  let secondClaim: string | null = null;
   const currentTerminal = (count: 1 | 2) => {
     const values = [...attachments.values()];
     if (closed || terminalFailed || values.length !== count) throw refused();
@@ -333,6 +335,16 @@ export function createBrowserFollowupProtocolObserver(
     )
       throw refused();
     return values;
+  };
+  const roleTerminal = () => {
+    const values = currentTerminal(2);
+    if (originalClaim === null) throw refused();
+    const original = values.find((value) => value.claim === originalClaim);
+    const second = values.find((value) => value.claim !== originalClaim);
+    if (!original || !second) throw refused();
+    if (secondClaim !== null && second.claim !== secondClaim) throw refused();
+    secondClaim = second.claim;
+    return [original, second] as const;
   };
   const observe = (
     connection: string,
@@ -588,7 +600,7 @@ export function createBrowserFollowupProtocolObserver(
       });
     },
     terminal: () => {
-      const values = currentTerminal(2);
+      const values = roleTerminal();
       return verifyBrowserFollowupTerminal({
         cwd: input.cwd,
         threadId: input.threadId,
@@ -601,7 +613,7 @@ export function createBrowserFollowupProtocolObserver(
       });
     },
     fitted: () => {
-      const values = currentTerminal(2);
+      const values = roleTerminal();
       if (
         !values.every((value) => value.snapshot.size?.sizeClaim === values[1]!.claim) ||
         values[0]!.snapshot.size?.cols !== values[1]!.snapshot.size?.cols ||
@@ -623,9 +635,11 @@ export function createBrowserFollowupProtocolObserver(
       const values = currentTerminal(1);
       if (
         values[0]!.snapshot.size?.sizeClaim !== values[0]!.claim ||
-        !values[0]!.snapshot.history.includes("Owned shared terminal output")
+        !values[0]!.snapshot.history.includes("Owned shared terminal output") ||
+        (originalClaim !== null && values[0]!.claim !== originalClaim)
       )
         throw refused();
+      originalClaim = values[0]!.claim;
     },
     rendererConnection: (connection: string) => !closed && rendererConnections.has(connection),
     close: () => {
@@ -634,6 +648,8 @@ export function createBrowserFollowupProtocolObserver(
       appendEnds.clear();
       attachments.clear();
       rendererConnections.clear();
+      originalClaim = null;
+      secondClaim = null;
       begin = null;
       preview = null;
       received = 0;
