@@ -1,10 +1,3 @@
-//! Cold GitLab list-module and single-merge-request loads against a local API.
-//!
-//! The stub `glab` performs one HTTP call per `api` or `mr list` invocation and
-//! the server sleeps for `BIBCODE_GITLAB_HARNESS_RTT_MS` (default 200) before
-//! each response. That is the round trip a self-hosted instance pays. It is not
-//! a trace of Mauro's private host. Auth and version probes stay local.
-
 #![cfg(unix)]
 
 #[path = "support/executable_fixture.rs"]
@@ -15,18 +8,18 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use bibcode_server::pull_requests::{
+    ContextRead, PullRequestsService,
     host::HostCommandRunner,
     model::{Context, ListQuery},
-    ContextRead, PullRequestsService,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -199,6 +192,28 @@ async fn gitlab_list_and_merge_request_loads_record_requests_and_wall_time() {
         assert_eq!(
             sample.mr.http, samples[0].mr.http,
             "mr request count drifted"
+        );
+    }
+    assert_eq!(samples[0].list.http, 7, "list http requests");
+    assert_eq!(samples[0].mr.http, 26, "merge request http requests");
+    if rtt_ms >= 100 {
+        let list_inflight = samples
+            .iter()
+            .map(|sample| sample.list.max_inflight)
+            .min()
+            .unwrap_or(0);
+        let mr_inflight = samples
+            .iter()
+            .map(|sample| sample.mr.max_inflight)
+            .min()
+            .unwrap_or(0);
+        assert!(
+            list_inflight >= 7,
+            "list host reads ran apart: max in flight {list_inflight}"
+        );
+        assert!(
+            mr_inflight >= 8,
+            "merge request host reads ran apart: max in flight {mr_inflight}"
         );
     }
 }
@@ -680,9 +695,10 @@ fn respond(api: &Api, method: &str, path: &str, body: &[u8]) -> (u16, Option<u64
         include_bytes!("fixtures/pull_requests/gitlab_reviewers.json").to_vec()
     } else if method == "GET" && route == format!("{mr}/approval_state") {
         br#"{"rules":[]}"#.to_vec()
-    } else if method == "GET" && route == format!("{mr}/award_emoji") {
-        b"[]".to_vec()
-    } else if method == "GET" && route.starts_with(&format!("{mr}/closes_issues")) {
+    } else if method == "GET"
+        && (route == format!("{mr}/award_emoji")
+            || route.starts_with(&format!("{mr}/closes_issues")))
+    {
         b"[]".to_vec()
     } else if method == "GET" && route.starts_with(&format!("{mr}/notes/")) {
         br#"{"suggestions":[{"id":7,"appliable":true,"applied":false,"from_line":2,"to_line":2,"from_content":"old","to_content":"new"}]}"#.to_vec()

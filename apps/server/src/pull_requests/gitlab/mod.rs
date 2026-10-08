@@ -88,6 +88,7 @@ impl GitLabHost {
         operation: &str,
         c: &CancellationToken,
     ) -> Result<Value, PullRequestsOperationError> {
+        let started = std::time::Instant::now();
         let output = self
             .runner
             .glab(
@@ -106,10 +107,11 @@ impl GitLabHost {
                 None,
                 c,
             )
-            .await
-            .map_err(|failure| {
-                from_process_error(operation, "glab", &failure.error, &failure.stderr)
-            })?;
+            .await;
+        trace_gitlab_read(operation, call_label(path), started);
+        let output = output.map_err(|failure| {
+            from_process_error(operation, "glab", &failure.error, &failure.stderr)
+        })?;
         serde_json::from_str(&output.stdout).map_err(|_| parse::invalid(operation))
     }
 
@@ -140,13 +142,15 @@ impl GitLabHost {
         c: &CancellationToken,
     ) -> Result<Value, PullRequestsOperationError> {
         let input = json!({"query":document,"variables":variables});
+        let started = std::time::Instant::now();
         let output = self
             .runner
             .glab_api_with_body(scope, "POST", "graphql", &input, c)
-            .await
-            .map_err(|failure| {
-                from_process_error(operation, "glab", &failure.error, &failure.stderr)
-            })?;
+            .await;
+        trace_gitlab_read(operation, "graphql", started);
+        let output = output.map_err(|failure| {
+            from_process_error(operation, "glab", &failure.error, &failure.stderr)
+        })?;
         let value: Value =
             serde_json::from_str(&output.stdout).map_err(|_| parse::invalid(operation))?;
         if value["errors"]
@@ -190,11 +194,13 @@ impl GitLabHost {
                 "{}/merge_requests?state={state}&per_page=1",
                 project_path(scope)
             );
+            let started = std::time::Instant::now();
             let output = self
                 .runner
                 .glab(scope, &["api", "-i", &path], Budget::Read, None, c)
-                .await
-                .ok()?;
+                .await;
+            trace_gitlab_read("pullRequests.list", "count", started);
+            let output = output.ok()?;
             parse::total(&output.stdout)
         };
         // Independent host round trips: read the three totals together.
@@ -431,10 +437,12 @@ impl PullRequestHost for GitLabHost {
                     .await
                     .ok()
             };
+            let started = std::time::Instant::now();
             let (output, counts) = tokio::join!(
                 self.runner.glab(scope, &args, Budget::Mutation, None, c),
                 totals,
             );
+            trace_gitlab_read(operation, "list", started);
             let output = output.map_err(|failure| {
                 from_process_error(operation, "glab", &failure.error, &failure.stderr)
             })?;
@@ -480,20 +488,26 @@ impl PullRequestHost for GitLabHost {
         Box::pin(async move {
             let operation = "pullRequests.get";
             let path = format!("{}/merge_requests/{number}", project_path(scope));
-            let mut request = self.api(scope, &path, operation, c).await?;
+            let approvals_path = format!("{path}/approvals");
+            let reviewers_path = format!("{path}/reviewers");
+            let approval_state_path = format!("{path}/approval_state");
+            let issues_path = format!("{path}/closes_issues?per_page=100");
+            let (request, approvals, reviewers, approval_state, awards, issues, metadata) = tokio::join!(
+                self.api(scope, &path, operation, c),
+                self.api(scope, &approvals_path, operation, c),
+                self.api(scope, &reviewers_path, operation, c),
+                self.api(scope, &approval_state_path, operation, c),
+                self.awards(scope, &path, operation, c),
+                self.api(scope, &issues_path, operation, c),
+                self.graphql(scope, number, graphql::DETAIL_METADATA_QUERY, operation, c),
+            );
+            let mut request = request?;
             if !request.is_object() {
                 return Err(parse::invalid(operation));
             }
-            let approvals = self
-                .api(scope, &format!("{path}/approvals"), operation, c)
-                .await?;
-            let reviewers = self
-                .api(scope, &format!("{path}/reviewers"), operation, c)
-                .await?;
-            let approval_state = match self
-                .api(scope, &format!("{path}/approval_state"), operation, c)
-                .await
-            {
+            let approvals = approvals?;
+            let reviewers = reviewers?;
+            let approval_state = match approval_state {
                 Ok(v) => v,
                 Err(e) if matches!(e.code, "not_found" | "forbidden") => Value::Null,
                 Err(e) => return Err(e),
@@ -507,21 +521,12 @@ impl PullRequestHost for GitLabHost {
                     .await?;
                 request["diff_refs"] = json!({"base_sha":versions[0]["base_commit_sha"],"start_sha":versions[0]["start_commit_sha"],"head_sha":versions[0]["head_commit_sha"]});
             }
-            let (awards, awards_truncated) = self.awards(scope, &path, operation, c).await?;
+            let (awards, awards_truncated) = awards?;
             if awards_truncated {
                 return Err(PullRequestsOperationError::new(operation, "output_limit"));
             }
-            let issues = self
-                .api(
-                    scope,
-                    &format!("{path}/closes_issues?per_page=100"),
-                    operation,
-                    c,
-                )
-                .await?;
-            let metadata = self
-                .graphql(scope, number, graphql::DETAIL_METADATA_QUERY, operation, c)
-                .await?;
+            let issues = issues?;
+            let metadata = metadata?;
             parse::detail(
                 parse::DetailResponses {
                     request: &request,
@@ -702,6 +707,53 @@ impl PullRequestHost for GitLabHost {
     }
 }
 
+fn gitlab_read_timing() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BIBCODE_PULL_REQUESTS_TIMING").is_some())
+}
+
+fn trace_gitlab_read(operation: &str, call: &str, started: std::time::Instant) {
+    if gitlab_read_timing() {
+        eprintln!(
+            "bibcode_pull_requests operation={operation} call={call} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
+fn call_label(path: &str) -> &'static str {
+    let path = path.split('?').next().unwrap_or(path);
+    if path.contains("/notes/") {
+        "note"
+    } else if path.ends_with("/approvals") {
+        "approvals"
+    } else if path.ends_with("/reviewers") {
+        "reviewers"
+    } else if path.ends_with("/approval_state") {
+        "approval_state"
+    } else if path.contains("/award_emoji") {
+        "award_emoji"
+    } else if path.contains("/closes_issues") {
+        "closes_issues"
+    } else if path.ends_with("/versions") {
+        "versions"
+    } else if path.contains("/resource_label_events") {
+        "label_events"
+    } else if path.contains("/resource_milestone_events") {
+        "milestone_events"
+    } else if path.contains("/resource_state_events") {
+        "state_events"
+    } else if path.contains("/merge_requests") {
+        "merge_request"
+    } else if path == "user" || path.ends_with("/user") {
+        "user"
+    } else if path == "version" || path.ends_with("/version") {
+        "version"
+    } else {
+        "other"
+    }
+}
+
 fn encoded(value: &str) -> String {
     utf8_percent_encode(value, OPERAND).to_string()
 }
@@ -722,6 +774,21 @@ mod tests {
             repository: "team/sub/repo".into(),
             provider: PullRequestsProvider::Gitlab,
         }
+    }
+
+    #[test]
+    fn pull_requests_gitlab_timing_label_hides_the_project_path() {
+        assert_eq!(
+            call_label("projects/team%2Frepo/merge_requests/42"),
+            "merge_request"
+        );
+        assert_eq!(
+            call_label("projects/team%2Frepo/merge_requests/42/notes/9?per_page=1"),
+            "note"
+        );
+        assert_eq!(call_label("projects/team%2Frepo"), "other");
+        assert_eq!(call_label("user"), "user");
+        assert_eq!(call_label("version"), "version");
     }
 
     #[test]
