@@ -51,6 +51,7 @@ function Section({
 const NONE = <p className="text-muted-foreground">None</p>;
 export const PullRequestsSideColumn = memo(function PullRequestsSideColumn({
   detail,
+  live = detail,
   context,
   scope,
   detailsRefreshing = false,
@@ -58,6 +59,12 @@ export const PullRequestsSideColumn = memo(function PullRequestsSideColumn({
   scope: PullRequestsScope;
   projectRef: ScopedProjectRef;
   detail: PullRequestsDetail;
+  /**
+   * Every picker and the re-request review button only ever act on a live
+   * detail, never a snapshot. Omitting this falls back to `detail`, so
+   * callers that have not adopted the split keep acting as before.
+   */
+  live?: PullRequestsDetail | null;
   context: Extract<PullRequestsContext, { status: "available" }>;
   detailsRefreshing?: boolean;
 }) {
@@ -93,11 +100,13 @@ export const PullRequestsSideColumn = memo(function PullRequestsSideColumn({
   const available = (permission: PullRequestsDetail["permissions"]["editLabels"]) =>
     constrainPermission(
       permission,
-      pending
-        ? "Wait for the current action to finish"
-        : detailsRefreshing
-          ? "Refreshing request details…"
-          : null,
+      live === null
+        ? "Loading…"
+        : pending
+          ? "Wait for the current action to finish"
+          : detailsRefreshing
+            ? "Refreshing request details…"
+            : null,
     );
   return (
     <aside aria-label="Request details" className="space-y-4 p-3" data-text-surface="background">
@@ -138,10 +147,7 @@ export const PullRequestsSideColumn = memo(function PullRequestsSideColumn({
                   {canRerequest ? (
                     <PermissionButton
                       mutation
-                      permission={constrainPermission(
-                        detail.permissions.rerequestReview,
-                        pending ? "Wait for the current action to finish" : null,
-                      )}
+                      permission={available(detail.permissions.rerequestReview)}
                       aria-label={`Re-request review from ${actor.login}`}
                       size="icon-sm"
                       variant="ghost"

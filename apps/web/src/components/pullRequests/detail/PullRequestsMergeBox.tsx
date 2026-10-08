@@ -16,11 +16,18 @@ const TONES = {
 };
 export const PullRequestsMergeBox = memo(function PullRequestsMergeBox({
   detail,
+  live = detail,
   context,
   projectRef,
 }: {
   projectRef: ScopedProjectRef;
   detail: PullRequestsDetail;
+  /**
+   * Merge, update-branch, and revert all act only on this live detail, never
+   * a snapshot. Omitting this falls back to `detail`, so callers that have
+   * not adopted the split keep acting as before.
+   */
+  live?: PullRequestsDetail | null;
   context: Extract<PullRequestsContext, { status: "available" }>;
 }) {
   const presentation = readinessPresentation(detail.readiness, context.capabilities.vocabulary);
@@ -62,16 +69,21 @@ export const PullRequestsMergeBox = memo(function PullRequestsMergeBox({
               </>
             ) : null}
           </p>
-          <PullRequestsRevertButton detail={detail} context={context} />
+          <PullRequestsRevertButton detail={detail} context={context} live={live} />
         </>
       ) : closed ? (
         <p className="text-sm">Closed</p>
       ) : (
         <>
           {detail.readiness.status === "behind" ? (
-            <PullRequestsUpdateBranch detail={detail} context={context} />
+            <PullRequestsUpdateBranch detail={detail} context={context} live={live} />
           ) : null}
-          <PullRequestsMergeControls detail={detail} context={context} projectRef={projectRef} />
+          <PullRequestsMergeControls
+            detail={detail}
+            context={context}
+            projectRef={projectRef}
+            live={live}
+          />
         </>
       )}
     </section>

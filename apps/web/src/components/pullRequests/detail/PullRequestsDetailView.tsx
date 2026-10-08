@@ -207,8 +207,12 @@ export function PullRequestsDetailView({
   }, []);
   const detailSucceeded =
     detailQuery.data !== null && detailQuery.error === null && !detailQuery.isPending;
-  // Action controls (merge, review) act only on this live detail, never a snapshot.
-  const liveDetail = detailSucceeded ? detailQuery.data : null;
+  // Action controls (merge, review, side column, header) act only on this live
+  // detail, never a snapshot. Unlike `detailSucceeded` above (which gates the
+  // visible-refresh timer), this stays set through a revalidate's `isPending`
+  // window: the atom still holds its own live value then, just a stale one.
+  const liveDetail =
+    detailQuery.data !== null && detailQuery.error === null ? detailQuery.data : null;
   const displayedDetailData = detailQuery.data ?? paintedDetail?.payload ?? null;
   const displayedDetailQuery: EnvironmentQueryView<PullRequestsDetail> =
     detailQuery.data !== null || paintedDetail === null
@@ -308,6 +312,7 @@ export function PullRequestsDetailView({
                 scope={scope}
                 projectRef={projectRef}
                 detail={detail}
+                live={liveDetail}
                 context={context}
                 onRefresh={refresh}
                 refreshing={refreshing}
@@ -385,6 +390,7 @@ export function PullRequestsDetailView({
                   <div className="hidden w-64 shrink-0 overflow-auto border-l border-border lg:block">
                     <PullRequestsSideColumn
                       detail={detail}
+                      live={liveDetail}
                       context={context}
                       scope={scope}
                       projectRef={projectRef}

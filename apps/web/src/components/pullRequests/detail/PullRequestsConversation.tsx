@@ -27,9 +27,11 @@ export interface PullRequestsConversationProps {
   timeline: PullRequestsTimeline;
   detailsRefreshing?: boolean;
   /**
-   * Action controls (review, merge) only act on a live detail that succeeded on
-   * this mount, never on a painted snapshot. Omitting this falls back to
-   * `detail`, so callers that have not adopted the split keep acting as before.
+   * Action controls (review, merge, side column pickers) only act on a live
+   * detail that succeeded on this mount, never on a painted snapshot. Those
+   * controls still render from `detail` but stay inactive with a "Loading…"
+   * reason until this exists. Omitting this falls back to `detail`, so
+   * callers that have not adopted the split keep acting as before.
    */
   liveDetail?: PullRequestsDetail | null;
 }
@@ -60,9 +62,12 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
   );
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {liveDetail ? (
-        <PullRequestsPendingReviewBar detail={liveDetail} context={context} projectRef={projectRef} />
-      ) : null}
+      <PullRequestsPendingReviewBar
+        detail={detail}
+        live={liveDetail}
+        context={context}
+        projectRef={projectRef}
+      />
       <LegendList
         data={items}
         keyExtractor={timelineKey}
@@ -118,15 +123,19 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
             <div className="lg:hidden">
               <PullRequestsSideColumn
                 detail={detail}
+                live={liveDetail}
                 context={context}
                 scope={scope}
                 projectRef={projectRef}
                 detailsRefreshing={detailsRefreshing}
               />
             </div>
-            {liveDetail ? (
-              <PullRequestsMergeBox detail={liveDetail} context={context} projectRef={projectRef} />
-            ) : null}
+            <PullRequestsMergeBox
+              detail={detail}
+              live={liveDetail}
+              context={context}
+              projectRef={projectRef}
+            />
           </div>
         }
       />

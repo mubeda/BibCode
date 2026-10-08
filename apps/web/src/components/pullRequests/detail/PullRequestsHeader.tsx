@@ -16,6 +16,12 @@ export interface PullRequestsHeaderProps {
   scope: PullRequestsScope;
   projectRef: ScopedProjectRef;
   detail: PullRequestsDetail;
+  /**
+   * The base branch picker and secondary actions only ever act on a live
+   * detail, never a snapshot. Omitting this falls back to `detail`, so
+   * callers that have not adopted the split keep acting as before.
+   */
+  live?: PullRequestsDetail | null;
   context: Extract<PullRequestsContext, { status: "available" }>;
   onRefresh: () => void;
   refreshing: boolean;
@@ -28,6 +34,7 @@ const STATES = {
 };
 export const PullRequestsHeader = memo(function PullRequestsHeader({
   detail,
+  live = detail,
   projectRef,
   scope,
   context,
@@ -62,12 +69,22 @@ export const PullRequestsHeader = memo(function PullRequestsHeader({
           {gitlabSentence ? (
             <>
               requested to merge {branch(detail.headBranch)} into{" "}
-              <PullRequestsBaseBranchPicker detail={detail} scope={scope} projectRef={projectRef} />
+              <PullRequestsBaseBranchPicker
+                detail={detail}
+                live={live}
+                scope={scope}
+                projectRef={projectRef}
+              />
             </>
           ) : (
             <>
               wants to merge {detail.commitCount} commit{detail.commitCount === 1 ? "" : "s"} into{" "}
-              <PullRequestsBaseBranchPicker detail={detail} scope={scope} projectRef={projectRef} />{" "}
+              <PullRequestsBaseBranchPicker
+                detail={detail}
+                live={live}
+                scope={scope}
+                projectRef={projectRef}
+              />{" "}
               from {branch(detail.headBranch)}
             </>
           )}
@@ -118,7 +135,7 @@ export const PullRequestsHeader = memo(function PullRequestsHeader({
           <RefreshCwIcon aria-hidden="true" />
           Refresh
         </PermissionButton>
-        <PullRequestsSecondaryActions detail={detail} context={context} />
+        <PullRequestsSecondaryActions detail={detail} live={live} context={context} />
       </div>
     </header>
   );

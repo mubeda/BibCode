@@ -372,16 +372,45 @@ describe("PullRequestsDetailView", () => {
     expect(h.getTimeline).toHaveBeenCalledOnce();
     expect(usePullRequestsStore.getState().selectDraft(projectRef, 14).comment).toBe("");
   });
-  it("paints a snapshot's title but leaves the merge control inactive until a live detail succeeds", async () => {
+  it("paints a snapshot's title but leaves every action control inactive until a live detail succeeds", async () => {
     h.data.get = null;
+    const permissiveSnapshot: PullRequestsDetail = {
+      ...detail,
+      permissions: {
+        ...detail.permissions,
+        merge: { ...detail.permissions.merge, ...allowed },
+        editPullRequest: allowed,
+        editReviewers: allowed,
+      },
+    };
     h.data.readSnapshot = {
       list: null,
-      detail: { payload: detail, observedAt: 1 },
+      detail: { payload: permissiveSnapshot, observedAt: 1 },
       tab: null,
     };
     await render("conversation", 14, null, gitlabContext);
+    // The title paints from the snapshot even with no live detail yet.
     expect(container.textContent).toContain(detail.title);
-    expect(container.querySelector('[aria-label="Merge status"]')).toBeNull();
+    // The merge box still renders (not hidden), but inactive until live succeeds.
+    const merge = container.querySelector('[aria-label="Merge status"]');
+    expect(merge).not.toBeNull();
+    const mergeButton = [...merge!.querySelectorAll("button")].find(
+      (button) => button.textContent === "Merge",
+    )!;
+    expect(mergeButton.disabled).toBe(true);
+    expect(mergeButton.title).toBe("Loading…");
+    // The header's base branch picker stays inactive too, not just the merge box.
+    const baseBranch = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Change base branch"]',
+    )!;
+    expect(baseBranch.disabled).toBe(true);
+    expect(baseBranch.title).toBe("Loading…");
+    // The side column's reviewer picker stays inactive as well.
+    const reviewerPicker = container.querySelector<HTMLButtonElement>(
+      `[aria-label="Edit ${gitlabContext.capabilities.vocabulary.reviewer}"]`,
+    )!;
+    expect(reviewerPicker.disabled).toBe(true);
+    expect(reviewerPicker.title).toBe("Loading…");
   });
   it("offers a direct path back to the request list", async () => {
     await render();
