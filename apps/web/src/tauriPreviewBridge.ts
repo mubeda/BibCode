@@ -182,7 +182,19 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
       onFrame: () => () => {},
     },
     automation: {
-      status: unsupported("preview.automation"),
+      status: async (tabId) => {
+        const state = stateByTab.get(tabId);
+        const nav = state?.navStatus;
+        const loaded = nav && nav.kind !== "Idle" ? nav : null;
+        return {
+          available: state !== undefined,
+          visible: true,
+          tabId,
+          url: loaded?.url ?? null,
+          title: loaded?.title ?? null,
+          loading: nav?.kind === "Loading",
+        };
+      },
       snapshot: unsupported("preview.automation"),
       click: unsupported("preview.automation"),
       type: unsupported("preview.automation"),

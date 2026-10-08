@@ -543,6 +543,37 @@ describe("tauriPreviewBridge", () => {
     expect(lastArgs?.factor).toBeCloseTo(1.2);
   });
 
+  it("reports tab status without automation support", async () => {
+    const { bridge, emit } = makeBridge();
+    bridge.onStateChange(() => {});
+    const { state } = statePayload("tab_1");
+    emit("preview://state", {
+      tabId: "tab_1",
+      state: { ...state, navStatus: { kind: "Loading", url: "http://x/", title: "" } },
+    });
+
+    await expect(bridge.automation.status("tab_1")).resolves.toEqual({
+      available: true,
+      visible: true,
+      tabId: "tab_1",
+      url: "http://x/",
+      title: "",
+      loading: true,
+    });
+    emit("preview://state", statePayload("tab_1", 1, "http://x/"));
+    await expect(bridge.automation.status("tab_1")).resolves.toMatchObject({
+      available: true,
+      loading: false,
+      title: "Example",
+    });
+    await expect(bridge.automation.status("missing")).resolves.toMatchObject({
+      available: false,
+      url: null,
+      loading: false,
+    });
+    await expect(bridge.automation.click("tab_1", {} as never)).rejects.toThrow(/not supported/);
+  });
+
   it("rejects every unsupported Promise surface with the stable Tauri capability error", async () => {
     const { bridge } = makeBridge();
     const unsupportedCalls: ReadonlyArray<() => Promise<unknown>> = [
@@ -551,7 +582,6 @@ describe("tauriPreviewBridge", () => {
       () => bridge.recording.startScreencast("t1"),
       () => bridge.recording.stopScreencast("t1"),
       () => bridge.recording.save("t1", "video/webm", new Uint8Array()),
-      () => bridge.automation.status("t1"),
       () => bridge.automation.snapshot("t1"),
       () => bridge.automation.click("t1", undefined as never),
       () => bridge.automation.type("t1", undefined as never),
