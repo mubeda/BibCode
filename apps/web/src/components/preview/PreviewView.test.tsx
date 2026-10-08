@@ -33,6 +33,8 @@ const h = vi.hoisted(() => {
     showEmptyState: false,
     panelRect: null as unknown,
     resolvedUrl: "http://resolved.local/" as string,
+    unreachableReason: null as string | null,
+    unreachableNotices: [] as unknown[],
     responsiveSize: { width: 800, height: 600 },
     // command results
     commandCalls: [] as Array<{ label: string; input: unknown }>,
@@ -134,7 +136,14 @@ vi.mock("~/previewStateStore", () => ({
 }));
 
 vi.mock("~/browser/browserTargetResolver", () => ({
-  resolveDiscoveredServerUrl: () => h.resolvedUrl,
+  resolvePreviewTarget: () =>
+    h.unreachableReason
+      ? { kind: "unreachable", reason: h.unreachableReason, environmentLabel: "Box" }
+      : { kind: "reachable", url: h.resolvedUrl },
+}));
+
+vi.mock("~/browser/linkNotices", () => ({
+  showPreviewUnreachableNotice: (resolution: unknown) => h.unreachableNotices.push(resolution),
 }));
 
 vi.mock("~/browser/desktopTabLifetime", () => ({
@@ -522,6 +531,8 @@ beforeEach(() => {
   h.showEmptyState = false;
   h.panelRect = null;
   h.resolvedUrl = "http://resolved.local/";
+  h.unreachableReason = null;
+  h.unreachableNotices.length = 0;
   h.responsiveSize = { width: 800, height: 600 };
   h.commandCalls.length = 0;
   h.resizeResult = { _tag: "Success", value: { viewport: { _tag: "fill" } } };
@@ -782,6 +793,25 @@ describe("navigation handlers", () => {
     expect(bridgeMethodCalls("navigate")).toHaveLength(0);
     expect(h.rememberPreviewUrlCalls).toHaveLength(1);
     expect(h.openPreviewSessionCalls).toHaveLength(0);
+  });
+
+  it("shows a notice and never navigates when the address is unreachable from here", async () => {
+    seedSession();
+    h.previewBridge = makeBridge();
+    h.unreachableReason = "ssh";
+    renderView();
+    const chrome = captured("chromeRow");
+
+    (chrome.onSubmit as (next: string) => void)("localhost:5173");
+    await flush();
+
+    expect(h.unreachableNotices).toEqual([
+      { kind: "unreachable", reason: "ssh", environmentLabel: "Box" },
+    ]);
+    expect(h.commandCalls.filter((call) => call.label === "navigate")).toHaveLength(0);
+    expect(h.desktopNavigateCalls).toHaveLength(0);
+    expect(h.openPreviewSessionCalls).toHaveLength(0);
+    expect(h.rememberPreviewUrlCalls).toHaveLength(0);
   });
 
   it("opens a fresh preview session when no tab is active", async () => {

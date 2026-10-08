@@ -18,7 +18,8 @@ import {
   updatePreviewServerSnapshot,
   useThreadPreviewState,
 } from "~/previewStateStore";
-import { resolveDiscoveredServerUrl } from "~/browser/browserTargetResolver";
+import { resolvePreviewTarget } from "~/browser/browserTargetResolver";
+import { showPreviewUnreachableNotice } from "~/browser/linkNotices";
 import { navigateDesktopTab } from "~/browser/desktopTabLifetime";
 import { useEnvironment, useEnvironmentHttpBaseUrl } from "~/state/environments";
 import { previewEnvironment } from "~/state/preview";
@@ -150,7 +151,12 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   const handleSubmitUrl = useCallback(
     async (next: string) => {
       try {
-        const resolvedUrl = resolveDiscoveredServerUrl(threadRef.environmentId, next);
+        const resolution = resolvePreviewTarget(threadRef.environmentId, next);
+        if (resolution.kind === "unreachable") {
+          showPreviewUnreachableNotice(resolution);
+          return;
+        }
+        const resolvedUrl = resolution.url;
         if (tabId && previewBridge) {
           // Commit the canonical snapshot before driving the native webview.
           // Native Loading/Success events can then enrich that snapshot

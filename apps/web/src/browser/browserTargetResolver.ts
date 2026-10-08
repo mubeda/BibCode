@@ -13,12 +13,15 @@ const isPrivateNetworkHost = (host: string): boolean => {
     return true;
   }
   if (normalized.endsWith(".ts.net")) return true;
+  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10).
+  if (/^f[cd][0-9a-f]{2}:/.test(normalized) || /^fe[89ab][0-9a-f]:/.test(normalized)) return true;
   const parts = normalized.split(".").map(Number);
   if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part))) return false;
   return (
     parts[0] === 10 ||
     (parts[0] === 172 && parts[1]! >= 16 && parts[1]! <= 31) ||
     (parts[0] === 192 && parts[1] === 168) ||
+    (parts[0] === 100 && parts[1]! >= 64 && parts[1]! <= 127) || // tailnet CGNAT 100.64.0.0/10
     parts[0] === 127 ||
     (parts[0] === 169 && parts[1] === 254)
   );
@@ -28,6 +31,57 @@ const isLocalLoopbackHost = (host: string): boolean => {
   const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
 };
+
+export type PreviewUnreachableReason = "disconnected" | "ssh" | "relay" | "public-host";
+export type PreviewTargetResolution =
+  | { readonly kind: "reachable"; readonly url: string }
+  | {
+      readonly kind: "unreachable";
+      readonly reason: PreviewUnreachableReason;
+      readonly environmentLabel: string;
+    };
+
+export const UNREACHABLE_MESSAGES: Record<PreviewUnreachableReason, (label: string) => string> = {
+  disconnected: (label) => `${label} isn't connected. Reconnect it, then open the link again.`,
+  ssh: (label) =>
+    `This address is on ${label}, not this computer. Opening server ports over SSH isn't available yet.`,
+  relay: (label) =>
+    `This address is on ${label}, not this computer. Opening server ports over BiBCode Connect isn't available yet.`,
+  "public-host": (label) =>
+    `This address is on ${label}, not this computer, and ${label} isn't on a private network, so its ports can't be opened directly.`,
+};
+
+type EnvironmentReach =
+  | { readonly kind: "same-host" }
+  | { readonly kind: "host"; readonly host: string }
+  | {
+      readonly kind: "unreachable";
+      readonly reason: PreviewUnreachableReason;
+      readonly label: string;
+    };
+
+// The connection target alone never decides "same machine": a primary can be a
+// browser served by a remote host, and desktop-local WSL is a bearer target on
+// the VM address. SSH and relay endpoints are never the environment's own host.
+function classifyEnvironmentReach(environmentId: EnvironmentId): EnvironmentReach {
+  const connection = readPreparedConnection(environmentId);
+  if (!connection) {
+    return { kind: "unreachable", reason: "disconnected", label: "This environment" };
+  }
+  const label = connection.label;
+  if (connection.target._tag === "SshConnectionTarget") {
+    return { kind: "unreachable", reason: "ssh", label };
+  }
+  if (connection.target._tag === "RelayConnectionTarget") {
+    return { kind: "unreachable", reason: "relay", label };
+  }
+  const host = new URL(connection.httpBaseUrl).hostname.replace(/^\[|\]$/g, "");
+  if (isLocalLoopbackHost(host)) return { kind: "same-host" };
+  if (isPrivateNetworkHost(host)) return { kind: "host", host };
+  return { kind: "unreachable", reason: "public-host", label };
+}
+
+const formatHost = (host: string) => (host.includes(":") ? `[${host}]` : host);
 
 export function resolveBrowserNavigationTarget(
   environmentId: EnvironmentId,
@@ -41,52 +95,51 @@ export function resolveBrowserNavigationTarget(
       environmentId,
     };
   }
-  const connection = readPreparedConnection(environmentId);
-  if (!connection) throw new Error(`Environment ${environmentId} is not connected.`);
-  const environmentUrl = new URL(connection.httpBaseUrl);
-  if (!isPrivateNetworkHost(environmentUrl.hostname)) {
-    throw new Error(
-      "This environment port needs the planned authenticated preview gateway; its server address is not directly private-network reachable.",
-    );
+  const reach = classifyEnvironmentReach(environmentId);
+  if (reach.kind === "unreachable") {
+    throw new Error(UNREACHABLE_MESSAGES[reach.reason](reach.label));
   }
   const protocol = target.protocol ?? "http";
   const path = target.path?.startsWith("/") ? target.path : `/${target.path ?? ""}`;
   const requestedUrl = `${protocol}://localhost:${target.port}${path}`;
-  const normalizedEnvironmentHost = environmentUrl.hostname.replace(/^\[|\]$/g, "");
-  const resolvedHost = normalizedEnvironmentHost.includes(":")
-    ? `[${normalizedEnvironmentHost}]`
-    : normalizedEnvironmentHost;
-  const resolved = new URL(path, `${protocol}://${resolvedHost}:${target.port}`);
+  if (reach.kind === "same-host") {
+    return { requestedUrl, resolvedUrl: requestedUrl, resolutionKind: "direct", environmentId };
+  }
+  const resolved = new URL(path, `${protocol}://${formatHost(reach.host)}:${target.port}`);
   return {
     requestedUrl,
     resolvedUrl: resolved.toString(),
-    resolutionKind:
-      normalizedEnvironmentHost === "localhost" || normalizedEnvironmentHost === "127.0.0.1"
-        ? "direct"
-        : "direct-private-network",
+    resolutionKind: "direct-private-network",
     environmentId,
   };
 }
 
-export function resolveDiscoveredServerUrl(environmentId: EnvironmentId, rawUrl: string): string {
+export function resolvePreviewTarget(
+  environmentId: EnvironmentId,
+  rawUrl: string,
+): PreviewTargetResolution {
+  let parsed: URL;
   try {
-    const normalizedUrl = normalizePreviewUrl(rawUrl);
-    const parsed = new URL(normalizedUrl);
-    if (!isLoopbackHost(parsed.hostname)) return normalizedUrl;
-    const connection = readPreparedConnection(environmentId);
-    if (!connection) throw new Error(`Environment ${environmentId} is not connected.`);
-    const environmentUrl = new URL(connection.httpBaseUrl);
-    if (parsed.hostname !== "0.0.0.0" && isLocalLoopbackHost(environmentUrl.hostname)) {
-      return normalizedUrl;
-    }
-    const port = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
-    return resolveBrowserNavigationTarget(environmentId, {
-      kind: "environment-port",
-      port,
-      protocol: parsed.protocol === "https:" ? "https" : "http",
-      path: `${parsed.pathname}${parsed.search}${parsed.hash}`,
-    }).resolvedUrl;
+    parsed = new URL(normalizePreviewUrl(rawUrl));
   } catch {
-    return rawUrl;
+    // Malformed input keeps the normal navigation error path.
+    return { kind: "reachable", url: rawUrl };
   }
+  if (!isLoopbackHost(parsed.hostname)) return { kind: "reachable", url: parsed.toString() };
+  // The server's own origin (e.g. an SSH-forwarded asset URL) is already reachable.
+  const serverUrl = readPreparedConnection(environmentId)?.httpBaseUrl;
+  if (serverUrl !== undefined && new URL(serverUrl).origin === parsed.origin) {
+    return { kind: "reachable", url: parsed.toString() };
+  }
+  const reach = classifyEnvironmentReach(environmentId);
+  if (reach.kind === "unreachable") {
+    return { kind: "unreachable", reason: reach.reason, environmentLabel: reach.label };
+  }
+  if (reach.kind === "host") {
+    parsed.hostname = formatHost(reach.host);
+  } else if (parsed.hostname === "0.0.0.0") {
+    // A wildcard bind is not a navigable address; loopback is.
+    parsed.hostname = "localhost";
+  }
+  return { kind: "reachable", url: parsed.toString() };
 }
