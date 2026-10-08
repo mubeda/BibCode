@@ -8497,6 +8497,51 @@ mod removal_suspension_tests {
     }
 
     #[tokio::test]
+    async fn shutdown_during_a_turn_keeps_the_cursor_through_restart_reconciliation() {
+        let (root, engine, supervisor, _driver) = fixture().await;
+        let repositories = engine.repositories();
+        let mut projection = repositories
+            .get_thread_session("t1".into())
+            .await
+            .unwrap()
+            .unwrap();
+        projection.status = "running".into();
+        projection.active_turn_id = Some("active-turn".into());
+        repositories
+            .upsert_thread_session(projection)
+            .await
+            .unwrap();
+        supervisor.shutdown().await.unwrap();
+
+        reconcile_abandoned_provider_sessions(&engine)
+            .await
+            .unwrap();
+        let session = repositories
+            .get_thread_session("t1".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, "error");
+        assert_eq!(session.active_turn_id, None);
+        assert_eq!(session.last_error_class.as_deref(), Some("session_stopped"));
+        let row = repositories
+            .get_provider_session_runtime("t1".into())
+            .await
+            .unwrap()
+            .expect("the settled runtime row keeps its resume cursor");
+        assert_eq!(row.status, "error");
+        let request =
+            launch_request_for_command(&engine, &root.path().to_path_buf(), &turn(), None)
+                .await
+                .unwrap();
+        assert_eq!(
+            request.resume_cursor,
+            Some(json!({"threadId":"native-removal-session"}))
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn non_idle_projection_stops_instead_of_suspending() {
         for (status, active_turn) in [
             ("running", None),
