@@ -18,12 +18,13 @@ use crate::process::locate_executable;
 use crate::{
     activity::{
         ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher,
-        ActivityCancellationService, ActivityCapabilities, ActivityDispatchError,
-        ActivityDispatchJob, ActivityHistoryRecovery, ActivityObservationState, ActivityProjection,
-        ActivityRepositoryError, ActivityRuntimeControlRegistration, ActivityRuntimeGeneration,
-        ActivityScopeRef, ActivityScopeSeed, ActivitySection, ActivitySectionHealth,
-        ActivitySummaryCounts, ActivityTargetDispatchDisposition, AgentActivityController,
-        ProviderActivityControlUpdate, ProviderActivityMutation, ProviderActivityNativeTarget,
+        ActivityCancellationService, ActivityCapabilities, ActivityChange, ActivityDelta,
+        ActivityDispatchError, ActivityDispatchJob, ActivityHistoryRecovery, ActivityLifecycle,
+        ActivityObservationState, ActivityProjection, ActivityRepositoryError,
+        ActivityRuntimeControlRegistration, ActivityRuntimeGeneration, ActivityScopeRef,
+        ActivityScopeSeed, ActivitySection, ActivitySectionHealth, ActivitySummaryCounts,
+        ActivityTargetDispatchDisposition, AgentActivityController, ProviderActivityControlUpdate,
+        ProviderActivityMutation, ProviderActivityNativeTarget,
     },
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -784,9 +785,17 @@ struct ProviderActivityLifecycleState {
     capabilities: ActivityCapabilities,
     retained: RetainedActivitySections,
     runtime_observed_capabilities: bool,
+    /// Actors and work items whose latest projected lifecycle is starting or running.
+    live_actor_ids: HashSet<String>,
+    live_work_item_ids: HashSet<String>,
+    last_provider_event_at: Option<tokio::time::Instant>,
 }
 
 type SharedActivityLifecycle = Arc<StdMutex<ProviderActivityLifecycleState>>;
+
+/// Live activity keeps an idle session only while the provider keeps reporting. This bounds
+/// activity that never reports a terminal state (a missed stop hook, an untracked exit).
+const LIVE_ACTIVITY_QUIET_CAP: Duration = Duration::from_secs(30 * 60);
 
 impl RetainedActivitySections {
     fn from_counts(counts: &ActivitySummaryCounts) -> Self {
@@ -808,7 +817,24 @@ impl ProviderActivityLifecycleState {
             capabilities,
             retained: RetainedActivitySections::default(),
             runtime_observed_capabilities: false,
+            live_actor_ids: HashSet::new(),
+            live_work_item_ids: HashSet::new(),
+            last_provider_event_at: None,
         }
+    }
+
+    /// Whether provider subagents or background work still run and recently reported.
+    fn has_recent_live_activity(&self) -> bool {
+        (!self.live_actor_ids.is_empty() || !self.live_work_item_ids.is_empty())
+            && self
+                .last_provider_event_at
+                .is_some_and(|at| at.elapsed() < LIVE_ACTIVITY_QUIET_CAP)
+    }
+
+    /// The process that ran this activity is gone.
+    fn forget_live_activity(&mut self) {
+        self.live_actor_ids.clear();
+        self.live_work_item_ids.clear();
     }
 
     fn apply_startup_capabilities(
@@ -824,7 +850,11 @@ impl ProviderActivityLifecycleState {
         self.capabilities.clone()
     }
 
-    fn observe_projected_batch(&mut self, mutations: &[ProviderActivityMutation]) {
+    fn observe_projected_batch(
+        &mut self,
+        mutations: &[ProviderActivityMutation],
+        deltas: &[ActivityDelta],
+    ) {
         for mutation in mutations {
             match mutation {
                 ProviderActivityMutation::SetScope { capabilities, .. } => {
@@ -834,6 +864,29 @@ impl ProviderActivityLifecycleState {
                 ProviderActivityMutation::UpsertActor(_) => self.retained.actors = true,
                 ProviderActivityMutation::UpsertWorkItem(_) => {
                     self.retained.background_work = true;
+                }
+                _ => {}
+            }
+        }
+        // The projection can ignore a mutation (a late non-terminal report), so live activity
+        // follows the changes it accepted.
+        for change in deltas.iter().flat_map(|delta| &delta.changes) {
+            match change {
+                ActivityChange::ActorUpserted { actor } => {
+                    track_live_activity(&mut self.live_actor_ids, &actor.id, actor.status);
+                }
+                ActivityChange::ActorRemoved { actor_id } => {
+                    self.live_actor_ids.remove(actor_id);
+                }
+                ActivityChange::WorkItemUpserted { work_item } => {
+                    track_live_activity(
+                        &mut self.live_work_item_ids,
+                        &work_item.id,
+                        work_item.status,
+                    );
+                }
+                ActivityChange::WorkItemRemoved { work_item_id } => {
+                    self.live_work_item_ids.remove(work_item_id);
                 }
                 _ => {}
             }
@@ -857,6 +910,17 @@ impl ProviderActivityLifecycleState {
         self.capabilities.targeted_actor_cancellation = false;
         self.runtime_observed_capabilities = true;
         self.capabilities.clone()
+    }
+}
+
+fn track_live_activity(live_ids: &mut HashSet<String>, id: &str, status: ActivityLifecycle) {
+    if matches!(
+        status,
+        ActivityLifecycle::Starting | ActivityLifecycle::Running
+    ) {
+        live_ids.insert(id.to_owned());
+    } else {
+        live_ids.remove(id);
     }
 }
 
@@ -2090,7 +2154,7 @@ pub async fn reconcile_abandoned_provider_sessions(
             );
         }
     }
-    // Graceful shutdown removes runtime rows without settling the session projection.
+    // Graceful shutdown leaves runtime rows suspended without settling the session projection.
     // Read after runtime recovery so a completed reconciliation is never dispatched twice.
     let sessions = repositories
         .list_thread_sessions_by_status(vec![
@@ -3144,7 +3208,12 @@ mod workspace_loss_tests {
             }
         );
         assert_eq!(after, before);
-        assert!(runtime.is_null());
+        // Shutdown suspends the session; the late publication does not mark it running.
+        assert_eq!(runtime["status"], "suspended");
+        assert_eq!(
+            runtime["resume_cursor"],
+            json!({"threadId":"loss-native-session"})
+        );
         assert_eq!(sends, 1);
     }
 
@@ -5528,7 +5597,17 @@ async fn run_supervisor(
                     )
                     .await
                     {
-                        Ok(confirmed_idle) => confirmed_idle,
+                        // Provider subagents and background work outlive the turn that started them.
+                        Ok(confirmed_idle) => {
+                            confirmed_idle
+                                && !sessions.get(&thread_id).is_some_and(|entry| {
+                                    entry
+                                        .activity_lifecycle
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .has_recent_live_activity()
+                                })
+                        }
                         Err(error) => {
                             tracing::warn!(%error, %thread_id, "failed to confirm idle provider session");
                             false
@@ -6163,6 +6242,12 @@ async fn set_live_agent_activity_enabled(
         if !enabled {
             entry.activity_control.write().await.take();
             cancel_and_reap_activity_tasks(entry).await;
+            // Disabling interrupts the projected activity, and no terminal report follows.
+            entry
+                .activity_lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forget_live_activity();
         }
         match entry.driver.set_agent_activity_enabled(enabled).await {
             Ok(()) => {
@@ -6950,6 +7035,11 @@ async fn restart_session(
     }
     if let Some(mut entry) = sessions.remove(thread_id) {
         close_publication_and_reap_event_task(&mut entry).await;
+        entry
+            .activity_lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget_live_activity();
         synchronize_activity_lifecycle(
             activity,
             &entry.launch.thread_id,
@@ -7180,6 +7270,10 @@ fn spawn_event_pump(
                     let Some(mut event) = event else {
                         break begin_settlement();
                     };
+                    activity_lifecycle
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .last_provider_event_at = Some(tokio::time::Instant::now());
                     if let Some(log) = &operational_log {
                         let _ = log.record(&event);
                     }
@@ -7295,7 +7389,7 @@ fn spawn_event_pump(
                                     activity_lifecycle
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .observe_projected_batch(&lifecycle_mutations);
+                                        .observe_projected_batch(&lifecycle_mutations, &deltas);
                                     true
                                 }
                                 Ok(_) => true,
@@ -8376,6 +8470,78 @@ mod removal_suspension_tests {
     }
 
     #[tokio::test]
+    async fn clean_shutdown_suspends_and_next_launch_resumes_the_native_session() {
+        let (root, engine, supervisor, driver) = fixture().await;
+        supervisor.shutdown().await.unwrap();
+        assert_eq!(driver.shutdowns.load(Ordering::SeqCst), 1);
+        let row = engine
+            .repositories()
+            .get_provider_session_runtime("t1".into())
+            .await
+            .unwrap()
+            .expect("a clean shutdown keeps the runtime row");
+        assert_eq!(row.status, "suspended");
+        assert_eq!(
+            row.resume_cursor,
+            Some(json!({"threadId":"native-removal-session"}))
+        );
+        let request =
+            launch_request_for_command(&engine, &root.path().to_path_buf(), &turn(), None)
+                .await
+                .unwrap();
+        assert_eq!(
+            request.resume_cursor,
+            Some(json!({"threadId":"native-removal-session"}))
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_a_turn_keeps_the_cursor_through_restart_reconciliation() {
+        let (root, engine, supervisor, _driver) = fixture().await;
+        let repositories = engine.repositories();
+        let mut projection = repositories
+            .get_thread_session("t1".into())
+            .await
+            .unwrap()
+            .unwrap();
+        projection.status = "running".into();
+        projection.active_turn_id = Some("active-turn".into());
+        repositories
+            .upsert_thread_session(projection)
+            .await
+            .unwrap();
+        supervisor.shutdown().await.unwrap();
+
+        reconcile_abandoned_provider_sessions(&engine)
+            .await
+            .unwrap();
+        let session = repositories
+            .get_thread_session("t1".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, "error");
+        assert_eq!(session.active_turn_id, None);
+        assert_eq!(session.last_error_class.as_deref(), Some("session_stopped"));
+        let row = repositories
+            .get_provider_session_runtime("t1".into())
+            .await
+            .unwrap()
+            .expect("the settled runtime row keeps its resume cursor");
+        assert_eq!(row.status, "error");
+        let request =
+            launch_request_for_command(&engine, &root.path().to_path_buf(), &turn(), None)
+                .await
+                .unwrap();
+        assert_eq!(
+            request.resume_cursor,
+            Some(json!({"threadId":"native-removal-session"}))
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn non_idle_projection_stops_instead_of_suspending() {
         for (status, active_turn) in [
             ("running", None),
@@ -8655,18 +8821,23 @@ async fn shutdown_sessions(
     let mut first_error = None;
     for thread_id in thread_ids {
         match detach_session(activity, sessions, &thread_id).await {
-            Ok(entry) => detached.push((thread_id, entry)),
+            Ok(entry) => detached.push(entry),
             Err(ProviderRuntimeError::SessionNotFound { .. }) => {}
             Err(error) if first_error.is_none() => first_error = Some(error),
             Err(_) => {}
         }
     }
-    let mut shutdowns = stream::iter(detached.into_iter().map(|(thread_id, entry)| async move {
+    // Like idle suspension, keep the resume cursor so the next launch resumes the conversation.
+    let mut shutdowns = stream::iter(detached.into_iter().map(|entry| async move {
         let result = entry.driver.shutdown().await;
-        repositories
-            .delete_provider_session_runtime(thread_id)
-            .await
-            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+        persist_runtime(
+            repositories,
+            &entry.launch,
+            "suspended",
+            entry.resume_cursor,
+            entry.runtime_payload,
+        )
+        .await?;
         result
     }))
     .buffer_unordered(MAX_PARALLEL_PROVIDER_SESSION_SHUTDOWNS);
@@ -21206,6 +21377,7 @@ done
         deadlines: mpsc::UnboundedReceiver<super::IdleDeadlineTestEvent>,
         idle_timeout: Duration,
         admission_waiting: Arc<tokio::sync::Notify>,
+        activity: super::ActivityProjection,
         _workspace: TempDir,
     }
 
@@ -21214,20 +21386,24 @@ done
             let engine = supervisor_engine().await;
             let state = Arc::new(StdMutex::new(SupervisorDriverState {
                 send_turn_ids: ["idle-turn-1".to_owned(), "idle-turn-2".to_owned()].into(),
+                activity_capabilities: crate::activity::ActivityCapabilities::structured_full(
+                    false,
+                ),
                 ..SupervisorDriverState::default()
             }));
             let (events, events_rx) = mpsc::channel(2);
             let (idle_deadline_tx, deadlines) = mpsc::unbounded_channel();
             let admission_waiting = Arc::new(tokio::sync::Notify::new());
+            let activity = super::ActivityProjection::new(
+                crate::activity::ActivityRepository::new(engine.repositories().database().clone()),
+            );
             let supervisor = super::ProviderRuntimeSupervisor::start(
                 engine.clone(),
                 Arc::new(SupervisorFactory {
                     state: state.clone(),
                     events: StdMutex::new(Some(events_rx)),
                 }),
-                super::ActivityProjection::new(crate::activity::ActivityRepository::new(
-                    engine.repositories().database().clone(),
-                )),
+                activity.clone(),
                 super::SupervisorOptions {
                     queue_capacity: 2,
                     session_idle_timeout: idle_timeout,
@@ -21250,6 +21426,7 @@ done
                 deadlines,
                 idle_timeout,
                 admission_waiting,
+                activity,
                 _workspace: workspace,
             }
         }
@@ -21320,6 +21497,76 @@ done
                 })
                 .await
                 .unwrap();
+        }
+
+        async fn emit_activity(&self, native_event_id: &str, mutation: ProviderActivityMutation) {
+            self.emit_activity_batch(native_event_id, vec![mutation])
+                .await;
+        }
+
+        /// Sends an activity-only batch and waits until the pump has projected it.
+        async fn emit_activity_batch(
+            &self,
+            native_event_id: &str,
+            mutations: Vec<ProviderActivityMutation>,
+        ) {
+            // The pump records the batch before it yields after publishing this completion.
+            let mut applied = self
+                .activity
+                .subscribe_apply_completions_for_integration_test();
+            self.events
+                .send(super::ProviderEvent {
+                    native_event_id: Some(
+                        super::ProviderNativeEventId::new(native_event_id.to_owned()).unwrap(),
+                    ),
+                    event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                    thread_id: "t1".to_owned(),
+                    turn_id: None,
+                    item_id: None,
+                    request_id: None,
+                    payload: json!({}),
+                    activity: mutations,
+                    activity_controls: Default::default(),
+                })
+                .await
+                .unwrap();
+            applied.recv().await.expect("activity batch projected");
+        }
+
+        /// Completes the first turn after a subagent actor reached `status`.
+        async fn complete_first_turn_with_actor(&mut self, status: &str) {
+            Self::accepted(self.admit("first").await, "idle-turn-1").await;
+            self.stream("idle-turn-1", "assistant-first").await;
+            self.emit_activity(
+                "subagent-start",
+                ProviderActivityMutation::upsert_actor("actor:sub", None, "Sub", status).unwrap(),
+            )
+            .await;
+            self.emit("turn.completed", "idle-turn-1", "assistant-first")
+                .await;
+            assert_eq!(
+                self.next_deadline().await,
+                super::IdleDeadlineTestEvent::Armed { generation: 2 }
+            );
+        }
+
+        async fn assert_busy_after_timeout(&mut self, generation: u64, reason: &str) {
+            tokio::time::advance(self.idle_timeout).await;
+            let evaluated = self.next_deadline().await;
+            self.assert_live(reason).await;
+            assert_eq!(
+                evaluated,
+                super::IdleDeadlineTestEvent::Evaluated {
+                    generation,
+                    outcome: super::IdleDeadlineEvaluation::Busy,
+                }
+            );
+            assert_eq!(
+                self.next_deadline().await,
+                super::IdleDeadlineTestEvent::Armed {
+                    generation: generation + 1
+                }
+            );
         }
 
         async fn stream(&self, turn_id: &str, message_id: &str) {
@@ -21681,6 +21928,107 @@ done
             .await
             .unwrap();
         fixture.assert_suspended_after_timeout(3).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_keeps_a_session_alive_while_a_subagent_runs() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        fixture
+            .assert_busy_after_timeout(
+                2,
+                "the idle deadline suspended the session while a subagent was running",
+            )
+            .await;
+
+        fixture
+            .emit_activity(
+                "subagent-stop",
+                ProviderActivityMutation::set_actor_status("actor:sub", "completed").unwrap(),
+            )
+            .await;
+        fixture.assert_suspended_after_timeout(3).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_suspends_a_running_subagent_after_the_quiet_cap() {
+        let _clock = keep_idle_clock_paused();
+        // Two deadlines straddle the cap: the first is within it, the second past it.
+        let mut fixture = IdleDeadlineFixture::new(super::LIVE_ACTIVITY_QUIET_CAP * 2 / 3).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        fixture
+            .assert_busy_after_timeout(
+                2,
+                "the idle deadline suspended a subagent that reported within the quiet cap",
+            )
+            .await;
+        fixture.assert_suspended_after_timeout(3).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_ignores_a_late_running_report_the_projection_rejected() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        fixture
+            .emit_activity(
+                "subagent-stop",
+                ProviderActivityMutation::set_actor_status("actor:sub", "completed").unwrap(),
+            )
+            .await;
+        // A running report older than the completion is ignored by the projection, while
+        // another mutation in the same batch is accepted.
+        let ProviderActivityMutation::UpsertActor(mut late) =
+            ProviderActivityMutation::upsert_actor("actor:sub", None, "Sub", "running").unwrap()
+        else {
+            unreachable!("upsert_actor builds an actor upsert");
+        };
+        late.started_at = "2020-01-01T00:00:00.000Z".to_owned();
+        late.updated_at = "2020-01-01T00:00:00.000Z".to_owned();
+        fixture
+            .emit_activity_batch(
+                "late-subagent-report",
+                vec![
+                    ProviderActivityMutation::UpsertActor(late),
+                    ProviderActivityMutation::upsert_actor(
+                        "actor:other",
+                        None,
+                        "Other",
+                        "completed",
+                    )
+                    .unwrap(),
+                ],
+            )
+            .await;
+        fixture.assert_suspended_after_timeout(2).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_forgets_live_activity_when_activity_monitoring_is_disabled() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        // Disabling monitoring interrupts the projected actor; no terminal report follows.
+        fixture
+            .supervisor
+            .set_agent_activity_enabled(false)
+            .await
+            .unwrap();
+        fixture.assert_suspended_after_timeout(2).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_suspends_a_session_whose_subagent_is_waiting() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("waiting").await;
+        fixture.assert_suspended_after_timeout(2).await;
         fixture.close().await;
     }
 

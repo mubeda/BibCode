@@ -6942,9 +6942,9 @@ async fn restart_recovers_eof_partial_after_terminal_settlement_retry_exhaustion
         assert_eq!(failed_runtime.status, "error");
 
         supervisor.shutdown().await.unwrap();
-        // Graceful supervisor shutdown removes its runtime row. Reinsert the
-        // already-observed durable EOF state to model an abrupt process exit
-        // while still joining the test worker cleanly.
+        // Graceful supervisor shutdown rewrites its runtime row as `suspended`.
+        // Reinsert the already-observed durable EOF state to model an abrupt
+        // process exit while still joining the test worker cleanly.
         engine
             .repositories()
             .upsert_provider_session_runtime(failed_runtime)
@@ -12359,7 +12359,7 @@ async fn failed_provider_completion_clears_running_state_and_preserves_the_error
 }
 
 #[tokio::test]
-async fn shutdown_stops_every_driver_and_removes_runtime_rows() {
+async fn shutdown_stops_every_driver_and_suspends_runtime_rows() {
     let engine = engine().await;
     let state = Arc::new(StdMutex::new(DriverState::default()));
     let (_events_tx, events_rx) = mpsc::channel(1);
@@ -12374,16 +12374,22 @@ async fn shutdown_stops_every_driver_and_removes_runtime_rows() {
         SupervisorOptions::default(),
     );
     supervisor.launch(launch()).await.unwrap();
-    supervisor.shutdown().await.unwrap();
-    assert_eq!(state.lock().unwrap().shutdowns, 1);
-    assert!(
+    let runtime = || async {
         engine
             .repositories()
             .get_provider_session_runtime("t1".to_owned())
             .await
             .unwrap()
-            .is_none()
-    );
+            .expect("runtime row")
+    };
+    let launched = runtime().await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(state.lock().unwrap().shutdowns, 1);
+    // A clean shutdown keeps the resume cursor so the next launch resumes the conversation.
+    let suspended = runtime().await;
+    assert_eq!(suspended.status, "suspended");
+    assert!(launched.resume_cursor.is_some());
+    assert_eq!(suspended.resume_cursor, launched.resume_cursor);
 }
 
 #[test]

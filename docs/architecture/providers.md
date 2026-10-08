@@ -282,9 +282,21 @@ the fatal-exit trigger, and intentional stop/idle suspension cancels and joins
 the supervisor event pump before shutting down any driver. Each completion reserves
 an idle deadline generation before `ready` is published; successful projection of a
 non-failed completion arms it. When a current deadline finds a busy session (an
-admitted delivery, a `running` or `starting` projection, or an active turn), it
-immediately re-arms for one idle timeout, and the next completion supersedes that
-re-arm.
+admitted delivery, a `running` or `starting` projection, an active turn, or live
+provider activity), it immediately re-arms for one idle timeout, and the next
+completion supersedes that re-arm. Live provider activity is the session's
+in-memory set of actors (Claude subagents, Codex child agents) and work items
+(background tasks and terminals) whose latest projected lifecycle is `starting` or
+`running`; `waiting` and `unknown` do not count. It follows the changes the
+projection accepted, not the provider's raw reports, and disabling Agent Activity
+clears it because the projection interrupts that activity. It keeps the session busy only
+while the provider has emitted an event within the last 30 minutes, which bounds
+activity that never reports a terminal state. Removal-time suspension ignores live
+activity. A clean server shutdown retires every live session like idle suspension:
+the runtime row becomes `suspended` with its resume cursor (unless the thread is
+deleted), so the next message after a restart resumes the same native
+conversation. Explicit stop, thread deletion, and provider restart still delete
+the row.
 
 **Stop** has a deadline. When the projection shows a running turn and Stop
 names that turn (or no turn), the supervisor arms a 10-second interrupt deadline before asking the driver to

@@ -1926,7 +1926,8 @@ reconciliation or provider claiming; restart preserves their queued state and
 payload until an eligible promotion or explicit user action. Before delivery
 starts, startup reconciles abandoned live runtime rows and every projected
 session still starting, connecting, or running without a live runtime row,
-including rows removed by graceful shutdown. It settles the abandoned turn's
+including sessions whose row graceful shutdown left `suspended` (the row keeps its
+resume cursor). It settles the abandoned turn's
 streaming assistant messages, clears the active turn, and projects the existing
 restart error as `session_stopped`. That error settlement holds queued messages
 for explicit **Send now** and releases the pending-start claim gate. Completed
