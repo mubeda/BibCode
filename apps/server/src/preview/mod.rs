@@ -7,6 +7,8 @@ use tokio::sync::{Mutex, broadcast};
 use url::Url;
 use uuid::Uuid;
 
+pub mod gateway;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag")]
 pub enum PreviewViewportSetting {
