@@ -1,3 +1,4 @@
+import type { BrowserTerminalGuardReason } from "./release-visual-browser-followups-source.ts";
 // @effect-diagnostics nodeBuiltinImport:off - CI-only concrete caller composes existing physical/RPC/capture owners.
 // @effect-diagnostics globalFetch:off - Current authenticated contracts on fixed owned loopback only.
 // @effect-diagnostics globalTimers:off - One bounded current-contract metadata subscription, joined before returning.
@@ -494,6 +495,7 @@ export async function runBrowserFollowupCaller(input: {
   step: (phase: string) => void;
   observeUnsafeCleanup: () => void;
   observeInitialFailure?: (error: unknown, value: BrowserInitialJoin | null) => void;
+  observeTerminalReceiptFailure?: (error: unknown, reason: BrowserTerminalGuardReason) => void;
 }) {
   if (input.CI !== "true") throw refused();
   let cleanupBinding: ReturnType<typeof bindBrowserFollowupTarget> | undefined;
@@ -817,6 +819,9 @@ export async function runBrowserFollowupCaller(input: {
       for (const row of browserFollowupRows)
         await runBrowserFollowupScene(
           {
+            ...(input.observeTerminalReceiptFailure
+              ? { observeTerminalReceiptFailure: input.observeTerminalReceiptFailure }
+              : {}),
             browser: input.browser,
             owner: input.owner,
             verifyOwnedIdentity: verifyIdentity,

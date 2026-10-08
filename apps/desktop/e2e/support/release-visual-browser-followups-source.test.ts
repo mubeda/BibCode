@@ -97,3 +97,99 @@ it.each(["terminal", "process", "claim", "dimensions", "output", "status"])(
     ).toThrow();
   },
 );
+
+import * as guardSource from "./release-visual-browser-followups-source.ts";
+function observedGuard(error: unknown) {
+  if (
+    "projectBrowserTerminalGuard" in guardSource &&
+    typeof guardSource.projectBrowserTerminalGuard === "function"
+  )
+    return guardSource.projectBrowserTerminalGuard(error);
+  return undefined;
+}
+it("retains only the actual original owner refusal", () => {
+  const snapshot = {
+    threadId: "owned-thread",
+    terminalId: "term-1",
+    cwd: "/owned/project",
+    status: "running",
+    pid: 123,
+    history: "Owned shared terminal output",
+    size: { cols: 91, rows: 24, sizeClaim: "second" },
+  } as unknown as TerminalSessionSnapshot;
+  let error: unknown;
+  try {
+    verifyBrowserFollowupTerminal({
+      threadId: "owned-thread",
+      terminalId: "term-1",
+      cwd: "/owned/project",
+      firstClaim: "first",
+      secondClaim: "second",
+      first: snapshot,
+      second: snapshot,
+      output: "Owned shared terminal output",
+    });
+  } catch (caught) {
+    error = caught;
+  }
+  expect(observedGuard(error)).toBe("original-owner-mismatch");
+});
+
+it.each([
+  ["first", "original-owner-mismatch"],
+  ["second", "second-owner-mismatch"],
+  ["grid", "shared-grid-mismatch"],
+] as const)("classifies the actual %s guard without serializing actor values", (mode, expected) => {
+  const value = terminal();
+  if (mode === "first") value.first.size.sizeClaim = "second-owner";
+  if (mode === "second") value.second.size.sizeClaim = "second-owner";
+  if (mode === "grid") value.second.size.rows++;
+  let error: unknown;
+  try {
+    verifyBrowserFollowupTerminal({
+      ...value,
+      first: value.first as unknown as TerminalSessionSnapshot,
+      second: value.second as unknown as TerminalSessionSnapshot,
+    });
+  } catch (caught) {
+    error = caught;
+  }
+  expect(observedGuard(error)).toBe(expected);
+});
+it("projects foreign malformed accessor and proxy errors without inspecting them", () => {
+  let reads = 0;
+  const accessor = Object.defineProperty({}, "message", {
+    get() {
+      reads++;
+      throw new Error("Private accessor");
+    },
+  });
+  const proxy = new Proxy(
+    {},
+    {
+      get() {
+        reads++;
+        throw undefined;
+      },
+      getOwnPropertyDescriptor() {
+        reads++;
+        throw undefined;
+      },
+      getPrototypeOf() {
+        reads++;
+        throw undefined;
+      },
+    },
+  );
+  for (const error of [
+    undefined,
+    null,
+    "private",
+    new Error("Private foreign error"),
+    {},
+    accessor,
+    proxy,
+  ])
+    expect(observedGuard(error)).toBe("private-unknown");
+  expect(reads).toBe(0);
+});

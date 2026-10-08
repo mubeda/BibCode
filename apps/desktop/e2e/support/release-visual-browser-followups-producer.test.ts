@@ -486,3 +486,106 @@ it.each(["display", "enabled", "click"] as const)(
     }
   },
 );
+
+it.each([new Error("Inert receipt deadline"), undefined])(
+  "records last terminal refusal before cleanup while preserving the primary rejection",
+  async (primary) => {
+    const value = fixture();
+    const events: string[] = [];
+    let checks = 0;
+    Object.assign(value.input, {
+      observeTerminalReceiptFailure: (error: unknown, reason: unknown) => {
+        events.push("record");
+        expect(Object.is(error, primary)).toBe(true);
+        expect(reason).toBe("private-unknown");
+      },
+    });
+    value.input.owner.until = async (predicate) => {
+      expect(await predicate()).toBe(false);
+      throw primary;
+    };
+    value.input.terminal.withSecondWindow = (run) =>
+      withBrowserFollowupResource({
+        run: () =>
+          run({
+            browser: value.input.browser,
+            label: "Terminal 1",
+            prepareOriginalSizeOwner: async () => {},
+            verify: async () => {
+              checks++;
+              throw undefined;
+            },
+            verifyFit: async () => {},
+          }),
+        cleanup: async () => {
+          events.push("cleanup");
+          throw new Error("Inert cleanup failure");
+        },
+        observeUnsafeCleanup: () => {},
+      });
+    let failed = false,
+      caught: unknown;
+    try {
+      await runBrowserFollowupScene(value.input, "terminal-shared-size");
+    } catch (error) {
+      failed = true;
+      caught = error;
+    }
+    expect(failed).toBe(true);
+    expect(Object.is(caught, primary)).toBe(true);
+    expect(events).toEqual(["record", "cleanup"]);
+    expect(checks).toBe(1);
+    expect(value.captures).toEqual([]);
+  },
+);
+
+it("suppresses successful wait packets and preserves rejected waits when callback fails", async () => {
+  for (const success of [true, false]) {
+    const value = fixture();
+    let records = 0,
+      checks = 0;
+    const primary = Object.freeze(new Error("Inert exact primary"));
+    Object.assign(value.input, {
+      observeTerminalReceiptFailure: () => {
+        records++;
+        throw undefined;
+      },
+    });
+    if (!success) {
+      value.input.owner.until = async (predicate) => {
+        expect(await predicate()).toBe(false);
+        throw primary;
+      };
+      value.input.terminal.withSecondWindow = (run) =>
+        withBrowserFollowupResource({
+          run: () =>
+            run({
+              browser: value.input.browser,
+              label: "Terminal 1",
+              prepareOriginalSizeOwner: async () => {},
+              verify: async () => {
+                checks++;
+                throw undefined;
+              },
+              verifyFit: async () => {},
+            }),
+          cleanup: async () => {},
+          observeUnsafeCleanup: () => {},
+        });
+    }
+    let failed = false,
+      caught: unknown;
+    try {
+      await runBrowserFollowupScene(value.input, "terminal-shared-size");
+    } catch (error) {
+      failed = true;
+      caught = error;
+    }
+    expect(failed).toBe(!success);
+    expect(records).toBe(success ? 0 : 1);
+    if (!success) {
+      expect(caught).toBe(primary);
+      expect(checks).toBe(1);
+    }
+  }
+});

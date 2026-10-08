@@ -1,3 +1,7 @@
+import {
+  projectBrowserTerminalGuardReason,
+  type BrowserTerminalGuardReason,
+} from "./support/release-visual-browser-followups-source.ts";
 import { observeOwnedBrowserAlert } from "./support/owned-browser-alert.ts";
 import {
   projectPrViewportObservation,
@@ -714,6 +718,12 @@ export async function runDeliveryRetryQualification() {
     readonly value: BrowserInitialJoin | null;
     readonly theme: string;
   } | null => browserInitialFailure;
+  let browserTerminalReceiptFailure: {
+    error: unknown;
+    reason: BrowserTerminalGuardReason;
+    theme: string;
+  } | null = null;
+  const readBrowserTerminalReceiptFailure = () => browserTerminalReceiptFailure;
   let browserFollowupFixtureSafeToDelete = true;
   const browserFollowupResources: Array<Awaited<ReturnType<typeof prepareBrowserFollowupCaller>>> =
     [];
@@ -2905,6 +2915,7 @@ export async function runDeliveryRetryQualification() {
           throw new Error("Owned browser follow-up grant unavailable.");
         const accessToken = await fixtureAccessToken("http://127.0.0.1:4887", credential);
         browserInitialFailure = null;
+        browserTerminalReceiptFailure = null;
         await runBrowserFollowupCaller({
           CI: childEnv.CI,
           prepared: browserFollowup,
@@ -2916,6 +2927,17 @@ export async function runDeliveryRetryQualification() {
               browserInitialFailure = { error, value: projectBrowserInitialJoin(value), theme };
           },
           browser,
+          observeTerminalReceiptFailure: (error, reason) => {
+            if (
+              phase === "visual-browser-followups-terminal-shared-size-terminal-receipt-wait" &&
+              browserTerminalReceiptFailure === null
+            )
+              browserTerminalReceiptFailure = {
+                error,
+                reason: projectBrowserTerminalGuardReason(reason),
+                theme,
+              };
+          },
           owner,
           theme,
           accessToken,
@@ -3312,6 +3334,7 @@ export async function runDeliveryRetryQualification() {
   } catch (error) {
     const originalCursorFailure = readCursorOriginalFailure();
     const originalBrowserInitialFailure = readBrowserInitialFailure();
+    const originalBrowserTerminalReceiptFailure = readBrowserTerminalReceiptFailure();
     if (originalCursorFailure !== null && originalCursorFailure.error === error) {
       phase = originalCursorFailure.phase;
       try {
@@ -3352,6 +3375,14 @@ export async function runDeliveryRetryQualification() {
       phase,
       theme,
       failure: classifyQualificationFailure(error),
+      browserTerminalReceiptGuard:
+        config.selection === "release-visual-browser-followups" &&
+        phase === "visual-browser-followups-terminal-shared-size-terminal-receipt-wait" &&
+        originalBrowserTerminalReceiptFailure !== null &&
+        Object.is(originalBrowserTerminalReceiptFailure.error, error) &&
+        originalBrowserTerminalReceiptFailure.theme === theme
+          ? projectBrowserTerminalGuardReason(originalBrowserTerminalReceiptFailure.reason)
+          : null,
       browserInitialJoin:
         config.selection === "release-visual-browser-followups" &&
         phase === "visual-browser-followups-observed-reconnect" &&

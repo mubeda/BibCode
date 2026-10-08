@@ -1,3 +1,7 @@
+import {
+  markBrowserTerminalGuard,
+  type BrowserTerminalGuardReason,
+} from "./release-visual-browser-followups-source.ts";
 // @effect-diagnostics nodeBuiltinImport:off - The observer decodes actual public SDK envelopes at an external raw protocol boundary.
 import * as NodeModule from "node:module";
 import * as NodeCrypto from "node:crypto";
@@ -28,6 +32,8 @@ const Schema = NodeModule.createRequire(
   new URL("../../../../packages/contracts/package.json", import.meta.url),
 )("effect/Schema");
 const refused = () => new Error("Owned browser follow-up protocol receipt refused.");
+const terminalRefused = (reason: Exclude<BrowserTerminalGuardReason, "private-unknown">) =>
+  markBrowserTerminalGuard(refused(), reason);
 const admitted = new Set([
   "uploads.begin",
   "uploads.append",
@@ -309,10 +315,18 @@ export function createBrowserFollowupProtocolObserver(
   let secondClaim: string | null = null;
   const currentTerminal = (count: 1 | 2) => {
     const values = [...attachments.values()];
-    if (closed || terminalFailed || values.length !== count) throw refused();
+    if (closed || terminalFailed) throw terminalRefused("observer-unavailable");
+    if (values.length !== count)
+      throw terminalRefused(
+        values.length === 0
+          ? "attachment-count-none"
+          : values.length === 1
+            ? "attachment-count-one"
+            : "attachment-count-many",
+      );
     for (const value of values) {
       const request = requests.get(value.entry);
-      if (request?.tag !== "terminal.attach") throw refused();
+      if (request?.tag !== "terminal.attach") throw terminalRefused("current-attachment-invalid");
       const payload = decode<typeof TerminalAttachInput.Type>(TerminalAttachInput, request.payload);
       const snapshot = value.snapshot;
       if (
@@ -327,22 +341,23 @@ export function createBrowserFollowupProtocolObserver(
         snapshot.pid === null ||
         !snapshot.history.includes("Owned shared terminal output")
       )
-        throw refused();
+        throw terminalRefused("current-attachment-invalid");
     }
     if (
       count === 2 &&
       (values[0]!.claim === values[1]!.claim || values[0]!.snapshot.pid !== values[1]!.snapshot.pid)
     )
-      throw refused();
+      throw terminalRefused("claim-or-pid-pair-invalid");
     return values;
   };
   const roleTerminal = () => {
     const values = currentTerminal(2);
-    if (originalClaim === null) throw refused();
+    if (originalClaim === null) throw terminalRefused("original-unpinned");
     const original = values.find((value) => value.claim === originalClaim);
     const second = values.find((value) => value.claim !== originalClaim);
-    if (!original || !second) throw refused();
-    if (secondClaim !== null && second.claim !== secondClaim) throw refused();
+    if (!original || !second) throw terminalRefused("role-missing");
+    if (secondClaim !== null && second.claim !== secondClaim)
+      throw terminalRefused("second-role-changed");
     secondClaim = second.claim;
     return [original, second] as const;
   };

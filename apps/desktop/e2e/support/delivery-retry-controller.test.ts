@@ -96,6 +96,7 @@ const runControllerSource = (
       cursorOriginalFailure: null,
       readCursorOriginalFailure: () => null,
       readBrowserInitialFailure: () => null,
+      readBrowserTerminalReceiptFailure: () => null,
       config: { selection: "delivery-retry-ui" },
       settingsFollowupUsageFixtures: [],
       browserFollowupResources: [],
@@ -104,7 +105,7 @@ const runControllerSource = (
     options,
   );
 
-it("the shared controller VM binds the same-source neutral browser failure read", () => {
+it("the shared controller VM binds the same-source neutral browser failure reads", () => {
   const source = NodeFS.readFileSync(
     NodePath.resolve("apps/desktop/e2e/qualify-delivery-retry.ts"),
     "utf8",
@@ -113,12 +114,18 @@ it("the shared controller VM binds the same-source neutral browser failure read"
     "    const originalBrowserInitialFailure = readBrowserInitialFailure();",
   );
   expect(start).toBeGreaterThan(0);
-  const end = source.indexOf("\n", start);
+  const terminalRead = source.indexOf(
+    "    const originalBrowserTerminalReceiptFailure = readBrowserTerminalReceiptFailure();",
+    start,
+  );
+  expect(terminalRead).toBeGreaterThan(start);
+  const end = source.indexOf("\n", terminalRead);
   const result = runControllerSource(
-    source.slice(start, end) + "\noriginalBrowserInitialFailure;",
+    source.slice(start, end) +
+      "\n[originalBrowserInitialFailure, originalBrowserTerminalReceiptFailure];",
     {},
   );
-  expect(result).toBeNull();
+  expect(result).toEqual([null, null]);
 });
 
 it.each(["safe", "already-unsafe", "first-refused", "signal-during-join", "unjoined"])(

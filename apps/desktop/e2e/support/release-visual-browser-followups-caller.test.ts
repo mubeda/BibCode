@@ -1,3 +1,10 @@
+import { createBrowserFollowupProtocolObserver } from "./release-visual-browser-followups-protocol.ts";
+import { runBrowserFollowupScene } from "./release-visual-browser-followups-producer.ts";
+import {
+  withBrowserFollowupSecondWindow,
+  withBrowserFollowupResource,
+} from "./release-visual-browser-followups-owner.ts";
+import { projectBrowserTerminalGuardReason } from "./release-visual-browser-followups-source.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Actual caller source executes only on inert ports.
 import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
@@ -23,7 +30,63 @@ import {
 import { browserFollowupRows } from "./release-visual-browser-followups.ts";
 import { joinBrowserFollowupCleanup } from "./release-visual-browser-followups-caller-resources.ts";
 import { pinBrowserFollowupTerminalReplay } from "./release-visual-browser-followups-caller-protocol.ts";
-test.each(["owned", "bootstrap-close", "source-drift"])(
+function terminalChainWriter(root: string) {
+  const qualifier = NodeFS.readFileSync(
+    new URL("../qualify-delivery-retry.ts", import.meta.url),
+    "utf8",
+  );
+  const declaration = qualifier.slice(
+    qualifier.indexOf("  let browserInitialFailure:"),
+    qualifier.indexOf("  let browserFollowupFixtureSafeToDelete = true;"),
+  );
+  const callbackStart = qualifier.indexOf(
+    "          observeTerminalReceiptFailure: (error, reason) =>",
+  );
+  const callback = qualifier
+    .slice(callbackStart, qualifier.indexOf("          owner,", callbackStart))
+    .trim()
+    .replace(/^observeTerminalReceiptFailure: /, "")
+    .replace(/,$/, "");
+  const fieldStart = qualifier.indexOf("      browserTerminalReceiptGuard:");
+  const field = qualifier
+    .slice(fieldStart, qualifier.indexOf("      browserInitialJoin:", fieldStart))
+    .trim()
+    .replace(/,$/, "");
+  const writeStart = qualifier.indexOf("  const write ="),
+    writeEnd = qualifier.indexOf("  const step =", writeStart);
+  const context = NodeVM.createContext({
+    NodeFS,
+    NodePath,
+    Object,
+    projectBrowserTerminalGuardReason,
+    config: { evidence: root, selection: "release-visual-browser-followups" },
+    phase: "prepare",
+    theme: "light",
+  });
+  const writer = NodeVM.runInContext(
+    NodeModule.stripTypeScriptTypes(
+      declaration +
+        qualifier.slice(writeStart, writeEnd) +
+        "\nconst observe=" +
+        callback +
+        ";function publish(error){const originalBrowserTerminalReceiptFailure=readBrowserTerminalReceiptFailure();write('failure',{" +
+        field +
+        "});}({observe,publish,read:readBrowserTerminalReceiptFailure});",
+    ),
+    context,
+  );
+  return { writer, context };
+}
+test.each([
+  "owned",
+  "bootstrap-close",
+  "source-drift",
+  "guard-error",
+  "guard-undefined",
+  "guard-callback",
+  "guard-cleanup",
+  "guard-success",
+])(
   "actual six-row caller composes real ownership boundaries before originals: %s",
   async (mode) => {
     const source = NodeFS.readFileSync(
@@ -55,6 +118,77 @@ test.each(["owned", "bootstrap-close", "source-drift"])(
       updatedAt: "2026-10-06T00:00:00.000Z",
     };
     const original = new Error("inert exact bootstrap failure");
+    const guardMode = mode.startsWith("guard-");
+    const primary: unknown = mode === "guard-undefined" ? undefined : original;
+    const root = guardMode
+      ? NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "terminal-chain-"))
+      : null;
+    if (root) NodeFS.chmodSync(root, 0o700);
+    const retained = root ? terminalChainWriter(root) : null;
+    const actorSnapshot: typeof TerminalSessionSnapshot.Type = {
+      ...snapshot,
+      status: "running",
+      size: { cols: 91, rows: 24, sizeClaim: "first-owner" },
+      oscColorResponderActive: false,
+      firstAttachmentGrant: false,
+    };
+    const observer = createBrowserFollowupProtocolObserver({
+      png: Buffer.from([1]),
+      cwd: snapshot.cwd,
+      threadId: snapshot.threadId,
+      terminalId: snapshot.terminalId,
+      patch: () => "inert",
+      slowTransport: () => false,
+    });
+    const attachActor = (connection: string, claim: string, second: boolean) => {
+      observer.observe(connection, "request", {
+        _tag: "Request",
+        id: "1",
+        tag: "terminal.attach",
+        payload: {
+          threadId: snapshot.threadId,
+          terminalId: snapshot.terminalId,
+          cwd: snapshot.cwd,
+          sizeClaim: claim,
+        },
+      });
+      observer.observe(connection, "reply", {
+        _tag: "Chunk",
+        requestId: "1",
+        values: [
+          {
+            type: "snapshot",
+            snapshot: {
+              ...actorSnapshot,
+              size: {
+                cols: 91,
+                rows: 24,
+                sizeClaim: second && mode !== "guard-success" ? "second-owner" : "first-owner",
+              },
+            },
+          },
+        ],
+      });
+    };
+    if (guardMode) attachActor("first", "first-owner", false);
+    let checks = 0,
+      selected = "inert-main",
+      handles = [selected];
+    const appliedSize = (claim: string) => {
+      for (const connection of handles.length === 2 ? ["first", "second"] : ["first"])
+        observer.observe(connection, "reply", {
+          _tag: "Chunk",
+          requestId: "1",
+          values: [
+            {
+              type: "resized",
+              threadId: snapshot.threadId,
+              terminalId: snapshot.terminalId,
+              size: { cols: 91, rows: 24, sizeClaim: claim },
+            },
+          ],
+        });
+    };
     let reads = 0;
     const prepared = {
       png: { path: "inert-original" },
@@ -72,7 +206,15 @@ test.each(["owned", "bootstrap-close", "source-drift"])(
     };
     const network = {
       observer: {
-        terminalRestored: () => events.push("reconnect"),
+        terminalRestored: () => {
+          events.push("reconnect");
+          if (guardMode) observer.terminalRestored();
+        },
+        terminal: () => {
+          checks++;
+          return observer.terminal();
+        },
+        fitted: () => observer.fitted(),
         replay: { verify: () => events.push("replay"), throwIfFailed: () => {} },
       },
       close: async () => {},
@@ -118,21 +260,29 @@ test.each(["owned", "bootstrap-close", "source-drift"])(
           await input.verifySource();
           return { scene: input.observation.scene };
         },
-        browserFollowupRows,
-        runBrowserFollowupScene: async (
-          input: {
-            verifyOwnedIdentity: () => Promise<void>;
-            capture: (scene: string, browser: object, verify: () => Promise<void>) => Promise<void>;
-            browser: object;
-          },
-          row: string,
-        ) => {
-          await input.verifyOwnedIdentity();
-          rows.push(row);
-          await input.capture(row, input.browser, async () => {
-            events.push("source");
-          });
-        },
+        browserFollowupRows: guardMode ? ["terminal-shared-size"] : browserFollowupRows,
+        withBrowserFollowupSecondWindow,
+        withBrowserFollowupResource,
+        runBrowserFollowupScene: guardMode
+          ? runBrowserFollowupScene
+          : async (
+              input: {
+                verifyOwnedIdentity: () => Promise<void>;
+                capture: (
+                  scene: string,
+                  browser: object,
+                  verify: () => Promise<void>,
+                ) => Promise<void>;
+                browser: object;
+              },
+              row: string,
+            ) => {
+              await input.verifyOwnedIdentity();
+              rows.push(row);
+              await input.capture(row, input.browser, async () => {
+                events.push("source");
+              });
+            },
         refused: () => new Error("inert source refused"),
       },
     ) as (input: object) => Promise<void>;
@@ -140,16 +290,37 @@ test.each(["owned", "bootstrap-close", "source-drift"])(
       CI: "true",
       prepared,
       browser: {
-        $: () => ({
+        $: (selector: string) => ({
           isDisplayed: async () => true,
           waitForDisplayed: async () => {},
           waitForEnabled: async () => {},
-          click: async () => {},
+          click: async () => {
+            if (guardMode && selector === "button=Fit to this window")
+              appliedSize(selected === "inert-main" ? "first-owner" : "second-owner");
+          },
         }),
         $$: () => [{ getAttribute: async () => terminal.terminalId }],
         execute: async () => true,
-        getWindowHandles: async () => ["inert-main"],
-        getWindowHandle: async () => "inert-main",
+        getWindowHandles: async () => handles,
+        getWindowHandle: async () => selected,
+        getWindowSize: async () => ({ width: 1280, height: 960 }),
+        setWindowSize: async () => {},
+        newWindow: async () => {
+          handles = ["inert-main", "inert-second"];
+          selected = "inert-second";
+          attachActor("second", "second-owner", true);
+          return { handle: selected };
+        },
+        switchToWindow: async (handle: string) => {
+          selected = handle;
+        },
+        closeWindow: async () => {
+          events.push("second-cleanup");
+          observer.connectionClosed("second");
+          handles = ["inert-main"];
+          selected = "inert-main";
+          if (mode === "guard-cleanup") throw new Error("Inert secondary cleanup failure");
+        },
         getUrl: async () => "http://127.0.0.1:4885/local/inert-thread",
         getWindowRect: async () => ({ x: 0, y: 0, width: 900, height: 700 }),
         setWindowRect: async () => {},
@@ -157,7 +328,10 @@ test.each(["owned", "bootstrap-close", "source-drift"])(
       },
       owner: {
         until: async (check: () => Promise<boolean>) => {
-          if (!(await check())) throw new Error("inert observation missing");
+          if (!(await check())) {
+            if (guardMode) throw primary;
+            throw new Error("inert observation missing");
+          }
         },
       },
       theme: "light",
@@ -184,12 +358,61 @@ test.each(["owned", "bootstrap-close", "source-drift"])(
       captured: new Set(),
       captures,
       publish: () => {},
-      step: () => {},
+      step: (phase: string) => {
+        if (retained) retained.context.phase = phase;
+      },
+      ...(guardMode
+        ? {
+            observeTerminalReceiptFailure: (error: unknown, reason: unknown) => {
+              events.push("guard-record");
+              NodeAssert.equal(Object.is(error, primary), true);
+              retained?.writer.observe(error, reason);
+              if (mode === "guard-callback") throw undefined;
+            },
+          }
+        : {}),
       observeUnsafeCleanup: () => {
         events.push("unsafe");
       },
     });
-    if (mode === "owned") {
+    if (guardMode) {
+      if (root === null || retained === null) throw new Error("Inert chain writer unavailable");
+      try {
+        let failed = false,
+          caught: unknown;
+        try {
+          await pending;
+        } catch (error) {
+          failed = true;
+          caught = error;
+        }
+        if (mode === "guard-success") {
+          NodeAssert.equal(failed, false);
+          NodeAssert.equal(retained?.writer.read(), null);
+          NodeAssert.equal(events.includes("guard-record"), false);
+          NodeAssert.equal(captures.length, 1);
+        } else {
+          NodeAssert.equal(failed, true);
+          NodeAssert.equal(Object.is(caught, primary), true);
+          NodeAssert.equal(events.filter((event) => event === "guard-record").length, 1);
+          NodeAssert.ok(events.indexOf("guard-record") < events.indexOf("second-cleanup"));
+          NodeAssert.equal(checks, 1);
+          NodeAssert.equal(captures.length, 0);
+          retained?.writer.publish(caught);
+          NodeAssert.equal(
+            JSON.parse(NodeFS.readFileSync(NodePath.join(root, "failure.json"), "utf8"))
+              .browserTerminalReceiptGuard,
+            "second-owner-mismatch",
+          );
+          NodeAssert.equal(
+            NodeFS.statSync(NodePath.join(root, "failure.json")).mode & 0o777,
+            0o600,
+          );
+        }
+      } finally {
+        if (root) NodeFS.rmSync(root, { recursive: true, force: true });
+      }
+    } else if (mode === "owned") {
       await pending;
       NodeAssert.deepEqual(rows, [...browserFollowupRows]);
       NodeAssert.equal(captures.length, 6);
@@ -1538,6 +1761,95 @@ test.each(["owned", "wrong-handle", "wrong-terminal", "duplicate-mount", "extra-
     } else {
       await NodeAssert.rejects(callbacks.restoreOriginalSizeOwner());
       NodeAssert.equal(clicks, 0);
+    }
+  },
+);
+
+test.each([new Error("Inert exact primary"), undefined])(
+  "actual private terminal writer admits only phase theme and exact primary identity",
+  (primary) => {
+    const qualifier = NodeFS.readFileSync(
+      new URL("../qualify-delivery-retry.ts", import.meta.url),
+      "utf8",
+    );
+    const declaration = qualifier.slice(
+      qualifier.indexOf("  let browserInitialFailure:"),
+      qualifier.indexOf("  let browserFollowupFixtureSafeToDelete = true;"),
+    );
+    const callbackStart = qualifier.indexOf(
+      "          observeTerminalReceiptFailure: (error, reason) =>",
+    );
+    const callback = qualifier
+      .slice(callbackStart, qualifier.indexOf("          owner,", callbackStart))
+      .trim()
+      .replace(/^observeTerminalReceiptFailure: /, "")
+      .replace(/,$/, "");
+    const fieldStart = qualifier.indexOf("      browserTerminalReceiptGuard:");
+    const field = qualifier
+      .slice(fieldStart, qualifier.indexOf("      browserInitialJoin:", fieldStart))
+      .trim()
+      .replace(/,$/, "");
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "browser-terminal-writer-"));
+    NodeFS.chmodSync(root, 0o700);
+    const phase = "visual-browser-followups-terminal-shared-size-terminal-receipt-wait";
+    const context = NodeVM.createContext({
+      NodeFS,
+      NodePath,
+      Object,
+      projectBrowserTerminalGuardReason,
+      config: { evidence: root, selection: "release-visual-browser-followups" },
+      phase,
+      theme: "light",
+    });
+    const writeStart = qualifier.indexOf("  const write ="),
+      writeEnd = qualifier.indexOf("  const step =", writeStart);
+    const writer = NodeVM.runInContext(
+      NodeModule.stripTypeScriptTypes(
+        declaration +
+          qualifier.slice(writeStart, writeEnd) +
+          "\nconst observe=" +
+          callback +
+          ";function publish(error){const originalBrowserTerminalReceiptFailure=readBrowserTerminalReceiptFailure();write('failure',{" +
+          field +
+          "});}({observe,publish});",
+      ),
+      context,
+    );
+    try {
+      writer.observe(primary, "second-owner-mismatch");
+      writer.publish(primary);
+      const read = () =>
+        JSON.parse(NodeFS.readFileSync(NodePath.join(root, "failure.json"), "utf8"))
+          .browserTerminalReceiptGuard;
+      NodeAssert.equal(read(), "second-owner-mismatch");
+      NodeAssert.equal(NodeFS.statSync(NodePath.join(root, "failure.json")).mode & 0o777, 0o600);
+      writer.publish(new Error("Different primary"));
+      NodeAssert.equal(read(), null);
+      context.theme = "dark";
+      writer.publish(primary);
+      NodeAssert.equal(read(), null);
+      context.theme = "light";
+      context.phase = "later";
+      writer.publish(primary);
+      NodeAssert.equal(read(), null);
+      const malformedContext = NodeVM.createContext({ ...context, phase });
+      const malformed = NodeVM.runInContext(
+        NodeModule.stripTypeScriptTypes(
+          declaration +
+            qualifier.slice(writeStart, writeEnd) +
+            "\nconst observe=" +
+            callback +
+            ";function publish(error){const originalBrowserTerminalReceiptFailure=readBrowserTerminalReceiptFailure();write('failure',{" +
+            field +
+            "});}({observe,publish});",
+        ),
+        malformedContext,
+      );
+      malformed.observe(primary, { message: "private" });
+      malformed.publish(primary);
+      NodeAssert.equal(read(), "private-unknown");
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
     }
   },
 );

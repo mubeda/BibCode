@@ -1,3 +1,4 @@
+import { projectBrowserTerminalGuard } from "./release-visual-browser-followups-source.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Original raw protocol fixtures drive the actual SDK receipt observer without product execution.
 import * as NodeCrypto from "node:crypto";
 import { expect, it } from "vite-plus/test";
@@ -48,7 +49,7 @@ function begin(value: ReturnType<typeof fixture>) {
   });
   value.reply("first", "1", { uploadId: "owned-upload", exists: false });
 }
-function terminalFixture() {
+function terminalFixture(pinOriginal = true) {
   const value = fixture();
   const snapshot = {
     threadId: "owned-thread",
@@ -75,7 +76,7 @@ function terminalFixture() {
       sizeClaim: claim,
     });
     value.chunk(connection, "1", { type: "snapshot", snapshot });
-    if (connection === "first") value.observer.terminalRestored();
+    if (connection === "first" && pinOriginal) value.observer.terminalRestored();
   }
   const fit = () => {
     for (const connection of ["first", "second"])
@@ -521,3 +522,38 @@ it("accepts exact reversed ACKs and retains unfinished progress", () => {
   expect(() => value.reply("first", "2", { receivedBytes: 16384 })).not.toThrow();
   expect(value.observer.upload().unfinished).toBe(true);
 });
+
+it.each(["none", "one", "unpinned", "closed", "second-owner", "grid"] as const)(
+  "retains actual %s actor guard",
+  (mode) => {
+    const value = mode === "none" ? fixture() : terminalFixture(mode !== "unpinned");
+    if (mode === "one") value.observer.connectionClosed("second");
+    if (mode === "closed") value.observer.close();
+    if (mode === "second-owner" || mode === "grid")
+      value.chunk("second", "1", {
+        type: "resized",
+        threadId: "owned-thread",
+        terminalId: "term-1",
+        size: {
+          cols: 91,
+          rows: mode === "grid" ? 30 : 24,
+          sizeClaim: mode === "second-owner" ? "second-owner" : "first-owner",
+        },
+      });
+    let error: unknown;
+    try {
+      value.observer.terminal();
+    } catch (caught) {
+      error = caught;
+    }
+    const expected = {
+      none: "attachment-count-none",
+      one: "attachment-count-one",
+      unpinned: "original-unpinned",
+      closed: "observer-unavailable",
+      "second-owner": "second-owner-mismatch",
+      grid: "shared-grid-mismatch",
+    }[mode];
+    expect(projectBrowserTerminalGuard(error)).toBe(expected);
+  },
+);

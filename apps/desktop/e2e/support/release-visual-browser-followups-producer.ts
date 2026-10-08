@@ -1,3 +1,7 @@
+import {
+  projectBrowserTerminalGuard,
+  type BrowserTerminalGuardReason,
+} from "./release-visual-browser-followups-source.ts";
 import type { QualificationBrowser, QualificationOwner } from "./qualification-owner.ts";
 import type {
   BrowserFollowupScene,
@@ -74,6 +78,7 @@ export interface BrowserFollowupProducerInput {
   };
   step: (phase: string) => void;
   observeUnsafeCleanup: () => void;
+  observeTerminalReceiptFailure?: (error: unknown, reason: BrowserTerminalGuardReason) => void;
 }
 const refused = () => new Error("Owned browser follow-up public producer refused.");
 /** Public route only; Settings replaces the thread sidebar, while keeping the selected environment rail. */
@@ -222,14 +227,26 @@ export async function runBrowserFollowupScene(
         };
         await scope.prepareOriginalSizeOwner();
         input.step("visual-browser-followups-terminal-shared-size-terminal-receipt-wait");
-        await input.owner.until(async () => {
+        let lastRefusal: BrowserTerminalGuardReason = "private-unknown";
+        try {
+          await input.owner.until(async () => {
+            try {
+              await verify();
+              lastRefusal = "private-unknown";
+              return true;
+            } catch (error) {
+              lastRefusal = projectBrowserTerminalGuard(error);
+              return false;
+            }
+          });
+        } catch (error) {
           try {
-            await verify();
-            return true;
+            input.observeTerminalReceiptFailure?.(error, lastRefusal);
           } catch {
-            return false;
+            /* Optional guard evidence cannot replace the original wait rejection. */
           }
-        });
+          throw error;
+        }
         input.step("visual-browser-followups-terminal-shared-size");
         await capture(row, scope.browser, verify);
         await click(scope.browser, "button=Fit to this window");

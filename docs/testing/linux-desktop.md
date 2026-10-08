@@ -2591,6 +2591,13 @@ Original failure, counts, cleanup and capture admission remain authoritative.
 Each admitted row sets its existing row phase before identity, viewport and public
 preparation; capture retains its existing subscene phase. The initial census
 remains limited to initial-join failures, so later row failures can retain null.
+At the terminal receipt wait only, failure.json may retain browserTerminalReceiptGuard,
+one fixed refusal code from the last normal receipt attempt before second-window
+cleanup. It does not sample after the deadline or change acceptance. Unknown,
+foreign, accessor-backed, or proxy errors remain private-unknown; successful waits
+retain no packet. Admission requires the same phase, theme, and exact primary
+rejection identity, including undefined. No runtime claims, PIDs, geometry values,
+credentials, paths, messages, stacks, or causes enter this field.
 The single terminal marker command must emit an explicit leading newline before
 its exact output line, then keep the same long-running sleep process. This
 establishes a raw line boundary after shell control sequences. Preserve the
