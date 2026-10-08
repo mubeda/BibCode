@@ -348,6 +348,8 @@ export async function withBrowserFollowupSecondWindow<A>(
     threadRoute: string;
     label: string;
     readTerminalReceipt: () => BrowserFollowupTerminalReceipt;
+    prepareOriginalSizeOwner: () => Promise<void>;
+    restoreOriginalSizeOwner: () => Promise<void>;
     verifyFit: () => void;
     verifyRestored: () => void;
     observeUnsafeCleanup: () => void;
@@ -356,6 +358,7 @@ export async function withBrowserFollowupSecondWindow<A>(
     browser: QualificationBrowser;
     label: string;
     verify: () => Promise<BrowserFollowupTerminalReceipt>;
+    prepareOriginalSizeOwner: () => Promise<void>;
     verifyFit: () => Promise<void>;
   }) => Promise<A>,
 ) {
@@ -380,6 +383,7 @@ export async function withBrowserFollowupSecondWindow<A>(
             browser,
             label: input.label,
             verify: async () => input.readTerminalReceipt(),
+            prepareOriginalSizeOwner: input.prepareOriginalSizeOwner,
             verifyFit: async () => {
               await input.owner.until(async () => {
                 try {
@@ -395,6 +399,7 @@ export async function withBrowserFollowupSecondWindow<A>(
     },
     cleanup: async () => {
       await input.browser.setWindowSize(original.width, original.height);
+      await input.restoreOriginalSizeOwner();
       const fit = input.browser.$("button=Fit to this window");
       if (await fit.isDisplayed()) {
         await fit.waitForEnabled();

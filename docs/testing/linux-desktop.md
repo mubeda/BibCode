@@ -2612,8 +2612,17 @@ Each label begins immediately before its existing predicate wait and returns
 to the row phase only on success; failed waits retain their original error and
 label through joined cleanup. Viewport preparation and screenshot calls keep
 the row phase. These labels add no read, action, wait, timeout or JSON member,
-and do not widen the separate initial-reconnect census. The second window attaches the same existing
-terminal and uses public Fit. Working-tree diff bytes come from actual Git.
+and do not widen the separate initial-reconnect census. After the second window's viewport and existing terminal-tab selection settle,
+click the single pinned original terminal screen once in the original owned
+window, then return to the selected second handle before the unchanged two-lease
+receipt wait. This restores the original renderer's size claim through its
+ordinary pointer/focus policy; it does not assert OS focus on a handle switch.
+The second window captures the genuine foreign-size notice and uses public Fit.
+After that window closes and original geometry is restored, click the original
+pinned screen once again before the unchanged one-lease restoration wait, even
+when matching dimensions hide the Fit notice. Keep exact window/mount/terminal
+identity, original PID/history/sequence, all claim receipts, deadlines and
+joined cleanup. Do not inject script events, claims or renderer state. Working-tree diff bytes come from actual Git.
 The diagnostics scene holds one original server reply beyond the unchanged
 15-second threshold. Hosted entries use fresh unused loopback grants, actual
 SDK/product scrub readiness and exact grant revocation; never submit Pair.

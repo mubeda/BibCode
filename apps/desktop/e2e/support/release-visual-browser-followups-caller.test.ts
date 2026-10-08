@@ -713,7 +713,7 @@ test.each([
       "utf8",
     );
     const start = source.indexOf(
-      "      const terminalWindow =",
+      "      terminalWindow =",
       source.indexOf('input.step("visual-browser-followups-observed-reconnect")'),
     );
     const oldStart = source.indexOf(
@@ -780,7 +780,7 @@ test.each([
     const run = NodeVM.runInNewContext(
       NodeModule.stripTypeScriptTypes(
         source.slice(clickStart, clickEnd) +
-          "\nasync function initial(input,terminal,transition){let waitingOn; const initialUi = {};" +
+          "\nasync function initial(input,terminal,transition){let terminalWindow;let waitingOn; const initialUi = {};" +
           source.slice(start >= 0 ? start : oldStart, end) +
           "}\ninitial;",
       ),
@@ -1487,6 +1487,55 @@ test.each(["chat-staged-attachment", "terminal-shared-size"])(
       } finally {
         NodeFS.rmSync(root, { recursive: true, force: true });
       }
+    }
+  },
+);
+
+test.each(["owned", "wrong-handle", "wrong-terminal", "duplicate-mount", "extra-window"])(
+  "original pointer callback retains exact pinned %s binding",
+  async (mode) => {
+    const source = NodeFS.readFileSync(
+      new URL("./release-visual-browser-followups-caller.ts", import.meta.url),
+      "utf8",
+    );
+    const begin = source.indexOf("      const originalTerminalWindow ="),
+      end = source.indexOf("      const route =", begin),
+      clickBegin = source.indexOf("async function click("),
+      clickEnd = source.indexOf("/** A real public Terminal", clickBegin);
+    NodeAssert.ok(begin > 0 && end > begin);
+    let clicks = 0;
+    const mounts = Array.from({ length: mode === "duplicate-mount" ? 2 : 1 }, () => ({
+      getAttribute: async () => (mode === "wrong-terminal" ? "foreign" : "owned-terminal"),
+    }));
+    const browser = {
+      getWindowHandle: async () => (mode === "wrong-handle" ? "foreign" : "main"),
+      getWindowHandles: async () => (mode === "extra-window" ? ["main", "foreign"] : ["main"]),
+      $$: (selector: string) => (selector.endsWith(".xterm-screen") ? [{}] : mounts),
+      $: () => ({
+        waitForDisplayed: async () => {},
+        waitForEnabled: async () => {},
+        click: async () => {
+          clicks++;
+        },
+      }),
+    };
+    const callbacks = NodeVM.runInNewContext(
+      NodeModule.stripTypeScriptTypes(
+        source.slice(clickBegin, clickEnd) + source.slice(begin, end),
+      ) + "\n({restoreOriginalSizeOwner})",
+      {
+        input: { browser },
+        terminalWindow: "main",
+        terminal: { terminalId: "owned-terminal" },
+        refused: () => new Error("Inert pinned focus refused."),
+      },
+    ) as { restoreOriginalSizeOwner: () => Promise<void> };
+    if (mode === "owned") {
+      await callbacks.restoreOriginalSizeOwner();
+      NodeAssert.equal(clicks, 1);
+    } else {
+      await NodeAssert.rejects(callbacks.restoreOriginalSizeOwner());
+      NodeAssert.equal(clicks, 0);
     }
   },
 );

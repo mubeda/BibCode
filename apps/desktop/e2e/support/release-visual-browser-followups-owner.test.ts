@@ -8,6 +8,7 @@ import {
 import { createBrowserFollowupProtocolObserver } from "./release-visual-browser-followups-protocol.ts";
 import { beforeEach, expect, it, vi } from "vite-plus/test";
 import {
+  withBrowserFollowupSecondWindow,
   withBrowserFollowupResource,
   withBrowserFollowupWindow,
   withBrowserFollowupHostedEntry,
@@ -767,6 +768,100 @@ it.each(["observer", "socket", "undefined"])(
       transport.throwIfFailed();
     } catch (error) {
       expect(error).toBe(original);
+    }
+  },
+);
+
+it.each(["owned", "setup-undefined", "restore-error"])(
+  "second window joins named public ownership callbacks after restoration: %s",
+  async (mode) => {
+    const events: string[] = [];
+    let handle = "main",
+      handles = ["main"],
+      unsafe = 0;
+    const original = Object.freeze(new Error("Inert restoration failure."));
+    const browser = {
+      getWindowSize: async () => ({ width: 1280, height: 960 }),
+      setWindowSize: async (_width: number, height: number) => {
+        events.push("size:" + height);
+      },
+      getWindowHandles: async () => [...handles],
+      getWindowHandle: async () => handle,
+      newWindow: async () => {
+        handles.push("second");
+        handle = "second";
+        events.push("open");
+        return { handle: "second" };
+      },
+      switchToWindow: async (value: string) => {
+        handle = value;
+        events.push("switch:" + value);
+      },
+      closeWindow: async () => {
+        handles = ["main"];
+        events.push("close");
+      },
+      $: () => ({ isDisplayed: async () => false }),
+    };
+    let failed = false,
+      caught: unknown;
+    try {
+      await withBrowserFollowupSecondWindow(
+        {
+          browser: browser as never,
+          owner: {
+            until: async (check) => {
+              events.push("restored-receipt");
+              expect(await check()).toBe(true);
+            },
+          },
+          threadRoute: "http://127.0.0.1:4885/local/owned-thread",
+          label: "Terminal 1",
+          readTerminalReceipt: () => ({
+            sameTerminalMatched: true,
+            twoAttachmentsObserved: true,
+            distinctSizeClaims: true,
+            originalOutputMatched: true,
+            sizeOwnerMatched: true,
+          }),
+          verifyFit: () => {},
+          verifyRestored: () => {},
+          prepareOriginalSizeOwner: async () => {
+            events.push("setup-pointer");
+            if (mode === "setup-undefined") throw undefined;
+          },
+          restoreOriginalSizeOwner: async () => {
+            events.push("restore-pointer");
+            if (mode !== "owned") throw original;
+          },
+          observeUnsafeCleanup: () => {
+            unsafe++;
+          },
+        },
+        async (scope) => {
+          await scope.prepareOriginalSizeOwner();
+          events.push("source-capture");
+        },
+      );
+    } catch (error) {
+      failed = true;
+      caught = error;
+    }
+    expect(handles).toEqual(["main"]);
+    expect(handle).toBe("main");
+    expect(events.indexOf("close")).toBeLessThan(events.indexOf("size:960"));
+    expect(events.indexOf("size:960")).toBeLessThan(events.indexOf("restore-pointer"));
+    expect(events.filter((x) => x === "setup-pointer")).toHaveLength(1);
+    expect(events.filter((x) => x === "restore-pointer")).toHaveLength(1);
+    if (mode === "owned") {
+      expect(failed).toBe(false);
+      expect(events.at(-1)).toBe("restored-receipt");
+      expect(unsafe).toBe(0);
+    } else {
+      expect(failed).toBe(true);
+      if (mode === "setup-undefined") expect(caught).toBeUndefined();
+      else expect(caught).toEqual(new Error("Owned browser follow-up resource refused."));
+      expect(unsafe).toBe(1);
     }
   },
 );

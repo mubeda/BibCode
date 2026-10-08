@@ -45,6 +45,7 @@ export interface BrowserFollowupProducerInput {
         browser: QualificationBrowser;
         label: string;
         verify: () => Promise<BrowserFollowupTerminalReceipt>;
+        prepareOriginalSizeOwner: () => Promise<void>;
         verifyFit: () => Promise<void>;
       }) => Promise<void>,
     ) => Promise<void>;
@@ -208,6 +209,7 @@ export async function runBrowserFollowupScene(
             "sizeOwnerMatched",
           ]);
         };
+        await scope.prepareOriginalSizeOwner();
         await input.owner.until(async () => {
           try {
             await verify();

@@ -84,6 +84,9 @@ function fixture(failCapture = false) {
           run({
             browser,
             label: "Terminal 1",
+            prepareOriginalSizeOwner: async () => {
+              actions.push("original-size-owner");
+            },
             verify: async () => ({
               sameTerminalMatched: true,
               twoAttachmentsObserved: true,
@@ -311,4 +314,57 @@ it("clears the receipt wait only on success without changing original capture bi
     sourceIdentityRetained: true,
     completeGroup: false,
   });
+});
+
+it("prepares original size owner once after second tab selection and before its receipt wait", async () => {
+  const value = fixture();
+  const events: string[] = [];
+  const open = value.input.terminal.withSecondWindow;
+  value.input.terminal.withSecondWindow = (run) =>
+    open((scope) =>
+      run({
+        ...scope,
+        prepareOriginalSizeOwner: async () => {
+          events.push("pointer");
+          expect(value.actions.at(-1)).toContain("data-right-panel-tab-list");
+        },
+      }),
+    );
+  value.input.owner.until = async (predicate) => {
+    events.push("wait");
+    expect(await predicate()).toBe(true);
+  };
+  await runBrowserFollowupScene(value.input, "terminal-shared-size");
+  expect(events).toEqual(["pointer", "wait"]);
+  expect(value.captures).toEqual(["terminal-shared-size"]);
+});
+it("keeps a failed setup pointer value before polling or capture", async () => {
+  const value = fixture();
+  const open = value.input.terminal.withSecondWindow;
+  let waits = 0;
+  value.input.terminal.withSecondWindow = (run) =>
+    open((scope) =>
+      run({
+        ...scope,
+        prepareOriginalSizeOwner: async () => {
+          throw undefined;
+        },
+      }),
+    );
+  value.input.owner.until = async () => {
+    waits++;
+  };
+  let failed = false,
+    caught: unknown;
+  try {
+    await runBrowserFollowupScene(value.input, "terminal-shared-size");
+  } catch (error) {
+    failed = true;
+    caught = error;
+  }
+  expect(failed).toBe(true);
+  expect(caught).toBeUndefined();
+  expect(waits).toBe(0);
+  expect(value.captures).toEqual([]);
+  expect(value.read().cleaned).toBe(1);
 });

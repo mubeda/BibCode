@@ -588,6 +588,7 @@ export async function runBrowserFollowupCaller(input: {
         }
       };
       let initialNetwork: Awaited<ReturnType<typeof startBrowserFollowupReplayNetwork>>;
+      let terminalWindow: string | undefined;
       try {
         const transition = createBrowserFollowupNetworkTransition({
           bootstrap: input.prepared.bootstrap,
@@ -609,7 +610,7 @@ export async function runBrowserFollowupCaller(input: {
         });
         input.prepared.retain(transition);
         input.step("visual-browser-followups-observed-reconnect");
-        const terminalWindow = await input.browser.getWindowHandle();
+        terminalWindow = await input.browser.getWindowHandle();
         const network = await transition.activate();
         network.transport.throwIfFailed();
         network.observer.replay.throwIfFailed();
@@ -693,6 +694,54 @@ export async function runBrowserFollowupCaller(input: {
         );
         if (live.pid !== terminal.pid) throw refused();
       };
+      const originalTerminalWindow = terminalWindow;
+      if (!originalTerminalWindow) throw refused();
+      const focusOriginalTerminal = async (windowCount: 1 | 2) => {
+        const windows = await input.browser.getWindowHandles();
+        if (
+          windows.length !== windowCount ||
+          !windows.includes(originalTerminalWindow) ||
+          (await input.browser.getWindowHandle()) !== originalTerminalWindow
+        )
+          throw refused();
+        const mount = "[data-preview-panel-mode] [data-terminal-xterm-mount]";
+        const mounts = input.browser.$$(mount);
+        if (
+          (await mounts.length) !== 1 ||
+          (await mounts[0]!.getAttribute("data-terminal-xterm-mount")) !== terminal.terminalId
+        )
+          throw refused();
+        await click(input.browser, mount + " .xterm-screen");
+      };
+      const prepareOriginalSizeOwner = async () => {
+        const selected = await input.browser.getWindowHandle();
+        const windows = await input.browser.getWindowHandles();
+        if (
+          selected === originalTerminalWindow ||
+          windows.length !== 2 ||
+          !windows.includes(selected) ||
+          !windows.includes(originalTerminalWindow)
+        )
+          throw refused();
+        await withBrowserFollowupResource({
+          run: async () => {
+            await input.browser.switchToWindow(originalTerminalWindow);
+            await focusOriginalTerminal(2);
+          },
+          cleanup: async () => {
+            const current = await input.browser.getWindowHandles();
+            if (
+              current.length !== 2 ||
+              !current.includes(selected) ||
+              !current.includes(originalTerminalWindow)
+            )
+              throw refused();
+            await input.browser.switchToWindow(selected);
+          },
+          observeUnsafeCleanup: input.observeUnsafeCleanup,
+        });
+      };
+      const restoreOriginalSizeOwner = () => focusOriginalTerminal(1);
       const route = "http://127.0.0.1:4885/local/" + encodeURIComponent(input.threadId);
       const capture = async (
         scene: BrowserFollowupScene,
@@ -789,6 +838,8 @@ export async function runBrowserFollowupCaller(input: {
                     threadRoute: route,
                     label: terminal.label,
                     readTerminalReceipt: network.observer.terminal,
+                    prepareOriginalSizeOwner,
+                    restoreOriginalSizeOwner,
                     verifyFit: network.observer.fitted,
                     verifyRestored: network.observer.terminalRestored,
                     observeUnsafeCleanup: input.observeUnsafeCleanup,
