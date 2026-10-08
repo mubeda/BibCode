@@ -887,12 +887,72 @@ The right panel hosts persistent tool surfaces for the active thread. Use its
 `+` menu to add Browser, Terminal, Files, Diff, or Source Control. Activity and
 Plan surfaces can also appear when the active provider/session supplies them.
 
-- **Browser** opens a local application preview or URL when the environment
-  supports previewing.
+- **Browser** opens a local application preview or URL. It is a Tauri child
+  webview, so it exists in the desktop app on macOS 14+, Windows, and Linux, not
+  in a browser tab.
 - **Terminal** starts a shell in the active workspace.
 - **Diff** reviews branch or worktree changes.
 - **Activity** shows structured provider activity when available.
 - **Plan** displays the active agent plan when available.
+
+### Opening links
+
+Web links open in the BiBCode browser by default. **Settings → General → Open
+links in** chooses **BiBCode browser** or **System browser**; a change applies to
+the next click. Without a thread, without desktop preview support (for example
+macOS before 14), or in a browser tab, web links open in the system browser, and
+the setting is not shown.
+
+- **Chat:** Ctrl/Cmd-, Shift-, or Alt-click or middle-click opens the other
+  target. Right-click on an `http(s)` link offers **Open in BiBCode browser**,
+  **Open in system browser**, and **Copy link**. Any
+  modifier-click on an `.html`, `.htm`, or `.pdf` file chip opens
+  it in the editor instead of the browser. Links to network or device paths
+  (`file://server/…`, `file:////server/…`, `\\server\share`, `\\?\…`, `\\.\…`)
+  never become file chips, so they can't open in the editor or the browser; a
+  `//host/…` link stays an ordinary web link.
+- **Terminal:** Ctrl/Cmd-click opens a link (Cmd on macOS); adding Shift opens
+  the other target. `.html`, `.htm`, and `.pdf` paths, including a bare
+  `index.html` and `file:///` URLs, open in the BiBCode browser; Ctrl/Cmd+Shift
+  opens them in the editor, and every other path opens in the editor. Without a
+  thread or desktop preview support, they open in the editor too. If such a
+  file can't be previewed (for example, the environment isn't connected), a
+  "Couldn't preview this file" notice offers **Open in editor**. A printed path
+  that starts with two separators (`\\server\share`, `//server/share`, `\\?\…`,
+  `\\.\…`) is refused with "Network paths can't be opened from the terminal."
+  A `file://` URL with a host shows "Unable to open this file link." Relative
+  links under a network working directory, such as a WSL `\\wsl.localhost\…`
+  folder, still open. A hyperlink a program emits (OSC 8)
+  needs the same Ctrl/Cmd activation. When its visible text doesn't match its
+  destination, a menu shows **Open …** with the destination and **Copy link**.
+- **Browser tabs:** popups and `target=_blank` links inside a preview tab open
+  as a new tab in the same thread. `about:blank` popups are dropped. A
+  `target=_blank` link in the app itself, such as a pull request title in Git
+  Manager, opens in the system browser.
+
+A link to `localhost`, a `*.localhost` name, any `127.x.x.x` address, `::1`, or a
+wildcard address (`0.0.0.0`, `[::]`) means the server's machine, not this
+computer. From a thread on a LAN, tailnet (`100.64.0.0/10`), or WSL environment,
+or one reached by a host name such as `devbox` or `box.lan`, it opens on the
+server's address. From a thread on an SSH or BiBCode Connect environment, or one
+reached by a public IP address, BiBCode shows "Can't open this address here"
+with the address and **Copy link**, and does not open this computer's
+`localhost`, whatever the target, modifier, or setting; reaching those ports is
+not supported yet. If the thread's environment isn't connected, the notice says
+so and asks you to reconnect it.
+
+A file outside the thread's workspace can't be previewed; the notice offers
+**Open in editor**. If the system browser fails to open a link, the notice shows
+the link with **Copy link**.
+
+HTML, XHTML, SVG, and XML files the agent wrote are served to the browser in a
+sandbox with no origin of their own, so their scripts can't use `localStorage`
+or cookies. The agent's `preview_open` tool works on desktop for opening and
+navigating a tab; reading the page, clicking, and typing aren't supported yet.
+On desktop it always shows the tab it opens, and a request for a thread that
+isn't on screen times out.
+A server a terminal starts is listed as a discovered port for that terminal and
+its thread.
 
 ### Activity and targeted Stop
 

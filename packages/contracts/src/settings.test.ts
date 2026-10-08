@@ -671,3 +671,17 @@ describe("WorktreeWorkspaceError", () => {
     expect(error.message).toBe("Workspace must be an absolute directory on this host.");
   });
 });
+
+describe("ClientSettings browser link target", () => {
+  it("opens links in the app by default and keeps an explicit choice", () => {
+    expect(decodeClientSettings({}).browserLinkTarget).toBe("app");
+    expect(DEFAULT_CLIENT_SETTINGS.browserLinkTarget).toBe("app");
+    expect(decodeClientSettings({ browserLinkTarget: "system" }).browserLinkTarget).toBe("system");
+    expect(decodeClientSettings({ browserLinkTarget: "bogus" }).browserLinkTarget).toBe("app");
+    expect(decodeClientSettingsPatch({ browserLinkTarget: "system" })).toMatchObject({
+      browserLinkTarget: "system",
+    });
+    expect(decodeClientSettingsPatch({})).not.toHaveProperty("browserLinkTarget");
+    expect(() => decodeClientSettingsPatch({ browserLinkTarget: "tab" })).toThrow();
+  });
+});

@@ -3498,6 +3498,23 @@ impl TerminalManager {
         live
     }
 
+    /// `(thread_id, terminal_id, root pid)` of every starting or running session.
+    pub async fn live_session_pids(&self) -> Vec<(String, String, u32)> {
+        let sessions = self.inner.sessions.read().await;
+        let mut live = Vec::new();
+        for session in sessions.values() {
+            let summary = session.lock().await.summary();
+            if matches!(
+                summary.status,
+                TerminalStatus::Starting | TerminalStatus::Running
+            ) && let Some(pid) = summary.pid
+            {
+                live.push((summary.thread_id, summary.terminal_id, pid));
+            }
+        }
+        live
+    }
+
     pub async fn subscribe_metadata(&self) -> TerminalMetadataAttachment {
         let events = self.inner.metadata.subscribe();
         let sessions = self.inner.sessions.read().await;
@@ -4566,6 +4583,18 @@ mod tests {
         assert_eq!(manager.live_session_count().await, 1);
         manager.close("sizing", Some("term-2")).await.unwrap();
         assert_eq!(manager.live_session_count().await, 0);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn live_session_pids_reports_running_sessions_until_they_close() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        assert_eq!(
+            manager.live_session_pids().await,
+            vec![("sizing".to_owned(), "term".to_owned(), 1)]
+        );
+        manager.close("sizing", Some("term")).await.unwrap();
+        assert!(manager.live_session_pids().await.is_empty());
         manager.shutdown().await;
     }
 

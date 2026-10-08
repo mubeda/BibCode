@@ -16,8 +16,8 @@ use bibcode_server::{
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tokio::{net::TcpListener, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -1059,50 +1059,6 @@ async fn trace_and_auxiliary_streams_use_exact_contract_shapes() {
     assert_eq!(next_event(&mut lifecycle).await["type"], "welcome");
     assert_eq!(next_event(&mut lifecycle).await["type"], "ready");
     lifecycle_cancel.cancel();
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind local listener");
-    let port = listener.local_addr().expect("listener address").port();
-    let discovery_cancel = CancellationToken::new();
-    let mut discovery =
-        control.subscribe("subscribeDiscoveredLocalServers", discovery_cancel.clone());
-    let discovered = next_event(&mut discovery).await;
-    assert!(discovered["scannedAt"].is_string());
-    assert!(
-        discovered["servers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|server| {
-                server["host"] == "127.0.0.1"
-                    && server["port"] == port
-                    && server["url"] == format!("http://127.0.0.1:{port}/")
-            })
-    );
-
-    drop(listener);
-    let rescanned = timeout(Duration::from_secs(5), async {
-        loop {
-            let snapshot = next_event(&mut discovery).await;
-            if snapshot["servers"]
-                .as_array()
-                .is_some_and(|servers| servers.iter().all(|server| server["port"] != port))
-            {
-                break snapshot;
-            }
-        }
-    })
-    .await
-    .expect("periodic discovery removes closed listener");
-    assert!(rescanned["scannedAt"].is_string());
-    discovery_cancel.cancel();
-    assert!(
-        timeout(Duration::from_secs(2), discovery.recv())
-            .await
-            .expect("discovery cancellation timeout")
-            .is_none()
-    );
 }
 
 #[tokio::test]

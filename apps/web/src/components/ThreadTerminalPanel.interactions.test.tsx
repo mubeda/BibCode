@@ -67,7 +67,7 @@ interface FakeTerminalInstance {
 
 interface FakeTerminalBufferLine {
   readonly isWrapped?: boolean;
-  translateToString(trimRight?: boolean): string;
+  translateToString(trimRight?: boolean, startColumn?: number, endColumn?: number): string;
 }
 
 interface FakeTerminalLink {
@@ -507,6 +507,10 @@ const testState = vi.hoisted(() => ({
   contextMenuShow: vi.fn(),
   shellOpenExternal: vi.fn(),
   localApiAvailable: false,
+  previewSupported: true,
+  // Assigned in beforeEach: Option is not initialized when vi.hoisted runs.
+  preparedConnection: null as unknown as Option.Option<{ httpBaseUrl: string }>,
+  createAssetUrl: vi.fn(),
   webglEnabled: false,
   resolvedTheme: "light" as TerminalThemeMode,
   terminalFontPreference: { mode: "bundled" } as TerminalFontPreference,
@@ -621,8 +625,22 @@ vi.mock("~/localApi", () => ({
         }
       : undefined,
 }));
-vi.mock("./preview/openTerminalLinkInPreview", () => ({
-  openTerminalLinkInPreview: vi.fn(),
+vi.mock("~/browser/openLink", () => ({ openLink: vi.fn() }));
+vi.mock("~/browser/linkNotices", () => ({
+  showFileOutsideWorkspaceNotice: vi.fn(),
+  showPreviewFailedNotice: vi.fn(),
+}));
+vi.mock("~/browser/openFileInPreview", () => ({ openFileInPreview: vi.fn() }));
+vi.mock("~/previewStateStore", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("~/previewStateStore")>()),
+  isPreviewSupportedInRuntime: () => testState.previewSupported,
+}));
+vi.mock("../state/session", () => ({
+  readPreparedConnection: () => Option.getOrNull(testState.preparedConnection),
+}));
+vi.mock("../state/assets", () => ({ assetEnvironment: { createUrl: "asset-create-url" } }));
+vi.mock("../state/use-atom-query-runner", () => ({
+  useAtomQueryRunner: () => testState.createAssetUrl,
 }));
 vi.mock("~/components/ui/popover", () => ({
   Popover: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
@@ -642,7 +660,9 @@ import ThreadTerminalPanel, {
   TerminalViewport,
 } from "./ThreadTerminalPanel";
 import { decodeTerminalLaunchCommand } from "../lib/terminalLaunchCommand";
-import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
+import { openLink } from "~/browser/openLink";
+import { showFileOutsideWorkspaceNotice, showPreviewFailedNotice } from "~/browser/linkNotices";
+import { openFileInPreview } from "~/browser/openFileInPreview";
 
 const ENVIRONMENT_ID = EnvironmentId.make("terminal-interactions");
 const THREAD_ID = ThreadId.make("thread-interactions");
@@ -842,8 +862,29 @@ async function publishActivitySnapshot(snapshot: ActivitySnapshot): Promise<void
 function terminalBufferLine(text: string, isWrapped = false): FakeTerminalBufferLine {
   return {
     isWrapped,
-    translateToString: (trimRight = false) => (trimRight ? text.trimEnd() : text),
+    translateToString: (trimRight = false, startColumn = 0, endColumn?: number) => {
+      const slice = text.slice(startColumn, endColumn);
+      return trimRight ? slice.trimEnd() : slice;
+    },
   };
+}
+
+interface Osc8LinkHandler {
+  activate(
+    event: MouseEvent,
+    uri: string,
+    range: { start: { x: number; y: number }; end: { x: number; y: number } },
+  ): void;
+  allowNonHttpProtocols: boolean;
+}
+
+/** Writes `visible` as an OSC 8 link on a new row and returns a click on it. */
+function osc8Link(terminal: FakeTerminalInstance, visible: string, uri: string) {
+  terminal.bufferLines.push(terminalBufferLine(`> ${visible} <`));
+  const y = terminal.bufferLines.length;
+  const range = { start: { x: 3, y }, end: { x: 2 + visible.length, y } };
+  const handler = terminal.options.linkHandler as Osc8LinkHandler;
+  return (event: MouseEvent) => handler.activate(event, uri, range);
 }
 
 function terminalSnapshot(
@@ -1244,8 +1285,14 @@ beforeEach(() => {
   testState.openPath.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.contextMenuShow.mockReset().mockResolvedValue(undefined);
   testState.shellOpenExternal.mockReset().mockResolvedValue(undefined);
-  vi.mocked(openTerminalLinkInPreview).mockReset();
+  vi.mocked(openLink).mockReset().mockReturnValue("app");
+  vi.mocked(showFileOutsideWorkspaceNotice).mockReset();
+  vi.mocked(showPreviewFailedNotice).mockReset();
+  vi.mocked(openFileInPreview).mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.localApiAvailable = false;
+  testState.previewSupported = true;
+  testState.createAssetUrl.mockReset();
+  testState.preparedConnection = Option.some({ httpBaseUrl: "http://127.0.0.1:3773" });
   testState.webglEnabled = false;
   testState.resolvedTheme = "light";
   testState.serverConfig = {
@@ -5502,6 +5549,7 @@ describe("TerminalViewport mounted lifecycle", () => {
 
   it("requires the platform link modifier and reports unavailable browser links", async () => {
     vi.stubGlobal("navigator", { platform: "MacIntel" });
+    vi.mocked(openLink).mockReturnValue("unavailable");
     await mount(<TerminalViewport {...viewportProps()} />);
     const terminal = xtermState.terminals[0]!;
     terminal.bufferLines.push(terminalBufferLine("https://example.test/docs"));
@@ -5511,54 +5559,514 @@ describe("TerminalViewport mounted lifecycle", () => {
 
     link!.activate(new MouseEvent("click"));
     expect(terminal.writes).toEqual([]);
+    expect(openLink).not.toHaveBeenCalled();
 
     link!.activate(new MouseEvent("click", { metaKey: true }));
     expect(terminal.writes).toContain(
       "\r\n[terminal] Opening links is unavailable in this browser.\r\n",
     );
-    expect(openTerminalLinkInPreview).not.toHaveBeenCalled();
   });
 
-  it("opens native URL links through preview with the event position", async () => {
-    vi.stubGlobal("navigator", { platform: "MacIntel" });
+  it("routes Ctrl-clicked URLs through the link router without a context menu", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
     testState.localApiAvailable = true;
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("http://localhost:5173"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        url: "http://localhost:5173",
+        threadRef: THREAD_REF,
+        invert: false,
+      }),
+    );
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true, shiftKey: true }));
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "http://localhost:5173", invert: true }),
+    );
+    expect(testState.contextMenuShow).not.toHaveBeenCalled();
+  });
+
+  it("reports link router failures in the terminal", async () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel" });
     await mount(<TerminalViewport {...viewportProps()} />);
     const terminal = xtermState.terminals[0]!;
     terminal.bufferLines.push(terminalBufferLine("https://example.test/docs"));
     const [link] = provideTerminalLinks(terminal) ?? [];
 
-    link!.activate(new MouseEvent("click", { metaKey: true, clientX: 24, clientY: 36 }));
+    link!.activate(new MouseEvent("click", { metaKey: true }));
+    const { onError } = vi.mocked(openLink).mock.calls[0]![0];
+    onError?.(new Error("browser blocked"));
+    expect(terminal.writes).toContain("\r\n[terminal] browser blocked\r\n");
+    onError?.("unknown");
+    expect(terminal.writes).toContain("\r\n[terminal] Unable to open link\r\n");
+  });
 
-    expect(openTerminalLinkInPreview).toHaveBeenCalledWith(
-      expect.objectContaining({
-        url: "https://example.test/docs",
-        position: { x: 24, y: 36 },
-        threadRef: THREAD_REF,
-      }),
+  it("routes OSC 8 hyperlinks through the link router behind the activation modifier", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    expect((terminal.options.linkHandler as Osc8LinkHandler).allowNonHttpProtocols).toBe(false);
+    const click = osc8Link(terminal, "example.test/osc", "https://example.test/osc");
+
+    click(new MouseEvent("click"));
+    expect(openLink).not.toHaveBeenCalled();
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "https://example.test/osc", invert: false }),
+    );
+
+    click(new MouseEvent("click", { ctrlKey: true, shiftKey: true }));
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "https://example.test/osc", invert: true }),
+    );
+    expect(testState.contextMenuShow).not.toHaveBeenCalled();
+  });
+
+  it("uses Cmd as the OSC 8 activation modifier on macOS", async () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const click = osc8Link(terminal, "https://example.test/osc", "https://example.test/osc");
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    expect(openLink).not.toHaveBeenCalled();
+    click(new MouseEvent("click", { metaKey: true }));
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "https://example.test/osc", invert: false }),
     );
   });
 
-  it("falls back to the native browser and reports shell launch failures", async () => {
-    vi.stubGlobal("navigator", { platform: "MacIntel" });
+  it("confirms OSC 8 links whose visible text names a different target", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
     testState.localApiAvailable = true;
-    vi.mocked(openTerminalLinkInPreview).mockImplementation(async ({ fallbackToBrowser }) => {
-      fallbackToBrowser();
-    });
+    testState.contextMenuShow.mockResolvedValue(null);
     await mount(<TerminalViewport {...viewportProps()} />);
     const terminal = xtermState.terminals[0]!;
-    terminal.bufferLines.push(terminalBufferLine("https://example.test/docs"));
+    const click = osc8Link(terminal, "docs.example.com", "https://evil.test/login?next=1");
+
+    click(new MouseEvent("click", { ctrlKey: true, clientX: 24, clientY: 36 }));
+    await act(async () => Promise.resolve());
+    expect(testState.contextMenuShow).toHaveBeenCalledWith(
+      [
+        { id: "open", label: "Open https://evil.test/login" },
+        { id: "copy", label: "Copy link" },
+      ],
+      { x: 24, y: 36 },
+    );
+    // Dismissing the menu opens and copies nothing.
+    expect(openLink).not.toHaveBeenCalled();
+  });
+
+  it("opens a confirmed OSC 8 link with the click's invert value", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    testState.localApiAvailable = true;
+    testState.contextMenuShow.mockResolvedValue("open");
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const click = osc8Link(terminal, "docs.example.com", "https://evil.test/");
+
+    click(new MouseEvent("click", { ctrlKey: true, shiftKey: true }));
+    await act(async () => Promise.resolve());
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "https://evil.test/", invert: true }),
+    );
+  });
+
+  it("copies a confirmed OSC 8 link instead of opening it", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { platform: "Linux", clipboard: { writeText } });
+    testState.localApiAvailable = true;
+    testState.contextMenuShow.mockResolvedValue("copy");
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const click = osc8Link(terminal, "docs.example.com", "https://evil.test/");
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(writeText).toHaveBeenCalledWith("https://evil.test/");
+    expect(openLink).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the textarea copy and explains a failed OSC 8 link copy", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    // xterm's own copy listener would replace the payload with its selection, so the fallback
+    // must copy from a textarea outside the terminal.
+    const copiedFrom: Array<{ value: string; insideTerminal: boolean }> = [];
+    const copy = vi.fn(() => {
+      const active = document.activeElement as HTMLTextAreaElement;
+      copiedFrom.push({
+        value: active.value,
+        insideTerminal: active === xtermState.terminals[0]!.textarea,
+      });
+      return true;
+    });
+    Object.defineProperty(document, "execCommand", { configurable: true, value: copy });
+    testState.localApiAvailable = true;
+    testState.contextMenuShow.mockResolvedValue("copy");
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const click = osc8Link(terminal, "docs.example.com", "https://evil.test/");
+    terminal.writes.length = 0;
+    // Focus moved to another pane while the menu was open; the copy must not take it away.
+    const composer = document.createElement("input");
+    document.body.append(composer);
+    composer.focus();
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(document.activeElement).toBe(composer);
+    composer.remove();
+    expect(copy).toHaveBeenCalledWith("copy");
+    expect(copiedFrom).toEqual([{ value: "https://evil.test/", insideTerminal: false }]);
+    expect(terminal.writes).toEqual([]);
+
+    copy.mockReturnValue(false);
+    click(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(terminal.writes).toContain(
+      "\r\n[terminal] Couldn't copy the link: https://evil.test/\r\n",
+    );
+  });
+
+  it("skips the link copy fallback once its terminal is gone", async () => {
+    let reject: (cause: unknown) => void = () => undefined;
+    const writeText = vi.fn(() => new Promise<void>((_, fail) => (reject = fail)));
+    vi.stubGlobal("navigator", { platform: "Linux", clipboard: { writeText } });
+    const copy = vi.fn(() => true);
+    Object.defineProperty(document, "execCommand", { configurable: true, value: copy });
+    testState.localApiAvailable = true;
+    testState.contextMenuShow.mockResolvedValue("copy");
+    const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const click = osc8Link(terminal, "docs.example.com", "https://evil.test/");
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(writeText).toHaveBeenCalledOnce();
+    await unmount(mounted);
+    await act(async () => reject(new Error("not allowed")));
+    expect(copy).not.toHaveBeenCalled();
+  });
+
+  it("ignores an OSC 8 menu choice that resolves after its terminal is gone", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    testState.localApiAvailable = true;
+    let choose: (choice: string | null) => void = () => undefined;
+    testState.contextMenuShow.mockReturnValue(
+      new Promise<string | null>((resolve) => (choose = resolve)),
+    );
+    const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const click = osc8Link(terminal, "docs.example.com", "https://evil.test/");
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    await unmount(mounted);
+    await act(async () => choose("open"));
+    expect(openLink).not.toHaveBeenCalled();
+  });
+
+  it("confirms a label linked inside a longer displayed address", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    testState.localApiAvailable = true;
+    testState.contextMenuShow.mockResolvedValue(null);
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("https://evil.test.trusted.example/"));
+    const handler = terminal.options.linkHandler as Osc8LinkHandler;
+
+    handler.activate(new MouseEvent("click", { ctrlKey: true }), "https://evil.test/", {
+      start: { x: 9, y: 1 },
+      end: { x: 17, y: 1 },
+    });
+    await act(async () => Promise.resolve());
+    expect(testState.contextMenuShow).toHaveBeenCalledOnce();
+    expect(openLink).not.toHaveBeenCalled();
+  });
+
+  it("truncates long OSC 8 targets in the confirmation menu", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    testState.localApiAvailable = true;
+    testState.contextMenuShow.mockResolvedValue(null);
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const click = osc8Link(terminal, "docs", `https://evil.test/${"a".repeat(120)}`);
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    const [items] = testState.contextMenuShow.mock.calls[0]!;
+    expect(items[0].label).toBe(`Open https://evil.test/${"a".repeat(61)}…`);
+    expect(items[0].label.length).toBe(85);
+  });
+
+  it("keeps the end of a long destination hostname in the confirmation menu", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    testState.localApiAvailable = true;
+    testState.contextMenuShow.mockResolvedValue(null);
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const host = `trusted.example.${"a".repeat(60)}.attacker.example`;
+    const click = osc8Link(terminal, "docs", `https://${host}/login`);
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    const [items] = testState.contextMenuShow.mock.calls[0]!;
+    const label: string = items[0].label;
+    expect(label).toMatch(/^Open https:\/\/….*\.attacker\.example\/login$/);
+    // The fallback menu right-truncates near 24rem, so the owning domain must come early.
+    expect(label.indexOf(".attacker.example") + ".attacker.example".length).toBeLessThanOrEqual(45);
+  });
+
+  it("reports unavailable OSC 8 confirmation without a local API", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const click = osc8Link(terminal, "docs.example.com", "https://evil.test/");
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    expect(openLink).not.toHaveBeenCalled();
+    expect(terminal.writes).toContain(
+      "\r\n[terminal] Opening links is unavailable in this browser.\r\n",
+    );
+  });
+
+  it("refuses network paths without previewing or opening an editor", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(
+      terminalBufferLine(
+        "\\\\server\\share\\a.html //server/share/b.html \\\\.\\C:\\..\\UNC\\a\\s\\x.html //./C:/../UNC/a/s/x.html \\\\?\\C:\\x.html",
+      ),
+    );
+    const links = provideTerminalLinks(terminal) ?? [];
+    expect(links.map((link) => link.text)).toEqual([
+      "\\\\server\\share\\a.html",
+      "//server/share/b.html",
+      "\\\\.\\C:\\..\\UNC\\a\\s\\x.html",
+      "//./C:/../UNC/a/s/x.html",
+      "\\\\?\\C:\\x.html",
+    ]);
+
+    // Plain clicks would preview; Ctrl+Shift clicks would open the editor. Both are refused.
+    for (const link of links) {
+      link.activate(new MouseEvent("click", { ctrlKey: true }));
+      link.activate(new MouseEvent("click", { ctrlKey: true, shiftKey: true }));
+    }
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).not.toHaveBeenCalled();
+    expect(testState.openPath).not.toHaveBeenCalled();
+    expect(
+      terminal.writes.filter(
+        (write) => write === "\r\n[terminal] Network paths can't be opened from the terminal.\r\n",
+      ),
+    ).toHaveLength(10);
+  });
+
+  it("opens relative links under a UNC working directory such as WSL", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    const cwd = "\\\\wsl.localhost\\Ubuntu\\home\\u\\proj";
+    await mount(<TerminalViewport {...viewportProps({ cwd })} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("index.html src/main.ts:4"));
+    const [htmlLink, sourceLink] = provideTerminalLinks(terminal) ?? [];
+    terminal.writes.length = 0;
+
+    htmlLink!.activate(new MouseEvent("click", { ctrlKey: true }));
+    sourceLink!.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).toHaveBeenCalledWith(
+      expect.objectContaining({ filePath: `${cwd}\\index.html` }),
+    );
+    expect(testState.openPath).toHaveBeenCalledWith(`${cwd}\\src\\main.ts:4`);
+    expect(terminal.writes).toEqual([]);
+  });
+
+  it("keeps one OSC 8 confirmation menu open at a time", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    testState.localApiAvailable = true;
+    let choose: (choice: string | null) => void = () => undefined;
+    testState.contextMenuShow.mockImplementation(
+      () => new Promise<string | null>((resolve) => (choose = resolve)),
+    );
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const click = osc8Link(terminal, "docs.example.com", "https://evil.test/");
+
+    click(new MouseEvent("click", { ctrlKey: true }));
+    click(new MouseEvent("click", { ctrlKey: true }));
+    expect(testState.contextMenuShow).toHaveBeenCalledOnce();
+
+    await act(async () => choose(null));
+    click(new MouseEvent("click", { ctrlKey: true }));
+    expect(testState.contextMenuShow).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses file URLs it cannot convert instead of treating them as relative paths", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("file://server/share/r.pdf file:///tmp/%E0.html"));
+    const links = provideTerminalLinks(terminal) ?? [];
+    expect(links).toHaveLength(2);
+
+    for (const link of links) link.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).not.toHaveBeenCalled();
+    expect(testState.openPath).not.toHaveBeenCalled();
+    expect(
+      terminal.writes.filter(
+        (write) => write === "\r\n[terminal] Unable to open this file link.\r\n",
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("opens html paths in the editor when the terminal has no thread", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(
+      <TerminalViewport
+        {...viewportProps({ threadRef: { ...THREAD_REF, threadId: "" as typeof THREAD_ID } })}
+      />,
+    );
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("dist/index.html"));
     const [link] = provideTerminalLinks(terminal) ?? [];
 
-    testState.shellOpenExternal.mockRejectedValueOnce(new Error("browser blocked"));
-    link!.activate(new MouseEvent("click", { metaKey: true }));
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
     await act(async () => Promise.resolve());
-    expect(testState.shellOpenExternal).toHaveBeenCalledWith("https://example.test/docs");
-    expect(terminal.writes).toContain("\r\n[terminal] browser blocked\r\n");
+    expect(openFileInPreview).not.toHaveBeenCalled();
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/dist/index.html");
+  });
 
-    testState.shellOpenExternal.mockRejectedValueOnce("unknown");
-    link!.activate(new MouseEvent("click", { metaKey: true }));
+  it("opens html paths in the integrated browser and Ctrl+Shift opens them in the editor", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("built dist/index.html"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
     await act(async () => Promise.resolve());
-    expect(terminal.writes).toContain("\r\n[terminal] Unable to open link\r\n");
+    expect(openFileInPreview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadRef: THREAD_REF,
+        filePath: "/repo/dist/index.html",
+        httpBaseUrl: "http://127.0.0.1:3773",
+        createAssetUrl: testState.createAssetUrl,
+      }),
+    );
+    expect(testState.openPath).not.toHaveBeenCalled();
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true, shiftKey: true }));
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).toHaveBeenCalledTimes(1);
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/dist/index.html");
+  });
+
+  it("keeps the physical Shift for link activation while mouse tracking inverts it", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.modes.mouseTrackingMode = "drag";
+    terminal.bufferLines.push(terminalBufferLine("http://localhost:5173 dist/index.html"));
+    const [urlLink, fileLink] = provideTerminalLinks(terminal) ?? [];
+    const surface = mounted.container.querySelector("[data-terminal-xterm-mount]")!;
+    const target = document.createElement("div");
+    surface.append(target);
+    // xterm activates links from its own mouseup listener, after the capture-phase inversion.
+    const clickWithCtrlShift = (link: FakeTerminalLink) => {
+      const activate = (event: MouseEvent) => link.activate(event);
+      document.addEventListener("mouseup", activate);
+      const modifiers = { bubbles: true, button: 0, ctrlKey: true, shiftKey: true };
+      target.dispatchEvent(new MouseEvent("mousedown", modifiers));
+      target.dispatchEvent(new MouseEvent("mouseup", modifiers));
+      document.removeEventListener("mouseup", activate);
+    };
+
+    clickWithCtrlShift(urlLink!);
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "http://localhost:5173", invert: true }),
+    );
+
+    clickWithCtrlShift(fileLink!);
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).not.toHaveBeenCalled();
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/dist/index.html");
+  });
+
+  it("keeps opening non-preview paths in the editor", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("src/main.ts:4"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).not.toHaveBeenCalled();
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/src/main.ts:4");
+  });
+
+  it("offers the editor when an html path is outside the workspace", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    vi.mocked(openFileInPreview).mockResolvedValue(
+      AsyncResult.failure(Cause.fail({ _tag: "AssetWorkspacePathValidationError" })),
+    );
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("/tmp/report.html"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+    terminal.writes.length = 0;
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(showFileOutsideWorkspaceNotice).toHaveBeenCalledOnce();
+    expect(terminal.writes).toEqual([]);
+
+    vi.mocked(showFileOutsideWorkspaceNotice).mock.calls[0]![0].onOpenInEditor();
+    await act(async () => Promise.resolve());
+    expect(testState.openPath).toHaveBeenCalledWith("/tmp/report.html");
+  });
+
+  it("offers the editor when an html preview fails for another reason", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    vi.mocked(openFileInPreview).mockResolvedValue(
+      AsyncResult.failure(Cause.fail(new Error("asset service down"))),
+    );
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("index.html"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+    terminal.writes.length = 0;
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(showFileOutsideWorkspaceNotice).not.toHaveBeenCalled();
+    expect(showPreviewFailedNotice).toHaveBeenCalledOnce();
+    expect(terminal.writes).toEqual([]);
+
+    vi.mocked(showPreviewFailedNotice).mock.calls[0]![0].onOpenInEditor();
+    await act(async () => Promise.resolve());
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/index.html");
+  });
+
+  it("offers the editor when the environment has no connection to preview through", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    testState.preparedConnection = Option.none();
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("index.html"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).not.toHaveBeenCalled();
+    expect(showPreviewFailedNotice).toHaveBeenCalledOnce();
   });
 
   it("opens path links and reports editor failures", async () => {

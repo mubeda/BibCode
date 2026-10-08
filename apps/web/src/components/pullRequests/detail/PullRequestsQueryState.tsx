@@ -25,20 +25,27 @@ export function PullRequestsQueryState({
     if (error?.code === "not_authenticated") refreshContext?.();
   }, [error, refreshContext]);
   const message = error?.message ?? query.error;
-  if (message !== null)
+  const alert = (
+    <div role="alert" className="space-y-3 p-4 text-sm">
+      <p>{message}</p>
+      {error?.hostDetail ? <p className="text-muted-foreground">{error.hostDetail}</p> : null}
+      <PermissionButton
+        permission={{ allowed: !query.isPending, reason: query.isPending ? "Loading…" : null }}
+        onClick={query.refresh}
+        variant="outline"
+        size="sm"
+      >
+        Retry
+      </PermissionButton>
+    </div>
+  );
+  if (message !== null && query.data === null) return alert;
+  if (message !== null && query.data !== null)
     return (
-      <div role="alert" className="space-y-3 p-4 text-sm">
-        <p>{message}</p>
-        {error?.hostDetail ? <p className="text-muted-foreground">{error.hostDetail}</p> : null}
-        <PermissionButton
-          permission={{ allowed: !query.isPending, reason: query.isPending ? "Loading…" : null }}
-          onClick={query.refresh}
-          variant="outline"
-          size="sm"
-        >
-          Retry
-        </PermissionButton>
-      </div>
+      <>
+        {alert}
+        {children}
+      </>
     );
   if (query.data === null)
     return (

@@ -10,6 +10,18 @@ use super::platform::{Platform, PlatformWebviewOps, PreviewPlatformError};
 use super::{PendingBounds, PreviewHostState};
 
 pub const STATE_EVENT: &str = "preview://state";
+pub const NEW_WINDOW_EVENT: &str = "preview://new-window";
+
+fn preview_new_window_url(url: &Url) -> Option<&Url> {
+    matches!(url.scheme(), "http" | "https").then_some(url)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NewWindowEvent {
+    #[serde(rename = "tabId")]
+    tab_id: String,
+    url: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CreationProgress {
@@ -814,6 +826,22 @@ pub fn create_tab(app: &AppHandle, tab_id: &str) -> Result<(), String> {
                     nav_status,
                 );
             });
+        })
+        .on_new_window({
+            let app = app.clone();
+            let tab_id = tab_id.to_string();
+            move |url, _features| {
+                if let Some(url) = preview_new_window_url(&url) {
+                    let payload = NewWindowEvent {
+                        tab_id: tab_id.clone(),
+                        url: url.to_string(),
+                    };
+                    if let Err(error) = app.emit(NEW_WINDOW_EVENT, payload) {
+                        tracing::warn!("failed to emit preview new-window request: {error}");
+                    }
+                }
+                tauri::webview::NewWindowResponse::Deny
+            }
         });
 
     // Preview browsing data is isolated from the main application session.
@@ -1476,5 +1504,13 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn preview_new_window_only_forwards_web_urls() {
+        let web = tauri::Url::parse("https://example.com/a").unwrap();
+        assert_eq!(super::preview_new_window_url(&web), Some(&web));
+        let data = tauri::Url::parse("data:text/html,hi").unwrap();
+        assert_eq!(super::preview_new_window_url(&data), None);
     }
 }

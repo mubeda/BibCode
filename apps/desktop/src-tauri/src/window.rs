@@ -198,6 +198,45 @@ fn capture_main_window_state<R: Runtime>(
     }))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MainNewWindowAction {
+    OpenExternal,
+    Ignore,
+}
+
+pub(crate) fn main_window_new_window_action(url: &tauri::Url) -> MainNewWindowAction {
+    match url.scheme() {
+        "http" | "https" | "mailto" => MainNewWindowAction::OpenExternal,
+        _ => MainNewWindowAction::Ignore,
+    }
+}
+
+/// Builds the main window from `tauri.conf.json` (`"create": false`) so it can
+/// route `window.open` / `target=_blank` requests to the system browser.
+pub(crate) fn build_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == MAIN_WINDOW_LABEL)
+        .cloned()
+        .expect("tauri.conf.json defines the main window");
+    let handle = app.clone();
+    tauri::WebviewWindowBuilder::from_config(app, &config)?
+        .on_new_window(move |url, _features| {
+            if main_window_new_window_action(&url) == MainNewWindowAction::OpenExternal
+                && let Err(error) = handle.opener().open_url(url.as_str(), None::<&str>)
+            {
+                tracing::warn!("failed to open link externally: {error}");
+            }
+            tauri::webview::NewWindowResponse::Deny
+        })
+        .build()?;
+    Ok(())
+}
+
 pub fn restore_main_window_state<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let path = window_state_path(app)?;
     let Some(value) = read_json_file(&path)? else {
@@ -235,6 +274,27 @@ pub fn persist_main_window_state<R: Runtime>(app: &AppHandle<R>) -> Result<(), S
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn main_window_new_windows_open_externally_for_web_and_mail_links() {
+        use super::{MainNewWindowAction, main_window_new_window_action};
+        for url in [
+            "https://github.com/x/y/pull/1",
+            "http://localhost:3000/",
+            "mailto:a@b.c",
+        ] {
+            let url = tauri::Url::parse(url).unwrap();
+            assert_eq!(
+                main_window_new_window_action(&url),
+                MainNewWindowAction::OpenExternal
+            );
+        }
+        let file = tauri::Url::parse("file:///etc/passwd").unwrap();
+        assert_eq!(
+            main_window_new_window_action(&file),
+            MainNewWindowAction::Ignore
+        );
+    }
 
     #[test]
     fn maps_known_application_menu_ids_to_actions() {
