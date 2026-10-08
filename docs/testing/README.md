@@ -143,9 +143,9 @@ and the desktop harnesses follow these rules. Cargo dev units enable the
 which refuses host provider/hosting executable resolution and credential reads.
 It defaults to Abort mode: a forbidden resolution or read writes the program,
 path, and current thread name directly to stderr and aborts the test process.
-Intentional guard aborts suppress core dumps, so local systemd-coredump and
-desktop crash notifications do not fire. The process still terminates with
-SIGABRT.
+On Unix, intentional guard aborts suppress core dumps so local
+systemd-coredump and desktop crash notifications do not fire. The process
+still terminates with SIGABRT.
 This applies to spawned threads/tasks and re-executed or CLI test binaries too;
 there is no off switch. For fixture diagnosis, set
 `BIBCODE_HERMETIC_GUARD=report` on the test child only. Report mode still refuses

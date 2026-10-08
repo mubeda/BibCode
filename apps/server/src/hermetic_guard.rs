@@ -34,8 +34,6 @@ const GUARDED_PROGRAMS: &[&str] = &[
 fn abort_guard_process() -> ! {
     #[cfg(unix)]
     {
-        // SAFETY: `limit` is a valid rlimit for this call, which only changes
-        // this process's core-file limit.
         let limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -46,7 +44,6 @@ fn abort_guard_process() -> ! {
     }
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: prctl has no pointer arguments and changes only this process.
         // Pipe core_pattern handlers such as systemd-coredump still dump when
         // RLIMIT_CORE is 0 unless the process is not dumpable.
         unsafe {
@@ -747,8 +744,6 @@ mod tests {
 
     #[cfg(unix)]
     fn raise_parent_core_limit() {
-        // SAFETY: `limit` is a valid rlimit for this call, which only changes
-        // this process's core-file limit.
         let limit = libc::rlimit {
             rlim_cur: libc::RLIM_INFINITY,
             rlim_max: libc::RLIM_INFINITY,
