@@ -218,6 +218,17 @@ performing a production install.
   configuration. Its primary grant must use the same `--dev-url` and base root.
   Ordinary/default and remote fake hosts keep their `userdata` profile. This
   opt-in changes no production authentication or CORS policy.
+
+- `bash scripts/measure-gitlab-merge-request-load.sh [rtt-ms] [runs]`: measure a
+  cold GitLab merge-request list load and a single merge-request load against
+  the local harness in `apps/server/tests/pull_requests_gitlab_load_harness.rs`.
+  The default round trip is 200 ms and the default sample count is 5. The
+  command prints `HARNESS_JSON` and writes the same document to
+  `BIBCODE_GITLAB_HARNESS_REPORT` (`/tmp/bibcode-gitlab-mr-load.json` when unset).
+  It also runs the ignored
+  `gitlab_subscribed_merge_request_polling_records_host_requests` scenario,
+  which waits through several real 20 s poll ticks and prints
+  `HARNESS_SUBSCRIBE_JSON`; the default `cargo test` suite skips it.
 - `bash scripts/test-linux-git-compatibility.sh TEST_BINARY [IMAGE ...]`: run the
   compiled Linux Git-runner regression in disposable Debian, Ubuntu, Fedora,
   and Arch containers. Build the executable on the Ubuntu 22.04 glibc baseline;

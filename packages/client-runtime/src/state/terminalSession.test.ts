@@ -59,6 +59,7 @@ const summary = () =>
         updatedAt: BASE_SNAPSHOT.updatedAt,
         hasRunningSubprocess: false,
         label: BASE_SNAPSHOT.label,
+        centerPanel: false,
       },
     ],
   })[0]!;

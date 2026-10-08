@@ -46,7 +46,11 @@ second window-state source.
 - **React app (`apps/web`)** owns the user interface and client-side state. It
   uses hash history in desktop mode and browser history on the web. Preview
   content is hosted in Tauri child webviews; preview automation is brokered by
-  the Rust server and consumed by the React host. Typography and text-contrast
+  the Rust server and consumed by the React host. On the Tauri desktop host only
+  tab status, open, and navigate are supported and advertised; snapshot, click,
+  type, and the other automation calls are not yet. Its single native view
+  drives only the visible tab, so open always shows the tab, and a request for a
+  thread that is not on screen times out. Typography and text-contrast
   rules live in [`UI.md`](../../UI.md).
 - **Desktop adapter (`apps/web/src/tauriDesktopBridge.ts`)** installs
   `window.desktopBridge` only when Tauri globals are present. Tauri commands and
@@ -972,6 +976,25 @@ thread; normal remote-deletion reconciliation resumes after that observation.
 Authoritative thread removal later clears every surface that references that
 thread. This ordering is shared by browser and all desktop hosts; it does not
 depend on a WebView-specific scheduling delay.
+
+Center-panel layout is renderer-local, but the panels it holds are shared.
+Center terminals open or attach with `centerPanel: true`; the terminal manager
+keeps that marker (sticky once set, including across restart and reopen) and
+the launch command of the current process, including its provider env
+defaults, and publishes both on `TerminalSummary`. A restart or reopen without
+a command reports none, matching the default shell it spawns. Right-panel shells never carry the marker. Panel threads
+record `hostThreadId`. Each environment's thread lifecycle reconciler adopts a
+center terminal session or live panel thread the first time it sees one, as an
+inactive tab in the host thread's focused group, skipping terminal ids reserved
+by an in-flight local open and chat panels still pending locally. Adoption only
+on first sight keeps a local close from being undone by later status updates.
+The reconciler reads the raw `subscribeTerminalMetadata` stream as whole
+delivered batches (an atom alone keeps only a batch's last event). Metadata
+`remove` events carry a `reason`: only `closed` (an explicit close) drops the
+tab and releases that client's retained terminal input; `shutdown` (server stop
+or update) and `restarted` (a failed restart) keep it, as does a reconnect
+snapshot that omits a session, so the tab can relaunch its command on attach.
+Tabs the client still shows follow the session's current launch command.
 
 The terminal's WebGL renderer is the current instance. xterm keeps its canvas
 backing store aligned to the exact device-pixel box by observing

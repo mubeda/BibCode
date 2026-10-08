@@ -9,6 +9,7 @@ import { act, useReducer } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { usePullRequestsStore, type PullRequestsDetailTab } from "../../../pullRequestsStore";
+import { recordPrefetch, resetPrefetchGates } from "../hoverPrefetch.logic";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { context, detail, gitlabContext } from "./testFixtures";
 import { click, allowed } from "../review/testHelpers";
@@ -47,6 +48,8 @@ vi.mock("../../../state/pullRequests", () => ({
     getChecks: h.getChecks,
     getFiles: h.getFiles,
     getVocabulary: h.getVocabulary,
+    readSnapshot: vi.fn(() => ({ kind: "readSnapshot" })),
+    subscribe: vi.fn(() => ({ kind: "subscribe" })),
   },
 }));
 vi.mock("../../../state/worktrees", () => ({
@@ -89,6 +92,10 @@ vi.mock("@tanstack/react-router", () => ({
   Link: ({ children }: { children: React.ReactNode }) => <a>{children}</a>,
 }));
 import { PullRequestsDetailView } from "./PullRequestsDetailView";
+function setVisibility(state: DocumentVisibilityState) {
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
 let root: Root;
 let container: HTMLDivElement;
 const projectRef = { environmentId: "env", projectId: "project" } as ScopedProjectRef;
@@ -136,6 +143,8 @@ beforeEach(() => {
   h.pending = false;
   h.pendingQueries.clear();
   h.complete = true;
+  resetPrefetchGates();
+  setVisibility("visible");
   vi.clearAllMocks();
   h.command.mockResolvedValue({ _tag: "Success", value: { kind: "done" } });
   usePullRequestsStore.setState({ byProjectKey: {} });
@@ -369,6 +378,88 @@ describe("PullRequestsDetailView", () => {
     expect(h.refresh.mock.calls.map(([kind]) => kind)).toEqual(["get", "getTimeline"]);
     expect(h.getTimeline).toHaveBeenCalledOnce();
     expect(usePullRequestsStore.getState().selectDraft(projectRef, 14).comment).toBe("");
+  });
+  it("paints a snapshot's title but leaves every action control inactive until a live detail succeeds", async () => {
+    h.data.get = null;
+    const permissiveSnapshot: PullRequestsDetail = {
+      ...detail,
+      permissions: {
+        ...detail.permissions,
+        merge: { ...detail.permissions.merge, ...allowed },
+        editPullRequest: allowed,
+        editReviewers: allowed,
+        comment: allowed,
+        approve: allowed,
+      },
+    };
+    h.data.readSnapshot = {
+      list: null,
+      detail: { payload: permissiveSnapshot, observedAt: 1 },
+      tab: null,
+    };
+    await render("conversation", 14, null, gitlabContext);
+    // The title paints from the snapshot even with no live detail yet.
+    expect(container.textContent).toContain(detail.title);
+    // The merge box still renders (not hidden), but inactive until live succeeds.
+    const merge = container.querySelector('[aria-label="Merge status"]');
+    expect(merge).not.toBeNull();
+    const mergeButton = [...merge!.querySelectorAll("button")].find(
+      (button) => button.textContent === "Merge",
+    )!;
+    expect(mergeButton.disabled).toBe(true);
+    expect(mergeButton.title).toBe("Loading…");
+    // The header's base branch picker stays inactive too, not just the merge box.
+    const baseBranch = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Change base branch"]',
+    )!;
+    expect(baseBranch.disabled).toBe(true);
+    expect(baseBranch.title).toBe("Loading…");
+    // The side column's reviewer picker stays inactive as well.
+    const reviewerPicker = container.querySelector<HTMLButtonElement>(
+      `[aria-label="Edit ${gitlabContext.capabilities.vocabulary.reviewer}"]`,
+    )!;
+    expect(reviewerPicker.disabled).toBe(true);
+    expect(reviewerPicker.title).toBe("Loading…");
+    // The main comment box's submit control stays inactive too.
+    const commentButton = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Comment",
+    )!;
+    expect(commentButton.disabled).toBe(true);
+    expect(commentButton.title).toBe("Loading…");
+    // GitLab Approve is on the overview, and a snapshot that would allow it
+    // still cannot run until the live detail succeeds.
+    const approval = container.querySelector('[aria-label="Approval"]');
+    expect(approval?.textContent).toContain("Approve");
+    expect(approval?.textContent).toContain("0 of 1 approvals");
+    const approveButton = [...approval!.querySelectorAll("button")].find(
+      (button) => button.textContent === "Approve",
+    )!;
+    expect(approveButton.disabled).toBe(true);
+    expect(approveButton.title).toBe("Loading…");
+  });
+  it("shows a hover prefetch answered within 5 s on open without reading it again", async () => {
+    const request = { environmentId: scope.environmentId, input: { cwd: scope.cwd, number: 14 } };
+    recordPrefetch("get", request, Date.now());
+    recordPrefetch("getTimeline", request, Date.now());
+    await render("conversation", 14, null, gitlabContext);
+    expect(container.querySelector("h1")?.textContent).toContain(detail.title);
+    expect(h.refresh).not.toHaveBeenCalledWith("get");
+    expect(h.refresh).not.toHaveBeenCalledWith("getTimeline");
+  });
+  it("re-reads a hover prefetch older than 5 s on open", async () => {
+    const request = { environmentId: scope.environmentId, input: { cwd: scope.cwd, number: 14 } };
+    recordPrefetch("get", request, Date.now() - 6_000);
+    recordPrefetch("getTimeline", request, Date.now() - 6_000);
+    await render("conversation", 14, null, gitlabContext);
+    expect(h.refresh).toHaveBeenCalledWith("get");
+    expect(h.refresh).toHaveBeenCalledWith("getTimeline");
+  });
+  it("drops the subscription while the document is hidden and subscribes again when shown", async () => {
+    setVisibility("hidden");
+    await render("conversation", 14, null, gitlabContext);
+    expect(h.subscribed.has("subscribe")).toBe(false);
+    await act(async () => setVisibility("visible"));
+    expect(h.subscribed.has("subscribe")).toBe(true);
   });
   it("offers a direct path back to the request list", async () => {
     await render();

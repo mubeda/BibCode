@@ -135,6 +135,7 @@ export async function createCenterTerminal(
     cwd: launch.cwd,
     worktreePath: launch.worktreePath,
     env: launch.env,
+    centerPanel: true,
     ...(launch.command !== undefined ? { command: launch.command } : {}),
     ...(launch.cols !== undefined ? { cols: launch.cols } : {}),
     ...(launch.rows !== undefined ? { rows: launch.rows } : {}),

@@ -14,7 +14,13 @@
  */
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { EnvironmentId, FILL_PREVIEW_VIEWPORT, ThreadId } from "@bibcode/contracts";
+import {
+  EnvironmentId,
+  FILL_PREVIEW_VIEWPORT,
+  PREVIEW_AUTOMATION_OPERATIONS,
+  ThreadId,
+} from "@bibcode/contracts";
+import type { DesktopPreviewBridge } from "@bibcode/contracts";
 import type { PreviewAutomationRequest } from "@bibcode/contracts";
 
 const h = vi.hoisted(() => {
@@ -31,6 +37,7 @@ const h = vi.hoisted(() => {
     consumerAtom: { __consumer: true } as unknown,
     // environment gating
     environments: [] as Array<{ environmentId: unknown }>,
+    automationHostInputs: [] as Array<{ supportedOperations: readonly string[] }>,
     // preview bridge
     previewBridge: null as unknown,
     automationStatus: { available: true, loading: false } as Record<string, unknown>,
@@ -55,6 +62,8 @@ const h = vi.hoisted(() => {
     viewportReady: true,
     resizeSetting: { _tag: "fill" } as unknown,
     resolvedUrl: "http://resolved.local/" as string,
+    resolveCalls: [] as unknown[],
+    resolveError: null as Error | null,
     // browser recording
     activeRecordingTabId: null as string | null,
     startBrowserRecordingImpl: (_tabId: string) => Promise.resolve("2026-01-01T00:00:00.000Z"),
@@ -131,7 +140,11 @@ vi.mock("~/rightPanelStore", () => ({
 }));
 
 vi.mock("~/browser/browserTargetResolver", () => ({
-  resolveBrowserNavigationTarget: () => ({ resolvedUrl: h.resolvedUrl }),
+  resolveBrowserNavigationTarget: (_environmentId: unknown, target: unknown) => {
+    h.resolveCalls.push(target);
+    if (h.resolveError) throw h.resolveError;
+    return { resolvedUrl: h.resolvedUrl };
+  },
 }));
 
 vi.mock("~/browser/browserRecording", () => ({
@@ -156,7 +169,10 @@ vi.mock("~/state/environments", () => ({
 
 vi.mock("~/state/preview", () => ({
   previewEnvironment: {
-    automationRequests: () => ({ label: "automationRequests" }),
+    automationRequests: (target: { input: { supportedOperations: readonly string[] } }) => {
+      h.automationHostInputs.push(target.input);
+      return { label: "automationRequests" };
+    },
     list: Object.assign((target: unknown) => ({ label: "list", target }), { label: "list" }),
     open: { label: "open" },
     resize: { label: "resize" },
@@ -209,6 +225,7 @@ vi.mock("./previewViewportReadiness", () => ({
 
 import { RegistryContext } from "@effect/atom-react";
 import { PreviewAutomationHosts } from "./PreviewAutomationHosts";
+import { registerPreviewRuntimeCapabilities } from "~/previewRuntimeCapabilities";
 import {
   PreviewAutomationOperationError,
   PreviewAutomationRecordingNotActiveError,
@@ -280,6 +297,7 @@ beforeEach(() => {
   h.setRequestHandlerCalls.length = 0;
   h.automationConnectionId = null;
   h.environments = [];
+  h.automationHostInputs.length = 0;
   h.automationStatus = { available: true, loading: false, visible: false, url: null, title: null };
   h.automationEvaluateResult = "complete";
   h.automationResults = {
@@ -311,6 +329,8 @@ beforeEach(() => {
   h.viewportReady = true;
   h.resizeSetting = FILL_PREVIEW_VIEWPORT;
   h.resolvedUrl = "http://resolved.local/";
+  h.resolveCalls.length = 0;
+  h.resolveError = null;
   h.activeRecordingTabId = null;
   h.startBrowserRecordingImpl = () => Promise.resolve("2026-01-01T00:00:00.000Z");
   h.stopBrowserRecordingImpl = () => Promise.resolve({ path: "/rec.webm" });
@@ -394,6 +414,28 @@ describe("PreviewAutomationHosts wrapper", () => {
     // Each host makes 3 useState calls (clientId, connectionAtom, handlerAtom).
     expect(h.stateCalls.length).toBe(6);
   });
+
+  it("advertises every operation for a fully automatable bridge", () => {
+    mountHost();
+    expect(h.automationHostInputs.at(-1)?.supportedOperations).toEqual([
+      ...PREVIEW_AUTOMATION_OPERATIONS,
+    ]);
+  });
+
+  it("advertises only status, open, and navigate for a bridge without automation", () => {
+    registerPreviewRuntimeCapabilities(h.previewBridge as DesktopPreviewBridge, {
+      picker: false,
+      recording: false,
+      automation: false,
+      imageClipboard: false,
+    });
+    mountHost();
+    expect(h.automationHostInputs.at(-1)?.supportedOperations).toEqual([
+      "status",
+      "open",
+      "navigate",
+    ]);
+  });
 });
 
 describe("handleRequest: status", () => {
@@ -434,6 +476,24 @@ describe("handleRequest: status", () => {
     expect(result.title).toBe("Loading");
     expect(result.loading).toBe(true);
     expect(result.tabId).toBe("tab-9");
+  });
+
+  it("falls back to the session status when the native tab has detached", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+    const snapshot = {
+      tabId: "tab-1",
+      navStatus: { _tag: "Loading", url: "http://committed/", title: "" },
+    };
+    h.target = { snapshot, tabId: "tab-1" };
+    h.automationStatus = { available: false, loading: false, url: null, title: null };
+
+    const result = (await handle(makeRequest({ operation: "status", tabId: "tab-1" }))) as Record<
+      string,
+      unknown
+    >;
+
+    expect(result).toMatchObject({ available: true, url: "http://committed/", loading: true });
   });
 
   it("reports no tab / idle navStatus when nothing is resolved", async () => {
@@ -523,6 +583,75 @@ describe("handleRequest: open", () => {
     expect(result.tabId).toBe("tab-existing");
   });
 
+  it("resolves the url of a fresh tab through the environment before opening it", async () => {
+    const handle = mountHost();
+    h.openTab = null;
+    h.commandResults.open = () => ({
+      _tag: "Success",
+      value: { tabId: "tab-new", navStatus: { _tag: "Idle" } },
+    });
+
+    await handle(
+      makeRequest({
+        operation: "open",
+        input: { url: "http://localhost:3000", show: false } as unknown,
+      }),
+    );
+
+    expect(h.resolveCalls).toEqual([{ kind: "url", url: "http://localhost:3000" }]);
+    expect(h.commandCalls.find((c) => c.label === "open")?.input).toMatchObject({
+      input: { url: h.resolvedUrl },
+    });
+  });
+
+  it("always reveals the tab on a navigation-only bridge, which drives only the visible tab", async () => {
+    registerPreviewRuntimeCapabilities(h.previewBridge as DesktopPreviewBridge, {
+      picker: false,
+      recording: false,
+      automation: false,
+      imageClipboard: false,
+    });
+    const handle = mountHost();
+    h.openTab = null;
+    h.commandResults.open = () => ({
+      _tag: "Success",
+      value: { tabId: "tab-new", navStatus: { _tag: "Idle" } },
+    });
+
+    await handle(makeRequest({ operation: "open", input: { show: false } as unknown }));
+
+    expect(h.openBrowserCalls).toHaveLength(1);
+  });
+
+  it("keeps a fully automatable bridge's hidden open hidden", async () => {
+    const handle = mountHost();
+    h.openTab = null;
+    h.commandResults.open = () => ({
+      _tag: "Success",
+      value: { tabId: "tab-new", navStatus: { _tag: "Idle" } },
+    });
+
+    await handle(makeRequest({ operation: "open", input: { show: false } as unknown }));
+
+    expect(h.openBrowserCalls).toHaveLength(0);
+  });
+
+  it("refuses to open an unreachable url instead of loading this computer's localhost", async () => {
+    const handle = mountHost();
+    h.openTab = null;
+    h.resolveError = new Error("This address is on Box, not this computer.");
+
+    const error = await handle(
+      makeRequest({ operation: "open", input: { url: "http://localhost:3000" } as unknown }),
+    ).then(
+      () => null,
+      (e) => e,
+    );
+
+    expect(error).toBeInstanceOf(PreviewAutomationOperationError);
+    expect(h.commandCalls.some((c) => c.label === "open")).toBe(false);
+  });
+
   it("wraps an open-command failure", async () => {
     const handle = mountHost();
     h.openTab = null;
@@ -550,6 +679,31 @@ describe("handleRequest: navigate + resize", () => {
     )) as Record<string, unknown>;
 
     expect(h.navigateCalls).toContainEqual({ tabId: "tab-1", url: h.resolvedUrl });
+    expect(result.available).toBe(true);
+  });
+
+  it("waits for load instead of evaluating script on a bridge without automation", async () => {
+    const bridge = h.previewBridge as DesktopPreviewBridge;
+    registerPreviewRuntimeCapabilities(bridge, {
+      picker: false,
+      recording: false,
+      automation: false,
+      imageClipboard: false,
+    });
+    const evaluate = vi.fn(() => Promise.reject(new Error("not supported")));
+    (bridge.automation as { evaluate: unknown }).evaluate = evaluate;
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+
+    const result = (await handle(
+      makeRequest({
+        operation: "navigate",
+        tabId: "tab-1",
+        input: { url: "example.com", readiness: "domContentLoaded" } as unknown,
+      }),
+    )) as Record<string, unknown>;
+
+    expect(evaluate).not.toHaveBeenCalled();
     expect(result.available).toBe(true);
   });
 

@@ -9,6 +9,7 @@ import {
   applyPreviewServerSnapshot,
   beginPreviewSessionClose,
   cancelPreviewSessionClose,
+  findPreviewThreadForTab,
   previewStateAtom,
   readThreadPreviewState,
   reconcilePreviewServerSessions,
@@ -49,6 +50,15 @@ describe("previewStateStore (single-tab)", () => {
     applyPreviewServerSnapshot(ref, makeSnapshot());
     expect(readThreadPreviewState(ref).snapshot?.tabId).toBe("tab_a");
     expect(readThreadPreviewState(otherRef)).toEqual(__testing.EMPTY_THREAD_PREVIEW_STATE);
+  });
+
+  it("finds the thread that owns a preview tab", () => {
+    applyPreviewServerSnapshot(ref, makeSnapshot({ tabId: "tab_a" }));
+    applyPreviewServerSnapshot(otherRef, makeSnapshot({ threadId: "thread-2", tabId: "tab_b" }));
+
+    expect(findPreviewThreadForTab("tab_b")).toEqual(otherRef);
+    expect(findPreviewThreadForTab("tab_a")).toEqual(ref);
+    expect(findPreviewThreadForTab("tab_missing")).toBeNull();
   });
 
   it("opened event seeds the snapshot and remembers the URL", () => {
