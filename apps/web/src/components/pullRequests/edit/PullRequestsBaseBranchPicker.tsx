@@ -71,10 +71,17 @@ function BranchChoices({
 }
 export function PullRequestsBaseBranchPicker({
   detail,
+  live = detail,
   scope,
   projectRef,
 }: {
   detail: PullRequestsDetail;
+  /**
+   * Changing the base branch only ever acts on a live detail, never a
+   * snapshot. Omitting this falls back to `detail`, so callers that have not
+   * adopted the split keep acting as before.
+   */
+  live?: PullRequestsDetail | null;
   scope: PullRequestsScope;
   projectRef: ScopedProjectRef;
 }) {
@@ -87,7 +94,7 @@ export function PullRequestsBaseBranchPicker({
   );
   const permission = constrainPermission(
     detail.permissions.editPullRequest,
-    pending ? "Wait for the current action to finish" : null,
+    live === null ? "Loading…" : pending ? "Wait for the current action to finish" : null,
   );
   async function change(baseBranch: string) {
     await run({ action: "editPullRequest", title: null, body: null, baseBranch });

@@ -35,6 +35,9 @@ import {
   PullRequestsVocabularyInput,
   PullRequestsCwdInput,
   PullRequestsCreateDefaults,
+  PullRequestsChanged,
+  PullRequestsSnapshot,
+  PullRequestsSubscribeInput,
 } from "./pullRequests.ts";
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
@@ -486,6 +489,8 @@ export const WS_METHODS = {
   pullRequestsGetFiles: "pullRequests.getFiles",
   pullRequestsRunAction: "pullRequests.runAction",
   pullRequestsCheckout: "pullRequests.checkout",
+  pullRequestsReadSnapshot: "pullRequests.readSnapshot",
+  pullRequestsSubscribe: "pullRequests.subscribe",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
@@ -1366,6 +1371,19 @@ export const WsPullRequestsCheckoutRpc = Rpc.make(WS_METHODS.pullRequestsCheckou
   error: PullRequestsOperationError,
 });
 
+export const WsPullRequestsReadSnapshotRpc = Rpc.make(WS_METHODS.pullRequestsReadSnapshot, {
+  payload: PullRequestsSubscribeInput,
+  success: PullRequestsSnapshot,
+  error: PullRequestsOperationError,
+});
+
+export const WsPullRequestsSubscribeRpc = Rpc.make(WS_METHODS.pullRequestsSubscribe, {
+  payload: PullRequestsSubscribeInput,
+  success: PullRequestsChanged,
+  error: PullRequestsOperationError,
+  stream: true,
+});
+
 /**
  * Ephemeral live diff preview for compact/mobile surfaces.
  * Not the persisted BiBCode Review model. Future review sessions should use
@@ -1804,6 +1822,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsPullRequestsGetFilesRpc,
   WsPullRequestsRunActionRpc,
   WsPullRequestsCheckoutRpc,
+  WsPullRequestsReadSnapshotRpc,
+  WsPullRequestsSubscribeRpc,
   WsReviewGetDiffPreviewRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,

@@ -18,9 +18,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use super::model::{TerminalConsoleTheme, terminal_console_theme_from_env};
 use super::{
     PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput, TerminalAttachInput,
-    TerminalEvent, TerminalMetadataEvent, TerminalOpenInput, TerminalRestartInput,
-    TerminalSessionSnapshot, TerminalSize, TerminalStatus, TerminalSummary,
-    history::TerminalHistory,
+    TerminalEvent, TerminalLaunchCommand, TerminalMetadataEvent, TerminalOpenInput,
+    TerminalRemovalReason, TerminalRestartInput, TerminalSessionSnapshot, TerminalSize,
+    TerminalStatus, TerminalSummary, history::TerminalHistory,
 };
 use crate::{
     diagnostics::{
@@ -215,6 +215,17 @@ struct Session {
     attribution_registration: Option<ProcessRegistration>,
     observer: Option<PreparedObserverHandle>,
     private_output: StreamingSecretRedactor,
+    /// Sticky once set: a host thread's center panel that every client adopts.
+    center_panel: bool,
+    /// Client-supplied command the current process was launched with (never
+    /// the prepared one with private env); `None` for a default shell.
+    command: Option<TerminalLaunchCommand>,
+}
+
+/// What a replacement process keeps from the session it replaces.
+#[derive(Default)]
+struct SessionCarryOver {
+    center_panel: bool,
 }
 
 type SessionKey = (String, String);
@@ -1548,6 +1559,14 @@ impl Session {
             has_running_subprocess: self.has_running_subprocess,
             label: self.display_label(),
             updated_at: self.updated_at.clone(),
+            center_panel: self.center_panel,
+            command: self.command.clone(),
+        }
+    }
+
+    fn carry_over(&self) -> SessionCarryOver {
+        SessionCarryOver {
+            center_panel: self.center_panel,
         }
     }
 
@@ -1765,14 +1784,8 @@ impl TerminalManager {
             }
             self.inner.generations.current(&key)
         };
-        self.start(
-            input,
-            false,
-            generation,
-            initial_input,
-            publication_cancellation,
-        )
-        .await
+        self.start(input, generation, initial_input, publication_cancellation)
+            .await
     }
 
     pub async fn restart(
@@ -1840,6 +1853,11 @@ impl TerminalManager {
             barrier.started.notify_one();
             barrier.release.notified().await;
         }
+        let previous = self.inner.sessions.read().await.get(&key).cloned();
+        let carry_over = match previous {
+            Some(previous) => previous.lock().await.carry_over(),
+            None => SessionCarryOver::default(),
+        };
         let closed = self
             .close_sessions(
                 &input.thread_id,
@@ -1851,7 +1869,7 @@ impl TerminalManager {
         match self
             .start_inner(
                 input,
-                true,
+                Some(carry_over),
                 generation,
                 None,
                 publication_cancellation,
@@ -1861,7 +1879,10 @@ impl TerminalManager {
         {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => {
-                self.publish_closed_sessions(&closed.notifications);
+                self.publish_closed_sessions(
+                    &closed.notifications,
+                    TerminalRemovalReason::Restarted,
+                );
                 Err(error)
             }
         }
@@ -1870,7 +1891,6 @@ impl TerminalManager {
     async fn start(
         &self,
         input: TerminalOpenInput,
-        restarted: bool,
         generation: Arc<SessionGeneration>,
         initial_input: Option<String>,
         publication_cancellation: CancellationToken,
@@ -1882,7 +1902,7 @@ impl TerminalManager {
         let _startup = startup.lock().await;
         self.start_inner(
             input,
-            restarted,
+            None,
             generation,
             initial_input,
             publication_cancellation,
@@ -1891,10 +1911,11 @@ impl TerminalManager {
         .await
     }
 
+    /// `restarted` carries what the replaced session keeps; `None` for open.
     async fn start_inner(
         &self,
         input: TerminalOpenInput,
-        restarted: bool,
+        restarted: Option<SessionCarryOver>,
         generation: Arc<SessionGeneration>,
         initial_input: Option<String>,
         publication_cancellation: CancellationToken,
@@ -1915,13 +1936,23 @@ impl TerminalManager {
         }
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let console_theme = terminal_console_theme_from_env(&input.env);
-        if let Some(existing) = self.inner.sessions.read().await.get(&key).cloned() {
+        let is_restart = restarted.is_some();
+        let mut carry_over = restarted.unwrap_or_default();
+        let existing = self.inner.sessions.read().await.get(&key).cloned();
+        if let Some(existing) = existing {
             let session = existing.lock().await;
             // Open dimensions initialize a new PTY. Existing sessions change
             // size only through resize, which publishes the applied size/claim.
             if session.process.is_some() {
-                return Ok(session.snapshot());
+                let snapshot = session.snapshot();
+                drop(session);
+                if input.center_panel {
+                    self.mark_center_panel(&key, &existing).await;
+                }
+                return Ok(snapshot);
             }
+            // Reopening an exited session keeps its center-panel marker.
+            carry_over = session.carry_over();
         }
 
         let mut private_values = Vec::new();
@@ -2278,6 +2309,8 @@ impl TerminalManager {
             attribution_registration,
             observer: generation.observer(),
             private_output: StreamingSecretRedactor::new(private_values),
+            center_panel: input.center_panel || carry_over.center_panel,
+            command: input.command.clone(),
         }));
         let _lifecycle = self.inner.lifecycle.lock().await;
         let _publication = generation.publication.lock().await;
@@ -2304,17 +2337,24 @@ impl TerminalManager {
                 .await;
             return Err(invalidated_creation_error(&input));
         }
-        if let Some(existing) = self.inner.sessions.read().await.get(&key).cloned()
+        let existing = self.inner.sessions.read().await.get(&key).cloned();
+        if let Some(existing) = existing
             && existing.lock().await.process.is_some()
         {
             generation
                 .cancel_observer(TerminalObserverCancellationReason::PreparationRejected)
                 .await;
-            return Ok(existing.lock().await.snapshot());
+            let snapshot = existing.lock().await.snapshot();
+            drop(_publication);
+            drop(_lifecycle);
+            if input.center_panel {
+                self.mark_center_panel(&key, &existing).await;
+            }
+            return Ok(snapshot);
         }
         // Only Restarted resets surviving attachments' sequence cursors.
         // A non-restart reopen leaves the first-attachment grant available.
-        let first_attachment_grant_used = restarted
+        let first_attachment_grant_used = is_restart
             && self
                 .inner
                 .size_claim_attachments
@@ -2333,7 +2373,7 @@ impl TerminalManager {
         // The installed observer is now visible to the lifecycle snapshot used by disable.
         drop(activity_admission);
         let snapshot = session.lock().await.snapshot();
-        let event = if restarted {
+        let event = if is_restart {
             TerminalEvent::Restarted {
                 thread_id: input.thread_id,
                 terminal_id: input.terminal_id,
@@ -2350,9 +2390,30 @@ impl TerminalManager {
         };
         let _ = self.inner.events.send(event);
         let _ = self.inner.metadata.send(TerminalMetadataEvent::Upsert {
-            terminal: session.lock().await.summary(),
+            terminal: Box::new(session.lock().await.summary()),
         });
         Ok(snapshot)
+    }
+
+    /// Sets the sticky center-panel marker on a registered session and
+    /// publishes the changed summary. Never clears it.
+    async fn mark_center_panel(&self, key: &SessionKey, session: &SharedSession) {
+        let generation = session.lock().await.generation.clone();
+        let _publication = generation.publication.lock().await;
+        let registered = self
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, session));
+        let mut session = session.lock().await;
+        if registered && !session.center_panel {
+            session.center_panel = true;
+            let _ = self.inner.metadata.send(TerminalMetadataEvent::Upsert {
+                terminal: Box::new(session.summary()),
+            });
+        }
     }
 
     fn supervise(
@@ -2537,9 +2598,9 @@ impl TerminalManager {
 
                 if let Some((event, summary)) = activity {
                     let _ = activity_inner.events.send(event);
-                    let _ = activity_inner
-                        .metadata
-                        .send(TerminalMetadataEvent::Upsert { terminal: summary });
+                    let _ = activity_inner.metadata.send(TerminalMetadataEvent::Upsert {
+                        terminal: Box::new(summary),
+                    });
                 }
             }
         });
@@ -2602,9 +2663,9 @@ impl TerminalManager {
             )
         };
         let _ = inner.events.send(event);
-        let _ = inner
-            .metadata
-            .send(TerminalMetadataEvent::Upsert { terminal: summary });
+        let _ = inner.metadata.send(TerminalMetadataEvent::Upsert {
+            terminal: Box::new(summary),
+        });
         drop(_publication);
         let callback = inner
             .process_exit_callback
@@ -2727,8 +2788,8 @@ impl TerminalManager {
                         rows: input.rows.unwrap_or(30),
                         env: input.env.clone(),
                         command: input.command.clone(),
+                        center_panel: input.center_panel,
                     },
-                    false,
                     request_generation.clone(),
                     None,
                     publication_cancellation,
@@ -2779,11 +2840,15 @@ impl TerminalManager {
                 rows: input.rows.unwrap_or(current_rows),
                 env: input.env,
                 command: input.command,
+                center_panel: input.center_panel,
             })
             .await?;
             session = self
                 .require_session(&input.thread_id, &input.terminal_id)
                 .await?;
+        }
+        if input.center_panel {
+            self.mark_center_panel(&key, &session).await;
         }
         let session_generation = session.lock().await.generation.clone();
         if self.inner.cancellation.is_cancelled() {
@@ -3142,7 +3207,7 @@ impl TerminalManager {
                 TerminalObserverCancellationReason::Closed,
             )
             .await;
-        self.publish_closed_sessions(&closed.notifications);
+        self.publish_closed_sessions(&closed.notifications, TerminalRemovalReason::Closed);
         log_terminal_cleanup("close", &closed.report);
         if closed.report.failure_count > 0 {
             return Err(TerminalError::Close);
@@ -3399,7 +3464,11 @@ impl TerminalManager {
         closed
     }
 
-    fn publish_closed_sessions(&self, notifications: &[ClosedSessionNotification]) {
+    fn publish_closed_sessions(
+        &self,
+        notifications: &[ClosedSessionNotification],
+        reason: TerminalRemovalReason,
+    ) {
         for notification in notifications {
             let _ = self.inner.events.send(TerminalEvent::Closed {
                 thread_id: notification.thread_id.clone(),
@@ -3409,6 +3478,7 @@ impl TerminalManager {
             let _ = self.inner.metadata.send(TerminalMetadataEvent::Remove {
                 thread_id: notification.thread_id.clone(),
                 terminal_id: notification.terminal_id.clone(),
+                reason,
             });
         }
     }
@@ -3423,6 +3493,23 @@ impl TerminalManager {
                 TerminalStatus::Starting | TerminalStatus::Running
             ) {
                 live += 1;
+            }
+        }
+        live
+    }
+
+    /// `(thread_id, terminal_id, root pid)` of every starting or running session.
+    pub async fn live_session_pids(&self) -> Vec<(String, String, u32)> {
+        let sessions = self.inner.sessions.read().await;
+        let mut live = Vec::new();
+        for session in sessions.values() {
+            let summary = session.lock().await.summary();
+            if matches!(
+                summary.status,
+                TerminalStatus::Starting | TerminalStatus::Running
+            ) && let Some(pid) = summary.pid
+            {
+                live.push((summary.thread_id, summary.terminal_id, pid));
             }
         }
         live
@@ -3489,7 +3576,7 @@ impl TerminalManager {
                     TerminalObserverCancellationReason::Shutdown,
                 )
                 .await;
-            self.publish_closed_sessions(&closed.notifications);
+            self.publish_closed_sessions(&closed.notifications, TerminalRemovalReason::Shutdown);
             report.merge(closed.report);
         }
         if let Some(preparer) = self.inner.options.launch_preparer.as_ref() {
@@ -4496,6 +4583,18 @@ mod tests {
         assert_eq!(manager.live_session_count().await, 1);
         manager.close("sizing", Some("term-2")).await.unwrap();
         assert_eq!(manager.live_session_count().await, 0);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn live_session_pids_reports_running_sessions_until_they_close() {
+        let (_root, _backend, manager) = size_fixture(80, 24).await;
+        assert_eq!(
+            manager.live_session_pids().await,
+            vec![("sizing".to_owned(), "term".to_owned(), 1)]
+        );
+        manager.close("sizing", Some("term")).await.unwrap();
+        assert!(manager.live_session_pids().await.is_empty());
         manager.shutdown().await;
     }
 
@@ -5925,6 +6024,7 @@ mod tests {
                 TerminalMetadataEvent::Remove {
                     ref thread_id,
                     ref terminal_id,
+                    ..
                 } if thread_id == "thread-race" && terminal_id == "term-race"
             ) {
                 break;
@@ -5977,6 +6077,7 @@ mod tests {
             args: vec!["--dangerously-bypass-approvals-and-sandbox".to_owned()],
             label: Some("Codex Terminal".to_owned()),
             activity: None,
+            env: None,
         });
 
         let first = manager.open(input.clone()).await.unwrap();
@@ -6011,6 +6112,7 @@ mod tests {
         );
         let attachment = manager
             .attach(TerminalAttachInput {
+                center_panel: false,
                 size_claim: None,
                 thread_id: "thread-provider".to_owned(),
                 terminal_id: "term-provider".to_owned(),
@@ -6025,6 +6127,7 @@ mod tests {
                     args: vec!["--dangerously-skip-permissions".to_owned()],
                     label: Some("Claude Terminal".to_owned()),
                     activity: None,
+                    env: None,
                 }),
             })
             .await
@@ -6057,6 +6160,7 @@ mod tests {
             attach_started_task.notify_one();
             attach_manager
                 .attach(TerminalAttachInput {
+                    center_panel: false,
                     size_claim: None,
                     thread_id: "thread-attach-close".to_owned(),
                     terminal_id: "term-attach-close".to_owned(),
@@ -6071,6 +6175,7 @@ mod tests {
                         args: vec!["--dangerously-bypass-approvals-and-sandbox".to_owned()],
                         label: Some("Codex Terminal".to_owned()),
                         activity: None,
+                        env: None,
                     }),
                 })
                 .await
@@ -6163,6 +6268,7 @@ mod tests {
         let attach_task = tokio::spawn(async move {
             attach_manager
                 .attach(TerminalAttachInput {
+                    center_panel: false,
                     size_claim: None,
                     thread_id: "thread-spawn-close".to_owned(),
                     terminal_id: "term-spawn-close".to_owned(),
@@ -6343,6 +6449,7 @@ mod tests {
 
         let attach = manager
             .attach(TerminalAttachInput {
+                center_panel: false,
                 size_claim: None,
                 thread_id: "server-known-thread".to_owned(),
                 terminal_id: "terminal-existing".to_owned(),
@@ -7006,6 +7113,7 @@ mod tests {
             args: vec!["--direct".to_owned()],
             label: Some("Provider Terminal".to_owned()),
             activity: None,
+            env: None,
         });
 
         let error = manager.open(input).await.unwrap_err();
@@ -7040,6 +7148,7 @@ mod tests {
             args: vec!["--dangerously-skip-permissions".to_owned()],
             label: Some("Claude Terminal".to_owned()),
             activity: None,
+            env: None,
         };
         let mut input = TerminalOpenInput::new(
             "thread-provider",
@@ -7068,6 +7177,7 @@ mod tests {
 
         let attachment = manager
             .attach(TerminalAttachInput {
+                center_panel: false,
                 size_claim: None,
                 thread_id: "thread-provider".to_owned(),
                 terminal_id: "term-provider".to_owned(),
@@ -7261,6 +7371,7 @@ mod tests {
 
         manager
             .restart(TerminalRestartInput {
+                center_panel: false,
                 thread_id: "thread-exact-quiesce".to_owned(),
                 terminal_id: "term-replaced".to_owned(),
                 cwd: root.path().to_path_buf(),
@@ -7427,6 +7538,188 @@ mod tests {
         ));
 
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn summaries_carry_sticky_center_panel_and_launch_command() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::from_secs(3600),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let summary = async |terminal_id: &str| {
+            manager
+                .subscribe_metadata()
+                .await
+                .initial
+                .into_iter()
+                .find(|summary| summary.terminal_id == terminal_id)
+                .expect("terminal summary")
+        };
+        let mut metadata = manager.subscribe_metadata().await;
+        let mut upserts = || {
+            std::iter::from_fn(|| metadata.events.try_recv().ok())
+                .filter_map(|event| match event {
+                    TerminalMetadataEvent::Upsert { terminal } => Some(terminal),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let launch = |executable: &str| TerminalLaunchCommand {
+            executable: executable.to_owned(),
+            args: vec!["--flag".to_owned()],
+            label: Some("AI Terminal".to_owned()),
+            activity: None,
+            env: Some(std::collections::BTreeMap::from([(
+                "PROVIDER_DEFAULT".to_owned(),
+                "1".to_owned(),
+            )])),
+        };
+
+        // A plain open is not a center panel and has no launch command.
+        let plain = TerminalOpenInput::new("host", "drawer", root.path().to_path_buf(), 80, 24);
+        manager.open(plain.clone()).await.unwrap();
+        let opened = summary("drawer").await;
+        assert!(!opened.center_panel);
+        assert_eq!(opened.command, None);
+        let wire = serde_json::to_value(&opened).unwrap();
+        assert_eq!(wire["centerPanel"], false);
+        assert!(wire.get("command").is_none());
+        assert_eq!(upserts().len(), 1);
+
+        // centerPanel=false never publishes or clears; true flips it once.
+        manager.open(plain.clone()).await.unwrap();
+        assert!(upserts().is_empty());
+        let mut marked = plain.clone();
+        marked.center_panel = true;
+        manager.open(marked.clone()).await.unwrap();
+        let flipped = upserts();
+        assert_eq!(flipped.len(), 1);
+        assert!(flipped[0].center_panel);
+        assert!(summary("drawer").await.center_panel);
+        manager.open(marked).await.unwrap();
+        manager.open(plain).await.unwrap();
+        assert!(upserts().is_empty());
+        assert!(summary("drawer").await.center_panel);
+
+        // A center panel opened with a command reports both.
+        let mut ai = TerminalOpenInput::new("host", "ai", root.path().to_path_buf(), 80, 24);
+        ai.center_panel = true;
+        ai.command = Some(launch("claude"));
+        manager.open(ai.clone()).await.unwrap();
+        let opened = summary("ai").await;
+        assert!(opened.center_panel);
+        assert_eq!(opened.command, Some(launch("claude")));
+        assert_eq!(
+            serde_json::to_value(&opened).unwrap()["command"],
+            serde_json::json!({
+                "executable": "claude",
+                "args": ["--flag"],
+                "label": "AI Terminal",
+                "env": { "PROVIDER_DEFAULT": "1" },
+            })
+        );
+
+        // Restart without a command keeps the marker and reports the shell it
+        // spawned, never the previous AI command.
+        let mut bare_restart = ai.clone();
+        bare_restart.center_panel = false;
+        bare_restart.command = None;
+        manager.restart(bare_restart).await.unwrap();
+        assert_ne!(backend.spawns().last().unwrap().executable, "claude");
+        let restarted = summary("ai").await;
+        assert!(restarted.center_panel);
+        assert_eq!(restarted.command, None);
+
+        // Restart with a new command stores that command.
+        let mut new_restart = ai.clone();
+        new_restart.center_panel = false;
+        new_restart.command = Some(launch("codex"));
+        manager.restart(new_restart).await.unwrap();
+        assert_eq!(backend.spawns().last().unwrap().executable, "codex");
+        let restarted = summary("ai").await;
+        assert!(restarted.center_panel);
+        assert_eq!(restarted.command, Some(launch("codex")));
+
+        // Reopening an exited center panel without a command keeps the marker
+        // and reports the default shell it spawned.
+        backend.latest().exit(0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while summary("ai").await.status != TerminalStatus::Exited {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal exit is published");
+        manager
+            .open(TerminalOpenInput::new(
+                "host",
+                "ai",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .unwrap();
+        let reopened = summary("ai").await;
+        assert_eq!(reopened.status, TerminalStatus::Running);
+        assert!(reopened.center_panel);
+        assert_ne!(backend.spawns().last().unwrap().executable, "codex");
+        assert_eq!(reopened.command, None);
+
+        // An attach that creates the session can mark it as a center panel.
+        let mut attach = TerminalAttachInput::existing("host", "attached");
+        attach.cwd = Some(root.path().to_path_buf());
+        attach.center_panel = true;
+        drop(manager.attach(attach).await.unwrap());
+        let attached = summary("attached").await;
+        assert!(attached.center_panel);
+        assert_eq!(attached.command, None);
+
+        // An attach to an existing plain session flips the marker once.
+        let mut other = TerminalOpenInput::new("host", "other", root.path().to_path_buf(), 80, 24);
+        other.command = Some(launch("claude"));
+        manager.open(other).await.unwrap();
+        upserts();
+        let mut attach = TerminalAttachInput::existing("host", "other");
+        attach.center_panel = true;
+        drop(manager.attach(attach).await.unwrap());
+        let flipped = upserts();
+        assert_eq!(flipped.len(), 1);
+        assert!(flipped[0].center_panel);
+        assert_eq!(flipped[0].command, Some(launch("claude")));
+
+        // Only an explicit close tells clients to drop the tab; shutdown
+        // removals keep it so the terminal can relaunch from its tab.
+        let mut removals = || {
+            std::iter::from_fn(|| metadata.events.try_recv().ok())
+                .filter_map(|event| match event {
+                    TerminalMetadataEvent::Remove {
+                        terminal_id,
+                        reason,
+                        ..
+                    } => Some((terminal_id, reason)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        manager.close("host", Some("other")).await.unwrap();
+        assert_eq!(
+            removals(),
+            vec![("other".to_owned(), TerminalRemovalReason::Closed)]
+        );
+        manager.shutdown().await;
+        let shutdown = removals();
+        assert!(!shutdown.is_empty());
+        assert!(
+            shutdown
+                .iter()
+                .all(|(_, reason)| *reason == TerminalRemovalReason::Shutdown)
+        );
     }
 
     #[tokio::test]

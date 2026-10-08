@@ -31,7 +31,10 @@ use crate::{
     worktree_catalog::{WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry},
 };
 
-use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
+use super::{
+    local_servers,
+    workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError},
+};
 
 const PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS: usize = 160;
 
@@ -358,16 +361,49 @@ fn register_control_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalSe
             control.call(method, request.payload, cancellation)
         });
     }
-    for method in [
-        "subscribeServerConfig",
-        "subscribeServerLifecycle",
-        "subscribeDiscoveredLocalServers",
-    ] {
+    for method in ["subscribeServerConfig", "subscribeServerLifecycle"] {
         let control = services.control.clone();
         registry.register_stream(method, move |_request, cancellation| {
             control.subscribe(method, cancellation)
         });
     }
+    {
+        let terminal = services.terminal.clone();
+        registry.register_stream(
+            "subscribeDiscoveredLocalServers",
+            move |_request, cancellation| {
+                discovered_local_servers_stream(terminal.clone(), cancellation)
+            },
+        );
+    }
+}
+
+fn discovered_local_servers_stream(
+    terminal: TerminalManager,
+    cancellation: CancellationToken,
+) -> JsonStream {
+    spawn_stream(cancellation, move |sender, cancellation| async move {
+        let mut discovery = local_servers::Discovery::default();
+        loop {
+            let terminals = terminal.live_session_pids().await;
+            let servers = discovery.scan(&cancellation, terminals).await;
+            if cancellation.is_cancelled()
+                || sender
+                    .send(Ok(vec![json!({
+                        "servers": servers,
+                        "scannedAt": format_time(OffsetDateTime::now_utc()),
+                    })]))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                () = tokio::time::sleep(local_servers::SCAN_INTERVAL) => {}
+            }
+        }
+    })
 }
 
 fn register_diagnostics_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
@@ -1066,8 +1102,35 @@ fn validate_terminal_launch_command(
             ));
         }
     }
+    // Mirrors the contract's TerminalEnvSchema: this env is broadcast in
+    // terminal summaries, and one invalid entry would fail every client's decode.
+    if let Some(env) = command.env.as_ref() {
+        if env.len() > TERMINAL_COMMAND_ENV_MAX_ENTRIES {
+            return Err(invalid_request("command env has too many entries"));
+        }
+        if env.iter().any(|(key, value)| {
+            !is_terminal_env_key(key)
+                || value.encode_utf16().count() > TERMINAL_COMMAND_ENV_VALUE_MAX_LENGTH
+        }) {
+            return Err(invalid_request("command env is invalid"));
+        }
+    }
 
     Ok(Some(command))
+}
+
+const TERMINAL_COMMAND_ENV_MAX_ENTRIES: usize = 128;
+const TERMINAL_COMMAND_ENV_KEY_MAX_LENGTH: usize = 128;
+const TERMINAL_COMMAND_ENV_VALUE_MAX_LENGTH: usize = 8_192;
+
+/// `^[A-Za-z_][A-Za-z0-9_]*$`, at most 128 characters.
+fn is_terminal_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    key.len() <= TERMINAL_COMMAND_ENV_KEY_MAX_LENGTH
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|rest| rest.is_ascii_alphanumeric() || rest == '_')
 }
 
 #[derive(Deserialize)]
@@ -1082,6 +1145,8 @@ struct TerminalStartPayload {
     #[serde(default)]
     env: BTreeMap<String, String>,
     command: Option<TerminalLaunchCommand>,
+    #[serde(default)]
+    center_panel: bool,
 }
 
 impl TerminalStartPayload {
@@ -1103,6 +1168,7 @@ impl TerminalStartPayload {
             rows,
             env: self.env,
             command: validate_terminal_launch_command(self.command)?,
+            center_panel: self.center_panel,
         })
     }
 }
@@ -1121,6 +1187,8 @@ struct TerminalAttachPayload {
     #[serde(default)]
     restart_if_not_running: bool,
     command: Option<TerminalLaunchCommand>,
+    #[serde(default)]
+    center_panel: bool,
 }
 
 impl TerminalAttachPayload {
@@ -1136,6 +1204,7 @@ impl TerminalAttachPayload {
             env: self.env,
             restart_if_not_running: self.restart_if_not_running,
             command: validate_terminal_launch_command(self.command)?,
+            center_panel: self.center_panel,
         })
     }
 }
@@ -1845,6 +1914,7 @@ mod tests {
                 ],
                 label: None,
                 activity: None,
+                env: None,
             });
         } else {
             input.command = Some(TerminalLaunchCommand {
@@ -1852,6 +1922,7 @@ mod tests {
                 args: Vec::new(),
                 label: None,
                 activity: None,
+                env: None,
             });
         }
         input
@@ -1911,6 +1982,67 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovered_local_servers_stream_rescans_and_ends_on_cancellation() {
+        async fn next_snapshot(stream: &mut JsonStream) -> Value {
+            let mut values = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+                .await
+                .expect("discovery snapshot timeout")
+                .expect("discovery stream open")
+                .expect("discovery snapshot succeeds");
+            assert_eq!(values.len(), 1);
+            values.remove(0)
+        }
+
+        let root = tempfile::tempdir().expect("services root");
+        let services = real_terminal_services(root.path()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let cancellation = CancellationToken::new();
+        let mut discovery =
+            discovered_local_servers_stream(services.terminal.clone(), cancellation.clone());
+
+        let discovered = next_snapshot(&mut discovery).await;
+        assert!(discovered["scannedAt"].is_string());
+        let server = discovered["servers"]
+            .as_array()
+            .expect("servers array")
+            .iter()
+            .find(|server| server["port"] == port)
+            .expect("bound listener is discovered")
+            .clone();
+        assert_eq!(server["host"], "127.0.0.1");
+        assert_eq!(server["url"], format!("http://127.0.0.1:{port}/"));
+        assert_eq!(server["terminal"], Value::Null);
+
+        drop(listener);
+        let rescanned = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = next_snapshot(&mut discovery).await;
+                if snapshot["servers"]
+                    .as_array()
+                    .is_some_and(|servers| servers.iter().all(|server| server["port"] != port))
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("periodic discovery removes closed listener");
+        assert!(rescanned["scannedAt"].is_string());
+
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), discovery.recv())
+                .await
+                .expect("discovery cancellation timeout")
+                .is_none()
+        );
+        services.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2062,6 +2194,7 @@ mod tests {
                     args: vec!["  --dangerously-bypass-approvals-and-sandbox  ".to_owned()],
                     label: Some("Codex Terminal".to_owned()),
                     activity: None,
+                    env: None,
                 })
             );
         }
@@ -2076,6 +2209,7 @@ mod tests {
                 args: vec!["  --dangerously-bypass-approvals-and-sandbox  ".to_owned()],
                 label: Some("Codex Terminal".to_owned()),
                 activity: None,
+                env: None,
             })
         );
     }
@@ -2129,6 +2263,7 @@ mod tests {
                 args: vec!["\u{feff}--model\u{feff}".to_owned()],
                 label: Some("Codex Terminal".to_owned()),
                 activity: None,
+                env: None,
             })
         );
 
@@ -2147,6 +2282,7 @@ mod tests {
                 args: Vec::new(),
                 label: Some("\u{85}Codex Terminal\u{85}".to_owned()),
                 activity: None,
+                env: None,
             })
         );
 
@@ -2891,6 +3027,7 @@ mod tests {
             "terminalId":"terminal-2",
             "cwd":temp.path(),
             "env":{},
+            "centerPanel":true,
             "command": {
                 "executable": "/opt/codex",
                 "args": ["--dangerously-bypass-approvals-and-sandbox"],
@@ -2900,6 +3037,7 @@ mod tests {
         .expect("terminal start payload");
         let open = start.into_open(false).expect("default dimensions");
         assert_eq!((open.cols, open.rows), (120, 30));
+        assert!(open.center_panel);
         assert_eq!(
             open.command,
             Some(TerminalLaunchCommand {
@@ -2907,6 +3045,7 @@ mod tests {
                 args: vec!["--dangerously-bypass-approvals-and-sandbox".to_owned()],
                 label: Some("Codex Terminal".to_owned()),
                 activity: None,
+                env: None,
             })
         );
         let missing_dimensions: TerminalStartPayload = decode_payload(&json!({
@@ -2916,6 +3055,10 @@ mod tests {
             "env":{}
         }))
         .expect("terminal restart payload");
+        assert!(
+            !missing_dimensions.center_panel,
+            "centerPanel defaults to false"
+        );
         assert!(missing_dimensions.into_open(true).is_err());
         let attach: TerminalAttachPayload = decode_payload(&json!({
             "threadId":"thread-2",
@@ -2925,6 +3068,7 @@ mod tests {
             "rows":24,
             "env":{"UNIT":"1"},
             "restartIfNotRunning":true,
+            "centerPanel":true,
             "command": {
                 "executable": "/opt/codex",
                 "args": ["--dangerously-bypass-approvals-and-sandbox"],
@@ -2937,6 +3081,7 @@ mod tests {
             .expect("valid terminal attach payload");
         assert_eq!(attach.cols, Some(80));
         assert!(attach.restart_if_not_running);
+        assert!(attach.center_panel);
         assert_eq!(
             attach.command,
             Some(TerminalLaunchCommand {
@@ -2944,6 +3089,7 @@ mod tests {
                 args: vec!["--dangerously-bypass-approvals-and-sandbox".to_owned()],
                 label: Some("Codex Terminal".to_owned()),
                 activity: None,
+                env: None,
             })
         );
         assert!(decode_payload::<TerminalStartPayload>(&json!({})).is_err());
@@ -3094,8 +3240,9 @@ mod tests {
             terminal_metadata_to_wire(TerminalMetadataEvent::Remove {
                 thread_id: "thread".to_owned(),
                 terminal_id: "terminal".to_owned(),
-            })["type"],
-            "remove"
+                reason: crate::terminal::TerminalRemovalReason::Closed,
+            })["reason"],
+            "closed"
         );
         assert_eq!(effect_none()["_tag"], "None");
         assert_eq!(effect_some(json!(1))["value"], 1);
@@ -3199,5 +3346,27 @@ mod tests {
                 "message": "Codex reset request failed.",
             })
         );
+    }
+
+    #[test]
+    fn launch_command_env_is_validated_before_it_is_broadcast() {
+        let command = |env: Value| {
+            serde_json::from_value::<TerminalLaunchCommand>(
+                json!({"executable": "opencode", "args": [], "env": env}),
+            )
+            .expect("command shape")
+        };
+        let validate = |env: Value| validate_terminal_launch_command(Some(command(env)));
+        assert!(validate(json!({"OPENCODE_CONFIG_CONTENT": "{\"theme\":\"system\"}"})).is_ok());
+        assert!(validate(json!({"_UNDER_1": "v"})).is_ok());
+        assert!(validate(json!({"BAD-KEY": "v"})).is_err());
+        assert!(validate(json!({"1BAD": "v"})).is_err());
+        assert!(validate(json!({"": "v"})).is_err());
+        assert!(validate(json!({"K".repeat(129): "v"})).is_err());
+        assert!(validate(json!({"BIG": "x".repeat(8_193)})).is_err());
+        let many = (0..129)
+            .map(|index| (format!("K{index}"), json!("v")))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(validate(Value::Object(many)).is_err());
     }
 }

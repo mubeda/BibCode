@@ -32,6 +32,14 @@ export interface PullRequestsFilesProps {
   detail: PullRequestsDetail;
   projectRef: ScopedProjectRef;
   context: Extract<PullRequestsContext, { status: "available" }>;
+  /**
+   * The bulk apply-suggestions control, the pending review bar, and every
+   * per-file review action (threads, pending comments, the inline composer)
+   * only ever act on a live detail, never a snapshot. Omitting this falls
+   * back to `detail`, so callers that have not adopted the split keep
+   * acting as before.
+   */
+  live?: PullRequestsDetail | null;
 }
 const EMPTY_TIMELINE: PullRequestsTimeline = { items: [], truncated: false };
 const EMPTY_VIEWED: readonly string[] = [];
@@ -117,10 +125,17 @@ function UnanchoredReviewDrafts({
   paths,
   detail,
   projectRef,
+  live = true,
 }: {
   paths: ReadonlyMap<string, number>;
   detail: PullRequestsDetail;
   projectRef: ScopedProjectRef;
+  /**
+   * Editing or submitting these drafts only ever acts on a live detail,
+   * never a snapshot. Defaults to `true` so callers that have not adopted
+   * the split keep acting as before.
+   */
+  live?: boolean;
 }) {
   const pending = usePullRequestsStore(
     useShallow((s) =>
@@ -157,6 +172,7 @@ function UnanchoredReviewDrafts({
             projectRef={projectRef}
             number={detail.number}
             permission={detail.permissions.review}
+            live={live}
           />
         </div>
       ))}
@@ -169,6 +185,7 @@ function UnanchoredReviewDrafts({
           permission={detail.permissions.review}
           headSha={detail.headSha}
           patch=""
+          live={live}
         />
       ))}
     </section>
@@ -178,9 +195,11 @@ export const PullRequestsFiles = memo(function PullRequestsFiles({
   files,
   timeline = EMPTY_TIMELINE,
   detail,
+  live = detail,
   projectRef,
   context,
 }: PullRequestsFilesProps) {
+  const isLive = live !== null;
   const navigate = useNavigate();
   const { hash } = useLocation();
   const anchorPath = pathFromHash(hash);
@@ -307,9 +326,10 @@ export const PullRequestsFiles = memo(function PullRequestsFiles({
         viewed={viewedSet.has(item.path)}
         onToggleViewed={toggleViewed}
         ignoreWhitespace={ignoreWhitespace}
+        live={isLive}
       />
     ),
-    [detail, context, projectRef, threadsByPath, ignoreWhitespace, toggleViewed, viewedSet],
+    [detail, context, projectRef, threadsByPath, ignoreWhitespace, toggleViewed, viewedSet, isLive],
   );
   return (
     <PullRequestsSuggestionSelectionContext value={selection}>
@@ -318,7 +338,12 @@ export const PullRequestsFiles = memo(function PullRequestsFiles({
         className="flex min-h-0 flex-1 flex-col"
         data-text-surface="background"
       >
-        <PullRequestsPendingReviewBar detail={detail} context={context} projectRef={projectRef} />
+        <PullRequestsPendingReviewBar
+          detail={detail}
+          live={live}
+          context={context}
+          projectRef={projectRef}
+        />
         <header className="flex flex-wrap items-center justify-between gap-3 border-b border-panel-separator px-4 py-3 text-xs">
           <span>
             {files.files.length} files{" "}
@@ -331,6 +356,7 @@ export const PullRequestsFiles = memo(function PullRequestsFiles({
               permission={detail.permissions.applySuggestion}
               label={`Apply ${selected.size} selected`}
               onApplied={appliedSuggestions}
+              live={isLive}
             />
           ) : null}
           <label className="flex cursor-pointer items-center gap-2">
@@ -343,7 +369,12 @@ export const PullRequestsFiles = memo(function PullRequestsFiles({
             Ignore whitespace
           </label>
         </header>
-        <UnanchoredReviewDrafts paths={indices} detail={detail} projectRef={projectRef} />
+        <UnanchoredReviewDrafts
+          paths={indices}
+          detail={detail}
+          projectRef={projectRef}
+          live={isLive}
+        />
         {files.truncated ? (
           <p className="p-3 text-sm">
             <PullRequestsExternalLink href={detail.url}>

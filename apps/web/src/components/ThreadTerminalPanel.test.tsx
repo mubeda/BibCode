@@ -83,6 +83,10 @@ vi.mock("../state/use-atom-command", () => ({
   useAtomCommand: () => async () => ({ _tag: "Success" }),
 }));
 
+vi.mock("../state/use-atom-query-runner", () => ({
+  useAtomQueryRunner: () => async () => ({ _tag: "Success" }),
+}));
+
 vi.mock("../state/terminalSessions", () => ({
   useAttachedTerminalSession: () => ({
     buffer: "",
@@ -90,10 +94,6 @@ vi.mock("../state/terminalSessions", () => ({
     status: "running",
     version: 0,
   }),
-}));
-
-vi.mock("./preview/openTerminalLinkInPreview", () => ({
-  openTerminalLinkInPreview: async () => undefined,
 }));
 
 // Base UI popovers are interaction-heavy; replace with static stand-ins that

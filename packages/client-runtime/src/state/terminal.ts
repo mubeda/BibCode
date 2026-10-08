@@ -210,6 +210,16 @@ export function createTerminalEnvironmentAtoms<R, E>(
       label: "environment-data:terminal:events",
       tag: WS_METHODS.subscribeTerminalEvents,
     }),
+    /**
+     * Raw metadata stream for consumers that must tell explicit removals from
+     * snapshots. Each value is a whole delivered batch: an atom keeps only the
+     * last element of a chunk, which would drop removals.
+     */
+    metadataEvents: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:terminal:metadata-events",
+      tag: WS_METHODS.subscribeTerminalMetadata,
+      transform: Stream.chunks,
+    }),
     metadata: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:terminal:metadata",
       subscribe: (_input: null) =>
