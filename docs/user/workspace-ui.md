@@ -341,7 +341,7 @@ chat header `+` menu contains:
 - enabled AI providers, which create new chat panels
 - Reopen closed chat, which lists this thread's ten most recently closed chat
   panels, newest first; it is disabled with **No closed chats** when there are
-  none
+  none, and offers a retry when closed chats could not be loaded
 - Open Terminal, which creates a shell terminal panel in the current worktree
 - enabled provider terminal actions, which launch the selected provider CLI in
   the current worktree using that provider instance's configured binary path

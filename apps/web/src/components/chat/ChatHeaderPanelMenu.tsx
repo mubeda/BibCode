@@ -63,7 +63,7 @@ function ReopenClosedChatMenu(props: {
   onReopen: (threadId: ThreadId, providerLabel: string) => void;
 }) {
   const environmentIds = useMemo(() => [props.environmentId], [props.environmentId]);
-  const { snapshots, isLoading } = useArchivedThreadSnapshots(environmentIds);
+  const { snapshots, isLoading, error, refresh } = useArchivedThreadSnapshots(environmentIds);
   const closedChats = (snapshots[0]?.snapshot.threads ?? [])
     .flatMap((thread) =>
       thread.kind === "panel" &&
@@ -75,6 +75,20 @@ function ReopenClosedChatMenu(props: {
     .toSorted((left, right) => right.archivedAt.localeCompare(left.archivedAt))
     .slice(0, MAX_CLOSED_CHATS);
   const available = props.disabledReason === null && closedChats.length > 0;
+  if (props.disabledReason === null && closedChats.length === 0 && error !== null) {
+    // An empty list here would hide closed chats that exist; offer a retry instead.
+    return (
+      <MenuItem closeOnClick={false} onClick={refresh}>
+        <HistoryIcon className="size-4" />
+        <span className="flex min-w-0 flex-col">
+          <span>Reopen closed chat</span>
+          <span className="text-xs text-muted-foreground">
+            Couldn't load closed chats. Select to retry.
+          </span>
+        </span>
+      </MenuItem>
+    );
+  }
   const trigger = (
     <MenuSubTrigger
       className={props.disabledReason ? "data-disabled:pointer-events-auto" : undefined}

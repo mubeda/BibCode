@@ -12,7 +12,8 @@ const harness = vi.hoisted(() => ({
   archived: {
     snapshots: [] as Array<{ environmentId: string; snapshot: { threads: unknown[] } }>,
     isLoading: false,
-    error: null,
+    error: null as string | null,
+    refresh: (() => undefined) as () => void,
   },
 }));
 
@@ -101,7 +102,7 @@ beforeEach(() => {
   harness.providerTerminalActionDisabledReason = null;
   harness.providerTerminalFallback = null;
   harness.subTriggers.length = 0;
-  harness.archived = { snapshots: [], isLoading: false, error: null };
+  harness.archived = { snapshots: [], isLoading: false, error: null, refresh: vi.fn() };
 });
 
 function panelItem(overrides: Record<string, unknown> = {}) {
@@ -235,6 +236,19 @@ describe("ChatHeaderPanelMenu", () => {
     const { markup } = render(true);
     expect(harness.subTriggers[0]).toMatchObject({ disabled: true });
     expect(markup).toContain("No closed chats");
+  });
+
+  it("offers a retry instead of an empty list when closed chats fail to load", () => {
+    harness.archived.error = "Network unavailable";
+    const { markup } = render(true);
+    expect(markup).not.toContain("No closed chats");
+    expect(markup).toContain("Couldn&#x27;t load closed chats. Select to retry.");
+    const retry = harness.menuItems.find((item) =>
+      renderToStaticMarkup(<>{item.children as React.ReactNode}</>).includes("Reopen closed chat"),
+    );
+    expect(retry).toMatchObject({ closeOnClick: false });
+    (retry!.onClick as () => void)();
+    expect(harness.archived.refresh).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a visible chat provider without a registered terminal action in the chat section", () => {
