@@ -1,9 +1,9 @@
 # Resume continuity — design
 
 Status: approved by the user on 2026-10-08, first as the direction ("do the
-idle-suspension fix and implement t3 code gaps") and then explicitly as written
-here, including the decisions below. T3 Code
-(`/work/github/t3code`) is the reference implementation for parts 3–5.
+idle-suspension fix and implement the reference-implementation gaps") and then explicitly as written
+here, including the decisions below. The upstream reference implementation is
+the model for parts 3–5.
 
 ## Problems
 
@@ -77,7 +77,8 @@ and restart are separate paths and keep deleting their rows.
   agent received a summary of earlier messages.
 
 Rejected: a model-generated summary (cost, latency, a provider call that can
-itself fail). T3 Code uses a transcript-derived handoff with a token budget.
+itself fail). The reference implementation uses a transcript-derived handoff
+with a token budget.
 
 ### 4. Import CLI sessions per project
 
@@ -93,7 +94,8 @@ itself fail). T3 Code uses a transcript-derived handoff with a token budget.
   through a new server-internal command `thread.history.import` (one
   `thread.message-sent` per message, no turn), and writes a `suspended`
   `provider_session_runtime` row with the resume cursor so the next message
-  resumes the CLI session. Parsing, skip rules and limits follow T3 Code's
+  resumes the CLI session. Parsing, skip rules and limits follow the reference
+  implementation's
   `AgentSessionScanner`/`AgentSessionImporter`; Claude ids must be UUIDs.
 - Home resolution: Claude uses the instance `CLAUDE_CONFIG_DIR`, then the
   process env, then `~/.claude`; Codex uses the instance `homePath`, then
