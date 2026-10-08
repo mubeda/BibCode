@@ -395,6 +395,22 @@ describe("ChatMarkdown", () => {
       expect(markup).not.toContain("domain=%5Binvalid");
     });
 
+    it("never turns network or device paths into file links", async () => {
+      const markup = await renderMarkdown(
+        [
+          "[unc url](file:////server/share/x.html)",
+          "[host url](file://server/share/y.html)",
+          "[slashes](//server/share/z.html)",
+        ].join("\n\n"),
+      );
+
+      expect(markup).not.toContain("chat-markdown-file-link");
+      expect(markup).not.toContain('href="//server/share/x.html"');
+      expect(markup).not.toContain('href="/share/y.html"');
+      // A protocol-relative destination stays an ordinary web link.
+      expect(markup).toContain('href="//server/share/z.html"');
+    });
+
     it("computes deeper suffixes and preserves line-only file references", async () => {
       const markup = await renderMarkdown(
         [

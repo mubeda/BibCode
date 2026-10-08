@@ -2291,9 +2291,15 @@ never count a sandbox-denied listener test as passed or skipped.
     the request URL; the comment model has no host permalink.
 13. Add single-line and reverse-drag multi-line inline comments; insert a
     suggestion with the selected new source lines. Verify amber pending cards,
-    Edit/Remove, the sticky counter in both tabs, and review submission. Reload
-    while comment, reply, edit, inline, and review-summary drafts exist and
-    verify they survive. Unrenderable lines must retain draft cards below the diff.
+    Edit/Remove, the sticky counter in both tabs, and review submission. On
+    GitLab, Overview shows **Approve** under the description, with **Approval
+    is optional** when the host requires none, otherwise the approved/required
+    count. It stays inactive with **Loading…** until the live detail succeeds,
+    and choosing it approves the current head without opening **Review** and
+    without posting pending inline comments. After approval the same control
+    is **Revoke approval**. A denied account still sees **Approve** with the
+    server reason. Reload while comment, reply, edit, inline, and review-summary
+    drafts exist and verify they survive. Unrenderable lines must retain draft cards below the diff.
 14. Exercise full-success, zero-landed, and partial-landed review receipts with
     controlled fixtures or an authorized test host. Only failed comments stay
     pending by path, line, and body; identical duplicate drafts retain their
@@ -2588,6 +2594,65 @@ diagnostic frames separate from acceptance evidence.
 
 Authentication-dependent scenarios must be reported as unavailable when the
 native host has no suitable credentials. Never copy secrets into evidence.
+
+### Integrated browser link routing
+
+Run on the packaged desktop app (macOS 14+, Windows, Linux) with a disposable
+thread whose workspace contains `index.html`, a `.pdf`, and a `.txt`. Repeat
+each row with **Settings → General → Open links in** set to **BiBCode browser**
+and **System browser**; the modifier must always select the other target.
+Record, per row, where the link landed (BiBCode browser tab, system browser,
+editor, or notice). In a browser tab (web mode), **Open links in** is not shown.
+
+- Chat `http(s)` link: plain click, Ctrl/Cmd-click, Shift-click, Alt-click, and
+  middle-click. Right-click offers **Open in BiBCode browser**, **Open in
+  system browser**, and **Copy link**; other link types show no custom menu. An `.html` or `.pdf` file chip opens in the BiBCode browser, and
+  any modifier-click opens the editor. A file outside the workspace shows the
+  notice with **Open in editor**.
+- Terminal URL: plain click does nothing; Ctrl/Cmd-click opens the setting's
+  target; Ctrl/Cmd+Shift-click opens the other.
+- OSC 8: `printf '\e]8;;https://example.com\e\\example.com\e]8;;\e\\\n'` opens
+  on Ctrl/Cmd-click with no menu (text matches destination). With
+  `printf '\e]8;;https://example.com\e\\docs\e]8;;\e\\\n'` a menu shows
+  **Open …** and **Copy link**; plain click does nothing.
+- Terminal paths: `index.html`, an absolute `.html` path, a `file:///…/x.pdf`
+  URL, and a `.txt` path. HTML and PDF open in the BiBCode browser and with
+  Ctrl/Cmd+Shift in the editor; `.txt` opens in the editor. On any platform,
+  `\\server\share\x.html`, `//server/share/x.html`, and `\\.\C:\x.html` print
+  "Network paths can't be opened from the terminal." and open nothing;
+  `file://server/share/x.html` prints "Unable to open this file link." A
+  relative `x.html` under a UNC working directory (WSL `\\wsl.localhost\…`)
+  still opens. With the thread's environment disconnected, an HTML path shows
+  "Couldn't preview this file" with **Open in editor**.
+- Preview tab `target=_blank` link and `window.open` popup open a new tab in the
+  same thread; `window.open('about:blank')` opens nothing. Git Manager pull
+  request title opens in the system browser, not nowhere.
+- Agent `preview_open` opens a tab, shows it (also with `show: false`), and
+  reports success; `preview_navigate` then loads a new URL in it. Snapshot,
+  click, and type are still unsupported and report so.
+- Loopback links (`http://localhost:3000`, `127.0.0.2`, `0.0.0.0`, `[::]`,
+  `app.localhost`): from a local thread they open locally; from an SSH or
+  BiBCode Connect thread they show "Can't open this address here" with the
+  address and **Copy link** for both targets, never this computer's localhost;
+  from a LAN, tailnet, WSL, or host-name (`devbox`) thread they open on the
+  server's address.
+- A failed system-browser open (no handler registered) shows the link with
+  **Copy link**.
+- Agent-written asset response: `curl -sI '<signed /api/assets URL>'` for an
+  HTML file shows a `content-security-policy` header of
+  `sandbox allow-scripts allow-forms allow-popups`; for SVG, XML, and any other `+xml` type, of
+  `default-src 'none'; style-src 'unsafe-inline'; sandbox`; a `.txt` or raster
+  image asset has none. In the BiBCode browser, a script
+  in the HTML reads `localStorage` and `document.cookie` as unavailable.
+- Port attribution: start `python3 -m http.server 8123` in a thread's terminal;
+  the port appears in that thread's and terminal's discovered ports (port
+  card), and not under another thread's terminal.
+
+Pending native checks (not covered by automated tests; mark each unavailable if
+the host cannot run it): Ctrl+Shift-click while a mouse-tracking TUI (Codex or
+opencode) runs must invert the target, not the TUI's selection; an OSC 8 link
+printed by a real CLI (a CLI that emits `https` hyperlinks) behaves as above;
+Linux/Wayland preview popups open as tabs; Windows UNC refusal as above.
 
 ## Non-native compatibility audit
 

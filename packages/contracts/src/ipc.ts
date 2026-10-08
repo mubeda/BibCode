@@ -1427,6 +1427,8 @@ export interface DesktopPreviewBridge {
     waitFor: (tabId: string, input: PreviewAutomationWaitForInput) => Promise<void>;
   };
   onStateChange: (listener: (tabId: string, state: DesktopPreviewTabState) => void) => () => void;
+  /** A page in a preview tab asked to open a new window (popup or target=_blank). */
+  onNewWindowRequest: (listener: (tabId: string, url: string) => void) => () => void;
   onPointerEvent: (listener: (event: DesktopPreviewPointerEvent) => void) => () => void;
 }
 

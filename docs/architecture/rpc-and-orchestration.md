@@ -573,7 +573,31 @@ Browser and desktop clients use these same typed unary RPCs; native actions such
 as opening a host URL retain the existing DesktopBridge/local API boundary.
 Reads begin on route/tab/picker open, user filters/pagination, Refresh, Rescan,
 or successful-action invalidation. No timer, window focus, constructor, or idle
-worker initiates provider traffic. `pullRequests.getContext` accepts an optional
+worker initiates provider traffic. A mounted GitLab merge request list or
+detail route opens `pullRequests.subscribe` only while the document is
+visible, paints from `pullRequests.readSnapshot` (display copies in SQLite;
+zero host calls), and keeps the client's 20 s mounted-query refresh timer
+paused from the subscription's first, all-false event until the subscription
+ends. Successful unary `list` (first page), `get`, `getTimeline`, `getCommits`,
+`getChecks`, and `getFiles` reads store those display copies. One server poller
+per list key runs the list read and one merge-request probe `GET` 20 s after
+each tick, stores the list page and the probe fingerprint, and emits the names
+of the query families that changed; it never runs the detail, timeline,
+commits, checks, or files reads. The client answers `list` with
+`readSnapshot`, keeping whichever copy has the newer `observedAt` (a live first
+page counts as observed at the newest stored copy already seen), and answers
+the other names with the unary reads. Every subscriber of a list key receives
+its list events, but only the open number of the subscriber driving the poller
+is probed, so a second window open on another number of the same list key
+gets list events only. Hiding the document or leaving the route drops the
+subscription, resumes the client timer, and stops the shared poller when no
+subscriber remains. The route still prefetches `get` plus `getTimeline` for a
+row hovered 150 ms, at most two per environment, and an open within 5 s of that
+prefetch shows it without reading again. `pullRequests.runAction` and
+`pullRequests.checkout` re-read the host and do not use snapshots; a successful
+`runAction` deletes that number's rows. GitHub routes do not subscribe. The
+explicit Refresh action is unchanged. `pullRequests.getContext` accepts an
+optional
 `rescan`: without it the server reuses its bounded 30 s probe and host-context
 answers (the origin is still read); with it the server clears those caches and
 forgets the origin host's recorded provider before resolving. Only Rescan and

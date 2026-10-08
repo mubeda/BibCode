@@ -7,6 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -14,10 +15,12 @@ use crate::{
     pull_requests::{
         ContextRead, PullRequestsService,
         error::PullRequestsOperationError,
-        model::{ActionRequest, ListQuery, VocabularyKind},
+        model::{self, ActionRequest, ListQuery, SubscribeInput, VocabularyKind},
     },
-    rpc::{RpcRegistry, RpcRequest, RpcResult},
+    rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
 };
+
+const SUBSCRIBE_STREAM_CAPACITY: usize = 8;
 
 pub const PULL_REQUESTS_UNARY_METHODS: &[&str] = &[
     "pullRequests.getContext",
@@ -31,7 +34,10 @@ pub const PULL_REQUESTS_UNARY_METHODS: &[&str] = &[
     "pullRequests.getFiles",
     "pullRequests.runAction",
     "pullRequests.checkout",
+    "pullRequests.readSnapshot",
 ];
+
+pub const PULL_REQUESTS_STREAM_METHODS: &[&str] = &["pullRequests.subscribe"];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PullRequestsRpcServices;
@@ -42,8 +48,11 @@ impl PullRequestsRpcServices {
         repositories: Repositories,
         provider_hosts: Arc<crate::source_control::ProviderHosts>,
     ) -> ConfiguredPullRequestsRpcServices {
+        let database = repositories.database().clone();
         ConfiguredPullRequestsRpcServices {
-            service: PullRequestsService::new(state_dir).with_provider_hosts(provider_hosts),
+            service: PullRequestsService::new(state_dir)
+                .with_provider_hosts(provider_hosts)
+                .with_database(database),
             repositories: Some(repositories),
             worktrees: None,
         }
@@ -102,6 +111,14 @@ impl ConfiguredPullRequestsRpcServices {
         self.handle_mutation_unary(request, cancellation).await
     }
 
+    pub fn subscribe(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<RpcStreamChunk> {
+        self.handle_subscribe(request, cancellation)
+    }
+
     async fn handle_read_unary(
         &self,
         request: RpcRequest,
@@ -158,6 +175,14 @@ impl ConfiguredPullRequestsRpcServices {
                 validate_cwd(&cwd, operation)?;
                 encode(
                     self.service.list(&cwd, input, &cancellation).await,
+                    operation,
+                )
+            }
+            "pullRequests.readSnapshot" => {
+                let input: SubscribeInput = decode(request.payload, operation)?;
+                validate_cwd(Path::new(&input.list.cwd), operation)?;
+                encode(
+                    self.service.read_snapshot(input, &cancellation).await,
                     operation,
                 )
             }
@@ -299,6 +324,50 @@ impl ConfiguredPullRequestsRpcServices {
             "unavailable"
         )))
     }
+
+    fn handle_subscribe(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<RpcStreamChunk> {
+        let (sender, receiver) = mpsc::channel(SUBSCRIBE_STREAM_CAPACITY);
+        let service = self.service.clone();
+        let operation = request.tag.clone();
+        tokio::spawn(async move {
+            let input = match decode::<SubscribeInput>(request.payload, &operation) {
+                Ok(input) => input,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+            };
+            if let Err(error) = validate_cwd(Path::new(&input.list.cwd), &operation) {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+            let emit = forward_changed_to_stream(sender.clone());
+            if let Err(error) = service.subscribe(input, &emit, &cancellation).await {
+                let _ = sender.send(Err(json!(error))).await;
+            }
+        });
+        receiver
+    }
+}
+
+/// The poller calls `emit` synchronously from inside its tick; a plain `Fn`
+/// cannot await the channel, so a dropped send under backpressure simply
+/// skips that one change notification. The client's own `readSnapshot` call
+/// stays authoritative for the stored payload.
+///
+/// Extracted so a regression test can assert this forwards onto the stream
+/// directly: `pullRequests.subscribe` previously wired a no-op emit closure
+/// here, which silently dropped every poller change event.
+fn forward_changed_to_stream(
+    sender: mpsc::Sender<RpcStreamChunk>,
+) -> impl Fn(model::Changed) + Send + Sync {
+    move |changed: model::Changed| {
+        let _ = sender.try_send(Ok(vec![json!(changed)]));
+    }
 }
 
 #[derive(Deserialize)]
@@ -378,6 +447,12 @@ pub fn register_pull_requests_rpc(
             });
         }
     }
+    for method in PULL_REQUESTS_STREAM_METHODS {
+        let services = services.clone();
+        registry.register_stream(*method, move |request, cancellation| {
+            services.subscribe(request, cancellation)
+        });
+    }
 }
 
 #[cfg(test)]
@@ -406,7 +481,7 @@ mod tests {
         assert!(registry.validate_complete().is_err());
         register_pull_requests_rpc(&mut registry, PullRequestsRpcServices);
         registry.validate_complete().unwrap();
-        assert_eq!(PULL_REQUESTS_UNARY_METHODS.len(), 11);
+        assert_eq!(PULL_REQUESTS_UNARY_METHODS.len(), 12);
     }
 
     #[tokio::test]
@@ -437,6 +512,29 @@ mod tests {
                 json!({"_tag":"PullRequestsOperationError","operation":format!("pullRequests.{method}"),"code":"unavailable","message":"Not implemented in this server build.","hostDetail":null,"retryable":false})
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pull_requests_subscribe_emit_forwards_changed_events_onto_the_stream() {
+        // Guards against `handle_subscribe` ever going back to the no-op emit
+        // closure it shipped with before the poller's change events were wired
+        // through: a dropped event here would mean the client never repaints.
+        let (sender, mut receiver) = mpsc::channel(SUBSCRIBE_STREAM_CAPACITY);
+        let emit = forward_changed_to_stream(sender);
+        let changed = model::Changed {
+            list: true,
+            detail: false,
+            timeline: true,
+            commits: false,
+            checks: false,
+            files: false,
+        };
+        emit(changed.clone());
+        let chunk = receiver
+            .recv()
+            .await
+            .expect("the emitted change must reach the RPC stream");
+        assert_eq!(chunk, Ok(vec![json!(changed)]));
     }
 
     #[tokio::test]
