@@ -706,7 +706,7 @@ it("requires child IPC readiness and preserves the primary late-tail fixture err
     "utf8",
   );
   const begin = tests.indexOf(
-    'it("retains late stdout and waits for close after the normal command exits"',
+    'it("joins the owned writer after parent close with platform-correct stdout"',
   );
   const end = tests.indexOf('it.each(["raw",', begin);
   const body = tests.slice(begin, end);

@@ -982,8 +982,12 @@ Run the declared helper and Pester controls before the native job. Local source,
 TempFS or fake-command tests do not prove WSL, Windows ACLs or native originals.
 The cheap Windows caller workflow also installs the existing frozen Node
 workspace and runs the same fixed native helper set before any costly WSL
-build. Its real late-stdout fixture uses the owned child IPC-ready acknowledgement
-before the parent exits and joins completion before removing TempFS. Linux
+build. Its real process fixture uses the owned child IPC-ready acknowledgement before
+the parent exits and joins the writer exit marker before removing TempFS. POSIX
+requires the flushed inherited late tail; Windows requires the exact parent
+output and avoids writing to its already closed inherited pipe. All-host inert
+collector cases require data before close to be retained and exit alone not to
+settle the result. Linux
 UID/chmod/AppImage/D-Bus backend cases remain actual Linux CI requirements;
 all-host inert metadata guard cases preserve their behavior without claiming
 Windows ACL or native ownership. Portable Windows capture/evidence fixtures pass

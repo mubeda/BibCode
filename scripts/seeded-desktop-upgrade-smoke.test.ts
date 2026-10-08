@@ -1711,17 +1711,31 @@ describe("seeded packaged desktop upgrade harness", () => {
     }
   });
 
-  it("retains late stdout and waits for close after the normal command exits", async () => {
+  it("joins the owned writer after parent close with platform-correct stdout", async () => {
     const root = await NodeFS.promises.mkdtemp(
       NodePath.join(NodeOS.tmpdir(), "bibcode-command-close-"),
     );
     const finishedPath = NodePath.join(root, "writer-finished"),
       readyPath = NodePath.join(root, "writer-ready");
     const writerSource = `
+      const windows = ${JSON.stringify(HostProcessPlatform.defaultValue() === "win32")};
+      process.on("exit", (code) => {
+        require("node:fs").writeFileSync(${JSON.stringify(finishedPath)}, code === 0 ? "finished" : "failed");
+      });
+      let finishing = false;
+      const finish = (error) => {
+        if (finishing) return;
+        finishing = true;
+        process.exit(error && error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED" ? 1 : 0);
+      };
+      process.stdout.on("error", finish);
       setTimeout(() => {
-        process.stdout.write("late-tail", () => {
-          require("node:fs").writeFileSync(${JSON.stringify(finishedPath)}, "finished");
-        });
+        try {
+          // Windows closes the parent's inherited pipe; do not issue an unsupported write.
+          // POSIX retains the inherited pipe and proves the flushed late tail.
+          if (windows) finish();
+          else process.stdout.write("late-tail", finish);
+        } catch (error) { finish(error); }
       }, 125);
       process.send("writer-ready");
     `;
@@ -1767,12 +1781,20 @@ describe("seeded packaged desktop upgrade harness", () => {
         probe: async () => NodeFS.existsSync(finishedPath),
       });
       writerJoined = true;
+      expect(await NodeFS.promises.readFile(finishedPath, "utf8")).toBe("finished");
     } catch (error) {
       if (!failed) original = error;
       failed = true;
     } finally {
       // Never delete a root while the bounded owned writer may still use it.
-      if (writerJoined) await NodeFS.promises.rm(root, { recursive: true, force: true });
+      if (writerJoined) {
+        try {
+          await NodeFS.promises.rm(root, { recursive: true, force: true });
+        } catch (error) {
+          if (!failed) original = error;
+          failed = true;
+        }
+      }
     }
     if (failed) throw original;
   });
