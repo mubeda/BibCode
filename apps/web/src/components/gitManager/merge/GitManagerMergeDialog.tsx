@@ -52,6 +52,7 @@ import {
   resolveMergeConfirmCopy,
   summarizeMergePreview,
 } from "./GitManagerMergeDialog.logic";
+import { resolveFetchRemote } from "./resolveFetchRemote";
 
 // The mode buttons carry `aria-pressed`, which the shared Button styles do not
 // read (they key on Base UI's `data-pressed`), so the selected mode needs its
@@ -61,6 +62,7 @@ const MERGE_MODE_BUTTON_CLASS =
 
 const NO_RECENT_BRANCHES: ReadonlyArray<string> = Object.freeze([]);
 const NO_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
+const NO_REMOTES: ReadonlyArray<string> = Object.freeze([]);
 // Repository-wide blocks that apply whatever the source is, so a remote source (which has
 // no per-branch guards) still shows them before the click.
 const REPOSITORY_BLOCK_CODES: ReadonlySet<string> = new Set([
@@ -89,8 +91,16 @@ export interface GitManagerMergeDialogProps {
   readonly mergeIntoAvailable?: boolean;
   /** "current-branch" merges only into the checked-out branch and hides the Into picker. */
   readonly targetMode?: "any-target" | "current-branch";
+  /** Remotes the Fetch button refreshes; no Fetch button when empty. */
+  readonly remotes?: ReadonlyArray<string>;
+  /** Why the owner's refs failed to load; shown with Retry (`onRefsStale`) when no source is listed. */
+  readonly refsError?: string | null;
   readonly onOpenChange: (open: boolean) => void;
   readonly onFinished?: () => void;
+  /** Called after a successful fetch so the owner reloads its refs. */
+  readonly onRefsStale?: () => void;
+  /** Reports whether a fetch or merge started here is running. */
+  readonly onRunningChange?: (running: boolean) => void;
 }
 
 function MergeSourceButton({
@@ -125,8 +135,12 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   disabledReason: capabilityDisabledReason = null,
   mergeIntoAvailable = false,
   targetMode = "any-target",
+  remotes = NO_REMOTES,
+  refsError = null,
   onOpenChange,
   onFinished = noop,
+  onRefsStale = noop,
+  onRunningChange = noop,
 }: GitManagerMergeDialogProps) {
   const registry = useContext(RegistryContext);
   const { environmentId, cwd } = scope;
@@ -139,9 +153,16 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   const [failureMessage, setFailureMessage] = useState<string | null>(null);
   const [operationRunning, setOperationRunning] = useState(false);
   const activeOperationRef = useRef<GitManagerOperationHandle | null>(null);
+  const onRunningChangeRef = useRef(onRunningChange);
+  useEffect(() => {
+    onRunningChangeRef.current = onRunningChange;
+  }, [onRunningChange]);
   useEffect(
     () => () => {
-      activeOperationRef.current?.cancel();
+      if (activeOperationRef.current === null) return;
+      activeOperationRef.current.cancel();
+      // The owner outlives this dialog; it must not stay busy for a cancelled operation.
+      onRunningChangeRef.current(false);
     },
     [],
   );
@@ -188,7 +209,9 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
     remoteSourceOptions[0] ??
     null;
   const selectedSource = selectedOption?.ref ?? null;
-  const effectiveMode = intoOtherBranch ? "merge" : mode;
+  // Merge into another branch, and the Source Control entry, record a merge commit only.
+  const mergeCommitOnly = intoOtherBranch || targetMode === "current-branch";
+  const effectiveMode = mergeCommitOnly ? "merge" : mode;
   const operationTag = intoOtherBranch
     ? "merge-into"
     : effectiveMode === "merge"
@@ -229,6 +252,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
     [capabilityDisabledReason, cwd, environmentId, intoOtherBranch, open, selectedSource, target],
   );
   const previewQuery = useEnvironmentQuery(previewAtom);
+  const refreshPreview = previewQuery.refresh;
   // A cached preview for another source or target must not enable Merge.
   const preview =
     previewQuery.data !== null &&
@@ -273,11 +297,91 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   const close = useCallback(() => {
     if (!operationRunning) onOpenChange(false);
   }, [onOpenChange, operationRunning]);
+  const setRunning = useCallback(
+    (running: boolean) => {
+      setOperationRunning(running);
+      onRunningChange(running);
+    },
+    [onRunningChange],
+  );
   const cancelOperation = useCallback(() => {
     activeOperationRef.current?.cancel();
     activeOperationRef.current = null;
-    setOperationRunning(false);
-  }, []);
+    setRunning(false);
+  }, [setRunning]);
+  /** Runs one operation, showing its events and any failure; `onEvent` decides what follows. */
+  const startOperation = useCallback(
+    (input: GitManagerOperationRequest, onEvent: (event: GitManagerOperationEvent) => void) => {
+      setOperationEvent({ _tag: "started", operation: input._tag });
+      const handle = runGitManagerOperation(registry, { environmentId, input }, (event) => {
+        setOperationEvent(event);
+        if (event._tag === "failed") {
+          setRunning(false);
+          setFailureCode(event.code);
+          setFailureMessage(event.blocked?.message ?? event.message);
+        }
+        onEvent(event);
+      });
+      activeOperationRef.current = handle;
+      void handle.result.then((result) => {
+        if (activeOperationRef.current === handle) activeOperationRef.current = null;
+        if (result._tag !== "Failure" || Cause.hasInterruptsOnly(result.cause)) return;
+        const error = Cause.squash(result.cause);
+        const message = error instanceof Error ? error.message : "The Git operation failed.";
+        setRunning(false);
+        setFailureCode("transport-error");
+        setFailureMessage(message);
+        setOperationEvent({
+          _tag: "failed",
+          operation: input._tag,
+          code: "transport-error",
+          message,
+          blocked: null,
+        });
+      });
+    },
+    [environmentId, registry, setRunning],
+  );
+  const fetchRemotes = useCallback(() => {
+    if (activeOperationRef.current !== null) return;
+    const queue = [...resolveFetchRemote(selectedSource, remotes)];
+    setFailureCode(null);
+    setFailureMessage(null);
+    setRunning(true);
+    let fetchedAny = false;
+    const reloadRefs = () => {
+      onRefsStale();
+      refreshPreview();
+    };
+    const fetchNext = () => {
+      const remote = queue.shift();
+      if (remote === undefined) {
+        setRunning(false);
+        reloadRefs();
+        return;
+      }
+      startOperation({ _tag: "fetch", cwd, projectId: projectRef.projectId, remote }, (event) => {
+        if (event._tag === "finished") {
+          fetchedAny = true;
+          activeOperationRef.current = null;
+          fetchNext();
+        } else if (event._tag === "failed" && fetchedAny) {
+          // Earlier remotes did update the repository; show what they fetched.
+          reloadRefs();
+        }
+      });
+    };
+    fetchNext();
+  }, [
+    cwd,
+    onRefsStale,
+    projectRef.projectId,
+    refreshPreview,
+    remotes,
+    selectedSource,
+    setRunning,
+    startOperation,
+  ]);
   const confirm = useCallback(() => {
     if (confirmDisabled || selectedSource === null || activeOperationRef.current !== null) return;
     const input: GitManagerOperationRequest =
@@ -298,48 +402,35 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
           };
     setFailureCode(null);
     setFailureMessage(null);
-    setOperationRunning(true);
-    setOperationEvent({ _tag: "started", operation: operationTag });
-    const handle = runGitManagerOperation(registry, { environmentId, input }, (event) => {
-      setOperationEvent(event);
-      if (event._tag === "failed") {
-        setOperationRunning(false);
-        setFailureCode(event.code);
-        setFailureMessage(event.blocked?.message ?? event.message);
-      } else if (event._tag === "finished") {
-        setOperationRunning(false);
+    setRunning(true);
+    startOperation(input, (event) => {
+      if (event._tag === "finished") {
+        setRunning(false);
+        onFinished();
+        onOpenChange(false);
+      } else if (
+        event._tag === "failed" &&
+        event.code === "conflicts" &&
+        input._tag === "merge" &&
+        targetMode === "current-branch"
+      ) {
+        // The merge is now in progress in this checkout; its owner shows the conflict strip.
         onFinished();
         onOpenChange(false);
       }
     });
-    activeOperationRef.current = handle;
-    void handle.result.then((result) => {
-      if (activeOperationRef.current === handle) activeOperationRef.current = null;
-      if (result._tag !== "Failure" || Cause.hasInterruptsOnly(result.cause)) return;
-      const error = Cause.squash(result.cause);
-      const message = error instanceof Error ? error.message : "The merge operation failed.";
-      setOperationRunning(false);
-      setFailureCode("transport-error");
-      setFailureMessage(message);
-      setOperationEvent({
-        _tag: "failed",
-        operation: operationTag,
-        code: "transport-error",
-        message,
-        blocked: null,
-      });
-    });
   }, [
     confirmDisabled,
     cwd,
-    environmentId,
     onFinished,
     onOpenChange,
     operationTag,
     projectRef.projectId,
-    registry,
     selectedSource,
+    setRunning,
+    startOperation,
     target,
+    targetMode,
   ]);
 
   return (
@@ -397,7 +488,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
             >
               Merge commit
             </Button>
-            {intoOtherBranch ? null : (
+            {mergeCommitOnly ? null : (
               <Button
                 aria-pressed={effectiveMode === "squash"}
                 className={MERGE_MODE_BUTTON_CLASS}
@@ -409,27 +500,49 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
               </Button>
             )}
           </div>
-          <label className="relative block">
-            <SearchIcon
-              aria-hidden="true"
-              className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
-            />
-            <span className="sr-only">Filter source branches</span>
-            <Input
-              aria-label="Filter source branches"
-              className="[&_input]:pl-7"
-              placeholder="Filter branches…"
-              size="sm"
-              type="search"
-              value={filter}
-              onChange={changeFilter}
-            />
-          </label>
+          <div className="flex items-center gap-2">
+            <label className="relative block min-w-0 flex-1">
+              <SearchIcon
+                aria-hidden="true"
+                className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
+              />
+              <span className="sr-only">Filter source branches</span>
+              <Input
+                aria-label="Filter source branches"
+                className="[&_input]:pl-7"
+                placeholder="Filter branches…"
+                size="sm"
+                type="search"
+                value={filter}
+                onChange={changeFilter}
+              />
+            </label>
+            {remotes.length === 0 ? null : (
+              <Button
+                disabled={operationRunning || capabilityDisabledReason !== null}
+                size="sm"
+                title={capabilityDisabledReason ?? "Fetch the latest branches from the remote"}
+                variant="outline"
+                onClick={fetchRemotes}
+              >
+                Fetch
+              </Button>
+            )}
+          </div>
           <div
             aria-label="Source branches"
             className="max-h-44 overflow-auto rounded-md border border-border"
           >
-            {localSourceOptions.length === 0 && remoteSourceOptions.length === 0 ? (
+            {localSourceOptions.length === 0 &&
+            remoteSourceOptions.length === 0 &&
+            refsError !== null ? (
+              <div className="space-y-2 p-3 text-xs" role="alert">
+                <p className="text-destructive">{refsError}</p>
+                <Button size="xs" variant="outline" onClick={onRefsStale}>
+                  Retry
+                </Button>
+              </div>
+            ) : localSourceOptions.length === 0 && remoteSourceOptions.length === 0 ? (
               <p className="p-3 text-xs text-muted-foreground">No source branches found.</p>
             ) : (
               <>

@@ -9,6 +9,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vite-
 import { joinWorkspacePath } from "./files/FileTreeContextMenu.logic";
 import type { WorkingTreeFile } from "./SourceControlPanel.logic";
 
+import type { GitManagerMergeDialogProps } from "./gitManager/merge/GitManagerMergeDialog";
 import type { GitManagerCreatePullRequestDialogProps } from "./gitManager/provider/GitManagerCreatePullRequestDialog";
 
 type EffectCallback = () => void | (() => void);
@@ -112,6 +113,7 @@ const testState = vi.hoisted(() => ({
   isBusy: false,
   primaryEnvironmentId: null as unknown,
   pullRequestBranchSelection: true,
+  mergeCapabilities: true,
   availableEditors: [] as string[],
   preferredEditor: null as string | null,
   localApi: undefined as unknown,
@@ -186,6 +188,7 @@ interface CapturedTextareaProps {
 
 const captured = vi.hoisted(() => ({
   createPullRequest: null as GitManagerCreatePullRequestDialogProps | null,
+  merge: null as GitManagerMergeDialogProps | null,
   buttons: [] as CapturedButtonProps[],
   menuItems: [] as CapturedMenuItemProps[],
   sections: [] as CapturedSectionProps[],
@@ -194,6 +197,7 @@ const captured = vi.hoisted(() => ({
   commits: [] as Array<{ reloadToken: number; nowMs: number; gitCwd: string | null }>,
   clear() {
     this.createPullRequest = null;
+    this.merge = null;
     this.buttons = [];
     this.menuItems = [];
     this.sections = [];
@@ -207,6 +211,19 @@ vi.mock("./gitManager/provider/GitManagerCreatePullRequestDialog", () => ({
   GitManagerCreatePullRequestDialog: (props: GitManagerCreatePullRequestDialogProps) => {
     captured.createPullRequest = props;
     return null;
+  },
+}));
+
+vi.mock("./gitManager/merge/GitManagerMergeDialog", () => ({
+  GitManagerMergeDialog: (props: GitManagerMergeDialogProps) => {
+    captured.merge = props;
+    return null;
+  },
+}));
+
+vi.mock("~/state/gitManager", () => ({
+  gitManagerEnvironment: {
+    getRefs: (args: unknown) => ({ kind: "refs-atom", args }),
   },
 }));
 
@@ -248,7 +265,11 @@ vi.mock("~/state/entities", () => ({
   useServerConfigs: () => ({
     get: () => ({
       environment: {
-        capabilities: { gitPullRequestBranchSelection: testState.pullRequestBranchSelection },
+        capabilities: {
+          gitPullRequestBranchSelection: testState.pullRequestBranchSelection,
+          gitManagerStashMergeOperations: testState.mergeCapabilities,
+          gitManagerBranchSyncOperations: testState.mergeCapabilities,
+        },
       },
     }),
   }),
@@ -633,6 +654,7 @@ beforeEach(() => {
   testState.setGroupByFolder.mockReset();
   testState.primaryEnvironmentId = ENVIRONMENT_ID;
   testState.pullRequestBranchSelection = true;
+  testState.mergeCapabilities = true;
   testState.availableEditors = ["vscode"];
   testState.preferredEditor = "vscode";
   testState.localApi = { shell: { openExternal: vi.fn() } };
@@ -1720,5 +1742,53 @@ describe("SourceControlPanel", () => {
     expect(commit?.disabled).toBe(true);
     expect(markup).toContain('data-testid="menu-trigger" data-disabled="true"');
     expect(sectionByTitle("Staged Changes")?.disabled).toBe(true);
+  });
+});
+
+describe("SourceControlPanel — Merge into current branch", () => {
+  const PROJECT_REF = { environmentId: ENVIRONMENT_ID, projectId: "project-1" } as NonNullable<
+    PanelProps["projectRef"]
+  >;
+
+  it("opens the merge dialog in current-branch mode for the thread's project", () => {
+    testState.statusQuery = { ...testState.statusQuery, data: status() };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    const item = menuItemByText("Merge into current branch…");
+    expect(item?.disabled).toBeFalsy();
+    expect(captured.merge?.open).toBe(false);
+
+    item?.onClick?.();
+    render(buildProps({ projectRef: PROJECT_REF }));
+
+    expect(captured.merge).toMatchObject({
+      open: true,
+      targetMode: "current-branch",
+      projectRef: PROJECT_REF,
+      scope: { environmentId: ENVIRONMENT_ID, cwd: GIT_CWD },
+    });
+  });
+
+  it("explains why merging is unavailable without the Git Manager capabilities", () => {
+    testState.mergeCapabilities = false;
+    testState.statusQuery = { ...testState.statusQuery, data: status() };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    const item = menuItemByText("Merge into current branch…");
+    expect(item).toMatchObject({
+      disabled: true,
+      title: "This environment does not support Git Manager stash and merge operations.",
+    });
+  });
+
+  it("disables the panel's actions while the dialog's merge or fetch runs", () => {
+    testState.statusQuery = { ...testState.statusQuery, data: status() };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(menuItemByText("Pull")?.title).toBe("Already up to date.");
+    expect(captured.merge?.onRunningChange).toBeTypeOf("function");
+    captured.merge?.onRunningChange?.(true);
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(menuItemByText("Pull")).toMatchObject({
+      disabled: true,
+      title: "Git action in progress.",
+    });
   });
 });

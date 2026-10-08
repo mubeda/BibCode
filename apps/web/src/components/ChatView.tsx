@@ -6634,6 +6634,7 @@ function ChatViewContent(props: ChatViewProps) {
           mode="embedded"
           threadRef={activeThreadRef}
           gitCwd={gitCwd}
+          projectRef={activeProjectRef}
           workspaceUnavailable={workspaceUnavailable}
         />
       </Suspense>

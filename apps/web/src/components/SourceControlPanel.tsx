@@ -1,6 +1,8 @@
 import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import type {
+  GitManagerRefEntry,
   GitStackedAction,
+  ScopedProjectRef,
   ScopedThreadRef,
   VcsStagingArea,
   VcsStatusResult,
@@ -58,6 +60,7 @@ import { getSourceControlPresentation } from "~/sourceControlPresentation";
 import { useSourceControlDraft } from "~/sourceControlDraft";
 import { useServerConfigs } from "~/state/entities";
 import { usePrimaryEnvironmentId } from "~/state/environments";
+import { gitManagerEnvironment } from "~/state/gitManager";
 import { useEnvironmentQuery } from "~/state/query";
 import { primaryServerAvailableEditorsAtom } from "~/state/server";
 import { shellEnvironment } from "~/state/shell";
@@ -97,6 +100,7 @@ import {
   workingTreeFiles,
 } from "./SourceControlPanel.logic";
 import { SourceControlSection } from "./SourceControlSection";
+import { GitManagerMergeDialog } from "./gitManager/merge/GitManagerMergeDialog";
 import {
   GitManagerCreatePullRequestDialog,
   type GitManagerCreatePullRequestDialogProps,
@@ -107,7 +111,12 @@ interface SourceControlPanelProps {
   threadRef: ScopedThreadRef;
   gitCwd: string | null;
   workspaceUnavailable?: string | null;
+  /** The thread's project; Git Manager operations (fetch, merge) are scoped to it. */
+  projectRef?: ScopedProjectRef | null;
 }
+
+const EMPTY_REFS: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
+const EMPTY_REMOTES: ReadonlyArray<string> = Object.freeze([]);
 
 const RUNNING_ACTIONS = [
   "runStackedAction",
@@ -152,6 +161,7 @@ export default function SourceControlPanel({
   threadRef,
   gitCwd,
   workspaceUnavailable = null,
+  projectRef = null,
 }: SourceControlPanelProps) {
   const environmentId = threadRef.environmentId;
   const scope = useMemo(() => ({ environmentId, cwd: gitCwd }), [environmentId, gitCwd]);
@@ -175,16 +185,30 @@ export default function SourceControlPanel({
   );
 
   const runAction = useGitStackedAction(scope);
-  const pullRequestBranchSelection =
-    useServerConfigs().get(environmentId)?.environment.capabilities
-      .gitPullRequestBranchSelection === true;
+  const capabilities = useServerConfigs().get(environmentId)?.environment.capabilities;
+  const pullRequestBranchSelection = capabilities?.gitPullRequestBranchSelection === true;
+  const mergeAvailable =
+    capabilities?.gitManagerStashMergeOperations === true &&
+    capabilities?.gitManagerBranchSyncOperations === true &&
+    projectRef !== null &&
+    gitCwd !== null;
   const pullAction = useVcsPullAction(scope);
   const stageAction = useVcsStageAction(scope);
   const unstageAction = useVcsUnstageAction(scope);
   const discardAction = useVcsDiscardAction(scope);
   const generateAction = useVcsGenerateCommitMessageAction(scope);
   const generationTokenRef = useRef(0);
-  const isBusy = useSourceControlActionRunning(scope, RUNNING_ACTIONS);
+  const vcsBusy = useSourceControlActionRunning(scope, RUNNING_ACTIONS);
+  // Fetch and merge run as Git Manager operations, outside the vcs action manager.
+  const [mergeOperationRunning, setMergeOperationRunning] = useState(false);
+  const isBusy = vcsBusy || mergeOperationRunning;
+  const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
+  // Refs (with remotes) load only while the merge dialog is open.
+  const refsQuery = useEnvironmentQuery(
+    mergeDialogOpen && gitCwd !== null
+      ? (gitManagerEnvironment.getRefs?.({ environmentId, input: { cwd: gitCwd } }) ?? null)
+      : null,
+  );
 
   const [pendingConfirm, setPendingConfirm] = useState<{
     action: DefaultBranchConfirmableAction;
@@ -266,8 +290,9 @@ export default function SourceControlPanel({
       hasPrimaryRemote,
       stagedCount,
       stageableCount,
+      mergeAvailable,
     }),
-    [status, isBusy, isDefaultRef, hasPrimaryRemote, stagedCount, stageableCount],
+    [status, isBusy, isDefaultRef, hasPrimaryRemote, stagedCount, stageableCount, mergeAvailable],
   );
   const primaryAction = useMemo(
     () => resolveSourceControlPrimaryAction(primaryActionInput),
@@ -742,6 +767,9 @@ export default function SourceControlPanel({
         case "open_publish":
           // The publish wizard lives in the (frozen) chat-header GitActionsControl;
           // the panel renders this item disabled and no-ops here.
+          return;
+        case "open_merge":
+          setMergeDialogOpen(true);
           return;
       }
     },
@@ -1257,6 +1285,22 @@ export default function SourceControlPanel({
             if (result.commit.status === "created") draft.clear();
             setCommitSignal((value) => value + 1);
           }}
+        />
+      ) : null}
+      {projectRef !== null && gitCwd !== null ? (
+        <GitManagerMergeDialog
+          open={mergeDialogOpen}
+          projectRef={projectRef}
+          refs={refsQuery.data?.localBranches ?? EMPTY_REFS}
+          remoteRefs={refsQuery.data?.remoteBranches ?? EMPTY_REFS}
+          remotes={refsQuery.data?.remotes ?? EMPTY_REMOTES}
+          refsError={refsQuery.error}
+          scope={{ environmentId, cwd: gitCwd }}
+          targetMode="current-branch"
+          onFinished={() => setCommitSignal((value) => value + 1)}
+          onOpenChange={setMergeDialogOpen}
+          onRefsStale={refsQuery.refresh}
+          onRunningChange={setMergeOperationRunning}
         />
       ) : null}
       <Dialog

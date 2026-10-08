@@ -300,6 +300,162 @@ describe("GitManagerMergeDialog", () => {
     expect(buttonWithText("Merge").disabled).toBe(true);
   });
 
+  it("fetches the selected source's remote, then asks for fresh refs", async () => {
+    const onRefsStale = vi.fn();
+    h.preview = { ...cleanPreview, source: "refs/remotes/origin/topic" };
+    await renderDialog([branch("main", true)], vi.fn(), null, [branch("origin/topic")], {
+      remotes: ["origin"],
+      onRefsStale,
+    });
+    await act(async () => buttonWithText("origin/topic").click());
+    await act(async () => buttonWithText("Fetch").click());
+    expect(h.runOperation).toHaveBeenLastCalledWith(
+      expect.anything(),
+      {
+        environmentId: "env-a",
+        input: { _tag: "fetch", cwd: "/repo", projectId: "project-a", remote: "origin" },
+      },
+      expect.any(Function),
+    );
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    expect(onRefsStale).toHaveBeenCalledTimes(1);
+  });
+
+  it("fetches each remote in turn for a local source", async () => {
+    const onRefsStale = vi.fn();
+    await renderDialog([branch("main", true), branch("feature")], vi.fn(), null, [], {
+      remotes: ["origin", "upstream"],
+      onRefsStale,
+    });
+    await act(async () => buttonWithText("Fetch").click());
+    expect(h.runOperation).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ input: expect.objectContaining({ remote: "origin" }) }),
+      expect.any(Function),
+    );
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    expect(h.runOperation).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ input: expect.objectContaining({ remote: "upstream" }) }),
+      expect.any(Function),
+    );
+    expect(onRefsStale).not.toHaveBeenCalled();
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    expect(onRefsStale).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the dialog open and shows a failed fetch", async () => {
+    const onOpenChange = await renderDialog(
+      [branch("main", true), branch("feature")],
+      vi.fn(),
+      null,
+      [],
+      { remotes: ["origin"] },
+    );
+    await act(async () => buttonWithText("Fetch").click());
+    await act(async () =>
+      h.onEvent?.({
+        _tag: "failed",
+        operation: "fetch",
+        code: "authentication",
+        message: "Authentication failed.",
+        blocked: null,
+      }),
+    );
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+    expect(container.textContent).toContain("Authentication failed.");
+  });
+
+  it("reports whether a fetch or merge is running", async () => {
+    const onRunningChange = vi.fn();
+    await renderDialog([branch("main", true), branch("feature")], vi.fn(), null, [], {
+      remotes: ["origin"],
+      onRunningChange,
+    });
+    await act(async () => buttonWithText("Fetch").click());
+    expect(onRunningChange).toHaveBeenLastCalledWith(true);
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    expect(onRunningChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("refreshes refs when a later remote fails after an earlier fetch succeeded", async () => {
+    const onRefsStale = vi.fn();
+    await renderDialog([branch("main", true), branch("feature")], vi.fn(), null, [], {
+      remotes: ["origin", "upstream"],
+      onRefsStale,
+    });
+    await act(async () => buttonWithText("Fetch").click());
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    await act(async () =>
+      h.onEvent?.({
+        _tag: "failed",
+        operation: "fetch",
+        code: "authentication",
+        message: "Authentication failed.",
+        blocked: null,
+      }),
+    );
+    expect(onRefsStale).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("Authentication failed.");
+  });
+
+  it("clears its owner's busy state when unmounted mid-operation", async () => {
+    const onRunningChange = vi.fn();
+    await renderDialog([branch("main", true), branch("feature")], vi.fn(), null, [], {
+      remotes: ["origin"],
+      onRunningChange,
+    });
+    await act(async () => buttonWithText("Fetch").click());
+    expect(onRunningChange).toHaveBeenLastCalledWith(true);
+    await act(async () => root?.unmount());
+    root = null;
+    expect(onRunningChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("shows a refs loading failure with a Retry action", async () => {
+    const onRefsStale = vi.fn();
+    await renderDialog([], vi.fn(), null, [], {
+      refsError: "Could not load branches.",
+      onRefsStale,
+    });
+    expect(container.textContent).toContain("Could not load branches.");
+    expect(container.textContent).not.toContain("No source branches found.");
+    await act(async () => buttonWithText("Retry").click());
+    expect(onRefsStale).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes on a conflicted current-branch merge so the panel strip shows", async () => {
+    const onOpenChange = await renderDialog(
+      [branch("main", true), branch("feature")],
+      vi.fn(),
+      null,
+      [],
+      { targetMode: "current-branch" },
+    );
+    expect(buttonWithText("Squash merge", { optional: true })).toBeNull();
+    await act(async () => buttonWithText("Merge").click());
+    await act(async () =>
+      h.onEvent?.({
+        _tag: "failed",
+        operation: "merge",
+        code: "conflicts",
+        message: "Conflicts.",
+        blocked: null,
+      }),
+    );
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
   it("closes on finished and stays open with the failure code on failed", async () => {
     const onOpenChange = await renderDialog([branch("main", true), branch("feature")]);
     await act(async () => buttonWithText("Merge").click());

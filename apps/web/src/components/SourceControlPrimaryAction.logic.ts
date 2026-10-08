@@ -1,5 +1,6 @@
 import type { GitStackedAction, VcsStatusResult } from "@bibcode/contracts";
 import { isTemporaryWorktreeBranch } from "@bibcode/shared/git";
+import { GIT_MANAGER_STASH_MERGE_DISABLED_REASON } from "./gitManager/gitManagerAvailability";
 import {
   DEFAULT_CHANGE_REQUEST_TERMINOLOGY,
   getChangeRequestTerminology,
@@ -20,7 +21,8 @@ import {
  * - Commit stays ENABLED with an empty message when there are staged changes
  *   (our auto-generate affordance fills the message server-side). Orca disables
  *   commit without a message.
- * - No stash / amend / Ctrl+Enter — those have no backing RPC (research §4/§5).
+ * - No stash / amend / Ctrl+Enter here: stash and amend live in Git Manager; fetch and
+ *   merge reach this panel through the "Merge into current branch…" dialog.
  */
 
 export type SourceControlPrimaryActionKind =
@@ -63,7 +65,8 @@ export type SourceControlMenuItemId =
   | "pull"
   | "create_pr"
   | "open_pr"
-  | "publish";
+  | "publish"
+  | "merge";
 
 export interface SourceControlMenuItem {
   id: SourceControlMenuItemId;
@@ -76,7 +79,7 @@ export interface SourceControlMenuItem {
    * actions below it. The caller renders the separator between groups.
    */
   group: "commit" | "remote";
-  kind: "run_stacked" | "run_pull" | "open_pr" | "open_publish";
+  kind: "run_stacked" | "run_pull" | "open_pr" | "open_publish" | "open_merge";
   stackedAction?: GitStackedAction;
   commitStagedIndexAsIs?: boolean;
 }
@@ -90,6 +93,8 @@ export interface SourceControlPrimaryActionInput {
   stagedCount: number;
   /** Files in the unstaged + untracked areas (everything stage-able). */
   stageableCount: number;
+  /** The environment runs Git Manager fetch and merge operations for this project. */
+  mergeAvailable: boolean;
 }
 
 function resolveChangeRequestTerminology(
@@ -287,8 +292,8 @@ const BUSY_REASON = "Git action in progress.";
  * Create-or-View PR / Publish-when-applicable) and carries `disabled` + a
  * `reason` when inapplicable rather than being hidden.
  *
- * Fetch / Force-push / Rebase / Sync menu items are intentionally omitted:
- * there is no backing RPC for any of them (research §2/§4).
+ * Force-push, rebase and stash stay Git Manager–only. Fetch and merge run through
+ * Git Manager operations from the "Merge into current branch…" dialog.
  */
 export function buildSourceControlMenuItems(
   input: SourceControlPrimaryActionInput,
@@ -360,6 +365,20 @@ export function buildSourceControlMenuItems(
             : isBehind
               ? undefined
               : "Already up to date."),
+      ),
+    },
+    {
+      id: "merge",
+      label: "Merge into current branch…",
+      group: "remote",
+      kind: "open_merge",
+      ...gate(
+        (input.mergeAvailable ? undefined : GIT_MANAGER_STASH_MERGE_DISABLED_REASON) ??
+          (hasBranch ? undefined : "Check out a branch to merge into.") ??
+          (gitStatus.operationInProgress === undefined
+            ? undefined
+            : "Finish or abort the current merge first.") ??
+          (gitStatus.hasWorkingTreeChanges ? "Commit your changes before merging." : undefined),
       ),
     },
     changeRequestsEnabled && hasOpenPr
