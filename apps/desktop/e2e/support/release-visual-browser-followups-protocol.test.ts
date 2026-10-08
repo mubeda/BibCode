@@ -1,8 +1,16 @@
 // @effect-diagnostics nodeBuiltinImport:off - Original raw protocol fixtures drive the actual SDK receipt observer without product execution.
 import * as NodeCrypto from "node:crypto";
 import { expect, it } from "vite-plus/test";
+import * as NodeModule from "node:module";
+import { stageUpload } from "../../../../packages/client-runtime/src/operations/uploadStager.ts";
+import { uploadHarness } from "../../../../packages/client-runtime/src/operations/uploadStager.testSupport.ts";
 import { createSizedPng } from "./chat-upload-fixture.ts";
 import { createBrowserFollowupProtocolObserver } from "./release-visual-browser-followups-protocol.ts";
+const requireFramework = NodeModule.createRequire(
+  new URL("../../../../packages/client-runtime/package.json", import.meta.url),
+);
+const Effect = requireFramework("effect/Effect");
+const RpcSerialization = requireFramework("effect/unstable/rpc/RpcSerialization");
 const png = createSizedPng(512 * 1024, "browser-followup");
 const patch =
   "diff --git a/pierre-step5.ts b/pierre-step5.ts\n--- a/pierre-step5.ts\n+++ b/pierre-step5.ts\n@@ -1 +1 @@\n-old\n+new\n";
@@ -281,4 +289,233 @@ it("joins two actual terminal attachments and requires a real resize event befor
   expect(() => value.observer.terminalRestored()).not.toThrow();
   value.observer.close();
   expect(() => value.observer.terminalRestored()).toThrow();
+});
+
+function stageThroughActualObserver(holdFirstAcknowledgement: boolean) {
+  const value = fixture();
+  const harness = uploadHarness(true, png.length);
+  const beginPort = harness.begin.getMockImplementation();
+  const appendPort = harness.append.getMockImplementation();
+  const cancelPort = harness.cancel.getMockImplementation();
+  if (!beginPort || !appendPort || !cancelPort)
+    throw new Error("Maintained upload ports unavailable.");
+  const codec = RpcSerialization.json.makeUnsafe();
+  let ordinal = 0;
+  const carry = (direction: "request" | "reply", envelope: object) => {
+    const encoded = codec.encode(envelope);
+    if (encoded === undefined) throw new Error("Maintained JSON serialization refused.");
+    const decoded = codec.decode(typeof encoded === "string" ? Buffer.from(encoded) : encoded);
+    if (decoded.length !== 1) throw new Error("Maintained JSON envelope refused.");
+    const envelopeValue = decoded[0];
+    if (typeof envelopeValue !== "object" || envelopeValue === null || Array.isArray(envelopeValue))
+      throw new Error("Maintained JSON object refused.");
+    value.observer.observe("first", direction, envelopeValue as Readonly<Record<string, unknown>>);
+  };
+  let releaseFirst: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let concurrentRefusal = false;
+  const acknowledgementEnds: number[] = [];
+  harness.begin.mockImplementation((input) =>
+    Effect.gen(function* () {
+      const id = String(++ordinal);
+      carry("request", { _tag: "Request", id, tag: "uploads.begin", payload: input, headers: [] });
+      const result = yield* beginPort(input);
+      carry("reply", { _tag: "Exit", requestId: id, exit: { _tag: "Success", value: result } });
+      return result;
+    }),
+  );
+  harness.append.mockImplementation((input) =>
+    Effect.gen(function* () {
+      const id = String(++ordinal);
+      try {
+        carry("request", {
+          _tag: "Request",
+          id,
+          tag: "uploads.append",
+          payload: input,
+          headers: [],
+        });
+      } catch (error) {
+        concurrentRefusal = input.offset > 0 && holdFirstAcknowledgement;
+        releaseFirst?.();
+        throw error;
+      }
+      if (holdFirstAcknowledgement && input.offset === 0) yield* Effect.promise(() => held);
+      const result = yield* appendPort(input);
+      carry("reply", { _tag: "Exit", requestId: id, exit: { _tag: "Success", value: result } });
+      acknowledgementEnds.push(result.receivedBytes);
+      if (holdFirstAcknowledgement && input.offset > 0) releaseFirst?.();
+      return result;
+    }),
+  );
+  harness.cancel.mockImplementation((input) =>
+    Effect.gen(function* () {
+      const id = String(++ordinal);
+      carry("request", { _tag: "Request", id, tag: "uploads.cancel", payload: input, headers: [] });
+      const result = yield* cancelPort(input);
+      carry("reply", { _tag: "Exit", requestId: id, exit: { _tag: "Success", value: result } });
+      return result;
+    }),
+  );
+  const run = stageUpload(
+    {
+      target: {
+        _tag: "chat-attachment",
+        type: "image",
+        name: "upload-browser-followup.png",
+        mimeType: "image/png",
+      },
+      file: new Blob([Uint8Array.from(png)]),
+      fileName: "upload-browser-followup.png",
+    },
+    harness.port,
+  );
+  return {
+    ...value,
+    harness,
+    run,
+    acknowledgementEnds,
+    concurrentRefusal: () => concurrentRefusal,
+  };
+}
+it("accepts the actual staged client without prehashed begin and validates its final hash", async () => {
+  const value = stageThroughActualObserver(false);
+  const result = await Effect.runPromise(value.run);
+  expect(result.sizeBytes).toBe(png.length);
+  expect(value.harness.begin.mock.calls[0]?.[0].sha256).toBeUndefined();
+  expect(value.harness.append.mock.calls.at(-1)?.[0].sha256).toBe(
+    NodeCrypto.createHash("sha256").update(png).digest("hex"),
+  );
+  expect(() => value.observer.upload()).toThrow();
+});
+it("completes actual staged upload when the second ACK precedes the held first ACK", async () => {
+  const value = stageThroughActualObserver(true);
+  const result = await Effect.runPromise(value.run);
+  expect(result.sizeBytes).toBe(png.length);
+  expect(value.concurrentRefusal()).toBe(false);
+  expect(value.acknowledgementEnds.slice(0, 2)).toEqual([128 * 1024, 64 * 1024]);
+  expect(value.harness.cancel).not.toHaveBeenCalled();
+  expect(() => value.observer.upload()).toThrow();
+});
+function acknowledgeOriginalPrefix(value: ReturnType<typeof fixture>) {
+  const chunkBytes = 64 * 1024;
+  for (let offset = 0; offset < png.length - chunkBytes; offset += chunkBytes) {
+    const id = String(2 + offset / chunkBytes);
+    value.request("first", id, "uploads.append", {
+      uploadId: "owned-upload",
+      offset,
+      data: png.subarray(offset, offset + chunkBytes).toString("base64"),
+    });
+    value.reply("first", id, { receivedBytes: offset + chunkBytes });
+  }
+  return png.length - chunkBytes;
+}
+it.each(["begin", "append"])("refuses an explicitly wrong %s digest", (operation) => {
+  const value = fixture();
+  if (operation === "begin") {
+    value.request("first", "1", "uploads.begin", {
+      target: {
+        _tag: "chat-attachment",
+        type: "image",
+        name: "upload-browser-followup.png",
+        mimeType: "image/png",
+      },
+      sizeBytes: png.length,
+      sha256: "0".repeat(64),
+    });
+    expect(() => value.reply("first", "1", { uploadId: "owned-upload", exists: false })).toThrow();
+  } else {
+    begin(value);
+    const offset = acknowledgeOriginalPrefix(value);
+    expect(() =>
+      value.request("first", "2", "uploads.append", {
+        uploadId: "owned-upload",
+        offset,
+        data: png.subarray(offset).toString("base64"),
+        sha256: "0".repeat(64),
+      }),
+    ).toThrow();
+  }
+});
+
+it("admits a matching digest only at the complete canonical image boundary", () => {
+  const value = fixture();
+  begin(value);
+  const digest = NodeCrypto.createHash("sha256").update(png).digest("hex");
+  expect(() =>
+    value.request("first", "2", "uploads.append", {
+      uploadId: "owned-upload",
+      offset: 0,
+      data: png.subarray(0, 16384).toString("base64"),
+      sha256: digest,
+    }),
+  ).toThrow();
+  const complete = fixture();
+  begin(complete);
+  const offset = acknowledgeOriginalPrefix(complete);
+  expect(() =>
+    complete.request("first", "9", "uploads.append", {
+      uploadId: "owned-upload",
+      offset,
+      data: png.subarray(offset).toString("base64"),
+      sha256: digest,
+    }),
+  ).not.toThrow();
+});
+
+it.each(["offset", "data", "upload"])("refuses malformed pipelined %s request", (fault) => {
+  const value = fixture();
+  begin(value);
+  value.request("first", "2", "uploads.append", {
+    uploadId: "owned-upload",
+    offset: 0,
+    data: png.subarray(0, 16384).toString("base64"),
+  });
+  expect(() =>
+    value.request("first", "3", "uploads.append", {
+      uploadId: fault === "upload" ? "foreign-upload" : "owned-upload",
+      offset: fault === "offset" ? 0 : 16384,
+      data:
+        fault === "data"
+          ? Buffer.from("not-original").toString("base64")
+          : png.subarray(16384, 32768).toString("base64"),
+    }),
+  ).toThrow();
+});
+it.each([0, 1, 32768, 16383, 16385, -1, 1.5, Number.MAX_SAFE_INTEGER])(
+  "rejects ACK %s not bound to its carrying request",
+  (count) => {
+    const value = fixture();
+    begin(value);
+    value.request("first", "2", "uploads.append", {
+      uploadId: "owned-upload",
+      offset: 0,
+      data: png.subarray(0, 16384).toString("base64"),
+    });
+    value.request("first", "3", "uploads.append", {
+      uploadId: "owned-upload",
+      offset: 16384,
+      data: png.subarray(16384, 32768).toString("base64"),
+    });
+    expect(() => value.reply("first", "2", { receivedBytes: count })).toThrow();
+  },
+);
+it("accepts exact reversed ACKs and retains unfinished progress", () => {
+  const value = fixture();
+  begin(value);
+  value.request("first", "2", "uploads.append", {
+    uploadId: "owned-upload",
+    offset: 0,
+    data: png.subarray(0, 16384).toString("base64"),
+  });
+  value.request("first", "3", "uploads.append", {
+    uploadId: "owned-upload",
+    offset: 16384,
+    data: png.subarray(16384, 32768).toString("base64"),
+  });
+  expect(() => value.reply("first", "3", { receivedBytes: 32768 })).not.toThrow();
+  expect(() => value.reply("first", "2", { receivedBytes: 16384 })).not.toThrow();
+  expect(value.observer.upload().unfinished).toBe(true);
 });

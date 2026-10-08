@@ -2597,7 +2597,12 @@ establishes a raw line boundary after shell control sequences. Preserve the
 original history bytes and exact marker-line predicate; do not strip ANSI or
 accept an echoed command as emitted output.
 The staged image is the maintained512KiB original fixture with a real slow
-transport and public Cancel. The second window attaches the same existing
+transport and public Cancel. Verify the original full fixture before and after the
+upload lease. The public client may omit the begin digest; retain target and size
+admission and compare each canonical append at its exact offset to those original
+bytes. Any declared digest must match that fixture; an append digest is admitted
+only at the final full-image boundary. The unfinished receipt describes the pinned
+source image and observed prefix, not a completed network transfer. The second window attaches the same existing
 terminal and uses public Fit. Working-tree diff bytes come from actual Git.
 The diagnostics scene holds one original server reply beyond the unchanged
 15-second threshold. Hosted entries use fresh unused loopback grants, actual

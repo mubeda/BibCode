@@ -6,6 +6,7 @@ import {
   UploadBeginInput,
   UploadBeginResult,
   UploadAppendInput,
+  UploadAppendResult,
   UploadCancelInput,
 } from "../../../../packages/contracts/src/uploads.ts";
 import {
@@ -231,6 +232,7 @@ export function createBrowserFollowupProtocolObserver(
   } & BrowserInitialHooks,
 ) {
   const requests = new Map<string, { tag: string; payload: unknown }>();
+  const appendEnds = new Map<string, number>();
   const rendererConnections = new Set<string>();
   const attachments = new Map<
     string,
@@ -242,7 +244,8 @@ export function createBrowserFollowupProtocolObserver(
   } | null = null;
   let appendObserved = false,
     cancelObserved = false,
-    received = 0;
+    received = 0,
+    requested = 0;
   let preview: typeof ReviewDiffPreviewResult.Type | null = null;
   let closed = false;
   let terminalFailed = false;
@@ -393,15 +396,22 @@ export function createBrowserFollowupProtocolObserver(
       }
       if (value.tag === "uploads.append") {
         const payload = decode<typeof UploadAppendInput.Type>(UploadAppendInput, value.payload);
-        if (!begin || payload.uploadId !== begin.result.uploadId || payload.offset !== received)
+        if (!begin || payload.uploadId !== begin.result.uploadId || payload.offset !== requested)
           throw refused();
         const bytes = Buffer.from(payload.data, "base64");
+        if (
+          payload.sha256 !== undefined &&
+          (payload.sha256 !== digest || payload.offset + bytes.length !== input.png.length)
+        )
+          throw refused();
         if (
           bytes.toString("base64") !== payload.data ||
           bytes.length === 0 ||
           !bytes.equals(input.png.subarray(payload.offset, payload.offset + bytes.length))
         )
           throw refused();
+        requested = payload.offset + bytes.length;
+        appendEnds.set(entry, requested);
         appendObserved = true;
       }
       return;
@@ -418,6 +428,7 @@ export function createBrowserFollowupProtocolObserver(
       }
       const exit = value.exit as { _tag?: unknown; value?: unknown } | null;
       if (exit?._tag !== "Success") {
+        appendEnds.delete(entry);
         requests.delete(entry);
         return;
       }
@@ -431,22 +442,26 @@ export function createBrowserFollowupProtocolObserver(
           payload.target.name !== "upload-browser-followup.png" ||
           payload.target.mimeType !== "image/png" ||
           payload.sizeBytes !== input.png.length ||
-          payload.sha256 !== digest ||
+          (payload.sha256 !== undefined && payload.sha256 !== digest) ||
           result.exists
         )
           throw refused();
         begin = { payload, result };
       }
       if (request.tag === "uploads.append") {
-        const count = (exit.value as { receivedBytes?: unknown } | null)?.receivedBytes;
+        const result = decode<typeof UploadAppendResult.Type>(UploadAppendResult, exit.value);
+        const count = result.receivedBytes;
+        const expected = appendEnds.get(entry);
         if (
-          typeof count !== "number" ||
+          expected === undefined ||
           !Number.isSafeInteger(count) ||
-          count <= received ||
+          count !== expected ||
+          count > requested ||
           count > input.png.length
         )
           throw refused();
-        received = count;
+        received = Math.max(received, count);
+        appendEnds.delete(entry);
       }
       if (request.tag === "uploads.cancel") {
         const payload = decode<typeof UploadCancelInput.Type>(UploadCancelInput, request.payload);
@@ -599,7 +614,10 @@ export function createBrowserFollowupProtocolObserver(
       attachments.delete(connection);
       rendererConnections.delete(connection);
       for (const entry of requests.keys())
-        if (entry.startsWith(connection + ":")) requests.delete(entry);
+        if (entry.startsWith(connection + ":")) {
+          appendEnds.delete(entry);
+          requests.delete(entry);
+        }
     },
     terminalRestored: () => {
       const values = currentTerminal(1);
@@ -613,6 +631,7 @@ export function createBrowserFollowupProtocolObserver(
     close: () => {
       closed = true;
       requests.clear();
+      appendEnds.clear();
       attachments.clear();
       rendererConnections.clear();
       begin = null;
