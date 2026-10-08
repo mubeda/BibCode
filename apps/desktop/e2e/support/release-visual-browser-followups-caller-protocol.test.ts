@@ -1,3 +1,4 @@
+import { projectBrowserTerminalGuard } from "./release-visual-browser-followups-source.ts";
 import { it, expect, vi, afterEach } from "vite-plus/test";
 import { createSizedPng } from "./chat-upload-fixture.ts";
 import {
@@ -384,4 +385,32 @@ it("refuses extra or stale resize actors after role binding", () => {
     expect(() => value.terminal()).toThrow();
     value.close();
   }
+});
+
+it("marks replay pin refusal without replacing the stored original failure", () => {
+  const value = observer();
+  let original: unknown;
+  try {
+    attach(value, "first", "first-owner", {
+      ...baseline,
+      history: baseline.history + "late delta",
+    });
+  } catch (error) {
+    original = error;
+  }
+  expect(projectBrowserTerminalGuard(original)).toBe("current-attachment-invalid");
+  let retained: unknown;
+  try {
+    value.replay.throwIfFailed();
+  } catch (error) {
+    retained = error;
+  }
+  expect(retained).toBe(original);
+  let terminalError: unknown;
+  try {
+    value.terminal();
+  } catch (error) {
+    terminalError = error;
+  }
+  expect(projectBrowserTerminalGuard(terminalError)).toBe("observer-unavailable");
 });

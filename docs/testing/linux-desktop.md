@@ -2598,6 +2598,10 @@ foreign, accessor-backed, or proxy errors remain private-unknown; successful wai
 retain no packet. Admission requires the same phase, theme, and exact primary
 rejection identity, including undefined. No runtime claims, PIDs, geometry values,
 credentials, paths, messages, stacks, or causes enter this field.
+The same code allowlist covers the actual replay wrapper before the inner receipt.
+Replay pin or config-classification refusals use current-attachment-invalid; an
+unavailable replay owner uses observer-unavailable. The codes describe the last
+normal guard outcome and do not identify an earlier native event or its cause.
 The single terminal marker command must emit an explicit leading newline before
 its exact output line, then keep the same long-running sleep process. This
 establishes a raw line boundary after shell control sequences. Preserve the

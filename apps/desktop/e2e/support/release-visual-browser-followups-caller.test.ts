@@ -1,4 +1,3 @@
-import { createBrowserFollowupProtocolObserver } from "./release-visual-browser-followups-protocol.ts";
 import { runBrowserFollowupScene } from "./release-visual-browser-followups-producer.ts";
 import {
   withBrowserFollowupSecondWindow,
@@ -86,6 +85,8 @@ test.each([
   "guard-callback",
   "guard-cleanup",
   "guard-success",
+  "guard-unclassified",
+  "guard-pinbad",
 ])(
   "actual six-row caller composes real ownership boundaries before originals: %s",
   async (mode) => {
@@ -132,18 +133,32 @@ test.each([
       oscColorResponderActive: false,
       firstAttachmentGrant: false,
     };
-    const observer = createBrowserFollowupProtocolObserver({
+    const observer = createBrowserFollowupReplayObserver({
       png: Buffer.from([1]),
       cwd: snapshot.cwd,
       threadId: snapshot.threadId,
       terminalId: snapshot.terminalId,
       patch: () => "inert",
       slowTransport: () => false,
+      baseline: pinBrowserFollowupTerminalReplay(
+        actorSnapshot,
+        snapshot.threadId,
+        snapshot.terminalId,
+        snapshot.cwd,
+      ),
     });
     const attachActor = (connection: string, claim: string, second: boolean) => {
+      if (!(second && mode === "guard-unclassified"))
+        observer.observe(connection, "request", {
+          _tag: "Request",
+          id: "1",
+          tag: "subscribeServerConfig",
+          payload: {},
+          headers: [],
+        });
       observer.observe(connection, "request", {
         _tag: "Request",
-        id: "1",
+        id: "2",
         tag: "terminal.attach",
         payload: {
           threadId: snapshot.threadId,
@@ -152,23 +167,31 @@ test.each([
           sizeClaim: claim,
         },
       });
-      observer.observe(connection, "reply", {
-        _tag: "Chunk",
-        requestId: "1",
-        values: [
-          {
-            type: "snapshot",
-            snapshot: {
-              ...actorSnapshot,
-              size: {
-                cols: 91,
-                rows: 24,
-                sizeClaim: second && mode !== "guard-success" ? "second-owner" : "first-owner",
+      try {
+        observer.observe(connection, "reply", {
+          _tag: "Chunk",
+          requestId: "2",
+          values: [
+            {
+              type: "snapshot",
+              snapshot: {
+                ...actorSnapshot,
+                history:
+                  second && mode === "guard-pinbad"
+                    ? actorSnapshot.history + "late delta"
+                    : actorSnapshot.history,
+                size: {
+                  cols: 91,
+                  rows: 24,
+                  sizeClaim: second && mode !== "guard-success" ? "second-owner" : "first-owner",
+                },
               },
             },
-          },
-        ],
-      });
+          ],
+        });
+      } catch (error) {
+        if (!(second && mode === "guard-pinbad")) throw error;
+      }
     };
     if (guardMode) attachActor("first", "first-owner", false);
     let checks = 0,
@@ -178,7 +201,7 @@ test.each([
       for (const connection of handles.length === 2 ? ["first", "second"] : ["first"])
         observer.observe(connection, "reply", {
           _tag: "Chunk",
-          requestId: "1",
+          requestId: "2",
           values: [
             {
               type: "resized",
@@ -402,7 +425,11 @@ test.each([
           NodeAssert.equal(
             JSON.parse(NodeFS.readFileSync(NodePath.join(root, "failure.json"), "utf8"))
               .browserTerminalReceiptGuard,
-            "second-owner-mismatch",
+            mode === "guard-unclassified"
+              ? "current-attachment-invalid"
+              : mode === "guard-pinbad"
+                ? "observer-unavailable"
+                : "second-owner-mismatch",
           );
           NodeAssert.equal(
             NodeFS.statSync(NodePath.join(root, "failure.json")).mode & 0o777,
