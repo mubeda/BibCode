@@ -1867,7 +1867,9 @@ failed does not block promotion; resolution metadata records that prior state
 so a rejected head can be dismissed without stranding its tail. Dismissal of
 sending or uncertain work does not prove the provider received nothing, so
 those placeholders and bound running turns continue to block automatic
-promotion. Explicit Send now remains available under its client gate.
+promotion. An archived `panel` thread (a closed chat panel) never promotes
+automatically, so its queue cannot start work after its tab closed; unarchiving
+it resumes the queue. Explicit Send now remains available under its client gate.
 
 Pending start deliveries from older clients also wait while the session is
 running or starting; the SQLite claim repeats this check so a stale worker read
@@ -1881,8 +1883,9 @@ command-id convention and require the automatic gate. Client **Send now** may
 promote the head when the session is neither running nor starting and no
 pending/sending row exists, including a held head. It clears only that hold.
 The delivery service registers its existing `Arc<Notify>` with the engine;
-after committed ready, steer, promote, resolve, and relevant request-resolution
-commands, the engine wakes the worker without retaining the service itself.
+after committed ready, steer, promote, resolve, unarchive, and relevant
+request-resolution commands, the engine wakes the worker without retaining the
+service itself.
 The event's `createdAt` is the promote command's time. Its message projector
 stamps the addressed user message's `created_at` and `updated_at` to that time
 in the same transaction, so the promoted prompt appears after the preceding

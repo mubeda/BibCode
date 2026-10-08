@@ -2724,6 +2724,8 @@ fn spawn_worker(
                             let wake_delivery = match &command {
                                 OrchestrationCommand::ThreadSessionSet { session, .. } => session.status == "ready",
                                 OrchestrationCommand::ThreadTurnPromote { .. } | OrchestrationCommand::ThreadTurnSteer { .. } | OrchestrationCommand::ThreadTurnDeliveryResolve { .. } => true,
+                                // A reopened chat panel's queue becomes promotable again.
+                                OrchestrationCommand::ThreadUnarchive { .. } => true,
                                 OrchestrationCommand::ThreadActivityAppend { activity, .. } => matches!(activity.kind.as_str(), "approval.resolved" | "user-input.resolved" | "provider.user-input.respond.failed"),
                                 _ => false,
                             };

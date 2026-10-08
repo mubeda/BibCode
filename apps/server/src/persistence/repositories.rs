@@ -2708,6 +2708,8 @@ pub(crate) fn can_promote_queued_provider_turn_on(
              AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')
              AND (? = 0 OR (
                session.status = 'ready' AND queued.held = 0
+               -- A closed (archived) chat panel keeps its queue until it is reopened.
+               AND NOT (thread.kind = 'panel' AND thread.archived_at IS NOT NULL)
                AND NOT EXISTS(SELECT 1 FROM projection_turns AS turn WHERE turn.thread_id = queued.thread_id AND turn.state = 'running'
                  AND NOT (turn.turn_id IS NULL AND EXISTS(SELECT 1 FROM provider_turn_outbox AS dismissed
                    WHERE dismissed.thread_id = turn.thread_id AND dismissed.message_id = turn.pending_message_id AND dismissed.state = 'dismissed'
