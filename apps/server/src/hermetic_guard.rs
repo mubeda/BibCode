@@ -720,13 +720,201 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn raise_parent_core_limit() {
+        // SAFETY: `limit` is a valid rlimit for this call, which only changes
+        // this process's core-file limit.
+        let limit = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        let status = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+        assert_eq!(
+            status,
+            0,
+            "raise RLIMIT_CORE so a dumpable abort would write a core: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Kernel comm and pthread_setname_np keep 15 bytes. libtest names the
+    // thread with the test path, and %e in core_pattern prints that prefix.
+    #[cfg(target_os = "linux")]
+    fn linux_abort_comm(test_name: &str) -> &str {
+        const LINUX_COMM_LEN: usize = 15;
+        let mut len = 0;
+        for (index, ch) in test_name.char_indices() {
+            let next = index + ch.len_utf8();
+            if next > LINUX_COMM_LEN {
+                break;
+            }
+            len = next;
+        }
+        &test_name[..len]
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_file_core_pattern() -> Option<String> {
+        let raw = std::fs::read_to_string("/proc/sys/kernel/core_pattern")
+            .expect("read /proc/sys/kernel/core_pattern");
+        let pattern = raw.trim();
+        if pattern.starts_with('|') {
+            return None;
+        }
+        Some(if pattern.is_empty() {
+            "core".to_owned()
+        } else {
+            pattern.to_owned()
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_core_dump_directory(pattern: &str, cwd: &Path) -> PathBuf {
+        match pattern.rfind('/') {
+            Some(0) => PathBuf::from("/"),
+            Some(index) => PathBuf::from(&pattern[..index]),
+            None => cwd.to_path_buf(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_core_template(pattern: &str) -> String {
+        match pattern.rfind('/') {
+            Some(index) => pattern[index + 1..].to_owned(),
+            None => pattern.to_owned(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_core_uses_pid() -> bool {
+        std::fs::read_to_string("/proc/sys/kernel/core_uses_pid")
+            .ok()
+            .is_some_and(|value| value.trim() == "1")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_core_name_matches(name: &str, template: &str, comm: &str, uses_pid: bool) -> bool {
+        if template.contains("%e") && !comm.is_empty() && name.contains(comm) {
+            return true;
+        }
+        let mut prefix = String::new();
+        let bytes = template.as_bytes();
+        let mut index = 0;
+        let mut variable = false;
+        while index < bytes.len() {
+            if bytes[index] == b'%' && index + 1 < bytes.len() {
+                match bytes[index + 1] {
+                    b'%' => prefix.push('%'),
+                    b'e' => prefix.push_str(comm),
+                    _ => {
+                        variable = true;
+                        break;
+                    }
+                }
+                index += 2;
+                continue;
+            }
+            prefix.push(char::from(bytes[index]));
+            index += 1;
+        }
+        if prefix.is_empty() {
+            return false;
+        }
+        if variable {
+            return name.starts_with(&prefix);
+        }
+        if name == prefix {
+            return true;
+        }
+        uses_pid
+            && name.len() > prefix.len() + 1
+            && name.as_bytes().get(prefix.len()) == Some(&b'.')
+            && name[prefix.len() + 1..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+            && name.starts_with(&prefix)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_core_snapshot(directory: &Path) -> std::collections::BTreeMap<PathBuf, (u64, u128)> {
+        let mut files = std::collections::BTreeMap::new();
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return files;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            files.insert(entry.path(), (metadata.len(), modified));
+        }
+        files
+    }
+
+    #[cfg(target_os = "linux")]
+    struct LinuxCoreBaseline {
+        directory: PathBuf,
+        template: String,
+        comm: String,
+        uses_pid: bool,
+        files: std::collections::BTreeMap<PathBuf, (u64, u128)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_core_baseline(test_name: &str, cwd: &Path) -> Option<LinuxCoreBaseline> {
+        let pattern = linux_file_core_pattern()?;
+        let directory = linux_core_dump_directory(&pattern, cwd);
+        Some(LinuxCoreBaseline {
+            files: linux_core_snapshot(&directory),
+            template: linux_core_template(&pattern),
+            comm: linux_abort_comm(test_name).to_owned(),
+            uses_pid: linux_core_uses_pid(),
+            directory,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_no_new_linux_core_dump(baseline: &LinuxCoreBaseline) {
+        let after = linux_core_snapshot(&baseline.directory);
+        let mut created = Vec::new();
+        for (path, stamp) in &after {
+            if baseline.files.get(path) == Some(stamp) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if linux_core_name_matches(name, &baseline.template, &baseline.comm, baseline.uses_pid)
+            {
+                created.push(format!("{} ({} bytes)", path.display(), stamp.0));
+            }
+        }
+        assert!(
+            created.is_empty(),
+            "abort wrote a core dump in {}: {}",
+            baseline.directory.display(),
+            created.join(", ")
+        );
+    }
+
     #[test]
     fn invalid_mode_aborts_with_raw_stderr_instead_of_allowing_an_off_switch() {
         const CASE: &str = "guard-invalid-mode";
         const TEST: &str = "hermetic_guard::tests::invalid_mode_aborts_with_raw_stderr_instead_of_allowing_an_off_switch";
         if TestSandbox::is_isolated_case(CASE, TEST) {
-            let sandbox = TestSandbox::new("guard-invalid-mode-child");
-            std::env::set_current_dir(sandbox.root()).unwrap();
+            let child_sandbox = TestSandbox::new("guard-invalid-mode-child");
+            let cwd = std::env::var_os("BIBCODE_GUARD_ABORT_CWD")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| child_sandbox.root().to_path_buf());
+            std::env::set_current_dir(cwd).unwrap();
             let _ = crate::production::provider_runtime::resolve_provider_executable_in_path(
                 "codex",
                 std::env::var_os("PATH").as_deref(),
@@ -734,8 +922,18 @@ mod tests {
             panic!("invalid guard mode must abort");
         }
         let sandbox = TestSandbox::new("guard-invalid-mode");
-        let output =
-            sandbox.run_isolated_case(CASE, TEST, &[("BIBCODE_HERMETIC_GUARD", OsStr::new("off"))]);
+        #[cfg(unix)]
+        raise_parent_core_limit();
+        #[cfg(target_os = "linux")]
+        let cores_before = linux_core_baseline(TEST, sandbox.root());
+        let output = sandbox.run_isolated_case(
+            CASE,
+            TEST,
+            &[
+                ("BIBCODE_HERMETIC_GUARD", OsStr::new("off")),
+                ("BIBCODE_GUARD_ABORT_CWD", sandbox.root().as_os_str()),
+            ],
+        );
         assert!(!output.status.success());
         #[cfg(unix)]
         {
@@ -746,6 +944,10 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
                 .contains("invalid BIBCODE_HERMETIC_GUARD value \"off\"")
         );
+        #[cfg(target_os = "linux")]
+        if let Some(cores_before) = cores_before.as_ref() {
+            assert_no_new_linux_core_dump(cores_before);
+        }
     }
 
     #[test]
