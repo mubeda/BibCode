@@ -33,6 +33,7 @@ import { resolveBrowserNavigationTarget } from "~/browser/browserTargetResolver"
 import {
   canonicalizePreviewUrl,
   type GatewayOpenMutation,
+  isGatewayBootstrapUrl,
   resolveForNavigation,
 } from "~/browser/previewGateway";
 import {
@@ -118,14 +119,18 @@ const waitForNavigationReadiness = async (
   if (!previewBridge || targetReadiness === "none") return;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
-    if (targetReadiness === "domContentLoaded") {
-      const readyState = await previewBridge.automation.evaluate(tabId, {
-        expression: "document.readyState",
-      });
-      if (readyState === "interactive" || readyState === "complete") return;
-    } else {
-      const status = await previewBridge.automation.status(tabId);
-      if (!status.loading) return;
+    // A gateway bootstrap page loads first and then replaces itself with the
+    // real page, so it never counts as ready. Check the raw native URL.
+    const status = await previewBridge.automation.status(tabId);
+    if (!isGatewayBootstrapUrl(status.url)) {
+      if (targetReadiness === "domContentLoaded") {
+        const readyState = await previewBridge.automation.evaluate(tabId, {
+          expression: "document.readyState",
+        });
+        if (readyState === "interactive" || readyState === "complete") return;
+      } else if (!status.loading) {
+        return;
+      }
     }
     await new Promise<void>((resolve) => window.setTimeout(resolve, 50));
   }

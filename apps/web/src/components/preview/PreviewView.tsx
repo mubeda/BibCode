@@ -21,7 +21,7 @@ import {
 import { resolvePreviewTarget } from "~/browser/browserTargetResolver";
 import { showPreviewUnreachableMessage, showPreviewUnreachableNotice } from "~/browser/linkNotices";
 import { navigateDesktopTab } from "~/browser/desktopTabLifetime";
-import { resolveForNavigation } from "~/browser/previewGateway";
+import { canonicalizePreviewUrl, resolveForNavigation } from "~/browser/previewGateway";
 import { useEnvironment, useEnvironmentHttpBaseUrl } from "~/state/environments";
 import { previewEnvironment } from "~/state/preview";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -162,11 +162,12 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   }, []);
 
   /**
-   * Resolves a canonical URL to what this client can load, or shows why it
-   * can't and returns null. `forTabId` ties an SSH forward to that tab.
+   * Resolves a canonical URL to what this client can load. Returns null when
+   * it can't (after showing why) or when `isCurrent` says the request was
+   * overtaken meanwhile (silently). `forTabId` ties an SSH forward to that tab.
    */
   const resolveForThisClient = useCallback(
-    async (canonicalUrl: string, forTabId: string | undefined) => {
+    async (canonicalUrl: string, forTabId: string | undefined, isCurrent: () => boolean) => {
       const target = await resolveForNavigation({
         environmentId: threadRef.environmentId,
         threadId: threadRef.threadId,
@@ -174,6 +175,7 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
         gatewayOpen,
         ...(forTabId === undefined ? {} : { tabId: forTabId }),
       });
+      if (!isCurrent()) return null;
       if (target.kind === "ok") return target.url;
       showPreviewUnreachableMessage(target.message, canonicalUrl);
       return null;
@@ -196,8 +198,8 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
         const canonicalUrl = resolution.url;
         if (tabId && previewBridge) {
           // Resolve first so a refused gateway leaves the shared tab untouched.
-          const resolvedUrl = await resolveForThisClient(canonicalUrl, tabId);
-          if (resolvedUrl === null || superseded()) return;
+          const resolvedUrl = await resolveForThisClient(canonicalUrl, tabId, () => !superseded());
+          if (resolvedUrl === null) return;
           // Commit the canonical snapshot before driving the native webview.
           // Native Loading/Success events can then enrich that snapshot
           // without a fast load leaving a new tab stuck on Idle or allowing
@@ -239,12 +241,9 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
     }
     // A reload is a navigation too: a newer submission or unmount cancels it.
     const submission = ++submissionRef.current;
-    void resolveForThisClient(url, tabId)
-      .then((resolved) =>
-        resolved === null || submission !== submissionRef.current || !isMountedRef.current
-          ? undefined
-          : navigateDesktopTab(tabId, resolved),
-      )
+    const isCurrent = () => submission === submissionRef.current && isMountedRef.current;
+    void resolveForThisClient(url, tabId, isCurrent)
+      .then((resolved) => (resolved === null ? undefined : navigateDesktopTab(tabId, resolved)))
       .catch(() => undefined);
   }, [resolveForThisClient, tabId, threadRef.environmentId, url]);
 
@@ -317,7 +316,7 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
     if (!localApi || !url) return;
     // The stored URL is canonical; a remote server's loopback must not open
     // this computer's localhost.
-    void resolveForThisClient(url, undefined)
+    void resolveForThisClient(url, undefined, () => isMountedRef.current)
       .then((resolved) => (resolved === null ? undefined : localApi.shell.openExternal(resolved)))
       .catch(() => undefined);
   }, [resolveForThisClient, url]);
@@ -597,7 +596,11 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
       try {
         const annotation = await previewBridge.pickElement(tabId);
         if (!annotation) return;
-        addPreviewAnnotation(threadRef, annotation);
+        // The agent sees the canonical page URL, never this client's gateway origin.
+        addPreviewAnnotation(threadRef, {
+          ...annotation,
+          pageUrl: canonicalizePreviewUrl(annotation.pageUrl),
+        });
         const screenshotFile = await previewAnnotationScreenshotFile(annotation);
         if (screenshotFile && annotation.screenshot) {
           addAttachment(threadRef, {

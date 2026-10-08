@@ -151,13 +151,20 @@ vi.mock("~/browser/browserTargetResolver", () => ({
 }));
 
 vi.mock("~/browser/previewGateway", () => ({
+  canonicalizePreviewUrl: (url: string) =>
+    url.replace("http://127.0.0.1:50000", "http://localhost:5173"),
   resolveForNavigation: (input: { canonicalUrl: string; tabId?: string }) => {
     h.resolveForNavigationCalls.push(input);
     if (h.holdNextResolve) {
       h.holdNextResolve = false;
       const url = h.gatewayNavUrl;
       return new Promise((resolve) => {
-        h.releaseHeldResolve = () => resolve({ kind: "ok", url });
+        h.releaseHeldResolve = () =>
+          resolve(
+            h.gatewayUnreachableMessage
+              ? { kind: "unreachable", message: h.gatewayUnreachableMessage }
+              : { kind: "ok", url },
+          );
       });
     }
     return Promise.resolve(
@@ -970,6 +977,26 @@ describe("navigation handlers", () => {
     expect(h.desktopNavigateCalls).toEqual([]);
   });
 
+  it("stays quiet about a refusal for a submission that was overtaken", async () => {
+    seedSession();
+    h.previewBridge = makeBridge();
+    h.gateway = true;
+    h.holdNextResolve = true;
+    renderView();
+    const chrome = captured("chromeRow");
+
+    (chrome.onSubmit as (next: string) => void)("http://localhost:5173/slow");
+    await flush();
+    h.gateway = false;
+    (chrome.onSubmit as (next: string) => void)("example.com");
+    await flush();
+    h.gatewayUnreachableMessage = "Nothing is listening.";
+    h.releaseHeldResolve();
+    await flush();
+
+    expect(h.unreachableNotices).toEqual([]);
+  });
+
   it("drops a gateway reload that a newer submission overtakes", async () => {
     seedSession();
     h.previewBridge = makeBridge();
@@ -1320,6 +1347,7 @@ describe("handlePickElement", () => {
     h.previewBridge = makeBridge();
     h.pickAnnotation = {
       id: "ann-1",
+      pageUrl: "http://app.local/",
       screenshot: { dataUrl: "data:image/png;base64,AAA" },
     };
     h.screenshotFile = { name: "shot.png", type: "image/png", size: 10 };
@@ -1335,6 +1363,21 @@ describe("handlePickElement", () => {
     // pickActive was toggled on then off.
     expect(h.setStateCalls.some((c) => c.applied === true)).toBe(true);
     expect(h.setStateCalls.some((c) => c.applied === false)).toBe(true);
+  });
+
+  it("records a gateway page's annotation under its canonical URL", async () => {
+    seedSession();
+    h.previewBridge = makeBridge();
+    h.pickAnnotation = { id: "ann-2", pageUrl: "http://127.0.0.1:50000/app?x=1" };
+    renderView();
+    const chrome = captured("chromeRow");
+
+    (chrome.onPickElement as () => void)();
+    await flush();
+
+    expect(h.addPreviewAnnotationCalls).toEqual([
+      [threadRef, { id: "ann-2", pageUrl: "http://localhost:5173/app?x=1" }],
+    ]);
   });
 
   it("cancels an in-flight pick when invoked while active", () => {

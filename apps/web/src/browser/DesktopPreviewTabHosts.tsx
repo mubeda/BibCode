@@ -10,6 +10,7 @@ import { previewEnvironment } from "~/state/preview";
 import { useAtomCommand } from "~/state/use-atom-command";
 
 import { acquireDesktopTab } from "./desktopTabLifetime";
+import { showPreviewUnreachableMessage } from "./linkNotices";
 import { releasePreviewTab, resolveForNavigation } from "./previewGateway";
 
 export interface DesktopPreviewTabHostDescriptor {
@@ -96,8 +97,14 @@ export function NativePreviewTabHost(props: {
             await lease.navigate(target.url, () => !disposed);
             return;
           }
+          // A failure of this client's own reach stays local: another client
+          // may load the page fine, so it must not see a failed tab.
+          if (!target.refusedByServer) {
+            showPreviewUnreachableMessage(target.message, initialUrl);
+            return;
+          }
           // Nothing loads, so no native status follows: fail the tab with the
-          // reason instead of leaving it Loading. Reload retries it.
+          // server's reason instead of leaving it Loading. Reload retries it.
           await report({
             environmentId: ref.environmentId,
             input: {

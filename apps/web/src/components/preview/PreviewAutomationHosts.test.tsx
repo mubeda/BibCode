@@ -159,8 +159,9 @@ vi.mock("~/browser/previewGateway", () => ({
         : { kind: "ok", url: h.gatewayNavUrl ?? input.canonicalUrl },
     );
   },
+  isGatewayBootstrapUrl: (url: string | null) => url?.includes("/__bibcode/bootstrap") ?? false,
   canonicalizePreviewUrl: (url: string) =>
-    h.gatewayNavUrl !== null && url === h.gatewayNavUrl ? h.resolvedUrl : url,
+    url.startsWith("http://127.0.0.1:50000/") ? h.resolvedUrl : url,
 }));
 
 vi.mock("~/browser/browserRecording", () => ({
@@ -707,7 +708,8 @@ describe("handleRequest: navigate + resize", () => {
     seedReadyTab("tab-1");
     h.resolvedUrl = "http://localhost:5173/";
     h.gatewayNavUrl = "http://127.0.0.1:50000/__bibcode/bootstrap?cap=C&to=%2F";
-    h.automationStatus = { ...h.automationStatus, url: h.gatewayNavUrl };
+    // The page the bootstrap replaced itself with, on this client's gateway origin.
+    h.automationStatus = { ...h.automationStatus, url: "http://127.0.0.1:50000/" };
 
     const result = (await handle(
       makeRequest({
@@ -723,6 +725,38 @@ describe("handleRequest: navigate + resize", () => {
     expect(h.navigateCalls).toContainEqual({ tabId: "tab-1", url: h.gatewayNavUrl });
     expect(result.url).toBe("http://localhost:5173/");
   });
+
+  it.each(["load", "domContentLoaded"] as const)(
+    "waits past the gateway bootstrap hop for %s readiness",
+    async (readiness) => {
+      const handle = mountHost();
+      seedReadyTab("tab-1");
+      const bootstrap = {
+        ...h.automationStatus,
+        loading: false,
+        url: "http://127.0.0.1:50000/__bibcode/bootstrap?cap=C&to=%2F",
+      };
+      const real = { ...h.automationStatus, loading: false, url: "http://127.0.0.1:50000/" };
+      // Overlay readiness, then the bootstrap page, then the real page.
+      const status = vi
+        .fn()
+        .mockResolvedValueOnce(real)
+        .mockResolvedValueOnce(bootstrap)
+        .mockResolvedValue(real);
+      (h.previewBridge as { automation: { status: unknown } }).automation.status = status;
+
+      await handle(
+        makeRequest({
+          operation: "navigate",
+          tabId: "tab-1",
+          input: { url: "http://localhost:5173/", readiness } as unknown,
+        }),
+      );
+
+      // overlay check, bootstrap (keeps waiting), real (ready), final status.
+      expect(status).toHaveBeenCalledTimes(4);
+    },
+  );
 
   it("fails navigation with the gateway's reason", async () => {
     const handle = mountHost();

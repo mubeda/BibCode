@@ -16,6 +16,7 @@ vi.mock("~/rpc/atomRegistry", () => ({ appAtomRegistry: { get: () => catalog } }
 import {
   canonicalizePreviewUrl,
   type GatewayOpenMutation,
+  isGatewayBootstrapUrl,
   releasePreviewTab,
   resetPreviewGatewayForTests,
   resolveForNavigation,
@@ -127,6 +128,7 @@ describe("resolveForNavigation", () => {
       kind: "unreachable",
       message:
         "HTTPS dev servers can't be previewed through the gateway yet; serve over HTTP or open it on Build box directly.",
+      refusedByServer: true,
     });
   });
 
@@ -144,6 +146,7 @@ describe("resolveForNavigation", () => {
     ).resolves.toEqual({
       kind: "unreachable",
       message: "Open this address from the thread's terminal or chat first, then try again.",
+      refusedByServer: true,
     });
   });
 
@@ -403,7 +406,98 @@ describe("ssh forward bookkeeping", () => {
     ).resolves.toEqual({
       kind: "unreachable",
       message: "Nothing is listening on port 5173 on Build box.",
+      refusedByServer: true,
     });
+  });
+
+  it("offers retry or reconnect when the gateway is unavailable or the call fails", async () => {
+    readPreparedConnection.mockReturnValue(lan());
+    const retry =
+      "Couldn't open a preview connection to Build box. Try again, or reconnect Build box if it keeps failing.";
+    const resolveWith = (gatewayOpen: GatewayOpenMutation) =>
+      resolveForNavigation({
+        environmentId,
+        threadId,
+        canonicalUrl: "http://localhost:5173/",
+        gatewayOpen,
+      });
+
+    await expect(resolveWith(async () => refused("unavailable"))).resolves.toEqual({
+      kind: "unreachable",
+      message: retry,
+      refusedByServer: true,
+    });
+    // A transport failure is this client's problem, not shared preview state.
+    await expect(
+      resolveWith(async (): Promise<GatewayOpenResult> =>
+        AsyncResult.failure(Cause.fail(new Error("socket closed"))),
+      ),
+    ).resolves.toEqual({ kind: "unreachable", message: retry });
+  });
+
+  it("keeps a failed SSH forward local to this client", async () => {
+    readPreparedConnection.mockReturnValue(ssh());
+    sshForward.mockRejectedValueOnce(new Error("SSH connection is not active."));
+    await expect(
+      resolveForNavigation({
+        environmentId,
+        threadId,
+        canonicalUrl: "http://localhost:5173/",
+        tabId: "tab-a",
+        gatewayOpen: async () => opened(41000),
+      }),
+    ).resolves.toEqual({
+      kind: "unreachable",
+      message: "Build box isn't connected. Reconnect it, then open the link again.",
+    });
+  });
+
+  it("forgets a released forward's client origin so a reused local port stays itself", async () => {
+    readPreparedConnection.mockReturnValue(ssh());
+    const result = await resolveForNavigation({
+      environmentId,
+      threadId,
+      canonicalUrl: "http://localhost:5173/",
+      tabId: "tab-a",
+      gatewayOpen: async () => opened(41000),
+    });
+    expect(result).toMatchObject({ url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:50000\//) });
+    expect(isGatewayBootstrapUrl("http://127.0.0.1:50000/__bibcode/bootstrap?cap=C&to=%2F")).toBe(
+      true,
+    );
+    expect(canonicalizePreviewUrl("http://127.0.0.1:50000/x")).toBe("http://localhost:5173/x");
+
+    releasePreviewTab(environmentId, "tab-a");
+
+    expect(canonicalizePreviewUrl("http://127.0.0.1:50000/x")).toBe("http://127.0.0.1:50000/x");
+    expect(isGatewayBootstrapUrl("http://127.0.0.1:50000/__bibcode/bootstrap?cap=C&to=%2F")).toBe(
+      false,
+    );
+  });
+
+  it("keeps the mapping when a replacement forward reuses the old local port", async () => {
+    readPreparedConnection.mockReturnValue(ssh());
+    const resolve = (gatewayPort: number) =>
+      resolveForNavigation({
+        environmentId,
+        threadId,
+        canonicalUrl: "http://localhost:5173/",
+        tabId: "tab-a",
+        gatewayOpen: async () => opened(gatewayPort),
+      });
+    await resolve(41000);
+    // The server restarted the listener; the tunnel handed out the freed port again.
+    sshForward.mockResolvedValueOnce(50000);
+    await resolve(41002);
+
+    expect(releaseSshForward.mock.calls).toEqual([[sshTarget, 41000]]);
+    expect(canonicalizePreviewUrl("http://127.0.0.1:50000/x")).toBe("http://localhost:5173/x");
+  });
+
+  it("recognizes only known gateway bootstrap pages", () => {
+    expect(isGatewayBootstrapUrl("http://localhost:5173/__bibcode/bootstrap?to=%2F")).toBe(false);
+    expect(isGatewayBootstrapUrl("not a url")).toBe(false);
+    expect(isGatewayBootstrapUrl(null)).toBe(false);
   });
 
   it("releases a forward established after its tab already closed", async () => {

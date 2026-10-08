@@ -9,6 +9,7 @@ const h = vi.hoisted(() => ({
   navigateCalls: [] as string[],
   releasedTabs: [] as string[],
   reports: [] as unknown[],
+  notices: [] as unknown[],
   previewState: { sessions: {}, desktopByTabId: {} } as Record<string, unknown>,
 }));
 
@@ -31,6 +32,9 @@ vi.mock("~/state/use-atom-command", () => ({
     if (command.label === "report") h.reports.push(input);
     return Promise.resolve(undefined);
   },
+}));
+vi.mock("./linkNotices", () => ({
+  showPreviewUnreachableMessage: (...args: unknown[]) => h.notices.push(args),
 }));
 vi.mock("./desktopTabLifetime", () => ({
   acquireDesktopTab: () => ({
@@ -75,6 +79,7 @@ beforeEach(() => {
   h.navigateCalls.length = 0;
   h.releasedTabs.length = 0;
   h.reports.length = 0;
+  h.notices.length = 0;
   h.previewState = {
     sessions: { "tab-1": { navStatus: { _tag: "Success", url: initialUrl, title: "" } } },
     desktopByTabId: {},
@@ -105,9 +110,14 @@ describe("NativePreviewTabHost", () => {
 
   it("fails a refused initial URL with its reason and releases forwards on unmount", async () => {
     const cleanup = mount();
-    h.finishResolve({ kind: "unreachable", message: "Nothing is listening." });
+    h.finishResolve({
+      kind: "unreachable",
+      message: "Nothing is listening.",
+      refusedByServer: true,
+    });
     await flush();
     expect(h.navigateCalls).toEqual([]);
+    expect(h.notices).toEqual([]);
     expect(h.reports).toEqual([
       {
         environmentId: threadRef.environmentId,
@@ -128,5 +138,13 @@ describe("NativePreviewTabHost", () => {
     ]);
     cleanup();
     expect(h.releasedTabs).toEqual(["tab-1"]);
+  });
+
+  it("keeps a failure on this client's side out of shared state", async () => {
+    mount();
+    h.finishResolve({ kind: "unreachable", message: "Build box isn't connected." });
+    await flush();
+    expect(h.reports).toEqual([]);
+    expect(h.notices).toEqual([["Build box isn't connected.", initialUrl]]);
   });
 });
