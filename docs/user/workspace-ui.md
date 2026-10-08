@@ -968,30 +968,36 @@ allowlists, and links or scripts that name `http://localhost:<port>`.
 These cases show "Can't open this address here" with the address and **Copy
 link**:
 
-| Situation                                                                  | Message                                                                                                               |
-| -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| BiBCode Connect, a public IP address, or SSH in a browser tab              | "This address is on <environment>, not this computer. Opening its ports from here isn't supported yet."               |
-| The environment isn't connected, or its SSH connection is down             | "<environment> isn't connected. Reconnect it, then open the link again."                                              |
-| An `https://` dev server                                                   | "HTTPS dev servers can't be previewed through the gateway yet; serve over HTTP or open it on <environment> directly." |
-| Nothing listens on the port                                                | "Nothing is listening on port <port> on <environment>."                                                               |
-| The server refused the address                                             | "BiBCode can only preview plain HTTP addresses on <environment>'s own localhost."                                     |
-| The server's address can't serve previews, such as a public or proxied one | "<the server's reason> Open it on <environment> directly."                                                            |
-| The gateway or SSH forward failed, or this client's session expired        | "Couldn't open a preview connection to <environment>. Try again, or reconnect <environment> if it keeps failing."     |
-| A terminal with no thread                                                  | "Open this address from a thread's chat or terminal to reach it from here."                                           |
+| Situation                                                           | Message                                                                                                               |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| BiBCode Connect, a public IP address, or SSH in a browser tab       | "This address is on <environment>, not this computer. Opening its ports from here isn't supported yet."               |
+| The environment isn't connected, or its SSH connection is down      | "<environment> isn't connected. Reconnect it, then open the link again."                                              |
+| An `https://` dev server                                            | "HTTPS dev servers can't be previewed through the gateway yet; serve over HTTP or open it on <environment> directly." |
+| Nothing listens on the port                                         | "Nothing is listening on port <port> on <environment>."                                                               |
+| The server refused the address                                      | "BiBCode can only preview plain HTTP addresses on <environment>'s own localhost."                                     |
+| You reached the server on a public address                          | "Previews aren't available on a public address. Open it on <environment> directly."                                   |
+| You reached the server through a reverse proxy or Tailscale Serve   | "Previews aren't available through a proxied address. Open it on <environment> directly."                             |
+| The gateway or SSH forward failed, or this client's session expired | "Couldn't open a preview connection to <environment>. Try again, or reconnect <environment> if it keeps failing."     |
+| A terminal with no thread                                           | "Open this address from a thread's chat or terminal to reach it from here."                                           |
 
 When a BiBCode browser tab's address can't load, the tab shows "This site
 can't be reached" with the reason in place of the page, and **Reload** opens
-the address through the gateway again. A refusal from the server (HTTPS,
-nothing listening, a refused address, an address that can't serve previews)
-shows the same on every client. A failure on this computer's side (its SSH
-forward, its BiBCode session, or its network route to the gateway) shows on
-this computer only, because another client may load the page fine. For
+the address through the gateway again. A refusal about the address itself
+(HTTPS, nothing listening, a refused address) shows the same on every client.
+A failure on this computer's side (its SSH forward, its BiBCode session, the
+address it reached the server on, or its network route to the gateway) shows
+on this computer only, because another client may load the page fine. For
 BiBCode's own reasons the page shows the sentence alone, without network error
 codes or connection tips. An agent asking for the tab's status, or opening a
 new tab, gets the same reason as an error.
 
 Gateway traffic is plain HTTP on the server's address, outside BiBCode's
-encrypted transport. On a public IP address BiBCode does not use the gateway.
+encrypted transport, so previews need a direct private route to the server: a
+LAN, tailnet, or WSL address, or a desktop-managed SSH connection. When the
+environment's address is a public IP address, BiBCode doesn't use the gateway.
+When you reach the server on a public address under a host name, or through a
+reverse proxy or Tailscale Serve, the server refuses the preview with the
+messages above. See [Reverse proxies](./remote-access.md#reverse-proxies).
 
 **In a browser tab**, a gateway link opens a new browser tab. The tab opens
 blank at once and loads the preview after BiBCode resolves it; if resolution
@@ -1043,9 +1049,8 @@ request no client takes within 60 seconds is dropped.
 (for example, run outside an agent or terminal session) or when BiBCode can't
 take the request. Its credential lasts 8 hours from the start of the agent or
 terminal session and is not renewed, so a longer session falls back to
-printing. Codex may withhold variables whose names contain `TOKEN` from the
-commands it runs, which would also make it print; this hasn't been verified.
-See
+printing. It also prints when the command can't reach BiBCode, for example
+inside a sandbox without network access. See
 [Provider architecture](../architecture/providers.md) for the mechanism.
 
 ### Activity and targeted Stop

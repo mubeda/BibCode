@@ -212,8 +212,13 @@ report's SSH environment evidence section.
   child is running, and its local port listens on `127.0.0.1` only (`ss -ltnp`
   on Linux, `lsof -nP -iTCP -sTCP:LISTEN` on macOS, `netstat -ano` on Windows).
 - **Reload** loads the page again. Stop the server and press **Reload**: the
-  tab reads "Nothing is listening on port 8123 on <environment>." Start it
-  again and press **Reload**: the page returns.
+  gateway's listener is still open, so the tab shows the gateway's own `502`
+  page, titled "Nothing is listening", with "Nothing is listening on port 8123
+  on <environment>." The address bar still shows `http://localhost:8123/`.
+  This is a page inside the tab, not BiBCode's "This site can't be reached"
+  overlay, which appears only when the listener has already closed and
+  BiBCode opens the address again. Start the server again and press
+  **Reload**: the page returns.
 - `https://localhost:8123/` shows "HTTPS dev servers can't be previewed through
   the gateway yet; serve over HTTP or open it on <environment> directly."
 - Open a second preview tab on another address, such as `https://example.com`,
@@ -223,6 +228,9 @@ report's SSH environment evidence section.
 - Close the preview tab: the forward's `ssh` child exits at once.
 - With **Open links in** set to **System browser**, the same click opens the
   system browser at `http://127.0.0.1:<local port>/`, and the listing loads.
+  That forward is held by a 5-minute lease: with no BiBCode browser tab on the
+  same address, its `ssh` child exits about 5 minutes after the click, and the
+  system-browser page stops loading.
 
 **Brainstorming companion.** This needs Node.js on the remote host and the
 superpowers plugin's brainstorming scripts copied there. Set **Open links in**

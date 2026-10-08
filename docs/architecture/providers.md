@@ -512,8 +512,16 @@ blocks network access, so inside it the post fails and the shim prints the URL.
 Neither behavior has been verified live with Codex yet.
 
 The token is issued per launch or terminal start, is scoped to the thread, and
-authorizes only that route. The provider credential stays outside the instance
+authorizes only that route. It lasts 8 hours and is not renewed, so a longer
+session gets `401` and the shim prints the URL. Issuing never revokes another
+holder's token. When the server's open-url token store is full, it evicts the
+token that expires soonest instead of refusing the launch, and that holder also
+falls back to printing. The provider credential stays outside the instance
 environment, so durable delivery route fingerprints do not change with it.
+
+Which client claims a delivered request, and how browser-mode clients turn it
+into a prompt, is described in
+[Open requests and automation hosts](remote.md#open-requests-and-automation-hosts).
 
 ## Provider maintenance
 

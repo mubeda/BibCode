@@ -1162,9 +1162,9 @@ address)` gets its own listener on an ephemeral port, so two clients that
   browser-mode tab, closes only in the other three cases.
 
 - **E2EE caveat.** Gateway traffic is plain HTTP, outside Noise, like
-  `/api/assets`. Clients keep the Phase 0 `public-host` notice instead of using
-  the gateway on public-IP binds, and the server refuses such callers with
-  `not-reachable`.
+  `/api/assets`. A client whose environment address is a public IP literal
+  shows the `public-host` notice instead of calling the gateway, and the server
+  refuses any caller that reached it on a public address with `not-reachable`.
 - **Relay limitation.** A relay (BiBCode Connect) client cannot reach gateway
   listeners. It shows "This address is on <label>, not this computer. Opening
   its ports from here isn't supported yet."
@@ -1183,6 +1183,64 @@ address)` gets its own listener on an ephemeral port, so two clients that
   `not-reachable` for the address it connected through, or a native load
   failure on its gateway origin) stays a client-local failed state that
   the tab and automation `status` report.
+
+### Open requests and automation hosts
+
+A command in an agent or terminal session asks a client to open a URL through
+`$BROWSER` or `$BRAINSTORM_OPEN_CMD`; the shim and its environment are in
+[Provider architecture](providers.md). The server never opens a browser
+itself. It announces the request, and exactly one client claims it.
+
+- **Route.** `POST /api/preview/open-url` with body `{ "url": … }` accepts only
+  a thread-scoped open-url bearer token. It never accepts a session cookie, and
+  that token authenticates no other route, `/mcp` included. A missing or
+  unknown token gets `401` `invalid_open_url_credential`. An invalid or
+  non-`http(s)` URL, or one longer than 2048 characters, gets `400`. A thread with 64
+  unclaimed requests gets `429` `too_many_open_requests`. Otherwise the route
+  answers `202 { requestId, delivered }`. `delivered` is false when no client
+  was subscribed to preview events; the gateway's own tab follower does not
+  count. The CLI then prints the URL itself.
+- **Event and claim.** The request is broadcast as
+  `openRequested { threadId, requestId, url, createdAt }` on
+  `subscribePreviewEvents`. A client claims it with
+  `preview.claimOpenRequest({ requestId })`, which needs
+  `orchestration:operate` and returns `{ claimed }`. Only the first claim of a
+  live request returns `true`; every other client does nothing. A request no
+  client claims within 60 s expires.
+- **Who claims** (`apps/web/src/components/preview/OpenRequestRouter.tsx`). A
+  client _shows_ a thread when the thread is its routed thread or an active
+  chat panel in its center layout.
+  - A visible client that shows the thread claims at once.
+  - Every other client waits 2 s and checks again. A hidden client then
+    claims only a thread it shows, since nobody would see its prompt. A
+    visible client claims anyway. If it doesn't show the thread, it shows a
+    prompt naming the thread ("A command in <thread title> wants to open …").
+    **Open** routes to that thread and then opens the URL.
+  - On desktop, a claim for a thread on screen opens like a clicked link: in
+    the BiBCode browser for the routed thread, or in the system browser when
+    the thread is only a panel and links open in the BiBCode browser. In
+    browser mode every claim becomes a prompt, because a new tab needs a user
+    click.
+- **Subscriptions.** Every client mounts one preview-events subscription per
+  registered environment, whatever thread is on screen. The subscription
+  runtime keeps it across reconnects. `delivered` therefore means some client
+  of that environment is connected, not that one shows the thread.
+- **Automation hosts.** Every client except a desktop without preview support
+  also registers a preview automation host per environment and advertises the
+  operations it supports. A desktop host
+  advertises the full set or `status`, `open`, and `navigate`. A browser-mode
+  host (no `window.desktopBridge`) advertises only `status` and `open`. It has
+  no tab to drive, so its `status` reports an unavailable preview. Its `open`
+  of a URL queues the "Agent wants to open" prompt and returns
+  `{ status: "pending-user" }` at once. An `open` without a URL returns the
+  unavailable status.
+- **Host selection** (`apps/server/src/mcp/preview_automation.rs`). For each
+  call the broker considers the hosts of that environment that support the
+  operation. It picks the one with the most supported operations, then the
+  most recent focus. Focus order advances when a host connects and when its
+  window gains focus. A desktop therefore keeps automation even after the user
+  last touched a browser tab, and the browser-mode host serves only when no
+  desktop host is connected.
 
 ## Security boundaries
 

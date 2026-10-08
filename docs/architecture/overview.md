@@ -39,7 +39,12 @@ flowchart TB
   tab status, open, and navigate are supported and advertised; snapshot, click,
   type, and the other automation calls are not yet. Its single native view
   drives only the visible tab, so open always shows the tab, and a request for a
-  thread that is not on screen times out. Typography and text-contrast
+  thread that is not on screen times out. In browser mode there is no child
+  webview: the client advertises only status and open, and open shows a prompt
+  and returns `pending-user` until the user clicks. The server prefers the host
+  with more operations, so a connected desktop serves automation first.
+  Loopback dev servers on a remote environment load through the server's
+  preview gateway. Typography and text-contrast
   rules live in [`UI.md`](../../UI.md).
 - **Desktop adapter (`apps/web/src/tauriDesktopBridge.ts`)** installs
   `window.desktopBridge` only when Tauri globals are present. Tauri commands and
@@ -707,10 +712,16 @@ Neither path introduces a production Node server or packaged helper sidecar.
 
 The server can also open preview gateway listeners. Each one reverse-proxies
 one loopback dev server for one thread to a client that is not on the server's
-host. A listener binds an ephemeral port on the main server's bind host. It is
-opened through `preview.gatewayOpen` and closed when its tabs close, after
-10 idle minutes, when its thread is deleted, or at shutdown. See
-[Preview gateway](remote.md#preview-gateway).
+host. A listener binds an ephemeral port on the local address the caller's RPC
+connection arrived on, and the server refuses callers that reached it on a
+public address or through a reverse proxy. It is opened through
+`preview.gatewayOpen` and closed when its tabs close, after 10 idle minutes,
+when its thread is deleted, or at shutdown. Agent and terminal sessions reach
+clients the other way: their `$BROWSER` shim posts to
+`POST /api/preview/open-url`, and the server broadcasts an `openRequested`
+event that one client claims. See
+[Preview gateway](remote.md#preview-gateway) and
+[Open requests and automation hosts](remote.md#open-requests-and-automation-hosts).
 
 When WSL-only mode is selected, that intent is authoritative even if an older
 persisted document has a stale disabled-backend flag. WSL planning and primary
