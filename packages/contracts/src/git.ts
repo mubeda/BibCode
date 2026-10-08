@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { SourceControlProviderError, SourceControlProviderInfo } from "./sourceControl.ts";
@@ -52,8 +53,18 @@ export const VcsWorkingTreeFileStatus = Schema.Literals([
   "renamed",
   "copied",
   "untracked",
+  "conflicted",
 ]);
 export type VcsWorkingTreeFileStatus = typeof VcsWorkingTreeFileStatus.Type;
+/** Repository operation left in progress (MERGE_HEAD, rebase state, ...). */
+export const VcsInProgressOperationKind = Schema.Literals([
+  "merge",
+  "rebase",
+  "cherry-pick",
+  "revert",
+  "squash",
+]);
+export type VcsInProgressOperationKind = typeof VcsInProgressOperationKind.Type;
 export const VcsStagingArea = Schema.Literals(["staged", "unstaged", "untracked"]);
 export type VcsStagingArea = typeof VcsStagingArea.Type;
 const GitPreparePullRequestThreadMode = Schema.Literal("local");
@@ -289,13 +300,20 @@ const VcsStatusLocalShape = {
         path: TrimmedNonEmptyStringSchema,
         insertions: NonNegativeInt,
         deletions: NonNegativeInt,
-        status: Schema.optional(VcsWorkingTreeFileStatus),
+        // A status this client does not know, from a newer server, decodes as absent.
+        status: Schema.optionalKey(
+          VcsWorkingTreeFileStatus.pipe(Schema.catchDecoding(() => Effect.succeedNone)),
+        ),
         area: Schema.optional(VcsStagingArea),
       }),
     ),
     insertions: NonNegativeInt,
     deletions: NonNegativeInt,
   }),
+  /** Absent when no operation is in progress, and from older servers. */
+  operationInProgress: Schema.optionalKey(
+    VcsInProgressOperationKind.pipe(Schema.catchDecoding(() => Effect.succeedNone)),
+  ),
 };
 
 const VcsStatusRemoteShape = {

@@ -210,6 +210,19 @@ describe("applyGitStatusStreamEvent", () => {
     }
   });
 
+  it("keeps operationInProgress when a remote update follows a local update", () => {
+    const local = { ...localStatus, operationInProgress: "merge" as const };
+    const updated = applyGitStatusStreamEvent(
+      applyGitStatusStreamEvent(null, { _tag: "snapshot", local: localStatus, remote: null }),
+      { _tag: "localUpdated", local },
+    );
+    const remoteUpdated = applyGitStatusStreamEvent(updated, {
+      _tag: "remoteUpdated",
+      remote: { hasUpstream: true, aheadCount: 1, behindCount: 0, pr: null },
+    });
+    expect(remoteUpdated.operationInProgress).toBe("merge");
+  });
+
   it("treats a remote-only update as a repository when local state is missing", () => {
     const remote: VcsStatusRemoteResult = {
       hasUpstream: true,
