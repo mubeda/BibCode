@@ -65,7 +65,7 @@ describe("browser target resolver", () => {
     const { resolveBrowserNavigationTarget } = await import("./browserTargetResolver");
     expect(() =>
       resolveBrowserNavigationTarget(env, { kind: "environment-port", port: 5173 }),
-    ).toThrow(/SSH/);
+    ).toThrow("This address is on Build box, not this computer.");
   });
 
   it("normalizes schemeless localhost server-picker values", async () => {
@@ -140,6 +140,7 @@ describe("browser target resolver", () => {
       kind: "unreachable",
       reason: "ssh",
       environmentLabel: "Build box",
+      url: "http://localhost:5173/",
     });
   });
 
@@ -192,6 +193,7 @@ describe("browser target resolver", () => {
       kind: "unreachable",
       reason: "disconnected",
       environmentLabel: "This environment",
+      url: "http://localhost:5173/",
     });
     expect(resolvePreviewTarget(env, "localhost:3000/path")).toMatchObject({
       kind: "unreachable",
@@ -380,7 +382,7 @@ describe("browser target resolver", () => {
     );
     expect(() =>
       resolveBrowserNavigationTarget(env, { kind: "url", url: "http://localhost:3000" }),
-    ).toThrow(/SSH/);
+    ).toThrow("This address is on Build box, not this computer.");
 
     readPreparedConnection.mockReturnValue(bearer("http://192.168.1.25:3773"));
     expect(
@@ -394,5 +396,17 @@ describe("browser target resolver", () => {
     expect(
       resolveBrowserNavigationTarget(env, { kind: "url", url: "https://example.test/docs" }),
     ).toMatchObject({ resolvedUrl: "https://example.test/docs", resolutionKind: "direct" });
+  });
+
+  it("names the environment without transport jargon", async () => {
+    const { UNREACHABLE_MESSAGES } = await import("./browserTargetResolver");
+    for (const reason of ["ssh", "relay", "public-host"] as const) {
+      expect(UNREACHABLE_MESSAGES[reason]("Box")).toBe(
+        "This address is on Box, not this computer. Opening its ports from here isn't supported yet.",
+      );
+    }
+    expect(UNREACHABLE_MESSAGES.disconnected("Box")).toBe(
+      "Box isn't connected. Reconnect it, then open the link again.",
+    );
   });
 });

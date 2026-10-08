@@ -75,6 +75,7 @@ const h = vi.hoisted(() => {
       refresh: vi.fn(),
     },
     localApi: undefined as unknown,
+    previewSupported: true,
     refreshProvidersCommand: vi.fn(),
     refreshProviderUsageCommand: vi.fn(),
     providerUsageQueryRefresh: vi.fn(),
@@ -204,6 +205,10 @@ vi.mock("../../localApi", () => ({
     }
     return h.localApi;
   },
+}));
+
+vi.mock("../../previewStateStore", () => ({
+  isPreviewSupportedInRuntime: () => h.previewSupported,
 }));
 
 vi.mock("../../branding", () => ({
@@ -624,6 +629,7 @@ beforeEach(() => {
   h.archive.isLoading = false;
   h.archive.refresh.mockReset();
   h.localApi = undefined;
+  h.previewSupported = true;
   h.refreshProvidersCommand.mockReset();
   h.refreshProvidersCommand.mockResolvedValue({ _tag: "Success", value: { providers: [] } });
   h.refreshProviderUsageCommand.mockReset();
@@ -855,6 +861,16 @@ describe("GeneralSettingsPanel", () => {
     render(<GeneralSettingsPanel />);
     invoke(control("button", "Reset link target to default"), "onClick");
     expect(h.updateSettings).toHaveBeenCalledWith({ browserLinkTarget: "app" });
+  });
+
+  it("hides the link target where the BiBCode browser is unavailable", () => {
+    h.previewSupported = false;
+    h.settings = { ...DEFAULT_UNIFIED_SETTINGS, browserLinkTarget: "system" };
+
+    const markup = renderedText();
+
+    expect(markup).not.toContain("Open links in");
+    expect(findControls("button", "Reset link target to default")).toHaveLength(0);
   });
 
   it("renders changed general settings with reset actions", () => {
@@ -1252,6 +1268,20 @@ describe("useGeneralSettingsRestore", () => {
     await restore.restoreDefaults();
     expect(h.updateSettings).toHaveBeenCalledWith(
       expect.objectContaining({ browserLinkTarget: "app" }),
+    );
+  });
+
+  it("leaves a hidden link target out of the restore list and patch", async () => {
+    h.previewSupported = false;
+    h.settings = { ...DEFAULT_UNIFIED_SETTINGS, browserLinkTarget: "system" };
+    h.theme = "dark";
+    h.localApi = { dialogs: { confirm: vi.fn(async () => true) } };
+    const restore = captureRestore();
+
+    expect(restore.changedSettingLabels).toEqual(["Theme"]);
+    await restore.restoreDefaults();
+    expect(h.updateSettings).toHaveBeenCalledWith(
+      expect.not.objectContaining({ browserLinkTarget: expect.anything() }),
     );
   });
 

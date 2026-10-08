@@ -9,12 +9,13 @@ import { findPreviewThreadForTab } from "~/previewStateStore";
 import { previewEnvironment } from "~/state/preview";
 import { useAtomCommand } from "~/state/use-atom-command";
 
+import { previewBridge } from "./previewBridge";
+
 export function PreviewNewWindowRouter() {
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: true });
   useEffect(() => {
-    const bridge = window.desktopBridge?.preview;
-    if (!bridge) return;
-    return bridge.onNewWindowRequest((tabId, url) => {
+    if (!previewBridge) return;
+    return previewBridge.onNewWindowRequest((tabId, url) => {
       const threadRef = findPreviewThreadForTab(tabId);
       if (!threadRef) return;
       // Popups always become internal tabs, but a server-loopback URL must

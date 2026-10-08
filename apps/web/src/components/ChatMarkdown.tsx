@@ -83,7 +83,7 @@ import {
   openFileInPreview,
   BrowserPreviewUnavailableError,
 } from "../browser/openFileInPreview";
-import { showFileOutsideWorkspaceNotice } from "../browser/linkNotices";
+import { copyLink, showFileOutsideWorkspaceNotice } from "../browser/linkNotices";
 import { openLink } from "../browser/openLink";
 
 class CodeHighlightErrorBoundary extends React.Component<
@@ -1136,7 +1136,7 @@ const MarkdownFileLink = memo(function MarkdownFileLink({
           [
             { id: "open", label: "Open in editor" },
             ...(onOpenInBrowser
-              ? ([{ id: "open-in-browser", label: "Open in integrated browser" }] as const)
+              ? ([{ id: "open-in-browser", label: "Open in BiBCode browser" }] as const)
               : []),
             { id: "copy-relative", label: "Copy relative path" },
             { id: "copy-full", label: "Copy full path" },
@@ -1404,12 +1404,15 @@ function ChatMarkdown({
                   try {
                     const clicked = await api.contextMenu.show(
                       [
-                        { id: "open-in-browser", label: "Open in integrated browser" },
+                        { id: "open-in-browser", label: "Open in BiBCode browser" },
                         { id: "open-external", label: "Open in system browser" },
+                        { id: "copy-link", label: "Copy link" },
                       ] as const,
                       { x: event.clientX, y: event.clientY },
                     );
-                    if (clicked === "open-in-browser" || clicked === "open-external") {
+                    if (clicked === "copy-link") {
+                      copyLink(href);
+                    } else if (clicked === "open-in-browser" || clicked === "open-external") {
                       const wantApp = clicked === "open-in-browser";
                       const setting = getClientSettings().browserLinkTarget;
                       const outcome = openLink({

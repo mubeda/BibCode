@@ -2,6 +2,11 @@ import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 
 import { type PreviewTargetResolution, UNREACHABLE_MESSAGES } from "./browserTargetResolver";
 
+const copyLinkAction = (url: string) => ({
+  children: "Copy link",
+  onClick: () => void navigator.clipboard?.writeText(url).catch(() => undefined),
+});
+
 export function showPreviewUnreachableNotice(
   resolution: Extract<PreviewTargetResolution, { kind: "unreachable" }>,
 ): void {
@@ -9,7 +14,21 @@ export function showPreviewUnreachableNotice(
     stackedThreadToast({
       type: "warning",
       title: "Can't open this address here",
-      description: UNREACHABLE_MESSAGES[resolution.reason](resolution.environmentLabel),
+      description: `${UNREACHABLE_MESSAGES[resolution.reason](resolution.environmentLabel)} (${resolution.url})`,
+      actionVariant: "outline",
+      actionProps: copyLinkAction(resolution.url),
+    }),
+  );
+}
+
+export function showPreviewFailedNotice(input: { readonly onOpenInEditor: () => void }): void {
+  toastManager.add(
+    stackedThreadToast({
+      type: "warning",
+      title: "Couldn't preview this file",
+      description: "You can open it in the editor instead.",
+      actionVariant: "outline",
+      actionProps: { children: "Open in editor", onClick: input.onOpenInEditor },
     }),
   );
 }
@@ -28,6 +47,11 @@ export function showFileOutsideWorkspaceNotice(input: {
   );
 }
 
+/** Copies a link; a refused clipboard leaves nothing further to do. */
+export function copyLink(url: string): void {
+  copyLinkAction(url).onClick();
+}
+
 export function showLinkOpenFailedNotice(url: string): void {
   toastManager.add(
     stackedThreadToast({
@@ -35,10 +59,7 @@ export function showLinkOpenFailedNotice(url: string): void {
       title: "Couldn't open the link",
       description: url,
       actionVariant: "outline",
-      actionProps: {
-        children: "Copy link",
-        onClick: () => void navigator.clipboard?.writeText(url).catch(() => undefined),
-      },
+      actionProps: copyLinkAction(url),
     }),
   );
 }

@@ -626,14 +626,17 @@ vi.mock("~/localApi", () => ({
       : undefined,
 }));
 vi.mock("~/browser/openLink", () => ({ openLink: vi.fn() }));
-vi.mock("~/browser/linkNotices", () => ({ showFileOutsideWorkspaceNotice: vi.fn() }));
+vi.mock("~/browser/linkNotices", () => ({
+  showFileOutsideWorkspaceNotice: vi.fn(),
+  showPreviewFailedNotice: vi.fn(),
+}));
 vi.mock("~/browser/openFileInPreview", () => ({ openFileInPreview: vi.fn() }));
 vi.mock("~/previewStateStore", async (importOriginal) => ({
   ...(await importOriginal<typeof import("~/previewStateStore")>()),
   isPreviewSupportedInRuntime: () => testState.previewSupported,
 }));
 vi.mock("../state/session", () => ({
-  usePreparedConnection: () => testState.preparedConnection,
+  readPreparedConnection: () => Option.getOrNull(testState.preparedConnection),
 }));
 vi.mock("../state/assets", () => ({ assetEnvironment: { createUrl: "asset-create-url" } }));
 vi.mock("../state/use-atom-query-runner", () => ({
@@ -658,7 +661,7 @@ import ThreadTerminalPanel, {
 } from "./ThreadTerminalPanel";
 import { decodeTerminalLaunchCommand } from "../lib/terminalLaunchCommand";
 import { openLink } from "~/browser/openLink";
-import { showFileOutsideWorkspaceNotice } from "~/browser/linkNotices";
+import { showFileOutsideWorkspaceNotice, showPreviewFailedNotice } from "~/browser/linkNotices";
 import { openFileInPreview } from "~/browser/openFileInPreview";
 
 const ENVIRONMENT_ID = EnvironmentId.make("terminal-interactions");
@@ -1284,6 +1287,7 @@ beforeEach(() => {
   testState.shellOpenExternal.mockReset().mockResolvedValue(undefined);
   vi.mocked(openLink).mockReset().mockReturnValue("app");
   vi.mocked(showFileOutsideWorkspaceNotice).mockReset();
+  vi.mocked(showPreviewFailedNotice).mockReset();
   vi.mocked(openFileInPreview).mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.localApiAvailable = false;
   testState.previewSupported = true;
@@ -6029,7 +6033,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(testState.openPath).toHaveBeenCalledWith("/tmp/report.html");
   });
 
-  it("reports other html preview failures in the terminal", async () => {
+  it("offers the editor when an html preview fails for another reason", async () => {
     vi.stubGlobal("navigator", { platform: "Linux" });
     vi.mocked(openFileInPreview).mockResolvedValue(
       AsyncResult.failure(Cause.fail(new Error("asset service down"))),
@@ -6038,11 +6042,31 @@ describe("TerminalViewport mounted lifecycle", () => {
     const terminal = xtermState.terminals[0]!;
     terminal.bufferLines.push(terminalBufferLine("index.html"));
     const [link] = provideTerminalLinks(terminal) ?? [];
+    terminal.writes.length = 0;
 
     link!.activate(new MouseEvent("click", { ctrlKey: true }));
     await act(async () => Promise.resolve());
     expect(showFileOutsideWorkspaceNotice).not.toHaveBeenCalled();
-    expect(terminal.writes).toContain("\r\n[terminal] Unable to preview this file.\r\n");
+    expect(showPreviewFailedNotice).toHaveBeenCalledOnce();
+    expect(terminal.writes).toEqual([]);
+
+    vi.mocked(showPreviewFailedNotice).mock.calls[0]![0].onOpenInEditor();
+    await act(async () => Promise.resolve());
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/index.html");
+  });
+
+  it("offers the editor when the environment has no connection to preview through", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    testState.preparedConnection = Option.none();
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("index.html"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).not.toHaveBeenCalled();
+    expect(showPreviewFailedNotice).toHaveBeenCalledOnce();
   });
 
   it("opens path links and reports editor failures", async () => {

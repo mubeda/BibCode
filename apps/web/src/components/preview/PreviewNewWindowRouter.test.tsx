@@ -4,7 +4,7 @@
  * The component renders `null` and does its work in a mount effect. Following
  * the PreviewAutomationHosts pattern, `vi.mock("react")` captures effects so
  * they can be run manually after a static render; the desktop bridge listener
- * is captured from `window.desktopBridge.preview.onNewWindowRequest`.
+ * is captured from the `previewBridge` module handle's `onNewWindowRequest`.
  */
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -21,6 +21,13 @@ const h = vi.hoisted(() => ({
   openCalls: [] as Array<Record<string, unknown>>,
   noticeCalls: [] as unknown[],
   openPreview: () => Promise.resolve(),
+  previewBridge: null as unknown,
+}));
+
+vi.mock("./previewBridge", () => ({
+  get previewBridge() {
+    return h.previewBridge;
+  },
 }));
 
 vi.mock("react", async (importOriginal) => {
@@ -87,18 +94,16 @@ beforeEach(() => {
   h.resolveCalls.length = 0;
   h.openCalls.length = 0;
   h.noticeCalls.length = 0;
-  vi.stubGlobal("window", {
-    desktopBridge: {
-      preview: {
-        onNewWindowRequest: (listener: (tabId: string, url: string) => void) => {
-          h.listener = listener;
-          return () => {
-            h.unsubscribed += 1;
-          };
-        },
-      },
+  h.previewBridge = {
+    onNewWindowRequest: (listener: (tabId: string, url: string) => void) => {
+      h.listener = listener;
+      return () => {
+        h.unsubscribed += 1;
+      };
     },
-  });
+  };
+  // The module handle is the only bridge source; the window is never read.
+  vi.stubGlobal("window", {});
 });
 
 afterEach(() => {
@@ -138,6 +143,13 @@ describe("PreviewNewWindowRouter", () => {
       { kind: "unreachable", reason: "ssh", environmentLabel: "Box" },
     ]);
     expect(h.openCalls).toEqual([]);
+  });
+
+  it("subscribes to nothing without a preview bridge", () => {
+    h.previewBridge = null;
+    renderToStaticMarkup(<PreviewNewWindowRouter />);
+    for (const effect of h.effects.splice(0)) expect(effect()).toBeUndefined();
+    expect(h.listener).toBeNull();
   });
 
   it("unsubscribes from the desktop bridge on unmount", () => {

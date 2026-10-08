@@ -882,17 +882,21 @@ Plan surfaces can also appear when the active provider/session supplies them.
 Web links open in the BiBCode browser by default. **Settings → General → Open
 links in** chooses **BiBCode browser** or **System browser**; a change applies to
 the next click. Without a thread, without desktop preview support (for example
-macOS before 14), or in a browser tab, web links open in the system browser.
+macOS before 14), or in a browser tab, web links open in the system browser, and
+the setting is not shown.
 
 - **Chat:** Ctrl/Cmd-, Shift-, or Alt-click or middle-click opens the other
-  target. Right-click on an `http(s)` link offers both targets. Any
+  target. Right-click on an `http(s)` link offers **Open in BiBCode browser**,
+  **Open in system browser**, and **Copy link**. Any
   modifier-click on an `.html`, `.htm`, or `.pdf` file chip opens
   it in the editor instead of the browser.
 - **Terminal:** Ctrl/Cmd-click opens a link (Cmd on macOS); adding Shift opens
   the other target. `.html`, `.htm`, and `.pdf` paths, including a bare
   `index.html` and `file:///` URLs, open in the BiBCode browser; Ctrl/Cmd+Shift
   opens them in the editor, and every other path opens in the editor. Without a
-  thread or desktop preview support, they open in the editor too. A printed path
+  thread or desktop preview support, they open in the editor too. If such a
+  file can't be previewed (for example, the environment isn't connected), a
+  "Couldn't preview this file" notice offers **Open in editor**. A printed path
   that starts with two separators (`\\server\share`, `//server/share`, `\\?\…`,
   `\\.\…`) is refused with "Network paths can't be opened from the terminal."
   A `file://` URL with a host shows "Unable to open this file link." Relative
@@ -905,14 +909,16 @@ macOS before 14), or in a browser tab, web links open in the system browser.
   `target=_blank` link in the app itself, such as a pull request title in Git
   Manager, opens in the system browser.
 
-A link to `localhost`, `127.0.0.1`, or `0.0.0.0` means the server's machine, not
-this computer. From a thread on a LAN, tailnet (`100.64.0.0/10`), or WSL
-environment it opens on the server's address. From a thread on an SSH or BiBCode
-Connect environment, or a non-private host, BiBCode shows "Can't open this
-address here" and does not open this computer's `localhost`, whatever the
-target, modifier, or setting; reaching those ports is not available yet. If the
-thread's environment isn't connected, the notice says so and asks you to
-reconnect it.
+A link to `localhost`, a `*.localhost` name, any `127.x.x.x` address, `::1`, or a
+wildcard address (`0.0.0.0`, `[::]`) means the server's machine, not this
+computer. From a thread on a LAN, tailnet (`100.64.0.0/10`), or WSL environment,
+or one reached by a host name such as `devbox` or `box.lan`, it opens on the
+server's address. From a thread on an SSH or BiBCode Connect environment, or one
+reached by a public IP address, BiBCode shows "Can't open this address here"
+with the address and **Copy link**, and does not open this computer's
+`localhost`, whatever the target, modifier, or setting; reaching those ports is
+not supported yet. If the thread's environment isn't connected, the notice says
+so and asks you to reconnect it.
 
 A file outside the thread's workspace can't be previewed; the notice offers
 **Open in editor**. If the system browser fails to open a link, the notice shows
@@ -922,6 +928,8 @@ HTML, XHTML, SVG, and XML files the agent wrote are served to the browser in a
 sandbox with no origin of their own, so their scripts can't use `localStorage`
 or cookies. The agent's `preview_open` tool works on desktop for opening and
 navigating a tab; reading the page, clicking, and typing aren't supported yet.
+On desktop it always shows the tab it opens, and a request for a thread that
+isn't on screen times out.
 A server a terminal starts is listed as a discovered port for that terminal and
 its thread.
 

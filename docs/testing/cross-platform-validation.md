@@ -2596,11 +2596,11 @@ thread whose workspace contains `index.html`, a `.pdf`, and a `.txt`. Repeat
 each row with **Settings → General → Open links in** set to **BiBCode browser**
 and **System browser**; the modifier must always select the other target.
 Record, per row, where the link landed (BiBCode browser tab, system browser,
-editor, or notice).
+editor, or notice). In a browser tab (web mode), **Open links in** is not shown.
 
 - Chat `http(s)` link: plain click, Ctrl/Cmd-click, Shift-click, Alt-click, and
-  middle-click. Right-click offers both targets; other link types show no custom
-  menu. An `.html` or `.pdf` file chip opens in the BiBCode browser, and
+  middle-click. Right-click offers **Open in BiBCode browser**, **Open in
+  system browser**, and **Copy link**; other link types show no custom menu. An `.html` or `.pdf` file chip opens in the BiBCode browser, and
   any modifier-click opens the editor. A file outside the workspace shows the
   notice with **Open in editor**.
 - Terminal URL: plain click does nothing; Ctrl/Cmd-click opens the setting's
@@ -2616,17 +2616,20 @@ editor, or notice).
   "Network paths can't be opened from the terminal." and open nothing;
   `file://server/share/x.html` prints "Unable to open this file link." A
   relative `x.html` under a UNC working directory (WSL `\\wsl.localhost\…`)
-  still opens.
+  still opens. With the thread's environment disconnected, an HTML path shows
+  "Couldn't preview this file" with **Open in editor**.
 - Preview tab `target=_blank` link and `window.open` popup open a new tab in the
   same thread; `window.open('about:blank')` opens nothing. Git Manager pull
   request title opens in the system browser, not nowhere.
-- Agent `preview_open` opens a tab and reports success. Snapshot, click, and
-  type are still unsupported and report so.
-- Loopback links (`http://localhost:3000`, `127.0.0.1`, `0.0.0.0`): from a
-  local thread they open locally; from an SSH or BiBCode Connect thread they
-  show "Can't open this address here" for both targets, never this computer's
-  localhost; from a LAN, tailnet, or WSL thread they open on the server's
-  address.
+- Agent `preview_open` opens a tab, shows it (also with `show: false`), and
+  reports success; `preview_navigate` then loads a new URL in it. Snapshot,
+  click, and type are still unsupported and report so.
+- Loopback links (`http://localhost:3000`, `127.0.0.2`, `0.0.0.0`, `[::]`,
+  `app.localhost`): from a local thread they open locally; from an SSH or
+  BiBCode Connect thread they show "Can't open this address here" with the
+  address and **Copy link** for both targets, never this computer's localhost;
+  from a LAN, tailnet, WSL, or host-name (`devbox`) thread they open on the
+  server's address.
 - A failed system-browser open (no handler registered) shows the link with
   **Copy link**.
 - Agent-written asset response: `curl -sI '<signed /api/assets URL>'` for an

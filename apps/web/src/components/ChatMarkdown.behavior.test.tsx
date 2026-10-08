@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   toastAdd: vi.fn(),
   openLink: vi.fn(),
   showFileOutsideWorkspaceNotice: vi.fn(),
+  copyLink: vi.fn(),
   browserLinkTarget: "app" as "app" | "system",
   previewSupported: true,
   localApiAvailable: true,
@@ -56,6 +57,7 @@ vi.mock("../browser/openFileInPreview", () => ({
 vi.mock("../browser/openLink", () => ({ openLink: mocks.openLink }));
 vi.mock("../browser/linkNotices", () => ({
   showFileOutsideWorkspaceNotice: mocks.showFileOutsideWorkspaceNotice,
+  copyLink: mocks.copyLink,
 }));
 vi.mock("../hooks/useSettings", () => ({
   getClientSettings: () => ({ wordWrap: false, browserLinkTarget: mocks.browserLinkTarget }),
@@ -529,8 +531,9 @@ describe("ChatMarkdown external-link behavior", () => {
     await openContextMenu(link);
     expect(mocks.contextMenuShow).toHaveBeenCalledWith(
       [
-        { id: "open-in-browser", label: "Open in integrated browser" },
+        { id: "open-in-browser", label: "Open in BiBCode browser" },
         { id: "open-external", label: "Open in system browser" },
+        { id: "copy-link", label: "Copy link" },
       ],
       { x: 14, y: 28 },
     );
@@ -556,6 +559,11 @@ describe("ChatMarkdown external-link behavior", () => {
     const calls = mocks.openLink.mock.calls.length;
     mocks.contextMenuShow.mockResolvedValueOnce(undefined);
     await openContextMenu(link);
+    expect(mocks.openLink).toHaveBeenCalledTimes(calls);
+
+    mocks.contextMenuShow.mockResolvedValueOnce("copy-link");
+    await openContextMenu(link);
+    expect(mocks.copyLink).toHaveBeenCalledWith(url);
     expect(mocks.openLink).toHaveBeenCalledTimes(calls);
   });
 

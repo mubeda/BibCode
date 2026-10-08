@@ -72,16 +72,18 @@ export type PreviewTargetResolution =
       readonly kind: "unreachable";
       readonly reason: PreviewUnreachableReason;
       readonly environmentLabel: string;
+      /** The normalized address that could not be opened. */
+      readonly url: string;
     };
+
+const UNREACHABLE_REMOTE = (label: string) =>
+  `This address is on ${label}, not this computer. Opening its ports from here isn't supported yet.`;
 
 export const UNREACHABLE_MESSAGES: Record<PreviewUnreachableReason, (label: string) => string> = {
   disconnected: (label) => `${label} isn't connected. Reconnect it, then open the link again.`,
-  ssh: (label) =>
-    `This address is on ${label}, not this computer. Opening server ports over SSH isn't available yet.`,
-  relay: (label) =>
-    `This address is on ${label}, not this computer. Opening server ports over BiBCode Connect isn't available yet.`,
-  "public-host": (label) =>
-    `This address is on ${label}, not this computer, and ${label} isn't on a private network, so its ports can't be opened directly.`,
+  ssh: UNREACHABLE_REMOTE,
+  relay: UNREACHABLE_REMOTE,
+  "public-host": UNREACHABLE_REMOTE,
 };
 
 type EnvironmentReach =
@@ -177,7 +179,12 @@ export function resolvePreviewTarget(
   }
   const reach = classifyEnvironmentReach(environmentId);
   if (reach.kind === "unreachable") {
-    return { kind: "unreachable", reason: reach.reason, environmentLabel: reach.label };
+    return {
+      kind: "unreachable",
+      reason: reach.reason,
+      environmentLabel: reach.label,
+      url: parsed.toString(),
+    };
   }
   if (reach.kind === "host") {
     parsed.hostname = formatHost(reach.host);

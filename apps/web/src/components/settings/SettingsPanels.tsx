@@ -65,6 +65,7 @@ import {
   sortProviderInstanceEntries,
 } from "../../providerInstances";
 import { ensureLocalApi, readLocalApi } from "../../localApi";
+import { isPreviewSupportedInRuntime } from "../../previewStateStore";
 import {
   primaryServerObservabilityAtom,
   primaryServerProvidersAtom,
@@ -428,6 +429,8 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
   const { theme, setTheme } = useTheme();
   const settings = usePrimarySettings();
   const updateSettings = useUpdatePrimarySettings();
+  // The link target row is hidden where the BiBCode browser can't open links.
+  const linkTargetShown = isPreviewSupportedInRuntime();
 
   const changedSettingLabels = useMemo(
     () => [
@@ -435,7 +438,8 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       ...(settings.timestampFormat !== DEFAULT_UNIFIED_SETTINGS.timestampFormat
         ? ["Time format"]
         : []),
-      ...(settings.browserLinkTarget !== DEFAULT_UNIFIED_SETTINGS.browserLinkTarget
+      ...(linkTargetShown &&
+      settings.browserLinkTarget !== DEFAULT_UNIFIED_SETTINGS.browserLinkTarget
         ? ["Open links in"]
         : []),
       ...(settings.wordWrap !== DEFAULT_UNIFIED_SETTINGS.wordWrap ? ["Word wrap"] : []),
@@ -486,6 +490,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       settings.enableProviderUpdateChecks,
       settings.timestampFormat,
       settings.wordWrap,
+      linkTargetShown,
       theme,
     ],
   );
@@ -503,7 +508,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
     setTheme("system");
     updateSettings({
       timestampFormat: DEFAULT_UNIFIED_SETTINGS.timestampFormat,
-      browserLinkTarget: DEFAULT_UNIFIED_SETTINGS.browserLinkTarget,
+      ...(linkTargetShown ? { browserLinkTarget: DEFAULT_UNIFIED_SETTINGS.browserLinkTarget } : {}),
       wordWrap: DEFAULT_UNIFIED_SETTINGS.wordWrap,
       diffIgnoreWhitespace: DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace,
       enableAssistantStreaming: DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming,
@@ -517,7 +522,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       confirmThreadDelete: DEFAULT_UNIFIED_SETTINGS.confirmThreadDelete,
     });
     onRestored?.();
-  }, [changedSettingLabels, onRestored, setTheme, updateSettings]);
+  }, [changedSettingLabels, linkTargetShown, onRestored, setTheme, updateSettings]);
 
   return {
     changedSettingLabels,
@@ -529,6 +534,7 @@ export function GeneralSettingsPanel() {
   const { theme, setTheme } = useTheme();
   const settings = usePrimarySettings();
   const updateSettings = useUpdatePrimarySettings();
+  const linkTargetShown = isPreviewSupportedInRuntime();
 
   return (
     <SettingsPageContainer>
@@ -608,42 +614,48 @@ export function GeneralSettingsPanel() {
           }
         />
 
-        <SettingsRow
-          title="Open links in"
-          description="Where web links from chat and the terminal open. Modifier-click a chat link, or Ctrl/Cmd+Shift-click a terminal link, to use the other one."
-          resetAction={
-            settings.browserLinkTarget !== DEFAULT_UNIFIED_SETTINGS.browserLinkTarget ? (
-              <SettingResetButton
-                label="link target"
-                onClick={() =>
-                  updateSettings({ browserLinkTarget: DEFAULT_UNIFIED_SETTINGS.browserLinkTarget })
-                }
-              />
-            ) : null
-          }
-          control={
-            <Select
-              value={settings.browserLinkTarget}
-              onValueChange={(value) => {
-                if (value === "app" || value === "system") {
-                  updateSettings({ browserLinkTarget: value });
-                }
-              }}
-            >
-              <SelectTrigger className="w-full sm:w-40" aria-label="Open links in">
-                <SelectValue>{BROWSER_LINK_TARGET_LABELS[settings.browserLinkTarget]}</SelectValue>
-              </SelectTrigger>
-              <SelectPopup align="end" alignItemWithTrigger={false}>
-                <SelectItem hideIndicator value="app">
-                  {BROWSER_LINK_TARGET_LABELS.app}
-                </SelectItem>
-                <SelectItem hideIndicator value="system">
-                  {BROWSER_LINK_TARGET_LABELS.system}
-                </SelectItem>
-              </SelectPopup>
-            </Select>
-          }
-        />
+        {linkTargetShown ? (
+          <SettingsRow
+            title="Open links in"
+            description="Where web links from chat and the terminal open. Modifier-click a chat link, or Ctrl/Cmd+Shift-click a terminal link, to use the other one."
+            resetAction={
+              settings.browserLinkTarget !== DEFAULT_UNIFIED_SETTINGS.browserLinkTarget ? (
+                <SettingResetButton
+                  label="link target"
+                  onClick={() =>
+                    updateSettings({
+                      browserLinkTarget: DEFAULT_UNIFIED_SETTINGS.browserLinkTarget,
+                    })
+                  }
+                />
+              ) : null
+            }
+            control={
+              <Select
+                value={settings.browserLinkTarget}
+                onValueChange={(value) => {
+                  if (value === "app" || value === "system") {
+                    updateSettings({ browserLinkTarget: value });
+                  }
+                }}
+              >
+                <SelectTrigger className="w-full sm:w-40" aria-label="Open links in">
+                  <SelectValue>
+                    {BROWSER_LINK_TARGET_LABELS[settings.browserLinkTarget]}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectPopup align="end" alignItemWithTrigger={false}>
+                  <SelectItem hideIndicator value="app">
+                    {BROWSER_LINK_TARGET_LABELS.app}
+                  </SelectItem>
+                  <SelectItem hideIndicator value="system">
+                    {BROWSER_LINK_TARGET_LABELS.system}
+                  </SelectItem>
+                </SelectPopup>
+              </Select>
+            }
+          />
+        ) : null}
 
         <SettingsRow
           title="Word wrap"

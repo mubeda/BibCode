@@ -79,10 +79,10 @@ import { serverEnvironment } from "../state/server";
 import { previewEnvironment } from "../state/preview";
 import { terminalEnvironment } from "../state/terminal";
 import { assetEnvironment } from "../state/assets";
-import { usePreparedConnection } from "../state/session";
+import { readPreparedConnection } from "../state/session";
 import { useAtomQueryRunner } from "../state/use-atom-query-runner";
 import { openLink } from "~/browser/openLink";
-import { showFileOutsideWorkspaceNotice } from "~/browser/linkNotices";
+import { showFileOutsideWorkspaceNotice, showPreviewFailedNotice } from "~/browser/linkNotices";
 import { openFileInPreview } from "~/browser/openFileInPreview";
 import { isPreviewSupportedInRuntime } from "~/previewStateStore";
 import { createTerminalOutputSink } from "./terminalOutputSink";
@@ -898,13 +898,13 @@ export function TerminalViewport({
   const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
     reportFailure: false,
   });
-  const preparedConnection = usePreparedConnection(environmentId);
   const openPreviewFile = useEffectEvent(async (absolutePath: string) => {
-    if (preparedConnection._tag === "None") return { ok: false as const, outside: false };
+    const connection = readPreparedConnection(environmentId);
+    if (!connection) return { ok: false as const, outside: false };
     const result = await openFileInPreview({
       threadRef,
       filePath: absolutePath,
-      httpBaseUrl: preparedConnection.value.httpBaseUrl,
+      httpBaseUrl: connection.httpBaseUrl,
       createAssetUrl,
       openPreview,
     });
@@ -1788,13 +1788,9 @@ export function TerminalViewport({
                 void (async () => {
                   const outcome = await openPreviewFile(previewFile);
                   if (outcome.ok) return;
-                  if (outcome.outside) {
-                    showFileOutsideWorkspaceNotice({
-                      onOpenInEditor: () => openEditorPath(editorTarget),
-                    });
-                    return;
-                  }
-                  writeSystemMessage(latestTerminal, "Unable to preview this file.");
+                  const onOpenInEditor = () => openEditorPath(editorTarget);
+                  if (outcome.outside) showFileOutsideWorkspaceNotice({ onOpenInEditor });
+                  else showPreviewFailedNotice({ onOpenInEditor });
                 })();
                 return;
               }
