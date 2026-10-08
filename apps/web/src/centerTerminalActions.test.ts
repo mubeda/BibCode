@@ -236,6 +236,7 @@ describe("createCenterTerminal", () => {
         BIBCODE_PROJECT_PATH: "/workspace/project",
         BIBCODE_WORKTREE_PATH: "/workspace/worktree",
       },
+      centerPanel: true,
       command,
     });
     expect(place).toHaveBeenCalledWith("term-4", action.placement, {

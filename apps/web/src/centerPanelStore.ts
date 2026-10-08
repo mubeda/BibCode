@@ -89,6 +89,21 @@ interface CenterPanelStoreState {
     terminalId: string,
     options?: OpenTerminalPanelOptions,
   ) => void;
+  /** Adds a panel another client opened, as an inactive tab; no-op when already present. */
+  adoptTerminalPanel: (
+    ref: ScopedThreadRef,
+    terminalId: string,
+    options?: OpenTerminalPanelOptions,
+  ) => void;
+  adoptChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
+  /** Replaces an existing terminal surface's launch command; never adds a surface. */
+  syncTerminalPanelCommand: (
+    ref: ScopedThreadRef,
+    terminalId: string,
+    command: TerminalLaunchCommand | undefined,
+  ) => void;
+  /** Drops a terminal surface whose session the server removed; the session needs no cleanup. */
+  removeTerminalPanel: (ref: ScopedThreadRef, terminalId: string) => void;
   replaceMainWithTerminal: (
     ref: ScopedThreadRef,
     existingTerminalIds: ReadonlyArray<string>,
@@ -211,6 +226,28 @@ function insertSurface(
     : [...current.surfaces, surface];
   if (!mutation.changed && surfaces === current.surfaces) return current;
   return { ...mutation.state, surfaces };
+}
+
+function appendInactiveSurface(
+  current: ThreadCenterPanelState,
+  surface: CenterSurface,
+): ThreadCenterPanelState {
+  if (current.surfaces.some((entry) => entry.id === surface.id)) return current;
+  const group = findCenterPanelGroup(current, current.focusedGroupId) ?? current.groups[0];
+  if (!group) return current;
+  return {
+    ...current,
+    surfaces: [...current.surfaces, surface],
+    groups: current.groups.map((entry) =>
+      entry.id === group.id
+        ? {
+            ...entry,
+            surfaceIds: [...entry.surfaceIds, surface.id],
+            activeSurfaceId: entry.activeSurfaceId ?? surface.id,
+          }
+        : entry,
+    ),
+  };
 }
 
 function validateTerminalPanelPlacement(
@@ -414,6 +451,55 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
           options,
         );
       },
+      adoptTerminalPanel: (ref, terminalId, options) =>
+        set((state) =>
+          withUpdatedThread(state, ref, (current) =>
+            appendInactiveSurface(current, terminalSurface(terminalId, options)),
+          ),
+        ),
+      adoptChatPanel: (ref, threadId, providerLabel) =>
+        set((state) =>
+          withUpdatedThread(state, ref, (current) =>
+            appendInactiveSurface(current, chatSurface(threadId, providerLabel)),
+          ),
+        ),
+      syncTerminalPanelCommand: (ref, terminalId, command) => {
+        const threadKey = scopedThreadKey(ref);
+        const current = get().byThreadKey[threadKey];
+        const surfaceId = `terminal:${terminalId}`;
+        const surface = current?.surfaces.find((entry) => entry.id === surfaceId);
+        // Checked before `set`: the persist middleware writes the whole layout on every call.
+        if (
+          !current ||
+          surface?.kind !== "terminal" ||
+          JSON.stringify(surface.command) === JSON.stringify(command)
+        ) {
+          return;
+        }
+        // A label taken from the previous command follows the new one; a custom label stays.
+        const label = surface.label === surface.command?.label ? command?.label : surface.label;
+        const next = terminalSurface(terminalId, {
+          ...(label !== undefined ? { label } : {}),
+          ...(command !== undefined ? { command } : {}),
+        });
+        set((state) => ({
+          byThreadKey: {
+            ...state.byThreadKey,
+            [threadKey]: {
+              ...current,
+              surfaces: current.surfaces.map((entry) => (entry.id === surfaceId ? next : entry)),
+            },
+          },
+        }));
+      },
+      removeTerminalPanel: (ref, terminalId) =>
+        set((state) =>
+          withUpdatedThread(
+            state,
+            ref,
+            (current) => applySurfaceRemoval(current, new Set([`terminal:${terminalId}`])).state,
+          ),
+        ),
       replaceMainWithTerminal: (ref, existingTerminalIds, options) => {
         const threadKey = scopedThreadKey(ref);
         const current = get().byThreadKey[threadKey] ?? EMPTY_THREAD_STATE;

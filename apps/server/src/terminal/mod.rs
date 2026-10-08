@@ -14,7 +14,7 @@ pub use manager::{
 };
 pub use model::{
     ProviderTerminalActivityLaunch, TerminalAttachInput, TerminalConsoleTheme, TerminalEvent,
-    TerminalLaunchCommand, TerminalMetadataEvent, TerminalOpenInput, TerminalRestartInput,
-    TerminalSessionSnapshot, TerminalSize, TerminalStatus, TerminalSummary,
+    TerminalLaunchCommand, TerminalMetadataEvent, TerminalOpenInput, TerminalRemovalReason,
+    TerminalRestartInput, TerminalSessionSnapshot, TerminalSize, TerminalStatus, TerminalSummary,
 };
 pub use pty::{PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput};

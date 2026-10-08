@@ -1131,7 +1131,11 @@ boundary, while `git.preparePullRequestThread` remains local-checkout-only.
 
 `worktree.createPanel` accepts only a persisted host thread plus new panel
 identity/title/defaults. The server re-reads the host under its mutation lock
-and derives project, `panel` kind, branch, and worktree path. Similarly,
+and derives project, `panel` kind, branch, and worktree path. The panel
+thread records the host as `hostThreadId` on `thread.created`, persisted in
+`projection_threads.host_thread_id` and emitted on thread shells and details so
+every client can open the panel under its host; public `thread.create` rejects a
+client-supplied `hostThreadId`. Similarly,
 `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present
 nonprimary/nonbare membership and exclusive ownership before dispatching the

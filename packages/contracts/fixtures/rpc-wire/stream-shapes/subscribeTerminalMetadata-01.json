@@ -16,7 +16,8 @@
         "consoleTheme": "dark",
         "hasRunningSubprocess": false,
         "label": "# >",
-        "updatedAt": "_)\""
+        "updatedAt": "_)\"",
+        "centerPanel": false
       }
     }
   ]

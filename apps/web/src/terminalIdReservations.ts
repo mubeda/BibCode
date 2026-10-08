@@ -38,3 +38,8 @@ export function reserveTerminalId(
     },
   };
 }
+
+/** True while a local open transaction holds this terminal id; that transaction places its own surface. */
+export function isTerminalIdReserved(threadRef: ScopedThreadRef, terminalId: string): boolean {
+  return reservedIdsByThreadKey.get(scopedThreadKey(threadRef))?.has(terminalId) ?? false;
+}

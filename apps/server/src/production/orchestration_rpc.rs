@@ -288,6 +288,10 @@ pub(crate) async fn decode_public_orchestration_command(
             worktree_path: Some(_),
             ..
         }
+        | OrchestrationCommand::ThreadCreate {
+            host_thread_id: Some(_),
+            ..
+        }
         | OrchestrationCommand::ThreadMetaUpdate {
             worktree_path: OptionalNullable::Present(_),
             ..
@@ -1503,6 +1507,9 @@ fn thread_shell_with_records(
             json!({ "state": state, "detail": thread.unresolved_delivery_detail })
         }),
     });
+    if let Some(host_thread_id) = &thread.host_thread_id {
+        shell["hostThreadId"] = json!(host_thread_id);
+    }
     if let Some(preview) = preview {
         shell["conversationPreview"] = json!({
             "prompt": preview.prompt,
@@ -1741,6 +1748,7 @@ mod tests {
                 unresolved_delivery_state: None,
                 unresolved_delivery_detail: None,
                 deleted_at: None,
+                host_thread_id: None,
             }],
             messages: vec![
                 ProjectionThreadMessage {

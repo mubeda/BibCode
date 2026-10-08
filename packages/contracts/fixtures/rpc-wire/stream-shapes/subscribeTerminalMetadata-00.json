@@ -17,74 +17,105 @@
           "consoleTheme": "light",
           "hasRunningSubprocess": true,
           "label": "z",
-          "updatedAt": "s'(QI&:Qa"
+          "updatedAt": "s'(QI&:Qa",
+          "centerPanel": false,
+          "command": {
+            "executable": "id;UI\"_/P",
+            "args": [")", ""],
+            "env": {
+              "e": ".wD#W4+8o"
+            },
+            "activity": {
+              "driverKind": "hQ_",
+              "providerInstanceId": "R1__JY"
+            }
+          }
         },
         {
-          "threadId": "itid;",
-          "terminalId": "I\"",
-          "cwd": "/P>a",
-          "worktreePath": null,
-          "status": "running",
-          "pid": null,
+          "threadId": "P&/X* `u",
+          "terminalId": "ae7,}0m9j3a",
+          "cwd": "X!,Mp{9Q",
+          "worktreePath": "7",
+          "status": "starting",
+          "pid": 530796252,
           "exitCode": null,
-          "exitSignal": null,
+          "exitSignal": -1493827727,
           "hasRunningSubprocess": true,
-          "label": "L,",
-          "updatedAt": "lN"
+          "label": "",
+          "updatedAt": "?OI;g:O!",
+          "centerPanel": true,
+          "command": {
+            "executable": "|*vn",
+            "args": ["b&6\"S%}f", ""],
+            "label": "\\5vQ$h",
+            "env": {
+              "K": "rWl"
+            }
+          }
         },
         {
-          "threadId": "NxFM8Octx",
-          "terminalId": "}*V",
-          "cwd": "kcVr{W&~}c",
-          "worktreePath": null,
+          "threadId": "<:o5Z]0J&",
+          "terminalId": "iS2ryY3~z'_(",
+          "cwd": "n\".\"Zdgf",
+          "worktreePath": "#RlQ[9lU-xU",
           "status": "starting",
           "pid": null,
           "exitCode": null,
-          "exitSignal": -1361953400,
+          "exitSignal": null,
           "hasRunningSubprocess": false,
-          "label": "B",
-          "updatedAt": "g6- .)&="
+          "label": "or)+",
+          "updatedAt": "H^7!q`'",
+          "centerPanel": false,
+          "command": {
+            "executable": "Y",
+            "args": ["", "C<Hy", "t'IB&Lr+F", "sveA\"8U", ""],
+            "env": {
+              "c": "<h07|i"
+            }
+          }
         },
         {
-          "threadId": "y17Z`Yf",
-          "terminalId": "9Gn}cP<",
-          "cwd": "2&u",
+          "threadId": "P=",
+          "terminalId": "i1u);6z",
+          "cwd": "A",
           "worktreePath": null,
-          "status": "running",
+          "status": "exited",
           "pid": null,
-          "exitCode": 1494537112,
-          "exitSignal": -645431119,
-          "consoleTheme": "dark",
-          "hasRunningSubprocess": false,
-          "label": "wv:+E[",
-          "updatedAt": ""
-        },
-        {
-          "threadId": "]+rRx;d",
-          "terminalId": "'D1-.d",
-          "cwd": "|H",
-          "worktreePath": null,
-          "status": "error",
-          "pid": 1134587220,
-          "exitCode": null,
-          "exitSignal": -1499695271,
-          "hasRunningSubprocess": true,
-          "label": "X]wrKI`z",
-          "updatedAt": ""
-        },
-        {
-          "threadId": "jb9U#AU:o",
-          "terminalId": "\"",
-          "cwd": "_RyCC",
-          "worktreePath": "u2,k",
-          "status": "error",
-          "pid": 857361239,
-          "exitCode": 1223399879,
-          "exitSignal": 932963937,
+          "exitCode": 622288241,
+          "exitSignal": 1241754173,
           "consoleTheme": "light",
           "hasRunningSubprocess": false,
-          "label": "+I_u~ct,",
-          "updatedAt": "3w^"
+          "label": "Q9k0",
+          "updatedAt": "",
+          "centerPanel": false
+        },
+        {
+          "threadId": "%:1.sO@U6",
+          "terminalId": ",oK;PVj0!",
+          "cwd": "Q&#",
+          "worktreePath": null,
+          "status": "starting",
+          "pid": 980689885,
+          "exitCode": null,
+          "exitSignal": null,
+          "hasRunningSubprocess": false,
+          "label": "",
+          "updatedAt": "XL",
+          "centerPanel": false
+        },
+        {
+          "threadId": "RS(dgfB@.A",
+          "terminalId": "p22='",
+          "cwd": "/QHa7=n",
+          "worktreePath": "[",
+          "status": "error",
+          "pid": null,
+          "exitCode": null,
+          "exitSignal": null,
+          "hasRunningSubprocess": false,
+          "label": "-3w",
+          "updatedAt": "",
+          "centerPanel": true
         }
       ]
     }

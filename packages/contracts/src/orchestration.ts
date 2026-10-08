@@ -494,6 +494,8 @@ export const OrchestrationThread = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
   kind: Schema.optional(ThreadKind),
+  /** Host thread of a `panel` thread; absent for other kinds and on older servers. */
+  hostThreadId: Schema.optional(ThreadId),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   latestTurn: Schema.NullOr(OrchestrationLatestTurn),
@@ -560,6 +562,8 @@ export const OrchestrationThreadShell = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
   kind: Schema.optional(ThreadKind),
+  /** Host thread of a `panel` thread; absent for other kinds and on older servers. */
+  hostThreadId: Schema.optional(ThreadId),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   latestTurn: Schema.NullOr(OrchestrationLatestTurn),
@@ -1152,6 +1156,7 @@ export const ThreadCreatedPayload = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
   kind: Schema.optional(ThreadKind),
+  hostThreadId: Schema.optional(ThreadId),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: IsoDateTime,

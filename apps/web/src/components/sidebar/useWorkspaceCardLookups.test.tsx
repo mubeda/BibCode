@@ -92,6 +92,7 @@ describe("list-wide card lookups", () => {
       hasRunningSubprocess,
       label: "",
       updatedAt: "2026-09-24T00:00:00Z",
+      centerPanel: false,
     });
     const map = indexes.buildRunningTerminalMap([
       { environmentId: local, rows: [terminal("active", true), terminal("idle", false)] },

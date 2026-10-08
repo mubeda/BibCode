@@ -1676,6 +1676,7 @@ mod tests {
                 ],
                 label: Some("Status mutation".to_owned()),
                 activity: None,
+                env: None,
             }
         } else {
             TerminalLaunchCommand {
@@ -1686,6 +1687,7 @@ mod tests {
                 ],
                 label: Some("Status mutation".to_owned()),
                 activity: None,
+                env: None,
             }
         });
         terminal

@@ -89,6 +89,8 @@ export const TerminalOpenInput = Schema.Struct({
   rows: Schema.optional(TerminalRowsSchema),
   env: Schema.optional(TerminalEnvSchema),
   command: Schema.optional(TerminalLaunchCommand),
+  /** Marks a host thread's center panel so every client can adopt it; sticky once set. */
+  centerPanel: Schema.optional(Schema.Boolean),
 });
 export type TerminalOpenInput = typeof TerminalOpenInput.Type;
 
@@ -102,6 +104,8 @@ export const TerminalAttachInput = Schema.Struct({
   command: Schema.optional(TerminalLaunchCommand),
   restartIfNotRunning: Schema.optional(Schema.Boolean),
   sizeClaim: Schema.optional(TerminalSizeClaimSchema),
+  /** Same marker as `TerminalOpenInput.centerPanel`, for attaches that create the session. */
+  centerPanel: Schema.optional(Schema.Boolean),
 });
 export type TerminalAttachInput = typeof TerminalAttachInput.Type;
 
@@ -218,6 +222,10 @@ export const TerminalSummary = Schema.Struct({
   /** Server-computed display title (idle shell vs subprocess command). */
   label: Schema.String.check(Schema.isMaxLength(128)),
   updatedAt: Schema.String,
+  /** True when the session is a host thread's center panel; false on older servers. */
+  centerPanel: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** Launch command the session was started with, when it was started with one. */
+  command: Schema.optional(TerminalLaunchCommand),
 });
 export type TerminalSummary = typeof TerminalSummary.Type;
 
@@ -231,10 +239,15 @@ const TerminalMetadataUpsertEvent = Schema.Struct({
   terminal: TerminalSummary,
 });
 
+/** Only `closed` means a client closed the session; absent on older servers. */
+export const TerminalRemovalReason = Schema.Literals(["closed", "restarted", "shutdown"]);
+export type TerminalRemovalReason = typeof TerminalRemovalReason.Type;
+
 const TerminalMetadataRemoveEvent = Schema.Struct({
   type: Schema.Literal("remove"),
   threadId: Schema.String.check(Schema.isNonEmpty()),
   terminalId: Schema.String.check(Schema.isNonEmpty()),
+  reason: Schema.optional(TerminalRemovalReason),
 });
 
 export const TerminalMetadataStreamEvent = Schema.Union([

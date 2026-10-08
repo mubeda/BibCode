@@ -5,7 +5,8 @@
     {
       "type": "remove",
       "threadId": "eU-1",
-      "terminalId": "|#Wco"
+      "terminalId": "|#Wco",
+      "reason": "restarted"
     }
   ]
 }

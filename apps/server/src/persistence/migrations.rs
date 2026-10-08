@@ -683,6 +683,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(51, "TurnDeliveryFailureReason", migration_051),
     Migration::new(52, "ProjectRepositoryIdentity", migration_052),
     Migration::new(53, "PullRequestSnapshots", migration_053),
+    Migration::new(54, "ProjectionThreadHostThread", migration_054),
 ];
 
 impl Migration {
@@ -2558,6 +2559,19 @@ fn migration_053(transaction: &Transaction<'_>) -> Result<()> {
     )
 }
 
+fn migration_054(transaction: &Transaction<'_>) -> Result<()> {
+    // A panel thread records its host thread so every client can open it as a
+    // tab under that host. Guarded like 045: a trusted-ledger restore may not
+    // carry this rebuildable projection table.
+    if table_exists(transaction, "projection_threads")?
+        && !table_has_column(transaction, "projection_threads", "host_thread_id")?
+    {
+        transaction
+            .execute_batch("ALTER TABLE projection_threads ADD COLUMN host_thread_id TEXT;")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2697,6 +2711,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn migration_054_adds_nullable_host_thread_column() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(53))?;
+        connection.execute(
+            "INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('t', 'p', 'T', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z', NULL, NULL)",
+            [],
+        )?;
+
+        let applied = run_migrations(&mut connection, None)?;
+
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [54]
+        );
+        let value = connection.query_row(
+            "SELECT host_thread_id FROM projection_threads WHERE thread_id = 't'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        assert_eq!(value, None);
+        Ok(())
     }
 
     #[test]
@@ -3357,7 +3398,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=53).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=54).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3378,6 +3419,8 @@ mod tests {
         assert_eq!(MIGRATIONS[48].name, "AuthPairingDeliveryState");
         assert_eq!(MIGRATIONS[45].name, "AuthPairingReach");
         assert_eq!(MIGRATIONS[46].name, "AuthPairingOfferIdempotency");
+        assert_eq!(MIGRATIONS[52].name, "PullRequestSnapshots");
+        assert_eq!(MIGRATIONS[53].name, "ProjectionThreadHostThread");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
@@ -3409,6 +3452,7 @@ mod tests {
                 (51, "TurnDeliveryFailureReason"),
                 (52, "ProjectRepositoryIdentity"),
                 (53, "PullRequestSnapshots"),
+                (54, "ProjectionThreadHostThread"),
             ],
         );
         assert_eq!(
@@ -3505,10 +3549,11 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 37);
+        assert_eq!(second.len(), 38);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
+        assert_eq!(second[37].id, 54);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3615,7 +3660,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
+            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3652,7 +3697,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
+            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3680,7 +3725,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
+            [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3820,7 +3865,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48, 49, 50, 51, 52, 53]
+            [48, 49, 50, 51, 52, 53, 54]
         );
         assert_eq!(
             connection.query_row(
@@ -3849,7 +3894,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 20);
+        assert_eq!(applied.len(), 21);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3870,6 +3915,7 @@ mod tests {
         assert_eq!(applied[17].id, 51);
         assert_eq!(applied[18].id, 52);
         assert_eq!(applied[19].id, 53);
+        assert_eq!(applied[20].id, 54);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

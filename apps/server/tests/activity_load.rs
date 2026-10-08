@@ -556,6 +556,7 @@ fn activity_terminal_input(
             driver_kind: "codex".to_owned(),
             provider_instance_id: "codex".to_owned(),
         }),
+        env: None,
     });
     input
 }
