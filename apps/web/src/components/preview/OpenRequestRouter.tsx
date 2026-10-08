@@ -7,6 +7,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import { useContext, useEffect } from "react";
 
 import { openLink } from "~/browser/openLink";
+import { enqueueOpenPrompt } from "~/browser/openPromptQueue";
 import { useCenterPanelStore } from "~/centerPanelStore";
 import { getClientSettings } from "~/hooks/useSettings";
 import type { AppRouter } from "~/router";
@@ -15,7 +16,7 @@ import { previewEnvironment } from "~/state/preview";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { resolveThreadRouteRef } from "~/threadRoutes";
 
-import { enqueueOpenPrompt } from "./OpenPromptBanner";
+import { isBrowserMode } from "./previewBridge";
 
 type ScreenRouter = Pick<AppRouter, "state">;
 
@@ -82,8 +83,13 @@ function EnvironmentOpenRequestRouter(props: {
           if (shown() === null) return;
           void claimOpenRequest({ environmentId, input: { requestId: event.requestId } }).then(
             (result) => {
-              if (result._tag !== "Success" || !result.value.claimed) return;
-              if (!window.desktopBridge) {
+              if (result._tag !== "Success") {
+                // The URL can carry a capability-bearing path; log only the request.
+                console.warn("Couldn't claim the preview open request", event.requestId);
+                return;
+              }
+              if (!result.value.claimed) return;
+              if (isBrowserMode()) {
                 // No click backs this open, so a browser would block the new tab.
                 enqueueOpenPrompt({
                   id: event.requestId,

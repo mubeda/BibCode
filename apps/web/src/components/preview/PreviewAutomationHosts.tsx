@@ -49,8 +49,9 @@ import { previewEnvironment } from "~/state/preview";
 import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 import { useAtomCommand } from "~/state/use-atom-command";
 
-import { enqueueOpenPrompt } from "./OpenPromptBanner";
-import { previewBridge } from "./previewBridge";
+import { enqueueOpenPrompt } from "~/browser/openPromptQueue";
+
+import { isBrowserMode, previewBridge } from "./previewBridge";
 import {
   PreviewAutomationNavigationTimeoutError,
   PreviewAutomationOperationError,
@@ -93,7 +94,7 @@ const NO_AUTOMATION_STATUS: PreviewAutomationStatus = {
 };
 
 const supportedAutomationOperations = () =>
-  !previewBridge
+  isBrowserMode()
     ? [...BROWSER_MODE_OPERATIONS]
     : supportsPreviewRuntimeCapability(previewBridge, "automation")
       ? [...PREVIEW_AUTOMATION_OPERATIONS]
@@ -334,7 +335,7 @@ const raisePreviewAutomationHostError = (
 export function PreviewAutomationHosts() {
   const { environments } = useEnvironments();
   // A desktop bridge without an automation surface hosts nothing; no bridge is browser mode.
-  if (previewBridge && !previewBridge.automation) return null;
+  if (!isBrowserMode() && !previewBridge?.automation) return null;
   return (
     <>
       {/*
@@ -399,7 +400,7 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
       };
       let tabId = request.tabId ?? null;
       try {
-        if (!previewBridge && (request.operation === "status" || request.operation === "open")) {
+        if (isBrowserMode() && (request.operation === "status" || request.operation === "open")) {
           return handleBrowserModeRequest(threadRef, request);
         }
         let state = readThreadPreviewState(threadRef);

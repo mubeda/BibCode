@@ -38,6 +38,8 @@ describe("ServerReloadPrompt", () => {
     expect(container.textContent).toContain("updated to v0.7.3. Reload to use it.");
     expect(input.value).toBe("Unsent text");
     expect(reload).not.toHaveBeenCalled();
+    // AppRoot's top banner stack positions it beside the open prompt.
+    expect(container.querySelector('[role="status"]')?.className).not.toContain("fixed");
     await act(async () => container.querySelector("button")!.click());
     expect(reload).toHaveBeenCalledOnce();
   });

@@ -223,6 +223,7 @@ vi.mock("./previewBridge", () => ({
   get previewBridge() {
     return h.previewBridge;
   },
+  isBrowserMode: () => h.previewBridge === null,
 }));
 
 vi.mock("./previewAutomationOpenReadiness", () => ({
@@ -239,7 +240,7 @@ vi.mock("./previewAutomationTarget", () => ({
   resolvePreviewAutomationTarget: () => h.target,
 }));
 
-vi.mock("./OpenPromptBanner", () => ({
+vi.mock("~/browser/openPromptQueue", () => ({
   enqueueOpenPrompt: (prompt: unknown) => h.promptCalls.push(prompt),
 }));
 

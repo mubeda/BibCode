@@ -181,6 +181,28 @@ export function subscribeThreadPreviewState(
   });
 }
 
+const RFC3339_FRACTION = /^(.*?)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$/i;
+
+/** Whole seconds plus the fraction padded to a fixed width, so digit strings compare. */
+function instant(value: string): readonly [number, string] | null {
+  const match = RFC3339_FRACTION.exec(value);
+  const seconds = match ? Date.parse(`${match[1]}${match[3]}`) : Number.NaN;
+  return Number.isNaN(seconds) ? null : [seconds, (match?.[2] ?? "").padEnd(12, "0")];
+}
+
+/**
+ * Server timestamps are RFC 3339 with variable fractional digits ("…01.1Z" is
+ * earlier than "…01.15Z") and finer than milliseconds, so compare instants at
+ * full precision, never raw strings or `Date.parse`.
+ */
+function isAfter(a: string | undefined, b: string): boolean {
+  if (a === undefined) return false;
+  const x = instant(a);
+  const y = instant(b);
+  if (!x || !y) return a > b;
+  return x[0] !== y[0] ? x[0] > y[0] : x[1] > y[1];
+}
+
 export function applyPreviewServerEvent(ref: ScopedThreadRef, event: PreviewEvent): void {
   updateThreadPreviewState(ref, (current) => {
     switch (event.type) {
@@ -189,6 +211,10 @@ export function applyPreviewServerEvent(ref: ScopedThreadRef, event: PreviewEven
       case "resized": {
         const snapshot = event.snapshot;
         if (current.suppressedTabIds.has(snapshot.tabId)) return current;
+        // A replayed event (the events atom outlives session syncs) must not regress newer state.
+        if (isAfter(current.sessions[snapshot.tabId]?.updatedAt, snapshot.updatedAt)) {
+          return current;
+        }
         const recentlySeenUrls =
           snapshot.navStatus._tag === "Idle"
             ? current.recentlySeenUrls
@@ -207,7 +233,7 @@ export function applyPreviewServerEvent(ref: ScopedThreadRef, event: PreviewEven
       }
       case "failed": {
         const existing = current.sessions[event.tabId];
-        if (!existing) return current;
+        if (!existing || isAfter(existing.updatedAt, event.createdAt)) return current;
         const failedSnapshot = {
           ...existing,
           navStatus: {
@@ -252,7 +278,7 @@ export function applyPreviewServerSnapshot(
     }
     if (current.suppressedTabIds.has(snapshot.tabId)) return current;
     const existing = current.sessions[snapshot.tabId];
-    if (existing && existing.updatedAt > snapshot.updatedAt) return current;
+    if (isAfter(existing?.updatedAt, snapshot.updatedAt)) return current;
     const recentlySeenUrls = rememberSnapshotUrl(current.recentlySeenUrls, snapshot);
     return {
       ...current,
@@ -278,7 +304,7 @@ export function updatePreviewServerSnapshot(
   updateThreadPreviewState(ref, (current) => {
     if (current.suppressedTabIds.has(snapshot.tabId)) return current;
     const existing = current.sessions[snapshot.tabId];
-    if (existing && existing.updatedAt > snapshot.updatedAt) return current;
+    if (isAfter(existing?.updatedAt, snapshot.updatedAt)) return current;
     const sessions = { ...current.sessions, [snapshot.tabId]: snapshot };
     const activeTabId =
       current.activeTabId && sessions[current.activeTabId] ? current.activeTabId : snapshot.tabId;
@@ -309,7 +335,8 @@ export function reconcilePreviewServerSessions(
     for (const snapshot of snapshots) {
       if (current.suppressedTabIds.has(snapshot.tabId)) continue;
       const existing = current.sessions[snapshot.tabId];
-      const next = existing && existing.updatedAt > snapshot.updatedAt ? existing : snapshot;
+      const next =
+        existing && isAfter(existing.updatedAt, snapshot.updatedAt) ? existing : snapshot;
       sessions[next.tabId] = next;
       recentlySeenUrls = rememberSnapshotUrl(recentlySeenUrls, next);
     }

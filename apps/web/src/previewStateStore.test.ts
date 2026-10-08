@@ -150,6 +150,66 @@ describe("previewStateStore (single-tab)", () => {
     });
   });
 
+  it("ignores a replayed event older than the session it would replace", () => {
+    // OpenRequestRouter keeps the events atom alive, so a later session-sync mount
+    // replays its last value after reconciling a newer session list.
+    const stale = makeSnapshot({ updatedAt: "2026-01-01T00:00:01.000Z" });
+    const fresh = makeSnapshot({
+      navStatus: { _tag: "Loading", url: "http://localhost:5173/b", title: "" },
+      updatedAt: "2026-01-01T00:00:05.000Z",
+    });
+    reconcilePreviewServerSessions(ref, [fresh]);
+
+    applyPreviewServerEvent(ref, {
+      type: "navigated",
+      threadId: "thread-1",
+      tabId: stale.tabId,
+      createdAt: stale.updatedAt,
+      snapshot: stale,
+    });
+    applyPreviewServerEvent(ref, {
+      type: "failed",
+      threadId: "thread-1",
+      tabId: stale.tabId,
+      createdAt: "2026-01-01T00:00:02.000Z",
+      url: "http://localhost:5173/",
+      title: "",
+      code: -105,
+      description: "ERR_NAME_NOT_RESOLVED",
+    });
+
+    expect(readThreadPreviewState(ref).sessions[fresh.tabId]).toEqual(fresh);
+  });
+
+  it("keeps sub-millisecond order between server timestamps", () => {
+    const newer = makeSnapshot({ updatedAt: "2026-01-01T00:00:01.123900Z" });
+    reconcilePreviewServerSessions(ref, [newer]);
+    const olderReply = makeSnapshot({
+      navStatus: { _tag: "Loading", url: "http://localhost:5173/old", title: "" },
+      updatedAt: "2026-01-01T00:00:01.123100Z",
+    });
+    updatePreviewServerSnapshot(ref, olderReply);
+
+    expect(readThreadPreviewState(ref).sessions[newer.tabId]).toEqual(newer);
+  });
+
+  it("compares event times as instants, whatever their fractional digits", () => {
+    reconcilePreviewServerSessions(ref, [makeSnapshot({ updatedAt: "2026-01-01T00:00:01.1Z" })]);
+    const later = makeSnapshot({
+      navStatus: { _tag: "Loading", url: "http://localhost:5173/b", title: "" },
+      updatedAt: "2026-01-01T00:00:01.15Z",
+    });
+    applyPreviewServerEvent(ref, {
+      type: "navigated",
+      threadId: "thread-1",
+      tabId: later.tabId,
+      createdAt: later.updatedAt,
+      snapshot: later,
+    });
+
+    expect(readThreadPreviewState(ref).sessions[later.tabId]).toEqual(later);
+  });
+
   it("failed event flips the snapshot to LoadFailed when tabId matches", () => {
     const snapshot = makeSnapshot();
     applyPreviewServerEvent(ref, {

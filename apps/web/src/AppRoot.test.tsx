@@ -24,6 +24,19 @@ import { AppRoot, ProjectDataRecoveryCoordinator, ShareExposureReconciler } from
 import { RemoteUpdateConfirmationCoordinator } from "./components/settings/UpdateServerDialog";
 import { ServerReloadPrompt } from "./components/ServerReloadPrompt";
 
+/** The reload prompt and the open prompt share one stacked top container, so neither hides the other. */
+function expectTopBannerStack(stack: ReactNode) {
+  expect(isValidElement(stack) && stack.type).toBe("div");
+  const props = (stack as ReactElement<{ className: string; children: ReactNode }>).props;
+  expect(props.className).toContain("fixed");
+  expect(props.className).toContain("flex-col");
+  const banners = Children.toArray(props.children);
+  expect(banners.map((banner) => isValidElement(banner) && banner.type)).toEqual([
+    ServerReloadPrompt,
+    OpenPromptBanner,
+  ]);
+}
+
 describe("AppRoot", () => {
   beforeEach(() => {
     h.previewBridge = {} as DesktopPreviewBridge;
@@ -36,7 +49,7 @@ describe("AppRoot", () => {
     const children = Children.toArray(
       (root as ReactElement<{ readonly children: ReactNode }>).props.children,
     );
-    expect(children).toHaveLength(11);
+    expect(children).toHaveLength(10);
     expect(isValidElement(children[0]) && children[0].type).toBe(ConnectionDatabaseRecoveryDialog);
     expect(isValidElement(children[1]) && children[1].type).toBe(ShareExposureReconciler);
     expect(isValidElement(children[2]) && children[2].type).toBe(ThreadLifecycleReconciler);
@@ -45,11 +58,10 @@ describe("AppRoot", () => {
     expect(isValidElement(children[5]) && children[5].type).toBe(
       RemoteUpdateConfirmationCoordinator,
     );
-    expect(isValidElement(children[6]) && children[6].type).toBe(ServerReloadPrompt);
+    expectTopBannerStack(children[6]);
     expect(isValidElement(children[7]) && children[7].type).toBe(PreviewAutomationHosts);
     expect(isValidElement(children[8]) && children[8].type).toBe(PreviewNewWindowRouter);
     expect(isValidElement(children[9]) && children[9].type).toBe(OpenRequestRouter);
-    expect(isValidElement(children[10]) && children[10].type).toBe(OpenPromptBanner);
   });
 
   it("mounts preview automation hosts for a preview bridge without full automation", () => {
@@ -67,7 +79,7 @@ describe("AppRoot", () => {
       (root as ReactElement<{ readonly children: ReactNode }>).props.children,
     );
 
-    expect(children).toHaveLength(11);
+    expect(children).toHaveLength(10);
     expect(isValidElement(children[7]) && children[7].type).toBe(PreviewAutomationHosts);
   });
 
@@ -79,11 +91,10 @@ describe("AppRoot", () => {
       (root as ReactElement<{ readonly children: ReactNode }>).props.children,
     );
 
-    expect(children).toHaveLength(11);
+    expect(children).toHaveLength(10);
     expect(isValidElement(children[0]) && children[0].type).toBe(ConnectionDatabaseRecoveryDialog);
     expect(isValidElement(children[4]) && children[4].type).toBe(RouterProvider);
     expect(isValidElement(children[7]) && children[7].type).toBe(PreviewAutomationHosts);
     expect(isValidElement(children[9]) && children[9].type).toBe(OpenRequestRouter);
-    expect(isValidElement(children[10]) && children[10].type).toBe(OpenPromptBanner);
   });
 });

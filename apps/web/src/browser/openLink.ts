@@ -1,7 +1,7 @@
 import type { EnvironmentId, ScopedThreadRef } from "@bibcode/contracts";
 import { isAtomCommandInterrupted, runAtomCommand } from "@bibcode/client-runtime/state/runtime";
 
-import { enqueueOpenPrompt } from "~/components/preview/OpenPromptBanner";
+import { isBrowserMode } from "~/components/preview/previewBridge";
 import { getClientSettings } from "~/hooks/useSettings";
 import { readLocalApi } from "~/localApi";
 import { isPreviewSupportedInRuntime } from "~/previewStateStore";
@@ -9,6 +9,7 @@ import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { previewEnvironment } from "~/state/preview";
 
 import { openPendingTab } from "./browserTab";
+import { enqueueOpenPrompt } from "./openPromptQueue";
 import { resolvePreviewTarget } from "./browserTargetResolver";
 import { type OpenPreviewMutation, openUrlInPreview } from "./openFileInPreview";
 import {
@@ -45,7 +46,7 @@ export function openLink(input: {
    * opens through the local API and a blocked gateway address queues the open prompt.
    */
   readonly onPopupBlocked?: (url: string) => void;
-  /** A gateway address the system browser was handed failed to open after this returned. */
+  /** A gateway address failed to open after this returned, in a way a later try may fix. */
   readonly onUnopened?: () => void;
 }): OpenLinkOutcome {
   let url = input.url;
@@ -78,7 +79,7 @@ export function openLink(input: {
       }
       return openGatewayInSystemBrowser(url, input.threadRef, input);
     }
-    if (input.onPopupBlocked && !window.desktopBridge) {
+    if (input.onPopupBlocked && isBrowserMode()) {
       // The caller handles a blocked tab, which a "noopener" window.open cannot report.
       const tab = openPendingTab();
       if (tab) tab.navigate(url);
@@ -116,9 +117,9 @@ function openGatewayInSystemBrowser(
     readonly onUnopened?: (() => void) | undefined;
   },
 ): OpenLinkOutcome {
-  const unopened = (notify: () => void) => {
+  const unopened = (notify: () => void, retryable: boolean) => {
     notify();
-    callbacks.onUnopened?.();
+    if (retryable) callbacks.onUnopened?.();
   };
   const resolve = () =>
     resolveForNavigation({
@@ -127,28 +128,31 @@ function openGatewayInSystemBrowser(
       canonicalUrl,
       gatewayOpen,
     });
-  if (window.desktopBridge) {
+  if (!isBrowserMode()) {
     // The desktop window refuses window.open; the bridge opens it without one.
     const api = readLocalApi();
     if (!api) return "unavailable";
     void resolve()
       .then((target) => {
         if (target.kind === "unreachable") {
-          unopened(() => showPreviewUnreachableMessage(target.message, canonicalUrl));
+          unopened(
+            () => showPreviewUnreachableMessage(target.message, canonicalUrl),
+            target.retryable === true,
+          );
           return;
         }
         return api.shell
           .openExternal(target.url)
-          .catch(() => unopened(() => showLinkOpenFailedNotice(canonicalUrl)));
+          .catch(() => unopened(() => showLinkOpenFailedNotice(canonicalUrl), true));
       })
-      .catch(() => unopened(() => showLinkOpenFailedNotice(canonicalUrl)));
+      .catch(() => unopened(() => showLinkOpenFailedNotice(canonicalUrl), true));
     return "system";
   }
   // Opened before any await: the click's user activation does not survive one.
   const tab = openPendingTab();
   if (!tab) {
     if (callbacks.onPopupBlocked) callbacks.onPopupBlocked(canonicalUrl);
-    else enqueueOpenPrompt({ source: "blocked", url: canonicalUrl, threadRef });
+    else enqueueOpenPrompt({ source: "link", blocked: true, url: canonicalUrl, threadRef });
     return "system";
   }
   void resolve()
@@ -158,11 +162,14 @@ function openGatewayInSystemBrowser(
         return;
       }
       tab.close();
-      unopened(() => showPreviewUnreachableMessage(target.message, canonicalUrl));
+      unopened(
+        () => showPreviewUnreachableMessage(target.message, canonicalUrl),
+        target.retryable === true,
+      );
     })
     .catch(() => {
       tab.close();
-      unopened(() => showLinkOpenFailedNotice(canonicalUrl));
+      unopened(() => showLinkOpenFailedNotice(canonicalUrl), true);
     });
   return "system";
 }

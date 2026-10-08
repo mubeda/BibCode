@@ -60,7 +60,7 @@ beforeEach(() => {
   let nextLocalPort = 50_000;
   sshForward = vi.fn(async () => nextLocalPort++);
   releaseSshForward = vi.fn(async () => undefined);
-  vi.stubGlobal("window", { desktopBridge: { sshForward, releaseSshForward } });
+  vi.stubGlobal("window", { desktopBridge: { preview: {}, sshForward, releaseSshForward } });
 });
 
 afterEach(() => {
@@ -442,13 +442,14 @@ describe("ssh forward bookkeeping", () => {
       kind: "unreachable",
       message: retry,
       refusedByServer: true,
+      retryable: true,
     });
     // A transport failure is this client's problem, not shared preview state.
     await expect(
       resolveWith(async (): Promise<GatewayOpenResult> =>
         AsyncResult.failure(Cause.fail(new Error("socket closed"))),
       ),
-    ).resolves.toEqual({ kind: "unreachable", message: retry });
+    ).resolves.toEqual({ kind: "unreachable", message: retry, retryable: true });
   });
 
   it("keeps a failed SSH forward local to this client", async () => {
@@ -465,6 +466,7 @@ describe("ssh forward bookkeeping", () => {
     ).resolves.toEqual({
       kind: "unreachable",
       message: "Build box isn't connected. Reconnect it, then open the link again.",
+      retryable: true,
     });
   });
 

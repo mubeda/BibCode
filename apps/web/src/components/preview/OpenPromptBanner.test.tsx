@@ -11,8 +11,11 @@ const h = vi.hoisted(() => ({
 vi.mock("~/browser/openLink", () => ({ openLink: h.openLink }));
 vi.mock("~/state/use-atom-command", () => ({ useAtomCommand: () => h.openPreview }));
 vi.mock("~/state/preview", () => ({ previewEnvironment: { open: {} } }));
+vi.mock("~/state/session", () => ({ readPreparedConnection: () => ({ label: "Build box" }) }));
 
-import { enqueueOpenPrompt, OpenPromptBanner, resetOpenPromptsForTests } from "./OpenPromptBanner";
+import { enqueueOpenPrompt, resetOpenPromptsForTests } from "~/browser/openPromptQueue";
+
+import { OpenPromptBanner } from "./OpenPromptBanner";
 
 const threadRef = {
   environmentId: EnvironmentId.make("env-1"),
@@ -47,13 +50,24 @@ describe("OpenPromptBanner", () => {
     await act(async () =>
       enqueueOpenPrompt({ id: "r1", source: "command", url: "http://localhost:5173/", threadRef }),
     );
-    expect(container.textContent).toContain("A command wants to open http://localhost:5173/");
+    expect(container.textContent).toContain(
+      "A command wants to open http://localhost:5173/ on Build box",
+    );
+    const region = container.querySelector('[role="region"]');
+    expect(region?.getAttribute("aria-label")).toBe("Requests to open links");
+    expect(region?.querySelector('[aria-live="polite"]')?.textContent).toContain(
+      "A command wants to open",
+    );
+    // The app's top banner stack positions it, so it never covers the reload prompt.
+    expect(region?.className).not.toContain("fixed");
 
     await act(async () => button("Dismiss").click());
     await act(async () =>
       enqueueOpenPrompt({ source: "agent", url: "http://localhost:3000/", threadRef }),
     );
-    expect(container.textContent).toContain("Agent wants to open http://localhost:3000/");
+    expect(container.textContent).toContain(
+      "Agent wants to open http://localhost:3000/ on Build box",
+    );
   });
 
   it("opens through openLink from the click and removes the prompt", async () => {
@@ -97,6 +111,7 @@ describe("OpenPromptBanner", () => {
 
     await act(async () => unopened());
     expect(container.textContent).toContain("A command wants to open http://localhost:5173/");
+    expect(container.textContent).not.toContain("blocked");
   });
 
   it("keeps a prompt whose tab the browser blocked, so Open can be retried", async () => {
@@ -109,11 +124,21 @@ describe("OpenPromptBanner", () => {
     await act(async () => button("Open").click());
 
     expect(container.textContent).toContain(
-      "Your browser blocked a new tab for http://localhost:5173/",
+      "Your browser blocked a new tab for http://localhost:5173/ on Build box",
     );
+    // The retry opens the tab, but the gateway then fails in a retryable way.
+    let unopened!: () => void;
+    h.openLink.mockImplementationOnce((input: { onUnopened: () => void }) => {
+      unopened = input.onUnopened;
+      return "system";
+    });
     await act(async () => button("Open").click());
     expect(h.openLink).toHaveBeenCalledTimes(2);
     expect(container.textContent).toBe("");
+    await act(async () => unopened());
+    // Offered again as the command's request, not as a blocked tab.
+    expect(container.textContent).toContain("A command wants to open http://localhost:5173/");
+    expect(container.textContent).not.toContain("blocked");
   });
 
   it("does not bring a dismissed prompt back and shows the next one", async () => {

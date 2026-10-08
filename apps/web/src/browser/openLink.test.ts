@@ -26,7 +26,7 @@ vi.mock("~/hooks/useSettings", () => ({
 const resolveForNavigation = vi.fn();
 vi.mock("./previewGateway", () => ({ resolveForNavigation }));
 const enqueueOpenPrompt = vi.fn();
-vi.mock("~/components/preview/OpenPromptBanner", () => ({ enqueueOpenPrompt }));
+vi.mock("./openPromptQueue", () => ({ enqueueOpenPrompt }));
 vi.mock("~/rpc/atomRegistry", () => ({ appAtomRegistry: {} }));
 vi.mock("~/state/preview", () => ({ previewEnvironment: { gatewayOpen: {} } }));
 
@@ -244,9 +244,31 @@ describe("openLink", () => {
       expect(tab.location.replace).not.toHaveBeenCalled();
     });
 
-    it("tells the caller when the gateway refuses after the tab opened", async () => {
+    it("does not offer a permanent gateway refusal again", async () => {
       stubBrowserTab({ opener: {}, location: { replace: vi.fn() }, close: vi.fn() });
       resolveForNavigation.mockResolvedValue({ kind: "unreachable", message: "No." });
+      const onUnopened = vi.fn();
+      const { openLink } = await import("./openLink");
+
+      openLink({
+        url: "http://localhost:5173/",
+        threadRef,
+        invert: false,
+        openPreview,
+        onUnopened,
+      });
+
+      await vi.waitFor(() => expect(showPreviewUnreachableMessage).toHaveBeenCalled());
+      expect(onUnopened).not.toHaveBeenCalled();
+    });
+
+    it("tells the caller when a retryable gateway failure follows the opened tab", async () => {
+      stubBrowserTab({ opener: {}, location: { replace: vi.fn() }, close: vi.fn() });
+      resolveForNavigation.mockResolvedValue({
+        kind: "unreachable",
+        message: "No.",
+        retryable: true,
+      });
       const onUnopened = vi.fn();
       const { openLink } = await import("./openLink");
 
@@ -268,7 +290,8 @@ describe("openLink", () => {
       openLink({ url: "http://localhost:5173/", threadRef, invert: false, openPreview });
 
       expect(enqueueOpenPrompt).toHaveBeenCalledWith({
-        source: "blocked",
+        source: "link",
+        blocked: true,
         url: "http://localhost:5173/",
         threadRef,
       });
@@ -312,7 +335,7 @@ describe("openLink", () => {
 
     it("desktop system destination resolves then calls openExternal without window.open", async () => {
       const open = vi.fn();
-      vi.stubGlobal("window", { open, desktopBridge: {} });
+      vi.stubGlobal("window", { open, desktopBridge: { preview: {} } });
       resolveForNavigation.mockResolvedValue({ kind: "ok", url: bootstrapUrl });
       const { openLink } = await import("./openLink");
 
@@ -324,8 +347,20 @@ describe("openLink", () => {
       expect(open).not.toHaveBeenCalled();
     });
 
+    it("uses openExternal on a desktop host without preview support", async () => {
+      const open = vi.fn();
+      vi.stubGlobal("window", { open, desktopBridge: {} });
+      resolveForNavigation.mockResolvedValue({ kind: "ok", url: bootstrapUrl });
+      const { openLink } = await import("./openLink");
+
+      openLink({ url: "http://localhost:5173/", threadRef, invert: false, openPreview });
+
+      await vi.waitFor(() => expect(openExternal).toHaveBeenCalledWith(bootstrapUrl));
+      expect(open).not.toHaveBeenCalled();
+    });
+
     it("notifies instead of opening when desktop resolution is refused", async () => {
-      vi.stubGlobal("window", { open: vi.fn(), desktopBridge: {} });
+      vi.stubGlobal("window", { open: vi.fn(), desktopBridge: { preview: {} } });
       resolveForNavigation.mockResolvedValue({ kind: "unreachable", message: "No." });
       const { openLink } = await import("./openLink");
 

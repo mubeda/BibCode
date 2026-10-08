@@ -25,7 +25,7 @@ vi.mock("~/centerPanelStore", () => ({
   useCenterPanelStore: { getState: () => ({ byThreadKey: h.centerPanels }) },
 }));
 vi.mock("~/browser/openLink", () => ({ openLink: h.openLink }));
-vi.mock("./OpenPromptBanner", () => ({ enqueueOpenPrompt: h.enqueueOpenPrompt }));
+vi.mock("~/browser/openPromptQueue", () => ({ enqueueOpenPrompt: h.enqueueOpenPrompt }));
 vi.mock("~/state/environments", () => ({
   useEnvironments: () => ({ environments: h.environments }),
 }));
@@ -96,7 +96,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   h.environments = [{ environmentId }];
   h.centerPanels = {};
-  (window as { desktopBridge?: unknown }).desktopBridge = {};
+  (window as { desktopBridge?: unknown }).desktopBridge = { preview: {} };
 });
 
 afterEach(async () => {
@@ -127,6 +127,22 @@ describe("OpenRequestRouter", () => {
       invert: false,
       openPreview: h.openPreview,
     });
+  });
+
+  it("warns with the request id, never the address, when the claim fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    h.claim.mockResolvedValue(AsyncResult.failure(new Error("socket closed") as never));
+    const registry = fakeRegistry();
+    await mount(registry, routerOn("thread-1"));
+
+    await act(async () => registry.emit(`events:${environmentId}`, openRequested("thread-1")));
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const logged = JSON.stringify(warn.mock.calls[0]);
+    expect(logged).toContain("req-1");
+    expect(logged).not.toContain("localhost:5173");
+    expect(h.openLink).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 
   it("ignores open requests for threads not on screen", async () => {

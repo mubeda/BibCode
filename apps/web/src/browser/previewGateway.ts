@@ -9,6 +9,8 @@ import { environmentCatalog } from "~/connection/catalog";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { readPreparedConnection } from "~/state/session";
 
+import { isBrowserMode } from "~/components/preview/previewBridge";
+
 import { formatHost, resolvePreviewTarget, UNREACHABLE_MESSAGES } from "./browserTargetResolver";
 
 export type GatewayOpenMutation = (input: {
@@ -29,6 +31,8 @@ export type PreviewNavigationResolution =
        * connection, transport) and must stay out of shared preview state.
        */
       readonly refusedByServer?: true;
+      /** Transient: the same request may succeed if tried again (unlike HTTPS or a stopped server). */
+      readonly retryable?: true;
     };
 
 const BOOTSTRAP_PATH = "/__bibcode/bootstrap";
@@ -143,7 +147,7 @@ export async function resolveForNavigation(input: {
   const canonical = new URL(resolution.url);
   const label = readPreparedConnection(environmentId)?.label ?? "This environment";
   // Only the desktop host can run the SSH forward; refuse before the server admits a target.
-  if (resolution.via === "ssh" && !window.desktopBridge) {
+  if (resolution.via === "ssh" && isBrowserMode()) {
     return { kind: "unreachable", message: UNREACHABLE_MESSAGES.ssh(label) };
   }
   // Opened before any await so a close or a sibling's failure during this
@@ -188,14 +192,14 @@ export async function resolveForNavigation(input: {
     const bridge = window.desktopBridge;
     if (!bridge) return fail({ message: UNREACHABLE_MESSAGES.ssh(label) });
     const target = readSshTarget(environmentId);
-    if (!target) return fail({ message: retryMessage(label) });
+    if (!target) return fail({ message: retryMessage(label), retryable: true });
     let localPort: number;
     try {
       // Forwards end when the managed tunnel reconnects; the bridge call is
       // idempotent while one is alive, so every navigation re-establishes it.
       localPort = await bridge.sshForward(target, gatewayPort);
     } catch {
-      return fail({ message: UNREACHABLE_MESSAGES.disconnected(label) });
+      return fail({ message: UNREACHABLE_MESSAGES.disconnected(label), retryable: true });
     }
     clientOrigin = `http://127.0.0.1:${localPort}`;
     const forward: SshForward = { target, gatewayPort, clientOrigin };
@@ -214,7 +218,11 @@ export async function resolveForNavigation(input: {
   };
 }
 
-type GatewayFailure = { readonly message: string; readonly refusedByServer?: true };
+type GatewayFailure = {
+  readonly message: string;
+  readonly refusedByServer?: true;
+  readonly retryable?: true;
+};
 
 const retryMessage = (label: string) =>
   `Couldn't open a preview connection to ${label}. Try again, or reconnect ${label} if it keeps failing.`;
@@ -225,7 +233,9 @@ function gatewayFailure(
   canonical: URL,
 ): GatewayFailure {
   const error = squashAtomCommandFailure(result) as { _tag?: unknown; reason?: unknown } | null;
-  if (error?._tag !== "PreviewGatewayError") return { message: retryMessage(label) };
+  if (error?._tag !== "PreviewGatewayError") {
+    return { message: retryMessage(label), retryable: true };
+  }
   const refused = (message: string): GatewayFailure => ({ message, refusedByServer: true });
   switch (error.reason) {
     case "https-unsupported":
@@ -239,7 +249,7 @@ function gatewayFailure(
       return refused(`Nothing is listening on port ${canonical.port || "80"} on ${label}.`);
     default:
       // An expired session, a gateway shutdown or a bind failure: worth retrying.
-      return refused(retryMessage(label));
+      return { ...refused(retryMessage(label)), retryable: true };
   }
 }
 
