@@ -18,14 +18,21 @@ pub(crate) fn effective_environment_value(
 pub(crate) fn claude_config_directory(environment: &[(OsString, OsString)]) -> Option<PathBuf> {
     effective_environment_value(environment, "CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            effective_environment_value(environment, "HOME")
-                .map(|home| PathBuf::from(home).join(".claude"))
-        })
-        .or_else(|| {
-            effective_environment_value(environment, "USERPROFILE")
-                .map(|home| PathBuf::from(home).join(".claude"))
-        })
+        .or_else(|| home_directory(environment).map(|home| home.join(".claude")))
+}
+
+/// The home Codex uses under `environment` when BiBCode sets no `CODEX_HOME` for it:
+/// `CODEX_HOME`, else `.codex` in the home directory.
+pub(crate) fn codex_home_directory(environment: &[(OsString, OsString)]) -> Option<PathBuf> {
+    effective_environment_value(environment, "CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_directory(environment).map(|home| home.join(".codex")))
+}
+
+fn home_directory(environment: &[(OsString, OsString)]) -> Option<PathBuf> {
+    effective_environment_value(environment, "HOME")
+        .or_else(|| effective_environment_value(environment, "USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// Isolate providers from host diagnostics and AppImage launcher paths.

@@ -25,7 +25,7 @@ use crate::{
     persistence::{ProjectionProject, ProviderSessionRuntime},
     provider::{
         claude,
-        environment::{claude_config_directory, effective_environment_value},
+        environment::{claude_config_directory, codex_home_directory},
     },
     rpc::{RpcRegistry, RpcRequest, RpcResult},
     server_settings::ProviderSettingsStore,
@@ -211,15 +211,16 @@ async fn resolve_sources(settings_root: &PathBuf) -> Vec<ResolvedSource> {
         let home = match (provider, route.codex) {
             (AgentSessionProvider::ClaudeAgent, _) => claude_config_directory(&environment),
             // A configured home (or shadow home) shares its sessions with `shared_home_path`;
-            // otherwise Codex follows CODEX_HOME, then `~/.codex`.
+            // otherwise the driver sets no CODEX_HOME and Codex resolves its own home from the
+            // instance environment.
             (AgentSessionProvider::Codex, Some(codex)) => Some(
                 codex
                     .home
                     .effective_home_path
                     .is_none()
-                    .then(|| effective_environment_value(&environment, "CODEX_HOME"))
+                    .then(|| codex_home_directory(&environment))
                     .flatten()
-                    .map_or(codex.home.shared_home_path, PathBuf::from),
+                    .unwrap_or(codex.home.shared_home_path),
             ),
             (AgentSessionProvider::Codex, None) => None,
         };
@@ -785,6 +786,32 @@ mod tests {
             assert_eq!(launch.resume_cursor, Some(json!({ cursor: session_id })));
         }
         engine.shutdown().await;
+    }
+
+    /// Without `homePath` or `CODEX_HOME`, Codex keeps its sessions under the HOME its instance
+    /// sets, not the server's.
+    #[tokio::test]
+    async fn codex_sessions_are_scanned_in_the_instance_home() {
+        if std::env::var_os("CODEX_HOME").is_some() {
+            // The server's CODEX_HOME decides for the instance too.
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("instance-home");
+        std::fs::write(
+            temp.path().join("settings.json"),
+            json!({"providerInstances":{"codex":{
+                "driver":"codex","environment":[{"name":"HOME","value":home}]
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let sources = resolve_sources(&temp.path().to_path_buf()).await;
+        let codex = sources
+            .iter()
+            .find(|resolved| resolved.source.provider == AgentSessionProvider::Codex)
+            .expect("codex source");
+        assert_eq!(codex.source.home, home.join(".codex"));
     }
 
     /// A turn another client admitted while the transcript was read keeps its own conversation.

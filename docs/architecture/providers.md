@@ -435,7 +435,9 @@ next turn resumes it. Homes resolve as the launch would:
   the home directory; transcripts are `<config dir>/projects/*/*.jsonl`.
 - Codex: the `codex` instance's configured home (its shared home when a shadow
   home is set), else `CODEX_HOME` from the instance and then the server
-  environment, else `~/.codex`; transcripts are
+  environment, else `.codex` in the home directory (`HOME`, then `USERPROFILE`,
+  each from the instance and then the server environment), as the Codex process
+  resolves it; transcripts are
   `<home>/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 
 Parsing and skip rules follow T3 Code's `AgentSessionScanner`: Claude records
