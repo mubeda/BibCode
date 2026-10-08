@@ -258,6 +258,53 @@ async fn diagnostic_logs_route_is_bounded_authorized_and_returns_zip_headers() {
 }
 
 #[tokio::test]
+async fn html_and_svg_assets_are_sandboxed() {
+    for (path, content_type, expected) in [
+        (
+            "page.html",
+            "text/html; charset=utf-8",
+            Some("sandbox allow-scripts allow-forms allow-popups"),
+        ),
+        (
+            "icon.svg",
+            "image/svg+xml",
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+        ),
+        ("doc.pdf", "application/pdf", None),
+    ] {
+        let mut state = state_with_json_recorder(Arc::new(Mutex::new(Vec::new())));
+        let content_type = content_type.to_owned();
+        state.assets = Arc::new(move |_token, _path, _context| {
+            let content_type = content_type.clone();
+            Box::pin(async move {
+                Ok(AssetHttpResponse {
+                    content_type,
+                    bytes: b"x".to_vec(),
+                    cache_control: "private, max-age=3600".to_owned(),
+                })
+            })
+        });
+        let app = add_routes(Router::new()).with_state(TestState(state));
+        let response = app
+            .oneshot(
+                Request::get(format!("/api/assets/t/{path}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .map(|v| v.to_str().unwrap()),
+            expected,
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn assets_and_mcp_use_native_handlers_with_protocol_headers() {
     let mut state = state_with_json_recorder(Arc::new(Mutex::new(Vec::new())));
     state.assets = Arc::new(|token, path, _context| {
@@ -299,6 +346,10 @@ async fn assets_and_mcp_use_native_handlers_with_protocol_headers() {
         "private, max-age=3600"
     );
     assert_eq!(asset.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(
+        asset.headers()[header::CONTENT_SECURITY_POLICY],
+        "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+    );
     assert_eq!(
         to_bytes(asset.into_body(), 1024).await.unwrap().as_ref(),
         b"<svg/>"
