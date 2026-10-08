@@ -100,7 +100,9 @@ itself fail). T3 Code uses a transcript-derived handoff with a token budget.
   driver are scanned.
 - UI: project actions menu → **Import CLI sessions…** opens a dialog listing
   the candidates with checkboxes; importing lands on the newest imported
-  thread. Scan uses `orchestration:read`, import uses `orchestration:operate`.
+  thread. Scan and import both require `orchestration:operate`: scan returns
+  first prompts of CLI transcripts from the server host, which read-only
+  credentials must not see.
 
 ### 5. Closing a chat panel archives it
 
