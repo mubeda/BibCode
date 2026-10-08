@@ -837,6 +837,26 @@ describe("GeneralSettingsPanel", () => {
     expect(assignSpy).not.toHaveBeenCalled();
   });
 
+  it("offers the link target choice and routes selections and resets", () => {
+    const markup = renderedText();
+
+    expect(markup).toContain("Open links in");
+    expect(markup).toContain("BiBCode browser");
+    expect(markup).toContain("System browser");
+    expect(findControls("button", "Reset link target")).toHaveLength(0);
+
+    invoke(control("select", "app"), "onValueChange", "system");
+    expect(h.updateSettings).toHaveBeenCalledWith({ browserLinkTarget: "system" });
+    invoke(control("select", "app"), "onValueChange", "bogus");
+    expect(h.updateSettings).toHaveBeenCalledTimes(1);
+
+    h.updateSettings.mockReset();
+    h.settings = { ...DEFAULT_UNIFIED_SETTINGS, browserLinkTarget: "system" };
+    render(<GeneralSettingsPanel />);
+    invoke(control("button", "Reset link target to default"), "onClick");
+    expect(h.updateSettings).toHaveBeenCalledWith({ browserLinkTarget: "app" });
+  });
+
   it("renders changed general settings with reset actions", () => {
     h.theme = "dark";
     h.settings = changedSettings();
@@ -1223,6 +1243,18 @@ describe("useGeneralSettingsRestore", () => {
     ]);
   });
 
+  it("lists and resets the link target when it is not the default", async () => {
+    h.settings = { ...DEFAULT_UNIFIED_SETTINGS, browserLinkTarget: "system" };
+    h.localApi = { dialogs: { confirm: vi.fn(async () => true) } };
+    const restore = captureRestore();
+
+    expect(restore.changedSettingLabels).toEqual(["Open links in"]);
+    await restore.restoreDefaults();
+    expect(h.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ browserLinkTarget: "app" }),
+    );
+  });
+
   it("restores defaults after confirmation and notifies the caller", async () => {
     h.theme = "dark";
     h.settings = changedSettings();
@@ -1243,6 +1275,7 @@ describe("useGeneralSettingsRestore", () => {
     expect(h.setTheme).toHaveBeenCalledWith("system");
     expect(h.updateSettings).toHaveBeenCalledWith({
       timestampFormat: DEFAULT_UNIFIED_SETTINGS.timestampFormat,
+      browserLinkTarget: DEFAULT_UNIFIED_SETTINGS.browserLinkTarget,
       wordWrap: DEFAULT_UNIFIED_SETTINGS.wordWrap,
       diffIgnoreWhitespace: DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace,
       enableAssistantStreaming: DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming,

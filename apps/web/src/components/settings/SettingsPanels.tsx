@@ -180,6 +180,11 @@ const TIMESTAMP_FORMAT_LABELS = {
   "24-hour": "24-hour",
 } as const;
 
+const BROWSER_LINK_TARGET_LABELS = {
+  app: "BiBCode browser",
+  system: "System browser",
+} as const;
+
 const DEFAULT_DRIVER_KIND = ProviderDriverKind.make("codex");
 
 function terminalFontPreferenceForMode(
@@ -430,6 +435,9 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       ...(settings.timestampFormat !== DEFAULT_UNIFIED_SETTINGS.timestampFormat
         ? ["Time format"]
         : []),
+      ...(settings.browserLinkTarget !== DEFAULT_UNIFIED_SETTINGS.browserLinkTarget
+        ? ["Open links in"]
+        : []),
       ...(settings.wordWrap !== DEFAULT_UNIFIED_SETTINGS.wordWrap ? ["Word wrap"] : []),
       ...(settings.diffIgnoreWhitespace !== DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace
         ? ["Diff whitespace changes"]
@@ -466,6 +474,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
     ],
     [
       settings.autoOpenPlanSidebar,
+      settings.browserLinkTarget,
       settings.confirmThreadArchive,
       settings.confirmThreadDelete,
       settings.addProjectBaseDirectory,
@@ -494,6 +503,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
     setTheme("system");
     updateSettings({
       timestampFormat: DEFAULT_UNIFIED_SETTINGS.timestampFormat,
+      browserLinkTarget: DEFAULT_UNIFIED_SETTINGS.browserLinkTarget,
       wordWrap: DEFAULT_UNIFIED_SETTINGS.wordWrap,
       diffIgnoreWhitespace: DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace,
       enableAssistantStreaming: DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming,
@@ -592,6 +602,43 @@ export function GeneralSettingsPanel() {
                 </SelectItem>
                 <SelectItem hideIndicator value="24-hour">
                   {TIMESTAMP_FORMAT_LABELS["24-hour"]}
+                </SelectItem>
+              </SelectPopup>
+            </Select>
+          }
+        />
+
+        <SettingsRow
+          title="Open links in"
+          description="Where web links from chat and the terminal open. Hold Ctrl or Cmd in chat, or Shift in the terminal, to use the other one."
+          resetAction={
+            settings.browserLinkTarget !== DEFAULT_UNIFIED_SETTINGS.browserLinkTarget ? (
+              <SettingResetButton
+                label="link target"
+                onClick={() =>
+                  updateSettings({ browserLinkTarget: DEFAULT_UNIFIED_SETTINGS.browserLinkTarget })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Select
+              value={settings.browserLinkTarget}
+              onValueChange={(value) => {
+                if (value === "app" || value === "system") {
+                  updateSettings({ browserLinkTarget: value });
+                }
+              }}
+            >
+              <SelectTrigger className="w-full sm:w-40" aria-label="Open links in">
+                <SelectValue>{BROWSER_LINK_TARGET_LABELS[settings.browserLinkTarget]}</SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                <SelectItem hideIndicator value="app">
+                  {BROWSER_LINK_TARGET_LABELS.app}
+                </SelectItem>
+                <SelectItem hideIndicator value="system">
+                  {BROWSER_LINK_TARGET_LABELS.system}
                 </SelectItem>
               </SelectPopup>
             </Select>
