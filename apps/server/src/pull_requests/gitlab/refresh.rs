@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-#[derive(Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct ListFingerprint {
     pub updated_at: String,
     pub state: String,
@@ -11,15 +13,16 @@ pub(super) struct ListFingerprint {
     pub unresolved_threads: Option<u64>,
 }
 
-#[derive(Clone)]
-pub(super) struct ProbeFingerprint {
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ProbeFingerprint {
     pub updated_at: String,
     pub user_notes_count: u64,
     pub pipeline_id: Option<u64>,
     pub pipeline_status: Option<String>,
 }
 
-pub(super) struct ActiveTab {
+#[derive(Clone, Copy)]
+pub(crate) struct ActiveTab {
     pub commits: bool,
     pub files: bool,
 }
@@ -106,7 +109,7 @@ mod tests {
     #[test]
     fn unchanged_list_and_probe_request_nothing() {
         let row = sample_row();
-        assert!(!list_changed(&[row.clone()], &[row]));
+        assert!(!list_changed(&[sample_row()], std::slice::from_ref(&row)));
         let probe = ProbeFingerprint {
             updated_at: "2026-10-08T00:00:00Z".into(),
             user_notes_count: 3,
@@ -114,7 +117,14 @@ mod tests {
             pipeline_status: None,
         };
         assert_eq!(
-            detail_refresh(&probe, &probe, ActiveTab { commits: true, files: true }),
+            detail_refresh(
+                &probe,
+                &probe,
+                ActiveTab {
+                    commits: true,
+                    files: true
+                }
+            ),
             RefreshNames::none()
         );
     }
@@ -133,8 +143,19 @@ mod tests {
             ..previous.clone()
         };
         assert_eq!(
-            detail_refresh(&previous, &next, ActiveTab { commits: true, files: true }),
-            RefreshNames { detail: true, checks: true, ..RefreshNames::none() }
+            detail_refresh(
+                &previous,
+                &next,
+                ActiveTab {
+                    commits: true,
+                    files: true
+                }
+            ),
+            RefreshNames {
+                detail: true,
+                checks: true,
+                ..RefreshNames::none()
+            }
         );
     }
 
@@ -151,8 +172,19 @@ mod tests {
             ..previous.clone()
         };
         assert_eq!(
-            detail_refresh(&previous, &next, ActiveTab { commits: true, files: true }),
-            RefreshNames { detail: true, timeline: true, ..RefreshNames::none() }
+            detail_refresh(
+                &previous,
+                &next,
+                ActiveTab {
+                    commits: true,
+                    files: true
+                }
+            ),
+            RefreshNames {
+                detail: true,
+                timeline: true,
+                ..RefreshNames::none()
+            }
         );
     }
 
@@ -169,7 +201,14 @@ mod tests {
             ..previous.clone()
         };
         assert_eq!(
-            detail_refresh(&previous, &next, ActiveTab { commits: false, files: true }),
+            detail_refresh(
+                &previous,
+                &next,
+                ActiveTab {
+                    commits: false,
+                    files: true
+                }
+            ),
             RefreshNames {
                 detail: true,
                 timeline: true,

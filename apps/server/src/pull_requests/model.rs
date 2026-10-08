@@ -364,6 +364,14 @@ pub struct ListQuery {
 }
 
 impl ListQuery {
+    /// The poller's list key: the canonical query without the explicit-Refresh
+    /// bit, which never changes the merge requests a page shows.
+    pub(crate) fn snapshot_key(&self) -> String {
+        let mut canonical = self.clone();
+        canonical.refresh_totals = false;
+        serde_json::to_string(&canonical).unwrap_or_default()
+    }
+
     pub fn has_filters(&self) -> bool {
         self.search.is_some()
             || self.author.is_some()

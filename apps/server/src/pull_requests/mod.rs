@@ -29,19 +29,37 @@ use error::PullRequestsOperationError;
 use host::{HostCommandRunner, PullRequestHost};
 use model::{
     ActionRequest, ActionResult, Checks, Commits, Context, CreateDefaults, Detail, Files, ListPage,
-    ListQuery, Permission, Permissions, ReviewEvent, Snapshot, SubscribeInput, Timeline,
-    Vocabulary, VocabularyKind,
+    ListQuery, Permission, Permissions, ReviewEvent, Snapshot, SnapshotPayload, SnapshotTab,
+    SubscribeInput, SubscribeTab, Timeline, Vocabulary, VocabularyKind,
 };
 
 type ActionGateKey = (bool, String, String, u64);
 type ActionGates = Mutex<HashMap<ActionGateKey, Weak<tokio::sync::Mutex<()>>>>;
+
+/// Captures the admitted host as soon as a bounded read resolves scope, so a
+/// later failure outside that read can still target the right host's
+/// snapshots without re-resolving it.
+#[derive(Clone, Default)]
+struct HostCapture(Arc<Mutex<Option<String>>>);
+
+impl HostCapture {
+    fn set(&self, host: &str) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(host.to_ascii_lowercase());
+    }
+    fn get(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
 
 #[derive(Clone)]
 pub struct PullRequestsService {
     runner: Arc<HostCommandRunner>,
     github: Arc<dyn PullRequestHost>,
     gitlab: Arc<dyn PullRequestHost>,
+    gitlab_host: Arc<gitlab::GitLabHost>,
     action_gates: Arc<ActionGates>,
+    database: Option<crate::persistence::Database>,
+    pollers: Arc<gitlab::poll::Registry>,
 }
 
 impl PullRequestsService {
@@ -57,22 +75,38 @@ impl PullRequestsService {
         self,
         provider_hosts: Arc<crate::source_control::ProviderHosts>,
     ) -> Self {
-        Self::with_runner(
-            self.runner
-                .as_ref()
-                .clone()
-                .with_provider_hosts(provider_hosts),
-        )
+        Self {
+            database: self.database,
+            pollers: self.pollers,
+            ..Self::with_runner(
+                self.runner
+                    .as_ref()
+                    .clone()
+                    .with_provider_hosts(provider_hosts),
+            )
+        }
     }
 
     pub fn with_runner(runner: HostCommandRunner) -> Self {
         let runner = Arc::new(runner);
+        let gitlab_host = Arc::new(gitlab::GitLabHost::new(runner.clone()));
         Self {
             github: Arc::new(github::GitHubHost::new(runner.clone())),
-            gitlab: Arc::new(gitlab::GitLabHost::new(runner.clone())),
+            gitlab: gitlab_host.clone(),
+            gitlab_host,
             runner,
             action_gates: Arc::default(),
+            database: None,
+            pollers: Arc::default(),
         }
+    }
+
+    /// Snapshot reads and the poller are GitLab-only (Task 4); without a
+    /// database, `readSnapshot` and `subscribe` answer `unavailable`.
+    #[must_use]
+    pub fn with_database(mut self, database: crate::persistence::Database) -> Self {
+        self.database = Some(database);
+        self
     }
 
     /// The admitted scope already names a supported provider.
@@ -95,7 +129,7 @@ impl PullRequestsService {
         if read == ContextRead::Rescan {
             self.invalidate_contexts();
         }
-        bounded_read(
+        let result = bounded_read(
             "pullRequests.getContext",
             Duration::from_secs(30),
             c,
@@ -124,29 +158,31 @@ impl PullRequestsService {
                 }
             },
         )
-        .await
-        .inspect(|context| {
-            // Availability is data on this RPC; these failures never reach inspect_err.
-            if let Context::Unavailable { code, host, .. } = context {
-                if matches!(
-                    code,
-                    model::UnavailableCode::NotAuthenticated
-                        | model::UnavailableCode::RepositoryUnreachable
-                        | model::UnavailableCode::CliMissing
-                        | model::UnavailableCode::CliTooOld
-                ) {
-                    self.invalidate_contexts();
-                }
-                // Scope resolution already forgets on `unknown_host` and on its own
-                // login check; a 401 from the host's context read arrives only here.
-                if *code == model::UnavailableCode::NotAuthenticated
-                    && let Some(host) = host
-                {
-                    self.runner.provider_hosts().forget(host);
-                }
+        .await;
+        // Availability is data on this RPC; these failures never reach the error branch.
+        if let Ok(Context::Unavailable { code, host, .. }) = &result {
+            if matches!(
+                code,
+                model::UnavailableCode::NotAuthenticated
+                    | model::UnavailableCode::RepositoryUnreachable
+                    | model::UnavailableCode::CliMissing
+                    | model::UnavailableCode::CliTooOld
+            ) {
+                self.invalidate_contexts();
             }
-        })
-        .inspect_err(|error| self.invalidate_failed_context(error))
+            // Scope resolution already forgets on `unknown_host` and on its own
+            // login check; a 401 from the host's context read arrives only here.
+            if *code == model::UnavailableCode::NotAuthenticated
+                && let Some(host) = host
+            {
+                self.runner.provider_hosts().forget(host);
+                self.delete_host_snapshots(host).await;
+            }
+        }
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, None).await;
+        }
+        result
     }
 
     pub async fn vocabulary(
@@ -156,7 +192,9 @@ impl PullRequestsService {
         query: Option<&str>,
         c: &CancellationToken,
     ) -> Result<Vocabulary, PullRequestsOperationError> {
-        bounded_read(
+        let host = HostCapture::default();
+        let captured = host.clone();
+        let result = bounded_read(
             "pullRequests.getVocabulary",
             Duration::from_secs(30),
             c,
@@ -164,11 +202,16 @@ impl PullRequestsService {
                 let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                     .await
                     .map_err(|u| u.operation_error("pullRequests.getVocabulary"))?;
+                captured.set(&scope.host);
                 self.host(&scope).vocabulary(&scope, kind, query, &c).await
             },
         )
-        .await
-        .inspect_err(|error| self.invalidate_failed_context(error))
+        .await;
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, host.get().as_deref())
+                .await;
+        }
+        result
     }
 
     pub async fn create_defaults(
@@ -176,7 +219,9 @@ impl PullRequestsService {
         cwd: &Path,
         c: &CancellationToken,
     ) -> Result<CreateDefaults, PullRequestsOperationError> {
-        bounded_read(
+        let host = HostCapture::default();
+        let captured = host.clone();
+        let result = bounded_read(
             "pullRequests.getCreateDefaults",
             Duration::from_secs(30),
             c,
@@ -184,27 +229,121 @@ impl PullRequestsService {
                 let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                     .await
                     .map_err(|u| u.operation_error("pullRequests.getCreateDefaults"))?;
+                captured.set(&scope.host);
                 self.host(&scope).create_defaults(&scope, &c).await
             },
         )
-        .await
-        .inspect_err(|error| self.invalidate_failed_context(error))
+        .await;
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, host.get().as_deref())
+                .await;
+        }
+        result
     }
 
     pub async fn read_snapshot(
         &self,
-        _input: SubscribeInput,
-        _c: &CancellationToken,
+        input: SubscribeInput,
+        c: &CancellationToken,
     ) -> Result<Snapshot, PullRequestsOperationError> {
-        Err(snapshot_unavailable("pullRequests.readSnapshot"))
+        let operation = "pullRequests.readSnapshot";
+        bounded_read(operation, Duration::from_secs(30), c, |c| async move {
+            // A database read needs the host's identity, not an authenticated
+            // CLI: skip `pending.authenticate` so this stays glab-free.
+            let pending = context::resolve_pending_scope(
+                &self.runner,
+                Path::new(&input.list.cwd),
+                &DiscoveredHosts::default(),
+                ContextRead::Open,
+                &c,
+            )
+            .await
+            .map_err(|u| u.operation_error(operation))?;
+            let scope = pending.scope;
+            let Some(database) = self.gitlab_snapshot_database(&scope) else {
+                return Err(snapshot_unavailable(operation));
+            };
+            let host = scope.host.to_ascii_lowercase();
+            let project = scope.repository.clone();
+            let list_key = input.list.snapshot_key();
+            let number = input.number;
+            let tab = input.tab;
+            let rows = database
+                .call(move |connection| {
+                    let store = snapshot_store::SnapshotStore::new(connection);
+                    let list = store.get(&host, &project, "list", &list_key)?;
+                    let detail = match number {
+                        Some(number) => {
+                            store.get(&host, &project, "detail", &number.to_string())?
+                        }
+                        None => None,
+                    };
+                    let tab_row = match (number, tab) {
+                        (Some(number), Some(tab)) => {
+                            store.get(&host, &project, tab_kind(tab), &number.to_string())?
+                        }
+                        _ => None,
+                    };
+                    Ok((list, detail, tab_row))
+                })
+                .await
+                .map_err(|_| snapshot_unavailable(operation))?;
+            Ok(build_snapshot(rows, tab))
+        })
+        .await
     }
 
     pub async fn subscribe(
         &self,
-        _input: SubscribeInput,
-        _c: &CancellationToken,
+        input: SubscribeInput,
+        c: &CancellationToken,
     ) -> Result<(), PullRequestsOperationError> {
-        Err(snapshot_unavailable("pullRequests.subscribe"))
+        let operation = "pullRequests.subscribe";
+        // The poll loop re-authenticates on every tick and backs off on failure;
+        // admitting the scope here only needs the host's identity, not a CLI check.
+        let pending = context::resolve_pending_scope(
+            &self.runner,
+            Path::new(&input.list.cwd),
+            &DiscoveredHosts::default(),
+            ContextRead::Open,
+            c,
+        )
+        .await
+        .map_err(|u| u.operation_error(operation))?;
+        let scope = pending.scope;
+        let Some(database) = self.gitlab_snapshot_database(&scope) else {
+            return Err(snapshot_unavailable(operation));
+        };
+        let tab = gitlab::poll::ActiveTab {
+            commits: input.tab == Some(SubscribeTab::Commits),
+            files: input.tab == Some(SubscribeTab::Files),
+        };
+        let list_key = input.list.snapshot_key();
+        gitlab::poll::run_subscriber(
+            &self.pollers,
+            &self.gitlab_host,
+            &database,
+            &scope,
+            &input.list,
+            &list_key,
+            input.number,
+            tab,
+            &|_changed: model::Changed| {},
+            c,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Snapshot reads and the poller are only wired for GitLab (Task 4).
+    fn gitlab_snapshot_database(
+        &self,
+        scope: &host::HostScope,
+    ) -> Option<crate::persistence::Database> {
+        if scope.provider != model::PullRequestsProvider::Gitlab {
+            return None;
+        }
+        self.database.clone()
     }
 
     pub async fn list(
@@ -213,7 +352,9 @@ impl PullRequestsService {
         query: ListQuery,
         c: &CancellationToken,
     ) -> Result<ListPage, PullRequestsOperationError> {
-        bounded_read(
+        let host = HostCapture::default();
+        let captured = host.clone();
+        let result = bounded_read(
             "pullRequests.list",
             Duration::from_secs(60),
             c,
@@ -228,6 +369,7 @@ impl PullRequestsService {
                 .await
                 .map_err(|u| u.operation_error("pullRequests.list"))?;
                 let scope = &pending.scope;
+                captured.set(&scope.host);
                 pending
                     .read_authenticated(&self.runner, &c, |read_c| async move {
                         self.host(scope).list(scope, &query, &read_c).await
@@ -236,8 +378,12 @@ impl PullRequestsService {
                     .map_err(|u| u.operation_error("pullRequests.list"))?
             },
         )
-        .await
-        .inspect_err(|error| self.invalidate_failed_context(error))
+        .await;
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, host.get().as_deref())
+                .await;
+        }
+        result
     }
     pub async fn get(
         &self,
@@ -246,10 +392,13 @@ impl PullRequestsService {
         c: &CancellationToken,
     ) -> Result<Detail, PullRequestsOperationError> {
         let operation = "pullRequests.get";
-        bounded_read(operation, Duration::from_secs(60), c, |c| async move {
+        let host = HostCapture::default();
+        let captured = host.clone();
+        let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
+            captured.set(&scope.host);
             let host = self.host(&scope);
             let context = host.context(&scope, &c).await.map_err(|mut e| {
                 e.operation = operation.into();
@@ -265,8 +414,12 @@ impl PullRequestsService {
             detail.readiness = readiness;
             Ok(detail)
         })
-        .await
-        .inspect_err(|error| self.invalidate_failed_context(error))
+        .await;
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, host.get().as_deref())
+                .await;
+        }
+        result
     }
 
     pub async fn timeline(
@@ -276,14 +429,21 @@ impl PullRequestsService {
         c: &CancellationToken,
     ) -> Result<Timeline, PullRequestsOperationError> {
         let operation = "pullRequests.getTimeline";
-        bounded_read(operation, Duration::from_secs(60), c, |c| async move {
+        let host = HostCapture::default();
+        let captured = host.clone();
+        let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
+            captured.set(&scope.host);
             self.host(&scope).timeline(&scope, number, &c).await
         })
-        .await
-        .inspect_err(|error| self.invalidate_failed_context(error))
+        .await;
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, host.get().as_deref())
+                .await;
+        }
+        result
     }
 
     pub async fn commits(
@@ -293,14 +453,21 @@ impl PullRequestsService {
         c: &CancellationToken,
     ) -> Result<Commits, PullRequestsOperationError> {
         let operation = "pullRequests.getCommits";
-        bounded_read(operation, Duration::from_secs(60), c, |c| async move {
+        let host = HostCapture::default();
+        let captured = host.clone();
+        let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
+            captured.set(&scope.host);
             self.host(&scope).commits(&scope, number, &c).await
         })
-        .await
-        .inspect_err(|error| self.invalidate_failed_context(error))
+        .await;
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, host.get().as_deref())
+                .await;
+        }
+        result
     }
 
     pub async fn checks(
@@ -310,14 +477,21 @@ impl PullRequestsService {
         c: &CancellationToken,
     ) -> Result<Checks, PullRequestsOperationError> {
         let operation = "pullRequests.getChecks";
-        bounded_read(operation, Duration::from_secs(60), c, |c| async move {
+        let host = HostCapture::default();
+        let captured = host.clone();
+        let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
+            captured.set(&scope.host);
             self.host(&scope).checks(&scope, number, &c).await
         })
-        .await
-        .inspect_err(|error| self.invalidate_failed_context(error))
+        .await;
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, host.get().as_deref())
+                .await;
+        }
+        result
     }
 
     pub async fn files(
@@ -327,14 +501,21 @@ impl PullRequestsService {
         c: &CancellationToken,
     ) -> Result<Files, PullRequestsOperationError> {
         let operation = "pullRequests.getFiles";
-        bounded_read(operation, Duration::from_secs(60), c, |c| async move {
+        let host = HostCapture::default();
+        let captured = host.clone();
+        let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(&self.runner, cwd, &DiscoveredHosts::default(), &c)
                 .await
                 .map_err(|u| u.operation_error(operation))?;
+            captured.set(&scope.host);
             self.host(&scope).files(&scope, number, &c).await
         })
-        .await
-        .inspect_err(|error| self.invalidate_failed_context(error))
+        .await;
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, host.get().as_deref())
+                .await;
+        }
+        result
     }
 
     pub async fn run_action(
@@ -344,7 +525,9 @@ impl PullRequestsService {
     ) -> Result<ActionResult, PullRequestsOperationError> {
         let operation = "pullRequests.runAction";
         action::validate(action)?;
-        bounded_read(operation, Duration::from_secs(60), c, |c| async move {
+        let host = HostCapture::default();
+        let captured = host.clone();
+        let result = bounded_read(operation, Duration::from_secs(60), c, |c| async move {
             let scope = resolve_scope(
                 &self.runner,
                 Path::new(&action.target().cwd),
@@ -353,14 +536,31 @@ impl PullRequestsService {
             )
             .await
             .map_err(|u| u.operation_error(operation))?;
+            captured.set(&scope.host);
             let result = self.run_scoped_action(&scope, action, &c).await?;
             // Merges, state changes, reverts and deletions can change the tab totals.
             self.host(&scope).invalidate_totals(&scope);
+            if scope.provider == model::PullRequestsProvider::Gitlab
+                && let Some(database) = self.database.clone()
+            {
+                let host = scope.host.to_ascii_lowercase();
+                let project = scope.repository.clone();
+                let number = action.target().number;
+                let _ = database
+                    .call(move |connection| {
+                        Ok(snapshot_store::SnapshotStore::new(connection)
+                            .delete_number(&host, &project, number)?)
+                    })
+                    .await;
+            }
             Ok(result)
         })
-        .await
-        .inspect_err(|error| self.invalidate_failed_context(error))
-        .map_err(|mut error| {
+        .await;
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, host.get().as_deref())
+                .await;
+        }
+        result.map_err(|mut error| {
             error.operation = operation.into();
             error
         })
@@ -482,13 +682,39 @@ impl PullRequestsService {
         self.gitlab.invalidate_context();
     }
 
-    fn invalidate_failed_context(&self, error: &PullRequestsOperationError) {
+    /// Rescan uses `invalidate_contexts` directly and must leave snapshots in
+    /// place; only a failure that discredits the account or its access to this
+    /// repository deletes them here.
+    async fn invalidate_failed_context(
+        &self,
+        error: &PullRequestsOperationError,
+        host: Option<&str>,
+    ) {
         if matches!(
             error.code,
             "not_authenticated" | "forbidden" | "not_found" | "cli_missing" | "cli_too_old"
         ) {
             self.invalidate_contexts();
         }
+        if matches!(error.code, "not_authenticated" | "forbidden")
+            && let Some(host) = host
+        {
+            self.delete_host_snapshots(host).await;
+        }
+    }
+
+    /// GitLab-only snapshots key on the lowercased host; a GitHub host simply
+    /// has no rows to delete.
+    async fn delete_host_snapshots(&self, host: &str) {
+        let Some(database) = self.database.clone() else {
+            return;
+        };
+        let host = host.to_ascii_lowercase();
+        let _ = database
+            .call(move |connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).delete_host(&host)?)
+            })
+            .await;
     }
 }
 
@@ -570,6 +796,53 @@ fn snapshot_unavailable(operation: &str) -> PullRequestsOperationError {
     let mut error = PullRequestsOperationError::new(operation, "unavailable");
     error.message = "Merge request snapshots are not available for this host.".into();
     error
+}
+
+/// The stored snapshot kind for one subscribed tab; conversation shares the
+/// `timeline` kind since that is what the panel renders there.
+fn tab_kind(tab: SubscribeTab) -> &'static str {
+    match tab {
+        SubscribeTab::Conversation => "timeline",
+        SubscribeTab::Commits => "commits",
+        SubscribeTab::Checks => "checks",
+        SubscribeTab::Files => "files",
+    }
+}
+
+type RawSnapshotRow = Option<snapshot_store::Snapshot>;
+
+fn build_snapshot(
+    (list, detail, tab_row): (RawSnapshotRow, RawSnapshotRow, RawSnapshotRow),
+    tab: Option<SubscribeTab>,
+) -> Snapshot {
+    Snapshot {
+        list: list.and_then(|row| {
+            serde_json::from_slice(&row.payload)
+                .ok()
+                .map(|payload| SnapshotPayload {
+                    payload,
+                    observed_at: row.observed_at_ms.max(0) as u64,
+                })
+        }),
+        detail: detail.and_then(|row| {
+            serde_json::from_slice(&row.payload)
+                .ok()
+                .map(|payload| SnapshotPayload {
+                    payload,
+                    observed_at: row.observed_at_ms.max(0) as u64,
+                })
+        }),
+        tab: match (tab_row, tab) {
+            (Some(row), Some(kind)) => serde_json::from_slice::<serde_json::Value>(&row.payload)
+                .ok()
+                .map(|payload| SnapshotTab {
+                    kind,
+                    payload,
+                    observed_at: row.observed_at_ms.max(0) as u64,
+                }),
+            _ => None,
+        },
+    }
 }
 
 /// One deadline includes discovery, authentication, metadata, pages and mutations.
@@ -744,7 +1017,12 @@ mod service_tests {
             runner: Arc::new(HostCommandRunner::new(PathBuf::new())),
             github: fake.clone(),
             gitlab: fake,
+            gitlab_host: Arc::new(gitlab::GitLabHost::new(Arc::new(HostCommandRunner::new(
+                PathBuf::new(),
+            )))),
             action_gates: Arc::default(),
+            database: None,
+            pollers: Arc::default(),
         };
         let scope = host::HostScope {
             cwd: PathBuf::from("/repo"),
@@ -860,7 +1138,12 @@ mod service_tests {
             runner: Arc::new(HostCommandRunner::new(PathBuf::new())),
             github: fake.clone(),
             gitlab: fake,
+            gitlab_host: Arc::new(gitlab::GitLabHost::new(Arc::new(HostCommandRunner::new(
+                PathBuf::new(),
+            )))),
             action_gates: Arc::default(),
+            database: None,
+            pollers: Arc::default(),
         };
         let scope = host::HostScope {
             cwd: "/checkout-a".into(),
@@ -1304,6 +1587,232 @@ esac"#,
             "timeout"
         );
     }
+
+    async fn new_database() -> crate::persistence::Database {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("database");
+        database
+            .call(|connection| Ok(crate::persistence::run_migrations(connection, None)?))
+            .await
+            .expect("migrations");
+        database
+    }
+
+    #[tokio::test]
+    async fn gitlab_poller_read_snapshot_with_a_populated_row_performs_zero_glab_calls() {
+        let s = crate::test_support::TestSandbox::new("pr-read-snapshot");
+        let glab = s.executable_script("glab", "printf '%s\\n' \"$*\" >> calls\nexit 64", "");
+        let git = s.executable_script(
+            "git",
+            "printf '%s' 'git@gitlab.acme.example:team/repo.git'",
+            "",
+        );
+        let database = new_database().await;
+        let service = PullRequestsService::with_runner(
+            HostCommandRunner::new(s.path("state")).with_commands("missing-gh", &glab, &git),
+        )
+        .with_database(database.clone());
+        service.runner.provider_hosts().record(
+            "gitlab.acme.example",
+            crate::source_control::ProviderKind::Gitlab,
+        );
+        let list_query: ListQuery = serde_json::from_value(serde_json::json!({"cwd":s.root(),"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null,"refreshTotals":true})).unwrap();
+        let list_key = list_query.snapshot_key();
+        database
+            .call(move |connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).put(
+                    snapshot_store::Snapshot {
+                        host: "gitlab.acme.example".into(),
+                        project: "team/repo".into(),
+                        kind: "list".into(),
+                        key: list_key,
+                        fingerprint: "fp".into(),
+                        payload: serde_json::to_vec(&ListPage {
+                            rows: vec![],
+                            next_cursor: None,
+                            total_count: None,
+                            counts: None,
+                        })
+                        .unwrap(),
+                        observed_at_ms: 1,
+                        generation: 1,
+                    },
+                )?)
+            })
+            .await
+            .unwrap();
+        let input: SubscribeInput = serde_json::from_value(serde_json::json!({"cwd":s.root(),"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null,"refreshTotals":true,"number":null,"tab":null})).unwrap();
+        let snapshot = service
+            .read_snapshot(input, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(snapshot.list.is_some());
+        assert!(!s.path("calls").exists(), "zero glab calls");
+    }
+
+    #[tokio::test]
+    async fn gitlab_poller_run_action_success_deletes_the_acted_numbers_rows_and_leaves_others() {
+        let s = crate::test_support::TestSandbox::new("pr-run-action-snapshots");
+        let git = s.executable_script(
+            "git",
+            "printf '%s' 'git@gitlab.acme.example:team/repo.git'",
+            "",
+        );
+        let database = new_database().await;
+        let glab = s.executable_script(
+            "glab",
+            r#"case "$1 $2" in
+  '--version ') echo 'glab 1.114.0' ;;
+  'auth status') printf 'gitlab.acme.example\n  ✓ Logged in to gitlab.acme.example as alice\n' ;;
+  *) exit 64 ;;
+esac"#,
+            "",
+        );
+        let runner = Arc::new(HostCommandRunner::new(s.path("state")).with_commands(
+            "missing-gh",
+            &glab,
+            &git,
+        ));
+        runner.provider_hosts().record(
+            "gitlab.acme.example",
+            crate::source_control::ProviderKind::Gitlab,
+        );
+        let fake = Arc::new(ActionHost {
+            inputs: permissions::tests::gitlab_inputs(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            context_calls: None,
+            block_first: None,
+        });
+        let service = PullRequestsService {
+            runner: runner.clone(),
+            github: fake.clone(),
+            gitlab: fake,
+            gitlab_host: Arc::new(gitlab::GitLabHost::new(Arc::new(HostCommandRunner::new(
+                PathBuf::new(),
+            )))),
+            action_gates: Arc::default(),
+            database: Some(database.clone()),
+            pollers: Arc::default(),
+        };
+        for (number, kind) in [
+            (3941u64, "detail"),
+            (3941, "timeline"),
+            (3941, "commits"),
+            (3941, "checks"),
+            (3941, "files"),
+            (42, "detail"),
+        ] {
+            database
+                .call(move |connection| {
+                    Ok(snapshot_store::SnapshotStore::new(connection).put(
+                        snapshot_store::Snapshot {
+                            host: "gitlab.acme.example".into(),
+                            project: "team/repo".into(),
+                            kind: kind.into(),
+                            key: number.to_string(),
+                            fingerprint: "fp".into(),
+                            payload: b"x".to_vec(),
+                            observed_at_ms: 1,
+                            generation: 1,
+                        },
+                    )?)
+                })
+                .await
+                .unwrap();
+        }
+        let cwd = s.root().to_string_lossy().into_owned();
+        let action: ActionRequest = serde_json::from_value(
+            serde_json::json!({"action":"comment","cwd":cwd,"number":3941,"body":"hi"}),
+        )
+        .unwrap();
+        let result = service
+            .run_action(&action, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result, ActionResult::Done);
+        for kind in ["detail", "timeline", "commits", "checks", "files"] {
+            let row = database
+                .call(move |connection| {
+                    Ok(snapshot_store::SnapshotStore::new(connection).get(
+                        "gitlab.acme.example",
+                        "team/repo",
+                        kind,
+                        "3941",
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert!(row.is_none(), "{kind} for the acted number must be gone");
+        }
+        let other = database
+            .call(|connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).get(
+                    "gitlab.acme.example",
+                    "team/repo",
+                    "detail",
+                    "42",
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(other.is_some(), "other numbers remain");
+    }
+
+    #[tokio::test]
+    async fn gitlab_poller_rescan_leaves_snapshot_rows_in_place() {
+        let s = crate::test_support::TestSandbox::new("pr-rescan-snapshots");
+        let git = s.executable_script(
+            "git",
+            "printf '%s' 'git@gitlab.acme.example:team/repo.git'",
+            "",
+        );
+        let database = new_database().await;
+        let service = PullRequestsService::with_runner(
+            HostCommandRunner::new(s.path("state")).with_commands(
+                "missing-gh",
+                "missing-glab",
+                &git,
+            ),
+        )
+        .with_database(database.clone());
+        service.runner.provider_hosts().record(
+            "gitlab.acme.example",
+            crate::source_control::ProviderKind::Gitlab,
+        );
+        database
+            .call(|connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).put(
+                    snapshot_store::Snapshot {
+                        host: "gitlab.acme.example".into(),
+                        project: "team/repo".into(),
+                        kind: "detail".into(),
+                        key: "3941".into(),
+                        fingerprint: "fp".into(),
+                        payload: b"x".to_vec(),
+                        observed_at_ms: 1,
+                        generation: 1,
+                    },
+                )?)
+            })
+            .await
+            .unwrap();
+        let _ = service
+            .context(s.root(), ContextRead::Rescan, &CancellationToken::new())
+            .await;
+        let row = database
+            .call(|connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).get(
+                    "gitlab.acme.example",
+                    "team/repo",
+                    "detail",
+                    "3941",
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(row.is_some(), "rescan must not delete snapshots");
+    }
 }
 
 #[cfg(test)]
@@ -1382,6 +1891,7 @@ mod tripwires {
         ("github/parse.rs", include_str!("github/parse.rs")),
         ("gitlab/mod.rs", include_str!("gitlab/mod.rs")),
         ("gitlab/actions.rs", include_str!("gitlab/actions.rs")),
+        ("gitlab/poll.rs", include_str!("gitlab/poll.rs")),
         (
             "gitlab/detail_tests.rs",
             include_str!("gitlab/detail_tests.rs"),
@@ -1394,6 +1904,8 @@ mod tripwires {
         ("gitlab/graphql.rs", include_str!("gitlab/graphql.rs")),
         ("gitlab/timeline.rs", include_str!("gitlab/timeline.rs")),
         ("gitlab/files.rs", include_str!("gitlab/files.rs")),
+        ("gitlab/refresh.rs", include_str!("gitlab/refresh.rs")),
+        ("snapshot_store.rs", include_str!("snapshot_store.rs")),
         (
             "production/pull_requests_rpc.rs",
             include_str!("../production/pull_requests_rpc.rs"),

@@ -48,8 +48,11 @@ impl PullRequestsRpcServices {
         repositories: Repositories,
         provider_hosts: Arc<crate::source_control::ProviderHosts>,
     ) -> ConfiguredPullRequestsRpcServices {
+        let database = repositories.database().clone();
         ConfiguredPullRequestsRpcServices {
-            service: PullRequestsService::new(state_dir).with_provider_hosts(provider_hosts),
+            service: PullRequestsService::new(state_dir)
+                .with_provider_hosts(provider_hosts)
+                .with_database(database),
             repositories: Some(repositories),
             worktrees: None,
         }

@@ -108,7 +108,7 @@ impl PullRequestsService {
         {
             return Err(error("invalid_request"));
         }
-        bounded_read(OP, Duration::from_secs(60), c, |c| async move {
+        let result = bounded_read(OP, Duration::from_secs(60), c, |c| async move {
             let operation = self.checkout_inner(worktrees, repositories, input, &c, write_started);
             tokio::pin!(operation);
             // This observer lives inside the bounded closure. The read token's
@@ -122,9 +122,11 @@ impl PullRequestsService {
                 }
             }
         })
-        .await
-        .inspect_err(|failure| self.invalidate_failed_context(failure))
-        .map_err(|mut failure| {
+        .await;
+        if let Err(failure) = &result {
+            self.invalidate_failed_context(failure, None).await;
+        }
+        result.map_err(|mut failure| {
             failure.operation = OP.into();
             failure
         })

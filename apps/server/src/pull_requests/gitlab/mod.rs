@@ -2,7 +2,8 @@ mod actions;
 mod files;
 mod graphql;
 mod parse;
-mod refresh;
+pub(super) mod poll;
+pub(crate) mod refresh;
 mod review_positions;
 mod timeline;
 
@@ -100,6 +101,7 @@ impl GitLabHost {
                     "pullRequests.getContext"
                         | "pullRequests.getVocabulary"
                         | "pullRequests.getCreateDefaults"
+                        | "pullRequests.subscribe"
                 ) {
                     Budget::Read
                 } else {
@@ -187,6 +189,20 @@ impl GitLabHost {
             }
         }
         Ok((Value::Array(awards), true))
+    }
+
+    /// One lightweight `GET merge_requests/:iid`, read for the poller's change
+    /// detection only. It never calls `detail`.
+    pub(super) async fn probe(
+        &self,
+        scope: &HostScope,
+        number: u64,
+        c: &CancellationToken,
+    ) -> Result<refresh::ProbeFingerprint, PullRequestsOperationError> {
+        let operation = "pullRequests.subscribe";
+        let path = format!("{}/merge_requests/{number}", project_path(scope));
+        let value = self.api(scope, &path, operation, c).await?;
+        parse::probe_fingerprint(&value, operation)
     }
 
     async fn counts(&self, scope: &HostScope, c: &CancellationToken) -> Option<ListCounts> {
