@@ -35,6 +35,12 @@ const h = vi.hoisted(() => {
     resolvedUrl: "http://resolved.local/" as string,
     unreachableReason: null as string | null,
     unreachableNotices: [] as unknown[],
+    gateway: false,
+    gatewayNavUrl: "http://10.0.0.2:41000/__bibcode/bootstrap?cap=CAP&to=%2F",
+    gatewayUnreachableMessage: null as string | null,
+    holdNextResolve: false,
+    releaseHeldResolve: () => undefined as void,
+    resolveForNavigationCalls: [] as Array<{ canonicalUrl: string; tabId?: string }>,
     responsiveSize: { width: 800, height: 600 },
     // command results
     commandCalls: [] as Array<{ label: string; input: unknown }>,
@@ -136,14 +142,36 @@ vi.mock("~/previewStateStore", () => ({
 }));
 
 vi.mock("~/browser/browserTargetResolver", () => ({
-  resolvePreviewTarget: () =>
+  resolvePreviewTarget: (_environmentId: unknown, url: string) =>
     h.unreachableReason
       ? { kind: "unreachable", reason: h.unreachableReason, environmentLabel: "Box" }
-      : { kind: "reachable", url: h.resolvedUrl },
+      : h.gateway
+        ? { kind: "gateway", via: "host", host: "10.0.0.2", url }
+        : { kind: "reachable", url: h.resolvedUrl },
+}));
+
+vi.mock("~/browser/previewGateway", () => ({
+  resolveForNavigation: (input: { canonicalUrl: string; tabId?: string }) => {
+    h.resolveForNavigationCalls.push(input);
+    if (h.holdNextResolve) {
+      h.holdNextResolve = false;
+      const url = h.gatewayNavUrl;
+      return new Promise((resolve) => {
+        h.releaseHeldResolve = () => resolve({ kind: "ok", url });
+      });
+    }
+    return Promise.resolve(
+      h.gatewayUnreachableMessage
+        ? { kind: "unreachable", message: h.gatewayUnreachableMessage }
+        : { kind: "ok", url: h.gateway ? h.gatewayNavUrl : input.canonicalUrl },
+    );
+  },
 }));
 
 vi.mock("~/browser/linkNotices", () => ({
   showPreviewUnreachableNotice: (resolution: unknown) => h.unreachableNotices.push(resolution),
+  showPreviewUnreachableMessage: (message: string, url: string) =>
+    h.unreachableNotices.push({ message, url }),
 }));
 
 vi.mock("~/browser/desktopTabLifetime", () => ({
@@ -166,6 +194,7 @@ vi.mock("~/state/preview", () => ({
     open: { label: "open" },
     navigate: { label: "navigate" },
     resize: { label: "resize" },
+    gatewayOpen: { label: "gatewayOpen" },
   },
 }));
 
@@ -533,6 +562,10 @@ beforeEach(() => {
   h.resolvedUrl = "http://resolved.local/";
   h.unreachableReason = null;
   h.unreachableNotices.length = 0;
+  h.gateway = false;
+  h.gatewayUnreachableMessage = null;
+  h.holdNextResolve = false;
+  h.resolveForNavigationCalls.length = 0;
   h.responsiveSize = { width: 800, height: 600 };
   h.commandCalls.length = 0;
   h.resizeResult = { _tag: "Success", value: { viewport: { _tag: "fill" } } };
@@ -853,6 +886,127 @@ describe("navigation handlers", () => {
     expect(bridgeMethodCalls("goBack")).toHaveLength(1);
     expect(bridgeMethodCalls("goForward")).toHaveLength(1);
     expect(bridgeMethodCalls("refresh")).toHaveLength(1);
+  });
+
+  it("sends the canonical URL to the server and the gateway URL to the native view", async () => {
+    seedSession();
+    h.previewBridge = makeBridge();
+    h.gateway = true;
+    renderView();
+    const chrome = captured("chromeRow");
+
+    (chrome.onSubmit as (next: string) => void)("http://localhost:5173/app");
+    await flush();
+
+    expect(h.resolveForNavigationCalls).toMatchObject([
+      { canonicalUrl: "http://localhost:5173/app", tabId: "tab-1" },
+    ]);
+    expect(h.commandCalls).toContainEqual({
+      label: "navigate",
+      input: {
+        environmentId: "environment-1",
+        input: { threadId: "thread-1", tabId: "tab-1", url: "http://localhost:5173/app" },
+      },
+    });
+    expect(h.navigationOrder).toEqual(["server", "desktop"]);
+    expect(h.desktopNavigateCalls).toEqual([["tab-1", h.gatewayNavUrl]]);
+    expect(h.rememberPreviewUrlCalls).toEqual([[threadRef, "http://localhost:5173/app"]]);
+  });
+
+  it("leaves shared state alone and explains why when the gateway refuses", async () => {
+    seedSession();
+    h.previewBridge = makeBridge();
+    h.gateway = true;
+    h.gatewayUnreachableMessage = "Nothing to see here.";
+    renderView();
+    const chrome = captured("chromeRow");
+
+    (chrome.onSubmit as (next: string) => void)("http://localhost:5173/app");
+    await flush();
+
+    expect(h.commandCalls.filter((call) => call.label === "navigate")).toHaveLength(0);
+    expect(h.desktopNavigateCalls).toHaveLength(0);
+    expect(h.unreachableNotices).toEqual([
+      { message: "Nothing to see here.", url: "http://localhost:5173/app" },
+    ]);
+  });
+
+  it("discards an older submission that finishes resolving after a newer one", async () => {
+    seedSession();
+    h.previewBridge = makeBridge();
+    h.gateway = true;
+    h.holdNextResolve = true;
+    renderView();
+    const chrome = captured("chromeRow");
+
+    (chrome.onSubmit as (next: string) => void)("http://localhost:5173/slow");
+    await flush();
+    h.gateway = false;
+    (chrome.onSubmit as (next: string) => void)("example.com");
+    await flush();
+    h.releaseHeldResolve();
+    await flush();
+
+    expect(h.commandCalls.filter((call) => call.label === "navigate")).toHaveLength(1);
+    expect(h.desktopNavigateCalls).toEqual([["tab-1", "http://resolved.local/"]]);
+  });
+
+  it("drops a pending gateway submission when the view leaves its tab", async () => {
+    seedSession();
+    h.previewBridge = makeBridge();
+    h.gateway = true;
+    h.holdNextResolve = true;
+    renderView();
+    const cleanups = runEffects();
+    const chrome = captured("chromeRow");
+
+    (chrome.onSubmit as (next: string) => void)("http://localhost:5173/slow");
+    await flush();
+    for (const cleanup of cleanups) cleanup();
+    h.releaseHeldResolve();
+    await flush();
+
+    expect(h.commandCalls.filter((call) => call.label === "navigate")).toHaveLength(0);
+    expect(h.desktopNavigateCalls).toEqual([]);
+  });
+
+  it("drops a gateway reload that a newer submission overtakes", async () => {
+    seedSession();
+    h.previewBridge = makeBridge();
+    h.gateway = true;
+    h.holdNextResolve = true;
+    renderView();
+    const chrome = captured("chromeRow");
+
+    (chrome.onRefresh as () => void)();
+    await flush();
+    h.gateway = false;
+    (chrome.onSubmit as (next: string) => void)("example.com");
+    await flush();
+    h.releaseHeldResolve();
+    await flush();
+
+    expect(h.desktopNavigateCalls).toEqual([["tab-1", "http://resolved.local/"]]);
+  });
+
+  it("reloads a gateway tab by resolving it again instead of refreshing natively", async () => {
+    seedSession({
+      navStatus: { _tag: "Success", url: "http://localhost:5173/a", title: "A" },
+      overlay: null,
+    });
+    h.previewBridge = makeBridge();
+    h.gateway = true;
+    renderView();
+    const chrome = captured("chromeRow");
+
+    (chrome.onRefresh as () => void)();
+    await flush();
+
+    expect(h.resolveForNavigationCalls).toMatchObject([
+      { canonicalUrl: "http://localhost:5173/a", tabId: "tab-1" },
+    ]);
+    expect(h.desktopNavigateCalls).toEqual([["tab-1", h.gatewayNavUrl]]);
+    expect(bridgeMethodCalls("refresh")).toHaveLength(0);
   });
 
   it("invokes open-in-browser without throwing (local api unavailable under node)", () => {

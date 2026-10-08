@@ -11,7 +11,12 @@ let setting: "app" | "system" = "app";
 
 vi.mock("./browserTargetResolver", () => ({ resolvePreviewTarget }));
 const showLinkOpenFailedNotice = vi.fn();
-vi.mock("./linkNotices", () => ({ showPreviewUnreachableNotice, showLinkOpenFailedNotice }));
+const showPreviewUnreachableMessage = vi.fn();
+vi.mock("./linkNotices", () => ({
+  showPreviewUnreachableNotice,
+  showLinkOpenFailedNotice,
+  showPreviewUnreachableMessage,
+}));
 vi.mock("./openFileInPreview", () => ({ openUrlInPreview }));
 vi.mock("~/previewStateStore", () => ({ isPreviewSupportedInRuntime: () => previewSupported }));
 vi.mock("~/localApi", () => ({ readLocalApi: () => ({ shell: { openExternal } }) }));
@@ -141,6 +146,42 @@ describe("openLink", () => {
       }),
     ).toBe("system");
     expect(openExternal).toHaveBeenCalledWith("http://10.0.0.2:5173/");
+  });
+
+  it("hands the canonical URL of a gateway address to the internal browser", async () => {
+    resolvePreviewTarget.mockReturnValue({
+      kind: "gateway",
+      via: "ssh",
+      url: "http://localhost:5173/",
+    });
+    const { openLink } = await import("./openLink");
+    expect(openLink({ url: "http://0.0.0.0:5173/", threadRef, invert: false, openPreview })).toBe(
+      "app",
+    );
+    expect(openUrlInPreview).toHaveBeenCalledWith({
+      threadRef,
+      url: "http://localhost:5173/",
+      openPreview,
+    });
+  });
+
+  it("never opens a gateway address on this computer's own localhost", async () => {
+    resolvePreviewTarget.mockReturnValue({
+      kind: "gateway",
+      via: "host",
+      host: "10.0.0.2",
+      url: "http://localhost:5173/",
+    });
+    setting = "system";
+    const { openLink } = await import("./openLink");
+    expect(openLink({ url: "http://localhost:5173/", threadRef, invert: false, openPreview })).toBe(
+      "unreachable",
+    );
+    expect(openExternal).not.toHaveBeenCalled();
+    expect(showPreviewUnreachableMessage).toHaveBeenCalledWith(
+      expect.stringContaining("BiBCode's browser"),
+      "http://localhost:5173/",
+    );
   });
 
   it("reports async preview failures through onError", async () => {

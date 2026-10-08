@@ -68,6 +68,13 @@ const parsePreviewUrl = (raw: string): URL | null => {
 export type PreviewUnreachableReason = "disconnected" | "ssh" | "relay" | "public-host";
 export type PreviewTargetResolution =
   | { readonly kind: "reachable"; readonly url: string }
+  /**
+   * A server-loopback address reached through the environment's preview
+   * gateway. `url` is canonical (`http://localhost:<port>/…`): it is what shared
+   * preview state stores, and each client resolves it for its own webview.
+   */
+  | { readonly kind: "gateway"; readonly url: string; readonly via: "host"; readonly host: string }
+  | { readonly kind: "gateway"; readonly url: string; readonly via: "ssh" }
   | {
       readonly kind: "unreachable";
       readonly reason: PreviewUnreachableReason;
@@ -89,6 +96,7 @@ export const UNREACHABLE_MESSAGES: Record<PreviewUnreachableReason, (label: stri
 type EnvironmentReach =
   | { readonly kind: "same-host" }
   | { readonly kind: "host"; readonly host: string }
+  | { readonly kind: "ssh" }
   | {
       readonly kind: "unreachable";
       readonly reason: PreviewUnreachableReason;
@@ -97,7 +105,8 @@ type EnvironmentReach =
 
 // The connection target alone never decides "same machine": a primary can be a
 // browser served by a remote host, and desktop-local WSL is a bearer target on
-// the VM address. SSH and relay endpoints are never the environment's own host.
+// the VM address. SSH and relay endpoints are never the environment's own host;
+// SSH reaches the gateway through a desktop-managed forward.
 function classifyEnvironmentReach(environmentId: EnvironmentId): EnvironmentReach {
   const connection = readPreparedConnection(environmentId);
   if (!connection) {
@@ -106,9 +115,7 @@ function classifyEnvironmentReach(environmentId: EnvironmentId): EnvironmentReac
   const label = connection.label;
   const baseUrl = parseUrl(connection.httpBaseUrl);
   if (!baseUrl) return { kind: "unreachable", reason: "disconnected", label };
-  if (connection.target._tag === "SshConnectionTarget") {
-    return { kind: "unreachable", reason: "ssh", label };
-  }
+  if (connection.target._tag === "SshConnectionTarget") return { kind: "ssh" };
   if (connection.target._tag === "RelayConnectionTarget") {
     return { kind: "unreachable", reason: "relay", label };
   }
@@ -120,48 +127,31 @@ function classifyEnvironmentReach(environmentId: EnvironmentId): EnvironmentReac
   return { kind: "unreachable", reason: "public-host", label };
 }
 
-const formatHost = (host: string) => (host.includes(":") ? `[${host}]` : host);
+/** Brackets an IPv6 literal for use in a URL authority. */
+export const formatHost = (host: string) => (host.includes(":") ? `[${host}]` : host);
 
+/**
+ * Resolves an agent navigation target to the URL shared preview state stores.
+ * A gateway-backed `resolvedUrl` stays canonical; the native view resolves it
+ * per client with `resolveForNavigation`.
+ */
 export function resolveBrowserNavigationTarget(
   environmentId: EnvironmentId,
   target: BrowserNavigationTarget,
 ): PreviewUrlResolution {
+  let requestedUrl: string;
   if (target.kind === "url") {
-    const resolution = resolvePreviewTarget(environmentId, target.url);
-    if (resolution.kind === "unreachable") {
-      throw new Error(UNREACHABLE_MESSAGES[resolution.reason](resolution.environmentLabel));
-    }
-    const requestedHost = parsePreviewUrl(target.url)?.hostname;
-    const resolvedHost = parseUrl(resolution.url)?.hostname;
-    const rewritten =
-      requestedHost !== undefined &&
-      resolvedHost !== undefined &&
-      isLoopbackHost(requestedHost) &&
-      !isLoopbackHost(resolvedHost);
-    return {
-      requestedUrl: target.url,
-      resolvedUrl: resolution.url,
-      resolutionKind: rewritten ? "direct-private-network" : "direct",
-      environmentId,
-    };
+    requestedUrl = target.url;
+  } else {
+    const protocol = target.protocol ?? "http";
+    const path = target.path?.startsWith("/") ? target.path : `/${target.path ?? ""}`;
+    requestedUrl = `${protocol}://localhost:${target.port}${path}`;
   }
-  const reach = classifyEnvironmentReach(environmentId);
-  if (reach.kind === "unreachable") {
-    throw new Error(UNREACHABLE_MESSAGES[reach.reason](reach.label));
+  const resolution = resolvePreviewTarget(environmentId, requestedUrl);
+  if (resolution.kind === "unreachable") {
+    throw new Error(UNREACHABLE_MESSAGES[resolution.reason](resolution.environmentLabel));
   }
-  const protocol = target.protocol ?? "http";
-  const path = target.path?.startsWith("/") ? target.path : `/${target.path ?? ""}`;
-  const requestedUrl = `${protocol}://localhost:${target.port}${path}`;
-  if (reach.kind === "same-host") {
-    return { requestedUrl, resolvedUrl: requestedUrl, resolutionKind: "direct", environmentId };
-  }
-  const resolved = new URL(path, `${protocol}://${formatHost(reach.host)}:${target.port}`);
-  return {
-    requestedUrl,
-    resolvedUrl: resolved.toString(),
-    resolutionKind: "direct-private-network",
-    environmentId,
-  };
+  return { requestedUrl, resolvedUrl: resolution.url, resolutionKind: "direct", environmentId };
 }
 
 export function resolvePreviewTarget(
@@ -186,11 +176,16 @@ export function resolvePreviewTarget(
       url: parsed.toString(),
     };
   }
-  if (reach.kind === "host") {
-    parsed.hostname = formatHost(reach.host);
-  } else if (isWildcardHost(parsed.hostname)) {
+  if (reach.kind === "same-host") {
     // A wildcard bind is not a navigable address; loopback is.
-    parsed.hostname = "localhost";
+    if (isWildcardHost(parsed.hostname)) parsed.hostname = "localhost";
+    return { kind: "reachable", url: parsed.toString() };
   }
-  return { kind: "reachable", url: parsed.toString() };
+  // Every loopback spelling names the same server port, so the canonical form
+  // is one origin per port. The scheme is kept: the gateway refuses HTTPS itself.
+  parsed.hostname = "localhost";
+  const url = parsed.toString();
+  return reach.kind === "host"
+    ? { kind: "gateway", via: "host", host: reach.host, url }
+    : { kind: "gateway", via: "ssh", url };
 }

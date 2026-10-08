@@ -64,6 +64,9 @@ const h = vi.hoisted(() => {
     resolvedUrl: "http://resolved.local/" as string,
     resolveCalls: [] as unknown[],
     resolveError: null as Error | null,
+    gatewayNavUrl: null as string | null,
+    gatewayMessage: null as string | null,
+    gatewayResolveCalls: [] as Array<{ canonicalUrl: string; tabId?: string }>,
     // browser recording
     activeRecordingTabId: null as string | null,
     startBrowserRecordingImpl: (_tabId: string) => Promise.resolve("2026-01-01T00:00:00.000Z"),
@@ -147,6 +150,19 @@ vi.mock("~/browser/browserTargetResolver", () => ({
   },
 }));
 
+vi.mock("~/browser/previewGateway", () => ({
+  resolveForNavigation: (input: { canonicalUrl: string; tabId?: string }) => {
+    h.gatewayResolveCalls.push(input);
+    return Promise.resolve(
+      h.gatewayMessage
+        ? { kind: "unreachable", message: h.gatewayMessage }
+        : { kind: "ok", url: h.gatewayNavUrl ?? input.canonicalUrl },
+    );
+  },
+  canonicalizePreviewUrl: (url: string) =>
+    h.gatewayNavUrl !== null && url === h.gatewayNavUrl ? h.resolvedUrl : url,
+}));
+
 vi.mock("~/browser/browserRecording", () => ({
   readActiveBrowserRecordingTabId: () => h.activeRecordingTabId,
   startBrowserRecording: (tabId: string) => h.startBrowserRecordingImpl(tabId),
@@ -175,6 +191,7 @@ vi.mock("~/state/preview", () => ({
     },
     list: Object.assign((target: unknown) => ({ label: "list", target }), { label: "list" }),
     open: { label: "open" },
+    gatewayOpen: { label: "gatewayOpen" },
     resize: { label: "resize" },
     respondToAutomation: { label: "respondToAutomation" },
     focusAutomationHost: { label: "focusAutomationHost" },
@@ -331,6 +348,9 @@ beforeEach(() => {
   h.resolvedUrl = "http://resolved.local/";
   h.resolveCalls.length = 0;
   h.resolveError = null;
+  h.gatewayNavUrl = null;
+  h.gatewayMessage = null;
+  h.gatewayResolveCalls.length = 0;
   h.activeRecordingTabId = null;
   h.startBrowserRecordingImpl = () => Promise.resolve("2026-01-01T00:00:00.000Z");
   h.stopBrowserRecordingImpl = () => Promise.resolve({ path: "/rec.webm" });
@@ -680,6 +700,49 @@ describe("handleRequest: navigate + resize", () => {
 
     expect(h.navigateCalls).toContainEqual({ tabId: "tab-1", url: h.resolvedUrl });
     expect(result.available).toBe(true);
+  });
+
+  it("navigates the native view through the gateway and reports the canonical URL", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+    h.resolvedUrl = "http://localhost:5173/";
+    h.gatewayNavUrl = "http://127.0.0.1:50000/__bibcode/bootstrap?cap=C&to=%2F";
+    h.automationStatus = { ...h.automationStatus, url: h.gatewayNavUrl };
+
+    const result = (await handle(
+      makeRequest({
+        operation: "navigate",
+        tabId: "tab-1",
+        input: { url: "http://localhost:5173/", readiness: "load" } as unknown,
+      }),
+    )) as Record<string, unknown>;
+
+    expect(h.gatewayResolveCalls).toMatchObject([
+      { canonicalUrl: "http://localhost:5173/", tabId: "tab-1" },
+    ]);
+    expect(h.navigateCalls).toContainEqual({ tabId: "tab-1", url: h.gatewayNavUrl });
+    expect(result.url).toBe("http://localhost:5173/");
+  });
+
+  it("fails navigation with the gateway's reason", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+    h.gatewayMessage = "Nothing is listening.";
+
+    const error = await handle(
+      makeRequest({
+        operation: "navigate",
+        tabId: "tab-1",
+        input: { url: "http://localhost:5173/" } as unknown,
+      }),
+    ).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(error).toBeInstanceOf(PreviewAutomationOperationError);
+    expect((error as { cause?: Error }).cause?.message).toBe("Nothing is listening.");
+    expect(h.navigateCalls).toEqual([]);
   });
 
   it("waits for load instead of evaluating script on a bridge without automation", async () => {

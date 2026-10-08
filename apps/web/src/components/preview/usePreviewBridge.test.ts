@@ -79,6 +79,14 @@ vi.mock("~/previewStateStore", () => ({
   },
 }));
 
+vi.mock("~/browser/previewGateway", () => ({
+  canonicalizePreviewUrl: (url: string) =>
+    url.replace(
+      "http://10.0.0.2:41000/__bibcode/bootstrap?cap=C&to=%2Fa",
+      "http://localhost:5173/a",
+    ),
+}));
+
 vi.mock("~/state/preview", () => ({
   previewEnvironment: { reportStatus: { key: "preview.reportStatus" } },
 }));
@@ -255,6 +263,27 @@ describe("usePreviewBridge", () => {
           },
         },
       },
+    ]);
+  });
+
+  it("projects and reports the canonical URL of a gateway page", () => {
+    renderHook();
+    runEffect();
+
+    emit("tab-1", {
+      kind: "Loading",
+      url: "http://10.0.0.2:41000/__bibcode/bootstrap?cap=C&to=%2Fa",
+      title: "",
+    });
+    emit("tab-1", { kind: "Loading", url: "http://localhost:5173/a", title: "" });
+
+    expect(testState.appliedStates.map(({ state }) => (state as { url: unknown }).url)).toEqual([
+      "http://localhost:5173/a",
+      "http://localhost:5173/a",
+    ]);
+    // The bootstrap hop and the page it replaces are one canonical load.
+    expect(testState.reportCalls).toMatchObject([
+      { input: { navStatus: { _tag: "Loading", url: "http://localhost:5173/a" } } },
     ]);
   });
 

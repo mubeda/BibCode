@@ -31,6 +31,11 @@ import { supportsPreviewRuntimeCapability } from "~/previewRuntimeCapabilities";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { resolveBrowserNavigationTarget } from "~/browser/browserTargetResolver";
 import {
+  canonicalizePreviewUrl,
+  type GatewayOpenMutation,
+  resolveForNavigation,
+} from "~/browser/previewGateway";
+import {
   readActiveBrowserRecordingTabId,
   startBrowserRecording,
   stopBrowserRecording,
@@ -236,7 +241,11 @@ const currentStatus = async (
   if (tabId && previewBridge && state.desktopByTabId[tabId]) {
     const status = await previewBridge.automation.status(tabId);
     // A detached native tab keeps its last overlay; its session is the truth then.
-    if (status.available) return { ...status, visible, ...viewportStatus };
+    if (status.available) {
+      // The webview may sit on this client's gateway origin; agents see the canonical URL.
+      const url = status.url === null ? null : canonicalizePreviewUrl(status.url);
+      return { ...status, url, visible, ...viewportStatus };
+    }
   }
   const navStatus = snapshot?.navStatus;
   return {
@@ -248,6 +257,24 @@ const currentStatus = async (
     loading: navStatus?._tag === "Loading",
     ...viewportStatus,
   };
+};
+
+/** Resolves a canonical URL for this client's native view, failing with the user-facing reason. */
+const resolveNativeUrl = async (
+  threadRef: ScopedThreadRef,
+  tabId: string,
+  canonicalUrl: string,
+  gatewayOpen: GatewayOpenMutation,
+): Promise<string> => {
+  const target = await resolveForNavigation({
+    environmentId: threadRef.environmentId,
+    threadId: threadRef.threadId,
+    canonicalUrl,
+    gatewayOpen,
+    tabId,
+  });
+  if (target.kind === "unreachable") throw new Error(target.message);
+  return target.url;
 };
 
 const raiseAtomCommandFailure = (result: Parameters<typeof squashAtomCommandFailure>[0]): never => {
@@ -303,6 +330,9 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
     reportFailure: false,
   });
   const resize = useAtomCommand(previewEnvironment.resize, {
+    reportFailure: false,
+  });
+  const gatewayOpen = useAtomCommand(previewEnvironment.gatewayOpen, {
     reportFailure: false,
   });
   const respondToAutomation = useAtomCommand(
@@ -373,8 +403,9 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
             const reusedExistingTab = activeTabId !== null;
             tabId = activeTabId;
             // Resolve first: a server-loopback URL must never load this
-            // computer's localhost for a remote environment.
-            const resolvedUrl = input.url
+            // computer's localhost for a remote environment. Shared state
+            // stores the canonical URL; the native view resolves it per client.
+            const canonicalUrl = input.url
               ? resolveBrowserNavigationTarget(environmentId, { kind: "url", url: input.url })
                   .resolvedUrl
               : null;
@@ -383,7 +414,7 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                 environmentId,
                 input: {
                   threadId: request.threadId,
-                  ...(resolvedUrl ? { url: resolvedUrl } : {}),
+                  ...(canonicalUrl ? { url: canonicalUrl } : {}),
                 },
               });
               if (result._tag === "Failure") {
@@ -411,8 +442,11 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                 request.timeoutMs,
               );
             }
-            if (reusedExistingTab && resolvedUrl !== null && previewBridge) {
-              await previewBridge.navigate(activeTabId, resolvedUrl);
+            if (reusedExistingTab && canonicalUrl !== null && previewBridge) {
+              await previewBridge.navigate(
+                activeTabId,
+                await resolveNativeUrl(threadRef, activeTabId, canonicalUrl, gatewayOpen),
+              );
               await waitForNavigationReadiness(
                 threadRef,
                 request.requestId,
@@ -433,7 +467,10 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                 url: input.url!,
               },
             );
-            await ready.bridge.navigate(ready.tabId, resolution.resolvedUrl);
+            await ready.bridge.navigate(
+              ready.tabId,
+              await resolveNativeUrl(threadRef, ready.tabId, resolution.resolvedUrl, gatewayOpen),
+            );
             await waitForNavigationReadiness(
               threadRef,
               request.requestId,
@@ -561,7 +598,7 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
         });
       }
     },
-    [environmentId, listPreviews, open, registry, resize],
+    [environmentId, gatewayOpen, listPreviews, open, registry, resize],
   );
   const [requestHandlerAtom] = useState(() => Atom.make({ handle: handleRequest }));
   const setRequestHandler = useAtomSet(requestHandlerAtom);

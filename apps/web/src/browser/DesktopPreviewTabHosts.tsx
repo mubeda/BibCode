@@ -5,8 +5,12 @@ import { useEffect, useRef } from "react";
 
 import type { RightPanelSurface } from "~/rightPanelStore";
 import { usePreviewBridge } from "~/components/preview/usePreviewBridge";
+import { readThreadPreviewState } from "~/previewStateStore";
+import { previewEnvironment } from "~/state/preview";
+import { useAtomCommand } from "~/state/use-atom-command";
 
 import { acquireDesktopTab } from "./desktopTabLifetime";
+import { releasePreviewTab, resolveForNavigation } from "./previewGateway";
 
 export interface DesktopPreviewTabHostDescriptor {
   readonly tabId: string;
@@ -30,6 +34,27 @@ export function selectDesktopPreviewTabHosts(
   ];
 }
 
+const readNativeUrl = (threadRef: ScopedThreadRef, tabId: string) =>
+  readThreadPreviewState(threadRef).desktopByTabId[tabId]?.url ?? null;
+
+/**
+ * True once the tab moved on while its initial URL was resolving: the URL bar
+ * commits a new shared URL, and an agent navigates the native view directly.
+ */
+function isSuperseded(
+  threadRef: ScopedThreadRef,
+  tabId: string,
+  initialUrl: string,
+  nativeUrlAtMount: string | null,
+): boolean {
+  const navStatus = readThreadPreviewState(threadRef).sessions[tabId]?.navStatus;
+  if (navStatus !== undefined && navStatus._tag !== "Idle" && navStatus.url !== initialUrl) {
+    return true;
+  }
+  const nativeUrl = readNativeUrl(threadRef, tabId);
+  return nativeUrl !== nativeUrlAtMount && nativeUrl !== null && nativeUrl !== initialUrl;
+}
+
 export function NativePreviewTabHost(props: {
   readonly threadRef: ScopedThreadRef;
   readonly tabId: string;
@@ -37,6 +62,12 @@ export function NativePreviewTabHost(props: {
 }) {
   const { threadRef, tabId, initialUrl } = props;
   const initialUrlRef = useRef(initialUrl);
+  // Gateway refusals become the tab's failed state with their own copy.
+  const gatewayOpen = useAtomCommand(previewEnvironment.gatewayOpen, { reportFailure: false });
+  const reportStatus = useAtomCommand(previewEnvironment.reportStatus, "preview status report");
+  // Captured at mount like the initial URL: the host is keyed by tab, and the
+  // effect must not re-acquire the native tab when these identities change.
+  const navigationRef = useRef({ threadRef, gatewayOpen, reportStatus });
 
   usePreviewBridge({ threadRef, tabId });
 
@@ -44,12 +75,52 @@ export function NativePreviewTabHost(props: {
     let disposed = false;
     const lease = acquireDesktopTab(tabId);
     const initialUrl = initialUrlRef.current;
+    const {
+      threadRef: ref,
+      gatewayOpen: openGateway,
+      reportStatus: report,
+    } = navigationRef.current;
     if (initialUrl !== null) {
-      void lease.navigate(initialUrl, () => !disposed).catch(() => undefined);
+      const nativeUrlAtMount = readNativeUrl(ref, tabId);
+      // The shared URL is canonical; resolve it for this client's webview.
+      void resolveForNavigation({
+        environmentId: ref.environmentId,
+        threadId: ref.threadId,
+        canonicalUrl: initialUrl,
+        gatewayOpen: openGateway,
+        tabId,
+      })
+        .then(async (target) => {
+          if (disposed || isSuperseded(ref, tabId, initialUrl, nativeUrlAtMount)) return;
+          if (target.kind === "ok") {
+            await lease.navigate(target.url, () => !disposed);
+            return;
+          }
+          // Nothing loads, so no native status follows: fail the tab with the
+          // reason instead of leaving it Loading. Reload retries it.
+          await report({
+            environmentId: ref.environmentId,
+            input: {
+              threadId: ref.threadId,
+              tabId,
+              canGoBack: false,
+              canGoForward: false,
+              navStatus: {
+                _tag: "LoadFailed",
+                url: initialUrl,
+                title: "",
+                code: 0,
+                description: target.message.replace(/\.$/, ""),
+              },
+            },
+          });
+        })
+        .catch(() => undefined);
     }
     return () => {
       disposed = true;
       lease.release();
+      releasePreviewTab(ref.environmentId, tabId);
     };
   }, [tabId]);
 

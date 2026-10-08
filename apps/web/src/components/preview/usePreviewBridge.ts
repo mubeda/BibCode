@@ -9,6 +9,7 @@ import type {
 import { useEffect, useRef } from "react";
 
 import { useBrowserPointerStore } from "~/browser/browserPointerStore";
+import { canonicalizePreviewUrl } from "~/browser/previewGateway";
 import { applyPreviewDesktopState, type DesktopPreviewOverlay } from "~/previewStateStore";
 import { previewEnvironment } from "~/state/preview";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -35,8 +36,11 @@ export function usePreviewBridge(input: { threadRef: ScopedThreadRef; tabId: str
     lastReportedUrl.current = null;
     lastReportedKind.current = null;
     lastDesktopNavStatus.current = null;
-    const unsubscribe = bridge.onStateChange((changedTabId, state) => {
+    const unsubscribe = bridge.onStateChange((changedTabId, nativeState) => {
       if (changedTabId !== tabId) return;
+      // The webview may sit on a client-specific gateway origin; everything
+      // shared or compared below uses the canonical URL.
+      const state = canonicalizeDesktopState(nativeState);
       if (shouldClearBrowserPointer(lastDesktopNavStatus.current, state.navStatus)) {
         clearBrowserPointer(tabId);
       }
@@ -59,6 +63,12 @@ export function usePreviewBridge(input: { threadRef: ScopedThreadRef; tabId: str
     });
     return unsubscribe;
   }, [bridge, clearBrowserPointer, reportStatus, tabId, threadRef]);
+}
+
+function canonicalizeDesktopState(state: DesktopPreviewTabState): DesktopPreviewTabState {
+  if (state.navStatus.kind === "Idle") return state;
+  const url = canonicalizePreviewUrl(state.navStatus.url);
+  return url === state.navStatus.url ? state : { ...state, navStatus: { ...state.navStatus, url } };
 }
 
 function shouldClearBrowserPointer(
