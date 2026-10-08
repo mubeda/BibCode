@@ -1,3 +1,40 @@
+use std::{ffi::OsString, path::PathBuf};
+
+/// The value a provider process sees for `name`: the instance environment first (matched
+/// case-insensitively, as Windows does), then the server's own environment.
+pub(crate) fn effective_environment_value(
+    environment: &[(OsString, OsString)],
+    name: &str,
+) -> Option<OsString> {
+    environment
+        .iter()
+        .find(|(candidate, _)| candidate.to_string_lossy().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os(name))
+}
+
+/// The configuration directory Claude Code uses under `environment`: `CLAUDE_CONFIG_DIR`, else
+/// `.claude` in the home directory.
+pub(crate) fn claude_config_directory(environment: &[(OsString, OsString)]) -> Option<PathBuf> {
+    effective_environment_value(environment, "CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home_directory(environment).map(|home| home.join(".claude")))
+}
+
+/// The home Codex uses under `environment` when BiBCode sets no `CODEX_HOME` for it:
+/// `CODEX_HOME`, else `.codex` in the home directory.
+pub(crate) fn codex_home_directory(environment: &[(OsString, OsString)]) -> Option<PathBuf> {
+    effective_environment_value(environment, "CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_directory(environment).map(|home| home.join(".codex")))
+}
+
+fn home_directory(environment: &[(OsString, OsString)]) -> Option<PathBuf> {
+    effective_environment_value(environment, "HOME")
+        .or_else(|| effective_environment_value(environment, "USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 /// Isolate providers from host diagnostics and AppImage launcher paths.
 pub(crate) fn sanitize_provider_subprocess_environment(command: &mut tokio::process::Command) {
     // Host diagnostics must not turn provider stderr into a high-volume event stream.

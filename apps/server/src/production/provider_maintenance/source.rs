@@ -1,5 +1,5 @@
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     io::ErrorKind,
     path::{Path, PathBuf},
     time::Duration,
@@ -7,6 +7,8 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
+
+use crate::provider::environment::{claude_config_directory, effective_environment_value};
 
 use super::{
     ProviderMaintenanceTarget,
@@ -184,7 +186,8 @@ async fn discover_claude_hints_from_paths(
     managed_directory: Option<&Path>,
     repository_paths: &[PathBuf],
 ) -> ClaudeSourceHints {
-    let user_settings = claude_config_directory(target).map(|path| path.join("settings.json"));
+    let user_settings =
+        claude_config_directory(&target.environment).map(|path| path.join("settings.json"));
     let (user_document, mut invalid_local_evidence) = match user_settings.as_deref() {
         Some(path) => match read_bounded_local_file(path).await {
             LocalEvidenceRead::Document(document) => (Some(document), false),
@@ -224,7 +227,7 @@ async fn discover_claude_hints_from_paths(
         hints.channel = None;
         hints.invalid_managed_channel = true;
     }
-    hints.updates_disabled = effective_environment_value(target, "DISABLE_UPDATES")
+    hints.updates_disabled = effective_environment_value(&target.environment, "DISABLE_UPDATES")
         .as_deref()
         .is_some_and(|value| value == OsStr::new("1"))
         || hints.updates_disabled;
@@ -401,28 +404,6 @@ async fn read_bounded_local_reader(reader: impl AsyncRead + Unpin) -> Option<Vec
     Some(bytes)
 }
 
-fn claude_config_directory(target: &ProviderMaintenanceTarget) -> Option<PathBuf> {
-    effective_environment_value(target, "CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            effective_environment_value(target, "HOME")
-                .map(|home| PathBuf::from(home).join(".claude"))
-        })
-        .or_else(|| {
-            effective_environment_value(target, "USERPROFILE")
-                .map(|home| PathBuf::from(home).join(".claude"))
-        })
-}
-
-fn effective_environment_value(target: &ProviderMaintenanceTarget, name: &str) -> Option<OsString> {
-    target
-        .environment
-        .iter()
-        .find(|(candidate, _)| candidate.to_string_lossy().eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.clone())
-        .or_else(|| std::env::var_os(name))
-}
-
 fn claude_managed_settings_path(target: &ProviderMaintenanceTarget) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -438,7 +419,7 @@ fn claude_managed_settings_path(target: &ProviderMaintenanceTarget) -> Option<Pa
     }
     #[cfg(windows)]
     {
-        effective_environment_value(target, "ProgramFiles")
+        effective_environment_value(&target.environment, "ProgramFiles")
             .map(|directory| PathBuf::from(directory).join("ClaudeCode/managed-settings.json"))
     }
 }

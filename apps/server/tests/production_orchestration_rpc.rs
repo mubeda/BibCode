@@ -566,6 +566,20 @@ async fn public_dispatch_rejects_every_generic_worktree_authority_bypass() {
                 }),
             ),
             (
+                "71",
+                json!({
+                    "type":"thread.history.import",
+                    "commandId":"internal-history-import",
+                    "threadId":default_thread_id,
+                    "messages":[{
+                        "messageId":"forged-history",
+                        "role":"assistant",
+                        "text":"forged",
+                        "createdAt":CREATED_AT
+                    }]
+                }),
+            ),
+            (
                 "64",
                 json!({
                     "type":"project.meta.update",

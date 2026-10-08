@@ -325,6 +325,24 @@ fails before removing files; close that process and retry the same row. If Git
 removal succeeds but deleting the sidebar row fails, retrying that stale row is
 safe even when a new worktree has since reused the old folder.
 
+### Importing CLI sessions
+
+To continue a conversation you started in Claude Code or Codex outside
+BiBCode, open the project menu and choose **Import CLI sessions…**. The dialog
+lists the sessions run in the project's folder on the server in the last 30
+days, newest first, with the provider, last activity and message count. Select
+sessions (or **Select all**) and choose **Import**. Each becomes a thread with
+the session's recent messages (up to 200, always including the first prompt); your
+next message in it continues the same CLI conversation. BiBCode opens the most
+recently active imported thread and reports how many sessions were imported or
+skipped and why.
+
+A session imported earlier shows **Already imported** with **Open**; importing
+it again does nothing. Conversations started in BiBCode, sessions run in a
+subfolder, and sessions run in another worktree are not listed. Only the
+default Claude Code and Codex providers are scanned, and a provider turned off
+in settings is skipped.
+
 ## Center Panel
 
 Terminal input pauses if delivery fails. **Reconnect input** reattaches to the

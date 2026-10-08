@@ -561,6 +561,13 @@ vi.mock("./WorktreeRemovalDialog", () => ({
   },
 }));
 
+vi.mock("./ImportCliSessionsDialog", () => ({
+  ImportCliSessionsDialog: (props: Record<string, unknown>) => {
+    h.capture("ImportCliSessionsDialog", props);
+    return null;
+  },
+}));
+
 vi.mock("../hooks/useHandleNewThread", () => ({
   useNewThreadHandler: () => h.spies.newThreadHandler,
 }));

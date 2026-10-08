@@ -60,10 +60,17 @@ export interface PrimaryCardMenuInput {
   readonly unread: boolean;
 }
 
-export type ProjectHeaderAction = "new-worktree" | "rename" | "grouping" | "copy-path" | "delete";
+export type ProjectHeaderAction =
+  | "new-worktree"
+  | "import-sessions"
+  | "rename"
+  | "grouping"
+  | "copy-path"
+  | "delete";
 
 const PROJECT_HEADER_ACTIONS: readonly ProjectHeaderAction[] = [
   "new-worktree",
+  "import-sessions",
   "rename",
   "grouping",
   "copy-path",
@@ -212,6 +219,7 @@ export function buildProjectHeaderMenu(input: ProjectHeaderMenuInput): SidebarMe
     projectHeaderEntry(input.members, action, label, destructive);
   return [
     entry("new-worktree", "New Worktree…"),
+    entry("import-sessions", "Import CLI sessions…"),
     SEPARATOR,
     entry("rename", "Rename…"),
     entry("grouping", "Group into…"),

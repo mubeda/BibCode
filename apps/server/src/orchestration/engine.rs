@@ -130,6 +130,20 @@ pub struct ThreadMessageInput {
     pub attachments: Vec<Value>,
 }
 
+/// One historical message appended by `thread.history.import`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImportedThreadMessage {
+    #[serde(rename = "messageId")]
+    pub message_id: String,
+    pub role: String,
+    pub text: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
+/// The most messages one `thread.history.import` command appends.
+pub const MAX_IMPORTED_THREAD_MESSAGES: usize = 200;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInput {
     #[serde(rename = "threadId")]
@@ -444,6 +458,15 @@ pub enum OrchestrationCommand {
         worktree_path: Option<String>,
         #[serde(rename = "createdAt")]
         created_at: String,
+    },
+    /// Server-internal: appends an imported CLI session's transcript without starting a turn.
+    #[serde(rename = "thread.history.import")]
+    ThreadHistoryImport {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        messages: Vec<ImportedThreadMessage>,
     },
     #[serde(rename = "thread.delete")]
     ThreadDelete {
@@ -4544,6 +4567,65 @@ async fn plan_command(
             metadata,
             json!({"threadId":thread_id,"turnCount":turn_count}),
         ),
+        OrchestrationCommand::ThreadHistoryImport {
+            command_id,
+            thread_id,
+            messages,
+        } => {
+            require_thread(model, command, thread_id)?;
+            // Checked by the engine worker, so a turn admitted after the importer's own check
+            // still keeps CLI history out of the thread's new conversation.
+            if repositories
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(wrap_persistence)?
+                .is_some_and(|thread| {
+                    thread.latest_turn_id.is_some() || thread.latest_user_message_at.is_some()
+                })
+            {
+                return invariant(
+                    command,
+                    "This thread was used before its history import.".to_owned(),
+                );
+            }
+            if messages.is_empty() || messages.len() > MAX_IMPORTED_THREAD_MESSAGES {
+                return invariant(
+                    command,
+                    format!(
+                        "A history import carries 1 to {MAX_IMPORTED_THREAD_MESSAGES} messages."
+                    ),
+                );
+            }
+            if let Some(message) = messages
+                .iter()
+                .find(|message| !matches!(message.role.as_str(), "user" | "assistant"))
+            {
+                return invariant(
+                    command,
+                    format!(
+                        "Imported message '{}' has unsupported role '{}'.",
+                        message.message_id, message.role
+                    ),
+                );
+            }
+            // Marks history so effects take no checkpoint baseline for a turn that never ran.
+            let mut metadata = metadata;
+            metadata["historyImport"] = json!(true);
+            Ok(messages
+                .iter()
+                .map(|message| {
+                    make_event(
+                        "thread.message-sent",
+                        "thread",
+                        thread_id,
+                        &message.created_at,
+                        command_id,
+                        metadata.clone(),
+                        json!({"threadId":thread_id,"messageId":message.message_id,"role":message.role,"text":message.text,"attachments":[],"turnId":null,"streaming":false,"createdAt":message.created_at,"updatedAt":message.created_at}),
+                    )
+                })
+                .collect())
+        }
     }
 }
 
@@ -6616,6 +6698,7 @@ impl OrchestrationCommand {
             Self::WorktreeDetachResolved { .. } => "worktree.detach-resolved",
             Self::WorktreeBranchReconcileResolved { .. } => "worktree.branch-reconcile-resolved",
             Self::ThreadCreate { .. } => "thread.create",
+            Self::ThreadHistoryImport { .. } => "thread.history.import",
             Self::ThreadDelete { .. } => "thread.delete",
             Self::ThreadArchive { .. } => "thread.archive",
             Self::ThreadUnarchive { .. } => "thread.unarchive",
@@ -6651,6 +6734,7 @@ impl OrchestrationCommand {
             | Self::WorktreeDetachResolved { command_id, .. }
             | Self::WorktreeBranchReconcileResolved { command_id, .. }
             | Self::ThreadCreate { command_id, .. }
+            | Self::ThreadHistoryImport { command_id, .. }
             | Self::ThreadDelete { command_id, .. }
             | Self::ThreadArchive { command_id, .. }
             | Self::ThreadUnarchive { command_id, .. }
@@ -6684,6 +6768,7 @@ impl OrchestrationCommand {
             | Self::WorktreeAdoptResolved { .. }
             | Self::WorktreeDetachResolved { .. }
             | Self::WorktreeBranchReconcileResolved { .. }
+            | Self::ThreadHistoryImport { .. }
             | Self::ThreadDelete { .. }
             | Self::ThreadArchive { .. }
             | Self::ThreadUnarchive { .. }
@@ -6721,6 +6806,7 @@ impl OrchestrationCommand {
             Self::WorktreeDetachResolved { project_id, .. } => ("project", project_id),
             Self::WorktreeBranchReconcileResolved { thread_id, .. } => ("thread", thread_id),
             Self::ThreadCreate { thread_id, .. }
+            | Self::ThreadHistoryImport { thread_id, .. }
             | Self::ThreadDelete { thread_id, .. }
             | Self::ThreadArchive { thread_id, .. }
             | Self::ThreadUnarchive { thread_id, .. }
@@ -6754,6 +6840,7 @@ impl OrchestrationCommand {
                 | Self::WorktreeAdoptResolved { .. }
                 | Self::WorktreeDetachResolved { .. }
                 | Self::WorktreeBranchReconcileResolved { .. }
+                | Self::ThreadHistoryImport { .. }
         )
     }
 }
@@ -11443,6 +11530,53 @@ mod tests {
             ["activity-other-turn"]
         );
         reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn history_import_refuses_a_thread_that_already_started_a_turn() {
+        const CREATED_AT: &str = "2026-10-08T10:00:00.000Z";
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine");
+        for value in [
+            json!({"type":"project.create","commandId":"project","projectId":"p1","title":"P","workspaceRoot":"C:/repo","createdAt":CREATED_AT}),
+            json!({"type":"thread.create","commandId":"used","threadId":"used","projectId":"p1","title":"Used","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+            json!({"type":"thread.create","commandId":"fresh","threadId":"fresh","projectId":"p1","title":"Fresh","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+            // Another client starts a turn before the import's history lands.
+            json!({"type":"thread.turn.start","commandId":"turn","threadId":"used","message":{"messageId":"m-user","role":"user","text":"hello","attachments":[]},"createdAt":CREATED_AT}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(value).unwrap())
+                .await
+                .expect("setup command");
+        }
+        let import = |thread_id: &str| OrchestrationCommand::ThreadHistoryImport {
+            command_id: format!("{thread_id}:history"),
+            thread_id: thread_id.to_owned(),
+            messages: vec![ImportedThreadMessage {
+                message_id: format!("{thread_id}:000000"),
+                role: "user".to_owned(),
+                text: "from the CLI".to_owned(),
+                created_at: CREATED_AT.to_owned(),
+            }],
+        };
+        assert!(matches!(
+            engine.dispatch(import("used")).await,
+            Err(OrchestrationError::Invariant { .. })
+        ));
+        engine
+            .dispatch(import("fresh"))
+            .await
+            .expect("an unused thread accepts its history");
+        engine.shutdown().await;
     }
 
     #[tokio::test]
