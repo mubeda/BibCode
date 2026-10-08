@@ -1,10 +1,22 @@
-import type { ServerProvider, ServerSettings } from "@bibcode/contracts";
-import { PlusIcon, TerminalSquare } from "lucide-react";
-import { memo, type ReactElement } from "react";
+import type { EnvironmentId, ServerProvider, ServerSettings, ThreadId } from "@bibcode/contracts";
+import { HistoryIcon, PlusIcon, TerminalSquare } from "lucide-react";
+import { memo, useMemo, type ReactElement } from "react";
 
+import { panelProviderLabel } from "~/centerPanelAdoption";
+import { useArchivedThreadSnapshots } from "~/lib/archivedThreadsState";
 import type { ProviderInstanceEntry } from "~/providerInstances";
+import { formatRelativeTimeLabel } from "~/timestampFormat";
 import { CenterHeaderIconButton } from "../CenterHeaderIconButton";
-import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "../ui/menu";
+import {
+  Menu,
+  MenuItem,
+  MenuPopup,
+  MenuSeparator,
+  MenuSub,
+  MenuSubPopup,
+  MenuSubTrigger,
+  MenuTrigger,
+} from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import { buildProviderAgentActions } from "./providerAgentActions";
@@ -18,7 +30,10 @@ interface ChatHeaderPanelMenuProps {
   >;
   /** False when the host thread can't yet spawn sibling panels (no thread ref). */
   readonly canCreatePanel: boolean;
+  readonly environmentId: EnvironmentId;
+  readonly hostThreadId: ThreadId;
   readonly onCreateChatPanel: (entry: ProviderInstanceEntry) => void;
+  readonly onReopenChatPanel: (threadId: ThreadId, providerLabel: string) => void;
   readonly onOpenTerminalPanel: () => void;
   readonly onOpenProviderTerminalPanel: (action: ProviderTerminalAction) => void;
   readonly onAddCustomAction: () => void;
@@ -26,6 +41,7 @@ interface ChatHeaderPanelMenuProps {
 }
 
 const PANEL_UNAVAILABLE_REASON = "Available once this thread has started.";
+const MAX_CLOSED_CHATS = 10;
 
 function DisabledReasonTooltip(props: { reason: string; trigger: ReactElement }) {
   return (
@@ -37,15 +53,98 @@ function DisabledReasonTooltip(props: { reason: string; trigger: ReactElement })
 }
 
 /**
+ * Lists the host's closed (archived) chat panels, newest first. Rendered inside
+ * the menu popup, so it reads archived threads only while the menu is open.
+ */
+function ReopenClosedChatMenu(props: {
+  environmentId: EnvironmentId;
+  hostThreadId: ThreadId;
+  disabledReason: string | null;
+  onReopen: (threadId: ThreadId, providerLabel: string) => void;
+}) {
+  const environmentIds = useMemo(() => [props.environmentId], [props.environmentId]);
+  const { snapshots, isLoading, error, refresh } = useArchivedThreadSnapshots(environmentIds);
+  const closedChats = (snapshots[0]?.snapshot.threads ?? [])
+    .flatMap((thread) =>
+      thread.kind === "panel" &&
+      thread.hostThreadId === props.hostThreadId &&
+      thread.archivedAt !== null
+        ? [{ ...thread, archivedAt: thread.archivedAt }]
+        : [],
+    )
+    .toSorted((left, right) => right.archivedAt.localeCompare(left.archivedAt))
+    .slice(0, MAX_CLOSED_CHATS);
+  const available = props.disabledReason === null && closedChats.length > 0;
+  if (props.disabledReason === null && closedChats.length === 0 && error !== null) {
+    // An empty list here would hide closed chats that exist; offer a retry instead.
+    return (
+      <MenuItem closeOnClick={false} onClick={refresh}>
+        <HistoryIcon className="size-4" />
+        <span className="flex min-w-0 flex-col">
+          <span>Reopen closed chat</span>
+          <span className="text-xs text-muted-foreground">
+            Couldn't load closed chats. Select to retry.
+          </span>
+        </span>
+      </MenuItem>
+    );
+  }
+  const trigger = (
+    <MenuSubTrigger
+      className={props.disabledReason ? "data-disabled:pointer-events-auto" : undefined}
+      disabled={!available}
+    >
+      <HistoryIcon className="size-4" />
+      <span className="flex min-w-0 flex-col">
+        <span>Reopen closed chat</span>
+        {props.disabledReason === null && closedChats.length === 0 ? (
+          <span className="text-xs text-muted-foreground">
+            {isLoading ? "Loading closed chats…" : "No closed chats"}
+          </span>
+        ) : null}
+      </span>
+    </MenuSubTrigger>
+  );
+  return (
+    <MenuSub>
+      {props.disabledReason ? (
+        <DisabledReasonTooltip reason={props.disabledReason} trigger={trigger} />
+      ) : (
+        trigger
+      )}
+      {available ? (
+        <MenuSubPopup className="min-w-52">
+          {closedChats.map((thread) => {
+            const label = panelProviderLabel(thread.title) ?? thread.title;
+            return (
+              <MenuItem key={thread.id} onClick={() => props.onReopen(thread.id, label)}>
+                <span className="truncate">{label}</span>
+                <span className="ms-auto shrink-0 ps-3 text-xs text-muted-foreground">
+                  {formatRelativeTimeLabel(thread.archivedAt)}
+                </span>
+              </MenuItem>
+            );
+          })}
+        </MenuSubPopup>
+      ) : null}
+    </MenuSub>
+  );
+}
+
+/**
  * The chat-header "+" menu: create a new chat panel for any enabled provider
- * instance, open a center terminal panel, or add a custom project action
- * (the entry point that replaces ProjectScriptsControl's old bare "+").
+ * instance, reopen a closed one, open a center terminal panel, or add a custom
+ * project action (the entry point that replaces ProjectScriptsControl's old
+ * bare "+").
  */
 export const ChatHeaderPanelMenu = memo(function ChatHeaderPanelMenu({
   providerStatuses,
   settings,
   canCreatePanel,
+  environmentId,
+  hostThreadId,
   onCreateChatPanel,
+  onReopenChatPanel,
   onOpenTerminalPanel,
   onOpenProviderTerminalPanel,
   onAddCustomAction,
@@ -88,7 +187,13 @@ export const ChatHeaderPanelMenu = memo(function ChatHeaderPanelMenu({
             menuItem
           );
         })}
-        {chatActions.length > 0 ? <MenuSeparator /> : null}
+        <ReopenClosedChatMenu
+          environmentId={environmentId}
+          hostThreadId={hostThreadId}
+          disabledReason={canCreatePanel ? null : (unavailableReason ?? PANEL_UNAVAILABLE_REASON)}
+          onReopen={onReopenChatPanel}
+        />
+        <MenuSeparator />
         {canCreatePanel ? (
           <MenuItem onClick={onOpenTerminalPanel}>
             <TerminalSquare className="size-4" />

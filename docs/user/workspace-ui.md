@@ -339,6 +339,9 @@ thread. While present, it remains mounted throughout layout and tab changes. The
 chat header `+` menu contains:
 
 - enabled AI providers, which create new chat panels
+- Reopen closed chat, which lists this thread's ten most recently closed chat
+  panels, newest first; it is disabled with **No closed chats** when there are
+  none, and offers a retry when closed chats could not be loaded
 - Open Terminal, which creates a shell terminal panel in the current worktree
 - enabled provider terminal actions, which launch the selected provider CLI in
   the current worktree using that provider instance's configured binary path
@@ -347,7 +350,13 @@ chat header `+` menu contains:
 Each extra chat panel is an isolated AI session. For contributors, this is
 implemented as a hidden sibling thread with `kind: "panel"` that shares the host
 thread's project, branch, and worktree. Panel threads are hidden from the left
-panel and are deleted when their tab closes. A new chat panel's tab shows
+panel and from Settings → Archived. Closing a chat panel's tab stops its running
+turn, keeps its queued messages waiting, and archives the panel thread, so its
+history is kept and it can resume;
+**Reopen closed chat** brings it back as the active tab (messages queued
+behind a stopped turn then offer **Send now**), and a
+**Failed to reopen chat panel** toast gives the reason if that fails. Deleting
+the host thread deletes its chat panels, open or closed. A new chat panel's tab shows
 **Opening chat…** until the server confirms the panel thread; if creation fails,
 the tab closes and a **Failed to open chat panel** toast gives the reason.
 
@@ -359,8 +368,8 @@ client connected to the same server. A panel opened on another client is added
 to this client's host thread as a new tab in the focused pane without switching
 to it; its terminal history or chat messages load when you open the tab.
 Closing a panel closes it on every client: closing a terminal tab ends its
-session, and closing a chat panel deletes its thread. Tab order and splits stay
-per client.
+session, and closing a chat panel archives its thread. A reopened chat panel
+returns to every client. Tab order and splits stay per client.
 
 Only the focused center pane may programmatically focus its terminal. Moving
 focus to a chat pane leaves visible terminals mounted but prevents them from
@@ -540,7 +549,8 @@ center creation actions, so new chats and terminals open there.
 Drag pane dividers to resize them. Layout, focus, tab order, and split ratios
 persist across reloads. Closing a split pane merges its tabs into the adjacent
 layout without closing chats or terminals. Explicit tab close commands remain
-pane-local and do close their underlying panel thread or terminal session.
+pane-local and do archive their chat panel thread or end their terminal
+session.
 
 ## Git Manager
 

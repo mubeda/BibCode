@@ -8,6 +8,17 @@ const harness = vi.hoisted(() => ({
   providerTerminalActionsAvailable: true,
   providerTerminalActionDisabledReason: null as string | null,
   providerTerminalFallback: null as Record<string, unknown> | null,
+  subTriggers: [] as Array<Record<string, unknown>>,
+  archived: {
+    snapshots: [] as Array<{ environmentId: string; snapshot: { threads: unknown[] } }>,
+    isLoading: false,
+    error: null as string | null,
+    refresh: (() => undefined) as () => void,
+  },
+}));
+
+vi.mock("~/lib/archivedThreadsState", () => ({
+  useArchivedThreadSnapshots: () => harness.archived,
 }));
 
 vi.mock("~/providerInstances", () => ({
@@ -57,6 +68,14 @@ vi.mock("../ui/menu", () => ({
   ),
   MenuPopup: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
   MenuSeparator: () => <hr />,
+  MenuSub: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
+  MenuSubTrigger: (props: Record<string, unknown>) => {
+    harness.subTriggers.push(props);
+    return (
+      <button disabled={props.disabled as boolean}>{props.children as React.ReactNode}</button>
+    );
+  },
+  MenuSubPopup: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
   MenuItem: (props: Record<string, unknown>) => {
     harness.menuItems.push(props);
     return (
@@ -82,6 +101,8 @@ beforeEach(() => {
   harness.providerTerminalActionsAvailable = true;
   harness.providerTerminalActionDisabledReason = null;
   harness.providerTerminalFallback = null;
+  harness.subTriggers.length = 0;
+  harness.archived = { snapshots: [], isLoading: false, error: null, refresh: vi.fn() };
 });
 
 function panelItem(overrides: Record<string, unknown> = {}) {
@@ -103,7 +124,10 @@ function render(canCreatePanel: boolean) {
     providerStatuses: [],
     settings: { providerInstances: {}, providers: {}, providerSessionDefaults: {} },
     canCreatePanel,
+    environmentId: "environment-1",
+    hostThreadId: "host-1",
     onCreateChatPanel: vi.fn(),
+    onReopenChatPanel: vi.fn(),
     onOpenTerminalPanel: vi.fn(),
     onOpenProviderTerminalPanel: vi.fn(),
     onAddCustomAction: vi.fn(),
@@ -156,15 +180,75 @@ describe("ChatHeaderPanelMenu", () => {
       "Available once this thread has started.",
       "Available once this thread has started.",
       "Available once this thread has started.",
+      "Available once this thread has started.",
     ]);
+    expect(harness.subTriggers[0]).toMatchObject({ disabled: true });
     expect(harness.menuItems[0]).toMatchObject({ disabled: true });
     expect(harness.menuItems[1]).toMatchObject({ disabled: true });
     expect(harness.menuItems[2]).toMatchObject({ disabled: true });
   });
 
-  it("renders no provider divider when the provider list is empty", () => {
+  it("keeps reopen in the chat section when the provider list is empty", () => {
     const { markup } = render(true);
-    expect(markup.match(/<hr/g)).toHaveLength(1);
+    expect(markup).toContain("Reopen closed chat");
+    expect(markup.match(/<hr/g)).toHaveLength(2);
+  });
+
+  it("lists the host's ten newest closed chats and reopens the chosen one", () => {
+    const panel = (index: number, overrides: Record<string, unknown> = {}) => ({
+      id: `panel-${index}`,
+      kind: "panel",
+      hostThreadId: "host-1",
+      title: `Panel — Chat ${index}`,
+      archivedAt: `2026-10-08T00:00:${String(index).padStart(2, "0")}.000Z`,
+      ...overrides,
+    });
+    harness.archived.snapshots = [
+      {
+        environmentId: "environment-1",
+        snapshot: {
+          threads: [
+            ...Array.from({ length: 12 }, (_, index) => panel(index + 1)),
+            panel(40, { hostThreadId: "other-host", title: "Panel — Other host" }),
+            panel(41, { kind: "workspace", title: "Archived workspace" }),
+          ],
+        },
+      },
+    ];
+
+    const { markup, props } = render(true);
+
+    expect(harness.subTriggers[0]).toMatchObject({ disabled: false });
+    expect(markup).not.toContain("No closed chats");
+    expect(markup).not.toContain("Other host");
+    expect(markup).not.toContain("Archived workspace");
+    expect(markup).not.toContain("Chat 2<");
+    expect(markup.indexOf("Chat 12")).toBeLessThan(markup.indexOf("Chat 3"));
+    const reopenItems = harness.menuItems.filter((item) =>
+      renderToStaticMarkup(<>{item.children as React.ReactNode}</>).includes("Chat "),
+    );
+    expect(reopenItems).toHaveLength(10);
+    (reopenItems[0]!.onClick as () => void)();
+    expect(props.onReopenChatPanel).toHaveBeenCalledWith("panel-12", "Chat 12");
+  });
+
+  it("explains an empty closed-chat list", () => {
+    const { markup } = render(true);
+    expect(harness.subTriggers[0]).toMatchObject({ disabled: true });
+    expect(markup).toContain("No closed chats");
+  });
+
+  it("offers a retry instead of an empty list when closed chats fail to load", () => {
+    harness.archived.error = "Network unavailable";
+    const { markup } = render(true);
+    expect(markup).not.toContain("No closed chats");
+    expect(markup).toContain("Couldn&#x27;t load closed chats. Select to retry.");
+    const retry = harness.menuItems.find((item) =>
+      renderToStaticMarkup(<>{item.children as React.ReactNode}</>).includes("Reopen closed chat"),
+    );
+    expect(retry).toMatchObject({ closeOnClick: false });
+    (retry!.onClick as () => void)();
+    expect(harness.archived.refresh).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a visible chat provider without a registered terminal action in the chat section", () => {

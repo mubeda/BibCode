@@ -1063,6 +1063,7 @@ struct ProjectState {
 struct ThreadState {
     project_id: String,
     kind: String,
+    host_thread_id: Option<String>,
     runtime_mode: String,
     interaction_mode: String,
     branch: Option<String>,
@@ -2723,6 +2724,8 @@ fn spawn_worker(
                             let wake_delivery = match &command {
                                 OrchestrationCommand::ThreadSessionSet { session, .. } => session.status == "ready",
                                 OrchestrationCommand::ThreadTurnPromote { .. } | OrchestrationCommand::ThreadTurnSteer { .. } | OrchestrationCommand::ThreadTurnDeliveryResolve { .. } => true,
+                                // A reopened chat panel's queue becomes promotable again.
+                                OrchestrationCommand::ThreadUnarchive { .. } => true,
                                 OrchestrationCommand::ThreadActivityAppend { activity, .. } => matches!(activity.kind.as_str(), "approval.resolved" | "user-input.resolved" | "provider.user-input.respond.failed"),
                                 _ => false,
                             };
@@ -3908,15 +3911,30 @@ async fn plan_command(
                     ),
                 );
             }
-            Ok(vec![make_event(
-                "thread.deleted",
-                "thread",
-                thread_id,
-                occurred_at,
-                command_id,
-                metadata,
-                json!({"threadId":thread_id,"deletedAt":occurred_at}),
-            )])
+            // Chat panels (live or closed, so archived) go with their host thread,
+            // in stable id order (the model is a BTreeMap), before the host itself.
+            Ok(model
+                .threads
+                .iter()
+                .filter(|(_, candidate)| {
+                    candidate.kind == "panel"
+                        && candidate.deleted_at.is_none()
+                        && candidate.host_thread_id.as_deref() == Some(thread_id.as_str())
+                })
+                .map(|(panel_id, _)| panel_id)
+                .chain([thread_id])
+                .map(|deleted_id| {
+                    make_event(
+                        "thread.deleted",
+                        "thread",
+                        deleted_id,
+                        occurred_at,
+                        command_id,
+                        metadata.clone(),
+                        json!({"threadId":deleted_id,"deletedAt":occurred_at}),
+                    )
+                })
+                .collect())
         }
         OrchestrationCommand::ThreadArchive {
             command_id,
@@ -4105,6 +4123,7 @@ async fn plan_command(
                         ThreadState {
                             project_id: create.project_id.clone(),
                             kind: "workspace".to_owned(),
+                            host_thread_id: None,
                             runtime_mode: create.runtime_mode.clone(),
                             interaction_mode: create.interaction_mode.clone(),
                             branch: create.branch.clone(),
@@ -5264,6 +5283,10 @@ fn apply_to_model(model: &mut CommandModel, events: &VecDeque<OrchestrationEvent
                                 .and_then(Value::as_str)
                                 .unwrap_or("workspace")
                                 .to_owned(),
+                            host_thread_id: payload
+                                .get("hostThreadId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
                             runtime_mode: payload
                                 .get("runtimeMode")
                                 .and_then(Value::as_str)
@@ -5453,6 +5476,7 @@ async fn load_command_model(
                 ThreadState {
                     project_id: thread.project_id.clone(),
                     kind: thread.kind.clone(),
+                    host_thread_id: thread.host_thread_id.clone(),
                     runtime_mode: thread.runtime_mode.clone(),
                     interaction_mode: thread.interaction_mode.clone(),
                     branch: thread.branch.clone(),
@@ -7252,6 +7276,120 @@ mod tests {
             assert_eq!(
                 engine.read_events(0).await.expect("events").len(),
                 event_count
+            );
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn thread_delete_cascades_to_live_and_archived_host_panels() {
+            let engine = detach_engine().await;
+            for (id, kind, host) in [
+                ("host", "workspace", None),
+                ("other-host", "workspace", None),
+                ("panel-live", "panel", Some("host")),
+                ("panel-archived", "panel", Some("host")),
+                ("panel-gone", "panel", Some("host")),
+                ("other-panel", "panel", Some("other-host")),
+            ] {
+                engine
+                    .dispatch(OrchestrationCommand::ThreadCreate {
+                        command_id: format!("create-{id}"),
+                        thread_id: id.to_owned(),
+                        project_id: PROJECT_ID.to_owned(),
+                        title: id.to_owned(),
+                        kind: Some(kind.to_owned()),
+                        host_thread_id: host.map(str::to_owned),
+                        model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+                        runtime_mode: "full-access".to_owned(),
+                        interaction_mode: "default".to_owned(),
+                        branch: None,
+                        worktree_path: None,
+                        created_at: "2026-10-08T00:00:01Z".to_owned(),
+                    })
+                    .await
+                    .expect("thread");
+            }
+            engine
+                .dispatch(OrchestrationCommand::ThreadArchive {
+                    command_id: "archive-panel".into(),
+                    thread_id: "panel-archived".into(),
+                })
+                .await
+                .expect("archive");
+            engine
+                .dispatch(OrchestrationCommand::ThreadDelete {
+                    command_id: "delete-panel-gone".into(),
+                    thread_id: "panel-gone".into(),
+                })
+                .await
+                .expect("delete panel");
+            engine
+                .repositories()
+                .upsert_provider_session_runtime(crate::persistence::ProviderSessionRuntime {
+                    thread_id: "panel-archived".into(),
+                    provider_name: "codex".into(),
+                    provider_instance_id: Some("codex".into()),
+                    adapter_key: "codex-app-server".into(),
+                    runtime_mode: "full-access".into(),
+                    status: "suspended".into(),
+                    last_seen_at: "2026-10-08T00:00:02Z".into(),
+                    resume_cursor: Some(json!({"threadId":"panel-archived"})),
+                    runtime_payload: None,
+                })
+                .await
+                .unwrap();
+
+            engine
+                .dispatch(OrchestrationCommand::ThreadDelete {
+                    command_id: "delete-host".into(),
+                    thread_id: "host".into(),
+                })
+                .await
+                .expect("delete host");
+
+            let events = engine
+                .read_events(0)
+                .await
+                .expect("events")
+                .into_iter()
+                .filter(|event| event.event.command_id.as_deref() == Some("delete-host"))
+                .map(|event| (event.event.event_type, event.event.aggregate_id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events,
+                vec![
+                    ("thread.deleted".to_owned(), "panel-archived".to_owned()),
+                    ("thread.deleted".to_owned(), "panel-live".to_owned()),
+                    ("thread.deleted".to_owned(), "host".to_owned()),
+                ]
+            );
+            let snapshot = load_snapshot(&engine.repositories())
+                .await
+                .expect("snapshot");
+            for (thread_id, deleted) in [
+                ("panel-archived", true),
+                ("panel-live", true),
+                ("host", true),
+                ("other-host", false),
+                ("other-panel", false),
+            ] {
+                assert_eq!(
+                    snapshot
+                        .threads
+                        .iter()
+                        .find(|thread| thread.thread_id == thread_id)
+                        .map(|thread| thread.deleted_at.is_some()),
+                    Some(deleted),
+                    "{thread_id} deleted"
+                );
+            }
+            assert!(
+                engine
+                    .repositories()
+                    .get_provider_session_runtime("panel-archived".into())
+                    .await
+                    .unwrap()
+                    .is_none()
             );
             engine.shutdown().await;
         }
