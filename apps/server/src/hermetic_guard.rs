@@ -31,6 +31,28 @@ const GUARDED_PROGRAMS: &[&str] = &[
     "winget",
 ];
 
+fn abort_guard_process() -> ! {
+    #[cfg(unix)]
+    {
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        unsafe {
+            let _ = libc::setrlimit(libc::RLIMIT_CORE, &limit);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Pipe core_pattern handlers such as systemd-coredump still dump when
+        // RLIMIT_CORE is 0 unless the process is not dumpable.
+        unsafe {
+            let _ = libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
+    }
+    std::process::abort()
+}
+
 fn abort_mode() -> bool {
     match std::env::var_os(MODE_ENV) {
         None => DEFAULT_MODE == "abort",
@@ -41,7 +63,7 @@ fn abort_mode() -> bool {
                 "hermetic-test-guard: invalid {MODE_ENV} value {value:?} (thread {})",
                 std::thread::current().name().unwrap_or("unnamed")
             );
-            std::process::abort();
+            abort_guard_process();
         }
     }
 }
@@ -55,7 +77,7 @@ pub(crate) fn refuse_access(name: &str, path: &Path) -> bool {
         std::thread::current().name().unwrap_or("unnamed")
     );
     if abort {
-        std::process::abort();
+        abort_guard_process();
     }
     false
 }
@@ -720,13 +742,74 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn raise_parent_core_limit() {
+        let limit = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        let status = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+        assert_eq!(
+            status,
+            0,
+            "raise RLIMIT_CORE so a dumpable abort would write a core: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Directory for file `core_pattern` values. Pipe handlers return `None`.
+    #[cfg(target_os = "linux")]
+    fn linux_file_core_directory(cwd: &Path) -> Option<PathBuf> {
+        let pattern = std::fs::read_to_string("/proc/sys/kernel/core_pattern").ok()?;
+        let pattern = pattern.trim();
+        if pattern.is_empty() || pattern.starts_with('|') {
+            return None;
+        }
+        Some(match pattern.rfind('/') {
+            Some(0) => PathBuf::from("/"),
+            Some(index) => PathBuf::from(&pattern[..index]),
+            None => cwd.to_path_buf(),
+        })
+    }
+
+    // libtest names the aborting thread from the test path; Linux keeps 15 bytes
+    // in `comm`, and `%e` in core_pattern uses that (`hermetic_guard:` here).
+    #[cfg(target_os = "linux")]
+    fn linux_abort_comm_cores(directory: &Path, test_name: &str) -> Vec<PathBuf> {
+        let comm = &test_name[..test_name.len().min(15)];
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        let mut paths = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.contains(comm) {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        paths
+    }
+
     #[test]
     fn invalid_mode_aborts_with_raw_stderr_instead_of_allowing_an_off_switch() {
         const CASE: &str = "guard-invalid-mode";
         const TEST: &str = "hermetic_guard::tests::invalid_mode_aborts_with_raw_stderr_instead_of_allowing_an_off_switch";
         if TestSandbox::is_isolated_case(CASE, TEST) {
-            let sandbox = TestSandbox::new("guard-invalid-mode-child");
-            std::env::set_current_dir(sandbox.root()).unwrap();
+            let child_sandbox = TestSandbox::new("guard-invalid-mode-child");
+            let cwd = std::env::var_os("BIBCODE_GUARD_ABORT_CWD")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| child_sandbox.root().to_path_buf());
+            std::env::set_current_dir(cwd).unwrap();
             let _ = crate::production::provider_runtime::resolve_provider_executable_in_path(
                 "codex",
                 std::env::var_os("PATH").as_deref(),
@@ -734,8 +817,22 @@ mod tests {
             panic!("invalid guard mode must abort");
         }
         let sandbox = TestSandbox::new("guard-invalid-mode");
-        let output =
-            sandbox.run_isolated_case(CASE, TEST, &[("BIBCODE_HERMETIC_GUARD", OsStr::new("off"))]);
+        #[cfg(unix)]
+        raise_parent_core_limit();
+        #[cfg(target_os = "linux")]
+        let core_directory = linux_file_core_directory(sandbox.root());
+        #[cfg(target_os = "linux")]
+        let cores_before = core_directory
+            .as_ref()
+            .map(|directory| linux_abort_comm_cores(directory, TEST));
+        let output = sandbox.run_isolated_case(
+            CASE,
+            TEST,
+            &[
+                ("BIBCODE_HERMETIC_GUARD", OsStr::new("off")),
+                ("BIBCODE_GUARD_ABORT_CWD", sandbox.root().as_os_str()),
+            ],
+        );
         assert!(!output.status.success());
         #[cfg(unix)]
         {
@@ -746,6 +843,16 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
                 .contains("invalid BIBCODE_HERMETIC_GUARD value \"off\"")
         );
+        #[cfg(target_os = "linux")]
+        if let (Some(directory), Some(before)) = (core_directory.as_ref(), cores_before.as_ref()) {
+            let after = linux_abort_comm_cores(directory, TEST);
+            let created: Vec<_> = after.iter().filter(|path| !before.contains(path)).collect();
+            assert!(
+                created.is_empty(),
+                "abort wrote a core dump in {}: {created:?}",
+                directory.display()
+            );
+        }
     }
 
     #[test]
