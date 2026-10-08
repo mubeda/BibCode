@@ -1176,11 +1176,12 @@ address)` gets its own listener on an ephemeral port, so two clients that
   forwards: a tab holds its forward until the tab closes, or 60 s after its
   view unmounts unless it mounts again; a system-browser open holds one for
   5 minutes. It calls `releaseSshForward` only when no lease remains, and when
-  the server replaces a target's listener. Only a typed gateway refusal
-  (`https-unsupported`, `not-admitted`, `no-upstream`, `not-reachable`) becomes
-  the shared tab's `LoadFailed`. A failure of the client's own reach (SSH
-  forward, missing bridge or profile, transport, `unavailable`, or a native
-  load failure on its gateway origin) stays a client-local failed state that
+  the server replaces a target's listener. Only a typed gateway refusal that
+  holds for every client (`https-unsupported`, `not-admitted`, `no-upstream`)
+  becomes the shared tab's `LoadFailed`. A failure of the client's own reach
+  (SSH forward, missing bridge or profile, transport, `unavailable`,
+  `not-reachable` for the address it connected through, or a native load
+  failure on its gateway origin) stays a client-local failed state that
   the tab and automation `status` report.
 
 ## Security boundaries

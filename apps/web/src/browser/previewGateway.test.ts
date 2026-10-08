@@ -173,13 +173,10 @@ describe("resolveForNavigation", () => {
 
   it("shows the server's not-reachable reason and where to open it instead", async () => {
     readPreparedConnection.mockReturnValue(lan());
-    // The contracts gain this reason in a parallel server change; until then
-    // the schema class refuses it, so build the decoded error's shape.
-    const notReachable = {
-      _tag: "PreviewGatewayError",
+    const notReachable = new PreviewGatewayError({
       reason: "not-reachable",
       message: "Previews aren't available on a public address.",
-    };
+    });
 
     await expect(
       resolveForNavigation({
@@ -191,7 +188,6 @@ describe("resolveForNavigation", () => {
     ).resolves.toEqual({
       kind: "unreachable",
       message: "Previews aren't available on a public address. Open it on Build box directly.",
-      refusedByServer: true,
     });
   });
 

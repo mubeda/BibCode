@@ -317,13 +317,10 @@ function gatewayFailure(
     case "no-upstream":
       // A stopped dev server is recoverable; say so instead of "unsupported".
       return refused(`Nothing is listening on port ${canonical.port || "80"} on ${label}.`);
-    // Matched as a string: the server adds "not-reachable" to the contracts'
-    // reason union in a parallel change (public or proxied server address).
     case "not-reachable":
-      if (typeof error.message === "string") {
-        return refused(`${error.message} Open it on ${label} directly.`);
-      }
-      return refused(`Previews aren't available on this address. Open it on ${label} directly.`);
+      // Depends on the address this client used (public or proxied), so it
+      // stays local: a client on the LAN may load the same tab fine.
+      return { message: `${error.message} Open it on ${label} directly.` };
     default:
       // This client's expired session, a gateway shutdown or a bind failure:
       // another client may load the page fine, and a retry may too.
