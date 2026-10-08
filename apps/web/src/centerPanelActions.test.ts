@@ -3,9 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 const h = vi.hoisted(() => ({
   createResult: { _tag: "Success", value: undefined } as unknown,
-  deleteResults: [] as unknown[],
+  archiveResults: [] as unknown[],
+  unarchiveResult: { _tag: "Success", value: undefined } as unknown,
+  shells: new Map<string, unknown>(),
   createPanel: vi.fn(),
-  deleteThread: vi.fn(),
+  archiveThread: vi.fn(),
+  unarchiveThread: vi.fn(),
+  interruptTurn: vi.fn(),
   addToast: vi.fn(),
   reserveChatPanel: vi.fn(),
   releaseChatPanelReservation: vi.fn(),
@@ -57,7 +61,11 @@ vi.mock("~/lib/utils", () => ({
 }));
 
 vi.mock("~/state/threads", () => ({
-  threadEnvironment: { delete: "delete" },
+  threadEnvironment: { archive: "archive", unarchive: "unarchive", interruptTurn: "interrupt" },
+}));
+
+vi.mock("~/state/entities", () => ({
+  readThreadShell: (ref: { threadId: string }) => h.shells.get(ref.threadId) ?? null,
 }));
 
 vi.mock("~/state/worktrees", () => ({
@@ -66,7 +74,12 @@ vi.mock("~/state/worktrees", () => ({
 
 vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: (command: string) =>
-    command === "create-panel" ? h.createPanel : h.deleteThread,
+    ({
+      "create-panel": h.createPanel,
+      archive: h.archiveThread,
+      unarchive: h.unarchiveThread,
+      interrupt: h.interruptTurn,
+    })[command],
 }));
 
 import { useCenterPanelActions } from "./centerPanelActions";
@@ -82,12 +95,20 @@ const onCloseTerminal = vi.fn();
 beforeEach(() => {
   vi.clearAllMocks();
   h.createResult = { _tag: "Success", value: undefined };
-  h.deleteResults = [];
+  h.archiveResults = [];
+  h.unarchiveResult = { _tag: "Success", value: undefined };
+  h.shells.clear();
   h.createPanel.mockImplementation(() => Promise.resolve(h.createResult));
-  h.deleteThread.mockImplementation(() =>
-    Promise.resolve(h.deleteResults.shift() ?? { _tag: "Success", value: undefined }),
+  h.archiveThread.mockImplementation(() =>
+    Promise.resolve(h.archiveResults.shift() ?? { _tag: "Success", value: undefined }),
+  );
+  h.unarchiveThread.mockImplementation(() => Promise.resolve(h.unarchiveResult));
+  h.interruptTurn.mockImplementation(() =>
+    Promise.resolve({ _tag: "Failure", cause: new Error("no running turn") }),
   );
 });
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -219,7 +240,7 @@ describe("center panel actions", () => {
     } as const;
     h.closeSurface.mockReturnValueOnce([terminal]);
     actions.closeSurface(hostRef, "group-left", terminal);
-    expect(h.deleteThread).not.toHaveBeenCalled();
+    expect(h.archiveThread).not.toHaveBeenCalled();
     expect(onCloseTerminal).toHaveBeenCalledWith(hostRef, terminal);
 
     const chat = {
@@ -231,7 +252,7 @@ describe("center panel actions", () => {
     actions.closeSurface(hostRef, "group-left", chat);
     await Promise.resolve();
     expect(h.closeSurface).toHaveBeenLastCalledWith(hostRef, "group-left", chat.id);
-    expect(h.deleteThread).toHaveBeenCalledOnce();
+    expect(h.archiveThread).toHaveBeenCalledOnce();
   });
 
   it("cleans up only the exact surfaces removed from the selected group", async () => {
@@ -260,28 +281,28 @@ describe("center panel actions", () => {
 
     actions.closeOtherSurfaces(hostRef, "group-right", chatSurface);
     await Promise.resolve();
-    expect(h.deleteThread).toHaveBeenCalledWith({
+    expect(h.archiveThread).toHaveBeenCalledWith({
       environmentId: hostRef.environmentId,
       input: { threadId: removedChat.threadId },
     });
     expect(onCloseTerminal).toHaveBeenCalledWith(hostRef, removedTerminal);
     expect(onCloseTerminal).not.toHaveBeenCalledWith(hostRef, terminalInOtherGroup);
 
-    h.deleteThread.mockClear();
+    h.archiveThread.mockClear();
     h.closeSurfacesToRight.mockReturnValueOnce([removedChat]);
     actions.closeSurfacesToRight(hostRef, "group-right", chatSurface);
     await Promise.resolve();
-    expect(h.deleteThread).toHaveBeenCalledOnce();
+    expect(h.archiveThread).toHaveBeenCalledOnce();
 
-    h.deleteThread.mockClear();
+    h.archiveThread.mockClear();
     h.closeSurfacesToRight.mockReturnValueOnce([]);
     actions.closeSurfacesToRight(hostRef, "group-right", terminalInOtherGroup);
-    expect(h.deleteThread).not.toHaveBeenCalled();
+    expect(h.archiveThread).not.toHaveBeenCalled();
 
     h.closeAllSurfaces.mockReturnValueOnce([chatSurface, removedChat]);
     actions.closeAllSurfaces(hostRef, "group-right");
     await Promise.resolve();
-    expect(h.deleteThread).toHaveBeenCalledTimes(2);
+    expect(h.archiveThread).toHaveBeenCalledTimes(2);
   });
 
   it("does not clean up surfaces during layout-only drop and merge operations", () => {
@@ -296,14 +317,14 @@ describe("center panel actions", () => {
     });
     useCenterPanelStore.getState().mergeGroup(hostRef, "group-right");
 
-    expect(h.deleteThread).not.toHaveBeenCalled();
+    expect(h.archiveThread).not.toHaveBeenCalled();
     expect(onCloseTerminal).not.toHaveBeenCalled();
   });
 
-  it("reports non-interrupted panel deletion failures", async () => {
-    h.deleteResults = [
+  it("reports non-interrupted panel archive failures", async () => {
+    h.archiveResults = [
       { _tag: "Failure", interrupted: true, cause: new Error("cancelled") },
-      { _tag: "Failure", cause: new Error("delete failed") },
+      { _tag: "Failure", cause: new Error("archive failed") },
       { _tag: "Failure", cause: "unknown" },
     ];
     const actions = useCenterPanelActions({ onCloseTerminal });
@@ -317,17 +338,97 @@ describe("center panel actions", () => {
     actions.closeSurface(hostRef, "group-left", surface);
     actions.closeSurface(hostRef, "group-left", surface);
     actions.closeSurface(hostRef, "group-left", surface);
-    await Promise.resolve();
-    await Promise.resolve();
+    await flush();
 
     expect(h.addToast).toHaveBeenCalledTimes(2);
     expect(h.addToast).toHaveBeenNthCalledWith(
       1,
-      expect.objectContaining({ description: "delete failed" }),
+      expect.objectContaining({
+        title: "Failed to close chat panel",
+        description: "archive failed",
+      }),
     );
     expect(h.addToast).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({ description: "An error occurred." }),
     );
+  });
+  it("interrupts a running panel turn before archiving it, even when the interrupt fails", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    const running = { id: "chat:panel-run", kind: "chat", threadId: ThreadId.make("panel-run") };
+    const idle = { id: "chat:panel-idle", kind: "chat", threadId: ThreadId.make("panel-idle") };
+    h.shells.set("panel-run", { session: { status: "running", activeTurnId: "turn-1" } });
+    h.shells.set("panel-idle", { session: { status: "ready", activeTurnId: null } });
+
+    h.closeSurface.mockReturnValueOnce([running, idle]);
+    actions.closeSurface(hostRef, "group-left", running as never);
+    await flush();
+
+    expect(h.interruptTurn).toHaveBeenCalledOnce();
+    expect(h.interruptTurn).toHaveBeenCalledWith({
+      environmentId: hostRef.environmentId,
+      input: { threadId: "panel-run", turnId: "turn-1" },
+    });
+    expect(h.archiveThread).toHaveBeenCalledWith({
+      environmentId: hostRef.environmentId,
+      input: { threadId: "panel-run" },
+    });
+    expect(h.archiveThread).toHaveBeenCalledWith({
+      environmentId: hostRef.environmentId,
+      input: { threadId: "panel-idle" },
+    });
+    const archiveRunOrder =
+      h.archiveThread.mock.invocationCallOrder[
+        h.archiveThread.mock.calls.findIndex(([call]) => call.input.threadId === "panel-run")
+      ]!;
+    expect(h.interruptTurn.mock.invocationCallOrder[0]).toBeLessThan(archiveRunOrder);
+    expect(h.addToast).not.toHaveBeenCalled();
+  });
+
+  it("reopens a closed chat panel as the active tab and rolls back explicit failures", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    const panelId = ThreadId.make("panel-closed");
+    const panelRef = { environmentId: hostRef.environmentId, threadId: panelId };
+
+    await actions.reopenChatPanel(hostRef, panelId, "Claude");
+    expect(h.reserveChatPanel).toHaveBeenCalledWith(hostRef, panelId, "Claude");
+    expect(h.reserveChatPanel.mock.invocationCallOrder[0]).toBeLessThan(
+      h.unarchiveThread.mock.invocationCallOrder[0]!,
+    );
+    expect(h.unarchiveThread).toHaveBeenCalledWith({
+      environmentId: hostRef.environmentId,
+      input: { threadId: panelId },
+    });
+    expect(h.removeThread).not.toHaveBeenCalled();
+
+    h.unarchiveResult = { _tag: "Failure", interrupted: true, cause: new Error("cancelled") };
+    await actions.reopenChatPanel(hostRef, panelId, "Claude");
+    expect(h.removeThread).not.toHaveBeenCalled();
+    expect(h.addToast).not.toHaveBeenCalled();
+
+    h.unarchiveResult = { _tag: "Failure", cause: new Error("server offline") };
+    await actions.reopenChatPanel(hostRef, panelId, "Claude");
+    expect(h.removeThread).toHaveBeenCalledWith(panelRef);
+    expect(h.addToast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Failed to reopen chat panel",
+        description: "server offline",
+      }),
+    );
+  });
+
+  it("keeps the tab when another client reopened the panel first", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    const panelId = ThreadId.make("panel-reopened-elsewhere");
+    const panelRef = { environmentId: hostRef.environmentId, threadId: panelId };
+    // The other client's unarchive already made the panel live here.
+    h.shells.set(panelId, { session: null, archivedAt: null });
+    h.unarchiveResult = { _tag: "Failure", cause: new Error("Thread is not archived.") };
+
+    await actions.reopenChatPanel(hostRef, panelId, "Claude");
+
+    expect(h.removeThread).not.toHaveBeenCalled();
+    expect(h.releaseChatPanelReservation).toHaveBeenCalledWith(panelRef);
+    expect(h.addToast).not.toHaveBeenCalled();
   });
 });

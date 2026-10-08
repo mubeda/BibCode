@@ -493,3 +493,82 @@ async fn deleting_a_thread_settles_its_pending_delivery_while_live_threads_still
     service.shutdown().await;
     engine.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_closed_chat_panel_never_promotes_its_queue_until_reopened() {
+    let engine = engine().await;
+    engine.dispatch(command(json!({"type":"thread.create", "commandId":"panel", "threadId":"panel", "projectId":"p", "title":"Panel — Codex", "kind":"panel", "hostThreadId":"t", "runtimeMode":"full-access", "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":TIME}))).await.unwrap();
+    for thread in ["t", "panel"] {
+        engine.dispatch(command(json!({"type":"thread.session.set", "commandId":format!("ready-{thread}"), "threadId":thread, "session":{"threadId":thread, "status":"ready", "providerName":"codex", "activeTurnId":null, "lastError":null, "updatedAt":TIME}, "createdAt":TIME}))).await.unwrap();
+        enqueue_for(&engine, thread, &format!("queued-{thread}"), true).await;
+    }
+    let repositories = engine.repositories();
+    let promotable = |thread: &'static str| {
+        let repositories = repositories.clone();
+        async move {
+            repositories
+                .can_promote_queued_provider_turn(thread.into(), format!("queued-{thread}"), true)
+                .await
+                .unwrap()
+        }
+    };
+    assert!(promotable("panel").await);
+    for (command_type, thread) in [("thread.archive", "panel"), ("thread.archive", "t")] {
+        engine.dispatch(command(json!({"type":command_type, "commandId":format!("{command_type}-{thread}"), "threadId":thread}))).await.unwrap();
+    }
+    // Closing a panel archives it: its queue waits. Archiving another thread changes nothing.
+    assert!(!promotable("panel").await);
+    assert!(promotable("t").await);
+    assert!(
+        repositories
+            .can_promote_queued_provider_turn("panel".into(), "queued-panel".into(), false)
+            .await
+            .unwrap(),
+        "Send now still promotes explicitly"
+    );
+    let (service, mut routes) = service(&engine);
+    received(&mut routes, "queued-t").await;
+    quiet(&mut routes).await;
+    // Reopening wakes delivery, so the panel's queue resumes without another settlement.
+    engine
+        .dispatch(command(
+            json!({"type":"thread.unarchive", "commandId":"reopen", "threadId":"panel"}),
+        ))
+        .await
+        .unwrap();
+    assert!(promotable("panel").await);
+    received(&mut routes, "queued-panel").await;
+    service.shutdown().await;
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_closed_chat_panel_does_not_start_a_prompt_sent_before_it_closed() {
+    let engine = engine().await;
+    engine.dispatch(command(json!({"type":"thread.create", "commandId":"panel", "threadId":"panel", "projectId":"p", "title":"Panel — Codex", "kind":"panel", "hostThreadId":"t", "runtimeMode":"full-access", "modelSelection":{"instanceId":"codex", "model":"gpt-5"}, "createdAt":TIME}))).await.unwrap();
+    // The prompt was admitted, but the panel closed before delivery claimed it.
+    enqueue_for(&engine, "panel", "pending-panel", false).await;
+    engine
+        .dispatch(command(
+            json!({"type":"thread.archive", "commandId":"close", "threadId":"panel"}),
+        ))
+        .await
+        .unwrap();
+    let (service, mut routes) = service(&engine);
+    quiet(&mut routes).await;
+    assert_eq!(
+        row(&engine, "pending-panel").await.state,
+        TurnDeliveryState::Pending
+    );
+    // Delivery skips the closed panel instead of retrying its claim in a loop.
+    assert_eq!(engine.repositories().provider_turn_claims_for_test(), 0);
+    engine
+        .dispatch(command(
+            json!({"type":"thread.unarchive", "commandId":"reopen", "threadId":"panel"}),
+        ))
+        .await
+        .unwrap();
+    received(&mut routes, "pending-panel").await;
+    service.shutdown().await;
+    engine.shutdown().await;
+}

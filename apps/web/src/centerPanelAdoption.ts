@@ -4,7 +4,9 @@
  * host thread when it first sees them, as inactive tabs. A later local close
  * is not undone by status updates, because adoption happens on first sight.
  * Only an explicit server `remove` drops a terminal tab; a reconnect or server
- * restart snapshot never does, so terminals can relaunch from their tab.
+ * restart snapshot never does, so terminals can relaunch from their tab. A
+ * tracked chat panel that leaves the live thread list (closed, so archived, or
+ * deleted elsewhere) loses its tab, and is adopted again if it is reopened.
  */
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
@@ -28,6 +30,11 @@ export function createCenterPanelAdoptionTracker(): CenterPanelAdoptionTracker {
 }
 
 const PANEL_TITLE_PREFIX = "Panel — ";
+
+/** The provider label a chat panel thread was titled with, if it has one. */
+export function panelProviderLabel(title: string): string | undefined {
+  return title.startsWith(PANEL_TITLE_PREFIX) ? title.slice(PANEL_TITLE_PREFIX.length) : undefined;
+}
 
 const terminalKey = (threadId: string, terminalId: string) => `${threadId}\u0000${terminalId}`;
 
@@ -91,7 +98,9 @@ export function applyPanelThreadAdoption(
     Pick<OrchestrationThreadShell, "id" | "kind" | "hostThreadId" | "title" | "archivedAt">
   >,
 ): void {
-  const liveThreadIds = new Set<string>(threads.map((thread) => thread.id));
+  const liveThreadIds = new Set<string>(
+    threads.flatMap((thread) => (thread.archivedAt === null ? [thread.id] : [])),
+  );
   const store = useCenterPanelStore.getState();
   for (const thread of threads) {
     const hostThreadId = thread.hostThreadId;
@@ -105,12 +114,15 @@ export function applyPanelThreadAdoption(
     store.adoptChatPanel(
       scopeThreadRef(environmentId, hostThreadId),
       thread.id,
-      thread.title.startsWith(PANEL_TITLE_PREFIX)
-        ? thread.title.slice(PANEL_TITLE_PREFIX.length)
-        : undefined,
+      panelProviderLabel(thread.title),
     );
   }
   for (const threadId of tracker.panelThreadIds) {
-    if (!liveThreadIds.has(threadId)) tracker.panelThreadIds.delete(threadId);
+    if (liveThreadIds.has(threadId)) continue;
+    tracker.panelThreadIds.delete(threadId);
+    const panelRef = scopeThreadRef(environmentId, ThreadId.make(threadId));
+    if (!store.pendingChatPanelThreadKeys.has(scopedThreadKey(panelRef))) {
+      store.removeThread(panelRef);
+    }
   }
 }

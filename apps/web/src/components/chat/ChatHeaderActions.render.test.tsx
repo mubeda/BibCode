@@ -246,6 +246,7 @@ function props(
     },
     canCreatePanel: false,
     onCreateChatPanel: vi.fn(),
+    onReopenChatPanel: vi.fn(),
     onOpenTerminalPanel: vi.fn(),
     onOpenProviderTerminalPanel: vi.fn(),
     onRunProjectScript: vi.fn(),

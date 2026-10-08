@@ -189,6 +189,8 @@ vi.mock("../state/threads", () => ({
   threadEnvironment: {
     create: { key: "thread.create" },
     delete: { key: "thread.delete" },
+    archive: { key: "thread.archive" },
+    unarchive: { key: "thread.unarchive" },
     updateMetadata: { key: "thread.updateMetadata" },
     setRuntimeMode: { key: "thread.setRuntimeMode" },
     setInteractionMode: { key: "thread.setInteractionMode" },
@@ -279,6 +281,7 @@ vi.mock("../state/entities", () => ({
     ref ? (h.threadsByKey.get(`${ref.environmentId}:${ref.threadId}`) ?? null) : null,
   useThreadRefs: () => h.threadRefs,
   useThreadProposedPlans: () => [],
+  readThreadShell: () => null,
 }));
 
 vi.mock("../state/environments", () => ({
@@ -6293,6 +6296,7 @@ describe("ChatView banners and dialogs", () => {
 
     expect(commandCallsFor("terminal.close")).toEqual([]);
     expect(commandCallsFor("thread.delete")).toEqual([]);
+    expect(commandCallsFor("thread.archive")).toEqual([]);
     expect(useCenterPanelStore.getState().byThreadKey[threadKey]!.groups).toHaveLength(1);
     expect(
       useCenterPanelStore.getState().byThreadKey[threadKey]!.surfaces.map((surface) => surface.id),
@@ -6442,7 +6446,7 @@ describe("ChatView banners and dialogs", () => {
     expect(useCenterPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).toEqual([]);
   });
 
-  it("does not close a terminal when dismissing a center chat surface", () => {
+  it("archives, not deletes, a center chat panel without closing a terminal", () => {
     seedConnectedServerThread();
     const siblingThreadId = ThreadId.make("center-chat-only");
     useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
@@ -6459,7 +6463,12 @@ describe("ChatView banners and dialogs", () => {
     );
 
     expect(commandCallsFor("terminal.close")).toHaveLength(0);
-    expect(commandCallsFor("thread.delete")).toHaveLength(1);
+    expect(commandCallsFor("thread.delete")).toHaveLength(0);
+    expect(commandCallsFor("thread.archive")).toEqual([
+      expect.objectContaining({
+        input: expect.objectContaining({ input: { threadId: siblingThreadId } }),
+      }),
+    ]);
   });
 });
 
