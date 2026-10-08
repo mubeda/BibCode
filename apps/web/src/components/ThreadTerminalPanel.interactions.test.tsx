@@ -507,6 +507,10 @@ const testState = vi.hoisted(() => ({
   contextMenuShow: vi.fn(),
   shellOpenExternal: vi.fn(),
   localApiAvailable: false,
+  previewSupported: true,
+  // Assigned in beforeEach: Option is not initialized when vi.hoisted runs.
+  preparedConnection: null as unknown as Option.Option<{ httpBaseUrl: string }>,
+  createAssetUrl: vi.fn(),
   webglEnabled: false,
   resolvedTheme: "light" as TerminalThemeMode,
   terminalFontPreference: { mode: "bundled" } as TerminalFontPreference,
@@ -621,8 +625,19 @@ vi.mock("~/localApi", () => ({
         }
       : undefined,
 }));
-vi.mock("./preview/openTerminalLinkInPreview", () => ({
-  openTerminalLinkInPreview: vi.fn(),
+vi.mock("~/browser/openLink", () => ({ openLink: vi.fn() }));
+vi.mock("~/browser/linkNotices", () => ({ showFileOutsideWorkspaceNotice: vi.fn() }));
+vi.mock("~/browser/openFileInPreview", () => ({ openFileInPreview: vi.fn() }));
+vi.mock("~/previewStateStore", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("~/previewStateStore")>()),
+  isPreviewSupportedInRuntime: () => testState.previewSupported,
+}));
+vi.mock("../state/session", () => ({
+  usePreparedConnection: () => testState.preparedConnection,
+}));
+vi.mock("../state/assets", () => ({ assetEnvironment: { createUrl: "asset-create-url" } }));
+vi.mock("../state/use-atom-query-runner", () => ({
+  useAtomQueryRunner: () => testState.createAssetUrl,
 }));
 vi.mock("~/components/ui/popover", () => ({
   Popover: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
@@ -642,7 +657,9 @@ import ThreadTerminalPanel, {
   TerminalViewport,
 } from "./ThreadTerminalPanel";
 import { decodeTerminalLaunchCommand } from "../lib/terminalLaunchCommand";
-import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
+import { openLink } from "~/browser/openLink";
+import { showFileOutsideWorkspaceNotice } from "~/browser/linkNotices";
+import { openFileInPreview } from "~/browser/openFileInPreview";
 
 const ENVIRONMENT_ID = EnvironmentId.make("terminal-interactions");
 const THREAD_ID = ThreadId.make("thread-interactions");
@@ -1244,8 +1261,13 @@ beforeEach(() => {
   testState.openPath.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.contextMenuShow.mockReset().mockResolvedValue(undefined);
   testState.shellOpenExternal.mockReset().mockResolvedValue(undefined);
-  vi.mocked(openTerminalLinkInPreview).mockReset();
+  vi.mocked(openLink).mockReset().mockReturnValue("app");
+  vi.mocked(showFileOutsideWorkspaceNotice).mockReset();
+  vi.mocked(openFileInPreview).mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.localApiAvailable = false;
+  testState.previewSupported = true;
+  testState.createAssetUrl.mockReset();
+  testState.preparedConnection = Option.some({ httpBaseUrl: "http://127.0.0.1:3773" });
   testState.webglEnabled = false;
   testState.resolvedTheme = "light";
   testState.serverConfig = {
@@ -5502,6 +5524,7 @@ describe("TerminalViewport mounted lifecycle", () => {
 
   it("requires the platform link modifier and reports unavailable browser links", async () => {
     vi.stubGlobal("navigator", { platform: "MacIntel" });
+    vi.mocked(openLink).mockReturnValue("unavailable");
     await mount(<TerminalViewport {...viewportProps()} />);
     const terminal = xtermState.terminals[0]!;
     terminal.bufferLines.push(terminalBufferLine("https://example.test/docs"));
@@ -5511,54 +5534,200 @@ describe("TerminalViewport mounted lifecycle", () => {
 
     link!.activate(new MouseEvent("click"));
     expect(terminal.writes).toEqual([]);
+    expect(openLink).not.toHaveBeenCalled();
 
     link!.activate(new MouseEvent("click", { metaKey: true }));
     expect(terminal.writes).toContain(
       "\r\n[terminal] Opening links is unavailable in this browser.\r\n",
     );
-    expect(openTerminalLinkInPreview).not.toHaveBeenCalled();
   });
 
-  it("opens native URL links through preview with the event position", async () => {
-    vi.stubGlobal("navigator", { platform: "MacIntel" });
+  it("routes Ctrl-clicked URLs through the link router without a context menu", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
     testState.localApiAvailable = true;
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("http://localhost:5173"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        url: "http://localhost:5173",
+        threadRef: THREAD_REF,
+        invert: false,
+      }),
+    );
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true, shiftKey: true }));
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "http://localhost:5173", invert: true }),
+    );
+    expect(testState.contextMenuShow).not.toHaveBeenCalled();
+  });
+
+  it("reports link router failures in the terminal", async () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel" });
     await mount(<TerminalViewport {...viewportProps()} />);
     const terminal = xtermState.terminals[0]!;
     terminal.bufferLines.push(terminalBufferLine("https://example.test/docs"));
     const [link] = provideTerminalLinks(terminal) ?? [];
 
-    link!.activate(new MouseEvent("click", { metaKey: true, clientX: 24, clientY: 36 }));
+    link!.activate(new MouseEvent("click", { metaKey: true }));
+    const { onError } = vi.mocked(openLink).mock.calls[0]![0];
+    onError?.(new Error("browser blocked"));
+    expect(terminal.writes).toContain("\r\n[terminal] browser blocked\r\n");
+    onError?.("unknown");
+    expect(terminal.writes).toContain("\r\n[terminal] Unable to open link\r\n");
+  });
 
-    expect(openTerminalLinkInPreview).toHaveBeenCalledWith(
-      expect.objectContaining({
-        url: "https://example.test/docs",
-        position: { x: 24, y: 36 },
-        threadRef: THREAD_REF,
-      }),
+  it("routes OSC 8 hyperlinks through the link router behind the activation modifier", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    const linkHandler = terminal.options.linkHandler as {
+      activate: (event: MouseEvent, uri: string) => void;
+      allowNonHttpProtocols: boolean;
+    };
+    expect(linkHandler.allowNonHttpProtocols).toBe(false);
+
+    linkHandler.activate(new MouseEvent("click"), "https://example.test/osc");
+    expect(openLink).not.toHaveBeenCalled();
+
+    linkHandler.activate(new MouseEvent("click", { ctrlKey: true }), "https://example.test/osc");
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "https://example.test/osc", invert: false }),
+    );
+
+    linkHandler.activate(
+      new MouseEvent("click", { ctrlKey: true, shiftKey: true }),
+      "https://example.test/osc",
+    );
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "https://example.test/osc", invert: true }),
     );
   });
 
-  it("falls back to the native browser and reports shell launch failures", async () => {
+  it("uses Cmd as the OSC 8 activation modifier on macOS", async () => {
     vi.stubGlobal("navigator", { platform: "MacIntel" });
-    testState.localApiAvailable = true;
-    vi.mocked(openTerminalLinkInPreview).mockImplementation(async ({ fallbackToBrowser }) => {
-      fallbackToBrowser();
-    });
     await mount(<TerminalViewport {...viewportProps()} />);
     const terminal = xtermState.terminals[0]!;
-    terminal.bufferLines.push(terminalBufferLine("https://example.test/docs"));
+    const linkHandler = terminal.options.linkHandler as {
+      activate: (event: MouseEvent, uri: string) => void;
+    };
+
+    linkHandler.activate(new MouseEvent("click", { ctrlKey: true }), "https://example.test/osc");
+    expect(openLink).not.toHaveBeenCalled();
+    linkHandler.activate(new MouseEvent("click", { metaKey: true }), "https://example.test/osc");
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "https://example.test/osc", invert: false }),
+    );
+  });
+
+  it("opens html paths in the integrated browser and Ctrl+Shift opens them in the editor", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("built dist/index.html"));
     const [link] = provideTerminalLinks(terminal) ?? [];
 
-    testState.shellOpenExternal.mockRejectedValueOnce(new Error("browser blocked"));
-    link!.activate(new MouseEvent("click", { metaKey: true }));
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
     await act(async () => Promise.resolve());
-    expect(testState.shellOpenExternal).toHaveBeenCalledWith("https://example.test/docs");
-    expect(terminal.writes).toContain("\r\n[terminal] browser blocked\r\n");
+    expect(openFileInPreview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadRef: THREAD_REF,
+        filePath: "/repo/dist/index.html",
+        httpBaseUrl: "http://127.0.0.1:3773",
+        createAssetUrl: testState.createAssetUrl,
+      }),
+    );
+    expect(testState.openPath).not.toHaveBeenCalled();
 
-    testState.shellOpenExternal.mockRejectedValueOnce("unknown");
-    link!.activate(new MouseEvent("click", { metaKey: true }));
+    link!.activate(new MouseEvent("click", { ctrlKey: true, shiftKey: true }));
     await act(async () => Promise.resolve());
-    expect(terminal.writes).toContain("\r\n[terminal] Unable to open link\r\n");
+    expect(openFileInPreview).toHaveBeenCalledTimes(1);
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/dist/index.html");
+  });
+
+  it("keeps the physical Shift for link activation while mouse tracking inverts it", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    const mounted = await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.modes.mouseTrackingMode = "drag";
+    terminal.bufferLines.push(terminalBufferLine("http://localhost:5173 dist/index.html"));
+    const [urlLink, fileLink] = provideTerminalLinks(terminal) ?? [];
+    const surface = mounted.container.querySelector("[data-terminal-xterm-mount]")!;
+    const target = document.createElement("div");
+    surface.append(target);
+    // xterm activates links from its own mouseup listener, after the capture-phase inversion.
+    const clickWithCtrlShift = (link: FakeTerminalLink) => {
+      const activate = (event: MouseEvent) => link.activate(event);
+      document.addEventListener("mouseup", activate);
+      const modifiers = { bubbles: true, button: 0, ctrlKey: true, shiftKey: true };
+      target.dispatchEvent(new MouseEvent("mousedown", modifiers));
+      target.dispatchEvent(new MouseEvent("mouseup", modifiers));
+      document.removeEventListener("mouseup", activate);
+    };
+
+    clickWithCtrlShift(urlLink!);
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: "http://localhost:5173", invert: true }),
+    );
+
+    clickWithCtrlShift(fileLink!);
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).not.toHaveBeenCalled();
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/dist/index.html");
+  });
+
+  it("keeps opening non-preview paths in the editor", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("src/main.ts:4"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(openFileInPreview).not.toHaveBeenCalled();
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/src/main.ts:4");
+  });
+
+  it("offers the editor when an html path is outside the workspace", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    vi.mocked(openFileInPreview).mockResolvedValue(
+      AsyncResult.failure(Cause.fail({ _tag: "AssetWorkspacePathValidationError" })),
+    );
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("/tmp/report.html"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+    terminal.writes.length = 0;
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(showFileOutsideWorkspaceNotice).toHaveBeenCalledOnce();
+    expect(terminal.writes).toEqual([]);
+
+    vi.mocked(showFileOutsideWorkspaceNotice).mock.calls[0]![0].onOpenInEditor();
+    await act(async () => Promise.resolve());
+    expect(testState.openPath).toHaveBeenCalledWith("/tmp/report.html");
+  });
+
+  it("reports other html preview failures in the terminal", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    vi.mocked(openFileInPreview).mockResolvedValue(
+      AsyncResult.failure(Cause.fail(new Error("asset service down"))),
+    );
+    await mount(<TerminalViewport {...viewportProps()} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("index.html"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    await act(async () => Promise.resolve());
+    expect(showFileOutsideWorkspaceNotice).not.toHaveBeenCalled();
+    expect(terminal.writes).toContain("\r\n[terminal] Unable to preview this file.\r\n");
   });
 
   it("opens path links and reports editor failures", async () => {

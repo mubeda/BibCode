@@ -39,6 +39,12 @@ export interface WrappedTerminalLinkLine {
 const URL_PATTERN = /https?:\/\/[^\s"'`<>]+/g;
 const FILE_PATH_PATTERN =
   /(?:~\/|\.{1,2}\/|\/|[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+|[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+(?::\d+){0,2}/g;
+const FILE_URL_PATTERN = /file:\/\/[^\s"'`<>]+/g;
+// Whole delimiter-bounded tokens only: a prefix or suffix of a longer name would open a different
+// file. The leading delimiter is consumed (not a lookbehind, which older macOS WebKit rejects) and
+// the `link` group carries the match.
+const PREVIEW_FILENAME_PATTERN =
+  /(?:^|[\s"'`<>([{])(?<link>[A-Za-z0-9._-]+\.(?:html?|pdf)(?::\d+){0,2})(?=[.,;!?)\]}]*(?:[\s"'`<>]|$))/gi;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;!?]+$/;
 
 // ConPTY full-screen repaints can mark an entire alt-screen TUI frame as one
@@ -86,8 +92,8 @@ function collectMatches(
   pattern.lastIndex = 0;
 
   for (const rawMatch of line.matchAll(pattern)) {
-    const raw = rawMatch[0];
-    const start = rawMatch.index ?? -1;
+    const raw = rawMatch.groups?.link ?? rawMatch[0];
+    const start = rawMatch.index === undefined ? -1 : rawMatch.index + rawMatch[0].indexOf(raw);
     if (start < 0 || raw.length === 0) continue;
 
     const trimmed = trimClosingDelimiters(raw);
@@ -180,10 +186,41 @@ export function splitPathAndPosition(value: string): {
   return { path, line, column };
 }
 
+export function fileUrlToPath(raw: string): string | null {
+  if (!raw.startsWith("file://")) return null;
+  let url: URL;
+  let pathname: string;
+  try {
+    url = new URL(raw);
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    return null;
+  }
+  if (url.host.length > 0) {
+    return `\\\\${url.host}${pathname.replaceAll("/", "\\")}`;
+  }
+  const drive = /^\/([A-Za-z]:)(\/.*)?$/.exec(pathname);
+  if (drive) return `${drive[1]}${(drive[2] ?? "\\").replaceAll("/", "\\")}`;
+  return pathname;
+}
+
+export function terminalPreviewFilePath(rawPath: string, cwd: string): string | null {
+  const { path } = splitPathAndPosition(fileUrlToPath(rawPath) ?? rawPath);
+  if (!/\.(?:html?|pdf)$/i.test(path)) return null;
+  return resolvePathLinkTarget(path, cwd);
+}
+
 export function extractTerminalLinks(line: string): TerminalLinkMatch[] {
   const urlMatches = collectMatches(line, "url", URL_PATTERN, []);
-  const pathMatches = collectMatches(line, "path", FILE_PATH_PATTERN, urlMatches);
-  return [...urlMatches, ...pathMatches].toSorted((a, b) => a.start - b.start);
+  // File URLs go first so the Windows-drive path alternative can't match inside `file:`.
+  const fileUrlMatches = collectMatches(line, "path", FILE_URL_PATTERN, urlMatches);
+  const taken = [...urlMatches, ...fileUrlMatches];
+  const pathMatches = collectMatches(line, "path", FILE_PATH_PATTERN, taken);
+  const filenameMatches = collectMatches(line, "path", PREVIEW_FILENAME_PATTERN, [
+    ...taken,
+    ...pathMatches,
+  ]);
+  return [...taken, ...pathMatches, ...filenameMatches].toSorted((a, b) => a.start - b.start);
 }
 
 export function collectWrappedTerminalLinkLine(

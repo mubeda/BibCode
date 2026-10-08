@@ -3,10 +3,12 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   collectWrappedTerminalLinkLine,
   extractTerminalLinks,
+  fileUrlToPath,
   isTerminalLinkActivation,
   resolvePathLinkTarget,
   splitPathAndPosition,
   resolveWrappedTerminalLinkRange,
+  terminalPreviewFilePath,
   wrappedTerminalLinkRangeIntersectsBufferLine,
   type TerminalBufferLineLike,
 } from "./terminal-links";
@@ -351,5 +353,44 @@ describe("isTerminalLinkActivation", () => {
     expect(isTerminalLinkActivation({ metaKey: true, ctrlKey: false }, "")).toBe(false);
     expect(isTerminalLinkActivation({ metaKey: true, ctrlKey: true }, "MacIntel")).toBe(false);
     expect(isTerminalLinkActivation({ metaKey: true, ctrlKey: true }, "Linux")).toBe(false);
+  });
+});
+
+describe("file links", () => {
+  it("extracts bare preview filenames", () => {
+    expect(extractTerminalLinks("open index.html now").map((m) => [m.kind, m.text])).toEqual([
+      ["path", "index.html"],
+    ]);
+  });
+  it("links only whole filename tokens, never a prefix or suffix of one", () => {
+    const line =
+      "report.html.bak report.pdf.sig index.html-old report+2026.pdf réport.html report.htmlé (index.html).";
+    expect(extractTerminalLinks(line).map((m) => [m.text, m.start])).toEqual([
+      ["index.html", line.indexOf("(index.html") + 1],
+    ]);
+  });
+  it("extracts file URLs whole", () => {
+    expect(extractTerminalLinks("see file:///tmp/report%20one.PDF").map((m) => m.text)).toEqual([
+      "file:///tmp/report%20one.PDF",
+    ]);
+  });
+  it("converts POSIX, Windows-drive, and UNC file URLs", () => {
+    expect(fileUrlToPath("file:///tmp/report%20one.PDF")).toBe("/tmp/report one.PDF");
+    expect(fileUrlToPath("file:///C:/repo/report.pdf")).toBe("C:\\repo\\report.pdf");
+    expect(fileUrlToPath("file://server/share/report.pdf")).toBe("\\\\server\\share\\report.pdf");
+    expect(fileUrlToPath("/not/a/url")).toBeNull();
+    expect(fileUrlToPath("file:///tmp/%E0.html")).toBeNull();
+  });
+  it("classifies html path with line and column", () => {
+    expect(terminalPreviewFilePath("dist/index.html:12:3", "/repo")).toBe("/repo/dist/index.html");
+  });
+  it("classifies a bare preview filename against the cwd", () => {
+    expect(terminalPreviewFilePath("index.html", "/repo")).toBe("/repo/index.html");
+  });
+  it("accepts file URLs and pdf, case-insensitively", () => {
+    expect(terminalPreviewFilePath("file:///tmp/report.PDF", "/repo")).toBe("/tmp/report.PDF");
+  });
+  it("ignores other files", () => {
+    expect(terminalPreviewFilePath("src/main.ts:4", "/repo")).toBeNull();
   });
 });

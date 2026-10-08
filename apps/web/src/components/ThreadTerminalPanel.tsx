@@ -50,9 +50,11 @@ import { useOpenInPreferredEditor } from "../editorPreferences";
 import {
   collectWrappedTerminalLinkLine,
   extractTerminalLinks,
+  fileUrlToPath,
   isTerminalLinkActivation,
   resolvePathLinkTarget,
   resolveWrappedTerminalLinkRange,
+  terminalPreviewFilePath,
   wrappedTerminalLinkRangeIntersectsBufferLine,
 } from "../terminal-links";
 import {
@@ -74,7 +76,13 @@ import { useAttachedTerminalSession } from "../state/terminalSessions";
 import { serverEnvironment } from "../state/server";
 import { previewEnvironment } from "../state/preview";
 import { terminalEnvironment } from "../state/terminal";
-import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
+import { assetEnvironment } from "../state/assets";
+import { usePreparedConnection } from "../state/session";
+import { useAtomQueryRunner } from "../state/use-atom-query-runner";
+import { openLink } from "~/browser/openLink";
+import { showFileOutsideWorkspaceNotice } from "~/browser/linkNotices";
+import { openFileInPreview } from "~/browser/openFileInPreview";
+import { isPreviewSupportedInRuntime } from "~/previewStateStore";
 import { createTerminalOutputSink } from "./terminalOutputSink";
 import { installTerminalReplyGuard } from "./terminalReplyGuard";
 import { proposeTerminalDimensions, registerTerminalSizeReader } from "./terminalSizing";
@@ -810,6 +818,48 @@ export function TerminalViewport({
   const openPreview = useAtomCommand(previewEnvironment.open, {
     reportFailure: false,
   });
+  const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
+    reportFailure: false,
+  });
+  const preparedConnection = usePreparedConnection(environmentId);
+  const openPreviewFile = useEffectEvent(async (absolutePath: string) => {
+    if (preparedConnection._tag === "None") return { ok: false as const, outside: false };
+    const result = await openFileInPreview({
+      threadRef,
+      filePath: absolutePath,
+      httpBaseUrl: preparedConnection.value.httpBaseUrl,
+      createAssetUrl,
+      openPreview,
+    });
+    if (result._tag === "Success" || isAtomCommandInterrupted(result)) return { ok: true as const };
+    const error = squashAtomCommandFailure(result) as { readonly _tag?: string } | undefined;
+    return { ok: false as const, outside: error?._tag === "AssetWorkspacePathValidationError" };
+  });
+  const routeTerminalUrl = useEffectEvent((url: string, invert: boolean) => {
+    const outcome = openLink({
+      url,
+      threadRef: threadRef.threadId.length > 0 ? threadRef : null,
+      invert,
+      openPreview,
+      onError: (cause) => {
+        const t = terminalRef.current;
+        if (t)
+          writeSystemMessage(t, cause instanceof Error ? cause.message : "Unable to open link");
+      },
+    });
+    if (outcome !== "unavailable") return;
+    const t = terminalRef.current;
+    if (t) writeSystemMessage(t, "Opening links is unavailable in this browser.");
+  });
+  const openEditorPath = useEffectEvent((target: string) => {
+    void (async () => {
+      const result = await openTerminalPath(target);
+      if (result._tag === "Success" || isAtomCommandInterrupted(result)) return;
+      const error = squashAtomCommandFailure(result);
+      const t = terminalRef.current;
+      if (t) writeSystemMessage(t, error instanceof Error ? error.message : "Unable to open path");
+    })();
+  });
   const runTerminalWrite = useAtomCommand(terminalEnvironment.write, {
     reportFailure: false,
   });
@@ -1123,6 +1173,10 @@ export function TerminalViewport({
     if (!mount || !shouldRender || !canAttachTerminal) return;
 
     const localApi = readLocalApi();
+    // Mouse-tracking gestures flip the force-selection modifier (Shift off macOS) on the
+    // events xterm later activates links with; Shift-click routing needs the physical key.
+    const physicalShiftKeys = new WeakMap<MouseEvent, boolean>();
+    const physicalShiftKey = (event: MouseEvent) => physicalShiftKeys.get(event) ?? event.shiftKey;
 
     const fitAddon = new FitAddon();
     const terminal = new Terminal({
@@ -1133,6 +1187,14 @@ export function TerminalViewport({
       scrollback: 5_000,
       fontFamily: readTerminalFontFamily(),
       theme: terminalThemeFromApp(effectiveTerminalThemeRef.current, mount),
+      // OSC 8 activations bypass the link provider, so apply the same activation guard here.
+      linkHandler: {
+        activate: (event, uri) => {
+          if (!isTerminalLinkActivation(event)) return;
+          routeTerminalUrl(uri, physicalShiftKey(event));
+        },
+        allowNonHttpProtocols: false,
+      },
     });
     terminal.loadAddon(fitAddon);
     terminal.open(mount);
@@ -1571,49 +1633,38 @@ export function TerminalViewport({
               if (!latestTerminal) return;
 
               if (match.kind === "url") {
-                if (!localApi) {
-                  writeSystemMessage(
-                    latestTerminal,
-                    "Opening links is unavailable in this browser.",
-                  );
-                  return;
-                }
-                const fallbackToBrowser = () => {
-                  void localApi.shell.openExternal(match.text).catch((error: unknown) => {
-                    writeSystemMessage(
-                      latestTerminal,
-                      error instanceof Error ? error.message : "Unable to open link",
-                    );
-                  });
-                };
-                void openTerminalLinkInPreview({
-                  url: match.text,
-                  position: { x: event.clientX, y: event.clientY },
-                  threadRef,
-                  openPreview,
-                  localApi,
-                  fallbackToBrowser,
-                });
+                routeTerminalUrl(match.text, physicalShiftKey(event));
                 return;
               }
-
-              const target = resolvePathLinkTarget(match.text, cwd);
               const unavailableReason = readWorkspaceUnavailable();
               if (unavailableReason !== null) {
                 writeSystemMessage(latestTerminal, unavailableReason);
                 return;
               }
-              void (async () => {
-                const result = await openTerminalPath(target);
-                if (result._tag === "Success" || isAtomCommandInterrupted(result)) {
-                  return;
-                }
-                const error = squashAtomCommandFailure(result);
-                writeSystemMessage(
-                  latestTerminal,
-                  error instanceof Error ? error.message : "Unable to open path",
-                );
-              })();
+              const editorTarget = resolvePathLinkTarget(
+                fileUrlToPath(match.text) ?? match.text,
+                cwd,
+              );
+              const previewFile = terminalPreviewFilePath(match.text, cwd);
+              if (
+                previewFile !== null &&
+                isPreviewSupportedInRuntime() &&
+                !physicalShiftKey(event)
+              ) {
+                void (async () => {
+                  const outcome = await openPreviewFile(previewFile);
+                  if (outcome.ok) return;
+                  if (outcome.outside) {
+                    showFileOutsideWorkspaceNotice({
+                      onOpenInEditor: () => openEditorPath(editorTarget),
+                    });
+                    return;
+                  }
+                  writeSystemMessage(latestTerminal, "Unable to preview this file.");
+                })();
+                return;
+              }
+              openEditorPath(editorTarget);
             },
           })),
         );
@@ -1656,8 +1707,10 @@ export function TerminalViewport({
     // stops at `.xterm-screen` (xterm's stable screen element), after xterm's
     // link detection there and before the report listener on `.xterm`.
     const forceSelectionKey = isMacPlatform(navigator.platform) ? "altKey" : "shiftKey";
-    const invertForceSelectionKey = (event: MouseEvent) =>
+    const invertForceSelectionKey = (event: MouseEvent) => {
+      if (!physicalShiftKeys.has(event)) physicalShiftKeys.set(event, event.shiftKey);
       Object.defineProperty(event, forceSelectionKey, { value: !event[forceSelectionKey] });
+    };
     let invertingGesture = false;
     const handleMouseDown = (event: MouseEvent) => {
       const tracking = terminal.modes.mouseTrackingMode !== "none";
