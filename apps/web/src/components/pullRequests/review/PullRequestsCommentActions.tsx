@@ -59,11 +59,7 @@ export function PullRequestsCommentActions({
   const permission = (key: "editOwnComment" | "deleteOwnComment" | "minimizeComment") =>
     constrainPermission(
       permissions[key],
-      !live
-        ? "Loading…"
-        : pending || deleting
-          ? "Wait for the current action to finish"
-          : null,
+      !live ? "Loading…" : pending || deleting ? "Wait for the current action to finish" : null,
     );
   const minimized = comment.minimized;
   return (

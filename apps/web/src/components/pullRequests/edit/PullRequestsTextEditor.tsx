@@ -40,11 +40,7 @@ export function PullRequestsTextEditor({
   const label = field === "title" ? "Title" : "Description";
   const permission = constrainPermission(
     detail.permissions.editPullRequest,
-    live === null
-      ? "Loading…"
-      : pending || saving
-        ? "Wait for the current action to finish"
-        : null,
+    live === null ? "Loading…" : pending || saving ? "Wait for the current action to finish" : null,
   );
   const savePermission = constrainPermission(
     permission,

@@ -105,7 +105,12 @@ export function PullRequestsRevertButton({
         Revert
       </PermissionButton>
       {open ? (
-        <StateConfirmation detail={detail} context={context} action="revert" onClose={() => setOpen(false)} />
+        <StateConfirmation
+          detail={detail}
+          context={context}
+          action="revert"
+          onClose={() => setOpen(false)}
+        />
       ) : null}
     </>
   );
@@ -165,7 +170,7 @@ export function PullRequestsSecondaryActions({
       permission,
       live === null
         ? "Loading…"
-        : disabledReason ?? (pending ? "Wait for the current action to finish" : null),
+        : (disabledReason ?? (pending ? "Wait for the current action to finish" : null)),
     );
   function apply(action: PullRequestsAction, title: string) {
     const inverse = inverseOf(action, { lockReason: detail.lockReason });

@@ -74,7 +74,9 @@ export function PullRequestsUpdateBranch({
   const disabledReason = useContext(MutationsDisabledContext);
   const permission = constrainPermission(
     detail.permissions.updateBranch,
-    live === null ? "Loading…" : disabledReason ?? (pending ? "Wait for the current action to finish" : null),
+    live === null
+      ? "Loading…"
+      : (disabledReason ?? (pending ? "Wait for the current action to finish" : null)),
   );
   const methods = detail.permissions.updateBranch.methods;
   const method = methods[0];
@@ -208,7 +210,9 @@ export function PullRequestsMergeControls({
     detail.permissions.mergeBypass.allowed ||
     detail.permissions.enableAutoMerge.allowed;
   const busyReason =
-    live === null ? "Loading…" : disabledReason ?? (pending ? "Wait for the current action to finish" : null);
+    live === null
+      ? "Loading…"
+      : (disabledReason ?? (pending ? "Wait for the current action to finish" : null));
   const configuration = constrainPermission(
     { allowed: canConfigure, reason: canConfigure ? null : merge.reason },
     busyReason,

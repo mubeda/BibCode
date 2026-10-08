@@ -2626,10 +2626,7 @@ mod tests {
         };
         store.put(third).unwrap();
         assert!(
-            store
-                .get(host, project, "detail", "1")
-                .unwrap()
-                .is_none(),
+            store.get(host, project, "detail", "1").unwrap().is_none(),
             "oldest observed_at_ms row must be evicted"
         );
         assert!(store.get(host, project, "detail", "2").unwrap().is_some());
@@ -2648,10 +2645,7 @@ mod tests {
         };
         store.put(oversized_files).unwrap();
         assert!(
-            store
-                .get(host, project, "files", "4")
-                .unwrap()
-                .is_none(),
+            store.get(host, project, "files", "4").unwrap().is_none(),
             "files payloads over 1 MiB must not be stored"
         );
 

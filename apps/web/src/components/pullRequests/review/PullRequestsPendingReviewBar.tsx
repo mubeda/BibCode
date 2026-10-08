@@ -24,7 +24,10 @@ export function PullRequestsPendingReviewBar({
     (s) => s.selectDraft(projectRef, detail.number).pendingReview.length,
   );
   const [open, setOpen] = useState(false);
-  const permission = constrainPermission({ allowed: true, reason: null }, live === null ? "Loading…" : null);
+  const permission = constrainPermission(
+    { allowed: true, reason: null },
+    live === null ? "Loading…" : null,
+  );
   return (
     <div
       className="sticky top-0 z-10 shrink-0 border-b border-panel-separator bg-background px-3 py-2"
@@ -34,7 +37,11 @@ export function PullRequestsPendingReviewBar({
         <PopoverTrigger
           disabled={!permission.allowed}
           render={
-            <PermissionButton permission={permission} variant={count > 0 ? "default" : "outline"} size="sm" />
+            <PermissionButton
+              permission={permission}
+              variant={count > 0 ? "default" : "outline"}
+              size="sm"
+            />
           }
         >
           Review · {count} pending comments

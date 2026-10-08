@@ -27,7 +27,10 @@ describe("useVisiblePullRequestRefresh", () => {
     node = document.createElement("div");
     document.body.appendChild(node);
     root = createRoot(node);
-    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
   });
   afterEach(() => {
     act(() => root.unmount());
@@ -63,7 +66,9 @@ describe("useVisiblePullRequestRefresh", () => {
   it("does not schedule or revalidate while paused", () => {
     const revalidate = vi.fn();
     act(() => {
-      root.render(createElement(Probe, { enabled: true, succeeded: true, paused: true, revalidate }));
+      root.render(
+        createElement(Probe, { enabled: true, succeeded: true, paused: true, revalidate }),
+      );
     });
     act(() => vi.advanceTimersByTime(60_000));
     expect(revalidate).not.toHaveBeenCalled();
@@ -77,7 +82,10 @@ describe("useVisiblePullRequestRefresh", () => {
     Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
     act(() => document.dispatchEvent(new Event("visibilitychange")));
     act(() => vi.advanceTimersByTime(5_001));
-    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
     act(() => document.dispatchEvent(new Event("visibilitychange")));
     expect(revalidate).toHaveBeenCalledTimes(1);
   });

@@ -329,16 +329,7 @@ export const PullRequestsFiles = memo(function PullRequestsFiles({
         live={isLive}
       />
     ),
-    [
-      detail,
-      context,
-      projectRef,
-      threadsByPath,
-      ignoreWhitespace,
-      toggleViewed,
-      viewedSet,
-      isLive,
-    ],
+    [detail, context, projectRef, threadsByPath, ignoreWhitespace, toggleViewed, viewedSet, isLive],
   );
   return (
     <PullRequestsSuggestionSelectionContext value={selection}>

@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
-import { act, useReducer } from "react";
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { EnvironmentQueryView } from "../../../state/query";
@@ -40,7 +40,7 @@ beforeEach(() => {
     data: { rows: [1] },
     error: null,
     isPending: false,
-    emission: { _tag: "Success", waiting: false },
+    emission: AsyncResult.success({ rows: [1] }),
     requiresRetry: false,
     refresh: () => {},
     revalidate: () => {},
@@ -65,7 +65,7 @@ describe("usePullRequestsQuery", () => {
       data: null,
       error: "GitLab timed out",
       isPending: false,
-      emission: { _tag: "Failure" },
+      emission: AsyncResult.fail("GitLab timed out"),
       requiresRetry: false,
       refresh: () => {},
       revalidate: () => {},
@@ -84,7 +84,7 @@ describe("usePullRequestsQuery", () => {
       data: null,
       error: "GitLab timed out",
       isPending: false,
-      emission: { _tag: "Failure" },
+      emission: AsyncResult.fail("GitLab timed out"),
       requiresRetry: false,
       refresh: () => {},
       revalidate: () => {},

@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { PullRequestsOperationError } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
+import { AsyncResult } from "effect/unstable/reactivity";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { EnvironmentQueryView } from "../../../state/query";
@@ -18,7 +19,7 @@ function queryView(
     data: null,
     error: null,
     isPending: false,
-    emission: { _tag: "Initial" },
+    emission: AsyncResult.initial(),
     refresh: vi.fn(),
     revalidate: vi.fn(),
     requiresRetry: false,
@@ -51,7 +52,7 @@ describe("PullRequestsQueryState", () => {
         query={queryView({
           data: { title: "Fix timeout" },
           error: error.message,
-          emission: { _tag: "Failure", cause: Cause.fail(error) },
+          emission: AsyncResult.failure(Cause.fail(error)),
         })}
       >
         <p>Merge request body</p>
@@ -59,7 +60,9 @@ describe("PullRequestsQueryState", () => {
     );
 
     expect(document.querySelector('[role="alert"]')?.textContent).toContain("GitLab timed out");
-    expect(document.querySelector('[role="alert"]')?.textContent).toContain("Try again in a moment.");
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(
+      "Try again in a moment.",
+    );
     expect(view.container.textContent).toContain("Merge request body");
   });
 
@@ -77,7 +80,7 @@ describe("PullRequestsQueryState", () => {
         query={queryView({
           data: null,
           error: error.message,
-          emission: { _tag: "Failure", cause: Cause.fail(error) },
+          emission: AsyncResult.failure(Cause.fail(error)),
         })}
       >
         <p>Merge request body</p>

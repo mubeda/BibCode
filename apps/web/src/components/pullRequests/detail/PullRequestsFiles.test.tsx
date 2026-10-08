@@ -174,7 +174,9 @@ describe("PullRequestsFiles", () => {
       truncated: false,
     };
     await render(suggestible, timeline);
-    await act(async () => container.querySelector<HTMLElement>("#file\\=src\\/a\\.ts button")!.click());
+    await act(async () =>
+      container.querySelector<HTMLElement>("#file\\=src\\/a\\.ts button")!.click(),
+    );
     await act(async () =>
       container
         .querySelector<HTMLInputElement>('input[aria-label="Select suggestion for lines 3–4"]')!
