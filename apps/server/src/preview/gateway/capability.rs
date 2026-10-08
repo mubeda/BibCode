@@ -159,13 +159,21 @@ mod tests {
     }
 
     #[test]
-    fn redeemed_ids_are_pruned_after_expiry() {
+    fn replay_after_pruning_is_expired_never_accepted() {
         let issuer = CapabilityIssuer::new(vec![7; 32]);
         let (first, _) = issuer.issue(40001, 5173, "t1", "s1", 1_000);
         issuer.redeem(&first, 40001, 2_000).unwrap();
+        // Redeeming a later token prunes the first token's jti (expired at 61_000).
         let (second, _) = issuer.issue(40001, 5173, "t1", "s1", 70_000);
         issuer.redeem(&second, 40001, 70_001).unwrap();
-        assert_eq!(issuer.redeemed.lock().unwrap().len(), 1);
+        assert_eq!(
+            issuer.redeem(&first, 40001, 70_002),
+            Err(CapabilityError::Expired)
+        );
+        assert_eq!(
+            issuer.redeem(&second, 40001, 70_003),
+            Err(CapabilityError::Replayed)
+        );
     }
 
     #[test]

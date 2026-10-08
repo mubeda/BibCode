@@ -47,8 +47,16 @@ impl GatewaySessions {
         id
     }
 
-    pub fn get(&self, id: &str) -> Option<GatewaySession> {
-        self.lock().get(id).cloned()
+    /// The live session for `id`. A session whose principal has expired
+    /// (`principal_expires_at_ms <= now_ms`) is evicted and treated as absent.
+    pub fn get(&self, id: &str, now_ms: u64) -> Option<GatewaySession> {
+        let mut sessions = self.lock();
+        let session = sessions.get(id)?;
+        if session.principal_expires_at_ms <= now_ms {
+            sessions.remove(id);
+            return None;
+        }
+        Some(session.clone())
     }
 
     /// Drops every gateway session minted for BiBCode session `session_id`.
@@ -101,7 +109,7 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 43, "32 random bytes, base64url without padding");
         assert_eq!(
-            sessions.get(&a),
+            sessions.get(&a, 1_000),
             Some(GatewaySession {
                 gateway_port: 40001,
                 upstream_port: 5173,
@@ -110,15 +118,28 @@ mod tests {
                 principal_expires_at_ms: 9_000,
             })
         );
-        assert_eq!(sessions.get("missing"), None);
+        assert_eq!(sessions.get("missing", 1_000), None);
 
         sessions.remove_for_principal("s1");
-        assert_eq!((sessions.get(&a), sessions.get(&c)), (None, None));
-        assert!(sessions.get(&b).is_some());
+        assert_eq!(
+            (sessions.get(&a, 1_000), sessions.get(&c, 1_000)),
+            (None, None)
+        );
+        assert!(sessions.get(&b, 1_000).is_some());
 
         let d = sessions.create(&claims(40002, "s3"), 9_000);
         sessions.remove_for_port(40001);
-        assert_eq!(sessions.get(&b), None);
-        assert!(sessions.get(&d).is_some());
+        assert_eq!(sessions.get(&b, 1_000), None);
+        assert!(sessions.get(&d, 1_000).is_some());
+    }
+
+    #[test]
+    fn expired_principal_session_is_ignored_and_evicted() {
+        let sessions = GatewaySessions::new();
+        let id = sessions.create(&claims(40001, "s1"), 9_000);
+        assert!(sessions.get(&id, 8_999).is_some());
+        assert_eq!(sessions.get(&id, 9_000), None);
+        // Evicted: even a clock that moved backwards does not resurrect it.
+        assert_eq!(sessions.get(&id, 1_000), None);
     }
 }

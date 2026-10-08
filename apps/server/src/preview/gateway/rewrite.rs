@@ -15,6 +15,9 @@ pub const HOP_BY_HOP: &[&str] = &[
 ];
 
 const GATEWAY_COOKIE_PREFIX: &str = "bibcode-gw-";
+/// Prefix of every BiBCode session cookie: desktop mode names it `bibcode_session_<port>`,
+/// so another instance's session on the same host must stay protected too.
+const SESSION_COOKIE_PREFIX: &str = "bibcode_session";
 
 pub fn gateway_cookie_name(gateway_port: u16) -> String {
     format!("{GATEWAY_COOKIE_PREFIX}{gateway_port}")
@@ -30,7 +33,9 @@ pub fn gateway_session_from_cookie(cookie_header: &str, gateway_port: u16) -> Op
 }
 
 fn is_reserved_cookie(name: &str, session_cookie_name: &str) -> bool {
-    name == session_cookie_name || name.starts_with(GATEWAY_COOKIE_PREFIX)
+    name == session_cookie_name
+        || name.starts_with(SESSION_COOKIE_PREFIX)
+        || name.starts_with(GATEWAY_COOKIE_PREFIX)
 }
 
 fn cookie_name(pair: &str) -> &str {
@@ -51,11 +56,13 @@ pub fn strip_request_cookies(cookie_header: &str, session_cookie_name: &str) -> 
 }
 
 /// Upstream `Set-Cookie` without its `Domain` attribute; `None` when it would overwrite a
-/// BiBCode session or gateway cookie.
+/// BiBCode session or gateway cookie, or when it is nameless. Browsers store a nameless
+/// cookie and send its bare value, so `=bibcode_session=x` would arrive as a reserved cookie.
 pub fn filter_set_cookie(value: &str, session_cookie_name: &str) -> Option<String> {
     let mut parts = value.split(';').map(str::trim);
     let first = parts.next()?;
-    if is_reserved_cookie(cookie_name(first), session_cookie_name) {
+    let name = cookie_name(first);
+    if !first.contains('=') || name.is_empty() || is_reserved_cookie(name, session_cookie_name) {
         return None;
     }
     let kept: Vec<&str> = std::iter::once(first)
@@ -67,8 +74,15 @@ pub fn filter_set_cookie(value: &str, session_cookie_name: &str) -> Option<Strin
 /// Points an upstream redirect at the client-facing gateway origin when it targets the
 /// upstream's own loopback port; every other `Location` is returned unchanged.
 pub fn rewrite_location(location: &str, upstream_port: u16, client_origin: &str) -> String {
-    let absolute = if location.starts_with("//") {
-        format!("http:{location}")
+    // Browsers treat `\` like `/` in special-scheme URLs, so `\\host`, `/\host` and `\/host`
+    // are all protocol-relative.
+    let mut leading = location.chars();
+    let protocol_relative = matches!(
+        (leading.next(), leading.next()),
+        (Some('/' | '\\'), Some('/' | '\\'))
+    );
+    let absolute = if protocol_relative {
+        format!("http://{}", &location[2..])
     } else {
         location.to_owned()
     };
@@ -217,6 +231,40 @@ mod tests {
     }
 
     #[test]
+    fn nameless_set_cookies_are_dropped() {
+        for nameless in [
+            "=bibcode_session=evil",
+            "=bibcode-gw-40001=x",
+            "=x",
+            "x",
+            "; Path=/",
+            "",
+        ] {
+            assert_eq!(
+                filter_set_cookie(nameless, "bibcode_session"),
+                None,
+                "{nameless:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn instance_scoped_session_cookies_are_reserved() {
+        assert_eq!(
+            filter_set_cookie("bibcode_session_3773=evil; Path=/", "bibcode_session_4000"),
+            None
+        );
+        assert_eq!(
+            strip_request_cookies(
+                "bibcode_session_3773=a; app=1; bibcode_session_4000=b",
+                "bibcode_session_4000"
+            )
+            .as_deref(),
+            Some("app=1")
+        );
+    }
+
+    #[test]
     fn location_rewrites_only_the_upstream_loopback() {
         let origin = "http://127.0.0.1:41000";
         assert_eq!(
@@ -234,6 +282,21 @@ mod tests {
         assert_eq!(
             rewrite_location("//localhost:5173/x#f", 5173, origin),
             "http://127.0.0.1:41000/x#f"
+        );
+        for backslash_form in [
+            "\\\\localhost:5173/x#f",
+            "/\\localhost:5173/x#f",
+            "\\/localhost:5173/x#f",
+        ] {
+            assert_eq!(
+                rewrite_location(backslash_form, 5173, origin),
+                "http://127.0.0.1:41000/x#f",
+                "{backslash_form}"
+            );
+        }
+        assert_eq!(
+            rewrite_location("\\\\localhost:9999/x", 5173, origin),
+            "\\\\localhost:9999/x"
         );
         assert_eq!(rewrite_location("/relative", 5173, origin), "/relative");
         assert_eq!(
