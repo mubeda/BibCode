@@ -1299,8 +1299,12 @@ export interface DesktopBridge {
   disconnectSshEnvironment: (target: DesktopSshEnvironmentTarget) => Promise<void>;
   /**
    * Forwards `remotePort` on the target's loopback over its live SSH
-   * connection and resolves the local port. Idempotent per remote port; the
-   * forward ends with the connection or on `releaseSshForward`.
+   * connection and resolves the local port. Idempotent per remote port. The
+   * forward ends when the connection ends or reconnects, on
+   * `releaseSshForward`, on LRU eviction when its connection holds more than
+   * 8 forwards, or on budget eviction when all connections hold more than 12.
+   * Eviction takes the least recently used forward, and only after the new
+   * one is ready; a later call for the same port opens a new forward.
    */
   sshForward: (target: DesktopSshEnvironmentTarget, remotePort: number) => Promise<number>;
   releaseSshForward: (target: DesktopSshEnvironmentTarget, remotePort: number) => Promise<void>;

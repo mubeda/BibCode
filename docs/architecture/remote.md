@@ -969,11 +969,18 @@ through the same cached password and prompt path. The explicit loopback bind
 overrides an inherited `GatewayPorts yes`, and `ControlPath=none` stops an
 inherited multiplexing setup from moving the forward into a master the child
 does not own. It is ready once its local port accepts a TCP connection while
-the child still runs, polled every 50 ms for at most 10 s; after that its
+the child still runs, polled every 50 ms for at most 30 s (the tunnel's
+readiness allowance, which forwards behind a `ProxyCommand` or bastion need
+too); after that its
 stderr is drained so refused-channel messages never fill the pipe and block
 `ssh`. Requests are idempotent per remote port:
 a live forward is reused and a dead one replaced. A tunnel keeps at most 8
-forwards; a further request evicts the least recently requested one.
+forwards and all tunnels together at most 12, which keeps tunnels, forwards,
+and the replacements being started well under the 32-child reaper capacity
+so reconnect, stop, and pairing still find room. A forward beyond either
+limit evicts the least recently used one (by creation or latest request) of
+that tunnel or of any tunnel, only once the new forward is ready: a forward
+that fails to start evicts nothing.
 Forwards are reaped with their tunnel (drop, disconnect, shutdown, or a dead
 tunnel found on the next request), and `releaseSshForward`
 (`desktop_bridge_release_ssh_forward`) reaps one.

@@ -32,12 +32,16 @@ const SSH_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_READY_INTERVAL: Duration = Duration::from_millis(250);
 const SSH_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const SSH_TUNNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
-const SSH_FORWARD_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_FORWARD_READY_INTERVAL: Duration = Duration::from_millis(50);
-/// Port forwards kept per tunnel: a backstop against leaks that leaves most
-/// of `SSH_CHILD_REAPER_CAPACITY` to other SSH work. A further request evicts
-/// the least recently requested forward.
+/// Port forwards kept per tunnel. A forward beyond it evicts the tunnel's
+/// least recently used one once it is ready.
 const SSH_MAX_PORT_FORWARDS_PER_TUNNEL: usize = 8;
+/// Port forwards kept across all tunnels, so that with tunnels and the
+/// replacements being started they stay well under
+/// `SSH_CHILD_REAPER_CAPACITY` and leave room for reconnect, stop, and
+/// pairing. A forward beyond it evicts the least recently used one of any
+/// tunnel once it is ready.
+const SSH_PORT_FORWARD_BUDGET: usize = 12;
 const SSH_CONNECTION_NOT_ACTIVE: &str = "SSH connection is not active.";
 /// How long the pipes of an exited SSH child may stay idle before the rest of
 /// its output is given up on. A descendant that inherited them (a
@@ -984,7 +988,9 @@ impl SshEnvironmentManager {
     ///
     /// It needs the target's live tunnel and ends with it. Per remote port it
     /// is idempotent: a live forward is reused and a dead one replaced. At
-    /// most `SSH_MAX_PORT_FORWARDS_PER_TUNNEL` forwards are kept per tunnel.
+    /// most `SSH_MAX_PORT_FORWARDS_PER_TUNNEL` forwards are kept per tunnel
+    /// and `SSH_PORT_FORWARD_BUDGET` across tunnels; the least recently used
+    /// one goes only after its replacement is ready.
     pub async fn ensure_port_forward<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -1002,8 +1008,8 @@ impl SshEnvironmentManager {
         let key = target_connection_key(&target);
         // Same lock as `ensure_environment`: the tunnel cannot be replaced or
         // stopped while its forwards change. The wait is bounded by
-        // `ensure_environment`'s, or here by the evictions (1.5 s each) and
-        // at most three 10 s readiness waits around two password prompts.
+        // `ensure_environment`'s, or here by at most three 30 s readiness
+        // waits around two password prompts and the evictions (1.5 s each).
         let target_lock = self.target_lock(&key)?;
         let _serialised = target_lock.lock().await;
         if self.take_existing_bootstrap_if_running(&key)?.is_none() {
@@ -1023,22 +1029,11 @@ impl SshEnvironmentManager {
                 forward.last_requested = tokio::time::Instant::now();
                 return Ok(forward.local_port);
             }
-            let mut stale: Vec<SshPortForward> =
-                tunnel.forwards.remove(&remote_port).into_iter().collect();
-            while tunnel.forwards.len() >= SSH_MAX_PORT_FORWARDS_PER_TUNNEL {
-                let Some(oldest) = tunnel
-                    .forwards
-                    .iter()
-                    .min_by_key(|(_, forward)| forward.last_requested)
-                    .map(|(port, _)| *port)
-                else {
-                    break;
-                };
-                stale.extend(tunnel.forwards.remove(&oldest));
-            }
-            stale
+            // Only a dead forward goes now; live ones are evicted after the
+            // new one is ready, so a failed start costs none of them.
+            tunnel.forwards.remove(&remote_port)
         };
-        for mut forward in stale {
+        if let Some(mut forward) = stale {
             forward.child.terminate_and_reap().await;
         }
 
@@ -1081,11 +1076,18 @@ impl SshEnvironmentManager {
             last_requested: tokio::time::Instant::now(),
             _stderr_drain: stderr_drain,
         };
-        if let Err((error, mut forward)) = self.publish_port_forward(&key, remote_port, forward) {
-            forward.child.terminate_and_reap().await;
-            return Err(error);
+        match self.publish_port_forward(&key, remote_port, forward) {
+            Ok(evicted) => {
+                for mut forward in evicted {
+                    forward.child.terminate_and_reap().await;
+                }
+                Ok(local_port)
+            }
+            Err((error, mut forward)) => {
+                forward.child.terminate_and_reap().await;
+                Err(error)
+            }
         }
-        Ok(local_port)
     }
 
     /// Terminates and reaps the forward of `remote_port`, if there is one.
@@ -1110,15 +1112,18 @@ impl SshEnvironmentManager {
         Ok(())
     }
 
-    /// Records a ready forward on its tunnel. Callers hold the target lock,
-    /// so only `shutdown` or the tunnel's own exit can have ended the tunnel
-    /// since they checked it; the forward is then refused, never orphaned.
+    /// Records a ready forward on its tunnel and returns the least recently
+    /// used forwards it evicts to stay within the per-tunnel and global
+    /// limits, for the caller to reap. Callers hold the target lock, so only
+    /// `shutdown` or the tunnel's own exit can have ended the tunnel since
+    /// they checked it; the forward is then refused, never orphaned, and
+    /// nothing is evicted.
     fn publish_port_forward(
         &self,
         key: &str,
         remote_port: u16,
         forward: SshPortForward,
-    ) -> Result<(), (String, Box<SshPortForward>)> {
+    ) -> Result<Vec<SshPortForward>, (String, Box<SshPortForward>)> {
         let mut tunnels = match self.tunnels.lock() {
             Ok(tunnels) => tunnels,
             Err(error) => {
@@ -1140,12 +1145,50 @@ impl SshEnvironmentManager {
         if !matches!(tunnel.child.child_mut().try_wait(), Ok(None)) {
             return Err((SSH_CONNECTION_NOT_ACTIVE.to_string(), Box::new(forward)));
         }
-        let replaced = tunnel.forwards.insert(remote_port, forward);
-        drop(tunnels);
-        // The caller removed any previous forward; a replaced one would go to
-        // the retained reaper.
-        drop(replaced);
-        Ok(())
+        // The caller removed any previous forward; a replaced one is reaped
+        // with the evicted ones.
+        let mut evicted: Vec<SshPortForward> = tunnel
+            .forwards
+            .insert(remote_port, forward)
+            .into_iter()
+            .collect();
+        while tunnel.forwards.len() > SSH_MAX_PORT_FORWARDS_PER_TUNNEL {
+            let Some((_, oldest)) = least_recent_forward(
+                tunnel
+                    .forwards
+                    .iter()
+                    .map(|(port, forward)| ((key, *port), forward)),
+                (key, remote_port),
+            ) else {
+                break;
+            };
+            evicted.extend(tunnel.forwards.remove(&oldest));
+        }
+        while tunnels
+            .values()
+            .map(|tunnel| tunnel.forwards.len())
+            .sum::<usize>()
+            > SSH_PORT_FORWARD_BUDGET
+        {
+            let Some((oldest_key, oldest_port)) = least_recent_forward(
+                tunnels.iter().flat_map(|(tunnel_key, tunnel)| {
+                    tunnel
+                        .forwards
+                        .iter()
+                        .map(move |(port, forward)| ((tunnel_key.as_str(), *port), forward))
+                }),
+                (key, remote_port),
+            )
+            .map(|(tunnel_key, port)| (tunnel_key.to_string(), port)) else {
+                break;
+            };
+            evicted.extend(
+                tunnels
+                    .get_mut(&oldest_key)
+                    .and_then(|tunnel| tunnel.forwards.remove(&oldest_port)),
+            );
+        }
+        Ok(evicted)
     }
 
     fn target_lock(&self, key: &str) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
@@ -2502,11 +2545,24 @@ async fn wait_for_ssh_tunnel_ready(child: &mut Child, http_base_url: &str) -> Re
     ))
 }
 
+/// The least recently used forward other than `keep`, by tunnel key and
+/// remote port.
+fn least_recent_forward<'a>(
+    forwards: impl Iterator<Item = ((&'a str, u16), &'a SshPortForward)>,
+    keep: (&str, u16),
+) -> Option<(&'a str, u16)> {
+    forwards
+        .filter(|(id, _)| *id != keep)
+        .min_by_key(|(_, forward)| forward.last_requested)
+        .map(|(id, _)| id)
+}
+
 /// Polls until the forward's local port accepts a TCP connection while the
 /// child is still running. ssh opens the listener only after authenticating,
 /// and with `ExitOnForwardFailure` exits when it cannot bind.
 async fn wait_for_ssh_port_forward_ready(child: &mut Child, local_port: u16) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + SSH_FORWARD_READY_TIMEOUT;
+    // Forwards behind a ProxyCommand or bastion need the tunnel's allowance.
+    let deadline = tokio::time::Instant::now() + SSH_READY_TIMEOUT;
     loop {
         let connected = tokio::time::timeout_at(
             deadline,
@@ -6092,6 +6148,16 @@ printf '{"credential":"fixture-credential-%s"}\n' "$count"
         http_base_url: &str,
         pairing_token: Option<&str>,
     ) -> (String, u32) {
+        publish_tunnel_for(manager, fixture_target(), http_base_url, pairing_token)
+    }
+
+    #[cfg(unix)]
+    fn publish_tunnel_for(
+        manager: &SshEnvironmentManager,
+        target: SshEnvironmentTarget,
+        http_base_url: &str,
+        pairing_token: Option<&str>,
+    ) -> (String, u32) {
         let launcher = manager.askpass_launcher().expect("askpass launcher");
         let mut command = Command::new("sh");
         command
@@ -6107,7 +6173,7 @@ printf '{"credential":"fixture-credential-%s"}\n' "$count"
             .as_ref()
             .and_then(Child::id)
             .expect("fixture tunnel pid");
-        let target = normalize_ssh_environment_target(fixture_target()).expect("fixture target");
+        let target = normalize_ssh_environment_target(target).expect("fixture target");
         let key = target_connection_key(&target);
         let bootstrap = SshEnvironmentBootstrap::new(
             target,
@@ -7354,6 +7420,7 @@ exit 0
     /// accepts TCP connections on the forward's local port.
     #[cfg(unix)]
     const LISTENING_PORT_FORWARD: &str = r##"if [ -z "$*" ]; then
+  case "$forward" in *:9999) printf 'refused\n' >&2; exit 255 ;; esac
   printf '%s\n' "$forward" >>"$dir/forwards.log"
   local_port=${forward#127.0.0.1:}
   exec python3 -c 'import socket, sys
@@ -7737,6 +7804,99 @@ exit 1
         assert!(forward_pid(&manager, &key, 5009).is_some());
         assert_eq!(forward_count(&manager, &key), 8);
         assert_eq!(manager.child_reaper.active(), 9);
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    fn second_target() -> SshEnvironmentTarget {
+        SshEnvironmentTarget {
+            alias: "second-host".to_string(),
+            hostname: "second-host".to_string(),
+            username: None,
+            port: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn global_forward_budget_evicts_least_recent_across_tunnels() {
+        let fake = fake_ssh::FakeSsh::with_body(LISTENING_PORT_FORWARD);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let (first, _) = publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+        let (second, _) =
+            publish_tunnel_for(&manager, second_target(), "http://127.0.0.1:9/", None);
+        let per_second = SSH_PORT_FORWARD_BUDGET - SSH_MAX_PORT_FORWARDS_PER_TUNNEL;
+        for remote_port in 5001..5001 + SSH_MAX_PORT_FORWARDS_PER_TUNNEL as u16 {
+            manager
+                .ensure_port_forward(app.handle(), &prompts, fixture_target(), remote_port)
+                .await
+                .expect("first tunnel forward");
+        }
+        for remote_port in 6001..6001 + per_second as u16 {
+            manager
+                .ensure_port_forward(app.handle(), &prompts, second_target(), remote_port)
+                .await
+                .expect("second tunnel forward");
+        }
+        // Requesting 5001 again makes 5002 the least recently used anywhere.
+        manager
+            .ensure_port_forward(app.handle(), &prompts, fixture_target(), 5001)
+            .await
+            .expect("reused forward");
+        let evicted = forward_pid(&manager, &first, 5002).expect("forward pid");
+
+        manager
+            .ensure_port_forward(app.handle(), &prompts, second_target(), 7001)
+            .await
+            .expect("forward over budget");
+
+        assert!(!process_is_alive(evicted), "budget eviction must reap");
+        assert_eq!(forward_pid(&manager, &first, 5002), None);
+        assert!(forward_pid(&manager, &first, 5001).is_some());
+        assert!(forward_pid(&manager, &second, 7001).is_some());
+        assert_eq!(
+            forward_count(&manager, &first) + forward_count(&manager, &second),
+            SSH_PORT_FORWARD_BUDGET
+        );
+        assert_eq!(manager.child_reaper.active(), 2 + SSH_PORT_FORWARD_BUDGET);
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_forward_over_the_limit_keeps_the_least_recent() {
+        let fake = fake_ssh::FakeSsh::with_body(LISTENING_PORT_FORWARD);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let (key, _) = publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+        for remote_port in 5001..5001 + SSH_MAX_PORT_FORWARDS_PER_TUNNEL as u16 {
+            manager
+                .ensure_port_forward(app.handle(), &prompts, fixture_target(), remote_port)
+                .await
+                .expect("forward");
+        }
+        let least_recent = forward_pid(&manager, &key, 5001).expect("forward pid");
+
+        manager
+            .ensure_port_forward(app.handle(), &prompts, fixture_target(), 9999)
+            .await
+            .expect_err("the fake refuses 9999");
+
+        assert!(
+            process_is_alive(least_recent),
+            "a failed replacement evicts nothing"
+        );
+        assert_eq!(
+            forward_count(&manager, &key),
+            SSH_MAX_PORT_FORWARDS_PER_TUNNEL
+        );
+        assert_eq!(
+            manager.child_reaper.active(),
+            1 + SSH_MAX_PORT_FORWARDS_PER_TUNNEL
+        );
         manager.shutdown().await;
     }
 
