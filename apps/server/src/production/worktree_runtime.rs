@@ -2855,6 +2855,7 @@ mod tests {
                     unresolved_delivery_state: None,
                     unresolved_delivery_detail: None,
                     deleted_at: None,
+                    host_thread_id: None,
                 })
                 .await
                 .expect("thread");
@@ -3688,6 +3689,7 @@ mod tests {
 
         manager
             .restart(TerminalRestartInput {
+                center_panel: false,
                 thread_id: "thread-1".to_owned(),
                 terminal_id: "term-first".to_owned(),
                 cwd: root.path().to_path_buf(),

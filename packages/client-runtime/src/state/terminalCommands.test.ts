@@ -5,9 +5,10 @@ import {
   ThreadId,
   WS_METHODS,
   type ServerConfig,
+  type TerminalMetadataStreamEvent,
   type TerminalSessionSnapshot,
 } from "@bibcode/contracts";
-import { Deferred, Effect, Fiber, Layer, Option, SubscriptionRef } from "effect";
+import { Deferred, Effect, Fiber, Layer, Option, Stream, SubscriptionRef } from "effect";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
@@ -36,6 +37,29 @@ const snapshot: TerminalSessionSnapshot = {
   updatedAt: "2026-09-08T00:00:00.000Z",
 };
 
+// One delivered chunk, as the RPC client drains queued stream events together.
+const metadataBatch: ReadonlyArray<TerminalMetadataStreamEvent> = [
+  { type: "snapshot", terminals: [] },
+  { type: "remove", threadId: "thread", terminalId: "closed" },
+  {
+    type: "upsert",
+    terminal: {
+      threadId: "thread",
+      terminalId: "terminal",
+      cwd: "/repo",
+      worktreePath: null,
+      status: "running",
+      pid: 1,
+      exitCode: null,
+      exitSignal: null,
+      hasRunningSubprocess: false,
+      label: "Terminal",
+      updatedAt: "2026-09-08T00:00:00.000Z",
+      centerPanel: true,
+    },
+  },
+];
+
 const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered: boolean) {
   const writes: string[] = [];
   const begins: number[] = [];
@@ -50,6 +74,7 @@ const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered
       [WS_METHODS.terminalOpen]: lifecycle,
       [WS_METHODS.terminalRestart]: lifecycle,
       [WS_METHODS.terminalClose]: () => Effect.void,
+      [WS_METHODS.subscribeTerminalMetadata]: () => Stream.fromIterable(metadataBatch),
       [WS_METHODS.terminalBeginInput]: (input: { attachmentSequence: number }) =>
         Effect.sync(() => {
           begins.push(input.attachmentSequence);
@@ -89,6 +114,8 @@ const makeHarness = Effect.fn("terminalCommands.makeHarness")(function* (ordered
   const environmentRegistry = EnvironmentRegistry.of({
     run: <A, E, R>(_environmentId: EnvironmentId, effect: Effect.Effect<A, E, R>) =>
       Effect.provideService(effect, EnvironmentSupervisor, supervisor),
+    followStream: <A, E, R>(_environmentId: EnvironmentId, stream: Stream.Stream<A, E, R>) =>
+      Stream.provideService(stream, EnvironmentSupervisor, supervisor),
   } as never);
   const atoms = createTerminalEnvironmentAtoms(
     Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
@@ -239,3 +266,25 @@ for (const ordered of [false, true]) {
     );
   });
 }
+
+describe("terminal metadata events", () => {
+  it.effect("delivers every event of a batch, including removals", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness(true);
+      const received: TerminalMetadataStreamEvent[] = [];
+      const done = yield* Deferred.make<void>();
+      const unsubscribe = h.registry.subscribe(
+        h.atoms.metadataEvents({ environmentId: target.environmentId, input: {} }),
+        (result) => {
+          if (!AsyncResult.isSuccess(result)) return;
+          received.push(...result.value);
+          if (received.length >= metadataBatch.length) Deferred.doneUnsafe(done, Effect.void);
+        },
+        { immediate: true },
+      );
+      yield* Deferred.await(done);
+      unsubscribe();
+      expect(received.map((event) => event.type)).toEqual(["snapshot", "remove", "upsert"]);
+    }),
+  );
+});

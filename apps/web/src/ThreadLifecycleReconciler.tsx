@@ -1,12 +1,19 @@
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomSubscribe, useAtomValue } from "@effect/atom-react";
 import {
   parseScopedThreadKey,
   scopedThreadKey,
   scopeThreadRef,
 } from "@bibcode/client-runtime/environment";
-import type { EnvironmentId, ThreadId } from "@bibcode/contracts";
+import type { EnvironmentId, TerminalMetadataStreamEvent, ThreadId } from "@bibcode/contracts";
 import * as Option from "effect/Option";
-import { useEffect, useMemo, useRef } from "react";
+import { AsyncResult } from "effect/unstable/reactivity";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  applyPanelThreadAdoption,
+  applyTerminalMetadataAdoption,
+  createCenterPanelAdoptionTracker,
+} from "./centerPanelAdoption";
 
 import { useCenterPanelStore } from "./centerPanelStore";
 import { useComposerDraftStore } from "./composerDraftStore";
@@ -14,6 +21,7 @@ import { useArchivedThreadSnapshots } from "./lib/archivedThreadsState";
 import { useRightPanelStore } from "./rightPanelStore";
 import { useEnvironments } from "./state/environments";
 import { environmentShell } from "./state/shell";
+import { terminalEnvironment } from "./state/terminal";
 
 function collectPersistedThreadIds(environmentId: EnvironmentId): Set<ThreadId> {
   const threadIds = new Set<ThreadId>();
@@ -74,6 +82,26 @@ function EnvironmentThreadLifecycleReconciler({
     [draftThreadsByThreadKey, environmentId],
   );
   const lastArchivedRefreshSequenceRef = useRef<number | null>(null);
+  const [adoptionTracker] = useState(createCenterPanelAdoptionTracker);
+  const terminalMetadataEventsAtom = useMemo(
+    () => terminalEnvironment.metadataEvents({ environmentId, input: {} }),
+    [environmentId],
+  );
+  const handleTerminalMetadataEvent = useCallback(
+    (result: AsyncResult.AsyncResult<ReadonlyArray<TerminalMetadataStreamEvent>, unknown>) => {
+      if (!AsyncResult.isSuccess(result)) return;
+      for (const event of result.value) {
+        applyTerminalMetadataAdoption(environmentId, adoptionTracker, event);
+      }
+    },
+    [adoptionTracker, environmentId],
+  );
+  useAtomSubscribe(terminalMetadataEventsAtom, handleTerminalMetadataEvent, { immediate: true });
+
+  useEffect(() => {
+    if (shellState.status !== "live" || Option.isNone(shellState.snapshot)) return;
+    applyPanelThreadAdoption(environmentId, adoptionTracker, shellState.snapshot.value.threads);
+  }, [adoptionTracker, environmentId, shellState]);
 
   useEffect(() => {
     if (shellState.status !== "live" || Option.isNone(shellState.snapshot)) {

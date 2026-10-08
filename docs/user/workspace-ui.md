@@ -354,6 +354,14 @@ the tab closes and a **Failed to open chat panel** toast gives the reason.
 Tabs persist across reloads. The host chat remains mounted while another center
 tab is active, so its transcript, scroll state, and composer state are preserved.
 
+Chat panels and center terminals, including AI Terminals, appear on every
+client connected to the same server. A panel opened on another client is added
+to this client's host thread as a new tab in the focused pane without switching
+to it; its terminal history or chat messages load when you open the tab.
+Closing a panel closes it on every client: closing a terminal tab ends its
+session, and closing a chat panel deletes its thread. Tab order and splits stay
+per client.
+
 Only the focused center pane may programmatically focus its terminal. Moving
 focus to a chat pane leaves visible terminals mounted but prevents them from
 reclaiming keyboard input until the user explicitly activates a terminal again.
