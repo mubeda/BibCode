@@ -1,10 +1,14 @@
 import type { EnvironmentId, ScopedThreadRef } from "@bibcode/contracts";
-import { isAtomCommandInterrupted } from "@bibcode/client-runtime/state/runtime";
+import { isAtomCommandInterrupted, runAtomCommand } from "@bibcode/client-runtime/state/runtime";
 
+import { enqueueOpenPrompt } from "~/components/preview/OpenPromptBanner";
 import { getClientSettings } from "~/hooks/useSettings";
 import { readLocalApi } from "~/localApi";
 import { isPreviewSupportedInRuntime } from "~/previewStateStore";
+import { appAtomRegistry } from "~/rpc/atomRegistry";
+import { previewEnvironment } from "~/state/preview";
 
+import { openPendingTab } from "./browserTab";
 import { resolvePreviewTarget } from "./browserTargetResolver";
 import { type OpenPreviewMutation, openUrlInPreview } from "./openFileInPreview";
 import {
@@ -12,6 +16,7 @@ import {
   showPreviewUnreachableMessage,
   showPreviewUnreachableNotice,
 } from "./linkNotices";
+import { type GatewayOpenMutation, resolveForNavigation } from "./previewGateway";
 
 export type LinkDestination = "app" | "system";
 export type OpenLinkOutcome = "app" | "system" | "unreachable" | "unavailable";
@@ -35,6 +40,13 @@ export function openLink(input: {
   readonly openPreview: OpenPreviewMutation<unknown>;
   /** Called for internal-browser failures only; a system-browser failure shows its own notice. */
   readonly onError?: (cause: unknown) => void;
+  /**
+   * Browser mode only: the new tab was blocked. Without it, a direct address
+   * opens through the local API and a blocked gateway address queues the open prompt.
+   */
+  readonly onPopupBlocked?: (url: string) => void;
+  /** A gateway address the system browser was handed failed to open after this returned. */
+  readonly onUnopened?: () => void;
 }): OpenLinkOutcome {
   let url = input.url;
   let viaGateway = false;
@@ -56,14 +68,22 @@ export function openLink(input: {
   });
   if (destination === "system" || input.threadRef === null) {
     if (viaGateway) {
-      // ponytail: handing a gateway session to the system browser needs async
-      // resolution this synchronous path lacks. Refuse rather than open this
-      // computer's own localhost; resolve-then-open is the upgrade path.
-      showPreviewUnreachableMessage(
-        "Open it in BiBCode's browser instead; opening a server port in your system browser isn't supported yet.",
-        url,
-      );
-      return "unreachable";
+      if (input.threadRef === null) {
+        // The gateway admits targets per thread; there is none to admit this one.
+        showPreviewUnreachableMessage(
+          "Open this address from a thread's chat or terminal to reach it from here.",
+          url,
+        );
+        return "unreachable";
+      }
+      return openGatewayInSystemBrowser(url, input.threadRef, input);
+    }
+    if (input.onPopupBlocked && !window.desktopBridge) {
+      // The caller handles a blocked tab, which a "noopener" window.open cannot report.
+      const tab = openPendingTab();
+      if (tab) tab.navigate(url);
+      else input.onPopupBlocked(url);
+      return "system";
     }
     const api = readLocalApi();
     if (!api) return "unavailable";
@@ -78,4 +98,71 @@ export function openLink(input: {
     })
     .catch((cause: unknown) => input.onError?.(cause));
   return "app";
+}
+
+const gatewayOpen: GatewayOpenMutation = (input) =>
+  runAtomCommand(appAtomRegistry, previewEnvironment.gatewayOpen, input, { reportFailure: false });
+
+/**
+ * Hands a server-loopback address to the system browser through a fresh
+ * gateway capability. Nothing is cached: every open resolves again, so a
+ * closed gateway target is restarted by opening the link again.
+ */
+function openGatewayInSystemBrowser(
+  canonicalUrl: string,
+  threadRef: ScopedThreadRef,
+  callbacks: {
+    readonly onPopupBlocked?: ((url: string) => void) | undefined;
+    readonly onUnopened?: (() => void) | undefined;
+  },
+): OpenLinkOutcome {
+  const unopened = (notify: () => void) => {
+    notify();
+    callbacks.onUnopened?.();
+  };
+  const resolve = () =>
+    resolveForNavigation({
+      environmentId: threadRef.environmentId,
+      threadId: threadRef.threadId,
+      canonicalUrl,
+      gatewayOpen,
+    });
+  if (window.desktopBridge) {
+    // The desktop window refuses window.open; the bridge opens it without one.
+    const api = readLocalApi();
+    if (!api) return "unavailable";
+    void resolve()
+      .then((target) => {
+        if (target.kind === "unreachable") {
+          unopened(() => showPreviewUnreachableMessage(target.message, canonicalUrl));
+          return;
+        }
+        return api.shell
+          .openExternal(target.url)
+          .catch(() => unopened(() => showLinkOpenFailedNotice(canonicalUrl)));
+      })
+      .catch(() => unopened(() => showLinkOpenFailedNotice(canonicalUrl)));
+    return "system";
+  }
+  // Opened before any await: the click's user activation does not survive one.
+  const tab = openPendingTab();
+  if (!tab) {
+    if (callbacks.onPopupBlocked) callbacks.onPopupBlocked(canonicalUrl);
+    else enqueueOpenPrompt({ source: "blocked", url: canonicalUrl, threadRef });
+    return "system";
+  }
+  void resolve()
+    .then((target) => {
+      if (target.kind === "ok") {
+        tab.navigate(target.url);
+        return;
+      }
+      tab.close();
+      unopened(() => showPreviewUnreachableMessage(target.message, canonicalUrl));
+    })
+    .catch(() => {
+      tab.close();
+      unopened(() => showLinkOpenFailedNotice(canonicalUrl));
+    });
+  return "system";
 }

@@ -17,6 +17,7 @@ import {
   type PreviewViewportSetting,
   type ScopedThreadRef,
 } from "@bibcode/contracts";
+import { normalizePreviewUrl } from "@bibcode/shared/preview";
 import { resolvePreviewViewport } from "@bibcode/shared/previewViewport";
 import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { Atom } from "effect/unstable/reactivity";
@@ -48,6 +49,7 @@ import { previewEnvironment } from "~/state/preview";
 import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 import { useAtomCommand } from "~/state/use-atom-command";
 
+import { enqueueOpenPrompt } from "./OpenPromptBanner";
 import { previewBridge } from "./previewBridge";
 import {
   PreviewAutomationNavigationTimeoutError,
@@ -75,10 +77,47 @@ import { isPreviewViewportReady } from "./previewViewportReadiness";
  */
 const NAVIGATION_ONLY_OPERATIONS = ["status", "open", "navigate"] as const;
 
+/**
+ * A plain browser has no internal browser: it reports that, and turns an
+ * agent's `open` into a prompt the user answers with a click.
+ */
+const BROWSER_MODE_OPERATIONS = ["status", "open"] as const;
+
+const NO_AUTOMATION_STATUS: PreviewAutomationStatus = {
+  available: false,
+  visible: false,
+  tabId: null,
+  url: null,
+  title: null,
+  loading: false,
+};
+
 const supportedAutomationOperations = () =>
-  supportsPreviewRuntimeCapability(previewBridge, "automation")
-    ? [...PREVIEW_AUTOMATION_OPERATIONS]
-    : [...NAVIGATION_ONLY_OPERATIONS];
+  !previewBridge
+    ? [...BROWSER_MODE_OPERATIONS]
+    : supportsPreviewRuntimeCapability(previewBridge, "automation")
+      ? [...PREVIEW_AUTOMATION_OPERATIONS]
+      : [...NAVIGATION_ONLY_OPERATIONS];
+
+/**
+ * Browser mode: no tab to drive, so `open` asks the user and returns at once;
+ * an `open` without an address has nothing to ask about.
+ */
+const handleBrowserModeRequest = (
+  threadRef: ScopedThreadRef,
+  request: PreviewAutomationRequest,
+): PreviewAutomationStatus | { readonly status: "pending-user" } => {
+  const url =
+    request.operation === "open" ? (request.input as PreviewAutomationOpenInput).url : undefined;
+  if (url === undefined) return NO_AUTOMATION_STATUS;
+  // Both throw: an address that is not http(s), or one this client can never reach.
+  const canonicalUrl = resolveBrowserNavigationTarget(threadRef.environmentId, {
+    kind: "url",
+    url: normalizePreviewUrl(url),
+  }).resolvedUrl;
+  enqueueOpenPrompt({ source: "agent", url: canonicalUrl, threadRef });
+  return { status: "pending-user" };
+};
 
 const waitForDesktopOverlay = async (
   threadRef: ScopedThreadRef,
@@ -294,7 +333,8 @@ const raisePreviewAutomationHostError = (
 
 export function PreviewAutomationHosts() {
   const { environments } = useEnvironments();
-  if (!previewBridge?.automation) return null;
+  // A desktop bridge without an automation surface hosts nothing; no bridge is browser mode.
+  if (previewBridge && !previewBridge.automation) return null;
   return (
     <>
       {/*
@@ -359,6 +399,9 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
       };
       let tabId = request.tabId ?? null;
       try {
+        if (!previewBridge && (request.operation === "status" || request.operation === "open")) {
+          return handleBrowserModeRequest(threadRef, request);
+        }
         let state = readThreadPreviewState(threadRef);
         const needsSessionSync = needsPreviewAutomationSessionSync(state, request.tabId);
         if (needsSessionSync) {

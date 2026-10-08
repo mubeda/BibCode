@@ -65,6 +65,12 @@ vi.mock("./components/preview/PreviewAutomationHosts", () => ({
 vi.mock("./components/preview/PreviewNewWindowRouter", () => ({
   PreviewNewWindowRouter: () => null,
 }));
+vi.mock("./components/preview/OpenRequestRouter", () => ({
+  OpenRequestRouter: () => null,
+}));
+vi.mock("./components/preview/OpenPromptBanner", () => ({
+  OpenPromptBanner: () => null,
+}));
 vi.mock("./components/settings/UpdateServerDialog", () => ({
   RemoteUpdateConfirmationCoordinator: () => null,
 }));

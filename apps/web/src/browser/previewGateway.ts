@@ -142,6 +142,10 @@ export async function resolveForNavigation(input: {
 
   const canonical = new URL(resolution.url);
   const label = readPreparedConnection(environmentId)?.label ?? "This environment";
+  // Only the desktop host can run the SSH forward; refuse before the server admits a target.
+  if (resolution.via === "ssh" && !window.desktopBridge) {
+    return { kind: "unreachable", message: UNREACHABLE_MESSAGES.ssh(label) };
+  }
   // Opened before any await so a close or a sibling's failure during this
   // resolution cannot release the forward it is about to use.
   const key = `${input.threadId} ${canonical.origin}`;

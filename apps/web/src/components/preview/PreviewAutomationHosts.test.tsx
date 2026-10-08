@@ -78,6 +78,8 @@ const h = vi.hoisted(() => {
     refreshCalls: [] as unknown[],
     // webviews (document.querySelectorAll)
     webviews: [] as unknown[],
+    // browser-mode open prompts
+    promptCalls: [] as unknown[],
     // focus effect
     docHasFocus: true,
     windowListeners: [] as Array<{ type: string }>,
@@ -237,6 +239,10 @@ vi.mock("./previewAutomationTarget", () => ({
   resolvePreviewAutomationTarget: () => h.target,
 }));
 
+vi.mock("./OpenPromptBanner", () => ({
+  enqueueOpenPrompt: (prompt: unknown) => h.promptCalls.push(prompt),
+}));
+
 vi.mock("./previewViewportReadiness", () => ({
   isPreviewViewportReady: () => h.viewportReady,
 }));
@@ -360,6 +366,7 @@ beforeEach(() => {
   h.openBrowserCalls.length = 0;
   h.refreshCalls.length = 0;
   h.webviews = [];
+  h.promptCalls.length = 0;
   h.docHasFocus = true;
   h.windowListeners.length = 0;
   h.cleanups.length = 0;
@@ -456,6 +463,73 @@ describe("PreviewAutomationHosts wrapper", () => {
       "open",
       "navigate",
     ]);
+  });
+});
+
+describe("browser mode (no preview bridge)", () => {
+  beforeEach(() => {
+    h.previewBridge = null;
+  });
+
+  it("advertises only status and open", () => {
+    mountHost();
+    expect(h.automationHostInputs.at(-1)?.supportedOperations).toEqual(["status", "open"]);
+  });
+
+  it("reports the no-automation status", async () => {
+    const handle = mountHost();
+    await expect(handle(makeRequest({ operation: "status" }))).resolves.toEqual({
+      available: false,
+      visible: false,
+      tabId: null,
+      url: null,
+      title: null,
+      loading: false,
+    });
+  });
+
+  it("browser-mode automation open returns pending-user and shows the prompt", async () => {
+    const handle = mountHost();
+    h.resolvedUrl = "http://localhost:5173/";
+
+    await expect(
+      handle(makeRequest({ operation: "open", input: { url: "localhost:5173" } as unknown })),
+    ).resolves.toEqual({ status: "pending-user" });
+
+    expect(h.resolveCalls).toEqual([{ kind: "url", url: "http://localhost:5173/" }]);
+    expect(h.promptCalls).toEqual([
+      { source: "agent", url: "http://localhost:5173/", threadRef: { environmentId, threadId } },
+    ]);
+    expect(h.commandCalls).toHaveLength(0);
+  });
+
+  it("refuses an address the browser cannot open instead of prompting for it", async () => {
+    const handle = mountHost();
+
+    const error = await handle(
+      makeRequest({ operation: "open", input: { url: "file:///tmp/index.html" } as unknown }),
+    ).then(
+      () => null,
+      (e) => e,
+    );
+
+    expect(error).toBeInstanceOf(PreviewAutomationOperationError);
+    expect(h.promptCalls).toHaveLength(0);
+  });
+
+  it("tells the agent why an unreachable address cannot open", async () => {
+    const handle = mountHost();
+    h.resolveError = new Error("This address is on Box, not this computer.");
+
+    const error = await handle(
+      makeRequest({ operation: "open", input: { url: "http://localhost:3000" } as unknown }),
+    ).then(
+      () => null,
+      (e) => e,
+    );
+
+    expect(error).toBeInstanceOf(PreviewAutomationOperationError);
+    expect(h.promptCalls).toHaveLength(0);
   });
 });
 

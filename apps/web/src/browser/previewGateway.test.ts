@@ -113,6 +113,22 @@ describe("resolveForNavigation", () => {
     expect(sshForward).toHaveBeenCalledWith(sshTarget, 41000);
   });
 
+  it("refuses SSH loopback without a desktop bridge before minting a capability", async () => {
+    readPreparedConnection.mockReturnValue(ssh());
+    vi.stubGlobal("window", {});
+    const gatewayOpen = vi.fn(async () => opened(41000));
+
+    await expect(
+      resolveForNavigation({
+        environmentId,
+        threadId,
+        canonicalUrl: "http://localhost:5173/",
+        gatewayOpen,
+      }),
+    ).resolves.toMatchObject({ kind: "unreachable" });
+    expect(gatewayOpen).not.toHaveBeenCalled();
+  });
+
   it("maps https rejection to the HTTPS copy", async () => {
     readPreparedConnection.mockReturnValue(lan());
     const gatewayOpen = vi.fn(async () => refused("https-unsupported"));
