@@ -389,6 +389,7 @@ describe("PullRequestsDetailView", () => {
         editPullRequest: allowed,
         editReviewers: allowed,
         comment: allowed,
+        approve: allowed,
       },
     };
     h.data.readSnapshot = {
@@ -425,6 +426,16 @@ describe("PullRequestsDetailView", () => {
     )!;
     expect(commentButton.disabled).toBe(true);
     expect(commentButton.title).toBe("Loading…");
+    // GitLab Approve is on the overview, and a snapshot that would allow it
+    // still cannot run until the live detail succeeds.
+    const approval = container.querySelector('[aria-label="Approval"]');
+    expect(approval?.textContent).toContain("Approve");
+    expect(approval?.textContent).toContain("0 of 1 approvals");
+    const approveButton = [...approval!.querySelectorAll("button")].find(
+      (button) => button.textContent === "Approve",
+    )!;
+    expect(approveButton.disabled).toBe(true);
+    expect(approveButton.title).toBe("Loading…");
   });
   it("shows a hover prefetch answered within 5 s on open without reading it again", async () => {
     const request = { environmentId: scope.environmentId, input: { cwd: scope.cwd, number: 14 } };

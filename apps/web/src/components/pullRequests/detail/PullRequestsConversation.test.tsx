@@ -32,7 +32,7 @@ vi.mock("@legendapp/list/react", () => ({
   },
 }));
 import { PullRequestsConversation } from "./PullRequestsConversation";
-import { comment, context, detail } from "./testFixtures";
+import { comment, context, detail, gitlabContext } from "./testFixtures";
 describe("PullRequestsConversation", () => {
   it("renders the conversation and review menus without console errors", async () => {
     usePullRequestsStore.setState({ byProjectKey: {} });
@@ -104,6 +104,34 @@ describe("PullRequestsConversation", () => {
     ).toBe(detail.permissions.comment.reason);
     expect(container.textContent).toContain("Older activity is on the host page");
     expect(container.querySelector(`a[href="${detail.url}"]`)).not.toBeNull();
+    expect(container.querySelector('[aria-label="Approval"]')).toBeNull();
+  });
+  it("shows GitLab Approve under the description without opening Review", () => {
+    const container = document.createElement("div");
+    container.innerHTML = renderToStaticMarkup(
+      <PullRequestsConversation
+        scope={{ environmentId: projectRef.environmentId, cwd: "/repo" }}
+        detail={{
+          ...detail,
+          permissions: { ...detail.permissions, approve: allowed },
+          readiness: {
+            ...detail.readiness,
+            requiredApprovals: { approved: 0, required: 0 },
+          },
+        }}
+        context={gitlabContext}
+        projectRef={{ environmentId: "env", projectId: "project" } as never}
+        timeline={{ items: [comment], truncated: false }}
+      />,
+    );
+    const approval = container.querySelector('[aria-label="Approval"]');
+    expect(approval?.textContent).toContain("Approve");
+    expect(approval?.textContent).toContain("Approval is optional");
+    expect(container.querySelector('[aria-label="Review type"]')).toBeNull();
+    const approve = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Approve",
+    )!;
+    expect(approve.disabled).toBe(false);
   });
   it("leaves the comment action and a timeline action inactive with a null live detail", () => {
     const permissiveDetail = {

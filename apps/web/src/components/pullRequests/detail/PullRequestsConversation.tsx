@@ -18,6 +18,7 @@ import { PullRequestsReactions } from "../shared/PullRequestsReactions";
 import { groupTimeline } from "./pullRequestsDetail.logic";
 import { PullRequestsTimelineItem } from "./PullRequestsTimelineItem";
 import { PullRequestsSideColumn } from "./PullRequestsSideColumn";
+import { PullRequestsApproveBar } from "./PullRequestsApproveBar";
 import { PullRequestsMergeBox } from "./PullRequestsMergeBox";
 export interface PullRequestsConversationProps {
   detail: PullRequestsDetail;
@@ -85,33 +86,36 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
         aria-label="Conversation"
         data-text-surface="background"
         ListHeaderComponent={
-          <article className="m-3 space-y-3 rounded-lg border border-border p-3">
-            <header className="flex flex-wrap items-center justify-between gap-2 text-xs">
-              <div className="flex items-center gap-2">
-                <PullRequestsActor actor={detail.author} />
-                <time
-                  dateTime={detail.createdAt}
-                  title={detail.createdAt}
-                  className="text-muted-foreground"
-                >
-                  {formatRelativeTimeLabel(detail.createdAt)}
-                </time>
-              </div>
-            </header>
-            <PullRequestsBodyEditor
-              detail={detail}
-              live={liveDetail}
-              projectRef={projectRef}
-              baseUrl={`${context.webUrl}/`}
-            />
-            <PullRequestsReactions
-              reactions={detail.reactions}
-              permission={detail.permissions.react}
-              busy={pending}
-              live={live}
-              onToggle={(content, on) => run({ action: "react", targetId: null, content, on })}
-            />
-          </article>
+          <>
+            <article className="m-3 space-y-3 rounded-lg border border-border p-3">
+              <header className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2">
+                  <PullRequestsActor actor={detail.author} />
+                  <time
+                    dateTime={detail.createdAt}
+                    title={detail.createdAt}
+                    className="text-muted-foreground"
+                  >
+                    {formatRelativeTimeLabel(detail.createdAt)}
+                  </time>
+                </div>
+              </header>
+              <PullRequestsBodyEditor
+                detail={detail}
+                live={liveDetail}
+                projectRef={projectRef}
+                baseUrl={`${context.webUrl}/`}
+              />
+              <PullRequestsReactions
+                reactions={detail.reactions}
+                permission={detail.permissions.react}
+                busy={pending}
+                live={live}
+                onToggle={(content, on) => run({ action: "react", targetId: null, content, on })}
+              />
+            </article>
+            <PullRequestsApproveBar detail={detail} live={liveDetail} context={context} />
+          </>
         }
         ListFooterComponent={
           <div className="space-y-4 p-3">
