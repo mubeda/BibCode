@@ -287,7 +287,9 @@ provider activity), it immediately re-arms for one idle timeout, and the next
 completion supersedes that re-arm. Live provider activity is the session's
 in-memory set of actors (Claude subagents, Codex child agents) and work items
 (background tasks and terminals) whose latest projected lifecycle is `starting` or
-`running`; `waiting` and `unknown` do not count. It keeps the session busy only
+`running`; `waiting` and `unknown` do not count. It follows the changes the
+projection accepted, not the provider's raw reports, and disabling Agent Activity
+clears it because the projection interrupts that activity. It keeps the session busy only
 while the provider has emitted an event within the last 30 minutes, which bounds
 activity that never reports a terminal state. Removal-time suspension ignores live
 activity. A clean server shutdown retires every live session like idle suspension:

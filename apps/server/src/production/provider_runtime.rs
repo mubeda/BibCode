@@ -6242,6 +6242,12 @@ async fn set_live_agent_activity_enabled(
         if !enabled {
             entry.activity_control.write().await.take();
             cancel_and_reap_activity_tasks(entry).await;
+            // Disabling interrupts the projected activity, and no terminal report follows.
+            entry
+                .activity_lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forget_live_activity();
         }
         match entry.driver.set_agent_activity_enabled(enabled).await {
             Ok(()) => {
@@ -21953,6 +21959,21 @@ done
                 ],
             )
             .await;
+        fixture.assert_suspended_after_timeout(2).await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_forgets_live_activity_when_activity_monitoring_is_disabled() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        // Disabling monitoring interrupts the projected actor; no terminal report follows.
+        fixture
+            .supervisor
+            .set_agent_activity_enabled(false)
+            .await
+            .unwrap();
         fixture.assert_suspended_after_timeout(2).await;
         fixture.close().await;
     }
