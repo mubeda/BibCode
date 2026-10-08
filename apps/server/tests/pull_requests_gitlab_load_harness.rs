@@ -221,6 +221,7 @@ async fn gitlab_list_and_merge_request_loads_record_requests_and_wall_time() {
 }
 
 #[tokio::test]
+#[ignore = "waits through real 20 s poll ticks; run via scripts/measure-gitlab-merge-request-load.sh"]
 async fn gitlab_subscribed_merge_request_polling_records_host_requests() {
     const RTT_MS: u64 = 200;
     let root = TempDir::new().expect("tempdir");
@@ -278,34 +279,38 @@ async fn gitlab_subscribed_merge_request_polling_records_host_requests() {
     assert!(empty_snapshot.detail.is_none());
     assert_eq!(host_requests(&api, &log_path), 0, "empty read_snapshot");
 
-    let cold_join = subscribe_until(
+    // The detail join belongs to the unary reads measured in the band; a
+    // number the poller has never probed only names every family once.
+    let cold_probe = subscribe_until(
         &service,
         &cwd,
         &api,
         &log_path,
         subscribe_input(&cwd, Some(MR_NUMBER)),
-        Duration::from_secs(90),
-        |sample| count_glab_mr_list(sample) >= 1 && detail_join_hits(sample) >= 14,
+        Duration::from_secs(45),
+        |sample| {
+            count_glab_mr_list(sample) >= 1 && probe_hits(sample) >= 1 && sample.events.len() >= 2
+        },
     )
     .await;
-    assert!(
-        detail_join_hits(&cold_join) >= 14,
-        "cold detail still performs the detail join: {}",
-        format_tick_sample(&cold_join)
+    assert_eq!(
+        probe_hits(&cold_probe),
+        1,
+        "cold probe: {}",
+        format_tick_sample(&cold_probe)
     );
-    let cold_detail_wall_ms = detail_join_wall_ms(&cold_join.hits);
-    assert!(
-        cold_detail_wall_ms <= detail_band.max_wall_ms.saturating_mul(3),
-        "cold detail join wall {} ms exceeds band max {} ms (full tick {} ms)",
-        cold_detail_wall_ms,
-        detail_band.max_wall_ms,
-        cold_join.wall_ms
+    assert_eq!(
+        detail_join_hits(&cold_probe),
+        0,
+        "the poller never runs the detail join: {}",
+        format_tick_sample(&cold_probe)
     );
     assert!(
-        cold_detail_wall_ms >= detail_band.min_wall_ms / 2,
-        "cold detail join wall {} ms below band min {} ms",
-        cold_detail_wall_ms,
-        detail_band.min_wall_ms
+        cold_probe
+            .events
+            .iter()
+            .any(|changed| changed.detail && changed.timeline && changed.checks),
+        "an unprobed number names detail, timeline, and checks for the client to re-read"
     );
 
     let _ = fs::write(&log_path, "");
@@ -402,10 +407,11 @@ async fn gitlab_subscribed_merge_request_polling_records_host_requests() {
             "medianWallMs": detail_band.median_wall_ms,
             "maxWallMs": detail_band.max_wall_ms,
         },
-        "coldDetailJoin": {
-            "tickWallMs": cold_join.wall_ms,
-            "detailJoinWallMs": detail_join_wall_ms(&cold_join.hits),
-            "detailJoinHits": detail_join_hits(&cold_join),
+        "coldProbeTick": {
+            "tickWallMs": cold_probe.wall_ms,
+            "listClassRequests": count_glab_mr_list(&cold_probe),
+            "probeHits": probe_hits(&cold_probe),
+            "detailJoinHits": detail_join_hits(&cold_probe),
         },
         "unchangedListTick": {
             "listClassRequests": count_glab_mr_list(&unchanged_list),
@@ -417,7 +423,10 @@ async fn gitlab_subscribed_merge_request_polling_records_host_requests() {
             "detailJoinHits": detail_join_hits(&unchanged_detail),
         },
     });
-    println!("HARNESS_SUBSCRIBE_JSON {}", serde_json::to_string(&report).unwrap());
+    println!(
+        "HARNESS_SUBSCRIBE_JSON {}",
+        serde_json::to_string(&report).unwrap()
+    );
 
     let _ = shutdown_tx.send(());
     server.await.expect("server task");
@@ -433,6 +442,7 @@ struct TickSample {
     wall_ms: u128,
     hits: Vec<Hit>,
     glab_args: Vec<Vec<String>>,
+    events: Vec<Changed>,
 }
 
 async fn open_database() -> Database {
@@ -487,7 +497,9 @@ async fn subscribe_until(
 ) -> TickSample {
     let _ = fs::write(log_path, "");
     api.snapshot_and_clear();
-    let emit_changed = |_event: Changed| {};
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    let emit_changed = move |event: Changed| recorded.lock().expect("events").push(event);
     let subscribe_token = CancellationToken::new();
     let subscribe_cancel = subscribe_token.clone();
     let subscribe_service = service.clone();
@@ -513,6 +525,7 @@ async fn subscribe_until(
                 .unwrap_or(0),
             hits,
             glab_args,
+            events: events.lock().expect("events").clone(),
         };
         if api.inflight.load(Ordering::Acquire) == 0 {
             idle_polls += 1;
@@ -548,8 +561,7 @@ fn read_glab_args(log_path: &Path) -> Vec<Vec<String>> {
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| {
-            serde_json::from_str::<Value>(line)
-                .expect("glab log line")["args"]
+            serde_json::from_str::<Value>(line).expect("glab log line")["args"]
                 .as_array()
                 .expect("glab args")
                 .iter()
@@ -611,22 +623,6 @@ fn detail_join_hits_in(hits: &[Hit]) -> usize {
     hits.iter()
         .filter(|hit| is_detail_join_path(&hit.path, MR_NUMBER))
         .count()
-}
-
-fn detail_join_wall_ms(hits: &[Hit]) -> u128 {
-    let relevant: Vec<&Hit> = hits
-        .iter()
-        .filter(|hit| {
-            is_detail_join_path(&hit.path, MR_NUMBER)
-                || (hit.method == "GET" && is_probe_path(&hit.path, MR_NUMBER))
-        })
-        .collect();
-    if relevant.is_empty() {
-        return 0;
-    }
-    let start = relevant.iter().map(|hit| hit.start_ms).min().unwrap_or(0);
-    let end = relevant.iter().map(|hit| hit.end_ms).max().unwrap_or(0);
-    end.saturating_sub(start)
 }
 
 fn format_hits(hits: &[Hit]) -> String {
