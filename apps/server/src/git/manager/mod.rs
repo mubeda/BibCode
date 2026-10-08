@@ -215,9 +215,17 @@ mod telemetry {
             .await
             .expect("merge comparison read");
         repository
-            .git_manager_merge_tree(cwd, SHA, PARENT_SHA, &cancellation)
+            .git_manager_merge_tree(cwd, SHA, PARENT_SHA, None, &cancellation)
             .await
             .expect("merge tree read");
+        repository
+            .git_manager_merge_tree(cwd, SHA, PARENT_SHA, Some(SHA), &cancellation)
+            .await
+            .expect("merge tree read with attribute source");
+        repository
+            .git_manager_git_version(cwd, &cancellation)
+            .await
+            .expect("git version read");
         tags::list_tags(&repository, cwd, &cancellation)
             .await
             .expect("tag read");

@@ -148,6 +148,7 @@ pub struct GitRepository {
     runner: Arc<dyn GitProcessRunner>,
     worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     worktree_porcelain_z_supported: Arc<Mutex<Option<bool>>>,
+    git_version: Arc<Mutex<Option<crate::git::GitVersion>>>,
     command_timeout: Duration,
     /// `-c` configuration placed before the subcommand of every command this variant runs.
     command_config: &'static [&'static str],
@@ -203,6 +204,7 @@ impl Default for GitRepository {
             runner: Arc::new(ProcessRunner),
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+            git_version: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
             discovery_environment: |name| std::env::var_os(name),
@@ -369,6 +371,7 @@ impl GitRepository {
             runner: Arc::new(ProcessRunner),
             worktree_settings,
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+            git_version: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
             discovery_environment: |name| std::env::var_os(name),
@@ -389,6 +392,7 @@ impl GitRepository {
             runner,
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+            git_version: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
             discovery_environment: |name| std::env::var_os(name),
@@ -1470,25 +1474,64 @@ impl GitRepository {
         .await
     }
 
+    /// `git --version`, read once per repository value and cached; `None` when unparseable.
+    pub(crate) async fn git_manager_git_version(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::git::GitVersion>, GitCommandError> {
+        if let Some(version) = *self
+            .git_version
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return Ok(Some(version));
+        }
+        let output = self
+            .git_manager_bounded_read(
+                "GitManager.gitVersion",
+                cwd,
+                &strings(&["--version"]),
+                true,
+                4 * 1024,
+                cancellation,
+            )
+            .await?;
+        let version = crate::git::GitVersion::parse(&output.stdout);
+        if let Some(version) = version {
+            *self
+                .git_version
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(version);
+        }
+        Ok(version)
+    }
+
     pub(crate) async fn git_manager_merge_tree(
         &self,
         cwd: &Path,
         ours_tip: &str,
         theirs_tip: &str,
+        attr_source: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = Vec::new();
+        if let Some(tree) = attr_source {
+            args.push(format!("--attr-source={tree}"));
+        }
+        args.extend(strings(&[
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+            ours_tip,
+            theirs_tip,
+        ]));
         self.git_manager_bounded_read(
             "GitManager.previewMerge.mergeTree",
             cwd,
-            &[
-                "merge-tree".into(),
-                "--write-tree".into(),
-                "--name-only".into(),
-                "--no-messages".into(),
-                "-z".into(),
-                ours_tip.into(),
-                theirs_tip.into(),
-            ],
+            &args,
             true,
             GIT_MANAGER_TIPS_OUTPUT_LIMIT,
             cancellation,

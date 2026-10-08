@@ -1097,6 +1097,70 @@ async fn merge_preview_reports_clean_ahead_and_behind_state() {
 }
 
 #[tokio::test]
+async fn merge_preview_compares_against_a_named_target_branch() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    git(&cwd, &["branch", "target"]);
+    git(&cwd, &["switch", "-q", "-c", "feature"]);
+    fs::write(cwd.join("feature.txt"), "feature\n").expect("feature file");
+    git(&cwd, &["add", "feature.txt"]);
+    git(&cwd, &["commit", "-q", "-m", "feature"]);
+    git(&cwd, &["switch", "-q", "main"]);
+    // A tag named like the target must not shadow the branch.
+    git(&cwd, &["tag", "target", "feature"]);
+
+    let preview = fixture
+        .read(
+            "34",
+            "gitManager.previewMerge",
+            json!({ "cwd": cwd, "source": "refs/heads/feature", "target": "target" }),
+        )
+        .await
+        .expect("merge preview");
+
+    assert_eq!(preview["_tag"], "clean");
+    assert_eq!(preview["current"], "target");
+    assert_eq!(preview["ahead"], 1);
+}
+
+#[tokio::test]
+async fn merge_preview_rejects_a_missing_target_branch() {
+    let fixture = Fixture::new().await;
+
+    let failure = fixture
+        .read(
+            "36",
+            "gitManager.previewMerge",
+            json!({ "cwd": fixture.repository_path, "source": "main", "target": "gone" }),
+        )
+        .await
+        .expect_err("a target branch that does not exist fails structurally");
+
+    assert_eq!(failure["code"], "local-branch-not-found");
+}
+
+#[tokio::test]
+async fn merge_preview_target_is_a_literal_branch_name_not_a_revision_expression() {
+    let fixture = Fixture::new().await;
+    let cwd = fixture.repository_path.clone();
+    fs::write(cwd.join("tracked.txt"), "second\n").expect("second commit content");
+    git(&cwd, &["commit", "-qam", "second"]);
+
+    for (index, target) in ["main~1", "main^", "main@{1}"].into_iter().enumerate() {
+        let failure = fixture
+            .read(
+                &format!("4{index}"),
+                "gitManager.previewMerge",
+                json!({ "cwd": cwd, "source": "main", "target": target }),
+            )
+            .await
+            .expect_err("a revision expression is not a local branch");
+
+        assert_eq!(failure["code"], "local-branch-not-found", "{target}");
+    }
+}
+
+#[tokio::test]
 async fn refs_detect_an_external_merge_inside_a_linked_worktree() {
     let fixture = Fixture::new().await;
     let linked = fixture._root.path().join("linked");
