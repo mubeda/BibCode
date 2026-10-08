@@ -469,8 +469,12 @@ fn asset_content_security_policy(content_type: &str) -> Option<&'static str> {
         "text/html" | "application/xhtml+xml" => {
             Some("sandbox allow-scripts allow-forms allow-popups")
         }
-        // XML documents can run scripts through XSLT, like SVG.
+        // XML documents (any `+xml` type: RSS, Atom, MathML, ...) can run scripts
+        // through XSLT or embedded XHTML, like SVG.
         "image/svg+xml" | "text/xml" | "application/xml" => {
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox")
+        }
+        essence if essence.ends_with("+xml") => {
             Some("default-src 'none'; style-src 'unsafe-inline'; sandbox")
         }
         _ => None,

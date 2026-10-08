@@ -2634,7 +2634,7 @@ editor, or notice). In a browser tab (web mode), **Open links in** is not shown.
   **Copy link**.
 - Agent-written asset response: `curl -sI '<signed /api/assets URL>'` for an
   HTML file shows a `content-security-policy` header of
-  `sandbox allow-scripts allow-forms allow-popups`; for SVG, of
+  `sandbox allow-scripts allow-forms allow-popups`; for SVG, XML, and any other `+xml` type, of
   `default-src 'none'; style-src 'unsafe-inline'; sandbox`; a `.txt` or raster
   image asset has none. In the BiBCode browser, a script
   in the HTML reads `localStorage` and `document.cookie` as unavailable.

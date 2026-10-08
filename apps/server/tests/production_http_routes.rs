@@ -290,6 +290,21 @@ async fn script_capable_assets_are_sandboxed() {
             "application/xml",
             Some("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
         ),
+        (
+            "feed.rss",
+            "application/rss+xml",
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+        ),
+        (
+            "feed.atom",
+            "application/atom+xml; charset=utf-8",
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+        ),
+        (
+            "math.mml",
+            "application/mathml+xml",
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+        ),
         ("doc.pdf", "application/pdf", None),
     ] {
         let mut state = state_with_json_recorder(Arc::new(Mutex::new(Vec::new())));
