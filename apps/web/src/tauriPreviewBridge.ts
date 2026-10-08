@@ -216,6 +216,16 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
         stopStateEvents = null;
       };
     },
+    onNewWindowRequest: (listener) =>
+      listen<{ tabId: string; url: string }>("preview://new-window", (payload) => {
+        // One native child is reused for every logical tab (see nativeHostTabId);
+        // remap exactly like the preview://state handler does.
+        const tabId =
+          nativeHostTabId !== null && payload.tabId === nativeHostTabId
+            ? activeTabId
+            : payload.tabId;
+        if (tabId !== null) listener(tabId, payload.url);
+      }),
     onPointerEvent: () => () => {},
   };
 

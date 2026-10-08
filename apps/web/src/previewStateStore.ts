@@ -6,7 +6,7 @@
  * is the one place that must enumerate every live preview tab.
  */
 import { useAtomValue } from "@effect/atom-react";
-import { scopedThreadKey } from "@bibcode/client-runtime/environment";
+import { parseScopedThreadKey, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import {
   type PreviewEvent,
   type PreviewSessionSnapshot,
@@ -154,6 +154,14 @@ export function useThreadPreviewState(ref: ScopedThreadRef | null | undefined): 
 
 export function useActivePreviewSessions(): Record<string, ThreadPreviewState> {
   return useAtomValue(activePreviewSessionsAtom);
+}
+
+export function findPreviewThreadForTab(tabId: string): ScopedThreadRef | null {
+  const sessions = appAtomRegistry.get(activePreviewSessionsAtom);
+  for (const [threadKey, state] of Object.entries(sessions)) {
+    if (state.sessions[tabId]) return parseScopedThreadKey(threadKey);
+  }
+  return null;
 }
 
 export function readThreadPreviewState(ref: ScopedThreadRef): ThreadPreviewState {

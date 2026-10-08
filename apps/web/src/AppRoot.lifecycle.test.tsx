@@ -62,6 +62,9 @@ vi.mock("./rpc/atomRegistry", () => ({
 vi.mock("./components/preview/PreviewAutomationHosts", () => ({
   PreviewAutomationHosts: () => null,
 }));
+vi.mock("./components/preview/PreviewNewWindowRouter", () => ({
+  PreviewNewWindowRouter: () => null,
+}));
 vi.mock("./components/settings/UpdateServerDialog", () => ({
   RemoteUpdateConfirmationCoordinator: () => null,
 }));

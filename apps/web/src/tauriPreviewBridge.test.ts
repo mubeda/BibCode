@@ -215,6 +215,25 @@ describe("tauriPreviewBridge", () => {
     ]);
   });
 
+  it("reports reused native host new-window requests under the active logical tab", async () => {
+    const { bridge, emit, listenerCount } = makeBridge();
+    const received: Array<readonly [string, string]> = [];
+    const stop = bridge.onNewWindowRequest((tabId, url) => received.push([tabId, url]));
+    await bridge.createTab("tab_a");
+    // Another thread's logical tab becomes active on the same native child.
+    await bridge.createTab("tab_b");
+
+    emit("preview://new-window", { tabId: "tab_a", url: "https://popup.test/" });
+    expect(received).toEqual([["tab_b", "https://popup.test/"]]);
+
+    await bridge.closeTab("tab_b");
+    emit("preview://new-window", { tabId: "tab_a", url: "https://ignored.test/" });
+    expect(received).toHaveLength(1);
+
+    stop();
+    expect(listenerCount("preview://new-window")).toBe(0);
+  });
+
   it("hides and repositions the native host while switching logical tabs", async () => {
     const { bridge, invoke } = makeBridge();
     const firstBounds = { x: 1, y: 2, width: 300, height: 200 };
