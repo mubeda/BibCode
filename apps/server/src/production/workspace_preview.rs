@@ -38,6 +38,7 @@ const WORKSPACE_METHODS: &[&str] = &[
     "review.getDiffPreview",
 ];
 const PREVIEW_METHODS: &[&str] = &[
+    "preview.claimOpenRequest",
     "preview.close",
     "preview.list",
     "preview.navigate",
@@ -214,7 +215,10 @@ fn preview_event_stream(
                 event = events.recv() => match event {
                     Ok(event) => {
                         let value = match serde_json::to_value(event) {
-                            Ok(value) => value,
+                            Ok(mut value) => {
+                                normalize_camel_case_fields(&mut value);
+                                value
+                            }
                             Err(error) => {
                                 let _ = sender.send(Err(json!({
                                     "_tag": "PreviewEventEncodeError",
@@ -332,6 +336,11 @@ impl WorkspacePreviewRpcServices {
                     .await
                     .map_err(preview_error)?;
                 Ok(Value::Null)
+            }
+            "preview.claimOpenRequest" => {
+                let input: PreviewClaimOpenRequestInput = decode(payload, method)?;
+                let claimed = self.preview.claim_open_request(&input.request_id).await;
+                Ok(json!({ "claimed": claimed }))
             }
             "preview.list" => {
                 let input: PreviewThreadInput = decode(payload, method)?;
@@ -726,6 +735,12 @@ struct PreviewTabInput {
 #[serde(rename_all = "camelCase")]
 struct PreviewThreadInput {
     thread_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewClaimOpenRequestInput {
+    request_id: String,
 }
 
 #[derive(Deserialize)]

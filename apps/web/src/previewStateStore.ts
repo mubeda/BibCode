@@ -228,6 +228,8 @@ export function applyPreviewServerEvent(ref: ScopedThreadRef, event: PreviewEven
       }
       case "closed":
         return removeSession(current, event.tabId);
+      case "openRequested":
+        return current;
     }
   });
 }

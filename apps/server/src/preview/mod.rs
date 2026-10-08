@@ -1,13 +1,25 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{Mutex, broadcast};
+use tokio::{
+    sync::{Mutex, broadcast},
+    time::Instant,
+};
 use url::Url;
 use uuid::Uuid;
 
 pub mod gateway;
+
+/// How long an `openRequested` event stays claimable.
+const OPEN_REQUEST_TTL: Duration = Duration::from_secs(60);
+/// The contract's preview URL cap.
+const MAX_URL_LENGTH: usize = 2048;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag")]
@@ -64,7 +76,7 @@ pub struct PreviewListResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum PreviewEvent {
     #[serde(rename = "opened")]
     Opened {
@@ -103,6 +115,15 @@ pub enum PreviewEvent {
         tab_id: String,
         created_at: String,
     },
+    /// A command in the thread asked to open `url`; the first client to claim `request_id`
+    /// opens it.
+    #[serde(rename = "openRequested")]
+    OpenRequested {
+        thread_id: String,
+        request_id: String,
+        url: String,
+        created_at: String,
+    },
 }
 
 impl PreviewEvent {
@@ -114,17 +135,19 @@ impl PreviewEvent {
             Self::Resized { .. } => "resized",
             Self::Failed { .. } => "failed",
             Self::Closed { .. } => "closed",
+            Self::OpenRequested { .. } => "openRequested",
         }
     }
 
     #[must_use]
-    pub fn tab_id(&self) -> &str {
+    pub fn tab_id(&self) -> Option<&str> {
         match self {
             Self::Opened { tab_id, .. }
             | Self::Navigated { tab_id, .. }
             | Self::Resized { tab_id, .. }
             | Self::Failed { tab_id, .. }
-            | Self::Closed { tab_id, .. } => tab_id,
+            | Self::Closed { tab_id, .. } => Some(tab_id),
+            Self::OpenRequested { .. } => None,
         }
     }
 }
@@ -144,6 +167,14 @@ pub enum PreviewError {
 #[derive(Default)]
 struct PreviewState {
     sessions: BTreeMap<String, PreviewSessionSnapshot>,
+    /// Unclaimed open requests by id, with their expiry.
+    open_requests: HashMap<String, Instant>,
+}
+
+impl PreviewState {
+    fn prune_open_requests(&mut self, now: Instant) {
+        self.open_requests.retain(|_, expires_at| *expires_at > now);
+    }
 }
 
 #[derive(Clone)]
@@ -392,6 +423,45 @@ impl PreviewManager {
             }
         }
         Ok(())
+    }
+
+    /// Announces that a command in `thread_id` wants `url` opened. Returns the request id that
+    /// clients race to claim with [`Self::claim_open_request`].
+    pub async fn request_open(&self, thread_id: &str, url: &str) -> Result<String, PreviewError> {
+        let input_length = url.len();
+        let url = normalize_url(url)?;
+        // The caller is a command, not a validated client, so enforce the contract's URL cap
+        // here: a longer URL would make every subscriber fail to decode the event.
+        if url.len() > MAX_URL_LENGTH {
+            return Err(PreviewError::InvalidUrl {
+                input_length,
+                reason: "too-long",
+                protocol: None,
+            });
+        }
+        let request_id = format!("open_{}", Uuid::new_v4().simple());
+        let now = Instant::now();
+        {
+            let mut state = self.state.lock().await;
+            state.prune_open_requests(now);
+            state
+                .open_requests
+                .insert(request_id.clone(), now + OPEN_REQUEST_TTL);
+        }
+        let _ = self.events.send(PreviewEvent::OpenRequested {
+            thread_id: thread_id.to_owned(),
+            request_id: request_id.clone(),
+            url,
+            created_at: now_iso(),
+        });
+        Ok(request_id)
+    }
+
+    /// Claims an open request. Only the first claim of a live request returns `true`.
+    pub async fn claim_open_request(&self, request_id: &str) -> bool {
+        let mut state = self.state.lock().await;
+        state.prune_open_requests(Instant::now());
+        state.open_requests.remove(request_id).is_some()
     }
 
     pub async fn list(&self, thread_id: &str) -> PreviewListResult {

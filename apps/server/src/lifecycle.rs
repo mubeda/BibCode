@@ -550,18 +550,20 @@ fn core_http_routes(
     });
     let transfer_download = runtime.transfer_download_handler();
     let transfer_upload = runtime.transfer_upload_handler();
+    let preview = runtime.preview.clone();
     let asset_runtime = runtime;
     let assets = Arc::new(move |token, path, _context| {
         let runtime = asset_runtime.clone();
         Box::pin(async move { runtime.asset(token, path).await })
             as crate::production::http_routes::BoxFuture<_>
     });
+    let open_url_connect = connect.clone();
     let mcp = Arc::new(move |method, body, context| {
         let connect = connect.clone();
         Box::pin(async move { connect.mcp_http(method, body, context).await })
             as crate::production::http_routes::BoxFuture<_>
     });
-    HttpRoutesState::new(
+    let mut routes = HttpRoutesState::new(
         authorize,
         json,
         diagnostic_logs,
@@ -569,7 +571,14 @@ fn core_http_routes(
         mcp,
         transfer_download,
         transfer_upload,
-    )
+    );
+    routes.open_url = Arc::new(move |body, context| {
+        let connect = open_url_connect.clone();
+        let preview = preview.clone();
+        Box::pin(async move { connect.open_url_http(&preview, body, context).await })
+            as crate::production::http_routes::BoxFuture<_>
+    });
+    routes
 }
 
 fn default_ui_process_observer(mode: ServerMode) -> Arc<dyn DesktopUiProcessObserver> {

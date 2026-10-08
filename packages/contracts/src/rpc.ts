@@ -224,6 +224,8 @@ import {
 } from "./terminal.ts";
 import {
   DiscoveredLocalServerList,
+  PreviewClaimOpenRequestInput,
+  PreviewClaimOpenRequestResult,
   PreviewCloseInput,
   PreviewError,
   PreviewEvent,
@@ -517,6 +519,7 @@ export const WS_METHODS = {
   previewClose: "preview.close",
   previewList: "preview.list",
   previewReportStatus: "preview.reportStatus",
+  previewClaimOpenRequest: "preview.claimOpenRequest",
   previewAutomationConnect: "previewAutomation.connect",
   previewAutomationRespond: "previewAutomation.respond",
   previewAutomationFocusHost: "previewAutomation.focusHost",
@@ -1501,6 +1504,12 @@ export const WsPreviewReportStatusRpc = Rpc.make(WS_METHODS.previewReportStatus,
   error: Schema.Union([PreviewError, EnvironmentRpcError]),
 });
 
+export const WsPreviewClaimOpenRequestRpc = Rpc.make(WS_METHODS.previewClaimOpenRequest, {
+  payload: PreviewClaimOpenRequestInput,
+  success: PreviewClaimOpenRequestResult,
+  error: EnvironmentRpcError,
+});
+
 export const WsPreviewAutomationConnectRpc = Rpc.make(WS_METHODS.previewAutomationConnect, {
   payload: PreviewAutomationHost,
   success: PreviewAutomationStreamEvent,
@@ -1820,6 +1829,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsPreviewCloseRpc,
   WsPreviewListRpc,
   WsPreviewReportStatusRpc,
+  WsPreviewClaimOpenRequestRpc,
   WsPreviewAutomationConnectRpc,
   WsPreviewAutomationRespondRpc,
   WsPreviewAutomationFocusHostRpc,

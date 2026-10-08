@@ -18,6 +18,7 @@ use uuid::Uuid;
 use super::http_routes::{
     HttpRouteError, JsonOperation, JsonRouteResponse, McpHttpResponse, RouteContext,
 };
+use crate::preview::PreviewManager;
 
 const RELAY_LINK_PROOF_TYP: &str = "bibcode-env-link+jwt";
 const RELAY_MINT_REQUEST_TYP: &str = "bibcode-cloud-mint+jwt";
@@ -256,6 +257,20 @@ impl ConnectMcpError {
             )]),
         }
     }
+
+    fn invalid_open_url_credential() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            body: json!({
+                "error": "invalid_open_url_credential",
+                "message": "A valid thread-scoped open-url bearer credential is required."
+            }),
+            headers: BTreeMap::from([(
+                header::WWW_AUTHENTICATE.as_str().to_owned(),
+                "Bearer".to_owned(),
+            )]),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -281,10 +296,26 @@ struct McpSessionRecord {
     last_used_at: i64,
 }
 
+/// A thread-scoped token that only authorizes `POST /api/preview/open-url`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenUrlCredential {
+    pub token: String,
+    pub expires_at: i64,
+}
+
+struct OpenUrlRecord {
+    thread_id: String,
+    expires_at: i64,
+}
+
 #[derive(Default)]
 struct McpState {
     credentials: HashMap<String, McpCredentialRecord>,
     sessions: HashMap<String, McpSessionRecord>,
+    /// Open-url credentials by token hash. Kept apart from `credentials` so neither kind of
+    /// token can authenticate the other's route. A thread may hold several (one per provider
+    /// session or terminal), so issuing one never revokes another.
+    open_url: HashMap<String, OpenUrlRecord>,
 }
 
 impl ConnectMcpService {
@@ -400,6 +431,90 @@ impl ConnectMcpService {
             authorization_header: format!("Bearer {token}"),
             expires_at,
         })
+    }
+
+    pub async fn issue_open_url_credential(
+        &self,
+        thread_id: &str,
+    ) -> Result<OpenUrlCredential, ConnectMcpError> {
+        let now = (self.config.now_epoch_seconds)();
+        let mut token_bytes = [0_u8; 32];
+        getrandom::fill(&mut token_bytes)
+            .map_err(|error| ConnectMcpError::internal(error.to_string()))?;
+        let token = URL_SAFE_NO_PAD.encode(token_bytes);
+        let expires_at = now.saturating_add(MCP_LIFETIME_SECONDS);
+        let mut state = self.mcp.lock().await;
+        state.open_url.retain(|_, record| record.expires_at >= now);
+        if state.open_url.len() >= self.config.max_mcp_credentials.max(1) {
+            // ponytail: evicts the soonest-expiring token (a linear scan) rather than refusing,
+            // so a busy server never fails a terminal launch; its holder's open-url stops working.
+            if let Some(oldest) = state
+                .open_url
+                .iter()
+                .min_by_key(|(_, record)| record.expires_at)
+                .map(|(hash, _)| hash.clone())
+            {
+                state.open_url.remove(&oldest);
+            }
+        }
+        state.open_url.insert(
+            hash_token(&token),
+            OpenUrlRecord {
+                thread_id: thread_id.to_owned(),
+                expires_at,
+            },
+        );
+        Ok(OpenUrlCredential { token, expires_at })
+    }
+
+    /// Returns the thread an open-url token was issued for, if it is live.
+    pub async fn verify_open_url_credential(&self, token: &str) -> Option<String> {
+        let now = (self.config.now_epoch_seconds)();
+        let mut state = self.mcp.lock().await;
+        state.open_url.retain(|_, record| record.expires_at >= now);
+        state
+            .open_url
+            .get(&hash_token(token))
+            .map(|record| record.thread_id.clone())
+    }
+
+    /// `POST /api/preview/open-url`: bearer open-url token only, body `{ "url": … }`.
+    pub async fn open_url(
+        &self,
+        preview: &PreviewManager,
+        body: Vec<u8>,
+        context: RouteContext,
+    ) -> Result<JsonRouteResponse, ConnectMcpError> {
+        let token =
+            bearer_token(&context).map_err(|_| ConnectMcpError::invalid_open_url_credential())?;
+        let thread_id = self
+            .verify_open_url_credential(token)
+            .await
+            .ok_or_else(ConnectMcpError::invalid_open_url_credential)?;
+        let url = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|payload| payload.get("url")?.as_str().map(str::to_owned))
+            .ok_or_else(|| ConnectMcpError::bad_request("A string \"url\" is required."))?;
+        let request_id = preview
+            .request_open(&thread_id, &url)
+            .await
+            .map_err(|error| ConnectMcpError::bad_request(error.to_string()))?;
+        Ok(JsonRouteResponse {
+            status: StatusCode::ACCEPTED,
+            headers: BTreeMap::new(),
+            body: json!({ "requestId": request_id }),
+        })
+    }
+
+    pub async fn open_url_http(
+        &self,
+        preview: &PreviewManager,
+        body: Vec<u8>,
+        context: RouteContext,
+    ) -> Result<JsonRouteResponse, HttpRouteError> {
+        self.open_url(preview, body, context)
+            .await
+            .map_err(ConnectMcpError::into_http)
     }
 
     pub async fn revoke_mcp_provider_session(&self, provider_session_id: &str) {

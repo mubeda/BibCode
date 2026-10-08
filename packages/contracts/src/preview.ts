@@ -191,6 +191,17 @@ export const PreviewListInput = Schema.Struct({
 });
 export type PreviewListInput = typeof PreviewListInput.Type;
 
+export const PreviewClaimOpenRequestInput = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+});
+export type PreviewClaimOpenRequestInput = typeof PreviewClaimOpenRequestInput.Type;
+
+/** `claimed` is false when another client claimed the request first or it expired. */
+export const PreviewClaimOpenRequestResult = Schema.Struct({
+  claimed: Schema.Boolean,
+});
+export type PreviewClaimOpenRequestResult = typeof PreviewClaimOpenRequestResult.Type;
+
 export const PreviewListResult = Schema.Struct({
   sessions: Schema.Array(PreviewSessionSnapshot),
 });
@@ -234,12 +245,26 @@ const PreviewClosedEvent = Schema.Struct({
   type: Schema.Literal("closed"),
 });
 
+/**
+ * A command in the thread (an agent's `$BROWSER`, a CLI) asked to open `url`.
+ * It names no tab: the first client to claim `requestId` opens it.
+ */
+export const PreviewOpenRequestedEvent = Schema.Struct({
+  type: Schema.Literal("openRequested"),
+  threadId: TrimmedNonEmptyString,
+  requestId: TrimmedNonEmptyString,
+  url: Url,
+  createdAt: Schema.String,
+});
+export type PreviewOpenRequestedEvent = typeof PreviewOpenRequestedEvent.Type;
+
 export const PreviewEvent = Schema.Union([
   PreviewOpenedEvent,
   PreviewNavigatedEvent,
   PreviewResizedEvent,
   PreviewFailedEvent,
   PreviewClosedEvent,
+  PreviewOpenRequestedEvent,
 ]);
 export type PreviewEvent = typeof PreviewEvent.Type;
 

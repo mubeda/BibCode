@@ -95,6 +95,7 @@ pub struct ProductionRuntime {
     pub orchestration: OrchestrationEngine,
     pub activity_projections: ActivityProjections,
     pub preview_automation: PreviewAutomationBroker,
+    pub preview: PreviewManager,
     asset_access: AssetAccess,
     transfer_access: TransferAccess,
     terminal_services: ServerTerminalServices,
@@ -383,7 +384,7 @@ impl ProductionRuntime {
         let preview_automation = PreviewAutomationBroker::new();
         let workspace_preview = WorkspacePreviewRpcServices::new(
             workspace.clone(),
-            preview,
+            preview.clone(),
             preview_automation.clone(),
         );
 
@@ -505,6 +506,7 @@ impl ProductionRuntime {
             orchestration,
             activity_projections,
             preview_automation,
+            preview,
             asset_access,
             transfer_access,
             terminal_services,

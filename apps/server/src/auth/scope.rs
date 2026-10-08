@@ -94,6 +94,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "uploads.get"
         | "uploads.cancel"
         | "orchestration.dispatchCommand"
+        | "preview.claimOpenRequest"
         | "preview.close"
         | "preview.navigate"
         | "preview.open"

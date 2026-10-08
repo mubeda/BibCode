@@ -138,6 +138,10 @@
       "mode": "stream"
     },
     {
+      "name": "preview.claimOpenRequest",
+      "mode": "unary"
+    },
+    {
       "name": "preview.close",
       "mode": "unary"
     },
@@ -571,7 +575,7 @@
     }
   ],
   "streamMethodCount": 21,
-  "expectedTopLevelStreamShapes": 72,
+  "expectedTopLevelStreamShapes": 73,
   "expectedOrchestrationEventShapes": 24,
   "streamShapeFixtures": [
     "stream-shapes/cloud__installRelayClient-00.json",
@@ -610,6 +614,7 @@
     "stream-shapes/subscribePreviewEvents-02.json",
     "stream-shapes/subscribePreviewEvents-03.json",
     "stream-shapes/subscribePreviewEvents-04.json",
+    "stream-shapes/subscribePreviewEvents-05.json",
     "stream-shapes/subscribeProjectEntries-00.json",
     "stream-shapes/subscribeServerConfig-00.json",
     "stream-shapes/subscribeServerConfig-01.json",
@@ -703,6 +708,8 @@
     "typed-failures/orchestration__getTurnDiff-01.json",
     "typed-failures/orchestration__replayEvents-00.json",
     "typed-failures/orchestration__replayEvents-01.json",
+    "typed-failures/preview__claimOpenRequest-00.json",
+    "typed-failures/preview__claimOpenRequest-01.json",
     "typed-failures/preview__close-00.json",
     "typed-failures/preview__close-01.json",
     "typed-failures/preview__list-00.json",
@@ -1030,6 +1037,8 @@
     "stream-shapes/orchestration__subscribeShell-01.json": "26d159f93abfc29a716548e9da0c1acb0ad13b55d9336c1b7d879d3da61b4597",
     "stream-shapes/orchestration__subscribeThread-00.json": "c009287be141ed88e514e6dc85b9f5172fea111d4b61fc9eb3d4b6e780134535",
     "stream-shapes/orchestration__subscribeThread-01.json": "af73f233dcdf1fcd82b98907ee2d2131b459a948d5f163c741d0b2ab08154267",
+    "typed-failures/preview__claimOpenRequest-00.json": "458ab3eaa56c31ebe2775b1dc1c0a6ba8d32115336f2ed7acec1b53d272af365",
+    "typed-failures/preview__claimOpenRequest-01.json": "67fe28f9afa4f2e8a20948477a9e72996dd013c6e33b3a768d31eb3a49061509",
     "typed-failures/preview__close-00.json": "31f659b1e3df7da3b14cb7b1dcd9522c9f549ae324e06c07548e006a8a0d984d",
     "typed-failures/preview__close-01.json": "ab08a5a9459dd717e1ee0d5bea28eb9092c8b860c22cb291e86bb70075bf559e",
     "typed-failures/preview__list-00.json": "458ab3eaa56c31ebe2775b1dc1c0a6ba8d32115336f2ed7acec1b53d272af365",
@@ -1171,6 +1180,7 @@
     "stream-shapes/subscribePreviewEvents-02.json": "4a4b0692cd3ca28837b23dfd72e821fe23719b9bbc627c79bb1762aefa3cc21d",
     "stream-shapes/subscribePreviewEvents-03.json": "610d11c2c75756edfc18e224e5e91c6944162760c00c48c4d0de54fc4772acff",
     "stream-shapes/subscribePreviewEvents-04.json": "f501cfce13136cfa7ae7bad4febe03c8c2f251deb39b95d89a955a1c39b449aa",
+    "stream-shapes/subscribePreviewEvents-05.json": "89668c3852d503a2fe4466c71e7b0b6285ef3d74616c8779b8c4af43bfaafb5a",
     "stream-shapes/subscribeProjectEntries-00.json": "16f4733b371dc6218161dd4edea9bdd75720b67a9e18533b6bdf20d00e120db5",
     "stream-shapes/subscribeServerConfig-00.json": "fd2c14d50340d0fbfa71a46509f420bc79b168f132d467a36b619907367f1ef7",
     "stream-shapes/subscribeServerConfig-01.json": "a1736b568373952030c3383ae56ebc777ff487d1732c6adfface416574e1dbf3",
@@ -1413,6 +1423,7 @@
     "stream-shapes/subscribePreviewEvents-02.json",
     "stream-shapes/subscribePreviewEvents-03.json",
     "stream-shapes/subscribePreviewEvents-04.json",
+    "stream-shapes/subscribePreviewEvents-05.json",
     "stream-shapes/subscribeProjectEntries-00.json",
     "stream-shapes/subscribeServerConfig-00.json",
     "stream-shapes/subscribeServerConfig-01.json",
@@ -1508,6 +1519,8 @@
     "typed-failures/previewAutomation__focusHost-01.json",
     "typed-failures/previewAutomation__respond-00.json",
     "typed-failures/previewAutomation__respond-01.json",
+    "typed-failures/preview__claimOpenRequest-00.json",
+    "typed-failures/preview__claimOpenRequest-01.json",
     "typed-failures/preview__close-00.json",
     "typed-failures/preview__close-01.json",
     "typed-failures/preview__list-00.json",
