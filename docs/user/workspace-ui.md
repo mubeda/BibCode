@@ -547,7 +547,8 @@ center creation actions, so new chats and terminals open there.
 Drag pane dividers to resize them. Layout, focus, tab order, and split ratios
 persist across reloads. Closing a split pane merges its tabs into the adjacent
 layout without closing chats or terminals. Explicit tab close commands remain
-pane-local and do close their underlying panel thread or terminal session.
+pane-local and do archive their chat panel thread or end their terminal
+session.
 
 ## Git Manager
 
