@@ -1,8 +1,10 @@
 # GitLab merge request background sync
 
-Status: **Proposed** on 2026-10-08. This document is not approval to implement.
-Implementation waits until this status line says **Approved** and names the
-approved slices.
+Status: **Approved** on 2026-10-08. Approved slices: slice 1 (visible refresh
+and hover prefetch) and slice 2 (snapshot, probe, and invalidation).
+
+Plans: [slice 1](../plans/2026-10-08-gitlab-mr-visible-refresh.md),
+[slice 2](../plans/2026-10-08-gitlab-mr-background-sync.md).
 
 ## Problem and evidence
 
