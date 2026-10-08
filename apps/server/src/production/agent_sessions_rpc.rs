@@ -114,7 +114,7 @@ pub fn register_agent_sessions_rpc(
     let scan_services = services.clone();
     registry.register_unary("agentSessions.scan", move |request, cancellation| {
         let services = scan_services.clone();
-        async move { cancellable(&cancellation, scan(&services, request)).await }
+        async move { cancellable(&cancellation, scan(&services, request, &cancellation)).await }
     });
     registry.register_unary("agentSessions.import", move |request, cancellation| {
         let services = services.clone();
@@ -238,7 +238,11 @@ fn canonical_workspace_root(project: &ProjectionProject) -> PathBuf {
     std::fs::canonicalize(&root).unwrap_or(root)
 }
 
-async fn scan(services: &Services, request: RpcRequest) -> RpcResult {
+async fn scan(
+    services: &Services,
+    request: RpcRequest,
+    cancellation: &CancellationToken,
+) -> RpcResult {
     let input = decode::<ScanInput>(request)?;
     let project = live_project(services, &input.project_id).await?;
     let sources = resolve_sources(&services.settings_root).await;
@@ -260,9 +264,17 @@ async fn scan(services: &Services, request: RpcRequest) -> RpcResult {
         .map(|resolved| resolved.source)
         .collect::<Vec<_>>();
     let owned = sessions_owned_by_other_threads(services).await?;
+    // An interrupted RPC drops this future, so the blocking scan watches the token itself.
+    let scan_cancellation = cancellation.clone();
     let result = tokio::task::spawn_blocking(move || {
         let workspace_root = canonical_workspace_root(&project);
-        agent_sessions::scan(&session_sources, &workspace_root, SystemTime::now(), &owned)
+        agent_sessions::scan(
+            &session_sources,
+            &workspace_root,
+            SystemTime::now(),
+            &owned,
+            &scan_cancellation,
+        )
     })
     .await
     .map_err(|_| error("The CLI session scan stopped unexpectedly. Try again."))?;

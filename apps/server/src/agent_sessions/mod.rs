@@ -17,6 +17,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::engine::MAX_IMPORTED_THREAD_MESSAGES;
 
@@ -120,12 +121,14 @@ impl LoadFailure {
 }
 
 /// Lists the sessions run in `workspace_root` (canonical) whose transcripts changed since
-/// `now - RECENT_WINDOW`, newest first, leaving out the `owned` session IDs.
+/// `now - RECENT_WINDOW`, newest first, leaving out the `owned` session IDs. Stops reading
+/// transcripts once `cancellation` fires.
 pub(crate) fn scan(
     sources: &[SessionSource],
     workspace_root: &Path,
     now: SystemTime,
     owned: &HashSet<String>,
+    cancellation: &CancellationToken,
 ) -> ScanResult {
     let since = now
         .checked_sub(RECENT_WINDOW)
@@ -139,6 +142,9 @@ pub(crate) fn scan(
         let mut seen = HashSet::new();
         let mut found = 0;
         for file in files {
+            if cancellation.is_cancelled() {
+                return ScanResult::default();
+            }
             if found > MAX_CANDIDATES {
                 result.truncated = true;
                 break;

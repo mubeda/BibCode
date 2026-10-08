@@ -338,6 +338,7 @@ fn scan_lists_recent_sessions_of_this_folder_newest_first() {
         &homes.workspace,
         SystemTime::now(),
         &HashSet::new(),
+        &CancellationToken::new(),
     );
 
     assert!(!result.truncated);
@@ -379,9 +380,21 @@ fn scan_lists_recent_sessions_of_this_folder_newest_first() {
         &homes.workspace,
         SystemTime::now(),
         &owned,
+        &CancellationToken::new(),
     );
     assert_eq!(result.candidates.len(), 1);
     assert_eq!(result.candidates[0].session.session_id, CLAUDE_ID);
+    // A cancelled scan (its RPC was interrupted) stops before reading transcripts.
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let result = scan(
+        &sources(&homes),
+        &homes.workspace,
+        SystemTime::now(),
+        &HashSet::new(),
+        &cancelled,
+    );
+    assert!(result.candidates.is_empty());
 }
 
 #[test]
