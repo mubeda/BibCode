@@ -705,9 +705,7 @@ it("requires child IPC readiness and preserves the primary late-tail fixture err
     new URL("./seeded-desktop-upgrade-smoke.test.ts", import.meta.url),
     "utf8",
   );
-  const begin = tests.indexOf(
-    'it("joins the owned writer after parent close with platform-correct stdout"',
-  );
+  const begin = tests.indexOf('it("joins platform-owned writers and retains stdout through close"');
   const end = tests.indexOf('it.each(["raw",', begin);
   const body = tests.slice(begin, end);
   expect(body).toContain('writer.once("message"');

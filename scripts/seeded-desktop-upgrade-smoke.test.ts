@@ -1711,7 +1711,7 @@ describe("seeded packaged desktop upgrade harness", () => {
     }
   });
 
-  it("joins the owned writer after parent close with platform-correct stdout", async () => {
+  it("joins platform-owned writers and retains stdout through close", async () => {
     const root = await NodeFS.promises.mkdtemp(
       NodePath.join(NodeOS.tmpdir(), "bibcode-command-close-"),
     );
@@ -1729,15 +1729,18 @@ describe("seeded packaged desktop upgrade harness", () => {
         process.exit(error && error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED" ? 1 : 0);
       };
       process.stdout.on("error", finish);
-      setTimeout(() => {
-        try {
-          // Windows closes the parent's inherited pipe; do not issue an unsupported write.
-          // POSIX retains the inherited pipe and proves the flushed late tail.
-          if (windows) finish();
-          else process.stdout.write("late-tail", finish);
-        } catch (error) { finish(error); }
+      const writeTail = () => setTimeout(() => {
+        try { process.stdout.write("late-tail", finish); }
+        catch (error) { finish(error); }
       }, 125);
-      process.send("writer-ready");
+      if (windows) {
+        // This directly owned child has no descendant whose lifetime depends on parent exit.
+        require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, "ready");
+        process.stdout.write("early|", writeTail);
+      } else {
+        writeTail();
+        process.send("writer-ready");
+      }
     `;
     const parentSource = `
       const writer = require("node:child_process").spawn(
@@ -1758,17 +1761,15 @@ describe("seeded packaged desktop upgrade harness", () => {
     try {
       const result = await runBoundedCommand({
         command: process.execPath,
-        args: ["-e", parentSource],
+        args: ["-e", HostProcessPlatform.defaultValue() === "win32" ? writerSource : parentSource],
         cwd: root,
         timeoutMs: 2_000,
       });
       expect(NodeFS.existsSync(readyPath)).toBe(true);
       expect(result.exitCode).toBe(0);
-      // POSIX inherited pipes outlive the parent; Windows reports its own closed pipe.
-      if (HostProcessPlatform.defaultValue() === "win32") expect(result.stdout).toBe("early|");
-      else expect(result.stdout).toBe("early|late-tail");
-      if (HostProcessPlatform.defaultValue() !== "win32")
-        expect(NodeFS.existsSync(finishedPath)).toBe(true);
+      // Windows owns one child; POSIX also proves its inherited grandchild tail.
+      expect(result.stdout).toBe("early|late-tail");
+      expect(NodeFS.existsSync(finishedPath)).toBe(true);
     } catch (error) {
       failed = true;
       original = error;

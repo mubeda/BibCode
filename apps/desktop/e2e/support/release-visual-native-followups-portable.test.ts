@@ -242,7 +242,7 @@ it.each(["exit-tail-close", "exit-close-tail"])(
 );
 
 it.each([
-  ["win32", "no-write"],
+  ["win32", "direct-owned"],
   ["win32", "async-unexpected"],
   ["linux", "callback"],
   ["linux", "async-unexpected"],
@@ -260,7 +260,7 @@ it.each([
       "utf8",
     );
     const caseStart = tests.indexOf(
-      'it("joins the owned writer after parent close with platform-correct stdout"',
+      'it("joins platform-owned writers and retains stdout through close"',
     );
     const begin = tests.indexOf("async () => {", caseStart),
       end = tests.indexOf('\n  it.each(["raw"', begin);
@@ -285,7 +285,8 @@ it.each([
       spawned = false,
       writes = 0,
       removals = 0,
-      writerExited = false;
+      writerExited = false,
+      descendantSpawns = 0;
     const original = mode === "parent-undefined" ? undefined : new Error("inert primary"),
       cleanupError = new Error("inert cleanup");
     const writerCodes: number[] = [];
@@ -311,13 +312,18 @@ it.each([
                 if (["parent-error", "parent-undefined", "primary-and-cleanup"].includes(mode))
                   child.emit("error", original);
                 else if (platform === "win32") child.emit("close", 0);
+                if (platform === "win32") writerTimer = undefined;
               },
             });
             Object.assign(writerStdout, {
               write: (text: string, callback: () => void) => {
                 writes++;
-                if (platform === "win32") return false;
-                if (mode === "callback") {
+                if (text === "early|") {
+                  ready = () => {
+                    child.stdout.emit("data", Buffer.from(text));
+                    callback();
+                  };
+                } else if (!["async-unexpected", "epipe", "destroyed"].includes(mode)) {
                   child.stdout.emit("data", Buffer.from(text));
                   callback();
                 }
@@ -334,18 +340,27 @@ it.each([
                 writerCodes.push(code);
                 writerExited = true;
                 writerProcess.emit("exit", code);
-                if (platform !== "win32") child.emit("close", 0);
+                if (platform === "win32") {
+                  child.emit("exit", code);
+                  if (["parent-error", "parent-undefined", "primary-and-cleanup"].includes(mode))
+                    child.emit("error", original);
+                  else child.emit("close", code);
+                } else child.emit("close", 0);
               },
             });
             const parentScript = args[1];
             if (parentScript === undefined) throw new Error("Inert parent script unavailable.");
             NodeVM.runInNewContext(parentScript, {
-              process: parentProcess,
+              process: parentScript.includes("node:child_process") ? parentProcess : writerProcess,
+              setTimeout: (callback: () => void) => {
+                writerTimer = callback;
+              },
               require: (name: string) =>
                 name === "node:fs"
                   ? NodeFS
                   : {
                       spawn: (_node: string, writerArgs: string[]) => {
+                        descendantSpawns++;
                         const writerScript = writerArgs[1];
                         if (writerScript === undefined)
                           throw new Error("Inert writer script unavailable.");
@@ -427,8 +442,9 @@ it.each([
         });
       }
       const result = await pending;
-      expect(writes).toBe(platform === "win32" ? 0 : 1);
-      expect(writerCodes).toEqual([mode === "async-unexpected" && platform !== "win32" ? 1 : 0]);
+      expect(descendantSpawns).toBe(platform === "win32" ? 0 : 1);
+      expect(writes).toBe(platform === "win32" ? 2 : 1);
+      expect(writerCodes).toEqual([mode === "async-unexpected" ? 1 : 0]);
       expect(removals).toBe(1);
       if (["parent-error", "parent-undefined", "primary-and-cleanup"].includes(mode)) {
         expect(result.failed).toBe(true);
@@ -436,7 +452,7 @@ it.each([
       } else if (mode === "cleanup-error") {
         expect(result.failed).toBe(true);
         expect(result.error).toBe(cleanupError);
-      } else expect(result.failed).toBe(mode !== "callback" && platform !== "win32");
+      } else expect(result.failed).toBe(["async-unexpected", "epipe", "destroyed"].includes(mode));
     } finally {
       if (ownedRoot) await NodeFS.promises.rm(ownedRoot, { recursive: true, force: true });
     }
