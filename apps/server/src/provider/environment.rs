@@ -1,4 +1,7 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 /// The value a provider process sees for `name`: the instance environment first (matched
 /// case-insensitively, as Windows does), then the server's own environment.
@@ -35,6 +38,61 @@ fn home_directory(environment: &[(OsString, OsString)]) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Claude Code shortens longer project directory names with a hash this cannot reproduce.
+const CLAUDE_PROJECT_DIRECTORY_NAME_MAX: usize = 200;
+
+/// The directory under `<config dir>/projects` where Claude Code keeps the transcripts of
+/// conversations started in `cwd`: the path with every character other than an ASCII letter or
+/// digit replaced by `-`, one per UTF-16 unit as Claude's JavaScript does. `None` for a name
+/// Claude would shorten.
+pub(crate) fn claude_project_directory_name(cwd: &Path) -> Option<String> {
+    let name = cwd
+        .to_string_lossy()
+        .chars()
+        .flat_map(|character| {
+            let replaced = if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            };
+            std::iter::repeat_n(replaced, character.len_utf16())
+        })
+        .collect::<String>();
+    (name.len() <= CLAUDE_PROJECT_DIRECTORY_NAME_MAX).then_some(name)
+}
+
+/// Whether Claude Code can resume `session_id` in `cwd`, which needs its transcript
+/// `<config dir>/projects/<project>/<session_id>.jsonl`. Claude looks in the project of `cwd`
+/// (also checked resolved, because Claude records the real path), then in every project, as for
+/// a conversation started in an earlier working directory. `None` when that cannot be told: no
+/// config directory, or no readable `projects` directory in it.
+pub(crate) fn claude_session_transcript_exists(
+    environment: &[(OsString, OsString)],
+    cwd: &Path,
+    session_id: &str,
+) -> Option<bool> {
+    let projects = claude_config_directory(environment)?.join("projects");
+    if !projects.is_dir() {
+        return None;
+    }
+    let file_name = format!("{session_id}.jsonl");
+    let mut candidates = vec![cwd.to_path_buf()];
+    candidates.extend(std::fs::canonicalize(cwd).ok().filter(|real| real != cwd));
+    for candidate in candidates {
+        if let Some(name) = claude_project_directory_name(&candidate)
+            && projects.join(name).join(&file_name).is_file()
+        {
+            return Some(true);
+        }
+    }
+    let entries = std::fs::read_dir(&projects).ok()?;
+    Some(
+        entries
+            .flatten()
+            .any(|entry| entry.path().join(&file_name).is_file()),
+    )
+}
+
 /// Isolate providers from host diagnostics and AppImage launcher paths.
 pub(crate) fn sanitize_provider_subprocess_environment(command: &mut tokio::process::Command) {
     // Host diagnostics must not turn provider stderr into a high-volume event stream.
@@ -46,6 +104,77 @@ pub(crate) fn sanitize_provider_subprocess_environment(command: &mut tokio::proc
 mod tests {
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+    use std::{ffi::OsString, path::Path};
+
+    use super::{claude_project_directory_name, claude_session_transcript_exists};
+
+    #[test]
+    fn claude_project_directories_replace_every_non_alphanumeric_character() {
+        // Names observed under `~/.claude/projects` for these working directories.
+        for (cwd, name) in [
+            (
+                "/work/workspaces/bibcode/BibCode/main-3",
+                "-work-workspaces-bibcode-BibCode-main-3",
+            ),
+            (
+                "/work/github/BibCode/.claude/worktrees/agent-a6485f3e336f43353",
+                "-work-github-BibCode--claude-worktrees-agent-a6485f3e336f43353",
+            ),
+            (r"C:\Users\me\my_repo", "C--Users-me-my-repo"),
+            // One `-` per UTF-16 unit, as Claude's JavaScript replaces them.
+            ("/tmp/caf\u{e9}/\u{1f600}", "-tmp-caf----"),
+        ] {
+            assert_eq!(
+                claude_project_directory_name(Path::new(cwd)).as_deref(),
+                Some(name)
+            );
+        }
+        let long = format!("/{}", "a".repeat(200));
+        assert_eq!(claude_project_directory_name(Path::new(&long)), None);
+    }
+
+    #[test]
+    fn claude_transcripts_are_found_under_the_working_directory_project() {
+        let config = tempfile::tempdir().expect("claude config");
+        let cwd = config.path().join("work tree");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let environment = [(
+            OsString::from("CLAUDE_CONFIG_DIR"),
+            config.path().as_os_str().to_owned(),
+        )];
+        // Without a projects directory BiBCode cannot tell, so it keeps resuming.
+        assert_eq!(
+            claude_session_transcript_exists(&environment, &cwd, "session"),
+            None
+        );
+        let project = config
+            .path()
+            .join("projects")
+            .join(claude_project_directory_name(&cwd).expect("short cwd"));
+        std::fs::create_dir_all(&project).expect("project");
+        assert_eq!(
+            claude_session_transcript_exists(&environment, &cwd, "session"),
+            Some(false)
+        );
+        std::fs::write(project.join("session.jsonl"), "{}\n").expect("transcript");
+        assert_eq!(
+            claude_session_transcript_exists(&environment, &cwd, "session"),
+            Some(true)
+        );
+        assert_eq!(
+            claude_session_transcript_exists(&environment, &cwd, "other"),
+            Some(false)
+        );
+        // Claude also resumes a transcript recorded under another project, such as an earlier
+        // working directory or another spelling of it.
+        let elsewhere = config.path().join("projects").join("-earlier-cwd");
+        std::fs::create_dir_all(&elsewhere).expect("other project");
+        std::fs::write(elsewhere.join("other.jsonl"), "{}\n").expect("other transcript");
+        assert_eq!(
+            claude_session_transcript_exists(&environment, &cwd, "other"),
+            Some(true)
+        );
+    }
 
     #[test]
     fn provider_commands_do_not_inherit_host_rust_logging() {
