@@ -1141,6 +1141,20 @@ in `apps/server/src/preview/gateway/`.
 - **Relay limitation.** A relay (BiBCode Connect) client cannot reach gateway
   listeners. It shows "This address is on <label>, not this computer. Opening
   its ports from here isn't supported yet."
+- **Client side** (`apps/web/src/browser/previewGateway.ts`). Shared preview
+  state keeps the canonical `http://localhost:<port>` URL; each client resolves
+  it for its own webview. A client maps every gateway origin a tab has used
+  back to the canonical origin until that tab is released, so history Back to
+  a replaced SSH forward still reports a canonical URL. Over SSH it leases
+  forwards: a tab holds its forward until the tab closes, or 60 s after its
+  view unmounts unless it mounts again; a system-browser open holds one for
+  5 minutes. It calls `releaseSshForward` only when no lease remains, and when
+  the server replaces a target's listener. Only a typed gateway refusal
+  (`https-unsupported`, `not-admitted`, `no-upstream`, `not-reachable`) becomes
+  the shared tab's `LoadFailed`. A failure of the client's own reach (SSH
+  forward, missing bridge or profile, transport, `unavailable`, or a native
+  load failure on its gateway origin) stays a client-local failed state that
+  the tab and automation `status` report.
 
 ## Security boundaries
 

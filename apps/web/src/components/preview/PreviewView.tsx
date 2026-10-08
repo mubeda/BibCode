@@ -22,6 +22,7 @@ import { resolvePreviewTarget } from "~/browser/browserTargetResolver";
 import { showPreviewUnreachableMessage, showPreviewUnreachableNotice } from "~/browser/linkNotices";
 import { navigateDesktopTab } from "~/browser/desktopTabLifetime";
 import { canonicalizePreviewUrl, resolveForNavigation } from "~/browser/previewGateway";
+import { failPreviewTabNavigation } from "~/browser/previewTabFailure";
 import { useEnvironment, useEnvironmentHttpBaseUrl } from "~/state/environments";
 import { previewEnvironment } from "~/state/preview";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -90,8 +91,9 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   const open = useAtomCommand(previewEnvironment.open);
   const navigate = useAtomCommand(previewEnvironment.navigate, "preview navigation");
   const resize = useAtomCommand(previewEnvironment.resize, "preview viewport resize");
-  // Gateway refusals become a notice with their own copy.
+  // Gateway refusals become a notice or the tab's failed state, with their own copy.
   const gatewayOpen = useAtomCommand(previewEnvironment.gatewayOpen, { reportFailure: false });
+  const reportStatus = useAtomCommand(previewEnvironment.reportStatus, "preview status report");
 
   usePreviewSession(threadRef);
 
@@ -120,7 +122,11 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   const canGoBack = desktopOverlay?.canGoBack ?? snapshot?.canGoBack ?? false;
   const canGoForward = desktopOverlay?.canGoForward ?? snapshot?.canGoForward ?? false;
   const refreshDisabled = navStatus._tag === "Idle";
-  const isUnreachable = navStatus._tag === "LoadFailed";
+  // This client's own failure wins: the shared tab may be fine for others.
+  const failure =
+    (tabId ? previewState.localFailures[tabId] : undefined) ??
+    (navStatus._tag === "LoadFailed" ? navStatus : null);
+  const isUnreachable = failure !== null;
   const showEmptyState = shouldShowPreviewEmptyState(snapshot);
   const controller = desktopOverlay?.controller ?? "none";
   const loadProgress = useLoadingProgress(loading);
@@ -242,10 +248,27 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
     // A reload is a navigation too: a newer submission or unmount cancels it.
     const submission = ++submissionRef.current;
     const isCurrent = () => submission === submissionRef.current && isMountedRef.current;
-    void resolveForThisClient(url, tabId, isCurrent)
-      .then((resolved) => (resolved === null ? undefined : navigateDesktopTab(tabId, resolved)))
+    void resolveForNavigation({
+      environmentId: threadRef.environmentId,
+      threadId: threadRef.threadId,
+      canonicalUrl: url,
+      gatewayOpen,
+      tabId,
+    })
+      .then((target) => {
+        if (!isCurrent()) return;
+        if (target.kind === "ok") return navigateDesktopTab(tabId, target.url);
+        // Nothing loads, so fail the tab (here only, or shared for a refusal).
+        return failPreviewTabNavigation({
+          threadRef,
+          tabId,
+          url,
+          failure: target,
+          reportStatus,
+        });
+      })
       .catch(() => undefined);
-  }, [resolveForThisClient, tabId, threadRef.environmentId, url]);
+  }, [gatewayOpen, reportStatus, tabId, threadRef, url]);
 
   const handleZoomIn = useCallback(() => {
     if (previewBridge && tabId) void previewBridge.zoomIn(tabId);
@@ -794,12 +817,12 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
             {controller === "agent" ? "Agent controlling browser" : "Human control"}
           </div>
         ) : null}
-        {navStatus._tag === "LoadFailed" ? (
+        {failure !== null ? (
           <div className="absolute inset-0 z-10 bg-background">
             <PreviewUnreachable
-              url={navStatus.url}
-              code={navStatus.code}
-              description={navStatus.description}
+              url={failure.url}
+              code={failure.code}
+              description={failure.description}
               onReload={handleRefresh}
             />
           </div>

@@ -956,6 +956,10 @@ without connections, when its thread is deleted, or when the server stops.
 Closing a system-browser or browser tab doesn't close it; the idle timeout
 does.
 
+Over SSH, the desktop keeps a tab's forward for a minute after you switch to
+another tab, so switching back reuses it; closing the tab ends its forward at
+once. An address opened in the system browser keeps its forward for 5 minutes.
+
 The previewed app runs on a new origin, not `localhost`. The gateway sends the
 app `Host: localhost:<port>`, but anything the browser checks against the page's
 own origin breaks if the app hard-codes `localhost`: OAuth redirect URLs, CORS
@@ -964,15 +968,27 @@ allowlists, and links or scripts that name `http://localhost:<port>`.
 These cases show "Can't open this address here" with the address and **Copy
 link**:
 
-| Situation                                                     | Message                                                                                                               |
-| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| BiBCode Connect, a public IP address, or SSH in a browser tab | "This address is on <environment>, not this computer. Opening its ports from here isn't supported yet."               |
-| The environment isn't connected                               | "<environment> isn't connected. Reconnect it, then open the link again."                                              |
-| An `https://` dev server                                      | "HTTPS dev servers can't be previewed through the gateway yet; serve over HTTP or open it on <environment> directly." |
-| Nothing listens on the port                                   | "Nothing is listening on port <port> on <environment>."                                                               |
-| The server refused the address                                | "Open this address from the thread's terminal or chat first, then try again."                                         |
-| The gateway or SSH forward failed                             | "Couldn't open a preview connection to <environment>. Try again, or reconnect <environment> if it keeps failing."     |
-| A terminal with no thread                                     | "Open this address from a thread's chat or terminal to reach it from here."                                           |
+| Situation                                                                  | Message                                                                                                               |
+| -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| BiBCode Connect, a public IP address, or SSH in a browser tab              | "This address is on <environment>, not this computer. Opening its ports from here isn't supported yet."               |
+| The environment isn't connected, or its SSH connection is down             | "<environment> isn't connected. Reconnect it, then open the link again."                                              |
+| An `https://` dev server                                                   | "HTTPS dev servers can't be previewed through the gateway yet; serve over HTTP or open it on <environment> directly." |
+| Nothing listens on the port                                                | "Nothing is listening on port <port> on <environment>."                                                               |
+| The server refused the address                                             | "BiBCode can only preview plain HTTP addresses on <environment>'s own localhost."                                     |
+| The server's address can't serve previews, such as a public or proxied one | "<the server's reason> Open it on <environment> directly."                                                            |
+| The gateway or SSH forward failed, or this client's session expired        | "Couldn't open a preview connection to <environment>. Try again, or reconnect <environment> if it keeps failing."     |
+| A terminal with no thread                                                  | "Open this address from a thread's chat or terminal to reach it from here."                                           |
+
+When a BiBCode browser tab's address can't load, the tab shows "This site
+can't be reached" with the reason in place of the page, and **Reload** opens
+the address through the gateway again. A refusal from the server (HTTPS,
+nothing listening, a refused address, an address that can't serve previews)
+shows the same on every client. A failure on this computer's side (its SSH
+forward, its BiBCode session, or its network route to the gateway) shows on
+this computer only, because another client may load the page fine. For
+BiBCode's own reasons the page shows the sentence alone, without network error
+codes or connection tips. An agent asking for the tab's status, or opening a
+new tab, gets the same reason as an error.
 
 Gateway traffic is plain HTTP on the server's address, outside BiBCode's
 encrypted transport. On a public IP address BiBCode does not use the gateway.
@@ -984,12 +1000,16 @@ tab, a bar at the top of the window asks again:
 
 - "Agent wants to open <address>": the agent's `preview_open`.
 - "A command wants to open <address>": a `$BROWSER` request (below).
-- "Your browser blocked a new tab for <address>": a click whose tab was blocked.
+- "A command in <thread title> wants to open <address>": a `$BROWSER` request
+  from a thread that isn't on screen, on desktop too.
+- "Your browser blocked a new tab for <address>": a click whose tab was
+  blocked, followed by "Allow pop-ups for this site to open links directly."
 
-**Open** opens the address from your click; **Dismiss** drops the request. The
-bar shows one request at a time, with "(N more waiting)" when more are queued,
-and keeps a request whose open failed so you can try again. The gateway pages a
-preview tab can show:
+**Open** opens the address from your click, first showing the thread when the
+bar names one; **Copy link** copies the address and keeps the request;
+**Dismiss** drops the request. The bar shows one request at a time, with
+"(N more waiting)" when more are queued, and keeps a request whose open failed
+so you can try again. The gateway pages a preview tab can show:
 
 - "This preview link expired. Go back to BiBCode and open it again." The
   preview's sign-in is gone: the link was already used or is older than 60
@@ -1010,11 +1030,13 @@ link again from BiBCode, which starts a new gateway session.
 `BROWSER` and `BRAINSTORM_OPEN_CMD` set to `bibcode-open-url` (a
 `bibcode-open-url.exe` on Windows), so tools that launch a browser through
 either variable, such as the brainstorming companion, ask BiBCode instead of
-opening a browser on the server's machine. One BiBCode client showing that
-thread takes the request; a client whose window is hidden waits 2 seconds so a
-visible one goes first. On desktop the address opens like a clicked link, in
-the system browser when the thread is only shown in a side panel. In a browser
-tab it always waits for **Open** on the "A command wants to open" bar. A
+opening a browser on the server's machine. One BiBCode client takes the
+request. A visible client showing that thread takes it at once. Otherwise,
+after 2 seconds, a visible client takes it and asks with the "A command in
+<thread title> wants to open" bar; a client whose window is hidden takes it
+only while showing the thread. On desktop, a request from a thread on screen
+opens like a clicked link, in the system browser when the thread is only shown
+in a side panel. In a browser tab it always waits for **Open** on the bar. A
 request no client takes within 60 seconds is dropped.
 
 `bibcode-open-url` prints the address instead when it has no BiBCode session

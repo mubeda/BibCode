@@ -212,11 +212,15 @@ report's SSH environment evidence section.
   child is running, and its local port listens on `127.0.0.1` only (`ss -ltnp`
   on Linux, `lsof -nP -iTCP -sTCP:LISTEN` on macOS, `netstat -ano` on Windows).
 - **Reload** loads the page again. Stop the server and press **Reload**: the
-  notice reads "Nothing is listening on port 8123 on <environment>." Start it
+  tab reads "Nothing is listening on port 8123 on <environment>." Start it
   again and press **Reload**: the page returns.
 - `https://localhost:8123/` shows "HTTPS dev servers can't be previewed through
   the gateway yet; serve over HTTP or open it on <environment> directly."
-- Close the preview tab: the forward's `ssh` child exits.
+- Open a second preview tab on another address, such as `https://example.com`,
+  then switch back to the first within a minute: no new forward `ssh` child
+  starts. Stay on the second tab for over a minute: the first tab's forward
+  `ssh` child exits.
+- Close the preview tab: the forward's `ssh` child exits at once.
 - With **Open links in** set to **System browser**, the same click opens the
   system browser at `http://127.0.0.1:<local port>/`, and the listing loads.
 

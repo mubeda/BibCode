@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 const h = vi.hoisted(() => ({
   openLink: vi.fn(),
   openPreview: vi.fn(),
+  navigate: vi.fn(),
 }));
 vi.mock("~/browser/openLink", () => ({ openLink: h.openLink }));
 vi.mock("~/state/use-atom-command", () => ({ useAtomCommand: () => h.openPreview }));
@@ -33,7 +34,9 @@ beforeEach(async () => {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
-  await act(async () => root.render(<OpenPromptBanner />));
+  await act(async () =>
+    root.render(<OpenPromptBanner router={{ navigate: h.navigate } as never} />),
+  );
 });
 
 afterEach(async () => {
@@ -83,6 +86,7 @@ describe("OpenPromptBanner", () => {
       openPreview: h.openPreview,
       onPopupBlocked: expect.any(Function),
       onUnopened: expect.any(Function),
+      onError: expect.any(Function),
     });
     expect(container.textContent).toBe("");
   });
@@ -155,5 +159,72 @@ describe("OpenPromptBanner", () => {
 
     await act(async () => button("Dismiss").click());
     expect(container.textContent).toBe("");
+  });
+
+  it("names a thread that isn't on screen and shows it before opening", async () => {
+    const order: string[] = [];
+    h.navigate.mockImplementation(() => {
+      order.push("navigate");
+      return Promise.resolve();
+    });
+    h.openLink.mockImplementation(() => {
+      order.push("open");
+      return "app";
+    });
+    await act(async () =>
+      enqueueOpenPrompt({
+        id: "r1",
+        source: "command",
+        url: "http://localhost:5173/",
+        threadRef,
+        threadTitle: "Fix login",
+      }),
+    );
+    expect(container.textContent).toContain(
+      "A command in Fix login wants to open http://localhost:5173/ on Build box",
+    );
+
+    await act(async () => button("Open").click());
+    expect(order).toEqual(["navigate", "open"]);
+    expect(h.navigate).toHaveBeenCalledWith({
+      to: "/$environmentId/$threadId",
+      params: { environmentId: threadRef.environmentId, threadId: threadRef.threadId },
+    });
+    expect(h.openLink).toHaveBeenCalledWith(expect.objectContaining({ threadRef }));
+  });
+
+  it("offers the request again when the internal browser fails to open it", async () => {
+    let failed!: () => void;
+    h.openLink.mockImplementationOnce((input: { onError: () => void }) => {
+      failed = input.onError;
+      return "app";
+    });
+    await act(async () =>
+      enqueueOpenPrompt({ id: "r1", source: "command", url: "http://localhost:5173/", threadRef }),
+    );
+    await act(async () => button("Open").click());
+    expect(container.textContent).toBe("");
+
+    await act(async () => failed());
+    expect(container.textContent).toContain("A command wants to open http://localhost:5173/");
+  });
+
+  it("says how to stop a blocked tab and offers the link to copy", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    h.openLink.mockImplementationOnce((input: { onPopupBlocked: (url: string) => void }) =>
+      input.onPopupBlocked("http://localhost:5173/"),
+    );
+    await act(async () =>
+      enqueueOpenPrompt({ id: "r1", source: "command", url: "http://localhost:5173/", threadRef }),
+    );
+    expect(container.textContent).not.toContain("Allow pop-ups");
+    await act(async () => button("Open").click());
+
+    expect(container.textContent).toContain("Allow pop-ups for this site to open links directly.");
+    await act(async () => button("Copy link").click());
+    expect(writeText).toHaveBeenCalledWith("http://localhost:5173/");
+    // Copying doesn't answer the request.
+    expect(container.textContent).toContain("http://localhost:5173/");
   });
 });

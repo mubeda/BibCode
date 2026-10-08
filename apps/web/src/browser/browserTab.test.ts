@@ -24,6 +24,19 @@ describe("openPendingTab", () => {
     expect(close).toHaveBeenCalled();
   });
 
+  it("closes the tab instead of navigating it to anything but http(s)", () => {
+    const replace = vi.fn();
+    const close = vi.fn();
+    vi.stubGlobal("window", { open: () => ({ opener: null, location: { replace }, close }) });
+
+    for (const url of ["javascript:alert(1)", "file:///etc/passwd", "not a url"]) {
+      openPendingTab()?.navigate(url);
+    }
+
+    expect(replace).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(3);
+  });
+
   it("returns null when the popup is blocked", () => {
     vi.stubGlobal("window", { open: vi.fn(() => null) });
     expect(openPendingTab()).toBeNull();

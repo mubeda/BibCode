@@ -10,8 +10,12 @@ import { previewEnvironment } from "~/state/preview";
 import { useAtomCommand } from "~/state/use-atom-command";
 
 import { acquireDesktopTab } from "./desktopTabLifetime";
-import { showPreviewUnreachableMessage } from "./linkNotices";
-import { releasePreviewTab, resolveForNavigation } from "./previewGateway";
+import {
+  releasePreviewTabAfterGrace,
+  resolveForNavigation,
+  retainPreviewTab,
+} from "./previewGateway";
+import { failPreviewTabNavigation } from "./previewTabFailure";
 
 export interface DesktopPreviewTabHostDescriptor {
   readonly tabId: string;
@@ -74,6 +78,7 @@ export function NativePreviewTabHost(props: {
 
   useEffect(() => {
     let disposed = false;
+    retainPreviewTab(tabId);
     const lease = acquireDesktopTab(tabId);
     const initialUrl = initialUrlRef.current;
     const {
@@ -97,29 +102,17 @@ export function NativePreviewTabHost(props: {
             await lease.navigate(target.url, () => !disposed);
             return;
           }
-          // A failure of this client's own reach stays local: another client
-          // may load the page fine, so it must not see a failed tab.
-          if (!target.refusedByServer) {
-            showPreviewUnreachableMessage(target.message, initialUrl);
-            return;
-          }
-          // Nothing loads, so no native status follows: fail the tab with the
-          // server's reason instead of leaving it Loading. Reload retries it.
-          await report({
-            environmentId: ref.environmentId,
-            input: {
-              threadId: ref.threadId,
-              tabId,
-              canGoBack: false,
-              canGoForward: false,
-              navStatus: {
-                _tag: "LoadFailed",
-                url: initialUrl,
-                title: "",
-                code: 0,
-                description: target.message.replace(/\.$/, ""),
-              },
-            },
+          // Something loaded meanwhile (a Reload or an agent, even to this same
+          // URL): this late failure must not cover it. A fresh native view
+          // resetting to Idle (no URL) loaded nothing.
+          const nativeUrl = readNativeUrl(ref, tabId);
+          if (nativeUrl !== null && nativeUrl !== nativeUrlAtMount) return;
+          await failPreviewTabNavigation({
+            threadRef: ref,
+            tabId,
+            url: initialUrl,
+            failure: target,
+            reportStatus: report,
           });
         })
         .catch(() => undefined);
@@ -127,7 +120,8 @@ export function NativePreviewTabHost(props: {
     return () => {
       disposed = true;
       lease.release();
-      releasePreviewTab(ref.environmentId, tabId);
+      // Switching tabs unmounts this host; switching back soon reuses the forwards.
+      releasePreviewTabAfterGrace(ref.environmentId, tabId);
     };
   }, [tabId]);
 

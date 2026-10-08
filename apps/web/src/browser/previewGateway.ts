@@ -28,7 +28,7 @@ export type PreviewNavigationResolution =
       /**
        * The server's gateway refused the URL, so every client sees the same
        * failure. Otherwise the cause is this client's own reach (SSH forward,
-       * connection, transport) and must stay out of shared preview state.
+       * connection, session, transport) and must stay out of shared preview state.
        */
       readonly refusedByServer?: true;
       /** Transient: the same request may succeed if tried again (unlike HTTPS or a stopped server). */
@@ -37,45 +37,56 @@ export type PreviewNavigationResolution =
 
 const BOOTSTRAP_PATH = "/__bibcode/bootstrap";
 
+/** A tab whose host unmounted keeps its forwards this long, so switching back reuses them. */
+export const TAB_RELEASE_GRACE_MS = 60_000;
+/** An open handed to the system browser has no tab to end with; its forward lives this long. */
+export const UNTRACKED_LEASE_MS = 5 * 60_000;
+
+/** The desktop bridge's exact rejection when the environment's SSH tunnel is down. */
+const SSH_NOT_ACTIVE = "SSH connection is not active.";
+
 /** Client-facing gateway origin -> canonical origin (`http://localhost:<port>`). */
 const canonicalOrigins = new Map<string, string>();
 
 interface SshForward {
   readonly target: DesktopSshEnvironmentTarget;
   readonly gatewayPort: number;
-  /** `http://127.0.0.1:<localPort>`; forgotten with the forward so a reused port isn't mapped. */
-  readonly clientOrigin: string;
 }
 
 /**
- * One thread's canonical origin over SSH and the forward its tabs share (the
- * server keeps one gateway listener per thread and upstream port). The forward
- * lives while a tab holds the entry or a tab's resolution is still pending.
+ * One thread's canonical origin over SSH and the forward its holders share
+ * (the server keeps one gateway listener per thread and upstream port). A
+ * holder is a tab or the timed lease of an untracked open. The forward lives
+ * while a holder remains or a resolution is still pending.
  */
 interface SshForwardEntry {
   forward: SshForward | null;
   readonly holders: Set<string>;
   pending: number;
+  /**
+   * Every local client origin this entry installed, kept until the entry goes:
+   * a tab's native history can go Back to a replaced forward's origin.
+   */
+  readonly origins: Set<string>;
 }
 
 /** Per environment: `<threadId> <canonical origin>` -> forward bookkeeping. */
 const sshForwards = new Map<EnvironmentId, Map<string, SshForwardEntry>>();
 
-/** Bumped when a tab closes, so a resolution that outlives its tab never holds a forward. */
+/** Bumped when a tab is released, so a resolution that outlives its tab never holds a forward. */
 const tabGenerations = new Map<string, number>();
 
-/** The SSH forward that last installed each local client origin. */
-const originOwners = new Map<string, SshForward>();
+/** Grace releases waiting for tabs whose host unmounted. */
+const tabReleaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-/** Forgets a forward's client origin unless a newer forward has reused that local port. */
-function forgetOrigin(forward: SshForward): void {
-  if (originOwners.get(forward.clientOrigin) !== forward) return;
-  originOwners.delete(forward.clientOrigin);
-  canonicalOrigins.delete(forward.clientOrigin);
-}
+/** Running leases of untracked opens. */
+const leaseTimers = new Set<ReturnType<typeof setTimeout>>();
+let nextLeaseId = 0;
+
+/** The entry that last installed each local client origin. */
+const originOwners = new Map<string, SshForwardEntry>();
 
 function releaseForward(forward: SshForward): void {
-  forgetOrigin(forward);
   void window.desktopBridge
     ?.releaseSshForward(forward.target, forward.gatewayPort)
     .catch(() => undefined);
@@ -100,7 +111,7 @@ function openEntry(environmentId: EnvironmentId, key: string): SshForwardEntry {
   }
   let entry = entries.get(key);
   if (!entry) {
-    entry = { forward: null, holders: new Set(), pending: 0 };
+    entry = { forward: null, holders: new Set(), pending: 0, origins: new Set() };
     entries.set(key, entry);
   }
   return entry;
@@ -110,19 +121,46 @@ function releaseIfUnused(environmentId: EnvironmentId, key: string, entry: SshFo
   if (entry.holders.size > 0 || entry.pending > 0) return;
   if (sshForwards.get(environmentId)?.get(key) === entry)
     sshForwards.get(environmentId)?.delete(key);
+  // A newer entry that reused one of these local ports keeps its mapping.
+  for (const origin of entry.origins) {
+    if (originOwners.get(origin) !== entry) continue;
+    originOwners.delete(origin);
+    canonicalOrigins.delete(origin);
+  }
   if (entry.forward) releaseForward(entry.forward);
 }
 
+function releaseHolder(environmentId: EnvironmentId, holder: string): void {
+  for (const [key, entry] of sshForwards.get(environmentId) ?? []) {
+    if (entry.holders.delete(holder)) releaseIfUnused(environmentId, key, entry);
+  }
+}
+
 /**
- * Stops tracking a closed tab; releases each SSH forward no tab uses any more.
- * A tab holds every origin it has shown until then, because its native
- * history can go Back to any of them without resolving again.
+ * Stops tracking a tab now (its shared preview tab closed) and releases each
+ * SSH forward nothing else holds. A tab holds every origin it has shown until
+ * then, because its native history can go Back to any of them without
+ * resolving again.
  */
 export function releasePreviewTab(environmentId: EnvironmentId, tabId: string): void {
+  retainPreviewTab(tabId);
   tabGenerations.set(tabId, (tabGenerations.get(tabId) ?? 0) + 1);
-  for (const [key, entry] of sshForwards.get(environmentId) ?? []) {
-    if (entry.holders.delete(tabId)) releaseIfUnused(environmentId, key, entry);
-  }
+  releaseHolder(environmentId, tabId);
+}
+
+/** The tab's host unmounted: release the tab unless it mounts again within the grace period. */
+export function releasePreviewTabAfterGrace(environmentId: EnvironmentId, tabId: string): void {
+  if (tabReleaseTimers.has(tabId)) return;
+  const timer = setTimeout(() => releasePreviewTab(environmentId, tabId), TAB_RELEASE_GRACE_MS);
+  tabReleaseTimers.set(tabId, timer);
+}
+
+/** The tab's host mounted again: cancel its grace release and keep its forwards. */
+export function retainPreviewTab(tabId: string): void {
+  const timer = tabReleaseTimers.get(tabId);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  tabReleaseTimers.delete(tabId);
 }
 
 /** Resolve a canonical preview URL to the URL this client's webview should load. */
@@ -131,7 +169,11 @@ export async function resolveForNavigation(input: {
   threadId: ThreadId;
   canonicalUrl: string;
   gatewayOpen: GatewayOpenMutation;
-  /** The preview tab that will load the URL; ties an SSH forward to the tab's lifetime. */
+  /**
+   * The preview tab that will load the URL; ties an SSH forward to the tab's
+   * lifetime. Without one (the system browser), the forward is leased for
+   * `UNTRACKED_LEASE_MS`.
+   */
   tabId?: string;
 }): Promise<PreviewNavigationResolution> {
   const { environmentId, tabId } = input;
@@ -145,7 +187,9 @@ export async function resolveForNavigation(input: {
   if (resolution.kind === "reachable") return { kind: "ok", url: resolution.url };
 
   const canonical = new URL(resolution.url);
-  const label = readPreparedConnection(environmentId)?.label ?? "This environment";
+  const connectionLabel = readPreparedConnection(environmentId)?.label;
+  // Used mid-sentence; only the "isn't connected" copy starts with it.
+  const label = connectionLabel ?? "this environment";
   // Only the desktop host can run the SSH forward; refuse before the server admits a target.
   if (resolution.via === "ssh" && isBrowserMode()) {
     return { kind: "unreachable", message: UNREACHABLE_MESSAGES.ssh(label) };
@@ -153,22 +197,22 @@ export async function resolveForNavigation(input: {
   // Opened before any await so a close or a sibling's failure during this
   // resolution cannot release the forward it is about to use.
   const key = `${input.threadId} ${canonical.origin}`;
-  const tracked = resolution.via === "ssh" && tabId !== undefined;
-  const entry = tracked ? openEntry(environmentId, key) : null;
+  const entry = resolution.via === "ssh" ? openEntry(environmentId, key) : null;
   const generation = tabId === undefined ? 0 : (tabGenerations.get(tabId) ?? 0);
   if (entry) entry.pending += 1;
-  const settle = (forward: SshForward | null) => {
-    if (!entry || tabId === undefined) return;
+  const settle = (forward: SshForward | null, clientOrigin?: string) => {
+    if (!entry) return;
     entry.pending -= 1;
-    if (forward) {
+    if (forward && clientOrigin !== undefined) {
       if (entry.forward && entry.forward.gatewayPort !== forward.gatewayPort) {
+        // The server replaced the listener; the old forward leads nowhere.
         releaseForward(entry.forward);
-      } else if (entry.forward && entry.forward.clientOrigin !== forward.clientOrigin) {
-        // Same listener, new local port (the tunnel reconnected): the old one is gone.
-        forgetOrigin(entry.forward);
       }
       entry.forward = forward;
-      if ((tabGenerations.get(tabId) ?? 0) === generation) entry.holders.add(tabId);
+      entry.origins.add(clientOrigin);
+      originOwners.set(clientOrigin, entry);
+      if (tabId === undefined) holdForUntrackedOpen(environmentId, key, entry);
+      else if ((tabGenerations.get(tabId) ?? 0) === generation) entry.holders.add(tabId);
     }
     releaseIfUnused(environmentId, key, entry);
   };
@@ -198,17 +242,18 @@ export async function resolveForNavigation(input: {
       // Forwards end when the managed tunnel reconnects; the bridge call is
       // idempotent while one is alive, so every navigation re-establishes it.
       localPort = await bridge.sshForward(target, gatewayPort);
-    } catch {
-      return fail({ message: UNREACHABLE_MESSAGES.disconnected(label), retryable: true });
+    } catch (cause) {
+      return fail({
+        message: isSshNotActive(cause)
+          ? UNREACHABLE_MESSAGES.disconnected(connectionLabel ?? "This environment")
+          : retryMessage(label),
+        retryable: true,
+      });
     }
     clientOrigin = `http://127.0.0.1:${localPort}`;
-    const forward: SshForward = { target, gatewayPort, clientOrigin };
     // Mapped before settling: settling may release (and forget) it at once.
     canonicalOrigins.set(clientOrigin, canonical.origin);
-    originOwners.set(clientOrigin, forward);
-    // ponytail: an untracked open (no tab, e.g. the system browser) shares the
-    // tab's forward and ends with it; give it its own lease if that matters.
-    settle(forward);
+    settle({ target, gatewayPort }, clientOrigin);
   }
 
   const to = `${canonical.pathname}${canonical.search}${canonical.hash}`;
@@ -216,6 +261,27 @@ export async function resolveForNavigation(input: {
     kind: "ok",
     url: `${clientOrigin}${BOOTSTRAP_PATH}?cap=${encodeURIComponent(capability)}&to=${encodeURIComponent(to)}`,
   };
+}
+
+/** An open with no tab (the system browser) holds its forward for a fixed time. */
+function holdForUntrackedOpen(
+  environmentId: EnvironmentId,
+  key: string,
+  entry: SshForwardEntry,
+): void {
+  const holder = `lease:${++nextLeaseId}`;
+  entry.holders.add(holder);
+  const timer = setTimeout(() => {
+    leaseTimers.delete(timer);
+    entry.holders.delete(holder);
+    releaseIfUnused(environmentId, key, entry);
+  }, UNTRACKED_LEASE_MS);
+  leaseTimers.add(timer);
+}
+
+function isSshNotActive(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : cause;
+  return message === SSH_NOT_ACTIVE;
 }
 
 type GatewayFailure = {
@@ -232,7 +298,11 @@ function gatewayFailure(
   label: string,
   canonical: URL,
 ): GatewayFailure {
-  const error = squashAtomCommandFailure(result) as { _tag?: unknown; reason?: unknown } | null;
+  const error = squashAtomCommandFailure(result) as {
+    _tag?: unknown;
+    reason?: unknown;
+    message?: unknown;
+  } | null;
   if (error?._tag !== "PreviewGatewayError") {
     return { message: retryMessage(label), retryable: true };
   }
@@ -243,13 +313,21 @@ function gatewayFailure(
         `HTTPS dev servers can't be previewed through the gateway yet; serve over HTTP or open it on ${label} directly.`,
       );
     case "not-admitted":
-      return refused("Open this address from the thread's terminal or chat first, then try again.");
+      return refused(`BiBCode can only preview plain HTTP addresses on ${label}'s own localhost.`);
     case "no-upstream":
       // A stopped dev server is recoverable; say so instead of "unsupported".
       return refused(`Nothing is listening on port ${canonical.port || "80"} on ${label}.`);
+    // Matched as a string: the server adds "not-reachable" to the contracts'
+    // reason union in a parallel change (public or proxied server address).
+    case "not-reachable":
+      if (typeof error.message === "string") {
+        return refused(`${error.message} Open it on ${label} directly.`);
+      }
+      return refused(`Previews aren't available on this address. Open it on ${label} directly.`);
     default:
-      // An expired session, a gateway shutdown or a bind failure: worth retrying.
-      return { ...refused(retryMessage(label)), retryable: true };
+      // This client's expired session, a gateway shutdown or a bind failure:
+      // another client may load the page fine, and a retry may too.
+      return { message: retryMessage(label), retryable: true };
   }
 }
 
@@ -259,6 +337,15 @@ export function isGatewayBootstrapUrl(url: string | null): boolean {
   try {
     const parsed = new URL(url);
     return parsed.pathname === BOOTSTRAP_PATH && canonicalOrigins.has(parsed.origin);
+  } catch {
+    return false;
+  }
+}
+
+/** True for a URL on one of this client's gateway origins (a LAN address or an SSH forward). */
+export function isGatewayClientUrl(url: string): boolean {
+  try {
+    return canonicalOrigins.has(new URL(url).origin);
   } catch {
     return false;
   }
@@ -283,6 +370,9 @@ export function canonicalizePreviewUrl(url: string): string {
 
 /** Test seam. */
 export function resetPreviewGatewayForTests(): void {
+  for (const timer of [...tabReleaseTimers.values(), ...leaseTimers]) clearTimeout(timer);
+  tabReleaseTimers.clear();
+  leaseTimers.clear();
   canonicalOrigins.clear();
   originOwners.clear();
   sshForwards.clear();

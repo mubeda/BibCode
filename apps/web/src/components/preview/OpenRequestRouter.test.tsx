@@ -16,6 +16,11 @@ const h = vi.hoisted(() => ({
   openPreview: vi.fn(),
   environments: [] as Array<{ environmentId: string }>,
   centerPanels: {} as Record<string, unknown>,
+  threadTitles: {} as Record<string, string>,
+}));
+vi.mock("~/state/entities", () => ({
+  readThreadShell: (ref: { threadId: string }) =>
+    h.threadTitles[ref.threadId] === undefined ? null : { title: h.threadTitles[ref.threadId] },
 }));
 let browserLinkTarget = "app";
 vi.mock("~/hooks/useSettings", () => ({
@@ -96,6 +101,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   h.environments = [{ environmentId }];
   h.centerPanels = {};
+  h.threadTitles = {};
   (window as { desktopBridge?: unknown }).desktopBridge = { preview: {} };
 });
 
@@ -145,15 +151,78 @@ describe("OpenRequestRouter", () => {
     warn.mockRestore();
   });
 
-  it("ignores open requests for threads not on screen", async () => {
+  it("asks about a request for a thread not on screen after giving others a chance", async () => {
+    vi.useFakeTimers();
+    try {
+      h.claim.mockResolvedValue(AsyncResult.success({ claimed: true }));
+      h.threadTitles = { "thread-1": "Fix login" };
+      const registry = fakeRegistry();
+      await mount(registry, routerOn("thread-2"));
+
+      await act(async () => registry.emit(`events:${environmentId}`, openRequested("thread-1")));
+      expect(h.claim).not.toHaveBeenCalled();
+
+      await act(async () => vi.advanceTimersByTime(2_000));
+      expect(h.claim).toHaveBeenCalledTimes(1);
+      // Opening from a thread the user isn't looking at needs their click, in every mode.
+      expect(h.openLink).not.toHaveBeenCalled();
+      expect(h.enqueueOpenPrompt).toHaveBeenCalledWith({
+        id: "req-1",
+        source: "command",
+        url: "http://localhost:5173/",
+        threadRef,
+        threadTitle: "Fix login",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never claims an off-screen request from a hidden client", async () => {
+    vi.useFakeTimers();
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    try {
+      const registry = fakeRegistry();
+      await mount(registry, routerOn("thread-2"));
+
+      await act(async () => registry.emit(`events:${environmentId}`, openRequested("thread-1")));
+      await act(async () => vi.advanceTimersByTime(2_000));
+
+      expect(h.claim).not.toHaveBeenCalled();
+    } finally {
+      visibility.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does nothing with a claim that settles after it unmounted", async () => {
+    let finish!: (value: unknown) => void;
+    h.claim.mockReturnValue(new Promise((resolve) => (finish = resolve)));
     const registry = fakeRegistry();
-    await mount(registry, routerOn("thread-2"));
-    await mount(registry, routerOn(null));
+    await mount(registry, routerOn("thread-1"));
 
     await act(async () => registry.emit(`events:${environmentId}`, openRequested("thread-1")));
+    for (const root of roots.splice(0)) await act(async () => root.unmount());
+    await act(async () => finish(AsyncResult.success({ claimed: true })));
 
-    expect(h.claim).not.toHaveBeenCalled();
     expect(h.openLink).not.toHaveBeenCalled();
+  });
+
+  it("remembers a bounded number of handled requests", async () => {
+    h.claim.mockResolvedValue(AsyncResult.success({ claimed: false }));
+    const registry = fakeRegistry();
+    await mount(registry, routerOn("thread-1"));
+
+    await act(async () => {
+      for (let i = 0; i <= 256; i += 1) {
+        registry.emit(`events:${environmentId}`, openRequested("thread-1", `r${i}`));
+      }
+      // The newest is still remembered; the oldest has been forgotten.
+      registry.emit(`events:${environmentId}`, openRequested("thread-1", "r256"));
+      registry.emit(`events:${environmentId}`, openRequested("thread-1", "r0"));
+    });
+
+    expect(h.claim).toHaveBeenCalledTimes(258);
   });
 
   it("routes requests from a chat panel shown beside the routed thread", async () => {

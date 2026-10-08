@@ -17,9 +17,14 @@ import {
   canonicalizePreviewUrl,
   type GatewayOpenMutation,
   isGatewayBootstrapUrl,
+  isGatewayClientUrl,
   releasePreviewTab,
+  releasePreviewTabAfterGrace,
   resetPreviewGatewayForTests,
   resolveForNavigation,
+  retainPreviewTab,
+  TAB_RELEASE_GRACE_MS,
+  UNTRACKED_LEASE_MS,
 } from "./previewGateway";
 
 const environmentId = EnvironmentId.make("environment-1");
@@ -148,7 +153,7 @@ describe("resolveForNavigation", () => {
     });
   });
 
-  it("maps a not-admitted rejection to the open-it-first copy", async () => {
+  it("maps a not-admitted rejection to the plain-HTTP-localhost copy", async () => {
     readPreparedConnection.mockReturnValue(lan());
     const gatewayOpen = vi.fn(async () => refused("not-admitted"));
 
@@ -161,8 +166,49 @@ describe("resolveForNavigation", () => {
       }),
     ).resolves.toEqual({
       kind: "unreachable",
-      message: "Open this address from the thread's terminal or chat first, then try again.",
+      message: "BiBCode can only preview plain HTTP addresses on Build box's own localhost.",
       refusedByServer: true,
+    });
+  });
+
+  it("shows the server's not-reachable reason and where to open it instead", async () => {
+    readPreparedConnection.mockReturnValue(lan());
+    // The contracts gain this reason in a parallel server change; until then
+    // the schema class refuses it, so build the decoded error's shape.
+    const notReachable = {
+      _tag: "PreviewGatewayError",
+      reason: "not-reachable",
+      message: "Previews aren't available on a public address.",
+    };
+
+    await expect(
+      resolveForNavigation({
+        environmentId,
+        threadId,
+        canonicalUrl: "http://localhost:5173/",
+        gatewayOpen: async () => AsyncResult.failure(Cause.fail(notReachable)),
+      }),
+    ).resolves.toEqual({
+      kind: "unreachable",
+      message: "Previews aren't available on a public address. Open it on Build box directly.",
+      refusedByServer: true,
+    });
+  });
+
+  it("names a missing environment in lower case mid-sentence", async () => {
+    // Reachability is classified with the connection, which then drops before the label is read.
+    let calls = 0;
+    readPreparedConnection.mockImplementation(() => (calls++ < 2 ? lan() : undefined));
+
+    await expect(
+      resolveForNavigation({
+        environmentId,
+        threadId,
+        canonicalUrl: "http://localhost:5173/",
+        gatewayOpen: async () => refused("not-admitted"),
+      }),
+    ).resolves.toMatchObject({
+      message: "BiBCode can only preview plain HTTP addresses on this environment's own localhost.",
     });
   });
 
@@ -438,10 +484,10 @@ describe("ssh forward bookkeeping", () => {
         gatewayOpen,
       });
 
+    // "unavailable" (e.g. this client's expired session) stays out of shared state.
     await expect(resolveWith(async () => refused("unavailable"))).resolves.toEqual({
       kind: "unreachable",
       message: retry,
-      refusedByServer: true,
       retryable: true,
     });
     // A transport failure is this client's problem, not shared preview state.
@@ -454,20 +500,34 @@ describe("ssh forward bookkeeping", () => {
 
   it("keeps a failed SSH forward local to this client", async () => {
     readPreparedConnection.mockReturnValue(ssh());
-    sshForward.mockRejectedValueOnce(new Error("SSH connection is not active."));
-    await expect(
+    const resolve = () =>
       resolveForNavigation({
         environmentId,
         threadId,
         canonicalUrl: "http://localhost:5173/",
         tabId: "tab-a",
         gatewayOpen: async () => opened(41000),
-      }),
-    ).resolves.toEqual({
+      });
+    const disconnected = {
       kind: "unreachable",
       message: "Build box isn't connected. Reconnect it, then open the link again.",
       retryable: true,
+    };
+    // The Tauri bridge rejects with the bare string.
+    sshForward.mockRejectedValueOnce("SSH connection is not active.");
+    await expect(resolve()).resolves.toEqual(disconnected);
+    sshForward.mockRejectedValueOnce(new Error("SSH connection is not active."));
+    await expect(resolve()).resolves.toEqual(disconnected);
+
+    // Any other rejection (forward budget, readiness timeout) is worth a retry.
+    sshForward.mockRejectedValueOnce("SSH port forward did not become ready.");
+    await expect(resolve()).resolves.toEqual({
+      kind: "unreachable",
+      message:
+        "Couldn't open a preview connection to Build box. Try again, or reconnect Build box if it keeps failing.",
+      retryable: true,
     });
+    expect(releaseSshForward).not.toHaveBeenCalled();
   });
 
   it("forgets a released forward's client origin so a reused local port stays itself", async () => {
@@ -512,10 +572,143 @@ describe("ssh forward bookkeeping", () => {
     expect(canonicalizePreviewUrl("http://127.0.0.1:50000/x")).toBe("http://localhost:5173/x");
   });
 
+  it("still canonicalizes Back to a replaced forward's origin until the tab is released", async () => {
+    readPreparedConnection.mockReturnValue(ssh());
+    const resolve = (gatewayPort: number) =>
+      resolveForNavigation({
+        environmentId,
+        threadId,
+        canonicalUrl: "http://localhost:5173/",
+        tabId: "tab-a",
+        gatewayOpen: async () => opened(gatewayPort),
+      });
+    await resolve(41000); // local 50000
+    // The listener was torn down and replaced; the new forward gets a new local port.
+    await resolve(41002); // local 50001
+
+    expect(releaseSshForward.mock.calls).toEqual([[sshTarget, 41000]]);
+    // History Back lands on the old local origin: shared state must stay canonical.
+    expect(canonicalizePreviewUrl("http://127.0.0.1:50000/back")).toBe(
+      "http://localhost:5173/back",
+    );
+    expect(isGatewayClientUrl("http://127.0.0.1:50000/back")).toBe(true);
+
+    releasePreviewTab(environmentId, "tab-a");
+    expect(canonicalizePreviewUrl("http://127.0.0.1:50000/back")).toBe(
+      "http://127.0.0.1:50000/back",
+    );
+    expect(canonicalizePreviewUrl("http://127.0.0.1:50001/x")).toBe("http://127.0.0.1:50001/x");
+    expect(isGatewayClientUrl("http://127.0.0.1:50000/back")).toBe(false);
+  });
+
   it("recognizes only known gateway bootstrap pages", () => {
     expect(isGatewayBootstrapUrl("http://localhost:5173/__bibcode/bootstrap?to=%2F")).toBe(false);
     expect(isGatewayBootstrapUrl("not a url")).toBe(false);
     expect(isGatewayBootstrapUrl(null)).toBe(false);
+  });
+
+  describe("leases", () => {
+    /** A desktop bridge that, like the real one, spawns one ssh child per live gateway port. */
+    function trackChildren() {
+      const live = new Map<number, number>();
+      let spawned = 0;
+      let nextLocal = 60_000;
+      sshForward.mockImplementation(async (_target: unknown, gatewayPort: number) => {
+        if (!live.has(gatewayPort)) {
+          spawned += 1;
+          live.set(gatewayPort, nextLocal++);
+        }
+        return live.get(gatewayPort)!;
+      });
+      releaseSshForward.mockImplementation(async (_target: unknown, gatewayPort: number) => {
+        live.delete(gatewayPort);
+      });
+      return { live, spawned: () => spawned };
+    }
+    const resolveTab = (tabId: string | undefined, gatewayPort = 41000, port = 5173) =>
+      resolveForNavigation({
+        environmentId,
+        threadId,
+        canonicalUrl: `http://localhost:${port}/`,
+        ...(tabId === undefined ? {} : { tabId }),
+        gatewayOpen: async () => opened(gatewayPort),
+      });
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      readPreparedConnection.mockReturnValue(ssh());
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("keeps a tab's forward through a tab switch and releases it after the grace period", async () => {
+      const children = trackChildren();
+      await resolveTab("tab-a");
+      // Switch to tab B: A's host unmounts.
+      releasePreviewTabAfterGrace(environmentId, "tab-a");
+      await resolveTab("tab-b", 42000, 3000);
+      vi.advanceTimersByTime(TAB_RELEASE_GRACE_MS - 1);
+      // Back to tab A: its host mounts again and resolves its URL again.
+      retainPreviewTab("tab-a");
+      releasePreviewTabAfterGrace(environmentId, "tab-b");
+      await resolveTab("tab-a");
+      vi.advanceTimersByTime(TAB_RELEASE_GRACE_MS);
+
+      expect(children.spawned()).toBe(2);
+      expect(releaseSshForward.mock.calls).toEqual([[sshTarget, 42000]]);
+
+      releasePreviewTabAfterGrace(environmentId, "tab-a");
+      vi.advanceTimersByTime(TAB_RELEASE_GRACE_MS);
+      expect(releaseSshForward.mock.calls).toEqual([
+        [sshTarget, 42000],
+        [sshTarget, 41000],
+      ]);
+      expect(children.live.size).toBe(0);
+    });
+
+    it("releases a closed tab at once, without waiting for the grace period", async () => {
+      await resolveTab("tab-a");
+      releasePreviewTabAfterGrace(environmentId, "tab-a");
+      releasePreviewTab(environmentId, "tab-a");
+      expect(releaseSshForward.mock.calls).toEqual([[sshTarget, 41000]]);
+
+      vi.advanceTimersByTime(TAB_RELEASE_GRACE_MS);
+      expect(releaseSshForward).toHaveBeenCalledTimes(1);
+    });
+
+    it("leases an untracked open's forward for five minutes", async () => {
+      await resolveTab(undefined);
+      vi.advanceTimersByTime(UNTRACKED_LEASE_MS - 1);
+      expect(releaseSshForward).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(releaseSshForward.mock.calls).toEqual([[sshTarget, 41000]]);
+    });
+
+    it("keeps a forward a tab still holds when an untracked lease on it expires", async () => {
+      await resolveTab("tab-a");
+      await resolveTab(undefined);
+      vi.advanceTimersByTime(UNTRACKED_LEASE_MS);
+      expect(releaseSshForward).not.toHaveBeenCalled();
+
+      releasePreviewTab(environmentId, "tab-a");
+      expect(releaseSshForward.mock.calls).toEqual([[sshTarget, 41000]]);
+    });
+
+    it("releases every forward it spawned once no lease remains", async () => {
+      const children = trackChildren();
+      await resolveTab("tab-a");
+      await resolveTab("tab-b");
+      await resolveTab(undefined);
+      await resolveTab("tab-a", 41005); // listener replaced
+      await resolveTab(undefined, 43000, 8080);
+      releasePreviewTabAfterGrace(environmentId, "tab-a");
+      releasePreviewTab(environmentId, "tab-b");
+      vi.advanceTimersByTime(UNTRACKED_LEASE_MS);
+
+      expect(children.live.size).toBe(0);
+      expect(releaseSshForward).toHaveBeenCalledTimes(children.spawned());
+    });
   });
 
   it("releases a forward established after its tab already closed", async () => {

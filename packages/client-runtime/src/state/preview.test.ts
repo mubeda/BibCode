@@ -21,8 +21,10 @@ describe("preview state commands", () => {
 });
 
 describe("preview events", () => {
-  it("delivers every event of a batch, not only the last", async () => {
-    // An open request followed by a navigation in one batch must both reach subscribers.
+  it("delivers every event of a chunk, not only the last", async () => {
+    // A stream atom keeps only the last value of each chunk it receives, so
+    // without one event per chunk every earlier event in a chunk is lost to
+    // subscribers. Two events in one chunk must both arrive.
     const registry = AtomRegistry.make();
     const seen: string[] = [];
     // One chunk of two events, arriving after the subscriber is attached (as RPC events do).

@@ -11,6 +11,7 @@ import { enqueueOpenPrompt } from "~/browser/openPromptQueue";
 import { useCenterPanelStore } from "~/centerPanelStore";
 import { getClientSettings } from "~/hooks/useSettings";
 import type { AppRouter } from "~/router";
+import { readThreadShell } from "~/state/entities";
 import { useEnvironments } from "~/state/environments";
 import { previewEnvironment } from "~/state/preview";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -20,7 +21,10 @@ import { isBrowserMode } from "./previewBridge";
 
 type ScreenRouter = Pick<AppRouter, "state">;
 
-const HIDDEN_CLAIM_DELAY_MS = 2_000;
+/** How long a client that doesn't show the thread, or is hidden, waits before claiming. */
+const CLAIM_DELAY_MS = 2_000;
+/** Request ids remembered against replays; requests expire after 60 s anyway. */
+const HANDLED_LIMIT = 256;
 
 /** Whether a thread is the routed one, a chat panel shown as an active center tab, or neither. */
 function shownAs(host: ScopedThreadRef, threadId: string): "route" | "panel" | null {
@@ -33,7 +37,9 @@ function shownAs(host: ScopedThreadRef, threadId: string): "route" | "panel" | n
 
 /**
  * Opens what a thread's commands ask to open (`$BROWSER`, `bibcode-open-url`).
- * Every client sees the request; only one showing that thread claims it.
+ * Every client sees the request and one claims it: a visible client showing
+ * that thread at once; otherwise, after a short delay, a visible client asks
+ * the user in a prompt naming the thread (or a hidden one showing the thread).
  */
 export function OpenRequestRouter(props: { readonly router: ScreenRouter }) {
   const { environments } = useEnvironments();
@@ -62,9 +68,11 @@ function EnvironmentOpenRequestRouter(props: {
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: true });
 
   useEffect(() => {
+    // Insertion-ordered, so the first entry is the oldest.
     const handled = new Set<string>();
     const timers = new Set<number>();
     let subscribed = false;
+    let disposed = false;
     // `immediate` starts the stream; the value it replays was already delivered.
     const unsubscribe = registry.subscribe(
       previewEnvironment.events({ environmentId, input: {} }),
@@ -73,22 +81,38 @@ function EnvironmentOpenRequestRouter(props: {
         const event = result.value;
         if (event.type !== "openRequested" || handled.has(event.requestId)) return;
         handled.add(event.requestId);
+        if (handled.size > HANDLED_LIMIT) handled.delete(handled.values().next().value!);
         const threadRef = scopeThreadRef(environmentId, event.threadId as ThreadId);
         const shown = () => {
           const host = resolveThreadRouteRef(router.state.matches.at(-1)?.params ?? {});
           return host?.environmentId === environmentId ? shownAs(host, event.threadId) : null;
         };
         const claim = () => {
-          // Checked when claiming: a delayed claim must not take a thread no longer shown.
-          if (shown() === null) return;
+          // Checked when claiming: things changed during a delay.
+          const visible = document.visibilityState !== "hidden";
+          const onScreen = shown() !== null;
+          // A hidden client claims only a thread it shows; nobody would see its prompt.
+          if (!visible && !onScreen) return;
           void claimOpenRequest({ environmentId, input: { requestId: event.requestId } }).then(
             (result) => {
+              if (disposed) return;
               if (result._tag !== "Success") {
                 // The URL can carry a capability-bearing path; log only the request.
                 console.warn("Couldn't claim the preview open request", event.requestId);
                 return;
               }
               if (!result.value.claimed) return;
+              if (!onScreen) {
+                // No client shows the thread: ask, naming it, and show it on Open.
+                enqueueOpenPrompt({
+                  id: event.requestId,
+                  source: "command",
+                  url: event.url,
+                  threadRef,
+                  threadTitle: readThreadShell(threadRef)?.title ?? "another thread",
+                });
+                return;
+              }
               if (isBrowserMode()) {
                 // No click backs this open, so a browser would block the new tab.
                 enqueueOpenPrompt({
@@ -106,21 +130,23 @@ function EnvironmentOpenRequestRouter(props: {
             },
           );
         };
-        if (document.visibilityState !== "hidden") {
+        if (document.visibilityState !== "hidden" && shown() !== null) {
           claim();
           return;
         }
-        // A hidden client claims only if no visible one has; requests expire after 60 s.
+        // A visible client showing the thread claims first; after the delay a
+        // visible one asks about a thread off screen. Requests expire after 60 s.
         const timer = window.setTimeout(() => {
           timers.delete(timer);
           claim();
-        }, HIDDEN_CLAIM_DELAY_MS);
+        }, CLAIM_DELAY_MS);
         timers.add(timer);
       },
       { immediate: true },
     );
     subscribed = true;
     return () => {
+      disposed = true;
       unsubscribe();
       for (const timer of timers) window.clearTimeout(timer);
     };

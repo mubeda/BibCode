@@ -15,6 +15,8 @@ export interface OpenPrompt {
   readonly environmentLabel: string;
   /** The browser blocked the new tab the last attempt opened. */
   readonly blocked: boolean;
+  /** Set when the asking thread isn't on screen; Open shows that thread first. */
+  readonly threadTitle?: string;
 }
 
 export const useOpenPromptStore = create<{ prompts: readonly OpenPrompt[] }>(() => ({
@@ -29,6 +31,7 @@ export function enqueueOpenPrompt(prompt: {
   readonly url: string;
   readonly threadRef: ScopedThreadRef;
   readonly blocked?: boolean;
+  readonly threadTitle?: string | undefined;
 }): void {
   const id = prompt.id ?? `prompt-${++nextPromptId}`;
   const queued: OpenPrompt = {
@@ -39,6 +42,7 @@ export function enqueueOpenPrompt(prompt: {
     environmentLabel:
       readPreparedConnection(prompt.threadRef.environmentId)?.label ?? "this environment",
     blocked: prompt.blocked ?? false,
+    ...(prompt.threadTitle === undefined ? {} : { threadTitle: prompt.threadTitle }),
   };
   useOpenPromptStore.setState(({ prompts }) =>
     prompts.some((p) => p.id === id) ? { prompts } : { prompts: [...prompts, queued] },

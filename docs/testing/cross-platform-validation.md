@@ -2714,8 +2714,9 @@ browser tab), the environment's address, and each gateway port.
   shim. `"$BROWSER" http://localhost:8123/` prints nothing and exits 0; on
   desktop the address opens like a clicked link, and in a browser tab the "A
   command wants to open <address>" bar appears. With two clients showing the thread, only one opens it; a client
-  showing another thread does nothing; a client in a hidden window loses to a
-  visible one. With the token unset
+  in a hidden window loses to a visible one. With every client on another
+  thread, after 2 seconds one visible client shows "A command in <thread title>
+  wants to open <address>", and **Open** switches to that thread and opens it. With the token unset
   (`env -u BIBCODE_OPEN_URL_TOKEN "$BROWSER" http://localhost:8123/`), it prints
   the address and exits 0. `"$BROWSER" file:///etc/hosts` writes
   `bibcode open-url: expected an http(s) URL` and exits 2.

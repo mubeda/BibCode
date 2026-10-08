@@ -38,6 +38,8 @@ const h = vi.hoisted(() => {
     gateway: false,
     gatewayNavUrl: "http://10.0.0.2:41000/__bibcode/bootstrap?cap=CAP&to=%2F",
     gatewayUnreachableMessage: null as string | null,
+    gatewayRefusedByServer: false,
+    localFailureCalls: [] as unknown[],
     holdNextResolve: false,
     releaseHeldResolve: () => undefined as void,
     resolveForNavigationCalls: [] as Array<{ canonicalUrl: string; tabId?: string }>,
@@ -136,6 +138,7 @@ vi.mock("~/localApi", () => ({
 }));
 
 vi.mock("~/previewStateStore", () => ({
+  setPreviewLocalFailure: (...args: unknown[]) => h.localFailureCalls.push(args),
   rememberPreviewUrl: (...args: unknown[]) => h.rememberPreviewUrlCalls.push(args),
   updatePreviewServerSnapshot: (...args: unknown[]) => h.updateSnapshotCalls.push(args),
   useThreadPreviewState: () => h.previewState,
@@ -150,6 +153,15 @@ vi.mock("~/browser/browserTargetResolver", () => ({
         : { kind: "reachable", url: h.resolvedUrl },
 }));
 
+const unreachable = () =>
+  h.gatewayUnreachableMessage
+    ? {
+        kind: "unreachable",
+        message: h.gatewayUnreachableMessage,
+        ...(h.gatewayRefusedByServer ? { refusedByServer: true } : {}),
+      }
+    : null;
+
 vi.mock("~/browser/previewGateway", () => ({
   canonicalizePreviewUrl: (url: string) =>
     url.replace("http://127.0.0.1:50000", "http://localhost:5173"),
@@ -159,18 +171,11 @@ vi.mock("~/browser/previewGateway", () => ({
       h.holdNextResolve = false;
       const url = h.gatewayNavUrl;
       return new Promise((resolve) => {
-        h.releaseHeldResolve = () =>
-          resolve(
-            h.gatewayUnreachableMessage
-              ? { kind: "unreachable", message: h.gatewayUnreachableMessage }
-              : { kind: "ok", url },
-          );
+        h.releaseHeldResolve = () => resolve(unreachable() ?? { kind: "ok", url });
       });
     }
     return Promise.resolve(
-      h.gatewayUnreachableMessage
-        ? { kind: "unreachable", message: h.gatewayUnreachableMessage }
-        : { kind: "ok", url: h.gateway ? h.gatewayNavUrl : input.canonicalUrl },
+      unreachable() ?? { kind: "ok", url: h.gateway ? h.gatewayNavUrl : input.canonicalUrl },
     );
   },
 }));
@@ -202,6 +207,7 @@ vi.mock("~/state/preview", () => ({
     navigate: { label: "navigate" },
     resize: { label: "resize" },
     gatewayOpen: { label: "gatewayOpen" },
+    reportStatus: { label: "report" },
   },
 }));
 
@@ -506,6 +512,7 @@ function seedSession(
     activeTabId: "tab-1",
     sessions: { "tab-1": snapshot },
     desktopByTabId: overlay ? { "tab-1": overlay } : {},
+    localFailures: {},
     recentlySeenUrls: ["http://recent.local/"],
   };
 }
@@ -557,6 +564,7 @@ beforeEach(() => {
     activeTabId: null,
     sessions: {},
     desktopByTabId: {},
+    localFailures: {},
     recentlySeenUrls: [],
   };
   h.environment = { label: "Local" };
@@ -571,6 +579,8 @@ beforeEach(() => {
   h.unreachableNotices.length = 0;
   h.gateway = false;
   h.gatewayUnreachableMessage = null;
+  h.gatewayRefusedByServer = false;
+  h.localFailureCalls.length = 0;
   h.holdNextResolve = false;
   h.resolveForNavigationCalls.length = 0;
   h.responsiveSize = { width: 800, height: 600 };
@@ -746,6 +756,32 @@ describe("PreviewView rendering", () => {
     expect(unreachable.code).toBe(-105);
     expect(unreachable.description).toBe("NAME_NOT_RESOLVED");
     expect(markup).toContain("Agent controlling browser");
+  });
+
+  it("covers the native view with this client's own load failure", () => {
+    seedSession();
+    h.previewState = {
+      ...h.previewState,
+      localFailures: {
+        "tab-1": {
+          url: "http://localhost:5173/",
+          code: 0,
+          description: "Build box isn't connected. Reconnect it, then open the link again.",
+        },
+      },
+    };
+    h.previewBridge = makeBridge();
+    renderView();
+
+    // The reused native view must not keep showing the previous page.
+    expect(captured("surfaceSlot").visible).toBe(false);
+    expect(captured("chromeRow").pickDisabled).toBe(true);
+    const unreachable = captured("unreachable");
+    expect(unreachable).toMatchObject({
+      url: "http://localhost:5173/",
+      code: 0,
+      description: "Build box isn't connected. Reconnect it, then open the link again.",
+    });
   });
 
   it("shows the human-control banner when a human drives the browser", () => {
@@ -1034,6 +1070,68 @@ describe("navigation handlers", () => {
     ]);
     expect(h.desktopNavigateCalls).toEqual([["tab-1", h.gatewayNavUrl]]);
     expect(bridgeMethodCalls("refresh")).toHaveLength(0);
+  });
+
+  it("fails the tab on this client when a gateway reload can't reach it from here", async () => {
+    seedSession({
+      navStatus: { _tag: "Success", url: "http://localhost:5173/a", title: "A" },
+      overlay: null,
+    });
+    h.previewBridge = makeBridge();
+    h.gateway = true;
+    h.gatewayUnreachableMessage =
+      "Build box isn't connected. Reconnect it, then open the link again.";
+    renderView();
+
+    (captured("chromeRow").onRefresh as () => void)();
+    await flush();
+
+    expect(h.desktopNavigateCalls).toEqual([]);
+    expect(h.localFailureCalls).toEqual([
+      [
+        threadRef,
+        "tab-1",
+        {
+          url: "http://localhost:5173/a",
+          code: 0,
+          description: "Build box isn't connected. Reconnect it, then open the link again.",
+        },
+      ],
+    ]);
+    expect(h.commandCalls.filter((call) => call.label === "report")).toEqual([]);
+  });
+
+  it("fails the shared tab when the server refuses a gateway reload", async () => {
+    seedSession({
+      navStatus: { _tag: "Success", url: "http://localhost:5173/a", title: "A" },
+      overlay: null,
+    });
+    h.previewBridge = makeBridge();
+    h.gateway = true;
+    h.gatewayUnreachableMessage = "Nothing is listening on port 5173 on Build box.";
+    h.gatewayRefusedByServer = true;
+    renderView();
+
+    (captured("chromeRow").onRefresh as () => void)();
+    await flush();
+
+    expect(h.localFailureCalls).toEqual([[threadRef, "tab-1", null]]);
+    expect(h.commandCalls.filter((call) => call.label === "report")).toMatchObject([
+      {
+        input: {
+          environmentId,
+          input: {
+            tabId: "tab-1",
+            navStatus: {
+              _tag: "LoadFailed",
+              url: "http://localhost:5173/a",
+              code: 0,
+              description: "Nothing is listening on port 5173 on Build box.",
+            },
+          },
+        },
+      },
+    ]);
   });
 
   it("invokes open-in-browser without throwing (local api unavailable under node)", () => {

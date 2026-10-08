@@ -16,7 +16,17 @@ export function openPendingTab(): PendingTab | null {
   // The previewed page must not script BiBCode through window.opener.
   tab.opener = null;
   return {
-    navigate: (url) => tab.location.replace(url),
+    // Only web addresses: a javascript: or file: URL must never run in the new tab.
+    navigate: (url) => (isHttpUrl(url) ? tab.location.replace(url) : tab.close()),
     close: () => tab.close(),
   };
+}
+
+function isHttpUrl(url: string): boolean {
+  try {
+    const { protocol } = new URL(url);
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
 }

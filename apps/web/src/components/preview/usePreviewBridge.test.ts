@@ -51,6 +51,7 @@ const testState = vi.hoisted(() => ({
   },
   clearCalls: [] as string[],
   listener: null as null | ((tabId: string, state: DesktopPreviewTabState) => void),
+  localFailureCalls: [] as unknown[],
   reportCalls: [] as unknown[],
   unsubscribe: vi.fn(),
 }));
@@ -77,6 +78,7 @@ vi.mock("~/previewStateStore", () => ({
   applyPreviewDesktopState: (threadRef: unknown, tabId: string, state: unknown) => {
     testState.appliedStates.push({ threadRef, tabId, state });
   },
+  setPreviewLocalFailure: (...args: unknown[]) => testState.localFailureCalls.push(args),
 }));
 
 vi.mock("~/browser/previewGateway", () => ({
@@ -85,6 +87,7 @@ vi.mock("~/browser/previewGateway", () => ({
       "http://10.0.0.2:41000/__bibcode/bootstrap?cap=C&to=%2Fa",
       "http://localhost:5173/a",
     ),
+  isGatewayClientUrl: (url: string) => url.startsWith("http://10.0.0.2:41000/"),
 }));
 
 vi.mock("~/state/preview", () => ({
@@ -160,6 +163,7 @@ beforeEach(() => {
   };
   testState.clearCalls = [];
   testState.listener = null;
+  testState.localFailureCalls = [];
   testState.reportCalls = [];
   testState.unsubscribe.mockReset();
 });
@@ -318,6 +322,55 @@ describe("usePreviewBridge", () => {
         },
       },
     });
+  });
+
+  it("keeps a failed load on this client's gateway origin local until the next navigation", () => {
+    renderHook();
+    runEffect();
+
+    emit("tab-1", { kind: "Success", url: "http://10.0.0.2:41000/old", title: "Old" });
+    testState.localFailureCalls = [];
+    emit("tab-1", {
+      kind: "LoadFailed",
+      url: "http://10.0.0.2:41000/__bibcode/bootstrap?cap=C&to=%2Fa",
+      title: "",
+      code: -102,
+      description: "ERR_CONNECTION_REFUSED",
+    });
+
+    // Another client may reach the gateway fine: nothing goes to shared state.
+    expect(testState.reportCalls).toHaveLength(1);
+    expect(testState.localFailureCalls).toEqual([
+      [
+        threadRef,
+        "tab-1",
+        { url: "http://localhost:5173/a", code: -102, description: "ERR_CONNECTION_REFUSED" },
+      ],
+    ]);
+
+    emit("tab-1", { kind: "Loading", url: "http://10.0.0.2:41000/x", title: "" });
+    expect(testState.localFailureCalls.at(-1)).toEqual([threadRef, "tab-1", null]);
+  });
+
+  it("clears a local failure when a history move settles without Loading, not on a repeat", () => {
+    renderHook();
+    runEffect();
+    const page = { kind: "Success", url: "http://10.0.0.2:41000/a", title: "A" } as const;
+
+    emit("tab-1", page);
+    emit("tab-1", page); // e.g. a zoom change
+    expect(testState.localFailureCalls).toEqual([]);
+
+    emit("tab-1", {
+      kind: "LoadFailed",
+      url: "http://10.0.0.2:41000/a",
+      title: "",
+      code: -102,
+      description: "ERR_CONNECTION_REFUSED",
+    });
+    // Back to the same page: the host reports only its Success.
+    emit("tab-1", page);
+    expect(testState.localFailureCalls.at(-1)).toEqual([threadRef, "tab-1", null]);
   });
 
   it("clears the pointer when loading begins or a settled URL changes", () => {

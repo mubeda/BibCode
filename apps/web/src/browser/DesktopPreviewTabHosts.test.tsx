@@ -8,8 +8,9 @@ const h = vi.hoisted(() => ({
   resolveCalls: [] as unknown[],
   navigateCalls: [] as string[],
   releasedTabs: [] as string[],
+  retainedTabs: [] as string[],
   reports: [] as unknown[],
-  notices: [] as unknown[],
+  localFailures: [] as unknown[],
   previewState: { sessions: {}, desktopByTabId: {} } as Record<string, unknown>,
 }));
 
@@ -23,7 +24,10 @@ vi.mock("react", async (importOriginal) => {
   };
 });
 vi.mock("~/components/preview/usePreviewBridge", () => ({ usePreviewBridge: () => undefined }));
-vi.mock("~/previewStateStore", () => ({ readThreadPreviewState: () => h.previewState }));
+vi.mock("~/previewStateStore", () => ({
+  readThreadPreviewState: () => h.previewState,
+  setPreviewLocalFailure: (...args: unknown[]) => h.localFailures.push(args),
+}));
 vi.mock("~/state/preview", () => ({
   previewEnvironment: { gatewayOpen: { label: "gatewayOpen" }, reportStatus: { label: "report" } },
 }));
@@ -32,9 +36,6 @@ vi.mock("~/state/use-atom-command", () => ({
     if (command.label === "report") h.reports.push(input);
     return Promise.resolve(undefined);
   },
-}));
-vi.mock("./linkNotices", () => ({
-  showPreviewUnreachableMessage: (...args: unknown[]) => h.notices.push(args),
 }));
 vi.mock("./desktopTabLifetime", () => ({
   acquireDesktopTab: () => ({
@@ -49,7 +50,9 @@ vi.mock("./previewGateway", () => ({
     h.resolveCalls.push(input);
     return new Promise((resolve) => (h.finishResolve = resolve));
   },
-  releasePreviewTab: (_environmentId: unknown, tabId: string) => h.releasedTabs.push(tabId),
+  releasePreviewTabAfterGrace: (_environmentId: unknown, tabId: string) =>
+    h.releasedTabs.push(tabId),
+  retainPreviewTab: (tabId: string) => h.retainedTabs.push(tabId),
 }));
 
 import { NativePreviewTabHost } from "./DesktopPreviewTabHosts";
@@ -78,8 +81,9 @@ beforeEach(() => {
   h.resolveCalls.length = 0;
   h.navigateCalls.length = 0;
   h.releasedTabs.length = 0;
+  h.retainedTabs.length = 0;
   h.reports.length = 0;
-  h.notices.length = 0;
+  h.localFailures.length = 0;
   h.previewState = {
     sessions: { "tab-1": { navStatus: { _tag: "Success", url: initialUrl, title: "" } } },
     desktopByTabId: {},
@@ -108,8 +112,9 @@ describe("NativePreviewTabHost", () => {
     expect(h.navigateCalls).toEqual([]);
   });
 
-  it("fails a refused initial URL with its reason and releases forwards on unmount", async () => {
+  it("fails a refused initial URL with its reason and releases forwards after a grace period", async () => {
     const cleanup = mount();
+    expect(h.retainedTabs).toEqual(["tab-1"]);
     h.finishResolve({
       kind: "unreachable",
       message: "Nothing is listening.",
@@ -117,7 +122,6 @@ describe("NativePreviewTabHost", () => {
     });
     await flush();
     expect(h.navigateCalls).toEqual([]);
-    expect(h.notices).toEqual([]);
     expect(h.reports).toEqual([
       {
         environmentId: threadRef.environmentId,
@@ -131,20 +135,48 @@ describe("NativePreviewTabHost", () => {
             url: initialUrl,
             title: "",
             code: 0,
-            description: "Nothing is listening",
+            description: "Nothing is listening.",
           },
         },
       },
     ]);
+    // The server's reason replaces any earlier failure of this client's own reach.
+    expect(h.localFailures).toEqual([[threadRef, "tab-1", null]]);
     cleanup();
     expect(h.releasedTabs).toEqual(["tab-1"]);
   });
 
-  it("keeps a failure on this client's side out of shared state", async () => {
+  it("drops a late failure once the tab loaded meanwhile, even the same URL", async () => {
+    mount();
+    // A Reload resolved and loaded the initial URL while the first resolution was pending.
+    h.previewState = { ...h.previewState, desktopByTabId: { "tab-1": { url: initialUrl } } };
+    h.finishResolve({ kind: "unreachable", message: "Build box isn't connected." });
+    await flush();
+    expect(h.localFailures).toEqual([]);
+    expect(h.reports).toEqual([]);
+  });
+
+  it("still fails the tab when its remounted native view only reset to Idle", async () => {
+    h.previewState = {
+      ...h.previewState,
+      desktopByTabId: { "tab-1": { url: "http://localhost:5173/old" } },
+    };
+    mount();
+    h.previewState = { ...h.previewState, desktopByTabId: { "tab-1": { url: null } } };
+    h.finishResolve({ kind: "unreachable", message: "Build box isn't connected." });
+    await flush();
+    expect(h.localFailures).toEqual([
+      [threadRef, "tab-1", { url: initialUrl, code: 0, description: "Build box isn't connected." }],
+    ]);
+  });
+
+  it("fails the tab on this client only when the failure is on this client's side", async () => {
     mount();
     h.finishResolve({ kind: "unreachable", message: "Build box isn't connected." });
     await flush();
     expect(h.reports).toEqual([]);
-    expect(h.notices).toEqual([["Build box isn't connected.", initialUrl]]);
+    expect(h.localFailures).toEqual([
+      [threadRef, "tab-1", { url: initialUrl, code: 0, description: "Build box isn't connected." }],
+    ]);
   });
 });

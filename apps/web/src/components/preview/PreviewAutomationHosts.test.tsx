@@ -47,6 +47,7 @@ const h = vi.hoisted(() => {
     // preview state store
     previewState: {} as Record<string, unknown>,
     applyCalls: [] as unknown[],
+    localFailureCalls: [] as unknown[],
     reconcileCalls: [] as unknown[],
     updateCalls: [] as unknown[],
     // atom command / query results
@@ -133,6 +134,7 @@ vi.mock("~/previewStateStore", () => ({
   applyPreviewServerSnapshot: (...args: unknown[]) => h.applyCalls.push(args),
   readThreadPreviewState: () => h.previewState,
   reconcilePreviewServerSessions: (...args: unknown[]) => h.reconcileCalls.push(args),
+  setPreviewLocalFailure: (...args: unknown[]) => h.localFailureCalls.push(args),
   updatePreviewServerSnapshot: (...args: unknown[]) => h.updateCalls.push(args),
 }));
 
@@ -253,6 +255,7 @@ import { PreviewAutomationHosts } from "./PreviewAutomationHosts";
 import { registerPreviewRuntimeCapabilities } from "~/previewRuntimeCapabilities";
 import {
   PreviewAutomationOperationError,
+  PreviewAutomationPageUnreachableError,
   PreviewAutomationRecordingNotActiveError,
   PreviewAutomationTargetUnavailableError,
 } from "./previewAutomationErrors";
@@ -339,8 +342,10 @@ beforeEach(() => {
     snapshot: null,
     sessions: {},
     desktopByTabId: {},
+    localFailures: {},
   };
   h.applyCalls.length = 0;
+  h.localFailureCalls.length = 0;
   h.reconcileCalls.length = 0;
   h.updateCalls.length = 0;
   h.commandCalls.length = 0;
@@ -418,6 +423,7 @@ function seedReadyTab(tabId: string) {
     snapshot,
     sessions: { [tabId]: snapshot },
     desktopByTabId: { [tabId]: { loading: false } },
+    localFailures: {},
   };
   h.target = { snapshot, tabId };
   h.webviews = [makeWebview(tabId)];
@@ -552,6 +558,31 @@ describe("handleRequest: status", () => {
     expect(result.viewportSetting).toEqual(FILL_PREVIEW_VIEWPORT);
   });
 
+  it("reports a tab this client can't load instead of a status that looks fine", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+    h.previewState = {
+      ...h.previewState,
+      localFailures: {
+        "tab-1": {
+          url: "http://localhost:5173/",
+          code: 0,
+          description: "Build box isn't connected. Reconnect it, then open the link again.",
+        },
+      },
+    };
+
+    const error = await handle(makeRequest({ operation: "status", tabId: "tab-1" })).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(error).toBeInstanceOf(PreviewAutomationPageUnreachableError);
+    expect((error as Error).message).toBe(
+      "Preview tab tab-1 couldn't load its page: Build box isn't connected. Reconnect it, then open the link again.",
+    );
+  });
+
   it("derives status from the snapshot navStatus when no desktop overlay exists", async () => {
     const handle = mountHost();
     h.previewState = {
@@ -561,6 +592,7 @@ describe("handleRequest: status", () => {
       },
       sessions: {},
       desktopByTabId: {},
+      localFailures: {},
     };
     h.target = { snapshot: h.previewState.snapshot, tabId: "tab-9" };
     h.webviews = [];
@@ -645,7 +677,7 @@ describe("handleRequest: open", () => {
       _tag: "Success",
       value: { tabId: "tab-new", navStatus: { _tag: "Idle" } },
     });
-    h.previewState = { snapshot: null, sessions: {}, desktopByTabId: {} };
+    h.previewState = { snapshot: null, sessions: {}, desktopByTabId: {}, localFailures: {} };
     h.target = { snapshot: { tabId: "tab-new", navStatus: { _tag: "Idle" } }, tabId: "tab-new" };
     h.webviews = [makeWebview("tab-new")];
 
@@ -698,6 +730,77 @@ describe("handleRequest: open", () => {
     expect(h.commandCalls.find((c) => c.label === "open")?.input).toMatchObject({
       input: { url: h.resolvedUrl },
     });
+  });
+
+  it("waits for a fresh tab's first load and reports why it couldn't load", async () => {
+    const handle = mountHost();
+    h.openTab = null;
+    h.openNeedsOverlay = true;
+    const snapshot = { tabId: "tab-new", navStatus: { _tag: "Loading", url: h.resolvedUrl } };
+    h.commandResults.open = () => ({ _tag: "Success", value: snapshot });
+    // The tab's native host resolved the URL and couldn't reach it from here.
+    h.previewState = {
+      snapshot,
+      sessions: { "tab-new": snapshot },
+      desktopByTabId: { "tab-new": { url: null, loading: false } },
+      localFailures: {
+        "tab-new": { url: h.resolvedUrl, code: 0, description: "Build box isn't connected." },
+      },
+    };
+
+    const error = await handle(
+      makeRequest({ operation: "open", input: { url: "http://localhost:5173" } as unknown }),
+    ).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(error).toBeInstanceOf(PreviewAutomationPageUnreachableError);
+    expect((error as Error).message).toContain("Build box isn't connected.");
+  });
+
+  it("reports a reused tab this client can't load instead of returning it as fine", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-existing");
+    h.openTab = "tab-existing";
+    h.previewState = {
+      ...h.previewState,
+      localFailures: {
+        "tab-existing": { url: "http://localhost:5173/", code: 0, description: "Lost route." },
+      },
+    };
+
+    const error = await handle(
+      makeRequest({ operation: "open", input: { reuseExistingTab: true } as unknown }),
+    ).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(error).toBeInstanceOf(PreviewAutomationPageUnreachableError);
+    expect((error as Error).message).toContain("Lost route.");
+  });
+
+  it("returns a fresh tab's status once its first page starts loading", async () => {
+    const handle = mountHost();
+    h.openTab = null;
+    h.openNeedsOverlay = true;
+    const snapshot = { tabId: "tab-new", navStatus: { _tag: "Loading", url: h.resolvedUrl } };
+    h.commandResults.open = () => ({ _tag: "Success", value: snapshot });
+    h.previewState = {
+      snapshot,
+      sessions: { "tab-new": snapshot },
+      desktopByTabId: { "tab-new": { url: h.resolvedUrl, loading: true } },
+      localFailures: {},
+    };
+    h.target = { snapshot, tabId: "tab-new" };
+    h.automationStatus = { ...h.automationStatus, tabId: "tab-new" };
+
+    const result = (await handle(
+      makeRequest({ operation: "open", input: { url: "http://localhost:5173" } as unknown }),
+    )) as Record<string, unknown>;
+
+    expect(result.tabId).toBe("tab-new");
   });
 
   it("always reveals the tab on a navigation-only bridge, which drives only the visible tab", async () => {
@@ -849,9 +952,25 @@ describe("handleRequest: navigate + resize", () => {
       (e: unknown) => e,
     );
 
-    expect(error).toBeInstanceOf(PreviewAutomationOperationError);
-    expect((error as { cause?: Error }).cause?.message).toBe("Nothing is listening.");
+    // The reason reaches the agent: the wire carries only the error's message.
+    expect(error).toBeInstanceOf(PreviewAutomationPageUnreachableError);
+    expect((error as Error).message).toContain("Nothing is listening.");
     expect(h.navigateCalls).toEqual([]);
+  });
+
+  it("clears a stale local failure before driving a resolved navigation", async () => {
+    const handle = mountHost();
+    seedReadyTab("tab-1");
+
+    await handle(
+      makeRequest({
+        operation: "navigate",
+        tabId: "tab-1",
+        input: { url: "http://localhost:5173/" } as unknown,
+      }),
+    );
+
+    expect(h.localFailureCalls).toEqual([[{ environmentId, threadId }, "tab-1", null]]);
   });
 
   it("waits for load instead of evaluating script on a bridge without automation", async () => {
@@ -945,6 +1064,7 @@ describe("handleRequest: passthrough bridge operations", () => {
       snapshot: null,
       sessions: { "tab-1": { tabId: "tab-1" } },
       desktopByTabId: {},
+      localFailures: {},
     };
     h.needsSync = false;
     // request has explicit tab but bridge is missing

@@ -171,7 +171,7 @@ export function AppRoot({ router }: { readonly router: AppRouter }) {
       {/* Top banners stack, so a pending open never covers the reload prompt. */}
       <div className="fixed inset-x-0 top-0 z-50 flex flex-col">
         {isDesktopHost ? null : <ServerReloadPrompt />}
-        <OpenPromptBanner />
+        <OpenPromptBanner router={router} />
       </div>
       <PreviewAutomationHosts />
       <PreviewNewWindowRouter />

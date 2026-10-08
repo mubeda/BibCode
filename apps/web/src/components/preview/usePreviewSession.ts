@@ -7,6 +7,7 @@ import type { ScopedThreadRef } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 
+import { releasePreviewTab } from "~/browser/previewGateway";
 import {
   applyPreviewServerEvent,
   applyPreviewServerSnapshot,
@@ -88,6 +89,10 @@ const previewSessionSyncAtom = Atom.family((threadKey: string) => {
     const applyLatestEvent = (result: Atom.Type<typeof eventsAtom>) => {
       if (!AsyncResult.isSuccess(result) || result.value.threadId !== threadRef.threadId) return;
       applyPreviewServerEvent(threadRef, result.value);
+      // A closed tab never comes back: its SSH forwards go now, not after the host's grace period.
+      if (result.value.type === "closed") {
+        releasePreviewTab(threadRef.environmentId, result.value.tabId);
+      }
       if (result.value.type === "opened" || result.value.type === "closed") {
         get.refresh(sessionsAtom);
       }

@@ -25,7 +25,7 @@ import { RemoteUpdateConfirmationCoordinator } from "./components/settings/Updat
 import { ServerReloadPrompt } from "./components/ServerReloadPrompt";
 
 /** The reload prompt and the open prompt share one stacked top container, so neither hides the other. */
-function expectTopBannerStack(stack: ReactNode) {
+function expectTopBannerStack(stack: ReactNode, router?: AppRouter) {
   expect(isValidElement(stack) && stack.type).toBe("div");
   const props = (stack as ReactElement<{ className: string; children: ReactNode }>).props;
   expect(props.className).toContain("fixed");
@@ -35,6 +35,10 @@ function expectTopBannerStack(stack: ReactNode) {
     ServerReloadPrompt,
     OpenPromptBanner,
   ]);
+  // The open prompt sits outside the router, so it gets the router to show an off-screen thread.
+  if (router !== undefined) {
+    expect((banners[1] as ReactElement<{ router: AppRouter }>).props.router).toBe(router);
+  }
 }
 
 describe("AppRoot", () => {
@@ -43,7 +47,8 @@ describe("AppRoot", () => {
   });
 
   it("shares the application atom registry with routed UI and preview automation", () => {
-    const root = AppRoot({ router: {} as AppRouter });
+    const router = {} as AppRouter;
+    const root = AppRoot({ router });
 
     expect(root.type).toBe(AppAtomRegistryProvider);
     const children = Children.toArray(
@@ -58,7 +63,7 @@ describe("AppRoot", () => {
     expect(isValidElement(children[5]) && children[5].type).toBe(
       RemoteUpdateConfirmationCoordinator,
     );
-    expectTopBannerStack(children[6]);
+    expectTopBannerStack(children[6], router);
     expect(isValidElement(children[7]) && children[7].type).toBe(PreviewAutomationHosts);
     expect(isValidElement(children[8]) && children[8].type).toBe(PreviewNewWindowRouter);
     expect(isValidElement(children[9]) && children[9].type).toBe(OpenRequestRouter);
