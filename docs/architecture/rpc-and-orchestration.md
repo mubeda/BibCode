@@ -574,10 +574,19 @@ as opening a host URL retain the existing DesktopBridge/local API boundary.
 Reads begin on route/tab/picker open, user filters/pagination, Refresh, Rescan,
 or successful-action invalidation. No timer, window focus, constructor, or idle
 worker initiates provider traffic. A visible, mounted GitLab merge request list
-or detail route refreshes its mounted queries 20 s after the last success and
-prefetches `get` plus `getTimeline` for a row hovered 150 ms, at most two per
-environment. Hiding the document or leaving the route stops that timer. GitHub
-routes do not. The explicit Refresh action is unchanged. `pullRequests.getContext`
+or detail route opens `pullRequests.subscribe`, paints from
+`pullRequests.readSnapshot` (display copies in SQLite; zero host calls), and
+keeps the client's 20 s mounted-query refresh timer paused while that
+subscription stays open. The server polls the subscribed list key and one
+merge-request probe `GET` every 20 s after each tick; full list or detail reads
+run only when a stored fingerprint changes, and change events name the query
+families the client answers from snapshots. Hiding the document or leaving the
+route drops the subscription, resumes the client timer, and stops the shared
+poller when no subscriber remains. The route still prefetches `get` plus
+`getTimeline` for a row hovered 150 ms, at most two per environment.
+`pullRequests.runAction` and `pullRequests.checkout` re-read the host and do
+not use snapshots. GitHub routes do not subscribe. The explicit Refresh action
+is unchanged. `pullRequests.getContext`
 accepts an optional
 `rescan`: without it the server reuses its bounded 30 s probe and host-context
 answers (the origin is still read); with it the server clears those caches and
