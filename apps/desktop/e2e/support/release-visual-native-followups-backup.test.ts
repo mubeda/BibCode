@@ -4,44 +4,50 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeCrypto from "node:crypto";
 import { expect, it } from "vite-plus/test";
+import { HostProcessPlatform } from "../../../../packages/shared/src/hostProcess.ts";
+const fixturePlatform = HostProcessPlatform.defaultValue();
+const linuxIt = it.runIf(fixturePlatform === "linux");
 import { pinNativeFollowupBackup } from "./release-visual-native-followups-backup.ts";
-it("binds a server-reported backup to its exact private generation and rejects byte or ancestor replacement", () => {
-  const root = NodeFS.realpathSync(
-      NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-backup-test-")),
-    ),
-    storage = "12345678-1234-1234-1234-123456789abc",
-    backup = "22345678-1234-1234-1234-123456789abc";
-  try {
-    let parent = root;
-    for (const segment of ["backups", "userdata", storage, backup]) {
-      parent = NodePath.join(parent, segment);
-      NodeFS.mkdirSync(parent, { mode: 0o700 });
+linuxIt(
+  "binds a server-reported backup to its exact private generation and rejects byte or ancestor replacement",
+  () => {
+    const root = NodeFS.realpathSync(
+        NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-backup-test-")),
+      ),
+      storage = "12345678-1234-1234-1234-123456789abc",
+      backup = "22345678-1234-1234-1234-123456789abc";
+    try {
+      let parent = root;
+      for (const segment of ["backups", "userdata", storage, backup]) {
+        parent = NodePath.join(parent, segment);
+        NodeFS.mkdirSync(parent, { mode: 0o700 });
+      }
+      const bytes = Buffer.from("unit fixture, not a real native database");
+      NodeFS.writeFileSync(NodePath.join(parent, "state.sqlite"), bytes, { mode: 0o600 });
+      NodeFS.writeFileSync(
+        NodePath.join(parent, "manifest.json"),
+        JSON.stringify({
+          backupId: backup,
+          storageInstanceId: storage,
+          stateKind: "userdata",
+          trigger: "pre-update",
+          sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+          databaseSizeBytes: bytes.length,
+        }),
+        { mode: 0o600 },
+      );
+      const pin = pinNativeFollowupBackup({ root, storage, backup });
+      expect(() => pin.verify()).not.toThrow();
+      NodeFS.writeFileSync(NodePath.join(parent, "state.sqlite"), "changed");
+      expect(() => pin.verify()).toThrow();
+      expect(() => pinNativeFollowupBackup({ root, storage, backup: "../../escape" })).toThrow();
+    } finally {
+      NodeFS.rmSync(root, { recursive: true, force: true });
     }
-    const bytes = Buffer.from("unit fixture, not a real native database");
-    NodeFS.writeFileSync(NodePath.join(parent, "state.sqlite"), bytes, { mode: 0o600 });
-    NodeFS.writeFileSync(
-      NodePath.join(parent, "manifest.json"),
-      JSON.stringify({
-        backupId: backup,
-        storageInstanceId: storage,
-        stateKind: "userdata",
-        trigger: "pre-update",
-        sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
-        databaseSizeBytes: bytes.length,
-      }),
-      { mode: 0o600 },
-    );
-    const pin = pinNativeFollowupBackup({ root, storage, backup });
-    expect(() => pin.verify()).not.toThrow();
-    NodeFS.writeFileSync(NodePath.join(parent, "state.sqlite"), "changed");
-    expect(() => pin.verify()).toThrow();
-    expect(() => pinNativeFollowupBackup({ root, storage, backup: "../../escape" })).toThrow();
-  } finally {
-    NodeFS.rmSync(root, { recursive: true, force: true });
-  }
-});
+  },
+);
 
-it.each(["alias", "replacement", "permissions"])(
+linuxIt.each(["alias", "replacement", "permissions"])(
   "re-admits physical backup ancestors on verification after %s drift",
   (fault) => {
     const fixture = NodeFS.realpathSync(

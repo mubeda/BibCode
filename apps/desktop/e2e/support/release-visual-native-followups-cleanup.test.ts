@@ -43,7 +43,7 @@ it("refuses a foreign same-home AppImage before sending any cleanup signal", asy
       "async function",
     ) + "\nstopNativeFollowupApplication",
     {
-      NodePath,
+      NodePath: NodePath.posix,
       NodeCrypto,
       NodeFS: {
         realpathSync: (path: string) => path,

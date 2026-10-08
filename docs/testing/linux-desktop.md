@@ -2671,3 +2671,12 @@ re-encoded and no observer/replay identity rule, poll or deadline is weakened.
 Inert complete-caller checks bind the actual upgrade, assembler, original
 terminal snapshot/claim/PID/cwd/history owner, hold/release and joined cleanup;
 they do not establish the failed run's cause or native/pixel acceptance.
+
+The native helper gate keeps the actual Linux private-root/UID, backup ancestor,
+AppImage permission-restoration and D-Bus session cases enabled on Linux. Other
+hosts run the explicit inert POSIX metadata guard models; those models are not
+native Linux or Windows ownership evidence. The Windows cheap caller gate uses
+the same frozen helper registration before WSL builds, without replacing this
+Linux backend gate or changing the native original-image scope.
+The cheap caller workflow also runs that helper set on Ubuntu, so the real Linux
+filesystem cases execute before a costly native partition is repeated.

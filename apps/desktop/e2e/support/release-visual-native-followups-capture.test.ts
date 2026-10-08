@@ -3,6 +3,8 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
+import { HostProcessPlatform } from "../../../../packages/shared/src/hostProcess.ts";
+const fixturePlatform = HostProcessPlatform.defaultValue();
 import { captureNativeFollowupOriginal } from "./release-visual-native-followups-capture.ts";
 import {
   syntheticNativeFollowupPng,
@@ -20,6 +22,7 @@ it("writes only original bytes after both identity and witness joins and refuses
       scene: "native-wsl-local" as const,
       theme: "light" as const,
       evidence,
+      platform: fixturePlatform === "win32" ? "win32" : "linux",
       captures: new Set<string>(),
       verify: async () => {},
       readWitness: async () => {
@@ -35,7 +38,8 @@ it("writes only original bytes after both identity and witness joins and refuses
       readWitness: async () => syntheticNativeWslWitness,
     });
     expect(NodeFS.readFileSync(NodePath.join(evidence, receipt.file))).toEqual(bytes);
-    expect(NodeFS.statSync(NodePath.join(evidence, receipt.file)).mode & 0o777).toBe(0o600);
+    if (fixturePlatform !== "win32")
+      expect(NodeFS.statSync(NodePath.join(evidence, receipt.file)).mode & 0o777).toBe(0o600);
     await expect(
       captureNativeFollowupOriginal({
         ...input,

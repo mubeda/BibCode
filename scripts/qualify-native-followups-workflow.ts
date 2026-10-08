@@ -170,6 +170,117 @@ function privateWrite(root: string, name: string, value: object) {
     flag: "wx",
   });
 }
+export function nativeFollowupFailedWindowsStatusEligible(
+  environment: NodeJS.ProcessEnv,
+  platform: string,
+) {
+  return (
+    environment.CI === "true" &&
+    environment.GITHUB_ACTIONS === "true" &&
+    platform === "win32" &&
+    environment.BIBCODE_NATIVE_STATUS_SELECTED === "true" &&
+    environment.BIBCODE_NATIVE_STATUS_PREPARE_AVAILABLE === "true" &&
+    environment.BIBCODE_NATIVE_STATUS_DEPENDENCIES === "success" &&
+    environment.BIBCODE_NATIVE_STATUS_PREREQUISITE === "failure" &&
+    environment.BIBCODE_NATIVE_STATUS_WRAPPER === "skipped" &&
+    environment.BIBCODE_NATIVE_STATUS_CANCELLED === "false"
+  );
+}
+export async function recordFailedNativeWindowsStatus(
+  repository: string,
+  sourceSha: string,
+  owningHostProcessPlatform: string,
+  environment: NodeJS.ProcessEnv,
+) {
+  if (
+    !nativeFollowupFailedWindowsStatusEligible(environment, owningHostProcessPlatform) ||
+    environment.GITHUB_SHA !== sourceSha ||
+    !/^[a-f0-9]{40}$/.test(sourceSha)
+  )
+    throw refused();
+  const temporary = environment.RUNNER_TEMP;
+  if (
+    !temporary ||
+    !NodePath.isAbsolute(temporary) ||
+    NodePath.resolve(temporary) !== temporary ||
+    NodeFS.realpathSync(temporary) !== temporary ||
+    !NodeFS.lstatSync(temporary).isDirectory() ||
+    NodeFS.lstatSync(temporary).isSymbolicLink()
+  )
+    throw refused();
+  const artifactDirectory = NodePath.join(temporary, "bibcode-native-followups-wsl", "evidence");
+  for (const directory of [NodePath.dirname(artifactDirectory), artifactDirectory]) {
+    let metadata: NodeFS.Stats | null = null;
+    try {
+      metadata = NodeFS.lstatSync(directory);
+    } catch (error) {
+      if (!NodeUtil.types.isNativeError(error) || !("code" in error) || error.code !== "ENOENT")
+        throw error;
+    }
+    if (
+      metadata !== null &&
+      (!metadata.isDirectory() ||
+        metadata.isSymbolicLink() ||
+        NodeFS.realpathSync(directory) !== directory)
+    )
+      throw refused();
+  }
+  NodeFS.mkdirSync(artifactDirectory, { recursive: true, mode: 0o700 });
+  const { NativeFollowupCommandOwner } = await import(
+    NodeURL.pathToFileURL(
+      NodePath.join(
+        repository,
+        "apps/desktop/e2e/support/release-visual-native-followups-process.ts",
+      ),
+    ).href
+  );
+  const { secureNativeFollowupWindowsRoot } = await import(
+    NodeURL.pathToFileURL(
+      NodePath.join(
+        repository,
+        "apps/desktop/e2e/support/release-visual-native-followups-windows.ts",
+      ),
+    ).href
+  );
+  const commands = new NativeFollowupCommandOwner(
+    environment,
+    artifactDirectory,
+    () => {},
+    "win32",
+  );
+  let failed = false;
+  let original: unknown;
+  try {
+    await secureNativeFollowupWindowsRoot(
+      commands,
+      NodePath.join(
+        environment.SystemRoot ?? "",
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      ),
+      artifactDirectory,
+    );
+  } catch (error) {
+    failed = true;
+    original = error;
+  }
+  try {
+    commands.assertClosed();
+  } catch (error) {
+    if (!failed) {
+      failed = true;
+      original = error;
+    }
+  }
+  if (failed) throw original;
+  privateWrite(
+    artifactDirectory,
+    "native-followups-workflow-status.json",
+    nativeFollowupWorkflowStatus(sourceSha, "windows-wsl", "failed", 0),
+  );
+}
 async function main() {
   const repository = NodePath.resolve(NodeURL.fileURLToPath(new URL("..", import.meta.url))),
     sourceSha = process.env.GITHUB_SHA ?? "";
@@ -188,6 +299,16 @@ async function main() {
     throw refused();
   const owningHostProcessPlatform = Effect.runSync(HostProcessPlatform);
   const args = process.argv.slice(2);
+  if (args[0] === "--failed-windows-prerequisite-status") {
+    if (args.length !== 1) throw refused();
+    await recordFailedNativeWindowsStatus(
+      repository,
+      sourceSha,
+      owningHostProcessPlatform,
+      process.env,
+    );
+    return;
+  }
   const input = parseSeededDesktopUpgradeSmokeArgs(args, repository);
   const plan = nativeFollowupWorkflowPlan(input, {
     CI: process.env.CI,

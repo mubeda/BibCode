@@ -1715,24 +1715,32 @@ describe("seeded packaged desktop upgrade harness", () => {
     const root = await NodeFS.promises.mkdtemp(
       NodePath.join(NodeOS.tmpdir(), "bibcode-command-close-"),
     );
-    const finishedPath = NodePath.join(root, "writer-finished");
+    const finishedPath = NodePath.join(root, "writer-finished"),
+      readyPath = NodePath.join(root, "writer-ready");
     const writerSource = `
       setTimeout(() => {
-        process.stdout.write("late-tail");
-        require("node:fs").writeFileSync(${JSON.stringify(finishedPath)}, "finished");
+        process.stdout.write("late-tail", () => {
+          require("node:fs").writeFileSync(${JSON.stringify(finishedPath)}, "finished");
+        });
       }, 125);
+      process.send("writer-ready");
     `;
     const parentSource = `
       const writer = require("node:child_process").spawn(
         process.execPath,
         ["-e", ${JSON.stringify(writerSource)}],
-        { stdio: ["ignore", "inherit", "inherit"] }
+        { stdio: ["ignore", "inherit", "inherit", "ipc"] }
       );
-      writer.once("spawn", () => {
-        process.stdout.write("early|");
-        process.exit(0);
+      writer.once("message", (message) => {
+        if (message !== "writer-ready") throw new Error("Inert writer readiness refused.");
+        require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, "ready");
+        writer.disconnect();
+        process.stdout.write("early|", () => process.exit(0));
       });
     `;
+    let failed = false,
+      original: unknown,
+      writerJoined = false;
     try {
       const result = await runBoundedCommand({
         command: process.execPath,
@@ -1740,20 +1748,30 @@ describe("seeded packaged desktop upgrade harness", () => {
         cwd: root,
         timeoutMs: 2_000,
       });
+      expect(NodeFS.existsSync(readyPath)).toBe(true);
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toBe("early|late-tail");
       expect(NodeFS.existsSync(finishedPath)).toBe(true);
-    } finally {
-      // Even the old exit-only counterexample owns its bounded writer until
-      // completion, before removing the directory that writer uses.
+    } catch (error) {
+      failed = true;
+      original = error;
+    }
+    try {
       await waitForUpgradeCondition({
         description: "synthetic writer completion",
         intervalMs: 10,
         timeoutMs: 2_000,
         probe: async () => NodeFS.existsSync(finishedPath),
       });
-      await NodeFS.promises.rm(root, { recursive: true, force: true });
+      writerJoined = true;
+    } catch (error) {
+      if (!failed) original = error;
+      failed = true;
+    } finally {
+      // Never delete a root while the bounded owned writer may still use it.
+      if (writerJoined) await NodeFS.promises.rm(root, { recursive: true, force: true });
     }
+    if (failed) throw original;
   });
 
   it.each(["raw", "truncated", "json", "slash-escaped", "unicode-slash", "encoded-token"] as const)(
@@ -1903,7 +1921,8 @@ describe("native follow-up owning setup stages", () => {
     NodeFS.readFileSync(new URL("./seeded-desktop-upgrade-smoke.ts", import.meta.url), "utf8");
   it("passes the same canonical owned work root to the session instead of the long build/driver tree", () => {
     const source = nativeSource(),
-      layout = createSeededUpgradeRunLayout("/owned/" + "x".repeat(52), "n".repeat(26), true),
+      ownedWorkRoot = NodePath.resolve(NodeOS.tmpdir(), "owned-" + "x".repeat(52)),
+      layout = createSeededUpgradeRunLayout(ownedWorkRoot, "n".repeat(26), true),
       nativeRoot = NodePath.dirname(layout.nativeFollowups!.dataRoot);
     const begin = source.indexOf(").withNativeFollowupsLinuxSession(");
     const actual = begin >= 0 ? begin : source.indexOf(".withNativeFollowupsLinuxSession(");
@@ -1923,7 +1942,7 @@ describe("native follow-up owning setup stages", () => {
         input: { runRoot: nativeRoot, phase: "seed-and-install" },
       },
     ) as { root?: string; workRoot?: string };
-    expect(input.workRoot === "/owned/" + "x".repeat(52)).toBe(true);
+    expect(input.workRoot === ownedWorkRoot).toBe(true);
     expect(input.root).toBeUndefined();
   });
   it.each([
@@ -1938,7 +1957,9 @@ describe("native follow-up owning setup stages", () => {
     "attributes actual owner %s failure and preserves original error against cleanup",
     async (mode) => {
       const boundaryMode = mode === "publish-observer" ? "publish" : mode;
-      const base = NodeFS.realpathSync(NodeFS.mkdtempSync("/tmp/nf-stage-")),
+      const base = NodeFS.realpathSync(
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "nf-stage-")),
+        ),
         repository = NodePath.join(base, "repository"),
         work = NodePath.join(base, "work"),
         original = Object.freeze(new Error("Inert original owning failure.")),
@@ -1988,7 +2009,8 @@ describe("native follow-up owning setup stages", () => {
           buildPackagedApplication: async (value: { checkout: string }) => {
             if (
               (boundaryMode === "candidate" && value.checkout.endsWith("candidate-checkout")) ||
-              (boundaryMode === "protected" && value.checkout.endsWith("/protected/checkout"))
+              (boundaryMode === "protected" &&
+                value.checkout.endsWith(NodePath.join("protected", "checkout")))
             )
               throw original;
           },
@@ -2058,7 +2080,9 @@ describe("native follow-up owning setup stages", () => {
 it.each(["nonzero", "retention-failure", "observer-throw"] as const)(
   "attributes actual session/caller result admission instead of successful cleanup: %s",
   async (mode) => {
-    const base = NodeFS.realpathSync(NodeFS.mkdtempSync("/tmp/nf-result-")),
+    const base = NodeFS.realpathSync(
+        NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "nf-result-")),
+      ),
       nativeRoot = NodePath.join(base, "run", "native"),
       evidence = NodePath.join(nativeRoot, "evidence");
     NodeFS.mkdirSync(nativeRoot, { recursive: true, mode: 0o700 });

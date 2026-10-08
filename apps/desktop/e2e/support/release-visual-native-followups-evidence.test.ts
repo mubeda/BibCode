@@ -3,6 +3,8 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { expect, it } from "vite-plus/test";
+import { HostProcessPlatform } from "../../../../packages/shared/src/hostProcess.ts";
+const fixturePlatform = HostProcessPlatform.defaultValue();
 import { retainNativeFollowupEvidence } from "./release-visual-native-followups-evidence.ts";
 import {
   syntheticNativeFollowupPng,
@@ -70,6 +72,7 @@ it("refuses private or unjoined receipts before any publication, then copies the
       retainNativeFollowupEvidence({
         privateEvidence: root,
         destination: output,
+        platform: fixturePlatform === "win32" ? "win32" : "linux",
         cleanupSafe: true,
       }),
     ).toThrow();
@@ -79,6 +82,7 @@ it("refuses private or unjoined receipts before any publication, then copies the
       retainNativeFollowupEvidence({
         privateEvidence: root,
         destination: output,
+        platform: fixturePlatform === "win32" ? "win32" : "linux",
         cleanupSafe: false,
       }),
     ).toThrow();
@@ -87,6 +91,7 @@ it("refuses private or unjoined receipts before any publication, then copies the
       retainNativeFollowupEvidence({
         privateEvidence: root,
         destination: output,
+        platform: fixturePlatform === "win32" ? "win32" : "linux",
         cleanupSafe: true,
       }),
     ).toMatchObject({ originalCount: 2, visualReview: "pending", complete: false });
@@ -174,7 +179,12 @@ it.each(["duplicate", "hash", "theme"])(
         NodeFS.writeFileSync(NodePath.join(root, original.file), bytes, { mode: 0o600 });
       const destination = NodePath.join(root, "out");
       expect(() =>
-        retainNativeFollowupEvidence({ privateEvidence: root, destination, cleanupSafe: true }),
+        retainNativeFollowupEvidence({
+          privateEvidence: root,
+          destination,
+          cleanupSafe: true,
+          platform: fixturePlatform === "win32" ? "win32" : "linux",
+        }),
       ).toThrow();
       expect(NodeFS.existsSync(destination)).toBe(false);
     } finally {

@@ -821,6 +821,20 @@ step fails. No distro names, raw WSL output, host paths or exception text enter
 these fields. The existing status read and conditional quiet list remain the
 only capability commands; these diagnostics do not provision or change WSL,
 download a root filesystem, update the host, select a default distro or reboot.
+If owned Prepare was available and dependencies were installed, a failed native
+source/public gate or later version/signing prerequisite can skip the native
+wrapper. The failure-only fallback then records the existing failed Windows
+status under the same secure root before finite upload: zero originals, two
+required originals and `native-owner-start`, which identifies the unreached
+owner boundary. It requires the actual Windows CI checkout/source, reuses the
+joined command owner and existing ACL admission, and publishes create-new;
+an existing status or ambiguous root refuses. It never requires release
+versions, updater keys or a remaining distro manifest, invokes no product
+runner, and does not relabel the failed prerequisite. Cancellation, unavailable
+Prepare, failed dependency install, executed wrappers, ordinary lanes and Linux
+are excluded. Native Windows CI must confirm the actual ACL/artifact boundary;
+Node fixtures only prove source compatibility.
+
 Native screenshot/status evidence uploads only two named PNGs, the three
 retainer JSONs and the closed workflow status. Credentials,
 private paths, ACL output and raw OS/driver logs remain in protected private
@@ -966,6 +980,17 @@ for setup failures and refuses an app that has not joined.
 
 Run the declared helper and Pester controls before the native job. Local source,
 TempFS or fake-command tests do not prove WSL, Windows ACLs or native originals.
+The cheap Windows caller workflow also installs the existing frozen Node
+workspace and runs the same fixed native helper set before any costly WSL
+build. Its real late-stdout fixture uses the owned child IPC-ready acknowledgement
+before the parent exits and joins completion before removing TempFS. Linux
+UID/chmod/AppImage/D-Bus backend cases remain actual Linux CI requirements;
+all-host inert metadata guard cases preserve their behavior without claiming
+Windows ACL or native ownership. Portable Windows capture/evidence fixtures pass
+the same platform argument as production, retaining byte/source/alias guards.
+Its Ubuntu companion executes the actual Linux filesystem cases; neither row
+substitutes for packaged native validation or accepted original captures.
+
 `owned-wsl-fixture-controls.yml` runs the actual Pester caller controls on Windows
 before packaging. It starts for fixture changes on the reviewed QA branch and
 can also be dispatched manually. Require its green result at the exact candidate

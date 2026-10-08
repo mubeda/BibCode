@@ -5,6 +5,9 @@ import * as NodeProcess from "node:process";
 import * as NodeModule from "node:module";
 import * as NodeVM from "node:vm";
 import { expect, it } from "vite-plus/test";
+import { HostProcessPlatform } from "../../../../packages/shared/src/hostProcess.ts";
+const fixturePlatform = HostProcessPlatform.defaultValue();
+const linuxIt = it.runIf(fixturePlatform === "linux");
 import { withNativeFollowupsLinuxSession } from "./release-visual-native-followups-session.ts";
 it("refuses a local or relabelled native session before launching any OS or browser work", async () => {
   let calls = 0;
@@ -38,29 +41,32 @@ function sessionRootFactory(uid = NodeProcess.getuid?.() ?? -1) {
     { NodeFS, NodePath, NodeProcess: { getuid: () => uid }, Buffer, Error },
   ) as (root: string, observe: (phase: string) => void) => string;
 }
-it("allocates only short exclusive private sibling sessions in the physical owned work root", () => {
-  const parent = NodeFS.realpathSync(NodeFS.mkdtempSync("/tmp/nf-root-"));
-  try {
-    const create = sessionRootFactory(),
-      phases: string[] = [],
-      first = create(parent, (phase) => phases.push(phase)),
-      second = create(parent, (phase) => phases.push(phase));
-    expect(first !== null && second !== null).toBe(true);
-    if (first === null || second === null) return;
-    expect(first === second).toBe(false);
-    for (const root of [first, second]) {
-      expect(NodePath.dirname(root) === parent).toBe(true);
-      expect(NodeFS.realpathSync(root) === root).toBe(true);
-      expect(NodeFS.lstatSync(root).uid === NodeFS.lstatSync(parent).uid).toBe(true);
-      expect(NodeFS.lstatSync(root).mode & 0o777).toBe(0o700);
-      expect(Buffer.byteLength(NodePath.join(root, "runtime", "bus")) <= 99).toBe(true);
+linuxIt(
+  "allocates only short exclusive private sibling sessions in the physical owned work root",
+  () => {
+    const parent = NodeFS.realpathSync(NodeFS.mkdtempSync("/tmp/nf-root-"));
+    try {
+      const create = sessionRootFactory(),
+        phases: string[] = [],
+        first = create(parent, (phase) => phases.push(phase)),
+        second = create(parent, (phase) => phases.push(phase));
+      expect(first !== null && second !== null).toBe(true);
+      if (first === null || second === null) return;
+      expect(first === second).toBe(false);
+      for (const root of [first, second]) {
+        expect(NodePath.dirname(root) === parent).toBe(true);
+        expect(NodeFS.realpathSync(root) === root).toBe(true);
+        expect(NodeFS.lstatSync(root).uid === NodeFS.lstatSync(parent).uid).toBe(true);
+        expect(NodeFS.lstatSync(root).mode & 0o777).toBe(0o700);
+        expect(Buffer.byteLength(NodePath.join(root, "runtime", "bus")) <= 99).toBe(true);
+      }
+      expect(phases).toEqual(["native-linux-address", "native-linux-address"]);
+    } finally {
+      NodeFS.rmSync(parent, { recursive: true, force: true });
     }
-    expect(phases).toEqual(["native-linux-address", "native-linux-address"]);
-  } finally {
-    NodeFS.rmSync(parent, { recursive: true, force: true });
-  }
-});
-it.each([
+  },
+);
+linuxIt.each([
   "public-parent",
   "alias-parent",
   "foreign-uid",
@@ -96,7 +102,7 @@ it.each([
     NodeFS.rmSync(container, { recursive: true, force: true });
   }
 });
-it.each(["record", "throw"])(
+linuxIt.each(["record", "throw"])(
   "keeps actual session original failure and cleanup phase under %s diagnostics",
   async (mode) => {
     const workRoot = NodeFS.realpathSync(NodeFS.mkdtempSync("/tmp/nf-effect-")),

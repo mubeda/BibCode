@@ -173,7 +173,7 @@ function processProbe(fault = "owned") {
       "\n({ readNativeFollowupProcess, readNativeFollowupLinuxBinding })",
     {
       NodeFS: ports,
-      NodePath,
+      NodePath: NodePath.posix,
       NodeCrypto,
       NodeProcess: { getuid: () => 1000 },
       Buffer,

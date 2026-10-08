@@ -657,3 +657,159 @@ it("arms approved Prepare refusal evidence only after passing Pester and revokes
   expect(artifact["continue-on-error"]).toBe(true);
   expect(artifact.with.path).not.toMatch(/\*|\.log|\.ps1/);
 });
+
+it("keeps real Linux backend tests registered and adds the same cheap frozen Windows helper gate", () => {
+  const upgrade = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const cheap = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/owned-wsl-fixture-controls.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const steps: Array<{ name?: string; run?: string }> = cheap.jobs.caller_controls.steps;
+  const pester = steps.findIndex((step) => step.run?.includes("Invoke-Pester"));
+  const frozen = steps.findIndex((step) => step.run === "vp install --frozen-lockfile");
+  const helper = steps.findIndex((step) =>
+    step.run?.includes("release-visual-native-followups-portable.test.ts"),
+  );
+  expect(pester).toBeGreaterThan(0);
+  expect(frozen).toBeGreaterThan(pester);
+  expect(helper).toBeGreaterThan(frozen);
+  expect(cheap.jobs.caller_controls["runs-on"]).toBe("${{ matrix.runner }}");
+  expect(cheap.jobs.caller_controls.strategy.matrix.runner).toEqual([
+    "windows-2025",
+    "ubuntu-22.04",
+  ]);
+  expect(steps[pester]).toHaveProperty("if", "runner.os == 'Windows'");
+  for (const role of ["backup", "session", "update"]) {
+    const name = "apps/desktop/e2e/support/release-visual-native-followups-" + role + ".test.ts";
+    const linuxRuns = upgrade.jobs.native_followups_linux.steps
+      .map((step: { run?: string }) => step.run ?? "")
+      .join("\n");
+    expect(linuxRuns).toContain(name);
+    expect(steps[helper]?.run).toContain(name);
+    const source = NodeFS.readFileSync(new URL("../" + name, import.meta.url), "utf8");
+    expect(source).toContain('const linuxIt = it.runIf(fixturePlatform === "linux")');
+    expect(source).toContain("const fixturePlatform = HostProcessPlatform.defaultValue()");
+  }
+  expect(steps[helper]?.run).toContain("scripts/seeded-desktop-upgrade-smoke.test.ts");
+});
+
+it("requires child IPC readiness and preserves the primary late-tail fixture error", () => {
+  const tests = NodeFS.readFileSync(
+    new URL("./seeded-desktop-upgrade-smoke.test.ts", import.meta.url),
+    "utf8",
+  );
+  const begin = tests.indexOf(
+    'it("retains late stdout and waits for close after the normal command exits"',
+  );
+  const end = tests.indexOf('it.each(["raw",', begin);
+  const body = tests.slice(begin, end);
+  expect(body).toContain('writer.once("message"');
+  expect(body).not.toContain('writer.once("spawn"');
+  expect(body).toContain('process.send("writer-ready")');
+  expect(body).toContain('expect(result.stdout).toBe("early|late-tail")');
+  expect(body).toContain("if (!failed) original = error");
+  expect(body).toContain("if (writerJoined)");
+});
+
+it("admits failed Windows prerequisite status only after installed dependencies and skipped wrapper", () => {
+  const source = NodeFS.readFileSync(
+    new URL("./qualify-native-followups-workflow.ts", import.meta.url),
+    "utf8",
+  );
+  expect(source).toContain("export function nativeFollowupFailedWindowsStatusEligible(");
+  const begin = source.indexOf("export function nativeFollowupFailedWindowsStatusEligible("),
+    end = source.indexOf("export async function recordFailedNativeWindowsStatus(", begin);
+  expect(begin).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(begin);
+  const method = NodeVM.runInNewContext(
+    source
+      .slice(begin, end)
+      .replace(/^export /, " ")
+      .replace(/: NodeJS.ProcessEnv/g, "")
+      .replace(/: string/g, "") + "\nnativeFollowupFailedWindowsStatusEligible;",
+  );
+  const env = {
+    CI: "true",
+    GITHUB_ACTIONS: "true",
+    BIBCODE_NATIVE_STATUS_SELECTED: "true",
+    BIBCODE_NATIVE_STATUS_PREPARE_AVAILABLE: "true",
+    BIBCODE_NATIVE_STATUS_DEPENDENCIES: "success",
+    BIBCODE_NATIVE_STATUS_PREREQUISITE: "failure",
+    BIBCODE_NATIVE_STATUS_WRAPPER: "skipped",
+    BIBCODE_NATIVE_STATUS_CANCELLED: "false",
+  };
+  expect(method(env, "win32")).toBe(true);
+  for (const [field, value] of [
+    ["CI", "false"],
+    ["GITHUB_ACTIONS", "false"],
+    ["BIBCODE_NATIVE_STATUS_SELECTED", "false"],
+    ["BIBCODE_NATIVE_STATUS_PREPARE_AVAILABLE", "false"],
+    ["BIBCODE_NATIVE_STATUS_DEPENDENCIES", "failure"],
+    ["BIBCODE_NATIVE_STATUS_PREREQUISITE", "success"],
+    ["BIBCODE_NATIVE_STATUS_PREREQUISITE", "skipped"],
+    ["BIBCODE_NATIVE_STATUS_PREREQUISITE", "cancelled"],
+    ["BIBCODE_NATIVE_STATUS_WRAPPER", "success"],
+    ["BIBCODE_NATIVE_STATUS_WRAPPER", "failure"],
+    ["BIBCODE_NATIVE_STATUS_CANCELLED", "true"],
+  ] as const)
+    expect(method({ ...env, [field]: value }, "win32")).toBe(false);
+  expect(method(env, "linux")).toBe(false);
+  expect(method(env, "darwin")).toBe(false);
+});
+it("workflow retains failure-only status with the original six-item artifact policy", () => {
+  const source = YAML.parse(
+    NodeFS.readFileSync(
+      new URL("../.github/workflows/desktop-upgrade-smoke.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const steps = source.jobs.windows_wsl_upgrade_smoke.steps;
+  const fallback = steps.find((step: { id?: string }) => step.id === "native_wsl_failed_status");
+  expect(fallback).toBeDefined();
+  expect(fallback.run).toContain("--failed-windows-prerequisite-status");
+  expect(fallback.if).toContain("!cancelled()");
+  expect(fallback.if).toContain("steps.wsl_dependencies.outcome == 'success'");
+  expect(fallback.if).toContain("steps.native_wsl_visuals.outcome == 'skipped'");
+  const expression = fallback.if.replace(/\$\{\{|\}\}/g, "");
+  const conditions = {
+    inputs: { native_followups: true },
+    runner: { os: "Windows" },
+    steps: {
+      native_wsl: { outputs: { available: "true" } },
+      wsl_dependencies: { outcome: "success" },
+      native_wsl_visuals: { outcome: "skipped" },
+      native_wsl_source_gates: { outcome: "failure" },
+      native_wsl_public_controls: { outcome: "skipped" },
+      wsl_versions: { outcome: "skipped" },
+      native_wsl_signing: { outcome: "skipped" },
+    },
+    always: () => true,
+    cancelled: () => false,
+  };
+  expect(NodeVM.runInNewContext(expression, conditions)).toBe(true);
+  for (const override of [
+    { cancelled: () => true },
+    { inputs: { native_followups: false } },
+    { runner: { os: "Linux" } },
+    { steps: { ...conditions.steps, native_wsl: { outputs: { available: "false" } } } },
+    { steps: { ...conditions.steps, native_wsl_visuals: { outcome: "failure" } } },
+    { steps: { ...conditions.steps, wsl_dependencies: { outcome: "failure" } } },
+  ])
+    expect(NodeVM.runInNewContext(expression, { ...conditions, ...override })).toBe(false);
+  const upload = steps.find(
+    (step: { name?: string }) =>
+      step.name === "Retain finite native WSL originals and closed status",
+  );
+  expect(upload.with.path.split("\n").filter(Boolean)).toHaveLength(6);
+  expect(upload.with["if-no-files-found"]).toBe("error");
+  expect(upload.with["retention-days"]).toBe(7);
+  expect(upload.uses).toBe("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a");
+  expect(steps.indexOf(fallback)).toBeLessThan(steps.indexOf(upload));
+});

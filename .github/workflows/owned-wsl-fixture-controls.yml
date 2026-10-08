@@ -7,6 +7,11 @@ on:
       - scripts/owned-wsl2-fixture.ps1
       - scripts/owned-wsl2-fixture.Tests.ps1
       - .github/workflows/owned-wsl-fixture-controls.yml
+      - apps/desktop/e2e/support/release-visual-native-followups*.ts
+      - scripts/seeded-desktop-upgrade-smoke*.ts
+      - scripts/qualify-native-followups-workflow*.ts
+      - package.json
+      - pnpm-lock.yaml
   workflow_dispatch:
 
 permissions:
@@ -14,11 +19,16 @@ permissions:
 
 jobs:
   caller_controls:
-    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, ubuntu-22.04]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Execute actual owned fixture caller controls
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Import-Module Pester -MinimumVersion 5.0 -ErrorAction Stop
@@ -26,3 +36,14 @@ jobs:
           if ($tests.FailedCount -ne 0 -or $tests.PassedCount -eq 0) {
             throw 'Owned WSL fixture caller controls failed.'
           }
+      - name: Setup Vite+ for the existing native helper gate
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Install frozen helper dependencies
+        run: vp install --frozen-lockfile
+      - name: Qualify existing native helper callers before costly WSL builds
+        run: |
+          vp test run scripts/qualify-native-followups-workflow.test.ts apps/desktop/e2e/support/release-visual-native-followups-backup.test.ts apps/desktop/e2e/support/release-visual-native-followups-capture.test.ts apps/desktop/e2e/support/release-visual-native-followups-cleanup.test.ts apps/desktop/e2e/support/release-visual-native-followups-controller.test.ts apps/desktop/e2e/support/release-visual-native-followups-endpoint.test.ts apps/desktop/e2e/support/release-visual-native-followups-evidence.test.ts apps/desktop/e2e/support/release-visual-native-followups-os.test.ts apps/desktop/e2e/support/release-visual-native-followups-preparation.test.ts apps/desktop/e2e/support/release-visual-native-followups-preview.test.ts apps/desktop/e2e/support/release-visual-native-followups-public.test.ts apps/desktop/e2e/support/release-visual-native-followups-session.test.ts apps/desktop/e2e/support/release-visual-native-followups-state.test.ts apps/desktop/e2e/support/release-visual-native-followups-update.test.ts apps/desktop/e2e/support/release-visual-native-followups-windows.test.ts apps/desktop/e2e/support/release-visual-native-followups.test.ts apps/desktop/e2e/support/release-visual-native-followups-portable.test.ts scripts/seeded-desktop-upgrade-smoke.test.ts scripts/owned-wsl2-fixture-caller.test.ts scripts/lib/owned-wsl2-fixture.test.ts

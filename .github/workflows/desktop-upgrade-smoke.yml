@@ -438,17 +438,20 @@ jobs:
         if: (inputs.native_followups != true && steps.wsl.outputs.available == 'true') || (inputs.native_followups == true && steps.native_wsl.outputs.available == 'true')
         uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
 
-      - name: Install frozen dependencies
+      - id: wsl_dependencies
+        name: Install frozen dependencies
         if: (inputs.native_followups != true && steps.wsl.outputs.available == 'true') || (inputs.native_followups == true && steps.native_wsl.outputs.available == 'true')
         run: vp install --frozen-lockfile
 
-      - name: Native WSL exact current-source gates
+      - id: native_wsl_source_gates
+        name: Native WSL exact current-source gates
         if: inputs.native_followups == true && steps.native_wsl.outputs.available == 'true'
         run: |
           vp check
           vp run typecheck
-          vp test run scripts/qualify-native-followups-workflow.test.ts apps/desktop/e2e/support/release-visual-native-followups-backup.test.ts apps/desktop/e2e/support/release-visual-native-followups-capture.test.ts apps/desktop/e2e/support/release-visual-native-followups-cleanup.test.ts apps/desktop/e2e/support/release-visual-native-followups-controller.test.ts apps/desktop/e2e/support/release-visual-native-followups-endpoint.test.ts apps/desktop/e2e/support/release-visual-native-followups-evidence.test.ts apps/desktop/e2e/support/release-visual-native-followups-os.test.ts apps/desktop/e2e/support/release-visual-native-followups-preparation.test.ts apps/desktop/e2e/support/release-visual-native-followups-preview.test.ts apps/desktop/e2e/support/release-visual-native-followups-public.test.ts apps/desktop/e2e/support/release-visual-native-followups-session.test.ts apps/desktop/e2e/support/release-visual-native-followups-state.test.ts apps/desktop/e2e/support/release-visual-native-followups-update.test.ts apps/desktop/e2e/support/release-visual-native-followups-windows.test.ts apps/desktop/e2e/support/release-visual-native-followups.test.ts scripts/seeded-desktop-upgrade-smoke.test.ts scripts/owned-wsl2-fixture-caller.test.ts scripts/lib/owned-wsl2-fixture.test.ts
-      - name: Native WSL compiled public controls
+          vp test run scripts/qualify-native-followups-workflow.test.ts apps/desktop/e2e/support/release-visual-native-followups-backup.test.ts apps/desktop/e2e/support/release-visual-native-followups-capture.test.ts apps/desktop/e2e/support/release-visual-native-followups-cleanup.test.ts apps/desktop/e2e/support/release-visual-native-followups-controller.test.ts apps/desktop/e2e/support/release-visual-native-followups-endpoint.test.ts apps/desktop/e2e/support/release-visual-native-followups-evidence.test.ts apps/desktop/e2e/support/release-visual-native-followups-os.test.ts apps/desktop/e2e/support/release-visual-native-followups-preparation.test.ts apps/desktop/e2e/support/release-visual-native-followups-preview.test.ts apps/desktop/e2e/support/release-visual-native-followups-public.test.ts apps/desktop/e2e/support/release-visual-native-followups-session.test.ts apps/desktop/e2e/support/release-visual-native-followups-portable.test.ts apps/desktop/e2e/support/release-visual-native-followups-state.test.ts apps/desktop/e2e/support/release-visual-native-followups-update.test.ts apps/desktop/e2e/support/release-visual-native-followups-windows.test.ts apps/desktop/e2e/support/release-visual-native-followups.test.ts scripts/seeded-desktop-upgrade-smoke.test.ts scripts/owned-wsl2-fixture-caller.test.ts scripts/lib/owned-wsl2-fixture.test.ts
+      - id: native_wsl_public_controls
+        name: Native WSL compiled public controls
         if: inputs.native_followups == true && steps.native_wsl.outputs.available == 'true'
         working-directory: apps/web
         run: vp test run --project unit src/release-visual-native-followups.public.test.tsx src/reactCompiler.test.tsx
@@ -493,7 +496,8 @@ jobs:
             echo "previous_version=$previous_version"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Generate WSL ephemeral updater signing key
+      - id: native_wsl_signing
+        name: Generate WSL ephemeral updater signing key
         if: (inputs.native_followups != true && steps.wsl.outputs.available == 'true') || (inputs.native_followups == true && steps.native_wsl.outputs.available == 'true')
         shell: bash
         run: |
@@ -527,7 +531,8 @@ jobs:
             --updater-port 43220 \
             --restart-timeout-ms 240000
 
-      - name: Run existing native Local WSL originals
+      - id: native_wsl_visuals
+        name: Run existing native Local WSL originals
         if: inputs.native_followups == true && steps.native_wsl.outputs.available == 'true'
         shell: bash
         run: |
@@ -577,6 +582,19 @@ jobs:
             ${{ runner.temp }}/bibcode-gpg-private-evidence/ready/tag.bin
           if-no-files-found: ignore
           retention-days: 1
+
+      - id: native_wsl_failed_status
+        name: Record failed native WSL prerequisite status
+        if: always() && !cancelled() && runner.os == 'Windows' && inputs.native_followups == true && steps.native_wsl.outputs.available == 'true' && steps.wsl_dependencies.outcome == 'success' && steps.native_wsl_visuals.outcome == 'skipped' && (steps.native_wsl_source_gates.outcome == 'failure' || steps.native_wsl_public_controls.outcome == 'failure' || steps.wsl_versions.outcome == 'failure' || steps.native_wsl_signing.outcome == 'failure')
+        shell: bash
+        env:
+          BIBCODE_NATIVE_STATUS_SELECTED: "${{ inputs.native_followups }}"
+          BIBCODE_NATIVE_STATUS_PREPARE_AVAILABLE: "${{ steps.native_wsl.outputs.available }}"
+          BIBCODE_NATIVE_STATUS_DEPENDENCIES: "${{ steps.wsl_dependencies.outcome }}"
+          BIBCODE_NATIVE_STATUS_PREREQUISITE: "${{ (steps.native_wsl_source_gates.outcome == 'failure' || steps.native_wsl_public_controls.outcome == 'failure' || steps.wsl_versions.outcome == 'failure' || steps.native_wsl_signing.outcome == 'failure') && 'failure' || 'skipped' }}"
+          BIBCODE_NATIVE_STATUS_WRAPPER: "${{ steps.native_wsl_visuals.outcome }}"
+          BIBCODE_NATIVE_STATUS_CANCELLED: "${{ cancelled() }}"
+        run: node scripts/qualify-native-followups-workflow.ts --failed-windows-prerequisite-status
 
       - name: Retain finite native WSL originals and closed status
         if: always() && inputs.native_followups == true
@@ -635,7 +653,7 @@ jobs:
         run: |
           vp check
           vp run typecheck
-          vp test run scripts/native-driver-failure-caller.test.ts scripts/qualify-native-followups-workflow.test.ts apps/desktop/e2e/support/release-visual-native-followups-backup.test.ts apps/desktop/e2e/support/release-visual-native-followups-capture.test.ts apps/desktop/e2e/support/release-visual-native-followups-cleanup.test.ts apps/desktop/e2e/support/release-visual-native-followups-controller.test.ts apps/desktop/e2e/support/release-visual-native-followups-endpoint.test.ts apps/desktop/e2e/support/release-visual-native-followups-evidence.test.ts apps/desktop/e2e/support/release-visual-native-followups-os.test.ts apps/desktop/e2e/support/release-visual-native-followups-preparation.test.ts apps/desktop/e2e/support/release-visual-native-followups-preview.test.ts apps/desktop/e2e/support/release-visual-native-followups-public.test.ts apps/desktop/e2e/support/release-visual-native-followups-session.test.ts apps/desktop/e2e/support/release-visual-native-followups-state.test.ts apps/desktop/e2e/support/release-visual-native-followups-update.test.ts apps/desktop/e2e/support/release-visual-native-followups-windows.test.ts apps/desktop/e2e/support/release-visual-native-followups.test.ts scripts/seeded-desktop-upgrade-smoke.test.ts scripts/owned-wsl2-fixture-caller.test.ts scripts/lib/owned-wsl2-fixture.test.ts
+          vp test run scripts/native-driver-failure-caller.test.ts scripts/qualify-native-followups-workflow.test.ts apps/desktop/e2e/support/release-visual-native-followups-backup.test.ts apps/desktop/e2e/support/release-visual-native-followups-capture.test.ts apps/desktop/e2e/support/release-visual-native-followups-cleanup.test.ts apps/desktop/e2e/support/release-visual-native-followups-controller.test.ts apps/desktop/e2e/support/release-visual-native-followups-endpoint.test.ts apps/desktop/e2e/support/release-visual-native-followups-evidence.test.ts apps/desktop/e2e/support/release-visual-native-followups-os.test.ts apps/desktop/e2e/support/release-visual-native-followups-preparation.test.ts apps/desktop/e2e/support/release-visual-native-followups-preview.test.ts apps/desktop/e2e/support/release-visual-native-followups-public.test.ts apps/desktop/e2e/support/release-visual-native-followups-session.test.ts apps/desktop/e2e/support/release-visual-native-followups-portable.test.ts apps/desktop/e2e/support/release-visual-native-followups-state.test.ts apps/desktop/e2e/support/release-visual-native-followups-update.test.ts apps/desktop/e2e/support/release-visual-native-followups-windows.test.ts apps/desktop/e2e/support/release-visual-native-followups.test.ts scripts/seeded-desktop-upgrade-smoke.test.ts scripts/owned-wsl2-fixture-caller.test.ts scripts/lib/owned-wsl2-fixture.test.ts
       - name: Actual compiled native public controls
         working-directory: apps/web
         run: vp test run --project unit src/release-visual-native-followups.public.test.tsx src/reactCompiler.test.tsx
