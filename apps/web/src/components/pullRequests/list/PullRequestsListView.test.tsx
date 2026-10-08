@@ -34,6 +34,8 @@ vi.mock("../../../state/pullRequests", () => ({
     list: h.requests,
     requestListTotalsRefresh: h.requestTotals,
     getVocabulary: vi.fn(() => ({ kind: "vocabulary" })),
+    get: vi.fn((args: unknown) => ({ kind: "get", args })),
+    getTimeline: vi.fn((args: unknown) => ({ kind: "getTimeline", args })),
   },
 }));
 vi.mock("../../../state/query", () => ({

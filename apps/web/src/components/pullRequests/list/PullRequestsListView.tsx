@@ -147,9 +147,9 @@ function PullRequestsPages({
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
   const renderRow = useCallback(
     ({ item }: { item: PullRequestsListRow }) => (
-      <PullRequestsRow row={item} projectRef={projectRef} context={context} />
+      <PullRequestsRow row={item} projectRef={projectRef} context={context} scope={scope} />
     ),
-    [context, projectRef],
+    [context, projectRef, scope],
   );
   const failure =
     query.emission._tag === "Failure" ? squashAtomCommandFailure(query.emission) : null;
