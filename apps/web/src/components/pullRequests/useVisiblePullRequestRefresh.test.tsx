@@ -7,13 +7,15 @@ import { useVisiblePullRequestRefresh } from "./useVisiblePullRequestRefresh";
 function Probe({
   enabled,
   succeeded,
+  paused = false,
   revalidate,
 }: {
   enabled: boolean;
   succeeded: boolean;
+  paused?: boolean;
   revalidate: () => void;
 }) {
-  useVisiblePullRequestRefresh({ enabled, succeeded, revalidate });
+  useVisiblePullRequestRefresh({ enabled, succeeded, paused, revalidate });
   return null;
 }
 
@@ -53,6 +55,15 @@ describe("useVisiblePullRequestRefresh", () => {
     const revalidate = vi.fn();
     act(() => {
       root.render(createElement(Probe, { enabled: false, succeeded: true, revalidate }));
+    });
+    act(() => vi.advanceTimersByTime(60_000));
+    expect(revalidate).not.toHaveBeenCalled();
+  });
+
+  it("does not schedule or revalidate while paused", () => {
+    const revalidate = vi.fn();
+    act(() => {
+      root.render(createElement(Probe, { enabled: true, succeeded: true, paused: true, revalidate }));
     });
     act(() => vi.advanceTimersByTime(60_000));
     expect(revalidate).not.toHaveBeenCalled();

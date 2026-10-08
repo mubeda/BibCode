@@ -15,7 +15,7 @@ use crate::{
     pull_requests::{
         ContextRead, PullRequestsService,
         error::PullRequestsOperationError,
-        model::{ActionRequest, ListQuery, SubscribeInput, VocabularyKind},
+        model::{self, ActionRequest, ListQuery, SubscribeInput, VocabularyKind},
     },
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
 };
@@ -345,7 +345,15 @@ impl ConfiguredPullRequestsRpcServices {
                 let _ = sender.send(Err(error)).await;
                 return;
             }
-            if let Err(error) = service.subscribe(input, &cancellation).await {
+            let changed_sender = sender.clone();
+            // The poller calls `emit` synchronously from inside its tick; a plain
+            // `Fn` cannot await the channel, so a dropped send under backpressure
+            // simply skips that one change notification. The client's own
+            // `readSnapshot` call stays authoritative for the stored payload.
+            let emit = move |changed: model::Changed| {
+                let _ = changed_sender.try_send(Ok(vec![json!(changed)]));
+            };
+            if let Err(error) = service.subscribe(input, &emit, &cancellation).await {
                 let _ = sender.send(Err(json!(error))).await;
             }
         });

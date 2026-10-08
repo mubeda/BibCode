@@ -296,6 +296,7 @@ impl PullRequestsService {
     pub async fn subscribe(
         &self,
         input: SubscribeInput,
+        emit: &(dyn Fn(model::Changed) + Send + Sync),
         c: &CancellationToken,
     ) -> Result<(), PullRequestsOperationError> {
         let operation = "pullRequests.subscribe";
@@ -328,7 +329,7 @@ impl PullRequestsService {
             &list_key,
             input.number,
             tab,
-            &|_changed: model::Changed| {},
+            emit,
             c,
         )
         .await;

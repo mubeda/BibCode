@@ -47,6 +47,8 @@ vi.mock("../../../state/pullRequests", () => ({
     getChecks: h.getChecks,
     getFiles: h.getFiles,
     getVocabulary: h.getVocabulary,
+    readSnapshot: vi.fn(() => ({ kind: "readSnapshot" })),
+    subscribe: vi.fn(() => ({ kind: "subscribe" })),
   },
 }));
 vi.mock("../../../state/worktrees", () => ({
@@ -369,6 +371,17 @@ describe("PullRequestsDetailView", () => {
     expect(h.refresh.mock.calls.map(([kind]) => kind)).toEqual(["get", "getTimeline"]);
     expect(h.getTimeline).toHaveBeenCalledOnce();
     expect(usePullRequestsStore.getState().selectDraft(projectRef, 14).comment).toBe("");
+  });
+  it("paints a snapshot's title but leaves the merge control inactive until a live detail succeeds", async () => {
+    h.data.get = null;
+    h.data.readSnapshot = {
+      list: null,
+      detail: { payload: detail, observedAt: 1 },
+      tab: null,
+    };
+    await render("conversation", 14, null, gitlabContext);
+    expect(container.textContent).toContain(detail.title);
+    expect(container.querySelector('[aria-label="Merge status"]')).toBeNull();
   });
   it("offers a direct path back to the request list", async () => {
     await render();

@@ -25,13 +25,14 @@ import {
 } from "react";
 import { DEFAULT_PULL_REQUESTS_FILTERS, usePullRequestsStore } from "../../../pullRequestsStore";
 import { pullRequestsEnvironment } from "../../../state/pullRequests";
-import { type EnvironmentQueryView } from "../../../state/query";
+import { useEnvironmentQuery, type EnvironmentQueryView } from "../../../state/query";
 import { Button } from "../../ui/button";
 import { Skeleton } from "../../ui/skeleton";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
 import { useVisiblePullRequestRefresh } from "../useVisiblePullRequestRefresh";
+import { newerObservedAt } from "../detail/snapshotDisplay.logic";
 import { PullRequestsFilters } from "./PullRequestsFilters";
 import { PullRequestsRow } from "./PullRequestsRow";
 import {
@@ -309,11 +310,59 @@ export function PullRequestsListView({
   const firstQuery = usePullRequestsQuery(firstAtom, {
     freshOnOpen: freshPageKey === environmentRpcKey({ environmentId: scope.environmentId, input }),
   });
+  const isGitlab = context.provider === "gitlab";
+  const snapshotTarget = useMemo(
+    () => ({ environmentId: scope.environmentId, input: { ...input, number: null, tab: null } }),
+    [input, scope.environmentId],
+  );
+  const snapshotAtom = useMemo(
+    () => (isGitlab ? pullRequestsEnvironment.readSnapshot(snapshotTarget) : null),
+    [isGitlab, snapshotTarget],
+  );
+  const snapshotQuery = useEnvironmentQuery(snapshotAtom);
+  const subscribeAtom = useMemo(
+    () => (isGitlab ? pullRequestsEnvironment.subscribe(snapshotTarget) : null),
+    [isGitlab, snapshotTarget],
+  );
+  const subscribeQuery = useEnvironmentQuery(subscribeAtom);
+  // A success on the push stream, even the initial all-false connected event,
+  // stands the client's own refresh timer down until the stream fails or waits again.
+  const paused = isGitlab && subscribeQuery.emission._tag === "Success";
+  const [paintedList, setPaintedList] = useState<{
+    payload: PullRequestsListPage;
+    observedAt: number;
+  } | null>(null);
+  useEffect(() => {
+    const row = snapshotQuery.data?.list ?? null;
+    if (!row) return;
+    setPaintedList((previous) =>
+      newerObservedAt(previous?.observedAt ?? null, row.observedAt) ? row : previous,
+    );
+  }, [snapshotQuery.data]);
+  const applySubscribedChange = useEffectEvent((changed: NonNullable<typeof subscribeQuery.data>) => {
+    if (changed.list) snapshotQuery.revalidate();
+  });
+  useEffect(() => {
+    if (subscribeQuery.data) applySubscribedChange(subscribeQuery.data);
+  }, [subscribeQuery.data]);
+  // A fresh mount with no cached live first page kicks off the authoritative read
+  // alongside the painted snapshot; an already-fresh atom keeps its own stale time.
+  useEffect(() => {
+    if (isGitlab && firstQuery.data === null) firstQuery.revalidate();
+    // Deliberately once per mount: a later input change remounts this view by key.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   useVisiblePullRequestRefresh({
-    enabled: context.provider === "gitlab",
+    enabled: isGitlab,
     succeeded: firstQuery.data !== null && firstQuery.error === null && !firstQuery.isPending,
+    paused,
     revalidate: firstQuery.revalidate,
   });
+  const displayedFirstPage = firstQuery.data ?? paintedList?.payload ?? null;
+  const displayedFirstQuery: EnvironmentQueryView<PullRequestsListPage> =
+    firstQuery.data !== null || paintedList === null
+      ? firstQuery
+      : { ...firstQuery, data: paintedList.payload, isPending: false };
   useEffect(() => {
     if (freshPageKey != null) onFreshPageConsumed?.(freshPageKey);
   }, [freshPageKey, onFreshPageConsumed]);
@@ -341,7 +390,7 @@ export function PullRequestsListView({
           className="mx-4 mt-3 shrink-0"
         >
           {tabs.map((tab) => {
-            const counts = firstQuery.data?.counts;
+            const counts = displayedFirstPage?.counts;
             const count =
               tab === "all"
                 ? counts?.open !== null &&
@@ -379,7 +428,7 @@ export function PullRequestsListView({
             context={context}
             ref={ref}
             input={input}
-            firstQuery={firstQuery}
+            firstQuery={displayedFirstQuery}
             hasFilters={hasFilters}
             onClear={clear}
           />

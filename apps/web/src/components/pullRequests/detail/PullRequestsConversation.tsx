@@ -26,6 +26,12 @@ export interface PullRequestsConversationProps {
   projectRef: ScopedProjectRef;
   timeline: PullRequestsTimeline;
   detailsRefreshing?: boolean;
+  /**
+   * Action controls (review, merge) only act on a live detail that succeeded on
+   * this mount, never on a painted snapshot. Omitting this falls back to
+   * `detail`, so callers that have not adopted the split keep acting as before.
+   */
+  liveDetail?: PullRequestsDetail | null;
 }
 const timelineKey = (item: PullRequestsTimeline["items"][number]) => item.id;
 export const PullRequestsConversation = memo(function PullRequestsConversation({
@@ -35,6 +41,7 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
   scope,
   timeline,
   detailsRefreshing = false,
+  liveDetail = detail,
 }: PullRequestsConversationProps) {
   const { run, pending } = usePullRequestsActions();
   const items = useMemo(() => groupTimeline(timeline.items), [timeline.items]);
@@ -53,7 +60,9 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
   );
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <PullRequestsPendingReviewBar detail={detail} context={context} projectRef={projectRef} />
+      {liveDetail ? (
+        <PullRequestsPendingReviewBar detail={liveDetail} context={context} projectRef={projectRef} />
+      ) : null}
       <LegendList
         data={items}
         keyExtractor={timelineKey}
@@ -115,7 +124,9 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
                 detailsRefreshing={detailsRefreshing}
               />
             </div>
-            <PullRequestsMergeBox detail={detail} context={context} projectRef={projectRef} />
+            {liveDetail ? (
+              <PullRequestsMergeBox detail={liveDetail} context={context} projectRef={projectRef} />
+            ) : null}
           </div>
         }
       />

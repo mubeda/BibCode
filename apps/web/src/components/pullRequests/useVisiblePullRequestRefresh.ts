@@ -4,10 +4,13 @@ import { shouldRefreshOnShow, visibleRefreshDelay } from "./visibleRefresh.logic
 export function useVisiblePullRequestRefresh({
   enabled,
   succeeded,
+  paused = false,
   revalidate,
 }: {
   enabled: boolean;
   succeeded: boolean;
+  /** The subscribe stream is pushing change events, so the client's own timer stands down. */
+  paused?: boolean;
   revalidate: () => void;
 }): void {
   const lastSuccessAt = useRef<number | null>(null);
@@ -16,7 +19,7 @@ export function useVisiblePullRequestRefresh({
   if (succeeded && lastSuccessAt.current === null) lastSuccessAt.current = Date.now();
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || paused) return;
     let timer: number | null = null;
     const clear = () => {
       if (timer !== null) window.clearTimeout(timer);
@@ -53,5 +56,5 @@ export function useVisiblePullRequestRefresh({
       document.removeEventListener("visibilitychange", onVisibility);
       clear();
     };
-  }, [enabled, succeeded]);
+  }, [enabled, paused, succeeded]);
 }

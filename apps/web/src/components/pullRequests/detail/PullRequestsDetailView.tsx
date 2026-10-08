@@ -3,16 +3,34 @@ import {
   formatChangeRequestNumber,
 } from "@bibcode/shared/sourceControl";
 import { useAtomRefresh } from "@effect/atom-react";
-import type { EnvironmentId, PullRequestsContext, ScopedProjectRef } from "@bibcode/contracts";
+import { projectKey } from "@bibcode/client-runtime/state/entities";
+import type {
+  EnvironmentId,
+  PullRequestsChecks as PullRequestsChecksData,
+  PullRequestsCommits as PullRequestsCommitsData,
+  PullRequestsContext,
+  PullRequestsDetail,
+  PullRequestsFiles as PullRequestsFilesData,
+  PullRequestsTimeline,
+  ScopedProjectRef,
+} from "@bibcode/contracts";
 import { useNavigate } from "@tanstack/react-router";
-import { lazy, Suspense, useCallback, useEffect, useMemo } from "react";
+import { lazy, Suspense, useCallback, useEffect, useEffectEvent, useMemo, useState } from "react";
 import { PullRequestsActionProvider } from "../usePullRequestsAction";
 import { usePullRequestsStore, type PullRequestsDetailTab } from "../../../pullRequestsStore";
 import { pullRequestsEnvironment } from "../../../state/pullRequests";
+import { useEnvironmentQuery, type EnvironmentQueryView } from "../../../state/query";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { Button } from "../../ui/button";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
 import { useVisiblePullRequestRefresh } from "../useVisiblePullRequestRefresh";
+import {
+  buildListInput,
+  selectListFilters,
+  selectListSort,
+  selectListTab,
+} from "../list/pullRequestsList.logic";
+import { newerObservedAt } from "./snapshotDisplay.logic";
 import { PullRequestsQueryState } from "./PullRequestsQueryState";
 import { PullRequestsHeader } from "./PullRequestsHeader";
 import { PullRequestsConversation } from "./PullRequestsConversation";
@@ -110,14 +128,129 @@ export function PullRequestsDetailView({
     checks: checksQuery,
     files: filesQuery,
   }[tab];
+  const isGitlab = context.provider === "gitlab";
+  // The same list the project's list view would show, so this detail's poller
+  // joins that list's background-sync group instead of starting another one.
+  const key = projectKey(projectRef);
+  const listFilters = usePullRequestsStore((state) => selectListFilters(state.byProjectKey[key]));
+  const listTab = usePullRequestsStore((state) => selectListTab(state.byProjectKey[key]));
+  const listSort = usePullRequestsStore((state) => selectListSort(state.byProjectKey[key]));
+  const listInput = useMemo(
+    () => buildListInput({ filters: listFilters, listTab, sort: listSort }, scope.cwd),
+    [listFilters, listTab, listSort, scope.cwd],
+  );
+  const snapshotTarget = useMemo(
+    () => ({ environmentId: scope.environmentId, input: { ...listInput, number, tab } }),
+    [listInput, number, scope.environmentId, tab],
+  );
+  const snapshotAtom = useMemo(
+    () => (isGitlab ? pullRequestsEnvironment.readSnapshot(snapshotTarget) : null),
+    [isGitlab, snapshotTarget],
+  );
+  const snapshotQuery = useEnvironmentQuery(snapshotAtom);
+  const subscribeAtom = useMemo(
+    () => (isGitlab ? pullRequestsEnvironment.subscribe(snapshotTarget) : null),
+    [isGitlab, snapshotTarget],
+  );
+  const subscribeQuery = useEnvironmentQuery(subscribeAtom);
+  // A success on the push stream, even the initial all-false connected event,
+  // means the server is actively watching this request; the client's own
+  // timer stands down until the stream drops back to waiting or fails.
+  const paused = isGitlab && subscribeQuery.emission._tag === "Success";
+  const [paintedDetail, setPaintedDetail] = useState<{
+    payload: PullRequestsDetail;
+    observedAt: number;
+  } | null>(null);
+  useEffect(() => {
+    const row = snapshotQuery.data?.detail ?? null;
+    if (!row) return;
+    setPaintedDetail((previous) =>
+      newerObservedAt(previous?.observedAt ?? null, row.observedAt) ? row : previous,
+    );
+  }, [snapshotQuery.data]);
+  const [paintedTab, setPaintedTab] = useState<{
+    tab: PullRequestsDetailTab;
+    payload: PullRequestsTimeline | PullRequestsCommitsData | PullRequestsChecksData | PullRequestsFilesData;
+    observedAt: number;
+  } | null>(null);
+  useEffect(() => {
+    const row = snapshotQuery.data?.tab ?? null;
+    if (!row) return;
+    setPaintedTab((previous) =>
+      previous === null ||
+      previous.tab !== row.kind ||
+      newerObservedAt(previous.observedAt, row.observedAt)
+        ? { tab: row.kind, payload: row.payload, observedAt: row.observedAt }
+        : previous,
+    );
+  }, [snapshotQuery.data]);
+  const applySubscribedChange = useEffectEvent(
+    (changed: NonNullable<typeof subscribeQuery.data>) => {
+      if (changed.detail) detailQuery.revalidate();
+      if (changed.timeline)
+        (tab === "conversation" || tab === "files" ? timelineQuery.revalidate : refreshTimelineAtom)();
+      if (changed.commits) (tab === "commits" ? commitsQuery.revalidate : refreshCommitsAtom)();
+      if (changed.checks) (tab === "checks" ? checksQuery.revalidate : refreshChecksAtom)();
+      if (changed.files) (tab === "files" ? filesQuery.revalidate : refreshFilesAtom)();
+    },
+  );
+  useEffect(() => {
+    if (subscribeQuery.data) applySubscribedChange(subscribeQuery.data);
+  }, [subscribeQuery.data]);
+  // A fresh mount with no cached live detail kicks off the authoritative read
+  // alongside the painted snapshot; an already-fresh atom keeps its own 5s
+  // stale time instead of being forced to re-read here.
+  useEffect(() => {
+    if (isGitlab && detailQuery.data === null) detailQuery.revalidate();
+    // Deliberately once per mount: a later tab/number change remounts this view.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const detailSucceeded =
+    detailQuery.data !== null && detailQuery.error === null && !detailQuery.isPending;
+  // Action controls (merge, review) act only on this live detail, never a snapshot.
+  const liveDetail = detailSucceeded ? detailQuery.data : null;
+  const displayedDetailData = detailQuery.data ?? paintedDetail?.payload ?? null;
+  const displayedDetailQuery: EnvironmentQueryView<PullRequestsDetail> =
+    detailQuery.data !== null || paintedDetail === null
+      ? detailQuery
+      : { ...detailQuery, data: paintedDetail.payload, isPending: false };
+  const paintedActivePayload = paintedTab?.tab === tab ? paintedTab.payload : null;
+  const displayedTimeline =
+    timelineQuery.data ??
+    (tab === "conversation" && paintedActivePayload
+      ? (paintedActivePayload as PullRequestsTimeline)
+      : null);
+  const displayedCommits =
+    commitsQuery.data ??
+    (tab === "commits" && paintedActivePayload
+      ? (paintedActivePayload as PullRequestsCommitsData)
+      : null);
+  const displayedChecks =
+    checksQuery.data ??
+    (tab === "checks" && paintedActivePayload ? (paintedActivePayload as PullRequestsChecksData) : null);
+  const displayedFiles =
+    filesQuery.data ??
+    (tab === "files" && paintedActivePayload ? (paintedActivePayload as PullRequestsFilesData) : null);
+  const displayedActiveData = {
+    conversation: displayedTimeline,
+    commits: displayedCommits,
+    checks: displayedChecks,
+    files: displayedFiles,
+  }[tab];
+  const displayedActiveQuery =
+    activeQuery.data !== null || displayedActiveData === null
+      ? activeQuery
+      : { ...activeQuery, data: displayedActiveData, isPending: false };
   useVisiblePullRequestRefresh({
-    enabled: context.provider === "gitlab",
-    succeeded: detailQuery.data !== null && detailQuery.error === null && !detailQuery.isPending,
+    enabled: isGitlab,
+    succeeded: detailSucceeded,
+    paused,
     revalidate: detailQuery.revalidate,
   });
   useVisiblePullRequestRefresh({
-    enabled: context.provider === "gitlab" && activeQuery.data !== null,
+    enabled: isGitlab && activeQuery.data !== null,
     succeeded: activeQuery.data !== null && activeQuery.error === null && !activeQuery.isPending,
+    paused,
     revalidate: activeQuery.revalidate,
   });
   useEffect(() => {
@@ -131,7 +264,7 @@ export function PullRequestsDetailView({
     checks: vocabulary.checks,
     files: vocabulary.filesChanged,
   };
-  const detail = detailQuery.data;
+  const detail = displayedDetailData;
   const refreshing = detailQuery.isPending || activeQuery.isPending;
   const refreshDetail = detailQuery.refresh;
   const refreshTab = activeQuery.refresh;
@@ -166,7 +299,7 @@ export function PullRequestsDetailView({
           </Button>
         </div>
         <PullRequestsQueryState
-          query={detailQuery}
+          query={displayedDetailQuery}
           label={`${presentation.longName} ${formatChangeRequestNumber(context.provider, number)}`}
         >
           {detail ? (
@@ -211,21 +344,22 @@ export function PullRequestsDetailView({
                 </TabsList>
                 <div className="flex min-h-0 flex-1">
                   <TabsPanel value={tab} className="min-h-0 flex-1 gap-0">
-                    <PullRequestsQueryState key={tab} query={activeQuery} label={labels[tab]}>
-                      {tab === "conversation" && timelineQuery.data ? (
+                    <PullRequestsQueryState key={tab} query={displayedActiveQuery} label={labels[tab]}>
+                      {tab === "conversation" && displayedTimeline ? (
                         <PullRequestsConversation
                           scope={scope}
                           detail={detail}
                           context={context}
                           projectRef={projectRef}
-                          timeline={timelineQuery.data}
+                          timeline={displayedTimeline}
                           detailsRefreshing={detailQuery.isPending}
+                          liveDetail={liveDetail}
                         />
-                      ) : tab === "commits" && commitsQuery.data ? (
-                        <PullRequestsCommits commits={commitsQuery.data} />
-                      ) : tab === "checks" && checksQuery.data ? (
-                        <PullRequestsChecks checks={checksQuery.data} context={context} />
-                      ) : tab === "files" && filesQuery.data ? (
+                      ) : tab === "commits" && displayedCommits ? (
+                        <PullRequestsCommits commits={displayedCommits} />
+                      ) : tab === "checks" && displayedChecks ? (
+                        <PullRequestsChecks checks={displayedChecks} context={context} />
+                      ) : tab === "files" && displayedFiles ? (
                         <Suspense
                           fallback={
                             <p role="status" className="p-4 text-sm">
@@ -234,10 +368,10 @@ export function PullRequestsDetailView({
                           }
                         >
                           <PullRequestsQueryState query={timelineQuery} label="Review threads">
-                            {timelineQuery.data ? (
+                            {displayedTimeline ? (
                               <PullRequestsFiles
-                                timeline={timelineQuery.data}
-                                files={filesQuery.data}
+                                timeline={displayedTimeline}
+                                files={displayedFiles}
                                 detail={detail}
                                 projectRef={projectRef}
                                 context={context}
