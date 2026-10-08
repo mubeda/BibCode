@@ -2021,8 +2021,16 @@ receipt, FIFO position, payload, model/options and delivery key. It refuses chan
 delivery ownership or newly restored/conflicting runtime identity; another native
 session's cursor remains a rejection. The retry starts without resume, freezes to
 the new native session, and immediate acceptance records `startedNewConversation`
-with the delivered state. The user message shows "Sent in a new conversation. The
-agent won't remember earlier messages in this thread." in muted status text. A
+with the delivered state. A retry that resumes its frozen session but finds the
+provider no longer has it (the driver starts a different conversation) recovers
+the same way inside `launch_session`: before the new cursor is saved, the saved
+cursor is cleared and the same guarded update releases the start, so the retry is
+delivered once in the new conversation instead of failing its identity check; a
+crash between those steps leaves a cursorless runtime the next retry recovers
+from. Reconciliation launches never release a frozen start. The new conversation receives the thread's earlier
+messages ([context handoff](./providers.md#resume-failures-and-context-handoff)),
+and the user message shows "Sent in a new conversation with a summary of earlier
+messages." in muted status text. A
 still-resumable frozen session resumes normally without that notice. Automatic
 reconciliation never unfreezes ambiguous work. Nonaccepted fresh attempts keep
 their existing outcomes and no notice; the fact is not retained for a later

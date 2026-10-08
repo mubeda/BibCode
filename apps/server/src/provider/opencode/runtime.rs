@@ -637,6 +637,11 @@ impl OpenCodeSessionRuntime {
             .send()
             .await
             .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?;
+        // The server no longer has the session, so retrying cannot resume it. Any other failure
+        // may be transient and keeps the saved session for the next attempt.
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return self.start().await;
+        }
         if !response.status().is_success() {
             return Err(OpenCodeRuntimeError::Http(format!(
                 "session resume returned HTTP {}",

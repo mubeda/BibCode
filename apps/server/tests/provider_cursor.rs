@@ -435,6 +435,38 @@ async fn cursor_runtime_applies_the_selected_model_after_session_creation() {
 }
 
 #[tokio::test]
+async fn cursor_runtime_starts_a_new_session_when_the_saved_one_cannot_be_loaded() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-lost-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: Some("cursor-gone".to_owned()),
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    peer.expect_request("initialize")
+        .respond(json!({ "protocolVersion": 1 }));
+    peer.expect_request("authenticate")
+        .respond(json!({ "status": "ok" }));
+    peer.expect_request("session/load")
+        .expect_params(json!({ "sessionId": "cursor-gone" }))
+        .respond_error(json!({ "code": -32602, "message": "Session not found" }));
+    peer.expect_request("session/new")
+        .expect_params(json!({ "cwd": "/tmp/project", "mcpServers": [] }))
+        .respond(json!({ "sessionId": "cursor-fresh" }));
+    let peer_task = tokio::spawn(peer.run());
+
+    assert_eq!(runtime.start().await.expect("start"), "cursor-fresh");
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
 async fn cursor_fast_mode_uses_acp_config_update() {
     let (connection, incoming, mut peer) = scripted_peer();
     let runtime = CursorSessionRuntime::new(
