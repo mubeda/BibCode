@@ -1297,6 +1297,13 @@ export interface DesktopBridge {
     options?: { issuePairingToken?: boolean },
   ) => Promise<DesktopSshEnvironmentBootstrap>;
   disconnectSshEnvironment: (target: DesktopSshEnvironmentTarget) => Promise<void>;
+  /**
+   * Forwards `remotePort` on the target's loopback over its live SSH
+   * connection and resolves the local port. Idempotent per remote port; the
+   * forward ends with the connection or on `releaseSshForward`.
+   */
+  sshForward: (target: DesktopSshEnvironmentTarget, remotePort: number) => Promise<number>;
+  releaseSshForward: (target: DesktopSshEnvironmentTarget, remotePort: number) => Promise<void>;
   fetchSshEnvironmentDescriptor: (httpBaseUrl: string) => Promise<ExecutionEnvironmentDescriptor>;
   /**
    * Exchanges a one-time SSH pairing credential for a bearer. `scopes` is

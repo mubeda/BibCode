@@ -32,6 +32,13 @@ const SSH_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_READY_INTERVAL: Duration = Duration::from_millis(250);
 const SSH_READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const SSH_TUNNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
+const SSH_FORWARD_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const SSH_FORWARD_READY_INTERVAL: Duration = Duration::from_millis(50);
+/// Port forwards kept per tunnel: a backstop against leaks that leaves most
+/// of `SSH_CHILD_REAPER_CAPACITY` to other SSH work. A further request evicts
+/// the least recently requested forward.
+const SSH_MAX_PORT_FORWARDS_PER_TUNNEL: usize = 8;
+const SSH_CONNECTION_NOT_ACTIVE: &str = "SSH connection is not active.";
 /// How long the pipes of an exited SSH child may stay idle before the rest of
 /// its output is given up on. A descendant that inherited them (a
 /// ProxyCommand helper, a ControlPersist master on older OpenSSH, a
@@ -595,6 +602,28 @@ impl SshEnvironmentLaunchPlan {
 struct ManagedSshTunnel {
     child: ManagedSshChild,
     bootstrap: SshEnvironmentBootstrap,
+    /// Port forwards over this connection, keyed by remote port. They are
+    /// reaped with the tunnel, or handed to the reaper when it is dropped, so
+    /// none outlives it.
+    forwards: HashMap<u16, SshPortForward>,
+}
+
+impl ManagedSshTunnel {
+    async fn terminate_and_reap(&mut self) {
+        for (_, mut forward) in self.forwards.drain() {
+            forward.child.terminate_and_reap().await;
+        }
+        self.child.terminate_and_reap().await;
+    }
+}
+
+/// A dedicated `ssh -N -L 127.0.0.1:<local>:127.0.0.1:<remote>` child.
+struct SshPortForward {
+    child: ManagedSshChild,
+    local_port: u16,
+    last_requested: tokio::time::Instant,
+    /// Dropping it stops the child's stderr drain.
+    _stderr_drain: oneshot::Sender<()>,
 }
 
 /// Per-operation deadlines for the remote scripts the manager runs over SSH.
@@ -766,7 +795,7 @@ impl SshEnvironmentManager {
                 Vec::new()
             });
         for mut tunnel in tunnels {
-            tunnel.child.terminate_and_reap().await;
+            tunnel.terminate_and_reap().await;
         }
         self.child_reaper.wait().await;
         // Every SSH child is reaped, so the I/O runtime has nothing left to
@@ -839,31 +868,20 @@ impl SshEnvironmentManager {
             .await?;
         let tunnel_result = self
             .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
-                let target = target.clone();
                 let askpass_launcher = askpass_launcher.clone();
-                let remote_launch = remote_launch.clone();
-                let ssh_program = self.ssh_program.clone();
-                #[cfg(test)]
-                let ssh_config_file_for_test = self.ssh_config_file_for_test.clone();
+                let plan = self.forward_plan(&target, local_port, remote_launch.clone(), &auth);
                 let io_runtime = io_runtime.clone();
                 async move {
-                    let mut plan = SshEnvironmentLaunchPlan::forward_with_auth(
-                        target,
-                        local_port,
-                        remote_launch,
-                        &auth,
-                    )?;
-                    plan.program = ssh_program;
-                    #[cfg(test)]
-                    if let Some(path) = ssh_config_file_for_test {
-                        plan.args.splice(
-                            0..0,
-                            ["-F".to_string(), path.to_string_lossy().into_owned()],
-                        );
-                    }
+                    let plan = plan?;
                     let tunnel_plan = plan.clone();
                     let child = run_on_ssh_io(&io_runtime, async move {
-                        start_ssh_tunnel(&tunnel_plan, &auth, askpass_launcher).await
+                        start_ssh_tunnel(
+                            &tunnel_plan,
+                            &auth,
+                            askpass_launcher,
+                            SshForwardKind::Tunnel,
+                        )
+                        .await
                     })
                     .await?;
                     Ok((plan, child))
@@ -907,6 +925,227 @@ impl SshEnvironmentManager {
             return Err(error);
         }
         Ok(bootstrap)
+    }
+
+    /// The `ssh -N -L <local>:127.0.0.1:<remote>` plan for this manager's
+    /// SSH program.
+    fn forward_plan(
+        &self,
+        target: &SshEnvironmentTarget,
+        local_port: u16,
+        remote: RemoteLaunchResult,
+        auth: &SshAuthOptions,
+    ) -> Result<SshEnvironmentLaunchPlan, String> {
+        let mut plan =
+            SshEnvironmentLaunchPlan::forward_with_auth(target.clone(), local_port, remote, auth)?;
+        plan.program = self.ssh_program.clone();
+        #[cfg(test)]
+        if let Some(path) = &self.ssh_config_file_for_test {
+            plan.args.splice(
+                0..0,
+                ["-F".to_string(), path.to_string_lossy().into_owned()],
+            );
+        }
+        Ok(plan)
+    }
+
+    /// A preview port forward's plan: the tunnel's arguments, forwarding to
+    /// `remote_port` on the host's loopback, and hardened against inherited
+    /// SSH configuration. The local end binds to loopback explicitly, since
+    /// `GatewayPorts yes` would otherwise expose it to the network, and
+    /// `ControlPath=none` keeps the forward in this child: a multiplexed
+    /// client would hand it to a master it does not own and exit.
+    fn port_forward_plan(
+        &self,
+        target: &SshEnvironmentTarget,
+        local_port: u16,
+        remote_port: u16,
+        auth: &SshAuthOptions,
+    ) -> Result<SshEnvironmentLaunchPlan, String> {
+        let remote = RemoteLaunchResult {
+            remote_port,
+            // Not a server; the plan's server kind goes unused.
+            server_kind: "external".to_string(),
+        };
+        let mut plan = self.forward_plan(target, local_port, remote, auth)?;
+        let spec = format!("{local_port}:127.0.0.1:{remote_port}");
+        for arg in &mut plan.args {
+            if *arg == spec {
+                *arg = format!("127.0.0.1:{spec}");
+            }
+        }
+        plan.args
+            .splice(0..0, ["-o".to_string(), "ControlPath=none".to_string()]);
+        Ok(plan)
+    }
+
+    /// Forwards `remote_port` on the target host's loopback to a free local
+    /// port over a dedicated `ssh -N -L` child, and returns the local port.
+    ///
+    /// It needs the target's live tunnel and ends with it. Per remote port it
+    /// is idempotent: a live forward is reused and a dead one replaced. At
+    /// most `SSH_MAX_PORT_FORWARDS_PER_TUNNEL` forwards are kept per tunnel.
+    pub async fn ensure_port_forward<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        prompts: &SshPasswordPromptManager,
+        target: SshEnvironmentTarget,
+        remote_port: u16,
+    ) -> Result<u16, String> {
+        if !self.child_reaper.accepting() {
+            return Err("SSH process owner is shutting down.".to_string());
+        }
+        if remote_port == 0 {
+            return Err("SSH port forward needs a remote port from 1 to 65535.".to_string());
+        }
+        let target = normalize_ssh_environment_target(target)?;
+        let key = target_connection_key(&target);
+        // Same lock as `ensure_environment`: the tunnel cannot be replaced or
+        // stopped while its forwards change. The wait is bounded by
+        // `ensure_environment`'s, or here by the evictions (1.5 s each) and
+        // at most three 10 s readiness waits around two password prompts.
+        let target_lock = self.target_lock(&key)?;
+        let _serialised = target_lock.lock().await;
+        if self.take_existing_bootstrap_if_running(&key)?.is_none() {
+            return Err(SSH_CONNECTION_NOT_ACTIVE.to_string());
+        }
+        let stale = {
+            let mut tunnels = self
+                .tunnels
+                .lock()
+                .map_err(|error| format!("Could not access SSH tunnels: {error}"))?;
+            let tunnel = tunnels
+                .get_mut(&key)
+                .ok_or_else(|| SSH_CONNECTION_NOT_ACTIVE.to_string())?;
+            if let Some(forward) = tunnel.forwards.get_mut(&remote_port)
+                && matches!(forward.child.child_mut().try_wait(), Ok(None))
+            {
+                forward.last_requested = tokio::time::Instant::now();
+                return Ok(forward.local_port);
+            }
+            let mut stale: Vec<SshPortForward> =
+                tunnel.forwards.remove(&remote_port).into_iter().collect();
+            while tunnel.forwards.len() >= SSH_MAX_PORT_FORWARDS_PER_TUNNEL {
+                let Some(oldest) = tunnel
+                    .forwards
+                    .iter()
+                    .min_by_key(|(_, forward)| forward.last_requested)
+                    .map(|(port, _)| *port)
+                else {
+                    break;
+                };
+                stale.extend(tunnel.forwards.remove(&oldest));
+            }
+            stale
+        };
+        for mut forward in stale {
+            forward.child.terminate_and_reap().await;
+        }
+
+        let askpass_launcher = self.askpass_launcher()?;
+        let io_runtime = self.io_runtime.handle()?;
+        let (local_port, mut child) = self
+            .run_with_ssh_auth(app, prompts, &key, &target, |auth| {
+                // Each attempt picks its port just before spawning, so a
+                // password prompt never leaves a picked port unbound for long.
+                let plan = portpicker::pick_unused_port()
+                    .ok_or_else(|| {
+                        "Could not find an available local SSH port forward port.".to_string()
+                    })
+                    .and_then(|local_port| {
+                        self.port_forward_plan(&target, local_port, remote_port, &auth)
+                    });
+                let askpass_launcher = askpass_launcher.clone();
+                let io_runtime = io_runtime.clone();
+                async move {
+                    let plan = plan?;
+                    let local_port = plan.local_port;
+                    let child = run_on_ssh_io(&io_runtime, async move {
+                        start_ssh_tunnel(
+                            &plan,
+                            &auth,
+                            askpass_launcher,
+                            SshForwardKind::PortForward,
+                        )
+                        .await
+                    })
+                    .await?;
+                    Ok((local_port, child))
+                }
+            })
+            .await?;
+        let stderr_drain = drain_forward_stderr(&io_runtime, &mut child);
+        let forward = SshPortForward {
+            child,
+            local_port,
+            last_requested: tokio::time::Instant::now(),
+            _stderr_drain: stderr_drain,
+        };
+        if let Err((error, mut forward)) = self.publish_port_forward(&key, remote_port, forward) {
+            forward.child.terminate_and_reap().await;
+            return Err(error);
+        }
+        Ok(local_port)
+    }
+
+    /// Terminates and reaps the forward of `remote_port`, if there is one.
+    pub async fn release_port_forward(
+        &self,
+        target: SshEnvironmentTarget,
+        remote_port: u16,
+    ) -> Result<(), String> {
+        let target = normalize_ssh_environment_target(target)?;
+        let key = target_connection_key(&target);
+        let target_lock = self.target_lock(&key)?;
+        let _serialised = target_lock.lock().await;
+        let forward = self
+            .tunnels
+            .lock()
+            .map_err(|error| format!("Could not access SSH tunnels: {error}"))?
+            .get_mut(&key)
+            .and_then(|tunnel| tunnel.forwards.remove(&remote_port));
+        if let Some(mut forward) = forward {
+            forward.child.terminate_and_reap().await;
+        }
+        Ok(())
+    }
+
+    /// Records a ready forward on its tunnel. Callers hold the target lock,
+    /// so only `shutdown` or the tunnel's own exit can have ended the tunnel
+    /// since they checked it; the forward is then refused, never orphaned.
+    fn publish_port_forward(
+        &self,
+        key: &str,
+        remote_port: u16,
+        forward: SshPortForward,
+    ) -> Result<(), (String, Box<SshPortForward>)> {
+        let mut tunnels = match self.tunnels.lock() {
+            Ok(tunnels) => tunnels,
+            Err(error) => {
+                return Err((
+                    format!("Could not record SSH port forward: {error}"),
+                    Box::new(forward),
+                ));
+            }
+        };
+        if !self.child_reaper.accepting() {
+            return Err((
+                "SSH process owner is shutting down.".to_string(),
+                Box::new(forward),
+            ));
+        }
+        let Some(tunnel) = tunnels.get_mut(key) else {
+            return Err((SSH_CONNECTION_NOT_ACTIVE.to_string(), Box::new(forward)));
+        };
+        if !matches!(tunnel.child.child_mut().try_wait(), Ok(None)) {
+            return Err((SSH_CONNECTION_NOT_ACTIVE.to_string(), Box::new(forward)));
+        }
+        let replaced = tunnel.forwards.insert(remote_port, forward);
+        drop(tunnels);
+        // The caller removed any previous forward; a replaced one would go to
+        // the retained reaper.
+        drop(replaced);
+        Ok(())
     }
 
     fn target_lock(&self, key: &str) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
@@ -970,7 +1209,7 @@ impl SshEnvironmentManager {
             }
         };
         if let Some(mut stale) = stale {
-            stale.child.terminate_and_reap().await;
+            stale.terminate_and_reap().await;
         }
     }
 
@@ -994,7 +1233,7 @@ impl SshEnvironmentManager {
         let askpass_launcher = match tunnel {
             Some(mut tunnel) => {
                 let askpass_launcher = tunnel.child.askpass_launcher().clone();
-                tunnel.child.terminate_and_reap().await;
+                tunnel.terminate_and_reap().await;
                 askpass_launcher
             }
             None => self.askpass_launcher()?,
@@ -1152,7 +1391,14 @@ impl SshEnvironmentManager {
                 Box::new(child),
             ));
         }
-        let replaced = tunnels.insert(key, ManagedSshTunnel { child, bootstrap });
+        let replaced = tunnels.insert(
+            key,
+            ManagedSshTunnel {
+                child,
+                bootstrap,
+                forwards: HashMap::new(),
+            },
+        );
         drop(tunnels);
         // Dropping hands a replaced child to the retained reaper.
         drop(replaced);
@@ -2116,10 +2362,20 @@ async fn issue_remote_pairing_token(
     parse_remote_pairing_credential(&output)
 }
 
+/// What a forwarding SSH child serves, which decides how it proves ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshForwardKind {
+    /// The environment tunnel: the remote server answers through it.
+    Tunnel,
+    /// A preview port forward: its local end accepts TCP connections.
+    PortForward,
+}
+
 async fn start_ssh_tunnel(
     plan: &SshEnvironmentLaunchPlan,
     auth: &SshAuthOptions,
     askpass_launcher: SshAskpassLauncher,
+    kind: SshForwardKind,
 ) -> Result<ManagedSshChild, String> {
     let mut command = Command::new(&plan.program);
     configure_background_command(&mut command);
@@ -2130,11 +2386,25 @@ async fn start_ssh_tunnel(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child = spawn_managed_ssh_child(command, askpass_launcher, "start SSH tunnel")?;
+    let operation = match kind {
+        SshForwardKind::Tunnel => "start SSH tunnel",
+        SshForwardKind::PortForward => "start SSH port forward",
+    };
+    let mut child = spawn_managed_ssh_child(command, askpass_launcher, operation)?;
 
     let mut shutdown = child.shutdown_receiver();
+    let ready = async {
+        match kind {
+            SshForwardKind::Tunnel => {
+                wait_for_ssh_tunnel_ready(child.child_mut(), &plan.http_base_url).await
+            }
+            SshForwardKind::PortForward => {
+                wait_for_ssh_port_forward_ready(child.child_mut(), plan.local_port).await
+            }
+        }
+    };
     let ready_result = tokio::select! {
-        result = wait_for_ssh_tunnel_ready(child.child_mut(), &plan.http_base_url) => result,
+        result = ready => result,
         _ = wait_for_ssh_shutdown(&mut shutdown) => {
             Err("SSH process owner is shutting down.".to_string())
         }
@@ -2145,6 +2415,32 @@ async fn start_ssh_tunnel(
     }
 
     Ok(child)
+}
+
+/// Discards a long-lived forward's stderr on the SSH I/O runtime, so the
+/// messages ssh writes for each channel it cannot open (nothing listening on
+/// the remote port) never fill the pipe and block it. The drain ends at end
+/// of file or when the returned sender is dropped with its forward; then a
+/// read still in flight is settled, since a descendant that inherited the
+/// pipe can keep it open after ssh exits.
+fn drain_forward_stderr(
+    io_runtime: &tokio::runtime::Handle,
+    child: &mut ManagedSshChild,
+) -> oneshot::Sender<()> {
+    let (stop, stopped) = oneshot::channel::<()>();
+    if let Some(mut stderr) = child.child_mut().stderr.take() {
+        io_runtime.spawn(async move {
+            let mut sink = tokio::io::sink();
+            let finished = tokio::select! {
+                _ = tokio::io::copy(&mut stderr, &mut sink) => true,
+                _ = stopped => false,
+            };
+            if !finished {
+                settle_unfinished_reads(vec![&mut stderr]).await;
+            }
+        });
+    }
+    stop
 }
 
 /// One readiness probe of the remote server through a cached tunnel.
@@ -2204,6 +2500,39 @@ async fn wait_for_ssh_tunnel_ready(child: &mut Child, http_base_url: &str) -> Re
     Err(format!(
         "SSH tunnel did not become ready at {http_base_url}: {last_error}"
     ))
+}
+
+/// Polls until the forward's local port accepts a TCP connection while the
+/// child is still running. ssh opens the listener only after authenticating,
+/// and with `ExitOnForwardFailure` exits when it cannot bind.
+async fn wait_for_ssh_port_forward_ready(child: &mut Child, local_port: u16) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + SSH_FORWARD_READY_TIMEOUT;
+    loop {
+        let connected = tokio::time::timeout_at(
+            deadline,
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, local_port)),
+        )
+        .await
+        .is_ok_and(|connection| connection.is_ok());
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Could not inspect SSH port forward process: {error}"))?
+        {
+            let stderr = read_child_stderr(child).await;
+            return Err(format!(
+                "SSH port forward exited before becoming ready with status {status}: {stderr}"
+            ));
+        }
+        if connected {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "SSH port forward did not become ready at 127.0.0.1:{local_port}."
+            ));
+        }
+        tokio::time::sleep(SSH_FORWARD_READY_INTERVAL).await;
+    }
 }
 
 /// Collects an exited child's stderr for an error message: reading stops at
@@ -3577,7 +3906,13 @@ mod tests {
             ws_base_url: "ws://127.0.0.1:9/".to_string(),
         };
         let owner = tokio::spawn(async move {
-            start_ssh_tunnel(&plan, &SshAuthOptions::batch(), launcher).await
+            start_ssh_tunnel(
+                &plan,
+                &SshAuthOptions::batch(),
+                launcher,
+                SshForwardKind::Tunnel,
+            )
+            .await
         });
         tokio::time::timeout(
             Duration::from_secs(3),
@@ -7012,6 +7347,396 @@ exit 0
             "the dropped tunnel child must be reaped"
         );
         assert_eq!(fake.invocations().len(), 1, "{:?}", fake.invocations());
+        manager.shutdown().await;
+    }
+
+    /// A `-N -L` fake that records its forward spec in `forwards.log` and then
+    /// accepts TCP connections on the forward's local port.
+    #[cfg(unix)]
+    const LISTENING_PORT_FORWARD: &str = r##"if [ -z "$*" ]; then
+  printf '%s\n' "$forward" >>"$dir/forwards.log"
+  local_port=${forward#127.0.0.1:}
+  exec python3 -c 'import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(16)
+while True:
+    s.accept()[0].close()' "${local_port%%:*}"
+fi
+exit 1
+"##;
+
+    #[cfg(unix)]
+    fn forward_pid(manager: &SshEnvironmentManager, key: &str, remote_port: u16) -> Option<u32> {
+        manager
+            .tunnels
+            .lock()
+            .expect("tunnels")
+            .get(key)?
+            .forwards
+            .get(&remote_port)?
+            .child
+            .child
+            .as_ref()
+            .and_then(Child::id)
+    }
+
+    #[cfg(unix)]
+    fn forward_count(manager: &SshEnvironmentManager, key: &str) -> usize {
+        manager
+            .tunnels
+            .lock()
+            .expect("tunnels")
+            .get(key)
+            .map_or(0, |tunnel| tunnel.forwards.len())
+    }
+
+    #[cfg(unix)]
+    fn recorded_forwards(fake: &fake_ssh::FakeSsh) -> Vec<String> {
+        fs::read_to_string(fake.path("forwards.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Kills the tunnel's child, or one of its forwards, and waits until the
+    /// manager's handle observes the exit (the zombie stays for the manager
+    /// to reap).
+    #[cfg(unix)]
+    async fn kill_managed_child(manager: &SshEnvironmentManager, key: &str, forward: Option<u16>) {
+        let exited = || {
+            let mut tunnels = manager.tunnels.lock().expect("tunnels");
+            let tunnel = tunnels.get_mut(key).expect("tunnel");
+            let child = match forward {
+                Some(port) => &mut tunnel.forwards.get_mut(&port).expect("forward").child,
+                None => &mut tunnel.child,
+            };
+            let pid = child.child_mut().id().map(|pid| pid as libc::pid_t);
+            if let Some(pid) = pid {
+                // SAFETY: the child is owned by this test's manager.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            matches!(child.child_mut().try_wait(), Ok(Some(_)))
+        };
+        for _ in 0..60 {
+            if exited() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("killed SSH child did not exit");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn port_forward_requires_live_tunnel() {
+        let fake = fake_ssh::FakeSsh::with_body(LISTENING_PORT_FORWARD);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+
+        let error = manager
+            .ensure_port_forward(app.handle(), &prompts, fixture_target(), 5173)
+            .await
+            .expect_err("no tunnel, no forward");
+
+        assert_eq!(error, "SSH connection is not active.");
+        assert!(recorded_forwards(&fake).is_empty());
+        assert_eq!(manager.child_reaper.active(), 0);
+
+        // A tunnel whose ssh exited is not live either, and takes its
+        // forwards with it.
+        let (key, _) = publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+        manager
+            .ensure_port_forward(app.handle(), &prompts, fixture_target(), 5173)
+            .await
+            .expect("forward over the live tunnel");
+        let forward = forward_pid(&manager, &key, 5173).expect("forward pid");
+        kill_managed_child(&manager, &key, None).await;
+
+        let error = manager
+            .ensure_port_forward(app.handle(), &prompts, fixture_target(), 5174)
+            .await
+            .expect_err("a dead tunnel carries no forward");
+        assert_eq!(error, "SSH connection is not active.");
+        assert!(
+            wait_until_exited(forward).await,
+            "the dead tunnel's forward must be reaped"
+        );
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn port_forward_is_idempotent_per_remote_port() {
+        let fake = fake_ssh::FakeSsh::with_body(LISTENING_PORT_FORWARD);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let (key, _) = publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+        let ensure = |remote_port| {
+            manager.ensure_port_forward(app.handle(), &prompts, fixture_target(), remote_port)
+        };
+
+        let first = ensure(5173).await.expect("first forward");
+        let again = ensure(5173).await.expect("same forward");
+        let other = ensure(8080).await.expect("other forward");
+        assert_eq!(first, again);
+        assert_ne!(first, other);
+        assert_eq!(
+            recorded_forwards(&fake).len(),
+            2,
+            "a live forward is reused"
+        );
+
+        let dead = forward_pid(&manager, &key, 5173).expect("forward pid");
+        kill_managed_child(&manager, &key, Some(5173)).await;
+        let replaced = ensure(5173).await.expect("a dead forward is replaced");
+        let replacement = forward_pid(&manager, &key, 5173).expect("replacement pid");
+
+        assert_ne!(replacement, dead);
+        assert_eq!(recorded_forwards(&fake).len(), 3);
+        assert_eq!(
+            recorded_forwards(&fake).last(),
+            Some(&format!("127.0.0.1:{replaced}:127.0.0.1:5173"))
+        );
+        assert_eq!(forward_count(&manager, &key), 2);
+        // The tunnel and two live forwards; the dead one was reaped.
+        assert_eq!(manager.child_reaper.active(), 3);
+        manager.shutdown().await;
+    }
+
+    #[test]
+    fn port_forward_args_forward_to_loopback_remote_port() {
+        let target = SshEnvironmentTarget {
+            alias: "devbox".to_string(),
+            hostname: "devbox.internal".to_string(),
+            username: Some("alice".to_string()),
+            port: Some(2222),
+        };
+        let manager = SshEnvironmentManager::with_ssh_program(
+            "fixture-ssh",
+            SshOperationDeadlines::default(),
+        );
+
+        let plan = manager
+            .port_forward_plan(&target, 45123, 5173, &SshAuthOptions::batch())
+            .expect("port forward plan");
+
+        assert_eq!(plan.program, "fixture-ssh");
+        assert_eq!(
+            plan.args,
+            vec![
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-p",
+                "2222",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-n",
+                "-N",
+                "-L",
+                "127.0.0.1:45123:127.0.0.1:5173",
+                "alice@devbox",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn port_forward_spawns_ssh_forwarding_to_loopback_remote_port() {
+        let fake = fake_ssh::FakeSsh::with_body(LISTENING_PORT_FORWARD);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+
+        let local_port = manager
+            .ensure_port_forward(app.handle(), &prompts, fixture_target(), 5173)
+            .await
+            .expect("forward");
+
+        assert_eq!(
+            recorded_forwards(&fake),
+            vec![format!("127.0.0.1:{local_port}:127.0.0.1:5173")]
+        );
+        tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+            .await
+            .expect("the returned local port accepts connections");
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn port_forward_stderr_never_fills_up() {
+        // After the readiness probe the fake writes far more than a pipe
+        // holds to stderr, as ssh does for many refused channels, and only
+        // then marks that it went on.
+        let fake = fake_ssh::FakeSsh::with_body(
+            r##"if [ -z "$*" ]; then
+  local_port=${forward#127.0.0.1:}
+  exec python3 -c 'import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(16)
+s.accept()[0].close()
+sys.stderr.write("channel 3: open failed: connect failed: Connection refused\n" * 8192)
+sys.stderr.flush()
+open(sys.argv[2], "w").close()
+while True:
+    s.accept()[0].close()' "${local_port%%:*}" "$dir/flooded"
+fi
+exit 1
+"##,
+        );
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+
+        manager
+            .ensure_port_forward(app.handle(), &prompts, fixture_target(), 5173)
+            .await
+            .expect("forward");
+
+        let flooded = fake.path("flooded");
+        let mut drained = false;
+        for _ in 0..100 {
+            if flooded.exists() {
+                drained = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(drained, "a forward's stderr must be drained");
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn port_forward_that_exits_before_ready_reports_its_error() {
+        let fake = fake_ssh::FakeSsh::with_body(
+            "printf 'bind [127.0.0.1]: Address already in use\\n' >&2\nexit 255\n",
+        );
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let (key, _) = publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+
+        let error = manager
+            .ensure_port_forward(app.handle(), &prompts, fixture_target(), 5173)
+            .await
+            .expect_err("an exited forward is not ready");
+
+        assert!(error.contains("Address already in use"), "{error}");
+        assert_eq!(forward_count(&manager, &key), 0);
+        assert_eq!(manager.child_reaper.active(), 1, "only the tunnel remains");
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forwards_are_reaped_with_the_tunnel() {
+        let fake = fake_ssh::FakeSsh::with_body(LISTENING_PORT_FORWARD);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+
+        // Dropping a cached tunnel reaps its forwards.
+        let (key, tunnel) = publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+        manager
+            .ensure_port_forward(app.handle(), &prompts, fixture_target(), 5173)
+            .await
+            .expect("forward");
+        let forward = forward_pid(&manager, &key, 5173).expect("forward pid");
+        manager.drop_cached_tunnel(&key).await;
+        assert!(!process_is_alive(tunnel));
+        assert!(!process_is_alive(forward), "drop must reap the forward");
+        assert_eq!(manager.child_reaper.active(), 0);
+
+        // Shutdown reaps them too.
+        publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+        manager
+            .ensure_port_forward(app.handle(), &prompts, fixture_target(), 5173)
+            .await
+            .expect("forward");
+        let forward = forward_pid(&manager, &key, 5173).expect("forward pid");
+        manager.shutdown().await;
+        assert!(!process_is_alive(forward), "shutdown must reap the forward");
+        assert_eq!(manager.child_reaper.active(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn release_reaps_one_forward() {
+        let fake = fake_ssh::FakeSsh::with_body(LISTENING_PORT_FORWARD);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let (key, tunnel) = publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+        for remote_port in [5173, 8080] {
+            manager
+                .ensure_port_forward(app.handle(), &prompts, fixture_target(), remote_port)
+                .await
+                .expect("forward");
+        }
+        let released = forward_pid(&manager, &key, 5173).expect("forward pid");
+        let kept = forward_pid(&manager, &key, 8080).expect("forward pid");
+
+        manager
+            .release_port_forward(fixture_target(), 5173)
+            .await
+            .expect("release");
+
+        assert!(!process_is_alive(released), "release must reap the forward");
+        assert!(process_is_alive(kept));
+        assert!(process_is_alive(tunnel));
+        assert_eq!(forward_count(&manager, &key), 1);
+        assert_eq!(manager.child_reaper.active(), 2);
+        manager
+            .release_port_forward(fixture_target(), 5173)
+            .await
+            .expect("releasing a released forward is a no-op");
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ninth_forward_evicts_least_recent() {
+        let fake = fake_ssh::FakeSsh::with_body(LISTENING_PORT_FORWARD);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let (key, _) = publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+        let ensure = |remote_port| {
+            manager.ensure_port_forward(app.handle(), &prompts, fixture_target(), remote_port)
+        };
+        for remote_port in 5001..=5008 {
+            ensure(remote_port).await.expect("forward");
+        }
+        // Requesting 5001 again makes 5002 the least recently requested.
+        ensure(5001).await.expect("reused forward");
+        let evicted = forward_pid(&manager, &key, 5002).expect("forward pid");
+
+        ensure(5009).await.expect("ninth forward");
+
+        assert!(!process_is_alive(evicted), "eviction must reap the forward");
+        assert_eq!(forward_pid(&manager, &key, 5002), None);
+        assert!(forward_pid(&manager, &key, 5001).is_some());
+        assert!(forward_pid(&manager, &key, 5009).is_some());
+        assert_eq!(forward_count(&manager, &key), 8);
+        assert_eq!(manager.child_reaper.active(), 9);
         manager.shutdown().await;
     }
 

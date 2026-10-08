@@ -958,6 +958,26 @@ a ControlPersist master on older OpenSSH, a backgrounded process) can keep
 them open indefinitely. Errors built from such output end with
 `[output cut off]`.
 
+**Preview port forwards.** `DesktopBridge.sshForward(target, remotePort)`
+(`desktop_bridge_ssh_forward`) forwards a port on the SSH host's loopback,
+such as the preview gateway's, to a free local port and returns it. It needs
+the target's live tunnel ("SSH connection is not active." otherwise) and holds
+the same per-target lock. Each forward is a dedicated
+`ssh -o ControlPath=none … -o ExitOnForwardFailure=yes -n -N -L 127.0.0.1:<local>:127.0.0.1:<remote>`
+child, admitted and reaped like every other SSH child and authenticated
+through the same cached password and prompt path. The explicit loopback bind
+overrides an inherited `GatewayPorts yes`, and `ControlPath=none` stops an
+inherited multiplexing setup from moving the forward into a master the child
+does not own. It is ready once its local port accepts a TCP connection while
+the child still runs, polled every 50 ms for at most 10 s; after that its
+stderr is drained so refused-channel messages never fill the pipe and block
+`ssh`. Requests are idempotent per remote port:
+a live forward is reused and a dead one replaced. A tunnel keeps at most 8
+forwards; a further request evicts the least recently requested one.
+Forwards are reaped with their tunnel (drop, disconnect, shutdown, or a dead
+tunnel found on the next request), and `releaseSshForward`
+(`desktop_bridge_release_ssh_forward`) reaps one.
+
 SSH children run on a private Tokio runtime owned by `SshEnvironmentManager`:
 one worker thread and at most 128 blocking threads. It starts on first use and
 stops in the background at the end of `shutdown()`, after every SSH child is
