@@ -41,7 +41,7 @@ flowchart TB
   drives only the visible tab, so open always shows the tab, and a request for a
   thread that is not on screen times out. In browser mode there is no child
   webview: the client advertises only status and open, and open shows a prompt
-  and returns `pending-user` until the user clicks. The server prefers the host
+  and returns `pending-user` at once; the page opens only if the user clicks Open. The server prefers the host
   with more operations, so a connected desktop serves automation first.
   Loopback dev servers on a remote environment load through the server's
   preview gateway. Typography and text-contrast
