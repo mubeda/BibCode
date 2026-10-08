@@ -2633,6 +2633,180 @@ async fn auth_routes_include_browser_cors_and_preflight_headers() {
     shutdown(handle).await;
 }
 
+#[tokio::test]
+async fn cookie_authenticated_post_requires_same_origin() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let cookie = browser_session_cookie(&client, &handle).await;
+    let administrator = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let administrator_token = access_token(&administrator);
+    let same_origin = format!("http://{}", handle.local_addr());
+    let dispatch = |origin: Option<&str>| {
+        let request = client
+            .post(http_url(&handle, "/api/orchestration/dispatch"))
+            .header(header::COOKIE, &cookie)
+            .json(&json!({}));
+        match origin {
+            Some(origin) => request.header(header::ORIGIN, origin),
+            None => request,
+        }
+    };
+
+    let missing = dispatch(None)
+        .send()
+        .await
+        .expect("dispatch without Origin");
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    let missing = missing.json::<Value>().await.expect("forbidden body");
+    assert_eq!(missing["_tag"], "EnvironmentOperationForbiddenError");
+    assert_eq!(missing["reason"], "origin_not_allowed");
+    let foreign = dispatch(Some("http://evil.localhost:9999"))
+        .send()
+        .await
+        .expect("dispatch with foreign Origin");
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    let same = dispatch(Some(&same_origin))
+        .send()
+        .await
+        .expect("dispatch with same Origin");
+    assert_ne!(same.status(), StatusCode::FORBIDDEN);
+    let bearer = client
+        .post(http_url(&handle, "/api/orchestration/dispatch"))
+        .bearer_auth(administrator_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("bearer dispatch without Origin");
+    assert_ne!(bearer.status(), StatusCode::FORBIDDEN);
+
+    // Auth routes resolve their method through the same gate.
+    let ticket = client
+        .post(http_url(&handle, "/api/auth/websocket-ticket"))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .expect("cookie ticket without Origin");
+    assert_eq!(ticket.status(), StatusCode::FORBIDDEN);
+    let ticket = client
+        .post(http_url(&handle, "/api/auth/websocket-ticket"))
+        .header(header::COOKIE, &cookie)
+        .header(header::ORIGIN, &same_origin)
+        .send()
+        .await
+        .expect("cookie ticket with same Origin");
+    assert_eq!(ticket.status(), StatusCode::OK);
+
+    // Cookie reads keep working without Origin.
+    for path in ["/api/auth/session", "/api/auth/share-state"] {
+        let read = client
+            .get(http_url(&handle, path))
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .expect("cookie read without Origin");
+        assert_eq!(read.status(), StatusCode::OK, "{path}");
+    }
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
+async fn cookie_authenticated_websocket_upgrade_requires_same_origin() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let cookie = browser_session_cookie(&client, &handle).await;
+    let administrator = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
+    let ticket = websocket_ticket(&client, &handle, access_token(&administrator)).await;
+    let same_origin = format!("http://{}", handle.local_addr());
+    let upgrade = |query: &str, origin: Option<&str>| {
+        let mut request = format!("ws://{}/ws{query}", handle.local_addr())
+            .into_client_request()
+            .expect("WebSocket request");
+        let headers = request.headers_mut();
+        headers.insert(header::COOKIE, cookie.parse().expect("cookie header"));
+        if let Some(origin) = origin {
+            headers.insert(header::ORIGIN, origin.parse().expect("origin header"));
+        }
+        connect_async(request)
+    };
+
+    for origin in [None, Some("http://other:1")] {
+        let error = upgrade("", origin)
+            .await
+            .expect_err("cross-origin cookie upgrade must be refused");
+        assert!(
+            matches!(
+                &error,
+                tungstenite::Error::Http(response) if response.status() == StatusCode::FORBIDDEN
+            ),
+            "{origin:?}: {error:?}"
+        );
+    }
+    let (mut socket, _) = upgrade("", Some(&same_origin))
+        .await
+        .expect("same-origin cookie upgrade");
+    socket.close(None).await.expect("close same-origin socket");
+    let (mut socket, _) = upgrade(&format!("?wsTicket={ticket}"), None)
+        .await
+        .expect("ticket upgrade without Origin");
+    socket.close(None).await.expect("close ticket socket");
+
+    shutdown(handle).await;
+}
+
+#[tokio::test]
+async fn trusted_desktop_origins_pass_cookie_checks() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let handle = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let cookie = browser_session_cookie(&client, &handle).await;
+
+    for origin in ["bibcode://app", "bibcode-dev://app"] {
+        let response = client
+            .post(http_url(&handle, "/api/orchestration/dispatch"))
+            .header(header::COOKIE, &cookie)
+            .header(header::ORIGIN, origin)
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("trusted-origin dispatch");
+        assert_ne!(response.status(), StatusCode::FORBIDDEN, "{origin}");
+    }
+    let untrusted = client
+        .post(http_url(&handle, "/api/orchestration/dispatch"))
+        .header(header::COOKIE, &cookie)
+        .header(header::ORIGIN, "bibcode-other://app")
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("untrusted app-origin dispatch");
+    assert_eq!(untrusted.status(), StatusCode::FORBIDDEN);
+
+    shutdown(handle).await;
+}
+
+async fn browser_session_cookie(client: &Client, handle: &ServerHandle) -> String {
+    client
+        .post(http_url(handle, "/api/auth/browser-session"))
+        .json(&json!({ "credential": DESKTOP_BOOTSTRAP }))
+        .send()
+        .await
+        .expect("browser session request")
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("session cookie")
+        .to_str()
+        .expect("ASCII session cookie")
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned()
+}
+
 async fn start_desktop_server(temp: &TempDir) -> ServerHandle {
     let config = ServerConfig::new(temp.path())
         .with_bind("127.0.0.1", 0)

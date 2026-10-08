@@ -1051,6 +1051,13 @@ endpoint can install software, start a process, or use SSH.
   and only for a plain-transport session (the client mints a fresh ticket per
   connection attempt). A process restart forgets redemptions for at most one
   five-minute ticket window.
+- When the browser-session cookie is the credential, any method other than
+  `GET`, `HEAD`, or `OPTIONS`, and any WebSocket upgrade, must carry an `Origin`
+  equal to the request's own `http(s)://<Host>` origin or one of
+  `bibcode://app`, `bibcode-dev://app`, or the `--dev-url` origin. A missing or
+  different `Origin` returns `403` `EnvironmentOperationForbiddenError` with
+  reason `origin_not_allowed`. Bearer, DPoP, and `wsTicket` authentication do
+  not check `Origin`.
 - DPoP binds Connect-issued relay and environment tokens to the client's proof
   key and the target HTTP request.
 - Relay request proofs and environment health/mint responses are independently

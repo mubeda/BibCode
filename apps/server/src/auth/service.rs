@@ -77,6 +77,8 @@ pub enum AuthError {
     ScopeNotGranted,
     ScopeRequired(String),
     CurrentSessionRevokeNotAllowed,
+    /// A cookie-authenticated mutation or WebSocket upgrade from an untrusted `Origin`.
+    Forbidden,
     Internal(String),
 }
 
@@ -96,6 +98,8 @@ pub struct AuthService {
     /// Redeemed single-use websocket ticket ids, pruned by expiry.
     redeemed_websocket_tickets: Arc<std::sync::Mutex<HashMap<String, i64>>>,
     dpop: DpopVerifier,
+    /// Non-request origins that may use the session cookie for mutations.
+    trusted_cookie_origins: Arc<[String]>,
 }
 
 pub(crate) struct AuthenticatedConnectionGuard {
@@ -485,6 +489,19 @@ impl AuthService {
                     expires_at_ms: now_ms().saturating_add(DESKTOP_BOOTSTRAP_TTL_MS),
                 });
         let (access_events, _) = broadcast::channel(ACCESS_EVENT_CAPACITY);
+        let trusted_cookie_origins = ["bibcode://app", "bibcode-dev://app"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(
+                config
+                    .dev_url
+                    .as_ref()
+                    .map(|dev_url| dev_url.origin())
+                    // An opaque origin serializes as `null`, which sandboxed frames send.
+                    .filter(url::Origin::is_tuple)
+                    .map(|origin| origin.ascii_serialization()),
+            )
+            .collect();
         Self {
             descriptor: AuthDescriptor {
                 policy,
@@ -508,6 +525,7 @@ impl AuthService {
             authority_watcher_running: Arc::new(AtomicBool::new(false)),
             redeemed_websocket_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dpop: DpopVerifier::new(secret_store),
+            trusted_cookie_origins,
         }
     }
 
@@ -560,6 +578,11 @@ impl AuthService {
     #[must_use]
     pub fn cookie_name(&self) -> &str {
         &self.descriptor.session_cookie_name
+    }
+
+    #[must_use]
+    pub(crate) fn trusted_cookie_origins(&self) -> &[String] {
+        &self.trusted_cookie_origins
     }
 
     #[must_use]
