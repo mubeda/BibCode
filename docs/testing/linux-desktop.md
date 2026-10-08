@@ -2612,7 +2612,17 @@ Each label begins immediately before its existing predicate wait and returns
 to the row phase only on success; failed waits retain their original error and
 label through joined cleanup. Viewport preparation and screenshot calls keep
 the row phase. These labels add no read, action, wait, timeout or JSON member,
-and do not widen the separate initial-reconnect census. After the second window's viewport and existing terminal-tab selection settle,
+and do not widen the separate initial-reconnect census.
+The terminal shared-size row similarly identifies its existing exact viewport,
+strict two-attachment receipt and common capture-witness waits as
+`visual-browser-followups-terminal-shared-size-viewport-wait`,
+`visual-browser-followups-terminal-shared-size-terminal-receipt-wait` and
+`visual-browser-followups-terminal-shared-size-capture-witness-wait`.
+Its original- and second-window viewport nominations use the fixed terminal row;
+chat viewport labels remain unchanged. Restore the terminal row phase only when
+the corresponding wait succeeds, preserving a failed label and original error
+through secondary cleanup. Pointer setup, public Fit, original fields, guards,
+timeouts and capture scope remain unchanged. After the second window's viewport and existing terminal-tab selection settle,
 click the single pinned original terminal screen once in the original owned
 window, then return to the selected second handle before the unchanged two-lease
 receipt wait. This restores the original renderer's size claim through its

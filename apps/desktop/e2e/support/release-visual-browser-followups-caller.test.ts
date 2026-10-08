@@ -1476,7 +1476,9 @@ test.each(["chat-staged-attachment", "terminal-shared-size"])(
           phases.at(-1),
           "visual-browser-followups-" +
             scene +
-            (scene === "chat-staged-attachment" ? "-capture-witness-wait" : ""),
+            (scene === "chat-staged-attachment" || scene === "terminal-shared-size"
+              ? "-capture-witness-wait"
+              : ""),
         );
         NodeAssert.equal(sourceJoins, 1);
         NodeAssert.equal(screenshots, 0);

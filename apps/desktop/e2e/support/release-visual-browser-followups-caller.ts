@@ -482,7 +482,10 @@ export async function runBrowserFollowupCaller(input: {
     browser: QualificationBrowser,
     width: 1280,
     height: 960,
-    step?: (phase: string) => void,
+    wait?: {
+      row: "chat-staged-attachment" | "terminal-shared-size";
+      step: (phase: string) => void;
+    },
   ) => Promise<void>;
   evidence: string;
   captured: Set<string>;
@@ -765,14 +768,20 @@ export async function runBrowserFollowupCaller(input: {
         const receipt = await captureBrowserFollowupScene({
           browser,
           owner:
-            scene === "chat-staged-attachment"
+            scene === "chat-staged-attachment" || scene === "terminal-shared-size"
               ? {
                   until: async (predicate, timeout) => {
                     input.step(
-                      "visual-browser-followups-chat-staged-attachment-capture-witness-wait",
+                      scene === "chat-staged-attachment"
+                        ? "visual-browser-followups-chat-staged-attachment-capture-witness-wait"
+                        : "visual-browser-followups-terminal-shared-size-capture-witness-wait",
                     );
                     await input.owner.until(predicate, timeout);
-                    input.step("visual-browser-followups-chat-staged-attachment");
+                    input.step(
+                      scene === "chat-staged-attachment"
+                        ? "visual-browser-followups-chat-staged-attachment"
+                        : "visual-browser-followups-terminal-shared-size",
+                    );
                   },
                 }
               : input.owner,

@@ -22,7 +22,10 @@ export interface BrowserFollowupProducerInput {
     browser: QualificationBrowser,
     width: 1280,
     height: 960,
-    step?: (phase: string) => void,
+    wait?: {
+      row: "chat-staged-attachment" | "terminal-shared-size";
+      step: (phase: string) => void;
+    },
   ) => Promise<void>;
   capture: (
     scene: BrowserFollowupScene,
@@ -125,7 +128,9 @@ export async function runBrowserFollowupScene(
     input.browser,
     1280,
     960,
-    row === "chat-staged-attachment" ? input.step : undefined,
+    row === "chat-staged-attachment" || row === "terminal-shared-size"
+      ? { row, step: input.step }
+      : undefined,
   );
   const capture = async (
     scene: BrowserFollowupScene,
@@ -194,7 +199,10 @@ export async function runBrowserFollowupScene(
     case "terminal-shared-size":
       await input.terminal.withSecondWindow(async (scope) => {
         if (!/^[A-Za-z0-9 -]{1,64}$/.test(scope.label)) throw refused();
-        await input.viewport(scope.browser, 1280, 960);
+        await input.viewport(scope.browser, 1280, 960, {
+          row: "terminal-shared-size",
+          step: input.step,
+        });
         // The second window selects an existing tab. It never invokes Add Terminal.
         await click(
           scope.browser,
@@ -210,6 +218,7 @@ export async function runBrowserFollowupScene(
           ]);
         };
         await scope.prepareOriginalSizeOwner();
+        input.step("visual-browser-followups-terminal-shared-size-terminal-receipt-wait");
         await input.owner.until(async () => {
           try {
             await verify();
@@ -218,6 +227,7 @@ export async function runBrowserFollowupScene(
             return false;
           }
         });
+        input.step("visual-browser-followups-terminal-shared-size");
         await capture(row, scope.browser, verify);
         await click(scope.browser, "button=Fit to this window");
         await scope.verifyFit();

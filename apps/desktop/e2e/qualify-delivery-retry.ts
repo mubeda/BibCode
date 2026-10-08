@@ -2923,7 +2923,7 @@ export async function runDeliveryRetryQualification() {
               workspace.path,
               ["diff", "--no-ext-diff", "--patch", "--minimal", "HEAD", "--"],
             ).stdout,
-          viewport: async (target, width, height, waitStep) => {
+          viewport: async (target, width, height, wait) => {
             const measured = await bounded(target.execute(readVisualViewport), 2000),
               outer = await target.getWindowSize(),
               corrected = correctDesktopUiOuterSize(
@@ -2933,12 +2933,20 @@ export async function runDeliveryRetryQualification() {
                 measured.devicePixelRatio,
               );
             await target.setWindowSize(corrected.width, corrected.height);
-            waitStep?.("visual-browser-followups-chat-staged-attachment-viewport-wait");
+            wait?.step(
+              wait.row === "chat-staged-attachment"
+                ? "visual-browser-followups-chat-staged-attachment-viewport-wait"
+                : "visual-browser-followups-terminal-shared-size-viewport-wait",
+            );
             await owner.until(async () => {
               const current = await bounded(target.execute(readVisualViewport), 2000);
               return current.width === width && current.height === height;
             });
-            waitStep?.("visual-browser-followups-chat-staged-attachment");
+            wait?.step(
+              wait.row === "chat-staged-attachment"
+                ? "visual-browser-followups-chat-staged-attachment"
+                : "visual-browser-followups-terminal-shared-size",
+            );
           },
           evidence: config.evidence,
           captured: capturedVisuals,

@@ -240,7 +240,7 @@ it.each(
 
 const firstRowPhase = "visual-browser-followups-chat-staged-attachment";
 it.each(browserFollowupRows)(
-  "offers viewport wait attribution only for the first row: %s",
+  "nominates only the existing chat and terminal viewport waits: %s",
   async (row) => {
     const value = fixture();
     const phases: string[] = [];
@@ -250,7 +250,11 @@ it.each(browserFollowupRows)(
       nominated = step;
     };
     await runBrowserFollowupScene(value.input, row);
-    expect(nominated).toBe(row === "chat-staged-attachment" ? value.input.step : undefined);
+    expect(nominated).toEqual(
+      row === "chat-staged-attachment" || row === "terminal-shared-size"
+        ? { row, step: value.input.step }
+        : undefined,
+    );
     if (row !== "chat-staged-attachment")
       expect(phases.some((phase) => phase.startsWith(firstRowPhase))).toBe(false);
   },
@@ -367,4 +371,45 @@ it("keeps a failed setup pointer value before polling or capture", async () => {
   expect(waits).toBe(0);
   expect(value.captures).toEqual([]);
   expect(value.read().cleaned).toBe(1);
+});
+
+it.each([new Error("Inert terminal receipt deadline."), undefined])(
+  "retains terminal receipt phase and its original value through cleanup",
+  async (original) => {
+    const value = fixture();
+    const phases: string[] = [];
+    value.input.step = (phase) => phases.push(phase);
+    value.input.owner.until = async (predicate) => {
+      expect(await predicate()).toBe(true);
+      throw original;
+    };
+    let failed = false,
+      caught: unknown;
+    try {
+      await runBrowserFollowupScene(value.input, "terminal-shared-size");
+    } catch (error) {
+      failed = true;
+      caught = error;
+    }
+    expect(failed).toBe(true);
+    expect(caught).toBe(original);
+    expect(phases.at(-1)).toBe(
+      "visual-browser-followups-terminal-shared-size-terminal-receipt-wait",
+    );
+    expect(value.captures).toEqual([]);
+    expect(value.read().cleaned).toBe(1);
+  },
+);
+it("clears terminal receipt phase on success before its unchanged capture", async () => {
+  const value = fixture();
+  const phases: string[] = [];
+  value.input.step = (phase) => phases.push(phase);
+  await runBrowserFollowupScene(value.input, "terminal-shared-size");
+  expect(phases).toEqual([
+    "visual-browser-followups-terminal-shared-size",
+    "visual-browser-followups-terminal-shared-size-terminal-receipt-wait",
+    "visual-browser-followups-terminal-shared-size",
+    "visual-browser-followups-terminal-shared-size",
+  ]);
+  expect(value.captures).toEqual(["terminal-shared-size"]);
 });
