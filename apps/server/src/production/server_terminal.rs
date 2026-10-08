@@ -31,7 +31,10 @@ use crate::{
     worktree_catalog::{WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry},
 };
 
-use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
+use super::{
+    local_servers,
+    workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError},
+};
 
 const PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS: usize = 160;
 
@@ -358,16 +361,49 @@ fn register_control_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalSe
             control.call(method, request.payload, cancellation)
         });
     }
-    for method in [
-        "subscribeServerConfig",
-        "subscribeServerLifecycle",
-        "subscribeDiscoveredLocalServers",
-    ] {
+    for method in ["subscribeServerConfig", "subscribeServerLifecycle"] {
         let control = services.control.clone();
         registry.register_stream(method, move |_request, cancellation| {
             control.subscribe(method, cancellation)
         });
     }
+    {
+        let terminal = services.terminal.clone();
+        registry.register_stream(
+            "subscribeDiscoveredLocalServers",
+            move |_request, cancellation| {
+                discovered_local_servers_stream(terminal.clone(), cancellation)
+            },
+        );
+    }
+}
+
+fn discovered_local_servers_stream(
+    terminal: TerminalManager,
+    cancellation: CancellationToken,
+) -> JsonStream {
+    spawn_stream(cancellation, move |sender, cancellation| async move {
+        let mut discovery = local_servers::Discovery::default();
+        loop {
+            let terminals = terminal.live_session_pids().await;
+            let servers = discovery.scan(&cancellation, terminals).await;
+            if cancellation.is_cancelled()
+                || sender
+                    .send(Ok(vec![json!({
+                        "servers": servers,
+                        "scannedAt": format_time(OffsetDateTime::now_utc()),
+                    })]))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                () = tokio::time::sleep(local_servers::SCAN_INTERVAL) => {}
+            }
+        }
+    })
 }
 
 fn register_diagnostics_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
@@ -1911,6 +1947,67 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovered_local_servers_stream_rescans_and_ends_on_cancellation() {
+        async fn next_snapshot(stream: &mut JsonStream) -> Value {
+            let mut values = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+                .await
+                .expect("discovery snapshot timeout")
+                .expect("discovery stream open")
+                .expect("discovery snapshot succeeds");
+            assert_eq!(values.len(), 1);
+            values.remove(0)
+        }
+
+        let root = tempfile::tempdir().expect("services root");
+        let services = real_terminal_services(root.path()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let cancellation = CancellationToken::new();
+        let mut discovery =
+            discovered_local_servers_stream(services.terminal.clone(), cancellation.clone());
+
+        let discovered = next_snapshot(&mut discovery).await;
+        assert!(discovered["scannedAt"].is_string());
+        let server = discovered["servers"]
+            .as_array()
+            .expect("servers array")
+            .iter()
+            .find(|server| server["port"] == port)
+            .expect("bound listener is discovered")
+            .clone();
+        assert_eq!(server["host"], "127.0.0.1");
+        assert_eq!(server["url"], format!("http://127.0.0.1:{port}/"));
+        assert_eq!(server["terminal"], Value::Null);
+
+        drop(listener);
+        let rescanned = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = next_snapshot(&mut discovery).await;
+                if snapshot["servers"]
+                    .as_array()
+                    .is_some_and(|servers| servers.iter().all(|server| server["port"] != port))
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("periodic discovery removes closed listener");
+        assert!(rescanned["scannedAt"].is_string());
+
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), discovery.recv())
+                .await
+                .expect("discovery cancellation timeout")
+                .is_none()
+        );
+        services.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

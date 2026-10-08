@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  isNetworkLinkHref,
   resolveMarkdownFileLinkMeta,
   resolveMarkdownFileLinkTarget,
   rewriteMarkdownFileUriHref,
@@ -163,5 +164,49 @@ describe("resolveMarkdownFileLinkTarget", () => {
 
   it("preserves malformed percent escapes instead of throwing", () => {
     expect(resolveMarkdownFileLinkTarget("file:///tmp/bad%E0%A4%A.md")).toBe("/tmp/bad%E0%A4%A.md");
+  });
+});
+
+describe("network link hrefs", () => {
+  const networkHrefs = [
+    "file:////server/share/x.html",
+    "file://server/share/x.html",
+    "file://SERVER/share/x.pdf",
+    "file:///%5C%5Cserver/share/x.html",
+    "file://localhost//server/share/x.html",
+    "//server/share/x.html",
+    "\\\\server\\share\\x.html",
+    "\\\\?\\UNC\\server\\share\\x.html",
+    "\\\\.\\C:\\..\\UNC\\server\\share\\x.html",
+    "%5C%5Cserver%5Cshare%5Cx.html",
+    "<//server/share/x.html>",
+  ];
+
+  it.each(networkHrefs)("flags %s as a network link", (href) => {
+    expect(isNetworkLinkHref(href)).toBe(true);
+  });
+
+  it.each(networkHrefs)("never resolves %s as a file link", (href) => {
+    expect(resolveMarkdownFileLinkTarget(href, "/repo")).toBeNull();
+    expect(resolveMarkdownFileLinkMeta(href, "/repo")).toBeNull();
+    expect(rewriteMarkdownFileUriHref(href)).toBeNull();
+  });
+
+  it.each([
+    "file:///Users/julius/project/src/main.ts#L42",
+    "file://localhost/tmp/a.html",
+    "file:///C:/repo/a.html",
+    "/Users/julius/project/src/main.ts",
+    "src/main.ts:12",
+    "https://example.com/docs",
+    "#section",
+  ])("does not flag %s", (href) => {
+    expect(isNetworkLinkHref(href)).toBe(false);
+  });
+
+  it("keeps file://localhost links resolving to the local path", () => {
+    expect(resolveMarkdownFileLinkTarget("file://localhost/tmp/a.html", "/repo")).toBe(
+      "/tmp/a.html",
+    );
   });
 });

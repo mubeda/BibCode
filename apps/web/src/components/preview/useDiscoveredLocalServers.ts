@@ -3,7 +3,7 @@ import { isLoopbackHost } from "@bibcode/shared/preview";
 import { useMemo } from "react";
 
 import type { EnvironmentId } from "@bibcode/contracts";
-import { resolveDiscoveredServerUrl } from "~/browser/browserTargetResolver";
+import { resolvePreviewTarget } from "~/browser/browserTargetResolver";
 import { useDiscoveredPorts } from "~/portDiscoveryState";
 
 export interface PreviewableServer extends DiscoveredLocalServer {
@@ -35,13 +35,19 @@ export function useDiscoveredLocalServers(
       mergeServers({
         scanner: scannerSnapshot.map((server) => ({
           ...server,
-          url: resolveDiscoveredServerUrl(input.environmentId, server.url),
+          // Display only; opening a server resolves again at click time.
+          url: displayUrl(input.environmentId, server.url),
         })),
         configuredUrls: input.configuredUrls ?? [],
         recentlySeenUrls: input.recentlySeenUrls ?? [],
       }),
     [input.environmentId, scannerSnapshot, input.configuredUrls, input.recentlySeenUrls],
   );
+}
+
+function displayUrl(environmentId: EnvironmentId, url: string): string {
+  const resolution = resolvePreviewTarget(environmentId, url);
+  return resolution.kind === "reachable" ? resolution.url : url;
 }
 
 export function mergeServers(input: {

@@ -5,8 +5,8 @@ import { useEffect, useRef, useState } from "react";
 import { ProjectDataRecoveryDialog } from "./components/desktop/ProjectDataRecoveryDialog";
 import { ConnectionDatabaseRecoveryDialog } from "./components/ConnectionDatabaseRecoveryDialog";
 import { PreviewAutomationHosts } from "./components/preview/PreviewAutomationHosts";
+import { PreviewNewWindowRouter } from "./components/preview/PreviewNewWindowRouter";
 import { previewBridge } from "./components/preview/previewBridge";
-import { supportsPreviewRuntimeCapability } from "./previewRuntimeCapabilities";
 import { AppAtomRegistryProvider } from "./rpc/atomRegistry";
 import type { AppRouter } from "./router";
 import { ThreadLifecycleReconciler } from "./ThreadLifecycleReconciler";
@@ -169,9 +169,8 @@ export function AppRoot({ router }: { readonly router: AppRouter }) {
       ) : (
         <ServerReloadPrompt />
       )}
-      {supportsPreviewRuntimeCapability(previewBridge, "automation") ? (
-        <PreviewAutomationHosts />
-      ) : null}
+      {previewBridge ? <PreviewAutomationHosts /> : null}
+      <PreviewNewWindowRouter />
     </AppAtomRegistryProvider>
   );
 }

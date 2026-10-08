@@ -101,7 +101,14 @@ pub fn run() {
         .manage(preview::PreviewHostState::new())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
+        // The plugin's injected click script would swallow `_blank` links in
+        // every webview (preview tabs included) and call an IPC command no
+        // capability grants. New windows are routed by `on_new_window` instead.
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                .open_js_links_on_click(false)
+                .build(),
+        )
         .plugin(tauri_plugin_updater::Builder::new().build());
     #[cfg(target_os = "linux")]
     let builder = builder.manage(linux_theme::LinuxThemeState::default());
@@ -111,6 +118,9 @@ pub fn run() {
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());
     let builder = builder.setup(move |app| {
+        // Built here (not from config) so it can route new-window requests;
+        // first, so everything below still runs after the main window exists.
+        window::build_main_window(app.handle())?;
         #[cfg(target_os = "linux")]
         {
             linux_text_rendering::apply_webview_hinting_override();
@@ -345,6 +355,14 @@ mod tests {
     use serde_json::Value;
 
     use super::{DESKTOP_BRIDGE_COMMAND_NAMES, DESKTOP_PREVIEW_COMMAND_NAMES};
+
+    #[test]
+    fn main_window_is_created_by_setup_so_it_can_handle_new_windows() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(config["app"]["windows"][0]["label"], "main");
+        assert_eq!(config["app"]["windows"][0]["create"], false);
+    }
 
     #[derive(Debug, Deserialize)]
     struct PermissionsFile {

@@ -456,6 +456,31 @@ async fn json_request(
     }
 }
 
+/// Agent-written HTML/SVG is served from the BiBCode origin; an opaque-origin
+/// sandbox keeps its scripts away from the session cookie and `/api`.
+fn asset_content_security_policy(content_type: &str) -> Option<&'static str> {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match essence.as_str() {
+        "text/html" | "application/xhtml+xml" => {
+            Some("sandbox allow-scripts allow-forms allow-popups")
+        }
+        // XML documents (any `+xml` type: RSS, Atom, MathML, ...) can run scripts
+        // through XSLT or embedded XHTML, like SVG.
+        "image/svg+xml" | "text/xml" | "application/xml" => {
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox")
+        }
+        essence if essence.ends_with("+xml") => {
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox")
+        }
+        _ => None,
+    }
+}
+
 async fn asset(
     State(state): State<HttpRoutesState>,
     Path((token, path)): Path<(String, String)>,
@@ -470,13 +495,19 @@ async fn asset(
         cancellation,
     };
     match (state.assets)(token, path, context).await {
-        Ok(asset) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, asset.content_type)
-            .header(header::CACHE_CONTROL, asset.cache_control)
-            .header("x-content-type-options", "nosniff")
-            .body(Body::from(asset.bytes))
-            .unwrap_or_else(|_| internal_error()),
+        Ok(asset) => {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, &asset.content_type)
+                .header(header::CACHE_CONTROL, asset.cache_control)
+                .header("x-content-type-options", "nosniff");
+            if let Some(policy) = asset_content_security_policy(&asset.content_type) {
+                builder = builder.header(header::CONTENT_SECURITY_POLICY, policy);
+            }
+            builder
+                .body(Body::from(asset.bytes))
+                .unwrap_or_else(|_| internal_error())
+        }
         Err(error) => error.into_response(),
     }
 }

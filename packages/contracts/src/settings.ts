@@ -33,6 +33,11 @@ export const DEFAULT_STATUS_BAR_ITEMS: readonly StatusBarItem[] = [
   "resource-usage",
 ];
 
+/** Where a clicked web link opens: the integrated browser or the system browser. */
+export const BrowserLinkTarget = Schema.Literals(["app", "system"]);
+export type BrowserLinkTarget = typeof BrowserLinkTarget.Type;
+export const DEFAULT_BROWSER_LINK_TARGET: BrowserLinkTarget = "app";
+
 export const SidebarProjectSortOrder = Schema.Literals(["updated_at", "created_at", "manual"]);
 export type SidebarProjectSortOrder = typeof SidebarProjectSortOrder.Type;
 export const DEFAULT_SIDEBAR_PROJECT_SORT_ORDER: SidebarProjectSortOrder = "updated_at";
@@ -113,6 +118,10 @@ export const TerminalThemePreference = TerminalThemePreferenceValue.pipe(
 
 export const ClientSettingsSchema = Schema.Struct({
   autoOpenPlanSidebar: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  browserLinkTarget: BrowserLinkTarget.pipe(
+    Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_BROWSER_LINK_TARGET)),
+    Schema.withDecodingDefault(Effect.succeed(DEFAULT_BROWSER_LINK_TARGET)),
+  ),
   confirmThreadArchive: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   confirmThreadDelete: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   dismissedProviderUpdateNotificationKeys: Schema.Array(TrimmedNonEmptyString).pipe(
@@ -682,6 +691,7 @@ export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 
 export const ClientSettingsPatch = Schema.Struct({
   autoOpenPlanSidebar: Schema.optionalKey(Schema.Boolean),
+  browserLinkTarget: Schema.optionalKey(BrowserLinkTarget),
   confirmThreadArchive: Schema.optionalKey(Schema.Boolean),
   confirmThreadDelete: Schema.optionalKey(Schema.Boolean),
   diffIgnoreWhitespace: Schema.optionalKey(Schema.Boolean),

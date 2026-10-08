@@ -27,6 +27,7 @@ import {
   reconcilePreviewServerSessions,
   updatePreviewServerSnapshot,
 } from "~/previewStateStore";
+import { supportsPreviewRuntimeCapability } from "~/previewRuntimeCapabilities";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { resolveBrowserNavigationTarget } from "~/browser/browserTargetResolver";
 import {
@@ -60,6 +61,19 @@ import {
 } from "./previewAutomationTarget";
 import { isPreviewViewportReady } from "./previewViewportReadiness";
 
+/**
+ * What a preview bridge without full automation (the Tauri desktop host) can
+ * serve: tab status, opening, and navigating. Page reading and input stay with
+ * fully automatable bridges, so the server routes them elsewhere or reports
+ * that no host can.
+ */
+const NAVIGATION_ONLY_OPERATIONS = ["status", "open", "navigate"] as const;
+
+const supportedAutomationOperations = () =>
+  supportsPreviewRuntimeCapability(previewBridge, "automation")
+    ? [...PREVIEW_AUTOMATION_OPERATIONS]
+    : [...NAVIGATION_ONLY_OPERATIONS];
+
 const waitForDesktopOverlay = async (
   threadRef: ScopedThreadRef,
   requestId: string,
@@ -90,7 +104,12 @@ const waitForNavigationReadiness = async (
   readiness: PreviewAutomationNavigateInput["readiness"],
   timeoutMs: number,
 ): Promise<void> => {
-  const targetReadiness = readiness ?? "load";
+  // Without script evaluation, the page load is the closest observable readiness.
+  const targetReadiness =
+    readiness === "domContentLoaded" &&
+    !supportsPreviewRuntimeCapability(previewBridge, "automation")
+      ? "load"
+      : (readiness ?? "load");
   if (!previewBridge || targetReadiness === "none") return;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
@@ -216,7 +235,8 @@ const currentStatus = async (
   };
   if (tabId && previewBridge && state.desktopByTabId[tabId]) {
     const status = await previewBridge.automation.status(tabId);
-    return { ...status, visible, ...viewportStatus };
+    // A detached native tab keeps its last overlay; its session is the truth then.
+    if (status.available) return { ...status, visible, ...viewportStatus };
   }
   const navStatus = snapshot?.navStatus;
   return {
@@ -268,7 +288,7 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
     () => ({
       clientId: automationClientId,
       environmentId,
-      supportedOperations: [...PREVIEW_AUTOMATION_OPERATIONS],
+      supportedOperations: supportedAutomationOperations(),
     }),
     [automationClientId, environmentId],
   );
@@ -352,12 +372,18 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
               : undefined;
             const reusedExistingTab = activeTabId !== null;
             tabId = activeTabId;
+            // Resolve first: a server-loopback URL must never load this
+            // computer's localhost for a remote environment.
+            const resolvedUrl = input.url
+              ? resolveBrowserNavigationTarget(environmentId, { kind: "url", url: input.url })
+                  .resolvedUrl
+              : null;
             if (!activeTabId) {
               const result = await open({
                 environmentId,
                 input: {
                   threadId: request.threadId,
-                  ...(input.url ? { url: input.url } : {}),
+                  ...(resolvedUrl ? { url: resolvedUrl } : {}),
                 },
               });
               if (result._tag === "Failure") {
@@ -369,7 +395,12 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
               activeSnapshot = snapshot;
               tabId = activeTabId;
             }
-            if (input.show ?? true) {
+            // The desktop host has one native view and drives only the visible
+            // tab, so a navigation-only bridge cannot honor `show: false`.
+            if (
+              (input.show ?? true) ||
+              !supportsPreviewRuntimeCapability(previewBridge, "automation")
+            ) {
               useRightPanelStore.getState().openBrowser(threadRef, activeTabId);
             }
             if (activeSnapshot && previewAutomationOpenNeedsOverlay(input, activeSnapshot)) {
@@ -380,12 +411,8 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                 request.timeoutMs,
               );
             }
-            if (reusedExistingTab && input.url && previewBridge) {
-              const resolution = resolveBrowserNavigationTarget(environmentId, {
-                kind: "url",
-                url: input.url,
-              });
-              await previewBridge.navigate(activeTabId, resolution.resolvedUrl);
+            if (reusedExistingTab && resolvedUrl !== null && previewBridge) {
+              await previewBridge.navigate(activeTabId, resolvedUrl);
               await waitForNavigationReadiness(
                 threadRef,
                 request.requestId,

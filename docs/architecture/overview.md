@@ -35,7 +35,11 @@ flowchart TB
 - **React app (`apps/web`)** owns the user interface and client-side state. It
   uses hash history in desktop mode and browser history on the web. Preview
   content is hosted in Tauri child webviews; preview automation is brokered by
-  the Rust server and consumed by the React host. Typography and text-contrast
+  the Rust server and consumed by the React host. On the Tauri desktop host only
+  tab status, open, and navigate are supported and advertised; snapshot, click,
+  type, and the other automation calls are not yet. Its single native view
+  drives only the visible tab, so open always shows the tab, and a request for a
+  thread that is not on screen times out. Typography and text-contrast
   rules live in [`UI.md`](../../UI.md).
 - **Desktop adapter (`apps/web/src/tauriDesktopBridge.ts`)** installs
   `window.desktopBridge` only when Tauri globals are present. Tauri commands and

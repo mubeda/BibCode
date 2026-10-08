@@ -75,6 +75,7 @@ const h = vi.hoisted(() => {
       refresh: vi.fn(),
     },
     localApi: undefined as unknown,
+    previewSupported: true,
     refreshProvidersCommand: vi.fn(),
     refreshProviderUsageCommand: vi.fn(),
     providerUsageQueryRefresh: vi.fn(),
@@ -204,6 +205,10 @@ vi.mock("../../localApi", () => ({
     }
     return h.localApi;
   },
+}));
+
+vi.mock("../../previewStateStore", () => ({
+  isPreviewSupportedInRuntime: () => h.previewSupported,
 }));
 
 vi.mock("../../branding", () => ({
@@ -624,6 +629,7 @@ beforeEach(() => {
   h.archive.isLoading = false;
   h.archive.refresh.mockReset();
   h.localApi = undefined;
+  h.previewSupported = true;
   h.refreshProvidersCommand.mockReset();
   h.refreshProvidersCommand.mockResolvedValue({ _tag: "Success", value: { providers: [] } });
   h.refreshProviderUsageCommand.mockReset();
@@ -835,6 +841,36 @@ describe("GeneralSettingsPanel", () => {
     expect(h.updateSettings).toHaveBeenCalledWith({ addProjectBaseDirectory: "~/somewhere" });
 
     expect(assignSpy).not.toHaveBeenCalled();
+  });
+
+  it("offers the link target choice and routes selections and resets", () => {
+    const markup = renderedText();
+
+    expect(markup).toContain("Open links in");
+    expect(markup).toContain("BiBCode browser");
+    expect(markup).toContain("System browser");
+    expect(findControls("button", "Reset link target")).toHaveLength(0);
+
+    invoke(control("select", "app"), "onValueChange", "system");
+    expect(h.updateSettings).toHaveBeenCalledWith({ browserLinkTarget: "system" });
+    invoke(control("select", "app"), "onValueChange", "bogus");
+    expect(h.updateSettings).toHaveBeenCalledTimes(1);
+
+    h.updateSettings.mockReset();
+    h.settings = { ...DEFAULT_UNIFIED_SETTINGS, browserLinkTarget: "system" };
+    render(<GeneralSettingsPanel />);
+    invoke(control("button", "Reset link target to default"), "onClick");
+    expect(h.updateSettings).toHaveBeenCalledWith({ browserLinkTarget: "app" });
+  });
+
+  it("hides the link target where the BiBCode browser is unavailable", () => {
+    h.previewSupported = false;
+    h.settings = { ...DEFAULT_UNIFIED_SETTINGS, browserLinkTarget: "system" };
+
+    const markup = renderedText();
+
+    expect(markup).not.toContain("Open links in");
+    expect(findControls("button", "Reset link target to default")).toHaveLength(0);
   });
 
   it("renders changed general settings with reset actions", () => {
@@ -1223,6 +1259,32 @@ describe("useGeneralSettingsRestore", () => {
     ]);
   });
 
+  it("lists and resets the link target when it is not the default", async () => {
+    h.settings = { ...DEFAULT_UNIFIED_SETTINGS, browserLinkTarget: "system" };
+    h.localApi = { dialogs: { confirm: vi.fn(async () => true) } };
+    const restore = captureRestore();
+
+    expect(restore.changedSettingLabels).toEqual(["Open links in"]);
+    await restore.restoreDefaults();
+    expect(h.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ browserLinkTarget: "app" }),
+    );
+  });
+
+  it("leaves a hidden link target out of the restore list and patch", async () => {
+    h.previewSupported = false;
+    h.settings = { ...DEFAULT_UNIFIED_SETTINGS, browserLinkTarget: "system" };
+    h.theme = "dark";
+    h.localApi = { dialogs: { confirm: vi.fn(async () => true) } };
+    const restore = captureRestore();
+
+    expect(restore.changedSettingLabels).toEqual(["Theme"]);
+    await restore.restoreDefaults();
+    expect(h.updateSettings).toHaveBeenCalledWith(
+      expect.not.objectContaining({ browserLinkTarget: expect.anything() }),
+    );
+  });
+
   it("restores defaults after confirmation and notifies the caller", async () => {
     h.theme = "dark";
     h.settings = changedSettings();
@@ -1243,6 +1305,7 @@ describe("useGeneralSettingsRestore", () => {
     expect(h.setTheme).toHaveBeenCalledWith("system");
     expect(h.updateSettings).toHaveBeenCalledWith({
       timestampFormat: DEFAULT_UNIFIED_SETTINGS.timestampFormat,
+      browserLinkTarget: DEFAULT_UNIFIED_SETTINGS.browserLinkTarget,
       wordWrap: DEFAULT_UNIFIED_SETTINGS.wordWrap,
       diffIgnoreWhitespace: DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace,
       enableAssistantStreaming: DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming,
