@@ -478,7 +478,12 @@ export async function runBrowserFollowupCaller(input: {
   readSnapshot: () => Promise<OrchestrationReadModel>;
   verifyPhysical: () => Promise<void>;
   patch: () => string;
-  viewport: (browser: QualificationBrowser, width: 1280, height: 960) => Promise<void>;
+  viewport: (
+    browser: QualificationBrowser,
+    width: 1280,
+    height: 960,
+    step?: (phase: string) => void,
+  ) => Promise<void>;
   evidence: string;
   captured: Set<string>;
   captures: Array<ReturnType<typeof projectBrowserFollowupCapture>>;
@@ -710,7 +715,18 @@ export async function runBrowserFollowupCaller(input: {
         };
         const receipt = await captureBrowserFollowupScene({
           browser,
-          owner: input.owner,
+          owner:
+            scene === "chat-staged-attachment"
+              ? {
+                  until: async (predicate, timeout) => {
+                    input.step(
+                      "visual-browser-followups-chat-staged-attachment-capture-witness-wait",
+                    );
+                    await input.owner.until(predicate, timeout);
+                    input.step("visual-browser-followups-chat-staged-attachment");
+                  },
+                }
+              : input.owner,
           evidence: input.evidence,
           captured: input.captured,
           observation,

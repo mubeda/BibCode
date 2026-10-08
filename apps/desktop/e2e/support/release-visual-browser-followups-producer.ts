@@ -18,7 +18,12 @@ export interface BrowserFollowupProducerInput {
   owner: Pick<QualificationOwner, "until">;
   /** The existing controller's descriptor, snapshot and physical managed Git identity join. */
   verifyOwnedIdentity: () => Promise<void>;
-  viewport: (browser: QualificationBrowser, width: 1280, height: 960) => Promise<void>;
+  viewport: (
+    browser: QualificationBrowser,
+    width: 1280,
+    height: 960,
+    step?: (phase: string) => void,
+  ) => Promise<void>;
   capture: (
     scene: BrowserFollowupScene,
     browser: QualificationBrowser,
@@ -115,7 +120,12 @@ export async function runBrowserFollowupScene(
   if (!browserFollowupRows.includes(row)) throw refused();
   input.step("visual-browser-followups-" + row);
   await input.verifyOwnedIdentity();
-  await input.viewport(input.browser, 1280, 960);
+  await input.viewport(
+    input.browser,
+    1280,
+    960,
+    row === "chat-staged-attachment" ? input.step : undefined,
+  );
   const capture = async (
     scene: BrowserFollowupScene,
     browser: QualificationBrowser,
@@ -162,6 +172,7 @@ export async function runBrowserFollowupScene(
           ]);
           if (value.bytes !== 512 * 1024 || !/^[a-f0-9]{64}$/.test(value.sha256)) throw refused();
         };
+        input.step("visual-browser-followups-chat-staged-attachment-upload-receipt-wait");
         await input.owner.until(async () => {
           try {
             await verify();
@@ -170,6 +181,7 @@ export async function runBrowserFollowupScene(
             return false;
           }
         });
+        input.step("visual-browser-followups-chat-staged-attachment");
         await capture(row, browser, verify);
         await click(
           browser,

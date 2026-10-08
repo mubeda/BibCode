@@ -1404,3 +1404,89 @@ test.each([
     }
   },
 );
+
+test.each(["chat-staged-attachment", "terminal-shared-size"])(
+  "actual delegated witness wait keeps first-row attribution local: %s",
+  async (scene) => {
+    const source = NodeFS.readFileSync(
+      new URL("./release-visual-browser-followups-caller.ts", import.meta.url),
+      "utf8",
+    );
+    const begin = source.indexOf("      const capture = async (");
+    const end = source.indexOf("      const cancelled = async", begin);
+    NodeAssert.ok(begin > 0 && end > begin);
+    const actualCapture = await import("./release-visual-browser-followups.ts");
+    for (const original of [new Error("Inert exact witness deadline."), undefined]) {
+      const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "browser-witness-phase-"));
+      const phases: string[] = ["visual-browser-followups-" + scene];
+      const captured = new Set<string>(),
+        captures: object[] = [];
+      let screenshots = 0,
+        sourceJoins = 0,
+        published = 0;
+      const input = {
+        theme: "light",
+        threadId: "inert-thread",
+        evidence: root,
+        captured,
+        captures,
+        step: (phase: string) => phases.push(phase),
+        publish: () => {
+          published++;
+        },
+        owner: {
+          until: async (predicate: () => Promise<boolean>, timeout?: number) => {
+            NodeAssert.equal(timeout, undefined);
+            NodeAssert.equal(await predicate(), false);
+            throw original;
+          },
+        },
+      };
+      const capture = NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(source.slice(begin, end)) + "\ncapture",
+        {
+          input,
+          binding: { projectId: "inert-project" },
+          terminal: { terminalId: "inert-terminal", label: "sleep" },
+          captureBrowserFollowupScene: actualCapture.captureBrowserFollowupScene,
+        },
+      ) as (scene: string, browser: object, verify: () => Promise<void>) => Promise<void>;
+      const browser = {
+        ownedIsAlertOpen: async () => false,
+        execute: async () => ({}),
+        takeScreenshot: async () => {
+          screenshots++;
+          return "";
+        },
+      };
+      try {
+        let failed = false,
+          caught: unknown;
+        try {
+          await capture(scene, browser, async () => {
+            sourceJoins++;
+          });
+        } catch (error) {
+          failed = true;
+          caught = error;
+        }
+        NodeAssert.equal(failed, true);
+        NodeAssert.equal(caught, original);
+        NodeAssert.equal(
+          phases.at(-1),
+          "visual-browser-followups-" +
+            scene +
+            (scene === "chat-staged-attachment" ? "-capture-witness-wait" : ""),
+        );
+        NodeAssert.equal(sourceJoins, 1);
+        NodeAssert.equal(screenshots, 0);
+        NodeAssert.equal(published, 0);
+        NodeAssert.equal(captured.size, 0);
+        NodeAssert.deepEqual(captures, []);
+        NodeAssert.deepEqual(NodeFS.readdirSync(root), []);
+      } finally {
+        NodeFS.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  },
+);

@@ -434,3 +434,75 @@ it.each(["browser", "ordinary"])(
     }
   },
 );
+
+it.each(["success", "wait-error", "wait-undefined", "measurement", "set-size"])(
+  "actual viewport callback labels only its predicate wait: %s",
+  async (mode) => {
+    const first = "visual-browser-followups-chat-staged-attachment";
+    const phases = [first];
+    const original =
+      mode === "wait-undefined" ? undefined : new Error("Inert exact viewport failure.");
+    const start = source.indexOf(
+      "viewport: async (target, width, height",
+      source.indexOf("await runBrowserFollowupCaller"),
+    );
+    const end = source.indexOf("\n          evidence:", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const text = source
+      .slice(start, end)
+      .trim()
+      .replace(/^viewport: /, "")
+      .replace(/,$/, "");
+    const reads: string[] = [];
+    let measured = false;
+    const viewport = code("(" + text + ")", {
+      bounded: (value: unknown) => value,
+      readVisualViewport: () => {},
+      correctDesktopUiOuterSize: (outer: object) => outer,
+      owner: {
+        until: async (predicate: () => Promise<boolean>) => {
+          reads.push("wait");
+          expect(await predicate()).toBe(true);
+          if (mode.startsWith("wait-")) throw original;
+        },
+      },
+    }) as (
+      target: object,
+      width: number,
+      height: number,
+      step?: (phase: string) => void,
+    ) => Promise<void>;
+    const target = {
+      execute: async () => {
+        reads.push(measured ? "readback" : "measure");
+        measured = true;
+        if (mode === "measurement") throw original;
+        return { width: 1280, height: 960, devicePixelRatio: 1 };
+      },
+      getWindowSize: async () => ({ width: 1280, height: 960 }),
+      setWindowSize: async () => {
+        reads.push("set-size");
+        if (mode === "set-size") throw original;
+      },
+    };
+    if (mode === "success") {
+      await viewport(target, 1280, 960, (phase) => phases.push(phase));
+      expect(phases).toEqual([first, first + "-viewport-wait", first]);
+    } else {
+      let failed = false,
+        caught: unknown;
+      try {
+        await viewport(target, 1280, 960, (phase) => phases.push(phase));
+      } catch (error) {
+        failed = true;
+        caught = error;
+      }
+      expect(failed).toBe(true);
+      expect(caught).toBe(original);
+      expect(phases.at(-1)).toBe(mode.startsWith("wait-") ? first + "-viewport-wait" : first);
+    }
+    if (mode === "success" || mode.startsWith("wait-"))
+      expect(reads).toEqual(["measure", "set-size", "wait", "readback"]);
+  },
+);

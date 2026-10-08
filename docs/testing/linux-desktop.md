@@ -2602,7 +2602,17 @@ upload lease. The public client may omit the begin digest; retain target and siz
 admission and compare each canonical append at its exact offset to those original
 bytes. Any declared digest must match that fixture; an append digest is admitted
 only at the final full-image boundary. The unfinished receipt describes the pinned
-source image and observed prefix, not a completed network transfer. The second window attaches the same existing
+source image and observed prefix, not a completed network transfer.
+The first attachment row records its existing viewport, upload-receipt and
+capture-witness waits in the phase field as
+`visual-browser-followups-chat-staged-attachment-viewport-wait`,
+`visual-browser-followups-chat-staged-attachment-upload-receipt-wait` and
+`visual-browser-followups-chat-staged-attachment-capture-witness-wait`.
+Each label begins immediately before its existing predicate wait and returns
+to the row phase only on success; failed waits retain their original error and
+label through joined cleanup. Viewport preparation and screenshot calls keep
+the row phase. These labels add no read, action, wait, timeout or JSON member,
+and do not widen the separate initial-reconnect census. The second window attaches the same existing
 terminal and uses public Fit. Working-tree diff bytes come from actual Git.
 The diagnostics scene holds one original server reply beyond the unchanged
 15-second threshold. Hosted entries use fresh unused loopback grants, actual

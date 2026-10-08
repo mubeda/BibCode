@@ -234,3 +234,81 @@ it.each(
   expect(admitted).toBe(0);
   expect(value.read().cleaned).toBe(0);
 });
+
+const firstRowPhase = "visual-browser-followups-chat-staged-attachment";
+it.each(browserFollowupRows)(
+  "offers viewport wait attribution only for the first row: %s",
+  async (row) => {
+    const value = fixture();
+    const phases: string[] = [];
+    value.input.step = (phase) => phases.push(phase);
+    let nominated: unknown;
+    value.input.viewport = async (_browser, _width, _height, step) => {
+      nominated = step;
+    };
+    await runBrowserFollowupScene(value.input, row);
+    expect(nominated).toBe(row === "chat-staged-attachment" ? value.input.step : undefined);
+    if (row !== "chat-staged-attachment")
+      expect(phases.some((phase) => phase.startsWith(firstRowPhase))).toBe(false);
+  },
+);
+it.each([new Error("Inert original receipt deadline."), undefined])(
+  "retains receipt wait and the exact thrown value through unsafe cleanup",
+  async (original) => {
+    const value = fixture();
+    const phases: string[] = [];
+    let cleanup = 0,
+      unsafe = 0;
+    value.input.step = (phase) => phases.push(phase);
+    value.input.owner.until = async (predicate) => {
+      expect(await predicate()).toBe(true);
+      throw original;
+    };
+    const upload = value.input.upload.withSlowTransport;
+    value.input.upload.withSlowTransport = (run) =>
+      withBrowserFollowupResource({
+        run: () => upload(run),
+        cleanup: async () => {
+          cleanup++;
+          throw new Error("Inert secondary cleanup failure.");
+        },
+        observeUnsafeCleanup: () => {
+          unsafe++;
+        },
+      });
+    let failed = false,
+      caught: unknown;
+    try {
+      await runBrowserFollowupScene(value.input, "chat-staged-attachment");
+    } catch (error) {
+      failed = true;
+      caught = error;
+    }
+    expect(failed).toBe(true);
+    expect(caught).toBe(original);
+    expect(phases.at(-1)).toBe(firstRowPhase + "-upload-receipt-wait");
+    expect(value.captures).toEqual([]);
+    expect(cleanup).toBe(1);
+    expect(unsafe).toBe(1);
+  },
+);
+it("clears the receipt wait only on success without changing original capture binding", async () => {
+  const value = fixture();
+  const phases: string[] = [];
+  value.input.step = (phase) => phases.push(phase);
+  const result = await runBrowserFollowupScene(value.input, "chat-staged-attachment");
+  expect(phases).toEqual([
+    firstRowPhase,
+    firstRowPhase + "-upload-receipt-wait",
+    firstRowPhase,
+    firstRowPhase,
+  ]);
+  expect(value.captures).toEqual(["chat-staged-attachment"]);
+  expect(result).toEqual({
+    row: "chat-staged-attachment",
+    baseOriginals: 1,
+    supplements: 0,
+    sourceIdentityRetained: true,
+    completeGroup: false,
+  });
+});
