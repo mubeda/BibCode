@@ -2119,6 +2119,15 @@ describe("ArchivedThreadsPanel", () => {
               archivedAt: null,
               createdAt: "2026-06-20T00:00:00.000Z",
             },
+            {
+              id: "panel-closed",
+              projectId: "project-a",
+              title: "Panel — Closed chat",
+              kind: "panel",
+              hostThreadId: "thread-new",
+              archivedAt: "2026-06-21T00:00:00.000Z",
+              createdAt: "2026-06-20T00:00:00.000Z",
+            },
           ],
         },
       },
@@ -2180,6 +2189,8 @@ describe("ArchivedThreadsPanel", () => {
     expect(markup).not.toContain("No Threads");
     // Newest archive key (createdAt fallback) sorts first.
     expect(markup.indexOf("Newer thread")).toBeLessThan(markup.indexOf("Older thread"));
+    // Closed chat panels are reopened from their host's + menu, not listed here.
+    expect(markup).not.toContain("Closed chat");
     expect(markup).toContain("Archived");
     expect(markup).toContain("Created");
   });
@@ -2362,32 +2373,6 @@ describe("ArchivedThreadsPanel", () => {
       threadId: "thread-new",
     });
     expect(h.confirmAndDeleteThread).not.toHaveBeenCalled();
-    expect(h.requestWorktreeRemoval).not.toHaveBeenCalled();
-  });
-
-  it("keeps archived panel-thread deletion on the ordinary thread path", async () => {
-    const snapshots = archivedSnapshots() as any[];
-    const archivedThread = snapshots[0].snapshot.threads[1];
-    archivedThread.kind = "panel";
-    archivedThread.worktreePath = "/work/alpha-worktrees/feature";
-    h.archive.snapshots = snapshots;
-    h.localApi = { contextMenu: { show: vi.fn().mockResolvedValue("delete") } };
-    render(<ArchivedThreadsPanel />);
-
-    const row = h.rows.find(
-      (entry) => entry.title === "Newer thread" && typeof entry.onContextMenu === "function",
-    );
-    (row!.onContextMenu as (event: unknown) => void)({
-      preventDefault: () => {},
-      clientX: 3,
-      clientY: 4,
-    });
-    await flush();
-
-    expect(h.confirmAndDeleteThread).toHaveBeenCalledWith({
-      environmentId: env1,
-      threadId: "thread-new",
-    });
     expect(h.requestWorktreeRemoval).not.toHaveBeenCalled();
   });
 

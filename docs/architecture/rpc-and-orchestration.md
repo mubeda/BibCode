@@ -1111,7 +1111,10 @@ and derives project, `panel` kind, branch, and worktree path. The panel
 thread records the host as `hostThreadId` on `thread.created`, persisted in
 `projection_threads.host_thread_id` and emitted on thread shells and details so
 every client can open the panel under its host; public `thread.create` rejects a
-client-supplied `hostThreadId`. Similarly,
+client-supplied `hostThreadId`. A generic `thread.delete` emits `thread.deleted`
+for every non-deleted panel whose `hostThreadId` is the deleted thread, live or
+archived, in id order before the thread's own event and in the same command, so
+the existing deletion effects clean up their sessions and terminals. Similarly,
 `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present
 nonprimary/nonbare membership and exclusive ownership before dispatching the

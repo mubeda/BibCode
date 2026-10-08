@@ -1912,11 +1912,11 @@ export function ArchivedThreadsPanel() {
         ),
       ),
     );
+    // Closed chat panels are reopened from their host's + menu, not listed here.
     const threads = archivedSnapshots.flatMap(({ environmentId, snapshot }) =>
-      snapshot.threads.map((thread) => ({
-        ...thread,
-        environmentId,
-      })),
+      snapshot.threads.flatMap((thread) =>
+        thread.kind === "panel" ? [] : [{ ...thread, environmentId }],
+      ),
     );
 
     const archivedProjects = Array.from(projectsByEnvironmentAndId.values());
@@ -1984,11 +1984,7 @@ export function ArchivedThreadsPanel() {
           serverConfig === undefined
             ? null
             : selectWorktreeCatalogCapabilityPolicy(serverConfig.environment).removal;
-        if (
-          thread.worktreePath &&
-          thread.kind !== "panel" &&
-          removalPolicy !== "legacy-detach-only"
-        ) {
+        if (thread.worktreePath && removalPolicy !== "legacy-detach-only") {
           requestWorktreeRemoval({
             environmentId: thread.environmentId,
             projectId: thread.projectId,
@@ -2005,7 +2001,6 @@ export function ArchivedThreadsPanel() {
         const isLegacyWorktreeDetach =
           thread.worktreePath !== null &&
           thread.worktreePath !== undefined &&
-          thread.kind !== "panel" &&
           removalPolicy === "legacy-detach-only";
         if (isLegacyWorktreeDetach) {
           const confirmed = await api.dialogs.confirm(

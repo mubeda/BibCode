@@ -482,4 +482,56 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     expect(useRightPanelStore.getState().byThreadKey[scopedThreadKey(ARCHIVED_REF)]).toBeDefined();
     expect(useCenterPanelStore.getState().byThreadKey[scopedThreadKey(DRAFT_REF)]).toBeDefined();
   });
+  it("drops a chat panel tab adopted from another client once that panel is archived", async () => {
+    const PANEL_ID = ThreadId.make("remote-panel-thread");
+    const shellThread = (id: ThreadId, extra: Record<string, unknown> = {}) =>
+      ({
+        id,
+        archivedAt: null,
+        title: "Host",
+        ...extra,
+      }) as OrchestrationShellSnapshot["threads"][number];
+    const host = shellThread(HOST_ID, { kind: "workspace" });
+    const panel = shellThread(PANEL_ID, {
+      kind: "panel",
+      hostThreadId: HOST_ID,
+      title: "Panel — Claude",
+    });
+    const withThreads = (
+      snapshotSequence: number,
+      threads: OrchestrationShellSnapshot["threads"],
+    ): OrchestrationShellSnapshot => ({ ...snapshot(snapshotSequence, []), threads });
+    const hostSurfaces = () =>
+      selectThreadCenterPanelState(useCenterPanelStore.getState().byThreadKey, HOST_REF).surfaces;
+
+    publishShellState(ENVIRONMENT_ID, shellState("live", withThreads(60, [host, panel])));
+    h.archivedStates.set(ENVIRONMENT_ID, {
+      snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(60, []) }],
+      error: null,
+      isLoading: false,
+    });
+    await act(async () => root.render(<AppRoot router={{} as AppRouter} />));
+    expect(hostSurfaces()).toContainEqual(
+      expect.objectContaining({ kind: "chat", threadId: PANEL_ID, providerLabel: "Claude" }),
+    );
+
+    h.archivedStates.set(ENVIRONMENT_ID, {
+      snapshots: [
+        {
+          environmentId: ENVIRONMENT_ID,
+          snapshot: withThreads(61, [{ ...panel, archivedAt: "2026-10-08T00:00:00.000Z" }]),
+        },
+      ],
+      error: null,
+      isLoading: false,
+    });
+    await act(async () => {
+      publishShellState(ENVIRONMENT_ID, shellState("live", withThreads(61, [host])));
+      root.render(<AppRoot router={{} as AppRouter} />);
+    });
+
+    expect(hostSurfaces()).not.toContainEqual(
+      expect.objectContaining({ kind: "chat", threadId: PANEL_ID }),
+    );
+  });
 });
