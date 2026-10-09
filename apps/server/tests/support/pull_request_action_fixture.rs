@@ -46,8 +46,19 @@ case "$1 $2" in
   'api user') role=user ;;
   'api version') role=version ;;
   'api projects/team%2Frepo') role=project ;;
+  'api projects/team%2Frepo/merge_requests/'*'/approvals') role=approvals ;;
+  'api projects/team%2Frepo/merge_requests/'*'/reviewers') role=reviewers ;;
+  'api projects/team%2Frepo/merge_requests/'*'/approval_state') role=approval-state ;;
+  'api projects/team%2Frepo/merge_requests/'*'/award_emoji'*) role=awards ;;
+  'api projects/team%2Frepo/merge_requests/'*'/closes_issues'*) role=issues ;;
+  'api projects/team%2Frepo/merge_requests/'*'/resource_label_events'*) role=label-events ;;
+  'api projects/team%2Frepo/merge_requests/'*'/resource_milestone_events'*) role=milestone-events ;;
+  'api projects/team%2Frepo/merge_requests/'*'/resource_state_events'*) role=state-events ;;
+  'api projects/team%2Frepo/merge_requests/'*/*) role= ;;
+  'api projects/team%2Frepo/merge_requests/'*) role=merge-request ;;
   'api repos/team/repo') role=repository ;;
   'api graphql') role=graphql ;;
+  'api --method') if [ "$4" = graphql ]; then role=graphql; else role=; fi ;;
   *) role= ;;
 esac
 if [ -n "$role" ] && [ -f "role-$role" ]; then
@@ -125,8 +136,10 @@ if [ -f "error-$slot" ]; then cat "error-$slot" >&2; exit 1; fi
         .unwrap();
     }
     /// Marks the last response as a concurrent command: `cli-version`/`auth`
-    /// probes, GitLab `user`/`project`/`version`, or GitHub
-    /// `user`/`repository`/`graphql`. Every call in an overlapping group must
+    /// probes, GitLab `user`/`project`/`version`, GitHub
+    /// `user`/`repository`/`graphql`, or GitLab merge request reads
+    /// (`merge-request`, `approvals`, `reviewers`, `approval-state`, `awards`,
+    /// `issues`, `graphql`, `*-events`). Every call in an overlapping group must
     /// reserve its own role; only sequential calls may use arrival-order slots.
     pub fn role(&self, role: &str) {
         fs::write(
