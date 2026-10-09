@@ -43,7 +43,10 @@ flowchart TB
   native view per environment's preview storage (the local environment keeps
   the original profile; each other environment gets its own), because
   recreating child webviews while switching tabs disconnected the app; logical
-  tabs rebind to their environment's view. In browser mode there is no child
+  tabs rebind to their environment's view. Removing an environment deletes its preview storage with its other
+  environment-owned data (`EnvironmentOwnedDataCleanup`, through
+  `desktop_preview_forget_environment`); a profile one of its previews used in
+  this session stays on disk, since its native view lives until the app exits. In browser mode there is no child
   webview: the client advertises only status and open, and open shows a prompt
   and returns `pending-user` at once; the page opens only if the user clicks Open. The server prefers the host
   with more operations, so a connected desktop serves automation first.
