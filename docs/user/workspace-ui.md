@@ -325,6 +325,24 @@ fails before removing files; close that process and retry the same row. If Git
 removal succeeds but deleting the sidebar row fails, retrying that stale row is
 safe even when a new worktree has since reused the old folder.
 
+### Importing CLI sessions
+
+To continue a conversation you started in Claude Code or Codex outside
+BiBCode, open the project menu and choose **Import CLI sessions…**. The dialog
+lists the sessions run in the project's folder on the server in the last 30
+days, newest first, with the provider, last activity and message count. Select
+sessions (or **Select all**) and choose **Import**. Each becomes a thread with
+the session's recent messages (up to 200, always including the first prompt); your
+next message in it continues the same CLI conversation. BiBCode opens the most
+recently active imported thread and reports how many sessions were imported or
+skipped and why.
+
+A session imported earlier shows **Already imported** with **Open**; importing
+it again does nothing. Conversations started in BiBCode, sessions run in a
+subfolder, and sessions run in another worktree are not listed. Only the
+default Claude Code and Codex providers are scanned, and a provider turned off
+in settings is skipped.
+
 ## Center Panel
 
 Terminal input pauses if delivery fails. **Reconnect input** reattaches to the
@@ -339,6 +357,9 @@ thread. While present, it remains mounted throughout layout and tab changes. The
 chat header `+` menu contains:
 
 - enabled AI providers, which create new chat panels
+- Reopen closed chat, which lists this thread's ten most recently closed chat
+  panels, newest first; it is disabled with **No closed chats** when there are
+  none, and offers a retry when closed chats could not be loaded
 - Open Terminal, which creates a shell terminal panel in the current worktree
 - enabled provider terminal actions, which launch the selected provider CLI in
   the current worktree using that provider instance's configured binary path
@@ -347,7 +368,13 @@ chat header `+` menu contains:
 Each extra chat panel is an isolated AI session. For contributors, this is
 implemented as a hidden sibling thread with `kind: "panel"` that shares the host
 thread's project, branch, and worktree. Panel threads are hidden from the left
-panel and are deleted when their tab closes. A new chat panel's tab shows
+panel and from Settings → Archived. Closing a chat panel's tab stops its running
+turn, keeps its queued messages waiting, and archives the panel thread, so its
+history is kept and it can resume;
+**Reopen closed chat** brings it back as the active tab (messages queued
+behind a stopped turn then offer **Send now**), and a
+**Failed to reopen chat panel** toast gives the reason if that fails. Deleting
+the host thread deletes its chat panels, open or closed. A new chat panel's tab shows
 **Opening chat…** until the server confirms the panel thread; if creation fails,
 the tab closes and a **Failed to open chat panel** toast gives the reason.
 
@@ -359,8 +386,8 @@ client connected to the same server. A panel opened on another client is added
 to this client's host thread as a new tab in the focused pane without switching
 to it; its terminal history or chat messages load when you open the tab.
 Closing a panel closes it on every client: closing a terminal tab ends its
-session, and closing a chat panel deletes its thread. Tab order and splits stay
-per client.
+session, and closing a chat panel archives its thread. A reopened chat panel
+returns to every client. Tab order and splits stay per client.
 
 Only the focused center pane may programmatically focus its terminal. Moving
 focus to a chat pane leaves visible terminals mounted but prevents them from
@@ -478,6 +505,17 @@ remains in the timeline with its copy button so you can prepare the corrected
 message. Other failed deliveries still offer Retry and Dismiss; uncertain
 deliveries still warn that Retry could send a duplicate.
 
+When BiBCode cannot resume a thread's provider conversation (the provider no
+longer has it, for example after its history was cleared), it starts a new one
+and the thread shows **Couldn't resume the previous <provider> conversation.
+Started a new one with a summary of this thread.** Your next message reaches the
+provider together with the thread's earlier messages (up to the last 40, about
+24,000 characters, oldest left out first), so the agent can pick up where it left
+off; the thread still shows only what you typed. A provider command starting with
+`/` is sent as written, and the summary goes with the next ordinary message. A
+retried message that had to start a new conversation shows **Sent in a new
+conversation with a summary of earlier messages.**
+
 ### Composer context window
 
 In the normal composer footer, controls remain visible in this order: MCP
@@ -540,7 +578,8 @@ center creation actions, so new chats and terminals open there.
 Drag pane dividers to resize them. Layout, focus, tab order, and split ratios
 persist across reloads. Closing a split pane merges its tabs into the adjacent
 layout without closing chats or terminals. Explicit tab close commands remain
-pane-local and do close their underlying panel thread or terminal session.
+pane-local and do archive their chat panel thread or end their terminal
+session.
 
 ## Git Manager
 

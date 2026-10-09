@@ -350,6 +350,49 @@ impl Repositories {
         }).await
     }
 
+    /// Links resumable state to a live thread only when the thread has none yet and has not
+    /// admitted a turn or user message, so a conversation the thread started is never replaced.
+    pub(crate) async fn insert_provider_session_runtime_if_absent_for_live_thread(
+        &self,
+        row: ProviderSessionRuntime,
+    ) -> Result<bool> {
+        self.database.call(move |connection| {
+            let written = connection.execute(
+                "INSERT INTO provider_session_runtime ( \
+                   thread_id, provider_name, provider_instance_id, adapter_key, runtime_mode, status, \
+                   last_seen_at, resume_cursor_json, runtime_payload_json \
+                 ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
+                   WHERE EXISTS (SELECT 1 FROM projection_threads WHERE thread_id = ?1 AND deleted_at IS NULL \
+                   AND latest_turn_id IS NULL AND latest_user_message_at IS NULL) \
+                 ON CONFLICT (thread_id) DO NOTHING",
+                params![row.thread_id, row.provider_name, row.provider_instance_id, row.adapter_key, row.runtime_mode, row.status, row.last_seen_at, optional_json(&row.resume_cursor)?, optional_json(&row.runtime_payload)?],
+            )?;
+            Ok(written != 0)
+        }).await
+    }
+
+    /// Native provider session IDs mapped to a thread that delivered turns to them or can
+    /// resume them.
+    pub(crate) async fn list_provider_session_owners(&self) -> Result<Vec<(String, String)>> {
+        self.database
+            .call(|connection| {
+                collect(
+                    connection,
+                    "SELECT provider_session_id, thread_id FROM provider_turn_outbox \
+                       WHERE provider_session_id IS NOT NULL \
+                     UNION SELECT json_extract(resume_cursor_json, '$.sessionId'), thread_id \
+                       FROM provider_session_runtime \
+                       WHERE json_type(resume_cursor_json, '$.sessionId') = 'text' \
+                     UNION SELECT json_extract(resume_cursor_json, '$.threadId'), thread_id \
+                       FROM provider_session_runtime \
+                       WHERE json_type(resume_cursor_json, '$.threadId') = 'text'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+    }
+
     pub async fn get_provider_session_runtime(
         &self,
         thread_id: String,
@@ -884,8 +927,9 @@ impl Repositories {
         self.delivery_test_hooks
             .claim_calls
             .fetch_add(1, Ordering::SeqCst);
+        // A closed (archived) chat panel starts nothing until it is reopened.
         let result = self.database.call(move |connection| connection.query_row(
-            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
+            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
             params![updated_at, command_id], decode_provider_turn_delivery).optional().map_err(Into::into)).await;
         #[cfg(test)]
         if result.as_ref().is_ok_and(Option::is_some) {
@@ -2708,6 +2752,8 @@ pub(crate) fn can_promote_queued_provider_turn_on(
              AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')
              AND (? = 0 OR (
                session.status = 'ready' AND queued.held = 0
+               -- A closed (archived) chat panel keeps its queue until it is reopened.
+               AND NOT (thread.kind = 'panel' AND thread.archived_at IS NOT NULL)
                AND NOT EXISTS(SELECT 1 FROM projection_turns AS turn WHERE turn.thread_id = queued.thread_id AND turn.state = 'running'
                  AND NOT (turn.turn_id IS NULL AND EXISTS(SELECT 1 FROM provider_turn_outbox AS dismissed
                    WHERE dismissed.thread_id = turn.thread_id AND dismissed.message_id = turn.pending_message_id AND dismissed.state = 'dismissed'

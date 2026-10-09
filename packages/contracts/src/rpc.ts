@@ -42,6 +42,13 @@ import {
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
+  AgentSessionImportInput,
+  AgentSessionImportResult,
+  AgentSessionScanInput,
+  AgentSessionScanResult,
+  AgentSessionsError,
+} from "./agentSessions.ts";
+import {
   AuthAccessStreamError,
   AuthAccessStreamEvent,
   EnvironmentAuthorizationError,
@@ -417,6 +424,10 @@ export const WS_METHODS = {
   projectsDeleteEntry: "projects.deleteEntry",
   projectsDuplicateEntry: "projects.duplicateEntry",
 
+  // CLI session import methods
+  agentSessionsScan: "agentSessions.scan",
+  agentSessionsImport: "agentSessions.import",
+
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
 
@@ -575,6 +586,18 @@ export const WsAuthConfirmPairingRpc = Rpc.make(WS_METHODS.authConfirmPairing, {
   payload: AuthConfirmPairingEmpty,
   success: AuthConfirmPairingEmpty,
   error: EnvironmentAuthorizationError,
+});
+
+export const WsAgentSessionsScanRpc = Rpc.make(WS_METHODS.agentSessionsScan, {
+  payload: AgentSessionScanInput,
+  success: AgentSessionScanResult,
+  error: Schema.Union([AgentSessionsError, EnvironmentRpcError]),
+});
+
+export const WsAgentSessionsImportRpc = Rpc.make(WS_METHODS.agentSessionsImport, {
+  payload: AgentSessionImportInput,
+  success: AgentSessionImportResult,
+  error: Schema.Union([AgentSessionsError, EnvironmentRpcError]),
 });
 
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
@@ -1704,6 +1727,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsUploadsGetRpc,
   WsUploadsCancelRpc,
   WsAuthConfirmPairingRpc,
+  WsAgentSessionsScanRpc,
+  WsAgentSessionsImportRpc,
   WsServerGetConfigRpc,
   WsServerGetProviderCapabilitiesRpc,
   WsServerRefreshProvidersRpc,

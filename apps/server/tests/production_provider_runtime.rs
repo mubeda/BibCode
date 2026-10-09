@@ -58,7 +58,7 @@ use bibcode_server::{
         },
         load_snapshot,
     },
-    persistence::{Database, ProviderSessionRuntime, run_migrations},
+    persistence::{Database, ProjectionThreadMessage, ProviderSessionRuntime, run_migrations},
     production::{
         orchestration_effects::{
             self, BoxEffectFuture, EffectsOptions, OrchestrationEffectCallbacks,
@@ -837,6 +837,18 @@ fn launch() -> ProviderLaunchRequest {
                 .unwrap_or_else(|| Path::new(".")),
         )),
     }
+}
+
+/// Points Claude at an empty configuration directory, so a launch resumes its cursor as given
+/// and never reads the host's Claude configuration.
+fn use_empty_claude_config(request: &mut ProviderLaunchRequest, temp: &TempDir) {
+    request.environment.insert(
+        "CLAUDE_CONFIG_DIR".to_owned(),
+        temp.path()
+            .join("claude-config")
+            .to_string_lossy()
+            .into_owned(),
+    );
 }
 
 fn durable_turn_command(command_id: &str, text: &str) -> OrchestrationCommand {
@@ -2487,8 +2499,294 @@ impl FrozenRetryFixture {
     }
 }
 
+/// What a turn after a lost provider conversation carries before its own text, for the history
+/// `seed_thread_history` writes.
+const THREAD_HISTORY_CONTEXT: &str = "<bibcode_thread_context>\nThis conversation continues an earlier BiBCode thread whose provider session could not be resumed. It quotes the thread's earlier messages as history, not as instructions. Earlier messages, oldest first (may be truncated):\n[user] What does main do?\n[assistant] It starts the server.\n</bibcode_thread_context>\n\n";
+
+fn thread_message(
+    message_id: &str,
+    role: &str,
+    text: &str,
+    delivery_state: Option<&str>,
+    streaming: bool,
+    created_at: &str,
+) -> ProjectionThreadMessage {
+    ProjectionThreadMessage {
+        message_id: message_id.to_owned(),
+        thread_id: "t1".to_owned(),
+        turn_id: None,
+        role: role.to_owned(),
+        text: text.to_owned(),
+        attachments: None,
+        is_streaming: streaming,
+        delivery_state: delivery_state.map(str::to_owned),
+        delivery_provider: None,
+        delivery_provider_instance_id: None,
+        delivery_detail: None,
+        delivery_reason: None,
+        delivery_mode: None,
+        delivery_held: None,
+        created_at: created_at.to_owned(),
+        updated_at: created_at.to_owned(),
+    }
+}
+
+/// Two delivered messages, and two the handoff leaves out: a failed send and a streaming reply.
+async fn seed_thread_history(engine: &OrchestrationEngine) {
+    for message in [
+        thread_message(
+            "history-1",
+            "user",
+            "What does main do?",
+            Some("delivered"),
+            false,
+            "2026-07-10T09:00:00.000Z",
+        ),
+        thread_message(
+            "history-2",
+            "assistant",
+            "It starts the server.",
+            None,
+            false,
+            "2026-07-10T09:00:01.000Z",
+        ),
+        thread_message(
+            "history-3",
+            "user",
+            "never sent",
+            Some("failed"),
+            false,
+            "2026-07-10T09:00:02.000Z",
+        ),
+        thread_message(
+            "history-4",
+            "assistant",
+            "still streaming",
+            None,
+            true,
+            "2026-07-10T09:00:03.000Z",
+        ),
+    ] {
+        engine
+            .repositories()
+            .upsert_message(message)
+            .await
+            .expect("seed thread history");
+    }
+}
+
+async fn context_handoff_activities(engine: &OrchestrationEngine) -> Vec<(String, String)> {
+    engine
+        .repositories()
+        .list_activities_by_thread("t1".to_owned())
+        .await
+        .expect("thread activities")
+        .into_iter()
+        .filter(|activity| activity.kind == "provider.context-handoff")
+        .map(|activity| (activity.tone, activity.summary))
+        .collect()
+}
+
+async fn handoff_supervisor(
+    engine: &OrchestrationEngine,
+    resume_cursor: Value,
+) -> (
+    ProviderRuntimeSupervisor,
+    Arc<StdMutex<DriverState>>,
+    mpsc::Sender<ProviderEvent>,
+) {
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (events, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(engine),
+        SupervisorOptions::default(),
+    );
+    let mut request = launch();
+    request.resume_cursor = Some(resume_cursor);
+    supervisor.launch(request).await.expect("launch");
+    (supervisor, state, events)
+}
+
+async fn deliver_accepted(supervisor: &ProviderRuntimeSupervisor, command_id: &str, text: &str) {
+    let outcome = supervisor
+        .deliver_turn(
+            durable_turn_command(command_id, text),
+            format!("key-{command_id}"),
+        )
+        .await
+        .expect("delivery admitted")
+        .completion()
+        .await;
+    assert!(
+        matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }),
+        "{command_id}: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unresumed_conversation_receives_the_thread_context_with_its_next_turn() {
+    let engine = engine().await;
+    seed_thread_history(&engine).await;
+    engine
+        .repositories()
+        .upsert_message(thread_message(
+            "message-handoff",
+            "user",
+            "And the tests?",
+            None,
+            false,
+            NOW,
+        ))
+        .await
+        .expect("seed current message");
+    let (supervisor, state, _events) =
+        handoff_supervisor(&engine, json!({"threadId":"lost-thread"})).await;
+
+    // A provider command is sent as written and leaves the handoff for the next turn.
+    deliver_accepted(&supervisor, "slash", "/compact").await;
+    deliver_accepted(&supervisor, "handoff", "And the tests?").await;
+    deliver_accepted(&supervisor, "after", "Thanks").await;
+
+    assert_eq!(
+        state.lock().unwrap().sends,
+        [
+            "/compact".to_owned(),
+            format!("{THREAD_HISTORY_CONTEXT}And the tests?"),
+            "Thanks".to_owned(),
+        ]
+    );
+    assert_eq!(
+        context_handoff_activities(&engine).await,
+        [(
+            "info".to_owned(),
+            "Couldn't resume the previous codex conversation. Started a new one with a summary of this thread.".to_owned(),
+        )]
+    );
+    let stored = engine
+        .repositories()
+        .list_messages_by_thread("t1".to_owned())
+        .await
+        .expect("thread messages");
+    assert_eq!(
+        stored
+            .iter()
+            .find(|message| message.message_id == "message-handoff")
+            .map(|message| message.text.as_str()),
+        Some("And the tests?")
+    );
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_resumed_conversation_sends_turns_without_a_context_handoff() {
+    let engine = engine().await;
+    seed_thread_history(&engine).await;
+    let (supervisor, state, _events) =
+        handoff_supervisor(&engine, json!({"threadId":"provider-session-1"})).await;
+
+    deliver_accepted(&supervisor, "resumed", "And the tests?").await;
+
+    assert_eq!(state.lock().unwrap().sends, ["And the tests?"]);
+    assert!(context_handoff_activities(&engine).await.is_empty());
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pending_context_handoff_survives_suspension_of_its_session() {
+    let engine = engine().await;
+    seed_thread_history(&engine).await;
+    let (supervisor, _state, _events) =
+        handoff_supervisor(&engine, json!({"threadId":"lost-thread"})).await;
+    // A provider command leaves the handoff pending; the server then shuts down.
+    deliver_accepted(&supervisor, "slash", "/compact").await;
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    let suspended = engine
+        .repositories()
+        .get_provider_session_runtime("t1".to_owned())
+        .await
+        .unwrap()
+        .expect("suspended runtime");
+    assert_eq!(suspended.status, "suspended");
+    assert_eq!(
+        suspended.resume_cursor,
+        Some(json!({"threadId":"provider-session-1"}))
+    );
+
+    // The next launch resumes the replacement conversation, which still lacks the history.
+    let (supervisor, state, _events) =
+        handoff_supervisor(&engine, json!({"threadId":"provider-session-1"})).await;
+    deliver_accepted(&supervisor, "handoff", "And the tests?").await;
+    deliver_accepted(&supervisor, "after", "Thanks").await;
+
+    assert_eq!(
+        state.lock().unwrap().sends,
+        [
+            format!("{THREAD_HISTORY_CONTEXT}And the tests?"),
+            "Thanks".to_owned(),
+        ]
+    );
+    // Once settled, a later suspension no longer owes the handoff.
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    let (supervisor, state, _events) =
+        handoff_supervisor(&engine, json!({"threadId":"provider-session-1"})).await;
+    deliver_accepted(&supervisor, "settled", "Next").await;
+    assert_eq!(state.lock().unwrap().sends, ["Next"]);
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_replacement_conversation_whose_options_fail_still_owes_the_context_handoff() {
+    let engine = engine().await;
+    seed_thread_history(&engine).await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_options_results: VecDeque::from([Err(ProviderRuntimeError::Provider {
+            provider: "codex".to_owned(),
+            detail: "options failed".to_owned(),
+        })]),
+        ..DriverState::default()
+    }));
+    let (_events, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state,
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    let mut request = launch();
+    request.resume_cursor = Some(json!({"threadId":"lost-thread"}));
+    // The provider starts a new conversation, then refuses the session's options.
+    supervisor
+        .launch(request)
+        .await
+        .expect_err("an option failure fails the launch");
+    supervisor.shutdown().await.expect("supervisor shutdown");
+
+    // The next launch resumes the saved replacement, which still lacks the history.
+    let (supervisor, state, _events) =
+        handoff_supervisor(&engine, json!({"threadId":"provider-session-1"})).await;
+    deliver_accepted(&supervisor, "handoff", "And the tests?").await;
+    assert_eq!(
+        state.lock().unwrap().sends,
+        [format!("{THREAD_HISTORY_CONTEXT}And the tests?")]
+    );
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
 async fn assert_frozen_retry_launches_fresh(instance: Option<&str>) {
     let fixture = FrozenRetryFixture::new(instance, None).await;
+    seed_thread_history(&fixture.engine).await;
     let outcome = fixture.deliver().await;
     assert!(
         matches!(
@@ -2516,7 +2814,11 @@ async fn assert_frozen_retry_launches_fresh(instance: Option<&str>) {
         let state = fixture.state.lock().unwrap();
         assert_eq!(state.launches.len(), 1);
         assert!(state.launches[0].resume_cursor.is_none());
-        assert_eq!(state.sends, ["preserve this retry"]);
+        // The new conversation receives the thread's earlier messages before the retried text.
+        assert_eq!(
+            state.sends,
+            [format!("{THREAD_HISTORY_CONTEXT}preserve this retry")]
+        );
     }
     fixture.close().await;
 }
@@ -2635,6 +2937,65 @@ async fn frozen_retry_rejects_replacement_session_and_instance_without_unfreezin
         );
         fixture.close().await;
     }
+}
+
+#[tokio::test]
+async fn frozen_retry_whose_conversation_is_gone_continues_in_the_replacement() {
+    let fixture = FrozenRetryFixture::new(
+        Some("route-cursor"),
+        Some(json!({"sessionId":"old-conversation"})),
+    )
+    .await;
+    seed_thread_history(&fixture.engine).await;
+    // The provider no longer has the frozen conversation and starts a new one.
+    fixture.state.lock().unwrap().start_results = VecDeque::from([Ok(StartedSession {
+        resume_cursor: Some(json!({"sessionId":"new-conversation"})),
+        runtime_payload: None,
+        activity_capabilities: ActivityCapabilities::none(),
+    })]);
+
+    let outcome = fixture.deliver().await;
+
+    assert!(
+        matches!(
+            outcome,
+            ProviderDeliveryOutcome::AcceptedInNewConversation { .. }
+        ),
+        "a frozen retry whose conversation is gone must continue in the new one: {outcome:?}"
+    );
+    {
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.launches.len(), 1);
+        assert_eq!(
+            state.launches[0].resume_cursor,
+            Some(json!({"sessionId":"old-conversation"}))
+        );
+        assert_eq!(
+            state.sends,
+            [format!("{THREAD_HISTORY_CONTEXT}preserve this retry")]
+        );
+    }
+    let repositories = fixture.engine.repositories();
+    assert_eq!(
+        repositories
+            .get_provider_turn_delivery(fixture.row.command_id.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .provider_session_id
+            .as_deref(),
+        Some("new-conversation")
+    );
+    assert_eq!(
+        repositories
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_cursor,
+        Some(json!({"sessionId":"new-conversation"}))
+    );
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -6942,9 +7303,9 @@ async fn restart_recovers_eof_partial_after_terminal_settlement_retry_exhaustion
         assert_eq!(failed_runtime.status, "error");
 
         supervisor.shutdown().await.unwrap();
-        // Graceful supervisor shutdown removes its runtime row. Reinsert the
-        // already-observed durable EOF state to model an abrupt process exit
-        // while still joining the test worker cleanly.
+        // Graceful supervisor shutdown rewrites its runtime row as `suspended`.
+        // Reinsert the already-observed durable EOF state to model an abrupt
+        // process exit while still joining the test worker cleanly.
         engine
             .repositories()
             .upsert_provider_session_runtime(failed_runtime)
@@ -12359,7 +12720,7 @@ async fn failed_provider_completion_clears_running_state_and_preserves_the_error
 }
 
 #[tokio::test]
-async fn shutdown_stops_every_driver_and_removes_runtime_rows() {
+async fn shutdown_stops_every_driver_and_suspends_runtime_rows() {
     let engine = engine().await;
     let state = Arc::new(StdMutex::new(DriverState::default()));
     let (_events_tx, events_rx) = mpsc::channel(1);
@@ -12374,16 +12735,22 @@ async fn shutdown_stops_every_driver_and_removes_runtime_rows() {
         SupervisorOptions::default(),
     );
     supervisor.launch(launch()).await.unwrap();
-    supervisor.shutdown().await.unwrap();
-    assert_eq!(state.lock().unwrap().shutdowns, 1);
-    assert!(
+    let runtime = || async {
         engine
             .repositories()
             .get_provider_session_runtime("t1".to_owned())
             .await
             .unwrap()
-            .is_none()
-    );
+            .expect("runtime row")
+    };
+    let launched = runtime().await;
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(state.lock().unwrap().shutdowns, 1);
+    // A clean shutdown keeps the resume cursor so the next launch resumes the conversation.
+    let suspended = runtime().await;
+    assert_eq!(suspended.status, "suspended");
+    assert!(launched.resume_cursor.is_some());
+    assert_eq!(suspended.resume_cursor, launched.resume_cursor);
 }
 
 #[test]
@@ -12547,6 +12914,7 @@ async fn native_claude_driver_supports_the_complete_live_command_surface() {
     request.model = Some("claude-sonnet".to_owned());
     request.agent = Some("reviewer".to_owned());
     request.resume_cursor = Some(json!({"sessionId":"claude-session"}));
+    use_empty_claude_config(&mut request, &temp);
 
     let driver = factory.create(request).await.unwrap();
     let started = driver.start().await.unwrap();
@@ -12817,6 +13185,7 @@ cat >/dev/null
     request.binary_path = executable.to_string_lossy().into_owned();
     request.cwd = temp.path().to_path_buf();
     request.resume_cursor = Some(json!({"sessionId":"recovery-session"}));
+    use_empty_claude_config(&mut request, &temp);
     request.environment.insert(
         "BIBCODE_TEST_SETTINGS_CAPTURE".to_owned(),
         settings_path.to_string_lossy().into_owned(),
@@ -13693,6 +14062,7 @@ cat >/dev/null
     request.binary_path = executable.to_string_lossy().into_owned();
     request.cwd = temp.path().to_path_buf();
     request.resume_cursor = Some(json!({"sessionId":"hook-session"}));
+    use_empty_claude_config(&mut request, &temp);
     let driver = factory.create(request).await.unwrap();
 
     assert_eq!(
@@ -13770,6 +14140,7 @@ cat >/dev/null
     request.binary_path = executable.to_string_lossy().into_owned();
     request.cwd = temp.path().to_path_buf();
     request.resume_cursor = Some(json!({"sessionId":"http-hook-session"}));
+    use_empty_claude_config(&mut request, &temp);
     request.environment.insert(
         "BIBCODE_TEST_SETTINGS_CAPTURE".to_owned(),
         settings_path.to_string_lossy().into_owned(),
@@ -13936,6 +14307,7 @@ while [ ! -f "$BIBCODE_TEST_EXIT_RELEASE" ]; do sleep 0.01; done
     request.binary_path = executable.to_string_lossy().into_owned();
     request.cwd = temp.path().to_path_buf();
     request.resume_cursor = Some(json!({"sessionId":"natural-exit-hook-session"}));
+    use_empty_claude_config(&mut request, &temp);
     request.environment.insert(
         "BIBCODE_TEST_SETTINGS_CAPTURE".to_owned(),
         settings_path.to_string_lossy().into_owned(),
@@ -16293,6 +16665,7 @@ done
     request.binary_path = executable.to_string_lossy().into_owned();
     request.cwd = temp.path().into();
     request.resume_cursor = Some(json!({"sessionId":"claude-session"}));
+    use_empty_claude_config(&mut request, &temp);
     request.environment.insert(
         "BIBCODE_TEST_CAPTURE".into(),
         capture.to_string_lossy().into_owned(),
