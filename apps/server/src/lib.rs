@@ -1,6 +1,7 @@
 //! Reusable BiBCode server runtime.
 
 pub mod activity;
+mod agent_sessions;
 pub mod assets;
 mod auth;
 pub mod checkpointing;

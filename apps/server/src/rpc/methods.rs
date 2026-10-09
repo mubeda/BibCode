@@ -59,6 +59,8 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("activity.listDetail"),
     read_unary("activity.listRoster"),
     mutation_unary("activity.retrySubtreeCancellation"),
+    mutation_unary("agentSessions.import"),
+    read_unary("agentSessions.scan"),
     read_unary("assets.createUrl"),
     mutation_unary("auth.confirmPairing"),
     read_unary("cloud.getRelayClientStatus"),

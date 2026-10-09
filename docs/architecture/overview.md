@@ -980,8 +980,10 @@ valid panel thread. The reservation is renderer-local and remains protected
 from older authoritative snapshots until a snapshot actually observes the new
 thread; normal remote-deletion reconciliation resumes after that observation.
 Authoritative thread removal later clears every surface that references that
-thread. This ordering is shared by browser and all desktop hosts; it does not
-depend on a WebView-specific scheduling delay.
+thread. Reopening a closed (archived) chat panel reserves its surface the same
+way before unarchiving the thread and removes it on a confirmed failure. This
+ordering is shared by browser and all desktop hosts; it does not depend on a
+WebView-specific scheduling delay.
 
 Center-panel layout is renderer-local, but the panels it holds are shared.
 Center terminals open or attach with `centerPanel: true`; the terminal manager
@@ -994,6 +996,11 @@ center terminal session or live panel thread the first time it sees one, as an
 inactive tab in the host thread's focused group, skipping terminal ids reserved
 by an in-flight local open and chat panels still pending locally. Adoption only
 on first sight keeps a local close from being undone by later status updates.
+Closing a chat panel archives its thread; a tracked panel thread that leaves the
+live list (archived or deleted) loses its tab on every client unless it is
+still pending locally, and is adopted again if it is unarchived. Lifecycle
+reconciliation does not retain archived panel threads, so a tab persisted by a
+client that was away when the panel closed is dropped too.
 The reconciler reads the raw `subscribeTerminalMetadata` stream as whole
 delivered batches (an atom alone keeps only a batch's last event). Metadata
 `remove` events carry a `reason`: only `closed` (an explicit close) drops the

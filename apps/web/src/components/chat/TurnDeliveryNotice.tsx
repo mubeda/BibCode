@@ -23,7 +23,7 @@ export function TurnDeliveryNotice({
   if (delivery.state === "delivered" && delivery.reason === "startedNewConversation") {
     return (
       <p role="status" className="w-full max-w-[80%] wrap-break-word text-xs text-muted-foreground">
-        Sent in a new conversation. The agent won't remember earlier messages in this thread.
+        Sent in a new conversation with a summary of earlier messages.
       </p>
     );
   }

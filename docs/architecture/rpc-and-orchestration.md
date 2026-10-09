@@ -29,6 +29,60 @@ The request cannot override server-owned provider settings or credentials. It
 uses the same authenticated environment RPC path in browser and desktop clients.
 See [provider capability ownership and lifecycle](./providers.md#workspace-capability-discovery).
 
+## CLI session import
+
+`agentSessions.scan { projectId }` and
+`agentSessions.import { projectId, sessions: [{ provider, sessionId }] }` are
+unary RPCs that both require `orchestration:operate`, because scan returns
+transcript content (first prompts as titles) from the server host's home
+directory, outside BiBCode's own data. They are owned by
+[`agent_sessions_rpc`](../../apps/server/src/production/agent_sessions_rpc.rs);
+the bounded transcript reader is
+[`agent_sessions`](../../apps/server/src/agent_sessions/mod.rs). Both fail with
+`AgentSessionsError { message }`.
+
+Scan reads Claude Code and Codex transcripts on the **server host** for the
+built-in `claudeAgent` and `codex` instances (a disabled driver is not
+scanned). It lists sessions whose first recorded working directory is the
+project's workspace root after canonicalization, whose file changed in the last
+30 days, newest first, at most 200 (`truncated` reports more). Each candidate
+carries title, last activity and visible message count. `alreadyImported` is set
+once thread `import:<instanceId>:<sessionId>` was deleted or its history command
+was accepted, and `threadId` names that thread while it is live; an import
+interrupted before its history committed stays selectable. Sessions another
+BiBCode thread already runs (a `provider_turn_outbox.provider_session_id` or a
+`provider_session_runtime` cursor owned by a thread other than their import)
+are left out, because BiBCode's own conversations write into the same homes;
+import skips them too. The scan keeps only metadata; import reads the
+transcript again.
+
+Import handles each requested session independently and reports it as
+`imported { sessionId, threadId }` or `skipped { sessionId, reason }`. It
+re-reads and re-validates the transcript, then:
+
+1. dispatches `thread.create` with command ID `<threadId>:create`, unless an
+   interrupted import already created the thread;
+2. inserts a `suspended` `provider_session_runtime` row with the CLI session as
+   its resume cursor only when the thread has no row, turn, or user message yet
+   (see
+   [imported CLI sessions](./providers.md#imported-cli-sessions)); a thread that
+   started its own conversation before an interrupted import finished keeps it
+   and the session is skipped;
+3. dispatches the server-internal `thread.history.import` with command ID
+   `<threadId>:history`, which emits one `thread.message-sent` per message
+   (`turnId: null`, `streaming: false`, no attachments) for at most 200
+   messages: the first user message and the latest ones. Its events carry
+   `metadata.historyImport: true`, so effects capture no checkpoint baseline
+   for them; the first real turn takes its own. The engine rejects it
+   once the thread has a turn or a user message, so a turn another client
+   started during the import keeps CLI history out of its conversation.
+
+Both commands use a digest of the step and thread ID, so a retry after a
+partial failure replays the committed steps; an accepted history command marks
+the session imported. A deleted import keeps its thread ID and is skipped
+rather than recreated. `thread.history.import` is rejected by public
+`orchestration.dispatchCommand` like every other server-internal command.
+
 ## Session establishment
 
 `ConnectionResolver` first produces a `PreparedConnection`. Remote bearer and
@@ -1135,7 +1189,10 @@ and derives project, `panel` kind, branch, and worktree path. The panel
 thread records the host as `hostThreadId` on `thread.created`, persisted in
 `projection_threads.host_thread_id` and emitted on thread shells and details so
 every client can open the panel under its host; public `thread.create` rejects a
-client-supplied `hostThreadId`. Similarly,
+client-supplied `hostThreadId`. A generic `thread.delete` emits `thread.deleted`
+for every non-deleted panel whose `hostThreadId` is the deleted thread, live or
+archived, in id order before the thread's own event and in the same command, so
+the existing deletion effects clean up their sessions and terminals. Similarly,
 `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present
 nonprimary/nonbare membership and exclusive ownership before dispatching the
@@ -1888,7 +1945,10 @@ failed does not block promotion; resolution metadata records that prior state
 so a rejected head can be dismissed without stranding its tail. Dismissal of
 sending or uncertain work does not prove the provider received nothing, so
 those placeholders and bound running turns continue to block automatic
-promotion. Explicit Send now remains available under its client gate.
+promotion. An archived `panel` thread (a closed chat panel) never promotes
+automatically, and delivery neither selects nor claims its pending rows, so
+neither its queue nor a prompt sent just before closing starts work after its
+tab closed; unarchiving it resumes both. Explicit Send now remains available under its client gate.
 
 Pending start deliveries from older clients also wait while the session is
 running or starting; the SQLite claim repeats this check so a stale worker read
@@ -1902,8 +1962,9 @@ command-id convention and require the automatic gate. Client **Send now** may
 promote the head when the session is neither running nor starting and no
 pending/sending row exists, including a held head. It clears only that hold.
 The delivery service registers its existing `Arc<Notify>` with the engine;
-after committed ready, steer, promote, resolve, and relevant request-resolution
-commands, the engine wakes the worker without retaining the service itself.
+after committed ready, steer, promote, resolve, unarchive, and relevant
+request-resolution commands, the engine wakes the worker without retaining the
+service itself.
 The event's `createdAt` is the promote command's time. Its message projector
 stamps the addressed user message's `created_at` and `updated_at` to that time
 in the same transaction, so the promoted prompt appears after the preceding
@@ -1926,7 +1987,8 @@ reconciliation or provider claiming; restart preserves their queued state and
 payload until an eligible promotion or explicit user action. Before delivery
 starts, startup reconciles abandoned live runtime rows and every projected
 session still starting, connecting, or running without a live runtime row,
-including rows removed by graceful shutdown. It settles the abandoned turn's
+including sessions whose row graceful shutdown left `suspended` (the row keeps its
+resume cursor). It settles the abandoned turn's
 streaming assistant messages, clears the active turn, and projects the existing
 restart error as `session_stopped`. That error settlement holds queued messages
 for explicit **Send now** and releases the pending-start claim gate. Completed
@@ -1959,8 +2021,16 @@ receipt, FIFO position, payload, model/options and delivery key. It refuses chan
 delivery ownership or newly restored/conflicting runtime identity; another native
 session's cursor remains a rejection. The retry starts without resume, freezes to
 the new native session, and immediate acceptance records `startedNewConversation`
-with the delivered state. The user message shows "Sent in a new conversation. The
-agent won't remember earlier messages in this thread." in muted status text. A
+with the delivered state. A retry that resumes its frozen session but finds the
+provider no longer has it (the driver starts a different conversation) recovers
+the same way inside `launch_session`: before the new cursor is saved, the saved
+cursor is cleared and the same guarded update releases the start, so the retry is
+delivered once in the new conversation instead of failing its identity check; a
+crash between those steps leaves a cursorless runtime the next retry recovers
+from. Reconciliation launches never release a frozen start. The new conversation receives the thread's earlier
+messages ([context handoff](./providers.md#resume-failures-and-context-handoff)),
+and the user message shows "Sent in a new conversation with a summary of earlier
+messages." in muted status text. A
 still-resumable frozen session resumes normally without that notice. Automatic
 reconciliation never unfreezes ambiguous work. Nonaccepted fresh attempts keep
 their existing outcomes and no notice; the fact is not retained for a later

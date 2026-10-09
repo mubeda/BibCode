@@ -223,6 +223,7 @@ describe("buildProjectHeaderMenu", () => {
     });
     expect(outline(menu)).toEqual([
       "New Worktree…",
+      "Import CLI sessions…",
       "---",
       "Rename…",
       "Group into…",
@@ -235,6 +236,7 @@ describe("buildProjectHeaderMenu", () => {
     ]);
     expect(ids(menu)).toEqual([
       "new-worktree:env-main:/repo",
+      "import-sessions:env-main:/repo",
       "---",
       "rename:env-main:/repo",
       "grouping:env-main:/repo",
@@ -304,6 +306,10 @@ describe("parseProjectHeaderSelection", () => {
     expect(parseProjectHeaderSelection("new-worktree:env-remote:R:\\repo")).toEqual({
       action: "new-worktree",
       physicalProjectKey: "env-remote:R:\\repo",
+    });
+    expect(parseProjectHeaderSelection("import-sessions:env-main:/repo")).toEqual({
+      action: "import-sessions",
+      physicalProjectKey: "env-main:/repo",
     });
   });
 

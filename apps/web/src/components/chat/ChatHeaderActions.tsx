@@ -47,6 +47,7 @@ interface ChatHeaderActionsProps {
   settings: Pick<ServerSettings, "providerInstances" | "providers" | "providerSessionDefaults">;
   canCreatePanel: boolean;
   onCreateChatPanel: (entry: ProviderInstanceEntry) => void;
+  onReopenChatPanel: (threadId: ThreadId, providerLabel: string) => void;
   onOpenTerminalPanel: () => void;
   onOpenProviderTerminalPanel: (action: ProviderTerminalAction) => void;
   onRunProjectScript: (script: ProjectScript) => void;
@@ -88,6 +89,7 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
   settings,
   canCreatePanel,
   onCreateChatPanel,
+  onReopenChatPanel,
   onOpenTerminalPanel,
   onOpenProviderTerminalPanel,
   onRunProjectScript,
@@ -139,7 +141,10 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
         settings={settings}
         canCreatePanel={canCreatePanel && workspaceUnavailable === null}
         unavailableReason={workspaceUnavailable}
+        environmentId={activeThreadEnvironmentId}
+        hostThreadId={activeThreadId}
         onCreateChatPanel={onCreateChatPanel}
+        onReopenChatPanel={onReopenChatPanel}
         onOpenTerminalPanel={onOpenTerminalPanel}
         onOpenProviderTerminalPanel={onOpenProviderTerminalPanel}
         onAddCustomAction={projectScripts.openAddDialog}

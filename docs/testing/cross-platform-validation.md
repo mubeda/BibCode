@@ -307,14 +307,26 @@ cargo test -p bibcode-server migrations -j 2
 
 Deliver a queued message at completion and let its turn run past the idle timeout;
 the session must stay live until one idle timeout after that turn completes.
+Likewise, end a turn while a provider subagent keeps running: the session must stay
+live until about one idle timeout after the subagent finishes. After a clean server
+restart, the next message must resume the same native conversation. Then make the
+saved conversation unresumable (for an isolated Claude instance, delete its
+transcript `<config dir>/projects/<project>/<session id>.jsonl`; for OpenCode,
+delete the session on its server) and send a message: the provider must start a
+new conversation instead of failing repeatedly, the thread must show "Couldn't
+resume the previous <provider> conversation. Started a new one with a summary of
+this thread." once, and only that message's provider input begins with the
+`<bibcode_thread_context>` block.
 
 With a fake provider withholding acknowledgement, stop the session through
 workspace loss so its frozen delivery becomes uncertain, then restore the
 workspace and explicitly confirm **Retry**. A deleted or cursorless matching
 runtime must launch a fresh native conversation, preserve the user message and
-FIFO order, and show "Sent in a new conversation. The agent won't remember earlier
-messages in this thread." under the delivered message in muted text. Verify the
-native invocation starts a new session without resume, and capture light/dark
+FIFO order, and show "Sent in a new conversation with a summary of earlier
+messages." under the delivered message in muted text. Verify the native
+invocation starts a new session without resume, that its input begins with a
+`<bibcode_thread_context>` block of the thread's earlier messages while the
+timeline shows only the typed text, and capture light/dark
 screenshots. A still-resumable runtime must retain its conversation and show no
 new notice; conflicting runtime identities, stale attempt/state guards, steers,
 and already delivered rows must not trigger a fresh launch. Nonaccepted outcomes

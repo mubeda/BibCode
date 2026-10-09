@@ -1749,6 +1749,7 @@ staticDescribe("project header context menu", () => {
       ),
     ).toEqual([
       "New Worktree…",
+      "Import CLI sessions…",
       "---",
       "Rename…",
       "Group into…",
@@ -1758,6 +1759,47 @@ staticDescribe("project header context menu", () => {
       "---",
       "Remove Project…",
     ]);
+  });
+
+  it("toasts an import and opens the newest imported thread", async () => {
+    baseScenario();
+    render(<Sidebar />);
+
+    const dialog = captured("ImportCliSessionsDialog").at(-1)!;
+    expect(dialog.props).toMatchObject({ open: false, target: null });
+    const target = {
+      environmentId: projectA.environmentId,
+      projectId: projectA.id,
+      workspaceRoot: projectA.workspaceRoot,
+    };
+    const onImported = dialog.props.onImported as (
+      target: unknown,
+      summary: { type: string; title: string; description?: string; newestThreadId: string | null },
+    ) => void;
+    onImported(target, {
+      type: "warning",
+      title: "Imported 2 sessions",
+      description: "1 session skipped: Already imported.",
+      newestThreadId: "import:codex:session-one",
+    });
+    await flush();
+
+    expect(h.spies.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "warning",
+        title: "Imported 2 sessions",
+        description: "1 session skipped: Already imported.",
+      }),
+    );
+    expect(h.spies.routerNavigate).toHaveBeenCalledWith({
+      to: "/$environmentId/$threadId",
+      params: { environmentId: projectA.environmentId, threadId: "import:codex:session-one" },
+    });
+
+    h.spies.routerNavigate.mockClear();
+    onImported(target, { type: "error", title: "No sessions imported", newestThreadId: null });
+    await flush();
+    expect(h.spies.routerNavigate).not.toHaveBeenCalled();
   });
 });
 
