@@ -158,6 +158,25 @@ command routing to the partition's host, and the partition flowing from the
 tab's thread; a runbook step with two SSH environments both previewing the same
 port, where data saved in one is absent from the other.
 
+## 7. Addendum: gateway cookie `SameSite=Lax`
+
+Approved 2026-10-09 after the final review. The gateway session cookie was
+`SameSite=Strict`, which browsers omit on a cross-site top-level navigation —
+exactly an OAuth provider's redirect back to `http://localhost:<port>/callback`
+— so the gateway refused the callback and same-port previews could not finish
+an OAuth sign-in. The cookie is now `SameSite=Lax`: top-level `GET`
+navigations from other sites carry it, cross-site subrequests do not, and the
+existing Origin rule still refuses cross-site writes and WebSocket upgrades.
+POST callbacks (`response_mode=form_post`) still fail. The change applies to
+every gateway target. Accepted trade-off: a page open in the preview can
+navigate it to a `GET` URL on the previewed app with the gateway cookie, as a
+normal browser with `ssh -L` would.
+
+The preferred local port is also checked again in each SSH authentication
+attempt, so a port another process took while a password prompt was open is
+never handed to `ssh` (its readiness probe could otherwise reach that
+listener and receive the bootstrap capability).
+
 ## Out of scope
 
 Same-port reach for LAN, WSL, relay, and browser mode; switching an open

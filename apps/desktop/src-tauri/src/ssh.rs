@@ -1048,12 +1048,12 @@ impl SshEnvironmentManager {
 
         // A live forward was reused above whatever its local port, so an open
         // tab never switches origin; the preference only shapes a new one.
-        let preferred = preferred_local_port.and_then(probe_preferred_port);
+        let preferred = preferred_local_port.filter(|port| *port >= 1024);
         let (local_port, mut child) = match self
             .spawn_port_forward(app, prompts, &key, &target, remote_port, preferred)
             .await
         {
-            // Another process took the preferred port after the probe.
+            // Another process took the preferred port after the attempt's probe.
             Err(error) if preferred.is_some() && is_forward_bind_failure(&error) => {
                 self.spawn_port_forward(app, prompts, &key, &target, remote_port, None)
                     .await?
@@ -1082,8 +1082,8 @@ impl SshEnvironmentManager {
         }
     }
 
-    /// Spawns one forward child to `remote_port`, bound as `bind` or, when
-    /// `None`, on a random `127.0.0.1` port picked just before each attempt.
+    /// Spawns one forward child to `remote_port` on the `preferred` local port
+    /// when it is free, otherwise on a random `127.0.0.1` port.
     async fn spawn_port_forward<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -1091,14 +1091,16 @@ impl SshEnvironmentManager {
         key: &str,
         target: &SshEnvironmentTarget,
         remote_port: u16,
-        bind: Option<ForwardBind>,
+        preferred: Option<u16>,
     ) -> Result<(u16, ManagedSshChild), String> {
         let askpass_launcher = self.askpass_launcher()?;
         let io_runtime = self.io_runtime.handle()?;
         self.run_with_ssh_auth(app, prompts, key, target, |auth| {
-            // Each attempt picks its port just before spawning, so a
-            // password prompt never leaves a picked port unbound for long.
-            let plan = bind
+            // Each attempt checks or picks its port just before spawning, so a
+            // password prompt never hands ssh a port another process took
+            // meanwhile (the readiness probe could then reach that listener).
+            let plan = preferred
+                .and_then(probe_preferred_port)
                 .map(Ok)
                 .unwrap_or_else(|| {
                     portpicker::pick_unused_port()
@@ -7887,6 +7889,37 @@ fi
 
         let attempts = fs::read_to_string(fake.path("attempts")).unwrap_or_default();
         assert_eq!(attempts.len(), 1, "a non-bind failure is not retried");
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preferred_port_taken_before_an_attempt_falls_back() {
+        // Each authentication attempt checks the port again: one taken while a
+        // password prompt was open must not be handed to ssh (whose readiness
+        // probe could then reach the other listener).
+        let fake = fake_ssh::FakeSsh::with_body(LISTENING_PORT_FORWARD);
+        let manager = fake.manager(SshOperationDeadlines::default());
+        let app = mock_app();
+        let prompts = SshPasswordPromptManager::with_timeout(Duration::ZERO);
+        let (key, _) = publish_fixture_tunnel(&manager, "http://127.0.0.1:9/", None);
+        let taken = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("taken");
+        let taken_port = taken.local_addr().unwrap().port();
+
+        let (local_port, mut child) = manager
+            .spawn_port_forward(
+                app.handle(),
+                &prompts,
+                &key,
+                &fixture_target(),
+                41000,
+                Some(taken_port),
+            )
+            .await
+            .expect("forward on another port");
+
+        assert_ne!(local_port, taken_port);
+        child.terminate_and_reap().await;
         manager.shutdown().await;
     }
 

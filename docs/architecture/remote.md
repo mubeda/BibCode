@@ -1129,10 +1129,14 @@ address)` gets its own listener on an ephemeral port, so two clients that
   and caller's session, lasts 60 s, and works once. The client navigates to
   `/__bibcode/bootstrap?cap=<token>&to=<path>`, where `to` is a path with no
   scheme or host. The gateway sets
-  `bibcode-gw-<gatewayPort>=<id>; HttpOnly; SameSite=Strict; Path=/` and
+  `bibcode-gw-<gatewayPort>=<id>; HttpOnly; SameSite=Lax; Path=/` and
   returns a `200` page that calls `location.replace(to)`. The follow-up
   navigation then comes from the gateway's own site, so the browser sends the
-  `Strict` cookie even when the BiBCode UI is on another site. Every later
+  cookie even when the BiBCode UI is on another site. `Lax` (not `Strict`)
+  lets a top-level `GET` navigation from another site, such as an OAuth
+  provider redirecting back to `http://localhost:<port>/callback`, carry the
+  cookie; cross-site subrequests do not, and the Origin rule below refuses
+  cross-site writes and WebSocket upgrades. Every later
   request needs that cookie; without it the gateway returns `401` with "This
   preview link expired. Go back to BiBCode and open it again."
 - **Principal binding.** A gateway session lives no longer than its BiBCode

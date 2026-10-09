@@ -1234,6 +1234,15 @@ mod tests {
         assert_ne!(store_a, *b"bibcodepreview01");
         assert_ne!(store_a, super::preview_data_store_id(Some("env-b")));
         assert_eq!(store_a, super::preview_data_store_id(Some("env-a")));
+        // Only an absent environment is the local one.
+        assert_ne!(
+            super::preview_profile_dir(Some("")),
+            super::preview_profile_dir(None)
+        );
+        assert_ne!(
+            super::preview_data_store_id(Some("")),
+            super::preview_data_store_id(None)
+        );
     }
 
     use super::{

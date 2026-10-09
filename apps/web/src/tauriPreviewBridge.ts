@@ -41,8 +41,8 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
   const stateListeners = new Set<(tabId: string, state: DesktopPreviewTabState) => void>();
   let stopStateEvents: (() => void) | null = null;
   // Recreating child webviews while switching logical tabs can disconnect the parent app.
-  // Keep one native child per preview storage partition (one per environment, `""` for
-  // the local one) for the desktop process lifetime and rebind its logical tabs to it.
+  // Keep one native child per preview storage partition (one per environment) for the
+  // desktop process lifetime and rebind its logical tabs to it.
   const hostByPartition = new Map<string, string>();
   const partitionOfTab = new Map<string, string>();
   /** Native host -> the logical tab it shows (`null` while hidden with none). */
@@ -132,7 +132,10 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
   const bridge: DesktopPreviewBridge = {
     createTab: (tabId, environmentId) =>
       enqueueTabOperation(tabId, async () => {
-        const partition = environmentId ?? "";
+        // Only an absent environment is the local one: any id, even a falsy one,
+        // gets its own storage, so isolation never fails open.
+        const isLocal = environmentId === null || environmentId === undefined;
+        const partition = isLocal ? "local" : `environment:${environmentId}`;
         partitionOfTab.set(tabId, partition);
         const presentation = boundsByTab.get(tabId);
         const host = hostByPartition.get(partition);
@@ -150,10 +153,7 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
         }
         // While other hosts exist, setBounds held this tab's bounds back.
         const boundsHeldBack = hostByPartition.size > 0;
-        await invoke(
-          "desktop_preview_create_tab",
-          environmentId ? { tabId, environmentId } : { tabId },
-        );
+        await invoke("desktop_preview_create_tab", isLocal ? { tabId } : { tabId, environmentId });
         hostByPartition.set(partition, tabId);
         activeByHost.set(tabId, tabId);
         // The latest bounds: a resize or occlusion may have landed during creation.

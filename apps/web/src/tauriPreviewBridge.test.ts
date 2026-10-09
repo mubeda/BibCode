@@ -219,6 +219,20 @@ describe("tauriPreviewBridge", () => {
     );
   });
 
+  it("never shares the local environment's storage with a falsy environment id", async () => {
+    const { bridge, invoke } = makeBridge();
+    await bridge.createTab("local-a");
+    await bridge.closeTab("local-a");
+    await bridge.createTab("odd-a", "");
+
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "desktop_preview_create_tab"),
+    ).toEqual([
+      ["desktop_preview_create_tab", { tabId: "local-a" }],
+      ["desktop_preview_create_tab", { tabId: "odd-a", environmentId: "" }],
+    ]);
+  });
+
   it("routes each logical tab through its own environment's native host", async () => {
     const { bridge, invoke, emit } = makeBridge();
     const received: Array<readonly [string, string]> = [];
