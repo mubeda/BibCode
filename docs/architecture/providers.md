@@ -597,6 +597,50 @@ effective executable-search policy. A provider instance's case-insensitive
 the ambient value is used. Explicit executable paths retain their normal
 platform-specific handling.
 
+Every provider launch and every terminal process start also receives the
+open-URL hook: `BROWSER` and `BRAINSTORM_OPEN_CMD` set to `bibcode-open-url`,
+`BIBCODE_OPEN_URL_AUTH` and `BIBCODE_OPEN_URL_ENDPOINT`, and `PATH` with
+`<state dir>/runtime/open-url` prepended to the effective `PATH` above. These
+server values replace any the instance or terminal caller supplied. At startup
+the server puts `bibcode-open-url` there:
+
+- On POSIX hosts, a sh shim that runs `<server executable> open-url "$1"`.
+  Inside an AppImage, the shim runs the image itself.
+- On Windows, `bibcode-open-url.exe`: a hard link to the server executable, or
+  a copy when linking fails. It is not a batch file, because a batch file would
+  pass the URL through the `cmd.exe` parser (command injection). Callers that
+  start processes without a shell also find only `.exe` files.
+
+Either form posts the URL to `POST /api/preview/open-url` with the token. The
+`bibcode` and desktop executables recognize an open-url invocation before
+anything else starts: before clap, data-root resolution, or Tauri. They match
+either the `open-url` argument or an executable named `bibcode-open-url`.
+
+The route answers `202 { requestId, delivered }`. `delivered` is false when no
+client was subscribed to preview events, since nobody would open the request;
+the server's own subscribers do not count. A thread may hold 64 unclaimed
+requests; past that the route answers `429`. When the request is not
+delivered, is refused, or BiBCode cannot be reached, `bibcode open-url` prints
+the URL to stdout and exits 0, so the calling tool still shows it.
+
+The token variable is not named `*_TOKEN` because Codex's default
+`shell_environment_policy` drops variables whose names contain `KEY`, `SECRET`,
+or `TOKEN` from the commands it runs. Codex's `workspace-write` sandbox also
+blocks network access, so inside it the post fails and the shim prints the URL.
+Neither behavior has been verified live with Codex yet.
+
+The token is issued per launch or terminal start, is scoped to the thread, and
+authorizes only that route. It lasts 8 hours and is not renewed, so a longer
+session gets `401` and the shim prints the URL. Issuing never revokes another
+holder's token. When the server's open-url token store is full, it evicts the
+token that expires soonest instead of refusing the launch, and that holder also
+falls back to printing. The provider credential stays outside the instance
+environment, so durable delivery route fingerprints do not change with it.
+
+Which client claims a delivered request, and how browser-mode clients turn it
+into a prompt, is described in
+[Open requests and automation hosts](remote.md#open-requests-and-automation-hosts).
+
 ## Provider maintenance
 
 The Rust server owns installed-version probes, latest-version registry checks,

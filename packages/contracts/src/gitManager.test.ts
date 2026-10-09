@@ -12,6 +12,7 @@ import {
   GitManagerOperationError,
   GitManagerOperationEvent,
   GitManagerOperationRequest,
+  GitManagerPreviewMergeInput,
   GitManagerRefEntry,
   GitManagerRefsSnapshot,
   GitManagerSignalEvent,
@@ -20,6 +21,7 @@ import {
 } from "./gitManager.ts";
 
 const decodeGitManagerBlockedReason = Schema.decodeUnknownSync(GitManagerBlockedReason);
+const decodeGitManagerPreviewMergeInput = Schema.decodeUnknownSync(GitManagerPreviewMergeInput);
 const decodeGitManagerWorktreeEntry = Schema.decodeUnknownSync(GitManagerWorktreeEntry);
 const decodeGitManagerRefEntry = Schema.decodeUnknownSync(GitManagerRefEntry);
 const decodeGitManagerRefsSnapshot = Schema.decodeUnknownSync(GitManagerRefsSnapshot);
@@ -204,6 +206,7 @@ describe("Git Manager wire schemas", () => {
       { ...base, _tag: "fetch", remote: "origin" },
       { ...base, _tag: "stash-push", message: "WIP", paths: ["src/file.ts"] },
       { ...base, _tag: "merge", source: "topic", noVerify: false },
+      { ...base, _tag: "merge-into", source: "refs/heads/topic", target: "main" },
       { ...base, _tag: "rebase", base: "main", target: "topic" },
       { ...base, _tag: "resolve-conflict", path: "src/file.ts", side: "ours" },
       { ...base, _tag: "tag-create", name: "v1.0.0", sha: "abcdef123456" },
@@ -214,10 +217,21 @@ describe("Git Manager wire schemas", () => {
       "fetch",
       "stash-push",
       "merge",
+      "merge-into",
       "rebase",
       "resolve-conflict",
       "tag-create",
     ]);
+  });
+
+  it("decodes a merge preview input with and without a target", () => {
+    const decode = decodeGitManagerPreviewMergeInput;
+    expect(decode({ cwd: "/repo", source: "topic" })).toEqual({ cwd: "/repo", source: "topic" });
+    expect(decode({ cwd: "/repo", source: "topic", target: "release" })).toEqual({
+      cwd: "/repo",
+      source: "topic",
+      target: "release",
+    });
   });
 
   it("decodes the four operation stream event kinds", () => {

@@ -17,17 +17,20 @@
               "path": "iz %ulen",
               "insertions": 10,
               "deletions": 43343597,
-              "status": "modified"
+              "status": "deleted"
             },
             {
-              "path": "k",
-              "insertions": 20,
-              "deletions": 8
+              "path": "?3k!\"s",
+              "insertions": 8,
+              "deletions": 1400965283,
+              "status": "conflicted",
+              "area": "untracked"
             }
           ],
-          "insertions": 2147483621,
-          "deletions": 21
-        }
+          "insertions": 21,
+          "deletions": 14
+        },
+        "operationInProgress": "cherry-pick"
       }
     }
   ]

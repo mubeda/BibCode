@@ -3560,6 +3560,7 @@ mod mutation_ownership_tests {
                         default_ref_name: Some("main".to_owned()),
                         has_working_tree_changes: true,
                         working_tree: Default::default(),
+                        operation_in_progress: None,
                     },
                 },
             )

@@ -1,6 +1,6 @@
 import { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const resolvePreviewTarget = vi.fn();
 const showPreviewUnreachableNotice = vi.fn();
@@ -11,13 +11,24 @@ let setting: "app" | "system" = "app";
 
 vi.mock("./browserTargetResolver", () => ({ resolvePreviewTarget }));
 const showLinkOpenFailedNotice = vi.fn();
-vi.mock("./linkNotices", () => ({ showPreviewUnreachableNotice, showLinkOpenFailedNotice }));
+const showPreviewUnreachableMessage = vi.fn();
+vi.mock("./linkNotices", () => ({
+  showPreviewUnreachableNotice,
+  showLinkOpenFailedNotice,
+  showPreviewUnreachableMessage,
+}));
 vi.mock("./openFileInPreview", () => ({ openUrlInPreview }));
 vi.mock("~/previewStateStore", () => ({ isPreviewSupportedInRuntime: () => previewSupported }));
 vi.mock("~/localApi", () => ({ readLocalApi: () => ({ shell: { openExternal } }) }));
 vi.mock("~/hooks/useSettings", () => ({
   getClientSettings: () => ({ browserLinkTarget: setting }),
 }));
+const resolveForNavigation = vi.fn();
+vi.mock("./previewGateway", () => ({ resolveForNavigation }));
+const enqueueOpenPrompt = vi.fn();
+vi.mock("./openPromptQueue", () => ({ enqueueOpenPrompt }));
+vi.mock("~/rpc/atomRegistry", () => ({ appAtomRegistry: {} }));
+vi.mock("~/state/preview", () => ({ previewEnvironment: { gatewayOpen: {} } }));
 
 const threadRef = {
   environmentId: EnvironmentId.make("env-1"),
@@ -141,6 +152,246 @@ describe("openLink", () => {
       }),
     ).toBe("system");
     expect(openExternal).toHaveBeenCalledWith("http://10.0.0.2:5173/");
+  });
+
+  it("hands the canonical URL of a gateway address to the internal browser", async () => {
+    resolvePreviewTarget.mockReturnValue({
+      kind: "gateway",
+      via: "ssh",
+      url: "http://localhost:5173/",
+    });
+    const { openLink } = await import("./openLink");
+    expect(openLink({ url: "http://0.0.0.0:5173/", threadRef, invert: false, openPreview })).toBe(
+      "app",
+    );
+    expect(openUrlInPreview).toHaveBeenCalledWith({
+      threadRef,
+      url: "http://localhost:5173/",
+      openPreview,
+    });
+  });
+
+  describe("gateway address in the system browser", () => {
+    const lanGateway = {
+      kind: "gateway",
+      via: "host",
+      host: "10.0.0.2",
+      url: "http://localhost:5173/",
+    };
+    const bootstrapUrl = "http://10.0.0.2:41000/__bibcode/bootstrap?cap=CAP&to=%2F";
+
+    function stubBrowserTab(tab: unknown) {
+      const open = vi.fn(() => tab);
+      vi.stubGlobal("window", { open });
+      return open;
+    }
+
+    beforeEach(() => {
+      resolvePreviewTarget.mockReturnValue(lanGateway);
+      setting = "system";
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("opens a blank tab synchronously then navigates", async () => {
+      const replace = vi.fn();
+      const tab = { opener: {}, location: { replace }, close: vi.fn() };
+      const open = stubBrowserTab(tab);
+      let finish!: (value: unknown) => void;
+      resolveForNavigation.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+      const { openLink } = await import("./openLink");
+
+      expect(
+        openLink({ url: "http://localhost:5173/", threadRef, invert: false, openPreview }),
+      ).toBe("system");
+      // The tab exists before any await, so the click's activation still counts.
+      expect(open).toHaveBeenCalledWith("about:blank", "_blank");
+      expect(tab.opener).toBeNull();
+      expect(replace).not.toHaveBeenCalled();
+      expect(resolveForNavigation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          environmentId: threadRef.environmentId,
+          threadId: threadRef.threadId,
+          canonicalUrl: "http://localhost:5173/",
+        }),
+      );
+
+      finish({ kind: "ok", url: bootstrapUrl });
+      await vi.waitFor(() => expect(replace).toHaveBeenCalledWith(bootstrapUrl));
+      expect(openExternal).not.toHaveBeenCalled();
+    });
+
+    it("closes the blank tab and notifies on unreachable", async () => {
+      const tab = { opener: {}, location: { replace: vi.fn() }, close: vi.fn() };
+      stubBrowserTab(tab);
+      resolveForNavigation.mockResolvedValue({
+        kind: "unreachable",
+        message: "Nothing is listening on port 5173 on Box.",
+      });
+      const { openLink } = await import("./openLink");
+
+      openLink({ url: "http://localhost:5173/", threadRef, invert: false, openPreview });
+
+      await vi.waitFor(() =>
+        expect(showPreviewUnreachableMessage).toHaveBeenCalledWith(
+          "Nothing is listening on port 5173 on Box.",
+          "http://localhost:5173/",
+        ),
+      );
+      expect(tab.close).toHaveBeenCalled();
+      expect(tab.location.replace).not.toHaveBeenCalled();
+    });
+
+    it("does not offer a permanent gateway refusal again", async () => {
+      stubBrowserTab({ opener: {}, location: { replace: vi.fn() }, close: vi.fn() });
+      resolveForNavigation.mockResolvedValue({ kind: "unreachable", message: "No." });
+      const onUnopened = vi.fn();
+      const { openLink } = await import("./openLink");
+
+      openLink({
+        url: "http://localhost:5173/",
+        threadRef,
+        invert: false,
+        openPreview,
+        onUnopened,
+      });
+
+      await vi.waitFor(() => expect(showPreviewUnreachableMessage).toHaveBeenCalled());
+      expect(onUnopened).not.toHaveBeenCalled();
+    });
+
+    it("tells the caller when a retryable gateway failure follows the opened tab", async () => {
+      stubBrowserTab({ opener: {}, location: { replace: vi.fn() }, close: vi.fn() });
+      resolveForNavigation.mockResolvedValue({
+        kind: "unreachable",
+        message: "No.",
+        retryable: true,
+      });
+      const onUnopened = vi.fn();
+      const { openLink } = await import("./openLink");
+
+      openLink({
+        url: "http://localhost:5173/",
+        threadRef,
+        invert: false,
+        openPreview,
+        onUnopened,
+      });
+
+      await vi.waitFor(() => expect(onUnopened).toHaveBeenCalledTimes(1));
+    });
+
+    it("falls back to the prompt when the popup is blocked", async () => {
+      stubBrowserTab(null);
+      const { openLink } = await import("./openLink");
+
+      openLink({ url: "http://localhost:5173/", threadRef, invert: false, openPreview });
+
+      expect(enqueueOpenPrompt).toHaveBeenCalledWith({
+        source: "link",
+        blocked: true,
+        url: "http://localhost:5173/",
+        threadRef,
+      });
+      expect(resolveForNavigation).not.toHaveBeenCalled();
+    });
+
+    it("lets a caller handle a blocked popup itself", async () => {
+      stubBrowserTab(null);
+      const onPopupBlocked = vi.fn();
+      const { openLink } = await import("./openLink");
+
+      openLink({
+        url: "http://localhost:5173/",
+        threadRef,
+        invert: false,
+        openPreview,
+        onPopupBlocked,
+      });
+
+      expect(onPopupBlocked).toHaveBeenCalledWith("http://localhost:5173/");
+      expect(enqueueOpenPrompt).not.toHaveBeenCalled();
+    });
+
+    it("reports a blocked tab for a direct address when the caller handles it", async () => {
+      resolvePreviewTarget.mockReturnValue({ kind: "reachable", url: "https://example.com/" });
+      stubBrowserTab(null);
+      const onPopupBlocked = vi.fn();
+      const { openLink } = await import("./openLink");
+
+      openLink({
+        url: "https://example.com/",
+        threadRef,
+        invert: false,
+        openPreview,
+        onPopupBlocked,
+      });
+
+      expect(onPopupBlocked).toHaveBeenCalledWith("https://example.com/");
+      expect(openExternal).not.toHaveBeenCalled();
+    });
+
+    it("desktop system destination resolves then calls openExternal without window.open", async () => {
+      const open = vi.fn();
+      vi.stubGlobal("window", { open, desktopBridge: { preview: {} } });
+      resolveForNavigation.mockResolvedValue({ kind: "ok", url: bootstrapUrl });
+      const { openLink } = await import("./openLink");
+
+      expect(
+        openLink({ url: "http://localhost:5173/", threadRef, invert: false, openPreview }),
+      ).toBe("system");
+
+      await vi.waitFor(() => expect(openExternal).toHaveBeenCalledWith(bootstrapUrl));
+      expect(open).not.toHaveBeenCalled();
+    });
+
+    it("uses openExternal on a desktop host without preview support", async () => {
+      const open = vi.fn();
+      vi.stubGlobal("window", { open, desktopBridge: {} });
+      resolveForNavigation.mockResolvedValue({ kind: "ok", url: bootstrapUrl });
+      const { openLink } = await import("./openLink");
+
+      openLink({ url: "http://localhost:5173/", threadRef, invert: false, openPreview });
+
+      await vi.waitFor(() => expect(openExternal).toHaveBeenCalledWith(bootstrapUrl));
+      expect(open).not.toHaveBeenCalled();
+    });
+
+    it("notifies instead of opening when desktop resolution is refused", async () => {
+      vi.stubGlobal("window", { open: vi.fn(), desktopBridge: { preview: {} } });
+      resolveForNavigation.mockResolvedValue({ kind: "unreachable", message: "No." });
+      const { openLink } = await import("./openLink");
+
+      openLink({ url: "http://localhost:5173/", threadRef, invert: false, openPreview });
+
+      await vi.waitFor(() =>
+        expect(showPreviewUnreachableMessage).toHaveBeenCalledWith("No.", "http://localhost:5173/"),
+      );
+      expect(openExternal).not.toHaveBeenCalled();
+    });
+
+    it("refuses a gateway address without a thread, never opening this computer's localhost", async () => {
+      const open = stubBrowserTab({ opener: {}, location: { replace: vi.fn() }, close: vi.fn() });
+      const { openLink } = await import("./openLink");
+
+      expect(
+        openLink({
+          url: "http://localhost:5173/",
+          threadRef: null,
+          environmentId: threadRef.environmentId,
+          invert: false,
+          openPreview,
+        }),
+      ).toBe("unreachable");
+      expect(open).not.toHaveBeenCalled();
+      expect(openExternal).not.toHaveBeenCalled();
+      expect(showPreviewUnreachableMessage).toHaveBeenCalledWith(
+        expect.stringContaining("thread"),
+        "http://localhost:5173/",
+      );
+    });
   });
 
   it("reports async preview failures through onError", async () => {

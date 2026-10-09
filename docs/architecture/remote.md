@@ -958,6 +958,33 @@ a ControlPersist master on older OpenSSH, a backgrounded process) can keep
 them open indefinitely. Errors built from such output end with
 `[output cut off]`.
 
+**Preview port forwards.** `DesktopBridge.sshForward(target, remotePort)`
+(`desktop_bridge_ssh_forward`) forwards a port on the SSH host's loopback,
+such as the preview gateway's, to a free local port and returns it. It needs
+the target's live tunnel ("SSH connection is not active." otherwise) and holds
+the same per-target lock. Each forward is a dedicated
+`ssh -o ControlPath=none … -o ExitOnForwardFailure=yes -n -N -L 127.0.0.1:<local>:127.0.0.1:<remote>`
+child, admitted and reaped like every other SSH child and authenticated
+through the same cached password and prompt path. The explicit loopback bind
+overrides an inherited `GatewayPorts yes`, and `ControlPath=none` stops an
+inherited multiplexing setup from moving the forward into a master the child
+does not own. It is ready once its local port accepts a TCP connection while
+the child still runs, polled every 50 ms for at most 30 s (the tunnel's
+readiness allowance, which forwards behind a `ProxyCommand` or bastion need
+too); after that its
+stderr is drained so refused-channel messages never fill the pipe and block
+`ssh`. Requests are idempotent per remote port:
+a live forward is reused and a dead one replaced. A tunnel keeps at most 8
+forwards and all tunnels together at most 12, which keeps tunnels, forwards,
+and the replacements being started well under the 32-child reaper capacity
+so reconnect, stop, and pairing still find room. A forward beyond either
+limit evicts the least recently used one (by creation or latest request) of
+that tunnel or of any tunnel, only once the new forward is ready: a forward
+that fails to start evicts nothing.
+Forwards are reaped with their tunnel (drop, disconnect, shutdown, or a dead
+tunnel found on the next request), and `releaseSshForward`
+(`desktop_bridge_release_ssh_forward`) reaps one.
+
 SSH children run on a private Tokio runtime owned by `SshEnvironmentManager`:
 one worker thread and at most 128 blocking threads. It starts on first use and
 stops in the background at the end of `shutdown()`, after every SSH child is
@@ -1041,6 +1068,193 @@ flowchart LR
 Keeping launch separate prevents connection code from assuming that every
 endpoint can install software, start a process, or use SSH.
 
+## Preview gateway
+
+A client that is not on the server's host cannot load a dev server that listens
+on the server's loopback. `preview.gatewayOpen({ threadId, url })`, which needs
+`orchestration:operate`, opens a reverse-proxy listener for it. The code lives
+in `apps/server/src/preview/gateway/`.
+
+- **Admission.** The URL must be plain `http` on `localhost`, `127.0.0.0/8`, or
+  `::1`. `https` fails with `PreviewGatewayError` reason `https-unsupported`,
+  and any other host or scheme fails with `not-admitted`. Every call is an
+  explicit user or agent action by an operate caller, so there is no per-port
+  allowlist. A literal address is probed only at that address, so
+  `127.0.0.2` is never served by `127.0.0.1`. `localhost` is probed at
+  `127.0.0.1:<port>`, then `[::1]:<port>`. Each probe waits 500 ms. The first
+  address that accepts wins; if none does, the call fails with `no-upstream`.
+  When a `localhost` upstream later refuses a connection, the gateway tries the
+  other loopback family once, so a dev server that restarted on IPv6 stays
+  reachable. A server without authentication returns `unavailable`, because a
+  capability binds a session.
+- **Bind and reachability.** The listener binds the local address the caller's
+  RPC connection was accepted on, not the configured bind host. On a `0.0.0.0`
+  bind, a LAN client gets a listener on the LAN address and an SSH tunnel gets
+  one on loopback. The call fails with reason `not-reachable` in two cases:
+  - The caller reached the server on a public address: "Previews aren't
+    available on a public address." Private reach is loopback, RFC 1918,
+    CGNAT `100.64.0.0/10` (tailnets), link-local, and IPv6 ULA `fc00::/7`.
+  - The caller reached a loopback socket under a `Host` that is not a loopback
+    name or address, which is a reverse proxy or Tailscale Serve: "Previews
+    aren't available through a proxied address." Their listeners would be
+    unreachable. SSH tunnels and WSL arrive with a loopback `Host` and are
+    allowed. Loopback names are `localhost`, `*.localhost`, and loopback or
+    unspecified IP literals; names are never resolved, so a machine name that
+    resolves to loopback (`127.0.1.1` on Debian) is refused the same way.
+
+  When the connection's local address is unknown, the listener binds the
+  configured host only if it is `localhost` or a private address; otherwise
+  the call returns `unavailable`.
+
+- **Per-target listeners.** Each `(thread, upstream address and port, bound
+address)` gets its own listener on an ephemeral port, so two clients that
+  reached the server on different addresses each get a listener they can
+  reach. The separate port gives each target its own origin. Ports stay unique
+  across addresses, because capabilities and gateway sessions name a listener
+  by its port. Opening is idempotent under one lock: a second call reuses the
+  listener and mints a fresh capability. At most 64 targets run at once;
+  another open returns `unavailable`. The result is
+  `{ gatewayPort, capability, expiresAtMs }`.
+- **Auth bootstrap.** The capability is a `signed_token` with purpose
+  `preview-gateway`. It is bound to the gateway port, upstream port, thread,
+  and caller's session, lasts 60 s, and works once. The client navigates to
+  `/__bibcode/bootstrap?cap=<token>&to=<path>`, where `to` is a path with no
+  scheme or host. The gateway sets
+  `bibcode-gw-<gatewayPort>=<id>; HttpOnly; SameSite=Strict; Path=/` and
+  returns a `200` page that calls `location.replace(to)`. The follow-up
+  navigation then comes from the gateway's own site, so the browser sends the
+  `Strict` cookie even when the BiBCode UI is on another site. Every later
+  request needs that cookie; without it the gateway returns `401` with "This
+  preview link expired. Go back to BiBCode and open it again."
+- **Principal binding.** A gateway session lives no longer than its BiBCode
+  session. The gateway rechecks the session through the auth service at least
+  every 30 s. Revocation or expiry ends the gateway session and closes its live
+  connections within that window.
+- **Origin rule.** Cookies ignore ports, so another previewed app on the same
+  host also carries the gateway cookie. Before any rewrite, a WebSocket upgrade
+  or a request other than `GET`, `HEAD`, or `OPTIONS` must carry an `Origin`
+  equal to the gateway's client-facing origin (`http://` plus the request
+  `Host`). A missing or different `Origin` returns `403` before the request
+  reaches the upstream. Only after that exact match does the gateway rewrite
+  `Origin` to `http://localhost:<port>` on these requests, so upstreams that
+  compare `Origin` with `Host` accept them.
+- **Forwarding.** `Host` becomes `localhost:<port>`. The gateway strips
+  BiBCode's session cookie, every `bibcode-gw-*` cookie, `authorization`,
+  `dpop`, and hop-by-hop headers, including `proxy-connection`. In responses
+  it drops `Domain=` from `Set-Cookie` and drops cookies with reserved names.
+  Cookie headers are filtered as bytes, so a non-ASCII cookie passes through
+  unchanged and never costs a request its gateway cookie. It also rewrites a
+  `Location` that points at `localhost`, `127.0.0.1`, or `[::1]` on the
+  upstream port to the client-facing origin.
+- **Limits.** Each target allows 64 concurrent upstream connections, and all
+  targets share one limit of 256. Bodies stream through 64 KiB buffers and are
+  never buffered whole. Over the limit, the gateway returns `503` with
+  `retry-after: 1`. When nothing listens, it returns `502` with "Nothing is
+  listening on port <port> on <environment>."
+- **Teardown.** A target closes in four cases:
+  - Every preview tab of its thread that has shown its port has closed. A
+    tab that navigated away keeps it, so Back to its gateway origin still
+    loads. The gateway follows `PreviewManager` events; after
+    missed events it re-checks every thread that has a target.
+  - It has had no connections for 10 minutes. The sweep runs every 60 s, and
+    minting a capability counts as activity.
+  - Its thread is deleted, which also closes the thread's preview tabs.
+  - The server shuts down. Shutdown stops accepting, closes idle connections
+    and WebSocket tunnels at once, and lets in-flight requests finish for up to
+    2 s before cutting what is left. The server has no shutdown deadline of its
+    own, and the desktop gives the whole backend 5 s to stop.
+
+  The first case applies only once a tab of the thread has pointed at the
+  target's port. A target no tab ever pointed at, such as one opened for a
+  browser-mode tab, closes only in the other three cases.
+
+- **E2EE caveat.** Gateway traffic is plain HTTP, outside Noise, like
+  `/api/assets`. A client whose environment address is a public IP literal
+  shows the `public-host` notice instead of calling the gateway, and the server
+  refuses any caller that reached it on a public address with `not-reachable`.
+- **Relay limitation.** A relay (BiBCode Connect) client cannot reach gateway
+  listeners. It shows "This address is on <label>, not this computer. Opening
+  its ports from here isn't supported yet."
+- **Client side** (`apps/web/src/browser/previewGateway.ts`). Shared preview
+  state keeps the canonical `http://localhost:<port>` URL; each client resolves
+  it for its own webview. A client maps every gateway origin a tab has used
+  back to the canonical origin until that tab is released, so history Back to
+  a replaced SSH forward still reports a canonical URL. Over SSH it leases
+  forwards: a tab holds its forward until the tab closes, or 60 s after its
+  view unmounts unless it mounts again; a system-browser open holds one for
+  5 minutes. It calls `releaseSshForward` only when no lease remains, and when
+  the server replaces a target's listener. Only a typed gateway refusal that
+  holds for every client (`https-unsupported`, `not-admitted`, `no-upstream`)
+  becomes the shared tab's `LoadFailed`. A failure of the client's own reach
+  (SSH forward, missing bridge or profile, transport, `unavailable`,
+  `not-reachable` for the address it connected through, or any other failure
+  resolving or forwarding the address) stays a client-local failed state that
+  the tab and automation `status` report. On such a failure, Reload resolves
+  the tab's URL again whatever its target kind. The desktop reports no native
+  load failures today, so after a page has loaded, a dropped forward shows the
+  webview's own error page instead of that state; Reload recovers.
+
+### Open requests and automation hosts
+
+A command in an agent or terminal session asks a client to open a URL through
+`$BROWSER` or `$BRAINSTORM_OPEN_CMD`; the shim and its environment are in
+[Provider architecture](providers.md). The server never opens a browser
+itself. It announces the request, and exactly one client claims it.
+
+- **Route.** `POST /api/preview/open-url` with body `{ "url": … }` accepts only
+  a thread-scoped open-url bearer token. It never accepts a session cookie, and
+  that token authenticates no other route, `/mcp` included. A missing or
+  unknown token gets `401` `invalid_open_url_credential`. An invalid or
+  non-`http(s)` URL, or one longer than 2048 characters, gets `400`. A thread with 64
+  unclaimed requests gets `429` `too_many_open_requests`. Otherwise the route
+  answers `202 { requestId, delivered }`. `delivered` is false when no client
+  was subscribed to preview events; the gateway's own tab follower does not
+  count. The CLI then prints the URL itself.
+- **Event and claim.** The request is broadcast as
+  `openRequested { threadId, requestId, url, createdAt }` on
+  `subscribePreviewEvents`. A client claims it with
+  `preview.claimOpenRequest({ requestId })`, which needs
+  `orchestration:operate` and returns `{ claimed }`. Only the first claim of a
+  live request returns `true`; every other client does nothing. A request no
+  client claims within 60 s expires.
+- **Who claims** (`apps/web/src/components/preview/OpenRequestRouter.tsx`). A
+  client _shows_ a thread when the thread is its routed thread or an active
+  chat panel in its center layout.
+  - A visible client that shows the thread claims at once.
+  - Every other client waits 2 s and checks again. A hidden client then
+    claims only a thread it shows, since nobody would see its prompt. A
+    visible client claims anyway. If it doesn't show the thread, it shows a
+    prompt naming the thread ("A command in “<thread title>” wants to open
+    …"). **Show thread and open** routes to that thread and then opens the
+    URL. Whether the client shows the thread is checked again when the claim
+    returns, so a user who left or reached the thread meanwhile gets the
+    prompt or the direct open accordingly.
+  - On desktop, a claim for a thread on screen opens like a clicked link: in
+    the BiBCode browser for the routed thread, or in the system browser when
+    the thread is only a panel and links open in the BiBCode browser. In
+    browser mode every claim becomes a prompt, because a new tab needs a user
+    click.
+- **Subscriptions.** Every client mounts one preview-events subscription per
+  registered environment, whatever thread is on screen. The subscription
+  runtime keeps it across reconnects. `delivered` therefore means some client
+  of that environment is connected, not that one shows the thread.
+- **Automation hosts.** Every client except a desktop without preview support
+  also registers a preview automation host per environment and advertises the
+  operations it supports. A desktop host
+  advertises the full set or `status`, `open`, and `navigate`. A browser-mode
+  host (no `window.desktopBridge`) advertises only `status` and `open`. It has
+  no tab to drive, so its `status` reports an unavailable preview. Its `open`
+  of a URL queues the "Agent wants to open" prompt and returns
+  `{ status: "pending-user" }` at once. An `open` without a URL returns the
+  unavailable status.
+- **Host selection** (`apps/server/src/mcp/preview_automation.rs`). For each
+  call the broker considers the hosts of that environment that support the
+  operation. It picks the one with the most supported operations, then the
+  most recent focus. Focus order advances when a host connects and when its
+  window gains focus. A desktop therefore keeps automation even after the user
+  last touched a browser tab, and the browser-mode host serves only when no
+  desktop host is connected.
+
 ## Security boundaries
 
 - Pairing credentials and access tokens are secrets; connection catalog labels
@@ -1051,6 +1265,22 @@ endpoint can install software, start a process, or use SSH.
   and only for a plain-transport session (the client mints a fresh ticket per
   connection attempt). A process restart forgets redemptions for at most one
   five-minute ticket window.
+- When the browser-session cookie is the credential, any method other than
+  `GET`, `HEAD`, or `OPTIONS`, and any WebSocket upgrade, must carry an `Origin`
+  equal to the request's own `http(s)://<Host>` origin or the `--dev-url`
+  origin. A missing or different `Origin` returns `403`
+  `EnvironmentOperationForbiddenError` with reason `origin_not_allowed`.
+  Bearer, DPoP, and `wsTicket` authentication do not check `Origin`. The
+  desktop app's `bibcode://app` origin gets no exception: it sends a bearer
+  token with `credentials: "omit"` and never uses the cookie.
+- `X-Forwarded-Host` and `X-Forwarded-Proto` are honored only from a loopback
+  socket peer, the same trust as `X-Forwarded-For`. From such a peer the first
+  `X-Forwarded-Host` entry replaces `Host` before any handler runs, so the
+  Origin rule, DPoP request URLs, and the preview gateway see the address the
+  browser used. Every other peer has both headers removed. A reverse proxy
+  must therefore run on the server's host and send `X-Forwarded-Host`. With
+  nginx's default `proxy_set_header Host $proxy_host`, a proxy that omits it
+  gets `403` on every cookie mutation and WebSocket.
 - DPoP binds Connect-issued relay and environment tokens to the client's proof
   key and the target HTTP request.
 - Relay request proofs and environment health/mint responses are independently

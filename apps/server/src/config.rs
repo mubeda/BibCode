@@ -518,6 +518,34 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_open_url_without_data_root() {
+        // Control: a relative explicit data root cannot be resolved.
+        let unusable_root = "relative-root";
+        assert!(matches!(
+            Cli::try_parse_from(["bibcode", "--base-dir", unusable_root, "storage", "inspect"])
+                .expect("parse storage inspect")
+                .into_action(),
+            Err(ConfigError::DataRoot(
+                DataRootError::RelativeExplicit { .. }
+            ))
+        ));
+        let action = Cli::try_parse_from([
+            "bibcode",
+            "--base-dir",
+            unusable_root,
+            "open-url",
+            "http://localhost:5173/?key=1",
+        ])
+        .expect("parse open-url")
+        .into_action()
+        .expect("open-url never resolves a data root");
+        assert!(matches!(
+            action,
+            CliAction::OpenUrl { url } if url == "http://localhost:5173/?key=1"
+        ));
+    }
+
+    #[test]
     fn pairing_offer_resolves_the_data_root_and_defaults_reach_to_another_device() {
         let temp = tempfile::tempdir().expect("temporary base directory");
         let base_dir = temp.path().to_string_lossy().into_owned();
@@ -650,6 +678,12 @@ enum CliCommand {
         about = "Install, remove, or inspect the per-user background service that keeps `bibcode serve` running."
     )]
     Service(ServiceArgs),
+    #[command(
+        name = "open-url",
+        about = "Ask the BiBCode client showing this agent or terminal's thread to open an http(s) URL.",
+        hide = true
+    )]
+    OpenUrl { url: String },
 }
 
 #[derive(Debug, Args)]
@@ -780,6 +814,10 @@ pub enum CliAction {
     Storage(StorageCommand),
     Pairing(PairingCommand),
     Service(ServiceCommand),
+    /// Run by the open-url shim; touches no data root.
+    OpenUrl {
+        url: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -867,6 +905,8 @@ pub enum ConfigError {
     PairingCommandIsNotServer,
     #[error("service commands cannot be converted into a server configuration")]
     ServiceCommandIsNotServer,
+    #[error("open-url cannot be converted into a server configuration")]
+    OpenUrlCommandIsNotServer,
     #[error("failed to resolve the current executable for static web discovery")]
     CurrentExecutable(#[source] io::Error),
     #[error(transparent)]
@@ -905,6 +945,7 @@ impl Cli {
             CliAction::Storage(_) => Err(ConfigError::StorageCommandIsNotServer),
             CliAction::Pairing(_) => Err(ConfigError::PairingCommandIsNotServer),
             CliAction::Service(_) => Err(ConfigError::ServiceCommandIsNotServer),
+            CliAction::OpenUrl { .. } => Err(ConfigError::OpenUrlCommandIsNotServer),
         }
     }
 
@@ -926,6 +967,7 @@ impl Cli {
             root: args,
         } = self;
         let command = match command {
+            Some(CliCommand::OpenUrl { url }) => return Ok(CliAction::OpenUrl { url }),
             Some(CliCommand::Storage(storage)) => {
                 let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
                 let request = select_data_root_request(

@@ -57,6 +57,11 @@ vi.mock("~/browser/browserTargetResolver", () => ({
   },
 }));
 
+vi.mock("~/browser/previewGateway", () => ({
+  canonicalizePreviewUrl: (url: string) =>
+    url.replace("http://127.0.0.1:50000", "http://localhost:5173"),
+}));
+
 vi.mock("~/browser/linkNotices", () => ({
   showPreviewUnreachableNotice: (resolution: unknown) => {
     h.noticeCalls.push(resolution);
@@ -143,6 +148,18 @@ describe("PreviewNewWindowRouter", () => {
       { kind: "unreachable", reason: "ssh", environmentLabel: "Box" },
     ]);
     expect(h.openCalls).toEqual([]);
+  });
+
+  it("opens a gateway page's popup at its canonical URL", () => {
+    h.resolution = { kind: "gateway", via: "ssh", url: "http://localhost:5173/next" };
+    const listener = mountRouter();
+
+    listener("tab_1", "http://127.0.0.1:50000/next");
+
+    expect(h.resolveCalls).toEqual([[environmentId, "http://localhost:5173/next"]]);
+    expect(h.openCalls).toEqual([
+      { threadRef, url: "http://localhost:5173/next", openPreview: h.openPreview },
+    ]);
   });
 
   it("subscribes to nothing without a preview bridge", () => {

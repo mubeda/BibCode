@@ -231,8 +231,13 @@ import {
 } from "./terminal.ts";
 import {
   DiscoveredLocalServerList,
+  PreviewClaimOpenRequestInput,
+  PreviewClaimOpenRequestResult,
   PreviewCloseInput,
   PreviewError,
+  PreviewGatewayError,
+  PreviewGatewayOpenInput,
+  PreviewGatewayOpenResult,
   PreviewEvent,
   PreviewListInput,
   PreviewListResult,
@@ -528,6 +533,8 @@ export const WS_METHODS = {
   previewClose: "preview.close",
   previewList: "preview.list",
   previewReportStatus: "preview.reportStatus",
+  previewClaimOpenRequest: "preview.claimOpenRequest",
+  previewGatewayOpen: "preview.gatewayOpen",
   previewAutomationConnect: "previewAutomation.connect",
   previewAutomationRespond: "previewAutomation.respond",
   previewAutomationFocusHost: "previewAutomation.focusHost",
@@ -1524,6 +1531,18 @@ export const WsPreviewReportStatusRpc = Rpc.make(WS_METHODS.previewReportStatus,
   error: Schema.Union([PreviewError, EnvironmentRpcError]),
 });
 
+export const WsPreviewClaimOpenRequestRpc = Rpc.make(WS_METHODS.previewClaimOpenRequest, {
+  payload: PreviewClaimOpenRequestInput,
+  success: PreviewClaimOpenRequestResult,
+  error: EnvironmentRpcError,
+});
+
+export const WsPreviewGatewayOpenRpc = Rpc.make(WS_METHODS.previewGatewayOpen, {
+  payload: PreviewGatewayOpenInput,
+  success: PreviewGatewayOpenResult,
+  error: Schema.Union([PreviewGatewayError, EnvironmentRpcError]),
+});
+
 export const WsPreviewAutomationConnectRpc = Rpc.make(WS_METHODS.previewAutomationConnect, {
   payload: PreviewAutomationHost,
   success: PreviewAutomationStreamEvent,
@@ -1845,6 +1864,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsPreviewCloseRpc,
   WsPreviewListRpc,
   WsPreviewReportStatusRpc,
+  WsPreviewClaimOpenRequestRpc,
+  WsPreviewGatewayOpenRpc,
   WsPreviewAutomationConnectRpc,
   WsPreviewAutomationRespondRpc,
   WsPreviewAutomationFocusHostRpc,

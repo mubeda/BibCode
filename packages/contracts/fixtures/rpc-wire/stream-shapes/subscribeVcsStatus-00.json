@@ -17,36 +17,32 @@
               "path": "f&[\"Vy>$~\"P",
               "insertions": 2147483626,
               "deletions": 13,
-              "status": "renamed"
-            },
-            {
-              "path": "VcbBMW",
-              "insertions": 2063773623,
-              "deletions": 1949265014,
-              "area": "unstaged"
-            },
-            {
-              "path": "Y}%",
-              "insertions": 2147483640,
-              "deletions": 12
-            },
-            {
-              "path": "N[:oNI;Y",
-              "insertions": 1021885809,
-              "deletions": 29,
               "status": "added"
+            },
+            {
+              "path": "caller",
+              "insertions": 18,
+              "deletions": 2063773623,
+              "status": "copied"
+            },
+            {
+              "path": "co",
+              "insertions": 1599290682,
+              "deletions": 398470203,
+              "status": "copied"
+            },
+            {
+              "path": "rj?",
+              "insertions": 9,
+              "deletions": 1796052935,
+              "area": "untracked"
             }
           ],
-          "insertions": 1126509057,
-          "deletions": 2
+          "insertions": 20,
+          "deletions": 1021885809
         }
       },
-      "remote": {
-        "hasUpstream": false,
-        "aheadCount": 1976854562,
-        "behindCount": 2147483621,
-        "pr": null
-      }
+      "remote": null
     }
   ]
 }

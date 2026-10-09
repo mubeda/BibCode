@@ -1,4 +1,10 @@
-import { FileCode2Icon, FileMinus2Icon, FilePenLineIcon, FilePlus2Icon } from "lucide-react";
+import {
+  FileCode2Icon,
+  FileMinus2Icon,
+  FilePenLineIcon,
+  FilePlus2Icon,
+  FileWarningIcon,
+} from "lucide-react";
 import { memo, type ComponentType, type KeyboardEvent, type MouseEvent } from "react";
 
 import { DiffStatLabel } from "~/components/chat/DiffStatLabel";
@@ -29,6 +35,7 @@ const STATUS_PRESENTATION: Record<NonNullable<ChangeRow["status"]>, StatusPresen
   renamed: { icon: FileCode2Icon, label: "Renamed", badge: "R" },
   copied: { icon: FileCode2Icon, label: "Copied", badge: "C" },
   untracked: { icon: FilePlus2Icon, label: "New", badge: "U" },
+  conflicted: { icon: FileWarningIcon, label: "Conflicted", badge: "!" },
 };
 
 const UNKNOWN_STATUS: StatusPresentation = {

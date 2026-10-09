@@ -22,7 +22,11 @@ export interface GitManagerInProgressStripProps {
   readonly onContinue: () => void;
   readonly onAbort: () => void;
   readonly blocked: GitManagerBlockedReason | null;
+  /** Disables Continue and Abort (busy, missing capability). */
   readonly disabledReason?: string | null;
+  /** Disables only Continue, e.g. while conflicts remain; Abort stays available. */
+  readonly continueDisabledReason?: string | null;
+  readonly continueLabel?: string;
 }
 
 export const GitManagerInProgressStrip = memo(function GitManagerInProgressStrip({
@@ -31,12 +35,15 @@ export const GitManagerInProgressStrip = memo(function GitManagerInProgressStrip
   onAbort,
   blocked,
   disabledReason = null,
+  continueDisabledReason = null,
+  continueLabel = "Continue",
 }: GitManagerInProgressStripProps) {
   const [abortConfirmationOpen, setAbortConfirmationOpen] = useState(false);
   const presentation = describeInProgressOperation(operation);
-  const blockedReason = disabledReason ?? resolveInProgressBlockedReason(blocked);
+  const continueReason = disabledReason ?? continueDisabledReason;
+  const blockedReason = continueReason ?? resolveInProgressBlockedReason(blocked);
   const disabledReasonId =
-    disabledReason === null ? undefined : "git-manager-in-progress-disabled-reason";
+    continueReason === null ? undefined : "git-manager-in-progress-disabled-reason";
   const requestAbort = useCallback(() => setAbortConfirmationOpen(true), []);
   const confirmAbort = useCallback(() => {
     setAbortConfirmationOpen(false);
@@ -63,16 +70,16 @@ export const GitManagerInProgressStrip = memo(function GitManagerInProgressStrip
           </span>
           <Button
             aria-describedby={disabledReasonId}
-            disabled={disabledReason !== null}
+            disabled={continueReason !== null}
             size="xs"
-            title={disabledReason ?? undefined}
+            title={continueReason ?? undefined}
             variant="outline"
             onClick={onContinue}
           >
-            Continue
+            {continueLabel}
           </Button>
           <Button
-            aria-describedby={disabledReasonId}
+            aria-describedby={disabledReason === null ? undefined : disabledReasonId}
             disabled={disabledReason !== null}
             size="xs"
             title={disabledReason ?? undefined}

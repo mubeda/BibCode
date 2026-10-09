@@ -37,7 +37,9 @@ vi.mock("./state/projectDataSafety", () => ({
   },
   useProjectDataSafetySnapshot: () => h.snapshot,
 }));
-vi.mock("./state/shell", () => ({
+// Partial: AppRoot's open-request router reads thread titles through the shell's atoms.
+vi.mock("./state/shell", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./state/shell")>()),
   environmentAvailabilityCommands: { retry: {}, adoptStorage: {} },
   useEnvironmentShellSummary: () => h.summary,
 }));

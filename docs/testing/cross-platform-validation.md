@@ -332,6 +332,19 @@ new notice; conflicting runtime identities, stale attempt/state guards, steers,
 and already delivered rows must not trigger a fresh launch. Nonaccepted outcomes
 and unknown-reason decoding retain their existing behavior.
 
+With OpenCode, stop the server while a message is still sending, delete that
+session on the OpenCode server, and restart: the message must become uncertain
+with "The provider no longer has the conversation this message was sent to, so
+BiBCode can't tell whether it arrived. Retry sends it to a new conversation.",
+nothing may be resent automatically, and a further restart must leave it
+unchanged. An explicit **Retry** must deliver it once in a new conversation with
+the muted new-conversation notice.
+
+Send a message in a chat panel whose provider takes several seconds to start,
+then close the panel's tab before the client shows it running: no turn may start
+or keep running in the workspace, and **Reopen closed chat** must deliver the
+message once.
+
 Verify enqueue without a turn-start event or working projection, oldest-first
 promotion once per settle, explicit Send now clearing only its row's hold,
 interrupt/error holds, approval and user-input gates, and withdrawal without
@@ -2022,7 +2035,18 @@ starts.
    reports one commit ahead and none behind, then merge with **Merge commit**.
    Confirm the operation's started-to-finished presentation and that History
    shows a new merge commit on `main` with two parents rather than a
-   fast-forward. Open the **Tags** tab: collapse and expand the **Local** and
+   fast-forward. Next, merge into a branch that is not checked out: from the
+   companion shell run
+   `git -C "$GIT_MANAGER_FIXTURE_ROOT/main" branch merge-into-target main~1`,
+   open **Merge…**, choose `merge-into-target` under **Into**, select `main` as
+   the source, confirm the dialog says the branch is updated without checking it
+   out and offers no Squash, and merge. Confirm `main` stays checked out with an
+   unchanged working tree and that
+   `git -C "$GIT_MANAGER_FIXTURE_ROOT/main" log -1 --format=%P merge-into-target`
+   prints two parents. In the chat's **Source Control** panel, confirm
+   **Merge into current branch…** is enabled on the clean tree and opens the
+   same dialog without an **Into** picker; **Fetch** completes and the dialog
+   stays open. Open the **Tags** tab: collapse and expand the **Local** and
    **Remote origin** sections and confirm the state survives leaving and
    reopening the manager; create a tag from a History commit with **Push to
    origin after creating** on and confirm it appears under Remote origin
@@ -2643,11 +2667,14 @@ editor, or notice). In a browser tab (web mode), **Open links in** is not shown.
   reports success; `preview_navigate` then loads a new URL in it. Snapshot,
   click, and type are still unsupported and report so.
 - Loopback links (`http://localhost:3000`, `127.0.0.2`, `0.0.0.0`, `[::]`,
-  `app.localhost`): from a local thread they open locally; from an SSH or
-  BiBCode Connect thread they show "Can't open this address here" with the
-  address and **Copy link** for both targets, never this computer's localhost;
-  from a LAN, tailnet, WSL, or host-name (`devbox`) thread they open on the
-  server's address.
+  `app.localhost`): from a local thread they open locally. From a LAN,
+  tailnet, WSL, host-name (`devbox`), or desktop SSH thread they open through
+  the preview gateway (see [Preview gateway](#preview-gateway)), never this
+  computer's localhost. From a BiBCode Connect or public-IP thread, or an SSH
+  thread in a browser tab, they show "Can't open this address here" with "This
+  address is on <environment>, not this computer. Opening its ports from here
+  isn't supported yet.", the address, and **Copy link** for both targets. A
+  disconnected thread's notice asks to reconnect the environment.
 - A failed system-browser open (no handler registered) shows the link with
   **Copy link**.
 - Agent-written asset response: `curl -sI '<signed /api/assets URL>'` for an
@@ -2665,6 +2692,89 @@ the host cannot run it): Ctrl+Shift-click while a mouse-tracking TUI (Codex or
 opencode) runs must invert the target, not the TUI's selection; an OSC 8 link
 printed by a real CLI (a CLI that emits `https` hyperlinks) behaves as above;
 Linux/Wayland preview popups open as tabs; Windows UNC refusal as above.
+
+### Preview gateway
+
+The gateway is described in
+[Remote access architecture](../architecture/remote.md#preview-gateway) and the
+[user guide](../user/workspace-ui.md#previewing-the-servers-dev-servers). The
+SSH preview and brainstorming-companion procedures live in
+[Desktop-managed SSH environments](./ssh-environments.md#preview-gateway-over-ssh).
+
+Use a server on another machine that the client reaches on a LAN, tailnet, or
+WSL address (a bearer environment; see
+[Remote access](../user/remote-access.md)), and a disposable thread on it. In
+the thread's terminal, run `python3 -m http.server 8123 --bind 127.0.0.1` and
+`python3 -m http.server 8124 --bind 127.0.0.1`. Record the client (desktop or
+browser tab), the environment's address, and each gateway port.
+
+- **LAN preview.** On desktop, clicking `http://localhost:8123/` in the chat
+  opens a BiBCode browser tab that shows the listing at
+  `http://localhost:8123/`. With **System browser**, the system browser lands on
+  `http://<server address>:<gateway port>/`. `https://localhost:8123/` shows
+  the HTTPS notice, and a port with nothing listening shows "Nothing is
+  listening on port <port> on <environment>."
+- **Bind and reach.** With the server started on `--host 0.0.0.0`, the gateway
+  port listens only on the address the client used (`ss -ltn` on Linux,
+  `netstat -an` elsewhere), not on `0.0.0.0`. Reach the same server through a
+  reverse proxy on its host, or through Tailscale Serve, and click the link
+  again: the preview is refused as a proxied address and no gateway port opens.
+- **Browser-mode cross-site bootstrap.** Open the BiBCode UI in a browser from
+  a different host than the environment's address, so the UI and the gateway
+  are different sites (for example, the UI served by this computer and the
+  environment on a LAN server). Click the 8123 link: a blank tab opens at once,
+  passes through `/__bibcode/bootstrap`, and ends on
+  `http://<server address>:<gateway port>/` with the listing. The browser's
+  developer tools list a `bibcode-gw-<gateway port>` cookie for that origin
+  that is `HttpOnly`, `SameSite=Strict`, and `Path=/`. A plain reload of the
+  tab still shows the listing, which proves the cookie survived the
+  `location.replace` hop.
+- **Cross-port 403.** Open the 8124 link too, so two gateway origins share the
+  host. In the 8124 tab's developer console run
+  `fetch('http://<server address>:<8123 gateway port>/', {method: 'POST', mode: 'no-cors', credentials: 'include'})`
+  and `new WebSocket('ws://<server address>:<8123 gateway port>/')`. The
+  network panel shows `403` for both, and the 8123 server's terminal logs no
+  new request. Over `curl`, with the 8123 cookie copied from the developer
+  tools, a `POST` whose `Origin` is the 8124 gateway origin, or that has no
+  `Origin`, returns `403` with "This request didn't come from the preview
+  itself, so the gateway blocked it." The same `POST` with
+  `Origin: http://<server address>:<8123 gateway port>` reaches the server
+  (Python answers `501`), and a `GET` with the 8124 `Origin` returns the
+  listing. Do not record the cookie value.
+- **Revocation.** In a browser-mode tab that holds a WebSocket (a Vite dev
+  server, or the brainstorming companion run on this environment), revoke the
+  client's session or device on the host's **Settings → Remote Servers →
+  Share** tab. Within 30 s the WebSocket closes; reloading the tab shows "This
+  preview link expired. Go back to BiBCode and open it again." After the
+  client pairs again, opening the link again from BiBCode works.
+- **Commands that open a browser.** In the thread's terminal, `BROWSER` and
+  `BRAINSTORM_OPEN_CMD` are `bibcode-open-url`. Looking it up
+  (`command -v bibcode-open-url`, or `where.exe bibcode-open-url` on Windows)
+  names `runtime/open-url/` under the server's state directory; on Windows
+  that directory holds `bibcode-open-url.exe` and no `.cmd` or extensionless
+  shim. `"$BROWSER" http://localhost:8123/` prints nothing and exits 0; on
+  desktop the address opens like a clicked link, and in a browser tab the "A
+  command wants to open <address>" bar appears. With two clients showing the thread, only one opens it; a client
+  in a hidden window loses to a visible one. With every client on another
+  thread, after 2 seconds one visible client shows "A command in “<thread title>”
+  wants to open <address>", and **Show thread and open** switches to that thread and opens it. With the token unset
+  (`env -u BIBCODE_OPEN_URL_AUTH "$BROWSER" http://localhost:8123/`), it prints
+  the address and exits 0. With no BiBCode client connected to the server, it
+  also prints the address and exits 0. `"$BROWSER" file:///etc/hosts` writes
+  `bibcode open-url: expected an http(s) URL` and exits 2.
+- **Agent open in a browser tab.** With only a browser-mode client on the
+  thread, ask the agent to call `preview_open` for `http://localhost:8123/`:
+  the "Agent wants to open <address>" bar appears and the agent's result is
+  `pending-user`.
+
+Pending native checks: Windows `bibcode-open-url.exe` started from `cmd` and
+PowerShell (the desktop build attaches to the parent console; record whether
+the prompt waits and the exit code is visible); whether a Codex agent's
+commands receive `BIBCODE_OPEN_URL_AUTH` (from a Codex tool call,
+`[ -n "$BIBCODE_OPEN_URL_AUTH" ] && echo present || echo missing`; never print
+the value); whether Codex's `workspace-write` sandbox makes `"$BROWSER"` print
+the address instead of opening it; a session older than 8 hours falls back to
+printing.
 
 ## Non-native compatibility audit
 

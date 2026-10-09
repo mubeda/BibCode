@@ -7,6 +7,7 @@ mod process;
 mod repository;
 mod status_owner;
 mod summary;
+mod version;
 mod watcher;
 mod worktree;
 
@@ -46,6 +47,7 @@ pub(crate) use repository::{StatusObservation, validate_pathspecs};
 pub use status_owner::StatusMutationGuard;
 pub(crate) use status_owner::{STATUS_SAFETY_INTERVAL, StatusReadFence};
 pub use summary::GitStatusSummaryService;
+pub use version::GitVersion;
 #[cfg(test)]
 pub(crate) use watcher::acquire_native_watcher_test_permit;
 #[allow(unused_imports)]

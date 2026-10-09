@@ -504,3 +504,40 @@ describe("GitRunStackedActionInput pullRequestOptions", () => {
     expect(result.pr.warning).toBe("Created, but some options weren't applied.");
   });
 });
+
+describe("VCS conflict state", () => {
+  const healthy = {
+    isRepo: true,
+    hasPrimaryRemote: false,
+    isDefaultRef: false,
+    refName: "main",
+    hasWorkingTreeChanges: true,
+    workingTree: {
+      files: [
+        { path: "a.txt", insertions: 0, deletions: 0, status: "conflicted", area: "unstaged" },
+      ],
+      insertions: 0,
+      deletions: 0,
+    },
+  };
+
+  it("decodes a conflicted file and an in-progress merge", () => {
+    const local = { ...healthy, operationInProgress: "merge" };
+    expect(encodeStatusLocalResult(decodeStatusLocalResult(local))).toEqual(local);
+    const event = { _tag: "localUpdated", local };
+    expect(encodeStatusStreamEvent(decodeStatusStreamEvent(event))).toEqual(event);
+  });
+
+  it("decodes an unknown future file status and operation as absent", () => {
+    const decoded = decodeStatusLocalResult({
+      ...healthy,
+      operationInProgress: "future-operation",
+      workingTree: {
+        ...healthy.workingTree,
+        files: [{ path: "a.txt", insertions: 0, deletions: 0, status: "future", area: "unstaged" }],
+      },
+    });
+    expect(Object.hasOwn(decoded, "operationInProgress")).toBe(false);
+    expect(Object.hasOwn(decoded.workingTree.files[0]!, "status")).toBe(false);
+  });
+});

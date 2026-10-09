@@ -184,6 +184,9 @@ function toLocalStatusPart(status: VcsStatusResult): VcsStatusLocalResult {
     ...(status.defaultRefName === undefined ? {} : { defaultRefName: status.defaultRefName }),
     hasWorkingTreeChanges: status.hasWorkingTreeChanges,
     workingTree: status.workingTree,
+    ...(status.operationInProgress === undefined
+      ? {}
+      : { operationInProgress: status.operationInProgress }),
   };
 }
 

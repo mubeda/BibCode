@@ -9,6 +9,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vite-
 import { joinWorkspacePath } from "./files/FileTreeContextMenu.logic";
 import type { WorkingTreeFile } from "./SourceControlPanel.logic";
 
+import type { GitManagerInProgressStripProps } from "./gitManager/GitManagerInProgressStrip";
+import type { GitManagerMergeDialogProps } from "./gitManager/merge/GitManagerMergeDialog";
+import type { SourceControlMergeChangesProps } from "./SourceControlMergeChanges";
 import type { GitManagerCreatePullRequestDialogProps } from "./gitManager/provider/GitManagerCreatePullRequestDialog";
 
 type EffectCallback = () => void | (() => void);
@@ -112,6 +115,8 @@ const testState = vi.hoisted(() => ({
   isBusy: false,
   primaryEnvironmentId: null as unknown,
   pullRequestBranchSelection: true,
+  mergeCapabilities: true,
+  runGitManagerOperation: vi.fn(),
   availableEditors: [] as string[],
   preferredEditor: null as string | null,
   localApi: undefined as unknown,
@@ -186,6 +191,10 @@ interface CapturedTextareaProps {
 
 const captured = vi.hoisted(() => ({
   createPullRequest: null as GitManagerCreatePullRequestDialogProps | null,
+  merge: null as GitManagerMergeDialogProps | null,
+  strip: null as GitManagerInProgressStripProps | null,
+  banner: null as { operation: unknown; onCancel: () => void } | null,
+  mergeChanges: null as SourceControlMergeChangesProps | null,
   buttons: [] as CapturedButtonProps[],
   menuItems: [] as CapturedMenuItemProps[],
   sections: [] as CapturedSectionProps[],
@@ -194,6 +203,10 @@ const captured = vi.hoisted(() => ({
   commits: [] as Array<{ reloadToken: number; nowMs: number; gitCwd: string | null }>,
   clear() {
     this.createPullRequest = null;
+    this.merge = null;
+    this.strip = null;
+    this.banner = null;
+    this.mergeChanges = null;
     this.buttons = [];
     this.menuItems = [];
     this.sections = [];
@@ -208,6 +221,41 @@ vi.mock("./gitManager/provider/GitManagerCreatePullRequestDialog", () => ({
     captured.createPullRequest = props;
     return null;
   },
+}));
+
+vi.mock("./gitManager/merge/GitManagerMergeDialog", () => ({
+  GitManagerMergeDialog: (props: GitManagerMergeDialogProps) => {
+    captured.merge = props;
+    return null;
+  },
+}));
+
+vi.mock("./gitManager/GitManagerInProgressStrip", () => ({
+  GitManagerInProgressStrip: (props: GitManagerInProgressStripProps) => {
+    captured.strip = props;
+    return null;
+  },
+}));
+
+vi.mock("./gitManager/toolbar/GitManagerOperationBanner", () => ({
+  GitManagerOperationBanner: (props: { operation: unknown; onCancel: () => void }) => {
+    captured.banner = props;
+    return null;
+  },
+}));
+
+vi.mock("./SourceControlMergeChanges", () => ({
+  SourceControlMergeChanges: (props: SourceControlMergeChangesProps) => {
+    captured.mergeChanges = props;
+    return null;
+  },
+}));
+
+vi.mock("~/state/gitManager", () => ({
+  gitManagerEnvironment: {
+    getRefs: (args: unknown) => ({ kind: "refs-atom", args }),
+  },
+  useRunGitManagerOperation: () => testState.runGitManagerOperation,
 }));
 
 vi.mock("react", async (importOriginal) => {
@@ -248,7 +296,11 @@ vi.mock("~/state/entities", () => ({
   useServerConfigs: () => ({
     get: () => ({
       environment: {
-        capabilities: { gitPullRequestBranchSelection: testState.pullRequestBranchSelection },
+        capabilities: {
+          gitPullRequestBranchSelection: testState.pullRequestBranchSelection,
+          gitManagerStashMergeOperations: testState.mergeCapabilities,
+          gitManagerBranchSyncOperations: testState.mergeCapabilities,
+        },
       },
     }),
   }),
@@ -633,6 +685,11 @@ beforeEach(() => {
   testState.setGroupByFolder.mockReset();
   testState.primaryEnvironmentId = ENVIRONMENT_ID;
   testState.pullRequestBranchSelection = true;
+  testState.mergeCapabilities = true;
+  testState.runGitManagerOperation = vi.fn(() => ({
+    result: new Promise(() => undefined),
+    cancel: vi.fn(),
+  }));
   testState.availableEditors = ["vscode"];
   testState.preferredEditor = "vscode";
   testState.localApi = { shell: { openExternal: vi.fn() } };
@@ -1720,5 +1777,229 @@ describe("SourceControlPanel", () => {
     expect(commit?.disabled).toBe(true);
     expect(markup).toContain('data-testid="menu-trigger" data-disabled="true"');
     expect(sectionByTitle("Staged Changes")?.disabled).toBe(true);
+  });
+});
+
+describe("SourceControlPanel — Merge into current branch", () => {
+  const PROJECT_REF = { environmentId: ENVIRONMENT_ID, projectId: "project-1" } as NonNullable<
+    PanelProps["projectRef"]
+  >;
+
+  it("opens the merge dialog in current-branch mode for the thread's project", () => {
+    testState.statusQuery = { ...testState.statusQuery, data: status() };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    const item = menuItemByText("Merge into current branch…");
+    expect(item?.disabled).toBeFalsy();
+    expect(captured.merge?.open).toBe(false);
+
+    item?.onClick?.();
+    render(buildProps({ projectRef: PROJECT_REF }));
+
+    expect(captured.merge).toMatchObject({
+      open: true,
+      targetMode: "current-branch",
+      projectRef: PROJECT_REF,
+      scope: { environmentId: ENVIRONMENT_ID, cwd: GIT_CWD },
+    });
+  });
+
+  it("explains why merging is unavailable without the Git Manager capabilities", () => {
+    testState.mergeCapabilities = false;
+    testState.statusQuery = { ...testState.statusQuery, data: status() };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    const item = menuItemByText("Merge into current branch…");
+    expect(item).toMatchObject({
+      disabled: true,
+      title: "This environment does not support Git Manager stash and merge operations.",
+    });
+  });
+
+  it("disables the panel's actions while the dialog's merge or fetch runs", () => {
+    testState.statusQuery = { ...testState.statusQuery, data: status() };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(menuItemByText("Pull")?.title).toBe("Already up to date.");
+    expect(captured.merge?.onRunningChange).toBeTypeOf("function");
+    captured.merge?.onRunningChange?.(true);
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(menuItemByText("Pull")).toMatchObject({
+      disabled: true,
+      title: "Git action in progress.",
+    });
+  });
+});
+
+describe("SourceControlPanel — merge in progress", () => {
+  const PROJECT_REF = { environmentId: ENVIRONMENT_ID, projectId: "project-1" } as NonNullable<
+    PanelProps["projectRef"]
+  >;
+  const CONFLICTED = {
+    path: "a.txt",
+    insertions: 0,
+    deletions: 0,
+    status: "conflicted",
+    area: "unstaged",
+  } as const;
+  const RESOLVED = {
+    path: "a.txt",
+    insertions: 1,
+    deletions: 1,
+    status: "modified",
+    area: "staged",
+  } as const;
+
+  function mergeStatus(files: readonly WorkingTreeFile[]): VcsStatusResult {
+    return status({
+      operationInProgress: "merge",
+      hasWorkingTreeChanges: true,
+      workingTree: { files: [...files] as never, insertions: 1, deletions: 1 },
+    });
+  }
+
+  it("keeps Commit merge disabled while conflicts remain and resolves a file", () => {
+    testState.statusQuery = { ...testState.statusQuery, data: mergeStatus([CONFLICTED]) };
+    render(buildProps({ projectRef: PROJECT_REF }));
+
+    expect(captured.strip).toMatchObject({
+      continueLabel: "Commit merge",
+      continueDisabledReason: "Resolve and stage every conflicted file first.",
+      disabledReason: null,
+      operation: { kind: "merge" },
+    });
+    expect(captured.mergeChanges?.files.map((file) => file.path)).toEqual(["a.txt"]);
+    expect(sectionByTitle("Changes")?.files ?? []).toEqual([]);
+
+    captured.mergeChanges?.onResolve("a.txt", "ours");
+    expect(testState.runGitManagerOperation).toHaveBeenCalledWith(
+      {
+        environmentId: ENVIRONMENT_ID,
+        input: {
+          _tag: "resolve-conflict",
+          cwd: GIT_CWD,
+          projectId: "project-1",
+          path: "a.txt",
+          side: "ours",
+        },
+      },
+      expect.any(Function),
+    );
+  });
+
+  it("finishes the merge through continue and hides the stacked Commit", () => {
+    testState.statusQuery = { ...testState.statusQuery, data: mergeStatus([RESOLVED]) };
+    render(buildProps({ projectRef: PROJECT_REF }));
+
+    expect(captured.strip?.continueDisabledReason).toBeNull();
+    expect(menuItemByText("Commit")).toBeUndefined();
+    expect(buttonByExactText("Commit")).toBeUndefined();
+
+    captured.strip?.onContinue();
+    expect(testState.runGitManagerOperation).toHaveBeenCalledWith(
+      {
+        environmentId: ENVIRONMENT_ID,
+        input: { _tag: "continue", cwd: GIT_CWD, projectId: "project-1", operation: "merge" },
+      },
+      expect.any(Function),
+    );
+  });
+
+  it("marks the panel busy and offers Cancel while a recovery operation runs", () => {
+    testState.statusQuery = { ...testState.statusQuery, data: mergeStatus([RESOLVED]) };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    captured.strip?.onAbort();
+    render(buildProps({ projectRef: PROJECT_REF }));
+
+    expect(captured.strip?.disabledReason).toBe("A merge is running.");
+    expect(captured.banner?.operation).toMatchObject({ _tag: "started", operation: "abort" });
+    expect(captured.banner?.onCancel).toBeTypeOf("function");
+    expect(sectionByTitle("Staged Changes")?.disabled).toBe(true);
+  });
+
+  it("disables both strip actions without the Git Manager capabilities", () => {
+    testState.mergeCapabilities = false;
+    testState.statusQuery = { ...testState.statusQuery, data: mergeStatus([CONFLICTED]) };
+    render(buildProps({ projectRef: PROJECT_REF }));
+
+    expect(captured.strip?.disabledReason).toBe(
+      "This environment does not support Git Manager stash and merge operations.",
+    );
+  });
+});
+
+describe("SourceControlPanel — merge recovery follow-through", () => {
+  const PROJECT_REF = { environmentId: ENVIRONMENT_ID, projectId: "project-1" } as NonNullable<
+    PanelProps["projectRef"]
+  >;
+  const CONFLICTED = {
+    path: "a.txt",
+    insertions: 0,
+    deletions: 0,
+    status: "conflicted",
+    area: "unstaged",
+  } as const;
+
+  function inProgress(kind: "merge" | "rebase", files: readonly WorkingTreeFile[]) {
+    return status({
+      operationInProgress: kind,
+      hasWorkingTreeChanges: true,
+      workingTree: { files: [...files] as never, insertions: 0, deletions: 0 },
+    });
+  }
+
+  it("stages a manually resolved conflict without overwriting it", () => {
+    testState.statusQuery = { ...testState.statusQuery, data: inProgress("merge", [CONFLICTED]) };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    captured.mergeChanges?.onMarkResolved("a.txt");
+    expect(testState.runStage).toHaveBeenCalledWith(["a.txt"]);
+  });
+
+  it("explains that conflicted files cannot open without an external editor", () => {
+    testState.preferredEditor = null as never;
+    testState.availableEditors = [];
+    testState.statusQuery = { ...testState.statusQuery, data: inProgress("merge", [CONFLICTED]) };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(captured.mergeChanges?.openInEditorDisabledReason).toBeTruthy();
+
+    testState.preferredEditor = "vscode";
+    testState.availableEditors = ["vscode"];
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(captured.mergeChanges?.openInEditorDisabledReason).toBeNull();
+  });
+
+  it("keeps conflicts in the ordinary sections outside a merge", () => {
+    testState.statusQuery = { ...testState.statusQuery, data: inProgress("rebase", [CONFLICTED]) };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(captured.mergeChanges).toBeNull();
+    expect(sectionByTitle("Changes")?.files.map((file) => file.path)).toEqual(["a.txt"]);
+  });
+
+  it("shows a transport failure instead of a stuck running banner", async () => {
+    testState.runGitManagerOperation = vi.fn(() => ({
+      result: Promise.resolve(AsyncResult.failure(Cause.fail(new Error("Socket closed.")))),
+      cancel: vi.fn(),
+    }));
+    testState.statusQuery = { ...testState.statusQuery, data: inProgress("merge", []) };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    captured.strip?.onContinue();
+    await flushPromises();
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(captured.banner?.operation).toMatchObject({
+      _tag: "failed",
+      operation: "continue",
+      code: "transport-error",
+      message: "Socket closed.",
+    });
+  });
+
+  it("reloads the commit history after Commit merge finishes", () => {
+    testState.statusQuery = { ...testState.statusQuery, data: inProgress("merge", []) };
+    render(buildProps({ projectRef: PROJECT_REF }));
+    const before = captured.commits.at(-1)?.reloadToken ?? 0;
+    captured.strip?.onContinue();
+    const onEvent = testState.runGitManagerOperation.mock.calls.at(-1)?.[1] as (
+      event: unknown,
+    ) => void;
+    onEvent({ _tag: "finished", operation: "continue", message: "Merged." });
+    render(buildProps({ projectRef: PROJECT_REF }));
+    expect(captured.commits.at(-1)?.reloadToken).toBe(before + 1);
   });
 });

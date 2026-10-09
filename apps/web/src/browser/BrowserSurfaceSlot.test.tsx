@@ -46,6 +46,7 @@ vi.mock("~/browser/browserPointerStore", () => ({
 
 vi.mock("~/previewStateStore", () => ({
   applyPreviewDesktopState: h.applyPreviewDesktopState,
+  readThreadPreviewState: () => ({ sessions: {}, desktopByTabId: {} }),
 }));
 
 vi.mock("~/state/preview", () => ({
