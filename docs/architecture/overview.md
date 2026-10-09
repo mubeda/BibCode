@@ -43,7 +43,11 @@ flowchart TB
   native view per environment's preview storage (the local environment keeps
   the original profile; each other environment gets its own), because
   recreating child webviews while switching tabs disconnected the app; logical
-  tabs rebind to their environment's view. Removing an environment deletes its preview storage with its other
+  tabs rebind to their environment's view. On Linux, Tauri packs child
+  webviews into the window's content box, where bounds cannot move them, so
+  the desktop wraps the main webview in a `GtkOverlay` with a pass-through
+  `GtkFixed` layer and places preview views there
+  (`apps/desktop/src-tauri/src/preview/platform/linux.rs`). Removing an environment deletes its preview storage with its other
   environment-owned data (`EnvironmentOwnedDataCleanup`, through
   `desktop_preview_forget_environment`); a profile one of its previews used in
   this session stays on disk, since its native view lives until the app exits. In browser mode there is no child

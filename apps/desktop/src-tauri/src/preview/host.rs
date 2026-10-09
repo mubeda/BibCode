@@ -1030,6 +1030,13 @@ pub fn create_tab(
             Err(error) => return Err(error),
         };
 
+        super::platform::place_child(
+            &webview,
+            snapshot.0.x,
+            snapshot.0.y,
+            snapshot.0.width.max(1.0),
+            snapshot.0.height.max(1.0),
+        );
         let apply_result = webview
             .set_position(LogicalPosition::new(snapshot.0.x, snapshot.0.y))
             .and_then(|()| {
@@ -1196,6 +1203,13 @@ pub fn set_bounds(
     };
 
     while let Some(current) = snapshot {
+        super::platform::place_child(
+            &current.webview,
+            current.bounds.x,
+            current.bounds.y,
+            current.bounds.width.max(1.0),
+            current.bounds.height.max(1.0),
+        );
         current
             .webview
             .set_position(LogicalPosition::new(current.bounds.x, current.bounds.y))
