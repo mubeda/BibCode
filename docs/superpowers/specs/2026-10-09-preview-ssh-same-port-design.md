@@ -120,6 +120,44 @@ Same change: `docs/architecture/remote.md` (preview port forwards),
 `docs/user/workspace-ui.md` (what users see over SSH), the cross-platform
 runbook step above, and a pointer from the Phase 1 spec's "Out of scope".
 
+## 6. Addendum: preview storage per environment
+
+Approved 2026-10-09 after review. With same-port origins, previews of
+`localhost:5173` from different environments would share one preview profile:
+cookies, localStorage, IndexedDB, and service workers. Each environment now gets
+its own preview profile.
+
+- **Partition key.** The local (primary) environment keeps today's profile
+  (`preview-profile` directory; macOS data store `bibcodepreview01`), so its
+  saved preview data survives. Every other environment uses
+  `SHA-256("bibcode-preview:" + environmentId)`: on Windows and Linux the
+  directory `<app data>/preview-profiles/<first 32 hex characters>`, on macOS
+  the data store identifier made of the first 16 bytes. Hashing keeps arbitrary
+  ids out of file paths.
+- **One long-lived native host per partition.** Recreating child webviews while
+  switching tabs disconnected the parent app, so the desktop keeps one native
+  preview child per profile in use: created the first time an environment opens
+  a preview, hidden while another partition is shown, and never recreated until
+  the app exits. Logical tabs rebind to their partition's host as today.
+- **Contract.** `DesktopPreviewBridge.createTab(tabId, environmentId?)`
+  (`null` or absent for the local environment); `desktop_preview_create_tab`
+  gains `environment_id: Option<String>`. The tab lifetime calls carry the
+  partition from the tab's thread.
+- **Clearing data** (`desktop_preview_clear_data`) clears through every live
+  preview host, since each holds a different profile.
+- **Cost.** Each profile in use is its own browser process group on Windows
+  (WebView2 environment) and its own web context elsewhere, kept while the app
+  runs.
+- **Not covered.** A removed environment's profile stays on disk; threads in
+  one environment share its profile (as in a normal browser).
+
+Testing: Rust unit tests for the profile directory and identifier derivation
+(stable, distinct per environment, legacy for the local environment, never
+containing id characters); web tests for one host per partition, event and
+command routing to the partition's host, and the partition flowing from the
+tab's thread; a runbook step with two SSH environments both previewing the same
+port, where data saved in one is absent from the other.
+
 ## Out of scope
 
 Same-port reach for LAN, WSL, relay, and browser mode; switching an open

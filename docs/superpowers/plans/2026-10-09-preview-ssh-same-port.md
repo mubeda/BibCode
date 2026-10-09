@@ -631,3 +631,26 @@ Review the new notice against `UI.md` (actionable, names the port and the conseq
 git add packages/contracts/src/ipc.ts apps/web/src/tauriDesktopBridge.ts apps/web/src/tauriDesktopBridge.test.ts apps/web/src/browser/linkNotices.ts apps/web/src/browser/previewGateway.ts apps/web/src/browser/previewGateway.test.ts docs/user/workspace-ui.md docs/testing/ssh-environments.md docs/superpowers/specs/2026-10-07-internal-browser-preview-gateway-design.md docs/superpowers/specs/2026-10-09-preview-ssh-same-port-design.md
 git commit -m "feat(web): open SSH previews on the real localhost origin when the port is free"
 ```
+
+---
+
+### Task 3: Preview storage per environment (spec §6)
+
+**Files:**
+- Modify: `apps/desktop/src-tauri/src/preview/host.rs` (`create_tab` profile selection), `apps/desktop/src-tauri/src/preview/commands.rs` (`desktop_preview_create_tab`, `desktop_preview_clear_data`)
+- Modify: `packages/contracts/src/ipc.ts` (`DesktopPreviewBridge.createTab`)
+- Modify: `apps/web/src/tauriPreviewBridge.ts` (+ test), `apps/web/src/browser/desktopTabLifetime.ts` (+ test), `apps/web/src/browser/DesktopPreviewTabHosts.tsx`, `apps/web/src/components/preview/PreviewView.tsx`
+- Create: `apps/web/src/browser/previewPartition.ts` (+ test)
+- Modify: `docs/architecture/overview.md` (single native view → one per environment), `docs/testing/ssh-environments.md`
+
+**Interfaces:**
+- Produces: Rust `preview_profile_dir_name(environment_id: Option<&str>) -> String` and `preview_data_store_id(environment_id: Option<&str>) -> [u8; 16]`; Tauri `desktop_preview_create_tab(tab_id, environment_id: Option<String>)`.
+- Produces: TS `DesktopPreviewBridge.createTab(tabId: string, environmentId?: string | null)`; `previewPartitionFor(environmentId: EnvironmentId): string | null` (null for the primary environment); `acquireDesktopTab(tabId, partition)`; `navigateDesktopTab(tabId, partition, url, shouldNavigate?)`.
+
+- [ ] **Step 1: Failing tests.** Rust (`host.rs` tests): `preview_profile_dir_name(None) == "preview-profile"`; for `Some("env-a")` it is `preview-profiles/<32 lowercase hex>`, stable across calls, different for `Some("env-b")`, and never contains the id (`Some("../evil")` yields only hex after the prefix); `preview_data_store_id(None) == *b"bibcodepreview01"`, `Some` ids differ from it and from each other. Web: `tauriPreviewBridge.test.ts` — tabs of the same partition reuse one native host (one `desktop_preview_create_tab`); a tab of another partition creates a second host with `{ tabId, environmentId }` and the first is never closed; commands, state, and new-window events route through each tab's own host; a hidden host's events map to its last active logical tab; the existing single-partition tests keep passing. `desktopTabLifetime.test.ts` — `createTab` receives the partition. `previewPartition.test.ts` — primary environment → `null`, another → its id.
+- [ ] **Step 2: Run them; expect failures** (missing functions, extra argument).
+- [ ] **Step 3: Implement.** Native: derive the profile from the partition (`sha2::Sha256` over `"bibcode-preview:" + id`); `create_tab(app, tab_id, environment_id)`; `clear_data` loops over every `preview-` webview. Web: replace `nativeHostTabId` with `hostByPartition: Map<string, string>` (key `""` for null), `partitionOfTab: Map<string, string>`, `activeByHost: Map<string, string | null>`; a new host applies the tab's stored bounds after creation.
+- [ ] **Step 4: Run tests; expect PASS.** Rust: `cargo test -p bibcode-desktop --lib preview`; web: `vp test run src/tauriPreviewBridge.test.ts src/browser`.
+- [ ] **Step 5: Docs** (overview.md native view sentence; runbook step: two SSH environments both previewing port 8123; `localStorage.setItem("probe", "<environment>")` in one is absent in the other; the local environment keeps its earlier preview data).
+- [ ] **Step 6: Gates and commit** (fmt, desktop clippy, desktop lib tests, `vp check`, typecheck, web suite; Codex review). `git commit -m "feat(desktop): keep preview storage separate per environment"`
+
