@@ -149,6 +149,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 | Branch create/checkout/rename/delete and occupied-branch redirect         |        |                                      |                                   |
 | Fetch/pull/push/publish/force-with-lease states                           |        |                                      |                                   |
 | Native stash list, entry diff, apply/pop/drop, and merge preview          |        |                                      |                                   |
+| Merge into a non-checked-out branch; Source Control merge entry and Fetch |        |                                      |                                   |
 | In-progress and conflicted repository presentation                        |        |                                      |                                   |
 | Tag create/delete/push and all four image-diff modes                      |        |                                      |                                   |
 | Explicit pull-request/check refresh and no idle provider refresh          |        |                                      |                                   |

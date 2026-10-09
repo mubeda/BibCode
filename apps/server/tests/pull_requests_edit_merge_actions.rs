@@ -223,16 +223,18 @@ async fn pull_requests_gitlab_warm_actions_reuse_context_but_refresh_permissions
 
     let before = f.count();
     f.raw_response("https://gitlab.com/team/repo.git");
-    for value in [
-        &mr,
-        &approvals,
-        &reviewers,
-        &json!({"rules":[]}),
-        &json!([]),
-        &json!([]),
-        &metadata,
+    // Detail reads run together; each reserves its response by argv.
+    for (value, role) in [
+        (&mr, "merge-request"),
+        (&approvals, "approvals"),
+        (&reviewers, "reviewers"),
+        (&json!({"rules":[]}), "approval-state"),
+        (&json!([]), "awards"),
+        (&json!([]), "issues"),
+        (&metadata, "graphql"),
     ] {
         f.response(value.clone());
+        f.role(role);
     }
     service.get(f.root.path(), 14, &c).await.unwrap();
     assert_eq!(f.count() - before, 8);
@@ -243,12 +245,21 @@ async fn pull_requests_gitlab_warm_actions_reuse_context_but_refresh_permissions
 
     let before = f.count();
     f.raw_response("https://gitlab.com/team/repo.git");
-    for value in [&mr, &approvals, &reviewers] {
+    // Timeline reads run together too.
+    for (value, role) in [
+        (&mr, "merge-request"),
+        (&approvals, "approvals"),
+        (&reviewers, "reviewers"),
+        (
+            &json!({"data":{"project":{"mergeRequest":{"userPermissions":{"createNote":true},"discussions":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}),
+            "graphql",
+        ),
+        (&json!([]), "label-events"),
+        (&json!([]), "milestone-events"),
+        (&json!([]), "state-events"),
+    ] {
         f.response(value.clone());
-    }
-    f.response(json!({"data":{"project":{"mergeRequest":{"userPermissions":{"createNote":true},"discussions":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}));
-    for _ in 0..3 {
-        f.response(json!([]));
+        f.role(role);
     }
     service.timeline(f.root.path(), 14, &c).await.unwrap();
     assert_eq!(f.count() - before, 8, "timeline reuses the context viewer");

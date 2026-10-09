@@ -686,7 +686,17 @@ whenever the source has commits the current branch lacks, it records a merge
 commit. Both modes override repository merge settings such as `merge.ff` or
 branch merge options that would otherwise skip the commit, squash, or reject
 the merge. A source with no commits the current branch lacks is reported as
-nothing to merge and Merge stays disabled. **Rebase…** opens a branch chooser
+nothing to merge and Merge stays disabled. Sources include remote branches,
+listed under **Remote**. **Into** chooses the branch to merge into; it defaults
+to the checked-out branch. Choosing another local branch updates that branch
+without checking it out: your files and the checked-out branch do not change,
+the checked-out branch can be the source, Squash is not offered, and commit
+hooks do not run (commit signing is still honored). A merge into another branch
+that would conflict stays disabled with a hint to check that branch out and
+merge there, and a branch checked out in another worktree is blocked with the
+worktree's path. On Git older than 2.38 there is no preview: a merge into the
+checked-out branch stays available, and merging into another branch is
+disabled. **Rebase…** opens a branch chooser
 and warns when the rewrite will require updating an upstream with
 force-with-lease.
 Repositories with a merge, rebase, cherry-pick, or revert in progress show a
@@ -1191,12 +1201,24 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
   editor, ignore file name, and ignore parent folder when the corresponding host
   actions are available.
 - Commit history and AI commit-message generation are available in the panel.
+- **Merge into current branch…** in the dropdown opens the merge dialog for the
+  checked-out branch with local and remote sources. **Fetch** refreshes the
+  selected remote branch's remote, or every remote for a local source, before
+  you merge; Merge records a merge commit. The entry explains why it is
+  disabled: no Git Manager support on the environment, a detached HEAD, an
+  operation already in progress, or uncommitted changes.
+- While a merge is in progress the panel shows a merge strip. **Commit merge**
+  stays disabled until every conflict is resolved and staged; **Abort** asks
+  for confirmation and restores the pre-merge state. **Merge Changes** lists
+  each conflicted file with **Ours**, **Theirs**, **Mark resolved** (stage the
+  file as you edited it) and open-in-editor. The usual Commit action is hidden
+  until the merge finishes.
 - Successful saves from the built-in file editor notify active Source Control
   subscriptions immediately. Periodic status polling remains a fallback for
   changes made by external tools.
 
-Stash and amend are intentionally not present in this right-panel Source
-Control surface; this matches the Orca reference behavior for this pass. The
+Stash, amend, rebase, and squash merges are intentionally not present in this
+right-panel Source Control surface; this matches the Orca reference behavior for this pass. The
 project-scoped Git Manager is a separate centre surface and does provide stash
 operations and amend.
 

@@ -1842,6 +1842,87 @@ async fn stage_unstage_discard_and_invalid_pathspecs_round_trip_over_rpc() {
 }
 
 #[tokio::test]
+async fn status_reports_each_conflict_once_and_the_merge_in_progress() {
+    let parallelism_permit = acquire_git_rpc_fixture().await;
+    if relaunch_with_isolated_git_config(
+        "status_reports_each_conflict_once_and_the_merge_in_progress",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary fixture root");
+    let repository = root.path().join("conflict-repository");
+    fs::create_dir(&repository).expect("create repository directory");
+    initialize_repository_in(&repository);
+    commit_file(&repository, "tracked.txt", "base\n", "base");
+    run_git_in(&repository, &["switch", "-q", "-c", "feature"]);
+    commit_file(&repository, "tracked.txt", "feature\n", "feature");
+    run_git_in(&repository, &["switch", "-q", "-"]);
+    commit_file(&repository, "tracked.txt", "main\n", "main");
+    let merge = git_command(&repository, &["merge", "feature"])
+        .output()
+        .expect("merge");
+    assert!(!merge.status.success(), "the fixture merge must conflict");
+
+    let mut server = GitServerHarness::start(&temp, parallelism_permit).await;
+    let cwd = repository.to_string_lossy();
+    request(
+        server.socket(),
+        "401",
+        "vcs.refreshStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let status = success_value(server.socket(), "401").await;
+    let entries: Vec<_> = status["workingTree"]["files"]
+        .as_array()
+        .expect("file list")
+        .iter()
+        .filter(|file| file["path"] == "tracked.txt")
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one entry per conflicted path: {entries:?}"
+    );
+    assert_eq!(entries[0]["status"], "conflicted");
+    assert_eq!(entries[0]["area"], "unstaged");
+    assert_eq!(status["operationInProgress"], "merge");
+
+    fs::write(repository.join("tracked.txt"), "resolved\n").expect("resolve");
+    run_git_in(&repository, &["add", "tracked.txt"]);
+    request(
+        server.socket(),
+        "402",
+        "vcs.refreshStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let staged = success_value(server.socket(), "402").await;
+    assert_eq!(staged["operationInProgress"], "merge");
+    assert!(
+        staged["workingTree"]["files"]
+            .as_array()
+            .expect("file list")
+            .iter()
+            .all(|file| file["status"] != "conflicted")
+    );
+
+    run_git_in(&repository, &["commit", "-q", "--no-edit"]);
+    request(
+        server.socket(),
+        "403",
+        "vcs.refreshStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let done = success_value(server.socket(), "403").await;
+    assert!(done.get("operationInProgress").is_none());
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn clone_pull_and_worktree_lifecycle_round_trip_over_rpc() {
     let parallelism_permit = acquire_git_rpc_fixture().await;
     if relaunch_with_isolated_git_config("clone_pull_and_worktree_lifecycle_round_trip_over_rpc") {

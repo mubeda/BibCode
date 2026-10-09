@@ -2035,7 +2035,18 @@ starts.
    reports one commit ahead and none behind, then merge with **Merge commit**.
    Confirm the operation's started-to-finished presentation and that History
    shows a new merge commit on `main` with two parents rather than a
-   fast-forward. Open the **Tags** tab: collapse and expand the **Local** and
+   fast-forward. Next, merge into a branch that is not checked out: from the
+   companion shell run
+   `git -C "$GIT_MANAGER_FIXTURE_ROOT/main" branch merge-into-target main~1`,
+   open **Merge…**, choose `merge-into-target` under **Into**, select `main` as
+   the source, confirm the dialog says the branch is updated without checking it
+   out and offers no Squash, and merge. Confirm `main` stays checked out with an
+   unchanged working tree and that
+   `git -C "$GIT_MANAGER_FIXTURE_ROOT/main" log -1 --format=%P merge-into-target`
+   prints two parents. In the chat's **Source Control** panel, confirm
+   **Merge into current branch…** is enabled on the clean tree and opens the
+   same dialog without an **Into** picker; **Fetch** completes and the dialog
+   stays open. Open the **Tags** tab: collapse and expand the **Local** and
    **Remote origin** sections and confirm the state survives leaving and
    reopening the manager; create a tag from a History commit with **Push to
    origin after creating** on and confirm it appears under Remote origin

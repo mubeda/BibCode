@@ -71,7 +71,14 @@ export const DEFAULT_CHANGE_FILTERS: ChangeFilters = Object.freeze({
 
 function matchesStatusFilter(status: VcsWorkingTreeFileStatus | undefined, filters: ChangeFilters) {
   if (filters.new && status !== "added" && status !== "untracked") return false;
-  if (filters.modified && status !== "modified" && status !== "renamed" && status !== "copied") {
+  // A conflicted path is modified on both sides of the merge.
+  if (
+    filters.modified &&
+    status !== "modified" &&
+    status !== "renamed" &&
+    status !== "copied" &&
+    status !== "conflicted"
+  ) {
     return false;
   }
   return !filters.deleted || status === "deleted";
