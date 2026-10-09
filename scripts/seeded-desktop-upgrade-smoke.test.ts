@@ -1849,9 +1849,17 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(
       startupRetry.test("The candidate application version was not running after update."),
     ).toBe(false);
-    expect(windowsUpgradeObservationScript).toContain("Get-Process -ErrorAction SilentlyContinue");
+    expect(windowsUpgradeObservationScript).toContain(
+      "Get-Process -Name $installerName -ErrorAction SilentlyContinue",
+    );
     expect(windowsUpgradeObservationScript).not.toContain("Get-CimInstance");
     expect(windowsUpgradeObservationScript).toContain("-installer");
+    expect(windowsUpgradeObservationScript).toContain("BIBCODE_SEEDED_PRODUCT_NAME");
+    expect(windowsUpgradeObservationScript).toContain(
+      "$observation.productVersion -eq $env:BIBCODE_SEEDED_CANDIDATE_VERSION",
+    );
+    expect(seed).not.toContain('state?.phase === "protecting") finish');
+    expect(seed).not.toContain("setTimeout(resolve, 30000)");
     expect(combined).toContain("getProjectDataStatuses");
     expect(combined).toContain("getUpdateState");
     expect(seed).toContain("downloadUpdate");

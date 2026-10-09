@@ -774,7 +774,6 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
         if (typeof state?.phase === "string" && !observed.includes(state.phase)) {
           observed.push(state.phase);
         }
-        if (lane === "protected-baseline" && state?.phase === "protecting") finish(null);
       })).then(async () => {
         const install = await bridge.installUpdate();
         if (install?.completed !== true) return finish("install did not complete");
@@ -796,7 +795,6 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
       phases: [...preparation.phases, ...installation.phases],
       installAttempted: true,
     }));
-    await new Promise((resolve) => setTimeout(resolve, 30000));
     `
           : ""
     }
@@ -1001,14 +999,16 @@ try {
     $file = Get-Item -LiteralPath $observation.path
     $observation.productVersion = $file.VersionInfo.ProductVersion
     $observation.fileVersion = $file.VersionInfo.FileVersion
-    $observation.sha256 = (Get-FileHash -LiteralPath $observation.path -Algorithm SHA256).Hash
+    # Hash only the candidate. Hashing the old executable on every sample
+    # exceeds the 10s probe bound on Windows ARM64.
+    if ($observation.productVersion -eq $env:BIBCODE_SEEDED_CANDIDATE_VERSION) {
+      $observation.sha256 = (Get-FileHash -LiteralPath $observation.path -Algorithm SHA256).Hash
+    }
   }
-  # Process enumeration stays inside the 10s probe bound. A full CIM snapshot
+  # Name lookup stays inside the 10s probe bound. Listing every process
   # exceeds it on Windows ARM64 and hides whether the installer has exited.
-  $suffix = '-' + $env:BIBCODE_SEEDED_CANDIDATE_VERSION + '-installer'
-  $observation.installers = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.ProcessName.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase)
-  } | ForEach-Object {
+  $installerName = $env:BIBCODE_SEEDED_PRODUCT_NAME + '-' + $env:BIBCODE_SEEDED_CANDIDATE_VERSION + '-installer'
+  $observation.installers = @(Get-Process -Name $installerName -ErrorAction SilentlyContinue | ForEach-Object {
     $imagePath = $null
     try { $imagePath = $_.Path } catch { $imagePath = $null }
     [ordered]@{ pid = $_.Id; parentPid = $null; path = $imagePath }
@@ -1039,6 +1039,7 @@ async function waitForWindowsInstalledCandidate(input: {
             ...process.env,
             BIBCODE_SEEDED_APPLICATION_PATH: input.appBinaryPath,
             BIBCODE_SEEDED_CANDIDATE_VERSION: input.candidateVersion,
+            BIBCODE_SEEDED_PRODUCT_NAME: "BiBCode",
           },
           timeoutMs: 10_000,
         }),
